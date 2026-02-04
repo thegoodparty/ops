@@ -1,0 +1,21 @@
+{
+  "name": "serve-ops",
+  "version": "1.0.0",
+  "description": "operations tooling for serve",
+  "homepage": "https://github.com/thegoodparty/serve-ops#readme",
+  "license": "UNLICENSED",
+  "author": "engineering@goodparty.org",
+  "type": "commonjs",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "script": "tsx --env-file-if-exists=.env run-script.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.983.0",
+    "@inquirer/prompts": "^8.2.0",
+    "@types/node": "^22.19.8",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
