@@ -2,6 +2,8 @@ import { PrismaClient } from "../../gp-api/node_modules/@prisma/client";
 import { S3 } from "@aws-sdk/client-s3";
 import { input as getInput } from "@inquirer/prompts";
 import { searchNewRelicLogs } from "../utils/newrelic";
+import { people } from "../utils/people";
+import { pick } from "es-toolkit";
 
 const prisma = new PrismaClient();
 
@@ -90,6 +92,28 @@ export default async () => {
     districtType: pathToVictory?.data.electionType,
     districtName: pathToVictory?.data.electionLocation,
   });
+
+  if (
+    pathToVictory?.data.electionType &&
+    pathToVictory?.data.electionLocation
+  ) {
+    const districtStats = await people.get("/v1/people/stats", {
+      params: {
+        state: campaign.details.state,
+        districtType: pathToVictory?.data.electionType,
+        districtName: pathToVictory?.data.electionLocation,
+      },
+    });
+
+    console.log(
+      "District stats:",
+      pick(districtStats.data, [
+        "districtId",
+        "totalConstituents",
+        "totalConstituentsWithCellPhone",
+      ])
+    );
+  }
 
   const electedOffice = await prisma.electedOffice.findFirst({
     where: {
