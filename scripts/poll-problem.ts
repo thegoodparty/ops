@@ -1,6 +1,7 @@
 import { PrismaClient } from "../../gp-api/node_modules/@prisma/client";
 import { S3 } from "@aws-sdk/client-s3";
 import { input as getInput } from "@inquirer/prompts";
+import { searchNewRelicLogs } from "../utils/newrelic";
 
 const prisma = new PrismaClient();
 
@@ -43,6 +44,10 @@ const getUser = async (input: string) => {
     },
   });
 };
+
+// yes, this very dumb
+const dumbParseLogJson = (rawMessage: string): any =>
+  JSON.parse(rawMessage.slice(rawMessage.indexOf("{")));
 
 export default async () => {
   const input =
@@ -115,6 +120,21 @@ export default async () => {
     });
     console.log();
     console.log(`Has CSV: ${!!res.Contents?.length}`);
+    console.log("");
+
+    const logs = await searchNewRelicLogs(
+      `SELECT message FROM Log WHERE entity.name = 'GP_API' AND message LIKE '%Message processing failed%' AND message LIKE '%${poll.id}%' SINCE 1 week ago`
+    );
+
+    console.log("Background job failures:");
+    console.log("--------------------------------");
+    for (const log of logs) {
+      const parsed = dumbParseLogJson(log.message);
+      console.log(parsed);
+      console.log();
+    }
+    console.log("--------------------------------");
+
     console.log();
   }
 };
