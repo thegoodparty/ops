@@ -1,6 +1,15 @@
 import { readdirSync } from "fs";
 
-const script = process.argv[2].replace(".ts", "");
+const scriptArg = process.argv[2];
+if (!scriptArg) {
+  const scripts = readdirSync(`${__dirname}/scripts`)
+    .filter((f) => f.endsWith(".ts"))
+    .map((f) => f.replace(/\.ts$/, ""));
+  console.error("Usage: npm run script <script-name>");
+  console.error("Available scripts:", scripts.join(", "));
+  process.exit(1);
+}
+const script = scriptArg.replace(".ts", "");
 
 const scripts = readdirSync(`${__dirname}/scripts`).map(
   (filename) => `${__dirname}/scripts/${filename}`
