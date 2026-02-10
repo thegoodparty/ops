@@ -69,15 +69,17 @@ type Override = {
   dev: DevName;
 };
 
-let OVERRIDES: Override[] = [];
+let OVERRIDES: Override[];
 try {
-  OVERRIDES = JSON.parse(OVERRIDES_JSON) as Override[];
-  if (!Array.isArray(OVERRIDES)) {
-    throw new Error("OVERRIDES_JSON must be a JSON array.");
-  }
-} catch (err) {
+  OVERRIDES = JSON.parse(OVERRIDES_JSON);
+} catch {
   throw new Error(
-    `OVERRIDES_JSON must be valid JSON array. Received: ${OVERRIDES_JSON}`
+    `OVERRIDES_JSON must be valid JSON. Received: ${OVERRIDES_JSON}`
+  );
+}
+if (!Array.isArray(OVERRIDES)) {
+  throw new Error(
+    `OVERRIDES_JSON must be a JSON array. Received: ${OVERRIDES_JSON}`
   );
 }
 
@@ -122,7 +124,15 @@ const getCurrentRotationDev = (): DevName => {
   }
 
   // Default rotation logic — use day-based math to avoid time-of-day edge cases
-  const daysSinceStart = now.startOf("day").diff(START.startOf("day"), "day");
+  const rawDaysSinceStart = now.startOf("day").diff(START.startOf("day"), "day");
+  if (rawDaysSinceStart < 0) {
+    console.warn(
+      `⚠️  Current date is before ROTATION_START (${ROTATION_START}), defaulting to first dev`
+    );
+  }
+  // Clamp to 0 so dates before ROTATION_START fall into the first rotation slot
+  // (JS `%` preserves the dividend's sign, so a negative index would yield undefined)
+  const daysSinceStart = Math.max(0, rawDaysSinceStart);
   const weeksSinceStart = Math.floor(daysSinceStart / 7);
   const rotationIndex = Math.floor(weeksSinceStart / CADENCE_WEEKS);
   return DEVS[rotationIndex % DEVS.length];
