@@ -12,3 +12,5 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm run script bug-rotation
+        env:
+          SLACK_ADMIN_USER_TOKEN: ${{ secrets.SLACK_ADMIN_USER_TOKEN }}
