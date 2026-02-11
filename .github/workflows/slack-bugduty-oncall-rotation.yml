@@ -1,0 +1,55 @@
+name: Slack Bug Duty On-Call Rotation
+
+on:
+  schedule:
+    - cron: "0 19 * * FRI"
+
+jobs:
+  serve-rotation:
+    runs-on: ubuntu-latest
+    env:
+      SLACK_USERGROUP_ID: S0AD54G9D3K
+      ROTATION_START: "2026-01-16"
+      ROTATION_CADENCE_WEEKS: "2"
+      USERMAP_JSON: >
+        {
+          "Collin": "U091FTXJ5DZ",
+          "Nikao": "U06EH0H6H8R",
+          "Stephen": "U09F6R9QA9G",
+          "Swain": "U09HGPTHHAT"
+        }
+      OVERRIDES_JSON: "[]"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run script bug-rotation
+        env:
+          SLACK_ADMIN_USER_TOKEN: ${{ secrets.SLACK_ADMIN_USER_TOKEN }}
+
+  win-rotation:
+    runs-on: ubuntu-latest
+    env:
+      SLACK_USERGROUP_ID: S0AE3NTCXM3
+      ROTATION_START: "2026-01-16"
+      ROTATION_CADENCE_WEEKS: "1"
+      USERMAP_JSON: >
+        {
+          "Aaron": "U09ESDJFT39",
+          "Daniel": "U09R9PH4ZRP",
+          "Feliks": "U0A1VFKDJUX"
+        }
+      OVERRIDES_JSON: "[]"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run script bug-rotation
+        env:
+          SLACK_ADMIN_USER_TOKEN: ${{ secrets.SLACK_ADMIN_USER_TOKEN }}
