@@ -66,13 +66,6 @@ async function main() {
 
   const client = new SQSClient({
     region: process.env.AWS_REGION || 'us-west-2',
-    ...(process.env.AWS_ACCESS_KEY_ID &&
-      process.env.AWS_SECRET_ACCESS_KEY && {
-        credentials: {
-          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-        },
-      }),
   })
 
   console.log('DLQ URL:', dlqUrl)
@@ -80,7 +73,6 @@ async function main() {
   console.log('Filtering for pollId:', filterPollId)
   console.log('Receiving messages from DLQ (batch size 10)...')
 
-  let received = 0
   const maxBatches = 100 // avoid infinite loop; 100 * 10 = 1000 messages max
 
   for (let batch = 0; batch < maxBatches; batch++) {
@@ -99,11 +91,10 @@ async function main() {
       if (batch === 0) {
         console.log('No messages in DLQ (or queue empty).')
       }
-      continue
+      break
     }
 
     for (const msg of Messages) {
-      received++
       let body: unknown
       try {
         body = JSON.parse(msg.Body ?? '{}')
