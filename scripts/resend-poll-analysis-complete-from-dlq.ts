@@ -124,7 +124,7 @@ async function main() {
         new SendMessageCommand({
           QueueUrl: mainQueueUrl,
           MessageBody: msg.Body!,
-          MessageGroupId: MESSAGE_GROUP_ID,
+          MessageGroupId: `polls-${pollId}`,
           MessageDeduplicationId: deduplicationId,
         }),
       )
