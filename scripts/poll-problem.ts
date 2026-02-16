@@ -147,7 +147,7 @@ export default async () => {
     console.log("");
 
     const logs = await searchNewRelicLogs(
-      `SELECT message FROM Log WHERE entity.name = 'GP_API' AND message LIKE '%Message processing failed%' AND message LIKE '%${poll.id}%' SINCE 1 week ago`
+      `SELECT message FROM Log WHERE entity.name = 'GP_API' AND message LIKE '%Message processing failed%' AND message LIKE '%${poll.id}%' SINCE 2 weeks ago`
     );
 
     console.log("Background job failures:");
