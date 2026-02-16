@@ -58,11 +58,8 @@ async function getPollId(): Promise<string> {
 async function main() {
   const filterPollId = await getPollId()
 
-  const baseUrl = getEnv('SQS_QUEUE_BASE_URL').replace(/\/$/, '')
-  const mainQueueName = getEnv('SQS_QUEUE')
-  const dlqName = process.env.SQS_DLQ_QUEUE || mainQueueName.replace('Queue', 'DLQ')
-  const mainQueueUrl = `${baseUrl}/${mainQueueName}`
-  const dlqUrl = `${baseUrl}/${dlqName}`
+  const mainQueueUrl = "https://sqs.us-west-2.amazonaws.com/333022194791/master-Queue.fifo"
+  const dlqUrl = "https://sqs.us-west-2.amazonaws.com/333022194791/master-DLQ.fifo"
 
   const client = new SQSClient({
     region: process.env.AWS_REGION || 'us-west-2',
