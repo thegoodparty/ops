@@ -3,6 +3,14 @@ import { input as getInput, confirm } from "@inquirer/prompts";
 
 const prisma = new PrismaClient();
 
+// Move polls from one user to another
+// This is used to fix the case where a user has the wrong email and the poll is associated with the wrong user
+// We need to move the poll to the correct user
+// We also need to delete the accidental campaign(s) from the correct user
+// We also need to transfer the campaign(s) from the wrong user to the correct user
+// We also need to transfer the elected offices & polls from the wrong user to the correct user
+// We also need to delete the wrong-email user
+
 export default async () => {
   const wrongEmail =
     process.argv.at(3) ??
@@ -37,12 +45,16 @@ export default async () => {
   console.log("\n--- Wrong email user (has the poll) ---");
   console.log(`  ID: ${wrongUser.id}`);
   console.log(`  Email: ${wrongUser.email}`);
-  console.log(`  Name: ${wrongUser.name ?? `${wrongUser.firstName} ${wrongUser.lastName}`}`);
+  console.log(
+    `  Name: ${wrongUser.name ?? `${wrongUser.firstName} ${wrongUser.lastName}`}`,
+  );
 
   console.log("\n--- Correct email user (should own the poll) ---");
   console.log(`  ID: ${correctUser.id}`);
   console.log(`  Email: ${correctUser.email}`);
-  console.log(`  Name: ${correctUser.name ?? `${correctUser.firstName} ${correctUser.lastName}`}`);
+  console.log(
+    `  Name: ${correctUser.name ?? `${correctUser.firstName} ${correctUser.lastName}`}`,
+  );
 
   // --- Show what the wrong user owns ---
   const wrongUserCampaigns = await prisma.campaign.findMany({
@@ -54,18 +66,24 @@ export default async () => {
     select: { id: true, campaignId: true, isActive: true },
   });
   const wrongUserPolls = await prisma.poll.findMany({
-    where: { electedOfficeId: { in: wrongUserElectedOffices.map((eo) => eo.id) } },
+    where: {
+      electedOfficeId: { in: wrongUserElectedOffices.map((eo) => eo.id) },
+    },
     select: { id: true, name: true, isCompleted: true, electedOfficeId: true },
   });
 
   console.log("\n--- Wrong user's data ---");
   console.log(`  Campaigns: ${wrongUserCampaigns.length}`);
   for (const c of wrongUserCampaigns) {
-    console.log(`    - ${c.id} (slug: ${c.slug}, created: ${c.createdAt.toISOString()})`);
+    console.log(
+      `    - ${c.id} (slug: ${c.slug}, created: ${c.createdAt.toISOString()})`,
+    );
   }
   console.log(`  Elected offices: ${wrongUserElectedOffices.length}`);
   for (const eo of wrongUserElectedOffices) {
-    console.log(`    - ${eo.id} (campaignId: ${eo.campaignId}, active: ${eo.isActive})`);
+    console.log(
+      `    - ${eo.id} (campaignId: ${eo.campaignId}, active: ${eo.isActive})`,
+    );
   }
   console.log(`  Polls: ${wrongUserPolls.length}`);
   for (const p of wrongUserPolls) {
@@ -85,11 +103,15 @@ export default async () => {
   console.log("\n--- Correct user's data ---");
   console.log(`  Campaigns: ${correctUserCampaigns.length}`);
   for (const c of correctUserCampaigns) {
-    console.log(`    - ${c.id} (slug: ${c.slug}, created: ${c.createdAt.toISOString()})`);
+    console.log(
+      `    - ${c.id} (slug: ${c.slug}, created: ${c.createdAt.toISOString()})`,
+    );
   }
   console.log(`  Elected offices: ${correctUserElectedOffices.length}`);
   for (const eo of correctUserElectedOffices) {
-    console.log(`    - ${eo.id} (campaignId: ${eo.campaignId}, active: ${eo.isActive})`);
+    console.log(
+      `    - ${eo.id} (campaignId: ${eo.campaignId}, active: ${eo.isActive})`,
+    );
   }
 
   // --- Determine actions ---
@@ -100,19 +122,19 @@ export default async () => {
   let step = 1;
   if (correctUserCampaigns.length > 0) {
     console.log(
-      `${step}. Delete accidental campaign(s) from correct user (${correctUser.id}):`
+      `${step}. Delete accidental campaign(s) from correct user (${correctUser.id}):`,
     );
     for (const c of correctUserCampaigns) {
       console.log(`   - Campaign ${c.id} (slug: ${c.slug})`);
     }
     console.log(
-      `   (Cascading deletes: PathToVictory, TopIssues, AiChats, Website, etc.)`
+      `   (Cascading deletes: PathToVictory, TopIssues, AiChats, Website, etc.)`,
     );
     step++;
   }
 
   console.log(
-    `${step}. Transfer campaign(s) from wrong user (${wrongUser.id}) to correct user (${correctUser.id})`
+    `${step}. Transfer campaign(s) from wrong user (${wrongUser.id}) to correct user (${correctUser.id})`,
   );
   for (const c of wrongUserCampaigns) {
     console.log(`   - Campaign ${c.id} (slug: ${c.slug})`);
@@ -120,13 +142,13 @@ export default async () => {
   step++;
 
   console.log(
-    `${step}. Transfer elected offices & polls from wrong user to correct user`
+    `${step}. Transfer elected offices & polls from wrong user to correct user`,
   );
   console.log(
-    `   - ${wrongUserElectedOffices.length} elected office(s) will have userId updated`
+    `   - ${wrongUserElectedOffices.length} elected office(s) will have userId updated`,
   );
   console.log(
-    `   - ${wrongUserPolls.length} poll(s) will follow via their elected office`
+    `   - ${wrongUserPolls.length} poll(s) will follow via their elected office`,
   );
   step++;
 
@@ -158,12 +180,12 @@ export default async () => {
         });
         if (pollCount > 0) {
           throw new Error(
-            `Elected office ${eo.id} on accidental campaign ${c.id} has ${pollCount} polls — aborting to avoid data loss`
+            `Elected office ${eo.id} on accidental campaign ${c.id} has ${pollCount} polls — aborting to avoid data loss`,
           );
         }
         await tx.electedOffice.delete({ where: { id: eo.id } });
         console.log(
-          `Deleted elected office ${eo.id} from accidental campaign ${c.id}`
+          `Deleted elected office ${eo.id} from accidental campaign ${c.id}`,
         );
       }
       await tx.campaign.delete({ where: { id: c.id } });
@@ -176,7 +198,9 @@ export default async () => {
         where: { id: c.id },
         data: { userId: correctUser.id },
       });
-      console.log(`Transferred campaign ${c.id} (slug: ${c.slug}) to user ${correctUser.id}`);
+      console.log(
+        `Transferred campaign ${c.id} (slug: ${c.slug}) to user ${correctUser.id}`,
+      );
     }
 
     // 3. Transfer elected offices to correct user
@@ -185,14 +209,22 @@ export default async () => {
         where: { id: eo.id },
         data: { userId: correctUser.id },
       });
-      console.log(`Transferred elected office ${eo.id} to user ${correctUser.id}`);
+      console.log(
+        `Transferred elected office ${eo.id} to user ${correctUser.id}`,
+      );
     }
 
     // 4. Delete the wrong-email user
     await tx.user.delete({ where: { id: wrongUser.id } });
-    console.log(`Deleted wrong-email user ${wrongUser.id} (${wrongUser.email})`);
+    console.log(
+      `Deleted wrong-email user ${wrongUser.id} (${wrongUser.email})`,
+    );
   });
 
-  console.log("\nDone! The correct user now owns the campaign, elected office, and polls.");
-  console.log(`User ${correctUser.id} (${correctUser.email}) should now see their poll.`);
+  console.log(
+    "\nDone! The correct user now owns the campaign, elected office, and polls.",
+  );
+  console.log(
+    `User ${correctUser.id} (${correctUser.email}) should now see their poll.`,
+  );
 };

@@ -4,6 +4,10 @@ import { input as getInput, confirm } from "@inquirer/prompts";
 
 const prisma = new PrismaClient();
 
+// Resend a single Poll Creation message to the main queue.
+// This is used to resend the message if it failed to send the first time.
+// We need to resend the message to the main queue so that the poll creation process can continue.
+
 // Production SQS config - matches gp-api queue.config.ts
 const SQS_QUEUE = "master-Queue.fifo";
 const SQS_QUEUE_BASE_URL = "https://sqs.us-west-2.amazonaws.com/333022194791";
