@@ -42,6 +42,13 @@ export default async () => {
     return;
   }
 
+  if (wrongUser.id === correctUser.id) {
+    console.error(
+      `Both emails resolve to the same user (${wrongUser.id}). Use two different users to run this script.`,
+    );
+    return;
+  }
+
   console.log("\n--- Wrong email user (has the poll) ---");
   console.log(`  ID: ${wrongUser.id}`);
   console.log(`  Email: ${wrongUser.email}`);
