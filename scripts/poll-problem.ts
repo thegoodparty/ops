@@ -138,12 +138,18 @@ export default async () => {
   for (const poll of polls) {
     console.log(poll);
 
-    const res = await s3.listObjectsV2({
-      Bucket: "tevyn-poll-csvs-master",
-      Prefix: poll.id,
-    });
+    const [res, individualMessageCount] = await Promise.all([
+      s3.listObjectsV2({
+        Bucket: "tevyn-poll-csvs-master",
+        Prefix: poll.id,
+      }),
+      prisma.pollIndividualMessage.count({
+        where: { pollId: poll.id },
+      }),
+    ]);
     console.log();
     console.log(`Has CSV: ${!!res.Contents?.length}`);
+    console.log(`Individual messages: ${individualMessageCount}`);
     console.log("");
 
     const logs = await searchNewRelicLogs(
