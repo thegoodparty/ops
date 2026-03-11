@@ -18,7 +18,14 @@ jobs:
           "Stephen": "U09F6R9QA9G",
           "Swain": "U09HGPTHHAT"
         }
-      OVERRIDES_JSON: "[]"
+      OVERRIDES_JSON: |
+        [
+          {
+            "start": "2026-03-12",
+            "end": "2026-03-14",
+            "dev": "Swain"
+          }
+        ]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
