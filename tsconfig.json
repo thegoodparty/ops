@@ -1,5 +1,10 @@
 {
-  "include": ["run-script.ts", "scripts/**/*.ts", "utils/**/*.ts"],
+  "include": [
+    "run-script.ts",
+    "utils/**/*.ts",
+    "delegate/**/*.ts",
+    "deploy/**/*.ts"
+  ],
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
@@ -7,9 +12,8 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "rootDir": ".",
+    "outDir": "dist",
     "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "noEmit": true
-  },
+    "resolveJsonModule": true
+  }
 }
