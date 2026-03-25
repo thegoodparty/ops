@@ -21,6 +21,10 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
   if (!verifySlackWebhook(body, timestamp, signature, secret))
     return UNAUTHORIZED;
 
+  if (headers["x-slack-retry-num"]) {
+    return { statusCode: 200, body: "ok" };
+  }
+
   const payload = JSON.parse(body);
 
   if (payload.type === "url_verification") {
