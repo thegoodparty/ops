@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["develop"]
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+env:
+  AWS_REGION: us-west-2
+  IMAGE_URI: 333022194791.dkr.ecr.us-west-2.amazonaws.com/delegate-worker:${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-pulumi-deploy
+          aws-region: us-west-2
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install Pulumi
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: "^3"
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Build Docker Image
+        run: docker build -t "$IMAGE_URI" --platform linux/amd64 -f delegate/worker/Dockerfile .
+      - name: Push Docker Image
+        if: ${{ github.event_name != 'pull_request' }}
+        run: docker push "$IMAGE_URI"
+      - name: Deploy
+        working-directory: deploy
+        if: ${{ github.event_name != 'pull_request' }}
+        run: ./deploy.sh
