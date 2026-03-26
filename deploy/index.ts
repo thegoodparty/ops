@@ -3,6 +3,7 @@ import * as aws from "@pulumi/aws";
 import { createWorker } from "./components/worker";
 import { createWebhookLambda } from "./components/webhooks";
 import { createPlaywrightReportsBucket } from "./components/playwright-reports";
+import { createJobs } from "./components/jobs";
 
 export = async () => {
   const config = new pulumi.Config();
@@ -38,6 +39,14 @@ export = async () => {
   });
 
   const playwrightReports = createPlaywrightReportsBucket();
+
+  createJobs({
+    secretArn: secretVersion.arn,
+    clusterArn: worker.cluster.arn,
+    taskDefArn: worker.taskDefinition.arn,
+    subnetIds: vpcSubnetIds.public,
+    securityGroupId,
+  });
 
   return {
     webhookUrl: webhook.url,

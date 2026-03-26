@@ -11,15 +11,10 @@ export type AgentConfig = {
   name: string;
   systemPrompt: string;
   model: string;
-  mcpServers?: Record<string, McpServerConfig>;
-  allowedTools?: string[];
-  maxTurns?: number;
-  maxBudgetUsd?: number;
-  permissionMode?: Options["permissionMode"];
+  maxBudgetUsd: number;
 };
 
 export type AgentJob = {
-  agent: string;
   message: string;
   callback?: CallbackTarget;
   cwd?: string;

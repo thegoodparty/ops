@@ -8,6 +8,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY dist/delegate/ ./dist/delegate/
+COPY dist/jobs/ ./dist/jobs/
 RUN adduser -D -s /bin/bash agent && chown -R agent:agent /app
 USER agent
 ENV SHELL=/bin/bash

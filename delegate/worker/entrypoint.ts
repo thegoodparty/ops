@@ -1,8 +1,52 @@
-import "../agents";
 import { WebClient } from "@slack/web-api";
-import { getAgent, runAgent, sendCallback } from "../framework";
-import type { AgentJob } from "../framework";
+import { runAgent, sendCallback } from "../framework";
+import type { AgentConfig, AgentJob } from "../framework";
+import { BASE_SYSTEM_PROMPT } from "../system-prompt";
 import { setupGitHubAuth } from "./github-auth";
+import { runScheduledAgentJob } from "./agent-job-runner";
+
+const SLACK_PROMPT = `You are responding to a question in Slack.
+
+Your response will be posted back to the Slack thread where you were mentioned. Write your final output as the message you want posted — no extra formatting or preamble needed.
+
+Be concise and conversational. You're in a Slack thread, not writing a report.
+
+## Formatting
+
+Your output is posted directly to Slack. Use Slack's mrkdwn format, NOT Markdown:
+- Bold: *bold* (not **bold**)
+- Italic: _italic_ (not *italic*)
+- Code: \`code\` (same as Markdown)
+- Code block: \`\`\`code\`\`\` (same as Markdown)
+- Bullet lists: use bullet character (•) or dash (-), no nested indentation
+- Links: <url|label>
+- Do NOT use headers (#), they don't render in Slack
+- Do NOT use markdown tables (| col | col |) or horizontal rules (---), they don't render in Slack
+- For tabular data, use a code block with monospaced alignment
+
+## Thread context
+
+You will receive the full Slack thread context in your prompt as <slack-thread> XML. ALWAYS read it carefully before responding. The thread contains all the information you need to understand the request. NEVER ask clarifying questions if the answer is in the thread. Just start investigating immediately with the tools you have.
+
+## Alert investigation
+
+If the thread contains a fired alert (e.g. from Grafana), investigate it immediately — do not ask for more details:
+1. Extract the alert details from the thread (alert name, service, metrics)
+2. Query Grafana logs/metrics around the alert time
+3. If the problem isn't clear from Grafana, check Sentry for related errors
+4. Summarize your findings — lead with the most important finding
+
+## Pull Requests
+
+When making pull requests, always link back to the original slack thread in the PR description.
+`;
+
+const slackResponder: AgentConfig = {
+  name: "delegate-slack-responder",
+  maxBudgetUsd: 5,
+  systemPrompt: BASE_SYSTEM_PROMPT + "\n" + SLACK_PROMPT,
+  model: "claude-opus-4-6",
+};
 
 const main = async () => {
   await setupGitHubAuth();
@@ -13,22 +57,28 @@ const main = async () => {
     process.exit(1);
   }
 
-  let job: AgentJob;
+  let parsed: Record<string, unknown>;
   try {
-    job = JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
     console.error("AGENT_JOB is not valid JSON:", raw);
     process.exit(1);
   }
 
-  console.log(`Starting agent: ${job.agent}`);
+  if (typeof parsed.jobName === "string") {
+    await runScheduledAgentJob(parsed.jobName);
+    return;
+  }
+
+  const job = parsed as unknown as AgentJob;
+
+  console.log("Starting delegate");
   if (job.metadata) console.log("Metadata:", job.metadata);
 
-  const config = getAgent(job.agent);
-
-  const slack = job.metadata?.source === "slack"
-    ? new WebClient(process.env.SLACK_BOT_TOKEN)
-    : undefined;
+  const slack =
+    job.metadata?.source === "slack"
+      ? new WebClient(process.env.SLACK_BOT_TOKEN)
+      : undefined;
 
   let message = job.message;
   if (slack && job.metadata?.source === "slack") {
@@ -55,8 +105,13 @@ const main = async () => {
           }
         }
         if (m.blocks) {
-          for (const block of m.blocks as Array<{ type: string; text?: { text?: string }; elements?: Array<{ elements?: Array<{ text?: string }> }> }>) {
-            if (block.type === "section" && block.text?.text) parts.push(block.text.text);
+          for (const block of m.blocks as Array<{
+            type: string;
+            text?: { text?: string };
+            elements?: Array<{ elements?: Array<{ text?: string }> }>;
+          }>) {
+            if (block.type === "section" && block.text?.text)
+              parts.push(block.text.text);
             if (block.type === "rich_text" && block.elements) {
               for (const el of block.elements) {
                 if (el.elements) {
@@ -74,7 +129,9 @@ const main = async () => {
       const threadMessages = (replies.messages ?? [])
         .map((m) => {
           const content = formatMessage(m);
-          return `<message user="${m.user ?? m.bot_id ?? "unknown"}" ts="${m.ts}">\n${content}\n</message>`;
+          return `<message user="${m.user ?? m.bot_id ?? "unknown"}" ts="${
+            m.ts
+          }">\n${content}\n</message>`;
         })
         .join("\n");
 
@@ -85,7 +142,7 @@ const main = async () => {
     }
   }
 
-  const result = await runAgent(config, message, job.cwd);
+  const result = await runAgent(slackResponder, message, job.cwd);
 
   console.log(`Agent completed in ${(result.durationMs / 1000).toFixed(1)}s`);
   console.log("Output:", result.output);

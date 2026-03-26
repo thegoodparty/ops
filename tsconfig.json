@@ -1,9 +1,11 @@
 {
   "include": [
     "run-script.ts",
+    "generate-lambdas.ts",
     "utils/**/*.ts",
     "delegate/**/*.ts",
-    "deploy/**/*.ts"
+    "deploy/**/*.ts",
+    "jobs/**/*.ts"
   ],
   "compilerOptions": {
     "target": "ES2022",

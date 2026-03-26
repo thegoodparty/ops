@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentConfig, AgentResult } from "./types";
+import { mcpServers } from "./mcp";
 
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
@@ -7,7 +8,7 @@ const log = (agent: string, event: string, data?: Record<string, unknown>) =>
 export const runAgent = async (
   config: AgentConfig,
   message: string,
-  cwd?: string,
+  cwd?: string
 ): Promise<AgentResult> => {
   const start = Date.now();
   let output = "";
@@ -19,19 +20,10 @@ export const runAgent = async (
     options: {
       systemPrompt: config.systemPrompt,
       model: config.model,
-      mcpServers: config.mcpServers,
-      allowedTools: config.allowedTools ?? [
-        "mcp__*",
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "Glob",
-        "Grep",
-      ],
-      maxTurns: config.maxTurns ?? 50,
-      maxBudgetUsd: config.maxBudgetUsd ?? 5,
-      permissionMode: config.permissionMode ?? "bypassPermissions",
+      mcpServers,
+      allowedTools: ["mcp__*", "Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+      maxBudgetUsd: config.maxBudgetUsd,
+      permissionMode: "bypassPermissions",
       cwd,
       stderr: (data: string) => console.error("[claude stderr]", data),
     },
@@ -41,10 +33,10 @@ export const runAgent = async (
       log(config.name, "session_init", { sessionId });
 
       const connected = msg.mcp_servers?.filter(
-        (s: { status: string; name: string }) => s.status === "connected",
+        (s: { status: string; name: string }) => s.status === "connected"
       );
       const failed = msg.mcp_servers?.filter(
-        (s: { status: string; name: string }) => s.status !== "connected",
+        (s: { status: string; name: string }) => s.status !== "connected"
       );
       if (connected?.length) {
         log(config.name, "mcp_connected", {

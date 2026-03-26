@@ -55,7 +55,6 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
           name: "eyes",
         }),
         dispatch({
-          agent: "slack-responder",
           message: text,
           callback: {
             type: "slack",
@@ -91,7 +90,7 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
 
 type RouteHandler = (
   body: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
 ) => Promise<{
   statusCode: number;
   body: string;
@@ -109,7 +108,7 @@ export const handler = async (event: FunctionURLEvent) => {
     return {
       statusCode: 404,
       body: `Unknown path: ${event.rawPath}. Available: ${Object.keys(
-        routes
+        routes,
       ).join(", ")}`,
     };
   }
