@@ -46,9 +46,9 @@ jobs:
       ROTATION_CADENCE_WEEKS: "2"
       USERMAP_JSON: >
         {
-          "Aaron": "U09ESDJFT39",
           "Daniel": "U09R9PH4ZRP",
-          "Feliks": "U0A1VFKDJUX"
+          "Feliks": "U0A1VFKDJUX",
+          "Tomer": "UKP6FPANN"
         }
       OVERRIDES_JSON: "[]"
     steps:
