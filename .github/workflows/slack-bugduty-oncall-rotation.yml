@@ -53,7 +53,7 @@ jobs:
       OVERRIDES_JSON: |
         [
           {
-            "start": "2026-04-14",
+            "start": "2026-04-13",
             "end": "2026-04-15",
             "dev": "Feliks"
           }
