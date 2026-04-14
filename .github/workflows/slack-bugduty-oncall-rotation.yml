@@ -50,7 +50,14 @@ jobs:
           "Feliks": "U0A1VFKDJUX",
           "Tomer": "UKP6FPANN"
         }
-      OVERRIDES_JSON: "[]"
+      OVERRIDES_JSON: |
+        [
+          {
+            "start": "2026-04-14",
+            "end": "2026-04-15",
+            "dev": "Feliks"
+          }
+        ]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
