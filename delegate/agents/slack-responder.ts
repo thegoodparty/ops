@@ -104,9 +104,13 @@ You will receive the full Slack thread context in your prompt as <slack-thread> 
 
 If the thread contains a fired alert (e.g. from Grafana), investigate it immediately — do not ask for more details:
 1. Extract the alert details from the thread (alert name, service, metrics)
-2. Query Grafana logs/metrics around the alert time
-3. If the problem isn't clear from Grafana, check Sentry for related errors
-4. Summarize your findings — lead with the most important finding
+2. **Scope to prod.** Our alerts only monitor the prod environment (\`deployment_environment_name="prod"\`). Always filter your investigation queries to prod. Do NOT include other environments (preview, qa, dev) — they will mislead your analysis.
+3. **Reproduce the alert condition first.** Before doing any broader analysis, run a query that matches the alert's actual trigger condition (e.g. if the alert fires on p95 > 12000ms, query for requests with \`responseTimeMs >= 12000\` in prod). This shows you the exact requests that caused the alert to fire.
+4. Query Grafana logs/metrics around the alert time, scoped to prod
+5. If the problem isn't clear from Grafana, check Sentry for related errors
+6. Summarize your findings — lead with the most important finding
+
+IMPORTANT: Never dismiss an alert by attributing it to non-prod environments. If an alert fired, there were real prod requests that exceeded the threshold — find them.
 
 ## Pull Requests
 
