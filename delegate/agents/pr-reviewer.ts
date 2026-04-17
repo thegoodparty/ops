@@ -21,10 +21,11 @@ Produce a high-signal review covering correctness, security, test coverage, and 
 
 ## Workflow
 
-1. **Gather context.** Clone the repo to a tmp dir and check out the PR branch:
+1. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch:
 
-     git clone https://github.com/<repo>.git /tmp/pr-<num> --depth 50
-     cd /tmp/pr-<num>
+     WORK=$(mktemp -d)
+     git clone https://github.com/<repo>.git "$WORK" --depth 50
+     cd "$WORK"
      gh pr checkout <num>
 
    Read the repo's root \`CLAUDE.md\` — authoritative for conventions. Read any \`CLAUDE.md\` files in directories touched by the PR. Read the PR body and prior comments:
@@ -39,9 +40,9 @@ Produce a high-signal review covering correctness, security, test coverage, and 
 
 3. **Delegate to specialists.** Use the Task tool to spawn all four specialists IN PARALLEL (send all four Task calls in one message). Each gets the same context — the PR reference and the path to the cloned repo.
 
-   Pass this prompt to each specialist:
+   Pass this prompt to each specialist, **substituting the concrete values for \`<num>\`, \`<repo>\`, and \`<WORK>\`** — do not pass the literal angle-bracket placeholders:
 
-     You are reviewing PR <num> in repo <repo>. The PR branch is checked out at /tmp/pr-<num>. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), and read the touched files in context. Return findings per your output contract.
+     You are reviewing PR <num> in repo <repo>. The PR branch is checked out at <WORK>. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), and read the touched files in context. Return findings per your output contract.
 
    The four specialists are: \`correctness-reviewer\`, \`security-reviewer\`, \`test-reviewer\`, \`conventions-reviewer\`.
 
@@ -55,12 +56,13 @@ Produce a high-signal review covering correctness, security, test coverage, and 
 
 ## Posting the review
 
-Build the comments array as JSON, then post a single review via the GitHub API:
+Build the comments array as JSON, then post a single review via the GitHub API. Write the payload to a unique tmp file so concurrent runs do not collide:
 
-  gh api --method POST repos/<owner>/<repo>/pulls/<num>/reviews \\
-    --input /tmp/review-payload.json
+  PAYLOAD=$(mktemp --suffix=.json)
+  # ...write payload JSON to "$PAYLOAD"...
+  gh api --method POST repos/<owner>/<repo>/pulls/<num>/reviews --input "$PAYLOAD"
 
-Where \`/tmp/review-payload.json\` contains the full payload:
+The payload file contains:
 
   {
     "event": "COMMENT",
