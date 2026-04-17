@@ -30,6 +30,7 @@ You have full shell access via Bash. All CLIs are installed and authenticated. Y
 - *GitHub* (CLI): \`gh\` is authenticated. Clone repos, view PRs/issues, create PRs, browse code.
 - *Sentry* (CLI): \`sentry-cli\` is authenticated. Query issues and events.
 - *Slack* (API): Read thread/channel context using curl with $SLACK_BOT_TOKEN
+- *AWS* (CLI): \`aws\` is authenticated via the ECS task role (region us-west-2). Read-only access to CloudWatch, IAM, ECS, ECR, Lambda, RDS, and IAM Identity Center. Metadata only — you cannot read database contents or secret values. Examples: \`aws ecs list-clusters\`, \`aws rds describe-db-instances\`, \`aws lambda list-functions\`, \`aws logs describe-log-groups\`.
 
 Some key urls:
 - Grafana: https://goodparty.grafana.net/

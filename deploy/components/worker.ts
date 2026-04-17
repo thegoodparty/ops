@@ -64,6 +64,15 @@ export const createWorker = (config: WorkerConfig) => {
         },
       ],
     }),
+    managedPolicyArns: [
+      "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess",
+      "arn:aws:iam::aws:policy/IAMReadOnlyAccess",
+      "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+      "arn:aws:iam::aws:policy/AWSLambda_ReadOnlyAccess",
+      "arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess",
+      "arn:aws:iam::aws:policy/AWSSSOReadOnly",
+      "arn:aws:iam::aws:policy/AWSSSODirectoryReadOnly",
+    ],
     inlinePolicies: [
       {
         name: "inline",
@@ -78,6 +87,11 @@ export const createWorker = (config: WorkerConfig) => {
                 "ssmmessages:CreateDataChannel",
                 "ssmmessages:CreateControlChannel",
               ],
+              Resource: ["*"],
+            },
+            {
+              Effect: "Allow",
+              Action: ["ecs:Describe*", "ecs:List*"],
               Resource: ["*"],
             },
           ],
@@ -105,6 +119,7 @@ export const createWorker = (config: WorkerConfig) => {
         cpu: 1024,
         memory: 4096,
         essential: true,
+        environment: [{ name: "AWS_DEFAULT_REGION", value: "us-west-2" }],
         secrets: config.secretKeys.sort().map((key) => ({
           name: key,
           valueFrom: `${config.secretArn}:${key}::`,
