@@ -21,10 +21,10 @@ Produce a high-signal review covering correctness, security, test coverage, and 
 
 ## Workflow
 
-1. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch:
+1. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch. **Include submodules** — some repos vendor an \`ai-rules\` submodule that the \`ai-rules-critic\` specialist needs:
 
      WORK=$(mktemp -d)
-     git clone https://github.com/<repo>.git "$WORK" --depth 50
+     git clone --recurse-submodules --depth 50 https://github.com/<repo>.git "$WORK"
      cd "$WORK"
      gh pr checkout <num>
 
@@ -38,15 +38,15 @@ Produce a high-signal review covering correctness, security, test coverage, and 
 
    For each touched file, read enough of the surrounding code to understand context — do not review diff hunks in isolation.
 
-3. **Delegate to specialists.** Use the Task tool to spawn all four specialists IN PARALLEL (send all four Task calls in one message). Each gets the same context — the PR reference and the path to the cloned repo.
+3. **Delegate to specialists.** Use the Task tool to spawn all five specialists IN PARALLEL (send all five Task calls in one message). Each gets the same context — the PR reference and the path to the cloned repo.
 
    Pass this prompt to each specialist, **substituting the concrete values for \`<num>\`, \`<repo>\`, and \`<WORK>\`** — do not pass the literal angle-bracket placeholders:
 
      You are reviewing PR <num> in repo <repo>. The PR branch is checked out at <WORK>. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), and read the touched files in context. Return findings per your output contract.
 
-   The four specialists are: \`correctness-reviewer\`, \`security-reviewer\`, \`test-reviewer\`, \`conventions-reviewer\`.
+   The five specialists are: \`correctness-reviewer\`, \`security-reviewer\`, \`test-reviewer\`, \`conventions-reviewer\`, \`ai-rules-critic\`.
 
-4. **Aggregate.** Collect the JSON findings from all four. Dedupe entries that overlap across specialists (prefer the most specific wording). Keep at most three \`nit\`-level findings per specialist — you are a staff engineer, not a linter. Rank remaining findings by severity.
+4. **Aggregate.** Collect the JSON findings from all five. Dedupe entries that overlap across specialists (prefer the most specific wording, and when an \`ai-rules-critic\` finding overlaps a general specialist's, prefer the \`ai-rules\` one because it cites a specific rule). Keep at most three \`nit\`-level findings per specialist — you are a staff engineer, not a linter. Rank remaining findings by severity.
 
 5. **Decide the verdict.**
    - **Request changes** if there is at least one \`blocker\` finding, or three+ unrelated \`concern\`-level findings.
