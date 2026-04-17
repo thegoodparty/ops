@@ -27,6 +27,7 @@ type PullRequestPayload = {
     title: string;
     user: { login: string };
     base: { ref: string };
+    head: { sha: string };
   };
   repository: { name: string; full_name: string };
 };
@@ -90,6 +91,7 @@ export const handleGithub = async (
   <title>${esc(pr.title)}</title>
   <author>${esc(pr.user.login)}</author>
   <baseRef>${esc(pr.base.ref)}</baseRef>
+  <headSha>${esc(pr.head.sha)}</headSha>
 </pr>`,
     callback: {
       type: "github-pr",
@@ -101,6 +103,7 @@ export const handleGithub = async (
       repo: repoFullName,
       prNumber: String(pr.number),
       author: pr.user.login,
+      headSha: pr.head.sha,
       deliveryId: deliveryId ?? "",
     },
   });

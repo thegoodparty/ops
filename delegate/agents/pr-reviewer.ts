@@ -13,6 +13,7 @@ You will receive a PR reference in your prompt as:
   <title>...</title>
   <author>...</author>
   <baseRef>develop</baseRef>
+  <headSha>abc123...</headSha>
 </pr>
 
 ## Your job
@@ -20,6 +21,22 @@ You will receive a PR reference in your prompt as:
 Produce a high-signal review covering correctness, security, test coverage, and repo conventions. You do this by DELEGATING to specialist subagents, then aggregating their findings into a single coherent review.
 
 ## Workflow
+
+0. **Compute your own task logs URL, then post \`pending\` status check.** You're running inside an ECS Fargate task; derive your task ID from the ECS metadata endpoint, then build the CloudWatch logs URL for this run. Use this exact shell recipe:
+
+     TASK_ARN=$(curl -s "$ECS_CONTAINER_METADATA_URI_V4/task" | jq -r '.TaskARN')
+     TASK_ID="\${TASK_ARN##*/}"
+     LOGS_URL="https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/\$252Faws\$252Fecs\$252Fdelegate/log-events/agent\$252Fagent\$252F\${TASK_ID}"
+
+   Then post the pending status before cloning anything. The \`details\` link on the PR check will go to \`$LOGS_URL\`:
+
+     gh api --method POST repos/<repo>/statuses/<headSha> \\
+       -f state=pending \\
+       -f context=pr-reviewer \\
+       -f description="Review in progress" \\
+       -f target_url="$LOGS_URL"
+
+   Do this FIRST, before cloning. If any step fails, log the error but continue — don't block the review on status-check failures. Keep \`$LOGS_URL\` around; you'll use it again in step 7.
 
 1. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch. **Include submodules** — some repos vendor an \`ai-rules\` submodule that the \`ai-rules-critic\` specialist needs:
 
@@ -53,6 +70,24 @@ Produce a high-signal review covering correctness, security, test coverage, and 
    - **Approve** otherwise.
 
 6. **Post the review.** ONE \`gh api\` call. See "Posting the review" below.
+
+7. **Post terminal status check.** After the review has been posted (or on your final error fallback), update the commit status. Reuse the \`$LOGS_URL\` you computed in step 0:
+
+     # on success (review posted cleanly)
+     gh api --method POST repos/<repo>/statuses/<headSha> \\
+       -f state=success \\
+       -f context=pr-reviewer \\
+       -f description="Review posted (verdict: <Approve|Request changes>)" \\
+       -f target_url="$LOGS_URL"
+
+     # on failure (review could not be posted at all)
+     gh api --method POST repos/<repo>/statuses/<headSha> \\
+       -f state=failure \\
+       -f context=pr-reviewer \\
+       -f description="Review failed — see task logs" \\
+       -f target_url="$LOGS_URL"
+
+   Use the same \`context=pr-reviewer\` string every time — GitHub keys by context, so this replaces the earlier \`pending\` status rather than adding a second check. Never use \`state=error\` — reserve that for infra failures outside the agent's responsibility.
 
 ## Posting the review
 
