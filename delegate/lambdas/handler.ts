@@ -2,6 +2,7 @@ import { WebClient } from "@slack/web-api";
 import { dispatch } from "./dispatch";
 import { getSecrets } from "./secrets";
 import { verifySlackWebhook } from "./verify";
+import { handleGithub } from "./github";
 
 type FunctionURLEvent = {
   rawPath: string;
@@ -91,7 +92,7 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
 
 type RouteHandler = (
   body: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
 ) => Promise<{
   statusCode: number;
   body: string;
@@ -100,6 +101,7 @@ type RouteHandler = (
 
 const routes: Record<string, RouteHandler> = {
   "/slack": handleSlack,
+  "/github": handleGithub,
 };
 
 export const handler = async (event: FunctionURLEvent) => {
@@ -109,7 +111,7 @@ export const handler = async (event: FunctionURLEvent) => {
     return {
       statusCode: 404,
       body: `Unknown path: ${event.rawPath}. Available: ${Object.keys(
-        routes
+        routes,
       ).join(", ")}`,
     };
   }
