@@ -15,6 +15,9 @@ const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 const UNAUTHORIZED = { statusCode: 401, body: "unauthorized" };
 const OK = { statusCode: 200, body: "ok" };
 
+const esc = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
 type PullRequestPayload = {
   action: string;
   pull_request: {
@@ -57,7 +60,12 @@ export const handleGithub = async (
   const eventType = headers["x-github-event"];
   const deliveryId = headers["x-github-delivery"];
 
-  const payload = JSON.parse(body) as unknown;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return { statusCode: 400, body: "invalid json" };
+  }
 
   if (!shouldDispatch(eventType, payload)) {
     console.log(
@@ -76,12 +84,12 @@ export const handleGithub = async (
   const { taskArn } = await dispatch({
     agent: "pr-reviewer",
     message: `<pr>
-  <repo>${repoFullName}</repo>
+  <repo>${esc(repoFullName)}</repo>
   <number>${pr.number}</number>
-  <url>${pr.html_url}</url>
-  <title>${pr.title}</title>
-  <author>${pr.user.login}</author>
-  <baseRef>${pr.base.ref}</baseRef>
+  <url>${esc(pr.html_url)}</url>
+  <title>${esc(pr.title)}</title>
+  <author>${esc(pr.user.login)}</author>
+  <baseRef>${esc(pr.base.ref)}</baseRef>
 </pr>`,
     callback: {
       type: "github-pr",
