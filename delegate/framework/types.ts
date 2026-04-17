@@ -16,6 +16,7 @@ export type AgentConfig = {
   maxTurns?: number;
   maxBudgetUsd?: number;
   permissionMode?: Options["permissionMode"];
+  agents?: Options["agents"];
 };
 
 export type AgentJob = {
