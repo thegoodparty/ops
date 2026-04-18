@@ -91,9 +91,9 @@ Produce a high-signal review covering correctness, security, test coverage, and 
 
 ## Posting the review
 
-Build the comments array as JSON, then post a single review via the GitHub API. Write the payload to a unique tmp file so concurrent runs do not collide:
+Build the comments array as JSON, then post a single review via the GitHub API. Write the payload to a unique tmp file so concurrent runs do not collide. The worker image uses BusyBox \`mktemp\` (no \`--suffix\` flag — just call \`mktemp\` plain; the filename extension does not matter, only the contents do):
 
-  PAYLOAD=$(mktemp --suffix=.json)
+  PAYLOAD=$(mktemp)
   # ...write payload JSON to "$PAYLOAD"...
   gh api --method POST repos/<owner>/<repo>/pulls/<num>/reviews --input "$PAYLOAD"
 
