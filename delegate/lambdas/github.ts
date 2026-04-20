@@ -8,7 +8,7 @@ const REVIEW_REPOS = new Set([
   "gp-webapp",
   "people-api",
   "election-api",
-  "serve-ops",
+  "ops",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 
@@ -82,9 +82,10 @@ export const handleGithub = async (
   const pr = payload.pull_request;
   const repoFullName = payload.repository.full_name;
 
-  const { taskArn } = await dispatch({
-    agent: "pr-reviewer",
-    message: `<pr>
+  try {
+    const { taskArn } = await dispatch({
+      agent: "pr-reviewer",
+      message: `<pr>
   <repo>${esc(repoFullName)}</repo>
   <number>${pr.number}</number>
   <url>${esc(pr.html_url)}</url>
@@ -93,31 +94,46 @@ export const handleGithub = async (
   <baseRef>${esc(pr.base.ref)}</baseRef>
   <headSha>${esc(pr.head.sha)}</headSha>
 </pr>`,
-    callback: {
-      type: "github-pr",
-      repo: repoFullName,
-      prNumber: pr.number,
-    },
-    metadata: {
-      source: "github",
-      repo: repoFullName,
-      prNumber: String(pr.number),
-      author: pr.user.login,
-      headSha: pr.head.sha,
-      deliveryId: deliveryId ?? "",
-    },
-  });
+      callback: {
+        type: "github-pr",
+        repo: repoFullName,
+        prNumber: pr.number,
+      },
+      metadata: {
+        source: "github",
+        repo: repoFullName,
+        prNumber: String(pr.number),
+        author: pr.user.login,
+        headSha: pr.head.sha,
+        deliveryId: deliveryId ?? "",
+      },
+    });
 
-  console.log(
-    JSON.stringify({
-      event: "github_webhook_dispatched",
-      repo: repoFullName,
-      prNumber: pr.number,
-      author: pr.user.login,
-      taskArn,
-      deliveryId,
-    }),
-  );
+    console.log(
+      JSON.stringify({
+        event: "github_webhook_dispatched",
+        repo: repoFullName,
+        prNumber: pr.number,
+        author: pr.user.login,
+        taskArn,
+        deliveryId,
+      }),
+    );
+  } catch (err) {
+    // Swallow dispatch failures and return 200 to prevent GitHub from retrying
+    // the same delivery for up to 72h — a missed review is far better than N
+    // duplicate reviews posted to the PR.
+    console.error(
+      JSON.stringify({
+        event: "github_webhook_dispatch_failed",
+        repo: repoFullName,
+        prNumber: pr.number,
+        author: pr.user.login,
+        deliveryId,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
 
   return OK;
 };
