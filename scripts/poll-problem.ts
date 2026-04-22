@@ -2,8 +2,6 @@ import { PrismaClient } from "../../gp-api/node_modules/@prisma/client";
 import { S3 } from "@aws-sdk/client-s3";
 import { input as getInput } from "@inquirer/prompts";
 import { searchGrafanaLogs } from "../utils/grafana";
-import { people } from "../utils/people";
-import { pick } from "es-toolkit";
 
 const prisma = new PrismaClient();
 
@@ -62,6 +60,14 @@ export default async () => {
   console.log("Found user id:", user.id);
   console.log("Found user email:", user.email);
 
+  const org = await prisma.organization.findFirstOrThrow({
+    where: {
+      ownerId: user.id,
+    },
+  });
+
+  console.log("Found org:", org);
+
   const campaign = await prisma.campaign.findFirstOrThrow({
     where: {
       userId: user.id,
@@ -69,47 +75,6 @@ export default async () => {
   });
 
   console.log("Found campaign id:", campaign.id);
-
-  const pathToVictory = await prisma.pathToVictory.findFirst({
-    where: {
-      campaignId: campaign.id,
-    },
-  });
-
-  if (!pathToVictory) {
-    console.log("No path to victory found");
-  } else {
-    console.log("Found path to victory id:", pathToVictory.id);
-  }
-
-  console.log("Path to victory: ", {
-    state: campaign.details.state,
-    districtId: pathToVictory?.data.districtId,
-    districtType: pathToVictory?.data.electionType,
-    districtName: pathToVictory?.data.electionLocation,
-  });
-
-  if (
-    pathToVictory?.data.electionType &&
-    pathToVictory?.data.electionLocation
-  ) {
-    const districtStats = await people.get("/v1/people/stats", {
-      params: {
-        state: campaign.details.state,
-        districtType: pathToVictory?.data.electionType,
-        districtName: pathToVictory?.data.electionLocation,
-      },
-    });
-
-    console.log(
-      "District stats:",
-      pick(districtStats.data, [
-        "districtId",
-        "totalConstituents",
-        "totalConstituentsWithCellPhone",
-      ])
-    );
-  }
 
   const electedOffice = await prisma.electedOffice.findFirst({
     where: {
