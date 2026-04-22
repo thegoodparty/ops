@@ -4,7 +4,7 @@ export const verifySlackWebhook = (
   body: string,
   timestamp: string | undefined,
   signature: string | undefined,
-  secret: string
+  secret: string,
 ): boolean => {
   if (!timestamp || !signature) return false;
 
@@ -15,6 +15,23 @@ export const verifySlackWebhook = (
   const expected = `v0=${createHmac("sha256", secret).update(basestring).digest("hex")}`;
 
   const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+
+  return timingSafeEqual(a, b);
+};
+
+export const verifyGithubWebhook = (
+  body: string,
+  signatureHeader: string | undefined,
+  secret: string,
+): boolean => {
+  if (!signatureHeader || !signatureHeader.startsWith("sha256=")) return false;
+
+  const expected =
+    "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
+
+  const a = Buffer.from(signatureHeader);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
 

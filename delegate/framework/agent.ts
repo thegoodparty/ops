@@ -20,6 +20,7 @@ export const runAgent = async (
       systemPrompt: config.systemPrompt,
       model: config.model,
       mcpServers: config.mcpServers,
+      agents: config.agents,
       allowedTools: config.allowedTools ?? [
         "mcp__*",
         "Read",
@@ -28,6 +29,7 @@ export const runAgent = async (
         "Bash",
         "Glob",
         "Grep",
+        "Task",
       ],
       maxTurns: config.maxTurns ?? 50,
       maxBudgetUsd: config.maxBudgetUsd ?? 5,
