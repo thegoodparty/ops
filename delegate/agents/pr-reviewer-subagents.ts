@@ -6,23 +6,65 @@ const OUTPUT_CONTRACT = `
 Return your findings as a JSON object on the final line of your output. Nothing
 else after it. Example:
 
-{"findings":[{"file":"src/foo.ts","line":42,"severity":"concern","body":"Missing null check; crashes when \`user\` is undefined. Add \`if (!user) return null\`."}],"summary":"One clean concern around null safety."}
+{"findings":[{"file":"src/foo.ts","line":43,"startLine":42,"severity":"concern","body":"Missing null check; \`user\` can be undefined when the token is stale.\\n\\n\\\`\\\`\\\`suggestion\\nif (!user) return null\\nconst name = user.name\\n\\\`\\\`\\\`"}],"summary":"One clean concern around null safety."}
 
 Fields:
 - file: repo-relative path
-- line: line number in the NEW version of the file (right side of the diff)
+- line: line number in the NEW version of the file (right side of the diff). For multi-line suggestions, this is the LAST line of the replaced range.
+- startLine: (optional) first line of the replaced range, for multi-line suggestions. Omit for single-line suggestions.
 - severity: "blocker" | "concern" | "nit"
   - blocker: must be fixed before merge (bug, vuln, broken test)
   - concern: should be fixed but won't block (design smell, missing edge case)
   - nit: trivial (style, naming) — use sparingly
 - body: direct comment with a concrete suggested fix
 
+## Suggestion blocks — ALWAYS include one when a fix is possible
+
+Whenever your finding has a concrete code-level fix, the \`body\` MUST embed a
+GitHub \`suggestion\` code block. This renders on the PR as a one-click "apply
+suggestion" button — it is the single highest-leverage thing you can do for the
+author. Skip it only when no single-block replacement makes sense (e.g., the
+fix spans an unrelated function, or the finding is about missing code somewhere
+else entirely).
+
+The suggestion block must contain EXACTLY the replacement text for lines
+\`startLine..line\` (inclusive), with no surrounding diff markers. GitHub
+replaces those lines verbatim with your block's contents.
+
+Body shape:
+
+  <one or two sentences: what's wrong and why>
+
+  \\\`\\\`\\\`suggestion
+  <exact replacement for lines startLine..line>
+  \\\`\\\`\\\`
+
+Single-line fix example (omit \`startLine\`, \`line\` points at the line being replaced):
+
+  Unhandled rejection — \`fetch\` can throw and the caller won't see it.
+
+  \\\`\\\`\\\`suggestion
+  const res = await fetch(url).catch((e) => { logger.error({ e }, 'fetch failed'); throw e })
+  \\\`\\\`\\\`
+
+Multi-line fix example (\`startLine\` = first replaced line, \`line\` = last):
+
+  Silent failure — the empty catch swallows errors that should surface.
+
+  \\\`\\\`\\\`suggestion
+  } catch (err) {
+    logger.error({ err }, 'failed to load user')
+    throw err
+  }
+  \\\`\\\`\\\`
+
 If you have no findings, return: {"findings":[],"summary":"<one-sentence take>"}.
 
 ## Voice
 
-Direct, specific, actionable. Every finding has a suggested fix. No hedging,
-no flattery, no restating what the PR does.
+Direct, specific, actionable. Every finding has a suggested fix — and that fix
+goes in a \`suggestion\` block whenever it's a code change. No hedging, no
+flattery, no restating what the PR does.
 `;
 
 export const prReviewerSubagents: NonNullable<AgentConfig["agents"]> = {
