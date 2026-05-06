@@ -3,6 +3,8 @@ import { getSecrets } from "./secrets";
 import { verifyGithubWebhook } from "./verify";
 
 const REVIEW_AUTHOR_WHITELIST = new Set(["swain", "delegate[bot]"]);
+// Distinct from delegate/framework/repos.ts:WRITE_REPOS (bot-write scope).
+// Update both lists when adding a repo.
 const REVIEW_REPOS = new Set([
   "gp-api",
   "gp-webapp",
