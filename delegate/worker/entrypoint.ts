@@ -1,4 +1,5 @@
 import "../agents";
+import { execSync } from "node:child_process";
 import { WebClient } from "@slack/web-api";
 import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
@@ -6,6 +7,31 @@ import { setupGitHubAuth } from "./github-auth";
 
 const main = async () => {
   await setupGitHubAuth();
+
+  const runbooksDir = process.env.RUNBOOKS_DIR ?? "/app/runbooks";
+  try {
+    execSync(
+      `gh repo clone thegoodparty/runbooks ${runbooksDir} -- --depth=1`,
+      { stdio: "inherit" },
+    );
+    const sha = execSync(`git -C ${runbooksDir} rev-parse --short HEAD`)
+      .toString()
+      .trim();
+    process.env.RUNBOOKS_DIR = runbooksDir;
+    process.env.RUNBOOKS_SHA = sha;
+    console.log(`Runbooks cloned at ${runbooksDir} (SHA ${sha})`);
+  } catch (err) {
+    console.error("Failed to clone runbooks:", err);
+    process.exit(1);
+  }
+
+  if (!process.env.CLICKUP_TOKEN) {
+    console.error("CLICKUP_TOKEN environment variable not set");
+    process.exit(1);
+  }
+  if (!process.env.CLICKUP_API_KEY) {
+    process.env.CLICKUP_API_KEY = process.env.CLICKUP_TOKEN;
+  }
 
   const raw = process.env.AGENT_JOB;
   if (!raw) {
