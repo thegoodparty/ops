@@ -252,13 +252,15 @@ Auto-approval declined. Please request human review.
 
 **Why not auto-approved:**
 <one or more bullets, one per failed gate, drawn from the list below>
+
+Once the issues above are addressed, comment \`/delegate-review\` on this PR to re-run me.
 \`\`\`
 
 Bullet phrasing per failure (include all that apply):
 
 - Blockers present: \`- <N> blocking issue(s) — see inline comments.\`
 - \`LINKAGE_FAIL_REASON=no-link\`: \`- No tech design link found in PR body. Add a \\\`Tech Design: <clickup-page-url>\\\` line, or link a ClickUp task whose epic references one.\`
-- \`LINKAGE_FAIL_REASON=draft\`: \`- Linked tech design <TDD_URL> is still in [DRAFT]. Get it blessed in Slack, then re-run with \\\`/delegate-review\\\`.\`
+- \`LINKAGE_FAIL_REASON=draft\`: \`- Linked tech design <TDD_URL> is still in [DRAFT]. Get it blessed in Slack first.\`
 - \`LINKAGE_FAIL_REASON=mismatch\`: \`- Linked tech design <TDD_URL> doesn't match this PR: <LINKAGE_MISMATCH_NOTE>.\`
 - \`LINKAGE_FAIL_REASON=no-clickup-token\`: \`- Reviewer cannot verify tech-design linkage (CLICKUP_API_TOKEN not configured).\`
 
