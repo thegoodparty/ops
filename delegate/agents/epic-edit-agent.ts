@@ -13,15 +13,15 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 1. There is no local editor. Slack thread replies (bless / edit / abandon) are handled by separate agent invocations dispatched by the continuation router — not your concern. Your job per run is to either **propose a diff plan** for an existing Epic, or **apply** an already-blessed plan, or **revert** an in-flight plan.
 
-2. State recovery: you receive the prior thread as <slack-thread> XML. The most recent bot post includes a [phase=...,status=...,clickup=...,runbooks=...] header — parse it to recover the Epic's ClickUp task ID and the current edit-cycle status.
+2. State recovery: you receive the prior thread as <slack-thread> XML. The most recent bot post starts with a header line of the form \`[phase=...,status=...,clickup=...]\` — parse it to recover the Epic's ClickUp task ID and the current edit-cycle status.
 
 3. Trigger surfaces — both go through the same code path:
     - **Direct:** \`@delegate epic-edit <epic-url> <description>\` (mention router)
     - **Continuation:** \`@delegate bless\` / \`edit\` / \`abandon\` in a thread with \`phase=epic-edit\` header (continuation router)
 
-4. Repo paths: clone via \`gh repo clone thegoodparty/<name>\` to /tmp/<unique>/ (use \`mktemp -d\`). Never write under /app — read-only for the agent user.
+4. Filesystem: clone via \`gh repo clone thegoodparty/<name>\` into a fresh \`mktemp -d\` directory under \`/tmp\`. Don't write under \`/app\` even though it's writable — keep work isolated to \`/tmp\` so concurrent runs in the same container can't collide.
 
-5. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set RUNBOOKS_DIR=/app/runbooks already. Read the rest of the runbook verbatim.
+5. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/runbooks\` already. Read the rest of the runbook verbatim.
 
 6. Cost & turns: maxBudgetUsd=5, maxTurns=60.
 
@@ -29,11 +29,11 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 The final Slack post must begin with this exact header on its own first line:
 
-  [phase=epic-edit,status=<draft|blessed|abandoned>,clickup=<epic_task_id>,runbooks=$RUNBOOKS_SHA]
+  [phase=epic-edit,status=<draft|blessed|abandoned>,clickup=<epic_task_id>]
 
 \`<epic_task_id>\` is the parent Epic's ClickUp ID — same as the \`phase=epic\` thread it grew out of (the edit cycle pivots on the Epic, not on the edit itself).
 
-After the header, leave one blank line, then the body.
+Do NOT include a \`runbooks=\` field — the worker appends \`runbooks=<sha>\` to the message footer automatically. After the header, leave one blank line, then the body.
 
 ## Formatting
 
@@ -53,8 +53,7 @@ Full shell via Bash. All CLIs installed and authenticated:
 
 ClickUp API:
   cd /app/runbooks/scripts/python && uv run clickup_api.py [...]
-  CLICKUP_API_KEY is in env (mirrored from CLICKUP_TOKEN by the worker entrypoint).
-  CLICKUP_TEAM_ID=90132012119
+  \`CLICKUP_API_KEY\` and \`CLICKUP_TEAM_ID\` are both set in env by the worker entrypoint — refer to them as \`$CLICKUP_TEAM_ID\` etc, do not hardcode.
 
 Slack API ($SLACK_BOT_TOKEN env). For intermediate progress posts:
   curl -s -X POST https://slack.com/api/chat.postMessage \\

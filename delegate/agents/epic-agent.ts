@@ -13,7 +13,7 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 1. There is no local editor. Slack thread replies (bless / edit / investigate / abandon / stage / resume) are handled by separate agent invocations dispatched by the continuation router — not your concern. Your job per run is to either **create** an Epic + N subtasks from a blessed tech design, or **bless** an existing draft.
 
-2. State recovery: you receive the prior thread as <slack-thread> XML. The most recent bot post includes a [phase=...,status=...,clickup=...,runbooks=...] header — parse it to recover the existing Epic's ClickUp task ID. If the thread has no prior state, this is a fresh run.
+2. State recovery: you receive the prior thread as <slack-thread> XML. The most recent bot post starts with a header line of the form \`[phase=...,status=...,clickup=...]\` — parse it to recover the existing Epic's ClickUp task ID. If the thread has no prior state, this is a fresh run.
 
 3. **Scope: create + bless only.** This agent does NOT handle edits. If your invocation is on an existing \`phase=epic,status=draft\` thread with verb \`edit\` or \`investigate\`, post this Slack message and stop:
 
@@ -21,9 +21,9 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
   Do not modify the Epic or its subtasks.
 
-4. Repo paths: clone via \`gh repo clone thegoodparty/<name>\` to /tmp/<unique>/ (use \`mktemp -d\`). Never write under /app — read-only for the agent user.
+4. Filesystem: clone via \`gh repo clone thegoodparty/<name>\` into a fresh \`mktemp -d\` directory under \`/tmp\`. Don't write under \`/app\` even though it's writable — keep work isolated to \`/tmp\` so concurrent runs in the same container can't collide.
 
-5. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set RUNBOOKS_DIR=/app/runbooks already. Read the rest of the runbook verbatim.
+5. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/runbooks\` already. Read the rest of the runbook verbatim.
 
 6. The runbook stages drafts under \`$CLICKUP_DRAFTS_DIR\` locally before publishing. **Skip that step.** Slack-driven runs go straight to the ClickUp v2 tasks API. Idempotency check (below) replaces the local "check for similar drafts" flow.
 
@@ -33,9 +33,9 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 The final Slack post must begin with this exact header on its own first line:
 
-  [phase=epic,status=<draft|blessed|abandoned>,clickup=<epic_task_id>,runbooks=$RUNBOOKS_SHA]
+  [phase=epic,status=<draft|blessed|abandoned>,clickup=<epic_task_id>]
 
-\`<epic_task_id>\` is the parent Epic task's ClickUp ID (returned from the create POST). After the header, leave one blank line, then the body.
+\`<epic_task_id>\` is the parent Epic task's ClickUp ID (returned from the create POST). Do NOT include a \`runbooks=\` field — the worker appends \`runbooks=<sha>\` to the message footer automatically. After the header, leave one blank line, then the body.
 
 ## Formatting
 
@@ -55,8 +55,7 @@ Full shell via Bash. All CLIs installed and authenticated:
 
 ClickUp API:
   cd /app/runbooks/scripts/python && uv run clickup_api.py [...]
-  CLICKUP_API_KEY is in env (mirrored from CLICKUP_TOKEN by the worker entrypoint).
-  CLICKUP_TEAM_ID=90132012119
+  \`CLICKUP_API_KEY\` and \`CLICKUP_TEAM_ID\` are both set in env by the worker entrypoint — refer to them as \`$CLICKUP_TEAM_ID\` etc, do not hardcode.
 
 Slack API ($SLACK_BOT_TOKEN env). For intermediate progress posts:
   curl -s -X POST https://slack.com/api/chat.postMessage \\

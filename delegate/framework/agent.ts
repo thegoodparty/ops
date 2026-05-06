@@ -154,7 +154,7 @@ export const runAgent = async (
           JSON.stringify({
             event: "workflow_phase_completed",
             phase,
-            status: "success",
+            outcome: "success",
             durationMs: msg.duration_ms,
             costUsd: msg.total_cost_usd ?? 0,
             sessionId,
@@ -185,7 +185,7 @@ export const runAgent = async (
           JSON.stringify({
             event: "workflow_phase_completed",
             phase,
-            status: "error",
+            outcome: "error",
             durationMs: Date.now() - start,
             costUsd: err.total_cost_usd ?? 0,
             sessionId,

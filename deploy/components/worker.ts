@@ -30,11 +30,14 @@ export const createWorker = (config: WorkerConfig) => {
       value: "1",
       dimensions: {
         phase: "$.phase",
-        status: "$.status",
+        outcome: "$.outcome",
       },
     },
   });
 
+  // Cost is dimensioned by both phase AND outcome so we can chart cost-of-
+  // failures separately — a high cost-on-error trend is the early-warning
+  // signal for an agent looping in its error path.
   new aws.cloudwatch.LogMetricFilter("workflowPhaseCost", {
     name: "workflow-phase-cost",
     logGroupName: logGroup.name,
@@ -45,6 +48,7 @@ export const createWorker = (config: WorkerConfig) => {
       value: "$.costUsd",
       dimensions: {
         phase: "$.phase",
+        outcome: "$.outcome",
       },
     },
   });

@@ -13,6 +13,50 @@ type FunctionURLEvent = {
 
 const UNAUTHORIZED = { statusCode: 401, body: "unauthorized" };
 
+// Verbs that begin a new workflow run. Each maps to the agent that owns
+// the corresponding phase.
+const WRITE_VERBS = {
+  "tech-design": "tech-design-agent",
+  epic: "epic-agent",
+  "epic-edit": "epic-edit-agent",
+  work: "task-execution-agent",
+} as const;
+
+type WriteVerb = keyof typeof WRITE_VERBS;
+
+// Verbs that continue an in-flight workflow run. We resolve which agent
+// to dispatch by parsing the most recent bot post's `[phase=...]` header
+// and looking up `PHASE_TO_AGENT`.
+const CONTINUATION_VERBS = new Set([
+  "bless",
+  "edit",
+  "investigate",
+  "abandon",
+  "stage",
+  "resume",
+  "go",
+  "plan",
+  "focus",
+  "split",
+]);
+
+const PHASE_TO_AGENT: Record<Phase, string> = {
+  "tech-design": "tech-design-agent",
+  epic: "epic-agent",
+  "epic-edit": "epic-edit-agent",
+  "task-execution": "task-execution-agent",
+};
+
+const isWriteVerb = (verb: string): verb is WriteVerb => verb in WRITE_VERBS;
+const isContinuationVerb = (verb: string): boolean =>
+  CONTINUATION_VERBS.has(verb);
+
+const parseAllowedUsers = (raw: string | undefined): string[] =>
+  (raw ?? "")
+    .split("\n")
+    .map((u) => u.trim())
+    .filter(Boolean);
+
 const handleSlack = async (body: string, headers: Record<string, string>) => {
   const secrets = await getSecrets();
   const secret = secrets["SLACK_SIGNING_SECRET"];
@@ -37,157 +81,130 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
     };
   }
 
-  if (payload.type === "event_callback") {
-    const event = payload.event;
+  if (payload.type !== "event_callback") {
+    return { statusCode: 200, body: "ok" };
+  }
 
-    if (event.bot_id || event.subtype === "bot_message") {
+  const event = payload.event;
+
+  if (event.bot_id || event.subtype === "bot_message") {
+    return { statusCode: 200, body: "ok" };
+  }
+
+  if (event.type !== "app_mention") {
+    return { statusCode: 200, body: "ok" };
+  }
+
+  const text = (event.text as string).replace(/<@[A-Z0-9]+>/g, "").trim();
+  const [verb, ...rest] = text.split(/\s+/);
+  const args = rest.join(" ");
+  const threadTs = event.thread_ts ?? event.ts;
+
+  const slack = new WebClient(secrets["SLACK_BOT_TOKEN"]);
+
+  const writeVerb = isWriteVerb(verb);
+  const continuationVerb = isContinuationVerb(verb);
+
+  if (writeVerb || continuationVerb) {
+    const allowed = parseAllowedUsers(secrets["WORKFLOW_USERS"]);
+    if (!allowed.includes(event.user)) {
+      await slack.chat.postEphemeral({
+        channel: event.channel,
+        user: event.user,
+        thread_ts: threadTs,
+        text: writeVerb
+          ? `You're not in WORKFLOW_USERS — write verbs are restricted. Ping an eng lead to be added.`
+          : `You're not in WORKFLOW_USERS — continuation verbs are restricted.`,
+      });
+      return { statusCode: 200, body: "ok" };
+    }
+  }
+
+  let agent: string;
+  let message: string;
+
+  if (writeVerb) {
+    agent = WRITE_VERBS[verb as WriteVerb];
+    message = args;
+  } else if (continuationVerb) {
+    const replies = await slack.conversations.replies({
+      channel: event.channel,
+      ts: threadTs,
+      limit: 50,
+    });
+    const messages = (replies.messages ?? []) as Array<{
+      text?: string;
+      bot_id?: string;
+    }>;
+    const state = findLatestState(messages);
+
+    if (!state) {
+      const lastBot = [...messages]
+        .reverse()
+        .find((m) => m.bot_id && m.text);
+      const firstLine = lastBot?.text
+        ?.split("\n")
+        .find((l) => l.trim().length > 0);
+      if (firstLine && /^\[(.+?)\]/.test(firstLine)) {
+        console.warn(
+          JSON.stringify({
+            event: "workflow_malformed_header",
+            channel: event.channel,
+            threadTs,
+            firstLine,
+          }),
+        );
+      }
+      await slack.chat.postEphemeral({
+        channel: event.channel,
+        user: event.user,
+        thread_ts: threadTs,
+        text: `No prior workflow state found in this thread. Start a new run with \`@delegate tech-design <url>\` (or \`epic\` / \`work\`).`,
+      });
       return { statusCode: 200, body: "ok" };
     }
 
-    if (event.type === "app_mention") {
-      const text = (event.text as string).replace(/<@[A-Z0-9]+>/g, "").trim();
-      const [verb, ...rest] = text.split(/\s+/);
-      const args = rest.join(" ");
-      const threadTs = event.thread_ts ?? event.ts;
+    agent = PHASE_TO_AGENT[state.phase];
+    message = text;
+  } else {
+    agent = "slack-responder";
+    message = text;
+  }
 
-      const slack = new WebClient(secrets["SLACK_BOT_TOKEN"]);
+  const [, { taskArn }] = await Promise.all([
+    slack.reactions.add({
+      channel: event.channel,
+      timestamp: event.ts,
+      name: "eyes",
+    }),
+    dispatch({
+      agent,
+      message,
+      callback: {
+        type: "slack",
+        channel: event.channel,
+        threadTs,
+      },
+      metadata: {
+        source: "slack",
+        user: event.user,
+        channel: event.channel,
+        reactionTs: event.ts,
+      },
+    }),
+  ]);
 
-      const WRITE_VERBS = {
-        "tech-design": "tech-design-agent",
-        epic: "epic-agent",
-        "epic-edit": "epic-edit-agent",
-        work: "task-execution-agent",
-      } as const;
-
-      const CONTINUATION_VERBS = new Set([
-        "bless",
-        "edit",
-        "investigate",
-        "abandon",
-        "stage",
-        "resume",
-        "go",
-        "plan",
-        "focus",
-        "split",
-      ]);
-
-      const PHASE_TO_AGENT: Record<Phase, string> = {
-        "tech-design": "tech-design-agent",
-        epic: "epic-agent",
-        "epic-edit": "epic-edit-agent",
-        "task-execution": "task-execution-agent",
-      };
-
-      const isWriteVerb = verb in WRITE_VERBS;
-      const isContinuationVerb = CONTINUATION_VERBS.has(verb);
-
-      if (isWriteVerb || isContinuationVerb) {
-        const allowed = (secrets["WORKFLOW_USERS"] ?? "")
-          .split("\n")
-          .map((u) => u.trim())
-          .filter(Boolean);
-
-        if (!allowed.includes(event.user)) {
-          await slack.chat.postEphemeral({
-            channel: event.channel,
-            user: event.user,
-            thread_ts: threadTs,
-            text: isWriteVerb
-              ? `You're not in WORKFLOW_USERS — write verbs are restricted. Ping an eng lead to be added.`
-              : `You're not in WORKFLOW_USERS — continuation verbs are restricted.`,
-          });
-          return { statusCode: 200, body: "ok" };
-        }
-      }
-
-      let agent: string;
-      let message: string;
-
-      if (isWriteVerb) {
-        agent = WRITE_VERBS[verb as keyof typeof WRITE_VERBS];
-        message = args;
-      } else if (isContinuationVerb) {
-        const replies = await slack.conversations.replies({
-          channel: event.channel,
-          ts: threadTs,
-          limit: 50,
-        });
-        const messages = (replies.messages ?? []) as Array<{
-          text?: string;
-          bot_id?: string;
-        }>;
-        const state = findLatestState(messages);
-
-        if (!state) {
-          const lastBot = [...messages]
-            .reverse()
-            .find((m) => m.bot_id && m.text);
-          const firstLine = lastBot?.text
-            ?.split("\n")
-            .find((l) => l.trim().length > 0);
-          if (firstLine && /^\[(.+?)\]/.test(firstLine)) {
-            console.warn(
-              JSON.stringify({
-                event: "workflow_malformed_header",
-                channel: event.channel,
-                threadTs,
-                firstLine,
-              }),
-            );
-          }
-          await slack.chat.postEphemeral({
-            channel: event.channel,
-            user: event.user,
-            thread_ts: threadTs,
-            text: `No prior workflow state found in this thread. Start a new run with \`@delegate tech-design <url>\` (or \`epic\` / \`work\`).`,
-          });
-          return { statusCode: 200, body: "ok" };
-        }
-
-        agent = PHASE_TO_AGENT[state.phase];
-        message = text;
-      } else {
-        agent = "slack-responder";
-        message = text;
-      }
-
-      const [, { taskArn }] = await Promise.all([
-        slack.reactions.add({
-          channel: event.channel,
-          timestamp: event.ts,
-          name: "eyes",
-        }),
-        dispatch({
-          agent,
-          message,
-          callback: {
-            type: "slack",
-            channel: event.channel,
-            threadTs,
-          },
-          metadata: {
-            source: "slack",
-            user: event.user,
-            channel: event.channel,
-            reactionTs: event.ts,
-          },
-        }),
-      ]);
-
-      if (taskArn) {
-        const taskId = taskArn.split("/").pop();
-        const clusterName = taskArn.split("/")[1];
-        const logsUrl = `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskId}`;
-        const taskUrl = `https://us-west-2.console.aws.amazon.com/ecs/v2/clusters/${clusterName}/tasks/${taskId}?region=us-west-2`;
-        await slack.chat.postEphemeral({
-          channel: event.channel,
-          user: event.user,
-          thread_ts: threadTs,
-          text: `I'm getting started on this now! (<${taskUrl}|view task> · <${logsUrl}|view logs>)`,
-        });
-      }
-    }
+  if (taskArn) {
+    const taskId = taskArn.split("/").pop();
+    const clusterName = taskArn.split("/")[1];
+    const logsUrl = `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskId}`;
+    const taskUrl = `https://us-west-2.console.aws.amazon.com/ecs/v2/clusters/${clusterName}/tasks/${taskId}?region=us-west-2`;
+    await slack.chat.postEphemeral({
+      channel: event.channel,
+      user: event.user,
+      thread_ts: threadTs,
+      text: `I'm getting started on this now! (<${taskUrl}|view task> · <${logsUrl}|view logs>)`,
+    });
   }
 
   return { statusCode: 200, body: "ok" };

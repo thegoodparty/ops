@@ -1,10 +1,33 @@
 export type Phase = "tech-design" | "epic" | "epic-edit" | "task-execution";
 export type Status = "draft" | "blessed" | "abandoned";
 
+const PHASES: readonly Phase[] = [
+  "tech-design",
+  "epic",
+  "epic-edit",
+  "task-execution",
+] as const;
+
+const STATUSES: readonly Status[] = [
+  "draft",
+  "blessed",
+  "abandoned",
+] as const;
+
+export const isPhase = (v: unknown): v is Phase =>
+  typeof v === "string" && (PHASES as readonly string[]).includes(v);
+
+export const isStatus = (v: unknown): v is Status =>
+  typeof v === "string" && (STATUSES as readonly string[]).includes(v);
+
 export type ThreadState = {
   phase: Phase;
   status: Status;
   clickup: string;
+  // The runbooks SHA used for the prior post. Optional — the canonical
+  // record is the message footer (`runbooks=<sha>`), which the worker
+  // appends at runtime. We accept it here for legacy posts but no longer
+  // require LLMs to emit it in the header.
   runbooks?: string;
 };
 
@@ -20,11 +43,12 @@ export const parseHeader = (text: string): ThreadState | null => {
     }),
   );
   if (!fields.phase || !fields.status || !fields.clickup) return null;
+  if (!isPhase(fields.phase) || !isStatus(fields.status)) return null;
   return {
-    phase: fields.phase as Phase,
-    status: fields.status as Status,
+    phase: fields.phase,
+    status: fields.status,
     clickup: fields.clickup,
-    runbooks: fields.runbooks,
+    ...(fields.runbooks ? { runbooks: fields.runbooks } : {}),
   };
 };
 

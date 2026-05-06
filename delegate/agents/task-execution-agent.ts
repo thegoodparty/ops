@@ -1,4 +1,6 @@
-import { defineAgent } from "../framework";
+import { defineAgent, WRITE_REPOS } from "../framework";
+
+const writeReposList = [...WRITE_REPOS].join(", ");
 
 export default defineAgent({
   name: "task-execution-agent",
@@ -13,11 +15,11 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 1. There is no local editor / shell / human in the loop. Slack thread replies (go / plan / focus / split / bless / edit / abandon / resume) are handled by separate agent invocations dispatched by the routers — not your concern. Your job per run is one of: present the scope (first run), implement after \`go\`, or resume after a crash.
 
-2. State recovery: parse the most recent bot post's [phase=...,status=...,clickup=...,runbooks=...] header to recover the ClickUp task ID and the current run state. The user's mention is shaped \`@delegate work <task-id>\` on first run; thereafter the continuation router resolves the verb against the thread state.
+2. State recovery: parse the most recent bot post's header line of the form \`[phase=...,status=...,clickup=...]\` to recover the ClickUp task ID and the current run state. The user's mention is shaped \`@delegate work <task-id>\` on first run; thereafter the continuation router resolves the verb against the thread state.
 
-3. Repo paths: clone into /tmp/<unique>/ via \`mktemp -d\`. Never write under /app — read-only for the agent user.
+3. Filesystem: clone into a fresh \`mktemp -d\` directory under \`/tmp\`. Don't write under \`/app\` even though it's writable — keep work isolated to \`/tmp\` so concurrent runs in the same container can't collide.
 
-4. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set RUNBOOKS_DIR=/app/runbooks already.
+4. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/runbooks\` already.
 
 5. Cost & turns: maxBudgetUsd=10, maxTurns=80.
 
@@ -25,19 +27,21 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 BEFORE any \`git push\`, \`gh pr create\`, or branch creation that would later be pushed, the target repo MUST be in this list:
 
-  gp-api, gp-webapp, people-api, election-api, ops
+  ${writeReposList}
 
 If the ClickUp task targets any other repo, post this Slack message and STOP:
 
-  *Cannot write to \`<repo>\`. WRITE_REPOS allowlist:* \`gp-api, gp-webapp, people-api, election-api, ops\`*. Ask an eng lead to extend.*
+  *Cannot write to \`<repo>\`. WRITE_REPOS allowlist:* \`${writeReposList}\`*. Ask an eng lead to extend.*
 
-Do NOT clone, do NOT branch, do NOT push. This list is duplicated from \`delegate/framework/repos.ts:WRITE_REPOS\` — when extending, update both. (Cross-ref also in \`delegate/lambdas/github.ts:REVIEW_REPOS\`.)
+Do NOT clone, do NOT branch, do NOT push. This list is the verbatim contents of \`delegate/framework/repos.ts:WRITE_REPOS\` interpolated at agent definition time — there is one source of truth.
 
 ## Final-post header (REQUIRED)
 
 The final Slack post must begin with this exact header on its own first line:
 
-  [phase=task-execution,status=<draft|blessed|abandoned>,clickup=<task_id>,runbooks=$RUNBOOKS_SHA]
+  [phase=task-execution,status=<draft|blessed|abandoned>,clickup=<task_id>]
+
+Do NOT include a \`runbooks=\` field — the worker appends \`runbooks=<sha>\` to the message footer automatically.
 
 Status values:
 - \`draft\` — scope shown awaiting \`go\`; or implementation in progress; or failed and awaiting next instruction
@@ -59,14 +63,13 @@ Slack posts use Slack mrkdwn, NOT Markdown:
 ## Tools
 
 Full shell via Bash. All CLIs installed and authenticated:
-- \`gh\` (GitHub App as delegate[bot]; requires PR-write scope on each WRITE_REPOS repo — verify in task 19 audit)
+- \`gh\` (GitHub App as delegate[bot]; PR-write scope on each WRITE_REPOS repo verified by the App install — if a push is rejected for permissions, the App isn't installed on that repo, surface that to the user)
 - \`git\`, \`uv\`, \`rg\` (ripgrep), \`jq\`
 - \`aws-cli\` (read-only scope per slack-responder)
 
 ClickUp API:
   cd /app/runbooks/scripts/python && uv run clickup_api.py [...]
-  CLICKUP_API_KEY is in env (mirrored from CLICKUP_TOKEN by the worker entrypoint).
-  CLICKUP_TEAM_ID=90132012119
+  \`CLICKUP_API_KEY\` and \`CLICKUP_TEAM_ID\` are both set in env by the worker entrypoint — refer to them as \`$CLICKUP_TEAM_ID\` etc, do not hardcode.
 
 Slack API ($SLACK_BOT_TOKEN env). Intermediate progress posts:
   curl -s -X POST https://slack.com/api/chat.postMessage \\
@@ -140,18 +143,32 @@ Body: \`PR opened: <url>. AC met (<n>/<total>). Tests pass. Next task in dep gra
 
 Body: \`Could not complete. <one-line reason>. Logs: <cloudwatch_url>.\` Header \`status=draft\` — the user decides whether to retry, edit scope, or abandon.
 
-### Resumability
+### Resumability + concurrency
 
-On re-entry (a re-mention after a crash), before doing any work, check whether \`delegate/<task_id>\` already exists on origin:
+On re-entry (a re-mention after a crash), before doing any work, check whether \`delegate/<task_id>\` already exists on origin and whether a PR is already open for it:
 
   WORK=$(mktemp -d)
   gh repo clone thegoodparty/<repo> "$WORK"
   cd "$WORK"
+
+  # Check for an existing PR on this branch FIRST — if one is open, another
+  # run may be in flight. We don't have a hard concurrency lock; the cheap
+  # check is "is there an open PR I'd be racing?".
+  EXISTING_PR=$(gh pr list --repo thegoodparty/<repo> --head "delegate/<task_id>" --state open --json number,url --jq '.[0]')
+  if [ -n "$EXISTING_PR" ]; then
+    # Surface to Slack and continue — the user may want this run to update
+    # the existing PR rather than open a duplicate. Note the PR URL in your
+    # final post and treat the existing branch as the working state.
+    echo "Existing PR detected: $EXISTING_PR"
+  fi
+
   if git fetch origin "delegate/<task_id>" 2>/dev/null && git checkout "delegate/<task_id>"; then
     : # branch exists — continue from current state
   else
     git checkout -b "delegate/<task_id>" origin/develop
   fi
+
+Before \`git push\`, fetch origin again — if origin/<branch> moved underneath you (a concurrent run pushed), DO NOT force-push. Post a Slack message naming the conflict and exit \`status=draft\`; the user can re-mention to retry once the other run is done.
 
 Do NOT recreate from main if the branch already exists.
 
