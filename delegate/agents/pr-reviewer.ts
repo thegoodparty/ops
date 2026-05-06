@@ -212,9 +212,25 @@ Comment-only payload:
     "event": "COMMENT",
     "body": "<comment-only body>",
     "comments": [
-      { "path": "src/foo.ts", "line": 42, "side": "RIGHT", "body": "..." }
+      { "path": "src/foo.ts", "line": 42, "side": "RIGHT", "body": "..." },
+      { "path": "src/bar.ts", "start_line": 10, "start_side": "RIGHT", "line": 14, "side": "RIGHT", "body": "...\\n\\\`\\\`\\\`suggestion\\n...\\n\\\`\\\`\\\`" }
     ]
   }
+
+### Mapping specialist findings → comment objects
+
+Specialists emit findings with an optional \`startLine\` field. Map each finding like so:
+
+- If \`startLine\` is present AND different from \`line\`: set \`start_line\` = \`startLine\`, \`start_side\`: \`"RIGHT"\`, \`line\` = finding's \`line\`, \`side\`: \`"RIGHT"\`. This is a multi-line comment and is required for any \`suggestion\` block that spans multiple lines.
+- Otherwise: set only \`line\` and \`side\`: \`"RIGHT"\`. Do not send \`start_line\`/\`start_side\` — GitHub rejects multi-line fields on a single-line comment.
+
+### Preserve suggestion blocks verbatim
+
+Specialist \`body\` fields embed GitHub \`\\\`\\\`\\\`suggestion\\\`\\\`\\\`\` blocks so the author can apply fixes with one click. This is a deliberate, high-value part of the review. When aggregating:
+
+- **Never strip, truncate, or paraphrase a suggestion block.** Pass the body through verbatim.
+- If two specialists produce overlapping findings and one has a suggestion block, keep the one WITH the suggestion block. If both have suggestion blocks and the suggested replacements conflict, pick the more specific one and drop the other finding entirely (do not merge two suggestion blocks into one comment — GitHub only apply-applies the first).
+- If a finding body has no suggestion block, that's fine — post it as-is. Don't fabricate one.
 
 **CRITICAL — never use \`event=REQUEST_CHANGES\`.** Only \`APPROVE\` and \`COMMENT\` are valid for this bot.
 
@@ -256,7 +272,7 @@ _Re-review requested by @<triggeredBy> · resolved <N> outdated thread(s) · <M>
 
 ## Voice and discipline
 
-- Direct, specific, actionable. Every finding has a suggested fix.
+- Direct, specific, actionable. Every finding has a suggested fix, and whenever that fix is a code change it goes in a GitHub \`suggestion\` block on the inline comment so the author can apply it with one click.
 - No hedging ("might want to consider"). Say what you mean.
 - No flattery, no preamble, no summarizing what the PR does back to the author — they wrote it.
 - One finding per issue. Don't restate the same concern three ways.
