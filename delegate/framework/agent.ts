@@ -16,6 +16,8 @@ export const runAgent = async (
   let output = "";
   let sessionId: string | undefined;
   let turnCount = 0;
+  let costUsd: number | undefined;
+  let resultTurns: number | undefined;
 
   for await (const msg of query({
     prompt: message,
@@ -137,6 +139,8 @@ export const runAgent = async (
 
     if (msg.type === "result" && msg.subtype === "success") {
       output = msg.result;
+      costUsd = msg.total_cost_usd;
+      resultTurns = msg.num_turns;
       log(config.name, "completed", {
         turns: msg.num_turns,
         costUsd: msg.total_cost_usd,
@@ -167,6 +171,8 @@ export const runAgent = async (
         total_cost_usd?: number;
       };
       output = `Agent error: ${err.errors ?? "unknown error"}`;
+      costUsd = err.total_cost_usd;
+      resultTurns = err.num_turns;
       log(config.name, "error", {
         subtype: err.subtype,
         errors: err.errors,
@@ -194,5 +200,7 @@ export const runAgent = async (
     output,
     durationMs: Date.now() - start,
     sessionId,
+    costUsd,
+    turns: resultTurns,
   };
 };

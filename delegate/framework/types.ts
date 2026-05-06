@@ -32,4 +32,6 @@ export type AgentResult = {
   output: string;
   durationMs: number;
   sessionId?: string;
+  costUsd?: number;
+  turns?: number;
 };
