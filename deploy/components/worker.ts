@@ -20,6 +20,39 @@ export const createWorker = (config: WorkerConfig) => {
     retentionInDays: 30,
   });
 
+  new aws.cloudwatch.LogMetricFilter("workflowPhaseCompleted", {
+    name: "workflow-phase-completed",
+    logGroupName: logGroup.name,
+    pattern: '{ $.event = "workflow_phase_completed" }',
+    metricTransformation: {
+      namespace: "Delegate/Workflow",
+      name: "PhaseCompleted",
+      value: "1",
+      dimensions: {
+        phase: "$.phase",
+        outcome: "$.outcome",
+      },
+    },
+  });
+
+  // Cost is dimensioned by both phase AND outcome so we can chart cost-of-
+  // failures separately — a high cost-on-error trend is the early-warning
+  // signal for an agent looping in its error path.
+  new aws.cloudwatch.LogMetricFilter("workflowPhaseCost", {
+    name: "workflow-phase-cost",
+    logGroupName: logGroup.name,
+    pattern: '{ $.event = "workflow_phase_completed" }',
+    metricTransformation: {
+      namespace: "Delegate/Workflow",
+      name: "PhaseCostUsd",
+      value: "$.costUsd",
+      dimensions: {
+        phase: "$.phase",
+        outcome: "$.outcome",
+      },
+    },
+  });
+
   const executionRole = new aws.iam.Role("agentExecutionRole", {
     name: "delegate-execution-role",
     assumeRolePolicy: JSON.stringify({

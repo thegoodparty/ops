@@ -1,25 +1,101 @@
 import "../agents";
+import { execFileSync } from "node:child_process";
 import { WebClient } from "@slack/web-api";
 import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
 import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
 
-const main = async () => {
-  await setupGitHubAuth();
-  await setupReviewerGitHubAuth();
+// Workflow agents (PRD-to-code) need the runbooks repo on disk and the
+// ClickUp credentials in env. Framework agents (slack-responder, pr-reviewer)
+// don't — they should keep working even if those secrets are unset.
+const isWorkflowAgent = (name: string): boolean => name.endsWith("-agent");
 
+const CLICKUP_TEAM_ID = "90132012119";
+
+// Best-effort Slack post used to surface fatal boot-time failures back to
+// the user's thread. Returns silently on any failure — the process is
+// going to exit anyway.
+const reportBootFailure = async (
+  job: AgentJob | undefined,
+  message: string,
+) => {
+  if (!job?.callback || job.callback.type !== "slack") return;
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) return;
+  try {
+    const slack = new WebClient(token);
+    await slack.chat.postMessage({
+      channel: job.callback.channel,
+      thread_ts: job.callback.threadTs,
+      text: `:warning: Boot failure: ${message}. Re-mention me to retry.`,
+    });
+  } catch {
+    // intentionally silent — we're already exiting
+  }
+};
+
+const parseJob = (): AgentJob | undefined => {
   const raw = process.env.AGENT_JOB;
-  if (!raw) {
-    console.error("AGENT_JOB environment variable not set");
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as AgentJob;
+  } catch {
+    return undefined;
+  }
+};
+
+const main = async () => {
+  // Parse the job first so any subsequent fatal can be surfaced to the
+  // originating Slack thread instead of leaving the user with :eyes: and
+  // silence.
+  const job = parseJob();
+  if (!job) {
+    console.error("AGENT_JOB environment variable not set or invalid JSON");
     process.exit(1);
   }
 
-  let job: AgentJob;
-  try {
-    job = JSON.parse(raw);
-  } catch {
-    console.error("AGENT_JOB is not valid JSON:", raw);
-    process.exit(1);
+  await setupGitHubAuth();
+  await setupReviewerGitHubAuth();
+
+  const needsRunbooks = isWorkflowAgent(job.agent);
+  const runbooksDir = process.env.RUNBOOKS_DIR ?? "/app/runbooks";
+
+  if (needsRunbooks) {
+    try {
+      execFileSync(
+        "gh",
+        ["repo", "clone", "thegoodparty/runbooks", runbooksDir, "--", "--depth=1"],
+        { stdio: "inherit" },
+      );
+      const sha = execFileSync("git", ["-C", runbooksDir, "rev-parse", "--short", "HEAD"])
+        .toString()
+        .trim();
+      process.env.RUNBOOKS_DIR = runbooksDir;
+      process.env.RUNBOOKS_SHA = sha;
+      console.log(`Runbooks cloned at ${runbooksDir} (SHA ${sha})`);
+    } catch (err) {
+      console.error("Failed to clone runbooks:", err);
+      await reportBootFailure(
+        job,
+        "could not clone `thegoodparty/runbooks`. Verify the GitHub App is installed on that repo",
+      );
+      process.exit(1);
+    }
+
+    if (!process.env.CLICKUP_TOKEN) {
+      console.error("CLICKUP_TOKEN environment variable not set");
+      await reportBootFailure(
+        job,
+        "`CLICKUP_TOKEN` is missing from the DELEGATES secret",
+      );
+      process.exit(1);
+    }
+    if (!process.env.CLICKUP_API_KEY) {
+      process.env.CLICKUP_API_KEY = process.env.CLICKUP_TOKEN;
+    }
+    if (!process.env.CLICKUP_TEAM_ID) {
+      process.env.CLICKUP_TEAM_ID = CLICKUP_TEAM_ID;
+    }
   }
 
   console.log(`Starting agent: ${job.agent}`);

@@ -2,6 +2,8 @@ import { dispatch } from "./dispatch";
 import { getSecrets } from "./secrets";
 import { verifyGithubWebhook } from "./verify";
 
+// Distinct from delegate/framework/repos.ts:WRITE_REPOS (bot-write scope).
+// Update both lists when adding a repo.
 const REVIEW_REPOS = new Set([
   "gp-api",
   "gp-webapp",

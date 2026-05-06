@@ -4,6 +4,9 @@ import type { AgentConfig, AgentResult } from "./types";
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
 
+const phaseFromAgentName = (name: string): string | null =>
+  name.endsWith("-agent") ? name.replace(/-agent$/, "") : null;
+
 export const runAgent = async (
   config: AgentConfig,
   message: string,
@@ -13,6 +16,8 @@ export const runAgent = async (
   let output = "";
   let sessionId: string | undefined;
   let turnCount = 0;
+  let costUsd: number | undefined;
+  let resultTurns: number | undefined;
 
   for await (const msg of query({
     prompt: message,
@@ -134,6 +139,8 @@ export const runAgent = async (
 
     if (msg.type === "result" && msg.subtype === "success") {
       output = msg.result;
+      costUsd = msg.total_cost_usd;
+      resultTurns = msg.num_turns;
       log(config.name, "completed", {
         turns: msg.num_turns,
         costUsd: msg.total_cost_usd,
@@ -141,6 +148,19 @@ export const runAgent = async (
         durationApiMs: msg.duration_api_ms,
         usage: msg.usage,
       });
+      const phase = phaseFromAgentName(config.name);
+      if (phase) {
+        console.log(
+          JSON.stringify({
+            event: "workflow_phase_completed",
+            phase,
+            outcome: "success",
+            durationMs: msg.duration_ms,
+            costUsd: msg.total_cost_usd ?? 0,
+            sessionId,
+          }),
+        );
+      }
     }
 
     if (msg.type === "result" && msg.subtype !== "success") {
@@ -151,12 +171,27 @@ export const runAgent = async (
         total_cost_usd?: number;
       };
       output = `Agent error: ${err.errors ?? "unknown error"}`;
+      costUsd = err.total_cost_usd;
+      resultTurns = err.num_turns;
       log(config.name, "error", {
         subtype: err.subtype,
         errors: err.errors,
         turns: err.num_turns,
         costUsd: err.total_cost_usd,
       });
+      const phase = phaseFromAgentName(config.name);
+      if (phase) {
+        console.log(
+          JSON.stringify({
+            event: "workflow_phase_completed",
+            phase,
+            outcome: "error",
+            durationMs: Date.now() - start,
+            costUsd: err.total_cost_usd ?? 0,
+            sessionId,
+          }),
+        );
+      }
     }
   }
 
@@ -165,5 +200,7 @@ export const runAgent = async (
     output,
     durationMs: Date.now() - start,
     sessionId,
+    costUsd,
+    turns: resultTurns,
   };
 };
