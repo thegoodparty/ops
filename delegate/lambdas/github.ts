@@ -213,11 +213,15 @@ export const handleGithub = async (
     // Swallow dispatch failures and return 200 to prevent GitHub from retrying
     // the same delivery for up to 72h — a missed review is far better than N
     // duplicate reviews posted to the PR.
+    const p = payload as Partial<PullRequestPayload & IssueCommentPayload>;
     console.error(
       JSON.stringify({
         event: "github_webhook_dispatch_failed",
         eventType,
         deliveryId,
+        repo: p.repository?.full_name,
+        prNumber: p.pull_request?.number ?? p.issue?.number,
+        author: p.pull_request?.user?.login ?? p.issue?.user?.login,
         error: err instanceof Error ? err.message : String(err),
       }),
     );

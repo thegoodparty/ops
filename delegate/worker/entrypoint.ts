@@ -29,10 +29,21 @@ const main = async () => {
   // come from a different identity than the delegate App (which authors PRs
   // via task-execution-agent — GitHub blocks self-approval). Swap the token
   // the agent's `gh` calls will use; all read ops still work because the
-  // reviewer App has Contents:Read on the same repos.
-  if (job.agent === "pr-reviewer" && process.env.REVIEWER_GITHUB_TOKEN) {
-    process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
-    console.log("pr-reviewer: using reviewer GitHub App token");
+  // reviewer App has Contents:Read on the same repos. The agent reads
+  // PR_REVIEWER_APPROVAL_ENABLED to decide whether it may emit event=APPROVE
+  // — when the swap doesn't happen (reviewer key not provisioned), the agent
+  // is forced into comment-only mode rather than approving from the wrong App.
+  if (job.agent === "pr-reviewer") {
+    if (process.env.REVIEWER_GITHUB_TOKEN) {
+      process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
+      process.env.PR_REVIEWER_APPROVAL_ENABLED = "true";
+      console.log("pr-reviewer: using reviewer GitHub App token");
+    } else {
+      process.env.PR_REVIEWER_APPROVAL_ENABLED = "false";
+      console.log(
+        "pr-reviewer: REVIEWER_GITHUB_TOKEN missing — comment-only mode",
+      );
+    }
   }
 
   const config = getAgent(job.agent);
