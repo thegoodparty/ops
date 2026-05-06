@@ -66,6 +66,10 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
         "abandon",
         "stage",
         "resume",
+        "go",
+        "plan",
+        "focus",
+        "split",
       ]);
 
       const PHASE_TO_AGENT: Record<Phase, string> = {
