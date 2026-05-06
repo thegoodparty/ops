@@ -56,12 +56,6 @@ const isWriteVerb = (verb: string): verb is WriteVerb =>
 const isContinuationVerb = (verb: string): boolean =>
   CONTINUATION_VERBS.has(verb);
 
-const parseAllowedUsers = (raw: string | undefined): string[] =>
-  (raw ?? "")
-    .split("\n")
-    .map((u) => u.trim())
-    .filter(Boolean);
-
 // Slack's `conversations.replies` returns messages oldest-first and caps each
 // page at ~1000 (recommended ≤200). Long workflow threads (many edits) blow
 // past a single page, and since the latest bot header lives at the END of the
@@ -141,21 +135,6 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
 
   const writeVerb = isWriteVerb(verb);
   const continuationVerb = isContinuationVerb(verb);
-
-  if (writeVerb || continuationVerb) {
-    const allowed = parseAllowedUsers(secrets["WORKFLOW_USERS"]);
-    if (!allowed.includes(event.user)) {
-      await slack.chat.postEphemeral({
-        channel: event.channel,
-        user: event.user,
-        thread_ts: threadTs,
-        text: writeVerb
-          ? `You're not in WORKFLOW_USERS — write verbs are restricted. Ping an eng lead to be added.`
-          : `You're not in WORKFLOW_USERS — continuation verbs are restricted.`,
-      });
-      return { statusCode: 200, body: "ok" };
-    }
-  }
 
   let agent: string;
   let message: string;

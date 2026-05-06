@@ -17,9 +17,8 @@ Continuation verbs (`bless` / `edit` / `investigate` / `abandon` / `stage` / `re
 
 ### Authorization
 
-- **Workflow verbs** (write + continuation) are restricted to the Slack user IDs in `WORKFLOW_USERS` (newline-separated, in the `DELEGATES` secret).
+- **No per-user gate.** Any user in any channel where `@delegate` is invited can invoke any verb. The trust boundary is the Slack workspace + which channels the App is added to. Limit the App's channel membership to control who can trigger workflow runs.
 - **Repo write scope** for `task-execution-agent` is restricted to the `WRITE_REPOS` set in `delegate/framework/repos.ts`. The set is interpolated into the agent's system prompt at module-load time, so there's a single source of truth — the LLM sees the same list the code defines. Enforcement is currently prompt-level; see the comment in `repos.ts` for how to add a runtime `PreToolUse` hook if needed.
-- Note: any user mentioning `@delegate` in a channel where the App is installed can route their mention to `slack-responder`, which has shell access via the GitHub App identity. The `WORKFLOW_USERS` gate is a UX-and-accident gate on top of that, not a privilege boundary.
 
 ### Required preconditions for boot
 
@@ -38,21 +37,6 @@ Continuation verbs (`bless` / `edit` / `investigate` / `abandon` / `stage` / `re
    ```
 
 3. If the task exited 1 with no output, `setupGitHubAuth` or the boot-time runbooks clone failed. The worker now best-effort posts a boot-failure message to the originating Slack thread before exiting — check the thread first. If still ambiguous, re-mention the bot to retry; if the failure persists, check GitHub App installation health (the App must be installed on `thegoodparty/runbooks`) and worker network egress.
-
-### Symptom: `not authorized` ephemeral reply on a write or continuation verb
-
-User isn't in `WORKFLOW_USERS`. Update the secret:
-
-```sh
-aws secretsmanager get-secret-value --secret-id DELEGATES --region us-west-2 \
-  | jq -r .SecretString > /tmp/delegates.json
-# Edit /tmp/delegates.json — append the user's Slack ID to WORKFLOW_USERS (newline-separated)
-aws secretsmanager put-secret-value --secret-id DELEGATES --region us-west-2 \
-  --secret-string file:///tmp/delegates.json
-rm /tmp/delegates.json
-```
-
-The next dispatched task picks up the new value at boot.
 
 ### Symptom: `Cannot write to <repo>` from `task-execution-agent`
 
