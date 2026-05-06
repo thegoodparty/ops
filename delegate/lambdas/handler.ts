@@ -47,7 +47,12 @@ const PHASE_TO_AGENT: Record<Phase, string> = {
   "task-execution": "task-execution-agent",
 };
 
-const isWriteVerb = (verb: string): verb is WriteVerb => verb in WRITE_VERBS;
+// Use Object.hasOwn (not `in`) so inherited Object.prototype keys
+// (`constructor`, `toString`, `valueOf`, `hasOwnProperty`, …) don't
+// match — otherwise WRITE_VERBS[verb] resolves to a prototype function,
+// JSON.stringify drops it, and the worker receives a malformed job.
+const isWriteVerb = (verb: string): verb is WriteVerb =>
+  Object.hasOwn(WRITE_VERBS, verb);
 const isContinuationVerb = (verb: string): boolean =>
   CONTINUATION_VERBS.has(verb);
 
