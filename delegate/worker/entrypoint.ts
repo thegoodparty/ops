@@ -64,10 +64,23 @@ const main = async () => {
     try {
       execFileSync(
         "gh",
-        ["repo", "clone", "thegoodparty/runbooks", runbooksDir, "--", "--depth=1"],
+        [
+          "repo",
+          "clone",
+          "thegoodparty/runbooks",
+          runbooksDir,
+          "--",
+          "--depth=1",
+        ],
         { stdio: "inherit" },
       );
-      const sha = execFileSync("git", ["-C", runbooksDir, "rev-parse", "--short", "HEAD"])
+      const sha = execFileSync("git", [
+        "-C",
+        runbooksDir,
+        "rev-parse",
+        "--short",
+        "HEAD",
+      ])
         .toString()
         .trim();
       process.env.RUNBOOKS_DIR = runbooksDir;
@@ -82,16 +95,16 @@ const main = async () => {
       process.exit(1);
     }
 
-    if (!process.env.CLICKUP_TOKEN) {
-      console.error("CLICKUP_TOKEN environment variable not set");
+    if (!process.env.CLICKUP_API_TOKEN) {
+      console.error("CLICKUP_API_TOKEN environment variable not set");
       await reportBootFailure(
         job,
-        "`CLICKUP_TOKEN` is missing from the DELEGATES secret",
+        "`CLICKUP_API_TOKEN` is missing from the DELEGATES secret",
       );
       process.exit(1);
     }
     if (!process.env.CLICKUP_API_KEY) {
-      process.env.CLICKUP_API_KEY = process.env.CLICKUP_TOKEN;
+      process.env.CLICKUP_API_KEY = process.env.CLICKUP_API_TOKEN;
     }
     if (!process.env.CLICKUP_TEAM_ID) {
       process.env.CLICKUP_TEAM_ID = CLICKUP_TEAM_ID;
