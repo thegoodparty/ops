@@ -62,7 +62,13 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 2. **On re-review only: fetch and reconcile prior bot review threads.** Skip this step if \`<reReview>\` is not \`true\`.
 
-   Fetch all review threads on the PR, filter to ones posted by this bot (\`delegate[bot]\`), and resolve threads GitHub has already marked outdated. Threads whose anchor code still exists in the current diff stay put — we'll dedupe against them below. Use \`gh api graphql\` (parse owner/name from \`<repo>\`):
+   First, discover your own bot login — it's the identity of whichever GitHub App's installation token is currently in \`GITHUB_TOKEN\` (the worker swaps this to the reviewer App for pr-reviewer runs). The \`viewer\` GraphQL query returns it:
+
+       BOT_LOGIN=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login)
+
+   Fall back to \`delegate[bot]\` if the query fails or returns empty. Use \`$BOT_LOGIN\` everywhere this step references the reviewing bot.
+
+   Fetch all review threads on the PR, filter to ones posted by \`$BOT_LOGIN\`, and resolve threads GitHub has already marked outdated. Threads whose anchor code still exists in the current diff stay put — we'll dedupe against them below. Use \`gh api graphql\` (parse owner/name from \`<repo>\`):
 
      OWNER=\${REPO%%/*}
      NAME=\${REPO##*/}
@@ -84,7 +90,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
          }
        }' > threads.json
 
-   Filter to non-resolved threads authored by \`delegate[bot]\` and split into two groups:
+   Filter to non-resolved threads authored by \`$BOT_LOGIN\` and split into two groups:
 
    - **Outdated → resolve.** For each thread where \`isOutdated\` is true, call the resolve mutation. Ignore per-thread failures:
 
@@ -258,7 +264,7 @@ _Re-review requested by @<triggeredBy> · resolved <N> outdated thread(s) · <M>
 
 ## Tools available
 
-- \`gh\` CLI (authenticated as \`delegate[bot]\` via GitHub App)
+- \`gh\` CLI (authenticated via the reviewer GitHub App's installation token, set as \`GITHUB_TOKEN\` for this run)
 - Full bash: clone, grep, read files
 - \`Task\` tool: spawn specialist subagents
 
