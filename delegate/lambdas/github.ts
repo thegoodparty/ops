@@ -101,11 +101,6 @@ const dispatchPullRequest = async (
   <baseRef>${esc(pr.base.ref)}</baseRef>
   <headSha>${esc(pr.head.sha)}</headSha>
 </pr>`,
-    callback: {
-      type: "github-pr",
-      repo: repoFullName,
-      prNumber: pr.number,
-    },
     metadata: {
       source: "github",
       repo: repoFullName,
@@ -148,11 +143,6 @@ const dispatchReReview = async (
   <reReview>true</reReview>
   <triggeredBy>${esc(comment.user.login)}</triggeredBy>
 </pr>`,
-    callback: {
-      type: "github-pr",
-      repo: repoFullName,
-      prNumber: issue.number,
-    },
     metadata: {
       source: "github",
       repo: repoFullName,
