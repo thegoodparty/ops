@@ -4,6 +4,9 @@ import type { AgentConfig, AgentResult } from "./types";
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
 
+const phaseFromAgentName = (name: string): string | null =>
+  name.endsWith("-agent") ? name.replace(/-agent$/, "") : null;
+
 export const runAgent = async (
   config: AgentConfig,
   message: string,
@@ -141,6 +144,19 @@ export const runAgent = async (
         durationApiMs: msg.duration_api_ms,
         usage: msg.usage,
       });
+      const phase = phaseFromAgentName(config.name);
+      if (phase) {
+        console.log(
+          JSON.stringify({
+            event: "workflow_phase_completed",
+            phase,
+            status: "success",
+            durationMs: msg.duration_ms,
+            costUsd: msg.total_cost_usd ?? 0,
+            sessionId,
+          }),
+        );
+      }
     }
 
     if (msg.type === "result" && msg.subtype !== "success") {
@@ -157,6 +173,19 @@ export const runAgent = async (
         turns: err.num_turns,
         costUsd: err.total_cost_usd,
       });
+      const phase = phaseFromAgentName(config.name);
+      if (phase) {
+        console.log(
+          JSON.stringify({
+            event: "workflow_phase_completed",
+            phase,
+            status: "error",
+            durationMs: Date.now() - start,
+            costUsd: err.total_cost_usd ?? 0,
+            sessionId,
+          }),
+        );
+      }
     }
   }
 
