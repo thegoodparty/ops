@@ -7,6 +7,7 @@ const REVIEW_REPOS = new Set([
   "gp-webapp",
   "people-api",
   "election-api",
+  "gp-ai-projects",
   "ops",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
