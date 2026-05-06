@@ -3,6 +3,7 @@ import { dispatch } from "./dispatch";
 import { getSecrets } from "./secrets";
 import { verifySlackWebhook } from "./verify";
 import { handleGithub } from "./github";
+import { findLatestState, type Phase } from "../framework/thread-state";
 
 type FunctionURLEvent = {
   rawPath: string;
@@ -45,9 +46,107 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
 
     if (event.type === "app_mention") {
       const text = (event.text as string).replace(/<@[A-Z0-9]+>/g, "").trim();
+      const [verb, ...rest] = text.split(/\s+/);
+      const args = rest.join(" ");
       const threadTs = event.thread_ts ?? event.ts;
 
       const slack = new WebClient(secrets["SLACK_BOT_TOKEN"]);
+
+      const WRITE_VERBS = {
+        "tech-design": "tech-design-agent",
+        epic: "epic-agent",
+        "epic-edit": "epic-edit-agent",
+        work: "task-execution-agent",
+      } as const;
+
+      const CONTINUATION_VERBS = new Set([
+        "bless",
+        "edit",
+        "investigate",
+        "abandon",
+        "stage",
+        "resume",
+      ]);
+
+      const PHASE_TO_AGENT: Record<Phase, string> = {
+        "tech-design": "tech-design-agent",
+        epic: "epic-agent",
+        "epic-edit": "epic-edit-agent",
+        "task-execution": "task-execution-agent",
+      };
+
+      const isWriteVerb = verb in WRITE_VERBS;
+      const isContinuationVerb = CONTINUATION_VERBS.has(verb);
+
+      if (isWriteVerb || isContinuationVerb) {
+        const allowed = (secrets["WORKFLOW_USERS"] ?? "")
+          .split("\n")
+          .map((u) => u.trim())
+          .filter(Boolean);
+
+        if (!allowed.includes(event.user)) {
+          await slack.chat.postEphemeral({
+            channel: event.channel,
+            user: event.user,
+            thread_ts: threadTs,
+            text: isWriteVerb
+              ? `You're not in WORKFLOW_USERS — write verbs are restricted. Ping an eng lead to be added.`
+              : `You're not in WORKFLOW_USERS — continuation verbs are restricted.`,
+          });
+          return { statusCode: 200, body: "ok" };
+        }
+      }
+
+      let agent: string;
+      let message: string;
+
+      if (isWriteVerb) {
+        agent = WRITE_VERBS[verb as keyof typeof WRITE_VERBS];
+        message = args;
+      } else if (isContinuationVerb) {
+        const replies = await slack.conversations.replies({
+          channel: event.channel,
+          ts: threadTs,
+          limit: 50,
+        });
+        const messages = (replies.messages ?? []) as Array<{
+          text?: string;
+          bot_id?: string;
+        }>;
+        const state = findLatestState(messages);
+
+        if (!state) {
+          const lastBot = [...messages]
+            .reverse()
+            .find((m) => m.bot_id && m.text);
+          const firstLine = lastBot?.text
+            ?.split("\n")
+            .find((l) => l.trim().length > 0);
+          if (firstLine && /^\[(.+?)\]/.test(firstLine)) {
+            console.warn(
+              JSON.stringify({
+                event: "workflow_malformed_header",
+                channel: event.channel,
+                threadTs,
+                firstLine,
+              }),
+            );
+          }
+          await slack.chat.postEphemeral({
+            channel: event.channel,
+            user: event.user,
+            thread_ts: threadTs,
+            text: `No prior workflow state found in this thread. Start a new run with \`@delegate tech-design <url>\` (or \`epic\` / \`work\`).`,
+          });
+          return { statusCode: 200, body: "ok" };
+        }
+
+        agent = PHASE_TO_AGENT[state.phase];
+        message = text;
+      } else {
+        agent = "slack-responder";
+        message = text;
+      }
 
       const [, { taskArn }] = await Promise.all([
         slack.reactions.add({
@@ -56,8 +155,8 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
           name: "eyes",
         }),
         dispatch({
-          agent: "slack-responder",
-          message: text,
+          agent,
+          message,
           callback: {
             type: "slack",
             channel: event.channel,
