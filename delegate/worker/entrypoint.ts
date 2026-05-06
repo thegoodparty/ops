@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { WebClient } from "@slack/web-api";
 import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
-import { setupGitHubAuth } from "./github-auth";
+import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
 
 // Workflow agents (PRD-to-code) need the runbooks repo on disk and the
 // ClickUp credentials in env. Framework agents (slack-responder, pr-reviewer)
@@ -55,6 +55,7 @@ const main = async () => {
   }
 
   await setupGitHubAuth();
+  await setupReviewerGitHubAuth();
 
   const needsRunbooks = isWorkflowAgent(job.agent);
   const runbooksDir = process.env.RUNBOOKS_DIR ?? "/app/runbooks";
@@ -100,11 +101,33 @@ const main = async () => {
   console.log(`Starting agent: ${job.agent}`);
   if (job.metadata) console.log("Metadata:", job.metadata);
 
+  // pr-reviewer posts reviews from a separate GitHub App so its approvals
+  // come from a different identity than the delegate App (which authors PRs
+  // via task-execution-agent — GitHub blocks self-approval). Swap the token
+  // the agent's `gh` calls will use; all read ops still work because the
+  // reviewer App has Contents:Read on the same repos. The agent reads
+  // PR_REVIEWER_APPROVAL_ENABLED to decide whether it may emit event=APPROVE
+  // — when the swap doesn't happen (reviewer key not provisioned), the agent
+  // is forced into comment-only mode rather than approving from the wrong App.
+  if (job.agent === "pr-reviewer") {
+    if (process.env.REVIEWER_GITHUB_TOKEN) {
+      process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
+      process.env.PR_REVIEWER_APPROVAL_ENABLED = "true";
+      console.log("pr-reviewer: using reviewer GitHub App token");
+    } else {
+      process.env.PR_REVIEWER_APPROVAL_ENABLED = "false";
+      console.log(
+        "pr-reviewer: REVIEWER_GITHUB_TOKEN missing — comment-only mode",
+      );
+    }
+  }
+
   const config = getAgent(job.agent);
 
-  const slack = job.metadata?.source === "slack"
-    ? new WebClient(process.env.SLACK_BOT_TOKEN)
-    : undefined;
+  const slack =
+    job.metadata?.source === "slack"
+      ? new WebClient(process.env.SLACK_BOT_TOKEN)
+      : undefined;
 
   let message = job.message;
   if (slack && job.metadata?.source === "slack") {
@@ -131,8 +154,13 @@ const main = async () => {
           }
         }
         if (m.blocks) {
-          for (const block of m.blocks as Array<{ type: string; text?: { text?: string }; elements?: Array<{ elements?: Array<{ text?: string }> }> }>) {
-            if (block.type === "section" && block.text?.text) parts.push(block.text.text);
+          for (const block of m.blocks as Array<{
+            type: string;
+            text?: { text?: string };
+            elements?: Array<{ elements?: Array<{ text?: string }> }>;
+          }>) {
+            if (block.type === "section" && block.text?.text)
+              parts.push(block.text.text);
             if (block.type === "rich_text" && block.elements) {
               for (const el of block.elements) {
                 if (el.elements) {
