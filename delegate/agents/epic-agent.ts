@@ -69,7 +69,12 @@ Channel and thread_ts come from the <slack-thread> XML root attributes.
 
 The user's mention is shaped:
 
-  @delegate epic <tech-design-page-url>
+  @delegate epic <tech-design-page-url> [list:<list-id>]
+
+The optional \`list:<list-id>\` token is the ClickUp List ID where the Epic should be created. Parsing rules:
+- Match \`list:\\S+\` anywhere in the message (case-insensitive on the key; ID can be numeric or whatever ClickUp returns).
+- If multiple \`list:\` tokens appear, use the first and warn in the final Slack post.
+- Strip the token from the message before treating the rest as the URL.
 
 Parse the URL — it's a v3 doc page: \`https://goodparty.clickup.com/<workspace>/v/dc/<doc_id>/<page_id>\`. Fetch the page content:
 
@@ -79,12 +84,19 @@ The page is the **blessed** tech design. Confirm before proceeding — its Click
 
   *_That tech design is still a draft (_*\`[DRAFT]\`*_ prefix). Bless it first with_* \`@delegate bless\` *_in the tech-design thread._*
 
+  Do NOT emit a \`[phase=...]\` header — no Epic was created, and a header with an empty \`clickup=\` field will corrupt state recovery on this thread (same reason as the no-list error case below).
+
 ### Target list resolution
 
-Where the Epic gets created:
+Where the Epic gets created. Resolution order — first hit wins:
 
-1. **Preferred:** the blessed tech design includes a \`clickupListId\` field in its frontmatter or body. Use that.
-2. **Fallback:** read the env var \`EPIC_DEFAULT_LIST_ID\`. If unset, post a Slack error explaining that an operator needs to set \`EPIC_DEFAULT_LIST_ID\` in the DELEGATES secret. Do not guess.
+1. **Slack arg:** \`list:<list-id>\` token from the user's mention (parsing above). Explicit user intent always wins, including over tech-design metadata.
+2. **Tech-design metadata:** the blessed tech design includes a \`clickupListId\` field in its frontmatter or body. Use that.
+3. **Error:** if neither is present, do not guess. Post this Slack message and stop:
+
+  *_No target ClickUp list. Re-run with_* \`@delegate epic <design-url> list:<list-id>\` *_or add_* \`clickupListId: <list-id>\` *_to the tech-design frontmatter and re-bless it._*
+
+  Do NOT emit a \`[phase=...]\` header — no Epic was created, and a header with an empty \`clickup=\` field will corrupt state recovery on this thread (\`parseHeader\` rejects empty fields, leaving any future \`bless\`/\`abandon\` reply to hit the "No prior workflow state found" path).
 
 ### Custom item IDs
 
