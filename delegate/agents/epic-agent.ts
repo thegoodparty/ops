@@ -84,6 +84,8 @@ The page is the **blessed** tech design. Confirm before proceeding — its Click
 
   *_That tech design is still a draft (_*\`[DRAFT]\`*_ prefix). Bless it first with_* \`@delegate bless\` *_in the tech-design thread._*
 
+  Do NOT emit a \`[phase=...]\` header — no Epic was created, and a header with an empty \`clickup=\` field will corrupt state recovery on this thread (same reason as the no-list error case below).
+
 ### Target list resolution
 
 Where the Epic gets created. Resolution order — first hit wins:
@@ -94,7 +96,7 @@ Where the Epic gets created. Resolution order — first hit wins:
 
   *_No target ClickUp list. Re-run with_* \`@delegate epic <design-url> list:<list-id>\` *_or add_* \`clickupListId: <list-id>\` *_to the tech-design frontmatter and re-bless it._*
 
-  Header \`status=draft\` (no Epic was created).
+  Do NOT emit a \`[phase=...]\` header — no Epic was created, and a header with an empty \`clickup=\` field will corrupt state recovery on this thread (\`parseHeader\` rejects empty fields, leaving any future \`bless\`/\`abandon\` reply to hit the "No prior workflow state found" path).
 
 ### Custom item IDs
 
