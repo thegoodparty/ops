@@ -62,6 +62,38 @@ const parseAllowedUsers = (raw: string | undefined): string[] =>
     .map((u) => u.trim())
     .filter(Boolean);
 
+// Slack's `conversations.replies` returns messages oldest-first and caps each
+// page at ~1000 (recommended ≤200). Long workflow threads (many edits) blow
+// past a single page, and since the latest bot header lives at the END of the
+// thread, dropping the tail silently breaks state recovery. Paginate fully.
+const fetchAllReplies = async (
+  slack: WebClient,
+  channel: string,
+  threadTs: string,
+): Promise<Array<{ text?: string; bot_id?: string }>> => {
+  const all: Array<{ text?: string; bot_id?: string }> = [];
+  let cursor: string | undefined;
+  // Hard upper bound on pages so a runaway thread can't pin the Lambda.
+  // 50 pages × 200 = 10k messages — well past any realistic thread.
+  for (let page = 0; page < 50; page++) {
+    const resp = await slack.conversations.replies({
+      channel,
+      ts: threadTs,
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    });
+    const messages = (resp.messages ?? []) as Array<{
+      text?: string;
+      bot_id?: string;
+    }>;
+    all.push(...messages);
+    if (!resp.has_more) break;
+    cursor = resp.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+  return all;
+};
+
 const handleSlack = async (body: string, headers: Record<string, string>) => {
   const secrets = await getSecrets();
   const secret = secrets["SLACK_SIGNING_SECRET"];
@@ -132,15 +164,7 @@ const handleSlack = async (body: string, headers: Record<string, string>) => {
     agent = WRITE_VERBS[verb as WriteVerb];
     message = args;
   } else if (continuationVerb) {
-    const replies = await slack.conversations.replies({
-      channel: event.channel,
-      ts: threadTs,
-      limit: 50,
-    });
-    const messages = (replies.messages ?? []) as Array<{
-      text?: string;
-      bot_id?: string;
-    }>;
+    const messages = await fetchAllReplies(slack, event.channel, threadTs);
     const state = findLatestState(messages);
 
     if (!state) {
