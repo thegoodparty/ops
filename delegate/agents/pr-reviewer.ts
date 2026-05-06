@@ -45,13 +45,26 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`/delegate-review\\\`.\` and exit. Don't run specialists, don't post a status check.
 
-1. **Compute your own task logs URL, then post \`pending\` status check.** You're running inside an ECS Fargate task; derive your task ID from the ECS metadata endpoint, then build the CloudWatch logs URL for this run. Use this exact shell recipe:
+1. **Bail if another task is already reviewing this commit, then post \`pending\` status check.** Parallel webhook deliveries (org + repo installations, retried deliveries) can dispatch two reviewer tasks for the same commit. Two tasks reaching different LLM verdicts on the same diff produces contradictory reviews on the PR. To prevent that, dedup against existing \`pr-reviewer\` statuses on the head SHA before doing any other work — skip the dedup only on re-review, where prior-run statuses always exist and the user explicitly asked for a fresh pass.
+
+   Skip this dedup block when \`<reReview>\` is \`true\`. Otherwise:
+
+     EXISTING=$(gh api repos/<repo>/commits/$HEAD_SHA/statuses \\
+       --jq '[.[] | select(.context == "pr-reviewer")] | length')
+     if [ "$EXISTING" -gt 0 ]; then
+       echo "Skipping: pr-reviewer already ran or is running on $HEAD_SHA"
+       exit 0
+     fi
+
+   Tiny race window: two tasks both reading "no existing status" before either has posted \`pending\`. The webhook gap is typically several seconds, large enough for the first task's \`pending\` post to land and abort the second. If they truly tie, you'll still get duplicate reviews — an acceptable rare miss vs. the cost of a full distributed lock.
+
+   Then compute your task logs URL and post \`pending\`. You're running inside an ECS Fargate task; derive your task ID from the ECS metadata endpoint, then build the CloudWatch logs URL for this run. Use this exact shell recipe:
 
      TASK_ARN=$(curl -s "$ECS_CONTAINER_METADATA_URI_V4/task" | jq -r '.TaskARN')
      TASK_ID="\${TASK_ARN##*/}"
      LOGS_URL="https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/\$252Faws\$252Fecs\$252Fdelegate/log-events/agent\$252Fagent\$252F\${TASK_ID}"
 
-   Then post the pending status before cloning anything. The \`details\` link on the PR check will go to \`$LOGS_URL\`:
+   Post the pending status before cloning anything. The \`details\` link on the PR check will go to \`$LOGS_URL\`:
 
      gh api --method POST repos/<repo>/statuses/$HEAD_SHA \\
        -f state=pending \\
@@ -116,6 +129,13 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    For each touched file, read enough of the surrounding code to understand context — do not review diff hunks in isolation.
 
+   **Self-review detection.** While reading the file list, check whether this PR modifies your own review system. Set \`SELF_REVIEW=true\` if BOTH of the following hold:
+
+   - \`<repo>\` is \`thegoodparty/ops\`, AND
+   - any path in \`gh pr view <num> --repo <repo> --json files --jq '.files[].path'\` starts with \`delegate/\`.
+
+   Otherwise \`SELF_REVIEW=false\`. The \`delegate/\` tree includes the agent prompts, the framework, the lambda dispatcher, and the worker — all of which can change what the bot does or whether it runs at all. You are NEVER allowed to auto-approve a PR that modifies any of it; that bar is checked in step 8. The specialists still run normally — their findings should still be posted as inline blockers — only the final verdict is forced to comment-only.
+
 5. **Delegate to specialists.** Use the Task tool to spawn all five specialists IN PARALLEL (send all five Task calls in one message). Each gets the same context — the PR reference and the path to the cloned repo.
 
    Pass this prompt to each specialist, **substituting the concrete values for \`<num>\`, \`<repo>\`, and \`<WORK>\`** — do not pass the literal angle-bracket placeholders:
@@ -170,6 +190,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      - \`LINKAGE_OK=true\` (no TDD referenced, OR the referenced TDD is blessed and matches the diff).
      - Every specialist returned valid JSON. If any specialist failed or returned malformed output, you cannot auto-approve — your "no blockers" signal would only mean "no blockers found by the specialists that ran."
      - The env var \`PR_REVIEWER_APPROVAL_ENABLED\` equals \`"true"\`. The worker sets this when it has swapped \`GITHUB_TOKEN\` to the reviewer App's installation token; if it isn't set, posting an approval would come from the wrong identity.
+     - \`SELF_REVIEW=false\`. A PR that modifies the bot's own review system can subvert any future auto-approval check; humans must look at it. This rule is non-negotiable — do not rationalize past it even when the diff looks benign.
    - **Comment-only review** otherwise.
 
 9. **Post the review.** ONE \`gh api\` call.
@@ -271,6 +292,7 @@ Sentence phrasing per non-blocker failure:
 - \`LINKAGE_FAIL_REASON=mismatch\`: \`linked tech design doesn't match this PR — <LINKAGE_MISMATCH_NOTE>\`
 - \`LINKAGE_FAIL_REASON=no-clickup-token\`: \`PR references a tech design but CLICKUP_API_TOKEN isn't configured\`
 - \`PR_REVIEWER_APPROVAL_ENABLED\` not \`"true"\`: \`reviewer App not configured (REVIEWER_APP_PRIVATE_KEY missing)\`
+- \`SELF_REVIEW=true\`: \`PR modifies the reviewer's own system (\`delegate/\`) — auto-approval is disabled on changes to the bot, human review required\`
 
 On re-review, do NOT prepend a "_Re-review requested by @<triggeredBy>_" line. Reviewers can see who triggered the re-run from the timeline; the prefix is noise.
 
