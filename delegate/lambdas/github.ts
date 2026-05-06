@@ -2,7 +2,6 @@ import { dispatch } from "./dispatch";
 import { getSecrets } from "./secrets";
 import { verifyGithubWebhook } from "./verify";
 
-const REVIEW_AUTHOR_WHITELIST = new Set(["swain", "delegate[bot]"]);
 const REVIEW_REPOS = new Set([
   "gp-api",
   "gp-webapp",
@@ -61,8 +60,6 @@ export const shouldDispatch = (
   if (!p?.pull_request || !p?.repository) return false;
   if (!DISPATCH_ACTIONS.has(p.action ?? "")) return false;
   if (p.pull_request.draft) return false;
-  if (!REVIEW_AUTHOR_WHITELIST.has(p.pull_request.user?.login ?? ""))
-    return false;
   if (!REVIEW_REPOS.has(p.repository.name ?? "")) return false;
   return true;
 };
@@ -79,7 +76,6 @@ export const shouldDispatchReReview = (
   if (!p.issue.pull_request) return false;
   if (p.issue.state !== "open") return false;
   if (!RE_REVIEW_TRIGGER.test(p.comment.body ?? "")) return false;
-  if (!REVIEW_AUTHOR_WHITELIST.has(p.comment.user?.login ?? "")) return false;
   if (!REVIEW_REPOS.has(p.repository.name ?? "")) return false;
   return true;
 };
