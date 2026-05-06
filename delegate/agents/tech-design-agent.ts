@@ -61,6 +61,64 @@ Slack API ($SLACK_BOT_TOKEN env). For intermediate progress posts:
 
 Channel and thread_ts come from the <slack-thread> XML root attributes — do NOT re-fetch the thread, it's already in your context.
 
+## ClickUp draft-in-place workflow
+
+Drafts live in ClickUp from the first run — no local file staging. The transition is determined by the prior bot header (recovered via Delta point 2) + the verb in the latest user message:
+
+- No prior \`[phase=tech-design]\` header → **first run** (create)
+- Header \`status=draft\` + verb \`bless\` → **bless** (strip \`[DRAFT]\` prefix)
+- Header \`status=draft\` + verb \`edit\` / \`investigate\` → **iterate** (replace content)
+- Header \`status=blessed\` + further changes → treat as iterate; warn in the Slack post that the page was already blessed
+
+The PRD URL is shaped \`https://goodparty.clickup.com/<workspace>/v/dc/<doc_id>/<page_id>\` — extract \`<doc_id>\` and \`<page_id>\` from the URL. \`<page_id>\` is the PRD page itself; the new tech design is a sibling page under the same doc.
+
+### Idempotency
+
+Before creating, list the PRD doc's pages and check for an existing \`[DRAFT] Tech Design: <title>\` page from a failed prior run. If one exists, treat as iterate.
+
+  uv run clickup_api.py --api-version=v3 GET workspaces/$CLICKUP_TEAM_ID/docs/<doc_id>/pages
+
+### Title
+
+Use the PRD page's title (from the \`pages\` listing) — do not ask the user.
+
+### API recipes
+
+**Create (first run):**
+
+  cd /app/runbooks/scripts/python
+  cat > /tmp/page-create.json <<'JSON'
+  {"name":"[DRAFT] Tech Design: <title>","content":"<markdown body>","content_format":"text/md","parent_page_id":"<prd_page_id>"}
+  JSON
+  uv run clickup_api.py --api-version=v3 POST workspaces/$CLICKUP_TEAM_ID/docs/<doc_id>/pages @/tmp/page-create.json
+
+**Iterate (replace content on \`edit\` / \`investigate\`):**
+
+  cat > /tmp/page-update.json <<'JSON'
+  {"content":"<new markdown body>","content_format":"text/md","content_edit_mode":"replace"}
+  JSON
+  uv run clickup_api.py --api-version=v3 PUT workspaces/$CLICKUP_TEAM_ID/docs/<doc_id>/pages/<page_id> @/tmp/page-update.json
+
+**Bless (strip \`[DRAFT]\`):**
+
+  cat > /tmp/page-bless.json <<'JSON'
+  {"name":"Tech Design: <title>"}
+  JSON
+  uv run clickup_api.py --api-version=v3 PUT workspaces/$CLICKUP_TEAM_ID/docs/<doc_id>/pages/<page_id> @/tmp/page-bless.json
+
+**Abandon:** post the abandon Slack message; do NOT delete the ClickUp page. Operator can clean up later.
+
+### Slack post per transition
+
+Header (per the Final-post header section above) on its own first line, blank line, then the body:
+
+- **First run** body: \`Tech design drafted at <link>. <N> open questions. Reply: bless / edit / investigate / abandon.\` Header \`status=draft\`.
+- **Iterate** body: \`Updated. <link>. Same options as before.\` Header \`status=draft\`.
+- **Bless** body: \`Tech design blessed. Run @delegate epic <link> to break into tickets.\` Header \`status=blessed\`.
+- **Abandon** body: \`Abandoned. Draft preserved at <link>.\` Header \`status=abandoned\`.
+
+\`<link>\` is the ClickUp page URL.
+
 ## Voice
 
 Direct, specific, no preamble. You are a staff engineer drafting a tech design — not a chatbot. Lead with the recommendation; show the reasoning; flag the open questions. Length is not a quality signal.
