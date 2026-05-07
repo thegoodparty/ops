@@ -19,11 +19,12 @@ export const WRITE_REPOS = new Set([
   "gp-webapp",
   "people-api",
   "election-api",
-  "ops",
+  "runbooks",
+  "gp-ai-projects",
+  "ai-rules",
 ]);
 
-export const isWritableRepo = (name: string): boolean =>
-  WRITE_REPOS.has(name);
+export const isWritableRepo = (name: string): boolean => WRITE_REPOS.has(name);
 
 export const assertWritableRepo = (name: string): void => {
   if (!WRITE_REPOS.has(name)) {
