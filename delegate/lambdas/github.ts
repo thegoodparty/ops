@@ -9,8 +9,13 @@ const REVIEW_REPOS = new Set([
   "gp-webapp",
   "people-api",
   "election-api",
+  "runbooks",
   "gp-ai-projects",
-  "ops",
+  "ai-rules",
+  "gp-sdk",
+  "campaign-plan-service",
+  "gp-data-platform",
+  "candidate-sites",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 

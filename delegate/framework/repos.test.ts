@@ -4,10 +4,19 @@ import { WRITE_REPOS, isWritableRepo, assertWritableRepo } from "./repos";
 
 describe("WRITE_REPOS", () => {
   it("contains the expected initial allowlist", () => {
-    assert.deepEqual(
-      [...WRITE_REPOS].sort(),
-      ["election-api", "gp-api", "gp-webapp", "ops", "people-api"],
-    );
+    assert.deepEqual([...WRITE_REPOS].sort(), [
+      "gp-api",
+      "gp-webapp",
+      "people-api",
+      "election-api",
+      "runbooks",
+      "gp-ai-projects",
+      "ai-rules",
+      "gp-sdk",
+      "campaign-plan-service",
+      "gp-data-platform",
+      "candidate-sites",
+    ]);
   });
 });
 

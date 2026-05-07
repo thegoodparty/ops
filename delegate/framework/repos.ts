@@ -4,9 +4,9 @@
 // list shown to the LLM and the list checked at runtime cannot drift.
 //
 // Distinct from `lambdas/github.ts:REVIEW_REPOS` (auto-PR-review trigger
-// scope). Same initial members, but kept separate so write scope can grow
-// without expanding the review-trigger scope. Update both lists when adding
-// a repo.
+// scope). The two scopes are independent: write access does not imply
+// review coverage and vice versa. If you also want auto-PR-review on a
+// repo added here, separately add it to `REVIEW_REPOS`.
 //
 // Enforcement posture (v1): the gate is prompt-level — the agent is
 // instructed to refuse pushes to any repo not in the list. There is no
