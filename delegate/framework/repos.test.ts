@@ -4,21 +4,30 @@ import { WRITE_REPOS, isWritableRepo, assertWritableRepo } from "./repos";
 
 describe("WRITE_REPOS", () => {
   it("contains the expected initial allowlist", () => {
-    assert.deepEqual(
-      [...WRITE_REPOS].sort(),
-      ["election-api", "gp-api", "gp-webapp", "ops", "people-api"],
-    );
+    assert.deepEqual([...WRITE_REPOS].sort(), [
+      "ai-rules",
+      "campaign-plan-service",
+      "candidate-sites",
+      "election-api",
+      "gp-ai-projects",
+      "gp-api",
+      "gp-data-platform",
+      "gp-sdk",
+      "gp-webapp",
+      "people-api",
+      "runbooks",
+    ]);
   });
 });
 
 describe("isWritableRepo", () => {
   it("returns true for repos in the allowlist", () => {
     assert.equal(isWritableRepo("gp-api"), true);
-    assert.equal(isWritableRepo("ops"), true);
+    assert.equal(isWritableRepo("runbooks"), true);
   });
 
   it("returns false for repos not in the allowlist", () => {
-    assert.equal(isWritableRepo("runbooks"), false);
+    assert.equal(isWritableRepo("ops"), false);
     assert.equal(isWritableRepo(""), false);
     assert.equal(isWritableRepo("Gp-Api"), false); // case-sensitive
   });
