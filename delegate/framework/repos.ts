@@ -22,6 +22,10 @@ export const WRITE_REPOS = new Set([
   "runbooks",
   "gp-ai-projects",
   "ai-rules",
+  "gp-sdk",
+  "campaign-plan-service",
+  "gp-data-platform",
+  "candidate-sites",
 ]);
 
 export const isWritableRepo = (name: string): boolean => WRITE_REPOS.has(name);
