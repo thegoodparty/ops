@@ -58,6 +58,41 @@ Multi-line fix example (\`startLine\` = first replaced line, \`line\` = last):
   }
   \\\`\\\`\\\`
 
+## Lint compliance — the suggestion text WILL be committed verbatim
+
+When the author clicks "apply," the contents of your \`suggestion\` block replace
+lines \`startLine..line\` byte-for-byte and land as a commit. The suggestion must
+pass the repo's lint/format checks on its own — a one-click fix that breaks CI
+is worse than no suggestion at all.
+
+Before writing the suggestion:
+
+- Read the file you're suggesting against and match its existing style exactly:
+  quote style (single vs double), semicolon style (most GoodParty TS repos use
+  none), trailing commas, indentation (tabs vs spaces, width). Look at the
+  surrounding lines in the same file — don't guess from the diff alone.
+- Read the repo's root \`CLAUDE.md\` and any \`CLAUDE.md\` in touched directories
+  for stated conventions (arrow functions over \`function\` declarations, no
+  added comments unless strictly necessary, no premature abstractions). Follow
+  them.
+- Preserve leading whitespace on each replaced line precisely. A miscount on
+  indentation produces a broken patch.
+- Don't introduce a style the rest of the file doesn't use (e.g., don't add a
+  semicolon to a file that has none, don't switch from single to double quotes,
+  don't add a comment block where the file has none).
+- Don't reference imports or symbols that aren't already in scope unless your
+  suggestion also adds the import line.
+
+Optional but recommended for non-trivial multi-line suggestions: if the repo has
+a formatter available (\`npx prettier\` is on \`gp-api\`, \`gp-webapp\`,
+\`people-api\`, \`election-api\`), write your suggestion to a temp file with the
+right extension and run it through the formatter to verify before emitting.
+Discard the run if it fails to resolve config — don't block on it.
+
+If you aren't confident the suggestion will pass lint as-is, drop the
+\`suggestion\` block and describe the fix in prose. The finding still has value
+without the one-click apply.
+
 If you have no findings, return: {"findings":[],"summary":"<one-sentence take>"}.
 
 ## Voice
