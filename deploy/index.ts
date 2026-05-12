@@ -13,18 +13,13 @@ export = async () => {
   };
   const securityGroupId = "sg-01de8d67b0f0ec787";
 
-  const secretVersion = await aws.secretsmanager.getSecretVersion({
-    secretId: "DELEGATES",
+  const secret = await aws.secretsmanager.getSecret({
+    name: "DELEGATES",
   });
-
-  const secretKeys = Object.keys(
-    JSON.parse(secretVersion.secretString || "{}") as Record<string, string>
-  );
 
   const worker = createWorker({
     imageUri: workerImageUri,
-    secretArn: secretVersion.arn,
-    secretKeys,
+    secretArn: secret.arn,
     subnetIds: vpcSubnetIds.public,
     securityGroupIds: [securityGroupId],
   });
@@ -34,7 +29,7 @@ export = async () => {
     taskDefArn: worker.taskDefinition.arn,
     subnetIds: vpcSubnetIds.public,
     securityGroupId,
-    secretArn: secretVersion.arn,
+    secretArn: secret.arn,
   });
 
   const playwrightReports = createPlaywrightReportsBucket();

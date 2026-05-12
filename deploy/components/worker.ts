@@ -4,7 +4,6 @@ import * as aws from "@pulumi/aws";
 export interface WorkerConfig {
   imageUri: string;
   secretArn: string;
-  secretKeys: string[];
   subnetIds: string[];
   securityGroupIds: string[];
 }
@@ -189,10 +188,11 @@ export const createWorker = (config: WorkerConfig) => {
         memory: 4096,
         essential: true,
         environment: [{ name: "AWS_DEFAULT_REGION", value: "us-west-2" }],
-        secrets: config.secretKeys.sort().map((key) => ({
-          name: key,
-          valueFrom: `${config.secretArn}:${key}::`,
-        })),
+        // Mount the entire DELEGATES JSON as one env var; bootstrap.ts in the
+        // worker container expands it into per-key env vars at process start.
+        // This means new keys added in Secrets Manager are picked up on the
+        // next task launch without redeploying the task definition.
+        secrets: [{ name: "DELEGATES_JSON", valueFrom: config.secretArn }],
         logConfiguration: {
           logDriver: "awslogs",
           options: {

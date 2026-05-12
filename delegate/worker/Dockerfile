@@ -13,4 +13,4 @@ USER agent
 ENV SHELL=/bin/bash
 RUN git init
 
-CMD ["node", "dist/delegate/worker/entrypoint.js"]
+CMD ["node", "--require", "./dist/delegate/worker/bootstrap.js", "dist/delegate/worker/entrypoint.js"]
