@@ -16,7 +16,7 @@ You will receive a PR reference in your prompt as:
   <headSha>abc123...</headSha>
 </pr>
 
-On a **re-review** triggered by a \`/delegate-review\` comment, the input looks like this instead — \`baseRef\` and \`headSha\` are omitted, and two extra fields are set:
+On a **re-review** triggered by an \`@delegate review\` (or legacy \`/delegate-review\`) comment, the input looks like this instead — \`baseRef\` and \`headSha\` are omitted, and two extra fields are set:
 
 <pr>
   <repo>thegoodparty/gp-api</repo>
@@ -36,14 +36,14 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 ## Workflow
 
-0. **Resolve missing PR metadata, and bail out on draft PRs.** Always fetch \`isDraft\` (the open-PR webhook path filters drafts in the lambda, but the \`/delegate-review\` re-review path doesn't — drafts can land here):
+0. **Resolve missing PR metadata, and bail out on draft PRs.** Always fetch \`isDraft\` (the open-PR webhook path filters drafts in the lambda, but the comment-triggered re-review path doesn't — drafts can land here):
 
      META=$(gh pr view <num> --repo <repo> --json headRefOid,baseRefName,isDraft)
      IS_DRAFT=$(jq -r '.isDraft' <<< "$META")
      HEAD_SHA=$(jq -r '.headRefOid' <<< "$META")  # use this if input <headSha> was omitted
      BASE_REF=$(jq -r '.baseRefName' <<< "$META")  # use this if input <baseRef> was omitted
 
-   If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`/delegate-review\\\`.\` and exit. Don't run specialists, don't post a status check.
+   If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`@delegate review\\\`.\` and exit. Don't run specialists, don't post a status check.
 
 1. **Bail if another task is already reviewing this commit, then post \`pending\` status check.** Parallel webhook deliveries (org + repo installations, retried deliveries) can dispatch two reviewer tasks for the same commit. Two tasks reaching different LLM verdicts on the same diff produces contradictory reviews on the PR. To prevent that, dedup against existing \`pr-reviewer\` statuses on the head SHA before doing any other work — skip the dedup only on re-review, where prior-run statuses always exist and the user explicitly asked for a fresh pass.
 
@@ -276,14 +276,14 @@ Keep the body short. The blockers (in inline comments, or in the fallback PR com
 The body depends on which gates failed. Pick exactly one of these shapes — do NOT combine the "blockers only" preamble with the "extra reasons" list.
 
 - **Blockers, nothing else:**
-  \`**<N> blocker(s).** Reply \\\`/delegate-review\\\` after fixing.\`
+  \`**<N> blocker(s).** Reply \\\`@delegate review\\\` after fixing.\`
   (No "request human review" line — the inline comments already make the ask self-evident.)
 
 - **No blockers but linkage / config failure** (e.g., re-review where blockers were fixed but TDD still draft, or token missing):
-  \`Cannot auto-approve: <single sentence drawn from the list below>. Reply \\\`/delegate-review\\\` to re-check.\`
+  \`Cannot auto-approve: <single sentence drawn from the list below>. Reply \\\`@delegate review\\\` to re-check.\`
 
 - **Both blockers AND a linkage / config failure** — combine into one line:
-  \`**<N> blocker(s).** Also: <single sentence from list below>. Reply \\\`/delegate-review\\\` after fixing.\`
+  \`**<N> blocker(s).** Also: <single sentence from list below>. Reply \\\`@delegate review\\\` after fixing.\`
 
 Sentence phrasing per non-blocker failure:
 

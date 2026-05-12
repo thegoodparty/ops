@@ -1,4 +1,5 @@
 import { dispatch } from "./dispatch";
+import { getReviewerInstallationToken } from "./github-auth";
 import { getSecrets } from "./secrets";
 import { verifyGithubWebhook } from "./verify";
 
@@ -19,8 +20,11 @@ const REVIEW_REPOS = new Set([
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 
-// Case-insensitive, must be a whole token so "/delegate-review-foo" doesn't match.
-const RE_REVIEW_TRIGGER = /(^|\s)\/delegate-review(\s|$)/i;
+// Matches either form, case-insensitive, with whole-token boundaries:
+//   @delegate review        (preferred — also matches @delegate-bot / @delegate[bot])
+//   /delegate-review        (legacy alias, kept working)
+const RE_REVIEW_TRIGGER =
+  /(^|\s)(?:@delegate(?:-?bot)?(?:\[bot\])?\s+review|\/delegate-review)(\s|$)/i;
 
 const UNAUTHORIZED = { statusCode: 401, body: "unauthorized" };
 const OK = { statusCode: 200, body: "ok" };
@@ -53,6 +57,7 @@ type IssueCommentPayload = {
     user: { login: string };
   };
   comment: {
+    id: number;
     body: string;
     user: { login: string };
   };
@@ -128,14 +133,180 @@ const dispatchPullRequest = async (
   );
 };
 
+const GH_HEADERS = (token: string) => ({
+  Authorization: `Bearer ${token}`,
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28",
+});
+
+// Mirrors the URL the pr-reviewer agent builds in its step 1. Keeping these in
+// sync matters so the lambda's pending status and the agent's terminal status
+// point at the same CloudWatch stream.
+const computeLogsUrl = (taskArn: string) => {
+  const taskId = taskArn.split("/").pop();
+  return `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskId}`;
+};
+
+// Best-effort :eyes: ack on the triggering comment. Returns the reaction's
+// ID on success so the worker can DELETE it after the review posts. Posted as
+// the reviewer App so the same identity that ultimately approves owns the
+// reaction (and can later remove it). Failures are swallowed — never block
+// dispatch on the ack.
+const addEyesReaction = async (
+  token: string,
+  repoFullName: string,
+  commentId: number,
+): Promise<number | null> => {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repoFullName}/issues/comments/${commentId}/reactions`,
+      {
+        method: "POST",
+        headers: { ...GH_HEADERS(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "eyes" }),
+      },
+    );
+    if (!res.ok) {
+      console.warn(
+        JSON.stringify({
+          event: "github_reaction_failed",
+          status: res.status,
+          repo: repoFullName,
+          commentId,
+        }),
+      );
+      return null;
+    }
+    const data = (await res.json()) as { id: number };
+    return data.id;
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        event: "github_reaction_error",
+        repo: repoFullName,
+        commentId,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
+};
+
+// The issue_comment payload doesn't carry the PR head SHA, but the statuses
+// API is keyed on it. One GET to /pulls/{num} resolves it.
+const fetchHeadSha = async (
+  token: string,
+  repoFullName: string,
+  prNumber: number,
+): Promise<string | null> => {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`,
+      { headers: GH_HEADERS(token) },
+    );
+    if (!res.ok) {
+      console.warn(
+        JSON.stringify({
+          event: "github_head_sha_fetch_failed",
+          status: res.status,
+          repo: repoFullName,
+          prNumber,
+        }),
+      );
+      return null;
+    }
+    const data = (await res.json()) as { head?: { sha?: string } };
+    return data.head?.sha ?? null;
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        event: "github_head_sha_fetch_error",
+        repo: repoFullName,
+        prNumber,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
+};
+
+// Flip the pr-reviewer status check to pending immediately on re-review so the
+// PR's check stops reading "Approved" / "Commented" from the prior run while
+// the worker (re)boots. The agent's step 1 re-posts the same pending state
+// when it starts running; identical context+state is a harmless no-op upsert.
+const postPendingStatus = async (
+  token: string,
+  repoFullName: string,
+  sha: string,
+  targetUrl: string,
+): Promise<void> => {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repoFullName}/statuses/${sha}`,
+      {
+        method: "POST",
+        headers: { ...GH_HEADERS(token), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          state: "pending",
+          context: "pr-reviewer",
+          description: "Review in progress",
+          target_url: targetUrl,
+        }),
+      },
+    );
+    if (!res.ok) {
+      console.warn(
+        JSON.stringify({
+          event: "github_pending_status_failed",
+          status: res.status,
+          repo: repoFullName,
+          sha,
+        }),
+      );
+    }
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        event: "github_pending_status_error",
+        repo: repoFullName,
+        sha,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+};
+
 const dispatchReReview = async (
   payload: IssueCommentPayload,
   deliveryId: string | undefined,
+  reviewerPrivateKey: string | undefined,
 ) => {
   const { issue, comment } = payload;
   const repoFullName = payload.repository.full_name;
   // issue.html_url points at the issue/PR itself; use pull_request.html_url when present for clarity.
   const prUrl = issue.pull_request?.html_url ?? issue.html_url;
+
+  // Mint the reviewer App token once and reuse for reaction + status post.
+  // If the key isn't provisioned we proceed without either ack; the worker
+  // still runs and the agent posts its own status from step 1.
+  const token = reviewerPrivateKey
+    ? await getReviewerInstallationToken(reviewerPrivateKey).catch((err) => {
+        console.warn(
+          JSON.stringify({
+            event: "github_reviewer_token_error",
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+        return null;
+      })
+    : null;
+
+  // Parallel: react on the comment + fetch the head SHA needed for the
+  // pending status post. Both are best-effort.
+  const [reactionId, headSha] = await Promise.all([
+    token ? addEyesReaction(token, repoFullName, comment.id) : null,
+    token ? fetchHeadSha(token, repoFullName, issue.number) : null,
+  ]);
 
   const { taskArn } = await dispatch({
     agent: "pr-reviewer",
@@ -155,9 +326,24 @@ const dispatchReReview = async (
       author: issue.user.login,
       triggeredBy: comment.user.login,
       reReview: "true",
+      reactionRepo: repoFullName,
+      reactionCommentId: String(comment.id),
+      ...(reactionId !== null ? { reactionId: String(reactionId) } : {}),
       deliveryId: deliveryId ?? "",
     },
   });
+
+  // Now that we have the task ARN, flip the pr-reviewer commit status to
+  // pending with the matching logs URL. Doing this from the lambda closes
+  // the 30–60s gap before the worker boots and posts the same status.
+  if (token && headSha && taskArn) {
+    await postPendingStatus(
+      token,
+      repoFullName,
+      headSha,
+      computeLogsUrl(taskArn),
+    );
+  }
 
   console.log(
     JSON.stringify({
@@ -196,7 +382,11 @@ export const handleGithub = async (
     if (shouldDispatch(eventType, payload)) {
       await dispatchPullRequest(payload, deliveryId);
     } else if (shouldDispatchReReview(eventType, payload)) {
-      await dispatchReReview(payload, deliveryId);
+      await dispatchReReview(
+        payload,
+        deliveryId,
+        secrets["REVIEWER_APP_PRIVATE_KEY"],
+      );
     } else {
       console.log(
         JSON.stringify({
