@@ -7,6 +7,37 @@ const log = (agent: string, event: string, data?: Record<string, unknown>) =>
 const phaseFromAgentName = (name: string): string | null =>
   name.endsWith("-agent") ? name.replace(/-agent$/, "") : null;
 
+// Force every Task spawn to be synchronous. Background-mode Task lets the
+// model proceed before subagents finish — for pr-reviewer this caused
+// reviews to publish on partial specialist results, dropping late blockers
+// and producing duplicate / contradictory reviews on the same SHA.
+// Synchronous Task blocks the parent turn until the subagent's final result
+// returns, which is what every existing agent prompt assumes anyway.
+const forceSynchronousTaskHook = async (input: unknown) => {
+  const i = input as {
+    hook_event_name?: string;
+    tool_name?: string;
+    tool_input?: Record<string, unknown>;
+  };
+  if (i.hook_event_name !== "PreToolUse" || i.tool_name !== "Task") {
+    return { continue: true } as const;
+  }
+  const ti = (i.tool_input ?? {}) as Record<string, unknown>;
+  if (ti.run_in_background !== true) {
+    return { continue: true } as const;
+  }
+  const { run_in_background: _drop, ...rest } = ti;
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse" as const,
+      updatedInput: rest,
+      additionalContext:
+        "Task tool calls are forced synchronous in this runtime; run_in_background was stripped. Wait for this Task's result before issuing the next tool call.",
+    },
+  };
+};
+
 export const runAgent = async (
   config: AgentConfig,
   message: string,
@@ -40,6 +71,9 @@ export const runAgent = async (
       maxBudgetUsd: config.maxBudgetUsd ?? 5,
       permissionMode: config.permissionMode ?? "bypassPermissions",
       cwd,
+      hooks: {
+        PreToolUse: [{ hooks: [forceSynchronousTaskHook] }],
+      },
       stderr: (data: string) => console.error("[claude stderr]", data),
     },
   })) {
@@ -103,6 +137,12 @@ export const runAgent = async (
               summary.file = b.input.file_path;
             else if (b.name?.startsWith("mcp__"))
               summary.input = JSON.stringify(b.input).slice(0, 300);
+            else if (b.name === "Task") {
+              if (b.input.subagent_type)
+                summary.subagent = b.input.subagent_type;
+              if (b.input.run_in_background)
+                summary.run_in_background = b.input.run_in_background;
+            }
           }
           return summary;
         });
