@@ -64,10 +64,23 @@ const main = async () => {
     try {
       execFileSync(
         "gh",
-        ["repo", "clone", "thegoodparty/runbooks", runbooksDir, "--", "--depth=1"],
+        [
+          "repo",
+          "clone",
+          "thegoodparty/runbooks",
+          runbooksDir,
+          "--",
+          "--depth=1",
+        ],
         { stdio: "inherit" },
       );
-      const sha = execFileSync("git", ["-C", runbooksDir, "rev-parse", "--short", "HEAD"])
+      const sha = execFileSync("git", [
+        "-C",
+        runbooksDir,
+        "rev-parse",
+        "--short",
+        "HEAD",
+      ])
         .toString()
         .trim();
       process.env.RUNBOOKS_DIR = runbooksDir;
@@ -207,6 +220,37 @@ const main = async () => {
         channel: job.metadata.channel,
         timestamp: job.metadata.reactionTs,
         name: "eyes",
+      }),
+    );
+  }
+
+  // Mirror of the Slack cleanup above for GitHub re-review acks. The lambda
+  // posts :eyes: as the reviewer App when a /delegate-review or @delegate
+  // review comment fires; we delete it here so the comment doesn't keep
+  // showing the in-progress signal after the review lands. By this point
+  // GITHUB_TOKEN has been swapped to the reviewer App token (see above), so
+  // we're acting as the same identity that owns the reaction.
+  if (
+    job.metadata?.source === "github" &&
+    job.metadata.reactionRepo &&
+    job.metadata.reactionCommentId &&
+    job.metadata.reactionId &&
+    process.env.GITHUB_TOKEN
+  ) {
+    const { reactionRepo, reactionCommentId, reactionId } = job.metadata;
+    callbacks.push(
+      fetch(
+        `https://api.github.com/repos/${reactionRepo}/issues/comments/${reactionCommentId}/reactions/${reactionId}`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        },
+      ).catch((err: unknown) => {
+        console.error("Failed to remove eyes reaction:", err);
       }),
     );
   }
