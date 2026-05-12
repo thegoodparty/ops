@@ -232,8 +232,11 @@ const fetchHeadSha = async (
 
 // Flip the pr-reviewer status check to pending immediately on re-review so the
 // PR's check stops reading "Approved" / "Commented" from the prior run while
-// the worker (re)boots. The agent's step 1 re-posts the same pending state
-// when it starts running; identical context+state is a harmless no-op upsert.
+// the worker (re)boots. GitHub status checks accumulate (they don't upsert by
+// context+state), so the agent's step 1 explicitly SKIPS its own pending post
+// on the re-review path — only this lambda post lands. On the non-re-review
+// path (opened / ready_for_review) the lambda does not post pending; the
+// agent's step 1 does.
 const postPendingStatus = async (
   token: string,
   repoFullName: string,

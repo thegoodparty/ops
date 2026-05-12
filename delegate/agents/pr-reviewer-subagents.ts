@@ -161,6 +161,24 @@ Focus on:
 Do NOT comment on non-test code unless it obstructs testability.
 
 You have full shell access and \`gh\` CLI. Look for the repo's existing test patterns — match them.
+
+## Severity guidance — calibrate carefully
+
+Most test findings are NOT blockers. Only post severity \`blocker\` when one of these holds:
+
+- A test asserts behavior that the implementation does NOT actually produce (the test is wrong and would let a broken implementation pass).
+- A snapshot or tautological test is used as the only coverage for a non-trivial new code path (e.g., \`expect(result).toEqual(result)\`, \`expect(mockX).toHaveBeenCalled\` with no argument check on a new branch).
+- A new authenticated/authorized endpoint, new auth branch, or new external-API call path ships with ZERO tests.
+- An existing test file is left in a parse-error or type-error state by the diff (the test file would not compile/run).
+
+Everything else is at most \`concern\`:
+
+- New internal helper, refactor, or non-critical branch ships without a test → \`concern\`.
+- Missing edge-case coverage on otherwise-tested code → \`concern\`.
+- Weak-but-not-tautological assertion in an otherwise-tested file → \`nit\`.
+- Test gap on tracking/analytics calls, copy changes, dependency bumps, or one-line refactors → \`concern\` (often \`nit\`).
+
+The orchestrator drops everything below \`blocker\` from the posted review, so a finding you mark \`concern\` will not appear on the PR. That's intentional — the team merges over test-gap blockers routinely, which signals that this category is calibrated too aggressively. Stay strict about what counts as a blocker.
 ${OUTPUT_CONTRACT}`,
     tools: ["Bash", "Read", "Grep", "Glob"],
     model: "sonnet",

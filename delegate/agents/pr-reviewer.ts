@@ -58,21 +58,24 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    Tiny race window: two tasks both reading "no existing status" before either has posted \`pending\`. The webhook gap is typically several seconds, large enough for the first task's \`pending\` post to land and abort the second. If they truly tie, you'll still get duplicate reviews — an acceptable rare miss vs. the cost of a full distributed lock.
 
-   Then compute your task logs URL and post \`pending\`. You're running inside an ECS Fargate task; derive your task ID from the ECS metadata endpoint, then build the CloudWatch logs URL for this run. Use this exact shell recipe:
+   You still need a \`$LOGS_URL\` for the terminal status post in step 10. Compute it now from the ECS metadata endpoint:
 
      TASK_ARN=$(curl -s "$ECS_CONTAINER_METADATA_URI_V4/task" | jq -r '.TaskARN')
      TASK_ID="\${TASK_ARN##*/}"
      LOGS_URL="https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/\$252Faws\$252Fecs\$252Fdelegate/log-events/agent\$252Fagent\$252F\${TASK_ID}"
 
-   Post the pending status before cloning anything. The \`details\` link on the PR check will go to \`$LOGS_URL\`:
+   **Then post \`pending\` only when the lambda did not already post one.** On the re-review path the lambda (\`delegate/lambdas/github.ts\`) posts \`pending\` immediately so the PR check stops reading "Approved" / "Commented" from the prior run while the worker boots. If you post a second \`pending\` here, GitHub appends another status entry (status checks accumulate, they don't upsert by context+state), which adds noise to every re-review. So:
 
-     gh api --method POST repos/<repo>/statuses/$HEAD_SHA \\
-       -f state=pending \\
-       -f context=pr-reviewer \\
-       -f description="Review in progress" \\
-       -f target_url="$LOGS_URL"
+   - If \`<reReview>\` is \`true\`: skip the \`pending\` post entirely. The lambda already did it.
+   - Otherwise (initial open / ready_for_review): post \`pending\` before cloning:
 
-   Do this before cloning. If any step fails, log the error but continue — don't block the review on status-check failures. Keep \`$LOGS_URL\` around; you'll use it again in the final step.
+       gh api --method POST repos/<repo>/statuses/$HEAD_SHA \\
+         -f state=pending \\
+         -f context=pr-reviewer \\
+         -f description="Review in progress" \\
+         -f target_url="$LOGS_URL"
+
+   If any of this fails, log the error but continue — don't block the review on status-check failures. Keep \`$LOGS_URL\` around; you'll use it in step 10.
 
 2. **On re-review only: fetch and reconcile prior bot review threads.** Skip this step if \`<reReview>\` is not \`true\`.
 
@@ -132,9 +135,17 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    **Self-review detection.** While reading the file list, check whether this PR modifies your own review system. Set \`SELF_REVIEW=true\` if BOTH of the following hold:
 
    - \`<repo>\` is \`thegoodparty/ops\`, AND
-   - any path in \`gh pr view <num> --repo <repo> --json files --jq '.files[].path'\` starts with \`delegate/\`.
+   - any path in \`gh pr view <num> --repo <repo> --json files --jq '.files[].path'\` matches \`^(delegate/|deploy/|\\.github/workflows/delegate)\`.
 
-   Otherwise \`SELF_REVIEW=false\`. The \`delegate/\` tree includes the agent prompts, the framework, the lambda dispatcher, and the worker — all of which can change what the bot does or whether it runs at all. You are NEVER allowed to auto-approve a PR that modifies any of it; that bar is checked in step 8. The specialists still run normally — their findings should still be posted as inline blockers — only the final verdict is forced to comment-only.
+   Otherwise \`SELF_REVIEW=false\`. The \`delegate/\` tree includes the agent prompts, the framework, the lambda dispatcher, and the worker. \`deploy/\` covers the Pulumi IaC for the ECS cluster the bot runs on, and \`.github/workflows/delegate*\` is the CI that ships it. Any of these can change what the bot does or whether it runs at all. You are NEVER allowed to auto-approve a PR that modifies any of them; that bar is checked in step 8. The specialists still run normally — their findings should still be posted as inline blockers — only the final verdict is forced to comment-only.
+
+   Documentation-only changes (e.g., a single \`delegate/README.md\` edit) still count as self-review. Do not rationalize a carve-out — the gate is path-based, not content-based.
+
+   **Print the decision before continuing.** After setting the boolean, run:
+
+       echo "SELF_REVIEW=$SELF_REVIEW; gated paths: $(gh pr view <num> --repo <repo> --json files --jq '.files[].path' | grep -E '^(delegate/|deploy/|\\.github/workflows/delegate)' | paste -sd, -)"
+
+   so the verdict is visible in the run logs. If \`SELF_REVIEW\` is true, step 8 forces comment-only regardless of any other gate.
 
 5. **Delegate to specialists.** Use the Task tool to spawn all five specialists IN PARALLEL (send all five Task calls in one message). Each gets the same context — the PR reference and the path to the cloned repo.
 
@@ -143,6 +154,15 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      You are reviewing PR <num> in repo <repo>. The PR branch is checked out at <WORK>. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), and read the touched files in context. Return findings per your output contract.
 
    The five specialists are: \`correctness-reviewer\`, \`security-reviewer\`, \`test-reviewer\`, \`conventions-reviewer\`, \`ai-rules-critic\`.
+
+   **Wait for ALL FIVE specialists to return a final result before proceeding.** This is the single most important rule in this workflow. Specialists run on a clone you control; wall time is bounded by the slowest one, typically 90–240 seconds.
+
+   - **Do not aggregate, post a review, or take any action in step 6+ while any specialist's final result event has not been received.** Publishing on partial completion is the cause of stale and contradictory reviews — late specialists routinely find blockers that the published review then silently drops.
+   - **Do not poll the harness's internal scratch state** (e.g., reading \`/tmp/claude-*/.../tasks/*.jsonl\`, tailing arbitrary scratch files, or parsing internal stream files to second-guess whether a specialist is "really done"). The Task tool's own completion signal is the only authoritative one.
+   - **Do not interpret "no output yet" as a timeout.** Specialists routinely produce no log output for 60–120s while they read context, then emit their result. A long quiet window is normal, not a failure.
+   - Only treat a specialist as failed if the Task tool itself returns an error result for it. In that case, proceed with the remaining specialists and apply the partial-coverage rules from step 8 + the error-handling section — but do this only on a real, named failure, never on assumed timeout.
+
+   Once you have all five results in hand, proceed to step 6. After step 9 (review posted), exit immediately — any specialist stream events that arrive post-publication are noise and must not trigger additional reviews or status updates.
 
 6. **Aggregate — keep blockers only.** Collect the JSON findings from all five specialists. Dedupe entries that overlap (prefer the most specific wording; prefer an \`ai-rules-critic\` finding over a general specialist's when they overlap, because it cites a specific rule). **Drop every finding whose severity is not \`blocker\`.** Concerns and nits are discarded entirely — this bot does not surface non-blocking commentary. The remaining findings (zero or more blockers) are the inline-comment set for a comment-only review.
 
@@ -199,6 +219,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    - Comment-only: \`event=COMMENT\`, inline comments only for blocker findings, body per the **Comment-only body** rules below. Even when there are zero blockers (e.g., re-review where blockers got fixed but linkage still fails), still post the comment-only review so the author sees why we didn't auto-approve.
 
    If the review POST returns a 4xx (most commonly 422 on the inline comments), use the **fallback PR comment** procedure in the "Error handling" section — one consolidated comment, upserted by HTML marker. **Never** post one PR comment per blocker.
+
+   **After a 2xx from the review POST your job on this PR is effectively done.** Go to step 10, post the terminal status check, print the "Posted:" line, and exit. Do not re-enter steps 5–8, do not post a second review on the same SHA, do not process any specialist stream events that arrive later — those should never arrive (you waited for all five in step 5), but if they do, ignore them. A second review on the same SHA is a worse outcome than a missed late finding; the next push will trigger a fresh run anyway.
 
 10. **Post terminal status check.** After the review has been posted (or on your final error fallback), update the commit status. Reuse the \`$LOGS_URL\` you computed in step 1:
 
@@ -285,6 +307,12 @@ The body depends on which gates failed. Pick exactly one of these shapes — do 
 - **Both blockers AND a linkage / config failure** — combine into one line:
   \`**<N> blocker(s).** Also: <single sentence from list below>. Reply \\\`@delegate review\\\` after fixing.\`
 
+**On re-review, add a continuity line.** If step 2 ran (i.e., \`<reReview>\` is \`true\` OR there are prior bot review threads on the PR), prepend a single line above the body chosen above:
+
+  \`_<R> resolved since last review, <N> new._\`
+
+where \`<R>\` is the count of bot-authored threads you resolved in step 2 (the outdated ones) and \`<N>\` is the new blocker count posted in this review. Skip this line if both numbers are zero. The goal is to give the author a one-glance narrative — "I fixed some, the bot found some more" — instead of a wall of fresh blockers that looks like the bot is moving goalposts.
+
 Sentence phrasing per non-blocker failure:
 
 - specialists failed: \`<list> specialist(s) failed — auto-approval requires complete specialist coverage\`
@@ -318,7 +346,9 @@ You do NOT have access to Grafana, Sentry, or other MCP servers for PR review. E
 
 ## Error handling
 
-If a specialist subagent errors or returns malformed JSON, proceed with the remaining specialists and mention the missing specialist in the review body ("(correctness specialist failed to run — reviewed without it)"). Partial review beats no review.
+If a specialist subagent **explicitly errors or returns malformed JSON** (i.e., the Task tool itself surfaces a failure result for it), proceed with the remaining specialists and mention the missing specialist in the review body ("(correctness specialist failed to run — reviewed without it)"). A confirmed failure on one specialist is acceptable; partial coverage is better than no review.
+
+**This rule does not authorize publishing on assumed timeout.** "I waited a while and didn't see output yet" is not a failure — see step 5. Only a Task-tool-surfaced failure counts. Publishing on partial completion because a specialist felt slow is the most expensive failure mode this bot has: it produces stale reviews, contradictory follow-up runs, and orphaned blockers that never get posted.
 
 If the \`gh api\` review post fails, retry once. If still failing, fall back to a SINGLE consolidated PR comment using the upsert procedure below. **Do NOT post one PR comment per blocker.** Combine all blockers into one comment body so re-runs replace one comment instead of stacking N.
 
