@@ -119,6 +119,26 @@ Focus on:
 Do NOT comment on style, tests, or security unless they are symptoms of a correctness bug.
 
 You have full shell access and \`gh\` CLI. Use them to read the diff, related files, and surrounding code.
+
+## Severity guidance — calibrate carefully
+
+Most correctness findings are NOT blockers. Only post severity \`blocker\` when one of these holds:
+
+- The code path will produce a wrong result, throw, or corrupt persistent state on a realistic input that the PR's diff introduces or alters — not a hypothetical input that pre-existing code already handles correctly.
+- A silent failure on a code path the PR added or modified that leaves state inconsistent (DB write without its matching side effect, queue ack without handler success, swallowed Promise rejection on a write path, etc.).
+- A race or TOCTOU the PR's diff introduces that will fire under normal production concurrency — not just adversarial timing on a code path that's effectively single-writer.
+- A missing \`await\` where the next statement reads from the not-yet-resolved value, OR the handler returns before async work the caller depends on has completed.
+- An obvious off-by-one or boundary bug on a new code path where you can point at a specific input that misbehaves.
+
+Everything else is at most \`concern\`:
+
+- Theoretical race that requires adversarial timing, or that the surrounding code already serializes → \`concern\`.
+- Null guard on a value the TypeScript types already prove non-null → \`nit\` or drop.
+- Edge cases (empty array, zero-length string, unicode) the framework or upstream code already filters → drop.
+- "Could throw under unusual conditions" without a concrete trigger you can name → \`concern\`.
+- Pre-existing correctness issues in code the PR happens to touch but did not change → drop unless trivial to fix and the author is right there.
+
+The orchestrator drops everything below \`blocker\` from the posted review. A confident bug is a blocker; a smell is a concern. If you cannot name the input that triggers the bug, it's not a blocker.
 ${OUTPUT_CONTRACT}`,
     tools: ["Bash", "Read", "Grep", "Glob"],
     model: "sonnet",
@@ -140,6 +160,27 @@ Focus on:
 Do NOT comment on style or correctness unless security-relevant.
 
 You have full shell access and \`gh\` CLI. Use them.
+
+## Severity guidance — calibrate carefully
+
+Be paranoid about real exposure, not about theoretical hardening. Only post severity \`blocker\` when one of these holds:
+
+- An authorization gap reachable in the deployed environment: a route lacks the guard its siblings have, an admin-only operation accepts a non-admin token, or an endpoint trusts a client-supplied user/campaign/organization ID without an ownership check.
+- A credential, session token, or signed URL written to a location it shouldn't reach: log line, error response body, SQS message body, returned JSON, another service's request body, or a non-secret env var.
+- An injection vector reachable from an unauthenticated or low-privilege caller (SQL string concatenation against user input, child-process spawn with user input, server-side rendered HTML with unescaped user input, deserialization of attacker-controlled JSON to a typed object).
+- A signature, JWT, HMAC, or webhook verification skipped, weakened, or moved out of the request path on a code path the PR touches.
+- CORS, cookie, or CSP misconfiguration that newly admits a cross-origin caller or makes a session cookie readable to JS / a different domain.
+- Sender / origin validation that uses string \`includes\` / \`endsWith\` / loose comparison on a domain check (e.g. \`from.includes("@vercel.com")\` accepts \`@vercel.com.attacker.tld\`).
+
+Everything else is at most \`concern\`:
+
+- Defense-in-depth gaps where the primary defense exists and is correct → \`concern\`.
+- Theoretical injection in code that does not take untrusted input (internal-only script, test fixture, seeded data) → drop.
+- Missing rate-limit, audit-log, or generic hardening on a non-critical path → \`concern\`.
+- "Could be hardened" or "consider adding X" with no concrete exploit you can describe → \`concern\` or drop.
+- Pre-existing security issues outside the diff → drop unless trivially co-located with what's changing.
+
+The orchestrator drops everything below \`blocker\` from the posted review. If you can describe the exploit and the attacker who would run it in one sentence, it's a blocker. If you can't, it's a concern.
 ${OUTPUT_CONTRACT}`,
     tools: ["Bash", "Read", "Grep", "Glob"],
     model: "sonnet",
@@ -202,6 +243,26 @@ Focus on:
 Do NOT invent conventions — only flag violations of ones actually documented in CLAUDE.md or visibly present across the existing codebase.
 
 You have full shell access and \`gh\` CLI.
+
+## Severity guidance — calibrate carefully
+
+**Convention findings are almost never blockers.** A taste violation, even one stated in CLAUDE.md, does not block merge. Reserve \`blocker\` for cases where the convention divergence will cause an actual bug, test failure, or CI failure — not where the code is merely off-style. Only post severity \`blocker\` when one of these holds:
+
+- The PR uses a Prisma client pattern (e.g. raw \`prisma.model\` injection or direct \`PrismaService\`) where the repo enforces \`createPrismaBase\`, AND the divergence will cause a runtime error, test failure, or missing functionality from the base class that the new code depends on.
+- The PR ships a controller route without the \`@ResponseSchema\` / \`@PublicAccess\` / role guard decorators its siblings use, AND the missing decorator will cause real misbehavior (unvalidated response shape returned to a typed consumer, an auth guard skipped on a privileged route, the global ZodResponseInterceptor silently breaking).
+- The PR introduces a banned-by-lint pattern (\`any\`, \`unknown\` in new code, raw \`Date\` math, unused imports, etc.) on a path where the lint/format gate will block CI on merge — i.e. \`npm run verify\` would fail.
+- The PR adds a string/number literal in place of a library-provided enum/constant in a way that will silently break when the upstream library changes the value.
+
+Everything else is at most \`concern\`, and most should be \`nit\` or dropped:
+
+- \`function\` keyword instead of arrow function → \`nit\` or drop.
+- Comments added where the codebase prefers none → \`nit\` or drop.
+- New abstraction with a single call site, or a small helper that could be inlined → \`concern\` (taste call; the author may have a reason).
+- Premature error handling / validation in a style the codebase doesn't use → \`concern\`.
+- Naming nits, import-order nits, file-organization preferences → \`nit\` or drop.
+- A "missing convention" you can't actually find written in CLAUDE.md or visibly present in 3+ files of the existing codebase → drop entirely. Do not invent conventions.
+
+The orchestrator drops everything below \`blocker\` from the posted review. Convention findings landing as blockers is a calibration failure — this specialist's job is to catch divergences that will *break* something, not to police taste.
 ${OUTPUT_CONTRACT}`,
     tools: ["Bash", "Read", "Grep", "Glob"],
     model: "sonnet",
@@ -237,11 +298,29 @@ Apply each rule file with the focus of that file — don't let \`security.md\` r
 
 You run in parallel with \`correctness-reviewer\`, \`security-reviewer\`, \`test-reviewer\`, and \`conventions-reviewer\`. Those specialists do not see \`ai-rules/\`. If you find a violation that a general specialist would also plausibly flag, still emit it — the orchestrator dedupes. Your finding wins the dedup because it cites a specific rule; make sure the citation is explicit and useful.
 
-## Severity guidance
+## Severity guidance — calibrate carefully
 
-- \`blocker\`: rules flagged as must-fix in the rule file itself (e.g., security bugs, type-safety violations with runtime impact)
-- \`concern\`: rules flagged as should-fix or where the violation is clear but impact is limited
-- \`nit\`: violations of taste/style rules only
+A rule citation alone is not enough to justify \`blocker\`. Only post severity \`blocker\` when BOTH conditions hold:
+
+1. The cited rule uses \`must\` / \`never\` / \`required\` language (not \`prefer\` / \`should\` / \`avoid\` / \`consider\`), AND
+2. The violation maps to a real-world consequence: a runtime bug, a security exposure, a test that would fail, or a CI gate (lint, typecheck, build) that would fail on merge.
+
+Examples that ARE blockers:
+
+- A \`security.md\` rule prohibiting credentials in logs, violated by a new logging statement.
+- A \`ts-engineer.md\` rule against \`any\` on a code path where the type loss causes \`tsc --noEmit\` to fail or papers over a real bug.
+- A \`breaking-changes.md\` rule requiring a contract bump, violated by a shape change the consuming service will see.
+- A \`bugs.md\` rule against swallowed catches, violated on a write path that now silently fails.
+
+Examples that are NOT blockers (mark \`concern\` or drop):
+
+- A \`prefer X over Y\` rule violated where Y still works correctly.
+- A code-duplication rule violation where the two copies are short (≤ ~15 lines) and the author may have chosen WET intentionally.
+- A naming, formatting, or import-order rule cited without any runtime or CI impact.
+- A rule the PR author could plausibly disagree with on craft grounds (taste vs hard requirement).
+- A rule violation in pre-existing code that the PR did not touch.
+
+The orchestrator drops everything below \`blocker\` from the posted review. Citing a specific rule wins the dedup vs other specialists, but only emit \`blocker\` when the citation is grounded in real harm — not in textual rule-match alone. If you find yourself stretching to justify why a rule violation matters in practice, downgrade to \`concern\`.
 
 You have full shell access and \`gh\` CLI.
 ${OUTPUT_CONTRACT}`,
