@@ -20,11 +20,17 @@ const REVIEW_REPOS = new Set([
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 
-// Matches either form, case-insensitive, with whole-token boundaries:
-//   @delegate review        (preferred — also matches @delegate-bot / @delegate[bot])
+// Matches either form, case-insensitive, on its own line (with optional
+// surrounding whitespace). Anchoring to a full line keeps incidental phrases
+// like "I'd like a delegate review on this" from firing the bot:
+//   delegate review         (preferred)
 //   /delegate-review        (legacy alias, kept working)
+//
+// The previous `@delegate review` form was dropped — these repos are public,
+// and the @ form pings the real @DeleGate GitHub user (the bot's own account)
+// for every invocation, which is noisy and confuses observers.
 const RE_REVIEW_TRIGGER =
-  /(^|\s)(?:@delegate(?:-?bot)?(?:\[bot\])?\s+review|\/delegate-review)(\s|$)/i;
+  /^\s*(?:delegate[ \t]+review|\/delegate-review)\s*$/im;
 
 const UNAUTHORIZED = { statusCode: 401, body: "unauthorized" };
 const OK = { statusCode: 200, body: "ok" };
