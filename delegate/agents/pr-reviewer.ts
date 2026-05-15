@@ -440,5 +440,5 @@ On re-review, if the GraphQL threads query or any resolve mutation fails, log an
   model: "claude-opus-4-6",
   agents: prReviewerSubagents,
   maxTurns: 80,
-  maxBudgetUsd: 15,
+  maxBudgetUsd: 10,
 });
