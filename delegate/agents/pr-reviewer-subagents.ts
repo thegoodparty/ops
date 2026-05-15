@@ -229,6 +229,10 @@ You are responsible for **this one lead only.** Other deep-reviewers are handlin
 - Unhandled edge cases (empty arrays, zero-length strings, auth failures, rate limits).
 - For timezone/date code: floating-vs-zoned datetime confusion, UTC midnight crossings, IANA timezone parsing errors, DST boundaries.
 
+Severity guidance for correctness findings (the orchestrator drops anything below \`blocker\`):
+- \`blocker\`: the code path produces a wrong result, throws, or corrupts persistent state on a realistic input the diff introduces or alters; silent failure on a write path the diff added or modified (DB write without its matching side effect, queue ack without handler success, swallowed Promise rejection on a write); race or TOCTOU the diff introduces that fires under normal production concurrency, not adversarial timing; missing \`await\` where the next statement reads the not-yet-resolved value or the handler returns before required async work completes; off-by-one with a specific triggering input you can name.
+- \`concern\` (will be dropped — surface only if it's worth dropping): theoretical race that requires adversarial timing or that surrounding code already serializes; null guards on values the type system already proves non-null; "could throw under unusual conditions" with no concrete trigger; edge cases (empty array, zero-length string, unicode) the framework or upstream code already filters. If you can't name the input that triggers the bug, it's not a blocker.
+
 **security:**
 - Missing authorization on new endpoints — can a user hit this who shouldn't?
 - SQL / command / XSS injection vectors.
@@ -238,6 +242,10 @@ You are responsible for **this one lead only.** Other deep-reviewers are handlin
 - Unvalidated input at trust boundaries: HTTP handlers, webhooks, file uploads, deserialization.
 - Ignore theoretical risks that require unlikely preconditions.
 - Ignore defense-in-depth suggestions when the primary defense is already in place.
+
+Severity guidance for security findings (the orchestrator drops anything below \`blocker\`):
+- \`blocker\`: authorization gap reachable in the deployed environment — a route lacks the guard its siblings have, an admin-only op accepts a non-admin token, or an endpoint trusts a client-supplied user / campaign / organization ID without an ownership check; a credential, session token, or signed URL written somewhere it shouldn't reach (log line, error response body, SQS message body, forwarded request body to another service); injection vector reachable from an unauthenticated or low-privilege caller (SQL string concatenation against user input, child-process spawn with user input, unescaped user input in server-rendered HTML, deserialization of attacker-controlled JSON to a typed object); signature / JWT / HMAC / webhook verification skipped, weakened, or moved out of the request path the PR touches; CORS / cookie / CSP misconfiguration that newly admits a cross-origin caller or makes a session cookie readable to JS; sender-origin check using string \`includes\` / \`endsWith\` (e.g., \`from.includes("@vercel.com")\` accepts \`@vercel.com.attacker.tld\`).
+- \`concern\` (will be dropped — surface only if it's worth dropping): defense-in-depth gaps where the primary defense exists and is correct; theoretical injection in code that does not take untrusted input (internal-only script, test fixture, seeded data); missing rate-limit / audit / generic hardening on a non-critical path; "could be hardened" with no concrete exploit you can describe. If you can't describe the exploit and the attacker in one sentence, it's not a blocker.
 
 **tests:**
 - New behavior shipped without tests.
@@ -260,11 +268,21 @@ Severity guidance for test findings (the orchestrator drops anything below \`blo
 - Premature validation / error-handling the codebase's existing style doesn't use.
 - Do NOT invent conventions. Only flag violations of stated rules or visibly-consistent existing patterns.
 
+Severity guidance for convention findings (the orchestrator drops anything below \`blocker\`):
+**Convention findings are almost never blockers.** A taste violation, even one stated in CLAUDE.md, does not block merge.
+- \`blocker\`: the divergence will cause an actual bug, test failure, or CI failure on merge — raw \`prisma.model\` injection where the repo enforces \`createPrismaBase\` AND the diff depends on functionality the base class provides; missing \`@ResponseSchema\` / guard decorators that cause real misbehavior (unvalidated response goes to a typed consumer, an auth guard is skipped on a privileged route, the global ZodResponseInterceptor silently breaks); banned-by-lint pattern (\`any\`, \`unknown\` in new code, raw \`Date\` math, unused imports) on a path where \`npm run verify\` would fail on merge; string / number literal in place of a library-provided enum where the upstream value silently changing would break the code.
+- \`concern\` (will be dropped — surface only if it's worth dropping): \`function\` keyword instead of arrow; comments where the codebase prefers none; new abstraction with one call site or small helper that could be inlined; premature error-handling style mismatch; naming / import-order / file-organization preferences. A "missing convention" you can't find written in CLAUDE.md or present in 3+ files of the existing codebase: drop entirely. Convention findings landing as blockers is a calibration failure — this lens's job is to catch divergences that will *break* something, not to police taste.
+
 **ai-rules:**
 - Open \`ai-rules/<file>.md\` cited by the lead (or the most relevant file if the lead doesn't cite one).
 - For each rule in the file, check if the diff violates it. Consider added lines AND surrounding context the PR could fix while here.
 - Do NOT flag pre-existing violations in code the PR doesn't touch.
 - Body MUST cite the rule file and number: \`ai-rules/security.md rule #3: <text>\` so the author can apply the fix without re-reading the rule.
+
+Severity guidance for ai-rules findings (the orchestrator drops anything below \`blocker\`):
+A rule citation alone is not enough to justify \`blocker\`. Emit \`blocker\` only when BOTH conditions hold: (1) the cited rule uses \`must\` / \`never\` / \`required\` language — not \`prefer\` / \`should\` / \`avoid\` / \`consider\`; AND (2) the violation maps to a real-world consequence — runtime bug, security exposure, test failure, or CI gate (lint, typecheck, build) failure on merge.
+- \`blocker\` examples: \`security.md\` rule prohibiting credentials in logs, violated by a new logging statement; \`ts-engineer.md\` rule against \`any\` on a code path where the type loss causes \`tsc --noEmit\` to fail or papers over a real bug; \`bugs.md\` rule against swallowed catches, violated on a write path that now silently fails; \`breaking-changes.md\` rule requiring a contract bump, violated by a shape change the consuming service will see.
+- \`concern\` (will be dropped — surface only if it's worth dropping): \`prefer X over Y\` rule violated where Y still works; code-duplication rule violation where the two copies are short (≤ ~15 lines) and the author may have chosen WET intentionally; naming / formatting / import-order rule cited without runtime or CI impact; rule violation the author could plausibly disagree with on craft grounds. If you find yourself stretching to justify why a rule violation matters in practice, drop it.
 
 **cross-file:**
 - Verify the cross-file pattern exists. If the scout flagged two duplicated helpers, open both and confirm they're identical (or near-identical).
