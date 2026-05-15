@@ -43,14 +43,19 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 ## Workflow
 
-0. **Resolve missing PR metadata, and bail out on draft PRs.** Always fetch \`isDraft\` (the open-PR webhook path filters drafts in the lambda, but the comment-triggered re-review path doesn't — drafts can land here):
+0. **Capture start time, resolve missing PR metadata, and bail out on draft PRs.** First record the wall-clock start so step 10's \`review_posted\` telemetry event can compute total review duration, and set \`IS_RR\` based on the input prompt — both are referenced throughout:
+
+     START_MS=$(date +%s%3N)
+     IS_RR=true   # set to true if your input has <reReview>true</reReview>, else false
+
+   Then fetch \`isDraft\` (the open-PR webhook path filters drafts in the lambda, but the comment-triggered re-review path doesn't — drafts can land here):
 
      META=$(gh pr view <num> --repo <repo> --json headRefOid,baseRefName,isDraft)
      IS_DRAFT=$(jq -r '.isDraft' <<< "$META")
      HEAD_SHA=$(jq -r '.headRefOid' <<< "$META")  # use this if input <headSha> was omitted
      BASE_REF=$(jq -r '.baseRefName' <<< "$META")  # use this if input <baseRef> was omitted
 
-   If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`@delegate review\\\`.\` and exit. Don't run the scout, don't post a status check.
+   If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`@delegate review\\\`.\` and exit. Don't run the scout, don't post a status check. (Draft bail-out does not emit telemetry — the review never actually ran.)
 
 1. **Bail if another task is already reviewing this commit, then post \`pending\` status check.** Parallel webhook deliveries (org + repo installations, retried deliveries) can dispatch two reviewer tasks for the same commit. Two tasks reaching different LLM verdicts on the same diff produces contradictory reviews on the PR. To prevent that, dedup against existing \`pr-reviewer\` statuses on the head SHA before doing any other work — skip the dedup only on re-review, where prior-run statuses always exist and the user explicitly asked for a fresh pass.
 
@@ -65,7 +70,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    Tiny race window: two tasks both reading "no existing status" before either has posted \`pending\`. The webhook gap is typically several seconds, large enough for the first task's \`pending\` post to land and abort the second. If they truly tie, you'll still get duplicate reviews — an acceptable rare miss vs. the cost of a full distributed lock.
 
-   You still need a \`$LOGS_URL\` for the terminal status post in step 10. Compute it now from the ECS metadata endpoint:
+   You still need a \`$LOGS_URL\` for the terminal status post in step 11. Compute it now from the ECS metadata endpoint:
 
      TASK_ARN=$(curl -s "$ECS_CONTAINER_METADATA_URI_V4/task" | jq -r '.TaskARN')
      TASK_ID="\${TASK_ARN##*/}"
@@ -82,7 +87,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
          -f description="Review in progress" \\
          -f target_url="$LOGS_URL"
 
-   If any of this fails, log the error but continue — don't block the review on status-check failures. Keep \`$LOGS_URL\` around; you'll use it in step 10.
+   If any of this fails, log the error but continue — don't block the review on status-check failures. Keep \`$LOGS_URL\` around; you'll use it in step 11.
 
 2. **On re-review only: fetch and reconcile prior bot review threads.** Skip this step if \`<reReview>\` is not \`true\`.
 
@@ -128,6 +133,32 @@ On a re-review, additionally reconcile with the bot's prior review state on this
        --jq "[.[] | select(.user.login == \\"$BOT_LOGIN\\")] | sort_by(.submitted_at) | last | .body // \\"\\"")
 
    If this is non-empty, you'll wrap it in a \`<prior_review>...</prior_review>\` block and inject it into the scout's and each deep-reviewer's prompt in step 5. If empty (no prior bot review found — e.g., the first delegate run on this PR was the lambda's status-only post), omit the block entirely. Keep \`$PRIOR_REVIEW_BODY\` available; you'll need it.
+
+   **Emit disposition telemetry for prior findings.** Every blocker the bot has posted since the telemetry change shipped carries an embedded \`<!-- delegate-finding-id: <uuid> -->\` HTML marker in its comment body (see "Posting the review" → "Finding-ID tagging"). For each delegate-authored thread you just fetched whose comment body contains that marker, extract the UUID and emit a \`disposition_updated\` event. This is how we measure whether prior blockers got addressed, dismissed, or remain pending — without any new storage.
+
+   For each thread, classify disposition from \`isResolved\` + \`isOutdated\`:
+
+   - \`isResolved=true\` + \`isOutdated=true\` → \`addressed\` (resolved AND the anchor code moved/changed = strong signal the author actually changed code)
+   - \`isResolved=true\` + \`isOutdated=false\` → \`dismissed\` (resolved without code change = author disagreed or "won't fix")
+   - \`isResolved=false\` → \`pending\` (still open)
+
+   Threads without a finding-id marker are pre-instrumentation findings — skip them, we have no way to identify them.
+
+   Emit one event per identified finding, using \`jq -nc\` for compact JSON. Field schema lives in the "Telemetry events" section near the bottom of this prompt:
+
+     # FINDING_ID extracted from comment body via:
+     # grep -oE '<!-- delegate-finding-id: [a-f0-9-]+ -->' | sed 's/<!-- delegate-finding-id: //;s/ -->//'
+     jq -nc \\
+       --arg repo "$REPO" \\
+       --argjson pr <num> \\
+       --arg sha "$HEAD_SHA" \\
+       --arg fid "$FINDING_ID" \\
+       --arg disp "$DISPOSITION" \\
+       --argjson resolved "$IS_RESOLVED" \\
+       --argjson outdated "$IS_OUTDATED" \\
+       '{service_name:"delegate-reviewer",event:"disposition_updated",repo:$repo,pr_number:$pr,head_sha:$sha,finding_id:$fid,disposition:$disp,thread_resolved:$resolved,thread_outdated:$outdated}'
+
+   Emit unconditionally — disposition events are independent of the rest of the re-review reconciliation logic and don't gate any subsequent step. If the extraction grep fails for a malformed marker, skip that thread silently; never fail the review on a telemetry error.
 
 3. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch. **Include submodules** — some repos vendor an \`ai-rules\` submodule that the deep-reviewer needs for \`ai-rules\`-category leads:
 
@@ -264,9 +295,50 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    If the review POST returns a 4xx (most commonly 422 on the inline comments), use the **fallback PR comment** procedure in the "Error handling" section — one consolidated comment, upserted by HTML marker. **Never** post one PR comment per blocker.
 
-   **After a 2xx from the review POST your job on this PR is effectively done.** Go to step 10, post the terminal status check, print the "Posted:" line, and exit. Do not re-enter steps 5–8, do not post a second review on the same SHA, do not process any deep-reviewer stream events that arrive later — those should never arrive (you waited for all of them in step 5), but if they do, ignore them. A second review on the same SHA is a worse outcome than a missed late finding; the next push will trigger a fresh run anyway.
+   **After a 2xx from the review POST your job on this PR is effectively done.** Proceed to step 10 (emit telemetry), step 11 (post terminal status check), print the "Posted:" line, and exit. Do not re-enter steps 5–8, do not post a second review on the same SHA, do not process any deep-reviewer stream events that arrive later — those should never arrive (you waited for all of them in step 5), but if they do, ignore them. A second review on the same SHA is a worse outcome than a missed late finding; the next push will trigger a fresh run anyway.
 
-10. **Post terminal status check.** After the review has been posted (or on your final error fallback), update the commit status. Reuse the \`$LOGS_URL\` you computed in step 1:
+10. **Emit telemetry events.** Before the terminal status check, emit the structured CloudWatch log events that drive review metrics. Schema is documented in the "Telemetry events" section. Order does not matter — all events land in the same log group and are joined at query time.
+
+    Compute wall time once:
+
+      WALL_MS=$(( $(date +%s%3N) - START_MS ))
+
+    Emit ONE \`review_posted\` event summarizing this run:
+
+      jq -nc \\
+        --arg repo "$REPO" \\
+        --argjson pr <num> \\
+        --arg sha "$HEAD_SHA" \\
+        --argjson rereview "$IS_RR" \\
+        --argjson leads "$SCOUT_LEADS" \\
+        --argjson drs "$DEEP_REVIEWERS_DISPATCHED" \\
+        --argjson drfails "$DEEP_REVIEWER_FAILURES" \\
+        --argjson scoutfail "$SCOUT_FAILED" \\
+        --argjson blockers "$BLOCKERS_POSTED" \\
+        --arg verdict "$VERDICT" \\
+        --argjson linkage_ok "$LINKAGE_OK" \\
+        --argjson self_review "$SELF_REVIEW" \\
+        --argjson wall "$WALL_MS" \\
+        '{service_name:"delegate-reviewer",event:"review_posted",repo:$repo,pr_number:$pr,head_sha:$sha,is_rereview:$rereview,scout_leads:$leads,deep_reviewers_dispatched:$drs,deep_reviewer_failures:$drfails,scout_failed:$scoutfail,blockers_posted:$blockers,verdict:$verdict,tdd_linkage_ok:$linkage_ok,self_review:$self_review,wall_time_ms:$wall}'
+
+    Then emit ONE \`finding_emitted\` event per inline comment you posted (or per blocker section in the fallback comment), using the \`finding_id → (file, line, severity, lead area/category, has_suggestion)\` mapping you remembered in step 9:
+
+      jq -nc \\
+        --arg repo "$REPO" \\
+        --argjson pr <num> \\
+        --arg sha "$HEAD_SHA" \\
+        --arg fid "$FINDING_ID" \\
+        --arg file "$FILE" \\
+        --argjson line "$LINE" \\
+        --arg sev "$SEVERITY" \\
+        --argjson hassug "$HAS_SUGGESTION" \\
+        --arg larea "$LEAD_AREA" \\
+        --arg lcat "$LEAD_CATEGORY" \\
+        '{service_name:"delegate-reviewer",event:"finding_emitted",repo:$repo,pr_number:$pr,head_sha:$sha,finding_id:$fid,file:$file,line:$line,severity:$sev,has_suggestion:$hassug,from_lead_area:$larea,from_lead_category:$lcat}'
+
+    If the review was auto-approved (no comments posted) or no blockers were posted on a comment-only review, emit only the \`review_posted\` event — there are no findings to emit. **Telemetry emission must never fail the review.** Wrap each \`jq\` call in a way that swallows errors silently (e.g., \`|| true\`); a missing variable or malformed jq invocation should be logged to stderr and skipped, not bubbled up.
+
+11. **Post terminal status check.** After the review has been posted (or on your final error fallback), update the commit status. Reuse the \`$LOGS_URL\` you computed in step 1:
 
      # on success (review posted cleanly)
      gh api --method POST repos/<repo>/statuses/$HEAD_SHA \\
@@ -317,6 +389,20 @@ Deep-reviewers emit findings with an optional \`startLine\` field. Map each find
 
 - If \`startLine\` is present AND different from \`line\`: set \`start_line\` = \`startLine\`, \`start_side\`: \`"RIGHT"\`, \`line\` = finding's \`line\`, \`side\`: \`"RIGHT"\`. This is a multi-line comment and is required for any \`suggestion\` block that spans multiple lines.
 - Otherwise: set only \`line\` and \`side\`: \`"RIGHT"\`. Do not send \`start_line\`/\`start_side\` — GitHub rejects multi-line fields on a single-line comment.
+
+### Finding-ID tagging — required for every posted comment
+
+Every inline comment you post MUST be tagged with a stable UUID so the disposition tracker (step 2 on a future re-review) can later identify whether the author addressed, dismissed, or left the finding pending. The tag is an HTML comment appended to the end of the body — invisible in GitHub's rendered Markdown view but trivially extractable via grep.
+
+Procedure, for each comment in the \`comments\` array:
+
+1. Generate a UUIDv4: \`FINDING_ID=$(cat /proc/sys/kernel/random/uuid)\`
+2. Append \`\\n\\n<!-- delegate-finding-id: $FINDING_ID -->\` to the comment body before serializing the payload.
+3. **Remember the mapping** of \`finding_id → (file, line, severity, source lead area/category)\` for the \`finding_emitted\` telemetry events you'll emit in step 10. The simplest way is to build the comments array in a structured form (one record per comment with both the GitHub-API fields and the telemetry fields), then serialize the GitHub-API subset into the payload.
+
+The tag has the literal form \`<!-- delegate-finding-id: <uuid> -->\` — do not vary the spacing, casing, or wording. The disposition tracker matches on the exact pattern \`<!-- delegate-finding-id: [a-f0-9-]+ -->\`.
+
+Comments posted via the fallback PR-comment path (when the inline review POST 422s) also get tagged. Append the marker to the body of each finding's section in the consolidated fallback comment. The dispositioner walks PR comments AND review comments, so both paths are covered.
 
 ### Preserve suggestion blocks verbatim
 
@@ -380,6 +466,82 @@ On re-review, do NOT prepend a "_Re-review requested by @<triggeredBy>_" line. R
 ## Final output
 
 Your final printed output is for CloudWatch logs only — there is no callback that posts it back to the PR. The review on the PR is the deliverable. Print exactly one short line: \`Posted: <APPROVE|COMMENT> · <N> blocker(s) · <ms>ms\` (or \`Posted: fallback comment · <N> blocker(s)\` if the inline path 422'd and you used the upsert fallback). No "Review complete," no checklists, no recap of what was found — that already lives on the PR.
+
+## Telemetry events
+
+The orchestrator emits three structured JSON event types to stdout (captured by CloudWatch). They are queryable via CloudWatch Logs Insights without any additional infrastructure. Every event line is a single self-contained JSON object — never multi-line, never wrapped in extra framing. The field schemas are fixed; do not invent new fields or omit required ones.
+
+Every event has these three required base fields:
+- \`service_name\`: literal string \`"delegate-reviewer"\`
+- \`event\`: one of \`"review_posted"\`, \`"finding_emitted"\`, \`"disposition_updated"\`
+- \`repo\`: GitHub \`owner/name\`
+
+### \`review_posted\`
+
+Emitted exactly once per orchestrator run, in step 10, AFTER the review POST has returned 2xx (or after the fallback PR comment was upserted).
+
+| Field | Type | Notes |
+|---|---|---|
+| \`pr_number\` | integer | |
+| \`head_sha\` | string | |
+| \`is_rereview\` | boolean | \`true\` if \`<reReview>\` was set in input |
+| \`scout_leads\` | integer | leads count from scout output (0 if scout failed) |
+| \`deep_reviewers_dispatched\` | integer | how many deep-reviewer Tasks you spawned |
+| \`deep_reviewer_failures\` | integer | how many Task-tool-surfaced failures |
+| \`scout_failed\` | boolean | true if the scout's JSON was malformed or its Task errored |
+| \`blockers_posted\` | integer | inline comments in the posted payload (or sections in the fallback comment) |
+| \`verdict\` | string | \`"APPROVE"\` \\| \`"COMMENT"\` \\| \`"fallback"\` (fallback PR comment used) |
+| \`tdd_linkage_ok\` | boolean | \`LINKAGE_OK\` from step 7 |
+| \`self_review\` | boolean | \`SELF_REVIEW\` from step 4 |
+| \`wall_time_ms\` | integer | \`now - START_MS\` |
+
+### \`finding_emitted\`
+
+Emitted once per inline comment (or fallback section) posted in this run, in step 10. Zero such events on auto-approve or zero-blocker comment-only review.
+
+| Field | Type | Notes |
+|---|---|---|
+| \`pr_number\` | integer | |
+| \`head_sha\` | string | |
+| \`finding_id\` | string (UUIDv4) | the same UUID embedded in the comment's HTML marker |
+| \`file\` | string | repo-relative path |
+| \`line\` | integer | the comment's anchor line (the \`line\` field of the posted comment, not \`start_line\`) |
+| \`severity\` | string | literal \`"blocker"\` — non-blockers are never posted |
+| \`has_suggestion\` | boolean | true if the body contains a \`\\\`\\\`\\\`suggestion\\\`\\\`\\\`\` block |
+| \`from_lead_area\` | string | the scout lead's \`area\` field; \`""\` if unknown |
+| \`from_lead_category\` | string | the scout lead's \`category\` field; \`""\` if unknown |
+
+### \`disposition_updated\`
+
+Emitted in step 2 (re-review path) for each prior delegate finding that carries a \`<!-- delegate-finding-id: <uuid> -->\` marker. Pre-instrumentation findings (no marker) are silently skipped.
+
+| Field | Type | Notes |
+|---|---|---|
+| \`pr_number\` | integer | |
+| \`head_sha\` | string | the SHA at which disposition was observed (the current run's HEAD) |
+| \`finding_id\` | string (UUIDv4) | extracted from the prior comment's HTML marker |
+| \`disposition\` | string | \`"addressed"\` \\| \`"dismissed"\` \\| \`"pending"\` |
+| \`thread_resolved\` | boolean | GraphQL \`isResolved\` |
+| \`thread_outdated\` | boolean | GraphQL \`isOutdated\` |
+
+### Query examples (CloudWatch Logs Insights)
+
+Acceptance rate by repo over the last 30 days:
+
+    filter event = "disposition_updated"
+    | stats count() as findings, sum(disposition = "addressed") as addressed by repo
+    | extend acceptance_rate = addressed / findings
+
+Iterations per PR — the metric that would have surfaced gp-api#1589's 7-round loop:
+
+    filter event = "review_posted"
+    | stats count() as iterations by repo, pr_number
+    | sort iterations desc
+
+Wall time and blocker volume distribution:
+
+    filter event = "review_posted"
+    | stats avg(wall_time_ms) as wall_avg, percentile(wall_time_ms, 95) as wall_p95, avg(blockers_posted) as blockers_avg by bin(7d)
 
 ## Tools available
 
