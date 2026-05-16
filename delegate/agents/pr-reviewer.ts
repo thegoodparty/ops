@@ -79,9 +79,9 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Check B — PR-level debounce.** Don't pile up reviews on rapid pushes. If a delegate-reviewer review was submitted on this PR within the last 4 minutes, exit. The next push (or an explicit \`delegate review\` comment) will still trigger a run; we just avoid the 5-pushes-in-a-minute thrash:
 
-     LAST_REVIEW_SECS=$(gh api "repos/<repo>/pulls/<num>/reviews" --paginate \\
-       --jq '[.[] | select((.user.login | startswith("delegate-reviewer")) and (.submitted_at != null)) | .submitted_at] | last // empty' \\
-       | xargs -I {} date -d {} +%s 2>/dev/null || echo "")
+    LAST_REVIEW_ISO=$(gh api "repos/<repo>/pulls/<num>/reviews" --paginate \\
+      | jq -rs '[.[] | .[] | select((.user.login | startswith("delegate-reviewer")) and (.submitted_at != null)) | .submitted_at] | last // empty')
+    LAST_REVIEW_SECS=$(xargs -I {} date -d {} +%s 2>/dev/null <<< "$LAST_REVIEW_ISO" || echo "")
      NOW_SECS=$(date +%s)
      if [ -n "$LAST_REVIEW_SECS" ] && [ "$((NOW_SECS - LAST_REVIEW_SECS))" -lt 240 ]; then
        echo "Skipping: delegate-reviewer review posted $((NOW_SECS - LAST_REVIEW_SECS))s ago on this PR (< 240s debounce)"
@@ -153,8 +153,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Then fetch prior bot review metadata** so the scout and deep-reviewers can read the prior round's reasoning verbatim, and so steps 6 and 8 can apply the same-line saturation cap and the bounded-rounds advisory-mode switch. This is what prevents the bot from re-considering and re-emitting concerns it explicitly dropped last round (the "moving goalposts" failure mode) and from oscillating opposite recommendations on the same line across rounds.
 
-     gh api "repos/$REPO/pulls/<num>/reviews" --paginate \\
-       --jq "[.[] | select(.user.login == \\"$BOT_LOGIN\\" and .state != \\"APPROVED\\")] | sort_by(.submitted_at)" > /tmp/prior_reviews.json
+    gh api "repos/$REPO/pulls/<num>/reviews" --paginate \\
+      | jq -s "[.[] | .[] | select(.user.login == \\"$BOT_LOGIN\\" and .state != \\"APPROVED\\")] | sort_by(.submitted_at)" > /tmp/prior_reviews.json
 
      PRIOR_REVIEW_COUNT=$(jq 'length' /tmp/prior_reviews.json)
      PRIOR_REVIEW_BODY=$(jq -r 'last | .body // ""' /tmp/prior_reviews.json)
