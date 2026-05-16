@@ -47,6 +47,13 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
      START_MS=$(date +%s%3N)
      IS_RR=true   # set to true if your input has <reReview>true</reReview>, else false
+     PRIOR_REVIEW_COUNT=0
+     PRIOR_REVIEW_BODY=""
+     PRIOR_BLOCKER_LINES='{}'
+     BLOCKERS_SUPPRESSED_BY_SATURATION=0
+     ADVISORY_MODE=false
+
+   These defaults are mandatory because step 2 is skipped on non-re-review runs. They keep later \`jq --argjson\` calls valid and make saturation/advisory logic a no-op unless step 2 overrides them.
 
    Then fetch \`isDraft\` (the open-PR webhook path filters drafts in the lambda, but the comment-triggered re-review path doesn't — drafts can land here):
 
@@ -536,7 +543,7 @@ If the advisory-mode round produced zero blockers after saturation, drop the "N 
 
 Advisory mode does NOT add the "_<R> resolved since last review, <N> new._" continuity prefix; the mode line is the continuity signal.
 
-**On re-review, add a continuity line.** If step 2 ran (i.e., \`<reReview>\` is \`true\` OR there are prior bot review threads on the PR), prepend a single line above the body chosen above:
+**On re-review (non-advisory only), add a continuity line.** If step 2 ran (i.e., \`<reReview>\` is \`true\` OR there are prior bot review threads on the PR) **and** \`ADVISORY_MODE=false\`, prepend a single line above the body chosen above:
 
   \`_<R> resolved since last review, <N> new._\`
 
