@@ -133,7 +133,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
                  isResolved
                  isOutdated
                  comments(first: 20) {
-                   nodes { author { login } body path line originalLine createdAt }
+                   nodes { author { login } body path line originalLine createdAt pullRequestReview { id submittedAt } }
                  }
                }
              }
@@ -154,24 +154,26 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    **Then fetch prior bot review metadata** so the scout and deep-reviewers can read the prior round's reasoning verbatim, and so steps 6 and 8 can apply the same-line saturation cap and the bounded-rounds advisory-mode switch. This is what prevents the bot from re-considering and re-emitting concerns it explicitly dropped last round (the "moving goalposts" failure mode) and from oscillating opposite recommendations on the same line across rounds.
 
      gh api "repos/$REPO/pulls/<num>/reviews" --paginate \\
-       --jq "[.[] | select(.user.login == \\"$BOT_LOGIN\\")] | sort_by(.submitted_at)" > /tmp/prior_reviews.json
+       --jq "[.[] | select(.user.login == \\"$BOT_LOGIN\\" and .state != \\"APPROVED\\")] | sort_by(.submitted_at)" > /tmp/prior_reviews.json
 
      PRIOR_REVIEW_COUNT=$(jq 'length' /tmp/prior_reviews.json)
      PRIOR_REVIEW_BODY=$(jq -r 'last | .body // ""' /tmp/prior_reviews.json)
 
    If \`$PRIOR_REVIEW_BODY\` is non-empty, you'll wrap it in a \`<prior_review>...</prior_review>\` block (with author replies, see below) and inject it into the scout's and each deep-reviewer's prompt in step 5. If empty (no prior bot review found — e.g., the first delegate run on this PR was the lambda's status-only post), omit the block entirely.
 
-   **Build the prior-blocker-lines saturation map.** For each prior bot-authored review thread you fetched above whose first comment has a non-null \`path\` and \`line\`, record \`(path, line)\` and count how many distinct prior reviews flagged that anchor. This drives step 6's saturation cap:
+   **Build the prior-blocker-lines saturation map.** For each prior bot-authored review thread you fetched above whose first comment has a non-null \`path\` and \`line\`, record \`(path, line)\` and count how many distinct prior reviews flagged that anchor. Distinctness must key off review identity (review id, with timestamp fallback), not raw thread count. This drives step 6's saturation cap:
 
      # PRIOR_BLOCKER_LINES is a JSON map: { "src/foo.ts:42": 3, "src/bar.ts:10": 1, ... }
-     # Built from threads.json — group bot-authored threads by (path, line), count distinct review timestamps
+     # Built from threads.json — group bot-authored threads by (path, line), then count distinct review refs
+     # (prefer pullRequestReview.id; fallback to timestamp if review metadata is missing)
      # Threads with no path/line (PR-body comments) are excluded.
 
      PRIOR_BLOCKER_LINES=$(jq -c '[.data.repository.pullRequest.reviewThreads.nodes[]
        | select(.comments.nodes[0].author.login == "'"$BOT_LOGIN"'")
        | select(.comments.nodes[0].path != null and (.comments.nodes[0].line // .comments.nodes[0].originalLine) != null)
-       | { key: (.comments.nodes[0].path + ":" + ((.comments.nodes[0].line // .comments.nodes[0].originalLine) | tostring)), val: 1 }
-     ] | group_by(.key) | map({key: .[0].key, value: length}) | from_entries' threads.json)
+       | { key: (.comments.nodes[0].path + ":" + ((.comments.nodes[0].line // .comments.nodes[0].originalLine) | tostring)),
+           review_ref: (.comments.nodes[0].pullRequestReview.id // .comments.nodes[0].pullRequestReview.submittedAt // .comments.nodes[0].createdAt // "unknown") }
+     ] | group_by(.key) | map({key: .[0].key, value: ([.[].review_ref] | unique | length)}) | from_entries' threads.json)
 
    You will use \`$PRIOR_BLOCKER_LINES\` in step 6 to drop new blockers whose \`(file, line)\` has been flagged in 2+ prior reviews — the bot has said what it has to say on that anchor.
 
@@ -195,6 +197,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      </prior_review>
 
    Threads with zero replies don't need to be repeated in \`<threads>\` — they're already covered by \`<body>\`. Only threads where the author (or another reviewer) has *replied* go in \`<threads>\`, because that's where the deep-reviewer needs to see pushback or clarification it would otherwise miss.
+
+   \`$PRIOR_REVIEW_COUNT\` is intentionally a **non-approval** count (COMMENTED / CHANGES_REQUESTED / DISMISSED states only). Clean approvals are excluded so advisory mode tracks repeated blocking/comment rounds, not successful passes.
 
    Keep \`$PRIOR_REVIEW_COUNT\`, \`$PRIOR_REVIEW_BODY\`, and \`$PRIOR_BLOCKER_LINES\` available; you'll need all three downstream.
 
@@ -352,7 +356,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 8. **Decide the verdict.** Three outcomes — never request changes:
 
-   **Advisory-mode gate (compute first).** If \`$PRIOR_REVIEW_COUNT\` (from step 2) is **5 or greater**, set \`ADVISORY_MODE=true\`. In advisory mode, the bot still ran the scout + deep-reviewers + saturation cap, but it has had five rounds to make its case — emitting more inline blockers past round 5 produces churn, not signal. The orchestrator stops blocking and switches to summary-only output. Step 9 will post a single comment-only review whose body lists any remaining blockers as plain-markdown sections (not inline anchored comments), with framing that explicitly tells the author the bot is done blocking and human review is required to merge.
+   **Advisory-mode gate (compute first).** If \`$PRIOR_REVIEW_COUNT\` (from step 2, counting non-approved bot reviews only) is **5 or greater**, set \`ADVISORY_MODE=true\`. In advisory mode, the bot still ran the scout + deep-reviewers + saturation cap, but it has had five rounds to make its case — emitting more inline blockers past round 5 produces churn, not signal. The orchestrator stops blocking and switches to summary-only output. Step 9 will post a single comment-only review whose body lists any remaining blockers as plain-markdown sections (not inline anchored comments), with framing that explicitly tells the author the bot is done blocking and human review is required to merge.
 
    Otherwise (\`ADVISORY_MODE=false\`), pick between auto-approve and the normal comment-only review:
 
@@ -527,7 +531,7 @@ The body depends on which gates failed. Pick exactly one of these shapes — do 
 
 Body shape — first line explains the mode, remaining sections list any blockers as plain markdown. The \`comments\` array stays empty; the bot does not anchor inline on advisory rounds.
 
-  **Advisory mode** — this PR has had <PRIOR_REVIEW_COUNT>+ rounds of bot review. Further blocking comments would be churn rather than signal. <N> concern(s) remain below for human reviewers; the bot will not block this PR again. Push more commits to retrigger the bot on a fresh head if needed.
+  **Advisory mode** — this PR has had <PRIOR_REVIEW_COUNT>+ prior non-approval bot review rounds. Further blocking comments would be churn rather than signal. <N> concern(s) remain below for human reviewers; the bot will not block this PR again. Push more commits to retrigger the bot on a fresh head if needed.
 
   ---
 
@@ -539,7 +543,7 @@ Body shape — first line explains the mode, remaining sections list any blocker
 
 If the advisory-mode round produced zero blockers after saturation, drop the "N concerns remain" wording and use a single-line body instead:
 
-  **Advisory mode** — this PR has had <PRIOR_REVIEW_COUNT>+ rounds of bot review. No new concerns this round. Push more commits to retrigger if needed; otherwise this PR is ready for human review.
+  **Advisory mode** — this PR has had <PRIOR_REVIEW_COUNT>+ prior non-approval bot review rounds. No new concerns this round. Push more commits to retrigger if needed; otherwise this PR is ready for human review.
 
 Advisory mode does NOT add the "_<R> resolved since last review, <N> new._" continuity prefix; the mode line is the continuity signal.
 
@@ -597,7 +601,7 @@ Emitted exactly once per orchestrator run, in step 10, AFTER the review POST has
 | \`scout_failed\` | boolean | true if the scout's JSON was malformed or its Task errored |
 | \`blockers_posted\` | integer | inline comments in the posted payload (or sections in the fallback comment or advisory body) |
 | \`blockers_suppressed_by_saturation\` | integer | blockers dropped in step 6 because their \`(file, line)\` was flagged in 2+ prior rounds |
-| \`prior_review_count\` | integer | number of prior delegate-reviewer reviews on this PR (drives advisory-mode gate) |
+| \`prior_review_count\` | integer | number of prior delegate-reviewer **non-approved** reviews on this PR (drives advisory-mode gate) |
 | \`advisory_mode\` | boolean | true when \`prior_review_count >= 5\` and the orchestrator switched to summary-only output |
 | \`verdict\` | string | \`"APPROVE"\` \\| \`"COMMENT"\` \\| \`"ADVISORY"\` \\| \`"fallback"\` (fallback PR comment used) |
 | \`tdd_linkage_ok\` | boolean | \`LINKAGE_OK\` from step 7 |
