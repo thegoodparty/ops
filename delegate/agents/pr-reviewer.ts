@@ -47,6 +47,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
      START_MS=$(date +%s%3N)
      IS_RR=true   # set to true if your input has <reReview>true</reReview>, else false
+     BOT_LOGIN=""
      PRIOR_REVIEW_COUNT=0
      PRIOR_REVIEW_BODY=""
      PRIOR_BLOCKER_LINES='{}'
@@ -61,6 +62,11 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      IS_DRAFT=$(jq -r '.isDraft' <<< "$META")
      HEAD_SHA=$(jq -r '.headRefOid' <<< "$META")  # use this if input <headSha> was omitted
      BASE_REF=$(jq -r '.baseRefName' <<< "$META")  # use this if input <baseRef> was omitted
+
+   Resolve the reviewing bot login up front so both step 1's debounce check and step 2's re-review reconciliation use the same identity:
+
+     BOT_LOGIN=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login 2>/dev/null || true)
+     [ -n "$BOT_LOGIN" ] || BOT_LOGIN='delegate[bot]'
 
    If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`delegate review\\\`.\` and exit. Don't run the scout, don't post a status check. (Draft bail-out does not emit telemetry — the review never actually ran.)
 
@@ -77,14 +83,14 @@ On a re-review, additionally reconcile with the bot's prior review state on this
        exit 0
      fi
 
-   **Check B — PR-level debounce.** Don't pile up reviews on rapid pushes. If a delegate-reviewer review was submitted on this PR within the last 4 minutes, exit. The next push (or an explicit \`delegate review\` comment) will still trigger a run; we just avoid the 5-pushes-in-a-minute thrash:
+   **Check B — PR-level debounce.** Don't pile up reviews on rapid pushes. If a review from \`$BOT_LOGIN\` was submitted on this PR within the last 4 minutes, exit. The next push (or an explicit \`delegate review\` comment) will still trigger a run; we just avoid the 5-pushes-in-a-minute thrash:
 
     LAST_REVIEW_ISO=$(gh api "repos/<repo>/pulls/<num>/reviews" --paginate \\
-      | jq -rs '[.[] | .[] | select((.user.login | startswith("delegate-reviewer")) and (.submitted_at != null)) | .submitted_at] | last // empty')
+      | jq -rs --arg bot "$BOT_LOGIN" '[.[] | .[] | select((.user.login == $bot) and (.submitted_at != null)) | .submitted_at] | last // empty')
     LAST_REVIEW_SECS=$(xargs -I {} date -d {} +%s 2>/dev/null <<< "$LAST_REVIEW_ISO" || echo "")
      NOW_SECS=$(date +%s)
      if [ -n "$LAST_REVIEW_SECS" ] && [ "$((NOW_SECS - LAST_REVIEW_SECS))" -lt 240 ]; then
-       echo "Skipping: delegate-reviewer review posted $((NOW_SECS - LAST_REVIEW_SECS))s ago on this PR (< 240s debounce)"
+       echo "Skipping: $BOT_LOGIN review posted $((NOW_SECS - LAST_REVIEW_SECS))s ago on this PR (< 240s debounce)"
        exit 0
      fi
 
@@ -113,11 +119,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 2. **On re-review only: fetch and reconcile prior bot review threads.** Skip this step if \`<reReview>\` is not \`true\`.
 
-   First, discover your own bot login — it's the identity of whichever GitHub App's installation token is currently in \`GITHUB_TOKEN\` (the worker swaps this to the reviewer App for pr-reviewer runs). The \`viewer\` GraphQL query returns it:
-
-       BOT_LOGIN=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login)
-
-   Fall back to \`delegate[bot]\` if the query fails or returns empty. Use \`$BOT_LOGIN\` everywhere this step references the reviewing bot.
+   Reuse \`$BOT_LOGIN\` from step 0 (resolved via \`viewer.login\`, with fallback to \`delegate[bot]\` when the query fails). Use \`$BOT_LOGIN\` everywhere this step references the reviewing bot.
 
    Fetch all review threads on the PR (including author replies on each thread, used downstream to respect "this is intentional" pushback), filter to ones whose first comment is from \`$BOT_LOGIN\`, and resolve threads GitHub has already marked outdated. Threads whose anchor code still exists in the current diff stay put — we'll dedupe against them below. Use \`gh api graphql\` (parse owner/name from \`<repo>\`):
 
