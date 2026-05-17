@@ -364,6 +364,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    - **Auto-approve** if ALL of the following hold:
      - Zero blocker findings (after the saturation cap in step 6).
+     - \`BLOCKERS_SUPPRESSED_BY_SATURATION=0\`. If any blocker was suppressed by the saturation cap, do NOT auto-approve: the cap's rationale is "the human reviewer can decide," so this round must remain comment-only.
      - \`LINKAGE_OK=true\` (no TDD referenced, OR the referenced TDD is blessed and matches the diff).
      - The scout returned valid JSON AND every dispatched deep-reviewer returned valid JSON. If the scout failed, you never had a list of leads to verify; if a deep-reviewer failed, its lead was never verified — in either case your "no blockers" signal would only mean "no blockers found by the subagents that ran." A scout that legitimately emits zero leads is NOT a failure — it's a positive signal that the diff is low-risk; that path auto-approves.
      - The env var \`PR_REVIEWER_APPROVAL_ENABLED\` equals \`"true"\`. The worker sets this when it has swapped \`GITHUB_TOKEN\` to the reviewer App's installation token; if it isn't set, posting an approval would come from the wrong identity.
@@ -371,6 +372,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    - **Comment-only review** otherwise.
 
    Advisory mode takes precedence over both other outcomes. A PR that has had 5+ rounds is by definition not auto-approvable on a fresh "zero blockers" verdict — if zero blockers come back, post a one-line advisory body anyway so the author sees the bot finished cleanly; if blockers remain, list them in the body but do not post inline.
+   Saturation suppression is also a hard auto-approval stop: if \`BLOCKERS_SUPPRESSED_BY_SATURATION > 0\`, force comment-only even when remaining blockers are zero and all other gates are green.
 
 9. **Post the review.** ONE \`gh api\` call.
 
@@ -523,7 +525,7 @@ The body depends on which gates failed. Pick exactly one of these shapes — do 
   \`**<N> blocker(s).** Reply \\\`delegate review\\\` after fixing.\`
   (No "request human review" line — the inline comments already make the ask self-evident.)
 
-- **No blockers but linkage / config failure** (e.g., re-review where blockers were fixed but TDD still draft, or token missing):
+- **No blockers but linkage / config / saturation-gate failure** (e.g., re-review where blockers were fixed but TDD still draft, token missing, or blockers were suppressed by saturation):
   \`Cannot auto-approve: <single sentence drawn from the list below>. Reply \\\`delegate review\\\` to re-check.\`
 
 - **Both blockers AND a linkage / config failure** — combine into one line:
@@ -564,6 +566,7 @@ Sentence phrasing per non-blocker failure:
 - \`LINKAGE_FAIL_REASON=no-clickup-token\`: \`PR references a tech design but CLICKUP_API_TOKEN isn't configured\`
 - \`PR_REVIEWER_APPROVAL_ENABLED\` not \`"true"\`: \`reviewer App not configured (REVIEWER_APP_PRIVATE_KEY missing)\`
 - \`SELF_REVIEW=true\`: \`PR modifies the reviewer's own system (\`delegate/\`) — auto-approval is disabled on changes to the bot, human review required\`
+- \`BLOCKERS_SUPPRESSED_BY_SATURATION > 0\`: \`blocker(s) were suppressed by saturation cap on previously flagged anchors — human reviewer should decide\`
 
 On re-review, do NOT prepend a "_Re-review requested by @<triggeredBy>_" line. Reviewers can see who triggered the re-run from the timeline; the prefix is noise.
 
