@@ -86,7 +86,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    **Check B — PR-level debounce.** Don't pile up reviews on rapid pushes. If a review from \`$BOT_LOGIN\` was submitted on this PR within the last 4 minutes, exit. The next push (or an explicit \`delegate review\` comment) will still trigger a run; we just avoid the 5-pushes-in-a-minute thrash:
 
     LAST_REVIEW_ISO=$(gh api "repos/<repo>/pulls/<num>/reviews" --paginate \\
-      | jq -rs --arg bot "$BOT_LOGIN" '[.[] | .[] | select((.user.login == $bot) and (.submitted_at != null)) | .submitted_at] | last // empty')
+      | jq -rs --arg bot "$BOT_LOGIN" '[.[] | .[] | select((.user.login == $bot) and (.state != "APPROVED") and (.submitted_at != null)) | .submitted_at] | last // empty')
     LAST_REVIEW_SECS=$(xargs -I {} date -d {} +%s 2>/dev/null <<< "$LAST_REVIEW_ISO" || echo "")
      NOW_SECS=$(date +%s)
      if [ -n "$LAST_REVIEW_SECS" ] && [ "$((NOW_SECS - LAST_REVIEW_SECS))" -lt 240 ]; then
