@@ -47,6 +47,14 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
      START_MS=$(date +%s%3N)
      IS_RR=true   # set to true if your input has <reReview>true</reReview>, else false
+     BOT_LOGIN=""
+     PRIOR_REVIEW_COUNT=0
+     PRIOR_REVIEW_BODY=""
+     PRIOR_BLOCKER_LINES='{}'
+     BLOCKERS_SUPPRESSED_BY_SATURATION=0
+     ADVISORY_MODE=false
+
+   These defaults are mandatory because step 2 is skipped on non-re-review runs. They keep later \`jq --argjson\` calls valid and make saturation/advisory logic a no-op unless step 2 overrides them.
 
    Then fetch \`isDraft\` (the open-PR webhook path filters drafts in the lambda, but the comment-triggered re-review path doesn't — drafts can land here):
 
@@ -55,11 +63,18 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      HEAD_SHA=$(jq -r '.headRefOid' <<< "$META")  # use this if input <headSha> was omitted
      BASE_REF=$(jq -r '.baseRefName' <<< "$META")  # use this if input <baseRef> was omitted
 
+   Resolve the reviewing bot login up front so both step 1's debounce check and step 2's re-review reconciliation use the same identity:
+
+     BOT_LOGIN=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login 2>/dev/null || true)
+     [ -n "$BOT_LOGIN" ] || BOT_LOGIN='delegate[bot]'
+
    If \`IS_DRAFT\` is \`true\`, post a single comment-only review with body \`This PR is in draft. Mark it ready for review and re-trigger me with \\\`delegate review\\\`.\` and exit. Don't run the scout, don't post a status check. (Draft bail-out does not emit telemetry — the review never actually ran.)
 
-1. **Bail if another task is already reviewing this commit, then post \`pending\` status check.** Parallel webhook deliveries (org + repo installations, retried deliveries) can dispatch two reviewer tasks for the same commit. Two tasks reaching different LLM verdicts on the same diff produces contradictory reviews on the PR. To prevent that, dedup against existing \`pr-reviewer\` statuses on the head SHA before doing any other work — skip the dedup only on re-review, where prior-run statuses always exist and the user explicitly asked for a fresh pass.
+1. **Bail if another task is already reviewing this commit OR if a recent review just ran on this PR, then post \`pending\` status check.** Parallel webhook deliveries (org + repo installations, retried deliveries) can dispatch two reviewer tasks for the same commit. Two tasks reaching different LLM verdicts on the same diff produces contradictory reviews on the PR. Back-to-back pushes from the same author (amend + force-push, rebase + push, etc.) can also produce a wall of redundant reviews. Two dedup checks prevent both — skip both checks only on re-review, where the user explicitly asked for a fresh pass.
 
-   Skip this dedup block when \`<reReview>\` is \`true\`. Otherwise:
+   Skip this entire block when \`<reReview>\` is \`true\`. Otherwise:
+
+   **Check A — per-SHA dedup.** Don't run twice on the same commit:
 
      EXISTING=$(gh api repos/<repo>/commits/$HEAD_SHA/statuses \\
        --jq '[.[] | select(.context == "pr-reviewer")] | length')
@@ -68,7 +83,20 @@ On a re-review, additionally reconcile with the bot's prior review state on this
        exit 0
      fi
 
-   Tiny race window: two tasks both reading "no existing status" before either has posted \`pending\`. The webhook gap is typically several seconds, large enough for the first task's \`pending\` post to land and abort the second. If they truly tie, you'll still get duplicate reviews — an acceptable rare miss vs. the cost of a full distributed lock.
+   **Check B — PR-level debounce.** Don't pile up reviews on rapid pushes. If a review from \`$BOT_LOGIN\` was submitted on this PR within the last 4 minutes, exit. The next push (or an explicit \`delegate review\` comment) will still trigger a run; we just avoid the 5-pushes-in-a-minute thrash:
+
+    LAST_REVIEW_ISO=$(gh api "repos/<repo>/pulls/<num>/reviews" --paginate \\
+      | jq -rs --arg bot "$BOT_LOGIN" '[.[] | .[] | select((.user.login == $bot) and (.state != "APPROVED") and (.submitted_at != null)) | .submitted_at] | last // empty')
+    LAST_REVIEW_SECS=$(xargs -I {} date -d {} +%s 2>/dev/null <<< "$LAST_REVIEW_ISO" || echo "")
+     NOW_SECS=$(date +%s)
+     if [ -n "$LAST_REVIEW_SECS" ] && [ "$((NOW_SECS - LAST_REVIEW_SECS))" -lt 240 ]; then
+       echo "Skipping: $BOT_LOGIN review posted $((NOW_SECS - LAST_REVIEW_SECS))s ago on this PR (< 240s debounce)"
+       exit 0
+     fi
+
+   Note on the BusyBox image: \`date -d <iso>\` works on GNU date. If your container's \`date\` rejects \`-d\`, fall back to a Python one-liner or skip Check B silently — debounce is a soft optimization, not correctness.
+
+   Tiny race window on Check A: two tasks both reading "no existing status" before either has posted \`pending\`. The webhook gap is typically several seconds, large enough for the first task's \`pending\` post to land and abort the second. If they truly tie, you'll still get duplicate reviews — an acceptable rare miss vs. the cost of a full distributed lock.
 
    You still need a \`$LOGS_URL\` for the terminal status post in step 11. Compute it now from the ECS metadata endpoint:
 
@@ -91,13 +119,9 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 2. **On re-review only: fetch and reconcile prior bot review threads.** Skip this step if \`<reReview>\` is not \`true\`.
 
-   First, discover your own bot login — it's the identity of whichever GitHub App's installation token is currently in \`GITHUB_TOKEN\` (the worker swaps this to the reviewer App for pr-reviewer runs). The \`viewer\` GraphQL query returns it:
+   Reuse \`$BOT_LOGIN\` from step 0 (resolved via \`viewer.login\`, with fallback to \`delegate[bot]\` when the query fails). Use \`$BOT_LOGIN\` everywhere this step references the reviewing bot.
 
-       BOT_LOGIN=$(gh api graphql -f query='{ viewer { login } }' --jq .data.viewer.login)
-
-   Fall back to \`delegate[bot]\` if the query fails or returns empty. Use \`$BOT_LOGIN\` everywhere this step references the reviewing bot.
-
-   Fetch all review threads on the PR, filter to ones posted by \`$BOT_LOGIN\`, and resolve threads GitHub has already marked outdated. Threads whose anchor code still exists in the current diff stay put — we'll dedupe against them below. Use \`gh api graphql\` (parse owner/name from \`<repo>\`):
+   Fetch all review threads on the PR (including author replies on each thread, used downstream to respect "this is intentional" pushback), filter to ones whose first comment is from \`$BOT_LOGIN\`, and resolve threads GitHub has already marked outdated. Threads whose anchor code still exists in the current diff stay put — we'll dedupe against them below. Use \`gh api graphql\` (parse owner/name from \`<repo>\`):
 
      OWNER=\${REPO%%/*}
      NAME=\${REPO##*/}
@@ -110,8 +134,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
                  id
                  isResolved
                  isOutdated
-                 comments(first: 1) {
-                   nodes { author { login } body path line originalLine }
+                 comments(first: 20) {
+                   nodes { author { login } body path line originalLine createdAt pullRequestReview { id submittedAt } }
                  }
                }
              }
@@ -119,7 +143,9 @@ On a re-review, additionally reconcile with the bot's prior review state on this
          }
        }' > threads.json
 
-   Filter to non-resolved threads authored by \`$BOT_LOGIN\` and split into two groups:
+   The \`comments\` array now carries up to 20 entries per thread, in chronological order. The first comment is the bot's original finding; subsequent comments are replies (typically the PR author, sometimes other reviewers). The deep-reviewer's \`<prior_review>\` block downstream needs these replies, since they encode "this is intentional" / "by design" / "won't fix" pushback the bot must respect on the next round.
+
+   Filter to non-resolved threads whose FIRST comment was authored by \`$BOT_LOGIN\` and split into two groups:
 
    - **Outdated → resolve.** For each thread where \`isOutdated\` is true, call the resolve mutation. Ignore per-thread failures:
 
@@ -127,12 +153,56 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    - **Still-anchored → skip-list.** Keep the \`(path, line, body)\` triples of threads where \`isOutdated\` is false. These are the already-posted findings; the dedup step below uses them to suppress duplicates. Pass this list along to the deep-reviewers indirectly — the orchestrator dedupes at aggregation time.
 
-   **Then fetch the most recent prior bot review body** so the scout and deep-reviewers can read the prior round's reasoning verbatim. This is what prevents the bot from re-considering and re-emitting concerns it explicitly dropped last round (the "moving goalposts" failure mode):
+   **Then fetch prior bot review metadata** so the scout and deep-reviewers can read the prior round's reasoning verbatim, and so steps 6 and 8 can apply the same-line saturation cap and the bounded-rounds advisory-mode switch. This is what prevents the bot from re-considering and re-emitting concerns it explicitly dropped last round (the "moving goalposts" failure mode) and from oscillating opposite recommendations on the same line across rounds.
 
-     PRIOR_REVIEW_BODY=$(gh api "repos/$REPO/pulls/<num>/reviews" --paginate \\
-       --jq "[.[] | select(.user.login == \\"$BOT_LOGIN\\")] | sort_by(.submitted_at) | last | .body // \\"\\"")
+    gh api "repos/$REPO/pulls/<num>/reviews" --paginate \\
+      | jq -s "[.[] | .[] | select(.user.login == \\"$BOT_LOGIN\\" and .state != \\"APPROVED\\")] | sort_by(.submitted_at)" > /tmp/prior_reviews.json
 
-   If this is non-empty, you'll wrap it in a \`<prior_review>...</prior_review>\` block and inject it into the scout's and each deep-reviewer's prompt in step 5. If empty (no prior bot review found — e.g., the first delegate run on this PR was the lambda's status-only post), omit the block entirely. Keep \`$PRIOR_REVIEW_BODY\` available; you'll need it.
+     PRIOR_REVIEW_COUNT=$(jq 'length' /tmp/prior_reviews.json)
+     PRIOR_REVIEW_BODY=$(jq -r 'last | .body // ""' /tmp/prior_reviews.json)
+
+   If \`$PRIOR_REVIEW_BODY\` is non-empty, you'll wrap it in a \`<prior_review>...</prior_review>\` block (with author replies, see below) and inject it into the scout's and each deep-reviewer's prompt in step 5. If empty (no prior bot review found — e.g., the first delegate run on this PR was the lambda's status-only post), omit the block entirely.
+
+   **Build the prior-blocker-lines saturation map.** For each prior bot-authored review thread you fetched above whose first comment has a non-null \`path\` and \`line\`, record \`(path, line)\` and count how many distinct prior reviews flagged that anchor. Distinctness must key off review identity (review id, with timestamp fallback), not raw thread count. This drives step 6's saturation cap:
+
+     # PRIOR_BLOCKER_LINES is a JSON map: { "src/foo.ts:42": 3, "src/bar.ts:10": 1, ... }
+     # Built from threads.json — group bot-authored threads by (path, line), then count distinct review refs
+     # (prefer pullRequestReview.id; fallback to timestamp if review metadata is missing)
+     # Threads with no path/line (PR-body comments) are excluded.
+
+     PRIOR_BLOCKER_LINES=$(jq -c '[.data.repository.pullRequest.reviewThreads.nodes[]
+       | select(.comments.nodes[0].author.login == "'"$BOT_LOGIN"'")
+       | select(.comments.nodes[0].path != null and (.comments.nodes[0].line // .comments.nodes[0].originalLine) != null)
+       | { key: (.comments.nodes[0].path + ":" + ((.comments.nodes[0].line // .comments.nodes[0].originalLine) | tostring)),
+           review_ref: (.comments.nodes[0].pullRequestReview.id // .comments.nodes[0].pullRequestReview.submittedAt // .comments.nodes[0].createdAt // "unknown") }
+     ] | group_by(.key) | map({key: .[0].key, value: ([.[].review_ref] | unique | length)}) | from_entries' threads.json)
+
+   You will use \`$PRIOR_BLOCKER_LINES\` in step 6 to drop new blockers whose \`(file, line)\` has been flagged in 2+ prior reviews — the bot has said what it has to say on that anchor.
+
+   **Build the \`<prior_review>\` block including author replies.** For each non-resolved thread authored by \`$BOT_LOGIN\` that has reply comments (any thread where \`.comments.nodes | length > 1\`), append the bot's original comment AND each reply (in chronological order) under a single thread heading. Format:
+
+     <prior_review>
+     <body>
+     <PRIOR_REVIEW_BODY verbatim>
+     </body>
+     <threads>
+     <thread path="src/foo.ts" line="42">
+       <comment author="delegate-reviewer[bot]">
+       <bot's original comment body>
+       </comment>
+       <comment author="tomer-tgp">
+       <author reply body — typically "this is intentional because X" or similar>
+       </comment>
+     </thread>
+     <!-- more threads, one per bot thread that has at least one reply -->
+     </threads>
+     </prior_review>
+
+   Threads with zero replies don't need to be repeated in \`<threads>\` — they're already covered by \`<body>\`. Only threads where the author (or another reviewer) has *replied* go in \`<threads>\`, because that's where the deep-reviewer needs to see pushback or clarification it would otherwise miss.
+
+   \`$PRIOR_REVIEW_COUNT\` is intentionally a **non-approval** count (COMMENTED / CHANGES_REQUESTED / DISMISSED states only). Clean approvals are excluded so advisory mode tracks repeated blocking/comment rounds, not successful passes.
+
+   Keep \`$PRIOR_REVIEW_COUNT\`, \`$PRIOR_REVIEW_BODY\`, and \`$PRIOR_BLOCKER_LINES\` available; you'll need all three downstream.
 
    **Emit disposition telemetry for prior findings.** Every blocker the bot has posted since the telemetry change shipped carries an embedded \`<!-- delegate-finding-id: <uuid> -->\` HTML marker in its comment body (see "Posting the review" → "Finding-ID tagging"). For each delegate-authored thread you just fetched whose comment body contains that marker, extract the UUID and emit a \`disposition_updated\` event. This is how we measure whether prior blockers got addressed, dismissed, or remain pending — without any new storage.
 
@@ -201,7 +271,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      You are scouting PR <num> in repo <repo>. The PR branch is checked out at <WORK>. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), skim touched files in context, and emit 3–10 investigation leads per your output contract.
 
      <prior_review>
-     <PRIOR_REVIEW_BODY verbatim>
+     <!-- the full block built in step 2: <body>...</body> followed by <threads>...</threads> with author replies on threads that have them. If there are no author replies, the <threads> block is omitted and only <body> is present. -->
      </prior_review>
 
    Parse the JSON object on the scout's last output line. You should get \`{"leads":[...], "summary":"..."}\`. If the JSON is malformed, treat the scout as failed (see partial-coverage rules in the error-handling section and step 8).
@@ -225,7 +295,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      </lead>
 
      <prior_review>
-     <PRIOR_REVIEW_BODY verbatim>
+     <!-- the full block built in step 2: <body>...</body> followed by <threads>...</threads> with author replies on threads that have them. If there are no author replies, the <threads> block is omitted and only <body> is present. -->
      </prior_review>
 
    ### 5c. Wait for all deep-reviewers
@@ -239,9 +309,17 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    Once you have results from the scout and every deep-reviewer, proceed to step 6. After step 9 (review posted), exit immediately — any deep-reviewer stream events that arrive post-publication are noise and must not trigger additional reviews or status updates.
 
-6. **Aggregate — keep blockers only.** Collect the JSON findings from every deep-reviewer. Dedupe entries that overlap (prefer the most specific wording; prefer a finding that cites an \`ai-rules/\` rule by name over one that doesn't, because the citation is the more actionable one). **Drop every finding whose severity is not \`blocker\`.** Concerns and nits are discarded entirely — this bot does not surface non-blocking commentary. The remaining findings (zero or more blockers) are the inline-comment set for a comment-only review.
+6. **Aggregate — keep blockers only, then apply saturation cap.** Collect the JSON findings from every deep-reviewer. Dedupe entries that overlap (prefer the most specific wording; prefer a finding that cites an \`ai-rules/\` rule by name over one that doesn't, because the citation is the more actionable one). **Drop every finding whose severity is not \`blocker\`.** Concerns and nits are discarded entirely — this bot does not surface non-blocking commentary.
 
    **On re-review only:** additionally drop any finding whose \`(path, line)\` matches a skip-list entry AND whose body substantively repeats the prior comment (same issue, not merely adjacent code). Be strict about "substantively repeats" — if the prior comment flagged a null-check and the new finding flags a different bug on the same line, post the new one. When in doubt, drop it; duplicates are worse than a missed finding.
+
+   **Same-line saturation cap.** For each remaining blocker, look up \`(path, line)\` in \`$PRIOR_BLOCKER_LINES\` (built in step 2). If that anchor has been flagged in **2 or more** prior reviews on this PR, drop the new blocker unconditionally — even if its content differs from the prior ones. Rationale: by the third round on the same anchor, the bot has either repeated itself, oscillated, or chased adjacent issues — none of which produces useful new signal for the author. The author has heard the bot; the human reviewer can decide. This rule applies whether or not the deep-reviewer's anti-reversal logic caught the contradiction internally; it's a structural backstop.
+
+   When you drop a blocker for saturation, log it to stderr so the run trace shows the suppressed finding — useful for tuning the threshold later:
+
+     echo "Suppressed (saturated anchor, $PRIOR_COUNT prior rounds): \$PATH:\$LINE — \$BRIEF_TITLE" >&2
+
+   The remaining findings (zero or more blockers) are the inline-comment set for a comment-only review — unless the advisory-mode gate in step 8 fires, in which case they will instead be consolidated into the review body.
 
 7. **Check tech-design linkage (only if the PR references one).** A tech-design link is **optional**. If the PR doesn't mention one, skip this entire step — it doesn't block approval. If the PR *does* reference one, the link must resolve to a blessed (non-\`[DRAFT]\`) ClickUp page whose scope matches the diff, otherwise we can't auto-approve. Default state: \`LINKAGE_REFERENCED=false\`, \`LINKAGE_OK=true\`.
 
@@ -278,20 +356,29 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    - Otherwise, read \`$TDD_CONTENT\` and the PR diff carefully. Use the TDD's "Detailed Design" / "Proposed Solution" sections as the spec; judge whether the PR's diff implements what's described — same repos, same surface area, same proposed approach. Be conservative: if the TDD describes a materially different change than the diff makes, set \`LINKAGE_OK=false\` and \`LINKAGE_FAIL_REASON="mismatch"\` along with a one-sentence reason in \`LINKAGE_MISMATCH_NOTE\`.
    - If \`$CLICKUP_API_TOKEN\` is unset or the page fetch fails, set \`LINKAGE_OK=false\` and \`LINKAGE_FAIL_REASON="no-clickup-token"\` (the PR claims a TDD link but we can't verify it — that's an explicit fail, not a skip).
 
-8. **Decide the verdict.** Two outcomes — never request changes:
+8. **Decide the verdict.** Three outcomes — never request changes:
+
+   **Advisory-mode gate (compute first).** If \`$PRIOR_REVIEW_COUNT\` (from step 2, counting non-approved bot reviews only) is **5 or greater**, set \`ADVISORY_MODE=true\`. In advisory mode, the bot still ran the scout + deep-reviewers + saturation cap, but it has had five rounds to make its case — emitting more inline blockers past round 5 produces churn, not signal. The orchestrator stops blocking and switches to summary-only output. Step 9 will post a single comment-only review whose body lists any remaining blockers as plain-markdown sections (not inline anchored comments), with framing that explicitly tells the author the bot is done blocking and human review is required to merge.
+
+   Otherwise (\`ADVISORY_MODE=false\`), pick between auto-approve and the normal comment-only review:
 
    - **Auto-approve** if ALL of the following hold:
-     - Zero blocker findings.
+     - Zero blocker findings (after the saturation cap in step 6).
+     - \`BLOCKERS_SUPPRESSED_BY_SATURATION=0\`. If any blocker was suppressed by the saturation cap, do NOT auto-approve: the cap's rationale is "the human reviewer can decide," so this round must remain comment-only.
      - \`LINKAGE_OK=true\` (no TDD referenced, OR the referenced TDD is blessed and matches the diff).
      - The scout returned valid JSON AND every dispatched deep-reviewer returned valid JSON. If the scout failed, you never had a list of leads to verify; if a deep-reviewer failed, its lead was never verified — in either case your "no blockers" signal would only mean "no blockers found by the subagents that ran." A scout that legitimately emits zero leads is NOT a failure — it's a positive signal that the diff is low-risk; that path auto-approves.
      - The env var \`PR_REVIEWER_APPROVAL_ENABLED\` equals \`"true"\`. The worker sets this when it has swapped \`GITHUB_TOKEN\` to the reviewer App's installation token; if it isn't set, posting an approval would come from the wrong identity.
      - \`SELF_REVIEW=false\`. A PR that modifies the bot's own review system can subvert any future auto-approval check; humans must look at it. This rule is non-negotiable — do not rationalize past it even when the diff looks benign.
    - **Comment-only review** otherwise.
 
+   Advisory mode takes precedence over both other outcomes. A PR that has had 5+ rounds is by definition not auto-approvable on a fresh "zero blockers" verdict — if zero blockers come back, post a one-line advisory body anyway so the author sees the bot finished cleanly; if blockers remain, list them in the body but do not post inline.
+   Saturation suppression is also a hard auto-approval stop: if \`BLOCKERS_SUPPRESSED_BY_SATURATION > 0\`, force comment-only even when remaining blockers are zero and all other gates are green.
+
 9. **Post the review.** ONE \`gh api\` call.
 
    - Auto-approve: \`event=APPROVE\`, empty \`comments\` array, body per the **Auto-approve body** rules below.
-   - Comment-only: \`event=COMMENT\`, inline comments only for blocker findings, body per the **Comment-only body** rules below. Even when there are zero blockers (e.g., re-review where blockers got fixed but linkage still fails), still post the comment-only review so the author sees why we didn't auto-approve.
+   - Comment-only (normal): \`event=COMMENT\`, inline comments only for blocker findings, body per the **Comment-only body** rules below. Even when there are zero blockers (e.g., re-review where blockers got fixed but linkage still fails), still post the comment-only review so the author sees why we didn't auto-approve.
+   - Comment-only (advisory mode): \`event=COMMENT\`, **empty \`comments\` array** (do NOT post inline anchors), body per the **Advisory-mode body** rules below. The remaining blockers are rendered as plain markdown sections inside the body itself, not as inline review comments. This is the structural part of advisory mode — the bot has decided to stop blocking after N rounds, and the visual signal of "no inline blockers, just a body summary" matches that decision.
 
    If the review POST returns a 4xx (most commonly 422 on the inline comments), use the **fallback PR comment** procedure in the "Error handling" section — one consolidated comment, upserted by HTML marker. **Never** post one PR comment per blocker.
 
@@ -315,11 +402,14 @@ On a re-review, additionally reconcile with the bot's prior review state on this
         --argjson drfails "$DEEP_REVIEWER_FAILURES" \\
         --argjson scoutfail "$SCOUT_FAILED" \\
         --argjson blockers "$BLOCKERS_POSTED" \\
+        --argjson suppressed "$BLOCKERS_SUPPRESSED_BY_SATURATION" \\
+        --argjson priorcount "$PRIOR_REVIEW_COUNT" \\
+        --argjson advisory "$ADVISORY_MODE" \\
         --arg verdict "$VERDICT" \\
         --argjson linkage_ok "$LINKAGE_OK" \\
         --argjson self_review "$SELF_REVIEW" \\
         --argjson wall "$WALL_MS" \\
-        '{service_name:"delegate-reviewer",event:"review_posted",repo:$repo,pr_number:$pr,head_sha:$sha,is_rereview:$rereview,scout_leads:$leads,deep_reviewers_dispatched:$drs,deep_reviewer_failures:$drfails,scout_failed:$scoutfail,blockers_posted:$blockers,verdict:$verdict,tdd_linkage_ok:$linkage_ok,self_review:$self_review,wall_time_ms:$wall}'
+        '{service_name:"delegate-reviewer",event:"review_posted",repo:$repo,pr_number:$pr,head_sha:$sha,is_rereview:$rereview,scout_leads:$leads,deep_reviewers_dispatched:$drs,deep_reviewer_failures:$drfails,scout_failed:$scoutfail,blockers_posted:$blockers,blockers_suppressed_by_saturation:$suppressed,prior_review_count:$priorcount,advisory_mode:$advisory,verdict:$verdict,tdd_linkage_ok:$linkage_ok,self_review:$self_review,wall_time_ms:$wall}'
 
     Then emit ONE \`finding_emitted\` event per inline comment you posted (or per blocker section in the fallback comment), using the \`finding_id → (file, line, severity, lead area/category, has_suggestion)\` mapping you remembered in step 9:
 
@@ -340,11 +430,15 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 11. **Post terminal status check.** After the review has been posted (or on your final error fallback), update the commit status. Reuse the \`$LOGS_URL\` you computed in step 1:
 
-     # on success (review posted cleanly)
+     # on success (review posted cleanly).
+     # Description vocabulary:
+     #   Approved          → auto-approved with no blockers and clean linkage.
+     #   Commented         → normal comment-only review with inline blockers.
+     #   Advisory          → ADVISORY_MODE=true (>=5 prior rounds): no inline blockers, summary body only.
      gh api --method POST repos/<repo>/statuses/$HEAD_SHA \\
        -f state=success \\
        -f context=pr-reviewer \\
-       -f description="Review posted (<Approved|Commented>)" \\
+       -f description="Review posted (<Approved|Commented|Advisory>)" \\
        -f target_url="$LOGS_URL"
 
      # on failure (review could not be posted at all)
@@ -423,7 +517,7 @@ Keep the body short. The blockers (in inline comments, or in the fallback PR com
 - No TDD: \`Approved.\`
 - TDD verified: \`Approved. Verified against [tech design](<TDD_URL>).\`
 
-**Comment-only body** (for \`event=COMMENT\`):
+**Comment-only body** (for \`event=COMMENT\` in NORMAL mode — see Advisory-mode body below for \`ADVISORY_MODE=true\`):
 
 The body depends on which gates failed. Pick exactly one of these shapes — do NOT combine the "blockers only" preamble with the "extra reasons" list.
 
@@ -431,13 +525,33 @@ The body depends on which gates failed. Pick exactly one of these shapes — do 
   \`**<N> blocker(s).** Reply \\\`delegate review\\\` after fixing.\`
   (No "request human review" line — the inline comments already make the ask self-evident.)
 
-- **No blockers but linkage / config failure** (e.g., re-review where blockers were fixed but TDD still draft, or token missing):
+- **No blockers but linkage / config / saturation-gate failure** (e.g., re-review where blockers were fixed but TDD still draft, token missing, or blockers were suppressed by saturation):
   \`Cannot auto-approve: <single sentence drawn from the list below>. Reply \\\`delegate review\\\` to re-check.\`
 
 - **Both blockers AND a linkage / config failure** — combine into one line:
   \`**<N> blocker(s).** Also: <single sentence from list below>. Reply \\\`delegate review\\\` after fixing.\`
 
-**On re-review, add a continuity line.** If step 2 ran (i.e., \`<reReview>\` is \`true\` OR there are prior bot review threads on the PR), prepend a single line above the body chosen above:
+**Advisory-mode body** (for \`event=COMMENT\` when \`ADVISORY_MODE=true\`):
+
+Body shape — first line explains the mode, remaining sections list any blockers as plain markdown. The \`comments\` array stays empty; the bot does not anchor inline on advisory rounds.
+
+  **Advisory mode** — this PR has had <PRIOR_REVIEW_COUNT>+ prior non-approval bot review rounds. Further blocking comments would be churn rather than signal. <N> concern(s) remain below for human reviewers; the bot will not block this PR again. Push more commits to retrigger the bot on a fresh head if needed.
+
+  ---
+
+  ### \`path/to/file.ts:LINE\` — <one-line summary>
+  <body of finding, suggestion block preserved verbatim>
+
+  ### \`path/to/other.ts:LINE\` — <next>
+  ...
+
+If the advisory-mode round produced zero blockers after saturation, drop the "N concerns remain" wording and use a single-line body instead:
+
+  **Advisory mode** — this PR has had <PRIOR_REVIEW_COUNT>+ prior non-approval bot review rounds. No new concerns this round. Push more commits to retrigger if needed; otherwise this PR is ready for human review.
+
+Advisory mode does NOT add the "_<R> resolved since last review, <N> new._" continuity prefix; the mode line is the continuity signal.
+
+**On re-review (non-advisory only), add a continuity line.** If step 2 ran (i.e., \`<reReview>\` is \`true\` OR there are prior bot review threads on the PR) **and** \`ADVISORY_MODE=false\`, prepend a single line above the body chosen above:
 
   \`_<R> resolved since last review, <N> new._\`
 
@@ -452,6 +566,7 @@ Sentence phrasing per non-blocker failure:
 - \`LINKAGE_FAIL_REASON=no-clickup-token\`: \`PR references a tech design but CLICKUP_API_TOKEN isn't configured\`
 - \`PR_REVIEWER_APPROVAL_ENABLED\` not \`"true"\`: \`reviewer App not configured (REVIEWER_APP_PRIVATE_KEY missing)\`
 - \`SELF_REVIEW=true\`: \`PR modifies the reviewer's own system (\`delegate/\`) — auto-approval is disabled on changes to the bot, human review required\`
+- \`BLOCKERS_SUPPRESSED_BY_SATURATION > 0\`: \`blocker(s) were suppressed by saturation cap on previously flagged anchors — human reviewer should decide\`
 
 On re-review, do NOT prepend a "_Re-review requested by @<triggeredBy>_" line. Reviewers can see who triggered the re-run from the timeline; the prefix is noise.
 
@@ -465,7 +580,7 @@ On re-review, do NOT prepend a "_Re-review requested by @<triggeredBy>_" line. R
 
 ## Final output
 
-Your final printed output is for CloudWatch logs only — there is no callback that posts it back to the PR. The review on the PR is the deliverable. Print exactly one short line: \`Posted: <APPROVE|COMMENT> · <N> blocker(s) · <ms>ms\` (or \`Posted: fallback comment · <N> blocker(s)\` if the inline path 422'd and you used the upsert fallback). No "Review complete," no checklists, no recap of what was found — that already lives on the PR.
+Your final printed output is for CloudWatch logs only — there is no callback that posts it back to the PR. The review on the PR is the deliverable. Print exactly one short line: \`Posted: <APPROVE|COMMENT|ADVISORY> · <N> blocker(s) · <ms>ms\` (or \`Posted: fallback comment · <N> blocker(s)\` if the inline path 422'd and you used the upsert fallback). \`ADVISORY\` is the advisory-mode round (5+ prior reviews, summary-only body, no inline blockers). No "Review complete," no checklists, no recap of what was found — that already lives on the PR.
 
 ## Telemetry events
 
@@ -489,8 +604,11 @@ Emitted exactly once per orchestrator run, in step 10, AFTER the review POST has
 | \`deep_reviewers_dispatched\` | integer | how many deep-reviewer Tasks you spawned |
 | \`deep_reviewer_failures\` | integer | how many Task-tool-surfaced failures |
 | \`scout_failed\` | boolean | true if the scout's JSON was malformed or its Task errored |
-| \`blockers_posted\` | integer | inline comments in the posted payload (or sections in the fallback comment) |
-| \`verdict\` | string | \`"APPROVE"\` \\| \`"COMMENT"\` \\| \`"fallback"\` (fallback PR comment used) |
+| \`blockers_posted\` | integer | inline comments in the posted payload (or sections in the fallback comment or advisory body) |
+| \`blockers_suppressed_by_saturation\` | integer | blockers dropped in step 6 because their \`(file, line)\` was flagged in 2+ prior rounds |
+| \`prior_review_count\` | integer | number of prior delegate-reviewer **non-approved** reviews on this PR (drives advisory-mode gate) |
+| \`advisory_mode\` | boolean | true when \`prior_review_count >= 5\` and the orchestrator switched to summary-only output |
+| \`verdict\` | string | \`"APPROVE"\` \\| \`"COMMENT"\` \\| \`"ADVISORY"\` \\| \`"fallback"\` (fallback PR comment used) |
 | \`tdd_linkage_ok\` | boolean | \`LINKAGE_OK\` from step 7 |
 | \`self_review\` | boolean | \`SELF_REVIEW\` from step 4 |
 | \`wall_time_ms\` | integer | \`now - START_MS\` |
