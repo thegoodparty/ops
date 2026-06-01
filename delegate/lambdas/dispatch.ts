@@ -3,6 +3,17 @@ import type { AgentJob } from "../framework/types";
 
 const ecs = new ECSClient({});
 
+// ECS resource tags only permit "UTF-8 letters, spaces, numbers, and
+// _ . / = + - : @". Some tag values are derived from GitHub data — notably
+// `metadata.author`, which is the PR author's login. Bot accounts render as
+// `dependabot[bot]` / `<app>[bot]`, and the `[` / `]` make RunTask reject the
+// whole call, which github.ts swallows as `github_webhook_dispatch_failed` —
+// so a Dependabot PR silently never gets reviewed. Replace any disallowed
+// character with `-` (and cap at the 256-char tag-value limit) so dispatch
+// always succeeds regardless of who authored the PR.
+export const sanitizeTagValue = (value: string): string =>
+  value.replace(/[^\p{L}\p{N} _.\/=+:@-]/gu, "-").slice(0, 256);
+
 export const dispatch = async (job: AgentJob) => {
   const { CLUSTER_ARN, TASK_DEF_ARN, SUBNET_IDS, SECURITY_GROUP_ID } =
     process.env;
@@ -40,7 +51,7 @@ export const dispatch = async (job: AgentJob) => {
         ...(job.metadata
           ? Object.entries(job.metadata).map(([key, value]) => ({
               key,
-              value,
+              value: sanitizeTagValue(value),
             }))
           : []),
       ],
