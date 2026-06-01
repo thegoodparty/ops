@@ -11,7 +11,7 @@
   "scripts": {
     "script": "tsx --env-file-if-exists=scripts/.env run-script.ts",
     "build": "tsc && esbuild delegate/lambdas/handler.ts --bundle --platform=node --target=node22 --outfile=dist/lambda/handler.js",
-    "test": "tsx --test delegate/framework/*.test.ts"
+    "test": "tsx --test delegate/framework/*.test.ts delegate/lambdas/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.72",
