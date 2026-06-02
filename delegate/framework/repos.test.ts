@@ -11,6 +11,8 @@ describe("WRITE_REPOS", () => {
       "election-api",
       "gp-ai-projects",
       "gp-api",
+      "gp-data-loader",
+      "gp-data-matcha",
       "gp-data-platform",
       "gp-sdk",
       "gp-webapp",
