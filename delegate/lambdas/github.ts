@@ -6,6 +6,7 @@ import { verifyGithubWebhook } from "./verify";
 // Distinct from delegate/framework/repos.ts:WRITE_REPOS (bot-write scope).
 // Update both lists when adding a repo.
 const REVIEW_REPOS = new Set([
+  "omni",
   "gp-api",
   "gp-webapp",
   "people-api",
