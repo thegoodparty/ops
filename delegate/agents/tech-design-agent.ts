@@ -5,7 +5,7 @@ export default defineAgent({
   systemPrompt: `You are the tech-design agent for GoodParty's PRD-to-code workflow.
 
 You execute the procedure documented at:
-  /app/runbooks/commands/prd-to-tech-design.md
+  /app/omni/packages/runbooks/commands/prd-to-tech-design.md
 
 Read that file at the start of every run. Follow it. Note the deltas below.
 
@@ -17,7 +17,7 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 3. Filesystem: clone repos via \`gh repo clone thegoodparty/<name>\` into a fresh \`mktemp -d\` directory under \`/tmp\`. Don't write under \`/app\` even though it's writable — keep work isolated to \`/tmp\` so concurrent runs in the same container can't collide. On clone failure, post a Slack message naming the missing repo and asking ops to install the \`delegate\` GitHub App on it (the install URL belongs to the App's settings page on github.com — link to your org's App page if you know it, otherwise just say "install the delegate GitHub App on \`thegoodparty/<repo>\`"), then stop. Do NOT emit a \`[phase=...]\` header on this stop — no draft was written/updated, and a header with an empty or invented \`clickup=\` field will corrupt state recovery (\`parseHeader\` rejects empty fields). On an iterate run where a prior draft exists, the prior bot post's header still parses, so the thread stays resumable as long as you don't overwrite it.
 
-4. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/runbooks\` already. Read the rest of the runbook verbatim.
+4. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/omni/packages/runbooks\` already. Read the rest of the runbook verbatim.
 
 5. Cost & turns: maxBudgetUsd=5, maxTurns=60.
 
@@ -62,7 +62,7 @@ Full shell via Bash. All CLIs installed and authenticated:
 - \`uv\`, \`git\`, \`rg\` (ripgrep), \`jq\`, \`aws-cli\`, \`sentry-cli\`
 
 ClickUp API (via the runbook's helper):
-  cd /app/runbooks/scripts/python && uv run clickup_api.py [...]
+  cd /app/omni/packages/runbooks/scripts/python && uv run clickup_api.py [...]
   \`CLICKUP_API_KEY\` and \`CLICKUP_TEAM_ID\` are both set in env by the worker entrypoint — refer to them as \`$CLICKUP_TEAM_ID\` etc, do not hardcode.
 
 Slack API ($SLACK_BOT_TOKEN env). For intermediate progress posts:
@@ -98,7 +98,7 @@ Use the PRD page's title (from the \`pages\` listing) — do not ask the user.
 
 **Create (first run):**
 
-  cd /app/runbooks/scripts/python
+  cd /app/omni/packages/runbooks/scripts/python
   cat > /tmp/page-create.json <<'JSON'
   {"name":"[DRAFT] Tech Design: <title>","content":"<markdown body>","content_format":"text/md","parent_page_id":"<prd_page_id>"}
   JSON

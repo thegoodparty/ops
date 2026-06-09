@@ -100,7 +100,7 @@ Continuation verbs are routed by parsing the most recent bot post's `[phase=...]
 
 ### Required preconditions for boot
 
-- The `delegate` GitHub App must be installed on `thegoodparty/runbooks` (read access). The worker entrypoint clones it on every Fargate task boot for workflow agents; framework agents (`slack-responder`, `pr-reviewer`) skip the clone.
+- The `delegate` GitHub App must be installed on `thegoodparty/omni` (read access). The worker entrypoint does a partial + sparse clone of omni (just `packages/runbooks`) on every Fargate task boot for workflow agents; framework agents (`slack-responder`, `pr-reviewer`) skip the clone.
 - The `delegate` GitHub App must be installed on every repo in `WRITE_REPOS` with `pull_requests:write` (for `task-execution-agent` to open PRs).
 
 ## Operator: bot got stuck
@@ -114,7 +114,7 @@ Continuation verbs are routed by parsing the most recent bot post's `[phase=...]
    aws ecs describe-tasks --cluster delegate-cluster --tasks <task-id> --region us-west-2
    ```
 
-3. If the task exited 1 with no output, `setupGitHubAuth` or the boot-time runbooks clone failed. The worker now best-effort posts a boot-failure message to the originating Slack thread before exiting — check the thread first. If still ambiguous, re-mention the bot to retry; if the failure persists, check GitHub App installation health (the App must be installed on `thegoodparty/runbooks`) and worker network egress.
+3. If the task exited 1 with no output, `setupGitHubAuth` or the boot-time omni clone failed. The worker now best-effort posts a boot-failure message to the originating Slack thread before exiting — check the thread first. If still ambiguous, re-mention the bot to retry; if the failure persists, check GitHub App installation health (the App must be installed on `thegoodparty/omni`) and worker network egress.
 
 ### Symptom: `Cannot write to <repo>` from `task-execution-agent`
 
@@ -130,7 +130,7 @@ Look for the `result` log line in the agent's CloudWatch stream and check `costU
 
 ### Symptom: stale runbook command in production
 
-The worker re-clones `thegoodparty/runbooks` at every boot, so updates to `commands/*.md` propagate without an `ops` redeploy. Confirm the `runbooks=<sha>` value in the agent's message footer matches HEAD of `thegoodparty/runbooks` master. If it lags, re-mention the bot — the next task boot will re-clone from current master.
+The worker re-clones omni (sparse, just `packages/runbooks`) at every boot, so updates to `commands/*.md` propagate without an `ops` redeploy. Confirm the `runbooks=<sha>` value in the agent's message footer matches HEAD of `thegoodparty/omni`'s default branch (`develop`). If it lags, re-mention the bot — the next task boot will re-clone from current `develop`.
 
 ### Symptom: malformed header in Slack thread
 
