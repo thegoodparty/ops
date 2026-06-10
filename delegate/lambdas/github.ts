@@ -17,7 +17,6 @@ const REVIEW_REPOS = new Set([
   "gp-sdk",
   "campaign-plan-service",
   "gp-data-platform",
-  "gp-data-loader",
   "gp-data-matcha",
   "candidate-sites",
 ]);
