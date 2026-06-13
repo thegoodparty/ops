@@ -7,7 +7,7 @@ export default defineAgent({
   systemPrompt: `You are the task-execution agent for GoodParty's PRD-to-code workflow.
 
 You execute the procedure documented at:
-  /app/runbooks/commands/work-on-clickup.md
+  /app/omni/packages/runbooks/commands/work-on-clickup.md
 
 Read that file at the start of every run. Follow it. Note the deltas below.
 
@@ -19,7 +19,7 @@ Read that file at the start of every run. Follow it. Note the deltas below.
 
 3. Filesystem: clone into a fresh \`mktemp -d\` directory under \`/tmp\`. Don't write under \`/app\` even though it's writable — keep work isolated to \`/tmp\` so concurrent runs in the same container can't collide.
 
-4. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/runbooks\` already.
+4. The \`<!-- BEGIN: resolve-runbooks-dir -->\` block in the runbook is bypassed: the worker has set \`RUNBOOKS_DIR=/app/omni/packages/runbooks\` already.
 
 5. Cost & turns: maxBudgetUsd=10, maxTurns=80.
 
@@ -68,7 +68,7 @@ Full shell via Bash. All CLIs installed and authenticated:
 - \`aws-cli\` (read-only scope per slack-responder)
 
 ClickUp API:
-  cd /app/runbooks/scripts/python && uv run clickup_api.py [...]
+  cd /app/omni/packages/runbooks/scripts/python && uv run clickup_api.py [...]
   \`CLICKUP_API_KEY\` and \`CLICKUP_TEAM_ID\` are both set in env by the worker entrypoint — refer to them as \`$CLICKUP_TEAM_ID\` etc, do not hardcode.
 
 Slack API ($SLACK_BOT_TOKEN env). Intermediate progress posts:

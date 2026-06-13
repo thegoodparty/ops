@@ -58,7 +58,12 @@ const main = async () => {
   await setupReviewerGitHubAuth();
 
   const needsRunbooks = isWorkflowAgent(job.agent);
-  const runbooksDir = process.env.RUNBOOKS_DIR ?? "/app/runbooks";
+  // Runbooks now live in omni at packages/runbooks. Clone omni with a
+  // partial + sparse checkout so only that subtree materializes — boot stays
+  // fast. The fresh clone each boot preserves the "edit a command, propagates
+  // next run, no ops redeploy" property.
+  const omniDir = process.env.OMNI_DIR ?? "/app/omni";
+  const runbooksDir = `${omniDir}/packages/runbooks`;
 
   if (needsRunbooks) {
     try {
@@ -67,16 +72,23 @@ const main = async () => {
         [
           "repo",
           "clone",
-          "thegoodparty/runbooks",
-          runbooksDir,
+          "thegoodparty/omni",
+          omniDir,
           "--",
+          "--filter=blob:none",
+          "--sparse",
           "--depth=1",
         ],
         { stdio: "inherit" },
       );
+      execFileSync(
+        "git",
+        ["-C", omniDir, "sparse-checkout", "set", "packages/runbooks"],
+        { stdio: "inherit" },
+      );
       const sha = execFileSync("git", [
         "-C",
-        runbooksDir,
+        omniDir,
         "rev-parse",
         "--short",
         "HEAD",
@@ -85,12 +97,12 @@ const main = async () => {
         .trim();
       process.env.RUNBOOKS_DIR = runbooksDir;
       process.env.RUNBOOKS_SHA = sha;
-      console.log(`Runbooks cloned at ${runbooksDir} (SHA ${sha})`);
+      console.log(`Runbooks cloned at ${runbooksDir} (omni SHA ${sha})`);
     } catch (err) {
-      console.error("Failed to clone runbooks:", err);
+      console.error("Failed to clone omni:", err);
       await reportBootFailure(
         job,
-        "could not clone `thegoodparty/runbooks`. Verify the GitHub App is installed on that repo",
+        "could not clone `thegoodparty/omni`. Verify the GitHub App is installed on that repo",
       );
       process.exit(1);
     }
