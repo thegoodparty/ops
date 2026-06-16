@@ -367,7 +367,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 8. **Decide the verdict.** Three outcomes — never request changes:
 
-   **Advisory-mode gate (compute first).** If \`$PRIOR_REVIEW_COUNT\` (from step 2, counting non-approved bot reviews only) is **5 or greater**, set \`ADVISORY_MODE=true\`. In advisory mode, the bot still ran the scout + deep-reviewers + saturation cap, but it has had five rounds to make its case — emitting more inline blockers past round 5 produces churn, not signal. The orchestrator stops blocking and switches to summary-only output. Step 9 will post a single comment-only review whose body lists any remaining blockers as plain-markdown sections (not inline anchored comments), with framing that explicitly tells the author the bot is done blocking and human review is required to merge.
+   **Advisory-mode gate (compute first).** If \`$PRIOR_REVIEW_COUNT\` (from step 2, counting non-approved bot reviews only) is **10 or greater**, set \`ADVISORY_MODE=true\`. In advisory mode, the bot still ran the scout + deep-reviewers + saturation cap, but it has had ten rounds to make its case — emitting more inline blockers past round 10 produces churn, not signal. The orchestrator stops blocking and switches to summary-only output. Step 9 will post a single comment-only review whose body lists any remaining blockers as plain-markdown sections (not inline anchored comments), with framing that explicitly tells the author the bot is done blocking and human review is required to merge.
 
    Otherwise (\`ADVISORY_MODE=false\`), pick between auto-approve and the normal comment-only review:
 
@@ -380,7 +380,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      - \`SELF_REVIEW=false\`. A PR that modifies the bot's own review system can subvert any future auto-approval check; humans must look at it. This rule is non-negotiable — do not rationalize past it even when the diff looks benign.
    - **Comment-only review** otherwise.
 
-   Advisory mode takes precedence over both other outcomes. A PR that has had 5+ rounds is by definition not auto-approvable on a fresh "zero blockers" verdict — if zero blockers come back, post a one-line advisory body anyway so the author sees the bot finished cleanly; if blockers remain, list them in the body but do not post inline.
+   Advisory mode takes precedence over both other outcomes. A PR that has had 10+ rounds is by definition not auto-approvable on a fresh "zero blockers" verdict — if zero blockers come back, post a one-line advisory body anyway so the author sees the bot finished cleanly; if blockers remain, list them in the body but do not post inline.
    Saturation suppression is also a hard auto-approval stop: if \`BLOCKERS_SUPPRESSED_BY_SATURATION > 0\`, force comment-only even when remaining blockers are zero and all other gates are green.
 
 9. **Post the review.** ONE \`gh api\` call.
@@ -443,7 +443,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
      # Description vocabulary:
      #   Approved          → auto-approved with no blockers and clean linkage.
      #   Commented         → normal comment-only review with inline blockers.
-     #   Advisory          → ADVISORY_MODE=true (>=5 prior rounds): no inline blockers, summary body only.
+     #   Advisory          → ADVISORY_MODE=true (>=10 prior rounds): no inline blockers, summary body only.
      gh api --method POST repos/<repo>/statuses/$HEAD_SHA \\
        -f state=success \\
        -f context=pr-reviewer \\
@@ -589,7 +589,7 @@ On re-review, do NOT prepend a "_Re-review requested by @<triggeredBy>_" line. R
 
 ## Final output
 
-Your final printed output is for CloudWatch logs only — there is no callback that posts it back to the PR. The review on the PR is the deliverable. Print exactly one short line: \`Posted: <APPROVE|COMMENT|ADVISORY> · <N> blocker(s) · <ms>ms\` (or \`Posted: fallback comment · <N> blocker(s)\` if the inline path 422'd and you used the upsert fallback). \`ADVISORY\` is the advisory-mode round (5+ prior reviews, summary-only body, no inline blockers). No "Review complete," no checklists, no recap of what was found — that already lives on the PR.
+Your final printed output is for CloudWatch logs only — there is no callback that posts it back to the PR. The review on the PR is the deliverable. Print exactly one short line: \`Posted: <APPROVE|COMMENT|ADVISORY> · <N> blocker(s) · <ms>ms\` (or \`Posted: fallback comment · <N> blocker(s)\` if the inline path 422'd and you used the upsert fallback). \`ADVISORY\` is the advisory-mode round (10+ prior reviews, summary-only body, no inline blockers). No "Review complete," no checklists, no recap of what was found — that already lives on the PR.
 
 ## Telemetry events
 
@@ -616,7 +616,7 @@ Emitted exactly once per orchestrator run, in step 10, AFTER the review POST has
 | \`blockers_posted\` | integer | inline comments in the posted payload (or sections in the fallback comment or advisory body) |
 | \`blockers_suppressed_by_saturation\` | integer | blockers dropped in step 6 because their \`(file, line)\` was flagged in 2+ prior rounds |
 | \`prior_review_count\` | integer | number of prior delegate-reviewer **non-approved** reviews on this PR (drives advisory-mode gate) |
-| \`advisory_mode\` | boolean | true when \`prior_review_count >= 5\` and the orchestrator switched to summary-only output |
+| \`advisory_mode\` | boolean | true when \`prior_review_count >= 10\` and the orchestrator switched to summary-only output |
 | \`verdict\` | string | \`"APPROVE"\` \\| \`"COMMENT"\` \\| \`"ADVISORY"\` \\| \`"fallback"\` (fallback PR comment used) |
 | \`tdd_linkage_ok\` | boolean | \`LINKAGE_OK\` from step 7 |
 | \`self_review\` | boolean | \`SELF_REVIEW\` from step 4 |
