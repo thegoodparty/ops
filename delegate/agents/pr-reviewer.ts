@@ -39,7 +39,7 @@ This split intentionally trades a small amount of latency and cost for higher si
 
 You aggregate the deep-reviewers' findings into a single coherent review.
 
-On a re-review, additionally reconcile with the bot's prior review state on this PR: resolve stale threads, leave still-valid threads alone, pass the most recent prior review body to the scout and deep-reviewers as continuity context, and post only net-new findings.
+On a re-review, additionally reconcile with the bot's prior review state on this PR: resolve threads GitHub marks outdated, resolve threads the current code has addressed or made inapplicable, leave still-valid threads alone, pass the most recent prior review body to the scout and deep-reviewers as continuity context, and post only net-new findings.
 
 ## Workflow
 
@@ -151,7 +151,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
          gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id } } }' -F id="$THREAD_ID"
 
-   - **Still-anchored → skip-list.** Keep the \`(path, line, body)\` triples of threads where \`isOutdated\` is false. These are the already-posted findings; the dedup step below uses them to suppress duplicates. Pass this list along to the deep-reviewers indirectly — the orchestrator dedupes at aggregation time.
+   - **Still-anchored → prior-thread set.** For each thread where \`isOutdated\` is false, keep its \`(id, path, line, body)\` plus whether the author replied with "intentional" / "by design" / "won't fix" pushback (any non-bot reply that disputes the finding). These are the already-posted findings. Step 6 uses this set twice: to suppress duplicate new findings, and — once the repo is checked out and the deep-reviewers have run — to resolve the threads whose underlying problem the current code has fixed. Keep the thread \`id\`; you need it to call the resolve mutation there.
 
    **Then fetch prior bot review metadata** so the scout and deep-reviewers can read the prior round's reasoning verbatim, and so steps 6 and 8 can apply the same-line saturation cap and the bounded-rounds advisory-mode switch. This is what prevents the bot from re-considering and re-emitting concerns it explicitly dropped last round (the "moving goalposts" failure mode) and from oscillating opposite recommendations on the same line across rounds.
 
@@ -210,7 +210,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    - \`isResolved=true\` + \`isOutdated=true\` → \`addressed\` (resolved AND the anchor code moved/changed = strong signal the author actually changed code)
    - \`isResolved=true\` + \`isOutdated=false\` → \`dismissed\` (resolved without code change = author disagreed or "won't fix")
-   - \`isResolved=false\` → \`pending\` (still open)
+   - \`isResolved=false\` → **defer; do NOT emit here.** Step 6 decides whether to resolve these still-open threads against the current code, and emits the final disposition there: \`addressed\` for the ones it resolves, \`pending\` for the ones it leaves open. Emitting \`pending\` now as well would double-count the same finding on the same head SHA.
 
    Threads without a finding-id marker are pre-instrumentation findings — skip them, we have no way to identify them.
 
@@ -228,7 +228,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
        --argjson outdated "$IS_OUTDATED" \\
        '{service_name:"delegate-reviewer",event:"disposition_updated",repo:$repo,pr_number:$pr,head_sha:$sha,finding_id:$fid,disposition:$disp,thread_resolved:$resolved,thread_outdated:$outdated}'
 
-   Emit unconditionally — disposition events are independent of the rest of the re-review reconciliation logic and don't gate any subsequent step. If the extraction grep fails for a malformed marker, skip that thread silently; never fail the review on a telemetry error.
+   Emit one event for each already-resolved thread classified above (the \`addressed\` and \`dismissed\` cases); the still-open threads are handled in step 6. Disposition events are independent of the rest of the re-review reconciliation logic and don't gate any subsequent step. If the extraction grep fails for a malformed marker, skip that thread silently; never fail the review on a telemetry error.
 
 3. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch. **Include submodules** — some repos vendor an \`ai-rules\` submodule that the deep-reviewer needs for \`ai-rules\`-category leads:
 
@@ -318,6 +318,15 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    When you drop a blocker for saturation, log it to stderr so the run trace shows the suppressed finding — useful for tuning the threshold later:
 
      echo "Suppressed (saturated anchor, $PRIOR_COUNT prior rounds): \$PATH:\$LINE — \$BRIEF_TITLE" >&2
+
+   **On re-review only: resolve prior threads the current code has addressed.** For each thread in the still-anchored prior-thread set from step 2, decide whether the specific problem its first comment described still exists in the *current* checked-out code at \`$WORK\`. Open the file at \`path\` and read around \`line\` — judge against the actual code, not against whether a deep-reviewer happened to re-flag it (a deep-reviewer not re-raising an anchor is NOT proof it was fixed).
+
+   - **Clearly fixed or no longer applicable → resolve.** If the author changed the code to address the finding, or surrounding changes made the original concern moot, resolve the thread. Ignore per-thread failures:
+
+         gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { id } } }' -F id="$THREAD_ID"
+
+     Log each one to stderr: \`echo "Resolved (addressed by current code): \$PATH:\$LINE" >&2\`. If the resolved thread's first comment carries a \`<!-- delegate-finding-id: <uuid> -->\` marker, also emit a \`disposition_updated\` event for it (same shape as step 2) with \`disposition=addressed\` and \`thread_resolved=true\` — this is the final disposition step 2 deferred for still-open threads.
+   - **Still present, uncertain, or author pushback → leave open.** If the problem still exists, you cannot tell with confidence, or the author replied with "intentional" / "by design" / "won't fix", leave the thread untouched, and (if it carries a finding-id marker) emit a \`disposition_updated\` event with \`disposition=pending\` and \`thread_resolved=false\` — the disposition step 2 deferred. Bias hard toward leaving open: wrongly resolving a still-valid blocker lets a real bug ship, which is far worse than a stale comment a human resolves in one click. A "won't fix" disposition is the human reviewer's call, not the bot's.
 
    The remaining findings (zero or more blockers) are the inline-comment set for a comment-only review — unless the advisory-mode gate in step 8 fires, in which case they will instead be consolidated into the review body.
 
