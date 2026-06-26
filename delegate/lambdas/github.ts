@@ -35,6 +35,19 @@ const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 const RE_REVIEW_TRIGGER =
   /^\s*(?:delegate[ \t]+review|\/delegate-review)\s*$/im;
 
+// Repos that ALSO get the parallel, non-blocking security pass
+// (delegate/agents/security-scanner). Kept separate from REVIEW_REPOS so the
+// security review can be onboarded per-repo independently. Additionally gated on
+// the SECURITY_APP_PRIVATE_KEY secret in handleGithub, so this list stays inert
+// until the dedicated Delegate Security App is provisioned + installed.
+const SECURITY_REVIEW_REPOS = new Set(["omni"]);
+
+// Distinct trigger from `delegate review` (which fires pr-reviewer only). The
+// full-line anchor means "delegate security review" never matches the
+// pr-reviewer trigger above and vice-versa, so the two passes never collide.
+const RE_SECURITY_REVIEW_TRIGGER =
+  /^\s*delegate[ \t]+security[ \t]+review\s*$/im;
+
 const UNAUTHORIZED = { statusCode: 401, body: "unauthorized" };
 const OK = { statusCode: 200, body: "ok" };
 
@@ -100,6 +113,82 @@ export const shouldDispatchReReview = (
   if (!RE_REVIEW_TRIGGER.test(p.comment.body ?? "")) return false;
   if (!REVIEW_REPOS.has(p.repository.name ?? "")) return false;
   return true;
+};
+
+// `delegate security review` comment on a security-enabled repo's PR → re-run
+// the security pass only (diff-scoped to the current head). Independent of the
+// pr-reviewer re-review path above.
+export const shouldDispatchSecurityReReview = (
+  eventType: string | undefined,
+  payload: unknown,
+): payload is IssueCommentPayload => {
+  if (eventType !== "issue_comment") return false;
+  const p = payload as Partial<IssueCommentPayload>;
+  if (!p?.issue || !p?.comment || !p?.repository) return false;
+  if (p.action !== "created") return false;
+  if (!p.issue.pull_request) return false;
+  if (p.issue.state !== "open") return false;
+  if (!RE_SECURITY_REVIEW_TRIGGER.test(p.comment.body ?? "")) return false;
+  if (!SECURITY_REVIEW_REPOS.has(p.repository.name ?? "")) return false;
+  return true;
+};
+
+// Fires the security-scanner agent — a SEPARATE Fargate task from pr-reviewer,
+// so the two run in parallel and never share state. The agent posts its own
+// pending status + resolves the head SHA itself, so the lambda stays lean (no
+// eyes-reaction / status pre-post here).
+const dispatchSecurityScan = async (
+  repoFullName: string,
+  pr: {
+    number: number;
+    html_url: string;
+    title: string;
+    user: { login: string };
+    base?: { ref: string };
+    head?: { sha: string };
+  },
+  deliveryId: string | undefined,
+  opts?: { reReview?: boolean; triggeredBy?: string },
+) => {
+  const { taskArn } = await dispatch({
+    agent: "security-scanner",
+    message: `<pr>
+  <repo>${esc(repoFullName)}</repo>
+  <number>${pr.number}</number>
+  <url>${esc(pr.html_url)}</url>
+  <title>${esc(pr.title)}</title>
+  <author>${esc(pr.user.login)}</author>${
+    pr.base ? `\n  <baseRef>${esc(pr.base.ref)}</baseRef>` : ""
+  }${pr.head ? `\n  <headSha>${esc(pr.head.sha)}</headSha>` : ""}${
+    opts?.reReview ? `\n  <reReview>true</reReview>` : ""
+  }${
+    opts?.triggeredBy
+      ? `\n  <triggeredBy>${esc(opts.triggeredBy)}</triggeredBy>`
+      : ""
+  }
+</pr>`,
+    metadata: {
+      source: "github",
+      repo: repoFullName,
+      prNumber: String(pr.number),
+      author: pr.user.login,
+      ...(opts?.reReview
+        ? { reReview: "true", triggeredBy: opts.triggeredBy ?? "" }
+        : {}),
+      deliveryId: deliveryId ?? "",
+    },
+  });
+
+  console.log(
+    JSON.stringify({
+      event: "github_security_scan_dispatched",
+      repo: repoFullName,
+      prNumber: pr.number,
+      reReview: opts?.reReview ?? false,
+      taskArn,
+      deliveryId,
+    }),
+  );
 };
 
 const dispatchPullRequest = async (
@@ -390,14 +479,46 @@ export const handleGithub = async (
     return { statusCode: 400, body: "invalid json" };
   }
 
+  // The security pass is inert until the dedicated Delegate Security App key is
+  // provisioned — safe to ship this code with SECURITY_REVIEW_REPOS populated.
+  const securityKeyPresent = Boolean(secrets["SECURITY_APP_PRIVATE_KEY"]);
+
   try {
     if (shouldDispatch(eventType, payload)) {
       await dispatchPullRequest(payload, deliveryId);
+      // Parallel, non-blocking security pass — a SEPARATE Fargate task that
+      // never touches the pr-reviewer run above.
+      if (
+        SECURITY_REVIEW_REPOS.has(payload.repository.name) &&
+        securityKeyPresent
+      ) {
+        await dispatchSecurityScan(
+          payload.repository.full_name,
+          payload.pull_request,
+          deliveryId,
+        );
+      }
     } else if (shouldDispatchReReview(eventType, payload)) {
       await dispatchReReview(
         payload,
         deliveryId,
         secrets["REVIEWER_APP_PRIVATE_KEY"],
+      );
+    } else if (
+      shouldDispatchSecurityReReview(eventType, payload) &&
+      securityKeyPresent
+    ) {
+      await dispatchSecurityScan(
+        payload.repository.full_name,
+        {
+          number: payload.issue.number,
+          html_url:
+            payload.issue.pull_request?.html_url ?? payload.issue.html_url,
+          title: payload.issue.title,
+          user: payload.issue.user,
+        },
+        deliveryId,
+        { reReview: true, triggeredBy: payload.comment.user.login },
       );
     } else {
       console.log(

@@ -3,7 +3,11 @@ import { execFileSync } from "node:child_process";
 import { WebClient } from "@slack/web-api";
 import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
-import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
+import {
+  setupGitHubAuth,
+  setupReviewerGitHubAuth,
+  setupSecurityGitHubAuth,
+} from "./github-auth";
 
 // Workflow agents (PRD-to-code) need the runbooks repo on disk and the
 // ClickUp credentials in env. Framework agents (slack-responder, pr-reviewer)
@@ -56,6 +60,7 @@ const main = async () => {
 
   await setupGitHubAuth();
   await setupReviewerGitHubAuth();
+  await setupSecurityGitHubAuth();
 
   const needsRunbooks = isWorkflowAgent(job.agent);
   // Runbooks now live in omni at packages/runbooks. Clone omni with a
@@ -144,6 +149,24 @@ const main = async () => {
       console.log(
         "pr-reviewer: REVIEWER_GITHUB_TOKEN missing — comment-only mode",
       );
+    }
+  }
+
+  // The security pass MUST post under its own App identity (distinct login) so
+  // pr-reviewer — which reconciles only reviews/threads authored by its own bot
+  // login — never touches it. If the token isn't present (key not provisioned),
+  // abort rather than post as the default delegate App, which WOULD interfere.
+  // The lambda only dispatches this agent when the key exists, so this is a
+  // belt-and-suspenders guard.
+  if (job.agent === "security-scanner") {
+    if (process.env.SECURITY_GITHUB_TOKEN) {
+      process.env.GITHUB_TOKEN = process.env.SECURITY_GITHUB_TOKEN;
+      console.log("security-scanner: using security GitHub App token");
+    } else {
+      console.error(
+        "security-scanner: SECURITY_GITHUB_TOKEN missing — refusing to post under the wrong identity; aborting",
+      );
+      process.exit(1);
     }
   }
 
