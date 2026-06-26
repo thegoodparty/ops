@@ -99,6 +99,22 @@ export const shouldDispatch = (
   return true;
 };
 
+// Mirrors shouldDispatch but gates on SECURITY_REVIEW_REPOS, so a repo gets the
+// security pass on open independently of REVIEW_REPOS membership — a repo can be
+// security-only. Evaluated alongside (not nested under) shouldDispatch.
+export const shouldDispatchSecurity = (
+  eventType: string | undefined,
+  payload: unknown,
+): payload is PullRequestPayload => {
+  if (eventType !== "pull_request") return false;
+  const p = payload as Partial<PullRequestPayload>;
+  if (!p?.pull_request || !p?.repository) return false;
+  if (!DISPATCH_ACTIONS.has(p.action ?? "")) return false;
+  if (p.pull_request.draft) return false;
+  if (!SECURITY_REVIEW_REPOS.has(p.repository.name ?? "")) return false;
+  return true;
+};
+
 export const shouldDispatchReReview = (
   eventType: string | undefined,
   payload: unknown,
@@ -479,23 +495,43 @@ export const handleGithub = async (
     return { statusCode: 400, body: "invalid json" };
   }
 
-  // The security pass is inert until the dedicated Delegate Security App key is
-  // provisioned — safe to ship this code with SECURITY_REVIEW_REPOS populated.
-  const securityKeyPresent = Boolean(secrets["SECURITY_APP_PRIVATE_KEY"]);
+  // Inert until the security App is FULLY provisioned. The worker mints the
+  // token from all three values, so gate dispatch on all three (a partial
+  // provision must not dispatch a task the worker will then abort).
+  const securityConfigured = Boolean(
+    secrets["SECURITY_APP_PRIVATE_KEY"] &&
+      secrets["SECURITY_APP_ID"] &&
+      secrets["SECURITY_INSTALLATION_ID"],
+  );
 
   try {
-    if (shouldDispatch(eventType, payload)) {
-      await dispatchPullRequest(payload, deliveryId);
-      // Parallel, non-blocking security pass — a SEPARATE Fargate task that
-      // never touches the pr-reviewer run above.
-      if (
-        SECURITY_REVIEW_REPOS.has(payload.repository.name) &&
-        securityKeyPresent
-      ) {
+    if (eventType === "pull_request") {
+      // pr-reviewer and the security pass are independent: a repo can be in
+      // REVIEW_REPOS, SECURITY_REVIEW_REPOS, or both. Evaluate each gate on its
+      // own so a security-only repo still gets the pass on open.
+      const prGate = shouldDispatch(eventType, payload);
+      const secGate = shouldDispatchSecurity(eventType, payload);
+      // Call the guards inline below so payload narrows for the dispatch calls
+      // (the consts above are plain booleans used only for the skip check).
+      if (shouldDispatch(eventType, payload)) {
+        await dispatchPullRequest(payload, deliveryId);
+      }
+      if (shouldDispatchSecurity(eventType, payload) && securityConfigured) {
+        // Parallel, non-blocking — a SEPARATE Fargate task that never touches
+        // the pr-reviewer run.
         await dispatchSecurityScan(
           payload.repository.full_name,
           payload.pull_request,
           deliveryId,
+        );
+      }
+      if (!prGate && !secGate) {
+        console.log(
+          JSON.stringify({
+            event: "github_webhook_skipped",
+            eventType,
+            deliveryId,
+          }),
         );
       }
     } else if (shouldDispatchReReview(eventType, payload)) {
@@ -506,7 +542,7 @@ export const handleGithub = async (
       );
     } else if (
       shouldDispatchSecurityReReview(eventType, payload) &&
-      securityKeyPresent
+      securityConfigured
     ) {
       await dispatchSecurityScan(
         payload.repository.full_name,

@@ -144,12 +144,12 @@ It posts under its **own GitHub App identity** (a third App, separate from the d
 
 ### Enable / onboard a repo
 
-The code is inert until the App is provisioned — `delegate/lambdas/github.ts` gates dispatch on the `SECURITY_APP_PRIVATE_KEY` secret. To turn it on:
+The code is inert until the App is **fully** provisioned — `delegate/lambdas/github.ts` gates dispatch on all three values below being present in the secret, so a partial provision dispatches nothing (rather than failing tasks). To turn it on:
 
 1. **Register a "Delegate Security" GitHub App** in the org. Permissions: Contents `Read`, Pull requests `Read & write`, Commit statuses `Read & write`. Subscribe to no events (the existing webhook drives dispatch). Generate a private key.
 2. **Install** the App on the target repo(s).
-3. **Provision** in the `DELEGATES` secret / task env: `SECURITY_APP_ID`, `SECURITY_INSTALLATION_ID`, `SECURITY_APP_PRIVATE_KEY`.
-4. **Add the repo** to `SECURITY_REVIEW_REPOS` in `delegate/lambdas/github.ts` (already seeded with `omni`).
+3. **Provision all three in the `DELEGATES` secret**: `SECURITY_APP_ID`, `SECURITY_INSTALLATION_ID`, `SECURITY_APP_PRIVATE_KEY`. The lambda reads them from the secret to gate dispatch; the worker reads the same three (injected as env from that secret) to mint the App token.
+4. **Add the repo** to `SECURITY_REVIEW_REPOS` in `delegate/lambdas/github.ts` (already seeded with `omni`). This is independent of `REVIEW_REPOS` — a repo can get the security pass without the main review.
 
 Onboarding another repo later = install the App there + add its name to `SECURITY_REVIEW_REPOS`. No other change.
 

@@ -149,7 +149,7 @@ A \`<pr>\` block: \`<repo>\`, \`<number>\`, \`<url>\`, \`<title>\`, \`<author>\`
 
 ## Flow
 
-1. **Resolve identity + post pending status.** Resolve YOUR bot login: \`BOT_LOGIN=$(gh api graphql -f query='{viewer{login}}' --jq '.data.viewer.login' 2>/dev/null)\`; if empty, fall back to \`delegate-security[bot]\`. Compute \`HEAD_SHA\` from \`<headSha>\`. Build a \`LOGS_URL\` to this run's CloudWatch stream (mirror the form pr-reviewer uses, \`$252Faws$252Fecs$252Fdelegate\`). Post a pending status:
+1. **Resolve identity + post pending status.** Resolve YOUR bot login: \`BOT_LOGIN=$(gh api graphql -f query='{viewer{login}}' --jq '.data.viewer.login' 2>/dev/null)\`; if empty, fall back to \`delegate-security[bot]\`. Resolve \`HEAD_SHA\`: use \`<headSha>\` when the message includes it (the open path); otherwise — the \`delegate security review\` re-trigger arrives as an issue_comment with no head SHA — fetch it: \`HEAD_SHA=$(gh api repos/<repo>/pulls/<num> --jq '.head.sha')\`. Without this the re-review's pending/terminal statuses would target an empty SHA. Build a \`LOGS_URL\` to this run's CloudWatch stream (mirror the form pr-reviewer uses, \`$252Faws$252Fecs$252Fdelegate\`). Post a pending status:
    \`gh api --method POST repos/<repo>/statuses/$HEAD_SHA -f state=pending -f context=security-review -f description='Security review in progress' -f target_url=$LOGS_URL\`
    If the PR is a draft, post a single \`event=COMMENT\` review saying the security pass runs on ready PRs and re-triggers on \`delegate security review\`, set the status to \`success\` ('skipped: draft'), and exit.
 
