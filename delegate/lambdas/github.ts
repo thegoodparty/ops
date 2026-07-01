@@ -20,6 +20,7 @@ const REVIEW_REPOS = new Set([
   "gp-data-loader",
   "gp-data-matcha",
   "candidate-sites",
+  "gp-marketing",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 
