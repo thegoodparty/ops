@@ -20,7 +20,7 @@ export const dispatch = async (job: AgentJob) => {
 
   if (!CLUSTER_ARN || !TASK_DEF_ARN || !SUBNET_IDS || !SECURITY_GROUP_ID) {
     throw new Error(
-      "Missing required env vars: CLUSTER_ARN, TASK_DEF_ARN, SUBNET_IDS, SECURITY_GROUP_ID"
+      "Missing required env vars: CLUSTER_ARN, TASK_DEF_ARN, SUBNET_IDS, SECURITY_GROUP_ID",
     );
   }
 
@@ -40,13 +40,14 @@ export const dispatch = async (job: AgentJob) => {
         containerOverrides: [
           {
             name: "agent",
-            environment: [
-              { name: "AGENT_JOB", value: JSON.stringify(job) },
-            ],
+            environment: [{ name: "AGENT_JOB", value: JSON.stringify(job) }],
           },
         ],
       },
       tags: [
+        // Attribute the Fargate task's cost to the ops project in Cost
+        // Explorer; the task def is tagged but RunTask tags aren't inherited.
+        { key: "Project", value: "ops" },
         { key: "agent", value: job.agent },
         ...(job.metadata
           ? Object.entries(job.metadata).map(([key, value]) => ({
@@ -55,7 +56,7 @@ export const dispatch = async (job: AgentJob) => {
             }))
           : []),
       ],
-    })
+    }),
   );
 
   const taskArn = result.tasks?.[0]?.taskArn;
