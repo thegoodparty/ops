@@ -42,6 +42,7 @@ export const runAgent = async (
   config: AgentConfig,
   message: string,
   cwd?: string,
+  abortController?: AbortController,
 ): Promise<AgentResult> => {
   const start = Date.now();
   let output = "";
@@ -53,6 +54,7 @@ export const runAgent = async (
   for await (const msg of query({
     prompt: message,
     options: {
+      abortController,
       systemPrompt: config.systemPrompt,
       model: config.model,
       mcpServers: config.mcpServers,

@@ -33,7 +33,7 @@ Slack @mention → Lambda (webhook handler) → ECS Fargate task → Claude Agen
 - `delegate/framework/` — Agent registry, execution engine, callback delivery, MCP config
 - `delegate/agents/` — Agent definitions (currently: `slack-responder` using claude-opus-4-6)
 - `delegate/lambdas/` — Lambda webhook handler with Slack signature verification, ECS dispatch
-- `delegate/worker/` — Fargate container entrypoint, GitHub App auth, Dockerfile
+- `delegate/worker/` — Fargate container entrypoint, GitHub App auth, Dockerfile. The entrypoint enforces a hard wall-clock deadline (`AGENT_DEADLINE_MS`, default 45m) that aborts the agent and exits the task — ECS has no native per-task timeout, and the SDK's `maxTurns`/`maxBudgetUsd` caps only fire between turns, so a hung tool call would otherwise run forever.
 - `delegate/tools/` — CLI tools available to agents (Databricks Genie)
 
 ### Adding a new agent

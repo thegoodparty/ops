@@ -12,13 +12,10 @@ const isWorkflowAgent = (name: string): boolean => name.endsWith("-agent");
 
 const CLICKUP_TEAM_ID = "90132012119";
 
-// Best-effort Slack post used to surface fatal boot-time failures back to
-// the user's thread. Returns silently on any failure — the process is
-// going to exit anyway.
-const reportBootFailure = async (
-  job: AgentJob | undefined,
-  message: string,
-) => {
+// Best-effort Slack post used to surface a fatal failure back to the user's
+// thread. Returns silently on any failure — the process is going to exit
+// anyway.
+const reportFatal = async (job: AgentJob | undefined, message: string) => {
   if (!job?.callback || job.callback.type !== "slack") return;
   const token = process.env.SLACK_BOT_TOKEN;
   if (!token) return;
@@ -27,7 +24,7 @@ const reportBootFailure = async (
     await slack.chat.postMessage({
       channel: job.callback.channel,
       thread_ts: job.callback.threadTs,
-      text: `:warning: Boot failure: ${message}. Re-mention me to retry.`,
+      text: `:warning: ${message}. Re-mention me to retry.`,
     });
   } catch {
     // intentionally silent — we're already exiting
@@ -54,6 +51,28 @@ const main = async () => {
     process.exit(1);
   }
 
+  // Hard wall-clock deadline. The agent's maxTurns/maxBudgetUsd caps only fire
+  // between turns, so a tool call that hangs (a Bash/gh/git subprocess that
+  // never returns) would otherwise run forever — the delegate cluster
+  // accumulated 10 zombie tasks (up to 5 weeks old) before this existed.
+  // Abort the SDK query on the deadline; if teardown itself wedges, the
+  // unref'd hard-exit timer fires. The blocking git clone below sets its own
+  // execFileSync timeout because a sync hang there would starve this timer.
+  const deadlineMs = Number(process.env.AGENT_DEADLINE_MS ?? 45 * 60 * 1000);
+  const abortController = new AbortController();
+  const deadline = setTimeout(() => {
+    console.error(`Agent exceeded ${deadlineMs}ms deadline — aborting`);
+    abortController.abort();
+    void reportFatal(
+      job,
+      `agent exceeded its ${Math.round(
+        deadlineMs / 60000,
+      )}-minute deadline and was stopped`,
+    );
+    setTimeout(() => process.exit(1), 10_000).unref();
+  }, deadlineMs);
+  deadline.unref();
+
   await setupGitHubAuth();
   await setupReviewerGitHubAuth();
 
@@ -79,20 +98,18 @@ const main = async () => {
           "--sparse",
           "--depth=1",
         ],
-        { stdio: "inherit" },
+        { stdio: "inherit", timeout: 120_000 },
       );
       execFileSync(
         "git",
         ["-C", omniDir, "sparse-checkout", "set", "packages/runbooks"],
-        { stdio: "inherit" },
+        { stdio: "inherit", timeout: 60_000 },
       );
-      const sha = execFileSync("git", [
-        "-C",
-        omniDir,
-        "rev-parse",
-        "--short",
-        "HEAD",
-      ])
+      const sha = execFileSync(
+        "git",
+        ["-C", omniDir, "rev-parse", "--short", "HEAD"],
+        { timeout: 30_000 },
+      )
         .toString()
         .trim();
       process.env.RUNBOOKS_DIR = runbooksDir;
@@ -100,18 +117,18 @@ const main = async () => {
       console.log(`Runbooks cloned at ${runbooksDir} (omni SHA ${sha})`);
     } catch (err) {
       console.error("Failed to clone omni:", err);
-      await reportBootFailure(
+      await reportFatal(
         job,
-        "could not clone `thegoodparty/omni`. Verify the GitHub App is installed on that repo",
+        "Boot failure: could not clone `thegoodparty/omni`. Verify the GitHub App is installed on that repo",
       );
       process.exit(1);
     }
 
     if (!process.env.CLICKUP_API_TOKEN) {
       console.error("CLICKUP_API_TOKEN environment variable not set");
-      await reportBootFailure(
+      await reportFatal(
         job,
-        "`CLICKUP_API_TOKEN` is missing from the DELEGATES secret",
+        "Boot failure: `CLICKUP_API_TOKEN` is missing from the DELEGATES secret",
       );
       process.exit(1);
     }
@@ -214,7 +231,8 @@ const main = async () => {
     }
   }
 
-  const result = await runAgent(config, message, job.cwd);
+  const result = await runAgent(config, message, job.cwd, abortController);
+  clearTimeout(deadline);
 
   console.log(`Agent completed in ${(result.durationMs / 1000).toFixed(1)}s`);
   console.log("Output:", result.output);
