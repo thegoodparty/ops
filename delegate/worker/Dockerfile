@@ -2,7 +2,7 @@ FROM node:22-alpine
 
 RUN apk add --no-cache git curl github-cli uv bash aws-cli jq ripgrep
 RUN curl -sL https://sentry.io/get-cli/ | sh
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code vercel
 
 WORKDIR /app
 COPY package*.json ./
