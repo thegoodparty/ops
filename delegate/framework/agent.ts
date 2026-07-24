@@ -60,6 +60,7 @@ export const runAgent = async (
       mcpServers: config.mcpServers,
       agents: config.agents,
       plugins: config.plugins,
+      settingSources: config.settingSources,
       allowedTools: config.allowedTools ?? [
         "mcp__*",
         "Read",

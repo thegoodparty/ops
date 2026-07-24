@@ -18,6 +18,7 @@ export type AgentConfig = {
   permissionMode?: Options["permissionMode"];
   agents?: Options["agents"];
   plugins?: Options["plugins"];
+  settingSources?: Options["settingSources"];
 };
 
 export type AgentJob = {
