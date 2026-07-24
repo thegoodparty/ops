@@ -28,6 +28,8 @@ On a **re-review** triggered by a \`delegate review\` (or legacy \`/delegate-rev
   <triggeredBy>swain</triggeredBy>
 </pr>
 
+The \`<headSha>\` in the message is context only — do NOT rely on it. The worker has already checked your working tree out to the authoritative head SHA and exported it as \`$REVIEW_HEAD_SHA\`; that env var is the SHA for this whole run (see step 1).
+
 ## Your job
 
 Produce a high-signal review covering correctness, security, test coverage, and repo conventions. You do this in two delegated phases:
@@ -60,7 +62,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
      META=$(gh pr view <num> --repo <repo> --json headRefOid,baseRefName,isDraft)
      IS_DRAFT=$(jq -r '.isDraft' <<< "$META")
-     HEAD_SHA=$(jq -r '.headRefOid' <<< "$META")  # use this if input <headSha> was omitted
+     HEAD_SHA="$REVIEW_HEAD_SHA"  # AUTHORITATIVE: the exact SHA the worker checked your tree out to. Use it for the debounce check, every status post, and the review commit_id. Do NOT derive HEAD_SHA from gh pr view — that follows the live tip and can drift from your checked-out tree, which is what caused reviews to attach to commits nobody read.
      BASE_REF=$(jq -r '.baseRefName' <<< "$META")  # use this if input <baseRef> was omitted
 
    Resolve the reviewing bot login up front so both step 1's debounce check and step 2's re-review reconciliation use the same identity:
@@ -454,6 +456,14 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    Use the same \`context=pr-reviewer\` string every time — GitHub keys by context, so this replaces the earlier \`pending\` status rather than adding a second check. Never use \`state=error\` — reserve that for infra failures outside the agent's responsibility.
 
+## Guard: confirm the tip hasn't moved before approving
+
+Your tree, diff, and findings are all pinned to \`$REVIEW_HEAD_SHA\`. A push can land on the PR while you review. Right before posting, re-read the live head:
+
+  LIVE_HEAD=$(gh pr view <num> --repo <repo> --json headRefOid --jq '.headRefOid')
+
+If \`LIVE_HEAD\` != \`$REVIEW_HEAD_SHA\`, the PR was pushed to during your review. You reviewed an older tree, so you must NOT approve: force the verdict to comment-only regardless of findings, and say in the body that the tip moved (\`$REVIEW_HEAD_SHA\` → \`$LIVE_HEAD\`) so a re-review is needed. Still post against \`commit_id: $REVIEW_HEAD_SHA\` — that's the tree you actually reviewed.
+
 ## Posting the review
 
 Build the comments array as JSON, then post a single review via the GitHub API. Write the payload to a unique tmp file so concurrent runs do not collide. The worker image uses BusyBox \`mktemp\` (no \`--suffix\` flag — just call \`mktemp\` plain; the filename extension does not matter, only the contents do):
@@ -462,10 +472,13 @@ Build the comments array as JSON, then post a single review via the GitHub API. 
   # ...write payload JSON to "$PAYLOAD"...
   gh api --method POST repos/<owner>/<repo>/pulls/<num>/reviews --input "$PAYLOAD"
 
+Every payload MUST set \`"commit_id": "<HEAD_SHA>"\` (your authoritative \`$REVIEW_HEAD_SHA\`). Omitting it makes GitHub attach the review to whatever the live tip is at post time — which is exactly how an APPROVE can land on commits you never read.
+
 Auto-approve payload:
 
   {
     "event": "APPROVE",
+    "commit_id": "<HEAD_SHA>",
     "body": "<auto-approve body>",
     "comments": []
   }
@@ -474,6 +487,7 @@ Comment-only payload:
 
   {
     "event": "COMMENT",
+    "commit_id": "<HEAD_SHA>",
     "body": "<comment-only body>",
     "comments": [
       { "path": "src/foo.ts", "line": 42, "side": "RIGHT", "body": "..." },

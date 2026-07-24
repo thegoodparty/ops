@@ -119,29 +119,35 @@ const main = async () => {
     }
 
     const reviewDir = process.env.REVIEW_DIR ?? "/app/review";
+    // Dispatch-time SHA is only a fallback for the failure-status post below.
+    // The checkout itself pins to the *live* PR head resolved at boot — a
+    // stale or force-pushed-away dispatch SHA isn't reachable from
+    // refs/pull/<n>/head and would fail to check out.
+    let headSha = job.metadata?.headSha;
     try {
-      // On re-review the dispatch omits headSha — resolve the live PR head so
-      // the checkout is still pinned to an exact commit.
-      let headSha = job.metadata?.headSha;
-      if (!headSha) {
-        headSha = execFileSync(
-          "gh",
-          [
-            "pr",
-            "view",
-            prNumber,
-            "--repo",
-            repoFullName,
-            "--json",
-            "headRefOid",
-            "--jq",
-            ".headRefOid",
-          ],
-          { timeout: 30_000 },
-        )
-          .toString()
-          .trim();
-      }
+      // Resolve the live PR head and make it the single authoritative SHA for
+      // the whole run: the tree is checked out to it, and the agent pins its
+      // diff, status posts, and review commit_id to it (via REVIEW_HEAD_SHA).
+      // Keeping the reviewed tree, the diff, and the posted verdict on one
+      // commit is what stops a mid-run push from landing an approval on
+      // commits nobody reviewed.
+      headSha = execFileSync(
+        "gh",
+        [
+          "pr",
+          "view",
+          prNumber,
+          "--repo",
+          repoFullName,
+          "--json",
+          "headRefOid",
+          "--jq",
+          ".headRefOid",
+        ],
+        { timeout: 30_000 },
+      )
+        .toString()
+        .trim();
 
       // Shallow-clone the base repo, fetch the PR head ref, then check out the
       // exact SHA. Going through refs/pull/<n>/head is reliable even for fork
@@ -175,11 +181,42 @@ const main = async () => {
         { stdio: "inherit", timeout: 120_000 },
       );
       cwd = reviewDir;
+      process.env.REVIEW_HEAD_SHA = headSha;
       console.log(
         `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,
       );
     } catch (err) {
       console.error("Failed to check out PR for pr-reviewer:", err);
+      // The re-review lambda already flipped the pr-reviewer check to pending;
+      // exiting silently would leave it stuck. Post a best-effort error status
+      // (state=error — a boot/infra failure, not a review verdict) so the
+      // check resolves. Prefer the reviewer App token (it owns the pending
+      // status); fall back to the delegate token.
+      const token =
+        process.env.REVIEWER_GITHUB_TOKEN ?? process.env.GITHUB_TOKEN;
+      if (headSha && token) {
+        try {
+          await fetch(
+            `https://api.github.com/repos/${repoFullName}/statuses/${headSha}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                state: "error",
+                context: "pr-reviewer",
+                description: "Review boot failed: could not check out the PR",
+              }),
+            },
+          );
+        } catch (statusErr) {
+          console.error("Failed to post checkout-failure status:", statusErr);
+        }
+      }
       process.exit(1);
     }
   }
