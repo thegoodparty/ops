@@ -230,12 +230,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    Emit one event for each already-resolved thread classified above (the \`addressed\` and \`dismissed\` cases); the still-open threads are handled in step 6. Disposition events are independent of the rest of the re-review reconciliation logic and don't gate any subsequent step. If the extraction grep fails for a malformed marker, skip that thread silently; never fail the review on a telemetry error.
 
-3. **Gather context.** Clone the repo to a unique tmp dir (concurrent runs must not collide) and check out the PR branch. **Include submodules** — some repos vendor an \`ai-rules\` submodule that the deep-reviewer needs for \`ai-rules\`-category leads:
-
-     WORK=$(mktemp -d)
-     git clone --recurse-submodules --depth 50 https://github.com/<repo>.git "$WORK"
-     cd "$WORK"
-     gh pr checkout <num>
+3. **Gather context.** The PR's repo is ALREADY checked out for you in your current working directory, pinned to the exact head SHA under review, with submodules synced (the \`ai-rules\` submodule some repos vendor is present for \`ai-rules\`-category leads). Do NOT clone or \`gh pr checkout\` — just work in place (\`pwd\` shows the checkout). \`git rev-parse HEAD\` is the reviewed SHA.
 
    Read the repo's root \`CLAUDE.md\` — authoritative for conventions. Read any \`CLAUDE.md\` files in directories touched by the PR. Read the PR body and prior comments:
 
@@ -266,9 +261,9 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    ### 5a. Spawn the scout
 
-   Use the Task tool to spawn a single \`scout\` subagent. Pass this prompt, **substituting the concrete values for \`<num>\`, \`<repo>\`, and \`<WORK>\`** — do not pass the literal angle-bracket placeholders. On re-review with a non-empty \`$PRIOR_REVIEW_BODY\`, append the prior-review block before the closing tag:
+   Use the Task tool to spawn a single \`scout\` subagent. Pass this prompt, **substituting the concrete values for \`<num>\` and \`<repo>\`** — do not pass the literal angle-bracket placeholders. On re-review with a non-empty \`$PRIOR_REVIEW_BODY\`, append the prior-review block before the closing tag:
 
-     You are scouting PR <num> in repo <repo>. The PR branch is checked out at <WORK>. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), skim touched files in context, and emit 3–10 investigation leads per your output contract.
+     You are scouting PR <num> in repo <repo>. The PR is already checked out in your current working directory, pinned to the reviewed head SHA. Read the root CLAUDE.md, read the diff (gh pr diff <num> --repo <repo>), skim touched files in context, and emit 3–10 investigation leads per your output contract.
 
      <prior_review>
      <!-- the full block built in step 2: <body>...</body> followed by <threads>...</threads> with author replies on threads that have them. If there are no author replies, the <threads> block is omitted and only <body> is present. -->
@@ -282,9 +277,9 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    Spawn one \`deep-reviewer\` subagent **per scout lead, in parallel** — send all of the Task calls in a single message. Wall time is bounded by the slowest deep-reviewer, typically 60–180s. There is no upper limit on parallelism enforced by the orchestrator; the scout caps itself at 10 leads, which is the practical bound.
 
-   Pass each deep-reviewer this prompt, substituting concrete values for \`<num>\`, \`<repo>\`, \`<WORK>\`, and the lead-specific fields. On re-review, append the same \`<prior_review>\` block as the scout's prompt:
+   Pass each deep-reviewer this prompt, substituting concrete values for \`<num>\`, \`<repo>\`, and the lead-specific fields. On re-review, append the same \`<prior_review>\` block as the scout's prompt:
 
-     You are deep-reviewing one lead from the scout's pass on PR <num> in repo <repo>. The PR branch is checked out at <WORK>. Read the cited paths in full, apply your category lens, run the disprove-it pass, and return findings per your output contract.
+     You are deep-reviewing one lead from the scout's pass on PR <num> in repo <repo>. The PR is already checked out in your current working directory, pinned to the reviewed head SHA. Read the cited paths in full, apply your category lens, run the disprove-it pass, and return findings per your output contract.
 
      <lead>
      <area>{{lead.area}}</area>
@@ -319,7 +314,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
      echo "Suppressed (saturated anchor, $PRIOR_COUNT prior rounds): \$PATH:\$LINE — \$BRIEF_TITLE" >&2
 
-   **On re-review only: resolve prior threads the current code has addressed.** For each thread in the still-anchored prior-thread set from step 2, decide whether the specific problem its first comment described still exists in the *current* checked-out code at \`$WORK\`. Open the file at \`path\` and read around \`line\` — judge against the actual code, not against whether a deep-reviewer happened to re-flag it (a deep-reviewer not re-raising an anchor is NOT proof it was fixed).
+   **On re-review only: resolve prior threads the current code has addressed.** For each thread in the still-anchored prior-thread set from step 2, decide whether the specific problem its first comment described still exists in the *current* checked-out code in your working directory. Open the file at \`path\` and read around \`line\` — judge against the actual code, not against whether a deep-reviewer happened to re-flag it (a deep-reviewer not re-raising an anchor is NOT proof it was fixed).
 
    - **Clearly fixed or no longer applicable → resolve.** If the author changed the code to address the finding, or surrounding changes made the original concern moot, resolve the thread. Ignore per-thread failures:
 
