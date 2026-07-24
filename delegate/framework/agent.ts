@@ -59,6 +59,8 @@ export const runAgent = async (
       model: config.model,
       mcpServers: config.mcpServers,
       agents: config.agents,
+      plugins: config.plugins,
+      settingSources: config.settingSources,
       allowedTools: config.allowedTools ?? [
         "mcp__*",
         "Read",
@@ -68,6 +70,7 @@ export const runAgent = async (
         "Glob",
         "Grep",
         "Task",
+        "Skill",
       ],
       maxTurns: config.maxTurns ?? 50,
       maxBudgetUsd: config.maxBudgetUsd ?? 5,

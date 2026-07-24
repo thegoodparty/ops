@@ -17,6 +17,8 @@ export type AgentConfig = {
   maxBudgetUsd?: number;
   permissionMode?: Options["permissionMode"];
   agents?: Options["agents"];
+  plugins?: Options["plugins"];
+  settingSources?: Options["settingSources"];
 };
 
 export type AgentJob = {

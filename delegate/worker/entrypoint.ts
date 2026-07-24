@@ -76,6 +76,151 @@ const main = async () => {
   await setupGitHubAuth();
   await setupReviewerGitHubAuth();
 
+  // Working directory handed to the agent. The deterministic per-agent
+  // checkouts below set this so the agent boots with the repo already on disk
+  // — no mid-run clone latency, and (for pr-reviewer) every specialist reads
+  // the exact tree the review is reported against.
+  let cwd = job.cwd;
+
+  // slack-responder: full shallow checkout of omni@develop so the bot can read
+  // and grep the whole codebase immediately. develop is omni's default branch,
+  // so a depth-1 clone is "latest develop" for free. Best-effort — a clone
+  // failure still lets the bot answer non-code (Grafana/Sentry/Vercel)
+  // questions, so we log and continue rather than aborting the task.
+  if (job.agent === "slack-responder") {
+    const omniDir = process.env.OMNI_DIR ?? "/app/omni";
+    try {
+      execFileSync(
+        "gh",
+        ["repo", "clone", "thegoodparty/omni", omniDir, "--", "--depth=1"],
+        { stdio: "inherit", timeout: 180_000 },
+      );
+      cwd = omniDir;
+      console.log(`omni checked out at ${omniDir} (latest develop)`);
+    } catch (err) {
+      console.error("Failed to clone omni for slack-responder:", err);
+    }
+  }
+
+  // pr-reviewer: deterministic checkout of the PR's repo at the exact reviewed
+  // head SHA, so the reviewer and its specialists read one consistent tree
+  // instead of each cloning mid-run. Repo-agnostic (any REVIEW_REPOS repo).
+  // The opened/ready dispatch carries headSha; the `delegate review`
+  // re-review path omits it, so resolve the live head here. A failed checkout
+  // is fatal — the reviewer cannot review code it doesn't have.
+  if (job.agent === "pr-reviewer") {
+    const repoFullName = job.metadata?.repo;
+    const prNumber = job.metadata?.prNumber;
+    if (!repoFullName || !prNumber) {
+      console.error(
+        "pr-reviewer job missing repo/prNumber metadata; cannot check out",
+      );
+      process.exit(1);
+    }
+
+    const reviewDir = process.env.REVIEW_DIR ?? "/app/review";
+    // Dispatch-time SHA is only a fallback for the failure-status post below.
+    // The checkout itself pins to the *live* PR head resolved at boot — a
+    // stale or force-pushed-away dispatch SHA isn't reachable from
+    // refs/pull/<n>/head and would fail to check out.
+    let headSha = job.metadata?.headSha;
+    try {
+      // Resolve the live PR head and make it the single authoritative SHA for
+      // the whole run: the tree is checked out to it, and the agent pins its
+      // diff, status posts, and review commit_id to it (via REVIEW_HEAD_SHA).
+      // Keeping the reviewed tree, the diff, and the posted verdict on one
+      // commit is what stops a mid-run push from landing an approval on
+      // commits nobody reviewed.
+      headSha = execFileSync(
+        "gh",
+        [
+          "pr",
+          "view",
+          prNumber,
+          "--repo",
+          repoFullName,
+          "--json",
+          "headRefOid",
+          "--jq",
+          ".headRefOid",
+        ],
+        { timeout: 30_000 },
+      )
+        .toString()
+        .trim();
+
+      // Shallow-clone the base repo, fetch the PR head ref, then check out the
+      // exact SHA. Going through refs/pull/<n>/head is reliable even for fork
+      // PRs, whose head commit isn't on any base-repo branch. Submodules
+      // (e.g. the ai-rules submodule the deep-reviewer needs) are synced after
+      // the checkout so they match the PR's pinned state.
+      execFileSync(
+        "gh",
+        ["repo", "clone", repoFullName, reviewDir, "--", "--depth=50"],
+        { stdio: "inherit", timeout: 180_000 },
+      );
+      execFileSync(
+        "git",
+        [
+          "-C",
+          reviewDir,
+          "fetch",
+          "--depth=50",
+          "origin",
+          `refs/pull/${prNumber}/head`,
+        ],
+        { stdio: "inherit", timeout: 120_000 },
+      );
+      execFileSync("git", ["-C", reviewDir, "checkout", headSha], {
+        stdio: "inherit",
+        timeout: 60_000,
+      });
+      execFileSync(
+        "git",
+        ["-C", reviewDir, "submodule", "update", "--init", "--recursive"],
+        { stdio: "inherit", timeout: 120_000 },
+      );
+      cwd = reviewDir;
+      process.env.REVIEW_HEAD_SHA = headSha;
+      console.log(
+        `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,
+      );
+    } catch (err) {
+      console.error("Failed to check out PR for pr-reviewer:", err);
+      // The re-review lambda already flipped the pr-reviewer check to pending;
+      // exiting silently would leave it stuck. Post a best-effort error status
+      // (state=error — a boot/infra failure, not a review verdict) so the
+      // check resolves. Prefer the reviewer App token (it owns the pending
+      // status); fall back to the delegate token.
+      const token =
+        process.env.REVIEWER_GITHUB_TOKEN ?? process.env.GITHUB_TOKEN;
+      if (headSha && token) {
+        try {
+          await fetch(
+            `https://api.github.com/repos/${repoFullName}/statuses/${headSha}`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                state: "error",
+                context: "pr-reviewer",
+                description: "Review boot failed: could not check out the PR",
+              }),
+            },
+          );
+        } catch (statusErr) {
+          console.error("Failed to post checkout-failure status:", statusErr);
+        }
+      }
+      process.exit(1);
+    }
+  }
+
   const needsRunbooks = isWorkflowAgent(job.agent);
   // Runbooks now live in omni at packages/runbooks. Clone omni with a
   // partial + sparse checkout so only that subtree materializes — boot stays
@@ -231,7 +376,7 @@ const main = async () => {
     }
   }
 
-  const result = await runAgent(config, message, job.cwd, abortController);
+  const result = await runAgent(config, message, cwd, abortController);
   clearTimeout(deadline);
 
   console.log(`Agent completed in ${(result.durationMs / 1000).toFixed(1)}s`);

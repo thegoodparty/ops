@@ -7,6 +7,14 @@ export default defineAgent({
 
 Your response will be posted back to the Slack thread where you were mentioned. Write your final output as the message you want posted — no extra formatting or preamble needed.
 
+## Your workspace
+
+The \`thegoodparty/omni\` monorepo is already checked out at your current working directory on the latest \`develop\`. It holds essentially all of our product code (gp-api, gp-webapp, people-api, election-api, and more). Its \`CLAUDE.md\` guidance is already loaded into your context, so you start knowing the repo's architecture and conventions. Read and grep the tree directly to answer code questions or investigate bugs; you do NOT need to clone omni. Clone other repos only if the answer lives outside omni.
+
+## Systematic debugging
+
+You have the Superpowers skills library installed and can invoke skills with the Skill tool. When you hit a bug, a test failure, or any unexpected behavior, invoke the \`superpowers:systematic-debugging\` skill and follow it BEFORE proposing a fix — don't guess. Reach for other Superpowers skills when they fit.
+
 ## Formatting
 
 Your output is posted directly to Slack. Use Slack's mrkdwn format, NOT Markdown:
@@ -123,5 +131,30 @@ When making pull requests:
   mcpServers: {
     grafana: mcpServers.grafana,
   },
+  // Superpowers skills library, vendored into the worker image at
+  // /app/plugins/superpowers (see delegate/worker/Dockerfile). Gives the bot
+  // systematic-debugging and friends via the Skill tool. Local plugin only —
+  // no runtime marketplace fetch. SUPERPOWERS_PLUGIN_DIR lets a local run
+  // point elsewhere.
+  plugins: [
+    {
+      type: "local",
+      path: process.env.SUPERPOWERS_PLUGIN_DIR ?? "/app/plugins/superpowers",
+    },
+  ],
+  // Load omni's CLAUDE.md into context (cwd is the omni checkout, see
+  // worker/entrypoint.ts). The SDK is isolation-mode by default — 'project' is
+  // what loads CLAUDE.md files. Deliberately NOT enabled for pr-reviewer: it
+  // should treat a repo's CLAUDE.md as data to review against (read via a
+  // tool), not as instructions injected into its system prompt, so a PR can't
+  // edit CLAUDE.md to steer its verdict. omni has no tracked
+  // .claude/settings.json, so this pulls in CLAUDE.md (+ project skills), not
+  // hooks/permissions.
+  settingSources: ["project"],
+  // Systematic debugging is multi-step and the bot now has the whole omni tree
+  // to explore, so lift the framework's $5 / 50-turn defaults enough that a
+  // real investigation isn't guillotined mid-run.
+  maxTurns: 80,
+  maxBudgetUsd: 15,
   model: "claude-opus-4-6",
 });
