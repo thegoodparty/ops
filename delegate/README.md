@@ -2,7 +2,7 @@
 
 AI agent framework powered by the Claude Agent SDK. Lambda webhook receives Slack/GitHub events, dispatches an ECS Fargate task that runs the agent, callback returns the result to the original surface.
 
-See `ops/CLAUDE.md` for the high-level architecture and `delegate/.env.example` for the full env contract.
+See `ops/AGENTS.md` for the high-level architecture and `delegate/.env.example` for the full env contract.
 
 ## Workflow agents (PRD-to-code)
 
