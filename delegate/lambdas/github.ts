@@ -19,6 +19,7 @@ const REVIEW_REPOS = new Set([
   "gp-data-platform",
   "gp-data-loader",
   "gp-data-matcha",
+  "gp-terraform-dataplatform",
   "candidate-sites",
   "gp-marketing",
 ]);
