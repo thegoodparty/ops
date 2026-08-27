@@ -58,7 +58,7 @@ const EXPECTED_PERMISSION_SETS: Record<string, { name: string; sessionDuration: 
 // fixtures are edited deliberately (the engineer policy gains its deny
 // statements), and a hardcoded hash would turn every intended policy change
 // into a spurious failure here on top of the one in policies.test.ts, which
-// is the test that actually guards byte-exactness.
+// is the test that guards the policies' meaning.
 const EXPECTED_POLICY_FILE: Record<string, string> = {
   [PS.engineer]: "engineer-access.json",
   [PS.readOnly]: "read-only-access.json",
