@@ -82,9 +82,9 @@ const main = async () => {
   // the exact tree the review is reported against.
   let cwd = job.cwd;
 
-  // slack-responder: full shallow checkout of omni@develop so the bot can read
-  // and grep the whole codebase immediately. develop is omni's default branch,
-  // so a depth-1 clone is "latest develop" for free. Best-effort — a clone
+  // slack-responder: full shallow checkout of omni@main so the bot can read
+  // and grep the whole codebase immediately. main is omni's default branch,
+  // so a depth-1 clone is "latest main" for free. Best-effort — a clone
   // failure still lets the bot answer non-code (Grafana/Sentry/Vercel)
   // questions, so we log and continue rather than aborting the task.
   if (job.agent === "slack-responder") {
@@ -96,7 +96,7 @@ const main = async () => {
         { stdio: "inherit", timeout: 180_000 },
       );
       cwd = omniDir;
-      console.log(`omni checked out at ${omniDir} (latest develop)`);
+      console.log(`omni checked out at ${omniDir} (latest main)`);
     } catch (err) {
       console.error("Failed to clone omni for slack-responder:", err);
     }

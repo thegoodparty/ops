@@ -55,7 +55,7 @@ Slack @mention
 
 ### Deployment
 
-Deployed automatically on push to `develop` via GitHub Actions. The workflow builds a Docker image, pushes to ECR, and runs Pulumi to update infrastructure. See [`deploy/`](./deploy) for the Pulumi code.
+Deployed automatically on push to `main` via GitHub Actions. The workflow builds a Docker image, pushes to ECR, and runs Pulumi to update infrastructure. See [`deploy/`](./deploy) for the Pulumi code.
 
 ## Runbooks
 

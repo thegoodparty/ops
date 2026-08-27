@@ -33,7 +33,7 @@ Slack @mention → Lambda (webhook handler) → ECS Fargate task → Claude Agen
 - `delegate/framework/` — Agent registry, execution engine, callback delivery, MCP config
 - `delegate/agents/` — Agent definitions (currently: `slack-responder` using claude-opus-4-6)
 - `delegate/lambdas/` — Lambda webhook handler with Slack signature verification, ECS dispatch
-- `delegate/worker/` — Fargate container entrypoint, GitHub App auth, Dockerfile. The entrypoint enforces a hard wall-clock deadline (`AGENT_DEADLINE_MS`, default 45m) that aborts the agent and exits the task — ECS has no native per-task timeout, and the SDK's `maxTurns`/`maxBudgetUsd` caps only fire between turns, so a hung tool call would otherwise run forever. The entrypoint also does deterministic per-agent repo checkouts before the agent starts, so no agent clones mid-run: `slack-responder` gets a full shallow clone of `omni@develop` at `/app/omni` (its cwd); `pr-reviewer` gets the PR's repo checked out at the exact reviewed head SHA at `/app/review` (its cwd) — repo-agnostic, submodules synced, and the head SHA is resolved from the live PR on the re-review path where dispatch omits it. Workflow agents (`*-agent`) still get the sparse `packages/runbooks`-only clone.
+- `delegate/worker/` — Fargate container entrypoint, GitHub App auth, Dockerfile. The entrypoint enforces a hard wall-clock deadline (`AGENT_DEADLINE_MS`, default 45m) that aborts the agent and exits the task — ECS has no native per-task timeout, and the SDK's `maxTurns`/`maxBudgetUsd` caps only fire between turns, so a hung tool call would otherwise run forever. The entrypoint also does deterministic per-agent repo checkouts before the agent starts, so no agent clones mid-run: `slack-responder` gets a full shallow clone of `omni@main` at `/app/omni` (its cwd); `pr-reviewer` gets the PR's repo checked out at the exact reviewed head SHA at `/app/review` (its cwd) — repo-agnostic, submodules synced, and the head SHA is resolved from the live PR on the re-review path where dispatch omits it. Workflow agents (`*-agent`) still get the sparse `packages/runbooks`-only clone.
 - `delegate/tools/` — CLI tools available to agents (Databricks Genie)
 - The Dockerfile vendors the Superpowers skills library (pinned tag) at `/app/plugins/superpowers`; `slack-responder` loads it as a local Claude Agent SDK plugin (`plugins: [{ type: 'local', ... }]`) so it can invoke `superpowers:systematic-debugging` and friends via the `Skill` tool (`Skill` is in the framework's default `allowedTools`).
 - Agents run in the SDK's isolation mode by default (no `settingSources`), so CLAUDE.md is NOT auto-loaded. `slack-responder` opts in with `settingSources: ['project']` so omni's CLAUDE.md loads into its context (its cwd is the omni checkout). `pr-reviewer` deliberately stays isolated: it reads a repo's CLAUDE.md via the Read tool as reference to review *against*, rather than injecting it as system instructions — otherwise a PR could edit CLAUDE.md to steer the verdict (prompt injection).
@@ -69,7 +69,7 @@ Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actio
 
 ### CI/CD
 
-On push to `develop`, the GitHub Actions workflow:
+On push to `main`, the GitHub Actions workflow:
 
 1. Type-checks with `tsc --noEmit`
 2. Bundles the Lambda handler with esbuild

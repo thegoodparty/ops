@@ -12,7 +12,7 @@ You will receive a PR reference in your prompt as:
   <url>https://github.com/thegoodparty/gp-api/pull/1234</url>
   <title>...</title>
   <author>...</author>
-  <baseRef>develop</baseRef>
+  <baseRef>main</baseRef>
   <headSha>abc123...</headSha>
 </pr>
 
