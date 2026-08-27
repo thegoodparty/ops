@@ -32,23 +32,20 @@ const policy = (file: string) =>
   readFileSync(join(__dirname, "identity-center", "policies", file), "utf8");
 
 export const createIdentityCenter = () => {
-  const permissionSets = Object.fromEntries(
-    Object.entries(SETS).map(([key, set]) => [
-      key,
-      new aws.ssoadmin.PermissionSet(
-        `permissionSet-${key}`,
-        {
-          name: set.name,
-          instanceArn: INSTANCE_ARN,
-          sessionDuration: set.duration,
-        },
-        {
-          import: `${psArn(set.id)},${INSTANCE_ARN}`,
-          protect: true,
-        },
-      ),
-    ]),
-  );
+  for (const [key, set] of Object.entries(SETS)) {
+    new aws.ssoadmin.PermissionSet(
+      `permissionSet-${key}`,
+      {
+        name: set.name,
+        instanceArn: INSTANCE_ARN,
+        sessionDuration: set.duration,
+      },
+      {
+        import: `${psArn(set.id)},${INSTANCE_ARN}`,
+        protect: true,
+      },
+    );
+  }
 
   const managed: [string, keyof typeof SETS, string][] = [
     ["engineer-s3", "engineer", "arn:aws:iam::aws:policy/AmazonS3FullAccess"],
@@ -65,7 +62,7 @@ export const createIdentityCenter = () => {
     new aws.ssoadmin.ManagedPolicyAttachment(
       `managedPolicy-${label}`,
       { instanceArn: INSTANCE_ARN, managedPolicyArn, permissionSetArn: arn },
-      { import: `${managedPolicyArn},${arn},${INSTANCE_ARN}` },
+      { import: `${managedPolicyArn},${arn},${INSTANCE_ARN}`, protect: true },
     );
   }
 
@@ -75,6 +72,9 @@ export const createIdentityCenter = () => {
     ["productManager", "product-manager.json"],
   ];
 
+  // No protect here, unlike the loops above: these are the resources we
+  // legitimately edit in-repo (e.g. Task 6's edit to engineer-access.json),
+  // so protecting them would block intended changes.
   for (const [setKey, file] of inline) {
     const arn = psArn(SETS[setKey].id);
     new aws.ssoadmin.PermissionSetInlinePolicy(
@@ -113,6 +113,4 @@ export const createIdentityCenter = () => {
       },
     );
   }
-
-  return { permissionSets };
 };
