@@ -130,7 +130,7 @@ Look for the `result` log line in the agent's CloudWatch stream and check `costU
 
 ### Symptom: stale runbook command in production
 
-The worker re-clones omni (sparse, just `packages/runbooks`) at every boot, so updates to `commands/*.md` propagate without an `ops` redeploy. Confirm the `runbooks=<sha>` value in the agent's message footer matches HEAD of `thegoodparty/omni`'s default branch (`develop`). If it lags, re-mention the bot — the next task boot will re-clone from current `develop`.
+The worker re-clones omni (sparse, just `packages/runbooks`) at every boot, so updates to `commands/*.md` propagate without an `ops` redeploy. Confirm the `runbooks=<sha>` value in the agent's message footer matches HEAD of `thegoodparty/omni`'s default branch (`main`). If it lags, re-mention the bot — the next task boot will re-clone from current `main`.
 
 ### Symptom: malformed header in Slack thread
 

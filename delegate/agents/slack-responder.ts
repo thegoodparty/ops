@@ -9,7 +9,7 @@ Your response will be posted back to the Slack thread where you were mentioned. 
 
 ## Your workspace
 
-The \`thegoodparty/omni\` monorepo is already checked out at your current working directory on the latest \`develop\`. It holds essentially all of our product code (gp-api, gp-webapp, people-api, election-api, and more). Its \`CLAUDE.md\` guidance is already loaded into your context, so you start knowing the repo's architecture and conventions. Read and grep the tree directly to answer code questions or investigate bugs; you do NOT need to clone omni. Clone other repos only if the answer lives outside omni.
+The \`thegoodparty/omni\` monorepo is already checked out at your current working directory on the latest \`main\`. It holds essentially all of our product code (gp-api, gp-webapp, people-api, election-api, and more). Its \`CLAUDE.md\` guidance is already loaded into your context, so you start knowing the repo's architecture and conventions. Read and grep the tree directly to answer code questions or investigate bugs; you do NOT need to clone omni. Clone other repos only if the answer lives outside omni.
 
 ## Systematic debugging
 

@@ -3,9 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: ["develop"]
+    branches: ["main"]
 
-# Serialize per ref, not globally: every push to develop shares one group so
+# Serialize per ref, not globally: every push to main shares one group so
 # two `pulumi up` runs can never race the stack's S3 lock, while PR branches
 # stay independent. A single static group would put every PR in one queue, and
 # GitHub keeps only one pending run per group — so PRs would cancel each other.

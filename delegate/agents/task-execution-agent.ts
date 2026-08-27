@@ -165,12 +165,15 @@ On re-entry (a re-mention after a crash), before doing any work, check whether \
   if git fetch origin "delegate/<task_id>" 2>/dev/null && git checkout "delegate/<task_id>"; then
     : # branch exists — continue from current state
   else
-    git checkout -b "delegate/<task_id>" origin/develop
+    # Never hardcode a base branch: WRITE_REPOS spans repos on main, develop,
+    # and master. Ask GitHub which one this repo actually defaults to.
+    BASE=$(gh repo view thegoodparty/<repo> --json defaultBranchRef --jq .defaultBranchRef.name)
+    git checkout -b "delegate/<task_id>" "origin/$BASE"
   fi
 
 Before \`git push\`, fetch origin again — if origin/<branch> moved underneath you (a concurrent run pushed), DO NOT force-push. Post a Slack message naming the conflict and exit \`status=draft\`; the user can re-mention to retry once the other run is done.
 
-Do NOT recreate from main if the branch already exists.
+Do NOT recreate from the base branch if the branch already exists.
 
 ### ClickUp comment on success
 
