@@ -205,13 +205,17 @@ need nothing.
 
 ### 4. The tag flip
 
-Three files change together:
+Two files change together:
 
 - `deploy/deploy.sh`: `pulumi config set --path aws:defaultTags.tags.Environment infra`
-- `deploy/Pulumi.ops-dev.yaml`: same value, so local `pulumi preview` matches CI
 - `delegate/lambdas/dispatch.ts`: add `{ key: "Environment", value: "infra" }`
   to the `RunTask` tags. Tasks currently carry only `Project`, which is why a
   live task showed no `Environment` value in the tag scan.
+
+`deploy/Pulumi.ops-dev.yaml` is deliberately NOT changed. `.gitignore` carries
+`Pulumi.*.yaml`, so the stack settings file is untracked; `deploy.sh`
+reconstructs every value it needs on each run. A local `pulumi preview` needs
+that file copied in from a checkout that has it.
 
 Known wart: roughly 45 historical ECS task-definition revisions keep
 `Environment=dev`. Pulumi only tags the revision it creates. They are inactive,
