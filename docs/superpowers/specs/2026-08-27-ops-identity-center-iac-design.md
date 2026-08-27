@@ -63,12 +63,32 @@ list: **implicitDeny**. Without this fix the retag is decorative.
 `s3:DeleteBucket` on `gp-playwright-reports` simulates **allowed** at any tag
 value.
 
-### Lockout risk is low
+### Engineers can escalate to full admin in three calls
 
-Engineers already cannot touch Identity Center. `sso:PutInlinePolicyToPermissionSet`,
-`sso:DeletePermissionSet`, and `sso:CreateAccountAssignment` all simulate
-**implicitDeny**, because permission sets are untagged and so never match the
-dev allow. Taking them under management does not change that.
+A naive simulation of `sso:PutInlinePolicyToPermissionSet`,
+`sso:DeletePermissionSet`, and `sso:CreateAccountAssignment` returns
+**implicitDeny**, which is misleading. Supplying a `RequestTag` context reveals a
+live escalation chain:
+
+1. `sso:TagResource` on any permission set with `Environment=dev`: **allowed**,
+   via `DevResourceCreation`.
+2. The permission set is now dev-tagged, so `DevResourceOperations` allows `*`
+   on it.
+3. `sso:PutInlinePolicyToPermissionSet`: **allowed**. The engineer writes
+   themselves `*` on `*`.
+
+This predates this work. Step 1 was already allowed against the untagged
+permission sets, because `StringNotEquals` evaluates true when the condition key
+is absent.
+
+The `DevResourceCreation` fix in this design closes step 1, now that the
+permission sets are tagged `infra`. Simulated with the fix: **implicitDeny**.
+Closing the account's sharpest escalation path is therefore a direct outcome of
+this change, not an incidental one.
+
+Residual, and general rather than Identity Center specific: any **untagged**
+resource in the account remains claimable by the same `RequestTag=dev` trick.
+Simulated **allowed**. See "Deferred findings".
 
 ### Bootstrapping is blocked
 
@@ -198,7 +218,7 @@ Known wart: roughly 45 historical ECS task-definition revisions keep
 so the residual exposure is an engineer deregistering a dead revision. A sweep
 is separate cleanup, not part of this change.
 
-### 5. The two EngineerAccess edits
+### 5. The three EngineerAccess edits
 
 **(a) Close the retag escalation.** In `DevResourceCreation`, one value becomes
 a list:
@@ -241,6 +261,79 @@ Playwright reports.
 The SQS half matches nothing today, since ops deploys no queues. It is included
 so a future queue is protected on creation rather than silently exposed.
 
+**(c) Backstop the Identity Center escalation, unconditionally.** Edit (a)
+closes the escalation chain only while the permission sets stay correctly
+tagged. A permission set created later without the `infra` tag silently reopens
+it, which is exactly how the hole existed in the first place. Explicit deny wins
+over any allow, and does not depend on a tag being right:
+
+```json
+{
+  "Sid": "DenyIdentityCenterMutation",
+  "Effect": "Deny",
+  "Action": ["sso:Create*", "sso:Delete*", "sso:Update*", "sso:Put*",
+             "sso:Attach*", "sso:Detach*", "sso:Provision*", "sso:Tag*",
+             "sso:Untag*", "sso:Associate*", "sso:Disassociate*",
+             "sso-directory:Create*", "sso-directory:Delete*",
+             "sso-directory:Update*", "sso-directory:Add*",
+             "sso-directory:Remove*", "identitystore:Create*",
+             "identitystore:Delete*", "identitystore:Update*"],
+  "Resource": "*"
+}
+```
+
+Deliberately enumerated rather than written as `NotAction` with a read
+allowlist. A `Deny` with `NotAction` on `Resource: "*"` would deny every action
+in every service that is not on the list, which is catastrophic rather than
+restrictive.
+
+Engineers retain full Identity Center read via the attached `ReadOnlyAccess`
+managed policy. Admins are unaffected: they use the separate
+`AdministratorAccess` permission set.
+
+### 6. Keep delegate from ever approving permission changes
+
+Three layers. Each is independently insufficient.
+
+**Layer 1: explicit reviewer gate.** The reviewer prompt already forces
+comment-only via `SELF_REVIEW` for any `thegoodparty/ops` PR matching
+`^(delegate/|deploy/|\.github/workflows/delegate)`. Our files are under
+`deploy/`, so this change is already gated today.
+
+That protection is incidental, though. The gate's stated rationale is "changes
+to the bot's own system", not "permission changes", so narrowing `deploy/` later
+would silently un-protect IAM. Add a separate `PERMISSION_CHANGE` gate in
+`delegate/agents/pr-reviewer.ts` keyed on the identity and policy paths, with
+its own rationale, and force comment-only on it in step 8 exactly as
+`SELF_REVIEW` does.
+
+**Layer 2: CODEOWNERS.** Add `.github/CODEOWNERS` covering the identity
+component, the deploy config, and CODEOWNERS itself.
+
+Owner is `@thegoodparty/gp-contrib`. This is deliberate. `gp-secops` holds only
+`pull` on `serve-ops`, and GitHub ignores code owners without write access, so
+naming it would be silently ineffective, and with layer 3 enabled would deadlock
+those PRs instead of protecting them. `gp-admins` has no repo access at all.
+`gp-contrib` has `push` and is humans only.
+
+**Layer 3: require code owner reviews.** `develop` currently requires 1 approval
+with `require_code_owner_reviews: false`, so `delegate[bot]`'s approval alone can
+satisfy the merge gate on any PR the self-gate misses. Flip
+`require_code_owner_reviews` to `true`. Without this, CODEOWNERS is advisory and
+layer 2 does nothing.
+
+Scope note: the requirement applies only to paths listed in CODEOWNERS, so other
+ops PRs are unaffected.
+
+**Why this actually binds.** Delegate approves as `delegate[bot]`, a GitHub App.
+Apps cannot be members of teams, so a code-owner requirement naming a team is
+unsatisfiable by the bot structurally, not by prompt behavior. Layer 1 depends on
+the bot following its prompt; layers 2 and 3 do not.
+
+Follow-up, not in this change: grant `gp-secops` `push` on `serve-ops` and make
+it the owner of the IAM paths. That is the semantically correct owner and gives
+real gatekeeping rather than "any engineer". It needs an org-admin change.
+
 ## Deploy ordering
 
 Order matters. Steps 1 and 2 are manual and must precede any deploy.
@@ -249,8 +342,11 @@ Order matters. Steps 1 and 2 are manual and must precede any deploy.
    `sso:*` and `identitystore:Describe*`/`List*` to
    `GitHubActionsPulumiDeployPolicy`. Click-ops, because that policy is
    click-ops and out of scope.
-2. **Pre-tag the five permission sets** with `Environment=infra`, `Project=ops`
-   via `aws sso-admin tag-resource`, so the import is clean.
+2. ~~**Pre-tag the five permission sets**~~ Done 2026-08-27. All five verified
+   carrying exactly `Environment=infra`, `Project=ops`, matching what
+   `defaultTags` will produce, so the import is clean.
+2b. **Enable `require_code_owner_reviews`** on `develop`. Repo settings, needs
+   admin. Without it the CODEOWNERS layer is advisory.
 3. **Import pass.** Merge the component with `import` options and the tag flip.
    Gate: `pulumi preview --diff` must show the 21 resources importing with no
    replacements and no property drift. Do not run `up` until that is true.
@@ -276,10 +372,19 @@ Re-run the simulator against
 | `s3:GetObject` | gp-playwright-reports/* | allowed | allowed |
 | `logs:GetLogEvents` | /aws/ecs/delegate | allowed | allowed |
 | `ecs:DeleteCluster` | any dev-tagged resource | allowed | allowed |
+| `sso:TagResource` | EngineerAccess permission set | allowed | explicitDeny |
+| `sso:PutInlinePolicyToPermissionSet` | EngineerAccess permission set | allowed | explicitDeny |
+| `sso:CreateAccountAssignment` | any | allowed | explicitDeny |
+| `sso:DescribePermissionSet` | any | allowed | allowed |
+| `identitystore:ListUsers` | any | allowed | allowed |
 
-The last three rows are regression guards and matter as much as the first four.
-This must not cost engineers their dev workflow or their ability to read
-delegate logs.
+The `allowed -> allowed` rows are regression guards and matter as much as the
+denials. This must not cost engineers their dev workflow, their ability to read
+delegate logs, or their Identity Center visibility.
+
+Edit (c) was verified in isolation before being written into this document:
+every escalation verb returns `explicitDeny`, every `sso`/`identitystore` read
+returns `allowed`, and `s3`, `ecs`, and `logs` actions are unaffected.
 
 Also confirm after deploy that the delegate webhook still dispatches a Fargate
 task end to end, since the task definition is replaced by the tag change.
@@ -312,3 +417,10 @@ so they are not lost.
    `ssm:GetParameter` on `/pulumi-state-config-passphrase` simulates allowed:
    the parameter is untagged and the SSM deny is prod-only. That passphrase
    decrypts ops Pulumi state.
+3. **Untagged resources are claimable.** `DevResourceCreation` grants `*` when
+   the caller supplies `RequestTag/Environment=dev` and the resource is not
+   tagged `prod` or `infra`. An absent tag satisfies `StringNotEquals`, so any
+   untagged resource in the account can be tagged into an engineer's control and
+   then fully operated on. This change closes the case that matters most
+   (permission sets, now `infra`-tagged) but not the general pattern. The real
+   fix is requiring `Environment` on creation, which is a broader policy change.
