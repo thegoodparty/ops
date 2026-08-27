@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import Module from "node:module";
 
 // Transcribed by hand from identity-center.ts's own SETS/GROUPS tables and
@@ -48,15 +50,25 @@ const EXPECTED_PERMISSION_SETS: Record<string, { name: string; sessionDuration: 
   [PS.billing]: { name: "Billing", sessionDuration: "PT8H" },
 };
 
-// sha256 of each permission set's inline policy body, transcribed from
-// policies.test.ts's EXPECTED table but keyed by permission set arn (not
-// filename) — this is what catches a swap of two entries in the component's
-// `inline` table, which leaves all import ids byte-identical.
-const EXPECTED_INLINE_POLICY_SHA: Record<string, string> = {
-  [PS.engineer]: "8eb20244b8b3848bc44a6869ae5cb2c9be649eeb26e79d425eb82b235cd02b6c",
-  [PS.readOnly]: "98e54d03d87835021f6fb3819f0cedc391a7bd23633d2a43aa27ab86f7b9127b",
-  [PS.productManager]: "e131860e532768dabf16fb518da04e5948723bbe1a7276d9e650996f14059eaf",
+// Which policy file each permission set must be paired with. Swapping two
+// entries in the component's `inline` table leaves every import id
+// byte-identical, so pairing is the only thing that catches it.
+//
+// The expected hash is derived from the file rather than hardcoded: the
+// fixtures are edited deliberately (the engineer policy gains its deny
+// statements), and a hardcoded hash would turn every intended policy change
+// into a spurious failure here on top of the one in policies.test.ts, which
+// is the test that actually guards byte-exactness.
+const EXPECTED_POLICY_FILE: Record<string, string> = {
+  [PS.engineer]: "engineer-access.json",
+  [PS.readOnly]: "read-only-access.json",
+  [PS.productManager]: "product-manager.json",
 };
+
+const shaOfPolicyFile = (file: string) =>
+  createHash("sha256")
+    .update(readFileSync(join(__dirname, "policies", file)))
+    .digest("hex");
 
 describe("identity center imports", () => {
   it("emits exactly the 21 expected import ids, with the right permission-set shape and policy pairing", () => {
@@ -112,7 +124,8 @@ describe("identity center imports", () => {
       assert.deepEqual(permissionSets[arn], expected, `permission set ${arn} name/sessionDuration mismatch`);
     }
 
-    for (const [arn, expectedSha] of Object.entries(EXPECTED_INLINE_POLICY_SHA)) {
+    for (const [arn, file] of Object.entries(EXPECTED_POLICY_FILE)) {
+      const expectedSha = shaOfPolicyFile(file);
       assert.equal(
         inlinePolicies[arn],
         expectedSha,
