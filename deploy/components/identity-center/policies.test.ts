@@ -13,6 +13,8 @@ const EXPECTED: Record<string, string> = {
     "98e54d03d87835021f6fb3819f0cedc391a7bd23633d2a43aa27ab86f7b9127b",
 };
 
+// A failure here means a fixture was reformatted. Restore the file from live
+// state; never update the hash to match — the import compares bytes verbatim.
 describe("inline policy fixtures", () => {
   for (const [file, sha] of Object.entries(EXPECTED)) {
     it(`${file} still matches live Identity Center byte for byte`, () => {

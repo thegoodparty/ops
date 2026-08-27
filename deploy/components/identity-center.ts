@@ -50,7 +50,7 @@ export const createIdentityCenter = () => {
     ]),
   );
 
-  const managed: [string, string, string][] = [
+  const managed: [string, keyof typeof SETS, string][] = [
     ["engineer-s3", "engineer", "arn:aws:iam::aws:policy/AmazonS3FullAccess"],
     ["engineer-readonly", "engineer", "arn:aws:iam::aws:policy/ReadOnlyAccess"],
     ["administrator", "administrator", "arn:aws:iam::aws:policy/AdministratorAccess"],
@@ -61,7 +61,7 @@ export const createIdentityCenter = () => {
   ];
 
   for (const [label, setKey, managedPolicyArn] of managed) {
-    const arn = psArn(SETS[setKey as keyof typeof SETS].id);
+    const arn = psArn(SETS[setKey].id);
     new aws.ssoadmin.ManagedPolicyAttachment(
       `managedPolicy-${label}`,
       { instanceArn: INSTANCE_ARN, managedPolicyArn, permissionSetArn: arn },
@@ -69,14 +69,14 @@ export const createIdentityCenter = () => {
     );
   }
 
-  const inline: [string, string][] = [
+  const inline: [keyof typeof SETS, string][] = [
     ["engineer", "engineer-access.json"],
     ["readOnly", "read-only-access.json"],
     ["productManager", "product-manager.json"],
   ];
 
   for (const [setKey, file] of inline) {
-    const arn = psArn(SETS[setKey as keyof typeof SETS].id);
+    const arn = psArn(SETS[setKey].id);
     new aws.ssoadmin.PermissionSetInlinePolicy(
       `inlinePolicy-${setKey}`,
       { instanceArn: INSTANCE_ARN, permissionSetArn: arn, inlinePolicy: policy(file) },
@@ -109,6 +109,7 @@ export const createIdentityCenter = () => {
       },
       {
         import: `${principalId},GROUP,${ACCOUNT_ID},AWS_ACCOUNT,${arn},${INSTANCE_ARN}`,
+        protect: true,
       },
     );
   }
