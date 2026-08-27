@@ -5,7 +5,7 @@ import prReviewer from "./pr-reviewer";
 describe("pr-reviewer permission gate", () => {
   it("names the permission paths it must never auto-approve", () => {
     const prompt = prReviewer.systemPrompt + JSON.stringify(prReviewer);
-    assert.match(prompt, /PERMISSION_CHANGE/);
+    assert.match(prompt, /PERMISSION_CHANGE=false/);
     assert.match(prompt, /identity-center/);
     assert.match(prompt, /CODEOWNERS/);
   });
