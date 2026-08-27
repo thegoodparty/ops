@@ -84,21 +84,30 @@ export const createIdentityCenter = () => {
     );
   }
 
-  const assignments: [string, keyof typeof GROUPS, keyof typeof SETS][] = [
-    ["engineers-engineer", "engineers", "engineer"],
-    ["engineers-readonly", "engineers", "readOnly"],
-    ["admins-administrator", "admins", "administrator"],
-    ["admins-readonly", "admins", "readOnly"],
-    ["research-readonly", "research", "readOnly"],
-    ["product-productManager", "product", "productManager"],
-    ["billingAdmins-billing", "billingAdmins", "billing"],
-  ];
+  // Which permission sets each group may assume. A group can hold more than
+  // one: they are separate roles a member picks between at sign-in, not an
+  // additive union, so holding both EngineerAccess and ReadOnlyAccess just
+  // offers a lower-privilege session to choose.
+  const assignments: Record<keyof typeof GROUPS, (keyof typeof SETS)[]> = {
+    engineers: ["engineer", "readOnly"],
+    admins: ["administrator", "readOnly"],
+    research: ["readOnly"],
+    product: ["productManager"],
+    billingAdmins: ["billing"],
+  };
 
-  for (const [label, groupKey, setKey] of assignments) {
+  const assignmentPairs = Object.entries(assignments).flatMap(
+    ([groupKey, setKeys]) =>
+      setKeys.map(
+        (setKey) => [groupKey as keyof typeof GROUPS, setKey] as const,
+      ),
+  );
+
+  for (const [groupKey, setKey] of assignmentPairs) {
     const principalId = GROUPS[groupKey];
     const arn = psArn(SETS[setKey].id);
     new aws.ssoadmin.AccountAssignment(
-      `assignment-${label}`,
+      `assignment-${groupKey}-${setKey}`,
       {
         instanceArn: INSTANCE_ARN,
         permissionSetArn: arn,
