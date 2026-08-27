@@ -5,6 +5,13 @@ on:
   push:
     branches: ["develop"]
 
+# cancel-in-progress is deliberately false: cancelling mid-`pulumi up` during
+# an import pass is the failure mode (orphaned S3 lock + pending_operations
+# entry), not the remedy. Queue behind the in-flight run instead.
+concurrency:
+  group: deploy-develop
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -40,6 +47,7 @@ jobs:
           pulumi-version: "^3"
 
       - run: npm ci
+      - run: npm test
       - run: npm run build
 
       - name: Build Docker Image

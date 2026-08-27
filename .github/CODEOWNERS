@@ -8,4 +8,5 @@
 
 /deploy/components/identity-center/    @thegoodparty/gp-contrib
 /deploy/components/identity-center.ts  @thegoodparty/gp-contrib
+/deploy/deploy.sh                      @thegoodparty/gp-contrib
 /.github/CODEOWNERS                    @thegoodparty/gp-contrib
