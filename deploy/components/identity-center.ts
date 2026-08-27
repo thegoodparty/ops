@@ -61,20 +61,41 @@ const permissionSets = {
   },
 } satisfies Record<string, PermissionSet>;
 
-// Which permission sets each group may assume. A group can hold more than one:
-// they are separate roles a member picks between at sign-in, not an additive
-// union, so holding both EngineerAccess and ReadOnlyAccess just offers a
-// lower-privilege session to choose.
+// Which permission sets each group may assume, keyed by the group's display
+// name in the identity store. A group can hold more than one: they are
+// separate roles a member picks between at sign-in, not an additive union, so
+// holding both EngineerAccess and ReadOnlyAccess just offers a lower-privilege
+// session to choose.
 //
-// Group ids are stable enough to pin: the identity store is native, with no
-// external IdP syncing users in.
+// `id` exists only so the import below can address the assignment that already
+// exists in AWS. It is deliberately not part of any Pulumi resource name, so it
+// can be dropped for a `getGroup` lookup on the display name once the import
+// has run, without renaming anything.
 const groups = {
-  "383193a0-7001-70d9-a321-ffe6d8af7378": ["engineer", "readOnly"],
-  "88c1b330-a001-707a-06ca-94e289013bf5": ["administrator", "readOnly"],
-  "a8011350-50b1-701c-5b41-c0e4c9b30976": ["readOnly"],
-  "2841e390-5011-7007-ad5d-c906acf4807d": ["productManager"],
-  "88313300-9031-70ed-ec00-bb80ba0e94e1": ["billing"],
-} satisfies Record<string, (keyof typeof permissionSets)[]>;
+  Engineers: {
+    id: "383193a0-7001-70d9-a321-ffe6d8af7378",
+    permissionSets: ["engineer", "readOnly"],
+  },
+  Admins: {
+    id: "88c1b330-a001-707a-06ca-94e289013bf5",
+    permissionSets: ["administrator", "readOnly"],
+  },
+  Research: {
+    id: "a8011350-50b1-701c-5b41-c0e4c9b30976",
+    permissionSets: ["readOnly"],
+  },
+  Product: {
+    id: "2841e390-5011-7007-ad5d-c906acf4807d",
+    permissionSets: ["productManager"],
+  },
+  "Billing Admins": {
+    id: "88313300-9031-70ed-ec00-bb80ba0e94e1",
+    permissionSets: ["billing"],
+  },
+} satisfies Record<
+  string,
+  { id: string; permissionSets: (keyof typeof permissionSets)[] }
+>;
 
 export const createIdentityCenter = () => {
   const entries = Object.entries(permissionSets) as [string, PermissionSet][];
@@ -117,11 +138,12 @@ export const createIdentityCenter = () => {
     }
   }
 
-  for (const [principalId, setKeys] of Object.entries(groups)) {
-    for (const key of setKeys) {
+  for (const [groupName, group] of Object.entries(groups)) {
+    const principalId = group.id;
+    for (const key of group.permissionSets) {
       const permissionSetArn = `${PS_PREFIX}/${permissionSets[key].id}`;
       new aws.ssoadmin.AccountAssignment(
-        `assignment-${principalId}-${key}`,
+        `assignment-${groupName.replace(/\s+/g, "")}-${key}`,
         {
           instanceArn: INSTANCE_ARN,
           permissionSetArn,
