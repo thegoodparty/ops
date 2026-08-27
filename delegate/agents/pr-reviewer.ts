@@ -261,7 +261,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Permission-change detection.** Independently of \`SELF_REVIEW\`, set
    \`PERMISSION_CHANGE=true\` if any path in the PR matches
-   \`^(deploy/components/identity-center|\\.github/CODEOWNERS)\`. These files
+   \`^(deploy/components/identity-center|deploy/deploy\\.sh|\\.github/CODEOWNERS)\`. These files
    define who can do what in AWS and who must approve changes to that. A bot
    approval on them is never acceptable, no matter how clean the diff looks.
    This gate is deliberately separate from \`SELF_REVIEW\` so that narrowing the

@@ -32,23 +32,20 @@ const policy = (file: string) =>
   readFileSync(join(__dirname, "identity-center", "policies", file), "utf8");
 
 export const createIdentityCenter = () => {
-  const permissionSets = Object.fromEntries(
-    Object.entries(SETS).map(([key, set]) => [
-      key,
-      new aws.ssoadmin.PermissionSet(
-        `permissionSet-${key}`,
-        {
-          name: set.name,
-          instanceArn: INSTANCE_ARN,
-          sessionDuration: set.duration,
-        },
-        {
-          import: `${psArn(set.id)},${INSTANCE_ARN}`,
-          protect: true,
-        },
-      ),
-    ]),
-  );
+  for (const [key, set] of Object.entries(SETS)) {
+    new aws.ssoadmin.PermissionSet(
+      `permissionSet-${key}`,
+      {
+        name: set.name,
+        instanceArn: INSTANCE_ARN,
+        sessionDuration: set.duration,
+      },
+      {
+        import: `${psArn(set.id)},${INSTANCE_ARN}`,
+        protect: true,
+      },
+    );
+  }
 
   const managed: [string, keyof typeof SETS, string][] = [
     ["engineer-s3", "engineer", "arn:aws:iam::aws:policy/AmazonS3FullAccess"],
@@ -65,7 +62,7 @@ export const createIdentityCenter = () => {
     new aws.ssoadmin.ManagedPolicyAttachment(
       `managedPolicy-${label}`,
       { instanceArn: INSTANCE_ARN, managedPolicyArn, permissionSetArn: arn },
-      { import: `${managedPolicyArn},${arn},${INSTANCE_ARN}` },
+      { import: `${managedPolicyArn},${arn},${INSTANCE_ARN}`, protect: true },
     );
   }
 
@@ -75,6 +72,9 @@ export const createIdentityCenter = () => {
     ["productManager", "product-manager.json"],
   ];
 
+  // No protect here, unlike the loops above: these are the resources we
+  // legitimately edit in-repo (e.g. Task 6's edit to engineer-access.json),
+  // so protecting them would block intended changes.
   for (const [setKey, file] of inline) {
     const arn = psArn(SETS[setKey].id);
     new aws.ssoadmin.PermissionSetInlinePolicy(
@@ -84,21 +84,30 @@ export const createIdentityCenter = () => {
     );
   }
 
-  const assignments: [string, keyof typeof GROUPS, keyof typeof SETS][] = [
-    ["engineers-engineer", "engineers", "engineer"],
-    ["engineers-readonly", "engineers", "readOnly"],
-    ["admins-administrator", "admins", "administrator"],
-    ["admins-readonly", "admins", "readOnly"],
-    ["research-readonly", "research", "readOnly"],
-    ["product-productManager", "product", "productManager"],
-    ["billingAdmins-billing", "billingAdmins", "billing"],
-  ];
+  // Which permission sets each group may assume. A group can hold more than
+  // one: they are separate roles a member picks between at sign-in, not an
+  // additive union, so holding both EngineerAccess and ReadOnlyAccess just
+  // offers a lower-privilege session to choose.
+  const assignments: Record<keyof typeof GROUPS, (keyof typeof SETS)[]> = {
+    engineers: ["engineer", "readOnly"],
+    admins: ["administrator", "readOnly"],
+    research: ["readOnly"],
+    product: ["productManager"],
+    billingAdmins: ["billing"],
+  };
 
-  for (const [label, groupKey, setKey] of assignments) {
+  const assignmentPairs = Object.entries(assignments).flatMap(
+    ([groupKey, setKeys]) =>
+      setKeys.map(
+        (setKey) => [groupKey as keyof typeof GROUPS, setKey] as const,
+      ),
+  );
+
+  for (const [groupKey, setKey] of assignmentPairs) {
     const principalId = GROUPS[groupKey];
     const arn = psArn(SETS[setKey].id);
     new aws.ssoadmin.AccountAssignment(
-      `assignment-${label}`,
+      `assignment-${groupKey}-${setKey}`,
       {
         instanceArn: INSTANCE_ARN,
         permissionSetArn: arn,
@@ -113,6 +122,4 @@ export const createIdentityCenter = () => {
       },
     );
   }
-
-  return { permissionSets };
 };
