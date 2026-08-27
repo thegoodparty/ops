@@ -27,7 +27,7 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": { "aws:RequestTag/Environment": "dev" },
-        "StringNotEquals": { "aws:ResourceTag/Environment": "prod" }
+        "StringNotEquals": { "aws:ResourceTag/Environment": ["prod", "infra"] }
       }
     },
     {
@@ -94,6 +94,33 @@
       "Sid": "TranscribeJobs",
       "Effect": "Allow",
       "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyInfraBucketAndQueueMutation",
+      "Effect": "Deny",
+      "Action": ["s3:Put*", "s3:Delete*", "s3:Create*", "s3:Replicate*",
+                 "sqs:Delete*", "sqs:Purge*", "sqs:Send*", "sqs:Set*",
+                 "sqs:Create*", "sqs:AddPermission", "sqs:RemovePermission"],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Environment": "infra" } }
+    },
+    {
+      "Sid": "DenyInfraObjectMutation",
+      "Effect": "Deny",
+      "Action": ["s3:Put*", "s3:Delete*", "s3:Restore*", "s3:Abort*"],
+      "Resource": ["arn:aws:s3:::gp-playwright-reports/*"]
+    },
+    {
+      "Sid": "DenyIdentityCenterMutation",
+      "Effect": "Deny",
+      "Action": ["sso:Create*", "sso:Delete*", "sso:Update*", "sso:Put*",
+                 "sso:Attach*", "sso:Detach*", "sso:Provision*", "sso:Tag*",
+                 "sso:Untag*", "sso:Associate*", "sso:Disassociate*",
+                 "sso-directory:Create*", "sso-directory:Delete*",
+                 "sso-directory:Update*", "sso-directory:Add*",
+                 "sso-directory:Remove*", "identitystore:Create*",
+                 "identitystore:Delete*", "identitystore:Update*"],
       "Resource": "*"
     }
   ]

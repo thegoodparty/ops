@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 const EXPECTED: Record<string, string> = {
   "engineer-access.json":
-    "8eb20244b8b3848bc44a6869ae5cb2c9be649eeb26e79d425eb82b235cd02b6c",
+    "69fbc617b9cbb7c69ff4acd46cf50490591f1deb262400fd4974a136e44741ff",
   "product-manager.json":
     "e131860e532768dabf16fb518da04e5948723bbe1a7276d9e650996f14059eaf",
   "read-only-access.json":
