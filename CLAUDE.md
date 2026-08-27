@@ -52,7 +52,10 @@ Delegate secrets are stored in AWS Secrets Manager under the key `DELEGATES`. Se
 
 Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actions.
 
-- **Stack:** `organization/ops/ops-dev` (single environment)
+- **Stack:** `organization/ops/ops-dev` (single environment; the name is a
+  holdover — resources are tagged `Environment: infra`, not `dev`, because
+  `EngineerAccess` grants blanket mutate on `dev`-tagged resources. Renaming
+  the stack needs a state migration and is out of scope for now.)
 - **Backend:** `s3://goodparty-iac-state`
 - **Region:** us-west-2
 
@@ -62,6 +65,7 @@ Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actio
 - Lambda Function URL as the webhook endpoint (no auth, Slack signature verification in-handler)
 - CloudWatch log group for agent execution logs
 - IAM roles for ECS execution, task, and Lambda
+- IAM Identity Center permission sets and account assignments
 
 ### CI/CD
 

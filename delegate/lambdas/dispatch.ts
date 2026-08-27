@@ -14,6 +14,22 @@ const ecs = new ECSClient({});
 export const sanitizeTagValue = (value: string): string =>
   value.replace(/[^\p{L}\p{N} _.\/=+:@-]/gu, "-").slice(0, 256);
 
+export const buildTaskTags = (job: AgentJob) => [
+  // Attribute the Fargate task's cost to the ops project in Cost
+  // Explorer; the task def is tagged but RunTask tags aren't inherited.
+  { key: "Project", value: "ops" },
+  // Matches the stack's Environment default tag. Without it a running task
+  // has no Environment tag, so it falls outside the infra tag protections.
+  { key: "Environment", value: "infra" },
+  { key: "agent", value: job.agent },
+  ...(job.metadata
+    ? Object.entries(job.metadata).map(([key, value]) => ({
+        key,
+        value: sanitizeTagValue(value),
+      }))
+    : []),
+];
+
 export const dispatch = async (job: AgentJob) => {
   const { CLUSTER_ARN, TASK_DEF_ARN, SUBNET_IDS, SECURITY_GROUP_ID } =
     process.env;
@@ -44,18 +60,7 @@ export const dispatch = async (job: AgentJob) => {
           },
         ],
       },
-      tags: [
-        // Attribute the Fargate task's cost to the ops project in Cost
-        // Explorer; the task def is tagged but RunTask tags aren't inherited.
-        { key: "Project", value: "ops" },
-        { key: "agent", value: job.agent },
-        ...(job.metadata
-          ? Object.entries(job.metadata).map(([key, value]) => ({
-              key,
-              value: sanitizeTagValue(value),
-            }))
-          : []),
-      ],
+      tags: buildTaskTags(job),
     }),
   );
 

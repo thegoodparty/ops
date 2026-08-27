@@ -23,7 +23,7 @@ pulumi login s3://goodparty-iac-state
 pulumi stack select "organization/ops/ops-dev" --create
 pulumi config set aws:region "$AWS_REGION"
 pulumi config set workerImageUri "$IMAGE_URI"
-pulumi config set --path aws:defaultTags.tags.Environment dev
+pulumi config set --path aws:defaultTags.tags.Environment infra
 pulumi config set --path aws:defaultTags.tags.Project ops
 
 if [ "$CI" = "true" ]; then

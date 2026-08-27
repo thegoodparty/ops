@@ -1,0 +1,12 @@
+# Changes to AWS permissions and to this file must be approved by a human.
+# delegate[bot] is a GitHub App and cannot be a team member, so a code-owner
+# requirement naming a team is structurally unsatisfiable by it.
+#
+# gp-contrib is used because it is the only team with write access to this
+# repo; gp-secops has read only, and GitHub silently ignores code owners
+# without write access.
+
+/deploy/components/identity-center/    @thegoodparty/gp-contrib
+/deploy/components/identity-center.ts  @thegoodparty/gp-contrib
+/deploy/deploy.sh                      @thegoodparty/gp-contrib
+/.github/CODEOWNERS                    @thegoodparty/gp-contrib
