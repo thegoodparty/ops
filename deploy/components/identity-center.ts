@@ -26,8 +26,9 @@ const SETS = {
   billing: { id: "ps-7907e6ad83ceef38", name: "Billing", duration: "PT8H" },
 };
 
-// Byte-exact captures of the live inline policies. Reformatting these breaks
-// the import: Pulumi compares declared inputs against live state verbatim.
+// Captures of the live inline policies. The provider parses this field as
+// JSON rather than comparing it as a string, so formatting is free to differ
+// from what AWS stores; only the policy's meaning has to match on import.
 const policy = (file: string) =>
   readFileSync(join(__dirname, "identity-center", "policies", file), "utf8");
 
