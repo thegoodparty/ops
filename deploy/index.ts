@@ -3,6 +3,7 @@ import * as aws from "@pulumi/aws";
 import { createWorker } from "./components/worker";
 import { createWebhookLambda } from "./components/webhooks";
 import { createPlaywrightReportsBucket } from "./components/playwright-reports";
+import { createIdentityCenter } from "./components/identity-center";
 
 export = async () => {
   const config = new pulumi.Config();
@@ -38,6 +39,8 @@ export = async () => {
   });
 
   const playwrightReports = createPlaywrightReportsBucket();
+
+  createIdentityCenter();
 
   return {
     webhookUrl: webhook.url,
