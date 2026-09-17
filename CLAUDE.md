@@ -58,6 +58,14 @@ Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actio
   the stack needs a state migration and is out of scope for now.)
 - **Backend:** `s3://goodparty-iac-state`
 - **Region:** us-west-2
+- **Planned second account:** a `goodparty-workbench` child account for
+  developer inner-loop tooling (coding agents against Bedrock). Adds two Pulumi
+  projects to this repo: `deploy-org/` for organization-level resources and
+  `deploy-workbench/` for the new account's contents, each with its own scoped
+  CI role. Design, rationale, staged plan and progress checklist:
+  [`docs/workbench-account.md`](./docs/workbench-account.md). Read that before
+  touching `components/identity-center.ts`, the deploy role, or anything
+  account-related.
 
 ### What gets deployed
 
