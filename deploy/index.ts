@@ -4,6 +4,7 @@ import { createWorker } from "./components/worker";
 import { createWebhookLambda } from "./components/webhooks";
 import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
+import { createCiRoles } from "./components/ci-roles";
 
 export = async () => {
   const config = new pulumi.Config();
@@ -41,6 +42,7 @@ export = async () => {
   const playwrightReports = createPlaywrightReportsBucket();
 
   createIdentityCenter();
+  createCiRoles();
 
   return {
     webhookUrl: webhook.url,
