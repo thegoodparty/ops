@@ -15,23 +15,26 @@ starting the work, not after. Steps 1, 9 and 10 happen in the console or in
 support cases and leave no other trace, so the claim is the only thing stopping
 two sessions from doing them twice.
 
-- [ ] 1. Create and verify `aws-workbench@goodparty.org` group alias — todo
-- [ ] 2. Add `deploy/components/organizations.ts` (OU + account) — todo
-- [ ] 3. Run `pulumi up` on `ops-dev`, record account id here — todo
-- [ ] 4. Extend `identity-center.ts` for the new account — todo
-- [ ] 5. Attach SCP to the `Workbench` OU — todo
-- [ ] 6. Create the `deploy-workbench/` project — todo
-- [ ] 7. Replace `OrganizationAccountAccessRole` with a scoped deploy role — todo
-- [ ] 8. Add CI job with `deploy-workbench/**` path filter — todo
-- [ ] 9. Enable Bedrock model access in the new account — todo
-- [ ] 10. Request quota increases if needed — todo
-- [ ] 11. Add budget and cost anomaly detection — todo
-- [ ] 12. Point `pi` at the account, document engineer setup — todo
+- [ ] 1. Create and verify `aws-workbench@goodparty.org` group alias: todo
+- [ ] 2. Create the two scoped CI roles in `deploy/`: todo
+- [ ] 3. Add the `deploy-org/` project (OU + account): todo
+- [ ] 4. Record the account id below, then let it settle: todo
+- [ ] 5. Add the `deploy-workbench/` project and its CI job: todo
+- [ ] 6. Extend `identity-center.ts` for the new account: todo
+- [ ] 7. Attach SCP to the `Workbench` OU: todo
+- [ ] 8. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
+- [ ] 9. Enable Bedrock model access in the new account: todo
+- [ ] 10. Request quota increases if needed: todo
+- [ ] 11. Add budget and cost anomaly detection: todo
+- [ ] 12. Point `pi` at the account, document engineer setup: todo
 
 Facts discovered during implementation go here as they are learned:
 
 - Workbench account id: _not yet created_
-- Workbench deploy role ARN: _not yet created_
+- `github-actions-org-deploy` ARN: _not yet created_
+- `github-actions-workbench-deploy` ARN: _not yet created_
+- In-account workbench deploy role ARN: _not yet created_
+- SCPs enabled on org root: _not yet checked_
 
 ## How to resume
 
@@ -177,8 +180,16 @@ Three decisions that are easy to conflate:
 - **Stacks** are state and locking boundaries, not account boundaries.
 - **Repos** are orthogonal to both.
 
-Decision: same repo, second Pulumi project. Account lifecycle lives with the
-existing organization code; account contents live in their own project.
+Decision: same repo, three Pulumi projects.
+
+| Project | Stack | Account | Role |
+|---|---|---|---|
+| `deploy/` (existing) | `organization/ops/ops-dev` | `333022194791` | `github-actions-pulumi-deploy` |
+| `deploy-org/` (new) | `organization/org/main` | `333022194791` | `github-actions-org-deploy` |
+| `deploy-workbench/` (new) | `organization/workbench/main` | workbench | `github-actions-workbench-deploy` |
+
+Organization-level resources get their own project rather than living in the
+`ops` stack as originally planned. See the deploy role section below for why.
 
 Why not the alternatives:
 
@@ -200,17 +211,143 @@ Why not the alternatives:
   `AccountAssignment` resources belong next to them, and splitting repos means
   cross-repo coordination every time access changes.
 
+## The deploy role
+
+`github-actions-pulumi-deploy` cannot provision the account today. As of policy
+version v16 it has no `organizations:` statement and no `sts:AssumeRole`
+statement. Its attached `ReadOnlyAccess` covers every Organizations read we
+need, including `DescribeCreateAccountStatus`, but no writes.
+
+We are not widening it. Its trust policy accepts nine repositories, each as
+`repo:thegoodparty/<name>:*`, which matches any ref including `pull_request`
+refs:
+
+```
+gp-api, people-api, election-api, gp-terraform-dataplatform,
+campaign-plan-service, ops, gpvpn, runbooks, omni
+```
+
+Granting `organizations:CreateAccount` there would let nine repositories' CI
+create AWS accounts, and the SCP work in step 7 would add `DetachPolicy`, which
+would let them remove org guardrails.
+
+Honest caveat: that role already holds `sso:*` on `*`, and anything that can
+call `sso:*` can assign itself `AdministratorAccess` through Identity Center.
+So it is already effectively organization-admin from nine repos, and the
+Organizations writes would not be a new category of risk. The reason to split
+anyway is that this project exists to make a boundary structurally real, and
+v16 suggests the drift has been steady. This is the moment to stop adding to
+the pile, not an emergency.
+
+Instead, two purpose-built roles, both created by the `ops` stack in step 2
+(which already holds `iam:CreateRole`). Trust for both is scoped to
+`repo:thegoodparty/ops:ref:refs/heads/main`, not `:*`, so PR branches cannot
+assume them.
+
+`github-actions-org-deploy` needs the writes:
+
+```
+organizations:CreateOrganizationalUnit
+organizations:CreateAccount
+organizations:MoveAccount
+organizations:TagResource
+```
+
+and, because a scoped role does not inherit the shared role's
+`ReadOnlyAccess`, the reads must be spelled out explicitly:
+
+```
+organizations:DescribeOrganization
+organizations:DescribeOrganizationalUnit
+organizations:DescribeAccount
+organizations:DescribeCreateAccountStatus
+organizations:ListRoots
+organizations:ListAccounts
+organizations:ListParents
+organizations:ListOrganizationalUnitsForParent
+organizations:ListTagsForResource
+```
+
+Never grant `organizations:CloseAccount`. Nothing in this plan needs it, and
+omitting it is a second independent barrier alongside `protect: true` against
+a resource deletion closing a real account.
+
+`github-actions-workbench-deploy` needs `sts:AssumeRole` on the target role in
+the workbench account, and nothing else in the management account.
+
+Both roles also need Pulumi backend access, which the shared role never had to
+think about because it holds `s3:*` on `*`:
+
+```
+s3 read/write on arn:aws:s3:::goodparty-iac-state and its objects
+ssm:GetParameter on arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase
+```
+
+Missing the passphrase grant produces a state decryption error that does not
+obviously point at IAM.
+
+Step 7 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
+`DescribePolicy`, `ListPoliciesForTarget` and friends) added to
+`github-actions-org-deploy`. Add them in that step's PR, so each grant arrives
+with the code that uses it.
+
+## Cross-project dependencies
+
+Pulumi resolves dependencies automatically **within** a stack, from Output
+dataflow. It does nothing across stacks. Each stack is an independent state
+file applied by its own `pulumi up`, and nothing sequences them or warns you
+about the order.
+
+The dependency here is one immutable string. `deploy-org/` creates the account;
+`deploy-workbench/` and `identity-center.ts` both need its id.
+
+Decision: hardcode it as a `WORKBENCH_ACCOUNT_ID` constant, and stage the PRs.
+Do not use `StackReference`.
+
+`StackReference` reads another stack's exported outputs from the backend. It
+creates a data dependency inside the consuming stack, but it does not trigger
+the producing stack, does not wait for it, and yields a missing output rather
+than a useful error if the producer was never applied. Its only real benefit is
+automatic propagation when the upstream value changes, and an account id cannot
+change for the life of the account. It would also require every consuming
+project to hold backend read access and the state passphrase purely to fetch a
+constant.
+
+Hardcoding also matches house style: `identity-center.ts:10` hardcodes
+`ACCOUNT_ID`, and `deploy/index.ts` hardcodes subnet ids, a security group id,
+the Identity Center instance ARN, and every permission set id.
+
+Revisit `StackReference` only if a consuming project comes to need upstream
+values that genuinely move.
+
 ## Implementation plan
+
+One step per pull request. Steps are staged so no cross-stack reads are ever
+needed, and so the asynchronous parts have a human gap after them.
 
 1. Create the `aws-workbench@goodparty.org` group alias and confirm mail is
    received. Blocking: account creation strands without a working address, and
    it is the break-glass recovery path, so it must be a group rather than a
    person. The address must never have been used for another AWS account.
 
-2. Add `deploy/components/organizations.ts` creating the `Workbench` OU and the
-   account, called from `deploy/index.ts`. This goes in the existing `ops`
-   stack because that stack already runs with credentials that can act on the
-   organization.
+2. In `deploy/`, create `github-actions-org-deploy` and
+   `github-actions-workbench-deploy` with the trust and actions described in
+   the deploy role section. Pure IAM, makes no Organizations calls, and applies
+   with the permissions the shared role already has. This has to land first,
+   because a CI job cannot assume a role that does not exist.
+
+   Consider adopting `github-actions-pulumi-deploy` itself into Pulumi at the
+   same time, using the `import:` plus `protect: true` pattern that
+   `components/identity-center.ts` already uses for pre-existing resources. It
+   is currently unmanaged, appearing only as a string in `deploy.yml:42`, so
+   every grant to it is an unreviewed console change. Caveat: Pulumi managing
+   the role Pulumi assumes is a bootstrapping hazard, mitigated by
+   `protect: true` and the `AdministratorAccess` permission set as a
+   break-glass path that does not depend on CI.
+
+3. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
+   `Workbench` OU, the account, and a CI job assuming
+   `github-actions-org-deploy`.
 
    ```ts
    const workbench = new aws.organizations.Account("workbench", {
@@ -225,39 +362,48 @@ Why not the alternatives:
    close the account, and a closed AWS account sits in a 90 day suspension
    window.
 
-3. Run `pulumi up` on `organization/ops/ops-dev`. Record the new account id.
+   `CreateAccount` is asynchronous and takes minutes. Pulumi polls
+   `DescribeCreateAccountStatus`. Expect the job to be slow, and expect
+   failures if the email is already in use anywhere in AWS.
 
-4. Extend `deploy/components/identity-center.ts` to assign permission sets to
-   the new account. Today `ACCOUNT_ID` is a hardcoded const used as every
-   assignment's `targetId`, so this needs parameterizing to iterate over
-   accounts. New assignments must not carry the `import:` option that the
-   existing ones use, since there is no pre-existing AWS state to adopt.
+4. Record the new account id in the Progress section above. Then stop and let
+   it settle. The account needs time to reach ACTIVE and for STS to see
+   `OrganizationAccountAccessRole`; a step 5 that runs immediately can fail
+   transiently in a way that looks like a permissions bug.
 
-5. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
-   else. Write it now while the account is nearly empty. Once four people
-   depend on the junk it becomes impossible.
-
-6. Create the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`,
-   `index.ts`, and either its own deploy script or a parameterized version of
-   the existing one. Its provider is explicit:
+5. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
+   `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
+   path filter so its deploys are independent of the delegate image build. Its
+   provider is explicit:
 
    ```ts
    const provider = new aws.Provider("workbench", {
      region: "us-west-2",
-     assumeRole: { roleArn: `arn:aws:iam::${accountId}:role/OrganizationAccountAccessRole` },
+     assumeRole: { roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole` },
      defaultTags: { tags: { Environment: "workbench", Project: "workbench" } },
    });
    ```
 
-7. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
-   automatically when Organizations provisions a member account, but it is
-   effectively administrator. Use it to stand the account up, then create
-   `github-actions-workbench-deploy` in-account and point the provider at that.
-   The existing `github-actions-pulumi-deploy` role needs `sts:AssumeRole` for
-   whichever role the provider targets.
+6. Extend `deploy/components/identity-center.ts` to assign permission sets to
+   the new account. Today `ACCOUNT_ID` is a hardcoded const used as every
+   assignment's `targetId`, so this needs parameterizing to iterate over
+   accounts. New assignments must not carry the `import:` option that the
+   existing ones use, since there is no pre-existing AWS state to adopt. See
+   the open question on which permission set to use.
 
-8. Add a CI job with a path filter on `deploy-workbench/**` so workbench
-   deploys are independent of the delegate image build.
+7. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
+   else. Requires adding the policy actions to `github-actions-org-deploy` in
+   the same PR. Write the SCP now while the account is nearly empty. Once four
+   people depend on the junk it becomes impossible.
+
+   Check first whether `SERVICE_CONTROL_POLICY` is enabled as a policy type on
+   the org root. If it never has been, that is a one-time enablement.
+
+8. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
+   automatically when Organizations provisions a member account, but it is
+   effectively administrator. Use it to stand the account up, then create a
+   scoped deploy role inside the workbench account and point the
+   `deploy-workbench/` provider at that instead.
 
 9. Enable Bedrock model access in the new account. This is per account and per
    region, so it must be done again here. Enable only the models needed.
