@@ -1,0 +1,69 @@
+name: Deploy org
+
+# A separate workflow rather than a job in deploy.yml, for two reasons.
+#
+# Path filtering is per workflow, not per job, and the point of the filter is
+# that organization changes must not queue behind the delegate image build
+# (and vice versa) when neither touched the other.
+#
+# And there is no pull_request trigger, because there cannot be one:
+# github-actions-org-deploy is trusted only for the subject
+# `repo:thegoodparty/ops:ref:refs/heads/main`. A pull_request run presents a
+# `pull_request` ref, so the AssumeRoleWithWebIdentity call would fail. That
+# is the intended scoping, not a gap to work around by widening the trust
+# policy. Review is the gate before merge here; the apply happens after.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "deploy-org/**"
+      - ".github/workflows/deploy-org.yml"
+
+# Its own group, independent of deploy.yml's: these are different stacks with
+# different S3 locks, so there is nothing to serialize between them.
+# cancel-in-progress is false for the same reason as in deploy.yml, and more
+# so: cancelling mid-CreateAccount orphans the state lock while an account is
+# half provisioned in Organizations.
+concurrency:
+  group: deploy-org-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # CreateAccount polls for minutes. The 6 hour default would let a wedged
+    # poll hold the stack lock all day; 30 minutes is far above the expected
+    # runtime and well below that.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-org-deploy
+          aws-region: us-west-2
+
+      - name: Install Pulumi
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: "^3"
+
+      - run: npm ci
+
+      - name: Deploy
+        working-directory: deploy-org
+        run: ./deploy.sh
