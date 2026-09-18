@@ -11,22 +11,26 @@ One step at a time, one pull request per step. Statuses are `todo`, `doing
 in-repo work, or an AWS case number or resource id for work done outside git.
 
 Claim a step by setting it to `doing` and pushing that change **before**
-starting the work, not after. Steps 1, 9 and 10 happen in the console or in
+starting the work, not after. Steps 1, 2, 11 and 12 happen in the console or in
 support cases and leave no other trace, so the claim is the only thing stopping
 two sessions from doing them twice.
 
-- [ ] 1. Create and verify `aws-workbench@goodparty.org` group alias: todo
-- [ ] 2. Create the two scoped CI roles in `deploy/`: todo
-- [ ] 3. Add the `deploy-org/` project (OU + account): todo
-- [ ] 4. Record the account id below, then let it settle: todo
-- [ ] 5. Add the `deploy-workbench/` project and its CI job: todo
-- [ ] 6. Extend `identity-center.ts` for the new account: todo
-- [ ] 7. Attach SCP to the `Workbench` OU: todo
-- [ ] 8. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
-- [ ] 9. Enable Bedrock model access in the new account: todo
-- [ ] 10. Request quota increases if needed: todo
-- [ ] 11. Add budget and cost anomaly detection: todo
-- [ ] 12. Point `pi` at the account, document engineer setup: todo
+- [x] 1. Create and verify `aws-workbench@goodparty.org` group alias: done
+      (2026-09-17, jeff, group created and receipt confirmed)
+- [ ] 2. Grant the deploy policy self-management, in the console: todo
+- [ ] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: doing (claude,
+      2026-09-17)
+- [ ] 4. Create the two scoped CI roles in `deploy/`: todo
+- [ ] 5. Add the `deploy-org/` project (OU + account): todo
+- [ ] 6. Record the account id below, then let it settle: todo
+- [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
+- [ ] 8. Extend `identity-center.ts` for the new account: todo
+- [ ] 9. Attach SCP to the `Workbench` OU: todo
+- [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
+- [ ] 11. Enable Bedrock model access in the new account: todo
+- [ ] 12. Request quota increases if needed: todo
+- [ ] 13. Add budget and cost anomaly detection: todo
+- [ ] 14. Point `pi` at the account, document engineer setup: todo
 
 Facts discovered during implementation go here as they are learned:
 
@@ -35,6 +39,13 @@ Facts discovered during implementation go here as they are learned:
 - `github-actions-workbench-deploy` ARN: _not yet created_
 - In-account workbench deploy role ARN: _not yet created_
 - SCPs enabled on org root: _not yet checked_
+- `GitHubActionsPulumiDeployPolicy` version at adoption: v17 as of 2026-09-17,
+  becoming v18 once step 2 lands. IAM caps a policy at five versions and this
+  one is at the cap, so step 2 also deletes v13, the oldest non-default.
+- Repos that actually reference `github-actions-pulumi-deploy`: only `ops` and
+  `omni`. The other seven in its trust policy have no reference anywhere. Of
+  the two, only `omni/.github/workflows/publish-experiments.yml` needs it on
+  `pull_request`. Relevant to tightening trust later; not part of this plan.
 
 ## How to resume
 
@@ -214,7 +225,7 @@ Why not the alternatives:
 ## The deploy role
 
 `github-actions-pulumi-deploy` cannot provision the account today. As of policy
-version v16 it has no `organizations:` statement and no `sts:AssumeRole`
+version v17 it has no `organizations:` statement and no `sts:AssumeRole`
 statement. Its attached `ReadOnlyAccess` covers every Organizations read we
 need, including `DescribeCreateAccountStatus`, but no writes.
 
@@ -228,7 +239,7 @@ campaign-plan-service, ops, gpvpn, runbooks, omni
 ```
 
 Granting `organizations:CreateAccount` there would let nine repositories' CI
-create AWS accounts, and the SCP work in step 7 would add `DetachPolicy`, which
+create AWS accounts, and the SCP work in step 9 would add `DetachPolicy`, which
 would let them remove org guardrails.
 
 Honest caveat: that role already holds `sso:*` on `*`, and anything that can
@@ -236,10 +247,11 @@ call `sso:*` can assign itself `AdministratorAccess` through Identity Center.
 So it is already effectively organization-admin from nine repos, and the
 Organizations writes would not be a new category of risk. The reason to split
 anyway is that this project exists to make a boundary structurally real, and
-v16 suggests the drift has been steady. This is the moment to stop adding to
+v17 suggests the drift has been steady, and v17 landed by console edit on
+the same day this plan was written. This is the moment to stop adding to
 the pile, not an emergency.
 
-Instead, two purpose-built roles, both created by the `ops` stack in step 2
+Instead, two purpose-built roles, both created by the `ops` stack in step 4
 (which already holds `iam:CreateRole`). Trust for both is scoped to
 `repo:thegoodparty/ops:ref:refs/heads/main`, not `:*`, so PR branches cannot
 assume them.
@@ -286,7 +298,7 @@ ssm:GetParameter on arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-co
 Missing the passphrase grant produces a state decryption error that does not
 obviously point at IAM.
 
-Step 7 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
+Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
 `DescribePolicy`, `ListPoliciesForTarget` and friends) added to
 `github-actions-org-deploy`. Add them in that step's PR, so each grant arrives
 with the code that uses it.
@@ -330,22 +342,65 @@ needed, and so the asynchronous parts have a human gap after them.
    it is the break-glass recovery path, so it must be a group rather than a
    person. The address must never have been used for another AWS account.
 
-2. In `deploy/`, create `github-actions-org-deploy` and
+2. In the console, add a `SelfManageDeployPolicy` statement to
+   `GitHubActionsPulumiDeployPolicy` granting `iam:CreatePolicyVersion`,
+   `DeletePolicyVersion`, `SetDefaultPolicyVersion`, `TagPolicy` and
+   `UntagPolicy`, scoped to that one policy ARN.
+
+   This is unavoidably a console step. Step 3 makes Pulumi the owner of this
+   policy, and Pulumi cannot grant itself the permission it needs in order to
+   grant itself permissions. It should be the last console edit this policy
+   ever receives.
+
+   Not granted: `iam:CreatePolicy`, so the role cannot mint managed policies at
+   all, and `iam:DeletePolicy`, a second independent barrier alongside
+   `protect: true`, on the same reasoning as never granting
+   `organizations:CloseAccount`.
+
+   Scoped to one ARN rather than `*` because the program has no
+   `aws.iam.Policy` resources at all: its IAM idiom is roles with inline
+   policies, already covered by the unscoped `iam:PutRolePolicy`. The adopted
+   policy is a standalone managed policy only because it was hand-created
+   before any of this was code. If that idiom ever changes, widen to an IAM
+   path prefix such as `arn:aws:iam::333022194791:policy/ops/*` rather than to
+   `*`. Do not give the adopted policy a path: changing one forces a
+   replacement of the policy that grants CI its permissions.
+
+   IAM caps a policy at five versions and this one is at the cap, so delete
+   v13, the oldest non-default, in order to save.
+
+3. Adopt `github-actions-pulumi-deploy` into Pulumi, using the `import:` plus
+   `protect: true` pattern that `components/identity-center.ts` already uses
+   for pre-existing resources. Four resources: the role, its customer-managed
+   policy, and the two `RolePolicyAttachment`s. It is currently unmanaged,
+   appearing only as a string in `deploy.yml:42`, so every grant to it is an
+   unreviewed console change.
+
+   A clean no-op preview is the acceptance test, so the captured trust policy
+   and document have to match AWS. Capture the document late: it changed on
+   2026-09-17 while this plan was being written, adding `alert-filter-*` SNS
+   and DynamoDB resources. If it drifts again between capture and merge,
+   Pulumi silently reverts that change on the next apply, possibly during an
+   unrelated PR.
+
+   Do not tighten the nine-repo trust policy here. Adoption must be a
+   zero-diff capture, or a clean preview stops being a meaningful check.
+
+   Caveat: Pulumi managing the role Pulumi assumes is a bootstrapping hazard.
+   `protect: true` blocks destroy and replace but not update, so a bad trust
+   policy update can still lock CI out. The real mitigation is the
+   `AdministratorAccess` permission set, a break-glass path that does not
+   depend on CI.
+
+4. In `deploy/`, create `github-actions-org-deploy` and
    `github-actions-workbench-deploy` with the trust and actions described in
    the deploy role section. Pure IAM, makes no Organizations calls, and applies
-   with the permissions the shared role already has. This has to land first,
-   because a CI job cannot assume a role that does not exist.
+   with the permissions the shared role already has. This has to land before
+   the projects that use them, because a CI job cannot assume a role that does
+   not exist. Give both inline policies via `aws.iam.RolePolicy` rather than
+   managed ones, so that step 2's statement needs no additions.
 
-   Consider adopting `github-actions-pulumi-deploy` itself into Pulumi at the
-   same time, using the `import:` plus `protect: true` pattern that
-   `components/identity-center.ts` already uses for pre-existing resources. It
-   is currently unmanaged, appearing only as a string in `deploy.yml:42`, so
-   every grant to it is an unreviewed console change. Caveat: Pulumi managing
-   the role Pulumi assumes is a bootstrapping hazard, mitigated by
-   `protect: true` and the `AdministratorAccess` permission set as a
-   break-glass path that does not depend on CI.
-
-3. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
+5. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
    `Workbench` OU, the account, and a CI job assuming
    `github-actions-org-deploy`.
 
@@ -366,12 +421,12 @@ needed, and so the asynchronous parts have a human gap after them.
    `DescribeCreateAccountStatus`. Expect the job to be slow, and expect
    failures if the email is already in use anywhere in AWS.
 
-4. Record the new account id in the Progress section above. Then stop and let
+6. Record the new account id in the Progress section above. Then stop and let
    it settle. The account needs time to reach ACTIVE and for STS to see
-   `OrganizationAccountAccessRole`; a step 5 that runs immediately can fail
+   `OrganizationAccountAccessRole`; a step 7 that runs immediately can fail
    transiently in a way that looks like a permissions bug.
 
-5. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
+7. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
    `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
    path filter so its deploys are independent of the delegate image build. Its
    provider is explicit:
@@ -384,14 +439,14 @@ needed, and so the asynchronous parts have a human gap after them.
    });
    ```
 
-6. Extend `deploy/components/identity-center.ts` to assign permission sets to
+8. Extend `deploy/components/identity-center.ts` to assign permission sets to
    the new account. Today `ACCOUNT_ID` is a hardcoded const used as every
    assignment's `targetId`, so this needs parameterizing to iterate over
    accounts. New assignments must not carry the `import:` option that the
    existing ones use, since there is no pre-existing AWS state to adopt. See
    the open question on which permission set to use.
 
-7. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
+9. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
    else. Requires adding the policy actions to `github-actions-org-deploy` in
    the same PR. Write the SCP now while the account is nearly empty. Once four
    people depend on the junk it becomes impossible.
@@ -399,23 +454,23 @@ needed, and so the asynchronous parts have a human gap after them.
    Check first whether `SERVICE_CONTROL_POLICY` is enabled as a policy type on
    the org root. If it never has been, that is a one-time enablement.
 
-8. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
+10. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
    automatically when Organizations provisions a member account, but it is
    effectively administrator. Use it to stand the account up, then create a
    scoped deploy role inside the workbench account and point the
    `deploy-workbench/` provider at that instead.
 
-9. Enable Bedrock model access in the new account. This is per account and per
+11. Enable Bedrock model access in the new account. This is per account and per
    region, so it must be done again here. Enable only the models needed.
 
-10. Request quota increases if the defaults are insufficient. These are per
+12. Request quota increases if the defaults are insufficient. These are per
     account, and a new account may start lower than our matured account.
     Budget lead time.
 
-11. Add a budget and cost anomaly detection before handing the account to
+13. Add a budget and cost anomaly detection before handing the account to
     engineers.
 
-12. Point `pi` at the new account and document engineer setup.
+14. Point `pi` at the new account and document engineer setup.
 
 ## Open questions
 
