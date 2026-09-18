@@ -367,6 +367,35 @@ Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
 `github-actions-org-deploy`. Add them in that step's PR, so each grant arrives
 with the code that uses it.
 
+## Apply ordering between workflows
+
+Not a Pulumi dependency, a GitHub Actions one, and it is easy to miss because
+the two workflows look independent.
+
+`deploy.yml` has no path filter, so it runs on *every* push to main.
+`deploy-org.yml` runs on pushes touching `deploy-org/**`. A merge that touches
+both therefore starts them at the same moment, in separate concurrency groups,
+with nothing sequencing them.
+
+That is fine as long as they are genuinely independent, and they are not
+whenever a PR grants `github-actions-org-deploy` a new permission. The grant
+lives in `deploy/components/ci-roles/policies.ts` and is applied by the `ops`
+stack, which is `deploy.yml`'s job; the code that needs the grant is applied by
+`deploy-org.yml`. If the latter wins the race, it runs against the old policy
+and fails with AccessDenied.
+
+So step 9's instruction to add the policy actions "in the same PR" that uses
+them is wrong as written, and step 4 only got away with it because the roles it
+created had no consumer yet. The rule should be: **a PR that widens
+`github-actions-org-deploy` must merge before, and finish applying before, the
+PR that depends on the widening.** Same staging reasoning step 4 already gives
+for role existence, extended to role permissions.
+
+Failure here is not clean. `CreateOrganizationalUnit` succeeds and the
+follow-up read fails, leaving an OU in AWS that may not be in state, and
+Organizations permits duplicate OU names under one parent, so a rerun makes a
+second `Workbench` rather than erroring.
+
 ## Cross-project dependencies
 
 Pulumi resolves dependencies automatically **within** a stack, from Output
@@ -475,6 +504,13 @@ needed, and so the asynchronous parts have a human gap after them.
 5. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
    `Workbench` OU, the account, and a CI job assuming
    `github-actions-org-deploy`.
+
+   Known gap, blocking this step: the role is missing
+   `organizations:ListAccountsForParent`. The OU resource exposes a computed
+   `accounts` attribute, so the provider's read-back after
+   `CreateOrganizationalUnit` lists the OU's children, and the role granted in
+   step 4 cannot. See the apply-ordering section above for why that grant has
+   to land and apply in an earlier PR rather than this one.
 
    The CI job is its own workflow file, `.github/workflows/deploy-org.yml`,
    not a second job in `deploy.yml`. Path filters are per workflow rather than

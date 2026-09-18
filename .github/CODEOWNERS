@@ -19,9 +19,17 @@
 # risk: those resources are protected precisely because removing one detaches
 # or closes a real account, and the role that applies them is the only one in
 # the org holding organizations:CreateAccount.
+#
+# deploy-org.yml is gated alongside it, because gating the program without
+# gating the workflow that hands it credentials is only half a gate: that file
+# is where role-to-assume names github-actions-org-deploy, so an edit there can
+# run anything it likes with account-creating permissions. Note the remaining
+# gap, deliberately left for a separate change: deploy.yml is ungated and
+# assumes the far broader github-actions-pulumi-deploy.
 
 /delegate/                             @thegoodparty/gp-contrib
 /deploy-org/                           @thegoodparty/gp-contrib
+/.github/workflows/deploy-org.yml      @thegoodparty/gp-contrib
 /deploy/components/ci-roles/           @thegoodparty/gp-contrib
 /deploy/components/ci-roles.ts         @thegoodparty/gp-contrib
 /deploy/components/identity-center/    @thegoodparty/gp-contrib

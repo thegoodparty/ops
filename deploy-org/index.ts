@@ -22,12 +22,23 @@ import * as aws from "@pulumi/aws";
 // obligations differ from production's. An OU rather than a bare account
 // under the root because step 9 attaches a service control policy, and SCPs
 // attach to an OU; retrofitting one later means moving a live account.
+//
+// The root id is hardcoded, matching how identity-center.ts hardcodes
+// ACCOUNT_ID and index.ts hardcodes subnet and security group ids. There is
+// exactly one root per organization and it cannot be recreated, so looking it
+// up with getOrganization() would trade a constant for an API call and a
+// permission, and buy nothing.
+//
+// Organizations does not enforce unique OU names under a parent. If an apply
+// ever fails partway and the OU is left in AWS but not in state, a rerun
+// creates a *second* OU also called Workbench rather than failing. Check for
+// an orphan before rerunning a failed apply of this file.
 const workbenchOu = new aws.organizations.OrganizationalUnit("workbench", {
   name: "Workbench",
   parentId: "r-jqqe",
 });
 
-// Three independent guards against losing this account, because the blast
+// Four independent guards against losing this account, because the blast
 // radius of deleting it is the whole point of reviewing this file.
 //
 // `protect: true` blocks the delete itself. It does not block an update, so
@@ -42,9 +53,12 @@ const workbenchOu = new aws.organizations.OrganizationalUnit("workbench", {
 // a fresh invitation, and a standalone account has no consolidated billing
 // and no SCP governance in the meantime.
 //
-// Third, github-actions-org-deploy does not hold organizations:CloseAccount
-// at all, so CI could not perform the close even if both settings above were
-// flipped. Do not add that action in order to make a destroy work.
+// Third and fourth, github-actions-org-deploy holds neither
+// organizations:CloseAccount nor organizations:RemoveAccountFromOrganization,
+// so IAM refuses *both* delete paths independently of the two settings above.
+// A `pulumi destroy` of this stack fails with AccessDenied rather than
+// detaching anything. Do not add either action in order to make a destroy
+// work.
 //
 // CreateAccount is asynchronous: the call returns immediately and Pulumi then
 // polls DescribeCreateAccountStatus, so expect this apply to take minutes
