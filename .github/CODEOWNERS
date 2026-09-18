@@ -6,6 +6,8 @@
 # repo; gp-secops has read only, and GitHub silently ignores code owners
 # without write access.
 
+/deploy/components/ci-roles/           @thegoodparty/gp-contrib
+/deploy/components/ci-roles.ts         @thegoodparty/gp-contrib
 /deploy/components/identity-center/    @thegoodparty/gp-contrib
 /deploy/components/identity-center.ts  @thegoodparty/gp-contrib
 /deploy/deploy.sh                      @thegoodparty/gp-contrib
