@@ -251,6 +251,13 @@ export const adminReservedActions: PolicyDocument = {
         "sso-directory:Remove*",
         "sso-directory:Start*",
         "sso-directory:Update*",
+        // VerifyEmail flips a directory user's email-verified state, which is
+        // the same mutation class as the rest of this list. It was missed the
+        // first time because the verb lists were built by filtering action
+        // names on their prefix, and `Verify` reads as a query. Raised in
+        // review. `VerifyEmail` is the only Verify action this namespace has
+        // today; the wildcard is for consistency with the entries around it.
+        "sso-directory:Verify*",
         // Named rather than wildcarded: identitystore-auth:Batch* would also
         // catch BatchGetSession, which is a read.
         "identitystore-auth:BatchDeleteSession",
