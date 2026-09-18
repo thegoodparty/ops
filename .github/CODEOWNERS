@@ -13,8 +13,15 @@
 # PR_REVIEWER_APPROVAL_ENABLED, and the subagent prompts drive what it looks
 # at. Gating one file would leave the same hole one file over, and the
 # existing gates are path-based rather than content-based for the same reason.
+#
+# /deploy-org/ provisions organizational units and member accounts. Creating
+# an account is not a permission change, but it carries the same shape of
+# risk: those resources are protected precisely because removing one detaches
+# or closes a real account, and the role that applies them is the only one in
+# the org holding organizations:CreateAccount.
 
 /delegate/                             @thegoodparty/gp-contrib
+/deploy-org/                           @thegoodparty/gp-contrib
 /deploy/components/ci-roles/           @thegoodparty/gp-contrib
 /deploy/components/ci-roles.ts         @thegoodparty/gp-contrib
 /deploy/components/identity-center/    @thegoodparty/gp-contrib
