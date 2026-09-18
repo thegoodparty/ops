@@ -1,11 +1,20 @@
-# Changes to AWS permissions and to this file must be approved by a human.
+# Changes to AWS permissions, to the bot's own review gates, and to this file
+# must be approved by a human.
 # delegate[bot] is a GitHub App and cannot be a team member, so a code-owner
 # requirement naming a team is structurally unsatisfiable by it.
 #
 # gp-contrib is used because it is the only team with write access to this
 # repo; gp-secops has read only, and GitHub silently ignores code owners
 # without write access.
+#
+# /delegate/ is the whole tree rather than just pr-reviewer.ts, because the
+# reviewer's behaviour is not confined to one file: the framework sets its
+# allowed tools, the worker swaps in the reviewer App's token and sets
+# PR_REVIEWER_APPROVAL_ENABLED, and the subagent prompts drive what it looks
+# at. Gating one file would leave the same hole one file over, and the
+# existing gates are path-based rather than content-based for the same reason.
 
+/delegate/                             @thegoodparty/gp-contrib
 /deploy/components/ci-roles/           @thegoodparty/gp-contrib
 /deploy/components/ci-roles.ts         @thegoodparty/gp-contrib
 /deploy/components/identity-center/    @thegoodparty/gp-contrib
