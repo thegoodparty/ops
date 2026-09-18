@@ -134,3 +134,156 @@ export const productManager: PolicyDocument = {
     },
   ],
 };
+
+// ---------------------------------------------------------------------------
+// Actions reserved for the AdministratorAccess permission set, denied to every
+// other one.
+//
+// Why a Deny rather than just not granting these. `engineerAccess` grants
+// `Action: ["*"]` twice, gated only on Environment tags, so any action that
+// accepts a request tag is reachable by tagging the request `dev`. That is how
+// `organizations:CreateAccount` ended up available to the Engineers group, and
+// closing that is the reason this document exists. A Deny is evaluated before
+// every Allow and cannot be satisfied around with a condition, so it keeps
+// holding as those Allow statements drift.
+//
+// Composed into each permission set's inline policy rather than attached as
+// its own AWS policy. A permission set accepts exactly one inline policy, and
+// the customer-managed alternative is referenced by name rather than ARN, so
+// it would have to exist in every account a set is provisioned to. That breaks
+// the moment the workbench account arrives.
+//
+// Scope, so this is not mistaken for more than it is: it constrains sessions
+// taken through the permission sets it is applied to, and nothing else. It
+// does not touch IAM roles or users in the account. The account-wide version
+// of this control is an SCP, and SCPs have no effect on the organization's
+// management account, which is where all of these sets are assigned.
+//
+// Verified against AWS's machine-readable service reference rather than
+// guessed, so the verb lists match the services' real action names.
+export const adminReservedActions: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    // Writes only. Denying `organizations:*` would also remove the org reads
+    // ReadOnlyAccess grants, which cost nothing to keep.
+    {
+      Sid: "DenyOrganizationWrites",
+      Effect: "Deny",
+      Action: [
+        "organizations:Accept*",
+        "organizations:Attach*",
+        "organizations:Cancel*",
+        "organizations:Close*",
+        "organizations:Create*",
+        "organizations:Decline*",
+        "organizations:Delete*",
+        "organizations:Deregister*",
+        "organizations:Detach*",
+        "organizations:Disable*",
+        "organizations:Enable*",
+        "organizations:Invite*",
+        "organizations:Leave*",
+        "organizations:Move*",
+        "organizations:Put*",
+        "organizations:Register*",
+        "organizations:Remove*",
+        "organizations:Tag*",
+        "organizations:Terminate*",
+        "organizations:Untag*",
+        "organizations:Update*",
+      ],
+      Resource: "*",
+    },
+    // Identity Center administration. CI manages permission sets through
+    // github-actions-pulumi-deploy, which is an IAM role rather than a
+    // permission set, so none of this reaches it. Sign-in is also unaffected:
+    // the portal calls that issue credentials run on the portal token, before
+    // any permission set role is assumed.
+    {
+      Sid: "DenyIdentityCenterWrites",
+      Effect: "Deny",
+      Action: [
+        "sso:Add*",
+        "sso:Associate*",
+        "sso:Attach*",
+        "sso:Create*",
+        "sso:Delete*",
+        "sso:Detach*",
+        "sso:Disassociate*",
+        "sso:Import*",
+        "sso:Provision*",
+        "sso:Put*",
+        "sso:Remove*",
+        "sso:Start*",
+        "sso:Tag*",
+        "sso:Untag*",
+        "sso:Update*",
+        "identitystore:Add*",
+        "identitystore:Create*",
+        "identitystore:Delete*",
+        "identitystore:Remove*",
+        "identitystore:Reserve*",
+        "identitystore:Update*",
+      ],
+      Resource: "*",
+    },
+    // IAM principal mutation. Nothing here is reachable today, because no IAM
+    // action supports a resource-tag condition key and so `DevResourceOperations`
+    // can never match one. That is an accident of how IAM works rather than a
+    // control anyone chose, which is exactly why it should not be relied on.
+    //
+    // The Create verbs are spelled out instead of wildcarded for one reason:
+    // `iam:Create*` would also deny `iam:CreateServiceLinkedRole`, which AWS
+    // creates implicitly the first time someone uses a service, and there is no
+    // way to allow it back. Deny wins, and IAM has no condition key that
+    // filters on the action name.
+    //
+    // `iam:Pass*` is deliberately absent. Passing an existing privileged role
+    // to a resource you control is a real escalation route, but denying it
+    // outright breaks ordinary work like creating a Lambda or an ECS task, and
+    // constraining it properly means knowing which roles are sensitive. That is
+    // its own change.
+    {
+      Sid: "DenyIamPrincipalWrites",
+      Effect: "Deny",
+      Action: [
+        "iam:CreateAccessKey",
+        "iam:CreateAccountAlias",
+        "iam:CreateDelegationRequest",
+        "iam:CreateGroup",
+        "iam:CreateInstanceProfile",
+        "iam:CreateLoginProfile",
+        "iam:CreateOpenIDConnectProvider",
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:CreateRole",
+        "iam:CreateSAMLProvider",
+        "iam:CreateServiceSpecificCredential",
+        "iam:CreateUser",
+        "iam:CreateVirtualMFADevice",
+        "iam:Accept*",
+        "iam:Add*",
+        "iam:Associate*",
+        "iam:Attach*",
+        "iam:Change*",
+        "iam:Deactivate*",
+        "iam:Delete*",
+        "iam:Detach*",
+        "iam:Disable*",
+        "iam:Enable*",
+        "iam:Put*",
+        "iam:Reject*",
+        "iam:Remove*",
+        "iam:Reset*",
+        "iam:Resync*",
+        "iam:Send*",
+        "iam:Set*",
+        "iam:Tag*",
+        "iam:Untag*",
+        "iam:Update*",
+        "iam:Upload*",
+      ],
+      Resource: "*",
+    },
+  ],
+};
