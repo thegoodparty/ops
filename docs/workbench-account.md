@@ -24,12 +24,15 @@ two sessions from doing them twice.
 - [x] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: done (2026-09-17,
       bbcb8ae, PR #59; apply created no v19 and both documents still match
       AWS exactly, so the capture was clean)
-- [ ] 4. Create the two scoped CI roles in `deploy/`: doing (claude,
-      2026-09-18, implemented in the same PR as this bookkeeping because
-      human review gates every merge here, so the claim cannot race.
-      Flip to done once the main apply is confirmed to have created both
-      roles, the way step 3 was confirmed.)
-- [ ] 5. Add the `deploy-org/` project (OU + account): todo
+- [x] 4. Create the two scoped CI roles in `deploy/`: done (2026-09-18,
+      5f3655e and 9dad234, PR #60; both roles confirmed in AWS with
+      `iam:GetRole`, created 18:29 UTC by that merge's apply, each carrying
+      its inline policy. ARNs recorded below.)
+- [ ] 5. Add the `deploy-org/` project (OU + account): doing (claude,
+      2026-09-18, implemented in the same PR as this claim, on the same
+      reasoning as step 4: human review gates every merge here, so the claim
+      cannot race. Flip to done once `aws organizations list-accounts` shows
+      the account and its id is recorded below.)
 - [ ] 6. Record the account id below, then let it settle: todo
 - [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
 - [ ] 8. Extend `identity-center.ts` for the new account: todo
@@ -43,8 +46,12 @@ two sessions from doing them twice.
 Facts discovered during implementation go here as they are learned:
 
 - Workbench account id: _not yet created_
-- `github-actions-org-deploy` ARN: _not yet created_
-- `github-actions-workbench-deploy` ARN: _not yet created_
+- `github-actions-org-deploy` ARN:
+  `arn:aws:iam::333022194791:role/github-actions-org-deploy`, inline policy
+  `OrgDeploy`
+- `github-actions-workbench-deploy` ARN:
+  `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
+  policy `WorkbenchDeploy`
 - In-account workbench deploy role ARN: _not yet created_
 - SCPs enabled on org root: none. Root `r-jqqe` reports an empty
   `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
@@ -469,18 +476,37 @@ needed, and so the asynchronous parts have a human gap after them.
    `Workbench` OU, the account, and a CI job assuming
    `github-actions-org-deploy`.
 
+   The CI job is its own workflow file, `.github/workflows/deploy-org.yml`,
+   not a second job in `deploy.yml`. Path filters are per workflow rather than
+   per job, and the filter is the point: organization changes should not queue
+   behind the delegate image build. It has no `pull_request` trigger either,
+   and cannot have one. `github-actions-org-deploy` is trusted only for the
+   subject `repo:thegoodparty/ops:ref:refs/heads/main`, so a pull_request run
+   presents a ref that cannot match and the role assumption fails by design.
+   The new project is added to `tsconfig.json` instead, so `deploy.yml`
+   type-checks it on every PR even though it never applies it.
+
    ```ts
    const workbench = new aws.organizations.Account("workbench", {
      name: "goodparty-workbench",
      email: "aws-workbench@goodparty.org",
      parentId: workbenchOu.id,
      iamUserAccessToBilling: "ALLOW",
+     closeOnDeletion: false,
    }, { protect: true });
    ```
 
-   `protect: true` is not optional. Removing this resource tells Pulumi to
-   close the account, and a closed AWS account sits in a 90 day suspension
-   window.
+   `protect: true` is not optional; it is what blocks the delete.
+
+   Correction to an earlier draft of this plan, which claimed that removing
+   the resource closes the account. It does not, by default. What a delete
+   does is governed by `closeOnDeletion`, which the provider defaults to
+   `false`: the account is removed from the organization and left standalone,
+   not closed. Only `true` calls `CloseAccount` and starts the 90 day
+   suspension window. Set it explicitly anyway. Neither outcome is quick to
+   undo, since rejoining an organization needs a fresh invitation and a
+   standalone account has no consolidated billing or SCP governance in the
+   interim, and an implicit default is the wrong thing to be relying on.
 
    `CreateAccount` is asynchronous and takes minutes. Pulumi polls
    `DescribeCreateAccountStatus`. Expect the job to be slow, and expect
