@@ -436,10 +436,17 @@ const pulumiBackendStatements = (project: string): PolicyStatement[] => [
 // organizations:CloseAccount is deliberately absent and must stay absent.
 // Nothing in the plan needs it, and its absence is a second barrier alongside
 // protect: true against a resource deletion closing a real AWS account, which
-// would begin a 90 day suspension.
+// would begin a 90 day suspension. organizations:RemoveAccountFromOrganization
+// is absent on the same reasoning: it is the other delete path, the one taken
+// when closeOnDeletion is false, and leaving it out means IAM refuses both.
 //
-// Step 9 adds the service control policy actions here, in the PR that first
-// uses them, so no grant arrives ahead of the code that needs it.
+// Widening this policy needs its own PR, merged and applied before the PR that
+// depends on the widening. It is tempting to pair a grant with the code that
+// uses it, and that is wrong here: this policy is applied by the ops stack via
+// deploy.yml, while the code using it is applied by deploy-org.yml, and both
+// start on the same push to main with nothing sequencing them. A same-PR grant
+// races its own consumer. That applies to step 9's service control policy
+// actions too.
 export const githubActionsOrgDeploy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -475,6 +482,15 @@ export const githubActionsOrgDeploy: PolicyDocument = {
         "organizations:ListAccounts",
         "organizations:ListParents",
         "organizations:ListOrganizationalUnitsForParent",
+        // Not obvious from the code that will use it, which only asks for an
+        // OU. The OU resource exposes a computed `accounts` attribute, so the
+        // provider's read-back after CreateOrganizationalUnit lists the OU's
+        // children. Without this the create succeeds and the read that
+        // follows it fails, which is the worst of both: an OU in the
+        // organization, an apply that errored, and possibly no state for it.
+        // Organizations does not require OU names to be unique under a
+        // parent, so the rerun makes a second Workbench instead of failing.
+        "organizations:ListAccountsForParent",
         "organizations:ListTagsForResource",
       ],
       Resource: "*",
