@@ -355,23 +355,71 @@ export const opsMainBranchTrust: TrustPolicyDocument = {
 // to think about this because it holds s3:* on *; a scoped role does not
 // inherit that, and it does not inherit ReadOnlyAccess either.
 //
+// Scoped per project rather than to the bucket. goodparty-iac-state is shared
+// by seven projects today (gp-api, people-api, election-api, delegates, gpvpn,
+// campaign-plan-service and ops), and all of them are encrypted with the one
+// passphrase granted below. A bucket-wide object grant would therefore let
+// either of these roles decrypt and rewrite any of those stacks, and the next
+// deploy of the victim project would apply the rewritten state with whatever
+// role that project uses. That is the opposite of what this whole change is
+// for.
+//
+// The DIY backend's layout is per project, verified against the live bucket
+// rather than assumed:
+//
+//   .pulumi/stacks/<project>/<stack>.json          (and .bak)
+//   .pulumi/locks/organization/<project>/<stack>/  ("organization" is literal)
+//   .pulumi/backups/<project>/<stack>/
+//   .pulumi/history/<project>/<stack>/
+//   .pulumi/meta.yaml                              (bucket-wide, read only)
+//
+// Trailing slashes matter. A prefix of `.pulumi/stacks/org` without one would
+// also match `.pulumi/stacks/organization-anything`.
+//
 // The passphrase parameter is a SecureString under the AWS-managed
 // alias/aws/ssm key. No kms:Decrypt grant is needed: that key's policy admits
 // callers in this account via ssm, which is why the shared role decrypts it
 // today holding ssm:GetParameter and nothing else. Omitting the ssm grant
 // surfaces as a state decryption error that does not obviously point at IAM.
-const pulumiBackendStatements: PolicyStatement[] = [
+//
+// Known wart, not fixed here: every project shares that one passphrase, so the
+// separation above is enforced by the object ARNs alone. A passphrase per
+// project would make it defence in depth instead. That is a change to the
+// existing stacks, not to this one.
+const BUCKET = "arn:aws:s3:::goodparty-iac-state";
+
+const pulumiBackendStatements = (project: string): PolicyStatement[] => [
+  // ListBucket is deliberately not prefix-conditioned. Pulumi enumerates
+  // stacks by listing `.pulumi/stacks/`, so an s3:prefix condition tight
+  // enough to matter risks breaking `stack select` in a way nothing here can
+  // verify until step 5 runs. What it leaks is key names, which are project
+  // and stack names we already publish in this repo. The content boundary is
+  // the object statements below, which is where the reviewable risk was.
   {
     Sid: "PulumiStateBucket",
     Effect: "Allow",
     Action: ["s3:ListBucket", "s3:GetBucketLocation"],
-    Resource: "arn:aws:s3:::goodparty-iac-state",
+    Resource: BUCKET,
   },
   {
     Sid: "PulumiStateObjects",
     Effect: "Allow",
     Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-    Resource: "arn:aws:s3:::goodparty-iac-state/*",
+    Resource: [
+      `${BUCKET}/.pulumi/stacks/${project}/*`,
+      `${BUCKET}/.pulumi/locks/organization/${project}/*`,
+      `${BUCKET}/.pulumi/backups/${project}/*`,
+      `${BUCKET}/.pulumi/history/${project}/*`,
+    ],
+  },
+  // Read only, and bucket-wide because it is a single bucket-level file. It
+  // already exists, so the backend reads it to check the format version and
+  // writes it only when initialising an empty bucket.
+  {
+    Sid: "PulumiStateMeta",
+    Effect: "Allow",
+    Action: ["s3:GetObject"],
+    Resource: `${BUCKET}/.pulumi/meta.yaml`,
   },
   {
     Sid: "PulumiStatePassphrase",
@@ -403,6 +451,11 @@ export const githubActionsOrgDeploy: PolicyDocument = {
         "organizations:CreateAccount",
         "organizations:MoveAccount",
         "organizations:TagResource",
+        // Paired with TagResource on purpose. Removing or renaming a tag on
+        // the OU or the account calls UntagResource, and without it step 5's
+        // apply fails partway with AccessDenied against a half-created
+        // account.
+        "organizations:UntagResource",
       ],
       Resource: "*",
     },
@@ -426,7 +479,7 @@ export const githubActionsOrgDeploy: PolicyDocument = {
       ],
       Resource: "*",
     },
-    ...pulumiBackendStatements,
+    ...pulumiBackendStatements("org"),
   ],
 };
 
@@ -445,5 +498,5 @@ export const githubActionsOrgDeploy: PolicyDocument = {
 // read and write Pulumi state and do nothing else.
 export const githubActionsWorkbenchDeploy: PolicyDocument = {
   Version: "2012-10-17",
-  Statement: [...pulumiBackendStatements],
+  Statement: [...pulumiBackendStatements("workbench")],
 };

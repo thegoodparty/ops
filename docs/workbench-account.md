@@ -275,7 +275,12 @@ organizations:CreateOrganizationalUnit
 organizations:CreateAccount
 organizations:MoveAccount
 organizations:TagResource
+organizations:UntagResource
 ```
+
+`UntagResource` is paired with `TagResource` deliberately. Removing or
+renaming a tag on the OU or the account calls it, and without it step 5 fails
+partway through an apply that has already created a real account.
 
 and, because a scoped role does not inherit the shared role's
 `ReadOnlyAccess`, the reads must be spelled out explicitly:
@@ -300,12 +305,44 @@ a resource deletion closing a real account.
 the workbench account, and nothing else in the management account.
 
 Both roles also need Pulumi backend access, which the shared role never had to
-think about because it holds `s3:*` on `*`:
+think about because it holds `s3:*` on `*`. Scope it per project, not to the
+bucket. `goodparty-iac-state` is shared by seven projects today (`gp-api`,
+`people-api`, `election-api`, `delegates`, `gpvpn`, `campaign-plan-service`
+and `ops`), all encrypted with the single passphrase below, so a bucket-wide
+object grant would let either of these roles decrypt and rewrite any of them,
+and the victim project would apply the rewritten state on its next deploy.
+
+The backend's layout is per project, checked against the live bucket:
 
 ```
-s3 read/write on arn:aws:s3:::goodparty-iac-state and its objects
+.pulumi/stacks/<project>/<stack>.json          and .bak
+.pulumi/locks/organization/<project>/<stack>/  "organization" is literal
+.pulumi/backups/<project>/<stack>/
+.pulumi/history/<project>/<stack>/
+.pulumi/meta.yaml                              bucket-wide, read only
+```
+
+So each role gets `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the
+four prefixes for its own project only, `s3:GetObject` on `meta.yaml`, and:
+
+```
+s3:ListBucket, s3:GetBucketLocation on arn:aws:s3:::goodparty-iac-state
 ssm:GetParameter on arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase
 ```
+
+Keep the trailing slash in each prefix. `.pulumi/stacks/org` without one also
+matches `.pulumi/stacks/organization-anything`.
+
+`ListBucket` is left unconditioned. Pulumi enumerates stacks by listing
+`.pulumi/stacks/`, so an `s3:prefix` condition tight enough to be worth having
+risks breaking `stack select` in a way nothing can verify until step 5 runs,
+and what it would protect is key names we already publish here. The content
+boundary is the object statements.
+
+Known wart: every project shares one passphrase, so that separation rests on
+the object ARNs alone rather than on defence in depth. A passphrase per
+project would be better and is a change to the existing stacks, not to this
+work.
 
 Missing the passphrase grant produces a state decryption error that does not
 obviously point at IAM.
