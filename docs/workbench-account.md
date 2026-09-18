@@ -17,9 +17,13 @@ two sessions from doing them twice.
 
 - [x] 1. Create and verify `aws-workbench@goodparty.org` group alias: done
       (2026-09-17, jeff, group created and receipt confirmed)
-- [ ] 2. Grant the deploy policy self-management, in the console: todo
-- [ ] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: doing (claude,
-      2026-09-17)
+- [x] 2. Grant the deploy policy self-management, in the console: done
+      (2026-09-17, policy v18 default as of 19:48 UTC, v13 deleted to stay
+      under the five-version cap; recorded from AWS after the fact, so the
+      actor is unconfirmed)
+- [x] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: done (2026-09-17,
+      bbcb8ae, PR #59; apply created no v19 and both documents still match
+      AWS exactly, so the capture was clean)
 - [ ] 4. Create the two scoped CI roles in `deploy/`: todo
 - [ ] 5. Add the `deploy-org/` project (OU + account): todo
 - [ ] 6. Record the account id below, then let it settle: todo
@@ -38,10 +42,14 @@ Facts discovered during implementation go here as they are learned:
 - `github-actions-org-deploy` ARN: _not yet created_
 - `github-actions-workbench-deploy` ARN: _not yet created_
 - In-account workbench deploy role ARN: _not yet created_
-- SCPs enabled on org root: _not yet checked_
-- `GitHubActionsPulumiDeployPolicy` version at adoption: v17 as of 2026-09-17,
-  becoming v18 once step 2 lands. IAM caps a policy at five versions and this
-  one is at the cap, so step 2 also deletes v13, the oldest non-default.
+- SCPs enabled on org root: none. Root `r-jqqe` reports an empty
+  `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
+  step 9: enabling it is a property of the organization, not of the OU.
+- `GitHubActionsPulumiDeployPolicy` version at adoption: v18, the default
+  since 2026-09-17. Step 2 deleted v13 to stay under the five-version cap,
+  so the surviving versions are v14 through v18. Adoption added the stack's
+  default tags (`Environment: infra`, `Project: ops`), which the policy did
+  not carry before; it made no change to the document itself.
 - Repos that actually reference `github-actions-pulumi-deploy`: only `ops` and
   `omni`. The other seven in its trust policy have no reference anywhere. Of
   the two, only `omni/.github/workflows/publish-experiments.yml` needs it on
@@ -451,8 +459,12 @@ needed, and so the asynchronous parts have a human gap after them.
    the same PR. Write the SCP now while the account is nearly empty. Once four
    people depend on the junk it becomes impossible.
 
-   Check first whether `SERVICE_CONTROL_POLICY` is enabled as a policy type on
-   the org root. If it never has been, that is a one-time enablement.
+   `SERVICE_CONTROL_POLICY` is not enabled on the org root, so this step has
+   to enable it first. That is a property of the organization itself rather
+   than of the `Workbench` OU, so the choice is between importing the
+   existing `aws.organizations.Organization` with `enabledPolicyTypes` and
+   `protect: true`, or a one-time console enablement of the kind step 2 was.
+   Decide that when the step is claimed, not mid-PR.
 
 10. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
    automatically when Organizations provisions a member account, but it is
