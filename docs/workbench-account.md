@@ -364,8 +364,10 @@ a customer-managed key.
 
 Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
 `DescribePolicy`, `ListPoliciesForTarget` and friends) added to
-`github-actions-org-deploy`. Add them in that step's PR, so each grant arrives
-with the code that uses it.
+`github-actions-org-deploy`. Add them in a PR of their own that merges and
+finishes applying **before** the PR that uses them. Pairing a grant with its
+consumer is the intuitive thing to do and it is wrong here; see "Apply
+ordering between workflows" below for why.
 
 ## Apply ordering between workflows
 
@@ -384,12 +386,16 @@ stack, which is `deploy.yml`'s job; the code that needs the grant is applied by
 `deploy-org.yml`. If the latter wins the race, it runs against the old policy
 and fails with AccessDenied.
 
-So step 9's instruction to add the policy actions "in the same PR" that uses
-them is wrong as written, and step 4 only got away with it because the roles it
-created had no consumer yet. The rule should be: **a PR that widens
-`github-actions-org-deploy` must merge before, and finish applying before, the
-PR that depends on the widening.** Same staging reasoning step 4 already gives
-for role existence, extended to role permissions.
+So the rule is: **a PR that widens `github-actions-org-deploy` must merge
+before, and finish applying before, the PR that depends on the widening.** Same
+staging reasoning step 4 already gives for role existence, extended to role
+permissions. Step 4 got away with pairing the two only because the roles it
+created had no consumer yet.
+
+An earlier draft of this plan told step 9 to add its grants in the PR that
+uses them. That instruction has been corrected where it appears rather than
+just contradicted here, because the nearest imperative is the one a future
+session will follow.
 
 Failure here is not clean. `CreateOrganizationalUnit` succeeds and the
 follow-up read fails, leaving an OU in AWS that may not be in state, and
@@ -557,6 +563,11 @@ needed, and so the asynchronous parts have a human gap after them.
 7. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
    `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
    path filter so its deploys are independent of the delegate image build.
+
+   The workflow file must be named exactly
+   `.github/workflows/deploy-workbench.yml`. `github-actions-workbench-deploy`
+   pins `job_workflow_ref` to that path, so any other name cannot assume the
+   role, and the failure reads as a trust problem rather than a typo.
    Also add the `sts:AssumeRole` statement that step 4 deferred to
    `github-actions-workbench-deploy`, scoped to the role ARN below. Its
    provider is explicit:
@@ -577,9 +588,10 @@ needed, and so the asynchronous parts have a human gap after them.
    the open question on which permission set to use.
 
 9. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
-   else. Requires adding the policy actions to `github-actions-org-deploy` in
-   the same PR. Write the SCP now while the account is nearly empty. Once four
-   people depend on the junk it becomes impossible.
+   else. Needs the policy actions added to `github-actions-org-deploy` first,
+   in a separate PR that has finished applying before this one merges, per
+   "Apply ordering between workflows". Write the SCP now while the account is
+   nearly empty. Once four people depend on the junk it becomes impossible.
 
    `SERVICE_CONTROL_POLICY` is not enabled on the org root, so this step has
    to enable it first. That is a property of the organization itself rather

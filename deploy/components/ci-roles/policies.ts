@@ -329,10 +329,30 @@ export const githubActionsPulumiDeploy: PolicyDocument = {
 
 const OPS_MAIN_SUBJECT = "repo:thegoodparty/ops:ref:refs/heads/main";
 
-// `ref:refs/heads/main` rather than `:*`. A pull_request ref cannot match it,
-// so a fork PR or an unreviewed branch cannot assume these roles even though
-// the workflow file is visible to anyone.
-export const opsMainBranchTrust: TrustPolicyDocument = {
+/**
+ * Trust for a role that exactly one workflow, on main, may assume.
+ *
+ * Two conditions, doing two different jobs.
+ *
+ * `sub` is `ref:refs/heads/main` rather than `:*`. A pull_request ref cannot
+ * match it, so a fork PR or an unreviewed branch cannot assume these roles
+ * even though the workflow file is visible to anyone.
+ *
+ * `job_workflow_ref` pins *which workflow file* the job came from. Without it
+ * the trust policy is per-ref only: `sub` is identical for every workflow
+ * running on main, so any workflow in the repo could assume the role. Adding
+ * a new workflow file touches no code-owned path, which means it needs no
+ * human review, which means the CODEOWNERS gate alone did not protect this
+ * credential. Raised in review on the PR that added deploy-org.yml, and fixed
+ * on both sides: the whole workflows directory is now code-owned, and this
+ * condition means an added file would not be believed even if it landed.
+ *
+ * Changing this is a tightening, so it has no apply-ordering hazard in either
+ * direction: the workflows that assume these roles already satisfy the new
+ * condition, and the old policy admits them too. The ordering rule in
+ * docs/workbench-account.md is about *widening*.
+ */
+const opsWorkflowTrust = (workflowFile: string): TrustPolicyDocument => ({
   Version: "2012-10-17",
   Statement: [
     {
@@ -345,11 +365,23 @@ export const opsMainBranchTrust: TrustPolicyDocument = {
         StringEquals: {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": OPS_MAIN_SUBJECT,
+          "token.actions.githubusercontent.com:job_workflow_ref": `thegoodparty/ops/.github/workflows/${workflowFile}@refs/heads/main`,
         },
       },
     },
   ],
-};
+});
+
+export const githubActionsOrgDeployTrust = opsWorkflowTrust("deploy-org.yml");
+
+// Pinned ahead of the workflow existing, deliberately. Until step 7 creates
+// `.github/workflows/deploy-workbench.yml`, no workflow can satisfy this
+// condition and the role cannot be assumed at all, which is the correct state
+// for a role nothing uses yet. Step 7 must use exactly this filename; if it
+// does not, the assume fails with a message that does not obviously point
+// here.
+export const githubActionsWorkbenchDeployTrust =
+  opsWorkflowTrust("deploy-workbench.yml");
 
 // Every Pulumi project needs its own backend access. The shared role never had
 // to think about this because it holds s3:* on *; a scoped role does not

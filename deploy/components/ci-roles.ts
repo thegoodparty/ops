@@ -1,10 +1,11 @@
 import * as aws from "@pulumi/aws";
 import {
   githubActionsOrgDeploy,
+  githubActionsOrgDeployTrust,
   githubActionsPulumiDeploy,
   githubActionsPulumiDeployTrust,
   githubActionsWorkbenchDeploy,
-  opsMainBranchTrust,
+  githubActionsWorkbenchDeployTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -84,8 +85,8 @@ export const createCiRoles = () => {
   const orgDeployRole = new aws.iam.Role("githubActionsOrgDeploy", {
     name: "github-actions-org-deploy",
     description:
-      "Organization-level Pulumi deploys (deploy-org). Assumed only by thegoodparty/ops on main.",
-    assumeRolePolicy: JSON.stringify(opsMainBranchTrust),
+      "Organization-level Pulumi deploys (deploy-org). Assumed only by deploy-org.yml on thegoodparty/ops main.",
+    assumeRolePolicy: JSON.stringify(githubActionsOrgDeployTrust),
     maxSessionDuration: 3600,
   });
 
@@ -98,8 +99,8 @@ export const createCiRoles = () => {
   const workbenchDeployRole = new aws.iam.Role("githubActionsWorkbenchDeploy", {
     name: "github-actions-workbench-deploy",
     description:
-      "Workbench account Pulumi deploys (deploy-workbench). Assumed only by thegoodparty/ops on main.",
-    assumeRolePolicy: JSON.stringify(opsMainBranchTrust),
+      "Workbench account Pulumi deploys (deploy-workbench). Assumed only by deploy-workbench.yml on thegoodparty/ops main.",
+    assumeRolePolicy: JSON.stringify(githubActionsWorkbenchDeployTrust),
     maxSessionDuration: 3600,
   });
 

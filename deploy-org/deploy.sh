@@ -24,7 +24,23 @@ fi
 export PULUMI_CONFIG_PASSPHRASE
 
 pulumi login s3://goodparty-iac-state
-pulumi stack select "organization/org/main" --create
+
+# --create only in CI. Without this guard, running the script locally to "just
+# preview" writes a new stack into the shared state bucket before reaching the
+# preview at all — a side effect that has to be dodged by hand, by pointing
+# PULUMI_BACKEND_URL at a throwaway local backend, which is what was done to
+# check this project before it first merged. Raised in review.
+#
+# Locally, against a stack that does not exist yet, `stack select` now fails
+# with "no stack named organization/org/main found". That is the honest
+# outcome: there is nothing to preview against, and the way to see the plan
+# before the stack exists is the throwaway backend, not a write to the shared
+# one. Once CI has created the stack, local previews work normally.
+if [ "$CI" = "true" ]; then
+  pulumi stack select "organization/org/main" --create
+else
+  pulumi stack select "organization/org/main"
+fi
 pulumi config set aws:region "${AWS_REGION:-us-west-2}"
 pulumi config set --path aws:defaultTags.tags.Environment infra
 pulumi config set --path aws:defaultTags.tags.Project org
