@@ -17,10 +17,18 @@ two sessions from doing them twice.
 
 - [x] 1. Create and verify `aws-workbench@goodparty.org` group alias: done
       (2026-09-17, jeff, group created and receipt confirmed)
-- [ ] 2. Grant the deploy policy self-management, in the console: todo
-- [ ] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: doing (claude,
-      2026-09-17)
-- [ ] 4. Create the two scoped CI roles in `deploy/`: todo
+- [x] 2. Grant the deploy policy self-management, in the console: done
+      (2026-09-17, policy v18 default as of 19:48 UTC, v13 deleted to stay
+      under the five-version cap; recorded from AWS after the fact, so the
+      actor is unconfirmed)
+- [x] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: done (2026-09-17,
+      bbcb8ae, PR #59; apply created no v19 and both documents still match
+      AWS exactly, so the capture was clean)
+- [ ] 4. Create the two scoped CI roles in `deploy/`: doing (claude,
+      2026-09-18, implemented in the same PR as this bookkeeping because
+      human review gates every merge here, so the claim cannot race.
+      Flip to done once the main apply is confirmed to have created both
+      roles, the way step 3 was confirmed.)
 - [ ] 5. Add the `deploy-org/` project (OU + account): todo
 - [ ] 6. Record the account id below, then let it settle: todo
 - [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
@@ -38,10 +46,14 @@ Facts discovered during implementation go here as they are learned:
 - `github-actions-org-deploy` ARN: _not yet created_
 - `github-actions-workbench-deploy` ARN: _not yet created_
 - In-account workbench deploy role ARN: _not yet created_
-- SCPs enabled on org root: _not yet checked_
-- `GitHubActionsPulumiDeployPolicy` version at adoption: v17 as of 2026-09-17,
-  becoming v18 once step 2 lands. IAM caps a policy at five versions and this
-  one is at the cap, so step 2 also deletes v13, the oldest non-default.
+- SCPs enabled on org root: none. Root `r-jqqe` reports an empty
+  `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
+  step 9: enabling it is a property of the organization, not of the OU.
+- `GitHubActionsPulumiDeployPolicy` version at adoption: v18, the default
+  since 2026-09-17. Step 2 deleted v13 to stay under the five-version cap,
+  so the surviving versions are v14 through v18. Adoption added the stack's
+  default tags (`Environment: infra`, `Project: ops`), which the policy did
+  not carry before; it made no change to the document itself.
 - Repos that actually reference `github-actions-pulumi-deploy`: only `ops` and
   `omni`. The other seven in its trust policy have no reference anywhere. Of
   the two, only `omni/.github/workflows/publish-experiments.yml` needs it on
@@ -263,7 +275,12 @@ organizations:CreateOrganizationalUnit
 organizations:CreateAccount
 organizations:MoveAccount
 organizations:TagResource
+organizations:UntagResource
 ```
+
+`UntagResource` is paired with `TagResource` deliberately. Removing or
+renaming a tag on the OU or the account calls it, and without it step 5 fails
+partway through an apply that has already created a real account.
 
 and, because a scoped role does not inherit the shared role's
 `ReadOnlyAccess`, the reads must be spelled out explicitly:
@@ -288,15 +305,55 @@ a resource deletion closing a real account.
 the workbench account, and nothing else in the management account.
 
 Both roles also need Pulumi backend access, which the shared role never had to
-think about because it holds `s3:*` on `*`:
+think about because it holds `s3:*` on `*`. Scope it per project, not to the
+bucket. `goodparty-iac-state` is shared by seven projects today (`gp-api`,
+`people-api`, `election-api`, `delegates`, `gpvpn`, `campaign-plan-service`
+and `ops`), all encrypted with the single passphrase below, so a bucket-wide
+object grant would let either of these roles decrypt and rewrite any of them,
+and the victim project would apply the rewritten state on its next deploy.
+
+The backend's layout is per project, checked against the live bucket:
 
 ```
-s3 read/write on arn:aws:s3:::goodparty-iac-state and its objects
+.pulumi/stacks/<project>/<stack>.json          and .bak
+.pulumi/locks/organization/<project>/<stack>/  "organization" is literal
+.pulumi/backups/<project>/<stack>/
+.pulumi/history/<project>/<stack>/
+.pulumi/meta.yaml                              bucket-wide, read only
+```
+
+So each role gets `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the
+four prefixes for its own project only, `s3:GetObject` on `meta.yaml`, and:
+
+```
+s3:ListBucket, s3:GetBucketLocation on arn:aws:s3:::goodparty-iac-state
 ssm:GetParameter on arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase
 ```
 
+Keep the trailing slash in each prefix. `.pulumi/stacks/org` without one also
+matches `.pulumi/stacks/organization-anything`.
+
+`ListBucket` is left unconditioned. Pulumi enumerates stacks by listing
+`.pulumi/stacks/`, so an `s3:prefix` condition tight enough to be worth having
+risks breaking `stack select` in a way nothing can verify until step 5 runs,
+and what it would protect is key names we already publish here. The content
+boundary is the object statements.
+
+Known wart: every project shares one passphrase, so that separation rests on
+the object ARNs alone rather than on defence in depth. A passphrase per
+project would be better and is a change to the existing stacks, not to this
+work.
+
 Missing the passphrase grant produces a state decryption error that does not
 obviously point at IAM.
+
+No `kms:Decrypt` grant is needed despite the parameter being a `SecureString`.
+It is encrypted under the AWS-managed `alias/aws/ssm` key, whose key policy
+admits callers in this account through the `ssm` service. Confirmed
+empirically rather than assumed: the shared role decrypts it on every deploy
+today holding `ssm:GetParameter` and nothing else, and `ReadOnlyAccess` does
+not grant `kms:Decrypt`. This would change if the parameter were ever moved to
+a customer-managed key.
 
 Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
 `DescribePolicy`, `ListPoliciesForTarget` and friends) added to
@@ -400,6 +457,14 @@ needed, and so the asynchronous parts have a human gap after them.
    not exist. Give both inline policies via `aws.iam.RolePolicy` rather than
    managed ones, so that step 2's statement needs no additions.
 
+   `github-actions-workbench-deploy` ships with Pulumi backend access only.
+   Its `sts:AssumeRole` statement names a role in an account that does not
+   exist until step 5 and whose id is unknown until step 6, and the two ways
+   to write it early are both bad: a wildcard account in the resource ARN, or
+   a placeholder that rots silently. Step 7 adds the statement next to the
+   `WORKBENCH_ACCOUNT_ID` constant it depends on. The role is still created
+   here so both trust policies can be reviewed side by side.
+
 5. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
    `Workbench` OU, the account, and a CI job assuming
    `github-actions-org-deploy`.
@@ -428,7 +493,9 @@ needed, and so the asynchronous parts have a human gap after them.
 
 7. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
    `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
-   path filter so its deploys are independent of the delegate image build. Its
+   path filter so its deploys are independent of the delegate image build.
+   Also add the `sts:AssumeRole` statement that step 4 deferred to
+   `github-actions-workbench-deploy`, scoped to the role ARN below. Its
    provider is explicit:
 
    ```ts
@@ -451,8 +518,12 @@ needed, and so the asynchronous parts have a human gap after them.
    the same PR. Write the SCP now while the account is nearly empty. Once four
    people depend on the junk it becomes impossible.
 
-   Check first whether `SERVICE_CONTROL_POLICY` is enabled as a policy type on
-   the org root. If it never has been, that is a one-time enablement.
+   `SERVICE_CONTROL_POLICY` is not enabled on the org root, so this step has
+   to enable it first. That is a property of the organization itself rather
+   than of the `Workbench` OU, so the choice is between importing the
+   existing `aws.organizations.Organization` with `enabledPolicyTypes` and
+   `protect: true`, or a one-time console enablement of the kind step 2 was.
+   Decide that when the step is claimed, not mid-PR.
 
 10. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
    automatically when Organizations provisions a member account, but it is

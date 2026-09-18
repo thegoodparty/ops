@@ -1,7 +1,10 @@
 import * as aws from "@pulumi/aws";
 import {
+  githubActionsOrgDeploy,
   githubActionsPulumiDeploy,
   githubActionsPulumiDeployTrust,
+  githubActionsWorkbenchDeploy,
+  opsMainBranchTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -66,5 +69,45 @@ export const createCiRoles = () => {
     { import: `${DEPLOY_ROLE_NAME}/${READ_ONLY_ACCESS_ARN}`, protect: true },
   );
 
-  return { deployRole, deployPolicy };
+  // The two scoped roles below are created, not imported, and are trusted by
+  // the ops repo's main branch alone. See docs/workbench-account.md, "The
+  // deploy role", for why the workbench work does not just widen the role
+  // above.
+  //
+  // Inline RolePolicy rather than managed policies on purpose: step 2 granted
+  // the shared role version management over exactly one policy ARN, so any
+  // managed policy created here would be unmanageable by CI. Inline documents
+  // are covered by the unscoped iam:PutRolePolicy it already holds.
+  //
+  // No protect on either. Neither is load bearing for existing deploys, and
+  // both should stay easy to correct while the workbench work is in progress.
+  const orgDeployRole = new aws.iam.Role("githubActionsOrgDeploy", {
+    name: "github-actions-org-deploy",
+    description:
+      "Organization-level Pulumi deploys (deploy-org). Assumed only by thegoodparty/ops on main.",
+    assumeRolePolicy: JSON.stringify(opsMainBranchTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsOrgDeployPolicy", {
+    name: "OrgDeploy",
+    role: orgDeployRole.id,
+    policy: JSON.stringify(githubActionsOrgDeploy),
+  });
+
+  const workbenchDeployRole = new aws.iam.Role("githubActionsWorkbenchDeploy", {
+    name: "github-actions-workbench-deploy",
+    description:
+      "Workbench account Pulumi deploys (deploy-workbench). Assumed only by thegoodparty/ops on main.",
+    assumeRolePolicy: JSON.stringify(opsMainBranchTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsWorkbenchDeployPolicy", {
+    name: "WorkbenchDeploy",
+    role: workbenchDeployRole.id,
+    policy: JSON.stringify(githubActionsWorkbenchDeploy),
+  });
+
+  return { deployRole, deployPolicy, orgDeployRole, workbenchDeployRole };
 };
