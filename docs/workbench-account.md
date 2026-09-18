@@ -24,7 +24,11 @@ two sessions from doing them twice.
 - [x] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: done (2026-09-17,
       bbcb8ae, PR #59; apply created no v19 and both documents still match
       AWS exactly, so the capture was clean)
-- [ ] 4. Create the two scoped CI roles in `deploy/`: todo
+- [ ] 4. Create the two scoped CI roles in `deploy/`: doing (claude,
+      2026-09-18, implemented in the same PR as this bookkeeping because
+      human review gates every merge here, so the claim cannot race.
+      Flip to done once the main apply is confirmed to have created both
+      roles, the way step 3 was confirmed.)
 - [ ] 5. Add the `deploy-org/` project (OU + account): todo
 - [ ] 6. Record the account id below, then let it settle: todo
 - [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
@@ -306,6 +310,14 @@ ssm:GetParameter on arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-co
 Missing the passphrase grant produces a state decryption error that does not
 obviously point at IAM.
 
+No `kms:Decrypt` grant is needed despite the parameter being a `SecureString`.
+It is encrypted under the AWS-managed `alias/aws/ssm` key, whose key policy
+admits callers in this account through the `ssm` service. Confirmed
+empirically rather than assumed: the shared role decrypts it on every deploy
+today holding `ssm:GetParameter` and nothing else, and `ReadOnlyAccess` does
+not grant `kms:Decrypt`. This would change if the parameter were ever moved to
+a customer-managed key.
+
 Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
 `DescribePolicy`, `ListPoliciesForTarget` and friends) added to
 `github-actions-org-deploy`. Add them in that step's PR, so each grant arrives
@@ -408,6 +420,14 @@ needed, and so the asynchronous parts have a human gap after them.
    not exist. Give both inline policies via `aws.iam.RolePolicy` rather than
    managed ones, so that step 2's statement needs no additions.
 
+   `github-actions-workbench-deploy` ships with Pulumi backend access only.
+   Its `sts:AssumeRole` statement names a role in an account that does not
+   exist until step 5 and whose id is unknown until step 6, and the two ways
+   to write it early are both bad: a wildcard account in the resource ARN, or
+   a placeholder that rots silently. Step 7 adds the statement next to the
+   `WORKBENCH_ACCOUNT_ID` constant it depends on. The role is still created
+   here so both trust policies can be reviewed side by side.
+
 5. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
    `Workbench` OU, the account, and a CI job assuming
    `github-actions-org-deploy`.
@@ -436,7 +456,9 @@ needed, and so the asynchronous parts have a human gap after them.
 
 7. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
    `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
-   path filter so its deploys are independent of the delegate image build. Its
+   path filter so its deploys are independent of the delegate image build.
+   Also add the `sts:AssumeRole` statement that step 4 deferred to
+   `github-actions-workbench-deploy`, scoped to the role ARN below. Its
    provider is explicit:
 
    ```ts
