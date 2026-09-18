@@ -194,11 +194,28 @@ export const adminReservedActions: PolicyDocument = {
       ],
       Resource: "*",
     },
-    // Identity Center administration. CI manages permission sets through
-    // github-actions-pulumi-deploy, which is an IAM role rather than a
-    // permission set, so none of this reaches it. Sign-in is also unaffected:
-    // the portal calls that issue credentials run on the portal token, before
-    // any permission set role is assumed.
+    // Identity Center administration, across all four of its namespaces.
+    //
+    // `sso-directory` is the one that is easy to miss, and leaving it out
+    // would have made the rest of this statement close to pointless: it
+    // carries its own CreateUser, DeleteUser, CreateGroup, AddMemberToGroup
+    // and UpdatePassword, so the same directory mutations identitystore
+    // exposes are reachable through a second prefix. Raised by Bugbot on the
+    // PR that added this.
+    //
+    // CI manages permission sets through github-actions-pulumi-deploy, which
+    // is an IAM role rather than a permission set, so none of this reaches it.
+    // Sign-in and MFA enrolment are unaffected too: those happen in the
+    // Identity Center portal, against the portal session, before any
+    // permission set role exists to carry this policy. What is denied here is
+    // calling the directory APIs as an assumed role in the account, which is
+    // the thing worth reserving.
+    //
+    // `sso-oauth` is deliberately absent. Its three actions
+    // (CreateTokenWithIAM, IntrospectTokenWithIAM, RevokeTokenWithIAM) are
+    // runtime token exchange for identity-aware applications, not directory
+    // administration, and denying them would break trusted identity
+    // propagation for anything that adopts it later.
     {
       Sid: "DenyIdentityCenterWrites",
       Effect: "Deny",
@@ -224,6 +241,40 @@ export const adminReservedActions: PolicyDocument = {
         "identitystore:Remove*",
         "identitystore:Reserve*",
         "identitystore:Update*",
+        "sso-directory:Add*",
+        "sso-directory:Complete*",
+        "sso-directory:Create*",
+        "sso-directory:Delete*",
+        "sso-directory:Disable*",
+        "sso-directory:Enable*",
+        "sso-directory:Import*",
+        "sso-directory:Remove*",
+        "sso-directory:Start*",
+        "sso-directory:Update*",
+        // Named rather than wildcarded: identitystore-auth:Batch* would also
+        // catch BatchGetSession, which is a read.
+        "identitystore-auth:BatchDeleteSession",
+      ],
+      Resource: "*",
+    },
+    // Account-level administration. Not reachable today either — none of
+    // these accept a request tag, so DevResourceCreation cannot reach them —
+    // but account:CloseAccount is the single most destructive action in this
+    // whole document. It closes an account and starts a 90 day suspension
+    // window nobody can shorten, and it is a separate namespace from
+    // organizations:CloseAccount, which deploy/components/ci-roles already
+    // withholds from CI on the same reasoning.
+    {
+      Sid: "DenyAccountAdministration",
+      Effect: "Deny",
+      Action: [
+        "account:Accept*",
+        "account:Close*",
+        "account:Delete*",
+        "account:Disable*",
+        "account:Enable*",
+        "account:Put*",
+        "account:Start*",
       ],
       Resource: "*",
     },
