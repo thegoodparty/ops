@@ -509,8 +509,9 @@ needed, and so the asynchronous parts have a human gap after them.
    `organizations:ListAccountsForParent`. The OU resource exposes a computed
    `accounts` attribute, so the provider's read-back after
    `CreateOrganizationalUnit` lists the OU's children, and the role granted in
-   step 4 cannot. See the apply-ordering section above for why that grant has
-   to land and apply in an earlier PR rather than this one.
+   step 4 cannot. Granted in PR #63, which has to merge and finish applying
+   before this step's PR does; see the apply-ordering section above for why
+   that grant cannot ride along in the same PR.
 
    The CI job is its own workflow file, `.github/workflows/deploy-org.yml`,
    not a second job in `deploy.yml`. Path filters are per workflow rather than
