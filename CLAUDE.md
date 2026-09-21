@@ -9,6 +9,7 @@ Operations tooling and AI agent infrastructure for GoodParty's Serve product.
 - `delegate/` — AI agent framework powered by Claude Agent SDK
 - `deploy/` — Pulumi IaC for AWS infrastructure (ECS, Lambda, etc.)
 - `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
+- `deploy-workbench/` — Pulumi IaC for the contents of the `goodparty-workbench` account
 - `.github/workflows/` — CI/CD and scheduled automation
 
 ## Scripts
@@ -64,7 +65,12 @@ Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actio
   projects to this repo, each with its own scoped CI role: `deploy-org/`
   (stack `organization/org/main`, role `github-actions-org-deploy`, deployed by
   `.github/workflows/deploy-org.yml`) for organization-level resources, and
-  `deploy-workbench/` (not yet created) for the new account's contents.
+  `deploy-workbench/` (stack `organization/workbench/main`, account
+  024901689212, role `github-actions-workbench-deploy`, deployed by
+  `.github/workflows/deploy-workbench.yml`) for the new account's contents.
+  `deploy-workbench/` is the one project whose provider points at a different
+  account than its credentials, so every resource there must name the
+  provider explicitly; the default provider is disabled to enforce it.
   Design, rationale, staged plan and progress checklist:
   [`docs/workbench-account.md`](./docs/workbench-account.md). Read that before
   touching `components/identity-center.ts`, the deploy role, or anything

@@ -1,0 +1,73 @@
+name: Deploy workbench
+
+# The filename is load bearing. github-actions-workbench-deploy pins
+# token.actions.githubusercontent.com:job_workflow_ref to
+# `thegoodparty/ops/.github/workflows/deploy-workbench.yml@refs/heads/main`,
+# so renaming or moving this file makes the role unassumable, and the failure
+# reads as a trust problem rather than as a rename.
+#
+# A separate workflow rather than a job in deploy.yml, for the same two
+# reasons as deploy-org.yml: path filters are per workflow, and workbench
+# changes should not queue behind the delegate image build.
+#
+# No pull_request trigger, and there cannot be one. The role is trusted only
+# for the subject `repo:thegoodparty/ops:ref:refs/heads/main`; a pull_request
+# run presents a pull_request ref and the AssumeRoleWithWebIdentity call
+# fails. Review is the gate before merge here; the apply happens after.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "deploy-workbench/**"
+      - ".github/workflows/deploy-workbench.yml"
+
+# Its own group. This is a different stack with a different S3 lock from
+# deploy.yml's and deploy-org.yml's, so there is nothing to serialize between
+# them. cancel-in-progress is false for the same reason as in those two:
+# cancelling mid-apply orphans the state lock.
+concurrency:
+  group: deploy-workbench-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # No CreateAccount here, so nothing in this stack polls for minutes the
+    # way deploy-org does. Well above the expected runtime, far below the six
+    # hour default that would let a wedged run hold the lock all day.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # The first hop. This role lives in the management account; index.ts
+      # makes the second hop into 024901689212 by assuming
+      # OrganizationAccountAccessRole through an explicit provider.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-workbench-deploy
+          aws-region: us-west-2
+
+      - name: Install Pulumi
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: "^3"
+
+      - run: npm ci
+
+      - name: Deploy
+        working-directory: deploy-workbench
+        run: ./deploy.sh

@@ -42,10 +42,12 @@ two sessions from doing them twice.
       does, so a transient failure there is the expected place to find out,
       not a permissions bug to debug.)
 - [ ] 7. Add the `deploy-workbench/` project and its CI job: doing (claude,
-      2026-09-21, first of the two PRs this step takes: the deferred
-      `sts:AssumeRole` grant, shipped alone so it applies before the project
-      that consumes it exists. The project and `deploy-workbench.yml` follow
-      once this one has applied.)
+      2026-09-21. First PR, the deferred `sts:AssumeRole` grant, is done:
+      PR #67, applied 16:00 UTC, confirmed on the role with
+      `iam:get-role-policy`. Second PR, the project and
+      `deploy-workbench.yml`, is open. Flip to done when its `Deploy
+      workbench` run is green and `pulumi stack output accountId` on
+      `organization/workbench/main` reads 024901689212.)
 - [ ] 8. Extend `identity-center.ts` for the new account: todo
 - [ ] 9. Attach SCP to the `Workbench` OU: todo
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
@@ -619,10 +621,44 @@ needed, and so the asynchronous parts have a human gap after them.
    ```ts
    const provider = new aws.Provider("workbench", {
      region: "us-west-2",
-     assumeRole: { roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole` },
+     assumeRoles: [{
+       roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+       sessionName: "pulumi-deploy-workbench",
+     }],
+     allowedAccountIds: [WORKBENCH_ACCOUNT_ID],
      defaultTags: { tags: { Environment: "workbench", Project: "workbench" } },
    });
    ```
+
+   `assumeRoles`, plural and an array, is the @pulumi/aws v7 spelling. An
+   earlier draft of this snippet used the v6 singular `assumeRole`, which no
+   longer type checks. The array exists for role chaining; one element is the
+   ordinary case.
+
+   This is the first project whose provider points somewhere other than the
+   account its credentials belong to, which makes a new mistake possible:
+   omit `{ provider }` on a resource and it lands in the *management* account
+   while the apply looks clean. Two independent guards, both verified against
+   pulumi 3.x and @pulumi/aws 7.23.0 rather than taken from the docs:
+
+   - `deploy.sh` disables the default AWS provider for this stack, so a
+     resource that names no provider fails with "Default provider for 'aws'
+     disabled. <urn> must use an explicit provider" instead of being created
+     in the management account.
+   - `allowedAccountIds` on the provider catches the same error arriving the
+     other way, the provider itself resolving to the wrong credentials. It
+     fails with "AWS account ID not allowed: 333022194791" at provider
+     configuration, before any resource is touched.
+
+   Also settled by testing, because it changes what the project needs: an
+   explicit provider that no resource uses is still registered and still
+   validates its credentials, so the role is assumed on every apply whether
+   or not anything consumes it. The `accountId` export is therefore evidence
+   for this checklist rather than the thing that exercises the chain.
+
+   `aws:defaultTags` stack config applies to the default provider, which this
+   project disables. Tags go on the provider in code, or they silently apply
+   to nothing.
 
 8. Extend `deploy/components/identity-center.ts` to assign permission sets to
    the new account. Today `ACCOUNT_ID` is a hardcoded const used as every
