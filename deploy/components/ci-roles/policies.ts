@@ -167,6 +167,18 @@ export const githubActionsPulumiDeploy: PolicyDocument = {
         "iam:ListRolePolicies",
         "iam:ListInstanceProfilesForRole",
         "iam:UpdateAssumeRolePolicy",
+        // A separate API call from UpdateAssumeRolePolicy above, and so a
+        // separate action. Missing from v18 and not noticed, because the only
+        // two roles this program gives a description to are the scoped roles
+        // below and CreateRole carried theirs; the first edit to one of those
+        // descriptions is what found the gap, by failing the deploy on main.
+        //
+        // Unlike the org-deploy grants, this one cannot ship ahead of its
+        // consumer: the grant and the roles that need it are in the same
+        // stack, applied by the same `deploy.yml` run, with no Pulumi
+        // dependency ordering the two. If that run reaches the roles first it
+        // fails again and a re-run succeeds, the policy version having landed.
+        "iam:UpdateRoleDescription",
         "iam:TagRole",
         "iam:UntagRole",
       ],
