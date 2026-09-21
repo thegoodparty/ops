@@ -234,6 +234,24 @@ export const createIdentityCenter = () => {
   // Output, so the adopt paths below read this map rather than the one above.
   const existingPermissionSetArns: Record<string, string | undefined> = {};
 
+  // Every resource that attaches policy to a set, by key, so the assignments
+  // below can wait for them.
+  //
+  // Creating a `ManagedPolicyAttachment` or a `PermissionSetInlinePolicy`
+  // calls `ProvisionPermissionSet`, and creating an `AccountAssignment`
+  // provisions the set into its target account with whatever is attached at
+  // that moment. Nothing in the Output graph orders those against each other:
+  // all three take only `permissionSetArn`, so they are siblings and Pulumi
+  // runs them in parallel. Raised by Bugbot on PR #69.
+  //
+  // The end state converges either way, since the policy resources
+  // re-provision to every assigned account, so this is not a set that ends up
+  // permanently empty. What it avoids is two provisioning operations in
+  // flight on one permission set, which Identity Center answers with a
+  // ConflictException and which surfaces as a deploy that fails for reasons
+  // that do not reproduce.
+  const permissionSetPolicies: Record<string, pulumi.Resource[]> = {};
+
   for (const [key, set] of entries) {
     // Present only for a set that already exists in AWS. Everything that
     // adopts rather than creates is gated on this, since an import string
@@ -267,16 +285,20 @@ export const createIdentityCenter = () => {
     permissionSetArns[key] = permissionSetArn;
     existingPermissionSetArns[key] = existingArn;
 
+    const policyResources: pulumi.Resource[] = [];
+
     for (const managedPolicyArn of set.managedPolicies) {
-      new aws.ssoadmin.ManagedPolicyAttachment(
+      policyResources.push(
+        new aws.ssoadmin.ManagedPolicyAttachment(
         `managedPolicy-${key}-${managedPolicyArn.split("/").pop()}`,
-        { instanceArn: INSTANCE_ARN, managedPolicyArn, permissionSetArn },
-        {
-          ...(existingArn
-            ? { import: `${managedPolicyArn},${existingArn},${INSTANCE_ARN}` }
-            : {}),
-          protect: true,
-        },
+          { instanceArn: INSTANCE_ARN, managedPolicyArn, permissionSetArn },
+          {
+            ...(existingArn
+              ? { import: `${managedPolicyArn},${existingArn},${INSTANCE_ARN}` }
+              : {}),
+            protect: true,
+          },
+        ),
       );
     }
 
@@ -286,17 +308,24 @@ export const createIdentityCenter = () => {
         : set.inlinePolicy;
 
     if (inlinePolicy) {
-      // No protect: inline policies are the ones we deliberately edit in-repo.
-      new aws.ssoadmin.PermissionSetInlinePolicy(
-        `inlinePolicy-${key}`,
-        {
-          instanceArn: INSTANCE_ARN,
-          permissionSetArn,
-          inlinePolicy: JSON.stringify(inlinePolicy),
-        },
-        existingArn ? { import: `${existingArn},${INSTANCE_ARN}` } : undefined,
+      policyResources.push(
+        // No protect: inline policies are the ones we deliberately edit
+        // in-repo.
+        new aws.ssoadmin.PermissionSetInlinePolicy(
+          `inlinePolicy-${key}`,
+          {
+            instanceArn: INSTANCE_ARN,
+            permissionSetArn,
+            inlinePolicy: JSON.stringify(inlinePolicy),
+          },
+          existingArn
+            ? { import: `${existingArn},${INSTANCE_ARN}` }
+            : undefined,
+        ),
       );
     }
+
+    permissionSetPolicies[key] = policyResources;
   }
 
   for (const account of Object.values(accounts) as Account[]) {
@@ -339,6 +368,10 @@ export const createIdentityCenter = () => {
                   import: `${principalId},GROUP,${account.id},AWS_ACCOUNT,${existingArn},${INSTANCE_ARN}`,
                 }
               : {}),
+            // Attach policy before provisioning the set into an account. See
+            // where this map is built for why the Output graph does not
+            // already order these.
+            dependsOn: permissionSetPolicies[key] ?? [],
             protect: true,
           },
         );

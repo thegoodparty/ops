@@ -736,6 +736,20 @@ needed, and so the asynchronous parts have a human gap after them.
    backing step 8 out is an explicit unprotect PR rather than a deletion that
    rides along in something else. Inline policies stay unprotected, as before.
 
+   Assignments must wait for their set's policy resources. Creating a
+   `ManagedPolicyAttachment` or a `PermissionSetInlinePolicy` calls
+   `ProvisionPermissionSet`, and creating an `AccountAssignment` provisions
+   the set into its account with whatever is attached at that moment. All
+   three take only `permissionSetArn`, so the Output graph makes them
+   siblings and Pulumi runs them in parallel. The end state converges
+   regardless, because the policy resources re-provision to every assigned
+   account, so the failure is not a permanently empty permission set. It is
+   two provisioning operations in flight on one set, which Identity Center
+   answers with a ConflictException, and which reads as a deploy that failed
+   for no reproducible reason. An explicit `dependsOn` serializes them.
+   Raised by Bugbot on PR #69; it never bit before because every resource in
+   this file was adopted and nothing was ever created.
+
    The `adopted` flag is a per-account approximation of a per-assignment fact.
    It is uniform today because every assignment in the management account
    predates Pulumi and none in the workbench account exist. Add a sixth group
