@@ -28,12 +28,19 @@ two sessions from doing them twice.
       5f3655e and 9dad234, PR #60; both roles confirmed in AWS with
       `iam:GetRole`, created 18:29 UTC by that merge's apply, each carrying
       its inline policy. ARNs recorded below.)
-- [ ] 5. Add the `deploy-org/` project (OU + account): doing (claude,
-      2026-09-18, implemented in the same PR as this claim, on the same
-      reasoning as step 4: human review gates every merge here, so the claim
-      cannot race. Flip to done once `aws organizations list-accounts` shows
-      the account and its id is recorded below.)
-- [ ] 6. Record the account id below, then let it settle: todo
+- [x] 5. Add the `deploy-org/` project (OU + account): done (2026-09-21,
+      PR #62, merged as 643c0a7; the `Deploy org` run created 3 resources
+      and the account reached ACTIVE at 13:17:15 UTC. `list-accounts` and
+      `describe-account` confirm id, email, OU path and `JoinedMethod:
+      CREATED`; ids recorded below.)
+- [x] 6. Record the account id below, then let it settle: done (2026-09-21,
+      this commit. `describe-account` reports `Status` and `State` both
+      ACTIVE, so the settling this step waits on is over as far as
+      Organizations is concerned. The other half of it, STS seeing
+      `OrganizationAccountAccessRole`, is unverified and cannot be checked
+      from a ReadOnlyAccess session: the assume is the first thing step 7
+      does, so a transient failure there is the expected place to find out,
+      not a permissions bug to debug.)
 - [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
 - [ ] 8. Extend `identity-center.ts` for the new account: todo
 - [ ] 9. Attach SCP to the `Workbench` OU: todo
@@ -45,7 +52,15 @@ two sessions from doing them twice.
 
 Facts discovered during implementation go here as they are learned:
 
-- Workbench account id: _not yet created_
+- Workbench account id: `024901689212`. Created 2026-09-21 13:17:15 UTC,
+  ACTIVE, email `aws-workbench@goodparty.org`. This is the
+  `WORKBENCH_ACCOUNT_ID` step 7 needs and the assignment target step 8 needs.
+- `Workbench` OU: `ou-jqqe-dv88i5zn`, directly under root `r-jqqe`. The
+  account's full path is `o-uuiolqc1di/r-jqqe/ou-jqqe-dv88i5zn/024901689212/`.
+  The root has one other OU, `ou-jqqe-qxbqugvv` (`ElectionAPI`), which matters
+  in step 9: enabling `SERVICE_CONTROL_POLICY` is a root-level change and the
+  FullAWSAccess default policy attaches everywhere, so that OU is affected by
+  the enablement even though no SCP of ours targets it.
 - `github-actions-org-deploy` ARN:
   `arn:aws:iam::333022194791:role/github-actions-org-deploy`, inline policy
   `OrgDeploy`
@@ -61,6 +76,11 @@ Facts discovered during implementation go here as they are learned:
   so the surviving versions are v14 through v18. Adoption added the stack's
   default tags (`Environment: infra`, `Project: ops`), which the policy did
   not carry before; it made no change to the document itself.
+- The five-version cap does not need managing by hand from here on. The first
+  in-repo edit to that policy (v19, PR #65, adding `iam:UpdateRoleDescription`)
+  hit the cap and the provider pruned the oldest non-default version itself;
+  v15 through v19 survive, v14 is gone. So the console deletion step 2 had to
+  do was a one-off, not a recurring chore.
 - Repos that actually reference `github-actions-pulumi-deploy`: only `ops` and
   `omni`. The other seven in its trust policy have no reference anywhere. Of
   the two, only `omni/.github/workflows/publish-experiments.yml` needs it on
@@ -74,8 +94,14 @@ died mid-step); AWS cannot. Before starting anything, reconcile:
 ```bash
 aws organizations list-accounts --query "Accounts[].[Id,Name,Status]" --output table
 pulumi stack select organization/ops/ops-dev && pulumi stack output
-git log --oneline -15 -- docs/workbench-account.md deploy/ deploy-workbench/
+pulumi stack select organization/org/main && pulumi stack output
+git log --oneline -15 -- docs/workbench-account.md deploy/ deploy-org/ deploy-workbench/
 ```
+
+Read-only AWS calls are enough for all of that, so reconcile with the
+`gp-readonly` profile rather than reaching for `gp-admin`. A preview needs
+`gp-admin` because `deploy/index.ts` reads the `DELEGATES` secret at preview
+time; reading state does not.
 
 If a step is marked `doing` with a date more than a day old, assume the session
 that claimed it is gone. Verify actual state with the commands above, then
@@ -503,8 +529,10 @@ needed, and so the asynchronous parts have a human gap after them.
    Its `sts:AssumeRole` statement names a role in an account that does not
    exist until step 5 and whose id is unknown until step 6, and the two ways
    to write it early are both bad: a wildcard account in the resource ARN, or
-   a placeholder that rots silently. Step 7 adds the statement next to the
-   `WORKBENCH_ACCOUNT_ID` constant it depends on. The role is still created
+   a placeholder that rots silently. Step 7 adds the statement once the id is
+   known, in the first of its two PRs, with the id written out: the
+   `WORKBENCH_ACCOUNT_ID` constant lives in the other project and the grant
+   has to be applied before that project exists. The role is still created
    here so both trust policies can be reviewed side by side.
 
 5. Add the `deploy-org/` project: `Pulumi.yaml` with `name: org`, the
@@ -564,12 +592,24 @@ needed, and so the asynchronous parts have a human gap after them.
    `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
    path filter so its deploys are independent of the delegate image build.
 
+   Two pull requests, not one, and in this order. The `sts:AssumeRole`
+   statement that step 4 deferred on `github-actions-workbench-deploy` lives
+   in `deploy/components/ci-roles/policies.ts` and is applied by `deploy.yml`;
+   everything else here is applied by `deploy-workbench.yml`. That is the
+   cross-workflow case in "Apply ordering between workflows" exactly, so the
+   grant ships first and finishes applying before the project PR merges, the
+   same shape as #63 before #62. Scope it to
+   `arn:aws:iam::024901689212:role/OrganizationAccountAccessRole`, and revisit
+   it at step 10 when that role is replaced.
+
+   Correction to an earlier draft of this step, which had the grant riding
+   along with its consumer. Noticed while recording the account id, not by
+   the deploy failing, which is the cheap way to find it.
+
    The workflow file must be named exactly
    `.github/workflows/deploy-workbench.yml`. `github-actions-workbench-deploy`
    pins `job_workflow_ref` to that path, so any other name cannot assume the
-   role, and the failure reads as a trust problem rather than a typo.
-   Also add the `sts:AssumeRole` statement that step 4 deferred to
-   `github-actions-workbench-deploy`, scoped to the role ARN below. Its
+   role, and the failure reads as a trust problem rather than a typo. Its
    provider is explicit:
 
    ```ts
