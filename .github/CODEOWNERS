@@ -13,8 +13,34 @@
 # PR_REVIEWER_APPROVAL_ENABLED, and the subagent prompts drive what it looks
 # at. Gating one file would leave the same hole one file over, and the
 # existing gates are path-based rather than content-based for the same reason.
+#
+# /deploy-org/ provisions organizational units and member accounts. Creating
+# an account is not a permission change, but it carries the same shape of
+# risk: those resources are protected precisely because removing one detaches
+# or closes a real account, and the role that applies them is the only one in
+# the org holding organizations:CreateAccount.
+#
+# /.github/workflows/ is the whole directory, not just deploy-org.yml, and the
+# reason is the same one that makes /delegate/ a whole tree. The OIDC trust
+# policies key on the `sub` claim, which is `repo:thegoodparty/ops:ref:
+# refs/heads/main` for *every* workflow running on main, not on which file
+# defines the job. Gating one filename therefore gates nothing: a PR adding a
+# brand-new workflow touches no code-owned path, so it needs no human, and
+# once merged it runs on main and can assume github-actions-org-deploy to do
+# anything that role can do. Raised in review on the PR that added
+# deploy-org.yml.
+#
+# This also closes the gap previously noted here, that deploy.yml was ungated
+# while assuming the far broader github-actions-pulumi-deploy.
+#
+# The credential-side half of the same fix is a job_workflow_ref condition on
+# the trust policy, in deploy/components/ci-roles/policies.ts. Both are worth
+# having: this one stops the file being added, that one stops an added file
+# being believed.
 
 /delegate/                             @thegoodparty/gp-contrib
+/deploy-org/                           @thegoodparty/gp-contrib
+/.github/workflows/                    @thegoodparty/gp-contrib
 /deploy/components/ci-roles/           @thegoodparty/gp-contrib
 /deploy/components/ci-roles.ts         @thegoodparty/gp-contrib
 /deploy/components/identity-center/    @thegoodparty/gp-contrib

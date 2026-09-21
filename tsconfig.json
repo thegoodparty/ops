@@ -3,7 +3,8 @@
     "run-script.ts",
     "utils/**/*.ts",
     "delegate/**/*.ts",
-    "deploy/**/*.ts"
+    "deploy/**/*.ts",
+    "deploy-org/**/*.ts"
   ],
   "compilerOptions": {
     "target": "ES2022",

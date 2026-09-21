@@ -24,12 +24,15 @@ two sessions from doing them twice.
 - [x] 3. Adopt `github-actions-pulumi-deploy` into Pulumi: done (2026-09-17,
       bbcb8ae, PR #59; apply created no v19 and both documents still match
       AWS exactly, so the capture was clean)
-- [ ] 4. Create the two scoped CI roles in `deploy/`: doing (claude,
-      2026-09-18, implemented in the same PR as this bookkeeping because
-      human review gates every merge here, so the claim cannot race.
-      Flip to done once the main apply is confirmed to have created both
-      roles, the way step 3 was confirmed.)
-- [ ] 5. Add the `deploy-org/` project (OU + account): todo
+- [x] 4. Create the two scoped CI roles in `deploy/`: done (2026-09-18,
+      5f3655e and 9dad234, PR #60; both roles confirmed in AWS with
+      `iam:GetRole`, created 18:29 UTC by that merge's apply, each carrying
+      its inline policy. ARNs recorded below.)
+- [ ] 5. Add the `deploy-org/` project (OU + account): doing (claude,
+      2026-09-18, implemented in the same PR as this claim, on the same
+      reasoning as step 4: human review gates every merge here, so the claim
+      cannot race. Flip to done once `aws organizations list-accounts` shows
+      the account and its id is recorded below.)
 - [ ] 6. Record the account id below, then let it settle: todo
 - [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
 - [ ] 8. Extend `identity-center.ts` for the new account: todo
@@ -43,8 +46,12 @@ two sessions from doing them twice.
 Facts discovered during implementation go here as they are learned:
 
 - Workbench account id: _not yet created_
-- `github-actions-org-deploy` ARN: _not yet created_
-- `github-actions-workbench-deploy` ARN: _not yet created_
+- `github-actions-org-deploy` ARN:
+  `arn:aws:iam::333022194791:role/github-actions-org-deploy`, inline policy
+  `OrgDeploy`
+- `github-actions-workbench-deploy` ARN:
+  `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
+  policy `WorkbenchDeploy`
 - In-account workbench deploy role ARN: _not yet created_
 - SCPs enabled on org root: none. Root `r-jqqe` reports an empty
   `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
@@ -357,8 +364,43 @@ a customer-managed key.
 
 Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
 `DescribePolicy`, `ListPoliciesForTarget` and friends) added to
-`github-actions-org-deploy`. Add them in that step's PR, so each grant arrives
-with the code that uses it.
+`github-actions-org-deploy`. Add them in a PR of their own that merges and
+finishes applying **before** the PR that uses them. Pairing a grant with its
+consumer is the intuitive thing to do and it is wrong here; see "Apply
+ordering between workflows" below for why.
+
+## Apply ordering between workflows
+
+Not a Pulumi dependency, a GitHub Actions one, and it is easy to miss because
+the two workflows look independent.
+
+`deploy.yml` has no path filter, so it runs on *every* push to main.
+`deploy-org.yml` runs on pushes touching `deploy-org/**`. A merge that touches
+both therefore starts them at the same moment, in separate concurrency groups,
+with nothing sequencing them.
+
+That is fine as long as they are genuinely independent, and they are not
+whenever a PR grants `github-actions-org-deploy` a new permission. The grant
+lives in `deploy/components/ci-roles/policies.ts` and is applied by the `ops`
+stack, which is `deploy.yml`'s job; the code that needs the grant is applied by
+`deploy-org.yml`. If the latter wins the race, it runs against the old policy
+and fails with AccessDenied.
+
+So the rule is: **a PR that widens `github-actions-org-deploy` must merge
+before, and finish applying before, the PR that depends on the widening.** Same
+staging reasoning step 4 already gives for role existence, extended to role
+permissions. Step 4 got away with pairing the two only because the roles it
+created had no consumer yet.
+
+An earlier draft of this plan told step 9 to add its grants in the PR that
+uses them. That instruction has been corrected where it appears rather than
+just contradicted here, because the nearest imperative is the one a future
+session will follow.
+
+Failure here is not clean. `CreateOrganizationalUnit` succeeds and the
+follow-up read fails, leaving an OU in AWS that may not be in state, and
+Organizations permits duplicate OU names under one parent, so a rerun makes a
+second `Workbench` rather than erroring.
 
 ## Cross-project dependencies
 
@@ -469,18 +511,45 @@ needed, and so the asynchronous parts have a human gap after them.
    `Workbench` OU, the account, and a CI job assuming
    `github-actions-org-deploy`.
 
+   Known gap, blocking this step: the role is missing
+   `organizations:ListAccountsForParent`. The OU resource exposes a computed
+   `accounts` attribute, so the provider's read-back after
+   `CreateOrganizationalUnit` lists the OU's children, and the role granted in
+   step 4 cannot. Granted in PR #63, which has to merge and finish applying
+   before this step's PR does; see the apply-ordering section above for why
+   that grant cannot ride along in the same PR.
+
+   The CI job is its own workflow file, `.github/workflows/deploy-org.yml`,
+   not a second job in `deploy.yml`. Path filters are per workflow rather than
+   per job, and the filter is the point: organization changes should not queue
+   behind the delegate image build. It has no `pull_request` trigger either,
+   and cannot have one. `github-actions-org-deploy` is trusted only for the
+   subject `repo:thegoodparty/ops:ref:refs/heads/main`, so a pull_request run
+   presents a ref that cannot match and the role assumption fails by design.
+   The new project is added to `tsconfig.json` instead, so `deploy.yml`
+   type-checks it on every PR even though it never applies it.
+
    ```ts
    const workbench = new aws.organizations.Account("workbench", {
      name: "goodparty-workbench",
      email: "aws-workbench@goodparty.org",
      parentId: workbenchOu.id,
      iamUserAccessToBilling: "ALLOW",
+     closeOnDeletion: false,
    }, { protect: true });
    ```
 
-   `protect: true` is not optional. Removing this resource tells Pulumi to
-   close the account, and a closed AWS account sits in a 90 day suspension
-   window.
+   `protect: true` is not optional; it is what blocks the delete.
+
+   Correction to an earlier draft of this plan, which claimed that removing
+   the resource closes the account. It does not, by default. What a delete
+   does is governed by `closeOnDeletion`, which the provider defaults to
+   `false`: the account is removed from the organization and left standalone,
+   not closed. Only `true` calls `CloseAccount` and starts the 90 day
+   suspension window. Set it explicitly anyway. Neither outcome is quick to
+   undo, since rejoining an organization needs a fresh invitation and a
+   standalone account has no consolidated billing or SCP governance in the
+   interim, and an implicit default is the wrong thing to be relying on.
 
    `CreateAccount` is asynchronous and takes minutes. Pulumi polls
    `DescribeCreateAccountStatus`. Expect the job to be slow, and expect
@@ -494,6 +563,11 @@ needed, and so the asynchronous parts have a human gap after them.
 7. Add the `deploy-workbench/` project: `Pulumi.yaml` with `name: workbench`, a
    `WORKBENCH_ACCOUNT_ID` constant, and a CI job with a `deploy-workbench/**`
    path filter so its deploys are independent of the delegate image build.
+
+   The workflow file must be named exactly
+   `.github/workflows/deploy-workbench.yml`. `github-actions-workbench-deploy`
+   pins `job_workflow_ref` to that path, so any other name cannot assume the
+   role, and the failure reads as a trust problem rather than a typo.
    Also add the `sts:AssumeRole` statement that step 4 deferred to
    `github-actions-workbench-deploy`, scoped to the role ARN below. Its
    provider is explicit:
@@ -514,9 +588,10 @@ needed, and so the asynchronous parts have a human gap after them.
    the open question on which permission set to use.
 
 9. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
-   else. Requires adding the policy actions to `github-actions-org-deploy` in
-   the same PR. Write the SCP now while the account is nearly empty. Once four
-   people depend on the junk it becomes impossible.
+   else. Needs the policy actions added to `github-actions-org-deploy` first,
+   in a separate PR that has finished applying before this one merges, per
+   "Apply ordering between workflows". Write the SCP now while the account is
+   nearly empty. Once four people depend on the junk it becomes impossible.
 
    `SERVICE_CONTROL_POLICY` is not enabled on the org root, so this step has
    to enable it first. That is a property of the organization itself rather

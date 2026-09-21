@@ -8,6 +8,7 @@ Operations tooling and AI agent infrastructure for GoodParty's Serve product.
 - `utils/` — Shared utilities (Grafana log search, People API client)
 - `delegate/` — AI agent framework powered by Claude Agent SDK
 - `deploy/` — Pulumi IaC for AWS infrastructure (ECS, Lambda, etc.)
+- `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
 - `.github/workflows/` — CI/CD and scheduled automation
 
 ## Scripts
@@ -58,11 +59,13 @@ Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actio
   the stack needs a state migration and is out of scope for now.)
 - **Backend:** `s3://goodparty-iac-state`
 - **Region:** us-west-2
-- **Planned second account:** a `goodparty-workbench` child account for
+- **Second account, in progress:** a `goodparty-workbench` child account for
   developer inner-loop tooling (coding agents against Bedrock). Adds two Pulumi
-  projects to this repo: `deploy-org/` for organization-level resources and
-  `deploy-workbench/` for the new account's contents, each with its own scoped
-  CI role. Design, rationale, staged plan and progress checklist:
+  projects to this repo, each with its own scoped CI role: `deploy-org/`
+  (stack `organization/org/main`, role `github-actions-org-deploy`, deployed by
+  `.github/workflows/deploy-org.yml`) for organization-level resources, and
+  `deploy-workbench/` (not yet created) for the new account's contents.
+  Design, rationale, staged plan and progress checklist:
   [`docs/workbench-account.md`](./docs/workbench-account.md). Read that before
   touching `components/identity-center.ts`, the deploy role, or anything
   account-related.
