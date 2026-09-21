@@ -556,7 +556,43 @@ export const githubActionsOrgDeploy: PolicyDocument = {
 // cannot assume a role that does not exist and keeping both roles in one
 // change keeps the trust scoping reviewable side by side. Until step 7 it can
 // read and write Pulumi state and do nothing else.
+// The account id is written out rather than imported from a constant. The
+// `WORKBENCH_ACCOUNT_ID` the plan describes lives in `deploy-workbench/`,
+// which does not exist yet and cannot: this grant has to be applied before
+// the project that consumes it is created. See "Apply ordering between
+// workflows"; the grant is in `deploy/` and applied by `deploy.yml`, while
+// its consumer is applied by `deploy-workbench.yml`.
+const WORKBENCH_ACCOUNT_ID = "024901689212";
+
 export const githubActionsWorkbenchDeploy: PolicyDocument = {
   Version: "2012-10-17",
-  Statement: [...pulumiBackendStatements("workbench")],
+  Statement: [
+    // The statement step 4 deferred, now that the account exists and its id
+    // is known. Deferred rather than guessed, because the two ways to write
+    // it early were a wildcard account in the resource ARN and a placeholder
+    // that rots unnoticed.
+    //
+    // What this grants is administrator in the workbench account, which is
+    // what OrganizationAccountAccessRole is. That is the intended state only
+    // until step 10 replaces it with a scoped in-account role. When that
+    // happens, this statement moves to the new role rather than gaining it:
+    // keeping both would leave a permanent admin path that nothing uses and
+    // nobody would notice.
+    //
+    // Nothing on the target side needs changing. The bootstrap role's trust
+    // policy names the management account root, which delegates the decision
+    // to IAM here, so this identity-based statement is the whole control.
+    //
+    // Inert on merge, deliberately. `github-actions-workbench-deploy` pins
+    // job_workflow_ref to `deploy-workbench.yml`, which does not exist, so no
+    // job can assume the role that now holds this. The second PR of step 7
+    // creates that file, and this grant starts mattering then.
+    {
+      Sid: "AssumeWorkbenchBootstrapRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+    },
+    ...pulumiBackendStatements("workbench"),
+  ],
 };
