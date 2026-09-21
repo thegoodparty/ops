@@ -41,7 +41,11 @@ two sessions from doing them twice.
       from a ReadOnlyAccess session: the assume is the first thing step 7
       does, so a transient failure there is the expected place to find out,
       not a permissions bug to debug.)
-- [ ] 7. Add the `deploy-workbench/` project and its CI job: todo
+- [ ] 7. Add the `deploy-workbench/` project and its CI job: doing (claude,
+      2026-09-21, first of the two PRs this step takes: the deferred
+      `sts:AssumeRole` grant, shipped alone so it applies before the project
+      that consumes it exists. The project and `deploy-workbench.yml` follow
+      once this one has applied.)
 - [ ] 8. Extend `identity-center.ts` for the new account: todo
 - [ ] 9. Attach SCP to the `Workbench` OU: todo
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
