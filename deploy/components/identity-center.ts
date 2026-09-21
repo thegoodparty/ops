@@ -1,5 +1,6 @@
 import * as aws from "@pulumi/aws";
 import {
+  adminReservedActions,
   engineerAccess,
   productManager,
   readOnlyAccess,
@@ -16,7 +17,27 @@ type PermissionSet = {
   sessionDuration: string;
   managedPolicies: string[];
   inlinePolicy?: PolicyDocument;
+  /**
+   * Whether `adminReservedActions` is composed into this set's inline policy.
+   * Defaults to true, so a permission set added later is protected without
+   * anyone remembering to opt in. Opting out is a decision that should be
+   * visible where the set is defined, not buried in the loop below, which is
+   * why this is a field rather than a name check.
+   */
+  guardrails?: boolean;
 };
+
+/**
+ * Prepends the admin-reserved denies to a permission set's own policy.
+ *
+ * Statement order does not affect evaluation, since an explicit Deny beats
+ * every Allow regardless of position. Denies come first because they read as
+ * the boundary the rest of the document sits inside.
+ */
+const withAdminReserved = (policy?: PolicyDocument): PolicyDocument => ({
+  Version: "2012-10-17",
+  Statement: [...adminReservedActions.Statement, ...(policy?.Statement ?? [])],
+});
 
 const permissionSets = {
   engineer: {
@@ -34,6 +55,16 @@ const permissionSets = {
     name: "AdministratorAccess",
     sessionDuration: "PT8H",
     managedPolicies: ["arn:aws:iam::aws:policy/AdministratorAccess"],
+    // The one set that must never carry the guardrails. This is the
+    // break-glass path ci-roles.ts names as the recovery route that does not
+    // depend on CI, for precisely the case where a bad trust policy update
+    // locks CI out of the account. Denying it the actions it exists to perform
+    // would remove the recovery path at the exact moment it is needed.
+    //
+    // It also has no inline policy at all today, so applying the guardrails
+    // here would not edit a document, it would create one consisting purely of
+    // denies.
+    guardrails: false,
   },
   readOnly: {
     id: "ps-790741c400f38152",
@@ -58,6 +89,15 @@ const permissionSets = {
     sessionDuration: "PT8H",
     // Billing is a job-function policy, not a top-level one.
     managedPolicies: ["arn:aws:iam::aws:policy/job-function/Billing"],
+    // Excluded pending a check of what job-function/Billing actually grants.
+    // Billing administration plausibly touches organizations write actions
+    // around consolidated billing, and a deny that collides with a real
+    // billing workflow surfaces as an AccessDenied nobody traces back to
+    // here. Nothing is lost by waiting: this set grants no writes that the
+    // guardrails would catch today. Run
+    // `aws iam get-policy-version --policy-arn arn:aws:iam::aws:policy/job-function/Billing`
+    // against its default version, then drop this line if it is clean.
+    guardrails: false,
   },
 } satisfies Record<string, PermissionSet>;
 
@@ -124,14 +164,19 @@ export const createIdentityCenter = () => {
       );
     }
 
-    if (set.inlinePolicy) {
+    const inlinePolicy =
+      (set.guardrails ?? true)
+        ? withAdminReserved(set.inlinePolicy)
+        : set.inlinePolicy;
+
+    if (inlinePolicy) {
       // No protect: inline policies are the ones we deliberately edit in-repo.
       new aws.ssoadmin.PermissionSetInlinePolicy(
         `inlinePolicy-${key}`,
         {
           instanceArn: INSTANCE_ARN,
           permissionSetArn,
-          inlinePolicy: JSON.stringify(set.inlinePolicy),
+          inlinePolicy: JSON.stringify(inlinePolicy),
         },
         { import: `${permissionSetArn},${INSTANCE_ARN}` },
       );
