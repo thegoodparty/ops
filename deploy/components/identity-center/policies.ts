@@ -135,6 +135,66 @@ export const productManager: PolicyDocument = {
   ],
 };
 
+// The whole grant for an engineer working in the workbench account. Unlike
+// every other set here it carries no managed policies, so this document is
+// the entire session: no `ReadOnlyAccess`, no S3, nothing but the two
+// services below.
+//
+// Why a new set rather than assigning `engineerAccess` to the second account.
+// That set already grants `bedrock:*`, so it would work on day one, but it
+// also carries `AmazonS3FullAccess` and `ReadOnlyAccess` and two
+// tag-conditioned `Action: ["*"]` statements. Provisioning that into the
+// workbench account concedes the thing the account boundary exists to make
+// true, which is that a coding agent's credentials cannot reach restricted
+// data. The account is empty today, so the grant would be harmless today and
+// wrong the first time anything lands there.
+//
+// `bedrock:*` rather than an invoke-only list, deliberately. The narrowing
+// that matters already happened at the account boundary: there is nothing
+// else in this account to reach. An action list would need revisiting for
+// every new Bedrock feature the inner loop picks up, and the failure mode is
+// an engineer blocked mid-task by an AccessDenied on something like
+// `bedrock:ListInferenceProfiles`. Cross-region inference in particular
+// invokes against both an inference profile ARN and the foundation model ARN
+// in each region it routes to, which is exactly the shape of grant that gets
+// guessed wrong.
+//
+// It does keep the `adminReservedActions` denies, since `guardrails` defaults
+// to true. Those cover organization and identity actions, none of which are
+// Bedrock, so nothing here collides with them.
+export const workbenchAccess: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "InvokeBedrockModels",
+      Effect: "Allow",
+      Action: ["bedrock:*"],
+      Resource: "*",
+    },
+    // Read-only, and read-only on purpose: this is for an engineer answering
+    // "why is my agent slow" or "what did that invocation cost", not for
+    // managing alarms. Bedrock's model invocation logging writes to CloudWatch
+    // Logs, so the logs half is what makes a failed invocation debuggable
+    // rather than opaque.
+    {
+      Sid: "ReadCloudWatchMetricsAndLogs",
+      Effect: "Allow",
+      Action: [
+        "cloudwatch:Describe*",
+        "cloudwatch:Get*",
+        "cloudwatch:List*",
+        "logs:Describe*",
+        "logs:FilterLogEvents",
+        "logs:Get*",
+        "logs:List*",
+        "logs:StartQuery",
+        "logs:StopQuery",
+      ],
+      Resource: "*",
+    },
+  ],
+};
+
 // ---------------------------------------------------------------------------
 // Actions reserved for the AdministratorAccess permission set, denied to every
 // other one.
@@ -157,7 +217,10 @@ export const productManager: PolicyDocument = {
 // taken through the permission sets it is applied to, and nothing else. It
 // does not touch IAM roles or users in the account. The account-wide version
 // of this control is an SCP, and SCPs have no effect on the organization's
-// management account, which is where all of these sets are assigned.
+// management account, which is where all of these sets except the workbench
+// one are assigned. The workbench account is a member account, so step 9 of
+// docs/workbench-account.md can put an SCP over it; this document is still
+// what constrains the sessions themselves.
 //
 // Verified against AWS's machine-readable service reference rather than
 // guessed, so the verb lists match the services' real action names.
