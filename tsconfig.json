@@ -4,7 +4,8 @@
     "utils/**/*.ts",
     "delegate/**/*.ts",
     "deploy/**/*.ts",
-    "deploy-org/**/*.ts"
+    "deploy-org/**/*.ts",
+    "deploy-workbench/**/*.ts"
   ],
   "compilerOptions": {
     "target": "ES2022",
