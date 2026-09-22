@@ -185,33 +185,48 @@ async function enableInRegion(
       continue;
     }
 
+    // Every record carries the raw quartet from here on. The first version
+    // printed only its own verdict, which is how "already-entitled" stood
+    // next to a sandbox being refused for 26 model/region pairs without
+    // anyone being able to see the disagreement. If the verdict is ever wrong
+    // again, the numbers behind it are in the log.
+    const state = [
+      `agreement=${availability.agreementAvailability?.status}`,
+      `entitlement=${availability.entitlementAvailability}`,
+      `auth=${availability.authorizationStatus}`,
+      `region=${availability.regionAvailability}`,
+    ].join(" ");
+
     if (availability.regionAvailability !== "AVAILABLE") {
-      record(region, model.id, "not-in-region", "regionAvailability");
+      record(region, model.id, "not-in-region", state);
       continue;
     }
 
-    // The idempotency check. Entitled and authorized means the agreement is
-    // already in place, so there is nothing to do and re-running is free.
-    if (
-      availability.entitlementAvailability === "AVAILABLE" &&
-      availability.authorizationStatus === "AUTHORIZED"
-    ) {
-      record(region, model.id, "already-entitled");
+    // The idempotency check, and the one field that actually answers the
+    // question. AWS documents `agreementAvailability` as AVAILABLE when
+    // access exists and NOT_AVAILABLE when it does not.
+    //
+    // This first gated on `entitlementAvailability` and `authorizationStatus`
+    // instead, which reported 26 of 26 already-entitled while nothing was
+    // subscribed and the sandbox was being refused. `authorizationStatus`
+    // appears to describe the caller rather than the account, so running as
+    // an administrator made every model look fine from CI and none of them
+    // work from `WorkbenchAccess`. A check that passes because of who is
+    // asking is worse than no check.
+    const agreement = availability.agreementAvailability?.status;
+
+    if (agreement === "AVAILABLE") {
+      record(region, model.id, "already-entitled", state);
       continue;
     }
 
-    if (availability.agreementAvailability?.status === "PENDING") {
-      record(region, model.id, "would-create", "agreement pending, wait");
+    if (agreement === "PENDING") {
+      record(region, model.id, "would-create", `pending, wait: ${state}`);
       continue;
     }
 
     if (!process.env.APPLY) {
-      record(
-        region,
-        model.id,
-        "would-create",
-        `entitlement=${availability.entitlementAvailability} auth=${availability.authorizationStatus}`
-      );
+      record(region, model.id, "would-create", state);
       continue;
     }
 
@@ -230,7 +245,12 @@ async function enableInRegion(
         // the alternative reading is that a model which does need an
         // agreement could not be offered one, and the two look identical from
         // here. The first run on a new model is worth a human glance.
-        record(region, model.id, "no-agreement-offered", "not a Marketplace product?");
+        record(
+          region,
+          model.id,
+          "no-agreement-offered",
+          `not a Marketplace product? ${state}`
+        );
         continue;
       }
       await client.send(
@@ -239,7 +259,9 @@ async function enableInRegion(
           offerToken,
         })
       );
-      record(region, model.id, "created");
+      // The state shown is the one from before the create, which is the
+      // useful half: it says what was missing that this just fixed.
+      record(region, model.id, "created", `was: ${state}`);
     } catch (err) {
       if (looksLikeUseCaseForm(err)) {
         record(region, model.id, "needs-use-case-form", (err as Error).message);

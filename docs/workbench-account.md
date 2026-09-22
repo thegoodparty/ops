@@ -109,7 +109,13 @@ still need the console once.
 
       Merging now accepts a model provider's terms on GoodParty's behalf,
       since that is what a subscription does. The reviewed list in
-      `utils/bedrock-models.ts` is where that consent lives.)
+      `utils/bedrock-models.ts` is where that consent lives.
+
+      First run, 2026-09-22, was green and did nothing: it reported all 26
+      pairs already entitled because the check read the wrong field, while
+      the sandbox was still refused. Fixed; not yet re-run. Do not flip this
+      to done on a green run alone. The evidence is `created` lines followed
+      by a model actually answering from the sandbox.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
@@ -175,6 +181,15 @@ Facts discovered during implementation go here as they are learned:
 - `github-actions-workbench-deploy` ARN:
   `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
   policy `WorkbenchDeploy`
+- **`agreementAvailability` is the field that says whether access exists.**
+  Not `entitlementAvailability`, and emphatically not `authorizationStatus`,
+  which appears to describe the caller. The first version of the subscription
+  script gated on the latter two, so run as an administrator from CI it
+  reported 26 of 26 model/region pairs already entitled, created nothing, and
+  exited green while the sandbox was being refused for want of a
+  subscription. A check that passes because of who is asking is worse than no
+  check. The script now prints all four fields on every line, so the next
+  disagreement between verdict and reality is visible rather than inferred.
 - **Bedrock enables every model by default, so there is no allowlist under
   us.** Access is on in all commercial regions, and Bedrock subscribes in the
   background on first invocation, provided the invoking role holds
