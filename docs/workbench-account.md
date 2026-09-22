@@ -50,11 +50,15 @@ two sessions from doing them twice.
       That output also closes the half of step 6 that could not be checked
       from a ReadOnlyAccess session: the assume into
       `OrganizationAccountAccessRole` worked, so STS sees the role.)
-- [ ] 8. Extend `identity-center.ts` for the new account: doing (claude,
-      2026-09-21. Single PR, not two: the shared deploy role already holds
-      `sso:*`, so unlike steps 5, 7 and 9 there is no grant to land first.
-      Flip to done when the `Deploy` run is green, and record the
-      `WorkbenchAccess` permission set id below at the same time.)
+- [x] 8. Extend `identity-center.ts` for the new account: done (2026-09-22,
+      PR #69, merged as 4b86d20; the `deploy` job in CI run 35729912370
+      created exactly the 4 expected resources at 12:55 UTC and deleted
+      nothing. Ids recorded below. Single PR, not two: the shared deploy role
+      already held `sso:*`, so unlike steps 5, 7 and 9 there was no grant to
+      land first. The `dependsOn` added in review worked as intended: the
+      Engineers assignment waited for `inlinePolicy-workbench` to finish
+      provisioning, while the Admins one, whose set's policies were already in
+      state, did not.)
 - [ ] 9. Attach SCP to the `Workbench` OU: todo
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
 - [ ] 11. Enable Bedrock model access in the new account: todo
@@ -80,12 +84,21 @@ Facts discovered during implementation go here as they are learned:
   `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
   policy `WorkbenchDeploy`
 - In-account workbench deploy role ARN: _not yet created_
-- `WorkbenchAccess` permission set id: _not yet created_. Unlike every other
-  set in `identity-center.ts`, this one is created by Pulumi rather than
-  adopted, so its id is not known until step 8 applies. Record it here for
-  reference, but do **not** add it to the `permissionSets` entry: an `id`
-  there is what switches the resource from create to import, and importing a
-  resource Pulumi already owns is not a no-op.
+- `WorkbenchAccess` permission set id: `ps-3aaed742183e3885`, full ARN
+  `arn:aws:sso:::permissionSet/ssoins-790711c2cafff252/ps-3aaed742183e3885`.
+  Created 2026-09-22 12:55:23 UTC. Unlike every other set in
+  `identity-center.ts`, this one is created by Pulumi rather than adopted, so
+  its id was not known until step 8 applied. It is recorded here for
+  reference only: do **not** add it to the `permissionSets` entry, because an
+  `id` there is what switches the resource from create to import, and
+  importing a resource Pulumi already owns is not a no-op.
+- Workbench account assignments, both created 2026-09-22 12:55 UTC:
+  `Engineers` (`383193a0-7001-70d9-a321-ffe6d8af7378`) to `WorkbenchAccess`,
+  and `Admins` (`88c1b330-a001-707a-06ca-94e289013bf5`) to
+  `AdministratorAccess`, each with `targetId` 024901689212. The `Admins` one
+  is a deliberate full-admin grant in the workbench account, kept as a named
+  break-glass path so the only way in is not assuming
+  `OrganizationAccountAccessRole` by hand; revisit it at step 10.
 - SCPs enabled on org root: none. Root `r-jqqe` reports an empty
   `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
   step 9: enabling it is a property of the organization, not of the OU.
