@@ -27,13 +27,17 @@
  * could construct itself. A dynamic provider is the honest alternative if a
  * second workbench-style account ever appears.
  *
- * Why it still walks regions. AWS says a subscription in one region makes the
- * model available in all of them, and also that access is enabled by default
- * in all commercial regions, so one region is probably enough. "Probably" is
- * doing work there, and the cost of being wrong is the intermittent
- * AccessDenied above. The per-region check is a handful of reads and creates
- * nothing where a subscription already exists, so it is cheap insurance
- * rather than a claim that per-region subscription is required.
+ * Why it still walks regions, now that we know it does not have to.
+ * Subscription propagates: the 2026-09-22 run created four agreements in
+ * us-east-1 and the same four models turned PENDING in the other three
+ * regions without being touched, which is what AWS's "available in all
+ * regions" wording means in practice. So the walk is not how models get
+ * subscribed.
+ *
+ * It stays because it is how we find out. Each region is a handful of reads
+ * that create nothing where an agreement already exists, and the per-region
+ * report is what would show propagation failing to reach somewhere. Dropping
+ * to a single region would trade that visibility for a second or two.
  *
  * Reports by default and changes nothing. Set `APPLY=1` to create the missing
  * agreements. The script runner takes no arguments, so this is an env var.
@@ -111,6 +115,7 @@ type Outcome =
   | "already-entitled"
   | "created"
   | "would-create"
+  | "pending"
   | "not-in-region"
   | "no-agreement-offered"
   | "needs-use-case-form"
@@ -220,8 +225,16 @@ async function enableInRegion(
       continue;
     }
 
+    // Its own outcome rather than would-create, which is what this said
+    // first and was wrong in a way worth avoiding. Nothing is waiting on us
+    // here: creating an agreement in one region propagates to the others as
+    // PENDING, observed on the 2026-09-22 run where four creates in
+    // us-east-1 turned into twelve PENDING elsewhere. Labelling that
+    // "would-create" made a summary of twelve outstanding items out of
+    // nothing outstanding at all, and would have hidden a PENDING that
+    // genuinely never resolved.
     if (agreement === "PENDING") {
-      record(region, model.id, "would-create", `pending, wait: ${state}`);
+      record(region, model.id, "pending", state);
       continue;
     }
 
@@ -399,6 +412,16 @@ export default async function main() {
   const blocked = results.filter(
     (r) => r.outcome === "failed" || r.outcome === "needs-use-case-form"
   );
+  const pending = results.filter((r) => r.outcome === "pending");
+  if (pending.length) {
+    console.log(
+      `\n${pending.length} subscription(s) still propagating. Normal right ` +
+        "after a create, since one region's agreement reaches the others on " +
+        "its own. Re-run in a few minutes; anything still pending long after " +
+        "that is worth looking at."
+    );
+  }
+
   const unoffered = results.filter((r) => r.outcome === "no-agreement-offered");
   if (unoffered.length) {
     console.log(

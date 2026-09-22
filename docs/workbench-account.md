@@ -70,81 +70,36 @@ still need the console once.
       changed, as the design predicted. Parts 2 and 3, the grant PR and the
       policy itself, are not started. See "The workbench SCP" for all three.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
-- [ ] 11. Enable Bedrock model access in the new account: doing (claude,
-      2026-09-22. This step turned out to mean something different from what
-      it says. Bedrock enables every foundation model by default and
-      subscribes in the background on first invocation, so there is nothing
-      to "enable" in bulk. What matters is who holds
-      `aws-marketplace:Subscribe`, because that is what the background
-      subscription needs.
+- [x] 11. Enable Bedrock model access in the new account: done (2026-09-22,
+      run 35756509720 created four agreements, and every model in the
+      sandbox's list now answers from a pi console. `WorkbenchAccess` holds no
+      `aws-marketplace` permissions on purpose, so `scripts/enable-bedrock-models.ts`
+      subscribes out of band with an admin role and the sandbox never needs
+      that permission itself.
 
-      `WorkbenchAccess` deliberately holds none, so an agent cannot pull in a
-      model nobody chose. `scripts/enable-bedrock-models.ts` does the
-      subscribing instead, with an admin role, and after that invoking needs
-      no marketplace permission at all. It reports by default and changes
-      nothing unless `APPLY=1`.
+      Two findings worth keeping. The first run of this was green and did
+      nothing: the idempotency check read `authorizationStatus`, which
+      describes the caller, so running as an administrator made all 26 pairs
+      look entitled while the sandbox was refused. `agreementAvailability` is
+      the field that answers the question, and every line now prints all four
+      so a wrong verdict is visible next to the numbers behind it.
 
-      Not a Pulumi resource because none exists: the provider's `bedrock`
-      namespace has agents, guardrails, custom models and provisioned
-      throughput and nothing for model agreements, and
-      `CreateFoundationModelAgreement` needs an `offerToken` fetched at
-      request time. Flip to done when a real `APPLY=1` run reports every
-      model as entitled.
-
-      Runnable two ways, and needs no new IAM either way. A human already in
-      the workbench account with `AdministratorAccess` uses their ambient
-      credentials; anything else, CI included, assumes
-      `OrganizationAccountAccessRole` exactly as `deploy-workbench`'s provider
-      does, on the `AssumeWorkbenchBootstrapRole` grant step 7 already landed.
-      `ReadOnlyAccess` cannot, for want of `sts:AssumeRole`; that was tried.
-      Step 10 moving the bootstrap role moves the script with it.
-
-      `deploy-workbench.yml` runs it with `APPLY=1` after the apply, so a
-      merge subscribes rather than leaving a script for someone to remember.
-      It has to live in that workflow specifically: the role pins
-      `job_workflow_ref` to that file, so no other workflow can get
-      credentials. There is deliberately no dry run on pull requests, because
-      the same pin means a `pull_request` ref cannot assume the role at all;
-      review before merge is the gate, as it already is for the apply.
-
-      Merging now accepts a model provider's terms on GoodParty's behalf,
-      since that is what a subscription does. The reviewed list in
-      `utils/bedrock-models.ts` is where that consent lives.
-
-      First run, 2026-09-22, was green and did nothing: it reported all 26
-      pairs already entitled because the check read the wrong field, while
-      the sandbox was still refused. Fixed; not yet re-run. Do not flip this
-      to done on a green run alone. The evidence is `created` lines followed
-      by a model actually answering from the sandbox.)
+      And subscription propagates across regions: four creates in `us-east-1`
+      turned the same models PENDING everywhere else untouched. The region
+      walk is therefore a verification pass, not the mechanism.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
-- [ ] 15. Narrow `WorkbenchAccess` to runtime needs: doing (claude,
-      2026-09-22. Reverses a decision recorded in `policies.ts`, which chose
-      `bedrock:*` deliberately. Part of that reasoning still holds and the
-      comment keeps it: an enumerated action list goes stale and the failure
-      is an engineer blocked mid-task, which is why the reads stay wide.
+- [x] 15. Narrow `WorkbenchAccess` to runtime needs: done (2026-09-22, PR #72.
+      Mutations are gone, reads stay wide, and the invoke statement names the
+      models from `utils/bedrock-models.ts` as resource ARNs. Both halves are
+      confirmed by a sandbox that invokes every model on that list and
+      nothing else: the scoped ARNs are right, which was the part most likely
+      to break invocation.
 
-      Two things changed it. `bedrock:*` covers
-      `CreateProvisionedModelThroughput` and `CreateCustomModel`, so a
-      prompt-injected agent could spend real money in an account whose budgets
-      are step 13 and not yet in place. And since Bedrock enables every model
-      by default, there is no allowlist underneath this policy: AWS's guidance
-      is that blocking a model means a Deny or a scoped Allow on
-      `bedrock:InvokeModel`. So the resource list here is the allowlist rather
-      than a second copy of one.
-
-      The invoke statement names the models from `utils/bedrock-models.ts`,
-      the same list the subscription script uses. Resources wildcard the
-      region and enumerate the model, which is the opposite of the shape the
-      original comment warned about: destination region sets differ per model
-      and `ca-central-1` is unresolved, so a region list would fail
-      intermittently, while the model is the thing actually being controlled.
-      Fourteen ARNs, composed policy 3698 of the 10240 byte limit.
-
-      Flip to done when the `Deploy` run is green and a sandbox session still
-      invokes. That second half matters: this is the change most likely to
-      break invocation, and it fails the same way everything else here does.)
+      Resources wildcard the region and enumerate the model, deliberately the
+      opposite of the shape the original `bedrock:*` comment warned about.
+      Fourteen ARNs, composed policy 3698 of the 10240 byte limit.)
 - [ ] 16. Raise the Identity Center authentication session duration: todo.
       Console only; there is no Pulumi resource for it, and `ssoadmin` in the
       provider covers permission sets and assignments but not this.
