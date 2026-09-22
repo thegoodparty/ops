@@ -112,6 +112,7 @@ type Outcome =
   | "created"
   | "would-create"
   | "not-in-region"
+  | "no-agreement-offered"
   | "needs-use-case-form"
   | "failed";
 
@@ -134,11 +135,20 @@ const record = (
 };
 
 /**
- * AWS returns AccessDenied for a model whose terms have not been accepted for
- * the account, and the acknowledgement form behind
- * `PutUseCaseForModelAccess` is an untyped blob with no schema in the service
- * model. Rather than guess at its contents, this reports the case and leaves
- * that one-time step to the console.
+ * AWS returns AccessDenied for an Anthropic model whose first-time-use form
+ * has not been submitted for the account.
+ *
+ * Detected rather than submitted, on the assumption that the form is already
+ * in place: it is required once per account or once at the organization's
+ * management account, a submission at the root is inherited org-wide, and the
+ * management account has been using Bedrock for a while. That is an
+ * assumption, so this reports clearly if it turns out to be wrong.
+ *
+ * Submitting it would be possible now. The schema is documented, unlike the
+ * service model's untyped blob: `companyName`, `companyWebsite`,
+ * `intendedUsers`, `industryOption`, `otherIndustryOption`, `useCases`. It
+ * needs real company details, which is a decision rather than a lookup, so it
+ * stays out until someone confirms the assumption is false.
  */
 const looksLikeUseCaseForm = (err: unknown) => {
   const name = (err as { name?: string })?.name ?? "";
@@ -211,7 +221,16 @@ async function enableInRegion(
       );
       const offerToken = offers.offers?.[0]?.offerToken;
       if (!offerToken) {
-        record(region, model.id, "failed", "no agreement offer returned");
+        // Not necessarily wrong. AWS names Amazon, DeepSeek, Mistral AI, Meta
+        // and Qwen as providers not sold through AWS Marketplace, with no
+        // product ids, so there is no subscription to create and nothing to
+        // offer. `deepseek.v3.2` is on our list and is expected to land here.
+        //
+        // Reported rather than failed for that reason, but reported loudly:
+        // the alternative reading is that a model which does need an
+        // agreement could not be offered one, and the two look identical from
+        // here. The first run on a new model is worth a human glance.
+        record(region, model.id, "no-agreement-offered", "not a Marketplace product?");
         continue;
       }
       await client.send(
@@ -358,6 +377,15 @@ export default async function main() {
   const blocked = results.filter(
     (r) => r.outcome === "failed" || r.outcome === "needs-use-case-form"
   );
+  const unoffered = results.filter((r) => r.outcome === "no-agreement-offered");
+  if (unoffered.length) {
+    console.log(
+      `\n${unoffered.length} model/region pair(s) had no agreement offer. ` +
+        "Expected for providers AWS does not sell through Marketplace, " +
+        "DeepSeek among them, where there is no subscription to create. " +
+        "Worth confirming by invocation the first time a model lands here."
+    );
+  }
   if (blocked.length) {
     console.error(
       `\n${blocked.length} model/region pair(s) need attention. ` +

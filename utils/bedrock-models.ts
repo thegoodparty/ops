@@ -66,7 +66,12 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "no in-region support in any region, so the geo profile is mandatory",
   },
   { id: "zai.glm-5", invokeId: "zai.glm-5", crossRegion: false },
-  { id: "deepseek.v3.2", invokeId: "deepseek.v3.2", crossRegion: false },
+  {
+    id: "deepseek.v3.2",
+    invokeId: "deepseek.v3.2",
+    crossRegion: false,
+    note: "AWS lists DeepSeek among the providers not sold through Marketplace, so expect no agreement offer and nothing to subscribe to",
+  },
 ];
 
 /**
