@@ -59,7 +59,14 @@ two sessions from doing them twice.
       Engineers assignment waited for `inlinePolicy-workbench` to finish
       provisioning, while the Admins one, whose set's policies were already in
       state, did not.)
-- [ ] 9. Attach SCP to the `Workbench` OU: todo
+- [ ] 9. Attach SCP to the `Workbench` OU: doing (claude, 2026-09-22. Part 1
+      of 3 done: jeff enabled `SERVICE_CONTROL_POLICY` on root `r-jqqe` in the
+      console on 2026-09-22, confirmed with `list-roots` reporting
+      `Status: ENABLED`. `list-policies` returns only the AWS-managed
+      `p-FullAWSAccess`, attached to both the root and `ou-jqqe-dv88i5zn`, so
+      nothing is constrained yet and no account's effective permissions
+      changed, as the design predicted. Parts 2 and 3, the grant PR and the
+      policy itself, are not started. See "The workbench SCP" for all three.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
 - [ ] 11. Enable Bedrock model access in the new account: todo
 - [ ] 12. Request quota increases if needed: todo
@@ -73,10 +80,12 @@ Facts discovered during implementation go here as they are learned:
   `WORKBENCH_ACCOUNT_ID` step 7 needs and the assignment target step 8 needs.
 - `Workbench` OU: `ou-jqqe-dv88i5zn`, directly under root `r-jqqe`. The
   account's full path is `o-uuiolqc1di/r-jqqe/ou-jqqe-dv88i5zn/024901689212/`.
-  The root has one other OU, `ou-jqqe-qxbqugvv` (`ElectionAPI`), which matters
-  in step 9: enabling `SERVICE_CONTROL_POLICY` is a root-level change and the
-  FullAWSAccess default policy attaches everywhere, so that OU is affected by
-  the enablement even though no SCP of ours targets it.
+  The root has one other OU, `ou-jqqe-qxbqugvv` (`ElectionAPI`), which
+  mattered in step 9: enabling `SERVICE_CONTROL_POLICY` is a root-level
+  change, so `FullAWSAccess` attached there too even though no SCP of ours
+  targets it. Confirmed after the fact on 2026-09-22:
+  `list-policies-for-target` returns `p-FullAWSAccess` for both OUs and both
+  accounts. Since `ElectionAPI` holds nothing, the effect was nil.
 - `github-actions-org-deploy` ARN:
   `arn:aws:iam::333022194791:role/github-actions-org-deploy`, inline policy
   `OrgDeploy`
@@ -99,9 +108,19 @@ Facts discovered during implementation go here as they are learned:
   is a deliberate full-admin grant in the workbench account, kept as a named
   break-glass path so the only way in is not assuming
   `OrganizationAccountAccessRole` by hand; revisit it at step 10.
-- SCPs enabled on org root: none. Root `r-jqqe` reports an empty
-  `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
-  step 9: enabling it is a property of the organization, not of the OU.
+- SCPs enabled on org root: `SERVICE_CONTROL_POLICY`, since 2026-09-22.
+  Enabled by jeff in the console as part 1 of step 9, because it is a
+  property of the organization rather than of the OU; see "The workbench SCP"
+  for why that was not done in code. The only policy in the organization is
+  the AWS-managed `p-FullAWSAccess`, which AWS attached automatically to the
+  root, both OUs and both accounts on enablement, so nothing is constrained
+  and no effective permission changed.
+- Organization facts checked while designing step 9, all as of 2026-09-22:
+  `FeatureSet` is `ALL`; there are no delegated administrators; `ElectionAPI`
+  (`ou-jqqe-qxbqugvv`) holds no accounts and no child OUs; the only account
+  directly under root `r-jqqe` is the management account. Together these are
+  why enabling the policy type changed nothing anywhere, and why nothing
+  inside the workbench account can move itself out of the OU.
 - `GitHubActionsPulumiDeployPolicy` version at adoption: v18, the default
   since 2026-09-17. Step 2 deleted v13 to stay under the five-version cap,
   so the surviving versions are v14 through v18. Adoption added the stack's
