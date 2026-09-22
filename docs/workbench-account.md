@@ -619,6 +619,24 @@ It does not apply to service-linked roles. And it constrains principals in
 the account, not the account's exposure to the outside: a resource policy
 that shares something publicly is a different control.
 
+It also stops applying if the account leaves the OU, which is worth being
+explicit about because attaching at the OU is what buys inheritance for a
+second workbench account later. Checked on 2026-09-22 rather than assumed:
+nothing inside the workbench account can perform that move. Organizations
+write actions are callable only from the management account or a delegated
+administrator, and `list-delegated-administrators` returns empty, so a
+coding agent holding credentials in 024901689212, which is the threat this
+policy exists for, cannot move itself out from under it.
+
+Moving it needs management-account admin, and that principal can detach the
+policy outright, so the move grants no capability that was not already
+there. The one path worth naming is CI:
+`github-actions-org-deploy` holds `organizations:MoveAccount` on `*`, so a
+merged PR touching `deploy-org/` could move the account out of the OU. That
+is the same bar as editing the SCP itself, since CODEOWNERS gates that path
+and the workflow directory both, so it is a fact to know rather than a gap
+to close. Revisit if that role's trust or the CODEOWNERS gate ever loosens.
+
 ### The grant this needs first
 
 `github-actions-org-deploy` today holds OU and account actions only, nothing
