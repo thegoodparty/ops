@@ -420,12 +420,234 @@ today holding `ssm:GetParameter` and nothing else, and `ReadOnlyAccess` does
 not grant `kms:Decrypt`. This would change if the parameter were ever moved to
 a customer-managed key.
 
-Step 9 will need the SCP policy actions (`CreatePolicy`, `AttachPolicy`,
-`DescribePolicy`, `ListPoliciesForTarget` and friends) added to
-`github-actions-org-deploy`. Add them in a PR of their own that merges and
-finishes applying **before** the PR that uses them. Pairing a grant with its
-consumer is the intuitive thing to do and it is wrong here; see "Apply
-ordering between workflows" below for why.
+Step 9 will need the SCP policy actions added to
+`github-actions-org-deploy`. The list, and the two scoping checks that grant
+has to pass, are in "The workbench SCP" below rather than here. Add them in a
+PR of their own that merges and finishes applying **before** the PR that uses
+them. Pairing a grant with its consumer is the intuitive thing to do and it
+is wrong here; see "Apply ordering between workflows" below for why.
+
+## The workbench SCP
+
+Design for step 9, settled 2026-09-22 before implementation. The plan told
+step 9 to decide the enablement question when the step was claimed rather
+than mid-PR; this section is that decision, plus the policy shape.
+
+### What an SCP does, and what it does not
+
+A Service Control Policy attaches to a root, an OU, or an account and sets a
+ceiling on what IAM inside those accounts may permit. It grants nothing.
+Effective permission is the intersection of every SCP down the tree and IAM.
+
+What makes it worth the trouble is that the ceiling cannot be raised from
+inside the account. It is set from the management account, so an account
+administrator, or that account's root user, can neither edit it nor escape
+it.
+
+Two exemptions matter here, both structural rather than configuration:
+
+- **SCPs never apply to the organization's management account.** For us that
+  is 333022194791, which is also where production runs. This mechanism will
+  never protect prod, and no SCP we write should be reasoned about as though
+  it might.
+- **They do not apply to service-linked roles.**
+
+### Why the workbench account wants one
+
+The justification for this whole account, in "Why a separate account" above,
+is the data argument: that the boundary makes "a coding agent cannot reach
+restricted L2 voter data" structurally true rather than a matter of policy.
+
+That is not yet true. What makes it true today is that the account is empty
+and nobody has put anything in it. IAM inside the account can grant up to
+full administrator, and step 8 deliberately assigned `AdministratorAccess`
+there as a named break-glass path. So the present guarantee is a promise, not
+a boundary. The SCP is what converts it.
+
+Three concrete things it buys:
+
+1. **A ceiling on the coding agent.** An agent running semi-autonomously with
+   credentials in this account is the point of the account. If it, or a
+   prompt injection, or a bad script, mints an IAM user with long-lived keys,
+   starts compute in a region nobody watches, or stops CloudTrail, the SCP
+   refuses regardless of what IAM says.
+2. **A ceiling on the step 8 admin grant.** `AdministratorAccess` in the
+   workbench account currently has nothing above it. An SCP is the only thing
+   that can sit above an account administrator.
+3. **A brake on drift.** This is the "once four people depend on the junk it
+   becomes impossible" point. Without a ceiling the cheap thing is for
+   someone to put a bucket of voter data here next quarter because it was
+   convenient, and at that moment the account's reason for existing is gone.
+
+### Enabling the policy type: console, once
+
+`SERVICE_CONTROL_POLICY` is not enabled on the organization root, so no SCP
+can attach anywhere until it is. That is a property of the organization
+rather than of the `Workbench` OU.
+
+**Decision: a one-time console enablement, recorded here the way step 2 was.
+`aws.organizations.Organization` stays unmanaged.**
+
+Rejected: importing that resource with `enabledPolicyTypes` and
+`protect: true`. Step 3's instinct, that an unmanaged resource means every
+change to it is an unreviewed console change, is right in general and wrong
+here for two reasons.
+
+The import has to capture `awsServiceAccessPrincipals` exactly. That list
+holds trusted access for `sso.amazonaws.com` among others. An incomplete
+capture does not fail loudly; it disables trusted service access on the next
+apply, which would break the Identity Center assignments step 8 just created.
+That is the same zero-diff-capture hazard step 3 managed, with a much worse
+failure mode.
+
+It also means granting `github-actions-org-deploy` write over the whole
+Organization resource, `DisableAWSServiceAccess` included. That is far
+broader than anything it holds today, and it is granted permanently in order
+to flip one boolean once.
+
+Against that cost, what code management buys here is close to nothing: one
+attribute, flipped a single time, whose value never changes again.
+
+Enablement must be done from an `AdministratorAccess` session.
+`adminReservedActions` denies `organizations:Enable*` to every other
+permission set, `EngineerAccess` included. That is the guardrail working as
+designed, not an obstacle to route around.
+
+### Blast radius of the enablement: verified nil
+
+Enabling attaches AWS's managed `FullAWSAccess` policy to the root, every OU
+and every account automatically, which is what makes the enablement itself a
+no-op. Checked against AWS on 2026-09-22 with `gp-readonly` rather than
+reasoned about:
+
+- `Organization.FeatureSet` is `ALL`, so SCPs are available and no
+  enable-all-features handshake is needed first. Had it been consolidated
+  billing only, the handshake would still have been a non-issue, since the
+  only member account has `JoinedMethod: CREATED` and created accounts do not
+  approve.
+- `ElectionAPI` (`ou-jqqe-qxbqugvv`) contains no accounts and no child OUs. It
+  is an empty branch.
+- The only account directly under root `r-jqqe` is the management account,
+  333022194791.
+- Root `PolicyTypes` is still `[]`.
+
+So after enabling, every account in the organization is either exempt by rule
+(the management account) or carries `FullAWSAccess` (the workbench account).
+No account's effective permissions change. This is a safer console change
+than step 2, which actually granted something.
+
+It is also reversible: the policy type can be disabled again once every
+non-default policy is detached.
+
+### Policy shape: deny list alongside FullAWSAccess
+
+**Decision: attach a deny-list SCP to the `Workbench` OU, leaving
+`FullAWSAccess` in place. Not an allow-list that replaces it.**
+
+Two reasons, and the second is the one that changed the answer.
+
+SCP denials are hard to diagnose. The `AccessDenied` does not always name the
+SCP, and the person hitting it usually has correct IAM permissions and no
+idea why they are being refused. A deny list fails in a small number of
+predictable places; an allow-list fails everywhere it forgot about.
+
+More importantly, an allow-list means detaching `FullAWSAccess`, and
+enablement has just made that policy a thing that can be detached. Remove it
+without a complete replacement and every member account loses everything at
+once. Keeping it attached and layering denies on top means the failure mode
+of a mistake in our policy is one service refused, not an account that
+stopped working.
+
+Attach to the OU, not the account, so a second workbench account inherits it.
+
+### What the policy denies
+
+Written to bound the account, not to minimise it. The tightening pass belongs
+after step 14, when we know what the inner loop actually uses.
+
+- `organizations:LeaveOrganization`. Leaving strands the account outside
+  consolidated billing and outside every governance control at once.
+- `iam:CreateUser`, `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access
+  here is federated through Identity Center; long-lived keys in an account
+  aimed at autonomous agents are the credential most likely to escape it.
+  Deliberately not `iam:CreateRole`: step 10 creates a scoped in-account
+  deploy role and needs it.
+- `cloudtrail:StopLogging`, `DeleteTrail`, `UpdateTrail`,
+  `PutEventSelectors`. There may be no trail in this account yet, which makes
+  these inert today and correct the moment there is one.
+- `rds:*`, `dynamodb:*`, `redshift:*`. The data argument, made structural.
+  These are the stores that would make the account worth attacking, and
+  nothing about running coding agents needs them.
+- Everything outside `us-west-2`, conditioned on `aws:RequestedRegion`, with
+  the usual `NotAction` exemption for global services (`iam`, `sts`,
+  `organizations`, `account`, `support`, `budgets`, `ce`, `cloudfront`,
+  `route53`). Without that exemption the region deny refuses global calls,
+  which are recorded against `us-east-1`.
+
+`bedrock:*` is exempted from the region restriction too. Cross-region
+inference profiles are listed in the open questions as probably wanted here,
+and they route an invocation to other regions internally. The caller's
+`aws:RequestedRegion` should still be `us-west-2`, since the principal makes
+one call to the local endpoint, but "should" is doing real work in that
+sentence and the cost of being wrong is a guardrail written today breaking a
+feature nobody tests until step 11. Exempt it now, revisit when Bedrock is
+actually in use.
+
+Deliberately **not** denied:
+
+- **S3.** The obvious candidate for the data argument, and the one to get
+  right rather than fast. Bedrock uses S3 for batch inference and can write
+  invocation logs there, so a blanket deny would block features we may want
+  in step 11. The right shape is probably a deny scoped by
+  `s3:ResourceAccount` so the account can reach its own buckets and nothing
+  else, which is worth writing deliberately rather than guessing at. Revisit
+  at step 11.
+- **GuardDuty tamper protection.** Standard in a policy like this, omitted
+  only because it is unclear whether we run GuardDuty at all. Add it if we
+  do; a deny for a service nobody runs is harmless but so is leaving it out.
+
+SCPs cap at 5120 bytes including whitespace. The list above is nowhere near
+it, but an allow-list version would have been closer, which is one more small
+argument for the shape chosen.
+
+### What this does not protect
+
+Worth stating plainly so the control is not credited with more than it does.
+
+It does nothing for the management account, which is where production runs.
+It does not apply to service-linked roles. And it constrains principals in
+the account, not the account's exposure to the outside: a resource policy
+that shares something publicly is a different control.
+
+### The grant this needs first
+
+`github-actions-org-deploy` today holds OU and account actions only, nothing
+about policies. Step 9's first PR adds, at minimum:
+
+`organizations:CreatePolicy`, `UpdatePolicy`, `DeletePolicy`, `AttachPolicy`,
+`DetachPolicy`, and the read-backs `DescribePolicy`, `ListPolicies`,
+`ListPoliciesForTarget`, `ListTargetsForPolicy`. `TagResource` and
+`UntagResource` are already held.
+
+Not `EnablePolicyType` or `DisablePolicyType`, since enablement is the
+console step above and the role should not be able to turn the mechanism off.
+
+Two checks to run when writing it, from the review lens these PRs have earned:
+
+The paired-action check. `CreatePolicy` without `UpdatePolicy` fails the
+first time the document changes; `AttachPolicy` without `DetachPolicy` fails
+the first time the attachment moves. Confirm what the provider reads back
+after each write, not only what the code asks for.
+
+The self-undermining check. `AttachPolicy` and `DetachPolicy` on `*` would
+let this role detach `FullAWSAccess` from the root, which is the one action
+that breaks every member account at once, and it would be doing so with a
+role whose whole purpose is to apply a policy that constrains a lower-trust
+account. Scope both to the `Workbench` OU as the target, and add a condition
+on `organizations:PolicyType` for `SERVICE_CONTROL_POLICY`. Verify the
+resource types those actions accept against AWS's service reference before
+writing the ARNs, the way `adminReservedActions` was built, rather than
+assuming they take a target ARN.
 
 ## Apply ordering between workflows
 
@@ -770,18 +992,35 @@ needed, and so the asynchronous parts have a human gap after them.
    importable. Split it per assignment at that point; the comment on the field
    says so too.
 
-9. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
-   else. Needs the policy actions added to `github-actions-org-deploy` first,
-   in a separate PR that has finished applying before this one merges, per
-   "Apply ordering between workflows". Write the SCP now while the account is
-   nearly empty. Once four people depend on the junk it becomes impossible.
+9. Attach an SCP to the `Workbench` OU. Designed in full in "The workbench
+   SCP" above; read that section before starting, not this summary. Write it
+   now while the account is nearly empty. Once four people depend on the junk
+   it becomes impossible.
 
-   `SERVICE_CONTROL_POLICY` is not enabled on the org root, so this step has
-   to enable it first. That is a property of the organization itself rather
-   than of the `Workbench` OU, so the choice is between importing the
-   existing `aws.organizations.Organization` with `enabledPolicyTypes` and
-   `protect: true`, or a one-time console enablement of the kind step 2 was.
-   Decide that when the step is claimed, not mid-PR.
+   Three parts, in this order:
+
+   1. A console enablement of `SERVICE_CONTROL_POLICY` on root `r-jqqe`, from
+      an `AdministratorAccess` session, since `adminReservedActions` denies
+      `organizations:Enable*` everywhere else. Verified nil blast radius: no
+      account in the organization changes effective permissions. Record it in
+      Progress above the way step 2 was recorded, since it leaves no git
+      trace.
+   2. A grant PR adding the policy actions to `github-actions-org-deploy`,
+      merged **and finished applying** before the third part, per "Apply
+      ordering between workflows".
+   3. The `aws.organizations.Policy` and its attachment to the `Workbench`
+      OU, in `deploy-org/`.
+
+   Corrections to an earlier draft of this step, both now resolved in the
+   design section rather than left open. It said to decide the enablement
+   question when the step was claimed: decided, console, with the import of
+   `aws.organizations.Organization` rejected because capturing
+   `awsServiceAccessPrincipals` wrong would disable trusted access for
+   Identity Center. And it described the policy as "allowing Bedrock,
+   CloudWatch, and little else", which is an allow-list: rejected in favour
+   of a deny list layered on top of `FullAWSAccess`, because an allow-list
+   means detaching `FullAWSAccess` and any gap in it takes the account out
+   entirely.
 
 10. Replace the bootstrap role. `OrganizationAccountAccessRole` is created
    automatically when Organizations provisions a member account, but it is
