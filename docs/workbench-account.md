@@ -81,7 +81,22 @@ still need the console once.
       does, on the `AssumeWorkbenchBootstrapRole` grant step 7 already landed.
       What cannot run it is an engineer's sandbox session, because step 15
       removed the mutations from `WorkbenchAccess`. Step 10 moving the
-      bootstrap role moves the script with it.)
+      bootstrap role moves the script with it.
+
+      `deploy-workbench.yml` runs it with `APPLY=1` after the apply, so a
+      merge enables the models rather than leaving a script for someone to
+      remember. It has to live in that workflow specifically: the role pins
+      `job_workflow_ref` to that file, so no other workflow can get
+      credentials. There is deliberately no dry run on pull requests, because
+      the same pin means a `pull_request` ref cannot assume the role at all;
+      review before merge is the gate, as it already is for the apply.
+
+      Two consequences worth knowing. A model still needing its terms
+      accepted in the console holds this workflow red until someone does it,
+      which is intended: green over a half-enabled account is the state the
+      whole step exists to prevent. And merging now accepts a model
+      provider's terms on GoodParty's behalf, so the reviewed model list in
+      the script is where that consent lives.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
