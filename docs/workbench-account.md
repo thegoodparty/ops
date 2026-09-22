@@ -11,7 +11,14 @@ One step at a time, one pull request per step. Statuses are `todo`, `doing
 in-repo work, or an AWS case number or resource id for work done outside git.
 
 Claim a step by setting it to `doing` and pushing that change **before**
-starting the work, not after. Steps 1, 2, 12 and 16 happen in the console or in
+starting the work, not after. Make `who` name the *session*, not the model:
+two concurrent sessions both wrote `claude` on 2026-09-22 across steps 9, 11
+and 15, which left no way to tell which claim was whose and would have made
+all three look abandoned together once the day-old rule below applied.
+Something like `claude-scp` costs nothing. Both sessions also shared one
+working tree, so check `git branch --show-current` before committing.
+
+Steps 1, 2, 12 and 16 happen in the console or in
 support cases and leave no other trace, so the claim is the only thing stopping
 two sessions from doing them twice. Step 11 used to be on that list and is not
 any more: it has a script now, though the terms acknowledgement inside it may
@@ -61,14 +68,24 @@ still need the console once.
       Engineers assignment waited for `inlinePolicy-workbench` to finish
       provisioning, while the Admins one, whose set's policies were already in
       state, did not.)
-- [ ] 9. Attach SCP to the `Workbench` OU: doing (claude, 2026-09-22. Part 1
-      of 3 done: jeff enabled `SERVICE_CONTROL_POLICY` on root `r-jqqe` in the
-      console on 2026-09-22, confirmed with `list-roots` reporting
+- [ ] 9. Attach SCP to the `Workbench` OU: doing (claude-scp, 2026-09-22.
+      Part 1 of 3 done: jeff enabled `SERVICE_CONTROL_POLICY` on root
+      `r-jqqe` in the console, confirmed with `list-roots` reporting
       `Status: ENABLED`. `list-policies` returns only the AWS-managed
-      `p-FullAWSAccess`, attached to both the root and `ou-jqqe-dv88i5zn`, so
-      nothing is constrained yet and no account's effective permissions
-      changed, as the design predicted. Parts 2 and 3, the grant PR and the
-      policy itself, are not started. See "The workbench SCP" for all three.)
+      `p-FullAWSAccess`, attached to both OUs and both accounts, so nothing
+      is constrained and no effective permission changed, as designed.
+
+      Part 2, the grant on `github-actions-org-deploy`, is in this PR along
+      with the design revisions steps 11 and 15 forced. Flip part 2 when the
+      `Deploy` run is green and `iam:get-role-policy` shows the five
+      `ServiceControlPolicy*` statements on the role.
+
+      Part 3, the `aws.organizations.Policy` and its attachment in
+      `deploy-org/`, is deliberately **not** here. The grant is applied by
+      `deploy.yml` and the policy by `deploy-org.yml`, and a single merge
+      starts both with nothing sequencing them; see "Apply ordering between
+      workflows". Same shape as #63 before #62. See "The workbench SCP" for
+      the full design.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
 - [x] 11. Enable Bedrock model access in the new account: done (2026-09-22,
       run 35756509720 created four agreements, and every model in the
@@ -689,6 +706,14 @@ Attach to the OU, not the account, so a second workbench account inherits it.
 Written to bound the account, not to minimise it. The tightening pass belongs
 after step 14, when we know what the inner loop actually uses.
 
+Revised 2026-09-22 after steps 11 and 15 landed in PR #72. Two of the entries
+below changed as a direct result, and both changes are the same lesson: this
+policy binds `OrganizationAccountAccessRole`, which is the identity CI itself
+uses inside the account, so a guardrail written carelessly does not merely
+inconvenience an engineer, it breaks the pipeline that maintains the account.
+Check any future addition against what `deploy-workbench.yml` does, not only
+against what a person does.
+
 - `organizations:LeaveOrganization`. Leaving strands the account outside
   consolidated billing and outside every governance control at once.
 - `iam:CreateUser`, `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access
@@ -702,30 +727,85 @@ after step 14, when we know what the inner loop actually uses.
 - `rds:*`, `dynamodb:*`, `redshift:*`. The data argument, made structural.
   These are the stores that would make the account worth attacking, and
   nothing about running coding agents needs them.
+- S3 against buckets this account does not own, conditioned on
+  `aws:ResourceAccount` not equal to 024901689212. See below: this replaces
+  an earlier decision to leave S3 alone.
 - Everything outside `us-west-2`, conditioned on `aws:RequestedRegion`, with
-  the usual `NotAction` exemption for global services (`iam`, `sts`,
-  `organizations`, `account`, `support`, `budgets`, `ce`, `cloudfront`,
-  `route53`). Without that exemption the region deny refuses global calls,
-  which are recorded against `us-east-1`.
+  a `NotAction` exemption for global services (`iam`, `sts`, `organizations`,
+  `account`, `support`, `budgets`, `ce`, `cloudfront`, `route53`) and for
+  `bedrock` and `aws-marketplace`. Without the global exemption the region
+  deny refuses global calls, which are recorded against `us-east-1`. The
+  other two are explained next.
 
-`bedrock:*` is exempted from the region restriction too. Cross-region
-inference profiles are listed in the open questions as probably wanted here,
-and they route an invocation to other regions internally. The caller's
-`aws:RequestedRegion` should still be `us-west-2`, since the principal makes
-one call to the local endpoint, but "should" is doing real work in that
-sentence and the cost of being wrong is a guardrail written today breaking a
-feature nobody tests until step 11. Exempt it now, revisit when Bedrock is
-actually in use.
+#### The two region exemptions, both load-bearing
+
+`bedrock` was exempted on suspicion when this section was first written: the
+reasoning was that cross-region inference profiles route internally, that the
+caller's `aws:RequestedRegion` should therefore still be `us-west-2`, and
+that "should" was doing too much work to risk it.
+
+Step 11 turned that suspicion into evidence. A sandbox session invoked
+Bedrock successfully several times and then failed with AccessDenied from
+identical input, because `us.`-prefixed model ids are geo profiles that route
+each request across member regions by capacity. That is not proof about the
+SCP condition key specifically, since model entitlement is checked by the
+service in the destination region rather than against the caller's request
+context. It is proof that this workload genuinely spans regions and that the
+failure mode is intermittent, which is the worst kind to introduce with a
+guardrail. Keep the exemption.
+
+`aws-marketplace` is the entry that was missing, and it would have bitten.
+Step 11's `scripts/enable-bedrock-models.ts` subscribes to model agreements,
+which needs `aws-marketplace:Subscribe`, and it walks `us-east-1`,
+`us-east-2`, `us-west-1` and `us-west-2`. `deploy-workbench.yml` runs it with
+`APPLY=1` after every apply. So the region deny as first drafted would have
+refused the subscribe call in three of the four regions.
+
+This is live, not latent, which is worth pinning down because the first
+version of this paragraph got it wrong. The pre-#73 script reported all 26
+model/region pairs `already-entitled` by reading the wrong field, so the
+subscribe path looked dormant and the gap looked like something that would
+bite months later. #73 fixed the check, and the next run created 4
+agreements with 12 more pending propagation, in `us-east-1`, `us-east-2` and
+`us-west-1` as well as `us-west-2`. The region deny as first drafted would
+have broken the running pipeline on its first apply.
+
+Even had it been dormant it would have been worth fixing: the same shape as
+the `TagResource` without `UntagResource` defect from the step 4 review, a
+write set complete for today's state that fails partway once the state
+moves. The correction here is only about how quickly it would have shown up.
+
+#### S3: denied cross-account, which resolves an earlier deferral
+
+The first draft of this section left S3 alone and said to revisit at step 11,
+on the grounds that Bedrock uses S3 for batch inference and invocation
+logging and a blanket deny would block features we might want.
+
+Step 11 is now done and needs no S3 at all. So the deferral resolves, and it
+resolves toward denying, because the thing worth protecting against was never
+this account's own buckets. It was reaching the management account's.
+
+The deny is therefore scoped by resource owner rather than by service:
+`s3:*` on resources whose `aws:ResourceAccount` is not 024901689212. The
+account keeps full use of buckets it owns, so batch inference and invocation
+logging remain available if step 11's follow-ups want them, and "a coding
+agent cannot reach restricted L2 voter data" stops depending on anyone's
+judgement about which buckets exist.
+
+Two caveats to check when writing it rather than at review.
+`aws:ResourceAccount` is not honoured by every service and AWS documents
+exceptions, notably for some AWS-owned resources accessed on the caller's
+behalf; the exceptions published for S3 are what matter here. And a
+cross-account deny of this shape blocks reading public buckets too, which is
+fine for this account and would not be for a general-purpose one.
+
+Jeff's call on 2026-09-22, in his words, was to do the deny now and loosen
+later if needed. That direction is the right way round for this account: a
+loosening is a reviewed PR against a working system, while the absence of the
+deny is invisible until it matters.
 
 Deliberately **not** denied:
 
-- **S3.** The obvious candidate for the data argument, and the one to get
-  right rather than fast. Bedrock uses S3 for batch inference and can write
-  invocation logs there, so a blanket deny would block features we may want
-  in step 11. The right shape is probably a deny scoped by
-  `s3:ResourceAccount` so the account can reach its own buckets and nothing
-  else, which is worth writing deliberately rather than guessing at. Revisit
-  at step 11.
 - **GuardDuty tamper protection.** Standard in a policy like this, omitted
   only because it is unclear whether we run GuardDuty at all. Add it if we
   do; a deny for a service nobody runs is harmless but so is leaving it out.
@@ -763,33 +843,75 @@ to close. Revisit if that role's trust or the CODEOWNERS gate ever loosens.
 
 ### The grant this needs first
 
-`github-actions-org-deploy` today holds OU and account actions only, nothing
-about policies. Step 9's first PR adds, at minimum:
+Written and landed as part 2 of step 9. `github-actions-org-deploy` held OU
+and account actions only, nothing about policies.
 
-`organizations:CreatePolicy`, `UpdatePolicy`, `DeletePolicy`, `AttachPolicy`,
-`DetachPolicy`, and the read-backs `DescribePolicy`, `ListPolicies`,
-`ListPoliciesForTarget`, `ListTargetsForPolicy`. `TagResource` and
-`UntagResource` are already held.
+Added, all five statements conditioned on
+`organizations:PolicyType` equal to `SERVICE_CONTROL_POLICY`, so enabling tag
+policies or backup policies on the root later does not silently widen this
+role: those are the same API with a different policy type, and an
+ARN-scoped grant would pick them up for free.
 
-Not `EnablePolicyType` or `DisablePolicyType`, since enablement is the
-console step above and the role should not be able to turn the mechanism off.
+- `CreatePolicy`, `UpdatePolicy`, `DeletePolicy`, scoped to this
+  organization's SCP namespace.
+- `AttachPolicy`, `DetachPolicy`, scoped to that namespace **and** the
+  `Workbench` OU.
+- `DescribePolicy`, `ListTargetsForPolicy`, the provider's read-backs, same
+  namespace.
+- `ListPoliciesForTarget`, scoped to the OU.
+- `ListPolicies`, unscopable and therefore `*`.
 
-Two checks to run when writing it, from the review lens these PRs have earned:
+Not `EnablePolicyType` or `DisablePolicyType`. Enablement is the console step
+above, and the role that applies the policy should not be able to turn off
+the mechanism the policy depends on.
 
-The paired-action check. `CreatePolicy` without `UpdatePolicy` fails the
-first time the document changes; `AttachPolicy` without `DetachPolicy` fails
-the first time the attachment moves. Confirm what the provider reads back
-after each write, not only what the code asks for.
+The two review checks this grant was written against, and what each turned up:
 
-The self-undermining check. `AttachPolicy` and `DetachPolicy` on `*` would
-let this role detach `FullAWSAccess` from the root, which is the one action
-that breaks every member account at once, and it would be doing so with a
-role whose whole purpose is to apply a policy that constrains a lower-trust
-account. Scope both to the `Workbench` OU as the target, and add a condition
-on `organizations:PolicyType` for `SERVICE_CONTROL_POLICY`. Verify the
-resource types those actions accept against AWS's service reference before
-writing the ARNs, the way `adminReservedActions` was built, rather than
-assuming they take a target ARN.
+**The paired-action check.** `CreatePolicy` without `UpdatePolicy` fails the
+first time the document changes, which for an SCP is the first tightening
+pass and therefore close to certain. `AttachPolicy` without `DetachPolicy`
+fails the first time the attachment moves. `DeletePolicy` is included even
+though nothing in the plan deletes a policy, because removing the resource
+from the program is how a bad SCP gets withdrawn and discovering a missing
+grant at that moment is discovering it at the worst one. That reasoning does
+not extend to `CloseAccount` or `RemoveAccountFromOrganization`, which stay
+absent: deleting a service control policy destroys nothing and is undone by
+reapplying.
+
+**The self-undermining check.** `AttachPolicy` and `DetachPolicy` on `*`
+would let this role detach `FullAWSAccess` from the root, the one action that
+breaks every member account at once, using a role whose purpose is to apply a
+policy constraining a lower-trust account.
+
+Checking the resource types rather than assuming them, as this section
+originally said to, changed the answer twice.
+
+First, the actions are scopable. Verified against AWS's machine-readable
+service reference, the source `adminReservedActions` was built from:
+`AttachPolicy` and `DetachPolicy` accept `account`, `organizationalunit`,
+`policy` and `root`, and a request naming both a policy and a target must be
+permitted for both. So listing only our namespace and only the `Workbench` OU
+is two independent bounds at once. This role cannot attach our policy to the
+root, and it cannot touch a policy we do not own.
+
+Second, and better than the scoping: AWS-managed policies are not in this
+organization's namespace at all. `FullAWSAccess` is
+`arn:aws:organizations::aws:policy/service_control_policy/p-FullAWSAccess`,
+with `aws` where the account id belongs and no `o-` segment. Confirmed with
+`describe-policy` against live AWS, because the published ARN format string
+does not show this case. So the pattern
+`arn:aws:organizations::333022194791:policy/o-uuiolqc1di/service_control_policy/*`
+cannot match it under any wildcard. The role is structurally unable to name
+the dangerous policy rather than merely scoped away from it.
+
+The same check found that the two pre-existing writes are scopable too and
+are not scoped. `CreateOrganizationalUnit` accepts `organizationalunit` and
+`root`; `MoveAccount` accepts `account`, `organizationalunit` and `root`;
+only `CreateAccount` genuinely takes no resource. That is a known wart rather
+than a considered choice, and narrowing `MoveAccount` to the `Workbench` OU
+would also close the move vector recorded under "What this does not protect".
+Worth its own PR, one that can check the exact ARNs the provider sends
+against existing state, rather than riding along with step 9.
 
 ## Apply ordering between workflows
 
