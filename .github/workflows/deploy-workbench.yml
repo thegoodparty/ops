@@ -21,6 +21,11 @@ on:
     paths:
       - "deploy-workbench/**"
       - ".github/workflows/deploy-workbench.yml"
+      # Not part of the Pulumi project, but deployed by this workflow for the
+      # trust reason in the header: the role is assumable only from this file,
+      # so a separate workflow could not get credentials. Listed explicitly so
+      # that editing the model list is enough to enable it.
+      - "scripts/enable-bedrock-models.ts"
 
 # Its own group. This is a different stack with a different S3 lock from
 # deploy.yml's and deploy-org.yml's, so there is nothing to serialize between
@@ -71,3 +76,30 @@ jobs:
       - name: Deploy
         working-directory: deploy-workbench
         run: ./deploy.sh
+
+      # Bedrock model access is not a Pulumi resource, so it cannot ride in
+      # deploy.sh; see the header of the script for why none exists. Without
+      # this step the script would be something a human had to remember, which
+      # is the failure it was written to prevent: enablement half-done reads
+      # as an intermittent AccessDenied rather than as missing setup.
+      #
+      # After the apply on purpose. Enablement does not depend on anything in
+      # the stack, but a failed apply is a reason to stop rather than to carry
+      # on mutating the account.
+      #
+      # It makes the second hop itself, assuming OrganizationAccountAccessRole
+      # exactly as index.ts does, so the credentials configured above are all
+      # it needs.
+      #
+      # Idempotent, so running it on every workbench deploy is a handful of
+      # availability reads once the models are entitled. It exits non-zero
+      # when a model still needs its terms accepted in the console, which will
+      # hold this workflow red until someone does it. That is deliberate: a
+      # green deploy over a half-enabled account is the exact state this whole
+      # step exists to make impossible.
+      #
+      # Worth naming, since merging now does it automatically: creating an
+      # agreement accepts that model provider's terms on GoodParty's behalf.
+      # The reviewed model list in the script is where that consent lives.
+      - name: Enable Bedrock models
+        run: APPLY=1 npm run script enable-bedrock-models

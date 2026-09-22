@@ -11,9 +11,11 @@ One step at a time, one pull request per step. Statuses are `todo`, `doing
 in-repo work, or an AWS case number or resource id for work done outside git.
 
 Claim a step by setting it to `doing` and pushing that change **before**
-starting the work, not after. Steps 1, 2, 11 and 12 happen in the console or in
+starting the work, not after. Steps 1, 2, 12 and 16 happen in the console or in
 support cases and leave no other trace, so the claim is the only thing stopping
-two sessions from doing them twice.
+two sessions from doing them twice. Step 11 used to be on that list and is not
+any more: it has a script now, though the terms acknowledgement inside it may
+still need the console once.
 
 - [x] 1. Create and verify `aws-workbench@goodparty.org` group alias: done
       (2026-09-17, jeff, group created and receipt confirmed)
@@ -68,10 +70,91 @@ two sessions from doing them twice.
       changed, as the design predicted. Parts 2 and 3, the grant PR and the
       policy itself, are not started. See "The workbench SCP" for all three.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
-- [ ] 11. Enable Bedrock model access in the new account: todo
+- [ ] 11. Enable Bedrock model access in the new account: doing (claude,
+      2026-09-22. This step turned out to mean something different from what
+      it says. Bedrock enables every foundation model by default and
+      subscribes in the background on first invocation, so there is nothing
+      to "enable" in bulk. What matters is who holds
+      `aws-marketplace:Subscribe`, because that is what the background
+      subscription needs.
+
+      `WorkbenchAccess` deliberately holds none, so an agent cannot pull in a
+      model nobody chose. `scripts/enable-bedrock-models.ts` does the
+      subscribing instead, with an admin role, and after that invoking needs
+      no marketplace permission at all. It reports by default and changes
+      nothing unless `APPLY=1`.
+
+      Not a Pulumi resource because none exists: the provider's `bedrock`
+      namespace has agents, guardrails, custom models and provisioned
+      throughput and nothing for model agreements, and
+      `CreateFoundationModelAgreement` needs an `offerToken` fetched at
+      request time. Flip to done when a real `APPLY=1` run reports every
+      model as entitled.
+
+      Runnable two ways, and needs no new IAM either way. A human already in
+      the workbench account with `AdministratorAccess` uses their ambient
+      credentials; anything else, CI included, assumes
+      `OrganizationAccountAccessRole` exactly as `deploy-workbench`'s provider
+      does, on the `AssumeWorkbenchBootstrapRole` grant step 7 already landed.
+      `ReadOnlyAccess` cannot, for want of `sts:AssumeRole`; that was tried.
+      Step 10 moving the bootstrap role moves the script with it.
+
+      `deploy-workbench.yml` runs it with `APPLY=1` after the apply, so a
+      merge subscribes rather than leaving a script for someone to remember.
+      It has to live in that workflow specifically: the role pins
+      `job_workflow_ref` to that file, so no other workflow can get
+      credentials. There is deliberately no dry run on pull requests, because
+      the same pin means a `pull_request` ref cannot assume the role at all;
+      review before merge is the gate, as it already is for the apply.
+
+      Merging now accepts a model provider's terms on GoodParty's behalf,
+      since that is what a subscription does. The reviewed list in
+      `utils/bedrock-models.ts` is where that consent lives.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
+- [ ] 15. Narrow `WorkbenchAccess` to runtime needs: doing (claude,
+      2026-09-22. Reverses a decision recorded in `policies.ts`, which chose
+      `bedrock:*` deliberately. Part of that reasoning still holds and the
+      comment keeps it: an enumerated action list goes stale and the failure
+      is an engineer blocked mid-task, which is why the reads stay wide.
+
+      Two things changed it. `bedrock:*` covers
+      `CreateProvisionedModelThroughput` and `CreateCustomModel`, so a
+      prompt-injected agent could spend real money in an account whose budgets
+      are step 13 and not yet in place. And since Bedrock enables every model
+      by default, there is no allowlist underneath this policy: AWS's guidance
+      is that blocking a model means a Deny or a scoped Allow on
+      `bedrock:InvokeModel`. So the resource list here is the allowlist rather
+      than a second copy of one.
+
+      The invoke statement names the models from `utils/bedrock-models.ts`,
+      the same list the subscription script uses. Resources wildcard the
+      region and enumerate the model, which is the opposite of the shape the
+      original comment warned about: destination region sets differ per model
+      and `ca-central-1` is unresolved, so a region list would fail
+      intermittently, while the model is the thing actually being controlled.
+      Fourteen ARNs, composed policy 3698 of the 10240 byte limit.
+
+      Flip to done when the `Deploy` run is green and a sandbox session still
+      invokes. That second half matters: this is the change most likely to
+      break invocation, and it fails the same way everything else here does.)
+- [ ] 16. Raise the Identity Center authentication session duration: todo.
+      Console only; there is no Pulumi resource for it, and `ssoadmin` in the
+      provider covers permission sets and assignments but not this.
+
+      `identity-center.ts` sets `sessionDuration: "PT12H"` on
+      `WorkbenchAccess`, but that is the role session: how long one set of
+      credentials lasts once issued. How often a human re-authenticates is
+      the Identity Center authentication session, a separate setting under
+      Settings then Authentication, and it is unconfigured and so at the 8
+      hour default. So the 12 hour intent is only half in place and re-login
+      lands mid-afternoon rather than at end of day.
+
+      This matters more than it sounds for the coding sandbox. pi renews role
+      credentials and the SSO token itself for as long as the authentication
+      session lasts, so this setting, not the permission set, is the real
+      ceiling on an unattended run.
 
 Facts discovered during implementation go here as they are learned:
 
@@ -92,6 +175,58 @@ Facts discovered during implementation go here as they are learned:
 - `github-actions-workbench-deploy` ARN:
   `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
   policy `WorkbenchDeploy`
+- **Bedrock enables every model by default, so there is no allowlist under
+  us.** Access is on in all commercial regions, and Bedrock subscribes in the
+  background on first invocation, provided the invoking role holds
+  `aws-marketplace:Subscribe`. AWS's guidance is that blocking a model means a
+  Deny or a scoped Allow on `bedrock:InvokeModel`, not withholding a
+  subscription. That is why `WorkbenchAccess` names its models as resource
+  ARNs: that statement is the allowlist, and it is the only one.
+- **"Worked a few times, then AccessDenied" is the documented shape of a
+  failed background subscription**, not necessarily a routing problem. AWS:
+  during the setup period, up to fifteen minutes, calls may succeed while the
+  subscription is finalised, and if a prerequisite is missing the attempt
+  fails and subsequent calls return AccessDeniedException. `WorkbenchAccess`
+  had no `aws-marketplace` permissions and no managed policies, so the
+  prerequisite was missing.
+
+  This was first diagnosed here as cross-region routing, which fits the
+  symptom less well: routing would keep flip-flopping rather than settling
+  into a steady refusal. Recorded because the wrong diagnosis is plausible
+  enough to be reached again.
+- **Cross-region inference is still worth knowing about**, even though it was
+  not the cause. The `us.` ids route each request across the profile's member
+  regions rather than staying in `AWS_REGION`, and member sets differ per
+  model: the Anthropic profiles span three regions, `us.moonshotai.kimi-k3`
+  spans five. This is why the IAM resources wildcard the region and enumerate
+  the model rather than the reverse.
+- **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
+  list imported by both the IAM policy that permits them and the script that
+  subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5`,
+  `anthropic.claude-sonnet-5`, `xai.grok-4.6`, `openai.gpt-5.6-sol`,
+  `openai.gpt-5.6-terra`, `moonshotai.kimi-k3`, plus `zai.glm-5` and
+  `deepseek.v3.2` kept region-pinned by choice.
+- **The Anthropic first-time-use form is assumed already submitted.** It is
+  required once per account or once at the organization's management account,
+  and a submission at the root is inherited by every account in the
+  organization. The management account has been using Bedrock, so this should
+  be covered; it is an assumption rather than something checked. If it is not,
+  `PutUseCaseForModelAccess` takes `companyName`, `companyWebsite`,
+  `intendedUsers`, `industryOption`, `otherIndustryOption` and `useCases`.
+- **`us.moonshotai.kimi-k3` has no in-region support in any region**, so a geo
+  profile is mandatory for it rather than a preference. Its model card also
+  lists `ca-central-1` as geo-supported while its prose says the `us.` profile
+  routes only among US-geography regions to respect US data residency. Those
+  disagree, and the script leaves `ca-central-1` out pending a resolution.
+  Worth settling deliberately given what GoodParty holds: if routing does
+  reach it, K3 fails intermittently until it is added.
+- **Kimi K3 through Converse is documented as broken for multi-turn
+  reasoning.** AWS's card says Converse raises `InternalServerException` when
+  reasoning content from earlier turns is included, and recommends the
+  OpenAI-compatible APIs instead. pi only speaks Converse, so `gp-pi` declares
+  the model with reasoning disabled to keep prior thinking blocks out of the
+  request. Not an account-side problem; recorded here because it constrains
+  which models are worth enabling.
 - In-account workbench deploy role ARN: _not yet created_
 - `WorkbenchAccess` permission set id: `ps-3aaed742183e3885`, full ARN
   `arn:aws:sso:::permissionSet/ssoins-790711c2cafff252/ps-3aaed742183e3885`.
@@ -1086,15 +1221,18 @@ needed, and so the asynchronous parts have a human gap after them.
 - **Removing `bedrock:*` from `EngineerAccess` in the main account.** This is
   the actual payoff of the exercise, and it is a follow-up rather than part of
   this work. Needs care, since something may depend on it.
-- **Cross-region inference profiles.** Probably worth enabling here given that
-  burstiness is the defining characteristic of the workload.
+- ~~**Cross-region inference profiles.**~~ Settled by circumstance rather than
+  by decision: the model ids pi ships are already geo profiles, so we are
+  using them. The cost is in the facts above, and it is that enablement is per
+  member region and getting it wrong fails intermittently.
 - **Per-engineer cost visibility.** Application inference profiles tagged per
   engineer, or a gateway. Defer until the account exists and we can see whether
   the aggregate number is enough.
-- **Region.** `us-west-2` to match the rest of our footprint. A separate region
-  is no longer needed for quota isolation now that the account provides it, but
-  model availability differs by region and is worth checking against the models
-  we want.
+- ~~**Region.**~~ Settled. `us-west-2` is where requests are sent and where the
+  two region-pinned models live, matching the rest of our footprint. The check
+  this asked for mattered more than expected: availability does differ by
+  region, and because the geo profiles route away from `us-west-2` anyway,
+  "the region" is a set rather than one place. See the facts above.
 
 ## Context: the management account
 

@@ -3,6 +3,8 @@
 // parses this field as JSON, so how it serialises does not have to match how
 // AWS stores it.
 
+import { bedrockInvokeResources } from "../../../utils/bedrock-models";
+
 type PolicyValue = string | string[];
 
 export type PolicyStatement = {
@@ -149,26 +151,59 @@ export const productManager: PolicyDocument = {
 // data. The account is empty today, so the grant would be harmless today and
 // wrong the first time anything lands there.
 //
-// `bedrock:*` rather than an invoke-only list, deliberately. The narrowing
-// that matters already happened at the account boundary: there is nothing
-// else in this account to reach. An action list would need revisiting for
-// every new Bedrock feature the inner loop picks up, and the failure mode is
-// an engineer blocked mid-task by an AccessDenied on something like
-// `bedrock:ListInferenceProfiles`. Cross-region inference in particular
-// invokes against both an inference profile ARN and the foundation model ARN
-// in each region it routes to, which is exactly the shape of grant that gets
-// guessed wrong.
+// This was `bedrock:*` until 2026-09-22. The reasoning for that is worth
+// keeping, because part of it still holds: an enumerated action list goes
+// stale as the inner loop picks up new Bedrock features, and the failure mode
+// is an engineer blocked mid-task by an AccessDenied on something like
+// `bedrock:ListInferenceProfiles`. That is why the reads below stay wide.
 //
-// It does keep the `adminReservedActions` denies, since `guardrails` defaults
-// to true. Those cover organization and identity actions, none of which are
+// Two things changed. `bedrock:*` covers
+// `CreateProvisionedModelThroughput`, `CreateCustomModel` and the
+// model-import jobs, so a prompt-injected agent could spend real money in an
+// account whose budgets are step 13 and not yet in place. And Bedrock enables
+// every foundation model by default, subscribing in the background on first
+// invocation, so there is no account-level allowlist underneath this. AWS's
+// own guidance is explicit that blocking model access means a Deny or a
+// scoped Allow on `bedrock:InvokeModel` at the account or organization level,
+// not withholding a subscription.
+//
+// So this statement is the allowlist, and it is the only one. Both halves
+// matter: the actions exclude every mutation, and the resources name the
+// models from `utils/bedrock-models.ts`, which is the same list the
+// subscription script works from.
+//
+// Deliberately no `aws-marketplace` permissions anywhere in this set. Those
+// are what Bedrock needs to auto-subscribe on first use, and withholding them
+// is what stops an agent pulling in a model nobody chose. The cost is that
+// somebody has to subscribe out of band, which is what step 11's script does
+// with an admin role; once a model is subscribed, invoking it needs no
+// marketplace permission at all.
+//
+// It keeps the `adminReservedActions` denies, since `guardrails` defaults to
+// true. Those cover organization and identity actions, none of which are
 // Bedrock, so nothing here collides with them.
 export const workbenchAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     {
-      Sid: "InvokeBedrockModels",
+      Sid: "InvokeSelectedBedrockModels",
       Effect: "Allow",
-      Action: ["bedrock:*"],
+      Action: [
+        "bedrock:Converse",
+        "bedrock:ConverseStream",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+      ],
+      Resource: bedrockInvokeResources(),
+    },
+    // Reads, wide on purpose, per the note above. These enumerate and
+    // describe; none of them changes anything or costs anything beyond the
+    // request itself. Keeping them wide is what stops a narrowed policy from
+    // reintroducing the mid-task AccessDenied the previous version avoided.
+    {
+      Sid: "ReadBedrockCatalogAndState",
+      Effect: "Allow",
+      Action: ["bedrock:Get*", "bedrock:List*"],
       Resource: "*",
     },
     // Read-only, and read-only on purpose: this is for an engineer answering
