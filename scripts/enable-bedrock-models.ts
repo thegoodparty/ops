@@ -24,14 +24,23 @@
  * Reports by default and changes nothing. Set `APPLY=1` to create the missing
  * agreements. The script runner takes no arguments, so this is an env var.
  *
- * Credentials: this needs Bedrock mutations, which `WorkbenchAccess`
- * deliberately does not grant, so run it with `AdministratorAccess` in the
- * workbench account. An engineer's day-to-day session cannot do this and
- * should not be able to.
+ * Credentials, from either direction. This needs Bedrock mutations, which
+ * `WorkbenchAccess` deliberately does not grant, so an engineer's day-to-day
+ * sandbox session cannot run it and should not be able to.
+ *
+ * Already inside the workbench account, as a human with
+ * `AdministratorAccess`, the ambient credentials are used as they are:
  *
  *   aws sso login --profile workbench-admin
  *   AWS_PROFILE=workbench-admin npm run script enable-bedrock-models
  *   AWS_PROFILE=workbench-admin APPLY=1 npm run script enable-bedrock-models
+ *
+ * Anywhere else, including as `github-actions-workbench-deploy` in CI, it
+ * assumes `OrganizationAccountAccessRole` the same way
+ * `deploy-workbench/index.ts` configures its provider to. That grant already
+ * exists: `AssumeWorkbenchBootstrapRole` in `ci-roles/policies.ts`, landed by
+ * step 7. So nothing new is needed on the IAM side, and step 10 moving that
+ * role will move this with it.
  */
 import {
   BedrockClient,
@@ -40,9 +49,20 @@ import {
   ListFoundationModelAgreementOffersCommand,
 } from "@aws-sdk/client-bedrock";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
+import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
+import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
 
 /** The workbench account. Step 6 of `docs/workbench-account.md`. */
 const WORKBENCH_ACCOUNT_ID = "024901689212";
+
+/**
+ * The same role `deploy-workbench/index.ts` has its provider assume, for the
+ * same reason: it is the only way into the account from CI credentials, and
+ * it is effectively administrator there. Step 10 replaces it with a scoped
+ * in-account role, at which point this moves with the provider rather than
+ * being left behind.
+ */
+const BOOTSTRAP_ROLE = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`;
 
 /**
  * Every region a `us.` geo profile can route to, per the model cards.
@@ -127,8 +147,12 @@ const looksLikeUseCaseForm = (err: unknown) => {
   );
 };
 
-async function enableInRegion(region: string, models: typeof MODELS) {
-  const client = new BedrockClient({ region });
+async function enableInRegion(
+  region: string,
+  models: typeof MODELS,
+  credentials: AwsCredentialIdentityProvider | undefined
+) {
+  const client = new BedrockClient({ region, credentials });
   console.log(`\n${region}`);
 
   for (const model of models) {
@@ -216,39 +240,83 @@ async function enableInRegion(region: string, models: typeof MODELS) {
 }
 
 /**
- * Fails once, before the loops, on the two things that would otherwise
- * produce one misleading error per model/region pair.
+ * Resolves credentials that act inside the workbench account, and fails once
+ * rather than producing one misleading error per model/region pair.
  *
- * The account check is not ceremony. This script creates agreements, the
+ * Two callers, two paths. A human who has already logged in to the workbench
+ * account keeps their ambient credentials. Anything else, CI included,
+ * assumes into the account, which is what makes this runnable by
+ * `github-actions-workbench-deploy` without a new grant.
+ *
+ * Returns the provider to hand to each client, or undefined to mean the
+ * default chain is already correct.
+ *
+ * The account check is not ceremony either way. This creates agreements, the
  * organization has more than one account, and `AWS_PROFILE` is easy to get
- * wrong. Running it against the management account would be a real mistake
- * and the error it produced would not say so.
+ * wrong. Acting on the management account would be a real mistake and the
+ * error it produced would not say so.
  */
-async function preflight() {
-  const sts = new STSClient({ region: REGIONS[0] });
-  let identity;
+async function resolveWorkbenchCredentials(): Promise<
+  AwsCredentialIdentityProvider | undefined
+> {
+  let ambient;
   try {
-    identity = await sts.send(new GetCallerIdentityCommand({}));
+    ambient = await new STSClient({ region: REGIONS[0] }).send(
+      new GetCallerIdentityCommand({})
+    );
   } catch (err) {
     throw new Error(
-      "Could not resolve AWS credentials. This needs AdministratorAccess in " +
-        `the workbench account ${WORKBENCH_ACCOUNT_ID}, not WorkbenchAccess: ` +
-        "enabling models is a mutation that WorkbenchAccess deliberately " +
-        `cannot perform.\n  ${(err as Error).message}`
+      "Could not resolve AWS credentials. Log in to the workbench account " +
+        `${WORKBENCH_ACCOUNT_ID} with AdministratorAccess, or run this as ` +
+        `a role that can assume ${BOOTSTRAP_ROLE}. WorkbenchAccess cannot ` +
+        `do it: enabling models is a mutation it deliberately lacks.\n  ${
+          (err as Error).message
+        }`
     );
   }
 
-  if (identity.Account !== WORKBENCH_ACCOUNT_ID) {
+  if (ambient.Account === WORKBENCH_ACCOUNT_ID) {
+    console.log(`Account ${ambient.Account} as ${ambient.Arn}`);
+    return undefined;
+  }
+
+  // Session name shows up in the workbench account's CloudTrail, which is
+  // worth setting for an assume this privileged: it separates this script
+  // from a Pulumi apply and from a human who assumed the same role by hand.
+  const credentials = fromTemporaryCredentials({
+    params: {
+      RoleArn: BOOTSTRAP_ROLE,
+      RoleSessionName: "enable-bedrock-models",
+    },
+  });
+
+  let assumed;
+  try {
+    assumed = await new STSClient({ region: REGIONS[0], credentials }).send(
+      new GetCallerIdentityCommand({})
+    );
+  } catch (err) {
     throw new Error(
-      `Wrong account. Expected the workbench account ${WORKBENCH_ACCOUNT_ID}, ` +
-        `got ${identity.Account} as ${identity.Arn}. Check AWS_PROFILE.`
+      `Credentials are in account ${ambient.Account} as ${ambient.Arn}, and ` +
+        `assuming ${BOOTSTRAP_ROLE} failed. Either those credentials are not ` +
+        "allowed to assume it, or you are in the wrong account entirely.\n" +
+        `  ${(err as Error).message}`
     );
   }
-  console.log(`Account ${identity.Account} as ${identity.Arn}`);
+
+  // Belt and braces: the assume could in principle resolve somewhere
+  // unexpected, and this script is about to create agreements.
+  if (assumed.Account !== WORKBENCH_ACCOUNT_ID) {
+    throw new Error(
+      `Assumed into ${assumed.Account}, expected ${WORKBENCH_ACCOUNT_ID}.`
+    );
+  }
+  console.log(`Assumed ${assumed.Arn} from ${ambient.Arn}`);
+  return credentials;
 }
 
 export default async function main() {
-  await preflight();
+  const credentials = await resolveWorkbenchCredentials();
   const applying = Boolean(process.env.APPLY);
   console.log(
     applying
@@ -260,12 +328,12 @@ export default async function main() {
   const pinnedModels = MODELS.filter((m) => m.pinned);
 
   for (const region of REGIONS) {
-    await enableInRegion(region, geoModels);
+    await enableInRegion(region, geoModels, credentials);
   }
   // The pinned models are deliberately not enabled across the geo set: they
   // are selected by bare model id, so they never route anywhere else.
   for (const region of PINNED_REGIONS) {
-    await enableInRegion(region, pinnedModels);
+    await enableInRegion(region, pinnedModels, credentials);
   }
 
   const tally = results.reduce<Record<string, number>>((acc, r) => {

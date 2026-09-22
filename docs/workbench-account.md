@@ -72,9 +72,16 @@ still need the console once.
 
       This step is wider than it looks. Enabling in `us-west-2` alone is what
       produced the intermittent AccessDenied recorded in the facts below,
-      because the `us.` profiles route across member regions. It also needs
-      `AdministratorAccess`, since step 15 removed the mutations from
-      `WorkbenchAccess` and an engineer session can no longer do this.)
+      because the `us.` profiles route across member regions.
+
+      Runnable two ways, and needs no new IAM either way. A human already in
+      the workbench account with `AdministratorAccess` uses their ambient
+      credentials; anything else, CI included, assumes
+      `OrganizationAccountAccessRole` exactly as `deploy-workbench`'s provider
+      does, on the `AssumeWorkbenchBootstrapRole` grant step 7 already landed.
+      What cannot run it is an engineer's sandbox session, because step 15
+      removed the mutations from `WorkbenchAccess`. Step 10 moving the
+      bootstrap role moves the script with it.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
