@@ -41,14 +41,20 @@ two sessions from doing them twice.
       from a ReadOnlyAccess session: the assume is the first thing step 7
       does, so a transient failure there is the expected place to find out,
       not a permissions bug to debug.)
-- [ ] 7. Add the `deploy-workbench/` project and its CI job: doing (claude,
-      2026-09-21. First PR, the deferred `sts:AssumeRole` grant, is done:
+- [x] 7. Add the `deploy-workbench/` project and its CI job: done
+      (2026-09-21, both PRs. First, the deferred `sts:AssumeRole` grant:
       PR #67, applied 16:00 UTC, confirmed on the role with
-      `iam:get-role-policy`. Second PR, the project and
-      `deploy-workbench.yml`, is open. Flip to done when its `Deploy
-      workbench` run is green and `pulumi stack output accountId` on
-      `organization/workbench/main` reads 024901689212.)
-- [ ] 8. Extend `identity-center.ts` for the new account: todo
+      `iam:get-role-policy`. Second, the project and `deploy-workbench.yml`:
+      PR #68, merged as 4c7b731, `Deploy workbench` run 35641993246 green at
+      19:01 UTC, 2 resources created, `accountId` output reads 024901689212.
+      That output also closes the half of step 6 that could not be checked
+      from a ReadOnlyAccess session: the assume into
+      `OrganizationAccountAccessRole` worked, so STS sees the role.)
+- [ ] 8. Extend `identity-center.ts` for the new account: doing (claude,
+      2026-09-21. Single PR, not two: the shared deploy role already holds
+      `sso:*`, so unlike steps 5, 7 and 9 there is no grant to land first.
+      Flip to done when the `Deploy` run is green, and record the
+      `WorkbenchAccess` permission set id below at the same time.)
 - [ ] 9. Attach SCP to the `Workbench` OU: todo
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
 - [ ] 11. Enable Bedrock model access in the new account: todo
@@ -74,6 +80,12 @@ Facts discovered during implementation go here as they are learned:
   `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
   policy `WorkbenchDeploy`
 - In-account workbench deploy role ARN: _not yet created_
+- `WorkbenchAccess` permission set id: _not yet created_. Unlike every other
+  set in `identity-center.ts`, this one is created by Pulumi rather than
+  adopted, so its id is not known until step 8 applies. Record it here for
+  reference, but do **not** add it to the `permissionSets` entry: an `id`
+  there is what switches the resource from create to import, and importing a
+  resource Pulumi already owns is not a no-op.
 - SCPs enabled on org root: none. Root `r-jqqe` reports an empty
   `PolicyTypes`, so `SERVICE_CONTROL_POLICY` has never been enabled. See
   step 9: enabling it is a property of the organization, not of the OU.
@@ -101,6 +113,7 @@ died mid-step); AWS cannot. Before starting anything, reconcile:
 aws organizations list-accounts --query "Accounts[].[Id,Name,Status]" --output table
 pulumi stack select organization/ops/ops-dev && pulumi stack output
 pulumi stack select organization/org/main && pulumi stack output
+pulumi stack select organization/workbench/main && pulumi stack output
 git log --oneline -15 -- docs/workbench-account.md deploy/ deploy-org/ deploy-workbench/
 ```
 
@@ -664,8 +677,85 @@ needed, and so the asynchronous parts have a human gap after them.
    the new account. Today `ACCOUNT_ID` is a hardcoded const used as every
    assignment's `targetId`, so this needs parameterizing to iterate over
    accounts. New assignments must not carry the `import:` option that the
-   existing ones use, since there is no pre-existing AWS state to adopt. See
-   the open question on which permission set to use.
+   existing ones use, since there is no pre-existing AWS state to adopt.
+
+   No grant PR in front of this one. `githubActionsPulumiDeploy` already holds
+   `sso:*` on `*`, which covers creating a permission set, putting its inline
+   policy, provisioning it, and creating an assignment, along with the tag and
+   describe calls the provider makes around them. Checked rather than assumed,
+   because steps 5, 7 and 9 all need a grant landed first and the pattern
+   invites assuming this one does too.
+
+   **Which sets.** Settled, closing the open question below. A new
+   `WorkbenchAccess` set, Bedrock plus CloudWatch read, no managed policies,
+   assigned to `Engineers`. Not `EngineerAccess`, which would work on day one
+   since it already carries `bedrock:*`, but which also drags
+   `AmazonS3FullAccess`, `ReadOnlyAccess` and two tag-conditioned
+   `Action: ["*"]` statements into the account whose entire purpose is that a
+   coding agent's credentials cannot reach data. Harmless while the account is
+   empty, wrong the moment it is not.
+
+   `AdministratorAccess`, the existing set, is also assigned here, to `Admins`.
+   That is a real grant of full admin in the workbench account, not a
+   formality, and it is worth stating plainly rather than leaving to be
+   discovered. The alternative is worse: without it the only human path into
+   the account is assuming `OrganizationAccountAccessRole` from the management
+   account by hand, which is a shared role attributable to a person only by
+   correlating CloudTrail, and which step 10 exists to retire. The permission
+   set resource itself is untouched, still imported and still protected; only
+   a second `AccountAssignment` is added.
+
+   **Three things in the refactor that are not parameterization.**
+
+   The new set's ARN is an `Output`, not a string. Every ARN in this file is
+   built today as `${PS_PREFIX}/${set.id}`, which works only because every set
+   already exists. A set Pulumi creates has no id until apply time, so the
+   loop keeps a key-to-ARN map of type `pulumi.Input<string>` and everything
+   downstream reads from it. That also supplies the ordering: the assignment
+   referencing the set's `.arn` depends on the set automatically. Import
+   strings are built before the apply and cannot hold an `Output`, so a second
+   map holds literal ARNs for the adopt paths only, and an assignment marked
+   adopted whose set has no id throws rather than importing `undefined`.
+
+   Existing resource names must not change. A logical name is part of the URN,
+   so renaming `assignment-Engineers-engineer` to
+   `assignment-main-Engineers-engineer` reads as a delete plus a create, and
+   `protect: true` refuses the delete and fails the apply. So the account
+   entry carries a `namePrefix`, empty for the management account and
+   `workbench-` for the new one. The asymmetry is ugly and deliberate; the
+   alternative is an `aliases` entry on each of the eight existing
+   assignments, which has to be right the first time or produces exactly the
+   failure it was added to avoid.
+
+   `protect: true` stops being conditional on `import:`. It read that way
+   only because every resource in the file was adopted, and the two answer
+   different questions: import is whether the resource already exists in AWS,
+   protect is whether destroying it should need its own pull request.
+   Deleting a permission set or an assignment revokes real access either way.
+   So the new set and the new assignments are protected too, which means
+   backing step 8 out is an explicit unprotect PR rather than a deletion that
+   rides along in something else. Inline policies stay unprotected, as before.
+
+   Assignments must wait for their set's policy resources. Creating a
+   `ManagedPolicyAttachment` or a `PermissionSetInlinePolicy` calls
+   `ProvisionPermissionSet`, and creating an `AccountAssignment` provisions
+   the set into its account with whatever is attached at that moment. All
+   three take only `permissionSetArn`, so the Output graph makes them
+   siblings and Pulumi runs them in parallel. The end state converges
+   regardless, because the policy resources re-provision to every assigned
+   account, so the failure is not a permanently empty permission set. It is
+   two provisioning operations in flight on one set, which Identity Center
+   answers with a ConflictException, and which reads as a deploy that failed
+   for no reproducible reason. An explicit `dependsOn` serializes them.
+   Raised by Bugbot on PR #69; it never bit before because every resource in
+   this file was adopted and nothing was ever created.
+
+   The `adopted` flag is a per-account approximation of a per-assignment fact.
+   It is uniform today because every assignment in the management account
+   predates Pulumi and none in the workbench account exist. Add a sixth group
+   to the management account and the flag will claim the new assignment is
+   importable. Split it per assignment at that point; the comment on the field
+   says so too.
 
 9. Attach an SCP to the `Workbench` OU allowing Bedrock, CloudWatch, and little
    else. Needs the policy actions added to `github-actions-org-deploy` first,
@@ -700,11 +790,10 @@ needed, and so the asynchronous parts have a human gap after them.
 
 ## Open questions
 
-- **Which permission set.** Reusing `EngineerAccess` is tempting since it
-  already carries `bedrock:*`, but it also carries `AmazonS3FullAccess` and
-  `ReadOnlyAccess`, which is the wrong shape for an account that should hold
-  nothing but model access. Leaning toward a new `WorkbenchAccess` set scoped
-  to Bedrock plus CloudWatch read.
+- ~~**Which permission set.**~~ Settled 2026-09-21 in step 8: a new
+  `WorkbenchAccess` set for `Engineers`, plus the existing
+  `AdministratorAccess` for `Admins` as a named break-glass path. Reasoning
+  is recorded in the step rather than here.
 - **Removing `bedrock:*` from `EngineerAccess` in the main account.** This is
   the actual payoff of the exercise, and it is a follow-up rather than part of
   this work. Needs care, since something may depend on it.
