@@ -11,9 +11,11 @@ One step at a time, one pull request per step. Statuses are `todo`, `doing
 in-repo work, or an AWS case number or resource id for work done outside git.
 
 Claim a step by setting it to `doing` and pushing that change **before**
-starting the work, not after. Steps 1, 2, 11 and 12 happen in the console or in
+starting the work, not after. Steps 1, 2, 12 and 16 happen in the console or in
 support cases and leave no other trace, so the claim is the only thing stopping
-two sessions from doing them twice.
+two sessions from doing them twice. Step 11 used to be on that list and is not
+any more: it has a script now, though the terms acknowledgement inside it may
+still need the console once.
 
 - [x] 1. Create and verify `aws-workbench@goodparty.org` group alias: done
       (2026-09-17, jeff, group created and receipt confirmed)
@@ -57,10 +59,58 @@ two sessions from doing them twice.
       `WorkbenchAccess` permission set id below at the same time.)
 - [ ] 9. Attach SCP to the `Workbench` OU: todo
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
-- [ ] 11. Enable Bedrock model access in the new account: todo
+- [ ] 11. Enable Bedrock model access in the new account: doing (claude,
+      2026-09-22. `scripts/enable-bedrock-models.ts` does it idempotently
+      across the geo profile's member regions, reporting by default and
+      changing nothing unless `APPLY=1`. Not a Pulumi resource because none
+      exists: the provider's `bedrock` namespace has agents, guardrails,
+      custom models and provisioned throughput and nothing for model access,
+      and `CreateFoundationModelAgreement` needs an `offerToken` fetched at
+      request time. Flip to done when a real `APPLY=1` run reports every
+      model/region pair as entitled, and record below anything the console
+      had to do by hand.
+
+      This step is wider than it looks. Enabling in `us-west-2` alone is what
+      produced the intermittent AccessDenied recorded in the facts below,
+      because the `us.` profiles route across member regions. It also needs
+      `AdministratorAccess`, since step 15 removed the mutations from
+      `WorkbenchAccess` and an engineer session can no longer do this.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
+- [ ] 15. Narrow `WorkbenchAccess` to runtime needs: doing (claude,
+      2026-09-22. Reverses a decision recorded in `policies.ts`, which chose
+      `bedrock:*` deliberately. That reasoning still holds on its own terms
+      and is kept in the comment; what changed is that `bedrock:*` includes
+      `CreateProvisionedModelThroughput` and `CreateCustomModel`, so a
+      prompt-injected coding agent could spend real money in an account whose
+      budgets are step 13 and not yet in place.
+
+      The split is mutations versus everything else, rather than an
+      enumerated invoke list. Reads stay wide, which answers the original
+      objection that a narrowed policy blocks an engineer mid-task on a
+      missing `List` or `Get`. Resources stay unscoped by region on purpose:
+      cross-region inference needs both the profile ARN here and the
+      foundation model ARN in each destination region, the destination set
+      differs per model, and a wrong guess there fails intermittently in a way
+      that looks like missing model access. Flip to done when the `Deploy` run
+      is green and a sandbox session still invokes.)
+- [ ] 16. Raise the Identity Center authentication session duration: todo.
+      Console only; there is no Pulumi resource for it, and `ssoadmin` in the
+      provider covers permission sets and assignments but not this.
+
+      `identity-center.ts` sets `sessionDuration: "PT12H"` on
+      `WorkbenchAccess`, but that is the role session: how long one set of
+      credentials lasts once issued. How often a human re-authenticates is
+      the Identity Center authentication session, a separate setting under
+      Settings then Authentication, and it is unconfigured and so at the 8
+      hour default. So the 12 hour intent is only half in place and re-login
+      lands mid-afternoon rather than at end of day.
+
+      This matters more than it sounds for the coding sandbox. pi renews role
+      credentials and the SSO token itself for as long as the authentication
+      session lasts, so this setting, not the permission set, is the real
+      ceiling on an unattended run.
 
 Facts discovered during implementation go here as they are learned:
 
@@ -79,6 +129,39 @@ Facts discovered during implementation go here as they are learned:
 - `github-actions-workbench-deploy` ARN:
   `arn:aws:iam::333022194791:role/github-actions-workbench-deploy`, inline
   policy `WorkbenchDeploy`
+- **Cross-region inference is the trap in this account, and it has already
+  caught us.** With models enabled in `us-west-2` only, a sandbox session
+  invoked successfully several times and then failed with AccessDenied, from
+  identical input. The `us.` prefixed ids are cross-region inference profiles:
+  they do not stay in `AWS_REGION`, they route each request across the
+  profile's member regions by capacity. Enabled in some and not others gives
+  intermittent failure.
+
+  The symptom misleads in a specific way. A genuinely missing grant fails on
+  the first call and every call after it. Intermittent failure means routing,
+  so the fix is enablement in every member region and never anything in the
+  client. Member region sets also differ per model: the `us.` Anthropic
+  profiles span three regions, `us.moonshotai.kimi-k3` spans five.
+- **Models the coding sandbox uses**, as base foundation-model ids. Geo
+  profiles unless noted: `anthropic.claude-opus-5`,
+  `anthropic.claude-sonnet-5`, `xai.grok-4.6`, `openai.gpt-5.6-sol`,
+  `openai.gpt-5.6-terra`, `moonshotai.kimi-k3`, plus `zai.glm-5` and
+  `deepseek.v3.2` kept region-pinned to `us-west-2` by choice. The list lives
+  in `scripts/enable-bedrock-models.ts`.
+- **`us.moonshotai.kimi-k3` has no in-region support in any region**, so a geo
+  profile is mandatory for it rather than a preference. Its model card also
+  lists `ca-central-1` as geo-supported while its prose says the `us.` profile
+  routes only among US-geography regions to respect US data residency. Those
+  disagree, and the script leaves `ca-central-1` out pending a resolution.
+  Worth settling deliberately given what GoodParty holds: if routing does
+  reach it, K3 fails intermittently until it is added.
+- **Kimi K3 through Converse is documented as broken for multi-turn
+  reasoning.** AWS's card says Converse raises `InternalServerException` when
+  reasoning content from earlier turns is included, and recommends the
+  OpenAI-compatible APIs instead. pi only speaks Converse, so `gp-pi` declares
+  the model with reasoning disabled to keep prior thinking blocks out of the
+  request. Not an account-side problem; recorded here because it constrains
+  which models are worth enabling.
 - In-account workbench deploy role ARN: _not yet created_
 - `WorkbenchAccess` permission set id: _not yet created_. Unlike every other
   set in `identity-center.ts`, this one is created by Pulumi rather than
@@ -797,15 +880,18 @@ needed, and so the asynchronous parts have a human gap after them.
 - **Removing `bedrock:*` from `EngineerAccess` in the main account.** This is
   the actual payoff of the exercise, and it is a follow-up rather than part of
   this work. Needs care, since something may depend on it.
-- **Cross-region inference profiles.** Probably worth enabling here given that
-  burstiness is the defining characteristic of the workload.
+- ~~**Cross-region inference profiles.**~~ Settled by circumstance rather than
+  by decision: the model ids pi ships are already geo profiles, so we are
+  using them. The cost is in the facts above, and it is that enablement is per
+  member region and getting it wrong fails intermittently.
 - **Per-engineer cost visibility.** Application inference profiles tagged per
   engineer, or a gateway. Defer until the account exists and we can see whether
   the aggregate number is enough.
-- **Region.** `us-west-2` to match the rest of our footprint. A separate region
-  is no longer needed for quota isolation now that the account provides it, but
-  model availability differs by region and is worth checking against the models
-  we want.
+- ~~**Region.**~~ Settled. `us-west-2` is where requests are sent and where the
+  two region-pinned models live, matching the rest of our footprint. The check
+  this asked for mattered more than expected: availability does differ by
+  region, and because the geo profiles route away from `us-west-2` anyway,
+  "the region" is a set rather than one place. See the facts above.
 
 ## Context: the management account
 

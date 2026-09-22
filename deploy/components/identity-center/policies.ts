@@ -149,15 +149,42 @@ export const productManager: PolicyDocument = {
 // data. The account is empty today, so the grant would be harmless today and
 // wrong the first time anything lands there.
 //
-// `bedrock:*` rather than an invoke-only list, deliberately. The narrowing
-// that matters already happened at the account boundary: there is nothing
-// else in this account to reach. An action list would need revisiting for
-// every new Bedrock feature the inner loop picks up, and the failure mode is
-// an engineer blocked mid-task by an AccessDenied on something like
-// `bedrock:ListInferenceProfiles`. Cross-region inference in particular
-// invokes against both an inference profile ARN and the foundation model ARN
-// in each region it routes to, which is exactly the shape of grant that gets
-// guessed wrong.
+// This was `bedrock:*` until 2026-09-22, deliberately, and the reasoning is
+// worth keeping because two thirds of it still holds. It said an action list
+// needs revisiting for every new Bedrock feature the inner loop picks up,
+// that the failure mode is an engineer blocked mid-task by an AccessDenied on
+// something like `bedrock:ListInferenceProfiles`, and that cross-region
+// inference invokes against both an inference profile ARN and the foundation
+// model ARN in each region it routes to, which is the shape of grant that
+// gets guessed wrong. All true.
+//
+// What changed is that `bedrock:*` turned out to include a way to spend real
+// money. It covers `CreateProvisionedModelThroughput`, `CreateCustomModel`
+// and the custom-model-import jobs, none of which the inner loop uses and
+// all of which a prompt-injected agent could reach. The account boundary
+// bounds what data that agent can see; it does not bound the bill. Step 13,
+// budgets and cost anomaly detection, is not in place yet either.
+//
+// So the split here is mutations versus everything else, rather than an
+// enumerated invoke list. Reads stay wide, which answers the original
+// objection: nothing in the inner loop can be blocked by a missing `List` or
+// `Get`, because every one of them is allowed. What is gone is the ability to
+// create, delete or modify anything.
+//
+// Deliberately no region or model scoping on the resources. The original
+// comment is right that cross-region inference needs the inference profile
+// ARN in this account and the foundation model ARN in each destination
+// region, and the destination set differs per model: the `us.` Anthropic
+// profiles span three regions, `us.moonshotai.kimi-k3` spans five and
+// includes `ca-central-1`. A region-scoped resource list is precisely the
+// grant that would get guessed wrong, and its failure mode is intermittent
+// AccessDenied that looks identical to missing model access, which has
+// already cost us one debugging session. See `docs/workbench-account.md`.
+//
+// Both spellings of the runtime actions are granted. The Converse family maps
+// onto `bedrock:InvokeModel` in some of AWS's own documentation and appears
+// as its own action name elsewhere; granting both means whichever is real is
+// covered and the other is inert.
 //
 // It does keep the `adminReservedActions` denies, since `guardrails` defaults
 // to true. Those cover organization and identity actions, none of which are
@@ -166,9 +193,24 @@ export const workbenchAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     {
-      Sid: "InvokeBedrockModels",
+      Sid: "InvokeBedrockRuntime",
       Effect: "Allow",
-      Action: ["bedrock:*"],
+      Action: [
+        "bedrock:Converse",
+        "bedrock:ConverseStream",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+      ],
+      Resource: "*",
+    },
+    // Reads, wide on purpose, per the note above. These enumerate and
+    // describe; none of them changes anything or costs anything beyond the
+    // request itself. Keeping them wide is what stops a narrowed policy from
+    // reintroducing the mid-task AccessDenied the previous version avoided.
+    {
+      Sid: "ReadBedrockCatalogAndState",
+      Effect: "Allow",
+      Action: ["bedrock:Get*", "bedrock:List*"],
       Resource: "*",
     },
     // Read-only, and read-only on purpose: this is for an engineer answering
