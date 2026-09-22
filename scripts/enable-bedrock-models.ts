@@ -1,39 +1,50 @@
 /**
- * Enables the Bedrock models the coding sandbox uses, in every region the
- * cross-region inference profiles route to. Step 11 of
+ * Subscribes the workbench account to the models the coding sandbox uses, so
+ * that the sandbox itself never needs permission to do it. Step 11 of
  * `docs/workbench-account.md`.
+ *
+ * This is not "enabling models" in the old sense. Bedrock enables every
+ * foundation model by default and subscribes in the background the first time
+ * you invoke one, provided the invoking role holds `aws-marketplace:Subscribe`
+ * and friends. `WorkbenchAccess` deliberately holds none of those, because
+ * that permission is what would let a prompt-injected agent pull in any model
+ * in the catalogue. AWS documents the way out of that directly: someone with
+ * marketplace permissions subscribes once, and after that invoking needs no
+ * marketplace permission at all. This script is that someone.
+ *
+ * It also removes a failure that is hard to read. With no marketplace
+ * permission, the first invocation of an unsubscribed model succeeds for up
+ * to fifteen minutes while the background subscription is attempted, then
+ * fails with AccessDeniedException once that attempt gives up. Working for a
+ * few calls and then refusing looks like an outage or a broken login rather
+ * than like missing setup.
  *
  * Why a script rather than Pulumi. There is no resource for this: the AWS
  * provider's `bedrock` namespace covers agents, guardrails, custom models and
- * provisioned throughput, and nothing for model access. The underlying API
- * exists, but `CreateFoundationModelAgreement` needs an `offerToken` fetched
- * at request time, so a declarative resource would have to do a lookup before
- * it could construct itself, and the use-case acknowledgement is an opaque
- * blob. This is also one-time-per-account work, which is the case Pulumi is
- * worst at earning its keep. A dynamic provider is the honest alternative and
- * is worth revisiting if a second workbench-style account ever appears.
+ * provisioned throughput, and nothing for model agreements. The API exists,
+ * but `CreateFoundationModelAgreement` needs an `offerToken` fetched at
+ * request time, so a declarative resource would have to do a lookup before it
+ * could construct itself. A dynamic provider is the honest alternative if a
+ * second workbench-style account ever appears.
  *
- * Why regions are the unit of work. The model ids the sandbox uses are `us.`
- * prefixed cross-region inference profiles, which do not stay in one region:
- * they route each request across the profile's member regions by capacity. A
- * model enabled in some member regions and not others produces AccessDenied
- * on some calls and not others, from identical input. That has already cost
- * one debugging session, because the symptom looks exactly like a broken
- * login rather than a half-finished enablement.
+ * Why it still walks regions. AWS says a subscription in one region makes the
+ * model available in all of them, and also that access is enabled by default
+ * in all commercial regions, so one region is probably enough. "Probably" is
+ * doing work there, and the cost of being wrong is the intermittent
+ * AccessDenied above. The per-region check is a handful of reads and creates
+ * nothing where a subscription already exists, so it is cheap insurance
+ * rather than a claim that per-region subscription is required.
  *
  * Reports by default and changes nothing. Set `APPLY=1` to create the missing
  * agreements. The script runner takes no arguments, so this is an env var.
  *
- * Credentials, from either direction. This needs Bedrock mutations, which
- * `WorkbenchAccess` deliberately does not grant, so an engineer's day-to-day
- * sandbox session cannot run it and should not be able to.
+ * Credentials, from either direction. Already inside the workbench account,
+ * as a human with `AdministratorAccess`, the ambient credentials are used as
+ * they are:
  *
- * Already inside the workbench account, as a human with
- * `AdministratorAccess`, the ambient credentials are used as they are:
- *
- *   aws sso login --profile workbench-admin
- *   AWS_PROFILE=workbench-admin npm run script enable-bedrock-models
- *   AWS_PROFILE=workbench-admin APPLY=1 npm run script enable-bedrock-models
+ *   aws sso login --profile gp-admin
+ *   AWS_PROFILE=gp-admin npm run script enable-bedrock-models
+ *   AWS_PROFILE=gp-admin APPLY=1 npm run script enable-bedrock-models
  *
  * Anywhere else, including as `github-actions-workbench-deploy` in CI, it
  * assumes `OrganizationAccountAccessRole` the same way
@@ -41,6 +52,9 @@
  * exists: `AssumeWorkbenchBootstrapRole` in `ci-roles/policies.ts`, landed by
  * step 7. So nothing new is needed on the IAM side, and step 10 moving that
  * role will move this with it.
+ *
+ * Note `ReadOnlyAccess` cannot run it: that set has no `sts:AssumeRole`, so
+ * the hop into the account is refused. Verified, not assumed.
  */
 import {
   BedrockClient,
@@ -51,9 +65,10 @@ import {
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
 import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
-
-/** The workbench account. Step 6 of `docs/workbench-account.md`. */
-const WORKBENCH_ACCOUNT_ID = "024901689212";
+import {
+  WORKBENCH_ACCOUNT_ID,
+  WORKBENCH_MODELS,
+} from "../utils/bedrock-models";
 
 /**
  * The same role `deploy-workbench/index.ts` has its provider assume, for the
@@ -83,27 +98,14 @@ const REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"];
 const PINNED_REGIONS = ["us-west-2"];
 
 /**
- * Base foundation-model ids, not the profile ids the sandbox selects. Access
- * is granted to the underlying model per region; the `us.` prefix is routing,
- * and asking about `us.anthropic.claude-opus-5` would be asking about a
- * profile rather than a model.
+ * Subscription is per foundation model, so this works from `id` rather than
+ * the `us.` profile the sandbox selects: the prefix is routing, and asking
+ * about a profile would be asking the wrong question.
  *
- * `pinned: true` marks the two models kept region-pinned by choice, so they
- * only need their own region rather than the whole geo set.
+ * Models that are not cross-region only ever run where the sandbox points, so
+ * they are handled separately below rather than walked across the geo set.
  */
-const MODELS: { id: string; pinned?: boolean; note?: string }[] = [
-  { id: "anthropic.claude-opus-5" },
-  { id: "anthropic.claude-sonnet-5" },
-  { id: "xai.grok-4.6" },
-  { id: "openai.gpt-5.6-sol" },
-  { id: "openai.gpt-5.6-terra" },
-  {
-    id: "moonshotai.kimi-k3",
-    note: "no in-region support anywhere, so a geo profile is mandatory here",
-  },
-  { id: "zai.glm-5", pinned: true },
-  { id: "deepseek.v3.2", pinned: true },
-];
+const MODELS = WORKBENCH_MODELS;
 
 type Outcome =
   | "already-entitled"
@@ -324,14 +326,14 @@ export default async function main() {
       : "Reporting only. Set APPLY=1 to create missing agreements."
   );
 
-  const geoModels = MODELS.filter((m) => !m.pinned);
-  const pinnedModels = MODELS.filter((m) => m.pinned);
+  const geoModels = MODELS.filter((m) => m.crossRegion);
+  const pinnedModels = MODELS.filter((m) => !m.crossRegion);
 
   for (const region of REGIONS) {
     await enableInRegion(region, geoModels, credentials);
   }
-  // The pinned models are deliberately not enabled across the geo set: they
-  // are selected by bare model id, so they never route anywhere else.
+  // The region-pinned models are deliberately not walked across the geo
+  // set: they are selected by bare model id, so they never route elsewhere.
   for (const region of PINNED_REGIONS) {
     await enableInRegion(region, pinnedModels, credentials);
   }

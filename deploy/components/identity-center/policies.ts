@@ -3,6 +3,8 @@
 // parses this field as JSON, so how it serialises does not have to match how
 // AWS stores it.
 
+import { bedrockInvokeResources } from "../../../utils/bedrock-models";
+
 type PolicyValue = string | string[];
 
 export type PolicyStatement = {
@@ -149,51 +151,42 @@ export const productManager: PolicyDocument = {
 // data. The account is empty today, so the grant would be harmless today and
 // wrong the first time anything lands there.
 //
-// This was `bedrock:*` until 2026-09-22, deliberately, and the reasoning is
-// worth keeping because two thirds of it still holds. It said an action list
-// needs revisiting for every new Bedrock feature the inner loop picks up,
-// that the failure mode is an engineer blocked mid-task by an AccessDenied on
-// something like `bedrock:ListInferenceProfiles`, and that cross-region
-// inference invokes against both an inference profile ARN and the foundation
-// model ARN in each region it routes to, which is the shape of grant that
-// gets guessed wrong. All true.
+// This was `bedrock:*` until 2026-09-22. The reasoning for that is worth
+// keeping, because part of it still holds: an enumerated action list goes
+// stale as the inner loop picks up new Bedrock features, and the failure mode
+// is an engineer blocked mid-task by an AccessDenied on something like
+// `bedrock:ListInferenceProfiles`. That is why the reads below stay wide.
 //
-// What changed is that `bedrock:*` turned out to include a way to spend real
-// money. It covers `CreateProvisionedModelThroughput`, `CreateCustomModel`
-// and the custom-model-import jobs, none of which the inner loop uses and
-// all of which a prompt-injected agent could reach. The account boundary
-// bounds what data that agent can see; it does not bound the bill. Step 13,
-// budgets and cost anomaly detection, is not in place yet either.
+// Two things changed. `bedrock:*` covers
+// `CreateProvisionedModelThroughput`, `CreateCustomModel` and the
+// model-import jobs, so a prompt-injected agent could spend real money in an
+// account whose budgets are step 13 and not yet in place. And Bedrock enables
+// every foundation model by default, subscribing in the background on first
+// invocation, so there is no account-level allowlist underneath this. AWS's
+// own guidance is explicit that blocking model access means a Deny or a
+// scoped Allow on `bedrock:InvokeModel` at the account or organization level,
+// not withholding a subscription.
 //
-// So the split here is mutations versus everything else, rather than an
-// enumerated invoke list. Reads stay wide, which answers the original
-// objection: nothing in the inner loop can be blocked by a missing `List` or
-// `Get`, because every one of them is allowed. What is gone is the ability to
-// create, delete or modify anything.
+// So this statement is the allowlist, and it is the only one. Both halves
+// matter: the actions exclude every mutation, and the resources name the
+// models from `utils/bedrock-models.ts`, which is the same list the
+// subscription script works from.
 //
-// Deliberately no region or model scoping on the resources. The original
-// comment is right that cross-region inference needs the inference profile
-// ARN in this account and the foundation model ARN in each destination
-// region, and the destination set differs per model: the `us.` Anthropic
-// profiles span three regions, `us.moonshotai.kimi-k3` spans five and
-// includes `ca-central-1`. A region-scoped resource list is precisely the
-// grant that would get guessed wrong, and its failure mode is intermittent
-// AccessDenied that looks identical to missing model access, which has
-// already cost us one debugging session. See `docs/workbench-account.md`.
+// Deliberately no `aws-marketplace` permissions anywhere in this set. Those
+// are what Bedrock needs to auto-subscribe on first use, and withholding them
+// is what stops an agent pulling in a model nobody chose. The cost is that
+// somebody has to subscribe out of band, which is what step 11's script does
+// with an admin role; once a model is subscribed, invoking it needs no
+// marketplace permission at all.
 //
-// Both spellings of the runtime actions are granted. The Converse family maps
-// onto `bedrock:InvokeModel` in some of AWS's own documentation and appears
-// as its own action name elsewhere; granting both means whichever is real is
-// covered and the other is inert.
-//
-// It does keep the `adminReservedActions` denies, since `guardrails` defaults
-// to true. Those cover organization and identity actions, none of which are
+// It keeps the `adminReservedActions` denies, since `guardrails` defaults to
+// true. Those cover organization and identity actions, none of which are
 // Bedrock, so nothing here collides with them.
 export const workbenchAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     {
-      Sid: "InvokeBedrockRuntime",
+      Sid: "InvokeSelectedBedrockModels",
       Effect: "Allow",
       Action: [
         "bedrock:Converse",
@@ -201,7 +194,7 @@ export const workbenchAccess: PolicyDocument = {
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
       ],
-      Resource: "*",
+      Resource: bedrockInvokeResources(),
     },
     // Reads, wide on purpose, per the note above. These enumerate and
     // describe; none of them changes anything or costs anything beyond the
