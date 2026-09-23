@@ -118,13 +118,28 @@ const LOG_GROUP_NAME = "/aws/bedrock/modelinvocations";
  *
  * Retention is set rather than left at the default, which is never expire.
  * This log group gets a record per model call for as long as the account is
- * in use, so "never" is the one value that is certainly wrong. Ninety days is
- * long enough to answer a question about last quarter's spend and short
- * enough that nothing accumulates unwatched.
+ * in use, so "never" is the one value that is certainly wrong.
+ *
+ * One year, raised from the ninety days this shipped with. Ninety answers a
+ * question about last quarter; it cannot answer whether this quarter is
+ * unusual, which is the question anyone actually asks about spend. A year of
+ * records makes the comparison arithmetic rather than memory, and covers a
+ * full budget cycle.
+ *
+ * The records are metadata only, a few hundred bytes each with no bodies, so
+ * four times the window is still a negligible amount of stored data. 365 is
+ * one of CloudWatch's accepted retention values; arbitrary day counts are
+ * rejected.
+ *
+ * Worth knowing before changing this again: retention applies to events
+ * already in the group, so lowering it deletes history immediately, and
+ * raising it does not bring back anything that has already expired. This
+ * raise lands before the first expiry, since logging began 2026-09-23, so
+ * nothing is lost by it.
  */
 const invocationLogs = new aws.cloudwatch.LogGroup(
   "modelInvocationLogs",
-  { name: LOG_GROUP_NAME, retentionInDays: 90 },
+  { name: LOG_GROUP_NAME, retentionInDays: 365 },
   { provider },
 );
 

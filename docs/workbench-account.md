@@ -161,7 +161,7 @@ still need the console once.
       than an alarm that the account spent too much, and the two are
       independent.
 
-      Three resources in `deploy-workbench/`: a log group with 90 day
+      Three resources in `deploy-workbench/`: a log group with one year
       retention, a role Bedrock assumes to write to it, and the
       per-region-singleton logging configuration with every
       `*DataDeliveryEnabled` flag false. Design, and why this is not
@@ -1095,7 +1095,15 @@ invocation that tests the metadata question tests this one.
 ### What this costs and what it does not protect
 
 Metadata records are small, so CloudWatch Logs ingestion is negligible.
-Retention is set to 90 days rather than the default of never expiring.
+Retention is one year rather than the default of never expiring. It shipped at
+ninety days and was raised on 2026-09-23, before anything had expired: ninety
+days answers a question about last quarter, but not whether this quarter is
+unusual, which is the question spend actually prompts. Four times the window
+is still a negligible amount of stored data when the records carry no bodies.
+
+Retention applies to events already in the group, so lowering it deletes
+history at once and raising it recovers nothing already expired. Worth knowing
+before the next change to that number.
 
 It gives estimated spend, not billed spend. It attributes by IAM principal,
 so anything invoked by CI rather than by a person attributes to the CI role,
