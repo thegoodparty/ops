@@ -136,7 +136,13 @@ still need the console once.
 
       And subscription propagates across regions: four creates in `us-east-1`
       turned the same models PENDING everywhere else untouched. The region
-      walk is therefore a verification pass, not the mechanism.)
+      walk is therefore a verification pass, not the mechanism.
+
+      Adding a model afterwards is not a new step, but it is not one edit
+      either: see "Adding a Bedrock model later" below. Written up on
+      2026-09-23 while adding Claude Opus 5.5, which is also when the
+      `deploy-workbench.yml` path filter turned out not to include the model
+      list at all.)
 - [ ] 12. Request quota increases if needed: todo
 - [ ] 13. Add budget and cost anomaly detection: todo
 - [ ] 14. Point `pi` at the account, document engineer setup: todo
@@ -1191,6 +1197,76 @@ It gives estimated spend, not billed spend. It attributes by IAM principal,
 so anything invoked by CI rather than by a person attributes to the CI role,
 which is correct but is not a person. And it records nothing about calls made
 outside `bedrock-runtime`.
+
+## Adding a Bedrock model later
+
+Written down on 2026-09-23, while adding Claude Opus 5.5, because the moving
+parts are in three places and one of them was silently disconnected.
+
+One edit does it: an entry in `utils/bedrock-models.ts`. Everything else follows
+from that list. Two workflows then have to run, and they are not the same one:
+
+- **`deploy.yml`** applies the `WorkbenchAccess` permission set, whose invoke
+  statement is `bedrockInvokeResources()` over that list. It has no path filter,
+  so it always runs. Without it the model is subscribed and every invocation is
+  refused by IAM.
+- **`deploy-workbench.yml`** runs `scripts/enable-bedrock-models.ts` with
+  `APPLY=1`, which creates the model agreement. Without it the model is permitted
+  and the first invocation works for up to fifteen minutes before turning into
+  AccessDenied, which is the failure that reads like an outage.
+
+That second workflow did not fire on a model list change until 2026-09-23. Its
+path filter listed `scripts/enable-bedrock-models.ts` with a comment saying that
+listing the script made editing the model list enough, but the list lives in
+`utils/`, so it was not. Adding Opus 5.5 was the first change to find it, because
+every previous model arrived with step 11 itself. `utils/bedrock-models.ts` is now
+in the filter.
+
+The third place is outside this repo. `etc/pi/extensions/gp-models.ts` in `gp-pi`
+carries the list pi offers engineers, and two repos cannot share a constant. A
+model added here and not there is invisible to the people it is for; added there
+and not here it fails with AccessDenied. Change both, and say so in both pull
+requests.
+
+### What to check before and after
+
+`GetFoundationModelAvailability` is the pre-flight, and only one of its four
+fields answers the question. For Opus 5.5 on 2026-09-23, from a sandbox session in
+the account, every one of `us-east-1`, `us-east-2` and `us-west-2` reported:
+
+```
+agreement=NOT_AVAILABLE entitlement=AVAILABLE auth=AUTHORIZED region=AVAILABLE
+```
+
+That is the step 11 trap in the wild, and it is worth seeing once. Two of those
+fields say the model is ready when no agreement exists at all. `agreement` is the
+one to read. Compare with `anthropic.claude-opus-5`, subscribed since 2026-09-22,
+which reports `agreement=AVAILABLE` in the same three regions.
+
+Worth reading too: `GetFoundationModel` says whether the geo profile is optional.
+Opus 5.5 reports `inferenceTypesSupported: [INFERENCE_PROFILE]` and nothing else,
+so there is no in-region invocation to fall back to and `crossRegion: true` is
+forced rather than chosen. `GetInferenceProfile` names the regions it routes to,
+which for `us.anthropic.claude-opus-5-5` are `us-east-1`, `us-east-2` and
+`us-west-2`. The policy wildcards the region on purpose, so that list is
+information rather than configuration, but it is the thing to look at if a model
+ever fails in one region and works in another.
+
+After the merge, the proof is an invocation. Before it, a `WorkbenchAccess`
+session being refused is evidence too, and worth capturing to tell the two gates
+apart. For Opus 5.5 on 2026-09-23 the refusal named `bedrock:InvokeModel` on
+`arn:aws:bedrock:us-west-2:024901689212:inference-profile/us.anthropic.claude-opus-5-5`,
+which is the IAM gate rather than the subscription, exactly as expected from a
+model that is not yet in the list.
+
+### What a model costs the policy
+
+Each cross-region model adds two resource ARNs, the inference profile and the
+foundation model, and about 144 bytes to the composed inline policy. Step 15
+recorded 14 ARNs at 3698 bytes; Opus 5.5 takes that to 16 ARNs at 3842 of the
+10240 byte permission set limit. So there is room for roughly forty more models
+before the limit is the thing to think about, which is worth knowing mainly so
+nobody trims the list to save space.
 
 ## Apply ordering between workflows
 

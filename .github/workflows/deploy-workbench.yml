@@ -23,9 +23,16 @@ on:
       - ".github/workflows/deploy-workbench.yml"
       # Not part of the Pulumi project, but deployed by this workflow for the
       # trust reason in the header: the role is assumable only from this file,
-      # so a separate workflow could not get credentials. Listed explicitly so
-      # that editing the model list is enough to enable it.
+      # so a separate workflow could not get credentials.
       - "scripts/enable-bedrock-models.ts"
+      # The model list itself, which is where a model is actually added. This
+      # was missing until 2026-09-23, and the comment above used to claim that
+      # listing the script made editing the list enough. It did not: the list
+      # lives in utils/, so adding Opus 5.5 would have merged, updated the IAM
+      # policy through deploy.yml, and never subscribed the model. The result
+      # is the exact failure the script exists to prevent, an invocation that
+      # works for up to fifteen minutes and then turns into AccessDenied.
+      - "utils/bedrock-models.ts"
 
 # Its own group. This is a different stack with a different S3 lock from
 # deploy.yml's and deploy-org.yml's, so there is nothing to serialize between
