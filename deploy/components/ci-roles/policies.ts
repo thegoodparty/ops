@@ -473,9 +473,21 @@ const pulumiBackendStatements = (project: string): PolicyStatement[] => [
   },
 ];
 
-// Organizations actions are not resource-scopable in any useful way: the API
-// takes "*" for the calls we make. The boundary here is the trust policy and
-// the action list, not the resource.
+// Correction to an earlier version of this comment, which said Organizations
+// actions "are not resource-scopable in any useful way" and that the API
+// takes "*" for the calls we make. That is true only of `CreateAccount`.
+// Checked against AWS's machine-readable service reference on 2026-09-22,
+// the same source `adminReservedActions` was built from:
+// `CreateOrganizationalUnit` accepts `organizationalunit` and `root`,
+// `MoveAccount` accepts `account`, `organizationalunit` and `root`, and every
+// policy action accepts `policy` plus its target types.
+//
+// The policy statements added for step 9 are scoped accordingly. The two
+// older writes are not, which is a known wart rather than a considered
+// choice: narrowing `MoveAccount` to the `Workbench` OU would also close the
+// move vector documented in docs/workbench-account.md, and it is worth doing
+// in a PR that can verify the exact ARNs the provider sends against the
+// existing state, rather than riding along here.
 //
 // organizations:CloseAccount is deliberately absent and must stay absent.
 // Nothing in the plan needs it, and its absence is a second barrier alongside
@@ -491,6 +503,39 @@ const pulumiBackendStatements = (project: string): PolicyStatement[] => [
 // start on the same push to main with nothing sequencing them. A same-PR grant
 // races its own consumer. That applies to step 9's service control policy
 // actions too.
+// Organizations resource ARNs, verified against live AWS on 2026-09-22 rather
+// than assembled from the ARN format strings, because the two disagree in a
+// way that matters below.
+const ORG_ID = "o-uuiolqc1di";
+const WORKBENCH_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/ou-jqqe-dv88i5zn`;
+
+/**
+ * Every service control policy this organization owns, and nothing else.
+ *
+ * The wildcard is on the policy id because a policy's id does not exist until
+ * it is created, so the grant cannot name it. What the wildcard does not
+ * reach is the thing that matters: AWS-managed policies live outside this
+ * organization's namespace entirely. `FullAWSAccess` is
+ * `arn:aws:organizations::aws:policy/service_control_policy/p-FullAWSAccess`,
+ * with `aws` where the account id goes and no `o-` segment at all, so this
+ * pattern cannot match it.
+ *
+ * That is what makes the detach grant below safe. Detaching `FullAWSAccess`
+ * from the root is the single action that would break every member account at
+ * once, and the role is structurally unable to name it rather than merely
+ * discouraged from it.
+ */
+const ORG_SCP_ARN_PATTERN = `arn:aws:organizations::333022194791:policy/${ORG_ID}/service_control_policy/*`;
+
+// Every policy action accepts this condition key, so it is applied to all of
+// them. It keeps the grant to service control policies even if tag policies,
+// backup policies or AI opt-out policies are enabled on the root later: those
+// are the same API with a different PolicyType, and a role scoped by ARN
+// alone would pick them up for free.
+const SCP_ONLY = {
+  StringEquals: { "organizations:PolicyType": "SERVICE_CONTROL_POLICY" },
+};
+
 export const githubActionsOrgDeploy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -538,6 +583,72 @@ export const githubActionsOrgDeploy: PolicyDocument = {
         "organizations:ListTagsForResource",
       ],
       Resource: "*",
+    },
+    // Step 9. The SCP itself is a separate PR that merges after this grant
+    // has finished applying, per the widening rule above.
+    {
+      Sid: "ServiceControlPolicyWrites",
+      Effect: "Allow",
+      Action: [
+        "organizations:CreatePolicy",
+        // Paired with CreatePolicy for the same reason UntagResource is
+        // paired with TagResource above. The SCP's document is the thing
+        // most likely to change after it first lands, and without this the
+        // first tightening pass fails on update rather than on create.
+        "organizations:UpdatePolicy",
+        // Kept despite nothing in the plan deleting a policy, because
+        // removing the resource from the program is how a bad SCP gets
+        // withdrawn, and discovering the grant is missing at that moment is
+        // discovering it at the worst moment. Unlike CloseAccount and
+        // RemoveAccountFromOrganization, deleting a service control policy
+        // destroys no data and is recoverable by reapplying.
+        "organizations:DeletePolicy",
+      ],
+      Resource: ORG_SCP_ARN_PATTERN,
+      Condition: SCP_ONLY,
+    },
+    // Attach and detach name two resources, the policy and its target, and
+    // the request has to be permitted for both. Listing only our own policy
+    // namespace and only the Workbench OU is therefore two independent
+    // bounds: this role cannot attach our policy to the root, and it cannot
+    // detach FullAWSAccess from anything.
+    {
+      Sid: "ServiceControlPolicyAttachment",
+      Effect: "Allow",
+      Action: ["organizations:AttachPolicy", "organizations:DetachPolicy"],
+      Resource: [ORG_SCP_ARN_PATTERN, WORKBENCH_OU_ARN],
+      Condition: SCP_ONLY,
+    },
+    {
+      Sid: "ServiceControlPolicyReads",
+      Effect: "Allow",
+      Action: [
+        // The provider's read-back after CreatePolicy and after UpdatePolicy.
+        "organizations:DescribePolicy",
+        // The attachment resource has no describe of its own; it reads back
+        // by listing one side or the other.
+        "organizations:ListTargetsForPolicy",
+      ],
+      Resource: ORG_SCP_ARN_PATTERN,
+      Condition: SCP_ONLY,
+    },
+    {
+      Sid: "ServiceControlPolicyListingForTarget",
+      Effect: "Allow",
+      Action: ["organizations:ListPoliciesForTarget"],
+      Resource: WORKBENCH_OU_ARN,
+      Condition: SCP_ONLY,
+    },
+    // The one policy action that accepts no resource type at all, so it
+    // cannot be scoped and gets its own statement rather than quietly
+    // widening one of the scoped ones to "*". It leaks the names of the
+    // organization's policies, which is not sensitive.
+    {
+      Sid: "ServiceControlPolicyListing",
+      Effect: "Allow",
+      Action: ["organizations:ListPolicies"],
+      Resource: "*",
+      Condition: SCP_ONLY,
     },
     ...pulumiBackendStatements("org"),
   ],
