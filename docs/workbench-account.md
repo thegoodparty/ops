@@ -253,7 +253,7 @@ Facts discovered during implementation go here as they are learned:
   the model rather than the reverse.
 - **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
   list imported by both the IAM policy that permits them and the script that
-  subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5`,
+  subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5-5`,
   `anthropic.claude-sonnet-5`, `xai.grok-4.6`, `openai.gpt-5.6-sol`,
   `openai.gpt-5.6-terra`, `moonshotai.kimi-k3`, plus `zai.glm-5` and
   `deepseek.v3.2` kept region-pinned by choice.
@@ -1263,10 +1263,41 @@ model that is not yet in the list.
 
 Each cross-region model adds two resource ARNs, the inference profile and the
 foundation model, and about 144 bytes to the composed inline policy. Step 15
-recorded 14 ARNs at 3698 bytes; Opus 5.5 takes that to 16 ARNs at 3842 of the
-10240 byte permission set limit. So there is room for roughly forty more models
-before the limit is the thing to think about, which is worth knowing mainly so
-nobody trims the list to save space.
+recorded 14 ARNs at 3698 bytes; Opus 5.5 took that to 16 ARNs at 3842, and
+retiring Opus 5 on 2026-09-23 brought it back to 14 ARNs at 3702 of the 10240 byte
+permission set limit. Not 3698: the replacement's id is four characters longer
+across its two ARNs, which is the kind of detail worth getting right in a document
+that asks people to check numbers. So there is room for roughly forty more models before the
+limit is the thing to think about, which is worth knowing mainly so nobody trims
+the list to save space.
+
+### Removing a model, and what removal does not do
+
+The reverse of adding is one edit too, and the order reverses with it: `gp-pi`
+stops offering the model first, then this list drops it. Doing it the other way
+round takes the model away from a picker that still offers it, which an engineer
+experiences as a working model that suddenly returns AccessDenied.
+
+What removal does is revoke IAM. The entry disappears from
+`bedrockInvokeResources()`, `deploy.yml` applies the narrowed permission set, and
+`bedrock:InvokeModel` on that profile stops being allowed.
+
+What removal does **not** do is unsubscribe. `scripts/enable-bedrock-models.ts`
+only ever creates agreements; it has no delete path, and
+`DeleteFoundationModelAgreement` is deliberately not called. So the agreement stays
+in the account after the model leaves the list. That is the right default twice
+over: an unused agreement is not billed, since Bedrock charges per invocation, and
+re-adding the model later then needs no subscription step at all. It does mean the
+list is the allowlist and not an inventory of what the account is subscribed to.
+If you ever need the account's real subscription set, ask Bedrock rather than this
+file.
+
+One consequence worth naming before merging a removal. A container built before
+`gp-pi` dropped the model still offers it, so the engineer running it gets an
+AccessDenied on their next message rather than a missing entry in the picker. There
+is no way to reach those containers from here; `gp-pi status` reporting `config
+stale` is the nearest thing to a warning. Say so in the pull request, or wait until
+people have recreated.
 
 ## Apply ordering between workflows
 

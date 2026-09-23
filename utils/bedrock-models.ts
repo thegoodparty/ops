@@ -45,11 +45,6 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and the geo profile is mandatory",
   },
   {
-    id: "anthropic.claude-opus-5",
-    invokeId: "us.anthropic.claude-opus-5",
-    crossRegion: true,
-  },
-  {
     id: "anthropic.claude-sonnet-5",
     invokeId: "us.anthropic.claude-sonnet-5",
     crossRegion: true,
