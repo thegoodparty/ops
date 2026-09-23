@@ -75,17 +75,25 @@ still need the console once.
       `p-FullAWSAccess`, attached to both OUs and both accounts, so nothing
       is constrained and no effective permission changed, as designed.
 
-      Part 2, the grant on `github-actions-org-deploy`, is in this PR along
-      with the design revisions steps 11 and 15 forced. Flip part 2 when the
-      `Deploy` run is green and `iam:get-role-policy` shows the five
-      `ServiceControlPolicy*` statements on the role.
+      Part 2 done: the grant on `github-actions-org-deploy`, PR #75, merged
+      as ec6d62f. The `deploy` job in CI run 35887341760 updated
+      `githubActionsOrgDeployPolicy` at 16:16 UTC and the applied document
+      carries all five statements, `ServiceControlPolicyWrites`,
+      `Attachment`, `Reads`, `ListingForTarget` and `Listing`. Read from the
+      apply log rather than from `iam:get-role-policy` as the criterion
+      asked, because no SSO token was live; the log shows the document
+      Pulumi actually sent, so it answers the same question. Worth a
+      `get-role-policy` next time someone has credentials.
+
+      That PR also carried the design revisions steps 11 and 15 forced, the
+      `aws-marketplace` region exemption and the cross-account S3 deny.
 
       Part 3, the `aws.organizations.Policy` and its attachment in
-      `deploy-org/`, is deliberately **not** here. The grant is applied by
-      `deploy.yml` and the policy by `deploy-org.yml`, and a single merge
-      starts both with nothing sequencing them; see "Apply ordering between
-      workflows". Same shape as #63 before #62. See "The workbench SCP" for
-      the full design.)
+      `deploy-org/`, is the only part left and is now unblocked: the grant
+      it depends on has merged and finished applying, which is what the
+      ordering rule required. See "Apply ordering between workflows" for why
+      it could not ride along with the grant, and "The workbench SCP" for
+      the policy to write.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account
       role: todo. The replacement has to carry what the stack already
       creates, which is easy to under-scope because the bootstrap role is
