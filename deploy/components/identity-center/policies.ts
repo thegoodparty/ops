@@ -224,11 +224,19 @@ export const workbenchAccess: PolicyDocument = {
     // everyone with this permission set. If you are here because you enabled
     // one, scope this statement to exclude
     // `/aws/bedrock/modelinvocations` in the same change, not afterwards.
+    //
+    // `cloudwatch:GenerateQuery` backs the natural-language query generator
+    // in the Logs Insights and Metrics Insights consoles. It only turns a
+    // prompt into query text and reads no log or metric data itself; running
+    // the result still goes through `logs:StartQuery` and `cloudwatch:Get*`.
+    // It sits under the `cloudwatch` prefix even for Logs Insights, and
+    // matches none of the wildcards above, hence the explicit entry.
     {
       Sid: "ReadCloudWatchMetricsAndLogs",
       Effect: "Allow",
       Action: [
         "cloudwatch:Describe*",
+        "cloudwatch:GenerateQuery",
         "cloudwatch:Get*",
         "cloudwatch:List*",
         "logs:Describe*",
