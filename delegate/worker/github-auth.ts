@@ -51,3 +51,32 @@ export const setupReviewerGitHubAuth = async () => {
   process.env.REVIEWER_GITHUB_TOKEN = token;
   console.log("Reviewer GitHub App installation token acquired");
 };
+
+// Mints an installation token for the dedicated *security* GitHub App — a THIRD
+// identity, distinct from both the delegate App (authors PRs) and the reviewer
+// App (pr-reviewer). A separate login is what guarantees the security pass never
+// gets reconciled by pr-reviewer, which filters its own reviews/threads by its
+// bot login. App id + installation id come from env so the App can be
+// provisioned with config only (no code change). No-op until the key lands, so
+// the worker still boots and the security pass simply doesn't run.
+export const setupSecurityGitHubAuth = async () => {
+  const raw = process.env.SECURITY_APP_PRIVATE_KEY;
+  const appId = process.env.SECURITY_APP_ID;
+  const installationId = process.env.SECURITY_INSTALLATION_ID;
+  if (!raw || !appId || !installationId) {
+    console.log(
+      "SECURITY_APP_PRIVATE_KEY/SECURITY_APP_ID/SECURITY_INSTALLATION_ID not all set; skipping security GitHub auth",
+    );
+    return;
+  }
+
+  const auth = createAppAuth({
+    appId: Number(appId),
+    privateKey: normalizePrivateKey(raw),
+    installationId: Number(installationId),
+  });
+
+  const { token } = await auth({ type: "installation" });
+  process.env.SECURITY_GITHUB_TOKEN = token;
+  console.log("Security GitHub App installation token acquired");
+};
