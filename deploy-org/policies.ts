@@ -131,32 +131,67 @@ export const workbenchScp: PolicyDocument = {
       // never this account's own buckets. It was reaching the management
       // account's, which is where voter data lives. The account keeps full use
       // of buckets it owns, so Bedrock batch inference and invocation logging
-      // to S3 stay available if we ever want them.
+      // stay available if we ever want them.
       //
-      // aws:ViaAWSService false is not optional and is the part most likely to
-      // be dropped as noise. Without it this also denies AWS services making
-      // requests on the principal's behalf through forward access sessions,
-      // which is the documented way a resource perimeter breaks things that
-      // look unrelated to S3. AWS's data perimeter guidance names this pair.
+      // `IfExists` is the whole control, not a detail. A plain
+      // `StringNotEquals` does not match when the key is missing from the
+      // request context, and a Deny whose condition does not match does not
+      // apply, so the bypass would be silent and total: the statement would
+      // read as a guardrail and enforce nothing. `IfExists` matches on
+      // absence instead, which fails closed. AWS's own resource perimeter
+      // sample uses this operator throughout, for this reason.
+      //
+      // An earlier version of this statement also carried a
+      // `Bool` condition on `aws:ViaAWSService` being false, which was wrong
+      // twice over and was caught by Bugbot on PR #77. That key is missing on
+      // a direct call, so under `Bool` the condition failed and the Deny
+      // applied only to service-mediated requests, the exact inverse of the
+      // intent. The deeper error was taking that key from the *network*
+      // perimeter row of AWS's data perimeter table and using it in a
+      // *resource* perimeter control. AWS's resource perimeter does not use
+      // it at all.
+      //
+      // What AWS uses instead, for the AWS-owned buckets that services read
+      // on your behalf, is a `NotResource` allowlist of specific bucket ARNs:
+      // SageMaker JumpStart caches, Glue crawler assets, Athena examples,
+      // Session Manager downloads and about forty more. Deliberately omitted
+      // here. This account runs Bedrock and CloudWatch and none of those
+      // services, so the list would be forty ARNs of noise against a 5120
+      // byte budget. If one is ever needed the failure is an AccessDenied
+      // naming the bucket, and the fix is adding that one ARN.
       //
       // The Pulumi state bucket is in the management account and looks like it
       // should trip this. It does not: deploy-workbench.yml reads the backend
       // with its management-account credentials and assumes into the workbench
       // account only for the AWS provider, and SCPs never apply to the
       // management account.
+      //
+      // Accepted collateral: calls that name no bucket, ListAllMyBuckets
+      // being the obvious one, carry no resource account and are therefore
+      // denied. There are no buckets in this account, so nothing is lost
+      // today.
       Sid: "DenyS3OutsideThisAccount",
       Effect: "Deny",
       Action: "s3:*",
       Resource: "*",
       Condition: {
-        StringNotEquals: { "aws:ResourceAccount": WORKBENCH_ACCOUNT_ID },
-        Bool: { "aws:ViaAWSService": "false" },
+        StringNotEqualsIfExists: {
+          "aws:ResourceAccount": WORKBENCH_ACCOUNT_ID,
+        },
       },
     },
     {
       // NotAction rather than an enumerated Action list: the point is that
       // everything is confined to one region unless named, so the exemption
       // list is the thing to review and the service list is not.
+      //
+      // Plain `StringNotEquals` here, unlike the statement above, and the
+      // asymmetry is deliberate rather than an oversight. This is AWS's
+      // canonical region-restriction shape: `aws:RequestedRegion` is present
+      // on every call to a regional endpoint, and the calls where it is not
+      // meaningful are global services, which `NotAction` already exempts.
+      // Using `IfExists` here would deny on absence and so reach exactly
+      // those global calls by the back door.
       //
       // Interaction with step 17 worth knowing, because it looks like a
       // problem and is not. Bedrock assumes a role in this account to write

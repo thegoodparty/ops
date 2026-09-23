@@ -867,23 +867,52 @@ logging remain available if step 11's follow-ups want them, and "a coding
 agent cannot reach restricted L2 voter data" stops depending on anyone's
 judgement about which buckets exist.
 
-Those caveats were checked before writing, and one of them changed the
-statement. AWS's data perimeter guidance names `aws:ResourceAccount` in an
-SCP as exactly this control, and then names the exception: you may need to
-permit "resources that do not belong to your organization and that are
-accessed by your principals or by AWS services acting on your behalf". The
-documented mitigation is `aws:ViaAWSService`, which separates a direct call
-by the principal from a forward access session a service makes on its
-behalf. So the statement carries both conditions, and the second one is the
-part most likely to be deleted later as noise:
+Those caveats were checked before writing, and the first attempt at the
+condition was wrong in a way worth recording, because the failure mode was
+silent.
+
+The statement now reads:
 
 ```
-StringNotEquals: { "aws:ResourceAccount": "024901689212" }
-Bool:            { "aws:ViaAWSService": "false" }
+StringNotEqualsIfExists: { "aws:ResourceAccount": "024901689212" }
 ```
 
-AWS also flags `aws:ResourceAccount` as a sensitive condition key where
-wildcards have no valid use, which is why the account id is exact.
+`IfExists` is the control, not a detail. A plain `StringNotEquals` does not
+match when the key is missing from the request context, and a Deny whose
+condition does not match does not apply. So the bypass would have been total
+and invisible: a statement that reads as a guardrail and enforces nothing.
+`IfExists` matches on absence instead, which fails closed. AWS's own resource
+perimeter sample uses that operator throughout.
+
+The first version also carried a `Bool` condition requiring
+`aws:ViaAWSService` to be false. Bugbot flagged it on PR #77 and was right.
+That key is missing on a direct call rather than present and false, so under
+`Bool` the condition failed and the Deny applied only to service-mediated
+requests, which is the exact inverse of the intent.
+
+The root cause is worth more than the symptom. AWS's data perimeter page
+lists condition keys in three groups, and `aws:ViaAWSService` sits in the
+**network** perimeter group, not the resource perimeter group. I took it from
+the wrong row. AWS's canonical resource perimeter SCP does not use it at all.
+
+What that policy uses instead, for the AWS-owned buckets services read on
+your behalf, is a `NotResource` allowlist of specific bucket ARNs: SageMaker
+JumpStart caches, Glue crawler assets, Athena examples, Session Manager
+downloads, around forty in total. Deliberately omitted here. This account
+runs Bedrock and CloudWatch and none of those services, so the list would be
+forty ARNs of noise against a 5120 byte budget. If one is ever needed the
+failure is an AccessDenied naming the bucket, and the fix is that one ARN.
+
+Accepted collateral of failing closed: calls that name no bucket, such as
+listing all buckets, carry no resource account and are therefore denied.
+There are no buckets in this account, so nothing is lost today.
+
+The region statement below keeps the plain operator, and the asymmetry is
+deliberate. That is AWS's canonical region-restriction shape:
+`aws:RequestedRegion` is present on every call to a regional endpoint, and
+the calls where it is not meaningful are global services, which the
+`NotAction` list already exempts. Using `IfExists` there would deny on
+absence and reach exactly those global calls by the back door.
 
 Still true and accepted: a cross-account deny of this shape blocks reading
 public buckets too, which is fine for this account and would not be for a
