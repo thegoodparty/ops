@@ -88,12 +88,26 @@ still need the console once.
       That PR also carried the design revisions steps 11 and 15 forced, the
       `aws-marketplace` region exemption and the cross-account S3 deny.
 
-      Part 3, the `aws.organizations.Policy` and its attachment in
-      `deploy-org/`, is the only part left and is now unblocked: the grant
-      it depends on has merged and finished applying, which is what the
-      ordering rule required. See "Apply ordering between workflows" for why
-      it could not ride along with the grant, and "The workbench SCP" for
-      the policy to write.)
+      Part 3, the policy and its attachment, is in this PR:
+      `deploy-org/policies.ts` holds the document and `deploy-org/index.ts`
+      the `aws.organizations.Policy` and `PolicyAttachment`. Unblocked
+      because part 2's grant merged and finished applying, which is what the
+      ordering rule required.
+
+      Flip the whole step to done when the `Deploy org` run is green **and**
+      two things still work under the policy: a `WorkbenchAccess` session
+      invokes a `us.`-prefixed model, and the next `Deploy workbench` run
+      completes including its `Enable Bedrock models` step. A green
+      `Deploy org` proves only that the policy was created and attached; it
+      says nothing about whether the denies are right, and both checks
+      exercise a region exemption that would be invisible until it failed.
+
+      If something does break, the way out is `DetachPolicy`, which works
+      whatever this policy says: SCPs never apply to the management account,
+      `github-actions-org-deploy` lives there, and part 2 scoped its detach
+      grant to exactly this OU. Admins hold `AdministratorAccess` there as a
+      second path. Withdrawing is why the policy resource is deliberately
+      unprotected.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account
       role: todo. The replacement has to carry what the stack already
       creates, which is easy to under-scope because the bootstrap role is
@@ -788,7 +802,24 @@ reasoning was that cross-region inference profiles route internally, that the
 caller's `aws:RequestedRegion` should therefore still be `us-west-2`, and
 that "should" was doing too much work to risk it.
 
-Step 11 turned that suspicion into evidence. A sandbox session invoked
+That hedge is now unnecessary. AWS documents the answer directly, on the
+inference profile support page:
+
+> Service Control Policies (SCPs) and AWS Identity and Access Management
+> (IAM) policies work together to control where cross-Region inference is
+> allowed. [...] If any destination Region in a cross-Region inference
+> profile is blocked in your SCPs, the request will fail even if other
+> Regions remain allowed.
+
+So the exemption is a requirement, not a precaution, and the failure without
+it is total rather than partial: every geo-profile call fails, and
+`moonshotai.kimi-k3` has no in-region fallback to degrade to. The same page
+also notes that prompts and outputs may be stored in opt-in destination
+regions for abuse detection, which is worth knowing given what GoodParty
+holds.
+
+Step 11 turned the original suspicion into evidence independently. A
+sandbox session invoked
 Bedrock successfully several times and then failed with AccessDenied from
 identical input, because `us.`-prefixed model ids are geo profiles that route
 each request across member regions by capacity. That is not proof about the
@@ -836,12 +867,34 @@ logging remain available if step 11's follow-ups want them, and "a coding
 agent cannot reach restricted L2 voter data" stops depending on anyone's
 judgement about which buckets exist.
 
-Two caveats to check when writing it rather than at review.
-`aws:ResourceAccount` is not honoured by every service and AWS documents
-exceptions, notably for some AWS-owned resources accessed on the caller's
-behalf; the exceptions published for S3 are what matter here. And a
-cross-account deny of this shape blocks reading public buckets too, which is
-fine for this account and would not be for a general-purpose one.
+Those caveats were checked before writing, and one of them changed the
+statement. AWS's data perimeter guidance names `aws:ResourceAccount` in an
+SCP as exactly this control, and then names the exception: you may need to
+permit "resources that do not belong to your organization and that are
+accessed by your principals or by AWS services acting on your behalf". The
+documented mitigation is `aws:ViaAWSService`, which separates a direct call
+by the principal from a forward access session a service makes on its
+behalf. So the statement carries both conditions, and the second one is the
+part most likely to be deleted later as noise:
+
+```
+StringNotEquals: { "aws:ResourceAccount": "024901689212" }
+Bool:            { "aws:ViaAWSService": "false" }
+```
+
+AWS also flags `aws:ResourceAccount` as a sensitive condition key where
+wildcards have no valid use, which is why the account id is exact.
+
+Still true and accepted: a cross-account deny of this shape blocks reading
+public buckets too, which is fine for this account and would not be for a
+general-purpose one.
+
+One thing that looks like it should trip this and does not, worth recording
+because it took checking. The Pulumi state bucket `goodparty-iac-state` is in
+the management account. `deploy-workbench.yml` reads it with its
+management-account credentials and assumes into the workbench account only
+for the AWS provider, and SCPs never apply to the management account, so the
+backend is untouched by this statement.
 
 Jeff's call on 2026-09-22, in his words, was to do the deny now and loosen
 later if needed. That direction is the right way round for this account: a
