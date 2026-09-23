@@ -211,6 +211,19 @@ export const workbenchAccess: PolicyDocument = {
     // managing alarms. Bedrock's model invocation logging writes to CloudWatch
     // Logs, so the logs half is what makes a failed invocation debuggable
     // rather than opaque.
+    //
+    // TRIPWIRE, added with step 17. `Resource: "*"` here means any engineer
+    // can read any log group in the workbench account, and that is safe only
+    // because model invocation logging is configured with every
+    // `*DataDeliveryEnabled` flag false in `deploy-workbench/index.ts`. The
+    // group therefore holds identity ARNs and token counts, which engineers
+    // seeing about each other is harmless.
+    //
+    // Turning any of those flags on puts prompt and completion bodies in that
+    // group, which for a coding agent means repository contents, readable by
+    // everyone with this permission set. If you are here because you enabled
+    // one, scope this statement to exclude
+    // `/aws/bedrock/modelinvocations` in the same change, not afterwards.
     {
       Sid: "ReadCloudWatchMetricsAndLogs",
       Effect: "Allow",

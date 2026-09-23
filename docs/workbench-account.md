@@ -86,7 +86,18 @@ still need the console once.
       starts both with nothing sequencing them; see "Apply ordering between
       workflows". Same shape as #63 before #62. See "The workbench SCP" for
       the full design.)
-- [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account role: todo
+- [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account
+      role: todo. The replacement has to carry what the stack already
+      creates, which is easy to under-scope because the bootstrap role is
+      administrator and hides the requirement. As of step 17 that is
+      `bedrock:PutModelInvocationLoggingConfiguration` with its Get and
+      Delete counterparts, `logs:CreateLogGroup`, `logs:PutRetentionPolicy`,
+      `logs:DeleteLogGroup`, `logs:DescribeLogGroups`,
+      `logs:TagResource`/`UntagResource`, and `iam:CreateRole`,
+      `iam:PutRolePolicy`, `iam:PassRole` for the logging role, plus the
+      matching reads and deletes. Re-derive from
+      `deploy-workbench/index.ts` when the step is claimed rather than
+      trusting this list, which will be stale by then.
 - [x] 11. Enable Bedrock model access in the new account: done (2026-09-22,
       run 35756509720 created four agreements, and every model in the
       sandbox's list now answers from a pi console. `WorkbenchAccess` holds no
@@ -133,6 +144,31 @@ still need the console once.
       credentials and the SSO token itself for as long as the authentication
       session lasts, so this setting, not the permission set, is the real
       ceiling on an unattended run.
+
+- [ ] 17. Log Bedrock invocations for per-user attribution: doing
+      (claude-scp, 2026-09-23. **Do this before step 13.** Numbered 17
+      because appending is how 15 and 16 were added and renumbering would
+      invalidate every step reference in this document; the list is work
+      items, not an execution order. Knowing who spent what is more useful
+      than an alarm that the account spent too much, and the two are
+      independent.
+
+      Three resources in `deploy-workbench/`: a log group with 90 day
+      retention, a role Bedrock assumes to write to it, and the
+      per-region-singleton logging configuration with every
+      `*DataDeliveryEnabled` flag false. Design, and why this is not
+      application inference profiles, in "Tracking Bedrock usage by user".
+
+      Flip to done only when **one real invocation from a `WorkbenchAccess`
+      session** has been followed by reading
+      `/aws/bedrock/modelinvocations`, and that read shows a record
+      containing `identity.arn` and non-zero token counts and **no** prompt
+      or completion body. A green apply proves nothing here: the failure mode
+      is an enabled configuration over an empty log group, because no AWS
+      page confirms a record is written when every modality is disabled. The
+      same check answers whether a geo-routed call logs in `us-west-2` at
+      all; if the group is empty but invocation worked, suspect the
+      destination region before suspecting the configuration.)
 
 Facts discovered during implementation go here as they are learned:
 
@@ -913,6 +949,151 @@ would also close the move vector recorded under "What this does not protect".
 Worth its own PR, one that can check the exact ARNs the provider sends
 against existing state, rather than riding along with step 9.
 
+## Tracking Bedrock usage by user
+
+Design for step 17, settled 2026-09-23 before implementation. It closes the
+"Per-engineer cost visibility" open question, which said to defer until the
+account existed.
+
+### What we want and what AWS offers
+
+The question is who spent what. Three mechanisms exist and they compose:
+
+- **IAM principal attribution**, via model invocation logging. Every record
+  carries `identity.arn` automatically, alongside `input.inputTokenCount` and
+  `output.outputTokenCount`. AWS documents the CloudWatch Logs Insights query
+  for grouping tokens by principal.
+- **Per-request metadata tagging**. The caller attaches up to 16 key-value
+  pairs per call. AWS is explicit that it is not enforced: a request without
+  it still succeeds and there is no service-side way to require it.
+- **Application inference profiles**, or Projects, or Workspaces. The only
+  option whose tags reach Cost Explorer and the Cost and Usage Report as cost
+  allocation tags, so the only one that yields invoice-accurate dollars.
+
+**Decision: IAM principal attribution.** Engineers reach this account through
+Identity Center, so `identity.arn` already ends in their username. It is one
+account-level setting, it needs no change to `gp-pi`, nothing exists per
+engineer, and a caller cannot omit or forge it.
+
+### Why not application inference profiles
+
+Worth recording at length, because it is the option that sounds right and the
+question will come back.
+
+They would work technically. `modelSource.copyFrom` accepts a cross-region
+system-defined profile, not only a foundation model, which matters because
+`moonshotai.kimi-k3` has no in-region support anywhere. Pulumi has the
+resource. The cost is in the shape.
+
+A profile is tied to one model, so you need one per engineer per model. Eight
+models and five engineers is forty, and because each is model-specific, every
+model version bump mints a new generation of them. `bedrockInvokeResources()`
+would have to name them all, growing an enumerated policy that step 15
+deliberately narrowed, against a 10240 byte limit it currently uses 3698 of.
+`gp-pi` could not bake them in either: model ids live in
+`etc/pi/extensions/gp-models.ts`, which is copied into the image, and
+`config_digest()` marks a container stale when it changes, so per-engineer
+ARNs mean per-engineer images unless the extension resolves them at runtime.
+
+Having pi create its own profile on first run removes that friction and
+introduces a worse problem. It needs `bedrock:CreateInferenceProfile` and
+`bedrock:TagResource` on `WorkbenchAccess`, reversing step 15, and more
+importantly it makes the attribution self-asserted: a prompt-injected agent
+could tag its profile as somebody else. Attribution the attributed party
+controls is not attribution.
+
+AWS says the same thing in its own scaling guidance: "Tag at the team or cost
+center level rather than per-user. For per-user cost attribution without
+creating additional profiles, use IAM principal attribution."
+
+There is also a structural reason they buy us less than they would elsewhere.
+Their value is splitting spend *within* an account. We already put this
+workload in its own account, so team-level attribution is free from the
+boundary, and the only split we want is the one AWS recommends against using
+them for.
+
+Finally, an unresolved risk that would decide it anyway: application
+inference profiles are not supported by the Responses and Chat Completions
+APIs, and AWS names InvokeModel and Converse as the supported pair without
+mentioning ConverseStream. Every model in `gp-pi` declares
+`api: "bedrock-converse-stream"`.
+
+What we give up by choosing logs is invoice accuracy. Token counts times a
+rate card ignores discounts, commitments and free tier, and neither classic
+CUR nor CUR 2.0 carries a per-request identifier to join on. If finance ever
+needs the real number, the answer is step 13's budgets and Cost Explorer at
+the account level, not forty profiles.
+
+### Metadata only, and why that is the load-bearing setting
+
+The four `*DataDeliveryEnabled` flags **default to `true`**. Left alone,
+logging records the full prompt and completion of every call, which for a
+coding agent means repository contents sitting in a log group. All four are
+set to `false` in `deploy-workbench/index.ts` and listed exhaustively rather
+than omitted, so that the code shows what it does without the reader knowing
+the default.
+
+AWS describes each flag as controlling whether that modality's *data* is
+included in the delivery, and the record format keeps
+`input.inputTokenCount` as a sibling of `input.inputBodyJson` rather than
+nested inside it. So the record, its `identity.arn` and its token counts are
+expected to survive with every flag off.
+
+Expected rather than confirmed. No AWS page states that a record is still
+written when all modalities are disabled, and the failure mode is silent: an
+enabled configuration over an empty log group. Step 17's acceptance criterion
+is one real invocation followed by reading the group, for that reason alone.
+
+**Known gap.** The API has a fifth flag, `audioDataDeliveryEnabled`, which
+the Pulumi provider does not expose, so it cannot be set and presumably stays
+on. No model in `utils/bedrock-models.ts` accepts audio, so nothing is
+delivered today. Adding one reopens it, and the fix is a
+`PutModelInvocationLoggingConfiguration` call outside Pulumi.
+
+### The grant this depends on
+
+`WorkbenchAccess` holds `logs:Get*`, `logs:FilterLogEvents` and
+`logs:StartQuery` on `*`, so any engineer can read any log group in the
+account.
+
+That is fine, and it is fine *because* the delivery flags are off. The group
+holds identity ARNs and token counts, which engineers seeing about each other
+is harmless and arguably useful. It stops being fine the moment a flag is
+flipped, at which point the grant has to be scoped in the same change.
+
+Deliberately not pre-emptively scoped. A deny on the log group would also
+block an engineer reading their own usage, which is a thing we want, and a
+control that costs something real to defend against a state we have not
+entered is the kind that gets removed by someone who cannot see why it is
+there. The coupling is recorded as a comment beside the grant in
+`identity-center/policies.ts` instead, because whoever flips the flag will be
+reading the Bedrock code and not this document.
+
+### Region, and the thing to check
+
+Logging is configured per region, destinations must be in the same account
+and region, and metadata is recorded only where the call is made. We invoke
+the `us-west-2` endpoint, so one configuration there should capture
+everything.
+
+"Should" again. Step 11 established that cross-region intuition is unreliable
+here: geo profiles route by capacity and enablement turned out to be per
+destination region. If invocation logging also follows the destination, this
+needs four copies of all three resources, and the provider warns the
+configuration is a per-region singleton that must not be declared twice, so
+that would be a structural change rather than a loop. The same single
+invocation that tests the metadata question tests this one.
+
+### What this costs and what it does not protect
+
+Metadata records are small, so CloudWatch Logs ingestion is negligible.
+Retention is set to 90 days rather than the default of never expiring.
+
+It gives estimated spend, not billed spend. It attributes by IAM principal,
+so anything invoked by CI rather than by a person attributes to the CI role,
+which is correct but is not a person. And it records nothing about calls made
+outside `bedrock-runtime`.
+
 ## Apply ordering between workflows
 
 Not a Pulumi dependency, a GitHub Actions one, and it is easy to miss because
@@ -1304,6 +1485,26 @@ needed, and so the asynchronous parts have a human gap after them.
 
 14. Point `pi` at the new account and document engineer setup.
 
+17. Log Bedrock invocations, for per-user attribution. Do this before step 13.
+    Designed in full in "Tracking Bedrock usage by user" above; read that
+    rather than this summary, particularly for why it is not application
+    inference profiles.
+
+    Three resources in `deploy-workbench/`, all taking the explicit provider
+    that project requires: a log group with retention set, an IAM role
+    Bedrock assumes to write to it, and
+    `aws.bedrockmodel.InvocationLoggingConfiguration` with all four
+    `*DataDeliveryEnabled` flags false.
+
+    Needs no new grant today. `deploy-workbench` reaches the account through
+    `OrganizationAccountAccessRole`, which is administrator. Step 10 is where
+    that stops being true; its entry now lists what the replacement role
+    needs.
+
+    The apply is not the test. See the Progress entry for the acceptance
+    criterion, which is a real invocation followed by reading the log group,
+    and which also settles whether a geo-routed call logs in `us-west-2`.
+
 ## Open questions
 
 - ~~**Which permission set.**~~ Settled 2026-09-21 in step 8: a new
@@ -1317,9 +1518,11 @@ needed, and so the asynchronous parts have a human gap after them.
   by decision: the model ids pi ships are already geo profiles, so we are
   using them. The cost is in the facts above, and it is that enablement is per
   member region and getting it wrong fails intermittently.
-- **Per-engineer cost visibility.** Application inference profiles tagged per
-  engineer, or a gateway. Defer until the account exists and we can see whether
-  the aggregate number is enough.
+- ~~**Per-engineer cost visibility.**~~ Settled 2026-09-23 as step 17: model
+  invocation logging, metadata only, attributing by the `identity.arn` that
+  Identity Center already puts in every record. Application inference
+  profiles tagged per engineer were rejected, and a gateway was not needed to
+  reject them. Reasoning is in "Tracking Bedrock usage by user".
 - ~~**Region.**~~ Settled. `us-west-2` is where requests are sent and where the
   two region-pinned models live, matching the rest of our footprint. The check
   this asked for mattered more than expected: availability does differ by
