@@ -1,5 +1,7 @@
 import * as aws from "@pulumi/aws";
 
+import { workbenchScp } from "./policies";
+
 /**
  * Organization-level resources: organizational units and member accounts.
  *
@@ -87,3 +89,56 @@ const workbench = new aws.organizations.Account(
 // the "Cross-project dependencies" section of that doc.
 export const workbenchOuId = workbenchOu.id;
 export const workbenchAccountId = workbench.id;
+
+// ---------------------------------------------------------------------------
+// The workbench service control policy. Step 9 part 3 of
+// docs/workbench-account.md; the document itself is in ./policies.ts and the
+// design is in that doc under "The workbench SCP".
+//
+// This is the last of step 9's three parts. Part 1 enabled
+// SERVICE_CONTROL_POLICY on the root, in the console, because doing it in
+// code would have meant importing the Organization resource and risking
+// awsServiceAccessPrincipals. Part 2 granted this role the policy actions,
+// in its own PR that had to finish applying before this one merges, because
+// the grant is applied by deploy.yml and this is applied by deploy-org.yml
+// and nothing sequences the two.
+
+const workbenchPolicy = new aws.organizations.Policy("workbenchScp", {
+  name: "WorkbenchGuardrails",
+  description:
+    "Bounds the workbench account: no leaving the organization, no IAM users or access keys, no CloudTrail tampering, no managed data stores, no cross-account S3, and us-west-2 only except where cross-region inference and marketplace subscription require otherwise.",
+  type: "SERVICE_CONTROL_POLICY",
+  content: JSON.stringify(workbenchScp),
+});
+
+// Attached to the OU rather than to the account, so a second workbench-style
+// account inherits it by being placed here. The cost of that choice is
+// recorded in the doc under "What this does not protect": the policy stops
+// applying if the account is moved out, which nothing inside the account can
+// do, because Organizations write actions are callable only from the
+// management account and there are no delegated administrators.
+//
+// workbenchOu.id rather than the literal, so Pulumi orders the attachment
+// after the OU and a renamed or recreated OU cannot leave this pointing at
+// nothing.
+new aws.organizations.PolicyAttachment("workbenchScp", {
+  policyId: workbenchPolicy.id,
+  targetId: workbenchOu.id,
+});
+
+// Deliberately unprotected, unlike the OU and the account above.
+//
+// Every other resource in this file guards against losing something
+// irreplaceable. This one is the opposite case: the thing most likely to go
+// wrong with an SCP is that it denies something real, and the fix is to
+// withdraw it quickly. protect: true would turn that into a two-step
+// emergency. The same reasoning is why part 2's grant deliberately includes
+// DeletePolicy and DetachPolicy.
+//
+// Recovery does not depend on this stack anyway. SCPs never apply to the
+// management account, so github-actions-org-deploy keeps working whatever
+// this policy says, and its DetachPolicy grant is scoped to exactly this OU.
+// Admins hold AdministratorAccess there as a second path. The way out sits
+// outside the thing being changed, which is the property that makes applying
+// this safe to do at all.
+export const workbenchScpId = workbenchPolicy.id;
