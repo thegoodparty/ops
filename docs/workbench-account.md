@@ -114,8 +114,8 @@ still need the console once.
       grant to exactly this OU. Admins hold `AdministratorAccess` there as a
       second path. Withdrawing is why the policy resource is deliberately
       unprotected.)
-- [ ] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
-      role: doing (pi-step10, 2026-09-24. Named `pulumi-deploy`, in the
+- [x] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
+      role: done (2026-09-24, pi-step10. Named `pulumi-deploy`, in the
       family of the `pulumi-preview` role the PR-preview plan already
       expects to add to this account.
 
@@ -161,15 +161,23 @@ still need the console once.
       said since step 11. The full reasoning is the header of
       `deploy-workbench/deploy-role.ts`.
 
-      End state, checked before this flips to done: `Deploy workbench` green
-      on the cutover PR with the provider and the script both on
-      `pulumi-deploy`, the bootstrap grant gone from
-      `github-actions-workbench-deploy`, and `OrganizationAccountAccessRole`
-      itself deleted from the account — a console act by an admin, recorded
-      here with the time, because no remaining automated path holds
-      `iam:DeleteRole` on it and none should. Until that deletion the
-      Admins `AdministratorAccess` assignment stays exactly as it is:
-      post-cutover it is the only non-CI path into the account, which is
+      Closed 2026-09-24 (pi-step10), all three end-state criteria met.
+      `Deploy workbench` run 36044457245 (merge of the cutover PR, 264b7b1)
+      is green with the provider and the script both on `pulumi-deploy`:
+      the provider change was an update in place — `roleArn`
+      `OrganizationAccountAccessRole` → `pulumi-deploy`, one resource
+      updated, nothing replaced — which doubles as the cascade check
+      pr-previews step 8 asks for, and the script's log line reads
+      `Assumed arn:aws:sts::024901689212:assumed-role/pulumi-deploy/enable-bedrock-models`.
+      CI run 36044457209 removed the bootstrap statement from the
+      `WorkbenchDeploy` policy in the same merge. And
+      `OrganizationAccountAccessRole` itself is deleted from the account:
+      jeff, console, 2026-09-24, recorded from the actor because
+      `WorkbenchAccess` holds no `iam:GetRole` to read the absence back
+      with — the same shape as step 2's after-the-fact recording. The
+      front door into this account is now exactly one named role, trusted
+      by exactly one named role. The Admins `AdministratorAccess`
+      assignment stays as it is: it is the only non-CI path in, which is
       what it was kept for. That closes the "revisit it at step 10" on its
       fact entry below.
 
@@ -202,9 +210,51 @@ still need the console once.
       2026-09-23 while adding Claude Opus 5.5, which is also when the
       `deploy-workbench.yml` path filter turned out not to include the model
       list at all.)
-- [ ] 12. Request quota increases if needed: todo
-- [ ] 13. Add budget and cost anomaly detection: todo
-- [ ] 14. Point `pi` at the account, document engineer setup: todo
+- [ ] 12. Request quota increases if needed: deferred (jeff, 2026-09-24 —
+      skip until a quota actually binds. Left unchecked rather than closed
+      because the need may still arrive, and nothing is lost by waiting: a
+      quota increase is a support case with lead time, not a project.)
+- [x] 13. Spend threshold alerts by email: done (2026-09-24,
+      pi-spend-alert; marked done in the PR that creates the budget, per
+      jeff's review, so no follow-up is needed once it merges — the
+      merge's `Deploy workbench` run is the read-back: green means the
+      budget exists with all four notifications, and if it fails this
+      entry is wrong in the visible way, with a red run beside it.
+      Reshaped by jeff in review of the original "budget and
+      cost anomaly detection": no hard budget — nothing stops spend, since
+      budget actions are the enforcement feature and are not attached — no
+      anomaly detection, and no Slack for now. What remains is one
+      `aws.budgets.Budget` in `deploy-workbench/` with four notifications:
+      actual monthly spend over $5,000 and $10,000, forecasted over
+      $10,000 and $20,000, all by email to the step 1 group alias
+      `aws-workbench@goodparty.org`.
+
+      The amounts are arbitrary-but-reviewable and each is a one-line
+      change; the wire is the point, not the values. Two caveats are
+      recorded in the code comment and repeated here because they are the
+      two ways this will look broken when it is not: forecasted alerts are
+      silent until the account has enough history for a forecast to exist,
+      and every budget alert lags billing data by hours. A runaway
+      measured in minutes would want a token-rate alarm on the step 17 log
+      group — recorded here as the known gap, deliberately not built.
+
+      Slack paths, deferred rather than rejected: AWS Chatbot (an SNS topic
+      in us-east-1 — the only region Budgets publishes to — plus a
+      per-account workspace OAuth in the console), or cheaper, Slack's own
+      email-to-channel address added as a second subscriber, which is a
+      one-line PR and no AWS change at all.
+
+      Delivery can only be proven by a real crossing, the same honesty as
+      step 17's empty-log-group caveat: a green apply shows the budget and
+      its subscribers exist, not that an email arrives.)
+- [x] 14. Point `pi` at the account, document engineer setup: done
+      (2026-09-22, gp-pi commit 5e0d72f "AWS SSO credentials for Bedrock in
+      the container" — `etc/aws-config` there ships a single
+      `WorkbenchAccess` profile against 024901689212, and the repo's README
+      carries the engineer setup section. Verified from a running sandbox
+      rather than from the document: the session recording this runs on
+      exactly those credentials and invokes the model list from them.
+      Recorded 2026-09-24, pi-spend-alert.)
 - [x] 15. Narrow `WorkbenchAccess` to runtime needs: done (2026-09-22, PR #72.
       Mutations are gone, reads stay wide, and the invoke statement names the
       models from `utils/bedrock-models.ts` as resource ARNs. Both halves are
@@ -360,7 +410,8 @@ Facts discovered during implementation go here as they are learned:
   is a deliberate full-admin grant in the workbench account, kept as a named
   break-glass path so the only way in is not assuming
   `OrganizationAccountAccessRole` by hand; revisited at step 10, which keeps
-  it: once the bootstrap role is deleted it is the only non-CI path in.
+  it: the bootstrap role is deleted (2026-09-24), so this is now the only
+  non-CI path in.
 - SCPs enabled on org root: `SERVICE_CONTROL_POLICY`, since 2026-09-22.
   Enabled by jeff in the console as part 1 of step 9, because it is a
   property of the organization rather than of the OU; see "The workbench SCP"
@@ -1755,7 +1806,9 @@ needed, and so the asynchronous parts have a human gap after them.
     Budget lead time.
 
 13. Add a budget and cost anomaly detection before handing the account to
-    engineers.
+    engineers. Reshaped in review to threshold alerts by email — no budget
+    actions, no anomaly detection; the Progress entry carries the reshaping
+    and its reasoning.
 
 14. Point `pi` at the new account and document engineer setup.
 
