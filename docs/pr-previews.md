@@ -36,8 +36,12 @@ the consumer by a different workflow, and nothing sequences the two.
       applied.
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
       todo. Depends on 8 being applied.
-- [ ] 11. Revisit the workbench preview role at workbench step 10: todo.
-      Tracked here so it is not lost; the work happens in that step.
+- [x] 11. Revisit the workbench preview role at workbench step 10: done
+      (2026-09-24, pi-step10; done as part of that step's design. The
+      provider keeps the `assumeRoles` shape and only the ARN changes, so
+      step 8 stands as written, with `pulumi-deploy` as the new default,
+      amended there. Step 10's entry in workbench-account.md records the
+      reasoning.)
 
 ## Why a preview needs admin today
 
@@ -238,9 +242,10 @@ Decided: ship now, and adjust at workbench step 10.
    `aws-reserved/sso.amazonaws.com/`, so match it with an `ArnLike`
    condition on `aws:PrincipalArn` against the account root principal, not
    with a literal principal ARN.
-   Make the provider's `assumeRoles[0].roleArn` come from stack config
-   (defaulting to today's `OrganizationAccountAccessRole`), set by preview
-   mode.
+   Make the provider's `assumeRoles[0].roleArn` come from stack config, set
+   by preview mode. The default is the deploy role of the day:
+   `OrganizationAccountAccessRole` until workbench step 10's cutover,
+   `pulumi-deploy` after it.
    **Check before merging:** a provider input change must show as at most an
    update of the `workbench` provider, never a replacement cascading to every
    resource. If it cascades, the alternative is CI doing the second hop
