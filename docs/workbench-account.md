@@ -119,7 +119,11 @@ still need the console once.
       `iam:PutRolePolicy`, `iam:PassRole` for the logging role, plus the
       matching reads and deletes. Re-derive from
       `deploy-workbench/index.ts` when the step is claimed rather than
-      trusting this list, which will be stale by then.
+      trusting this list, which will be stale by then. Also re-check the
+      PR preview path into this account (`pulumi-preview` role and the
+      configurable provider role ARN): if this step changes how the
+      provider reaches the account, previews must change with it. See
+      step 11 of [`pr-previews.md`](./pr-previews.md).
 - [x] 11. Enable Bedrock model access in the new account: done (2026-09-22,
       run 35756509720 created four agreements, and every model in the
       sandbox's list now answers from a pi console. `WorkbenchAccess` holds no
@@ -338,7 +342,8 @@ git log --oneline -15 -- docs/workbench-account.md deploy/ deploy-org/ deploy-wo
 Read-only AWS calls are enough for all of that, so reconcile with the
 `gp-readonly` profile rather than reaching for `gp-admin`. A preview needs
 `gp-admin` because `deploy/index.ts` reads the `DELEGATES` secret at preview
-time; reading state does not.
+time; reading state does not. [`pr-previews.md`](./pr-previews.md) removes
+that read (its step 3); update this paragraph when it lands.
 
 If a step is marked `doing` with a date more than a day old, assume the session
 that claimed it is gone. Verify actual state with the commands above, then

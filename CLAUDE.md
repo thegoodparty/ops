@@ -96,6 +96,12 @@ On push to `main`, the GitHub Actions workflow:
 
 PRs run type-checking and builds but skip the deploy step.
 
+Pulumi previews on PRs, under a scoped read-only role, are in progress:
+plan, reasoning and progress checklist in
+[`docs/pr-previews.md`](./docs/pr-previews.md). Read it before touching
+`deploy/components/ci-roles*`, the `deploy.sh` scripts, or PR-triggered
+workflows.
+
 ## Build Commands
 
 ```bash
