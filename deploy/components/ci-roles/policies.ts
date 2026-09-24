@@ -654,68 +654,37 @@ export const githubActionsOrgDeploy: PolicyDocument = {
   ],
 };
 
-// Backend access only, for now.
+// The management-account half of the workbench deploy path: assumed by
+// deploy-workbench.yml on main, and holds the assume grant below plus this
+// project's Pulumi backend access. Nothing else in this account.
 //
-// The role's actual job is sts:AssumeRole on the deploy role inside the
-// workbench account, but that account does not exist until step 5 and its id
-// is not known until step 6. Granting it early would mean either a wildcard
-// account in the resource ARN or a placeholder that silently rots, so the
-// statement is added in step 7, alongside the WORKBENCH_ACCOUNT_ID constant
-// and the provider that uses it.
-//
-// The role is still created here rather than in step 7, because a CI job
-// cannot assume a role that does not exist and keeping both roles in one
-// change keeps the trust scoping reviewable side by side. Until step 7 it can
-// read and write Pulumi state and do nothing else.
-// The account id is written out rather than imported from a constant. The
-// `WORKBENCH_ACCOUNT_ID` the plan describes lives in `deploy-workbench/`,
-// which does not exist yet and cannot: this grant has to be applied before
-// the project that consumes it is created. See "Apply ordering between
-// workflows"; the grant is in `deploy/` and applied by `deploy.yml`, while
-// its consumer is applied by `deploy-workbench.yml`.
+// The account id is written out rather than imported from a constant.
+// Hardcoding matches house style (identity-center.ts does the same), and the
+// grant has twice had to be applied before the project that consumes it —
+// see "Apply ordering between workflows": the grant is in `deploy/` and
+// applied by `deploy.yml`, while its consumer is applied by
+// `deploy-workbench.yml`.
 const WORKBENCH_ACCOUNT_ID = "024901689212";
 
 export const githubActionsWorkbenchDeploy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
-    // The statement step 4 deferred, now that the account exists and its id
-    // is known. Deferred rather than guessed, because the two ways to write
-    // it early were a wildcard account in the resource ARN and a placeholder
-    // that rots unnoticed.
+    // The role's reason to exist: reach the workbench account's deploy role.
     //
-    // What this grants is administrator in the workbench account, which is
-    // what OrganizationAccountAccessRole is. That is the intended state only
-    // until step 10 replaces it with the in-account deploy role. When that
-    // happens, this statement moves to the new role rather than gaining it:
-    // keeping both would leave a permanent admin path that nothing uses and
-    // nobody would notice. The two statements below coexist for exactly the
-    // span of step 10's two PRs — the grant must be applied by deploy.yml
-    // before the cutover PR's consumer change merges — and the cutover PR
-    // deletes this one. "Moves rather than gains" describes the end state,
-    // not the transition. (Comment revised when step 10's first PR landed.)
+    // Until step 10's cutover this granted the Organizations-planted
+    // `OrganizationAccountAccessRole`. The move happened as gain-then-remove
+    // across step 10's two PRs, because this grant has to be applied before
+    // the consumer change merges ("Apply ordering between workflows"). If
+    // git history shows the two statements coexisting, that was the
+    // transition, not the end state — the end state is this one statement,
+    // since keeping the old one would have left a permanent admin path that
+    // nothing uses and nobody would notice.
     //
-    // Nothing on the target side needs changing. The bootstrap role's trust
-    // policy names the management account root, which delegates the decision
-    // to IAM here, so this identity-based statement is the whole control.
-    //
-    // Inert on merge, deliberately. `github-actions-workbench-deploy` pins
-    // job_workflow_ref to `deploy-workbench.yml`, which does not exist, so no
-    // job can assume the role that now holds this. The second PR of step 7
-    // creates that file, and this grant starts mattering then.
-    {
-      Sid: "AssumeWorkbenchBootstrapRole",
-      Effect: "Allow",
-      Action: ["sts:AssumeRole"],
-      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
-    },
-    // Step 10's replacement for the bootstrap grant: the in-account deploy
-    // role, created by deploy-workbench itself in the same PR. Added
-    // alongside the statement above rather than in its place because the two
-    // workflows are unordered ("Apply ordering between workflows") — this
-    // grant must already be applied when the cutover PR repoints the
-    // provider, and this PR is the one that can guarantee that. Inert until
-    // then: nothing references the new role yet, and the role does not exist
-    // until this PR's deploy-workbench apply creates it.
+    // The target side narrowed at the same time: the bootstrap role trusted
+    // the management account root, delegating the decision to any principal
+    // there holding sts:AssumeRole, while `pulumi-deploy` names this role
+    // exactly. A cross-account assume needs both sides to allow it, and both
+    // sides now agree on a single role.
     {
       Sid: "AssumeWorkbenchDeployRole",
       Effect: "Allow",

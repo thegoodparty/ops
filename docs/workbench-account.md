@@ -115,22 +115,30 @@ still need the console once.
       second path. Withdrawing is why the policy resource is deliberately
       unprotected.)
 - [ ] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
-      role: doing (pi-step10, 2026-09-24; the role and its grant are in
-      this PR, the cutover is the follow-up. Named `pulumi-deploy`, in the
+      role: doing (pi-step10, 2026-09-24. Named `pulumi-deploy`, in the
       family of the `pulumi-preview` role the PR-preview plan already
       expects to add to this account.
 
+      Part 1 landed as PR #84, merged as 868e608: `Deploy workbench` run
+      36036290645 created the role and its `AdministratorAccess`
+      attachment (2 resources, `deployRoleArn` output reads
+      `arn:aws:iam::024901689212:role/pulumi-deploy`), and CI run
+      36036290663 applied the `AssumeWorkbenchDeployRole` grant — read
+      from the apply log, since no management-account SSO token was live
+      for a `get-role-policy` read-back. Part 2, the cutover, is in this
+      PR.
+
       Two PRs, forced by bootstrap causality: the apply that creates the
-      role cannot assume it, so this PR creates the role (provider still on
-      the bootstrap role) and adds the new `sts:AssumeRole` grant on
-      `github-actions-workbench-deploy` alongside the old one, and the
-      follow-up repoints the provider and the enable script and removes the
-      old grant. This PR's two halves can apply in either order — the
-      role's creation does not need the grant and the grant does not need
-      the role to exist — so the "Apply ordering between workflows" rule is
-      satisfied by there being nothing to order. The cutover PR's grant
-      dependency is already applied by then, which is what the rule exists
-      to arrange.
+      role cannot assume it, so PR #84 created the role (provider still on
+      the bootstrap role) and added the new `sts:AssumeRole` grant on
+      `github-actions-workbench-deploy` alongside the old one, and this PR
+      repoints the provider and the enable script and removes the old
+      grant. PR #84's two halves could apply in either order — the role's
+      creation did not need the grant and the grant did not need the role
+      to exist — so the "Apply ordering between workflows" rule was
+      satisfied by there being nothing to order. This PR's grant dependency
+      was already applied by then, which is what the rule exists to
+      arrange.
 
       The design simplified in review, and the simplification is recorded
       rather than papered over. The role was first built with a permission
@@ -832,9 +840,10 @@ after step 14, when we know what the inner loop actually uses.
 
 Revised 2026-09-22 after steps 11 and 15 landed in PR #72. Two of the entries
 below changed as a direct result, and both changes are the same lesson: this
-policy binds `OrganizationAccountAccessRole`, which is the identity CI itself
-uses inside the account, so a guardrail written carelessly does not merely
-inconvenience an engineer, it breaks the pipeline that maintains the account.
+policy binds the identity CI uses inside the account — `pulumi-deploy` since
+step 10's cutover, `OrganizationAccountAccessRole` before it — so a guardrail
+written carelessly does not merely inconvenience an engineer, it breaks the
+pipeline that maintains the account.
 Check any future addition against what `deploy-workbench.yml` does, not only
 against what a person does.
 

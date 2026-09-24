@@ -54,9 +54,11 @@ Four independent causes. Each one alone would force admin or near-admin.
    only to derive the ARN and the *key names*, which become the task
    definition's `secrets` list. `workbench-account.md` ("How to resume")
    records this as the reason preview needs `gp-admin`.
-2. **`deploy-workbench/` assumes `OrganizationAccountAccessRole`.** The
-   explicit provider assumes it at configure time, which happens on preview
-   too, and that role is effectively administrator in 024901689212.
+2. **`deploy-workbench/` assumes an admin role.** The explicit provider
+   assumes `pulumi-deploy` at configure time, which happens on preview too,
+   and that role is administrator in 024901689212. Before workbench step 10's
+   cutover it was `OrganizationAccountAccessRole`, likewise admin; the rename
+   changed the trust, not the power.
 3. **`deploy/` requires `workerImageUri`.** PR runs push no image, so there is
    nothing honest to pass without a lookup.
 4. **The `deploy.sh` scripts are apply scripts.** With `CI=true` they run
