@@ -275,6 +275,68 @@ test("a transport failure ends the stream as an error, not a hang", async () => 
   assert.match(message.errorMessage ?? "", /slow down/);
 });
 
+test("a dropped thinking block reaches the finished message for chunk 5 to log", async () => {
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  const drifted = [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_drift",
+        usage: { input_tokens: 10 },
+        input_transformations: [
+          { type: "thinking_dropped", path: "messages.6.content.0", reason: "prefix_binding_mismatch" },
+        ],
+      },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "still fine" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } },
+    { type: "message_stop" },
+  ];
+  const provider = await createBedrockInvokeModelProvider({ invoke: async () => chunks(drifted) });
+  const pi = await import("@earendil-works/pi-ai");
+
+  const message = await provider
+    .stream(model, pi.normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] }))
+    .result();
+
+  // The turn succeeded. Only the diagnostic says the prefix stopped being stable.
+  assert.equal(message.stopReason, "stop");
+  assert.equal(message.diagnostics?.[0].type, "anthropic_input_transformations");
+  assert.deepEqual(message.diagnostics?.[0].details?.transformations, [
+    { type: "thinking_dropped", path: "messages.6.content.0", reason: "prefix_binding_mismatch" },
+  ]);
+});
+
+test("a turn that both drifted and failed still reports the drift", async () => {
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  const provider = await createBedrockInvokeModelProvider({
+    invoke: async () =>
+      chunks([
+        {
+          type: "message_start",
+          message: {
+            id: "msg_both",
+            input_transformations: [
+              { type: "thinking_dropped", path: "messages.2.content.0", reason: "prefix_binding_mismatch" },
+            ],
+          },
+        },
+        { type: "message_delta", delta: { stop_reason: "refusal" } },
+        { type: "message_stop" },
+      ]),
+  });
+  const pi = await import("@earendil-works/pi-ai");
+
+  const message = await provider
+    .stream(model, pi.normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] }))
+    .result();
+
+  assert.equal(message.stopReason, "error");
+  assert.equal(message.diagnostics?.[0].type, "anthropic_input_transformations");
+});
+
 test("the region option and an abort signal reach the client", async () => {
   const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
   const seen: { region?: string; signal?: AbortSignal }[] = [];

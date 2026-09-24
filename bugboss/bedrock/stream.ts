@@ -43,6 +43,18 @@ export interface AnthropicBlockDelta {
   partial_json?: string;
 }
 
+/**
+ * One thinking block the service dropped before inference. `reason` is the
+ * binding check that removed it: prefix_binding_mismatch is our resume drift,
+ * organization_binding_mismatch is a block replayed under a different AWS
+ * account, model_binding_mismatch a block replayed against another model.
+ */
+export interface AnthropicInputTransformation {
+  type?: string | null;
+  path?: string | null;
+  reason?: string | null;
+}
+
 export interface BedrockInvocationMetrics {
   inputTokenCount?: number;
   outputTokenCount?: number;
@@ -53,16 +65,25 @@ export interface BedrockInvocationMetrics {
 export interface AnthropicStreamEvent {
   type: string;
   index?: number;
-  message?: { id?: string; model?: string; usage?: AnthropicUsagePayload };
+  message?: {
+    id?: string;
+    model?: string;
+    usage?: AnthropicUsagePayload;
+    input_transformations?: AnthropicInputTransformation[];
+  };
   content_block?: AnthropicBlockStart;
   /** Partial because a message_delta carries a stop reason and no block type. */
   delta?: Partial<AnthropicBlockDelta> & { stop_reason?: string | null };
   usage?: AnthropicUsagePayload;
   error?: { type?: string; message?: string };
+  input_transformations?: AnthropicInputTransformation[];
   "amazon-bedrock-invocationMetrics"?: BedrockInvocationMetrics;
 }
 
 export const REDACTED_THINKING_PLACEHOLDER = "[Reasoning redacted]";
+
+/** The diagnostic Pi's Anthropic path emits, so one listener covers both. */
+export const INPUT_TRANSFORMATIONS_DIAGNOSTIC = "anthropic_input_transformations";
 
 export const mapStopReason = (reason: string): { stopReason: StopReason; errorMessage?: string } => {
   switch (reason) {
@@ -124,6 +145,7 @@ export const consumeAnthropicStream = async ({
   const tracked = new Map<number, TrackedBlock>();
   let started = false;
   let sawMessageStop = false;
+  let transformations: AnthropicInputTransformation[] | undefined;
 
   for await (const event of events) {
     if (signal?.aborted) throw new Error("Request was aborted");
@@ -133,6 +155,9 @@ export const consumeAnthropicStream = async ({
     }
 
     if (event.type === "message_start") {
+      if (Array.isArray(event.message?.input_transformations)) {
+        transformations = event.message.input_transformations;
+      }
       output.responseId = event.message?.id;
       const responseModel = event.message?.model;
       if (responseModel && responseModel !== output.model) output.responseModel = responseModel;
@@ -268,6 +293,9 @@ export const consumeAnthropicStream = async ({
     }
 
     if (event.type === "message_delta") {
+      if (Array.isArray(event.input_transformations)) {
+        transformations = event.input_transformations;
+      }
       const stopReason = event.delta?.stop_reason;
       if (stopReason) {
         output.rawStopReason = stopReason;
@@ -297,6 +325,28 @@ export const consumeAnthropicStream = async ({
         applyCost();
       }
     }
+  }
+
+  // drop_block is deliberately the quiet failure mode: prompt drift costs
+  // reasoning instead of a 400. Quiet is not silent -- without this the first
+  // evidence of a prefix that stopped being byte-stable would be an agent that
+  // just reasons worse after a resume. Recorded before the outcome checks so a
+  // turn that both drifted and failed still reports the drift.
+  if (transformations && transformations.length > 0) {
+    output.diagnostics = [
+      ...(output.diagnostics ?? []),
+      {
+        type: INPUT_TRANSFORMATIONS_DIAGNOSTIC,
+        timestamp: Date.now(),
+        details: {
+          transformations: transformations.map((transformation) => ({
+            type: transformation.type ?? null,
+            path: transformation.path ?? null,
+            reason: transformation.reason ?? null,
+          })),
+        },
+      },
+    ];
   }
 
   if (signal?.aborted) throw new Error("Request was aborted");

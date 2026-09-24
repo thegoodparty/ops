@@ -710,6 +710,19 @@ prompt and tool list. So:
   them** rather than regenerating. Anything nondeterministic in either one is a
   landmine: a timestamp, a cwd, a git branch, a tool array built from a `Set`,
   an MCP server registering tools in varying order.
+- **Alert on the diagnostic, and split it by `reason`.** `drop_block` is
+  deliberately quiet, so `anthropic_input_transformations` is the only
+  evidence the prefix stopped being stable. Its `reason` is a closed set of
+  four and they are not the same story:
+  `prefix_binding_mismatch` is our resume drift;
+  `organization_binding_mismatch` means the block was made under a different
+  AWS account; **`model_binding_mismatch` means the session was replayed
+  against a different model**, which is exactly what changing the
+  `resolveModel` mapping would produce — and that mapping lives in SSM and
+  retunes without a deploy, so it can silently degrade every running agent;
+  and `end_user_binding_mismatch`. Treating all four as prompt drift sends
+  you looking in the wrong place. `path` is `messages.{i}.content.{j}`, so a
+  dropped block is locatable in the transcript.
 - Set `prefix_mismatch_behavior: "drop_block"` and monitor
   `input_transformations`, so drift costs reasoning instead of throwing a 400.
 - **Pin the model id in the session file.** Bedrock does not restore it on

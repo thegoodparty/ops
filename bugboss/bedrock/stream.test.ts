@@ -3,7 +3,12 @@ import { test } from "node:test";
 
 import type { AssistantMessage, AssistantMessageEvent, JsonObject } from "@earendil-works/pi-ai";
 
-import { type AnthropicStreamEvent, consumeAnthropicStream, mapStopReason } from "./stream";
+import {
+  type AnthropicStreamEvent,
+  consumeAnthropicStream,
+  INPUT_TRANSFORMATIONS_DIAGNOSTIC,
+  mapStopReason,
+} from "./stream";
 import { BEDROCK_INVOKE_MODEL_API } from "./options";
 
 const newOutput = (): AssistantMessage => ({
@@ -226,6 +231,90 @@ test("reported usage is never overwritten by the bedrock metrics", async () => {
 
   assert.equal(output.usage.input, 10);
   assert.equal(output.usage.output, 7);
+});
+
+test("a dropped thinking block is reported as a diagnostic, not swallowed", async () => {
+  // drop_block keeps a drifted prefix from throwing a 400. The diagnostic is
+  // the only evidence it happened.
+  const { output } = await run([
+    {
+      type: "message_start",
+      message: {
+        id: "msg_3",
+        input_transformations: [
+          {
+            type: "thinking_dropped",
+            path: "messages.4.content.0",
+            reason: "prefix_binding_mismatch",
+          },
+        ],
+      },
+    },
+    ...stopped(),
+  ]);
+
+  assert.deepEqual(output.diagnostics, [
+    {
+      type: INPUT_TRANSFORMATIONS_DIAGNOSTIC,
+      timestamp: output.diagnostics![0].timestamp,
+      details: {
+        transformations: [
+          {
+            type: "thinking_dropped",
+            path: "messages.4.content.0",
+            reason: "prefix_binding_mismatch",
+          },
+        ],
+      },
+    },
+  ]);
+});
+
+test("transformations reported on message_delta are picked up too", async () => {
+  const { output } = await run([
+    messageStart,
+    {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+      input_transformations: [{ type: "thinking_dropped", path: "messages.2.content.1", reason: "organization_binding_mismatch" }],
+    },
+    { type: "message_stop" },
+  ]);
+
+  assert.equal(output.diagnostics?.length, 1);
+  assert.equal(
+    (output.diagnostics![0].details?.transformations as { reason: string }[])[0].reason,
+    "organization_binding_mismatch",
+  );
+});
+
+test("a later report replaces an earlier one rather than double-counting", async () => {
+  const { output } = await run([
+    {
+      type: "message_start",
+      message: {
+        id: "msg_4",
+        input_transformations: [{ type: "thinking_dropped", path: "messages.1.content.0", reason: "prefix_binding_mismatch" }],
+      },
+    },
+    {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+      input_transformations: [
+        { type: "thinking_dropped", path: "messages.1.content.0", reason: "prefix_binding_mismatch" },
+        { type: "thinking_dropped", path: "messages.1.content.1", reason: "prefix_binding_mismatch" },
+      ],
+    },
+    { type: "message_stop" },
+  ]);
+
+  assert.equal(output.diagnostics?.length, 1);
+  assert.equal((output.diagnostics![0].details?.transformations as unknown[]).length, 2);
+});
+
+test("an undrifted turn carries no diagnostics at all", async () => {
+  const { output } = await run([messageStart, ...stopped()]);
+  assert.equal(output.diagnostics, undefined);
 });
 
 test("stop reasons map onto Pi's vocabulary", () => {
