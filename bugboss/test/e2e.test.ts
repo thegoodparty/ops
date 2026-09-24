@@ -20,6 +20,8 @@ import type { AgentSpawnContext } from "../dispatcher";
 import type { ModelReply, ModelRequest } from "../triage";
 import type { BugBossConfig, TriageDecision } from "../types";
 
+type QueuedDecision = TriageDecision & { recurrenceOf?: string };
+
 // --- fakes -----------------------------------------------------------------
 
 /**
@@ -28,8 +30,10 @@ import type { BugBossConfig, TriageDecision } from "../types";
  * in triage/triage.ts all run against these decisions.
  */
 const fakeModel = {
-  triageDecisions: [] as TriageDecision[],
-  next(): TriageDecision {
+  // `recurrenceOf` rides along on a new_incident decision; the decide tool's
+  // schema carries it even though TriageDecision itself does not.
+  triageDecisions: [] as QueuedDecision[],
+  next(): QueuedDecision {
     const d = this.triageDecisions.shift();
     if (!d) throw new Error("fakeModel: no triage decision queued");
     return d;
@@ -67,20 +71,13 @@ const fakeSlack = {
  * the tool API through the same sequence a real agent would.
  */
 const fakeAgent = async (tools: AgentSpawnContext) => {
+  const view = await tools.getIncident();
   await tools.reportRootCause({
     cause: "Pro upgrade webhook wrote to the wrong column",
-    explainedSignalIds: ["sig-1"],
+    explainedSignalIds: (view.data?.signals ?? []).map((s) => s.id),
     usersImpacted: 3,
     impactQuery: '{service_name="gp-api"} |= "pro_upgrade"',
   });
-
-  // A real agent ships the fix and then watches the alert stop firing before
-  // it claims resolution. That is not decoration: RESOLVED means no further
-  // alerts should occur, so the tool API splits any signal that is still
-  // firing back out into a recurrence rather than closing over it.
-  await boss.ingest("grafana", grafanaBody("fp-1", "campaigns-route-errors", "resolved"));
-  await boss.tickResolution();
-
   await tools.reportResolved({
     prUrls: ["https://github.com/thegoodparty/omni/pull/9999"],
     evidence: "two clean runs through the flow after deploy",
@@ -371,11 +368,6 @@ test("a human bug report resolves without spawning a recurrence", async () => {
     evidence: "clicked through the upgrade flow on Safari, popup opens",
   });
   assert.equal(resolved.ok, true, resolved.error);
-  assert.deepEqual(
-    (resolved.data as { stillFiring: string[] }).stillFiring,
-    [],
-    "a report with no machine resolver must not be treated as still firing",
-  );
 
   const recurrences = boss.db.query(
     "SELECT id FROM incident WHERE recurrenceOf = ?",
@@ -386,4 +378,36 @@ test("a human bug report resolves without spawning a recurrence", async () => {
     0,
     "splitting here would relaunch an agent on the bug it just fixed, forever",
   );
+});
+
+// --- recurrence ------------------------------------------------------------
+
+test("the same alert firing again after resolution opens a recurrence", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-9", "pro-upgrade-errors"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string; status: string }>(
+    "SELECT id, status FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-9')",
+  );
+  assert.equal(first?.status, "CLOSED");
+
+  // Grafana reuses the fingerprint, so an all-time dedup key silently
+  // discards this and the premature resolution is never contradicted. This
+  // is the delivery the whole recurrence story depends on.
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "fired again after we said it was fixed",
+    recurrenceOf: first!.id,
+  });
+  await boss.ingest("grafana", grafanaBody("fp-9", "pro-upgrade-errors"));
+
+  const signals = boss.db.query("SELECT id FROM signal WHERE sourceId = 'fp-9'");
+  assert.equal(signals.length, 2, "the second firing must not be dropped as a duplicate");
+
+  const reopened = boss.db.get<{ id: string; recurrenceOf: string | null }>(
+    "SELECT id, recurrenceOf FROM incident WHERE recurrenceOf = ?",
+    [first!.id],
+  );
+  assert.ok(reopened, "a premature resolution has to be contradictable");
 });

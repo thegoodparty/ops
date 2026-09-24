@@ -198,6 +198,8 @@ export class Dispatcher {
         alarm("tick_failed", { error: String(err) }),
       );
     }, this.config.tickSeconds * 1000);
+    // The overlap guard lives in tick() itself, not here: dispatchOnce is
+    // public and runs the same body against a live interval.
     this.timer.unref();
     log("started", {
       tickSeconds: this.config.tickSeconds,
@@ -224,7 +226,27 @@ export class Dispatcher {
     await Promise.all([...this.running.values()].map((e) => e.done));
   };
 
+  /**
+   * Serialized against itself. A tick awaits an S3 PUT and an STS call before
+   * it records a launch in `running`, so an overlapping tick would read the
+   * same row as unclaimed and start a second child. Two children on one
+   * incident both hold valid tokens and both whole-file PUT the same session
+   * transcript, so they overwrite each other's turns. The single-writer
+   * guarantee the whole resume design rests on is this map, and the map is
+   * only authoritative if ticks cannot interleave.
+   */
   tick = async (): Promise<TickResult> => {
+    const mine = this.ticking.then(() => this.runTick());
+    this.ticking = mine.then(
+      () => undefined,
+      () => undefined,
+    );
+    return mine;
+  };
+
+  private ticking: Promise<void> = Promise.resolve();
+
+  private runTick = async (): Promise<TickResult> => {
     const now = this.now();
     const expired = await this.enforceDeadlines(now);
 

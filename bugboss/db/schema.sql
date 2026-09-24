@@ -61,10 +61,20 @@ CREATE TABLE IF NOT EXISTS signal (
   openedAt          INTEGER NOT NULL,
   closedAt          INTEGER,
   incidentId        TEXT REFERENCES incident(id),
-  explained         INTEGER NOT NULL DEFAULT 0,
-
-  UNIQUE (source, sourceId)
+  explained         INTEGER NOT NULL DEFAULT 0
 );
+
+-- At most one OPEN signal per (source, sourceId), not one for all time.
+--
+-- A Grafana fingerprint is stable for the life of the rule, so an all-time
+-- unique key means the second time an alert ever fires it is discarded as a
+-- duplicate: one incident per alert, forever. It also silently disables
+-- recurrence, since the delivery proving a resolution was premature is the
+-- one most certain to collide with the signal that resolution closed.
+-- Scoped to open signals, a repeat delivery still collapses while the
+-- incident is live, and becomes a new signal once the old one is closed.
+CREATE UNIQUE INDEX IF NOT EXISTS signal_open_source_idx
+  ON signal (source, sourceId) WHERE closedAt IS NULL;
 
 -- The open list, which is the only query the control plane itself makes often.
 CREATE INDEX IF NOT EXISTS incident_status_idx ON incident (status);

@@ -566,7 +566,5 @@ export const createGrafanaAdapter = (
     dedupKey: (signal) => `${signal.source}:${signal.sourceId}`,
     prefetchEvidence,
     isResolved: async (signal: Signal) => resolved.has(signal.sourceId),
-
-    tracksResolution: true,
   };
 };

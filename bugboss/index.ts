@@ -648,7 +648,6 @@ export const createBugBoss = async (
       correlator,
       slack: options.slack,
       evidence,
-      tracksResolution: (source) => ingress.get(source).tracksResolution,
     });
 
     return {
@@ -692,7 +691,8 @@ export const createBugBoss = async (
     const inserted = await db.withWrite((w: Database.Database) => {
       const exists = w
         .prepare(
-          "SELECT id, incidentId FROM signal WHERE source = ? AND sourceId = ?",
+          `SELECT id, incidentId FROM signal
+             WHERE source = ? AND sourceId = ? AND closedAt IS NULL`,
         )
         .get(signal.source, signal.sourceId) as
         | { id: string; incidentId: string | null }

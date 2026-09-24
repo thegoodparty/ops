@@ -128,16 +128,6 @@ export interface SignalAdapter {
    */
   isResolved(signal: Signal): Promise<boolean>;
 
-  /**
-   * Whether `isResolved` can ever become true on its own. False for sources
-   * that only ever report a problem starting, where an agent's verification
-   * is the only resolution there will be.
-   *
-   * This is the difference between "the alert is still firing" and "no
-   * machine will ever tell us this stopped", which look identical in the
-   * signal row and must not be treated the same at resolution time.
-   */
-  readonly tracksResolution: boolean;
 }
 
 export interface IncomingRequest {

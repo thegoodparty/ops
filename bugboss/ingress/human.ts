@@ -187,7 +187,5 @@ export const createHumanAdapter = (
      * this adapter can observe.
      */
     isResolved: async (_signal: Signal) => false,
-
-    tracksResolution: false,
   };
 };

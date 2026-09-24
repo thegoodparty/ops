@@ -64,7 +64,6 @@ const toolsFor = (incidentId: string): ToolApi =>
     correlator,
     slack,
     evidence,
-    tracksResolution: () => true,
   });
 
 const seed = async (id: string, opts: { closedAt?: number } = {}) => {
@@ -282,8 +281,18 @@ describe("invariant 1: every attached signal must be explained", () => {
   });
 });
 
-describe("invariant 2: an incident cannot close over a firing signal", () => {
-  it("splits the firing signal out rather than resolving over it", async () => {
+describe("invariant 2: resolution closes the signals it claims to have fixed", () => {
+  // The tool API used to split any signal without a resolve notification out
+  // into a recurrence. That asked whether we had heard the alert stop, not
+  // whether it was still broken, and the two differ on the ordinary path:
+  // the agent watches the alert go quiet and reports before Grafana's
+  // resolved delivery lands. Every resolution split its own signal and
+  // launched an agent on it.
+  //
+  // What proves a resolution wrong is a delivery arriving after it, which
+  // triage judges and which `signal_open_source_idx` makes reachable. The
+  // end-to-end case lives in test/e2e.test.ts.
+  it("closes every open signal on the incident", async () => {
     await seed("sig-a");
     await seed("sig-b");
     const id = await openIncident(["sig-a", "sig-b"]);
@@ -298,21 +307,19 @@ describe("invariant 2: an incident cannot close over a firing signal", () => {
 
     assert.equal(res.ok, true, res.error);
     assert.equal(incidentRow(id)?.status, "RESOLVED");
-    assert.deepEqual(signalsOn(id), ["sig-a"]);
-
-    const moved = db.get<{ incidentId: string }>(
-      "SELECT incidentId FROM signal WHERE id = 'sig-b'",
+    assert.deepEqual(
+      signalsOn(id),
+      ["sig-a", "sig-b"],
+      "both stay attached: this incident is the record of what was worked",
     );
-    assert.notEqual(moved?.incidentId, id);
-    assert.equal(
-      incidentRow(moved!.incidentId)?.recurrenceOf,
-      id,
-      "the split carries recurrenceOf, so its agent starts knowing we thought this was fixed",
+    const open = db.query(
+      "SELECT id FROM signal WHERE incidentId = ? AND closedAt IS NULL",
+      [id],
     );
-    assert.equal(incidentRow(moved!.incidentId)?.status, "INVESTIGATING");
+    assert.equal(open.length, 0, "a RESOLVED incident holds no open signal");
   });
 
-  it("applies the same deterministic check at close", async () => {
+  it("closes a signal that reopened between RESOLVED and CLOSED", async () => {
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
     const tools = toolsFor(id);
@@ -320,7 +327,6 @@ describe("invariant 2: an incident cannot close over a firing signal", () => {
     await goesQuiet("sig-a");
     await tools.reportResolved({ prUrls: [], evidence: "quiet" });
 
-    // Something re-opened the signal between RESOLVED and CLOSED.
     await db.withWrite((w) => {
       w.prepare("UPDATE signal SET closedAt = NULL WHERE id = 'sig-a'").run();
     });
@@ -333,11 +339,11 @@ describe("invariant 2: an incident cannot close over a firing signal", () => {
 
     assert.equal(res.ok, true, res.error);
     assert.equal(incidentRow(id)?.status, "CLOSED");
-    assert.deepEqual(signalsOn(id), [], "the firing signal did not close with it");
-    const moved = db.get<{ incidentId: string }>(
-      "SELECT incidentId FROM signal WHERE id = 'sig-a'",
+    const open = db.query(
+      "SELECT id FROM signal WHERE incidentId = ? AND closedAt IS NULL",
+      [id],
     );
-    assert.equal(incidentRow(moved!.incidentId)?.recurrenceOf, id);
+    assert.equal(open.length, 0, "a CLOSED incident holds no open signal");
   });
 });
 
@@ -385,7 +391,6 @@ describe("the scoped token", () => {
       correlator,
       slack,
       evidence,
-      tracksResolution: () => true,
     });
 
     const res = await expired.reportRootCause({
@@ -408,7 +413,6 @@ describe("the scoped token", () => {
       correlator,
       slack,
       evidence,
-      tracksResolution: () => true,
     });
 
     const res = await forged.getIncident();
@@ -547,7 +551,6 @@ describe("getIncident", () => {
       tokenSecret: SECRET,
       correlator,
       slack,
-      tracksResolution: () => true,
       evidence: {
         load: async () => {
           throw new Error("S3 is having a day");

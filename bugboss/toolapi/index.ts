@@ -88,13 +88,6 @@ export interface ToolApiDeps {
   correlator: Correlator;
   slack: ThreadPoster;
   evidence: EvidenceStore;
-  /**
-   * Whether a source can observe its own resolution. A signal from a source
-   * that cannot is closed on the agent's evidence rather than split out as
-   * still firing: splitting it would relaunch an agent on the bug that agent
-   * just fixed, and again after that.
-   */
-  tracksResolution(source: string): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +97,7 @@ type Body<T> = { ok: true; data: T } | { ok: false; error: string };
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
 
 export const createToolApi = (deps: ToolApiDeps): ToolApi => {
-  const { db, correlator, slack, evidence, tracksResolution } = deps;
+  const { db, correlator, slack, evidence } = deps;
 
   const readIncident = (id: string): Incident | undefined => {
     const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [id]);
@@ -208,41 +201,30 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    * ground a resolution claimed.
    */
   /**
-   * Close the signals nothing will ever close for us. An agent reaching
-   * RESOLVED is the verification a human report waits for, so at that point
-   * the report is genuinely over.
+   * Resolution closes the incident's open signals. It does not split them.
+   *
+   * Splitting here asked the wrong question. "Has a resolve notification
+   * arrived yet" is not "is this still broken": the agent watches the alert
+   * go quiet and reports, and Grafana's resolved delivery lands after that,
+   * so on the ordinary path every single resolution split its own signal
+   * into a fresh incident and the dispatcher launched an agent on it. A
+   * source that cannot report resolution at all never closed.
+   *
+   * The evidence that a resolution was wrong is a signal arriving after it,
+   * which triage already judges: it may not attach to a RESOLVED incident
+   * and can point `recurrenceOf` at the one that claimed the ground. That is
+   * positive evidence rather than absence of contrary evidence, and it is
+   * the mechanism the spec describes. This is the only one now.
    */
-  const closeUntrackedSignals = (
+  const closeOpenSignals = (
     w: Database.Database,
     incidentId: string,
     at: number,
   ): void => {
-    const untracked = getSignalsFor(w, incidentId).filter(
-      (s) => s.closedAt === null && !tracksResolution(s.source),
-    );
-    for (const s of untracked) {
-      w.prepare("UPDATE signal SET closedAt = ? WHERE id = ?").run(at, s.id);
-    }
+    w.prepare(
+      "UPDATE signal SET closedAt = ? WHERE incidentId = ? AND closedAt IS NULL",
+    ).run(at, incidentId);
   };
-
-  const splitFiringSignals = (
-    w: Database.Database,
-    incidentId: string,
-  ): AssignResult[] =>
-    getSignalsFor(w, incidentId)
-      .filter((s) => s.closedAt === null && tracksResolution(s.source))
-      .map((s) =>
-        assign(
-          w,
-          {
-            signalIds: [s.id],
-            target: "NEW",
-            reason: `still firing when incident ${incidentId} claimed resolution: ${s.title}`,
-          },
-          { kind: "agent", incidentId },
-          { recurrenceOf: incidentId },
-        ),
-      );
 
   const applyMerge = (
     w: Database.Database,
@@ -415,35 +397,21 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["FIXING"], "reportResolved");
       if (stop) return reject(stop);
 
-      const splits = await db.withWrite((w) => {
+      await db.withWrite((w) => {
         const at = Date.now();
-        closeUntrackedSignals(w, incidentId, at);
-        const out = splitFiringSignals(w, incidentId);
+        closeOpenSignals(w, incidentId, at);
         w.prepare(
           "UPDATE incident SET status = 'RESOLVED', resolvedAt = ?, prUrls = ? WHERE id = ?",
         ).run(at, JSON.stringify(args.prUrls), incidentId);
-        return out;
       });
-      splits.forEach(logAssign);
 
       await notify(
         incident,
         `Incident ${incidentId} resolved. ${args.evidence}${args.prUrls.length ? ` PRs: ${args.prUrls.join(", ")}` : ""}`,
       );
-      if (splits.length > 0) {
-        await notify(
-          incident,
-          `${splits.length} signal(s) were still firing and did not resolve with ${incidentId}. Now incident(s) ${splits.map((s) => s.target).join(", ")}, recorded as a recurrence.`,
-        );
-      }
-
       return {
         ok: true,
-        data: {
-          incidentId,
-          status: "RESOLVED" as IncidentStatus,
-          stillFiring: splits.map((s) => s.target),
-        },
+        data: { incidentId, status: "RESOLVED" as IncidentStatus },
       };
     });
 
@@ -455,9 +423,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["RESOLVED"], "reportAnalysis");
       if (stop) return reject(stop);
 
-      const splits = await db.withWrite((w) => {
-        closeUntrackedSignals(w, incidentId, Date.now());
-        const out = splitFiringSignals(w, incidentId);
+      await db.withWrite((w) => {
+        closeOpenSignals(w, incidentId, Date.now());
         w.prepare(
           `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
              usersImpacted = ?, impactQuery = ?
@@ -469,9 +436,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           args.impactQuery,
           incidentId,
         );
-        return out;
       });
-      splits.forEach(logAssign);
 
       await notify(
         incident,
@@ -480,11 +445,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       return {
         ok: true,
-        data: {
-          incidentId,
-          status: "CLOSED" as IncidentStatus,
-          stillFiring: splits.map((s) => s.target),
-        },
+        data: { incidentId, status: "CLOSED" as IncidentStatus },
       };
     });
 
