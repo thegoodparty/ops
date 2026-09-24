@@ -793,8 +793,16 @@ docs.aws.amazon.com on thinking semantics.
 The agent talks to Slack and GitHub **directly**, with its own scoped tokens,
 rather than through the Boss.
 
-**Slack.** Posts questions, hypotheses and PR links into the incident thread
-itself.
+**Slack, through the Boss rather than directly.** This reverses an earlier
+version of this design, and the build was right to push back.
+
+A Slack bot token is broad: it can post anywhere the bot is a member and read
+channel history. Handing that to a process whose job is reading
+attacker-writable log lines undoes most of the containment the child-process
+split buys. Routing posts through the Boss costs one hop the agent was
+already making for everything else, and buys an enforceable rule: **an agent
+may only post to its own incident's thread.** A credential cannot enforce
+that; a mediating API can.
 
 `contact_human(message)` is one tool in the agent's harness:
 
