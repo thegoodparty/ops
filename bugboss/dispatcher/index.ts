@@ -21,6 +21,9 @@ import type {
   RunningAgent,
   ToolApi,
 } from "../types";
+// The child's own grace, read rather than copied: the parent's backstop is
+// defined relative to it, so a change there must move this too.
+import { DEADLINE_GRACE_SECONDS } from "../agent/run";
 import type { AgentCredentialProvider } from "./credentials";
 import { buildChildEnv } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
@@ -95,11 +98,27 @@ interface EligibleRow {
   firstSignalAt: number;
 }
 
+/**
+ * The statuses the agent still owns, so the statuses that must have a live
+ * one. RESOLVED belongs here: `report_analysis` is the only exit from it and
+ * it is the agent's to call, so an incident whose post-mortem was interrupted
+ * by a restart needs relaunching like any other. Leaving it out stranded it at
+ * `owner: 'agent'` with nothing to relaunch it and no path to a human, and it
+ * is invisible to the escalated-and-unclaimed digest while owner stays agent.
+ * `slack/relay.ts` holds the same list as AGENT_RUNNING_STATUSES.
+ */
+const AGENT_STATUSES: readonly IncidentStatus[] = [
+  "INVESTIGATING",
+  "FIXING",
+  "RESOLVED",
+];
+
 // No ORDER BY: a priority order is a scheduler, and this is not one.
 const ELIGIBLE_SQL = `
   SELECT id, status, sessionRef, attempts, lastStartedAt, firstSignalAt
   FROM incident
-  WHERE status IN ('INVESTIGATING', 'FIXING') AND owner = 'agent'
+  WHERE status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+    AND owner = 'agent'
 `;
 
 interface Entry {
@@ -107,7 +126,16 @@ interface Entry {
   pid: number;
   startedAt: number;
   phase: string;
+  /** What the child got as BUGBOSS_DEADLINE_AT: its own soft deadline. */
   deadlineAt: number;
+  /**
+   * The parent's backstop, a tick later than the child's hard stop. The child
+   * treats deadlineAt as soft, steers itself to write a handoff brief, and
+   * aborts DEADLINE_GRACE_SECONDS later; killing at deadlineAt gave it one
+   * tick of that window, so every timeout escalation handed a human the
+   * placeholder brief instead of the agent's.
+   */
+  killAt: number;
   sessionRef: string | null;
   attempt: number;
   proc: AgentProcess | null;
@@ -126,7 +154,7 @@ const deadlineBrief = (e: Entry, ranSeconds: number): string =>
   [
     "Escalated by the dispatcher. The agent did not hand off itself.",
     "",
-    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt} and was killed, so it never wrote a brief.`,
+    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not hand off in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed, so it never wrote a brief.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
@@ -270,7 +298,20 @@ export class Dispatcher {
           `${failures} consecutive launches died within ${this.fastFailureMs / 1000}s`,
           crashLoopBrief(row, failures, this.fastFailureMs / 1000),
         );
+        // Cleared either way. A successful escalation flipped the incident to
+        // a human, and if they hand it back the agent earns a fresh three
+        // launches rather than being re-escalated on the first tick. A failed
+        // one must fall back to relaunching: keeping the counter at the
+        // ceiling retried the same failing escalation every tick for as long
+        // as the incident stayed open, which never resolved and never said so.
+        this.fastFailures.delete(row.id);
         if (ok) escalated.push(row.id);
+        else
+          alarm("crash_loop_escalation_failed", {
+            incidentId: row.id,
+            failures,
+            note: "nobody was told; relaunching instead of retrying the escalation",
+          });
         continue;
       }
 
@@ -360,6 +401,9 @@ export class Dispatcher {
       startedAt: now,
       phase: row.status,
       deadlineAt,
+      killAt:
+        deadlineAt +
+        (DEADLINE_GRACE_SECONDS + this.config.tickSeconds) * 1000,
       sessionRef: row.sessionRef,
       attempt,
       proc: null,
@@ -394,6 +438,7 @@ export class Dispatcher {
       attempt,
       resumed: row.sessionRef !== null,
       deadlineAt,
+      killAt: entry.killAt,
     });
 
     // Called synchronously so a child registers its pid before this returns.
@@ -444,7 +489,7 @@ export class Dispatcher {
     const killed: string[] = [];
     const escalated: string[] = [];
     for (const entry of [...this.running.values()]) {
-      if (entry.killed || now < entry.deadlineAt) continue;
+      if (entry.killed || now < entry.killAt) continue;
       entry.killed = true;
       killed.push(entry.incidentId);
       const ranSeconds = Math.round((now - entry.startedAt) / 1000);
@@ -452,7 +497,12 @@ export class Dispatcher {
         incidentId: entry.incidentId,
         pid: entry.pid,
         ranSeconds,
+        deadlineAt: entry.deadlineAt,
+        graceSeconds: DEADLINE_GRACE_SECONDS,
       });
+      // Kill first, then escalate: an agent that used its grace already called
+      // hand_off, and escalate re-reads owner, so the placeholder brief is
+      // suppressed rather than racing the real one.
       entry.proc?.kill();
       const ok = await this.escalate(
         entry.incidentId,
@@ -479,7 +529,7 @@ export class Dispatcher {
       [incidentId],
     );
     if (!row || row.owner !== "agent") return false;
-    if (row.status !== "INVESTIGATING" && row.status !== "FIXING") return false;
+    if (!AGENT_STATUSES.includes(row.status)) return false;
 
     try {
       await this.toolApiFor(incidentId).handOff({ reason, brief });

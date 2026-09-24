@@ -19,10 +19,13 @@ COPY dist/bugboss/ ./dist/bugboss/
 # __dirname. Without it the container starts and dies on the first query.
 COPY bugboss/db/schema.sql ./dist/bugboss/db/schema.sql
 
-# Each incident agent clones omni into its own directory under here. The task
-# gets 200 GiB of ephemeral storage for exactly this.
-RUN mkdir -p /app/work && adduser -D -s /bin/bash agent \
-  && chown -R agent:agent /app
+# /app/work is where each incident agent clones omni; the task gets 200 GiB of
+# ephemeral storage for exactly that. /data holds the SQLite file, which is
+# BUGBOSS_DB_PATH's default and is created here because the container runs as
+# a non-root user: without it the first write throws SQLITE_CANTOPEN and the
+# task crash-loops before it can report why.
+RUN mkdir -p /app/work /data && adduser -D -s /bin/bash agent \
+  && chown -R agent:agent /app /data
 USER agent
 ENV SHELL=/bin/bash
 

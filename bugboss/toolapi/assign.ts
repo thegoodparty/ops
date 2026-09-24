@@ -201,7 +201,11 @@ export const assign = (
   } else {
     const existing = getIncidentRow(db, req.target);
     if (!existing) throw new AssignError(`unknown incident: ${req.target}`);
-    if (existing.status === "CLOSED" || existing.status === "MERGED") {
+    // Never across RESOLVED either. A signal arriving after a resolution is
+    // evidence the resolution was wrong, so it belongs to a recurrence and
+    // not to the incident that claimed the ground. Triage judges that; this
+    // is the single writer that holds it.
+    if (!OPEN_STATUSES.includes(existing.status)) {
       throw new AssignError(
         `incident ${req.target} is ${existing.status} and cannot take signals`,
       );

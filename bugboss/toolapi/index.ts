@@ -169,16 +169,24 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     }
   };
 
-  const notify = async (incident: Incident, text: string): Promise<void> => {
+  const notify = async (incident: Incident, text: string): Promise<boolean> => {
     try {
       await slack.post(incident.slackThreadTs, text);
+      return true;
     } catch (err) {
       log("thread_post_failed", { incidentId: incident.id, error: String(err) });
+      return false;
     }
   };
 
   const reject = (error: string): Body<never> => ({ ok: false, error });
 
+  /**
+   * The cheap probe, on the read-only connection. It runs before the call
+   * reaches the write queue, so it can reject early but cannot hold a
+   * transition: every write below repeats it as a predicate on its own
+   * UPDATE, which is what actually decides.
+   */
   const blocked = (
     incident: Incident,
     allowed: IncidentStatus[],
@@ -191,6 +199,16 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       return `${tool} requires ${allowed.join(" or ")}; incident ${incident.id} is ${incident.status}`;
     }
     return null;
+  };
+
+  /** The guarded UPDATE matched nothing, so someone else moved the record. */
+  const raced = (incidentId: string, tool: string): Body<never> => {
+    const now = readIncident(incidentId);
+    return reject(
+      now
+        ? `${tool} lost a race on incident ${incidentId}: it is ${now.status}, owned by ${now.owner === "human" ? "a human" : "an agent"}, and the transition did not apply`
+        : `${tool} lost a race on incident ${incidentId}, which is gone`,
+    );
   };
 
   /**
@@ -236,6 +254,12 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     if (absorb.status !== "INVESTIGATING" && absorb.status !== "FIXING") {
       return null;
     }
+    // Skipped rather than thrown: assign refuses a target that is not open,
+    // and a stale merge proposal must not fail the root cause that ran it.
+    const into = getIncidentRow(w, merge.into);
+    if (!into || (into.status !== "INVESTIGATING" && into.status !== "FIXING")) {
+      return null;
+    }
     const signals = getSignalsFor(w, merge.absorb);
     if (signals.length === 0) return null;
     return assign(
@@ -274,18 +298,24 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       }
 
       const splits = await db.withWrite((w) => {
-        w.prepare(
-          `UPDATE incident SET status = 'FIXING', rootCause = ?, fixingAt = ?,
-             usersImpacted = COALESCE(?, usersImpacted),
-             impactQuery = COALESCE(?, impactQuery)
-           WHERE id = ?`,
-        ).run(
-          args.cause,
-          Date.now(),
-          args.usersImpacted ?? null,
-          args.impactQuery ?? null,
-          incidentId,
-        );
+        // Guarded on status as well as id. Correlation can merge this
+        // incident away while the call waits its turn in the write queue,
+        // and a FIXING record with no signals is eligible forever.
+        const taken = w
+          .prepare(
+            `UPDATE incident SET status = 'FIXING', rootCause = ?, fixingAt = ?,
+               usersImpacted = COALESCE(?, usersImpacted),
+               impactQuery = COALESCE(?, impactQuery)
+             WHERE id = ? AND status = 'INVESTIGATING' AND owner = 'agent'`,
+          )
+          .run(
+            args.cause,
+            Date.now(),
+            args.usersImpacted ?? null,
+            args.impactQuery ?? null,
+            incidentId,
+          ).changes;
+        if (taken === 0) return null;
 
         // Scoped by incidentId as well as by id, so this statement cannot
         // reach another incident's signals even if the check above regresses.
@@ -311,6 +341,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             ),
           );
       });
+      if (splits === null) return raced(incidentId, "reportRootCause");
       splits.forEach(logAssign);
 
       if (splits.length > 0) {
@@ -371,11 +402,17 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       );
       if (stop) return reject(stop);
 
-      await db.withWrite((w) => {
-        w.prepare(
-          "UPDATE incident SET usersImpacted = ?, impactQuery = ? WHERE id = ?",
-        ).run(args.usersImpacted, args.query, incidentId);
-      });
+      const applied = await db.withWrite(
+        (w) =>
+          w
+            .prepare(
+              `UPDATE incident SET usersImpacted = ?, impactQuery = ?
+               WHERE id = ? AND status IN ('INVESTIGATING','FIXING','RESOLVED')
+                 AND owner = 'agent'`,
+            )
+            .run(args.usersImpacted, args.query, incidentId).changes,
+      );
+      if (applied === 0) return raced(incidentId, "reportImpact");
 
       // A human deciding whether to step in needs the current number, so a
       // change goes to the thread. An unchanged number is not news.
@@ -397,13 +434,20 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["FIXING"], "reportResolved");
       if (stop) return reject(stop);
 
-      await db.withWrite((w) => {
+      const applied = await db.withWrite((w) => {
         const at = Date.now();
+        const taken = w
+          .prepare(
+            `UPDATE incident SET status = 'RESOLVED', resolvedAt = ?, prUrls = ?,
+               resolvedEvidence = ?
+             WHERE id = ? AND status = 'FIXING' AND owner = 'agent'`,
+          )
+          .run(at, JSON.stringify(args.prUrls), args.evidence, incidentId).changes;
+        if (taken === 0) return false;
         closeOpenSignals(w, incidentId, at);
-        w.prepare(
-          "UPDATE incident SET status = 'RESOLVED', resolvedAt = ?, prUrls = ? WHERE id = ?",
-        ).run(at, JSON.stringify(args.prUrls), incidentId);
+        return true;
       });
+      if (!applied) return raced(incidentId, "reportResolved");
 
       await notify(
         incident,
@@ -423,20 +467,26 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["RESOLVED"], "reportAnalysis");
       if (stop) return reject(stop);
 
-      await db.withWrite((w) => {
-        closeOpenSignals(w, incidentId, Date.now());
-        w.prepare(
-          `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
-             usersImpacted = ?, impactQuery = ?
-           WHERE id = ?`,
-        ).run(
-          Date.now(),
-          args.postmortem,
-          args.usersImpacted,
-          args.impactQuery,
-          incidentId,
-        );
+      const applied = await db.withWrite((w) => {
+        const at = Date.now();
+        const taken = w
+          .prepare(
+            `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
+               usersImpacted = ?, impactQuery = ?
+             WHERE id = ? AND status = 'RESOLVED' AND owner = 'agent'`,
+          )
+          .run(
+            at,
+            args.postmortem,
+            args.usersImpacted,
+            args.impactQuery,
+            incidentId,
+          ).changes;
+        if (taken === 0) return false;
+        closeOpenSignals(w, incidentId, at);
+        return true;
       });
+      if (!applied) return raced(incidentId, "reportAnalysis");
 
       await notify(
         incident,
@@ -460,6 +510,20 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         );
       }
 
+      // The post comes first because it is the part that cannot be retried
+      // from anywhere else. Once owner is 'human' the dispatcher stops
+      // relaunching, so committing without the brief leaves an escalation
+      // nobody was told about and nothing to pick it back up.
+      const posted = await notify(
+        incident,
+        `Incident ${incidentId} handed to a human: ${args.reason}\n\n${args.brief}`,
+      );
+      if (!posted) {
+        return reject(
+          `could not post the hand-off brief for incident ${incidentId}; it stays owned by the agent so the hand off can be retried`,
+        );
+      }
+
       // Not guarded on owner. A human claiming the incident in Slack flips
       // owner first, and the agent's last act is still to write the brief.
       await db.withWrite((w) => {
@@ -467,11 +531,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           incidentId,
         );
       });
-
-      await notify(
-        incident,
-        `Incident ${incidentId} handed to a human: ${args.reason}\n\n${args.brief}`,
-      );
 
       return { ok: true, data: { incidentId, owner: "human" as const } };
     });

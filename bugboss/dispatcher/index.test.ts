@@ -8,6 +8,7 @@ import type { ChildProcess } from "node:child_process";
 
 import Database from "better-sqlite3";
 
+import { DEADLINE_GRACE_SECONDS } from "../agent/run";
 import type { DispatcherConfig, ToolApi } from "../types";
 import { createDispatcher, type DispatcherDb, type DispatcherDeps } from "./index";
 import { createChildProcessSpawn, type AgentSpawnContext, type SpawnAgent } from "./spawn";
@@ -131,8 +132,11 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", { status: "INVESTIGATING" });
     insertIncident(sqlite, "i2", { status: "FIXING" });
     insertIncident(sqlite, "i3", { status: "INVESTIGATING", owner: "human" });
+    // RESOLVED is an agent status: report_analysis is the only exit from it
+    // and it is the agent's to call, so a RESOLVED incident still needs one.
     insertIncident(sqlite, "i4", { status: "RESOLVED" });
     insertIncident(sqlite, "i5", { status: "CLOSED" });
+    insertIncident(sqlite, "i6", { status: "MERGED" });
 
     const spawned: string[] = [];
     const spawn: SpawnAgent = async (ctx) => {
@@ -143,8 +147,11 @@ describe("Dispatcher.tick", () => {
     const result = await d.tick();
     await result.settled;
 
-    assert.deepEqual(spawned.sort(), ["i1", "i2"]);
-    assert.deepEqual(result.started.map((a) => a.incidentId).sort(), ["i1", "i2"]);
+    assert.deepEqual(spawned.sort(), ["i1", "i2", "i4"]);
+    assert.deepEqual(
+      result.started.map((a) => a.incidentId).sort(),
+      ["i1", "i2", "i4"],
+    );
     assert.equal(result.circuitOpen, false);
 
     const attempts = Object.fromEntries(
@@ -152,7 +159,55 @@ describe("Dispatcher.tick", () => {
         .query<{ id: string; attempts: number }>("SELECT id, attempts FROM incident")
         .map((r) => [r.id, r.attempts]),
     );
-    assert.deepEqual(attempts, { i1: 1, i2: 1, i3: 0, i4: 0, i5: 0 });
+    assert.deepEqual(attempts, { i1: 1, i2: 1, i3: 0, i4: 1, i5: 0, i6: 0 });
+    cleanup();
+  });
+
+  it("resumes and escalates a RESOLVED incident, because the post-mortem is the agent's", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    // The container restarted while the agent was drafting the post-mortem.
+    insertIncident(sqlite, "i1", {
+      status: "RESOLVED",
+      attempts: 1,
+      sessionRef: "s-1",
+      lastStartedAt: T0 - 600_000,
+    });
+
+    let clock = T0;
+    let kills = 0;
+    const releases: (() => void)[] = [];
+    const contexts: AgentSpawnContext[] = [];
+    const spawn: SpawnAgent = (ctx) => {
+      contexts.push(ctx);
+      ctx.register({ pid: 91, kill: () => { kills += 1; } });
+      return new Promise<void>((resolve) => releases.push(resolve));
+    };
+
+    const d = createDispatcher(
+      deps({ db, spawn, toolApiFor, config: config({ agentTimeoutSeconds: 60 }), now: () => clock }),
+    );
+
+    const first = await d.tick();
+    assert.deepEqual(first.started.map((a) => a.incidentId), ["i1"]);
+    assert.equal(contexts[0].sessionRef, "s-1", "resume the post-mortem, not restart it");
+    assert.deepEqual(d.list().map((a) => a.phase), ["RESOLVED"]);
+
+    // And if it wedges there, RESOLVED must still reach a human rather than
+    // sitting owner='agent' forever, invisible to the unclaimed digest.
+    clock = T0 + 60_000 + 211_000;
+    const second = await d.tick();
+    assert.equal(kills, 1);
+    assert.deepEqual(second.killed, ["i1"]);
+    assert.deepEqual(second.escalated, ["i1"]);
+    assert.equal(handOffs.length, 1);
+    assert.equal(
+      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
+      "human",
+    );
+
+    releases.forEach((r) => r());
+    await d.drain();
     cleanup();
   });
 
@@ -249,6 +304,54 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  it("falls back to relaunching when the crash-loop escalation fails", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let launches = 0;
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+    };
+
+    let handOffFails = true;
+    const failingToolApiFor = (incidentId: string): ToolApi => ({
+      ...toolApiFor(incidentId),
+      handOff: async (args) => {
+        if (handOffFails) throw new Error("Slack is down");
+        return toolApiFor(incidentId).handOff(args);
+      },
+    });
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor: failingToolApiFor,
+        config: config({ maxAttempts: 3 }),
+      }),
+    );
+
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    assert.equal(launches, 3);
+
+    const failed = await d.tick();
+    assert.deepEqual(failed.escalated, [], "the handoff threw, so nobody was told");
+    assert.equal(launches, 3, "this tick spends itself on the escalation");
+
+    // Before: the counter stayed at the ceiling, so every later tick retried
+    // the same failing escalation and the incident never moved again.
+    await (await d.tick()).settled;
+    assert.equal(launches, 4, "a failed escalation falls back to relaunching");
+
+    handOffFails = false;
+    for (let i = 0; i < 2; i += 1) await (await d.tick()).settled;
+    const recovered = await d.tick();
+    assert.deepEqual(recovered.escalated, ["i1"], "and it can still escalate later");
+    assert.equal(handOffs.length, 1);
+    cleanup();
+  });
+
   it("treats an interrupted agent as interrupted, not as crashing", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, handOffs } = makeTools(sqlite);
@@ -330,7 +433,7 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
-  it("kills a child that passes its deadline and hands off on its behalf", async () => {
+  it("leaves the child its whole handoff grace before the kill", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, handOffs } = makeTools(sqlite);
     insertIncident(sqlite, "i1");
@@ -350,7 +453,7 @@ describe("Dispatcher.tick", () => {
         db,
         spawn,
         toolApiFor,
-        config: config({ agentTimeoutSeconds: 60 }),
+        config: config({ agentTimeoutSeconds: 60, tickSeconds: 30 }),
         now: () => clock,
       }),
     );
@@ -359,24 +462,84 @@ describe("Dispatcher.tick", () => {
     assert.deepEqual(d.list(), [
       { incidentId: "i1", pid: 4242, startedAt: T0, phase: "INVESTIGATING" },
     ]);
-    assert.equal(contexts[0].deadlineAt, T0 + 60_000);
+    assert.equal(
+      contexts[0].deadlineAt,
+      T0 + 60_000,
+      "the child still gets the soft deadline, unchanged",
+    );
 
+    // The soft deadline is the child's to act on: it steers itself to write a
+    // handoff brief and hard-stops DEADLINE_GRACE_SECONDS later. A parent
+    // SIGKILL here is what left every timeout escalation with an empty brief.
     clock = T0 + 61_000;
-    const second = await d.tick();
+    const duringGrace = await d.tick();
+    assert.equal(kills, 0, "killing at the soft deadline eats the grace window");
+    assert.deepEqual(duringGrace.killed, []);
+    assert.deepEqual(duringGrace.escalated, []);
+    assert.equal(handOffs.length, 0);
+
+    clock = T0 + 60_000 + DEADLINE_GRACE_SECONDS * 1000 - 1_000;
+    const beforeHardStop = await d.tick();
+    assert.equal(kills, 0, "still inside the grace the child was promised");
+    assert.deepEqual(beforeHardStop.killed, []);
+
+    // A tick past the child's own hard stop, so the backstop only fires for an
+    // agent that was too wedged to use its grace at all.
+    clock = T0 + 60_000 + (DEADLINE_GRACE_SECONDS + 30) * 1000 + 1_000;
+    const afterGrace = await d.tick();
 
     assert.equal(kills, 1, "the parent is the backstop for a wedged agent");
-    assert.deepEqual(second.killed, ["i1"]);
-    assert.deepEqual(second.escalated, ["i1"]);
+    assert.deepEqual(afterGrace.killed, ["i1"]);
+    assert.deepEqual(afterGrace.escalated, ["i1"]);
     assert.equal(handOffs.length, 1);
     assert.match(handOffs[0].reason, /deadline/);
 
     // Killed once, not once per tick.
-    clock = T0 + 120_000;
+    clock += 60_000;
     await d.tick();
     assert.equal(kills, 1);
 
     releases.forEach((r) => r());
     await d.drain();
+    cleanup();
+  });
+
+  it("never escalates a child that used its grace to hand off itself", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    insertIncident(sqlite, "i1");
+
+    let kills = 0;
+    const spawn: SpawnAgent = async (ctx) => {
+      ctx.register({ pid: 55, kill: () => { kills += 1; } });
+      // What the child does with the grace the soft deadline buys it.
+      await ctx.handOff({ reason: "out of time", brief: "the real brief" });
+    };
+
+    let clock = T0;
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        config: config({ agentTimeoutSeconds: 60 }),
+        now: () => clock,
+      }),
+    );
+
+    await (await d.tick()).settled;
+
+    clock = T0 + 60_000 + (DEADLINE_GRACE_SECONDS + 60) * 1000;
+    const after = await d.tick();
+
+    assert.equal(kills, 0, "it exited on its own; there is nothing to kill");
+    assert.deepEqual(after.killed, []);
+    assert.deepEqual(after.escalated, []);
+    assert.deepEqual(
+      handOffs.map((h) => h.brief),
+      ["the real brief"],
+      "the agent's brief, not the dispatcher's placeholder",
+    );
     cleanup();
   });
 
