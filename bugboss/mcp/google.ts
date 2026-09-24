@@ -104,11 +104,14 @@ export const createGoogleClient = (
 /**
  * Validates the ID token's envelope claims.
  *
- * The signature is not checked. The token came back on a direct TLS
- * connection to Google's token endpoint, in response to a request carrying
- * our client secret, which OIDC Core 3.1.3.7 accepts in place of signature
- * validation. Verifying it instead would mean a JWKS fetch and cache, and
- * this is the only Google token we ever see.
+ * The signature is deliberately not checked, and this is spec-compliant
+ * rather than a shortcut: OIDC Core 3.1.3.7 step 6 allows TLS server
+ * validation in place of signature checking when the token arrives by direct
+ * client-to-token-endpoint communication, which is exactly this flow,
+ * authenticated with our client secret.
+ *
+ * Do not "fix" this by adding a JWKS fetch. If we ever do want that second
+ * layer, it belongs behind the `GoogleClient` port, not here.
  */
 export const verifyGoogleIdToken = (
   idToken: string,

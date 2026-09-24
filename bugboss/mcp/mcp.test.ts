@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import type { AddressInfo } from "node:net";
 import { after, describe, it } from "node:test";
 import { OAuthError } from "@modelcontextprotocol/server";
 import { createMcpServer } from "./index";
+import { serveMcp } from "./serve";
 import { createTokenService } from "./tokens";
 import type { Db } from "../db";
 import {
@@ -348,6 +350,49 @@ describe("the discovery documents", () => {
     // DCR stays off: deprecated, and an unauthenticated write endpoint.
     assert.equal(doc.registration_endpoint, undefined);
     await server.close();
+  });
+});
+
+describe("the standalone listener", () => {
+  // Automates check A: the 401 challenge has to survive a real HTTP hop
+  // spelled `WWW-Authenticate`, or OAuth discovery never starts.
+  it("serves the challenge over real HTTP", async () => {
+    const db = await openTestDb();
+    openDbs.push(db);
+    const { mcp, server } = serveMcp({
+      config,
+      db,
+      sessions: stubSessions(),
+      reportSignal: recordingReporter().reportSignal,
+      port: 0,
+      hostname: "127.0.0.1",
+    });
+    if (!server.listening) {
+      await new Promise<void>((resolve) =>
+        server.once("listening", () => resolve()),
+      );
+    }
+    const { port } = server.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+
+      assert.equal(res.status, 401);
+      const challenge = res.headers.get("www-authenticate");
+      assert.ok(challenge, "WWW-Authenticate did not survive the HTTP hop");
+      assert.match(challenge, /resource_metadata="/);
+
+      const notAllowed = await fetch(`http://127.0.0.1:${port}/mcp`);
+      assert.equal(notAllowed.status, 405);
+      assert.equal(notAllowed.headers.get("allow"), "POST");
+    } finally {
+      server.close();
+      await mcp.close();
+    }
   });
 });
 
