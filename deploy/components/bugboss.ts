@@ -376,13 +376,16 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
-  // What a compromised agent gets, and the design assumes one is: read-only
-  // telemetry and its own model calls. No S3, no Secrets Manager, no ECS or
-  // ECR write, no IAM, and no `sts:AssumeRole`, so it cannot pivot. The one
-  // real exposure is account-wide CloudWatch Logs read, which is inseparable
-  // from the job — an agent that cannot read arbitrary log groups cannot
-  // investigate. Attribution comes free from the role session name the
-  // parent sets per incident, which CloudTrail records.
+  // What a compromised agent gets, and the design assumes one is. Primary
+  // observability is Grafana — Loki, Tempo and Prometheus over MCP — so AWS
+  // is only for the layer beneath it: a task that never started, an OOM kill,
+  // a crash that happened before anything reached Loki. That is why there is
+  // no RDS or load balancer access here; neither is reachable that way and
+  // neither was ever needed.
+  //
+  // No S3, no Secrets Manager, no ECS or ECR write, no IAM, and no
+  // `sts:AssumeRole`, so it cannot pivot. Attribution comes free from the
+  // role session name the parent sets per incident, which CloudTrail records.
   const agentRole = new aws.iam.Role("bugbossAgentRole", {
     name: AGENT_ROLE_NAME,
     description:
@@ -416,19 +419,57 @@ export const createBugBoss = (config: BugBossConfig) => {
                 `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:application-inference-profile/*`,
               ],
             },
+            // Service events, which say why a task failed to start or was
+            // replaced, come back in DescribeServices output.
             {
-              Sid: "ReadOnlyInvestigation",
+              Sid: "DeploymentState",
+              Effect: "Allow",
+              Action: ["ecs:Describe*", "ecs:List*"],
+              Resource: ["*"],
+            },
+            // The line is our application logs, which an agent may read,
+            // against infrastructure and security logs, which it may not:
+            // VPC flow logs, GuardDuty, RDS OS metrics and the VPN groups
+            // stay unreadable. A new prefix belongs here only if it carries
+            // logs our own code emits.
+            //
+            // Derive the prefixes from the live account rather than from the
+            // service that writes them. SST does not use `/ecs` or
+            // `/aws/ecs`, so leaving `/sst/cluster/*` out would silently
+            // exclude gp-api, election-api and people-api.
+            {
+              Sid: "ApplicationLogContent",
               Effect: "Allow",
               Action: [
-                "ecs:Describe*",
-                "ecs:List*",
                 "logs:FilterLogEvents",
                 "logs:GetLogEvents",
-                "logs:Describe*",
+                "logs:DescribeLogStreams",
+              ],
+              Resource: [
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/ecs/*`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/ecs/*`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/sst/cluster/*`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/*`,
+              ],
+            },
+            // Unscoped because a resource-restricted DescribeLogGroups denies
+            // the whole call rather than filtering it, which breaks discovery
+            // outright. Group names are not content.
+            {
+              Sid: "LogGroupDiscovery",
+              Effect: "Allow",
+              Action: ["logs:DescribeLogGroups"],
+              Resource: ["*"],
+            },
+            // Metrics cannot be resource-scoped meaningfully, and they are
+            // numbers rather than content.
+            {
+              Sid: "Metrics",
+              Effect: "Allow",
+              Action: [
                 "cloudwatch:GetMetricData",
                 "cloudwatch:GetMetricStatistics",
-                "rds:Describe*",
-                "elasticloadbalancing:Describe*",
+                "cloudwatch:ListMetrics",
               ],
               Resource: ["*"],
             },
@@ -457,13 +498,14 @@ export const createBugBoss = (config: BugBossConfig) => {
       cpuArchitecture: "X86_64",
       operatingSystemFamily: "LINUX",
     },
-    // Fifteen concurrent agents in `FIXING` hold a measured 4.79 GB omni tree
-    // each, which is 72 GB, plus the image, one shared npm cache, and the
-    // SQLite file with its `VACUUM INTO` snapshot. Investigating agents clone
-    // source only and cost a fraction of that. Fargate allows 21-200 GiB and
-    // the first 20 GiB is free, so 100 GiB is roughly six dollars a month —
-    // cheaper than running out of disk halfway through an incident.
-    ephemeralStorage: { sizeInGib: 100 },
+    // The Fargate maximum. Fifteen concurrent agents in `FIXING` hold a
+    // measured 4.79 GB omni tree each, which is 72 GB, plus the image, one
+    // shared npm cache, and the SQLite file with its `VACUUM INTO` snapshot.
+    // Investigating agents clone source only and cost a fraction of that, so
+    // the ceiling is rarely approached. Everything above the free 20 GiB runs
+    // about fifteen dollars a month, which is not worth trading against
+    // running out of disk halfway through an incident.
+    ephemeralStorage: { sizeInGib: 200 },
     containerDefinitions: pulumi.jsonStringify([
       {
         name: "bugboss",
