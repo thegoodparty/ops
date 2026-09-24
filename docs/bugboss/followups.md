@@ -14,7 +14,7 @@ Nothing downstream works until these are done.
 | 2   | Create a **new** `bugboss` Grafana contact point      | Grafana UI                                         | todo     |
 | 3   | Repoint a notification-policy route at it            | Grafana UI                                         | todo     |
 | 4   | Populate the `BUGBOSS` Secrets Manager secret        | AWS console                                        | todo     |
-| 5   | Add `bugbossImageUri` config + an image build step   | `deploy/deploy.sh`, `.github/workflows/deploy.yml` | todo     |
+| 5   | Add `bugbossImageUri` config + an image build step   | `deploy/deploy.sh`, `.github/workflows/deploy.yml` | **done** |
 
 ### The contact point, and three settings that must be right
 
@@ -115,7 +115,7 @@ with a note on the cost, or still open.
 | K   | The Boss's own `ModelClient` (triage, correlation, the Slack agent) had no production implementation: `bugboss/bedrock` is a Pi api provider for the incident agent, not a one-shot client                                                              | resolved: `createBedrockModelClient` in `bugboss/index.ts`      |
 | L   | `SlackAgentModel` had no implementation either. The default built here loops over the same `ModelClient` and persists the transcript per thread, which does **not** carry thinking blocks across a resume the way the incident agent's Pi session does | resolved with a documented floor; replace with a Pi harness if the Slack agent starts reasoning hard |
 | M   | With no `agentRoleArn` configured, a launch hands the child empty AWS credentials and alarms, rather than refusing to launch                                                                                                                           | deliberate, so a local Boss still runs. Revisit if it ever fires in prod |
-| N   | `bugboss/db/schema.sql` is read at runtime from `__dirname` and `tsc` does not copy it into `dist/`                                                                                                                                                    | open, and it belongs to whoever writes the Dockerfile           |
+| N   | `bugboss/db/schema.sql` is read at runtime from `__dirname` and `tsc` does not copy it into `dist/`                                                                                                                                                    | resolved: `bugboss/Dockerfile` copies it beside the compiled `db/index.js` |
 
 ## Separate tickets, out of scope here
 
@@ -150,3 +150,10 @@ with a note on the cost, or still open.
   is application logs but not VPC flow logs, GuardDuty, RDS or the VPN. The
   line is application versus infrastructure, and that rule matters more than
   the list.
+
+## Changed outside BugBoss
+
+- **A root `.dockerignore` now exists** (`node_modules`, `.git`, `.worktrees`,
+  `.claude`). The build context was 583 MB of `node_modules` that neither
+  image copies, since both run `npm ci` inside. This speeds up the delegate
+  worker build too; it does not change either image's contents.

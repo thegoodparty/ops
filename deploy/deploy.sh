@@ -6,6 +6,11 @@ if [ -z "$IMAGE_URI" ]; then
   exit 1
 fi
 
+if [ -z "$BUGBOSS_IMAGE_URI" ]; then
+  echo "Error: BUGBOSS_IMAGE_URI is not set"
+  exit 1
+fi
+
 PULUMI_CONFIG_PASSPHRASE=$(aws ssm get-parameter \
   --name "pulumi-state-config-passphrase" \
   --with-decryption \
@@ -23,6 +28,7 @@ pulumi login s3://goodparty-iac-state
 pulumi stack select "organization/ops/ops-dev" --create
 pulumi config set aws:region "$AWS_REGION"
 pulumi config set workerImageUri "$IMAGE_URI"
+pulumi config set bugbossImageUri "$BUGBOSS_IMAGE_URI"
 pulumi config set --path aws:defaultTags.tags.Environment infra
 pulumi config set --path aws:defaultTags.tags.Project ops
 

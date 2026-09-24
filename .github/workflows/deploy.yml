@@ -24,6 +24,7 @@ permissions:
 env:
   AWS_REGION: us-west-2
   IMAGE_URI: 333022194791.dkr.ecr.us-west-2.amazonaws.com/delegate-worker:${{ github.sha }}
+  BUGBOSS_IMAGE_URI: 333022194791.dkr.ecr.us-west-2.amazonaws.com/bugboss:${{ github.sha }}
 
 jobs:
   deploy:
@@ -59,6 +60,15 @@ jobs:
       - name: Push Docker Image
         if: ${{ github.event_name != 'pull_request' }}
         run: docker push "$IMAGE_URI"
+
+      # Sequential on purpose. Both are emulated amd64 builds on an arm-free
+      # runner either way, and running two at once just contends for the same
+      # cores.
+      - name: Build BugBoss Image
+        run: docker build -t "$BUGBOSS_IMAGE_URI" --platform linux/amd64 -f bugboss/Dockerfile .
+      - name: Push BugBoss Image
+        if: ${{ github.event_name != 'pull_request' }}
+        run: docker push "$BUGBOSS_IMAGE_URI"
       - name: Deploy
         working-directory: deploy
         if: ${{ github.event_name != 'pull_request' }}
