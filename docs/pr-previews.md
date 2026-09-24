@@ -34,7 +34,8 @@ the consumer by a different workflow, and nothing sequences the two.
       Depends on 4 being applied.
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
       applied.
-- [ ] 10. `PulumiPreview` Identity Center permission set for humans: todo.
+- [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
+      todo. Depends on 8 being applied.
 - [ ] 11. Revisit the workbench preview role at workbench step 10: todo.
       Tracked here so it is not lost; the work happens in that step.
 
@@ -232,6 +233,11 @@ Decided: ship now, and adjust at workbench step 10.
    validates principal ARNs), holding no permissions beyond what observed
    previews need. `aws.getCallerIdentityOutput` needs none. Grant the step 4
    role `sts:AssumeRole` on exactly that ARN, in the `ops` stack.
+   The trust also admits the management account's `ReadOnlyAccess` SSO role,
+   for step 10. Its role name carries a random suffix and sits under
+   `aws-reserved/sso.amazonaws.com/`, so match it with an `ArnLike`
+   condition on `aws:PrincipalArn` against the account root principal, not
+   with a literal principal ARN.
    Make the provider's `assumeRoles[0].roleArn` come from stack config
    (defaulting to today's `OrganizationAccountAccessRole`), set by preview
    mode.
@@ -250,21 +256,49 @@ Decided: ship now, and adjust at workbench step 10.
 
 ### Step 10: humans
 
-Decided: yes. A `PulumiPreview` permission set in `identity-center.ts`,
-carrying the same statements as the step 4 role (share the document, do not
-copy it), so local previews stop needing `gp-admin`. Open: which group it is
-assigned to, and whether it replaces the `gp-admin` advice in
-`workbench-account.md` "How to resume".
+Decided: extend the existing `ReadOnlyAccess` permission set (`gp-readonly`)
+rather than add a new `PulumiPreview` one.
 
-Noticed while planning, to verify then: the existing `ReadOnlyAccess`
-permission set attaches `AWSSecretsManagerClientReadOnlyAccess`, which may
-include `secretsmanager:GetSecretValue`. If so, the doc's claim that preview
-needs `gp-admin` (rather than `gp-readonly`) is stale, and that permission set
-is broader than its name suggests. Record the finding either way.
+Why that is enough: the step 4 grant is a strict subset of what
+`ReadOnlyAccess` already holds in the management account. The AWS-managed
+`ReadOnlyAccess` policy covers the state bucket (`s3:Get*`, `s3:List*`), the
+passphrase (`ssm:GetParameter`; the set's inline policy denies only
+`Environment=prod`-tagged parameters, so confirm the passphrase is not tagged
+that way) and `ecs:DescribeTaskDefinition`. `AWSSecretsManagerClientReadOnlyAccess`
+covers `DescribeSecret`. So `ops` and `org` previews should already work
+under `gp-readonly` once step 3 lands, with no change to the set.
+
+Why not a separate set: the step 4 role is narrow because it is
+PR-assumable, and that threat model does not apply to a human session. A
+narrow human set would be a third read-only option alongside `EngineerAccess`
+and `ReadOnlyAccess`, held by the same groups (Engineers, Admins, Research),
+and would protect nothing the other two do not already expose to them.
+
+The one gap is `workbench`: `ReadOnlyAccess` is deliberately not assigned in
+024901689212, and the managed policy has no `sts:AssumeRole`. So the change is:
+
+- Add a statement to `readOnlyAccess` in `identity-center/policies.ts`
+  allowing `sts:AssumeRole` on exactly the step 8 `pulumi-preview` role ARN.
+- Step 8's trust admits the `ReadOnlyAccess` SSO role (see there). No new
+  assignment in the workbench account.
+- Research holds `ReadOnlyAccess` too and so gains this hop. Acceptable:
+  the role it reaches holds only what a preview needs.
+- Update "How to resume" in `workbench-account.md` to say previews run under
+  `gp-readonly`, and drop the `gp-admin` advice.
+
+Verify then, and record the finding: whether
+`AWSSecretsManagerClientReadOnlyAccess` includes
+`secretsmanager:GetSecretValue`. If it does, `gp-readonly` can run an `ops`
+preview even before step 3, the "How to resume" claim that preview needs
+`gp-admin` is already stale, and the set is broader than its name suggests.
+That last point is worth its own follow-up, but it does not change this
+decision: step 10 adds only the workbench hop.
 
 ## Open questions
 
 - Does a DIY-backend preview lock? (step 4)
 - Does a change to the workbench provider's role ARN cascade? (step 8)
 - One comment per project or one combined comment? (step 5)
-- Which group gets `PulumiPreview`? (step 10)
+- Is the passphrase parameter tagged `Environment=prod`? If so,
+  `ReadOnlyAccess`'s inline deny blocks it and step 10 needs an exception.
+  (step 10)
