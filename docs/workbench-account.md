@@ -202,9 +202,48 @@ still need the console once.
       2026-09-23 while adding Claude Opus 5.5, which is also when the
       `deploy-workbench.yml` path filter turned out not to include the model
       list at all.)
-- [ ] 12. Request quota increases if needed: todo
-- [ ] 13. Add budget and cost anomaly detection: todo
-- [ ] 14. Point `pi` at the account, document engineer setup: todo
+- [ ] 12. Request quota increases if needed: deferred (jeff, 2026-09-24 —
+      skip until a quota actually binds. Left unchecked rather than closed
+      because the need may still arrive, and nothing is lost by waiting: a
+      quota increase is a support case with lead time, not a project.)
+- [ ] 13. Spend threshold alerts by email: doing (pi-spend-alert,
+      2026-09-24; the budget is in this PR, and the step flips to done when
+      the merge apply is green and the budget reads back with all four
+      notifications. Reshaped by jeff in review of the original "budget and
+      cost anomaly detection": no hard budget — nothing stops spend, since
+      budget actions are the enforcement feature and are not attached — no
+      anomaly detection, and no Slack for now. What remains is one
+      `aws.budgets.Budget` in `deploy-workbench/` with four notifications:
+      actual monthly spend over $5,000 and $10,000, forecasted over
+      $10,000 and $20,000, all by email to the step 1 group alias
+      `aws-workbench@goodparty.org`.
+
+      The amounts are arbitrary-but-reviewable and each is a one-line
+      change; the wire is the point, not the values. Two caveats are
+      recorded in the code comment and repeated here because they are the
+      two ways this will look broken when it is not: forecasted alerts are
+      silent until the account has enough history for a forecast to exist,
+      and every budget alert lags billing data by hours. A runaway
+      measured in minutes would want a token-rate alarm on the step 17 log
+      group — recorded here as the known gap, deliberately not built.
+
+      Slack paths, deferred rather than rejected: AWS Chatbot (an SNS topic
+      in us-east-1 — the only region Budgets publishes to — plus a
+      per-account workspace OAuth in the console), or cheaper, Slack's own
+      email-to-channel address added as a second subscriber, which is a
+      one-line PR and no AWS change at all.
+
+      Delivery can only be proven by a real crossing, the same honesty as
+      step 17's empty-log-group caveat: a green apply shows the budget and
+      its subscribers exist, not that an email arrives.)
+- [x] 14. Point `pi` at the account, document engineer setup: done
+      (2026-09-22, gp-pi commit 5e0d72f "AWS SSO credentials for Bedrock in
+      the container" — `etc/aws-config` there ships a single
+      `WorkbenchAccess` profile against 024901689212, and the repo's README
+      carries the engineer setup section. Verified from a running sandbox
+      rather than from the document: the session recording this runs on
+      exactly those credentials and invokes the model list from them.
+      Recorded 2026-09-24, pi-spend-alert.)
 - [x] 15. Narrow `WorkbenchAccess` to runtime needs: done (2026-09-22, PR #72.
       Mutations are gone, reads stay wide, and the invoke statement names the
       models from `utils/bedrock-models.ts` as resource ARNs. Both halves are
@@ -1755,7 +1794,9 @@ needed, and so the asynchronous parts have a human gap after them.
     Budget lead time.
 
 13. Add a budget and cost anomaly detection before handing the account to
-    engineers.
+    engineers. Reshaped in review to threshold alerts by email — no budget
+    actions, no anomaly detection; the Progress entry carries the reshaping
+    and its reasoning.
 
 14. Point `pi` at the new account and document engineer setup.
 

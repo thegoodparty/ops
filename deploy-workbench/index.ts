@@ -10,10 +10,11 @@ import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
  * `github-actions-workbench-deploy`, via
  * `.github/workflows/deploy-workbench.yml`.
  *
- * No longer empty: step 17's invocation logging arrived first, and step 10's
- * scoped deploy role is at the bottom of this file. What this file
- * established before either is the path into the account, so that each step
- * debugs its own resources rather than the credential chain underneath them.
+ * No longer empty: step 17's invocation logging arrived first, then step
+ * 10's deploy role (bottom of this file) and step 13's spend alerts (just
+ * above it). What this file established before any of them is the path into
+ * the account, so that each step debugs its own resources rather than the
+ * credential chain underneath them.
  *
  * Unlike `deploy/` and `deploy-org/`, everything here takes an explicit
  * provider. Those two run in the account their credentials already belong to;
@@ -259,6 +260,66 @@ new aws.bedrockmodel.InvocationLoggingConfiguration(
 
 /** Where to look, so the step 17 check does not start with a console hunt. */
 export const invocationLogGroup = invocationLogs.name;
+
+// ---------------------------------------------------------------------------
+// Spend threshold alerts, by email.
+//
+// Step 13 of docs/workbench-account.md, reshaped in review: no budget
+// actions (nothing here stops spend), no anomaly detection, no Slack for
+// now — an email when actual or forecasted monthly spend crosses a
+// threshold. The reasoning, and the deferred Slack paths, are in the step
+// entry.
+//
+// `ABSOLUTE_VALUE` thresholds, so each number below is simply dollars and
+// the budget's limit is only the console's reference bar; it is set to the
+// highest threshold. The amounts are jeff's, arbitrary-but-reviewable, and
+// each is a one-line change — the wire is the point here, not the values.
+//
+// Two honest caveats. Forecasted alerts need weeks of usage history before
+// AWS can compute a forecast at all, so on this young account they are
+// silent until then by construction, not by failure. And every budget alert
+// lags billing data by hours: a runaway measured in minutes would want a
+// token-rate alarm on the step 17 log group instead, which the step entry
+// records as the known gap rather than something to build now.
+//
+// Budgets is account-global — its ARNs carry no region — so the provider's
+// region is immaterial here, and `budgets:*` is one of the SCP's region
+// exemptions, added with this step in mind.
+
+/** The step 1 group alias, which has been waiting for exactly this job. */
+const SPEND_ALERT_EMAIL = "aws-workbench@goodparty.org";
+
+const spendNotification = (
+  notificationType: "ACTUAL" | "FORECASTED",
+  dollars: number,
+) => ({
+  comparisonOperator: "GREATER_THAN",
+  notificationType,
+  threshold: dollars,
+  thresholdType: "ABSOLUTE_VALUE",
+  subscriberEmailAddresses: [SPEND_ALERT_EMAIL],
+});
+
+new aws.budgets.Budget(
+  "workbenchMonthlySpend",
+  {
+    name: "workbench-monthly-spend",
+    budgetType: "COST",
+    timeUnit: "MONTHLY",
+    limitAmount: "20000",
+    limitUnit: "USD",
+    notifications: [
+      // Actual spend: "this is real" early, then loud.
+      spendNotification("ACTUAL", 5000),
+      spendNotification("ACTUAL", 10000),
+      // Forecasted: the mid-month runaway tripwires. Silent until the
+      // account has enough history for a forecast to exist; see above.
+      spendNotification("FORECASTED", 10000),
+      spendNotification("FORECASTED", 20000),
+    ],
+  },
+  { provider },
+);
 
 // ---------------------------------------------------------------------------
 // The deploy role: what applies everything above, after step 10's cutover.
