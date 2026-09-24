@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import { createDeployRole } from "./deploy-role";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -9,11 +10,10 @@ import * as aws from "@pulumi/aws";
  * `github-actions-workbench-deploy`, via
  * `.github/workflows/deploy-workbench.yml`.
  *
- * Empty of real resources on purpose. Steps 8 through 11 of
- * docs/workbench-account.md are what fill this account, and step 10 creates
- * the first resource that belongs here. What this file establishes now is the
- * path into the account, so that the next step debugs its own resources
- * rather than the credential chain underneath them.
+ * No longer empty: step 17's invocation logging arrived first, and step 10's
+ * scoped deploy role is at the bottom of this file. What this file
+ * established before either is the path into the account, so that each step
+ * debugs its own resources rather than the credential chain underneath them.
  *
  * Unlike `deploy/` and `deploy-org/`, everything here takes an explicit
  * provider. Those two run in the account their credentials already belong to;
@@ -247,3 +247,25 @@ new aws.bedrockmodel.InvocationLoggingConfiguration(
 
 /** Where to look, so the step 17 check does not start with a console hunt. */
 export const invocationLogGroup = invocationLogs.name;
+
+// ---------------------------------------------------------------------------
+// The scoped deploy role: what applies everything above, after step 10's
+// cutover. It lives in its own file because it is the one resource here that
+// manages itself, and the comment that takes to explain honestly would drown
+// the logging resources. Created while the provider above still uses the
+// bootstrap role — the apply that creates a role cannot assume it — and the
+// provider repoints in the cutover PR, when the grant added alongside this in
+// deploy/components/ci-roles/policies.ts has already been applied.
+const deployRole = createDeployRole({
+  provider,
+  accountId: WORKBENCH_ACCOUNT_ID,
+  region: REGION,
+  logGroupName: LOG_GROUP_NAME,
+  // The literal matches `name` on the logging role above. The deploy policy
+  // names it by ARN, which is name-derived, so an Output would add a dataflow
+  // edge without adding information.
+  invocationLogsRoleName: "bedrock-model-invocation-logs",
+});
+
+/** Evidence for the step 10 entry: the apply log should show this ARN. */
+export const deployRoleArn = deployRole.arn;
