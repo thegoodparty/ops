@@ -272,7 +272,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    \`CODEOWNERS\` does: it decides who must approve. \`SELF_REVIEW\` already
    covers all of \`delegate/\` today, which makes this redundant right now and
    not redundant the moment those paths are narrowed. The protection that does
-   not depend on this prompt at all is the \`/delegate/\` entry in CODEOWNERS.
+   not depend on this prompt at all is CODEOWNERS, which requires a human
+   code-owner approval on every path in the repo.
 
    You are NEVER allowed to auto-approve a PR where \`PERMISSION_CHANGE=true\`.
    Like \`SELF_REVIEW\`, the scout and deep-reviewers still run normally and their
