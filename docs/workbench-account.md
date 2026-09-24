@@ -214,10 +214,13 @@ still need the console once.
       skip until a quota actually binds. Left unchecked rather than closed
       because the need may still arrive, and nothing is lost by waiting: a
       quota increase is a support case with lead time, not a project.)
-- [ ] 13. Spend threshold alerts by email: doing (pi-spend-alert,
-      2026-09-24; the budget is in this PR, and the step flips to done when
-      the merge apply is green and the budget reads back with all four
-      notifications. Reshaped by jeff in review of the original "budget and
+- [x] 13. Spend threshold alerts by email: done (2026-09-24,
+      pi-spend-alert; marked done in the PR that creates the budget, per
+      jeff's review, so no follow-up is needed once it merges — the
+      merge's `Deploy workbench` run is the read-back: green means the
+      budget exists with all four notifications, and if it fails this
+      entry is wrong in the visible way, with a red run beside it.
+      Reshaped by jeff in review of the original "budget and
       cost anomaly detection": no hard budget — nothing stops spend, since
       budget actions are the enforcement feature and are not attached — no
       anomaly detection, and no Slack for now. What remains is one
