@@ -88,6 +88,13 @@ export interface ToolApiDeps {
   correlator: Correlator;
   slack: ThreadPoster;
   evidence: EvidenceStore;
+  /**
+   * Whether a source can observe its own resolution. A signal from a source
+   * that cannot is closed on the agent's evidence rather than split out as
+   * still firing: splitting it would relaunch an agent on the bug that agent
+   * just fixed, and again after that.
+   */
+  tracksResolution(source: string): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +104,7 @@ type Body<T> = { ok: true; data: T } | { ok: false; error: string };
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
 
 export const createToolApi = (deps: ToolApiDeps): ToolApi => {
-  const { db, correlator, slack, evidence } = deps;
+  const { db, correlator, slack, evidence, tracksResolution } = deps;
 
   const readIncident = (id: string): Incident | undefined => {
     const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [id]);
@@ -200,12 +207,30 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    * recurrenceOf, which is exactly what that field is for: this reopens
    * ground a resolution claimed.
    */
+  /**
+   * Close the signals nothing will ever close for us. An agent reaching
+   * RESOLVED is the verification a human report waits for, so at that point
+   * the report is genuinely over.
+   */
+  const closeUntrackedSignals = (
+    w: Database.Database,
+    incidentId: string,
+    at: number,
+  ): void => {
+    const untracked = getSignalsFor(w, incidentId).filter(
+      (s) => s.closedAt === null && !tracksResolution(s.source),
+    );
+    for (const s of untracked) {
+      w.prepare("UPDATE signal SET closedAt = ? WHERE id = ?").run(at, s.id);
+    }
+  };
+
   const splitFiringSignals = (
     w: Database.Database,
     incidentId: string,
   ): AssignResult[] =>
     getSignalsFor(w, incidentId)
-      .filter((s) => s.closedAt === null)
+      .filter((s) => s.closedAt === null && tracksResolution(s.source))
       .map((s) =>
         assign(
           w,
@@ -391,10 +416,12 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (stop) return reject(stop);
 
       const splits = await db.withWrite((w) => {
+        const at = Date.now();
+        closeUntrackedSignals(w, incidentId, at);
         const out = splitFiringSignals(w, incidentId);
         w.prepare(
           "UPDATE incident SET status = 'RESOLVED', resolvedAt = ?, prUrls = ? WHERE id = ?",
-        ).run(Date.now(), JSON.stringify(args.prUrls), incidentId);
+        ).run(at, JSON.stringify(args.prUrls), incidentId);
         return out;
       });
       splits.forEach(logAssign);
@@ -429,6 +456,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (stop) return reject(stop);
 
       const splits = await db.withWrite((w) => {
+        closeUntrackedSignals(w, incidentId, Date.now());
         const out = splitFiringSignals(w, incidentId);
         w.prepare(
           `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,

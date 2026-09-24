@@ -64,6 +64,7 @@ const toolsFor = (incidentId: string): ToolApi =>
     correlator,
     slack,
     evidence,
+    tracksResolution: () => true,
   });
 
 const seed = async (id: string, opts: { closedAt?: number } = {}) => {
@@ -384,6 +385,7 @@ describe("the scoped token", () => {
       correlator,
       slack,
       evidence,
+      tracksResolution: () => true,
     });
 
     const res = await expired.reportRootCause({
@@ -406,6 +408,7 @@ describe("the scoped token", () => {
       correlator,
       slack,
       evidence,
+      tracksResolution: () => true,
     });
 
     const res = await forged.getIncident();
@@ -544,6 +547,7 @@ describe("getIncident", () => {
       tokenSecret: SECRET,
       correlator,
       slack,
+      tracksResolution: () => true,
       evidence: {
         load: async () => {
           throw new Error("S3 is having a day");

@@ -100,6 +100,23 @@ webhook.
 | E   | Five Bedrock body-shape questions, one live call settles all                     | `output_config: { effort }`, `block_binding: { prefix_mismatch_behavior }` (resume depends on it), `amazon-bedrock-invocationMetrics` field names, `anthropic_beta` as a body field, `context_management` / `clear_thinking_20251015` |
 | F   | Measure a real `npm ci` in the container                                         | Sizes how many concurrent fixers are viable                                                                                                                                                                                           |
 
+## Found while wiring Phase 2, still open
+
+The composition root is the first thing that sees all nine chunks at once.
+These are what did not line up. Each is either resolved in `bugboss/index.ts`
+with a note on the cost, or still open.
+
+|     | What                                                                                                                                                                                                                                                  | State                                                          |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| G   | `sessionKeyFor` in `bugboss/agent/session.ts` writes `sessions/<id>.jsonl`, but the Slack agent's `read_agent_session`, the MCP session reader and the S3 lifecycle rule all read `sessions/incident/<id>/`                                            | worked around: the launch overrides `BUGBOSS_SESSION_REF`. The default and its test still encode the old path |
+| H   | `RelayEvent` has a `pr_needs_merge` case, one of the three things the design says earns an `@`, but nothing can emit it: the Boss does not learn a PR exists until `report_resolved`, which is after the merge already happened                        | open. Needs either a tool-API field or the agent posting it     |
+| I   | Chunk 4's tool API posts its own transitions through `ThreadPoster` while chunk 7's relay renders the same transitions. Both are wired, split by who knows what: the relay does `opened` and `prod_critical_signal`, the tool API does the rest         | resolved, but the two renderers should be reconciled            |
+| J   | `hand_off` reaches the rotation only because `toolApiFor` wraps it and posts the mention itself. Escalation is one of the three `@`-worthy events and no chunk owned it                                                                                 | resolved in the composition root                                |
+| K   | The Boss's own `ModelClient` (triage, correlation, the Slack agent) had no production implementation: `bugboss/bedrock` is a Pi api provider for the incident agent, not a one-shot client                                                              | resolved: `createBedrockModelClient` in `bugboss/index.ts`      |
+| L   | `SlackAgentModel` had no implementation either. The default built here loops over the same `ModelClient` and persists the transcript per thread, which does **not** carry thinking blocks across a resume the way the incident agent's Pi session does | resolved with a documented floor; replace with a Pi harness if the Slack agent starts reasoning hard |
+| M   | With no `agentRoleArn` configured, a launch hands the child empty AWS credentials and alarms, rather than refusing to launch                                                                                                                           | deliberate, so a local Boss still runs. Revisit if it ever fires in prod |
+| N   | `bugboss/db/schema.sql` is read at runtime from `__dirname` and `tsc` does not copy it into `dist/`                                                                                                                                                    | open, and it belongs to whoever writes the Dockerfile           |
+
 ## Separate tickets, out of scope here
 
 - **Fix the preview-database migration problem.** Editing a migration after a

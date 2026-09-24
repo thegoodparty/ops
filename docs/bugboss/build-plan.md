@@ -4,7 +4,7 @@
 criteria, not background reading. Every chunk below names the sections that
 define it.
 
-**Status:** Phase 0 not started.
+**Status:** Phases 0, 1 and 2 landed. Phase 3 (review) is next.
 
 ## Shape
 
@@ -52,15 +52,15 @@ Nobody touches `types.ts`, `package.json`, or another chunk's files.
 
 | #   | Chunk            | Owns                                          | Spec sections                                       | Status      |
 | --- | ---------------- | --------------------------------------------- | --------------------------------------------------- | ----------- |
-| 1   | Ingress          | `bugboss/ingress/{grafana,slack,human}.ts`    | Job 1, Human reports                                | not started |
-| 2   | Triage           | `bugboss/triage/`                             | Job 2, Job 2b                                       | not started |
-| 3   | Dispatcher       | `bugboss/dispatcher/`                         | Job 3, Authentication (child env scrubbing)         | not started |
-| 4   | Tool API         | `bugboss/toolapi/`                            | Job 4                                               | not started |
-| 5   | Incident agent   | `bugboss/agent/{run,session,tools,prompt}.ts` | Layer 3 in full                                     | not started |
-| 6   | Bedrock provider | `bugboss/bedrock/`                            | Model and provider, Why InvokeModel is not optional | not started |
-| 7   | Slack            | `bugboss/slack/{relay,agent}.ts`              | Job 5, Job 6                                        | not started |
-| 8   | MCP + OAuth      | `bugboss/mcp/`                                | The MCP server                                      | not started |
-| 9   | Pulumi           | `deploy/components/bugboss.ts`                | Infrastructure in full                              | not started |
+| 1   | Ingress          | `bugboss/ingress/{grafana,slack,human}.ts`    | Job 1, Human reports                                | done        |
+| 2   | Triage           | `bugboss/triage/`                             | Job 2, Job 2b                                       | done        |
+| 3   | Dispatcher       | `bugboss/dispatcher/`                         | Job 3, Authentication (child env scrubbing)         | done        |
+| 4   | Tool API         | `bugboss/toolapi/`                            | Job 4                                               | done        |
+| 5   | Incident agent   | `bugboss/agent/{run,session,tools,prompt}.ts` | Layer 3 in full                                     | done        |
+| 6   | Bedrock provider | `bugboss/bedrock/`                            | Model and provider, Why InvokeModel is not optional | done        |
+| 7   | Slack            | `bugboss/slack/{relay,agent}.ts`              | Job 5, Job 6                                        | done        |
+| 8   | MCP + OAuth      | `bugboss/mcp/`                                | The MCP server                                      | done        |
+| 9   | Pulumi           | `deploy/components/bugboss.ts`                | Infrastructure in full                              | done        |
 
 Chunk 9 is fully independent and can start during Phase 0.
 
@@ -70,8 +70,9 @@ and that is what replaces a per-task review gate.
 
 ## Phase 2 — wire-up
 
-`bugboss/index.ts`, the composition root. Make the E2E pass. Mis-fits surface
-here, all at once, which is the point.
+`bugboss/index.ts`, the composition root, plus `bugboss/http/` for the agent's
+loopback API, the webhook routes and `/health`. Make the E2E pass. Mis-fits
+surface here, all at once, which is the point.
 
 ## Phase 3 — review
 

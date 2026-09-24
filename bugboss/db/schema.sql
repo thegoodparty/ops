@@ -74,8 +74,11 @@ CREATE INDEX IF NOT EXISTS signal_incident_idx ON signal (incidentId);
 -- resumed agent find the message it already posted rather than asking twice.
 CREATE TABLE IF NOT EXISTS pending_question (
   incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  -- Empty until the post that follows the marker succeeds. The marker has to
+  -- be durable before the message exists, so there is no ts to record yet.
   messageTs         TEXT NOT NULL,
-  askedAt           INTEGER NOT NULL
+  askedAt           INTEGER NOT NULL,
+  message           TEXT NOT NULL DEFAULT ''
 );
 
 -- Slack replies the Boss has relayed, which agents poll for.
