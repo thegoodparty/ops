@@ -114,7 +114,7 @@ still need the console once.
       grant to exactly this OU. Admins hold `AdministratorAccess` there as a
       second path. Withdrawing is why the policy resource is deliberately
       unprotected.)
-- [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account
+- [ ] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
       role: doing (pi-step10, 2026-09-24; the role and its grant are in
       this PR, the cutover is the follow-up. Named `pulumi-deploy`, in the
       family of the `pulumi-preview` role the PR-preview plan already
@@ -132,22 +132,26 @@ still need the console once.
       dependency is already applied by then, which is what the rule exists
       to arrange.
 
-      The permission list was re-derived from `deploy-workbench/index.ts`
-      rather than trusted from the note this entry used to carry, which had
-      the logging resources right and could not have known the rest. The
-      derivation adds `DeleteRetentionPolicy`, the tag reads
-      (`ListTagsForResource`/`ListTagsLogGroup`) and IAM list reads the
-      provider makes at refresh, `TagRole`/`UntagRole` and
-      `UpdateAssumeRolePolicy`, the three Bedrock agreement actions
-      `scripts/enable-bedrock-models.ts` uses — the script moves to this
-      role at cutover, as its header has said since step 11 — and, with no
-      precedent in the note, the same IAM set on `pulumi-deploy` itself,
-      because this stack manages the role that runs it. Self-management is
-      the `github-actions-pulumi-deploy` shape from step 2 with the same
-      consequence, stated in `deploy-workbench/deploy-role.ts`:
-      `PutRolePolicy` on itself means the role can widen itself, and the
-      real boundary is who can assume it and what merges to main. The full
-      list and per-statement reasoning live in that file.
+      The design simplified in review, and the simplification is recorded
+      rather than papered over. The role was first built with a permission
+      set derived from the stack's resources (git history has it, and the
+      derivation caught real things — the `UpdateRoleDescription` quirk,
+      and proof that `iam:ListRoleTags` is never called for this resource).
+      jeff's review question — whether narrow scoping is worth a policy
+      change for every new piece of infra — had an honest answer that
+      argued against the scoped shape: self-management undercut it, since a
+      role holding `iam:PutRolePolicy` on itself can widen itself, making
+      the list friction rather than a boundary; the account is deliberately
+      sleepy; and the exclusions that matter already live in the SCP, which
+      binds admins too. The shipped shape is therefore
+      `AdministratorAccess` (the AWS-managed policy, attached) with the
+      trust policy as the whole control: it names exactly
+      `github-actions-workbench-deploy`, humans keep their own door (the
+      Identity Center `AdministratorAccess` assignment, step 8's
+      break-glass), and previews get their own role (pr-previews step 8).
+      The enable script moves to this role at cutover, as its header has
+      said since step 11. The full reasoning is the header of
+      `deploy-workbench/deploy-role.ts`.
 
       End state, checked before this flips to done: `Deploy workbench` green
       on the cutover PR with the provider and the script both on
@@ -839,8 +843,8 @@ against what a person does.
 - `iam:CreateUser`, `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access
   here is federated through Identity Center; long-lived keys in an account
   aimed at autonomous agents are the credential most likely to escape it.
-  Deliberately not `iam:CreateRole`: step 10 creates a scoped in-account
-  deploy role and needs it.
+  Deliberately not `iam:CreateRole`: step 10 creates an in-account deploy
+  role and needs it.
 - `cloudtrail:StopLogging`, `DeleteTrail`, `UpdateTrail`,
   `PutEventSelectors`. There may be no trail in this account yet, which makes
   these inert today and correct the moment there is one.

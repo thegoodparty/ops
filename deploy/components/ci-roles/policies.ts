@@ -685,7 +685,7 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
     //
     // What this grants is administrator in the workbench account, which is
     // what OrganizationAccountAccessRole is. That is the intended state only
-    // until step 10 replaces it with a scoped in-account role. When that
+    // until step 10 replaces it with the in-account deploy role. When that
     // happens, this statement moves to the new role rather than gaining it:
     // keeping both would leave a permanent admin path that nothing uses and
     // nobody would notice. The two statements below coexist for exactly the
@@ -708,7 +708,7 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
       Action: ["sts:AssumeRole"],
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
     },
-    // Step 10's replacement for the bootstrap grant: the scoped in-account
+    // Step 10's replacement for the bootstrap grant: the in-account deploy
     // role, created by deploy-workbench itself in the same PR. Added
     // alongside the statement above rather than in its place because the two
     // workflows are unordered ("Apply ordering between workflows") — this

@@ -35,10 +35,11 @@ const WORKBENCH_ACCOUNT_ID = "024901689212";
  *
  * `OrganizationAccountAccessRole` is created automatically by Organizations
  * when it provisions a member account, and it is effectively administrator.
- * Step 10 replaces it with a scoped in-account role and repoints this
- * `assumeRole` at that; the matching `sts:AssumeRole` grant on
- * `github-actions-workbench-deploy` moves at the same time rather than being
- * joined by a second one.
+ * Step 10 replaces it with the in-account deploy role in `deploy-role.ts`
+ * and repoints this `assumeRole` at that; the replacement grant on
+ * `github-actions-workbench-deploy` is added alongside the old one first
+ * (the apply that creates a role cannot assume it), and the old grant is
+ * removed in the same cutover PR that repoints this provider.
  *
  * `defaultTags` lives here rather than in `deploy.sh`. The `aws:defaultTags`
  * stack config the other two projects set applies to the *default* provider,
@@ -249,23 +250,15 @@ new aws.bedrockmodel.InvocationLoggingConfiguration(
 export const invocationLogGroup = invocationLogs.name;
 
 // ---------------------------------------------------------------------------
-// The scoped deploy role: what applies everything above, after step 10's
-// cutover. It lives in its own file because it is the one resource here that
-// manages itself, and the comment that takes to explain honestly would drown
-// the logging resources. Created while the provider above still uses the
-// bootstrap role — the apply that creates a role cannot assume it — and the
-// provider repoints in the cutover PR, when the grant added alongside this in
-// deploy/components/ci-roles/policies.ts has already been applied.
-const deployRole = createDeployRole({
-  provider,
-  accountId: WORKBENCH_ACCOUNT_ID,
-  region: REGION,
-  logGroupName: LOG_GROUP_NAME,
-  // The literal matches `name` on the logging role above. The deploy policy
-  // names it by ARN, which is name-derived, so an Output would add a dataflow
-  // edge without adding information.
-  invocationLogsRoleName: "bedrock-model-invocation-logs",
-});
+// The deploy role: what applies everything above, after step 10's cutover.
+// In its own file because the comment there is the design record for the
+// door into this account — what the role may do matters less than who can
+// assume it, and the why takes some explaining. Created while the provider
+// above still uses the bootstrap role — the apply that creates a role cannot
+// assume it — and the provider repoints in the cutover PR, when the grant
+// added alongside this in deploy/components/ci-roles/policies.ts has already
+// been applied.
+const deployRole = createDeployRole({ provider });
 
 /** Evidence for the step 10 entry: the apply log should show this ARN. */
 export const deployRoleArn = deployRole.arn;
