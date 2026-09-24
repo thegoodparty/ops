@@ -204,9 +204,11 @@ const accounts = {
   // this account and not a formality. The alternative is that the only human
   // way in is assuming `OrganizationAccountAccessRole` from the management
   // account by hand: a shared role, attributable to a person only by
-  // correlating CloudTrail, and the exact thing step 10 exists to retire.
-  // Break-glass through Identity Center is the same privilege with a named
-  // session attached to it.
+  // correlating CloudTrail, and the exact thing step 10 exists to retire —
+  // which it since has: the grant moved to the in-account `pulumi-deploy`
+  // role at cutover, and the bootstrap role itself leaves the account as the
+  // step's final act. Break-glass through Identity Center is the same
+  // privilege with a named session attached to it.
   workbench: {
     id: "024901689212",
     namePrefix: "workbench-",

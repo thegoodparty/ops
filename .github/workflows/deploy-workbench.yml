@@ -65,8 +65,8 @@ jobs:
           cache: npm
 
       # The first hop. This role lives in the management account; index.ts
-      # makes the second hop into 024901689212 by assuming
-      # OrganizationAccountAccessRole through an explicit provider.
+      # makes the second hop into 024901689212 by assuming pulumi-deploy
+      # through an explicit provider.
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -94,9 +94,8 @@ jobs:
       # the stack, but a failed apply is a reason to stop rather than to carry
       # on mutating the account.
       #
-      # It makes the second hop itself, assuming OrganizationAccountAccessRole
-      # exactly as index.ts does, so the credentials configured above are all
-      # it needs.
+      # It makes the second hop itself, assuming pulumi-deploy exactly as
+      # index.ts does, so the credentials configured above are all it needs.
       #
       # Idempotent, so running it on every workbench deploy is a handful of
       # availability reads once the models are entitled. It exits non-zero

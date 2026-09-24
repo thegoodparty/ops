@@ -51,11 +51,11 @@
  *   AWS_PROFILE=gp-admin APPLY=1 npm run script enable-bedrock-models
  *
  * Anywhere else, including as `github-actions-workbench-deploy` in CI, it
- * assumes `OrganizationAccountAccessRole` the same way
- * `deploy-workbench/index.ts` configures its provider to. That grant already
- * exists: `AssumeWorkbenchBootstrapRole` in `ci-roles/policies.ts`, landed by
- * step 7. So nothing new is needed on the IAM side, and step 10 moving that
- * role will move this with it.
+ * assumes `pulumi-deploy` the same way `deploy-workbench/index.ts`
+ * configures its provider to. That grant is `AssumeWorkbenchDeployRole` in
+ * `ci-roles/policies.ts`. Until step 10's cutover this assumed
+ * `OrganizationAccountAccessRole`, the Organizations-planted admin role; the
+ * script moved with the provider, as this header always said it would.
  *
  * Note `ReadOnlyAccess` cannot run it: that set has no `sts:AssumeRole`, so
  * the hop into the account is refused. Verified, not assumed.
@@ -75,13 +75,11 @@ import {
 } from "../utils/bedrock-models";
 
 /**
- * The same role `deploy-workbench/index.ts` has its provider assume, for the
- * same reason: it is the only way into the account from CI credentials, and
- * it is effectively administrator there. Step 10 replaces it with a scoped
- * in-account role, at which point this moves with the provider rather than
- * being left behind.
+ * The same role `deploy-workbench/index.ts` has its provider assume: the way
+ * into the account from CI credentials, administrator there by design
+ * (step 10 — the trust policy, not the permission set, is the boundary).
  */
-const BOOTSTRAP_ROLE = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`;
+const DEPLOY_ROLE_ARN = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`;
 
 /**
  * Every region a `us.` geo profile can route to, per the model cards.
@@ -324,7 +322,7 @@ async function resolveWorkbenchCredentials(): Promise<
     throw new Error(
       "Could not resolve AWS credentials. Log in to the workbench account " +
         `${WORKBENCH_ACCOUNT_ID} with AdministratorAccess, or run this as ` +
-        `a role that can assume ${BOOTSTRAP_ROLE}. WorkbenchAccess cannot ` +
+        `a role that can assume ${DEPLOY_ROLE_ARN}. WorkbenchAccess cannot ` +
         `do it: enabling models is a mutation it deliberately lacks.\n  ${
           (err as Error).message
         }`
@@ -341,7 +339,7 @@ async function resolveWorkbenchCredentials(): Promise<
   // from a Pulumi apply and from a human who assumed the same role by hand.
   const credentials = fromTemporaryCredentials({
     params: {
-      RoleArn: BOOTSTRAP_ROLE,
+      RoleArn: DEPLOY_ROLE_ARN,
       RoleSessionName: "enable-bedrock-models",
     },
   });
@@ -354,7 +352,7 @@ async function resolveWorkbenchCredentials(): Promise<
   } catch (err) {
     throw new Error(
       `Credentials are in account ${ambient.Account} as ${ambient.Arn}, and ` +
-        `assuming ${BOOTSTRAP_ROLE} failed. Either those credentials are not ` +
+        `assuming ${DEPLOY_ROLE_ARN} failed. Either those credentials are not ` +
         "allowed to assume it, or you are in the wrong account entirely.\n" +
         `  ${(err as Error).message}`
     );

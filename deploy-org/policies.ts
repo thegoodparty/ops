@@ -13,8 +13,9 @@
 // refusing one service.
 //
 // Scope, so this is not credited with more than it does: it binds every
-// principal in the workbench account, including OrganizationAccountAccessRole
-// which is how CI deploys there. It does not bind the management account,
+// principal in the workbench account, including `pulumi-deploy`, the role CI
+// deploys as there (`OrganizationAccountAccessRole` until step 10's cutover).
+// It does not bind the management account,
 // which is exempt from SCPs by design and is where production runs.
 
 type PolicyValue = string | string[];

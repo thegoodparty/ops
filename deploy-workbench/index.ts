@@ -1,6 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
-import { createDeployRole } from "./deploy-role";
+import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -33,13 +33,20 @@ const WORKBENCH_ACCOUNT_ID = "024901689212";
 /**
  * The way into the account.
  *
- * `OrganizationAccountAccessRole` is created automatically by Organizations
- * when it provisions a member account, and it is effectively administrator.
- * Step 10 replaces it with the in-account deploy role in `deploy-role.ts`
- * and repoints this `assumeRole` at that; the replacement grant on
- * `github-actions-workbench-deploy` is added alongside the old one first
- * (the apply that creates a role cannot assume it), and the old grant is
- * removed in the same cutover PR that repoints this provider.
+ * Step 10's cutover: the provider assumes `pulumi-deploy`, the role this
+ * same stack creates in `deploy-role.ts`, which makes this file
+ * self-referential in a way worth stating plainly. The apply runs as the
+ * role the apply manages. That works because the role is administrator,
+ * including over itself; `protect` on the role and its attachment is what
+ * keeps an edit from locking CI out of the account, and the Admins
+ * Identity Center assignment is the recovery path if that ever fails.
+ *
+ * Until the cutover this assumed `OrganizationAccountAccessRole`, the
+ * administrator role Organizations plants in every member account, whose
+ * trust names the management account *root* — any principal there holding
+ * `sts:AssumeRole` — rather than a single role. That grant is removed in
+ * this same change, and the role itself is deleted from the account as
+ * step 10's final act, recorded in the step entry.
  *
  * `defaultTags` lives here rather than in `deploy.sh`. The `aws:defaultTags`
  * stack config the other two projects set applies to the *default* provider,
@@ -69,10 +76,14 @@ const provider = new aws.Provider("workbench", {
   region: REGION,
   assumeRoles: [
     {
-      roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+      // DEPLOY_ROLE_NAME rather than a literal: the grant in
+      // deploy/components/ci-roles/policies.ts and the trust in
+      // deploy-role.ts spell the same ARN out, and a drift between the
+      // three is an assume failure that reads as a trust problem.
+      roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/${DEPLOY_ROLE_NAME}`,
       // Shows up in the workbench account's CloudTrail as the session name.
-      // Worth setting for an assume this privileged: it distinguishes a CI
-      // apply from a human who assumed the same role by hand.
+      // Worth setting for an assume this privileged: it separates the apply
+      // from the enable script's assume, which sets its own name.
       sessionName: "pulumi-deploy-workbench",
     },
   ],
