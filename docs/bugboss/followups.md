@@ -1,0 +1,110 @@
+# BugBoss follow-ups
+
+Everything that needs a human, accumulated during design and the build. Kept
+current as chunks report. Design spec: `design.md`. Build status:
+`build-plan.md`.
+
+## Blocking a first real alert
+
+Nothing downstream works until these are done.
+
+|     | What                                                 | Where                                              | Status   |
+| --- | ---------------------------------------------------- | -------------------------------------------------- | -------- |
+| 1   | Create the `bugboss` ECR repository                  | AWS console                                        | **done** |
+| 2   | Name a timestamp header on the Grafana contact point | Grafana UI                                         | todo     |
+| 3   | Turn resolve messages **on** for that contact point  | Grafana UI                                         | todo     |
+| 4   | Uncap `Max Alerts` on that contact point             | Grafana UI                                         | todo     |
+| 5   | Populate the `BUGBOSS` Secrets Manager secret        | AWS console                                        | todo     |
+| 6   | Add `bugbossImageUri` config + an image build step   | `deploy/deploy.sh`, `.github/workflows/deploy.yml` | todo     |
+
+**On 2, this one is silent if missed.** Grafana only sends a timestamp header
+if the contact point explicitly names one; there is no default. Without it
+Grafana signs the body alone, which is replayable, so ingress rejects every
+delivery. The adapter expects `X-Grafana-Alerting-Timestamp`. The symptom is
+"the webhook does nothing", with no error anywhere.
+
+**On 3 and 4, the existing `gpbot-alert-filter` contact point has both
+wrong.** It sets `disableResolveMessage: true`, which would blind every agent
+to the single most useful signal it gets, and caps at 20 alerts, which
+silently drops the rest of a burst — exactly the correlation case we care
+most about.
+
+## Ship regardless, and ideally first
+
+**Add a parallel raw route in Grafana** so the alert firehose always reaches
+Slack through Grafana's own integration, independent of BugBoss. Alertmanager's
+`continue: true` keeps evaluating sibling routes, and `dev-alerts` already
+exists as both a Slack and a webhook contact point, so this is a policy edit
+rather than a build.
+
+After that BugBoss is purely additive: it can crash, be redeployed, or be
+switched off entirely, and the worst case is exactly today's behaviour. It is
+also the kill switch — one UI action repoints the policy away from the
+webhook.
+
+## Before the MCP server is usable
+
+|     | What                                                                                                                                                                                                                                 |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 7   | Register a Google OAuth client (pre-registered, not DCR — Google does not support it)                                                                                                                                                |
+| 8   | Set the Google consent screen to **Internal** if the GCP project is inside the Workspace org. Strongest control available and it costs nothing; if moving the project is annoying, the three claim checks in code are adequate alone |
+| 9   | Slack app: scopes and event subscriptions for the relay                                                                                                                                                                              |
+
+## Decisions only you can make
+
+- **What is on the prod-critical allowlist.** These are the signals that ping
+  the channel at open, in parallel with the agent. Everything else opens a
+  thread silently.
+- **The rotation.** Who is in it, shift length, and the response targets in
+  the spec's _What the rotation owes_ table. The spec assumes a rotation
+  exists and deliberately does not invent one.
+- **Talk to Nikao about `alert_filter`.** `packages/gp-ai/alert_filter/` is
+  theirs, landed 2026-09-16 in omni PR #1836, and has been running in
+  `mode = "shadow"` in prod since. BugBoss substantially supersedes it: same
+  Grafana webhook, same `KnownCause` evidence idea, same triage decision. Not
+  a call to make in a doc.
+
+## Checks to run, each of which invalidates real work if it comes back wrong
+
+|     | Check                                                                            | Why it matters                                                                                                                                                                                                                        |
+| --- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A   | `curl -i` the 401 and confirm `WWW-Authenticate` survives the ALB                | API Gateway REST remaps it and kills OAuth discovery silently. An ALB should pass it, but confirm                                                                                                                                     |
+| B   | Kill an agent mid-turn, resume, confirm thinking signatures replay               | The whole resume design rests on this                                                                                                                                                                                                 |
+| C   | Compact a session, restore from S3, confirm resume respects the compaction point | Separate failure from B                                                                                                                                                                                                               |
+| D   | Reproduce the Converse empty-thinking drop on Opus 5                             | Justifies the InvokeModel provider we built. Confirmed in source, not against a live call                                                                                                                                             |
+| E   | Five Bedrock body-shape questions, one live call settles all                     | `output_config: { effort }`, `block_binding: { prefix_mismatch_behavior }` (resume depends on it), `amazon-bedrock-invocationMetrics` field names, `anthropic_beta` as a body field, `context_management` / `clear_thinking_20251015` |
+| F   | Measure a real `npm ci` in the container                                         | Sizes how many concurrent fixers are viable                                                                                                                                                                                           |
+
+## Separate tickets, out of scope here
+
+- **Fix the preview-database migration problem.** Editing a migration after a
+  PR push breaks the preview DB with a checksum mismatch, surfacing as broad
+  unrelated E2E failures. An agent iterating on a migration will hit this. The
+  fix is making preview databases tolerate it (wipe on deploy, or similar),
+  not restricting what agents may write.
+- **pmf-engine IAM.** Its policy grants `ecs:TagResource` without the
+  `"Condition": {"StringEquals": {"ecs:CreateAction": ["RunTask"]}}` guard, so
+  that role can retag arbitrary resources. Unrelated to BugBoss, found while
+  surveying.
+
+## Decided, recorded so they are not relitigated
+
+- **No Bedrock model invocation logging.** Our session transcripts are richer
+  for debugging and we derive cost from Pi's per-turn usage, so it would be
+  redundant. It would also duplicate potentially sensitive log content into a
+  second store with different retention.
+- **Slack agent is read-only in V1.** Merge, split, close, stop, restart and
+  take-ownership are deliberately out. Ownership still changes by replying in
+  the incident thread.
+- **No subagent query budget yet.** Fan-out multiplies Loki reads, which is
+  the line that bit us in August. Watch the bill rather than pre-solving it.
+- **No cost ceiling across concurrent incidents.** The 15-agent circuit
+  breaker bounds the pathological case; the merely expensive case is
+  unguarded by design.
+- **Agents may write migrations.** The restriction was solving the wrong
+  problem; see the preview-database ticket above.
+- **Account-wide log read is closed.** The agent role is scoped to four
+  prefixes (`/aws/ecs/*`, `/ecs/*`, `/sst/cluster/*`, `/aws/lambda/*`), which
+  is application logs but not VPC flow logs, GuardDuty, RDS or the VPN. The
+  line is application versus infrastructure, and that rule matters more than
+  the list.
