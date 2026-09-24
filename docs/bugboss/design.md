@@ -1470,6 +1470,34 @@ solving a problem we do not have.
 | Boss → S3, Slack, Bedrock | Task role and Secrets Manager | Outbound |
 | Agent → Slack, GitHub, Bedrock, Grafana | Scoped tokens; GitHub App limited to omni | Outbound, cannot merge |
 
+### The agent's AWS access is a second role, not a scrub
+
+The task role cannot simply be withheld: on Fargate it arrives through
+`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, so scrubbing it removes Bedrock and
+the read-only AWS an agent needs to investigate at all.
+
+Instead the parent assumes a dedicated **`bugboss-agent`** role via STS and
+hands the child those temporary credentials. It carries `bedrock:InvokeModel*`
+and read-only ECS, CloudWatch, RDS and ELB, and nothing else. The boundary is
+an IAM role rather than a list of environment variable names someone has to
+keep current. `maxSessionDuration` is 12 hours, the maximum, because incidents
+outlive the one-hour default; expiry is one more reason an agent restarts, and
+it resumes from its session.
+
+Attribution is free: a role session name per incident makes every call show up
+in CloudTrail as `bugboss-agent/<incidentId>`.
+
+**Assuming a compromised agent, the one real exposure is account-wide
+CloudWatch Logs read.** It cannot reach S3, Secrets Manager, the release path,
+or `sts:AssumeRole` to pivot. It can burn Bedrock spend, bounded by the
+deadline. But `logs:FilterLogEvents` on `*` means it can read production logs
+for every service in the account.
+
+That is inseparable from the job. An agent restricted to a fixed list of log
+groups cannot investigate the first incident in a service nobody predicted. We
+accept it knowingly, and it raises the stakes on the log-redaction rule in
+`docs/observability.md`, since redaction is now the control that matters.
+
 **Co-location weakens containment, so run agents as child processes with a
 scrubbed environment.** Previously an agent was a separate task with its own
 role, so a compromised one could corrupt one incident record. Now it shares a

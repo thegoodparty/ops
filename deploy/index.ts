@@ -5,6 +5,7 @@ import { createWebhookLambda } from "./components/webhooks";
 import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
+import { createBugBoss } from "./components/bugboss";
 
 export = async () => {
   const config = new pulumi.Config();
@@ -44,10 +45,25 @@ export = async () => {
   createIdentityCenter();
   createCiRoles();
 
+  // Gated rather than unconditional because deploy.yml still builds and
+  // pushes only delegate-worker, so there is no BugBoss image to pull and the
+  // service would sit at zero healthy tasks. The `bugboss` ECR repository is
+  // created out of band; nothing here creates it, which is what keeps
+  // `ecr:CreateRepository` off the deploy role. Set `bugbossImageUri` in
+  // deploy.sh once the build step lands.
+  const bugbossImageUri = config.get("bugbossImageUri");
+  const bugboss = bugbossImageUri
+    ? createBugBoss({
+        imageUri: bugbossImageUri,
+        subnetIds: vpcSubnetIds.public,
+      })
+    : undefined;
+
   return {
     webhookUrl: webhook.url,
     clusterName: worker.cluster.name,
     logGroupName: worker.logGroup.name,
     playwrightReportsBucket: playwrightReports.bucket.bucket,
+    bugbossUrl: bugboss?.url,
   };
 };
