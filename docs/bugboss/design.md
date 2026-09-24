@@ -1484,7 +1484,13 @@ the read-only AWS an agent needs to investigate at all.
 
 Instead the parent assumes a dedicated **`bugboss-agent`** role via STS and
 hands the child those temporary credentials. It carries `bedrock:InvokeModel*`
-and read-only ECS, CloudWatch, RDS and ELB, and nothing else. The boundary is
+plus read access to ECS and CloudWatch, and nothing else.
+
+**Deliberately narrow.** The agent's primary observability is Grafana, through
+Loki, Tempo and Prometheus over MCP. AWS is only for the layer beneath that: a
+task that failed to start, an OOM kill, a crash that happened before anything
+reached Loki. RDS and load balancers are not reachable that way and were never
+needed. The boundary is
 an IAM role rather than a list of environment variable names someone has to
 keep current. `maxSessionDuration` is 12 hours, the maximum, because incidents
 outlive the one-hour default; expiry is one more reason an agent restarts, and
@@ -1493,16 +1499,16 @@ it resumes from its session.
 Attribution is free: a role session name per incident makes every call show up
 in CloudTrail as `bugboss-agent/<incidentId>`.
 
-**Assuming a compromised agent, the one real exposure is account-wide
-CloudWatch Logs read.** It cannot reach S3, Secrets Manager, the release path,
-or `sts:AssumeRole` to pivot. It can burn Bedrock spend, bounded by the
-deadline. But `logs:FilterLogEvents` on `*` means it can read production logs
-for every service in the account.
+**Assuming a compromised agent**, it cannot reach S3, Secrets Manager, the
+release path, or `sts:AssumeRole` to pivot with. It can burn Bedrock spend,
+bounded by the deadline, and it can read ECS state and the CloudWatch log
+groups its policy names.
 
-That is inseparable from the job. An agent restricted to a fixed list of log
-groups cannot investigate the first incident in a service nobody predicted. We
-accept it knowingly, and it raises the stakes on the log-redaction rule in
-`docs/observability.md`, since redaction is now the control that matters.
+Log reads are scoped to the ECS log-group prefixes rather than `*`, since
+deployment debugging is the only reason it needs them. Whatever residue
+remains, the log-redaction rule in `docs/observability.md` is the control that
+matters, because redaction is what stops sensitive content reaching a log line
+in the first place.
 
 **Co-location weakens containment, so run agents as child processes with a
 scrubbed environment.** Previously an agent was a separate task with its own
