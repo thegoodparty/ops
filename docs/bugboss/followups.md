@@ -165,6 +165,26 @@ These are the ones left, with the reason.
   that role can retag arbitrary resources. Unrelated to BugBoss, found while
   surveying.
 
+## Deferred by decision, not forgotten
+
+**BugBoss has no self-monitoring, and that is deliberate for now.** No
+CloudWatch alarms, no metric filters, no SNS topic, no heartbeat. Swain is
+watching it by hand until it has earned automation.
+
+The thing to know when that changes: BugBoss's healthy state and its dead
+state produce the same output, which is silence. A missing
+`GRAFANA_WEBHOOK_SECRET` makes it boot healthy, answer `/health` with 200,
+and reject every delivery at info level. So the first alarm worth building
+is heartbeat-on-absence, evaluated outside the process, treating missing
+data as breaching. Nothing in-process can catch a dead process.
+
+Nothing currently emits a periodic signal to key that on, so it needs a few
+lines in the Boss as well as the alarm.
+
+When it is built, it routes through the parallel raw Grafana-to-Slack route
+described above — same channel, a path that does not touch BugBoss's own
+ingest.
+
 ## Decided, recorded so they are not relitigated
 
 - **No Bedrock model invocation logging.** Our session transcripts are richer

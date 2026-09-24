@@ -157,6 +157,12 @@ export const createBugBoss = (config: BugBossConfig) => {
     internal: false,
     securityGroups: [albSecurityGroup.id],
     subnets: config.subnetIds,
+    // Explicit rather than implicit, because the ingest path is designed
+    // against this number: the webhook has to acknowledge inside it or
+    // Grafana sees a dead endpoint and retries into duplicate work. 60 is
+    // AWS's default, so this changes nothing today and stops the number
+    // moving silently underneath that design.
+    idleTimeout: 60,
     tags: TAGS,
   });
 
