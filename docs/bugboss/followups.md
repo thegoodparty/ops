@@ -11,23 +11,48 @@ Nothing downstream works until these are done.
 |     | What                                                 | Where                                              | Status   |
 | --- | ---------------------------------------------------- | -------------------------------------------------- | -------- |
 | 1   | Create the `bugboss` ECR repository                  | AWS console                                        | **done** |
-| 2   | Name a timestamp header on the Grafana contact point | Grafana UI                                         | todo     |
-| 3   | Turn resolve messages **on** for that contact point  | Grafana UI                                         | todo     |
-| 4   | Uncap `Max Alerts` on that contact point             | Grafana UI                                         | todo     |
-| 5   | Populate the `BUGBOSS` Secrets Manager secret        | AWS console                                        | todo     |
-| 6   | Add `bugbossImageUri` config + an image build step   | `deploy/deploy.sh`, `.github/workflows/deploy.yml` | todo     |
+| 2   | Create a **new** `bugboss` Grafana contact point      | Grafana UI                                         | todo     |
+| 3   | Repoint a notification-policy route at it            | Grafana UI                                         | todo     |
+| 4   | Populate the `BUGBOSS` Secrets Manager secret        | AWS console                                        | todo     |
+| 5   | Add `bugbossImageUri` config + an image build step   | `deploy/deploy.sh`, `.github/workflows/deploy.yml` | todo     |
 
-**On 2, this one is silent if missed.** Grafana only sends a timestamp header
-if the contact point explicitly names one; there is no default. Without it
-Grafana signs the body alone, which is replayable, so ingress rejects every
-delivery. The adapter expects `X-Grafana-Alerting-Timestamp`. The symptom is
-"the webhook does nothing", with no error anywhere.
+### The contact point, and three settings that must be right
 
-**On 3 and 4, the existing `gpbot-alert-filter` contact point has both
-wrong.** It sets `disableResolveMessage: true`, which would blind every agent
-to the single most useful signal it gets, and caps at 20 alerts, which
-silently drops the rest of a burst — exactly the correlation case we care
-most about.
+Pointed at `https://bugboss.goodparty.org/grafana`, with:
+
+```
+hmacConfig.timestampHeader: "X-Grafana-Alerting-Timestamp"
+disableResolveMessage:      false
+maxAlerts:                  0      (uncapped)
+```
+
+**The timestamp header is silent if missed.** Grafana only sends one if the
+contact point explicitly names it; there is no default. Without it Grafana
+signs the body alone, which is replayable, so ingress rejects every delivery.
+The symptom is "the webhook does nothing", with no error anywhere.
+
+**Do not edit `gpbot-alert-filter` to achieve this.** Its `maxAlerts: 20` and
+`disableResolveMessage: true` are correct *for that consumer* and documented
+as such: the filter Lambda runs a Loki query and a model call per alert, so a
+delivery of hundreds would exceed the webhook timeout and be retried into
+duplicate Slack posts, and its handler drops resolved notifications anyway.
+It also points at a different URL with different auth. BugBoss needs its own
+instance of the same resource, not a change to one that works.
+
+**Where it should be defined is an open choice.** omni already provisions
+contact points through `@pulumiverse/grafana` in
+`packages/gp-api/deploy/components/grafana.ts`, and all three settings are
+expressible there. `ops` has no Grafana provider, token or credential, so
+doing it here means a new dependency plus a service account. Putting
+BugBoss's contact point in gp-api's stack is also wrong. Recommendation: the
+UI now, an ops-side provider later only if it earns one.
+
+**The route is manual regardless of who provisions what.** omni's own comment
+says the policy tree "was configured by hand in Grafana Cloud before this
+repo provisioned any alerting" and is deliberately not managed in code, so a
+contact point routes nothing until a human repoints a route. That is also the
+kill switch the design relies on, and the same operation as the parallel raw
+route below.
 
 ## Ship regardless, and ideally first
 
