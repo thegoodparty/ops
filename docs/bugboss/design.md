@@ -563,11 +563,11 @@ today; Pi keeps the door open.
 
 | Gap | Work |
 | --- | --- |
-| Bedrock is ConverseStream-only | An InvokeModel provider, ~400-700 LOC, registered through `registerApiProvider` from `@earendil-works/pi-ai/compat`. **No fork.** `Api` is an open union so a new id needs no type change, and builtins only register if an id is unclaimed, so we can override `bedrock-converse-stream` itself and keep every existing model definition pointed at it. |
+| Bedrock is ConverseStream-only | An InvokeModel provider registered under a **new** api id, `bedrock-invoke-model`. **No fork.** Overriding `bedrock-converse-stream` does not work: `provider-composer.js:339` prefers the builtin's `stream()` whenever the builtin declares any model with that id, so the registry override is bypassed for stock catalog models. A new id is also correct on its merits, since the native Anthropic body is invalid for the 165 non-Claude Bedrock models under the old id. |
 | Subagents are an example, not a built-in | Adopt the ~1,200 LOC example extension. Two fixes it needs: give children their own session directory instead of `--no-session`, and set `usage` on the returned tool result so child cost rolls up. The mechanism for both exists; the example just does not use it. |
 | Session sync to S3 | The wrapper described in Layer 1. Roughly 100 lines off `turn_end`. |
-| No reasoning-token split on Bedrock | Accept it. Thinking tokens are still inside `output`, just not separable. |
-| Pricing from a gitignored hydrated catalog | Register explicit `cost` rates for our model ids rather than assuming the catalog knows an inference-profile ARN. |
+| No reasoning-token split on Bedrock | Possibly a non-issue. Converse does not deliver it, but the native body may populate `output_tokens_details.thinking_tokens`. Wired; confirm on the first live call. |
+| Pricing from a gitignored hydrated catalog | Resolved: the catalog **does** ship in the published package at `dist/providers/data/amazon-bedrock.json`, gitignored in Pi's repo but copied in at publish, with real rates for Opus 5 and Sonnet 5. Explicit rates are needed only for an *application* inference profile ARN, whose opaque suffix has no catalog entry. |
 
 Roughly a week of work, against permanent Anthropic lock-in. The harness sits
 behind our tool API, so the decision stays reversible at the cost of a
@@ -764,6 +764,12 @@ the 1-hour TTL and price it in.
 schema-Required but arrives empty on Opus 5 and Sonnet 5. InvokeModel passes
 the native Anthropic body straight through, giving one serialization format
 across providers.
+
+**Pi is ESM-only; this repo is CommonJS.** Its `exports` map declares no
+`require` condition, so a static import typechecks and then fails at runtime
+with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Every runtime value from Pi must come
+through a dynamic `import()`; `import type` is free. Load once in an async
+initializer and close over it so functions that must stay synchronous can.
 
 **Adaptive thinking, not `budget_tokens`.** Extended thinking with
 `budget_tokens` is deprecated on 4.6 and rejected with a 400 on 4.7+. Frontier
@@ -1654,9 +1660,14 @@ degrades to today's behavior rather than to silence.
    checking while that code is being written, since it would be a better
    compaction primitive than summarization.
 
-5. **Does the shipped model catalog price our Bedrock model ids?** The data
-   file is gitignored, so this cannot be answered by reading the repo. If
-   not, register explicit cost rates.
+5. **Five body-shape questions one live Bedrock call settles**, in risk
+   order: whether `output_config: { effort }` passes through InvokeModel;
+   whether `block_binding: { prefix_mismatch_behavior }` does (resume depends
+   on it); the `amazon-bedrock-invocationMetrics` field names (a wrong name
+   degrades to zeros, not wrong numbers); `anthropic_beta` as a body field;
+   and whether `context_management` / `clear_thinking_20251015` is accepted.
+   All are modelled on Pi's first-party Anthropic path and unverified against
+   Bedrock.
 
 6. **Fix the preview-database migration problem separately.** Editing a
    migration after a PR push breaks the preview DB with a checksum mismatch,
