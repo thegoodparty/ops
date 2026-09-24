@@ -30,13 +30,23 @@ CREATE TABLE IF NOT EXISTS incident (
   recurrenceOf      TEXT REFERENCES incident(id),
 
   sessionRef        TEXT,
+  -- When the current or most recent agent launch started. Survives a
+  -- container restart, which is the case where the dispatcher has no memory
+  -- of the run it is resuming.
+  lastStartedAt     INTEGER,
+  -- Total launches, informational. Escalation is gated on consecutive fast
+  -- failures instead, so an interrupted agent is not mistaken for a crashing
+  -- one: every merge to main restarts this container.
   attempts          INTEGER NOT NULL DEFAULT 0,
   modelId           TEXT,
   costUsd           REAL NOT NULL DEFAULT 0,
   tokensIn          INTEGER NOT NULL DEFAULT 0,
   tokensOut         INTEGER NOT NULL DEFAULT 0,
   cacheRead         INTEGER NOT NULL DEFAULT 0,
-  cacheWrite        INTEGER NOT NULL DEFAULT 0
+  cacheWrite        INTEGER NOT NULL DEFAULT 0,
+  -- What the agent observed stop happening. RESOLVED is an evidence-based
+  -- claim, so the evidence has to outlive the Slack message that carried it.
+  resolvedEvidence  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS signal (
@@ -91,3 +101,19 @@ CREATE TABLE IF NOT EXISTS pending_directive (
 
 CREATE INDEX IF NOT EXISTS pending_directive_incident_idx
   ON pending_directive (incidentId);
+
+-- Who did what. The post-mortem template has a "humans involved" section, and
+-- merge / close / stop / split are supposed to appear in it, so the actions
+-- need a home that survives the Slack thread.
+CREATE TABLE IF NOT EXISTS incident_action (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  incidentId        TEXT NOT NULL REFERENCES incident(id),
+  actorKind         TEXT NOT NULL CHECK (actorKind IN ('agent','human','boss')),
+  actorId           TEXT,
+  action            TEXT NOT NULL,
+  reason            TEXT,
+  at                INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS incident_action_incident_idx
+  ON incident_action (incidentId, at);

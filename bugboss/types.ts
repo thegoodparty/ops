@@ -69,7 +69,12 @@ export interface Incident {
   /** Set when this reopens ground a RESOLVED incident claimed. */
   recurrenceOf: string | null;
 
+  resolvedEvidence: string | null;
+
   sessionRef: string | null;
+  /** When the current or most recent launch started. Survives a restart. */
+  lastStartedAt: number | null;
+  /** Total launches, informational. Escalation gates on fast failures. */
   attempts: number;
   modelId: string | null;
   costUsd: number;
