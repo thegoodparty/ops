@@ -114,8 +114,8 @@ still need the console once.
       grant to exactly this OU. Admins hold `AdministratorAccess` there as a
       second path. Withdrawing is why the policy resource is deliberately
       unprotected.)
-- [ ] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
-      role: doing (pi-step10, 2026-09-24. Named `pulumi-deploy`, in the
+- [x] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
+      role: done (2026-09-24, pi-step10. Named `pulumi-deploy`, in the
       family of the `pulumi-preview` role the PR-preview plan already
       expects to add to this account.
 
@@ -161,15 +161,23 @@ still need the console once.
       said since step 11. The full reasoning is the header of
       `deploy-workbench/deploy-role.ts`.
 
-      End state, checked before this flips to done: `Deploy workbench` green
-      on the cutover PR with the provider and the script both on
-      `pulumi-deploy`, the bootstrap grant gone from
-      `github-actions-workbench-deploy`, and `OrganizationAccountAccessRole`
-      itself deleted from the account — a console act by an admin, recorded
-      here with the time, because no remaining automated path holds
-      `iam:DeleteRole` on it and none should. Until that deletion the
-      Admins `AdministratorAccess` assignment stays exactly as it is:
-      post-cutover it is the only non-CI path into the account, which is
+      Closed 2026-09-24 (pi-step10), all three end-state criteria met.
+      `Deploy workbench` run 36044457245 (merge of the cutover PR, 264b7b1)
+      is green with the provider and the script both on `pulumi-deploy`:
+      the provider change was an update in place — `roleArn`
+      `OrganizationAccountAccessRole` → `pulumi-deploy`, one resource
+      updated, nothing replaced — which doubles as the cascade check
+      pr-previews step 8 asks for, and the script's log line reads
+      `Assumed arn:aws:sts::024901689212:assumed-role/pulumi-deploy/enable-bedrock-models`.
+      CI run 36044457209 removed the bootstrap statement from the
+      `WorkbenchDeploy` policy in the same merge. And
+      `OrganizationAccountAccessRole` itself is deleted from the account:
+      jeff, console, 2026-09-24, recorded from the actor because
+      `WorkbenchAccess` holds no `iam:GetRole` to read the absence back
+      with — the same shape as step 2's after-the-fact recording. The
+      front door into this account is now exactly one named role, trusted
+      by exactly one named role. The Admins `AdministratorAccess`
+      assignment stays as it is: it is the only non-CI path in, which is
       what it was kept for. That closes the "revisit it at step 10" on its
       fact entry below.
 
@@ -399,7 +407,8 @@ Facts discovered during implementation go here as they are learned:
   is a deliberate full-admin grant in the workbench account, kept as a named
   break-glass path so the only way in is not assuming
   `OrganizationAccountAccessRole` by hand; revisited at step 10, which keeps
-  it: once the bootstrap role is deleted it is the only non-CI path in.
+  it: the bootstrap role is deleted (2026-09-24), so this is now the only
+  non-CI path in.
 - SCPs enabled on org root: `SERVICE_CONTROL_POLICY`, since 2026-09-22.
   Enabled by jeff in the console as part 1 of step 9, because it is a
   property of the organization rather than of the OU; see "The workbench SCP"
