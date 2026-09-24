@@ -112,6 +112,12 @@ export interface BugBossSecrets {
   slackBotUserId?: string;
   /** Slack user-group id for the rotation. Null falls back to <!here>. */
   slackRotationGroupId?: string;
+  /**
+   * The channel incidents open threads in. Config rather than a credential,
+   * but it lives here because it is something a person knows and Pulumi does
+   * not, so the task definition has no way to supply it.
+   */
+  slackChannelId?: string;
   grafanaWebhookSecret?: string;
   grafanaBasicAuthPassword?: string;
   grafanaUrl?: string;
@@ -1126,6 +1132,7 @@ const readSecrets = (): BugBossSecrets => {
     slackSigningSecret: pick("SLACK_SIGNING_SECRET"),
     slackBotUserId: pick("SLACK_BOT_USER_ID"),
     slackRotationGroupId: pick("SLACK_ROTATION_GROUP_ID"),
+    slackChannelId: pick("BUGBOSS_SLACK_CHANNEL_ID"),
     grafanaWebhookSecret: pick("GRAFANA_WEBHOOK_SECRET"),
     grafanaBasicAuthPassword: pick("GRAFANA_BASIC_AUTH_PASSWORD"),
     grafanaUrl: pick("GRAFANA_URL") ?? "https://goodparty.grafana.net",
@@ -1148,7 +1155,7 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
   const secrets = readSecrets();
   const bucket = process.env.BUGBOSS_BUCKET;
   if (!bucket) throw new Error("BUGBOSS_BUCKET is required");
-  const channelId = process.env.BUGBOSS_SLACK_CHANNEL_ID;
+  const channelId = secrets.slackChannelId;
   if (!channelId) throw new Error("BUGBOSS_SLACK_CHANNEL_ID is required");
   if (!secrets.slackBotToken) throw new Error("SLACK_BOT_TOKEN is required");
 

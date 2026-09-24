@@ -54,6 +54,29 @@ contact point routes nothing until a human repoints a route. That is also the
 kill switch the design relies on, and the same operation as the parallel raw
 route below.
 
+### What goes in the `BUGBOSS` secret
+
+One JSON object. Two keys are checked at boot and the container exits
+without them, so a half-populated secret is a crash loop, not a degraded
+service. Everything else is checked where it is used.
+
+| Key | Needed | What it is |
+| --- | --- | --- |
+| `SLACK_BOT_TOKEN` | **at boot** | `xoxb-…` for the app that posts incident threads |
+| `BUGBOSS_SLACK_CHANNEL_ID` | **at boot** | The channel threads open in (`#dev-alerts`) |
+| `SLACK_SIGNING_SECRET` | for replies | Verifies inbound Slack events; without it the relay rejects every one |
+| `SLACK_BOT_USER_ID` | for replies | So the bot does not answer itself |
+| `SLACK_ROTATION_GROUP_ID` | optional | User-group to `@`. Falls back to `<!here>` |
+| `GRAFANA_WEBHOOK_SECRET` | for alerts | HMAC on the webhook body |
+| `GRAFANA_BASIC_AUTH_PASSWORD` | for alerts | Only if the contact point uses basic auth |
+| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | for evidence | Runs the alert's own LogQL before triage |
+| `GITHUB_TOKEN` | for fixes | The agent opens PRs with it. Must not be able to merge |
+| `BUGBOSS_MODEL_ID` | optional | Incident agent model. Defaults in code |
+| `BUGBOSS_TRIAGE_MODEL_ID` | optional | Defaults to `us.anthropic.claude-sonnet-5` |
+
+`BUGBOSS_BUCKET`, `BUGBOSS_AGENT_ROLE_ARN`, `BUGBOSS_PUBLIC_URL` and the
+region come from the task definition. Do not duplicate them here.
+
 ## Ship regardless, and ideally first
 
 **Add a parallel raw route in Grafana** so the alert firehose always reaches
