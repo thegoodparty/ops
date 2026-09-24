@@ -22,6 +22,11 @@ const REVIEW_REPOS = new Set([
   "gp-terraform-dataplatform",
   "candidate-sites",
   "gp-marketing",
+  // ops: review scope only (not in WRITE_REPOS). Bot approvals here are a
+  // signal, not a merge gate: .github/CODEOWNERS covers the whole repo and
+  // the ruleset requires code-owner review, which the reviewer App cannot
+  // satisfy.
+  "ops",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 

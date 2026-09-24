@@ -1,5 +1,6 @@
+# Every change to this repo must be approved by a human (see `*` below).
 # Changes to AWS permissions, to the bot's own review gates, and to this file
-# must be approved by a human.
+# are called out individually because they matter most.
 # delegate[bot] is a GitHub App and cannot be a team member, so a code-owner
 # requirement naming a team is structurally unsatisfiable by it.
 #
@@ -37,7 +38,16 @@
 # the trust policy, in deploy/components/ci-roles/policies.ts. Both are worth
 # having: this one stops the file being added, that one stops an added file
 # being believed.
+#
+# The `*` rule makes gp-contrib the owner of every path, so with code-owner
+# review required on main, no PR merges without a human approval. This is
+# what lets delegate review ops: a bot approval is a signal to humans, never
+# sufficient to merge. The explicit entries below are redundant with `*`
+# today but are kept, with the reasoning above, so that narrowing `*` later
+# cannot silently un-protect them. `*` must stay first: the last matching
+# pattern wins.
 
+*                                      @thegoodparty/gp-contrib
 /delegate/                             @thegoodparty/gp-contrib
 /deploy-org/                           @thegoodparty/gp-contrib
 /deploy-workbench/                     @thegoodparty/gp-contrib
