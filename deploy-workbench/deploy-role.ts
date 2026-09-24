@@ -35,6 +35,19 @@ import * as pulumi from "@pulumi/pulumi";
  *   `ListFoundationModelAgreementOffers`, `CreateFoundationModelAgreement`;
  * - `sts:GetCallerIdentity` for the `accountId` output, which needs no grant.
  *
+ * The inventory was checked against the bridged provider's source
+ * (terraform-provider-aws at the commit @pulumi/aws 7.23.0 pins) rather than
+ * guessed. Two findings from that check: a role refresh reads tags from the
+ * `GetRole` response, so `iam:ListRoleTags` exists as an action but is never
+ * called for this resource — and the tagging interceptor's ListTags fallback
+ * fires only when the read handler left tags unset, which `setTagsOut` in the
+ * role read never does; and a description edit goes through
+ * `UpdateRoleDescription`, a separate action from `UpdateRole` and the one
+ * that is actually needed. The live counter-evidence for the first is the
+ * v18 grant set in deploy/components/ci-roles/policies.ts, which has no
+ * `iam:ListRoleTags` and refreshes four tagged roles under `aws:defaultTags`
+ * on every green `deploy.yml` run.
+ *
  * Two things are deliberately absent. `aws-marketplace:*`, the permission
  * step 11 kept out of `WorkbenchAccess`: the script speaks Bedrock's
  * agreement API, not the Marketplace one, and if that ever stops being true
@@ -195,6 +208,11 @@ export const createDeployRole = (args: {
               "iam:CreateRole",
               "iam:GetRole",
               "iam:UpdateRole",
+              // A separate API call and a separate action, and the one a
+              // description edit actually needs — UpdateRole covers max
+              // session duration. The v18 comment in ci-roles/policies.ts
+              // records this failing a deploy when it was missing there.
+              "iam:UpdateRoleDescription",
               "iam:UpdateAssumeRolePolicy",
               "iam:DeleteRole",
               "iam:TagRole",
