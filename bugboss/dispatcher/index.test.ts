@@ -53,7 +53,7 @@ interface IncidentOverrides {
   attempts?: number;
   sessionRef?: string | null;
   firstSignalAt?: number;
-  fixingAt?: number | null;
+  lastStartedAt?: number | null;
 }
 
 const insertIncident = (
@@ -64,7 +64,7 @@ const insertIncident = (
   sqlite
     .prepare(
       `INSERT INTO incident
-         (id, status, owner, firstSignalAt, attempts, sessionRef, fixingAt)
+         (id, status, owner, firstSignalAt, attempts, sessionRef, lastStartedAt)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
@@ -74,7 +74,7 @@ const insertIncident = (
       over.firstSignalAt ?? T0,
       over.attempts ?? 0,
       over.sessionRef ?? null,
-      over.fixingAt ?? null,
+      over.lastStartedAt ?? null,
     );
 
 const ok = async () => ({ ok: true, directives: [] });
@@ -215,31 +215,118 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
-  it("escalates instead of relaunching past maxAttempts", async () => {
+  it("escalates a crash loop instead of relaunching forever", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, handOffs } = makeTools(sqlite);
-    insertIncident(sqlite, "i1", { attempts: 3, sessionRef: "s-1" });
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
-    const held = heldSpawn();
+    let launches = 0;
+    // Exits the instant it starts, which is what a crash loop looks like.
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+    };
+
     const d = createDispatcher(
-      deps({ db, spawn: held.spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
+      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
     );
 
-    const first = await d.tick();
-    assert.equal(held.contexts.length, 0, "no relaunch past the limit");
-    assert.deepEqual(first.escalated, ["i1"]);
-    assert.equal(handOffs.length, 1);
-    assert.match(handOffs[0].reason, /attempts/);
-    assert.match(handOffs[0].brief, /did not hand off itself/);
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    assert.equal(launches, 3);
+    assert.equal(handOffs.length, 0, "the limit is a ceiling, not a trigger");
+
+    const fourth = await d.tick();
+    assert.equal(launches, 3, "no relaunch past three consecutive fast deaths");
+    assert.deepEqual(fourth.escalated, ["i1"]);
+    assert.match(handOffs[0].reason, /consecutive launches died/);
+    assert.match(handOffs[0].brief, /crash loop/);
     assert.equal(
       db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
       "human",
     );
 
-    // Human-owned now, so the crash loop is over rather than merely slowed.
-    const second = await d.tick();
-    assert.deepEqual(second.escalated, []);
-    assert.equal(handOffs.length, 1);
+    const fifth = await d.tick();
+    assert.deepEqual(fifth.escalated, [], "human-owned, so the loop is over");
+    cleanup();
+  });
+
+  it("treats an interrupted agent as interrupted, not as crashing", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    // A high total: every merge to ops main restarts this container, and a
+    // long incident collects launches that way.
+    insertIncident(sqlite, "i1", { attempts: 12, sessionRef: "s-1" });
+
+    let clock = T0;
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+        fastFailureSeconds: 60,
+        now: () => clock,
+      }),
+    );
+
+    for (let i = 0; i < 4; i += 1) {
+      await d.tick();
+      clock += 600_000;
+      held.releaseAll();
+      await d.drain();
+    }
+
+    assert.equal(held.contexts.length, 4, "a healthy agent is always relaunched");
+    assert.deepEqual(handOffs, [], "attempts alone must never escalate");
+    assert.equal(
+      db.get<{ attempts: number }>("SELECT attempts FROM incident WHERE id = 'i1'")
+        ?.attempts,
+      16,
+      "attempts stays a running total, purely informational",
+    );
+    cleanup();
+  });
+
+  it("keeps ticking when one incident fails to launch", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    insertIncident(sqlite, "i1");
+    insertIncident(sqlite, "i2");
+
+    const held = heldSpawn();
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        config: config({ maxAttempts: 2 }),
+        credentials: async (incidentId) => {
+          if (incidentId === "i1") throw new Error("AssumeRole denied");
+          return {
+            accessKeyId: "ASIA-AGENT",
+            secretAccessKey: "agent-secret",
+            sessionToken: "agent-session",
+          };
+        },
+      }),
+    );
+
+    await d.tick();
+    assert.deepEqual(
+      held.contexts.map((c) => c.incidentId),
+      ["i2"],
+      "i1's failure must not stall i2",
+    );
+
+    await d.tick();
+    const third = await d.tick();
+    assert.deepEqual(third.escalated, ["i1"], "a launch that never starts escalates");
+    assert.match(handOffs[0].reason, /consecutive launches died/);
+    assert.deepEqual(d.list().map((a) => a.incidentId), ["i2"], "i2 ran throughout");
+
+    held.releaseAll();
+    await d.drain();
     cleanup();
   });
 
@@ -300,7 +387,7 @@ describe("Dispatcher.tick", () => {
       status: "FIXING",
       attempts: 1,
       sessionRef: "s-1",
-      fixingAt: T0 - 600_000,
+      lastStartedAt: T0 - 600_000,
     });
     insertIncident(sqlite, "i2");
 
@@ -322,8 +409,48 @@ describe("Dispatcher.tick", () => {
       seconds: 600,
     });
 
+    assert.equal(
+      db.get<{ lastStartedAt: number }>(
+        "SELECT lastStartedAt FROM incident WHERE id = 'i1'",
+      )?.lastStartedAt,
+      T0,
+      "every launch records its own start for the next resume",
+    );
+
     held.releaseAll();
     await d.drain();
+    cleanup();
+  });
+
+  it("measures the gap from lastStartedAt after a container restart", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    // The container dies mid-run: no exit is observed and no memory survives.
+    const first = createDispatcher(
+      deps({ db, spawn: heldSpawn().spawn, toolApiFor, now: () => T0 }),
+    );
+    await first.tick();
+
+    const restarted = createDispatcher(
+      deps({
+        db,
+        spawn: heldSpawn().spawn,
+        toolApiFor,
+        now: () => T0 + 420_000,
+      }),
+    );
+    await restarted.tick();
+
+    const directives = db.query<{ payload: string }>(
+      "SELECT payload FROM pending_directive",
+    );
+    assert.deepEqual(JSON.parse(directives[directives.length - 1].payload), {
+      type: "resumed_after",
+      seconds: 420,
+    });
+    assert.deepEqual(handOffs, [], "a restart is not a crash loop");
     cleanup();
   });
 
@@ -333,7 +460,7 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", {
       attempts: 1,
       sessionRef: "s-1",
-      firstSignalAt: T0 - 5_000,
+      lastStartedAt: T0 - 5_000,
     });
 
     const held = heldSpawn();

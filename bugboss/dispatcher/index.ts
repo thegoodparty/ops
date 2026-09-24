@@ -65,6 +65,11 @@ export interface DispatcherDeps {
   childCredentials?: Record<string, string | undefined>;
   /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
   childBaseEnv?: Record<string, string | undefined>;
+  /**
+   * An exit sooner than this after launch is a crash rather than a run.
+   * Defaults to two ticks, the shortest gap the dispatcher can even observe.
+   */
+  fastFailureSeconds?: number;
   now?: () => number;
 }
 
@@ -86,13 +91,13 @@ interface EligibleRow {
   status: IncidentStatus;
   sessionRef: string | null;
   attempts: number;
-  fixingAt: number | null;
+  lastStartedAt: number | null;
   firstSignalAt: number;
 }
 
 // No ORDER BY: a priority order is a scheduler, and this is not one.
 const ELIGIBLE_SQL = `
-  SELECT id, status, sessionRef, attempts, fixingAt, firstSignalAt
+  SELECT id, status, sessionRef, attempts, lastStartedAt, firstSignalAt
   FROM incident
   WHERE status IN ('INVESTIGATING', 'FIXING') AND owner = 'agent'
 `;
@@ -130,16 +135,20 @@ const deadlineBrief = (e: Entry, ranSeconds: number): string =>
     `Full transcript: session ${e.sessionRef ?? "none written yet"}.`,
   ].join("\n");
 
-const attemptsBrief = (row: EligibleRow, maxAttempts: number): string =>
+const crashLoopBrief = (
+  row: EligibleRow,
+  failures: number,
+  fastFailureSeconds: number,
+): string =>
   [
     "Escalated by the dispatcher. The agent did not hand off itself.",
     "",
-    `It has been launched ${row.attempts} times and has not reached a terminal state, so relaunching stopped at the limit of ${maxAttempts} rather than crash-looping.`,
+    `Its last ${failures} launches each died within ${fastFailureSeconds}s of starting, which is a crash loop rather than an interrupted investigation, so relaunching stopped. Total launches to date: ${row.attempts}.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
-    "What I was about to do: unknown; each attempt died before handing off.",
-    "Side effects: check the incident for PRs an earlier attempt opened.",
+    "What I was about to do: unknown; each launch died before handing off.",
+    "Side effects: check the incident for PRs an earlier launch opened.",
     `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
   ].join("\n");
 
@@ -152,12 +161,20 @@ export class Dispatcher {
   private readonly credentials: AgentCredentialProvider;
   private readonly childCredentials: Record<string, string | undefined>;
   private readonly childBaseEnv: Record<string, string | undefined>;
+  private readonly fastFailureMs: number;
   private readonly now: () => number;
 
   /** The live side of the comparison. In-process, so it is simply true. */
   private readonly running = new Map<string, Entry>();
   /** When we last saw an agent exit, for the resumed_after figure. */
   private readonly lastExitAt = new Map<string, number>();
+  /**
+   * Launches that died almost immediately, in a row. Deliberately not
+   * persisted: a container that came back up healthy is not evidence that
+   * the agent is crashing, and a crash-looping container is ECS service
+   * health's alarm rather than this counter's.
+   */
+  private readonly fastFailures = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
 
   constructor(deps: DispatcherDeps) {
@@ -169,6 +186,8 @@ export class Dispatcher {
     this.credentials = deps.credentials;
     this.childCredentials = deps.childCredentials ?? {};
     this.childBaseEnv = deps.childBaseEnv ?? {};
+    this.fastFailureMs =
+      (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.now = deps.now ?? Date.now;
   }
 
@@ -222,11 +241,12 @@ export class Dispatcher {
         continue;
       }
 
-      if (row.attempts >= this.config.maxAttempts) {
+      const failures = this.fastFailures.get(row.id) ?? 0;
+      if (failures >= this.config.maxAttempts) {
         const ok = await this.escalate(
           row.id,
-          `${row.attempts} agent attempts without a terminal state`,
-          attemptsBrief(row, this.config.maxAttempts),
+          `${failures} consecutive launches died within ${this.fastFailureMs / 1000}s`,
+          crashLoopBrief(row, failures, this.fastFailureMs / 1000),
         );
         if (ok) escalated.push(row.id);
         continue;
@@ -237,7 +257,22 @@ export class Dispatcher {
         continue;
       }
 
-      const entry = await this.launch(row, now);
+      // One incident's bad launch must not stall the rest of the tick. A
+      // launch that never started is a fast failure by definition, so a
+      // persistent one escalates rather than retrying every 30s forever.
+      let entry: Entry;
+      try {
+        entry = await this.launch(row, now);
+      } catch (err) {
+        const failures = (this.fastFailures.get(row.id) ?? 0) + 1;
+        this.fastFailures.set(row.id, failures);
+        alarm("launch_failed", {
+          incidentId: row.id,
+          error: String(err),
+          consecutiveFastFailures: failures,
+        });
+        continue;
+      }
       started.push(toRunningAgent(entry));
       settling.push(entry.done);
     }
@@ -264,9 +299,9 @@ export class Dispatcher {
   private launch = async (row: EligibleRow, now: number): Promise<Entry> => {
     const attempt = row.attempts + 1;
     await this.db.withWrite((db) => {
-      db.prepare("UPDATE incident SET attempts = attempts + 1 WHERE id = ?").run(
-        row.id,
-      );
+      db.prepare(
+        "UPDATE incident SET attempts = attempts + 1, lastStartedAt = ? WHERE id = ?",
+      ).run(now, row.id);
     });
 
     if (row.sessionRef) await this.emitResumedAfter(row, now);
@@ -357,12 +392,24 @@ export class Dispatcher {
       })
       .then(() => {
         if (this.running.get(row.id) === entry) this.running.delete(row.id);
-        this.lastExitAt.set(row.id, this.now());
+        const exitedAt = this.now();
+        this.lastExitAt.set(row.id, exitedAt);
+
+        // A crash loop dies quickly after starting; a deploy-killed agent was
+        // running fine for a while. Only the first should ever escalate.
+        const ranMs = exitedAt - entry.startedAt;
+        const fast = !entry.killed && ranMs < this.fastFailureMs;
+        const failures = fast ? (this.fastFailures.get(row.id) ?? 0) + 1 : 0;
+        if (fast) this.fastFailures.set(row.id, failures);
+        else this.fastFailures.delete(row.id);
+
         log("agent_exited", {
           incidentId: row.id,
           attempt,
           pid: entry.pid,
           killed: entry.killed,
+          ranSeconds: Math.round(ranMs / 1000),
+          consecutiveFastFailures: failures,
         });
       });
 
@@ -426,11 +473,12 @@ export class Dispatcher {
     row: EligibleRow,
     now: number,
   ): Promise<void> => {
-    // Precise when we watched the exit ourselves. After a container restart
-    // we did not, so fall back to the incident's last transition: an upper
-    // bound on the gap, which errs toward making the agent re-check.
+    // Exact when we watched the exit ourselves. After a container restart we
+    // did not, and a SIGKILLed process writes no exit time, so the best
+    // available is when that run started: still an upper bound, but bounded
+    // by the agent's own lifecycle rather than by the incident's age.
     const since =
-      this.lastExitAt.get(row.id) ?? row.fixingAt ?? row.firstSignalAt;
+      this.lastExitAt.get(row.id) ?? row.lastStartedAt ?? row.firstSignalAt;
     const seconds = Math.max(0, Math.round((now - since) / 1000));
     if (seconds < this.config.tickSeconds) return;
     await this.emitDirective(row.id, { type: "resumed_after", seconds });
