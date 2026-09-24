@@ -90,7 +90,7 @@ export const workbenchScp: PolicyDocument = {
       // key in an account built for autonomous agents is the credential most
       // likely to end up somewhere it cannot be revoked from.
       //
-      // Deliberately not iam:CreateRole. Step 10 creates a scoped in-account
+      // Deliberately not iam:CreateRole. Step 10 creates an in-account
       // deploy role and step 17 creates the role Bedrock assumes to write
       // invocation logs; denying role creation breaks both.
       Sid: "DenyIamUsersAndLongLivedKeys",

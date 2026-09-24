@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import { createDeployRole } from "./deploy-role";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -9,11 +10,10 @@ import * as aws from "@pulumi/aws";
  * `github-actions-workbench-deploy`, via
  * `.github/workflows/deploy-workbench.yml`.
  *
- * Empty of real resources on purpose. Steps 8 through 11 of
- * docs/workbench-account.md are what fill this account, and step 10 creates
- * the first resource that belongs here. What this file establishes now is the
- * path into the account, so that the next step debugs its own resources
- * rather than the credential chain underneath them.
+ * No longer empty: step 17's invocation logging arrived first, and step 10's
+ * scoped deploy role is at the bottom of this file. What this file
+ * established before either is the path into the account, so that each step
+ * debugs its own resources rather than the credential chain underneath them.
  *
  * Unlike `deploy/` and `deploy-org/`, everything here takes an explicit
  * provider. Those two run in the account their credentials already belong to;
@@ -35,10 +35,11 @@ const WORKBENCH_ACCOUNT_ID = "024901689212";
  *
  * `OrganizationAccountAccessRole` is created automatically by Organizations
  * when it provisions a member account, and it is effectively administrator.
- * Step 10 replaces it with a scoped in-account role and repoints this
- * `assumeRole` at that; the matching `sts:AssumeRole` grant on
- * `github-actions-workbench-deploy` moves at the same time rather than being
- * joined by a second one.
+ * Step 10 replaces it with the in-account deploy role in `deploy-role.ts`
+ * and repoints this `assumeRole` at that; the replacement grant on
+ * `github-actions-workbench-deploy` is added alongside the old one first
+ * (the apply that creates a role cannot assume it), and the old grant is
+ * removed in the same cutover PR that repoints this provider.
  *
  * `defaultTags` lives here rather than in `deploy.sh`. The `aws:defaultTags`
  * stack config the other two projects set applies to the *default* provider,
@@ -247,3 +248,17 @@ new aws.bedrockmodel.InvocationLoggingConfiguration(
 
 /** Where to look, so the step 17 check does not start with a console hunt. */
 export const invocationLogGroup = invocationLogs.name;
+
+// ---------------------------------------------------------------------------
+// The deploy role: what applies everything above, after step 10's cutover.
+// In its own file because the comment there is the design record for the
+// door into this account — what the role may do matters less than who can
+// assume it, and the why takes some explaining. Created while the provider
+// above still uses the bootstrap role — the apply that creates a role cannot
+// assume it — and the provider repoints in the cutover PR, when the grant
+// added alongside this in deploy/components/ci-roles/policies.ts has already
+// been applied.
+const deployRole = createDeployRole({ provider });
+
+/** Evidence for the step 10 entry: the apply log should show this ARN. */
+export const deployRoleArn = deployRole.arn;

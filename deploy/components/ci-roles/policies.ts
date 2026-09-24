@@ -685,10 +685,14 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
     //
     // What this grants is administrator in the workbench account, which is
     // what OrganizationAccountAccessRole is. That is the intended state only
-    // until step 10 replaces it with a scoped in-account role. When that
+    // until step 10 replaces it with the in-account deploy role. When that
     // happens, this statement moves to the new role rather than gaining it:
     // keeping both would leave a permanent admin path that nothing uses and
-    // nobody would notice.
+    // nobody would notice. The two statements below coexist for exactly the
+    // span of step 10's two PRs — the grant must be applied by deploy.yml
+    // before the cutover PR's consumer change merges — and the cutover PR
+    // deletes this one. "Moves rather than gains" describes the end state,
+    // not the transition. (Comment revised when step 10's first PR landed.)
     //
     // Nothing on the target side needs changing. The bootstrap role's trust
     // policy names the management account root, which delegates the decision
@@ -703,6 +707,20 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
       Effect: "Allow",
       Action: ["sts:AssumeRole"],
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+    },
+    // Step 10's replacement for the bootstrap grant: the in-account deploy
+    // role, created by deploy-workbench itself in the same PR. Added
+    // alongside the statement above rather than in its place because the two
+    // workflows are unordered ("Apply ordering between workflows") — this
+    // grant must already be applied when the cutover PR repoints the
+    // provider, and this PR is the one that can guarantee that. Inert until
+    // then: nothing references the new role yet, and the role does not exist
+    // until this PR's deploy-workbench apply creates it.
+    {
+      Sid: "AssumeWorkbenchDeployRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`,
     },
     ...pulumiBackendStatements("workbench"),
   ],

@@ -68,7 +68,8 @@ still need the console once.
       Engineers assignment waited for `inlinePolicy-workbench` to finish
       provisioning, while the Admins one, whose set's policies were already in
       state, did not.)
-- [ ] 9. Attach SCP to the `Workbench` OU: doing (claude-scp, 2026-09-22.
+- [x] 9. Attach SCP to the `Workbench` OU: done (2026-09-24, pi-step10;
+      claimed 2026-09-22 by claude-scp.
       Part 1 of 3 done: jeff enabled `SERVICE_CONTROL_POLICY` on root
       `r-jqqe` in the console, confirmed with `list-roots` reporting
       `Status: ENABLED`. `list-policies` returns only the AWS-managed
@@ -94,13 +95,18 @@ still need the console once.
       because part 2's grant merged and finished applying, which is what the
       ordering rule required.
 
-      Flip the whole step to done when the `Deploy org` run is green **and**
-      two things still work under the policy: a `WorkbenchAccess` session
-      invokes a `us.`-prefixed model, and the next `Deploy workbench` run
-      completes including its `Enable Bedrock models` step. A green
-      `Deploy org` proves only that the policy was created and attached; it
-      says nothing about whether the denies are right, and both checks
-      exercise a region exemption that would be invisible until it failed.
+      Closed 2026-09-24 (pi-step10), all three checks met. The `Deploy org`
+      run on the merge of PR #77 (e092d9e) was green: run 35921160450,
+      2026-09-23 21:14 UTC. A `WorkbenchAccess` session (jeff) invoked
+      `us.anthropic.claude-sonnet-5` on 2026-09-24 15:21 UTC — response id
+      `msg_bdrk_wz75srlipzytsr2um5ke4mn2oaue33jnessiuu5d4ajay3do22ma` — so
+      the geo-profile exemption holds under the policy rather than only on
+      paper. And the next `Deploy workbench` runs completed with their
+      `Enable Bedrock models` step: 35922190423, which created the Opus 5.5
+      agreement in us-east-1 and so exercised the `aws-marketplace`
+      exemption for real, and 35923530651. A green `Deploy org` alone would
+      have proved only creation and attachment; these are the checks that
+      say the denies are right.
 
       If something does break, the way out is `DetachPolicy`, which works
       whatever this policy says: SCPs never apply to the management account,
@@ -108,22 +114,63 @@ still need the console once.
       grant to exactly this OU. Admins hold `AdministratorAccess` there as a
       second path. Withdrawing is why the policy resource is deliberately
       unprotected.)
-- [ ] 10. Replace `OrganizationAccountAccessRole` with a scoped in-account
-      role: todo. The replacement has to carry what the stack already
-      creates, which is easy to under-scope because the bootstrap role is
-      administrator and hides the requirement. As of step 17 that is
-      `bedrock:PutModelInvocationLoggingConfiguration` with its Get and
-      Delete counterparts, `logs:CreateLogGroup`, `logs:PutRetentionPolicy`,
-      `logs:DeleteLogGroup`, `logs:DescribeLogGroups`,
-      `logs:TagResource`/`UntagResource`, and `iam:CreateRole`,
-      `iam:PutRolePolicy`, `iam:PassRole` for the logging role, plus the
-      matching reads and deletes. Re-derive from
-      `deploy-workbench/index.ts` when the step is claimed rather than
-      trusting this list, which will be stale by then. Also re-check the
-      PR preview path into this account (`pulumi-preview` role and the
-      configurable provider role ARN): if this step changes how the
-      provider reaches the account, previews must change with it. See
-      step 11 of [`pr-previews.md`](./pr-previews.md).
+- [ ] 10. Replace `OrganizationAccountAccessRole` with an in-account deploy
+      role: doing (pi-step10, 2026-09-24; the role and its grant are in
+      this PR, the cutover is the follow-up. Named `pulumi-deploy`, in the
+      family of the `pulumi-preview` role the PR-preview plan already
+      expects to add to this account.
+
+      Two PRs, forced by bootstrap causality: the apply that creates the
+      role cannot assume it, so this PR creates the role (provider still on
+      the bootstrap role) and adds the new `sts:AssumeRole` grant on
+      `github-actions-workbench-deploy` alongside the old one, and the
+      follow-up repoints the provider and the enable script and removes the
+      old grant. This PR's two halves can apply in either order — the
+      role's creation does not need the grant and the grant does not need
+      the role to exist — so the "Apply ordering between workflows" rule is
+      satisfied by there being nothing to order. The cutover PR's grant
+      dependency is already applied by then, which is what the rule exists
+      to arrange.
+
+      The design simplified in review, and the simplification is recorded
+      rather than papered over. The role was first built with a permission
+      set derived from the stack's resources (git history has it, and the
+      derivation caught real things — the `UpdateRoleDescription` quirk,
+      and proof that `iam:ListRoleTags` is never called for this resource).
+      jeff's review question — whether narrow scoping is worth a policy
+      change for every new piece of infra — had an honest answer that
+      argued against the scoped shape: self-management undercut it, since a
+      role holding `iam:PutRolePolicy` on itself can widen itself, making
+      the list friction rather than a boundary; the account is deliberately
+      sleepy; and the exclusions that matter already live in the SCP, which
+      binds admins too. The shipped shape is therefore
+      `AdministratorAccess` (the AWS-managed policy, attached) with the
+      trust policy as the whole control: it names exactly
+      `github-actions-workbench-deploy`, humans keep their own door (the
+      Identity Center `AdministratorAccess` assignment, step 8's
+      break-glass), and previews get their own role (pr-previews step 8).
+      The enable script moves to this role at cutover, as its header has
+      said since step 11. The full reasoning is the header of
+      `deploy-workbench/deploy-role.ts`.
+
+      End state, checked before this flips to done: `Deploy workbench` green
+      on the cutover PR with the provider and the script both on
+      `pulumi-deploy`, the bootstrap grant gone from
+      `github-actions-workbench-deploy`, and `OrganizationAccountAccessRole`
+      itself deleted from the account — a console act by an admin, recorded
+      here with the time, because no remaining automated path holds
+      `iam:DeleteRole` on it and none should. Until that deletion the
+      Admins `AdministratorAccess` assignment stays exactly as it is:
+      post-cutover it is the only non-CI path into the account, which is
+      what it was kept for. That closes the "revisit it at step 10" on its
+      fact entry below.
+
+      The PR-preview re-check this entry used to call for is done with the
+      design: the provider still reaches the account through
+      `assumeRoles`, only the ARN changes, so step 8 of
+      [`pr-previews.md`](./pr-previews.md) stands, with `pulumi-deploy`
+      replacing `OrganizationAccountAccessRole` as the default its
+      configurable ARN falls back to.)
 - [x] 11. Enable Bedrock model access in the new account: done (2026-09-22,
       run 35756509720 created four agreements, and every model in the
       sandbox's list now answers from a pi console. `WorkbenchAccess` holds no
@@ -177,8 +224,9 @@ still need the console once.
       session lasts, so this setting, not the permission set, is the real
       ceiling on an unattended run.
 
-- [ ] 17. Log Bedrock invocations for per-user attribution: doing
-      (claude-scp, 2026-09-23. **Do this before step 13.** Numbered 17
+- [x] 17. Log Bedrock invocations for per-user attribution: done
+      (2026-09-24, pi-step10; claimed 2026-09-23 by claude-scp. **Do this
+      before step 13.** Numbered 17
       because appending is how 15 and 16 were added and renumbering would
       invalidate every step reference in this document; the list is work
       items, not an execution order. Knowing who spent what is more useful
@@ -191,16 +239,22 @@ still need the console once.
       `*DataDeliveryEnabled` flag false. Design, and why this is not
       application inference profiles, in "Tracking Bedrock usage by user".
 
-      Flip to done only when **one real invocation from a `WorkbenchAccess`
-      session** has been followed by reading
-      `/aws/bedrock/modelinvocations`, and that read shows a record
-      containing `identity.arn` and non-zero token counts and **no** prompt
-      or completion body. A green apply proves nothing here: the failure mode
-      is an enabled configuration over an empty log group, because no AWS
-      page confirms a record is written when every modality is disabled. The
-      same check answers whether a geo-routed call logs in `us-west-2` at
-      all; if the group is empty but invocation worked, suspect the
-      destination region before suspecting the configuration.)
+      Closed 2026-09-24 (pi-step10) on the acceptance criterion above: a
+      real invocation from a `WorkbenchAccess` session (jeff,
+      `us.anthropic.claude-sonnet-5`, 15:21:29 UTC) was followed by reading
+      `/aws/bedrock/modelinvocations`, and the record — requestId
+      `173af5f6-bcbd-4aba-9dbf-9b40d540bdca` — carries `identity.arn`
+      `arn:aws:sts::024901689212:assumed-role/AWSReservedSSO_WorkbenchAccess_2c05f47560d36270/jeff@goodparty.org`,
+      `inputTokenCount` 15, `outputTokenCount` 5, and no prompt or
+      completion body, only the content types. The geo question is answered
+      too: the call routed to `us-east-1` (`inferenceRegion`) and the
+      record still landed in the `us-west-2` group, so a routed call logs
+      at home, not at the destination. The group already held about 220 KB
+      of records before this read, so this was confirmation of the
+      criterion, not first light. A green apply would have proved none of
+      it: the failure mode was an enabled configuration over an empty log
+      group, because no AWS page confirms a record is written when every
+      modality is disabled.)
 
 Facts discovered during implementation go here as they are learned:
 
@@ -297,7 +351,8 @@ Facts discovered during implementation go here as they are learned:
   `AdministratorAccess`, each with `targetId` 024901689212. The `Admins` one
   is a deliberate full-admin grant in the workbench account, kept as a named
   break-glass path so the only way in is not assuming
-  `OrganizationAccountAccessRole` by hand; revisit it at step 10.
+  `OrganizationAccountAccessRole` by hand; revisited at step 10, which keeps
+  it: once the bootstrap role is deleted it is the only non-CI path in.
 - SCPs enabled on org root: `SERVICE_CONTROL_POLICY`, since 2026-09-22.
   Enabled by jeff in the console as part 1 of step 9, because it is a
   property of the organization rather than of the OU; see "The workbench SCP"
@@ -788,8 +843,8 @@ against what a person does.
 - `iam:CreateUser`, `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access
   here is federated through Identity Center; long-lived keys in an account
   aimed at autonomous agents are the credential most likely to escape it.
-  Deliberately not `iam:CreateRole`: step 10 creates a scoped in-account
-  deploy role and needs it.
+  Deliberately not `iam:CreateRole`: step 10 creates an in-account deploy
+  role and needs it.
 - `cloudtrail:StopLogging`, `DeleteTrail`, `UpdateTrail`,
   `PutEventSelectors`. There may be no trail in this account yet, which makes
   these inert today and correct the moment there is one.
