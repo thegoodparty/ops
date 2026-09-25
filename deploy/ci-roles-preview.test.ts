@@ -69,16 +69,20 @@ describe("githubActionsPulumiPreview", () => {
     );
   });
 
-  it("scopes secret metadata to the DELEGATES secret, not *", () => {
+  it("scopes secret metadata to the runtime secrets, not *", () => {
     const describe = githubActionsPulumiPreview.Statement.find((s) =>
       (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
         "secretsmanager:DescribeSecret"
       )
     );
     assert.ok(describe);
-    assert.equal(
-      describe.Resource,
-      "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????"
-    );
+    const resources = (Array.isArray(describe.Resource)
+      ? describe.Resource
+      : [describe.Resource]
+    ).sort();
+    assert.deepEqual(resources, [
+      "arn:aws:secretsmanager:us-west-2:333022194791:secret:BUGBOSS-??????",
+      "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
+    ]);
   });
 });

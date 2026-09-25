@@ -835,20 +835,24 @@ export const githubActionsPulumiPreview: PolicyDocument = {
   Statement: [
     ...pulumiBackendReadStatements(["ops", "org", "workbench"]),
     {
-      Sid: "DelegatesSecretMetadata",
+      Sid: "RuntimeSecretMetadata",
       Effect: "Allow",
+      // The two Secrets Manager secrets the ops program looks up by name:
+      // `DELEGATES` (`deploy/index.ts`) and `BUGBOSS` (`components/bugboss.ts`).
       // The `getSecret` data source reads the secret's resource policy along
-      // with `DescribeSecret` (tags come back from the describe itself), so a
-      // preview needs `GetResourcePolicy` too. Both are metadata; neither
-      // returns a value. Found by running the first real preview: the initial
-      // `DescribeSecret`-only grant failed with AccessDenied on
-      // `GetResourcePolicy`.
+      // with `DescribeSecret` (tags come back from the describe itself), so
+      // `GetResourcePolicy` is needed as well. All metadata; none returns a
+      // value. Both secrets were found by running real previews: the first
+      // failed on `GetResourcePolicy` for `DELEGATES`, the second on
+      // `DescribeSecret` for `BUGBOSS`.
       Action: [
         "secretsmanager:DescribeSecret",
         "secretsmanager:GetResourcePolicy",
       ],
-      Resource:
+      Resource: [
         "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
+        "arn:aws:secretsmanager:us-west-2:333022194791:secret:BUGBOSS-??????",
+      ],
     },
     {
       Sid: "CurrentTaskDefinition",
