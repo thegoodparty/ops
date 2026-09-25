@@ -77,6 +77,11 @@ export const LOOKBACK_SECONDS = 3_600;
 
 export const QUERY_TIMEOUT_MS = 8_000;
 
+export const DEFAULT_GRAFANA_URL = "https://goodparty.grafana.net";
+
+/** The Loki datasource behind Grafana's proxy. Same uid in every env. */
+export const DEFAULT_LOKI_DATASOURCE_UID = "grafanacloud-logs";
+
 const METRIC_RESULT_TYPES = new Set(["matrix", "vector"]);
 
 // Recent alerts kept to make the known-cause share visible. Sized to a burst,
@@ -273,23 +278,32 @@ export const linesFrom = (payload: unknown): string[] => {
 /**
  * The default Loki client. Credentials are read at call time rather than at
  * import, so this module stays importable in a test that has no Loki.
- */
-/**
+ *
+ * Queries go through Grafana's datasource proxy rather than straight at the
+ * Loki endpoint, so the service account token is the single Grafana
+ * credential this system holds. The alternative wants a Grafana Cloud access
+ * policy token, minted in a different portal from the one the agents' token
+ * comes from: two credentials, two rotations, and triage authenticating by a
+ * different mechanism than the agents it hands off to. The path after the
+ * proxy prefix is the Loki API verbatim, so this costs nothing but a base URL.
+ *
  * Takes an env rather than reading `process.env`, because the values it
  * wants live in the `BUGBOSS_SECRETS` blob and `settingsEnv()` merges that
  * into a new object without mutating the process. Reading the process
- * directly makes blob-supplied Loki credentials invisible, and the symptom
- * is "Loki credentials are not configured" on values that are configured.
+ * directly makes blob-supplied credentials invisible, and the symptom is
+ * "not configured" on values that are configured.
  */
 export const createLokiQuery = (
   env: NodeJS.ProcessEnv = process.env,
 ): LokiQuery => async (logql, options) => {
-  const base = env.LOKI_URL;
-  const user = env.LOKI_USER;
-  const token = env.LOKI_TOKEN;
-  if (!base || !user || !token) {
-    throw new Error("Loki credentials are not configured");
+  const grafanaUrl = env.GRAFANA_URL ?? DEFAULT_GRAFANA_URL;
+  const token = env.GRAFANA_SERVICE_ACCOUNT_TOKEN;
+  if (!token) {
+    throw new Error("Grafana service account token is not configured");
   }
+  const base = `${grafanaUrl.replace(/\/+$/, "")}/api/datasources/proxy/uid/${
+    env.LOKI_DATASOURCE_UID ?? DEFAULT_LOKI_DATASOURCE_UID
+  }`;
 
   const params = new URLSearchParams({
     query: logql,
@@ -305,22 +319,15 @@ export const createLokiQuery = (
     direction: "backward",
   });
 
-  const credentials = Buffer.from(`${user}:${token}`, "utf8").toString(
-    "base64",
-  );
-
   let res: Response;
   try {
-    res = await fetch(
-      `${base.replace(/\/+$/, "")}/loki/api/v1/query_range?${params}`,
-      {
-        headers: {
-          accept: "application/json",
-          authorization: `Basic ${credentials}`,
-        },
-        signal: AbortSignal.timeout(QUERY_TIMEOUT_MS),
+    res = await fetch(`${base}/loki/api/v1/query_range?${params}`, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${token}`,
       },
-    );
+      signal: AbortSignal.timeout(QUERY_TIMEOUT_MS),
+    });
   } catch (err) {
     throw new Error(`Loki unreachable (${(err as Error).name})`);
   }
