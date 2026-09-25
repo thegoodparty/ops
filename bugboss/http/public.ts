@@ -21,6 +21,14 @@ const log = makeLog("boss-http");
 const alarm = makeAlarm("boss-http");
 
 /**
+ * A body read that ended because the caller went away, rather than because
+ * anything here is wrong. Matched on the message because the shapes come from
+ * three layers — undici aborts the request, Node resets the socket, and the
+ * runtime raises AbortError — and none of them carry a code worth switching on.
+ */
+const CLIENT_DISCONNECT = /aborted|ECONNRESET|AbortError|terminated/i;
+
+/**
  * Both webhook paths take the same handshake: the part that has to be durable
  * before the source is answered has already happened, and the part that costs
  * model calls is a promise nobody here waits on. Stated in the minimum these
@@ -68,12 +76,27 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
   // thing this system exists not to do. Registered on the app rather than
   // per route so a route added later cannot forget it. The routes that
   // answer 401 return that response rather than throwing, so they do not
-  // come through here — anything reaching this really is unexpected.
+  // come through here.
+  //
+  // A caller hanging up mid-body is the exception, and it has to be sorted
+  // out here rather than treated as unexpected. Reading the body is the first
+  // thing both webhook routes do, before anything authenticates the request,
+  // so an anonymous caller that declares a length and then disconnects makes
+  // this throw. Alarming on that lets anyone on the internet bury a real
+  // `route_failed` — the backstop for a dropped alert — under any volume of
+  // identical lines, which is precisely the "an alarm that fires during
+  // normal operation teaches people to ignore alarms" failure, arriving from
+  // outside. A disconnect is a fact about the client, not about us.
   app.onError((err, c) => {
+    const detail = String(err);
+    if (CLIENT_DISCONNECT.test(detail)) {
+      log("client_aborted", { method: c.req.method, path: c.req.path });
+      return c.json({ ok: false, error: "bad request" }, 400);
+    }
     alarm("route_failed", {
       method: c.req.method,
       path: c.req.path,
-      error: String(err),
+      error: detail,
     });
     return c.json({ ok: false, error: "internal error" }, 500);
   });

@@ -232,3 +232,51 @@ test("a normal delivery is still ingested", async () => {
   assert.notEqual(res.status, 413);
   assert.equal(ingested, 1);
 });
+
+// Reading the body is the first thing both routes do, before anything
+// authenticates the caller. So an anonymous client that declares a length and
+// then hangs up makes the handler throw. Alarming on that would let anyone
+// bury a real route_failed — the backstop for a dropped alert — under any
+// volume of identical lines.
+test("a caller hanging up mid-body logs rather than alarming", async () => {
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        throw new Error("aborted");
+      },
+    }),
+  );
+
+  const { result: res, errors } = await withCapturedErrors(async () =>
+    post(app, "/grafana", { status: "firing", alerts: [] }),
+  );
+
+  assert.equal(res.status, 400);
+  assert.equal(
+    errors.filter((line) => line.includes("route_failed")).length,
+    0,
+    `a client disconnect must not alarm, got ${JSON.stringify(errors)}`,
+  );
+});
+
+// The backstop itself has to keep working, or this fix would trade one silent
+// failure for another.
+test("a genuine route failure still alarms", async () => {
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        throw new Error("s3 is refusing writes");
+      },
+    }),
+  );
+
+  const { result: res, errors } = await withCapturedErrors(async () =>
+    post(app, "/grafana", { status: "firing", alerts: [] }),
+  );
+
+  assert.equal(res.status, 500);
+  assert.ok(
+    errors.some((line) => line.includes("route_failed")),
+    `expected a route_failed alarm, got ${JSON.stringify(errors)}`,
+  );
+});
