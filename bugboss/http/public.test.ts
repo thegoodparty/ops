@@ -155,3 +155,80 @@ test("health stays flat 200 so ECS does not replace a degraded task", async () =
   const res = await app.request("/health");
   assert.equal(res.status, 200);
 });
+
+// The body is read before anything authenticates it, because the HMAC is over
+// the raw bytes. So the size bound is the only thing standing between an
+// anonymous caller and the task's heap, and it has to hold before the handler
+// runs rather than inside it.
+test("an oversized grafana delivery is refused without being ingested", async () => {
+  let ingested = 0;
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        ingested++;
+        return { settled: Promise.resolve(), recorded: 1 };
+      },
+    }),
+  );
+
+  const { result: res } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1),
+    }),
+  );
+
+  assert.equal(res.status, 413);
+  assert.equal(ingested, 0);
+});
+
+test("an oversized slack delivery is refused the same way", async () => {
+  const app = createPublicApp(deps());
+
+  const { result: res } = await withCapturedErrors(async () =>
+    app.request("/slack", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1),
+    }),
+  );
+
+  assert.equal(res.status, 413);
+});
+
+// A refused burst would silently undo the `maxAlerts: 0` the contact point is
+// set to, so the refusal is an alarm rather than a log line.
+test("an oversized delivery alarms rather than passing quietly", async () => {
+  const app = createPublicApp(deps());
+
+  const { errors } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1),
+    }),
+  );
+
+  assert.ok(
+    errors.some((line) => line.includes("body_rejected")),
+    `expected a body_rejected alarm, got ${JSON.stringify(errors)}`,
+  );
+});
+
+test("a normal delivery is still ingested", async () => {
+  let ingested = 0;
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        ingested++;
+        return { settled: Promise.resolve(), recorded: 1 };
+      },
+    }),
+  );
+
+  const res = await post(app, "/grafana", { status: "firing", alerts: [] });
+
+  assert.notEqual(res.status, 413);
+  assert.equal(ingested, 1);
+});

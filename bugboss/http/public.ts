@@ -7,6 +7,7 @@
 // exception: the target group polls the task directly.
 
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import type { Context } from "hono";
 
 import { IngestRejected } from "./errors";
@@ -81,6 +82,33 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
   // Boss still beats no Boss: failing this check would have ECS replace a
   // task that is losing alerts rather than one that cannot take them.
   app.get("/health", (c) => c.json({ status: "ok" }));
+
+  // Both webhook handlers read the whole body before anything authenticates
+  // it, because the HMAC is over the raw bytes and there is nothing to verify
+  // until all of them are here. That order cannot change, so the bound has to
+  // come first: without it an anonymous caller makes one 16 GiB task hold an
+  // arbitrary number of arbitrary-length bodies and answers each 401, which is
+  // the deploy-window outage handed to whoever wants it.
+  //
+  // A megabyte is far above any real delivery. The contact point runs with
+  // `maxAlerts: 0` so a burst is never truncated, and a refusal here would
+  // silently recreate the truncation that setting exists to prevent — hence an
+  // alarm rather than a log. If this fires for a real burst, raise the
+  // ceiling; it must not become routine.
+  const ingestBodyLimit = bodyLimit({
+    maxSize: 1024 * 1024,
+    onError: (c) => {
+      alarm("body_rejected", {
+        path: c.req.path,
+        contentLength: c.req.header("content-length") ?? "unset",
+        note: "a delivery exceeded the ingest body limit and was refused unread",
+      });
+      return c.json({ ok: false, error: "body too large" }, 413);
+    },
+  });
+
+  app.post("/grafana", ingestBodyLimit);
+  app.post("/slack", ingestBodyLimit);
 
   // The contact point runs uncapped, so a burst arrives as one delivery and
   // costs a prefetch and a triage call per alert. Held open, that outlasts
