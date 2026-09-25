@@ -22,7 +22,8 @@ the consumer by a different workflow, and nothing sequences the two.
 - [ ] 1. Record this plan: doing (claude-pr-previews, 2026-09-24)
 - [ ] 2. Audit the `ops`, `org` and `workbench` stack state for secrets: todo.
       Gate for posting full diffs publicly; see "Secrets in the diff".
-- [ ] 3. Stop reading the `DELEGATES` secret value in `deploy/index.ts`: todo.
+- [ ] 3. Stop reading the `DELEGATES` secret value in `deploy/index.ts`:
+      doing (pi-pr-previews, 2026-09-25).
 - [ ] 4. Create the `github-actions-pulumi-preview` role: todo.
 - [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
       `org`: todo. Depends on 2, 3 and 4 being applied.
