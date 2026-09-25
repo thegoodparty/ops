@@ -936,13 +936,17 @@ export const createBugBoss = async (
       // which is what makes "how often does this fire and get suppressed" a
       // question the Slack agent can answer.
       //
-      // explained records that the Boss reached a decision about it. Every
-      // other reader of that column scopes it by incidentId, so this is
-      // invisible to them, and it is the only thing separating a suppression
-      // from an orphan the sweep still owes an incident -- which is also the
-      // difference the "zero alerts go unaddressed" metric is counted on.
+      // closedAt is what separates a suppression from an orphan the sweep
+      // still owes an incident, which is also the difference the "zero alerts
+      // go unaddressed" metric is counted on. It is closedAt rather than
+      // explained because explained means an agent's root cause accounted for
+      // this signal, and a suppression has neither an agent nor a root cause.
+      // A suppressed signal is simply finished, which is what closedAt says.
       await db.withWrite((w: Database.Database) => {
-        w.prepare("UPDATE signal SET explained = 1 WHERE id = ?").run(signalId);
+        w.prepare("UPDATE signal SET closedAt = ? WHERE id = ?").run(
+          now(),
+          signalId,
+        );
       });
       log("suppressed", {
         signalId,
@@ -1135,19 +1139,19 @@ export const createBugBoss = async (
     }>(
       `SELECT id, source, sourceId, kind, title, body, labels, reportedBy, openedAt
        FROM signal
-       WHERE incidentId IS NULL AND explained = 0 AND closedAt IS NULL
+       WHERE incidentId IS NULL AND closedAt IS NULL
        ORDER BY openedAt
        LIMIT ?`,
       [ORPHAN_SWEEP_LIMIT],
     );
 
     // The project is judged on alerts that reach nobody, and this predicate
-    // is that number: recorded, still firing, no incident, no suppression.
+    // is that number: recorded, still open, no incident, no suppression.
     // Emitted every pass so it is a series rather than a thing to go and ask.
     log("orphan_backlog", {
       signals: db.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM signal
-         WHERE incidentId IS NULL AND explained = 0 AND closedAt IS NULL`,
+         WHERE incidentId IS NULL AND closedAt IS NULL`,
       )?.n ?? 0,
     });
 

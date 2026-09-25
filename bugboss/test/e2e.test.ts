@@ -12,9 +12,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, before, test } from "node:test";
+import { after, before, mock, test } from "node:test";
 
-import { createBugBoss, type BugBoss } from "../index";
+import {
+  bossConfigFromEnv,
+  createBugBoss,
+  createMemoryS3,
+  installCrashHandlers,
+  mcpConfigFor,
+  settingsEnv,
+  withSlackDeadline,
+  type BugBoss,
+} from "../index";
 import { createBossClient } from "../agent/run";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { ModelReply, ModelRequest } from "../triage";
@@ -33,30 +42,57 @@ const fakeModel = {
   // `recurrenceOf` rides along on a new_incident decision; the decide tool's
   // schema carries it even though TriageDecision itself does not.
   triageDecisions: [] as QueuedDecision[],
+  /** Held, every triage call blocks on it. Stands in for a slow model. */
+  gate: null as Promise<void> | null,
+  /** Runs once, inside a triage call, after its digest of open incidents. */
+  beforeDecide: null as (() => Promise<void>) | null,
+  /** Triage calls overlapping right now, and the high-water mark. */
+  inFlight: 0,
+  maxInFlight: 0,
+  /** The last triage prompt, so a test can assert what triage was offered. */
+  lastPrompt: "",
   next(): QueuedDecision {
     const d = this.triageDecisions.shift();
     if (!d) throw new Error("fakeModel: no triage decision queued");
     return d;
   },
-  complete(request: ModelRequest): Promise<ModelReply> {
-    const call = (name: string, input: Record<string, unknown>) =>
-      Promise.resolve({
-        text: "",
-        toolCalls: [{ id: `call-${name}`, name, input }],
-      });
+  async complete(request: ModelRequest): Promise<ModelReply> {
+    const call = (name: string, input: Record<string, unknown>) => ({
+      text: "",
+      toolCalls: [{ id: `call-${name}`, name, input }],
+    });
     // Correlation asks a different question and must not eat a queued triage
     // decision. Nothing in these tests expects a merge.
     if (request.tools.some((tool) => tool.name === "propose")) {
       return call("propose", { merges: [] });
     }
-    return call("decide", { ...this.next() });
+    this.lastPrompt = JSON.stringify(request.messages);
+    this.inFlight++;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    try {
+      if (this.beforeDecide) {
+        const hook = this.beforeDecide;
+        this.beforeDecide = null;
+        await hook();
+      }
+      if (this.gate) await this.gate;
+      return call("decide", { ...this.next() });
+    } finally {
+      this.inFlight--;
+    }
   },
 };
 
 /** Captures what would have been posted, so assertions can read the thread. */
 const fakeSlack = {
   posts: [] as { threadTs: string | null; text: string }[],
+  /** One refused post. Slack being down for a moment is the normal case. */
+  failNextPost: false,
   post(threadTs: string | null, text: string) {
+    if (this.failNextPost) {
+      this.failNextPost = false;
+      return Promise.reject(new Error("slack: ratelimited"));
+    }
     this.posts.push({ threadTs, text });
     return Promise.resolve({ ts: `ts-${this.posts.length}` });
   },
@@ -410,4 +446,457 @@ test("the same alert firing again after resolution opens a recurrence", async ()
     [first!.id],
   );
   assert.ok(reopened, "a premature resolution has to be contradictable");
+});
+
+// --- the webhook answers before it works -----------------------------------
+
+const until = async (ready: () => boolean, what: string): Promise<void> => {
+  for (let attempt = 0; attempt < 400; attempt++) {
+    if (ready()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+};
+
+const incidentOf = (sourceId: string): string | null =>
+  boss.db.get<{ incidentId: string | null }>(
+    "SELECT incidentId FROM signal WHERE sourceId = ?",
+    [sourceId],
+  )?.incidentId ?? null;
+
+const threadOf = (incidentId: string): string | null =>
+  boss.db.get<{ slackThreadTs: string | null }>(
+    "SELECT slackThreadTs FROM incident WHERE id = ?",
+    [incidentId],
+  )?.slackThreadTs ?? null;
+
+test("the Grafana webhook answers before triage, and places afterwards", async () => {
+  let release!: () => void;
+  fakeModel.gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "the model is taking its time",
+  });
+
+  const body = grafanaBody("fp-40", "slow-triage-errors");
+  const res = await boss.publicApp.request("/grafana", {
+    method: "POST",
+    headers: body.headers,
+    body: body.rawBody,
+  });
+
+  // The contact point runs uncapped and triage costs tens of seconds an
+  // alert, so a held-open request is a burst lost to a webhook timeout.
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, recorded: 1 });
+  assert.ok(
+    boss.db.get("SELECT id FROM signal WHERE sourceId = 'fp-40'"),
+    "the row is durable before the 200, so a retry dedups onto it",
+  );
+  assert.equal(incidentOf("fp-40"), null, "and triage has not run yet");
+
+  release();
+  fakeModel.gate = null;
+  await until(() => incidentOf("fp-40") !== null, "fp-40 to be placed");
+});
+
+// --- a signal that reached no incident is never abandoned ------------------
+
+/**
+ * What a container leaves on disk when it dies between recording a signal and
+ * placing it: a durable row with no incident, which tickResolution cannot see
+ * because it joins through incident, and which a redelivery used to answer
+ * "duplicate" to.
+ */
+const orphanSignal = (id: string, sourceId: string, slug: string) =>
+  boss.db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO signal
+         (id, source, sourceId, kind, title, body, labels, reportedBy, openedAt, closedAt, incidentId, explained)
+       VALUES (?, 'grafana', ?, 'alert', ?, ?, ?, NULL, ?, NULL, NULL, 0)`,
+    ).run(
+      id,
+      sourceId,
+      `[PROD] ${slug}`,
+      "recorded, then the process died before it was placed",
+      JSON.stringify({ alert_slug: slug, environment: "prod" }),
+      Date.now(),
+    );
+  });
+
+test("a redelivery places a signal that was recorded but never placed", async () => {
+  await orphanSignal("sig-orphan-a", "fp-70", "orphan-redelivery-errors");
+
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open covers this",
+  });
+  const [placed] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-70", "orphan-redelivery-errors"),
+  );
+
+  assert.notEqual(
+    placed.action,
+    "duplicate",
+    "a row with no incident is not a duplicate, it is the last chance to place it",
+  );
+  assert.equal(placed.signalId, "sig-orphan-a");
+  assert.ok(incidentOf("fp-70"), "the redelivery is what finally placed it");
+});
+
+test("the sweep places a signal no redelivery will ever repeat", async () => {
+  await orphanSignal("sig-orphan-b", "fp-71", "orphan-sweep-errors");
+
+  await boss.tickResolution();
+  assert.equal(
+    incidentOf("fp-71"),
+    null,
+    "resolution joins through incident, so it cannot see an unattached signal",
+  );
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "swept up" });
+  assert.equal(await boss.sweepOrphans(), 1);
+  assert.ok(incidentOf("fp-71"), "the sweep is the only thing that recovers it");
+});
+
+test("an attach target that merges away mid-triage opens a new incident", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "the target" });
+  await boss.ingest("grafana", grafanaBody("fp-81", "merge-target-errors"));
+  const target = incidentOf("fp-81")!;
+  const into = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE status = 'CLOSED' LIMIT 1",
+  )!.id;
+
+  fakeModel.triageDecisions.push({
+    action: "attach",
+    incidentId: target,
+    reason: "the same problem as the open incident",
+  });
+  // Triage answers against a digest read before the model call, so its target
+  // can be absorbed by a correlation merge while it is still thinking.
+  fakeModel.beforeDecide = () =>
+    boss.db.withWrite((w) => {
+      w.prepare(
+        "UPDATE incident SET status = 'MERGED', mergedInto = ? WHERE id = ?",
+      ).run(into, target);
+    });
+
+  const [placed] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-82", "merge-victim-errors"),
+  );
+
+  assert.notEqual(
+    placed.action,
+    "failed",
+    "a target that vanished mid-triage must not strand the signal",
+  );
+  const landed = incidentOf("fp-82");
+  assert.ok(landed, "the signal reached an incident");
+  assert.notEqual(landed, target);
+});
+
+// --- a thread follows an incident, not an ingest ---------------------------
+
+test("an incident created by a split gets a thread of its own", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first" });
+  await boss.ingest("grafana", grafanaBody("fp-50", "split-parent-errors"));
+  const parent = incidentOf("fp-50")!;
+
+  fakeModel.triageDecisions.push({
+    action: "attach",
+    incidentId: parent,
+    reason: "looks like the same thing",
+  });
+  await boss.ingest("grafana", grafanaBody("fp-51", "split-child-errors"));
+
+  const explained = boss.db.get<{ id: string }>(
+    "SELECT id FROM signal WHERE sourceId = 'fp-50'",
+  )!;
+  const reported = await boss.toolApiFor(parent).reportRootCause({
+    cause: "only the first alert is this bug",
+    explainedSignalIds: [explained.id],
+  });
+  assert.ok(reported.ok, reported.error);
+
+  const split = incidentOf("fp-51")!;
+  assert.notEqual(split, parent, "the unexplained signal splits into its own incident");
+  assert.ok(
+    threadOf(split),
+    "without a thread its agent posts top level and contact_human can never be answered",
+  );
+});
+
+test("a thread that failed to open is opened on the next pass", async () => {
+  fakeSlack.failNextPost = true;
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "slack is down" });
+  await boss.ingest("grafana", grafanaBody("fp-60", "slack-down-errors"));
+
+  const incidentId = incidentOf("fp-60")!;
+  assert.equal(threadOf(incidentId), null, "the opening post was refused");
+
+  assert.ok((await boss.ensureIncidentThreads()) >= 1);
+  assert.ok(threadOf(incidentId), "a refused post costs a delay, not the thread");
+});
+
+// --- Slack cannot hold anything open ---------------------------------------
+
+test("a Slack call that never answers is bounded, not silently queued", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const stalled = withSlackDeadline({
+      post: () => new Promise(() => {}),
+      replies: () => new Promise(() => {}),
+    });
+    // The SDK retries a 429 for half an hour by default and raises nothing
+    // while it does, which is how one throttled channel stops the ingest path.
+    const rejected = assert.rejects(stalled.post(null, "anything"), /exceeded/);
+    mock.timers.tick(60_000);
+    await rejected;
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+// --- a burst is not a queue ------------------------------------------------
+
+const grafanaBurst = (fingerprints: string[], slug: string) => ({
+  headers: { "x-grafana-alerting-signature": "valid-in-test" },
+  rawBody: JSON.stringify({
+    status: "firing",
+    alerts: fingerprints.map((fingerprint) => ({
+      status: "firing",
+      fingerprint,
+      labels: { alert_slug: `${slug}-${fingerprint}`, environment: "prod" },
+      annotations: { summary: `[PROD] ${slug} ${fingerprint}` },
+      startsAt: new Date().toISOString(),
+    })),
+  }),
+});
+
+test("the alerts in one delivery triage together, not one after another", async () => {
+  let release!: () => void;
+  fakeModel.gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  fakeModel.maxInFlight = 0;
+  for (const reason of ["one", "two", "three"]) {
+    fakeModel.triageDecisions.push({ action: "new_incident", reason });
+  }
+
+  const burst = boss.ingest(
+    "grafana",
+    grafanaBurst(["fp-90", "fp-91", "fp-92"], "burst"),
+  );
+  try {
+    // Sequentially this is three 55s model calls before the last alert has an
+    // agent, and uncapped contact points make fifty possible.
+    await until(() => fakeModel.maxInFlight > 1, "two triage calls to overlap");
+  } finally {
+    release();
+    fakeModel.gate = null;
+  }
+
+  const placed = await burst;
+  assert.equal(placed.length, 3);
+  assert.deepEqual(
+    placed.map((p) => p.incidentId !== null),
+    [true, true, true],
+    "every alert in the burst is placed, in delivery order",
+  );
+});
+
+// --- owner is an axis of its own -------------------------------------------
+
+test("triage is not offered an incident a human already owns", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "handed off later" });
+  await boss.ingest("grafana", grafanaBody("fp-95", "handed-off-marker-errors"));
+  const owned = incidentOf("fp-95")!;
+  await boss.db.withWrite((w) => {
+    w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(owned);
+  });
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "unrelated" });
+  await boss.ingest("grafana", grafanaBody("fp-96", "unrelated-errors"));
+
+  assert.ok(
+    !fakeModel.lastPrompt.includes("handed-off-marker-errors"),
+    "assign refuses a boss write into a human-owned incident, so proposing one can only produce a refusal",
+  );
+});
+
+// --- the delivery that cannot be recorded is not answered 200 --------------
+
+test("a delivery that cannot be written answers a failure, not ok", async () => {
+  const refusing = createMemoryS3();
+  const send = refusing.send.bind(refusing) as (c: unknown) => Promise<unknown>;
+  refusing.send = ((command: { constructor: { name: string } }) =>
+    command.constructor.name === "PutObjectCommand"
+      ? Promise.reject(new Error("s3 is refusing writes"))
+      : send(command)) as typeof refusing.send;
+
+  const halted = await createBugBoss({
+    config: config(join(dir, "halted.db")),
+    model: fakeModel,
+    slack: fakeSlack,
+    spawnAgent: fakeAgent,
+    s3: refusing,
+    credentials: async () => ({
+      accessKeyId: "test",
+      secretAccessKey: "test",
+      sessionToken: "test",
+    }),
+    insecureTestVerifiers: { grafana: () => {} },
+  });
+
+  try {
+    const body = grafanaBody("fp-99", "unwritable-errors");
+    const res = await halted.publicApp.request("/grafana", {
+      method: "POST",
+      headers: body.headers,
+      body: body.rawBody,
+    });
+    // Placement failures are recovered by the sweep, but a row that never
+    // landed has nothing to sweep, so this one delivery is the only chance
+    // and the source has to be told to send it again.
+    assert.equal(res.status, 500);
+  } finally {
+    halted.stop();
+  }
+});
+
+// --- configuration a person supplies reaches the code that needs it --------
+
+const withBlob = (settings: Record<string, string>): NodeJS.ProcessEnv =>
+  settingsEnv({ BUGBOSS_SECRETS: JSON.stringify(settings) });
+
+test("the prod-critical allowlist can be delivered in the secret blob", () => {
+  const cfg = bossConfigFromEnv(
+    withBlob({
+      BUGBOSS_BUCKET: "bugboss-prod",
+      BUGBOSS_SLACK_CHANNEL_ID: "C0PROD",
+      BUGBOSS_PROD_CRITICAL_SLUGS: "pro-upgrade-errors, checkout-5xx ",
+    }),
+  );
+  // One of exactly three things the design says earns an @, and there is no
+  // other way to deliver it: the task definition does not set this.
+  assert.deepEqual(cfg.prodCriticalSlugs, ["pro-upgrade-errors", "checkout-5xx"]);
+});
+
+test("the MCP server mounts from the secret blob, or says nothing is set", () => {
+  const settings = {
+    BUGBOSS_PUBLIC_URL: "https://bugboss.goodparty.org/",
+    BUGBOSS_MCP_JWT_SECRET: "jwt",
+    BUGBOSS_GOOGLE_CLIENT_ID: "client",
+    BUGBOSS_GOOGLE_CLIENT_SECRET: "secret",
+  };
+  const mounted = mcpConfigFor(withBlob(settings));
+  assert.ok(mounted, "the whole OAuth leg is configured, so it mounts");
+  assert.equal(mounted?.publicUrl, "https://bugboss.goodparty.org");
+  assert.equal(mounted?.google.clientId, "client");
+
+  const { BUGBOSS_GOOGLE_CLIENT_SECRET: _omitted, ...half } = settings;
+  assert.equal(
+    mcpConfigFor(withBlob(half)),
+    undefined,
+    "half configured answers discovery and then cannot finish a login",
+  );
+});
+
+// --- the process does not die quietly --------------------------------------
+
+test("an unhandled rejection exits non-zero rather than dying quietly", () => {
+  // Called rather than emitted: the test runner installs its own handler for
+  // both of these, and a real emit would reach that one too.
+  const beforeRejection = process.listeners("unhandledRejection");
+  const beforeException = process.listeners("uncaughtException");
+  const exits: number[] = [];
+  installCrashHandlers((code) => exits.push(code));
+
+  const onRejection = process
+    .listeners("unhandledRejection")
+    .filter((listener) => !beforeRejection.includes(listener));
+  const onException = process
+    .listeners("uncaughtException")
+    .filter((listener) => !beforeException.includes(listener));
+  for (const listener of onRejection) {
+    process.off("unhandledRejection", listener);
+  }
+  for (const listener of onException) {
+    process.off("uncaughtException", listener);
+  }
+
+  assert.equal(onRejection.length, 1, "nothing was listening for a rejection");
+  assert.equal(onException.length, 1, "nothing was listening for an exception");
+  onRejection[0](new Error("boom"), Promise.resolve());
+  onException[0](new Error("worse"), "uncaughtException");
+
+  // A task that keeps passing its health check while half dead outlives the
+  // incident it was supposed to be working.
+  assert.deepEqual(exits, [1, 1]);
+});
+
+// --- suppression ------------------------------------------------------------
+
+test("a suppressed signal is finished, and the sweep does not re-triage it", async () => {
+  // The model cannot suppress on its own say-so: the alert has to declare the
+  // cause and declare it suppressible. That rule is the reason this needs a
+  // real body rather than a queued decision.
+  const knownCauses = JSON.stringify([
+    {
+      id: "known-flaky-canary",
+      summary: "the canary restarts nightly and trips this for a minute",
+      confirmedBy: "the restart shows in the deploy log",
+      action: "suppress",
+    },
+  ]);
+
+  fakeModel.triageDecisions.push({
+    action: "suppress",
+    knownCauseId: "known-flaky-canary",
+    reason: "the canary restarts nightly; this is that",
+  });
+  await boss.ingest("grafana", {
+    headers: { "x-grafana-alerting-signature": "valid-in-test" },
+    rawBody: JSON.stringify({
+      status: "firing",
+      alerts: [
+        {
+          status: "firing",
+          fingerprint: "fp-supp",
+          labels: { alert_slug: "canary-restart", environment: "prod" },
+          annotations: {
+            summary: "[PROD] canary-restart",
+            known_causes: knownCauses,
+          },
+          startsAt: new Date().toISOString(),
+        },
+      ],
+    }),
+  });
+
+  const signal = boss.db.get<{
+    id: string;
+    incidentId: string | null;
+    closedAt: number | null;
+  }>("SELECT id, incidentId, closedAt FROM signal WHERE sourceId = 'fp-supp'");
+  assert.ok(signal, "a suppressed signal is still recorded, or we cannot count suppressions");
+  assert.equal(signal!.incidentId, null, "suppression means no incident");
+  assert.ok(
+    signal!.closedAt,
+    "a suppressed signal is finished; without this the orphan sweep re-triages it forever",
+  );
+
+  // The sweep exists to recover signals that reached no incident. A
+  // suppression reached a decision, so it is not one of those.
+  const before = boss.db.query("SELECT id FROM incident").length;
+  await boss.sweepOrphans();
+  assert.equal(
+    boss.db.query("SELECT id FROM incident").length,
+    before,
+    "sweeping a suppression must not open an incident for it",
+  );
 });
