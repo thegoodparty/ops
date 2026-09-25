@@ -6,7 +6,14 @@ RUN npm install -g @anthropic-ai/claude-code
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --omit=dev
+# The toolchain is here for better-sqlite3, which this image does not use but
+# does install: one package.json serves both images, and `--omit=dev` keeps
+# anything in `dependencies`. It is native with no musl prebuild, so npm falls
+# through to node-gyp and alpine has no `make`. Removed again in the same
+# layer so it does not ship.
+RUN apk add --no-cache --virtual .build build-base python3 \
+  && npm ci --omit=dev \
+  && apk del .build
 COPY dist/delegate/ ./dist/delegate/
 
 # Vendor the Superpowers skills library (systematic-debugging, etc.) so the
