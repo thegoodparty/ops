@@ -42,8 +42,13 @@ the consumer by a different workflow, and nothing sequences the two.
       `DescribeSecret` on `DELEGATES` and `DescribeTaskDefinition`. No lock,
       backup or history objects: a preview is expected not to lock, and if it
       does, the missing grant fails closed and is added then).
-- [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
-      `org`: todo. Depends on 2, 3 and 4 being applied.
+- [x] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
+      `org`: done (2026-09-25, PR #101. `PULUMI_MODE=preview` in both scripts,
+      no `--create` and no `up`; ops reuses the deployed image; the workflow
+      assumes `github-actions-pulumi-preview`, skips forks, pins actions by
+      SHA, and posts one marker-identified comment per project. Actions
+      pinned, YAML and embedded scripts checked, tests green. The first live
+      preview after merge settles the state-lock question).
 - [x] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:
       done (2026-09-25, PR #90. `if: github.event_name != 'pull_request'`
       on "Configure AWS Credentials" and "Login to Amazon ECR"; the build's
@@ -206,10 +211,14 @@ derived from `CI`, and in that mode each `deploy.sh`:
 
 - runs `stack select` **without** `--create`;
 - sets config as today (local `Pulumi.*.yaml`, gitignored, not state);
-- for `ops`, resolves `IMAGE_URI` to the currently deployed image from the
-  `delegate` task definition, so code-only PRs show no task-definition diff;
-- runs `pulumi preview` (`--json` for the summary, `--diff` for the body) and
-  never `up`.
+- for `ops`, resolves `IMAGE_URI` and `BUGBOSS_IMAGE_URI` to the currently
+  deployed images from the `delegate` and `bugboss` task definitions, so
+  code-only PRs show no task-definition diff (and, for BugBoss, are not
+  previewed as destroyed — its resources are gated on `bugbossImageUri`);
+- runs `pulumi preview` once per invocation: `--json` to the path in
+  `PULUMI_PREVIEW_JSON` for the summary and diagnostics, `--diff` to stdout for
+  the body. Never `up`. One setup means the resolved images are consistent
+  across both passes.
 
 New workflow `.github/workflows/pulumi-preview.yml` (filename is not load
 bearing, since trust is by `sub` only, but keep it stable):
@@ -331,7 +340,9 @@ decision: step 10 adds only the workbench hop.
 
 - Does a DIY-backend preview lock? (step 4)
 - Does a change to the workbench provider's role ARN cascade? (step 8)
-- One comment per project or one combined comment? (step 5)
+- ~~One comment per project or one combined comment?~~ Decided at step 5:
+  one comment per project, marker-identified. Two parallel jobs editing one
+  shared comment would race; a per-project comment needs no coordination.
 - Is the passphrase parameter tagged `Environment=prod`? If so,
   `ReadOnlyAccess`'s inline deny blocks it and step 10 needs an exception.
   (step 10)

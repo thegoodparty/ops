@@ -18,7 +18,8 @@
 # /deploy/components/identity-center*, /deploy/deploy.sh); account-level IaC
 # (/deploy-org/, /deploy-workbench/); all of /.github/workflows/, since the
 # OIDC trust policies key on the ref, not the workflow file, so a newly added
-# workflow on main can assume the deploy roles; and this file. Scope each by
+# workflow on main can assume the deploy roles and one on any branch can
+# assume the PR preview role; and this file. Scope each by
 # directory rather than by file: a narrower gate leaves the same hole one file
 # over.
 

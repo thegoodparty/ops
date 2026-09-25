@@ -41,7 +41,7 @@ describe("githubActionsPulumiPreview", () => {
   // cannot slip in without failing here.
   it("grants read-only actions and nothing else", () => {
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:Describe|ecs:Describe)/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe)/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
