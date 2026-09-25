@@ -57,11 +57,13 @@ import { mcpConfigFromEnv } from "./mcp/config";
 import { createS3SessionStore } from "./mcp/sessions";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
 import { createS3ObjectStore, createSlackClient } from "./slack/client";
-import { SlackRelay, type SlackEvent } from "./slack/relay";
+import { SlackRelay, type InboundRoute, type SlackEvent } from "./slack/relay";
 import {
   applyAssign,
+  AssignError,
   createToolApi,
   mintAgentToken,
+  type AssignResult,
   type Correlator,
   type EvidenceStore,
 } from "./toolapi";
@@ -77,6 +79,7 @@ import type {
   Signal,
   SignalAdapter,
   ToolApi,
+  TriageDecision,
 } from "./types";
 
 const log = (event: string, data?: Record<string, unknown>) =>
@@ -91,6 +94,19 @@ const alarm = (event: string, data?: Record<string, unknown>) =>
 const OPEN_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING", "RESOLVED"];
 
 export const DEFAULT_TRIAGE_MODEL_ID = "us.anthropic.claude-sonnet-5";
+
+/** Per pass. Each one costs a triage call, so a backlog drains over ticks. */
+const ORPHAN_SWEEP_LIMIT = 25;
+
+/**
+ * How many signals in one delivery triage at once. Sequential, a fifteen
+ * alert burst is fifteen 55-second model calls before the last one has an
+ * agent. Bounded rather than unbounded because signals in flight are
+ * invisible to each other's openIncidents read, so a wide fan-out turns one
+ * cause into several incidents: the recoverable direction, since correlation
+ * merges them, but not a free one.
+ */
+const TRIAGE_CONCURRENCY = 5;
 
 /**
  * Where an incident agent's session lives. Chunk 5's own default writes to
@@ -175,6 +191,26 @@ export interface PlacedSignal {
   reason: string;
 }
 
+/**
+ * A delivery whose rows are durable and whose placement is still running.
+ * Recording is what makes a retry of the same delivery collapse, so it is the
+ * only part a webhook has to wait for; triage is tens of seconds per signal
+ * and would outlast every timeout between us and the source.
+ */
+export interface AcceptedIngest {
+  /** Signal rows written or matched by dedup, before the response goes out. */
+  recorded: number;
+  /** Prefetch, triage and assign for each of them. Does not reject. */
+  settled: Promise<PlacedSignal[]>;
+}
+
+/** The same split for Slack: the relay is synchronous, the agent is not. */
+export interface AcceptedSlackEvent {
+  routed: InboundRoute["kind"];
+  /** The Slack agent's answer, when the event earned one. */
+  settled: Promise<void>;
+}
+
 export interface BugBoss {
   readonly db: Db;
   readonly dispatcher: Dispatcher;
@@ -189,14 +225,22 @@ export interface BugBoss {
   /** Scoped to one incident by the token, which the caller may supply. */
   toolApiFor(incidentId: string, token?: string): ToolApi;
   ingest(source: string, req: IncomingRequest): Promise<PlacedSignal[]>;
+  /** Record now, place after. What the webhook route calls. */
+  ingestAccepted(source: string, req: IncomingRequest): Promise<AcceptedIngest>;
   /** An already-verified Slack Events payload: relay it, then answer it. */
   slackEvent(event: SlackEvent): Promise<void>;
+  /** Relay now, answer after. What the webhook route calls. */
+  slackEventAccepted(event: SlackEvent): Promise<AcceptedSlackEvent>;
   /** The MCP report_signal tool. Same path a Slack report takes. */
   reportSignal(report: HumanBugReport): Promise<ReportSignalResult>;
   /** One dispatcher tick, waited out. Agents normally outlive a tick. */
   dispatchOnce(): Promise<TickResult>;
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
   tickResolution(): Promise<number>;
+  /** Re-place signals that reached no incident. Returns how many moved. */
+  sweepOrphans(): Promise<number>;
+  /** Open a Slack thread for any incident still without one. */
+  ensureIncidentThreads(): Promise<number>;
   start(): void;
   stop(): void;
 }
@@ -467,6 +511,34 @@ export const createSlackAgentModel = (
   },
 });
 
+/**
+ * @slack/web-api defaults to tenRetriesInAboutThirtyMinutes with
+ * rejectRateLimitedCalls off, so a 429 pauses the SDK's queue and raises
+ * nothing while it retries. Every lifecycle post goes to one channel and
+ * chat.postMessage is throttled per channel, so that is reachable at fifteen
+ * concurrent agents, and it would otherwise stall whatever awaited the post.
+ * This bounds the wait, not the call: the SDK keeps retrying underneath.
+ */
+const SLACK_CALL_TIMEOUT_MS = 10_000;
+
+const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`slack ${what} exceeded ${SLACK_CALL_TIMEOUT_MS}ms`)),
+      SLACK_CALL_TIMEOUT_MS,
+    );
+    timer.unref();
+  });
+  return Promise.race([work, expiry]).finally(() => clearTimeout(timer));
+};
+
+export const withSlackDeadline = (slack: SlackClient): SlackClient => ({
+  post: (threadTs, text, channel) =>
+    withDeadline(slack.post(threadTs, text, channel), "chat.postMessage"),
+  replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
+});
+
 // ---------------------------------------------------------------------------
 // The composition root
 // ---------------------------------------------------------------------------
@@ -489,6 +561,10 @@ export const createBugBoss = async (
       note: "running against an in-memory object store; nothing survives this process",
     });
   }
+
+  // Everything here talks to Slack through this, so no single stalled post
+  // can hold the placement loop, the tool API or a resolution tick.
+  const slack = withSlackDeadline(options.slack);
 
   const s3 = options.s3 ?? createMemoryS3();
   const db = await Db.open({
@@ -551,7 +627,7 @@ export const createBugBoss = async (
 
   const relay = new SlackRelay({
     db,
-    slack: options.slack,
+    slack,
     config: {
       channelId: config.slackChannelId,
       botUserId: secrets.slackBotUserId ?? "",
@@ -562,14 +638,65 @@ export const createBugBoss = async (
   const slackAgent = new SlackAgent({
     db,
     store,
-    slack: options.slack,
+    slack,
     model: options.slackAgentModel ?? createSlackAgentModel(options.model, store),
-    config: { botUserId: secrets.slackBotUserId ?? "" },
+    config: {
+      botUserId: secrets.slackBotUserId ?? "",
+      // The Slack agent's fallback for a failure the thread cannot carry.
+      // Both values are already computed for the relay above; leaving them
+      // unset made that whole path unreachable in production.
+      alertChannel: config.slackChannelId,
+      rotationGroupId: secrets.slackRotationGroupId ?? null,
+    },
   });
 
   const mention = secrets.slackRotationGroupId
     ? `<!subteam^${secrets.slackRotationGroupId}>`
     : "<!here>";
+
+  /**
+   * A thread belongs to an incident, not to the ingest that happened to open
+   * one. reportRootCause splits unexplained signals into incidents of their
+   * own without passing anywhere near ingest, and a post that fails leaves an
+   * incident threadless for good; in both cases the agent posts top level and
+   * contact_human can never be answered, because answering it is matching a
+   * reply against slackThreadTs. So this keys off the incident and retries.
+   */
+  let threading: Promise<unknown> = Promise.resolve();
+
+  const ensureIncidentThreads = (): Promise<number> => {
+    const run = threading.catch(() => undefined).then(async () => {
+      const rows = db.query<{ id: string }>(
+        `SELECT id FROM incident
+         WHERE slackThreadTs IS NULL
+           AND status IN (${OPEN_STATUSES.map(() => "?").join(",")})
+         ORDER BY firstSignalAt`,
+        OPEN_STATUSES,
+      );
+
+      let opened = 0;
+      for (const row of rows) {
+        const signals = db.query<{ title: string }>(
+          "SELECT title FROM signal WHERE incidentId = ? ORDER BY openedAt, id",
+          [row.id],
+        );
+        try {
+          await relay.emit({
+            type: "opened",
+            incidentId: row.id,
+            title: signals[0]?.title ?? `Incident ${row.id}`,
+            signalCount: signals.length,
+          });
+          opened++;
+        } catch (err) {
+          alarm("open_post_failed", { incidentId: row.id, error: String(err) });
+        }
+      }
+      return opened;
+    });
+    threading = run.catch(() => undefined);
+    return run;
+  };
 
   // -------------------------------------------------------------------------
   // Triage, correlation and the tool API
@@ -584,8 +711,13 @@ export const createBugBoss = async (
       rootCause: string | null;
       firstSignalAt: number;
     }>(
+      // Status is where the work is, owner is who has it, and they are
+      // orthogonal. assign refuses a boss-actor write into a human-owned
+      // incident, so offering one as an attach or merge candidate can only
+      // produce a refusal -- triage would propose it, the assign would throw,
+      // and the retry below would open the new incident anyway.
       `SELECT id, status, rootCause, firstSignalAt FROM incident
-       WHERE status IN ('INVESTIGATING','FIXING','RESOLVED')
+       WHERE status IN ('INVESTIGATING','FIXING','RESOLVED') AND owner = 'agent'
        ORDER BY firstSignalAt`,
     );
     if (rows.length === 0) return [];
@@ -646,19 +778,27 @@ export const createBugBoss = async (
       token: token ?? mintToken(incidentId),
       tokenSecret,
       correlator,
-      slack: options.slack,
+      slack,
       evidence,
     });
 
     return {
       ...api,
+      // Where a split happens. The incidents it creates are real incidents
+      // with agents of their own, so they need threads before those agents
+      // start posting into the channel.
+      reportRootCause: async (args) => {
+        const response = await api.reportRootCause(args);
+        await ensureIncidentThreads();
+        return response;
+      },
       // The only transition that has to reach the rotation. The tool API
       // posts the brief itself; this adds the ping, which is the one thing it
       // cannot know to do.
       handOff: async (args) => {
         const response = await api.handOff(args);
         if (response.ok) {
-          await options.slack
+          await slack
             .post(
               db.get<{ slackThreadTs: string | null }>(
                 "SELECT slackThreadTs FROM incident WHERE id = ?",
@@ -682,20 +822,27 @@ export const createBugBoss = async (
   // Placing a signal: dedup, prefetch, triage, assign
   // -------------------------------------------------------------------------
 
-  const place = async (
-    signal: RawSignal,
-    adapter: SignalAdapter,
-  ): Promise<PlacedSignal> => {
+  /** Signals whose placement is running right now, so nothing double-places. */
+  const placing = new Set<string>();
+
+  interface RecordedSignal {
+    id: string;
+    incidentId: string | null;
+    /** False when this delivery has nothing left to decide. */
+    needsPlacement: boolean;
+  }
+
+  const recordSignal = async (signal: RawSignal): Promise<RecordedSignal> => {
     // One transaction, so the id and the uniqueness check cannot race two
     // concurrent deliveries of the same alert.
-    const inserted = await db.withWrite((w: Database.Database) => {
+    const row = await db.withWrite((w: Database.Database) => {
       const exists = w
         .prepare(
-          `SELECT id, incidentId FROM signal
+          `SELECT id, incidentId, explained FROM signal
              WHERE source = ? AND sourceId = ? AND closedAt IS NULL`,
         )
         .get(signal.source, signal.sourceId) as
-        | { id: string; incidentId: string | null }
+        | { id: string; incidentId: string | null; explained: number }
         | undefined;
       if (exists) return { ...exists, fresh: false };
 
@@ -720,24 +867,53 @@ export const createBugBoss = async (
         signal.reportedBy,
         signal.openedAt,
       );
-      return { id, incidentId: null, fresh: true };
+      return { id, incidentId: null, explained: 0, fresh: true };
     });
 
-    if (!inserted.fresh) {
-      log("duplicate_signal", {
-        signalId: inserted.id,
-        source: signal.source,
-        sourceId: signal.sourceId,
-      });
-      return {
-        signalId: inserted.id,
-        incidentId: inserted.incidentId,
-        action: "duplicate",
-        reason: "already ingested",
-      };
-    }
-    const signalId = inserted.id;
+    // A re-delivery of a signal that never reached an incident is the last
+    // chance anything has to place it, so it falls through rather than
+    // answering "duplicate" to a signal nobody is working. explained on an
+    // unattached row marks a suppression, which is a decision, not a gap.
+    const needsPlacement =
+      !placing.has(row.id) &&
+      (row.fresh || (row.incidentId === null && row.explained === 0));
+    if (needsPlacement) placing.add(row.id);
+    return { id: row.id, incidentId: row.incidentId, needsPlacement };
+  };
 
+  /**
+   * Triage decided against an openIncidents read taken before a model call
+   * that runs for tens of seconds, so its target can have been merged away or
+   * closed while it was thinking. NEW is where triage already falls back on a
+   * timeout or bad output, so a vanished target takes the same conservative
+   * direction instead of throwing and stranding the signal.
+   */
+  const assignPlacement = async (
+    signalId: string,
+    decision: TriageDecision,
+    recurrenceOf: string | null,
+  ): Promise<AssignResult> => {
+    const target = decision.action === "attach" ? decision.incidentId : "NEW";
+    const req = { signalIds: [signalId], target, reason: decision.reason };
+    const opts = recurrenceOf ? { recurrenceOf } : {};
+    try {
+      return await applyAssign(db, req, { kind: "boss" }, opts);
+    } catch (err) {
+      if (target === "NEW" || !(err instanceof AssignError)) throw err;
+      alarm("assign_target_vanished", {
+        signalId,
+        target,
+        error: String(err),
+      });
+      return applyAssign(db, { ...req, target: "NEW" }, { kind: "boss" }, opts);
+    }
+  };
+
+  const placeRecorded = async (
+    signalId: string,
+    signal: RawSignal,
+    adapter: SignalAdapter,
+  ): Promise<PlacedSignal> => {
     // Deterministic and free of agent turns, which is where triage quality
     // comes from. A failure here is not a reason to drop the signal.
     let prefetched: Evidence[] = [];
@@ -761,6 +937,15 @@ export const createBugBoss = async (
       // No incident and no agent. The signal stays in the table unattached,
       // which is what makes "how often does this fire and get suppressed" a
       // question the Slack agent can answer.
+      //
+      // explained records that the Boss reached a decision about it. Every
+      // other reader of that column scopes it by incidentId, so this is
+      // invisible to them, and it is the only thing separating a suppression
+      // from an orphan the sweep still owes an incident -- which is also the
+      // difference the "zero alerts go unaddressed" metric is counted on.
+      await db.withWrite((w: Database.Database) => {
+        w.prepare("UPDATE signal SET explained = 1 WHERE id = ?").run(signalId);
+      });
       log("suppressed", {
         signalId,
         knownCauseId: decision.knownCauseId,
@@ -774,29 +959,13 @@ export const createBugBoss = async (
       };
     }
 
-    const result = await applyAssign(
-      db,
-      {
-        signalIds: [signalId],
-        target: decision.action === "attach" ? decision.incidentId : "NEW",
-        reason: decision.reason,
-      },
-      { kind: "boss" },
-      outcome.recurrenceOf ? { recurrenceOf: outcome.recurrenceOf } : {},
+    const result = await assignPlacement(
+      signalId,
+      decision,
+      outcome.recurrenceOf,
     );
 
-    if (result.created) {
-      await relay
-        .emit({
-          type: "opened",
-          incidentId: result.target,
-          title: signal.title,
-          signalCount: 1,
-        })
-        .catch((err: unknown) =>
-          alarm("open_post_failed", { incidentId: result.target, error: String(err) }),
-        );
-    }
+    if (result.created) await ensureIncidentThreads();
 
     const slug = signal.labels[SLUG_LABEL];
     if (slug && config.prodCriticalSlugs.includes(slug)) {
@@ -832,10 +1001,35 @@ export const createBugBoss = async (
     };
   };
 
-  const ingest = async (
+  const place = async (
+    signal: RawSignal,
+    adapter: SignalAdapter,
+  ): Promise<PlacedSignal> => {
+    const recorded = await recordSignal(signal);
+    if (!recorded.needsPlacement) {
+      log("duplicate_signal", {
+        signalId: recorded.id,
+        source: signal.source,
+        sourceId: signal.sourceId,
+      });
+      return {
+        signalId: recorded.id,
+        incidentId: recorded.incidentId,
+        action: "duplicate",
+        reason: "already ingested",
+      };
+    }
+    try {
+      return await placeRecorded(recorded.id, signal, adapter);
+    } finally {
+      placing.delete(recorded.id);
+    }
+  };
+
+  const ingestAccepted = async (
     source: string,
     req: IncomingRequest,
-  ): Promise<PlacedSignal[]> => {
+  ): Promise<AcceptedIngest> => {
     const adapter = ingress.get(source);
 
     // Fails closed: nothing downstream ever sees an unverified body, and the
@@ -848,27 +1042,149 @@ export const createBugBoss = async (
       throw new IngestRejected((err as Error).message);
     }
 
+    // Durable before the caller answers 200, so a redelivery of the same
+    // burst collapses onto these rows instead of triaging it a second time.
+    // A row that cannot be written has to reach the source as a failure, or
+    // the one delivery that would have saved the alert is answered 200.
+    const recorded: { signal: RawSignal; row: RecordedSignal }[] = [];
+    try {
+      for (const signal of signals) {
+        recorded.push({ signal, row: await recordSignal(signal) });
+      }
+    } catch (err) {
+      for (const { row } of recorded) placing.delete(row.id);
+      throw err;
+    }
+
     // Per signal, because a Grafana burst arrives as one delivery and one
     // unplaceable alert must not lose the other fourteen.
-    const placed: PlacedSignal[] = [];
-    for (const signal of signals) {
+    const settled = (async () => {
+      const placed: PlacedSignal[] = new Array(recorded.length);
+      let next = 0;
+      const worker = async (): Promise<void> => {
+        for (let i = next++; i < recorded.length; i = next++) {
+          const { signal, row } = recorded[i];
+          if (!row.needsPlacement) {
+            log("duplicate_signal", {
+              signalId: row.id,
+              source: signal.source,
+              sourceId: signal.sourceId,
+            });
+            placed[i] = {
+              signalId: row.id,
+              incidentId: row.incidentId,
+              action: "duplicate",
+              reason: "already ingested",
+            };
+            continue;
+          }
+          try {
+            placed[i] = await placeRecorded(row.id, signal, adapter);
+          } catch (err) {
+            alarm("place_failed", {
+              signalId: row.id,
+              source: signal.source,
+              sourceId: signal.sourceId,
+              error: String(err),
+            });
+            placed[i] = {
+              signalId: row.id,
+              incidentId: null,
+              action: "failed",
+              reason: String(err),
+            };
+          } finally {
+            placing.delete(row.id);
+          }
+        }
+      };
+      await Promise.all(
+        Array.from(
+          { length: Math.min(TRIAGE_CONCURRENCY, recorded.length) },
+          worker,
+        ),
+      );
+      return placed;
+    })();
+
+    return { recorded: recorded.length, settled };
+  };
+
+  const ingest = async (
+    source: string,
+    req: IncomingRequest,
+  ): Promise<PlacedSignal[]> => (await ingestAccepted(source, req)).settled;
+
+  /**
+   * A signal whose placement threw is left with no incident and nothing that
+   * would ever look at it again: tickResolution joins through incident, so it
+   * skips unattached rows, and an agent only ever sees what is attached to
+   * its own. Since the number this project is judged on is alerts that reach
+   * nobody, an orphan is the worst state a row can be in, and any throw
+   * between the insert and the assign produces one.
+   */
+  const sweepOrphans = async (): Promise<number> => {
+    const rows = db.query<{
+      id: string;
+      source: string;
+      sourceId: string;
+      kind: Signal["kind"];
+      title: string;
+      body: string;
+      labels: string;
+      reportedBy: string | null;
+      openedAt: number;
+    }>(
+      `SELECT id, source, sourceId, kind, title, body, labels, reportedBy, openedAt
+       FROM signal
+       WHERE incidentId IS NULL AND explained = 0 AND closedAt IS NULL
+       ORDER BY openedAt
+       LIMIT ?`,
+      [ORPHAN_SWEEP_LIMIT],
+    );
+
+    // The project is judged on alerts that reach nobody, and this predicate
+    // is that number: recorded, still firing, no incident, no suppression.
+    // Emitted every pass so it is a series rather than a thing to go and ask.
+    log("orphan_backlog", {
+      signals: db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM signal
+         WHERE incidentId IS NULL AND explained = 0 AND closedAt IS NULL`,
+      )?.n ?? 0,
+    });
+
+    let replaced = 0;
+    for (const row of rows) {
+      if (placing.has(row.id) || !ingress.has(row.source)) continue;
+      placing.add(row.id);
       try {
-        placed.push(await place(signal, adapter));
+        const result = await placeRecorded(
+          row.id,
+          {
+            source: row.source,
+            sourceId: row.sourceId,
+            kind: row.kind,
+            title: row.title,
+            body: row.body,
+            labels: JSON.parse(row.labels) as Record<string, string>,
+            reportedBy: row.reportedBy,
+            openedAt: row.openedAt,
+          },
+          ingress.get(row.source),
+        );
+        log("orphan_replaced", {
+          signalId: row.id,
+          action: result.action,
+          incidentId: result.incidentId,
+        });
+        replaced++;
       } catch (err) {
-        alarm("place_failed", {
-          source: signal.source,
-          sourceId: signal.sourceId,
-          error: String(err),
-        });
-        placed.push({
-          signalId: null,
-          incidentId: null,
-          action: "failed",
-          reason: String(err),
-        });
+        alarm("orphan_replace_failed", { signalId: row.id, error: String(err) });
+      } finally {
+        placing.delete(row.id);
       }
     }
-    return placed;
+    return replaced;
   };
 
   const reportSignal = async (
@@ -1028,16 +1344,31 @@ export const createBugBoss = async (
   // Inbound Slack
   // -------------------------------------------------------------------------
 
-  const slackEvent = async (event: SlackEvent): Promise<void> => {
+  const slackEventAccepted = async (
+    event: SlackEvent,
+  ): Promise<AcceptedSlackEvent> => {
+    // The relay's writes are idempotent on (channel, ts) and bounded, so they
+    // stay inside the request: recording the reply is what a Slack retry is
+    // supposed to collapse onto. The agent is a two-minute model run against
+    // a three-second ack, so it cannot.
     const route = await relay.handle(event);
-    if (route.kind !== "slack_agent") return;
-    await slackAgent.handle({
-      channel: route.channel,
-      threadTs: route.threadTs,
-      ts: route.ts,
-      user: route.user,
-      text: route.text,
-    });
+    if (route.kind !== "slack_agent") {
+      return { routed: route.kind, settled: Promise.resolve() };
+    }
+    return {
+      routed: route.kind,
+      settled: slackAgent.handle({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        ts: route.ts,
+        user: route.user,
+        text: route.text,
+      }),
+    };
+  };
+
+  const slackEvent = async (event: SlackEvent): Promise<void> => {
+    await (await slackEventAccepted(event)).settled;
   };
 
   // -------------------------------------------------------------------------
@@ -1057,8 +1388,8 @@ export const createBugBoss = async (
   }
 
   const publicApp = createPublicApp({
-    ingest,
-    slackEvent,
+    ingestAccepted,
+    slackEventAccepted,
     slackConfig: slackIngress,
     mcp,
   });
@@ -1066,21 +1397,31 @@ export const createBugBoss = async (
     db,
     tokenSecret,
     toolApiFor,
-    slack: options.slack,
+    slack,
     now,
   });
 
   let servers: BugBossServers | null = null;
   let resolutionTimer: NodeJS.Timeout | null = null;
 
+  const background = (what: string, work: () => Promise<unknown>): void => {
+    void work().catch((err: unknown) =>
+      alarm(`${what}_failed`, { error: String(err) }),
+    );
+  };
+
   const start = (): void => {
     if (servers) return;
     servers = startServers({ publicApp, loopbackApp, config: options.http });
     dispatcher.start();
+    // A restart is the one moment nothing is in flight, so every unplaced
+    // signal and every threadless incident on disk is real rather than young.
+    background("startup_sweep", sweepOrphans);
+    background("startup_threads", ensureIncidentThreads);
     resolutionTimer = setInterval(() => {
-      void tickResolution().catch((err: unknown) =>
-        alarm("resolution_tick_failed", { error: String(err) }),
-      );
+      background("resolution_tick", tickResolution);
+      background("orphan_sweep", sweepOrphans);
+      background("thread_sweep", ensureIncidentThreads);
     }, config.dispatcher.tickSeconds * 1000);
     resolutionTimer.unref();
     log("started", { env: config.env, bucket: config.s3Bucket });
@@ -1107,10 +1448,14 @@ export const createBugBoss = async (
     mintToken,
     toolApiFor,
     ingest,
+    ingestAccepted,
     slackEvent,
+    slackEventAccepted,
     reportSignal,
     dispatchOnce,
     tickResolution,
+    sweepOrphans,
+    ensureIncidentThreads,
     start,
     stop,
   };
@@ -1120,30 +1465,85 @@ export const createBugBoss = async (
 // Production wiring
 // ---------------------------------------------------------------------------
 
-const readSecrets = (): BugBossSecrets => {
-  const blob = process.env.BUGBOSS_SECRETS;
-  const parsed = blob
-    ? (JSON.parse(blob) as Record<string, string | undefined>)
+/**
+ * Everything a person has to supply, in one place. A value can arrive in the
+ * Secrets Manager blob or as a plain environment variable, and which one
+ * carries a given key is an operational choice rather than a code one. The
+ * only way to keep that true is for nothing downstream to read process.env
+ * directly: a call site that does silently ignores the blob, which is how the
+ * MCP server and the prod-critical allowlist ended up permanently off with no
+ * error to find. Blob wins, so a secret can override a task definition.
+ */
+export const settingsEnv = (
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv => {
+  const parsed = base.BUGBOSS_SECRETS
+    ? (JSON.parse(base.BUGBOSS_SECRETS) as Record<string, string | undefined>)
     : {};
-  const pick = (key: string) => parsed[key] ?? process.env[key];
+  const merged: NodeJS.ProcessEnv = { ...base };
+  for (const [key, value] of Object.entries(parsed)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
+};
+
+const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
+  slackBotToken: env.SLACK_BOT_TOKEN,
+  slackSigningSecret: env.SLACK_SIGNING_SECRET,
+  slackBotUserId: env.SLACK_BOT_USER_ID,
+  slackRotationGroupId: env.SLACK_ROTATION_GROUP_ID,
+  slackChannelId: env.BUGBOSS_SLACK_CHANNEL_ID,
+  grafanaWebhookSecret: env.GRAFANA_WEBHOOK_SECRET,
+  grafanaBasicAuthPassword: env.GRAFANA_BASIC_AUTH_PASSWORD,
+  grafanaUrl: env.GRAFANA_URL ?? "https://goodparty.grafana.net",
+  grafanaServiceAccountToken: env.GRAFANA_SERVICE_ACCOUNT_TOKEN,
+  githubToken: env.GITHUB_TOKEN,
+  agentRoleArn: env.BUGBOSS_AGENT_ROLE_ARN,
+  triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
+  agentModelId: env.BUGBOSS_MODEL_ID,
+  awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
+});
+
+/**
+ * Pure, so the shape of a deployment is checkable without an AWS client in
+ * the room. The wiring below still is not: it is the only place a real Slack
+ * workspace, a real bucket and a real model are named.
+ */
+export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
+  const bucket = env.BUGBOSS_BUCKET;
+  if (!bucket) throw new Error("BUGBOSS_BUCKET is required");
+  const channelId = env.BUGBOSS_SLACK_CHANNEL_ID;
+  if (!channelId) throw new Error("BUGBOSS_SLACK_CHANNEL_ID is required");
 
   return {
-    slackBotToken: pick("SLACK_BOT_TOKEN"),
-    slackSigningSecret: pick("SLACK_SIGNING_SECRET"),
-    slackBotUserId: pick("SLACK_BOT_USER_ID"),
-    slackRotationGroupId: pick("SLACK_ROTATION_GROUP_ID"),
-    slackChannelId: pick("BUGBOSS_SLACK_CHANNEL_ID"),
-    grafanaWebhookSecret: pick("GRAFANA_WEBHOOK_SECRET"),
-    grafanaBasicAuthPassword: pick("GRAFANA_BASIC_AUTH_PASSWORD"),
-    grafanaUrl: pick("GRAFANA_URL") ?? "https://goodparty.grafana.net",
-    grafanaServiceAccountToken: pick("GRAFANA_SERVICE_ACCOUNT_TOKEN"),
-    githubToken: pick("GITHUB_TOKEN"),
-    agentRoleArn: pick("BUGBOSS_AGENT_ROLE_ARN"),
-    triageModelId: pick("BUGBOSS_TRIAGE_MODEL_ID"),
-    agentModelId: pick("BUGBOSS_MODEL_ID"),
-    awsRegion: pick("AWS_REGION") ?? pick("AWS_DEFAULT_REGION"),
+    env: "prod",
+    s3Bucket: bucket,
+    dbPath: env.BUGBOSS_DB_PATH ?? "/data/bugboss.db",
+    slackChannelId: channelId,
+    dispatcher: {
+      maxConcurrentAgents: Number(env.BUGBOSS_MAX_AGENTS ?? 15),
+      tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
+      agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 1800),
+      maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
+    },
+    prodCriticalSlugs: (env.BUGBOSS_PROD_CRITICAL_SLUGS ?? "")
+      .split(",")
+      .map((slug) => slug.trim())
+      .filter(Boolean),
   };
 };
+
+/**
+ * Only mounted when the whole OAuth leg is configured. A half-configured MCP
+ * server answers discovery and then cannot complete a login.
+ */
+export const mcpConfigFor = (env: NodeJS.ProcessEnv): McpConfig | undefined =>
+  env.BUGBOSS_PUBLIC_URL &&
+  env.BUGBOSS_MCP_JWT_SECRET &&
+  env.BUGBOSS_GOOGLE_CLIENT_ID &&
+  env.BUGBOSS_GOOGLE_CLIENT_SECRET
+    ? mcpConfigFromEnv(env)
+    : undefined;
 
 /**
  * The container entrypoint. Nothing here is reachable from a test, which is
@@ -1152,39 +1552,10 @@ const readSecrets = (): BugBossSecrets => {
  * verifier override.
  */
 export const bugBossFromEnv = async (): Promise<BugBoss> => {
-  const secrets = readSecrets();
-  const bucket = process.env.BUGBOSS_BUCKET;
-  if (!bucket) throw new Error("BUGBOSS_BUCKET is required");
-  const channelId = secrets.slackChannelId;
-  if (!channelId) throw new Error("BUGBOSS_SLACK_CHANNEL_ID is required");
+  const env = settingsEnv();
+  const secrets = readSecrets(env);
+  const config = bossConfigFromEnv(env);
   if (!secrets.slackBotToken) throw new Error("SLACK_BOT_TOKEN is required");
-
-  const config: BugBossConfig = {
-    env: "prod",
-    s3Bucket: bucket,
-    dbPath: process.env.BUGBOSS_DB_PATH ?? "/data/bugboss.db",
-    slackChannelId: channelId,
-    dispatcher: {
-      maxConcurrentAgents: Number(process.env.BUGBOSS_MAX_AGENTS ?? 15),
-      tickSeconds: Number(process.env.BUGBOSS_TICK_SECONDS ?? 30),
-      agentTimeoutSeconds: Number(process.env.BUGBOSS_AGENT_TIMEOUT ?? 1800),
-      maxAttempts: Number(process.env.BUGBOSS_MAX_ATTEMPTS ?? 3),
-    },
-    prodCriticalSlugs: (process.env.BUGBOSS_PROD_CRITICAL_SLUGS ?? "")
-      .split(",")
-      .map((slug) => slug.trim())
-      .filter(Boolean),
-  };
-
-  // Only mounted when the whole OAuth leg is configured. A half-configured
-  // MCP server answers discovery and then cannot complete a login.
-  const mcpConfig =
-    process.env.BUGBOSS_PUBLIC_URL &&
-    process.env.BUGBOSS_MCP_JWT_SECRET &&
-    process.env.BUGBOSS_GOOGLE_CLIENT_ID &&
-    process.env.BUGBOSS_GOOGLE_CLIENT_SECRET
-      ? mcpConfigFromEnv()
-      : undefined;
 
   return createBugBoss({
     config,
@@ -1192,20 +1563,41 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       modelId: secrets.triageModelId ?? DEFAULT_TRIAGE_MODEL_ID,
       region: secrets.awsRegion,
     }),
-    slack: createSlackClient(secrets.slackBotToken, channelId),
+    slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
     s3: new S3Client({}),
     secrets,
-    mcpConfig,
+    mcpConfig: mcpConfigFor(env),
     http: {
-      publicPort: Number(process.env.PORT ?? DEFAULT_PUBLIC_PORT),
-      loopbackPort: Number(
-        process.env.BUGBOSS_LOOPBACK_PORT ?? DEFAULT_LOOPBACK_PORT,
-      ),
+      publicPort: Number(env.PORT ?? DEFAULT_PUBLIC_PORT),
+      loopbackPort: Number(env.BUGBOSS_LOOPBACK_PORT ?? DEFAULT_LOOPBACK_PORT),
     },
   });
 };
 
+/**
+ * Node 22 makes an unhandled rejection fatal. Left to the default handler the
+ * process dies with no line of ours in the log, ECS replaces the task, and
+ * /health answers 200 again within seconds: a Boss that has been losing
+ * alerts looks identical to one that has not. Exiting non-zero is the point,
+ * not a side effect -- a half-dead task that still passes its health check is
+ * worse than a replaced one.
+ */
+export const installCrashHandlers = (
+  onFatal: (code: number) => void = (code) => process.exit(code),
+): void => {
+  const die = (event: string) => (error: unknown) => {
+    alarm(event, {
+      error:
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+    });
+    onFatal(1);
+  };
+  process.on("unhandledRejection", die("unhandled_rejection"));
+  process.on("uncaughtException", die("uncaught_exception"));
+};
+
 if (require.main === module) {
+  installCrashHandlers();
   bugBossFromEnv().then(
     (boss) => {
       boss.start();

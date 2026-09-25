@@ -12,10 +12,16 @@
 
 import type { Db } from "../db";
 import type { SlackPoster } from "./relay";
-import { stripBotMention } from "./relay";
+import { mentionPrefix, stripBotMention } from "./relay";
 
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "slack-agent", event, ...data }));
+
+/** Error level, for the failures whose only other notice is a Slack post. */
+const alarm = (event: string, data?: Record<string, unknown>) =>
+  console.error(
+    JSON.stringify({ component: "slack-agent", level: "error", event, ...data }),
+  );
 
 // ---------------------------------------------------------------------------
 // Session keys
@@ -408,6 +414,14 @@ export interface SlackMention {
 
 export interface SlackAgentConfig {
   botUserId: string;
+  /**
+   * Where a failure goes when the thread's own channel is what failed. A
+   * revoked token takes this too, but a bot removed from one channel or a
+   * channel that no longer exists does not.
+   */
+  alertChannel: string;
+  /** Rendered as <!subteam^ID> on that alert. Null falls back to <!here>. */
+  rotationGroupId: string | null;
   maxTurns?: number;
   lockTtlMs?: number;
   idleExpiryMs?: number;
@@ -430,6 +444,9 @@ interface ThreadState {
 
 const BUSY_REPLY =
   "Still working on the previous question in this thread. Ask me again once I have answered it.";
+
+const FAILURE_REPLY =
+  "I could not finish that one. The error is in the BugBoss logs.";
 
 export class SlackAgent {
   private readonly store: ObjectStore;
@@ -483,22 +500,67 @@ export class SlackAgent {
       });
 
       await this.slack.post(mention.threadTs, text, mention.channel);
-      await this.writeState(stateKey, {
-        lastSeenTs: mention.ts,
-        lastActivityAt: Date.now(),
-      });
+
+      // The answer is already posted. A failed state write costs the next
+      // resume its watermark; it must not turn an answer into an apology.
+      try {
+        await this.writeState(stateKey, {
+          lastSeenTs: mention.ts,
+          lastActivityAt: Date.now(),
+        });
+      } catch (err) {
+        log("state_write_failed", { thread: lockKey, error: String(err) });
+      }
       log("answered", { thread: lockKey, fresh, missed: missed.length });
     } catch (err) {
       log("run_failed", { thread: lockKey, error: String(err) });
-      await this.slack
-        .post(
-          mention.threadTs,
-          "I could not finish that one. The error is in the BugBoss logs.",
-          mention.channel,
-        )
-        .catch(() => undefined);
+      await this.reportFailure(mention, err);
     } finally {
       await this.lock.release(lockKey);
+    }
+  }
+
+  /**
+   * Saying "I failed" in the thread uses the same token, channel and API as
+   * the post that just failed, so the likeliest causes take both and the
+   * question goes unanswered with nobody told. The error log does not depend
+   * on Slack at all; the alert channel at least does not depend on this one.
+   */
+  private async reportFailure(
+    mention: SlackMention,
+    cause: unknown,
+  ): Promise<void> {
+    const thread = `${mention.channel}/${mention.threadTs}`;
+    try {
+      await this.slack.post(mention.threadTs, FAILURE_REPLY, mention.channel);
+      return;
+    } catch (err) {
+      alarm("failure_reply_failed", {
+        thread,
+        error: String(err),
+        cause: String(cause),
+      });
+    }
+
+    const alertChannel = this.cfg.alertChannel;
+    if (!alertChannel || alertChannel === mention.channel) return;
+    try {
+      await this.slack.post(
+        null,
+        [
+          `${mentionPrefix(this.cfg.rotationGroupId ?? null)}*A question in <#${mention.channel}> went unanswered*`,
+          `<@${mention.user}> asked in thread ${mention.threadTs} and I could not answer or say so there.`,
+          "The error is in the BugBoss logs.",
+        ].join("\n"),
+        alertChannel,
+      );
+      log("failure_alerted", { thread, channel: alertChannel });
+    } catch (err) {
+      alarm("failure_alert_failed", {
+        thread,
+        channel: alertChannel,
+        error: String(err),
+      });
     }
   }
 
@@ -545,11 +607,19 @@ export class SlackAgent {
     if (!body) return null;
     try {
       const parsed = JSON.parse(body) as Partial<ThreadState>;
-      if (typeof parsed.lastSeenTs !== "string") return null;
-      if (typeof parsed.lastActivityAt !== "number") return null;
+      if (
+        typeof parsed.lastSeenTs !== "string" ||
+        typeof parsed.lastActivityAt !== "number"
+      ) {
+        log("state_unusable", { key, reason: "shape" });
+        return null;
+      }
       return { lastSeenTs: parsed.lastSeenTs, lastActivityAt: parsed.lastActivityAt };
-    } catch {
-      // Unreadable state means start clean rather than resume into garbage.
+    } catch (err) {
+      // Unreadable state means start clean rather than resume into garbage,
+      // which silently drops every reply since the last answer, so it is said
+      // out loud rather than looking like the bot forgot the thread.
+      log("state_unusable", { key, reason: "unparseable", error: String(err) });
       return null;
     }
   }

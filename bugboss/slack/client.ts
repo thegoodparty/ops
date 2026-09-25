@@ -8,7 +8,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { WebClient } from "@slack/web-api";
+import { retryPolicies, WebClient } from "@slack/web-api";
 
 import type { ObjectStore, SlackClient } from "./agent";
 
@@ -23,7 +23,14 @@ export const createSlackClient = (
   token: string,
   defaultChannel: string,
 ): SlackClient => {
-  const web = new WebClient(token);
+  // The SDK defaults to ten retries over about thirty minutes and does not
+  // reject a rate-limited call, so a 429 parks the caller inside the SDK with
+  // nothing thrown and nothing logged. Posts are off the ingest request now,
+  // but an agent blocked in contact_human still waits on one, so the ceiling
+  // has to be minutes rather than half an hour.
+  const web = new WebClient(token, {
+    retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+  });
   return {
     post: async (threadTs, text, channel) => {
       const res = await web.chat.postMessage({

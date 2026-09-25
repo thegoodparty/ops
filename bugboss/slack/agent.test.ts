@@ -24,7 +24,26 @@ import {
 } from "./agent";
 
 const BOT = "U0BUGBOSS";
+const ALERT_CHANNEL = "C0ALERTS";
 const CHANNEL = "C0DEVALERTS";
+const ALERT = "C0BUGBOSS";
+const ROTATION = "S0ROTATION";
+
+/** Both consoles, because a failure the thread cannot carry lands there. */
+const captureLogs = async (fn: () => Promise<unknown>): Promise<string[]> => {
+  const lines: string[] = [];
+  const log = console.log;
+  const error = console.error;
+  console.log = (line: unknown) => lines.push(String(line));
+  console.error = (line: unknown) => lines.push(String(line));
+  try {
+    await fn();
+  } finally {
+    console.log = log;
+    console.error = error;
+  }
+  return lines;
+};
 
 const noS3 = (): S3Client =>
   ({
@@ -262,7 +281,7 @@ describe("prefix binding", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
 
     await agent.handle(mention({ ts: "100.0" }));
@@ -304,7 +323,7 @@ describe("the per-thread lock", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
 
     model.state.hold = true;
@@ -338,7 +357,7 @@ describe("the per-thread lock", () => {
           return { text: "second time lucky" };
         },
       },
-      config: { botUserId: BOT },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
 
     await agent.handle(mention({ ts: "100.0" }));
@@ -358,7 +377,7 @@ describe("the per-thread lock", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
 
     model.state.hold = true;
@@ -386,7 +405,7 @@ describe("session persistence", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
     return { model, slack, store, objects, agent };
   };
@@ -447,6 +466,38 @@ describe("session persistence", () => {
     assert.equal(model.runs[1].fresh, true);
   });
 
+  test("unreadable state says so instead of looking like amnesia", async () => {
+    const { model, objects, agent } = build();
+    objects.set(`sessions/slack/${CHANNEL}/100.0/state.json`, "{ truncated");
+
+    const lines = await captureLogs(() => agent.handle(mention({ ts: "200.0" })));
+
+    assert.equal(model.runs[0].fresh, true, "it starts clean, not on garbage");
+    assert.ok(
+      lines.some((line) => line.includes("state_unusable")),
+      "dropping every reply since the last answer must not be silent",
+    );
+  });
+
+  test("a state write that fails after the answer does not retract it", async () => {
+    const model = fakeModel();
+    const slack = fakeSlack();
+    const { store } = memoryStore();
+    const agent = new SlackAgent({
+      db,
+      store: { ...store, put: () => Promise.reject(new Error("s3 500")) },
+      slack: slack.client,
+      model: model.model,
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+    });
+
+    const lines = await captureLogs(() => agent.handle(mention({ ts: "100.0" })));
+
+    assert.equal(slack.posts.length, 1, "nothing contradicts the answer");
+    assert.equal(slack.posts[0].text, "answered");
+    assert.ok(lines.some((line) => line.includes("state_write_failed")));
+  });
+
   test("a throttled thread fetch costs context, not the answer", async () => {
     const model = fakeModel();
     const { store } = memoryStore();
@@ -462,7 +513,7 @@ describe("session persistence", () => {
         replies: () => Promise.reject(new Error("ratelimited")),
       },
       model: model.model,
-      config: { botUserId: BOT },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
 
     await agent.handle(mention({ ts: "100.0" }));
@@ -483,6 +534,39 @@ describe("Slack timestamps", () => {
     assert.equal(tsAfter("1758700001.000000", "1758700000.999999"), true);
     assert.equal(tsAfter("100.0", "100.0"), false, "equal is not after");
     assert.equal(tsAfter("100.1", "100"), true, "a missing fraction is zero");
+  });
+});
+
+describe("when the answer itself fails", () => {
+  test("a failure the thread cannot carry goes where the thread is not", async () => {
+    const { store } = memoryStore();
+    const posts: { channel?: string; text: string }[] = [];
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: {
+        post: (_threadTs, text, channel) => {
+          if (channel === CHANNEL) {
+            return Promise.reject(new Error("channel_not_found"));
+          }
+          posts.push({ channel, text });
+          return Promise.resolve({ ts: "ts-1" });
+        },
+        replies: () => Promise.resolve([]),
+      },
+      model: { run: () => Promise.reject(new Error("bedrock said no")) },
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION },
+    });
+
+    const lines = await captureLogs(() => agent.handle(mention({ ts: "100.0" })));
+
+    assert.equal(posts.length, 1, "someone was told");
+    assert.equal(posts[0].channel, ALERT, "not through the channel that failed");
+    assert.match(posts[0].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
+    assert.ok(
+      lines.some((line) => line.includes("failure_reply_failed")),
+      "and the apology failing is logged on its own, not swallowed",
+    );
   });
 });
 
