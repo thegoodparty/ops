@@ -19,7 +19,7 @@ applying** before the step that uses it, per "Apply ordering between
 workflows" in `workbench-account.md`. The grant is applied by `deploy.yml`,
 the consumer by a different workflow, and nothing sequences the two.
 
-- [ ] 1. Record this plan: doing (claude-pr-previews, 2026-09-24)
+- [x] 1. Record this plan: done (2026-09-24, PR #83).
 - [ ] 2. Audit the `ops`, `org` and `workbench` stack state for secrets: todo.
       Gate for posting full diffs publicly; see "Secrets in the diff".
 - [ ] 3. Stop reading the `DELEGATES` secret value in `deploy/index.ts`: todo.
@@ -27,7 +27,7 @@ the consumer by a different workflow, and nothing sequences the two.
 - [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
       `org`: todo. Depends on 2, 3 and 4 being applied.
 - [ ] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:
-      todo.
+      doing (pi-pr-previews, 2026-09-25).
 - [ ] 7. Narrow `github-actions-pulumi-deploy`'s ops trust entry to `main`:
       todo. Depends on 6 being merged.
 - [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
