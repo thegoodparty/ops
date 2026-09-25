@@ -21,6 +21,7 @@ let db: Db;
 let app: ReturnType<typeof createToolApiRoutes>;
 let clock = 1_000_000;
 let reached = 0;
+const threadPosts: string[] = [];
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-http-"));
@@ -45,7 +46,12 @@ before(async () => {
         reportRootCause: async (args: unknown) => ({ ok: true, data: args, directives: [] }),
       } as unknown as ToolApi;
     },
-    slack: { post: async () => ({ ts: "ts-1" }) },
+    slack: {
+      post: async (_threadTs: string | null, text: string) => {
+        threadPosts.push(text);
+        return { ts: "ts-1" };
+      },
+    },
     now: () => clock,
   });
 });
@@ -184,6 +190,32 @@ test("the directive read is scoped by the token like every other route", async (
     },
   });
   assert.equal(crossed.status, 403);
+});
+
+test("what the agent writes is converted for Slack and never truncated", async () => {
+  const before = threadPosts.length;
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({
+      message: "## Found it\n- **the cache**, log says `near <Set-Cookie>`",
+    }),
+  });
+  const posted = threadPosts[before];
+  assert.ok(posted.includes("*Found it*"), posted);
+  assert.ok(posted.includes("• *the cache*"), posted);
+  assert.ok(posted.includes("`near &lt;Set-Cookie&gt;`"), posted);
+
+  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: long }),
+  });
+  assert.equal(res.status, 200);
+  const parts = threadPosts.slice(before + 1);
+  assert.ok(parts.length > 1, `expected a split, got ${parts.length}`);
+  assert.ok(parts.join("").includes("ruled out 399"), "the tail is not dropped");
+
+  await authed("/pending-question", { method: "DELETE" });
 });
 
 test("the marker says whether the question was actually posted", async () => {

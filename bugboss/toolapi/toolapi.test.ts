@@ -722,6 +722,51 @@ describe("directives", () => {
 });
 
 describe("hand off", () => {
+  it("posts the brief as mrkdwn, with what it quotes made safe", async () => {
+    await seed("sig-fmt");
+    const id = await openIncident(["sig-fmt"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-fmt"] });
+
+    await tools.handOff({
+      reason: "deadline",
+      brief: [
+        "## What I believe now",
+        "- **the cookie** is dropped, see [the run](https://ci.test/7)",
+        "- the log says `parse failed near <Set-Cookie>`",
+      ].join("\n"),
+    });
+
+    const text = posts.at(-1)?.text ?? "";
+    assert.ok(text.includes("*What I believe now*"), text);
+    assert.ok(text.includes("• *the cookie* is dropped"), text);
+    assert.ok(text.includes("<https://ci.test/7|the run>"), text);
+    // The quoted log line is the attacker-writable part. Unescaped, its `<`
+    // swallows the rest of the brief and Slack still answers 200.
+    assert.ok(text.includes("`parse failed near &lt;Set-Cookie&gt;`"), text);
+    assert.doesNotMatch(text, /\*\*/);
+  });
+
+  it("splits a brief too long for one message rather than losing its tail", async () => {
+    await seed("sig-long");
+    const id = await openIncident(["sig-long"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-long"] });
+
+    const before = posts.length;
+    await tools.handOff({
+      reason: "deadline",
+      brief: Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n"),
+    });
+
+    const brief = posts.slice(before);
+    assert.ok(brief.length > 1, `expected a split, got ${brief.length}`);
+    assert.ok(
+      brief.map((p) => p.text).join("").includes("ruled out 399"),
+      "the tail is not dropped",
+    );
+  });
+
   it("is terminal for the agent and leaves the incident open", async () => {
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);

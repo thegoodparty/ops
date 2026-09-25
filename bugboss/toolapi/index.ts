@@ -42,6 +42,14 @@ import {
   type SignalRow,
 } from "./assign";
 import { verifyAgentToken } from "./token";
+import {
+  bullets,
+  link,
+  mrkdwn,
+  raw,
+  splitForSlack,
+  toMrkdwn,
+} from "../slack/format";
 import { makeAlarm, makeLog } from "../logging";
 
 export * from "./assign";
@@ -198,9 +206,18 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     }
   };
 
+  /**
+   * Everything the Boss says in an incident thread goes through here, so this
+   * is where mrkdwn and the length ceiling are enforced. A hand-off brief or a
+   * root cause is model prose that can run past what one message holds, and
+   * chat.postMessage truncates rather than refusing, so it is split into
+   * consecutive messages instead of being cut mid sentence.
+   */
   const notify = async (incident: Incident, text: string): Promise<boolean> => {
     try {
-      await slack.post(incident.slackThreadTs, text);
+      for (const part of splitForSlack(text)) {
+        await slack.post(incident.slackThreadTs, part);
+      }
       return true;
     } catch (err) {
       alarm("thread_post_failed", {
@@ -430,7 +447,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (splits.length > 0) {
         await notify(
           incident,
-          `Root cause on ${incidentId} does not explain ${splits.length} attached signal(s). Split out as incident(s) ${splits.map((s) => s.target).join(", ")}.`,
+          mrkdwn`*Root cause on ${incidentId} does not explain ${splits.length} attached signal${splits.length === 1 ? "" : "s"}*\n_Split out as ${splits.map((s) => s.target).join(", ")}._`,
         );
       }
 
@@ -469,7 +486,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       for (const merge of applied) {
         await notify(
           incident,
-          `Merged incident(s) ${merge.merged.join(", ")} into ${merge.target}: ${merge.reason}`,
+          mrkdwn`*Merged ${merge.merged.join(", ")} into ${merge.target}*\n${raw(toMrkdwn(merge.reason))}`,
         );
       }
 
@@ -513,7 +530,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (incident.usersImpacted !== args.usersImpacted) {
         await notify(
           incident,
-          `Impact on ${incidentId}: ${args.usersImpacted} users (was ${incident.usersImpacted ?? "unknown"}).`,
+          mrkdwn`*Impact on ${incidentId}: ${args.usersImpacted} users*\n_Previously ${incident.usersImpacted ?? "unknown"}._`,
         );
       }
 
@@ -568,13 +585,19 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (splits.length > 0) {
         await notify(
           incident,
-          `Resolving ${incidentId} left ${splits.length} signal(s) its root cause never explained. Split out as incident(s) ${splits.map((s) => s.target).join(", ")}.`,
+          mrkdwn`*Resolving ${incidentId} left ${splits.length} signal${splits.length === 1 ? "" : "s"} its root cause never explained*\n_Split out as ${splits.map((s) => s.target).join(", ")}._`,
         );
       }
 
       await notify(
         incident,
-        `Incident ${incidentId} resolved. ${args.evidence}${args.prUrls.length ? ` PRs: ${args.prUrls.join(", ")}` : ""}`,
+        [
+          mrkdwn`*Incident ${incidentId} resolved*`,
+          toMrkdwn(args.evidence),
+          ...(args.prUrls.length
+            ? [bullets(args.prUrls.map((url) => `Shipped: ${link(url)}`))]
+            : []),
+        ].join("\n"),
       );
       return {
         ok: true,
@@ -622,7 +645,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       await notify(
         incident,
-        `Incident ${incidentId} closed. ${args.usersImpacted} users impacted. Post-mortem written.`,
+        mrkdwn`*Incident ${incidentId} closed*\n_${args.usersImpacted} users impacted · post-mortem written._`,
       );
 
       return {
@@ -648,7 +671,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       // nobody was told about and nothing to pick it back up.
       const posted = await notify(
         incident,
-        `Incident ${incidentId} handed to a human: ${args.reason}\n\n${args.brief}`,
+        mrkdwn`*Incident ${incidentId} handed to a human* · ${args.reason}\n\n${raw(toMrkdwn(args.brief))}`,
       );
       if (!posted) {
         return reject(
@@ -666,7 +689,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const retract = (why: string) =>
         notify(
           incident,
-          `Correction on ${incidentId}: that hand-off could not be recorded, so ${why} Treat the brief above as a status update.`,
+          mrkdwn`*Correction on ${incidentId}*\nThat hand-off could not be recorded, so ${why} Treat the brief above as a status update.`,
         );
 
       try {

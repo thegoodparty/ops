@@ -27,6 +27,65 @@ agent waited out its full timeout.
 `mentioned` still drives `interrupt`. So a mention answers *and* interrupts;
 a plain reply answers.
 
+## Slack renders mrkdwn, and Markdown renders wrong
+
+`format.ts` is the only place text is prepared for Slack, and everything that
+posts goes through it. Markdown does not degrade in Slack, it renders broken:
+`**bold**` shows its asterisks, `## Root cause` shows its hashes, `[a](b)` is
+not a link, and a pipe table is a wall of pipes.
+
+Two kinds of text, escaped differently:
+
+- **Values** — signal titles, slugs, ids, counts. Data, never formatting, so
+  the `` mrkdwn`` `` tag escapes every interpolation. `raw()` is the only way
+  past it, which makes each exception greppable.
+- **Model prose** — root causes, evidence, briefs, post-mortems, the Slack
+  agent's answers. `toMrkdwn` keeps the mrkdwn the model meant, converts the
+  Markdown it wrote anyway, and escapes the rest.
+
+Escaping is the part that bites. Slack reads `<…>` as an entity, so one `<` in
+a quoted log line swallows everything after it and `chat.postMessage` still
+returns `ok: true`. The agent reads attacker-writable log lines for a living,
+so this is an input, not a hypothetical. `escape` is deliberately **not**
+idempotent: a log line containing the literal text `&amp;` has to survive, and
+nothing upstream pre-escapes — `agent/prompt.ts` tells the model to write the
+raw characters and let the boundary handle them.
+
+`toMrkdwn` will not pass `<!here>`, `<!channel>` or `<!subteam^…>` through. Who
+gets paged is the Boss's decision (`MENTION_EVENTS`), and an agent that can
+page the rotation for itself is how a rotation at twenty incidents a week gets
+muted. They escape, so they render as literal text rather than vanishing.
+
+Conversion happens **at the Slack boundary only**. What the incident stores is
+what the agent wrote, so the Slack agent reading `postmortem` back out of the
+database gets prose and not `&lt;`-riddled markup.
+
+## Length is a split, never a truncation
+
+`chat.postMessage` accepts 40,000 characters and truncates past it with a 200
+back, which is the one failure a reader cannot recover from by reading on. So
+`splitForSlack` cuts on line boundaries at 3,000 characters, marks each part
+`_(2/3)_`, and closes and reopens a code fence that a split falls inside —
+otherwise the rest of a post-mortem renders as code.
+
+## No Block Kit, deliberately
+
+Every message here is plain `text` mrkdwn, which is also what the delegate
+reviewer posts in this channel.
+
+Block Kit buys visual structure and interactive elements. BugBoss has no use
+for the second — ownership changes by replying in the thread, on purpose, and
+a button would be a second surface next to the thread that is supposed to be
+the whole record. The first is mostly `header` blocks, which are `plain_text`
+only and capped at 150 characters, so the heading Block Kit adds cannot carry
+an incident title anyway.
+
+Against that: `blocks` still needs a `text` fallback or the notification reads
+"This content can't be displayed"; `section` text is mrkdwn regardless, so the
+escaping work is identical; and `SlackPoster.post` is text-only across the
+relay, the tool API, the loopback route and every fake in the tests. It is
+more moving parts and more failure surface for a thread reply.
+
 ## Ownership claims
 
 `ownershipClaim` matches `mine` and `back to you` on the **whole normalized

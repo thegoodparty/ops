@@ -135,3 +135,17 @@ test("alert definitions stay inside their budget", async () => {
   assert.equal(context.alertDefinitions[0].content.length, 100);
   assert.match(context.alertDefinitions[1].content, /omitted for length/);
 });
+
+test("the agent is told to write mrkdwn, not Markdown", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.ok(prompt.includes("## Writing to Slack"));
+  // Everything the agent writes is posted verbatim, so the rules it needs are
+  // the ones Markdown gets wrong: bold, links, headings, and the escaping it
+  // must not attempt by hand.
+  assert.ok(prompt.includes("not **bold**"));
+  assert.ok(prompt.includes("<https://example.com|label>"));
+  assert.ok(prompt.includes("There are no headings and no tables."));
+  assert.match(prompt, /Do not escape `&`, `<` or `>` yourself/);
+  assert.match(prompt, /Never write `<!here>`/);
+});
