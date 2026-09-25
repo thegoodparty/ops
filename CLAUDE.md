@@ -2,15 +2,41 @@
 
 Operations tooling and AI agent infrastructure for GoodParty's Serve product.
 
+## How to use this file
+
+This is the map, not the manual. It carries repo-wide facts and points at
+the detailed docs. **Read the nearest `CLAUDE.md` to what you are changing**
+rather than loading everything: `bugboss/`, `delegate/` and `deploy/` each
+have their own, and the larger subsystems under `bugboss/` have theirs.
+
 ## Repo Structure
 
+- `bugboss/` — Incident agents that work Grafana alerts end to end. See
+  [`bugboss/CLAUDE.md`](./bugboss/CLAUDE.md)
+- `delegate/` — AI agent framework powered by Claude Agent SDK
 - `scripts/` — Operational automation scripts, run via `npm run script <name>`
 - `utils/` — Shared utilities (Grafana log search, People API client)
-- `delegate/` — AI agent framework powered by Claude Agent SDK
 - `deploy/` — Pulumi IaC for AWS infrastructure (ECS, Lambda, etc.)
 - `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
 - `deploy-workbench/` — Pulumi IaC for the contents of the `goodparty-workbench` account
 - `.github/workflows/` — CI/CD and scheduled automation
+
+## Repo-wide facts that will bite
+
+**One `package.json` serves every image.** Both Dockerfiles run
+`npm ci --omit=dev`, so anything in `dependencies` installs into both. A
+native module added for one breaks the other's build unless that image has a
+toolchain — which is exactly how `better-sqlite3` broke the delegate worker.
+
+**There is no prettier config.** No `.prettierrc`, no `prettier` key, and
+`main` is not prettier-clean. Do not run `prettier --write` here: it applies
+defaults this repo does not use and reformats files nobody touched.
+
+**Tests are `node --test` via `tsx`**, files named `*.test.ts`. Run the
+whole suite with `npm test`.
+
+**Commit with `--no-verify`.** Explain *why* in PR bodies, not what. No
+"test plan" section, no Co-Authored-By.
 
 ## Scripts
 
@@ -21,6 +47,25 @@ npm run script <script-name>
 ```
 
 Environment variables for scripts live in `scripts/.env` (see `scripts/.env.example`).
+
+## BugBoss
+
+Incident agents that work Grafana alerts end to end: triage each alert into
+an incident, spawn one coding agent per incident, and end in a post-mortem.
+One container, agents as child processes, SQLite mirrored to S3.
+
+Read [`bugboss/CLAUDE.md`](./bugboss/CLAUDE.md) before changing anything in
+there. The three things most likely to catch you out:
+
+- **Nothing auto-closes**, and nothing may fail silently. This system's
+  healthy state and its dead state both look like silence in Slack.
+- **Status and owner are orthogonal.** Status is where the work is; owner is
+  who has it. Do not collapse them.
+- **The schema's `CHECK` constraints cannot be added later.** SQLite cannot
+  `ALTER TABLE ADD CHECK` and there is no migration runner.
+
+Design goal: [`bugboss/docs/purpose.md`](./bugboss/docs/purpose.md).
+Architecture: [`bugboss/docs/architecture.md`](./bugboss/docs/architecture.md).
 
 ## Delegate
 
