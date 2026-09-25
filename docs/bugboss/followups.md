@@ -23,7 +23,7 @@ Pointed at `https://bugboss.goodparty.org/grafana`, with:
 
 ```
 hmacConfig.timestampHeader: "X-Grafana-Alerting-Timestamp"
-disableResolveMessage:      false
+disableResolveMessage:      true
 maxAlerts:                  0      (uncapped)
 ```
 
@@ -31,6 +31,11 @@ maxAlerts:                  0      (uncapped)
 contact point explicitly names it; there is no default. Without it Grafana
 signs the body alone, which is replayable, so ingress rejects every delivery.
 The symptom is "the webhook does nothing", with no error anywhere.
+
+**Resolve messages are off on purpose.** BugBoss discards them: an alert
+that stopped firing on its own has not stopped mattering, so the resolve
+carries no information it acts on. Turning them off at the contact point
+just saves the delivery.
 
 **Do not edit `gpbot-alert-filter` to achieve this.** Its `maxAlerts: 20` and
 `disableResolveMessage: true` are correct *for that consumer* and documented

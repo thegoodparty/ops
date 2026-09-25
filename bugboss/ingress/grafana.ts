@@ -376,13 +376,6 @@ export const createGrafanaAdapter = (
   const loki = config.loki ?? createLokiQuery();
   const replayWindow = config.replayWindowSeconds ?? REPLAY_WINDOW_SECONDS;
 
-  /**
-   * Fingerprints Grafana has told us are resolved. Process-local on purpose:
-   * resolution is evidence an agent reads, never a transition the Boss makes,
-   * so losing it across a restart degrades to "not known resolved", which is
-   * the conservative direction.
-   */
-  const resolved = new Set<string>();
 
   /**
    * Whether each recent alert arrived declaring any known cause. The share is
@@ -496,13 +489,11 @@ export const createGrafanaAdapter = (
       // open a second incident for the same alert.
       if (!fingerprint) continue;
 
-      if (deliveryResolved || status(alert.status) === "resolved") {
-        resolved.add(fingerprint);
-        continue;
-      }
-      // A firing alert reopens ground a previous resolved notification
-      // claimed, so the stale resolution must not outlive it.
-      resolved.delete(fingerprint);
+      // A resolved notification is discarded outright. An alert that fired
+      // means something needed attention, and an alert that stopped firing on
+      // its own does not mean it no longer does -- it means the symptom went
+      // away. Only an agent closes an incident, on evidence it went and got.
+      if (deliveryResolved || status(alert.status) === "resolved") continue;
 
       // The alert's own labels win, with the group's as fallback. That order
       // is what keeps four grouped per-route alerts distinguishable:
@@ -552,8 +543,6 @@ export const createGrafanaAdapter = (
       if (truncatedAlerts > 0) {
         carried[`${META_PREFIX}truncated_alerts`] = String(truncatedAlerts);
       }
-      // An alert stops firing on its own, which is what makes tickResolution
-      // meaningful for this source and not for a human report.
       carried[RESOLUTION_POLICY_LABEL] = "auto";
 
       const startedAt = Date.parse(String(alert.startsAt ?? ""));
@@ -646,6 +635,5 @@ export const createGrafanaAdapter = (
     parse,
     dedupKey: (signal) => `${signal.source}:${signal.sourceId}`,
     prefetchEvidence,
-    isResolved: async (signal: Signal) => resolved.has(signal.sourceId),
   };
 };

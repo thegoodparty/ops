@@ -323,8 +323,7 @@ test("a Slack retry of the same report dedups", async () => {
   assert.match(adapter.dedupKey(first), /^human:slack:/);
 });
 
-test("a Slack adapter pre-fetches nothing and never auto-resolves", async () => {
+test("a Slack adapter pre-fetches nothing", async () => {
   const adapter = createSlackAdapter(config);
   assert.deepEqual(await adapter.prefetchEvidence({} as never), []);
-  assert.equal(await adapter.isResolved({} as never), false);
 });

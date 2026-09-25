@@ -349,21 +349,18 @@ test("dedup keys on (grafana, fingerprint)", async () => {
 
 // --- resolution ------------------------------------------------------------
 
-test("isResolved keys off Grafana's resolved notification", async () => {
+test("a resolved notification produces no signal and no state", async () => {
   const a = adapter();
-  const [raw] = await a.parse(request(firing("fp-1")));
-  const signal = { ...raw, id: "sig-1", incidentId: null, explained: false, closedAt: null } as Signal;
+  assert.equal((await a.parse(request(firing("fp-1")))).length, 1);
 
-  assert.equal(await a.isResolved(signal), false);
-
+  // Discarded outright. An alert that stopped firing on its own has not
+  // stopped mattering: the symptom went away, which is not the same as the
+  // cause being handled. Only an agent closes an incident.
   const resolved = { ...firing("fp-1"), status: "resolved" };
-  await a.parse(request(resolved));
-  assert.equal(await a.isResolved(signal), true);
+  assert.deepEqual(await a.parse(request(resolved)), []);
 
-  // Firing again reopens ground the resolution claimed, so the stale
-  // resolution must not outlive it.
-  await a.parse(request(firing("fp-1")));
-  assert.equal(await a.isResolved(signal), false);
+  // And it leaves nothing behind that could affect the next firing.
+  assert.equal((await a.parse(request(firing("fp-1")))).length, 1);
 });
 
 // --- evidence --------------------------------------------------------------

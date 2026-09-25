@@ -242,7 +242,6 @@ export interface BugBoss {
   /** One dispatcher tick, waited out. Agents normally outlive a tick. */
   dispatchOnce(): Promise<TickResult>;
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
-  tickResolution(): Promise<number>;
   /** Re-place signals that reached no incident. Returns how many moved. */
   sweepOrphans(): Promise<number>;
   /** Open a Slack thread for any incident still without one. */
@@ -1135,7 +1134,7 @@ export const createBugBoss = async (
 
   /**
    * A signal whose placement threw is left with no incident and nothing that
-   * would ever look at it again: tickResolution joins through incident, so it
+   * would ever look at it again: every reader joins through incident, so it
    * skips unattached rows, and an agent only ever sees what is attached to
    * its own. Since the number this project is judged on is alerts that reach
    * nobody, an orphan is the worst state a row can be in, and any throw
@@ -1312,52 +1311,6 @@ export const createBugBoss = async (
   // Resolution
   // -------------------------------------------------------------------------
 
-  const tickResolution = async (): Promise<number> => {
-    const rows = db.query<{
-      id: string;
-      source: string;
-      sourceId: string;
-      kind: Signal["kind"];
-      title: string;
-      body: string;
-      labels: string;
-      reportedBy: string | null;
-      openedAt: number;
-      incidentId: string | null;
-      explained: number;
-    }>(
-      `SELECT s.* FROM signal s JOIN incident i ON i.id = s.incidentId
-       WHERE s.closedAt IS NULL AND i.status IN (${OPEN_STATUSES.map(() => "?").join(",")})`,
-      OPEN_STATUSES,
-    );
-
-    const closed: string[] = [];
-    for (const row of rows) {
-      if (!ingress.has(row.source)) continue;
-      const signal: Signal = {
-        ...row,
-        labels: JSON.parse(row.labels) as Record<string, string>,
-        explained: row.explained === 1,
-        closedAt: null,
-      };
-      try {
-        if (await ingress.get(row.source).isResolved(signal)) closed.push(row.id);
-      } catch (err) {
-        alarm("resolution_check_failed", { signalId: row.id, error: String(err) });
-      }
-    }
-    if (closed.length === 0) return 0;
-
-    // Signals only. A quiet signal is evidence an agent reads, never a
-    // transition the Boss makes: nothing auto-closes.
-    await db.withWrite((w: Database.Database) => {
-      const stamp = w.prepare("UPDATE signal SET closedAt = ? WHERE id = ?");
-      for (const id of closed) stamp.run(now(), id);
-    });
-    log("signals_closed", { count: closed.length, signalIds: closed });
-    return closed.length;
-  };
-
   // -------------------------------------------------------------------------
   // Inbound Slack
   // -------------------------------------------------------------------------
@@ -1437,7 +1390,6 @@ export const createBugBoss = async (
     background("startup_sweep", sweepOrphans);
     background("startup_threads", ensureIncidentThreads);
     resolutionTimer = setInterval(() => {
-      background("resolution_tick", tickResolution);
       background("orphan_sweep", sweepOrphans);
       background("thread_sweep", ensureIncidentThreads);
     }, config.dispatcher.tickSeconds * 1000);
@@ -1471,7 +1423,6 @@ export const createBugBoss = async (
     slackEventAccepted,
     reportSignal,
     dispatchOnce,
-    tickResolution,
     sweepOrphans,
     ensureIncidentThreads,
     start,

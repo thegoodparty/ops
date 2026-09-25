@@ -125,13 +125,6 @@ export interface SignalAdapter {
    */
   prefetchEvidence(signal: RawSignal): Promise<Evidence[]>;
 
-  /**
-   * Whether the underlying problem has stopped. An alert resolves when it
-   * stops firing; a human report resolves on verification. Evidence for an
-   * agent's judgement, never an automatic transition.
-   */
-  isResolved(signal: Signal): Promise<boolean>;
-
 }
 
 export interface IncomingRequest {

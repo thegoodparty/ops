@@ -181,11 +181,5 @@ export const createHumanAdapter = (
     /** Nothing to pre-fetch: the description is the evidence. */
     prefetchEvidence: async (): Promise<Evidence[]> => [],
 
-    /**
-     * Always false. A report resolves when an agent verifies the reported
-     * behaviour is fixed or the reporter confirms it, and neither is something
-     * this adapter can observe.
-     */
-    isResolved: async (_signal: Signal) => false,
   };
 };

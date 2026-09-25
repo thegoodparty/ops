@@ -289,6 +289,5 @@ export const createSlackAdapter = (config: SlackConfig = {}): SignalAdapter => {
 
     prefetchEvidence: async (): Promise<Evidence[]> => [],
 
-    isResolved: async (_signal: Signal) => false,
   };
 };

@@ -28,15 +28,6 @@ test("there is nothing to pre-fetch: the description is the evidence", async () 
   assert.equal(signal.body, "Pro upgrades 500 on submit");
 });
 
-test("a human report never auto-resolves", async () => {
-  const adapter = createHumanAdapter({ now });
-  assert.equal(
-    await adapter.isResolved({} as never),
-    false,
-    "a report resolves on verification, which this adapter cannot observe",
-  );
-});
-
 test("a human report is never suppressed", () => {
   const signal = humanSignal({
     text: "checkout is broken",

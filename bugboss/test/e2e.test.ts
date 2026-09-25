@@ -249,12 +249,15 @@ test("a second alert for the same cause attaches rather than opening", async () 
   assert.ok(signals.length >= 2, "both signals should be attached");
 });
 
-test("nothing auto-closes when a signal goes quiet", async () => {
+test("a resolved notification changes nothing at all", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
   await boss.ingest("grafana", grafanaBody("fp-4", "people-route-errors"));
 
+  // An alert that stopped firing on its own has not stopped mattering: the
+  // symptom went away, which is not the same as the cause being handled. So
+  // the resolve is discarded, the incident stands, and closing it stays the
+  // agent's job.
   await boss.ingest("grafana", grafanaBody("fp-4", "people-route-errors", "resolved"));
-  await boss.tickResolution();
 
   const still = boss.db.get<{ status: string }>(
     "SELECT status FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-4')",
@@ -264,11 +267,12 @@ test("nothing auto-closes when a signal goes quiet", async () => {
     "RESOLVED",
     "a quiet signal is evidence for an agent, never an automatic transition",
   );
-  assert.ok(
+  assert.equal(
     boss.db.get<{ closedAt: number | null }>(
       "SELECT closedAt FROM signal WHERE sourceId = 'fp-4'",
     )?.closedAt,
-    "the signal itself is recorded as closed",
+    null,
+    "the signal stays open too: only an agent decides this is over",
   );
 });
 
@@ -511,7 +515,7 @@ test("the Grafana webhook answers before triage, and places afterwards", async (
 
 /**
  * What a container leaves on disk when it dies between recording a signal and
- * placing it: a durable row with no incident, which tickResolution cannot see
+ * placing it: a durable row with no incident, which nothing else looks at
  * because it joins through incident, and which a redelivery used to answer
  * "duplicate" to.
  */
@@ -555,11 +559,10 @@ test("a redelivery places a signal that was recorded but never placed", async ()
 test("the sweep places a signal no redelivery will ever repeat", async () => {
   await orphanSignal("sig-orphan-b", "fp-71", "orphan-sweep-errors");
 
-  await boss.tickResolution();
   assert.equal(
     incidentOf("fp-71"),
     null,
-    "resolution joins through incident, so it cannot see an unattached signal",
+    "nothing but the sweep looks at a signal with no incident",
   );
 
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "swept up" });
