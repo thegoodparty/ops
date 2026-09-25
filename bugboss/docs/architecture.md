@@ -111,13 +111,28 @@ It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP
 toolset, and a scoped token for the Boss's loopback API. It investigates,
 fixes, opens a PR, waits for a merge and a deploy, and writes a post-mortem.
 
-## The agent boundary
+## What bounds an agent
 
-An agent reaches incident state through **one HTTP API on loopback**, with a
-bearer token minted per launch. The incident is derived from the token and
-then checked against the path, so a valid token for incident A cannot be
-aimed at B. That containment matters because the agent reads
-attacker-writable log lines for a living.
+An agent is a child process of the Boss, running as the same user. It
+resolves the task role through the container credential provider, exactly as
+its parent does, so whatever the Boss can reach in AWS an agent can reach
+too. There is no privilege boundary inside the container — a child can read
+the parent's own environment — so anything claimed at that line would be a
+claim rather than a control.
+
+The boundary that is real is the task. This container holds no database
+credentials, no deploy role and no merge rights. Its AWS identity reads logs,
+metrics and ECS state, calls Bedrock, and writes its own bucket; it cannot
+reach RDS, the release path, or any secret but its own. The GitHub App opens
+pull requests and cannot merge one, enforced by branch protection on `main`
+rather than by the prompt. So every effect an agent can have on the platform
+arrives as a pull request a human approves.
+
+The loopback API is the **interface** to incident state, not a fence around
+it. Every transition is one HTTP call on `127.0.0.1` carrying a bearer token
+minted per launch; the incident is derived from the token and then checked
+against the path, so a valid token for incident A cannot be aimed at B. That
+check is what keeps fifteen concurrent agents out of each other's incidents.
 
 Five state-changing tools, each a transition:
 

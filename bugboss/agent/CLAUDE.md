@@ -10,8 +10,13 @@ it turns, but the actual controls are branch protection on `main` and the
 GitHub App's permissions — it runs with a real shell, so a prompt is not a
 control.
 
-It gets the App's **credentials**, not a token minted for it, and re-mints
-every twenty minutes. Installation tokens last an hour and an incident can
+In AWS it runs on the Boss's own identity, resolved through the container
+credential provider, which refreshes itself for as long as the run lasts.
+Nothing inside the container separates the two, so what limits an agent is
+what the task can reach at all — no database, no release path.
+
+GitHub is different. It gets the App's **credentials**, not a token minted for
+it, and re-mints every twenty minutes. Installation tokens last an hour and an incident can
 run for a day, so a token handed down at launch would expire
 mid-investigation and surface as `gh` refusing to push a branch the agent
 had already built.

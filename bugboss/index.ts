@@ -24,10 +24,8 @@ import type { Hono } from "hono";
 import { Db } from "./db";
 import {
   createChildProcessSpawn,
-  createAssumeRoleCredentials,
   createDispatcher,
   pickBaseEnv,
-  type AgentCredentialProvider,
   type Dispatcher,
   type SpawnAgent,
   type TickResult,
@@ -156,8 +154,6 @@ export interface BugBossSecrets {
   githubAppId?: string;
   githubAppPrivateKey?: string;
   githubAppInstallationId?: string;
-  /** STS role the parent assumes for each child. Chunk 9 creates it. */
-  agentRoleArn?: string;
   triageModelId?: string;
   agentModelId?: string;
   awsRegion?: string;
@@ -179,11 +175,10 @@ export interface CreateBugBossOptions {
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
   model: ModelClient;
   slack: SlackClient;
-  /** What a launch means. Defaults to a scrubbed child process. */
+  /** What a launch means. Defaults to a child process. */
   spawnAgent?: SpawnAgent;
   /** Omitted means no S3: state stays in memory and dies with the process. */
   s3?: S3Client;
-  credentials?: AgentCredentialProvider;
   /** Overrides the default harness the Slack agent runs on. */
   slackAgentModel?: SlackAgentModel;
   secrets?: BugBossSecrets;
@@ -1212,27 +1207,6 @@ export const createBugBoss = async (
   // Dispatch
   // -------------------------------------------------------------------------
 
-  const credentials: AgentCredentialProvider =
-    options.credentials ??
-    (secrets.agentRoleArn
-      ? createAssumeRoleCredentials({
-          roleArn: secrets.agentRoleArn,
-          // No durationSeconds override: the default is the one hour that role
-          // chaining allows. A task role is itself an assumed role, so this
-          // AssumeRole is a chained one, and AWS caps those at an hour and
-          // REJECTS a longer request rather than clamping it. The role's
-          // maxSessionDuration is not the limit here and asking for it fails
-          // every launch. An incident still outlives the session because the
-          // child re-reads these from the loopback API before they expire.
-        })
-      : async (incidentId) => {
-          alarm("no_agent_role", {
-            incidentId,
-            note: "no agentRoleArn configured; the child gets no AWS access",
-          });
-          return { accessKeyId: "", secretAccessKey: "", sessionToken: "" };
-        });
-
   const childSpawn =
     options.spawnAgent ??
     createChildProcessSpawn({
@@ -1350,7 +1324,6 @@ export const createBugBoss = async (
     spawn,
     toolApiFor,
     mintToken,
-    credentials,
     childBaseEnv: {
       ...pickBaseEnv(process.env),
       AWS_REGION: secrets.awsRegion ?? process.env.AWS_REGION,
@@ -1546,10 +1519,6 @@ export const createBugBoss = async (
     tokenSecret,
     toolApiFor,
     slack,
-    // The child re-reads these on a timer. A role tops out at a twelve-hour
-    // session and an incident can run for a day, so credentials assumed once
-    // at launch expire mid-run.
-    credentials,
     now,
   });
 
@@ -1648,7 +1617,6 @@ const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
   githubAppId: env.GITHUB_APP_ID,
   githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
   githubAppInstallationId: env.GITHUB_APP_INSTALLATION_ID,
-  agentRoleArn: env.BUGBOSS_AGENT_ROLE_ARN,
   triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
   agentModelId: env.BUGBOSS_MODEL_ID,
   awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,

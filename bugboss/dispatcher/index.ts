@@ -1,13 +1,13 @@
 // The dispatcher. Design spec: bugboss/docs/architecture.md, Job 3, plus
-// Authentication for the child environment.
+// "What bounds an agent" for the child environment.
 //
 // One question, every 30 seconds: does every incident that should have an
 // agent have a live one? Both sides of that comparison are in this process,
 // so there is nothing to reconcile. No task ARNs, no clientToken, no
 // ListTasks that cannot see a finished task, no orphan sweep, no lease.
 //
-// Everything else here is what co-location and a wall-clock bound force: a
-// scrubbed child environment, a kill backstop for the in-container deadline,
+// Everything else here is what co-location and a wall-clock bound force: an
+// allowlisted child environment, a kill backstop for the in-container deadline,
 // a relaunch limit, and a ceiling that is a circuit breaker rather than a
 // scheduler. There is deliberately no queue and no priority order.
 
@@ -24,12 +24,10 @@ import type {
 // The child's own grace, read rather than copied: the parent's backstop is
 // defined relative to it, so a change there must move this too.
 import { DEADLINE_GRACE_SECONDS } from "../agent/run";
-import type { AgentCredentialProvider } from "./credentials";
-import { buildChildEnv } from "./env";
+import { buildChildEnv, hasAwsCredentialPath } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
 import { makeAlarm, makeLog } from "../logging";
 
-export * from "./credentials";
 export * from "./env";
 export * from "./spawn";
 
@@ -72,8 +70,6 @@ export interface DispatcherDeps {
   toolApiFor: (incidentId: string) => ToolApi;
   /** Bearer for the tool API, scoped to one incident. */
   mintToken: (incidentId: string) => string;
-  /** Temporary credentials for the read-only agent role, fresh per launch. */
-  credentials: AgentCredentialProvider;
   /** Outbound tokens a child may hold. The composition root decides. */
   childCredentials?: Record<string, string | undefined>;
   /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
@@ -216,7 +212,6 @@ export class Dispatcher {
   private readonly spawn: SpawnAgent;
   private readonly toolApiFor: (incidentId: string) => ToolApi;
   private readonly mintToken: (incidentId: string) => string;
-  private readonly credentials: AgentCredentialProvider;
   private readonly childCredentials: Record<string, string | undefined>;
   private readonly childBaseEnv: Record<string, string | undefined>;
   private readonly fastFailureMs: number;
@@ -253,7 +248,6 @@ export class Dispatcher {
     this.spawn = deps.spawn;
     this.toolApiFor = deps.toolApiFor;
     this.mintToken = deps.mintToken;
-    this.credentials = deps.credentials;
     this.childCredentials = deps.childCredentials ?? {};
     this.childBaseEnv = deps.childBaseEnv ?? {};
     this.fastFailureMs =
@@ -298,9 +292,9 @@ export class Dispatcher {
   };
 
   /**
-   * Serialized against itself. A tick awaits an S3 PUT and an STS call before
-   * it records a launch in `running`, so an overlapping tick would read the
-   * same row as unclaimed and start a second child. Two children on one
+   * Serialized against itself. A tick awaits an S3 PUT before it records a
+   * launch in `running`, so an overlapping tick would read the same row as
+   * unclaimed and start a second child. Two children on one
    * incident both hold valid tokens and both whole-file PUT the same session
    * transcript, so they overwrite each other's turns. The single-writer
    * guarantee the whole resume design rests on is this map, and the map is
@@ -435,30 +429,27 @@ export class Dispatcher {
 
     if (row.sessionRef) await this.emitResumedAfter(row, now);
 
-    const aws = await this.credentials(row.id);
     const token = this.mintToken(row.id);
     const deadlineAt = now + this.config.agentTimeoutSeconds * 1000;
 
-    if (aws.expiresAt && aws.expiresAt < deadlineAt) {
-      log("credentials_expire_before_deadline", {
-        incidentId: row.id,
-        expiresAt: aws.expiresAt,
-        deadlineAt,
-      });
-    }
-
-    const { env, stripped } = buildChildEnv({
+    const env = buildChildEnv({
       base: this.childBaseEnv,
       credentials: this.childCredentials,
-      aws,
       incidentId: row.id,
       token,
       sessionRef: row.sessionRef,
       deadlineAt,
       attempt,
     });
-    if (stripped.length > 0) {
-      alarm("child_env_stripped", { incidentId: row.id, stripped });
+    // The child resolves AWS through the container credential provider, so
+    // the allowlist in env.ts has to carry that path. Dropping a name from
+    // it would cost the agent Bedrock and surface a turn later as a model
+    // call failing, with nothing pointing back at the environment.
+    if (!hasAwsCredentialPath(env)) {
+      alarm("child_has_no_aws_credentials", {
+        incidentId: row.id,
+        note: "no AWS credential path reached the child; it cannot call Bedrock",
+      });
     }
 
     const entry: Entry = {

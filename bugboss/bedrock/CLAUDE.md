@@ -30,13 +30,12 @@ rather than a hole.
 ## No explicit credentials
 
 The client is constructed with no `credentials` key, so the SDK's default
-chain resolves them. In the parent that is the ECS task role; in a child it
-is the environment variables the dispatcher set.
+chain resolves them: the ECS task role, in the parent and in a child alike.
 
-That matters now that agents run for a day: the child refreshes those
-variables on a timer, and the SDK's env provider honours
-`AWS_CREDENTIAL_EXPIRATION` and re-resolves once it passes. Setting
-credentials explicitly here would pin them at construction and defeat that.
+That matters now that agents run for a day. The container provider refreshes
+on its own schedule, so a client built at startup keeps working for the whole
+run. Setting credentials explicitly here would pin them at construction and
+defeat that.
 
 ## The model id is pinned in the session
 

@@ -16,9 +16,9 @@ it and that is the agent's job.
 
 ## Ticks are serialized against themselves
 
-`tick()` chains on the previous one. A tick awaits an S3 PUT and an STS call
-*before* it records a launch in `running`, so an overlapping tick reads the
-same row as unclaimed and starts a second child. Two children then hold
+`tick()` chains on the previous one. A tick awaits an S3 PUT *before* it
+records a launch in `running`, so an overlapping tick reads the same row as
+unclaimed and starts a second child. Two children then hold
 valid tokens for one incident and both whole-file write the same session
 transcript, overwriting each other's turns.
 
@@ -60,6 +60,22 @@ would break hand-back, since nothing resets it.
 `maxConcurrentAgents` is a circuit breaker, not a scheduler. Hitting it
 means something is wrong. Setting it to `0` holds it open, which is the
 useful local mode: ingest and triage run, no agent is ever spawned.
+
+## The child environment
+
+Built up from nothing rather than filtered down from `process.env`, so a
+child holds only what the composition root named: process essentials, the
+outbound tokens it needs, and its own incident identity. That is hygiene, not
+containment — a child can read the parent's environment — but a credential
+nobody handed the agent cannot end up in a log line or a Slack post by
+accident.
+
+AWS is the deliberate exception. `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` is
+passed through, so the child resolves the task role through the SDK's
+container provider and that provider refreshes for as long as the run lasts.
+A launch whose environment carries no credential path at all alarms:
+without it the agent loses Bedrock, and that surfaces a turn later as a model
+call failing with nothing pointing back at the environment.
 
 ## Exit codes
 

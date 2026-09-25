@@ -45,9 +45,10 @@ answers 200.
 Bound to `127.0.0.1`, never through the ALB. Bearer token minted per launch.
 
 **The incident comes from the token, then is checked against the path.** A
-valid token for incident A aimed at B gets a 403, not a wrong answer. That
-containment is the whole story for a process that reads attacker-writable
-log lines for a living.
+valid token for incident A aimed at B gets a 403, not a wrong answer. That is
+what keeps fifteen concurrent agents out of each other's incidents. It is not
+a privilege boundary: a child runs with the Boss's own credentials, and what
+bounds it is the deployment boundary of the whole task.
 
 - No token → 401 with a `WWW-Authenticate` challenge
 - Wrong incident → 403
@@ -62,10 +63,8 @@ schemas.
 Those schemas are the trust boundary. The child validates too, but that is
 the untrusted side, so validation here is the one that counts.
 
-## Two routes that are not tools
+## One route that is not a tool
 
 `GET /incidents/:id/directives` is a **non-draining** read on the read-only
 connection, because the `contact_human` poll would otherwise destroy
-directives it has not read. `GET /incidents/:id/aws-credentials` mints fresh
-AWS credentials, because a role session is capped at twelve hours and an
-incident can run for a day.
+directives it has not read.
