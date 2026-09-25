@@ -80,20 +80,32 @@ export const openTestDb = async (seed: SeededIncident[] = []): Promise<Db> => {
   if (seed.length > 0) {
     await db.withWrite((sqlite) => {
       const insertIncident = sqlite.prepare(
-        `INSERT INTO incident (id, status, owner, firstSignalAt, rootCause, usersImpacted)
-         VALUES (?, ?, 'agent', ?, ?, ?)`,
+        `INSERT INTO incident
+           (id, status, owner, firstSignalAt, rootCause, usersImpacted,
+            resolvedAt, closedAt, postmortem)
+         VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, ?)`,
       );
       const insertSignal = sqlite.prepare(
         `INSERT INTO signal (id, source, sourceId, kind, title, body, openedAt, incidentId)
          VALUES (?, 'grafana', ?, 'alert', ?, ?, ?, ?)`,
       );
       for (const incident of seed) {
+        const at = incident.firstSignalAt ?? 1_700_000_000_000;
+        // Terminal statuses carry the fields that define them; the schema
+        // enforces the pair, so a fixture cannot build a CLOSED incident
+        // with no post-mortem.
+        const terminal =
+          incident.status === "RESOLVED" || incident.status === "CLOSED";
+        const closed = incident.status === "CLOSED";
         insertIncident.run(
           incident.id,
           incident.status,
-          incident.firstSignalAt ?? 1_700_000_000_000,
+          at,
           incident.rootCause ?? null,
           incident.usersImpacted ?? null,
+          terminal ? at : null,
+          closed ? at : null,
+          closed ? "fixture post-mortem" : null,
         );
         insertSignal.run(
           `sig-${incident.id}`,

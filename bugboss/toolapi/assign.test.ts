@@ -322,7 +322,10 @@ describe("assign: containment", () => {
       await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "a" }, { kind: "boss" })
     ).target;
     await db.withWrite((w) => {
-      w.prepare("UPDATE incident SET status = 'CLOSED' WHERE id = ?").run(a);
+      w.prepare(
+        `UPDATE incident SET status = 'CLOSED', resolvedAt = 1, closedAt = 2,
+           postmortem = 'closed by the test' WHERE id = ?`,
+      ).run(a);
     });
 
     await assert.rejects(

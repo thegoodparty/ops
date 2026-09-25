@@ -46,7 +46,26 @@ CREATE TABLE IF NOT EXISTS incident (
   cacheWrite        INTEGER NOT NULL DEFAULT 0,
   -- What the agent observed stop happening. RESOLVED is an evidence-based
   -- claim, so the evidence has to outlive the Slack message that carried it.
-  resolvedEvidence  TEXT
+  resolvedEvidence  TEXT,
+
+  -- Cross-field constraints, which are the difference between an invariant
+  -- and a comment. Every one of these was reachable at some point today: a
+  -- resurrected MERGED row, a RESOLVED incident whose evidence lived only in
+  -- a Slack message, a CLOSED one with no post-mortem.
+  --
+  -- They are here rather than in a migration because SQLite cannot add a
+  -- CHECK to an existing table, this DDL runs as CREATE TABLE IF NOT EXISTS
+  -- over a restored snapshot, and there is no migration runner. Free while
+  -- the database is empty; a table rebuild afterwards.
+  CHECK (mergedInto IS NULL OR mergedInto <> id),
+  CHECK (recurrenceOf IS NULL OR recurrenceOf <> id),
+  CHECK ((mergedInto IS NULL) = (status <> 'MERGED')),
+  CHECK (closedAt IS NULL OR status = 'CLOSED'),
+  CHECK (resolvedAt IS NULL OR status IN ('RESOLVED', 'CLOSED')),
+  CHECK (status <> 'RESOLVED' OR resolvedAt IS NOT NULL),
+  CHECK (status <> 'CLOSED'
+         OR (resolvedAt IS NOT NULL AND closedAt IS NOT NULL
+             AND postmortem IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS signal (
@@ -61,7 +80,11 @@ CREATE TABLE IF NOT EXISTS signal (
   openedAt          INTEGER NOT NULL,
   closedAt          INTEGER,
   incidentId        TEXT REFERENCES incident(id),
-  explained         INTEGER NOT NULL DEFAULT 0
+  explained         INTEGER NOT NULL DEFAULT 0,
+
+  CHECK (kind IN ('alert', 'error', 'bug_report', 'regression')),
+  -- explained is relative to a root cause, so it is meaningless detached.
+  CHECK (explained = 0 OR incidentId IS NOT NULL)
 );
 
 -- At most one OPEN signal per (source, sourceId), not one for all time.
