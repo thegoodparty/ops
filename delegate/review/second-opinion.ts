@@ -342,14 +342,19 @@ const arrayFrom = (raw: unknown, key: string): unknown[] => {
   return [];
 };
 
+// Reports rawCount for the same reason normalizeLeads does: a deep-reviewer
+// whose findings all fail normalization must not be recorded as a clean pass
+// with nothing to say, because the orchestrator's approve gate reads a clean
+// pass as coverage it actually got.
 export const normalizeFindings = (
   raw: unknown,
   leadArea: string,
   leadCategory: string
-): SecondOpinionFinding[] => {
+): { findings: SecondOpinionFinding[]; rawCount: number } => {
   const findings: SecondOpinionFinding[] = [];
+  const entries = arrayFrom(raw, "findings");
 
-  for (const entry of arrayFrom(raw, "findings")) {
+  for (const entry of entries) {
     if (!isRecord(entry)) continue;
 
     const file = typeof entry.file === "string" ? entry.file.trim() : "";
@@ -384,7 +389,7 @@ export const normalizeFindings = (
     findings.push(finding);
   }
 
-  return findings;
+  return { findings, rawCount: entries.length };
 };
 
 export const normalizeLeads = (
@@ -629,15 +634,29 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
             `deep-reviewer for lead "${lead.area}" returned no parseable JSON`
           );
         }
-        return normalizeFindings(parsed, lead.area, lead.category);
+        const { findings: leadFindings, rawCount: rawFindings } =
+          normalizeFindings(parsed, lead.area, lead.category);
+        if (rawFindings > 0 && leadFindings.length === 0) {
+          throw new Error(
+            `deep-reviewer for lead "${lead.area}" returned ${rawFindings} finding(s) but none were usable`
+          );
+        }
+        return leadFindings;
       })
     );
 
     const findings: SecondOpinionFinding[] = [];
     let deepReviewerFailures = 0;
+    // Carried into `error` below: the orchestrator gates on the count alone,
+    // but without a reason a recurring failure can only be diagnosed by
+    // reading the task logs.
+    let firstFailure = "";
     for (const result of settled) {
       if (result.status === "fulfilled") findings.push(...result.value);
-      else deepReviewerFailures++;
+      else {
+        deepReviewerFailures++;
+        if (firstFailure === "") firstFailure = errorMessage(result.reason);
+      }
     }
 
     return {
@@ -655,7 +674,9 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
         ? {
             error: `the scout returned ${rawCount} lead(s) but none were usable — every entry was missing the paths a deep-reviewer needs`,
           }
-        : {}),
+        : firstFailure !== ""
+          ? { error: `first deep-reviewer failure: ${firstFailure}` }
+          : {}),
     };
   } catch (err) {
     return {

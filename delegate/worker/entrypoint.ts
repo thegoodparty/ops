@@ -513,7 +513,14 @@ const main = async () => {
     cwd,
     abortController,
   ).finally(() => {
-    if (secondOpinion && secondOpinion.exitCode === null) secondOpinion.kill();
+    // Both, because exitCode is null for a child killed by a signal too, so
+    // exitCode alone does not mean "still running".
+    if (
+      secondOpinion &&
+      secondOpinion.exitCode === null &&
+      secondOpinion.signalCode === null
+    )
+      secondOpinion.kill();
   });
   clearTimeout(deadline);
 

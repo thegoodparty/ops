@@ -59,7 +59,7 @@ describe("normalizeFindings", () => {
         { file: "a.ts", line: 3, severity: "blocker" },
       ],
     };
-    assert.deepEqual(normalizeFindings(raw, "area", "correctness"), []);
+    assert.deepEqual(normalizeFindings(raw, "area", "correctness").findings, []);
   });
 
   it("coerces a numeric-string line", () => {
@@ -68,7 +68,7 @@ describe("normalizeFindings", () => {
         { file: "a.ts", line: "42", severity: "concern", body: "careful" },
       ],
     };
-    assert.deepEqual(normalizeFindings(raw, "area", "correctness"), [
+    assert.deepEqual(normalizeFindings(raw, "area", "correctness").findings, [
       {
         file: "a.ts",
         line: 42,
@@ -87,7 +87,20 @@ describe("normalizeFindings", () => {
         { file: "a.ts", line: 2, body: "b" },
       ],
     };
-    assert.deepEqual(normalizeFindings(raw, "area", "security"), []);
+    assert.deepEqual(normalizeFindings(raw, "area", "security").findings, []);
+  });
+
+  it("reports the raw count so an all-malformed reply is not a clean pass", () => {
+    const raw = {
+      findings: [
+        { file: "a.ts", severity: "blocker", body: "no line" },
+        { file: "a.ts", line: 0, severity: "blocker", body: "bad line" },
+      ],
+    };
+    const result = normalizeFindings(raw, "area", "correctness");
+    assert.deepEqual(result.findings, []);
+    assert.equal(result.rawCount, 2);
+    assert.equal(normalizeFindings({ findings: [] }, "a", "b").rawCount, 0);
   });
 
   it("drops lines GitHub cannot anchor a comment to", () => {
@@ -98,7 +111,7 @@ describe("normalizeFindings", () => {
         { file: "a.ts", line: 2.5, severity: "blocker", body: "b" },
       ],
     };
-    assert.deepEqual(normalizeFindings(raw, "area", "correctness"), []);
+    assert.deepEqual(normalizeFindings(raw, "area", "correctness").findings, []);
   });
 
   it("preserves startLine when present and omits it when absent", () => {
@@ -108,7 +121,7 @@ describe("normalizeFindings", () => {
         { file: "b.ts", line: 4, severity: "nit", body: "y" },
       ],
     };
-    const findings = normalizeFindings(raw, "area", "tests");
+    const findings = normalizeFindings(raw, "area", "tests").findings;
     assert.equal(findings.length, 2);
     assert.equal(findings[0].startLine, 7);
     assert.equal("startLine" in findings[1], false);
@@ -118,7 +131,7 @@ describe("normalizeFindings", () => {
     const raw = {
       findings: [{ file: "a.ts", line: 1, severity: "blocker", body: "b" }],
     };
-    const findings = normalizeFindings(raw, "Timezone logic", "cross-file");
+    const findings = normalizeFindings(raw, "Timezone logic", "cross-file").findings;
     assert.equal(findings[0].leadArea, "Timezone logic");
     assert.equal(findings[0].leadCategory, "cross-file");
   });
