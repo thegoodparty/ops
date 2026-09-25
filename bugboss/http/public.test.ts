@@ -155,3 +155,235 @@ test("health stays flat 200 so ECS does not replace a degraded task", async () =
   const res = await app.request("/health");
   assert.equal(res.status, 200);
 });
+
+// The body is read before anything authenticates it, because the HMAC is over
+// the raw bytes. So the size bound is the only thing standing between an
+// anonymous caller and the task's heap, and it has to hold before the handler
+// runs rather than inside it.
+test("an oversized grafana delivery is refused without being ingested", async () => {
+  let ingested = 0;
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        ingested++;
+        return { settled: Promise.resolve(), recorded: 1 };
+      },
+    }),
+  );
+
+  const { result: res } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1),
+    }),
+  );
+
+  assert.equal(res.status, 413);
+  assert.equal(ingested, 0);
+});
+
+test("an oversized slack delivery is refused the same way", async () => {
+  const app = createPublicApp(deps());
+
+  const { result: res } = await withCapturedErrors(async () =>
+    app.request("/slack", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1),
+    }),
+  );
+
+  assert.equal(res.status, 413);
+});
+
+// A refused burst would silently undo the `maxAlerts: 0` the contact point is
+// set to, so the refusal is an alarm rather than a log line.
+test("an oversized delivery alarms rather than passing quietly", async () => {
+  const app = createPublicApp(deps());
+
+  const { errors } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1),
+    }),
+  );
+
+  assert.ok(
+    errors.some((line) => line.includes("body_rejected")),
+    `expected a body_rejected alarm, got ${JSON.stringify(errors)}`,
+  );
+});
+
+test("a normal delivery is still ingested", async () => {
+  let ingested = 0;
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        ingested++;
+        return { settled: Promise.resolve(), recorded: 1 };
+      },
+    }),
+  );
+
+  const res = await post(app, "/grafana", { status: "firing", alerts: [] });
+
+  assert.notEqual(res.status, 413);
+  assert.equal(ingested, 1);
+});
+
+// Reading the body is the first thing both routes do, before anything
+// authenticates the caller. So an anonymous client that declares a length and
+// then hangs up makes the read throw. Alarming on that would let anyone bury a
+// real route_failed — the backstop for a dropped alert — under any volume of
+// identical lines.
+const abortedBody = (): ReadableStream =>
+  new ReadableStream({
+    start(controller) {
+      controller.error(new Error("aborted"));
+    },
+  });
+
+test("a caller hanging up mid-body logs rather than alarming", async () => {
+  let ingested = 0;
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        ingested++;
+        return { settled: Promise.resolve(), recorded: 1 };
+      },
+    }),
+  );
+
+  const { result: res, errors } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: abortedBody(),
+      // @ts-expect-error undici requires this for a stream body; Hono's types
+      // describe the standard RequestInit, which has no such field.
+      duplex: "half",
+    }),
+  );
+
+  assert.equal(res.status, 400);
+  assert.equal(ingested, 0);
+  assert.equal(
+    errors.filter((line) => line.includes("route_failed")).length,
+    0,
+    `a client disconnect must not alarm, got ${JSON.stringify(errors)}`,
+  );
+});
+
+// The blocker a reviewer caught on the first version of this fix. Classifying
+// disconnects by matching the error message demoted this to a log line: the
+// AWS SDK's socket failures inside db.withWrite throw the same shapes, and a
+// failed write on the ingest path IS a dropped alert. Only the body read can
+// raise BodyUnreadable now, so no message can be mistaken for one.
+test("an S3 write failure that reads like a disconnect still alarms", async () => {
+  for (const message of ["terminated", "aborted", "ECONNRESET"]) {
+    const app = createPublicApp(
+      deps({
+        ingestAccepted: async () => {
+          throw new Error(message);
+        },
+      }),
+    );
+
+    const { result: res, errors } = await withCapturedErrors(async () =>
+      post(app, "/grafana", { status: "firing", alerts: [] }),
+    );
+
+    assert.equal(res.status, 500, `${message} should not be a client disconnect`);
+    assert.ok(
+      errors.some((line) => line.includes("route_failed")),
+      `${message} must still alarm, got ${JSON.stringify(errors)}`,
+    );
+  }
+});
+
+test("a genuine route failure still alarms", async () => {
+  const app = createPublicApp(
+    deps({
+      ingestAccepted: async () => {
+        throw new Error("s3 is refusing writes");
+      },
+    }),
+  );
+
+  const { result: res, errors } = await withCapturedErrors(async () =>
+    post(app, "/grafana", { status: "firing", alerts: [] }),
+  );
+
+  assert.equal(res.status, 500);
+  assert.ok(
+    errors.some((line) => line.includes("route_failed")),
+    `expected a route_failed alarm, got ${JSON.stringify(errors)}`,
+  );
+});
+
+// getReader() takes an exclusive lock on the body. Returning the 413 without
+// cancelling holds that lock, and whatever the sender is still pushing, until
+// GC — the path that enforces the limit keeping alive the resource it bounds.
+test("the oversized path cancels the reader rather than abandoning it", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  const app = createPublicApp(deps());
+
+  const { result: res } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      // @ts-expect-error undici requires this for a stream body; Hono's types
+      // describe the standard RequestInit, which has no such field.
+      duplex: "half",
+    }),
+  );
+
+  assert.equal(res.status, 413);
+  assert.ok(cancelled, "the reader must be cancelled when the limit is hit");
+});
+
+// A cancel that throws must not turn a deliberate 413 into a route_failed
+// alarm — that is the alarm standing for a dropped alert, handed to whoever
+// sends an oversized body with an awkward stream.
+test("a throwing cancel does not turn the 413 into an alarm", async () => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+    },
+    cancel() {
+      throw new Error("cancel blew up");
+    },
+  });
+
+  const app = createPublicApp(deps());
+
+  const { result: res, errors } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      // @ts-expect-error undici requires this for a stream body; Hono's types
+      // describe the standard RequestInit, which has no such field.
+      duplex: "half",
+    }),
+  );
+
+  assert.equal(res.status, 413);
+  assert.equal(
+    errors.filter((line) => line.includes("route_failed")).length,
+    0,
+    `a throwing cancel must not alarm, got ${JSON.stringify(errors)}`,
+  );
+});
