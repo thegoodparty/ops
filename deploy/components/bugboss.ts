@@ -559,6 +559,17 @@ export const createBugBoss = (config: BugBossConfig) => {
     // tuning choice. Accepting the gap in ingest is the trade.
     deploymentMinimumHealthyPercent: 0,
     deploymentMaximumPercent: 100,
+    // Roll back a revision that never reaches steady state, rather than
+    // retrying it forever. This is recovery, not monitoring: nothing is
+    // notified, the service simply returns to the last revision that ran.
+    //
+    // It earns its place because the two ways this container failed to boot
+    // during the build were both silent and both total -- an unwritable
+    // database path and a required setting the task definition never passed.
+    // With minimumHealthyPercent at 0 there is no old task still serving, so
+    // a bad revision is not a degraded deploy, it is an outage that waits for
+    // someone to notice.
+    deploymentCircuitBreaker: { enable: true, rollback: true },
     healthCheckGracePeriodSeconds: 120,
     enableExecuteCommand: true,
     // Default tags do not reach resources created at runtime — see
