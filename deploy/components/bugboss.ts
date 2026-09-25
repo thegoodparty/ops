@@ -370,11 +370,17 @@ export const createBugBoss = (config: BugBossConfig) => {
         },
       ],
     }),
-    // One hour, because that is all this role can ever issue: its only
-    // trusted principal is the task role, so every AssumeRole against it is
-    // chained, and chained sessions are capped at an hour whatever this says.
-    // A larger value here would only advertise a session nobody can get.
-    maxSessionDuration: 3600,
+    // Twelve hours is a fiction and is left alone deliberately. The only
+    // principal this role trusts is the task role, so every AssumeRole
+    // against it is chained, and AWS caps a chained session at one hour
+    // whatever this says — which is why the caller asks for an hour.
+    //
+    // Correcting the number needs `iam:UpdateRole`, which the deploy role
+    // does not have and should not be given for a cosmetic fix: it is the
+    // permission that lets a CI role rewrite any role's trust boundary.
+    // Changing it here failed the deploy with AccessDenied and left `main`
+    // undeployable until this reverted.
+    maxSessionDuration: 43200,
     inlinePolicies: [
       {
         name: "inline",
