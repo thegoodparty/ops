@@ -33,6 +33,11 @@ pulumi config set --path aws:defaultTags.tags.Environment infra
 pulumi config set --path aws:defaultTags.tags.Project ops
 
 if [ "$CI" = "true" ]; then
+  # Apply only. The task definition's key list now comes from the repo
+  # (`delegate-secret.ts`), so confirm the live secret still matches it before
+  # changing anything. Not run on preview: preview must not read the secret's
+  # value. See docs/pr-previews.md, step 3.
+  ../node_modules/.bin/tsx check-secret-keys.ts
   pulumi up --diff --yes
 else
   pulumi preview --diff

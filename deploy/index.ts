@@ -6,6 +6,7 @@ import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createBugBoss } from "./components/bugboss";
+import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
   const config = new pulumi.Config();
@@ -16,18 +17,18 @@ export = async () => {
   };
   const securityGroupId = "sg-01de8d67b0f0ec787";
 
-  const secretVersion = await aws.secretsmanager.getSecretVersion({
-    secretId: "DELEGATES",
+  // Metadata only: `getSecret` is a `DescribeSecret` call, so a preview never
+  // reads the secret's value. The key names come from the repo; `deploy.sh`
+  // checks the live secret against them on apply. See `docs/pr-previews.md`,
+  // step 3.
+  const secret = await aws.secretsmanager.getSecret({
+    name: "DELEGATES",
   });
-
-  const secretKeys = Object.keys(
-    JSON.parse(secretVersion.secretString || "{}") as Record<string, string>
-  );
 
   const worker = createWorker({
     imageUri: workerImageUri,
-    secretArn: secretVersion.arn,
-    secretKeys,
+    secretArn: secret.arn,
+    secretKeys: [...DELEGATE_SECRET_KEYS],
     subnetIds: vpcSubnetIds.public,
     securityGroupIds: [securityGroupId],
   });
@@ -37,7 +38,7 @@ export = async () => {
     taskDefArn: worker.taskDefinition.arn,
     subnetIds: vpcSubnetIds.public,
     securityGroupId,
-    secretArn: secretVersion.arn,
+    secretArn: secret.arn,
   });
 
   const playwrightReports = createPlaywrightReportsBucket();
