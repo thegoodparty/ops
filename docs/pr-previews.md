@@ -22,8 +22,12 @@ the consumer by a different workflow, and nothing sequences the two.
 - [ ] 1. Record this plan: doing (claude-pr-previews, 2026-09-24)
 - [ ] 2. Audit the `ops`, `org` and `workbench` stack state for secrets: todo.
       Gate for posting full diffs publicly; see "Secrets in the diff".
-- [ ] 3. Stop reading the `DELEGATES` secret value in `deploy/index.ts`:
-      doing (pi-pr-previews, 2026-09-25).
+- [x] 3. Stop reading the `DELEGATES` secret value in `deploy/index.ts`:
+      done (2026-09-25, PR #91. `getSecret` (DescribeSecret) for the ARN, key
+      names declared in `deploy/delegate-secret.ts`, and an apply-only drift
+      check in `deploy.sh`. Merge gate: confirm the live secret holds exactly
+      the declared keys, since an undeclared extra would be dropped from the
+      task definition).
 - [ ] 4. Create the `github-actions-pulumi-preview` role: todo.
 - [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
       `org`: todo. Depends on 2, 3 and 4 being applied.
