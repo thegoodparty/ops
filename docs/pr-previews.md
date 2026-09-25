@@ -43,7 +43,8 @@ the consumer by a different workflow, and nothing sequences the two.
       backup or history objects: a preview is expected not to lock, and if it
       does, the missing grant fails closed and is added then).
 - [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
-      `org`: todo. Depends on 2, 3 and 4 being applied.
+      `org`: doing (pi-pr-previews, 2026-09-25). Depends on 2, 3 and 4 being
+      applied (all three are).
 - [x] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:
       done (2026-09-25, PR #90. `if: github.event_name != 'pull_request'`
       on "Configure AWS Credentials" and "Login to Amazon ECR"; the build's
