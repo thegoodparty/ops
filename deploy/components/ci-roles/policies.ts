@@ -7,6 +7,10 @@
 // Ordering follows what AWS returned. The provider parses these as JSON, so
 // serialisation does not have to match how AWS stores it, but keeping the
 // adoption diff empty is worth more than tidying the shape.
+//
+// The trust document is no longer byte-identical to what was captured: step 7
+// of `docs/pr-previews.md` pins the ops subject to `main` (the first statement
+// below). The policy document is still as adopted.
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
 
@@ -24,12 +28,40 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
-// Nine repositories, each matched as `:*`, which includes pull_request
-// refs. Deliberately captured as-is: narrowing this belongs in its own
-// change, not in an adoption that is meant to be a no-op.
+// Nine repositories. Ops is pinned to `main` in its own statement; the other
+// eight keep the captured `:*` pattern, which includes pull_request refs.
+//
+// Why two statements rather than one list. `sub` under both `StringEquals` and
+// `StringLike` in the same statement is not "either": IAM ANDs the condition
+// operators for one key, so the subject would have to be both the exact main
+// ref and one of the wildcard patterns at once, and no request would match. The
+// exact pin therefore needs its own statement.
+//
+// The ops pin is only safe now. It depends on `deploy.yml` no longer requesting
+// credentials on `pull_request` (docs/pr-previews.md step 6, merged as PR #90);
+// before that, a PR run still assumed this role and would now fail. The other
+// eight stay wildcarded on purpose: omni's `publish-experiments.yml` assumes
+// this role on `pull_request`.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // No wildcard, so this matches only a `main` run in this repo. A
+          // `pull_request` run presents a `refs/pull/N/merge` subject and is
+          // refused.
+          "token.actions.githubusercontent.com:sub":
+            "repo:thegoodparty/ops:ref:refs/heads/main",
+        },
+      },
+    },
     {
       Effect: "Allow",
       Principal: {
@@ -47,7 +79,6 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
             "repo:thegoodparty/election-api:*",
             "repo:thegoodparty/gp-terraform-dataplatform:*",
             "repo:thegoodparty/campaign-plan-service:*",
-            "repo:thegoodparty/ops:*",
             "repo:thegoodparty/gpvpn:*",
             "repo:thegoodparty/runbooks:*",
             "repo:thegoodparty/omni:*",
