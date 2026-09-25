@@ -15,7 +15,7 @@ describe("agentInlinePolicy", () => {
   // at startup and the crash-loop breaker escalated.
   it("lets the agent write its own transcript", () => {
     assert.deepEqual(resourcesFor("s3:PutObject"), [
-      "arn:aws:s3:::bugboss-prod/sessions/*",
+      "arn:aws:s3:::bugboss-prod/sessions/incident/*",
     ]);
   });
 
@@ -40,8 +40,8 @@ describe("agentInlinePolicy", () => {
 
     for (const resource of granted) {
       assert.ok(
-        resource.startsWith("arn:aws:s3:::bugboss-prod/sessions/"),
-        `object access to ${resource} reaches outside sessions/`,
+        resource.startsWith("arn:aws:s3:::bugboss-prod/sessions/incident/"),
+        `object access to ${resource} reaches outside sessions/incident/`,
       );
     }
   });
@@ -51,7 +51,7 @@ describe("agentInlinePolicy", () => {
   // until a container restart fails to resume an incident already underway.
   it("lets the agent read its own transcript back", () => {
     assert.deepEqual(resourcesFor("s3:GetObject"), [
-      "arn:aws:s3:::bugboss-prod/sessions/*",
+      "arn:aws:s3:::bugboss-prod/sessions/incident/*",
     ]);
   });
 
@@ -69,5 +69,29 @@ describe("agentInlinePolicy", () => {
       ),
     );
     assert.equal(wildcard, false);
+  });
+
+  // The Slack agent keeps its thread state under `sessions/slack/<channel>/`.
+  // That is the Boss's own material, not a child's, and a grant on `sessions/`
+  // covered it — which is what a prefix one segment too short costs. Asserted
+  // by whether a real key is reachable, not by how the resource is spelled.
+  it("cannot reach the Slack agent's thread state", () => {
+    const covers = (resource: string, key: string): boolean =>
+      resource.endsWith("/*")
+        ? key.startsWith(resource.slice(0, -1))
+        : resource === key;
+
+    const granted = ["s3:GetObject", "s3:PutObject"].flatMap(resourcesFor);
+    const ownTranscript = "arn:aws:s3:::bugboss-prod/sessions/incident/4/session.jsonl";
+    const someoneElses = "arn:aws:s3:::bugboss-prod/sessions/slack/C0AHXARLX2T/100.0/state.json";
+
+    assert.ok(
+      granted.some((r) => covers(r, ownTranscript)),
+      "the agent must reach its own transcript",
+    );
+    assert.ok(
+      !granted.some((r) => covers(r, someoneElses)),
+      "the agent must not reach the Slack agent's thread state",
+    );
   });
 });

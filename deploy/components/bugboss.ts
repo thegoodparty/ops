@@ -41,14 +41,18 @@ export const agentInlinePolicy = {
             {
               // The child writes its own transcript: `agent/run.ts` builds an
               // S3 session store and mirrors the JSONL per turn, which is what
-              // makes a restart resume rather than start over. Scoped to
-              // `sessions/` so `state/db` — the incident database snapshot the
-              // Boss restores from — stays out of reach of a process that
-              // reads attacker-writable log lines for a living.
+              // makes a restart resume rather than start over.
+              //
+              // `sessions/incident/`, not `sessions/`. The Slack agent keeps
+              // its own conversation state under `sessions/slack/<channel>/`,
+              // and that is a different agent's material — a child has no
+              // reason to read what people said to the Boss in another thread.
+              // `state/db`, the incident database the Boss restores from, sits
+              // outside both and stays unreachable either way.
               Sid: "OwnSessionTranscript",
               Effect: "Allow",
               Action: ["s3:GetObject", "s3:PutObject"],
-              Resource: [`arn:aws:s3:::${BUCKET_NAME}/sessions/*`],
+              Resource: [`arn:aws:s3:::${BUCKET_NAME}/sessions/incident/*`],
             },
             {
               // Not decoration, and not scopable by prefix. S3 answers a GET
