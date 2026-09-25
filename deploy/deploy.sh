@@ -48,20 +48,26 @@ fi
 
 export PULUMI_CONFIG_PASSPHRASE
 
-pulumi login s3://goodparty-iac-state
+# Setup writes to stderr so that, in the JSON preview pass, stdout carries only
+# the JSON document. `pulumi login` in particular prints a banner to stdout,
+# which otherwise corrupts it.
+{
+  pulumi login s3://goodparty-iac-state
 
-# --create only when applying in CI. Preview must not write state, and a local
-# run against a missing stack should fail honestly rather than create one.
-if [ "$CI" = "true" ] && [ "$PREVIEW" != "true" ]; then
-  pulumi stack select "organization/ops/ops-dev" --create
-else
-  pulumi stack select "organization/ops/ops-dev"
-fi
+  # --create only when applying in CI. Preview must not write state, and a
+  # local run against a missing stack should fail honestly rather than create
+  # one.
+  if [ "$CI" = "true" ] && [ "$PREVIEW" != "true" ]; then
+    pulumi stack select "organization/ops/ops-dev" --create
+  else
+    pulumi stack select "organization/ops/ops-dev"
+  fi
 
-pulumi config set aws:region "$AWS_REGION"
-pulumi config set workerImageUri "$IMAGE_URI"
-pulumi config set --path aws:defaultTags.tags.Environment infra
-pulumi config set --path aws:defaultTags.tags.Project ops
+  pulumi config set aws:region "$AWS_REGION"
+  pulumi config set workerImageUri "$IMAGE_URI"
+  pulumi config set --path aws:defaultTags.tags.Environment infra
+  pulumi config set --path aws:defaultTags.tags.Project ops
+} 1>&2
 
 if [ "$PREVIEW" = "true" ]; then
   # Two passes for the two things the PR comment needs: `--json` for the
