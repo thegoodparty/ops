@@ -1,4 +1,4 @@
-// Job 2: triage. Design spec: docs/bugboss/design.md, "Job 2: Triage".
+// Job 2: triage. Design spec: bugboss/docs/architecture.md, "Job 2: Triage".
 //
 // One bounded call per inbound signal, concurrent across batches, targeting
 // under 60 seconds. It decides where a signal belongs and nothing else: no

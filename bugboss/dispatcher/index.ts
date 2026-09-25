@@ -1,4 +1,4 @@
-// The dispatcher. Design spec: docs/bugboss/design.md, Job 3, plus
+// The dispatcher. Design spec: bugboss/docs/architecture.md, Job 3, plus
 // Authentication for the child environment.
 //
 // One question, every 30 seconds: does every incident that should have an

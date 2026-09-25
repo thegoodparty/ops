@@ -1,4 +1,4 @@
-// Human reports. Design spec: docs/bugboss/design.md, Job 1 / Human reports.
+// Human reports. Design spec: bugboss/docs/architecture.md, Job 1 / Human reports.
 //
 // An employee reports the same way they do anything else: @bugboss in Slack,
 // or a report_signal tool over MCP. Both arrive here, which is why this is an

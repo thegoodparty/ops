@@ -1,7 +1,7 @@
 // A Pi api provider that talks to Bedrock through InvokeModel with the native
 // Anthropic message body, bypassing Converse.
 //
-// Design spec: docs/bugboss/design.md, "Why InvokeModel is not optional".
+// Design spec: bugboss/docs/architecture.md, "Why InvokeModel is not optional".
 // Converse reshapes thinking into reasoningContent.reasoningText { text,
 // signature } and then drops any block whose text is empty
 // (bedrock-converse-stream.ts:1022) -- which on Opus 5 and Sonnet 5 with

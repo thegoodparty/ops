@@ -1,4 +1,4 @@
-// Slack ingress. Design spec: docs/bugboss/design.md, Job 1 and Job 5.
+// Slack ingress. Design spec: bugboss/docs/architecture.md, Job 1 and Job 5.
 //
 // Inbound Slack is three different things arriving down one webhook, and only
 // one of them is a signal:

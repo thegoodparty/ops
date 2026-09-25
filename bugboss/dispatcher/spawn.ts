@@ -1,4 +1,4 @@
-// The spawn boundary. Design spec: docs/bugboss/design.md, Job 3 and
+// The spawn boundary. Design spec: bugboss/docs/architecture.md, Job 3 and
 // Topology.
 //
 // Agents are child processes of the Boss, not separate ECS tasks, so the

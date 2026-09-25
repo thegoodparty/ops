@@ -1,4 +1,4 @@
-// AWS credentials for a child agent. Design spec: docs/bugboss/design.md,
+// AWS credentials for a child agent. Design spec: bugboss/docs/architecture.md,
 // Authentication.
 //
 // The parent holds the task role: S3 write, Secrets Manager, and every

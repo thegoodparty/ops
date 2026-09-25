@@ -1,6 +1,6 @@
 // The five tools an engineer reaches from their own Claude Code session.
 //
-// Design spec: docs/bugboss/design.md, "The MCP server" and "Who can query
+// Design spec: bugboss/docs/architecture.md, "The MCP server" and "Who can query
 // it" — the MCP server is one of the control-plane surfaces that gets raw
 // read-only SQL, so a person can ask a question nobody wrote a query for.
 

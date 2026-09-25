@@ -1,4 +1,4 @@
-// The Slack agent. Design spec: docs/bugboss/design.md, Job 6.
+// The Slack agent. Design spec: bugboss/docs/architecture.md, Job 6.
 //
 // An @bugboss mention spawns a short, bounded run in-process. This is the
 // fallback and cross-incident interface, not the primary conversational

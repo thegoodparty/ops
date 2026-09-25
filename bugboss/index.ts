@@ -1,4 +1,4 @@
-// The composition root. Design spec: docs/bugboss/design.md.
+// The composition root. Design spec: bugboss/docs/architecture.md.
 //
 // Every chunk below is built against an interface and knows nothing about the
 // others: ingress does not know triage exists, triage does not know how a
@@ -1237,8 +1237,9 @@ export const createBugBoss = async (
     (secrets.agentRoleArn
       ? createAssumeRoleCredentials({
           roleArn: secrets.agentRoleArn,
-          // The role's maxSessionDuration is twelve hours; ask for all of it,
-          // since credentials cannot be refreshed inside a running child.
+          // The role's maxSessionDuration is twelve hours; ask for all of it.
+          // The child re-reads these from the loopback API well before they
+          // expire, which is what lets an incident outlive a single session.
           durationSeconds: 43_200,
         })
       : async (incidentId) => {
@@ -1575,6 +1576,10 @@ export const createBugBoss = async (
     tokenSecret,
     toolApiFor,
     slack,
+    // The child re-reads these on a timer. A role tops out at a twelve-hour
+    // session and an incident can run for a day, so credentials assumed once
+    // at launch expire mid-run.
+    credentials,
     now,
   });
 

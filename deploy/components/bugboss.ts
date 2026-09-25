@@ -50,18 +50,10 @@ export const createBugBoss = (config: BugBossConfig) => {
   new aws.s3.BucketLifecycleConfiguration("bugbossBucketLifecycle", {
     bucket: bucket.id,
     rules: [
-      {
-        id: "expire-slack-sessions",
-        status: "Enabled",
-        filter: { prefix: "sessions/slack/" },
-        expiration: { days: 7 },
-      },
-      {
-        id: "expire-incident-sessions",
-        status: "Enabled",
-        filter: { prefix: "sessions/incident/" },
-        expiration: { days: 90 },
-      },
+      // Session transcripts are never expired. They are the whole record of
+      // what an agent did and why, they are what a post-mortem is checked
+      // against months later, and they are small. Nothing here deletes them.
+      //
       // Versioning plus a whole-object PUT of the snapshot on every committed
       // write means thousands of noncurrent versions a day. Without this the
       // bucket grows without bound for a database that stays single-digit
@@ -100,15 +92,8 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
-  // A placeholder so the first deploy has something to resolve; real values
-  // are written by hand and `ignoreChanges` stops the next `pulumi up`
-  // reverting them. Nothing here reads the live secret at evaluation time,
-  // unlike the `getSecretVersion` call in index.ts.
-  new aws.secretsmanager.SecretVersion(
-    "bugbossSecretPlaceholder",
-    { secretId: secret.id, secretString: "{}" },
-    { ignoreChanges: ["secretString"] },
-  );
+  // No SecretVersion resource. The value is written by hand and Pulumi does
+  // not manage it, so there is nothing here that could revert it.
 
   const albSecurityGroup = new aws.ec2.SecurityGroup("bugbossAlbSg", {
     name: "bugboss-alb",

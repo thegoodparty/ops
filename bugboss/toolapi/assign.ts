@@ -1,6 +1,6 @@
 // The assign primitive: re-partition signals across incidents.
 //
-// Design spec: docs/bugboss/design.md, "Merge and split are one primitive --
+// Design spec: bugboss/docs/architecture.md, "Merge and split are one primitive --
 // one code path, one audit shape".
 //
 // Create, attach, merge and split are all the same move, distinguished only by

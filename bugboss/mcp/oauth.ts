@@ -4,7 +4,7 @@
 // ID token and mints our 60-second authorization code, /token swaps that code
 // for an HS256 access token whose `aud` is the MCP URL.
 //
-// Design spec: docs/bugboss/design.md, "The shape".
+// Design spec: bugboss/docs/architecture.md, "The shape".
 
 import type { OAuthMetadata } from "@modelcontextprotocol/server";
 import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";

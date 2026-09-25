@@ -1,4 +1,4 @@
-// The Boss's Slack side. Design spec: docs/bugboss/design.md, Job 5, plus
+// The Boss's Slack side. Design spec: bugboss/docs/architecture.md, Job 5, plus
 // "When a human gets pinged" in Layer 4.
 //
 // Outbound is incident status transitions and two notifications. The incident

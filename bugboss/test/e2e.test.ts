@@ -6,7 +6,7 @@
 // real webhook parsing, real triage rules, real assign, real tool API, real
 // dispatcher, real SQLite with its snapshot write path.
 //
-// Design spec: docs/bugboss/design.md
+// Design spec: bugboss/docs/architecture.md
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";

@@ -1,5 +1,5 @@
 // Read-only SQL over the incident database, exposed as a tool to the Boss's
-// own agentic calls. Design spec: docs/bugboss/design.md, "Who can query it".
+// own agentic calls. Design spec: bugboss/docs/architecture.md, "Who can query it".
 //
 // The digest answers "what is open right now". This answers everything else:
 // has this alert slug produced a real incident before, how did the last one

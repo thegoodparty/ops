@@ -1,6 +1,6 @@
 // Builds the native Anthropic Messages body we hand to Bedrock InvokeModel.
 //
-// Design spec: docs/bugboss/design.md, "Model and provider" and
+// Design spec: bugboss/docs/architecture.md, "Model and provider" and
 // "Why InvokeModel is not optional" under "Harness: Pi".
 //
 // The one rule the whole resume design rests on: an assistant thinking block

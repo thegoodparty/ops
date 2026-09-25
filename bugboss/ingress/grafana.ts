@@ -1,4 +1,4 @@
-// Grafana ingress. Design spec: docs/bugboss/design.md, Job 1.
+// Grafana ingress. Design spec: bugboss/docs/architecture.md, Job 1.
 //
 // Two things here fail in deliberately opposite directions.
 //

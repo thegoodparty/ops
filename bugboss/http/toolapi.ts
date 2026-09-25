@@ -1,5 +1,5 @@
 // The Boss's loopback API: how a real child agent reaches the in-process
-// ToolApi. Design spec: docs/bugboss/design.md, "Authentication" — "a scoped
+// ToolApi. Design spec: bugboss/docs/architecture.md, "Authentication" — "a scoped
 // token on a local socket or loopback HTTP, carrying incidentId -> that one
 // incident".
 //
@@ -15,17 +15,19 @@
 // pending_question table. It also has to watch for a reply without draining,
 // which no ToolApi call can do, so the directive read lives here too.
 
-import { makeLog } from "../logging";
+import { makeAlarm, makeLog } from "../logging";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { z } from "zod";
 
 import type { Db } from "../db";
+import type { AgentCredentialProvider } from "../dispatcher/credentials";
 import type { ThreadPoster } from "../toolapi";
 import { verifyAgentToken } from "../toolapi";
 import type { Directive, ToolApi } from "../types";
 
 const log = makeLog("boss-http");
+const alarm = makeAlarm("boss-http");
 
 export interface ToolApiHttpDeps {
   db: Db;
@@ -34,6 +36,8 @@ export interface ToolApiHttpDeps {
   /** Built against the token the caller presented, not a freshly minted one. */
   toolApiFor: (incidentId: string, token: string) => ToolApi;
   slack: ThreadPoster;
+  /** Mints short-lived AWS credentials for a child. Absent when no role is set. */
+  credentials?: AgentCredentialProvider;
   now?: () => number;
 }
 
@@ -228,6 +232,37 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
         directive: JSON.parse(row.payload) as Directive,
       })),
     );
+  });
+
+  /**
+   * Fresh AWS credentials for the child.
+   *
+   * A role's maximum session duration is twelve hours and an incident can run
+   * for a day, so credentials assumed once at launch expire mid-run and the
+   * agent loses Bedrock — which is not a degraded agent, it is a dead one.
+   *
+   * The child cannot re-assume for itself: doing so needs credentials, and
+   * the only ones it could use would be the task role, which reads the
+   * secret holding every other credential in the system. So the parent keeps
+   * that path and hands down short-lived results through the channel the
+   * child is already authenticated on.
+   */
+  app.get("/incidents/:id/aws-credentials", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    if (!deps.credentials) {
+      return c.json({ ok: false, error: "no agent role is configured" }, 503);
+    }
+    try {
+      const creds = await deps.credentials(caller.incidentId);
+      return c.json({ ok: true, ...creds });
+    } catch (error: unknown) {
+      alarm("agent_credentials_failed", {
+        incidentId: caller.incidentId,
+        error: String(error),
+      });
+      return c.json({ ok: false, error: "could not assume the agent role" }, 502);
+    }
   });
 
   /**

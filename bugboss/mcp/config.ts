@@ -1,5 +1,5 @@
 // Configuration for the MCP server and the colocated authorization server.
-// Design spec: docs/bugboss/design.md, "The MCP server".
+// Design spec: bugboss/docs/architecture.md, "The MCP server".
 
 export interface GoogleOAuthConfig {
   clientId: string;

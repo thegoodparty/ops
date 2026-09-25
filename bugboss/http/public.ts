@@ -1,7 +1,7 @@
 // The public face: the three webhook paths the ALB routes, the health check
 // its target group polls, and the MCP server mounted at its own paths.
 //
-// Design spec: docs/bugboss/design.md, "Topology" and "The MCP server". The
+// Design spec: bugboss/docs/architecture.md, "Topology" and "The MCP server". The
 // listener rules in deploy/components/bugboss.ts are an allowlist, so a path
 // added here also has to be added there before anything outside can reach it.
 // /health is the exception: the target group polls the task directly.

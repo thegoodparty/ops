@@ -4,7 +4,7 @@
 // file per turn, so S3 holds a copy that is at most one turn behind. That is
 // what "what is this agent doing" reads.
 //
-// Design spec: docs/bugboss/design.md, "Session persistence".
+// Design spec: bugboss/docs/architecture.md, "Session persistence".
 
 import {
   GetObjectCommand,

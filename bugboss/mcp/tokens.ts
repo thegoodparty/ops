@@ -1,7 +1,7 @@
 // Our own tokens: the signed state we hand Google, the 60-second
 // authorization code, and the access token the MCP endpoint accepts.
 //
-// Design spec: docs/bugboss/design.md, "The shape". State is nearly nil
+// Design spec: bugboss/docs/architecture.md, "The shape". State is nearly nil
 // because everything durable is carried inside a signed JWT. The only
 // server-side memory is a redeemed-code set for replay prevention, which a
 // single process holds in a Map.

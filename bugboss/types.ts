@@ -1,7 +1,7 @@
 // The contract every BugBoss component is built against. Owned by Phase 0 of
 // the build plan; nothing in Phase 1 edits this file.
 //
-// Design spec: docs/bugboss/design.md
+// Design spec: bugboss/docs/architecture.md
 
 // ---------------------------------------------------------------------------
 // Entities

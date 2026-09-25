@@ -1,4 +1,4 @@
-// Job 2b: correlate on root cause. Design spec: docs/bugboss/design.md,
+// Job 2b: correlate on root cause. Design spec: bugboss/docs/architecture.md,
 // "Job 2b: Correlate on root cause".
 //
 // Incident agents cannot see each other, so noticing that two incidents share

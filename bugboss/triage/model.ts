@@ -1,5 +1,5 @@
 // The model seam for the Boss's own bounded calls: triage (Job 2) and
-// root-cause correlation (Job 2b). Design spec: docs/bugboss/design.md.
+// root-cause correlation (Job 2b). Design spec: bugboss/docs/architecture.md.
 //
 // The interface is deliberately smaller than any SDK's -- one call, tools in,
 // text and tool calls out. Two reasons. These calls run inside the Boss

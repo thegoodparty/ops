@@ -6,7 +6,7 @@
 // be the confused-deputy pattern the spec forbids. So we take an ID token
 // once, at /callback, check it, and mint our own.
 //
-// Design spec: docs/bugboss/design.md, "Restricting to our Workspace".
+// Design spec: bugboss/docs/architecture.md, "Restricting to our Workspace".
 
 import jwt from "jsonwebtoken";
 import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";

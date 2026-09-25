@@ -1,5 +1,5 @@
 // Fallback-rate tracking for the Boss's own model calls. Design spec:
-// docs/bugboss/design.md, "BugBoss alerts must not route through BugBoss".
+// bugboss/docs/architecture.md, "BugBoss alerts must not route through BugBoss".
 //
 // Every fallback in this directory returns a well-formed answer: triage
 // returns new_incident, correlation returns no merges. Downstream neither is

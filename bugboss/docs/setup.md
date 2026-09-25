@@ -1,8 +1,12 @@
-# BugBoss follow-ups
+# BugBoss setup
 
-Everything that needs a human, accumulated during design and the build. Kept
-current as chunks report. Design spec: `design.md`. Build status:
-`build-plan.md`.
+Everything that needs a person, and the things still open. Nothing here can
+be done from code: it is Grafana's UI, a Slack app, a GitHub App and a
+Secrets Manager value.
+
+Why any of this exists: [`purpose.md`](./purpose.md). How it works:
+[`architecture.md`](./architecture.md). What order to switch it on in:
+[`trying-it.md`](./trying-it.md).
 
 ## Blocking a first real alert
 

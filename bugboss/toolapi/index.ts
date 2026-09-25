@@ -1,4 +1,4 @@
-// Job 4: serve the agent tool API. Design spec: docs/bugboss/design.md.
+// Job 4: serve the agent tool API. Design spec: bugboss/docs/architecture.md.
 //
 // The agent's only path to state. Six methods, four of which are state
 // transitions, and every response carries the directives the agent has not

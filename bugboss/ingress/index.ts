@@ -1,4 +1,4 @@
-// The adapter registry. Design spec: docs/bugboss/design.md, Job 1.
+// The adapter registry. Design spec: bugboss/docs/architecture.md, Job 1.
 //
 // Keyed by source name because Signal.source is a free string rather than a
 // union: a new source is an adapter and a registry entry, not a type change.

@@ -1,5 +1,5 @@
 // The environment a child agent runs with. Design spec:
-// docs/bugboss/design.md, Authentication.
+// bugboss/docs/architecture.md, Authentication.
 //
 // The child environment is built up from nothing rather than filtered down
 // from process.env. Agents share a container with the Slack token, the GitHub

@@ -1,4 +1,4 @@
-// The database layer. Design spec: docs/bugboss/design.md, Layer 1.
+// The database layer. Design spec: bugboss/docs/architecture.md, Layer 1.
 //
 // Two properties come from one place, the withWrite helper: writes are
 // serialized so two concurrent handlers cannot clobber each other even though

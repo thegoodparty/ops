@@ -5,7 +5,7 @@
 //   GET  /.well-known/oauth-authorization-server    our AS metadata
 //        /authorize /callback /token                the AS leg
 //
-// Design spec: docs/bugboss/design.md, "The MCP server".
+// Design spec: bugboss/docs/architecture.md, "The MCP server".
 
 import { Hono } from "hono";
 import {

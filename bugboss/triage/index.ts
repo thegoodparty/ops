@@ -1,5 +1,5 @@
 // Triage (Job 2) and root-cause correlation (Job 2b). Design spec:
-// docs/bugboss/design.md.
+// bugboss/docs/architecture.md.
 //
 // Both are advisory. The caller applies what comes back through `assign`, and
 // neither entry point throws: triage degrades to opening an incident,
