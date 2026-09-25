@@ -188,6 +188,111 @@ describe("the mention policy", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("what a transition looks like in Slack", () => {
+  test("a signal title out of an alert annotation cannot eat the message", () => {
+    const text = renderEvent({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "500s parsing <Config> for a & b",
+      signalCount: 2,
+    });
+    assert.ok(text.includes("500s parsing &lt;Config&gt; for a &amp; b"), text);
+    assert.ok(text.endsWith("nobody is being paged_"), text);
+  });
+
+  test("a slug is code, and a count agrees with its noun", () => {
+    assert.ok(
+      renderEvent({
+        type: "prod_critical_signal",
+        incidentId: "inc-1",
+        signalTitle: "checkout down",
+        slug: "payments-5xx",
+      }).includes("(`payments-5xx`)"),
+    );
+    assert.ok(
+      renderEvent({
+        type: "opened",
+        incidentId: "inc-1",
+        title: "t",
+        signalCount: 1,
+      }).includes("_1 signal ·"),
+    );
+  });
+
+  test("a pull request is linked by its number, not by a bare url", () => {
+    const text = renderEvent({
+      type: "pr_needs_merge",
+      incidentId: "inc-1",
+      prUrl: "https://github.com/thegoodparty/omni/pull/2",
+    });
+    assert.ok(
+      text.includes("<https://github.com/thegoodparty/omni/pull/2|thegoodparty/omni#2>"),
+      text,
+    );
+    assert.ok(text.includes("• Does the RCA explain the signals?"), text);
+  });
+
+  test("a url that is not a GitHub pull request still links", () => {
+    assert.ok(
+      renderEvent({
+        type: "pr_needs_merge",
+        incidentId: "inc-1",
+        prUrl: "https://gitlab.test/x/-/merge_requests/9",
+      }).includes("<https://gitlab.test/x/-/merge_requests/9>"),
+    );
+  });
+
+  test("an agent brief written as Markdown arrives as mrkdwn", () => {
+    const text = renderEvent({
+      type: "escalated",
+      incidentId: "inc-1",
+      reason: "deadline",
+      brief: "## What I ruled out\n- **the cache**, see [the run](https://ci.test/7)",
+    });
+    assert.ok(text.includes("*What I ruled out*"), text);
+    assert.ok(text.includes("• *the cache*, see <https://ci.test/7|the run>"), text);
+    assert.doesNotMatch(text, /\*\*|^## /m);
+  });
+
+  test("a brief cannot page the rotation on the agent's own say-so", () => {
+    const text = renderEvent({
+      type: "escalated",
+      incidentId: "inc-1",
+      reason: "deadline",
+      brief: "<!subteam^S0ROTATION> someone look",
+    });
+    assert.doesNotMatch(text, /<!here>|<!channel>|<!subteam\^/);
+  });
+
+  test("a brief longer than one message becomes several, not a truncation", async () => {
+    await seedIncident("inc-1");
+    await relay.emit({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "t",
+      signalCount: 1,
+    });
+    const brief = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
+    await relay.emit({
+      type: "escalated",
+      incidentId: "inc-1",
+      reason: "deadline",
+      brief,
+    });
+
+    const posted = slack.posts.slice(1);
+    assert.ok(posted.length > 1, `expected a split, got ${posted.length}`);
+    assert.ok(posted.every((p) => p.threadTs !== null), "every part lands in the thread");
+    assert.ok(
+      posted.map((p) => p.text).join("").includes("ruled out 399"),
+      "the tail is not dropped",
+    );
+    assert.match(posted[0].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
+  });
+});
+
+// ---------------------------------------------------------------------------
+
 describe("threading", () => {
   test("opened starts the thread and records its ts on the incident", async () => {
     await seedIncident("inc-1");

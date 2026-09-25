@@ -13,6 +13,13 @@
 import type { Db } from "../db";
 import type { SlackPoster } from "./relay";
 import { mentionPrefix, stripBotMention } from "./relay";
+import {
+  channelLink,
+  mrkdwn,
+  postProse,
+  raw,
+  userMention,
+} from "./format";
 import { makeAlarm, makeLog } from "../logging";
 
 const log = makeLog("slack-agent");
@@ -385,6 +392,14 @@ export const SLACK_AGENT_SYSTEM = [
   "- query_incidents: one read-only SQL SELECT against the incident database.",
   "- read_agent_session: the tail of an incident agent's transcript, for what it tried and ruled out.",
   "",
+  "Formatting. What you write is posted to Slack as you wrote it, and Slack renders mrkdwn, not Markdown:",
+  "- *bold*, _italic_, ~strike~, `code`, ```block```. Never **bold**: the asterisks show.",
+  "- Links are <https://example.com|label>, never [label](https://example.com).",
+  "- There are no headings and no tables. A bold line on its own is a heading. For columns, use a ``` block; a pipe table renders as a wall of pipes.",
+  "- A bullet is a literal \"• \" you type, and a numbered list is numbers you type. Nothing is numbered for you.",
+  "- Do not escape &, < or > yourself. That is done for you, so typing &amp; posts a literal &amp;.",
+  "- Never write <!here>, <!channel> or <!subteam^ID>. Who gets paged is the Boss's decision, and from you they post as literal text.",
+  "",
   "How to answer:",
   "- Look it up. Never answer an incident question from memory of this conversation alone when a tool can check.",
   "- You keep this session across mentions, so you already remember what you looked up earlier in this thread. Re-check anything that may have moved.",
@@ -496,7 +511,11 @@ export class SlackAgent {
         maxTurns: this.cfg.maxTurns ?? 12,
       });
 
-      await this.slack.post(mention.threadTs, text, mention.channel);
+      await postProse(
+        (part) => this.slack.post(mention.threadTs, part, mention.channel),
+        text,
+        { thread: lockKey },
+      );
 
       // The answer is already posted. A failed state write costs the next
       // resume its watermark; it must not turn an answer into an apology.
@@ -545,9 +564,9 @@ export class SlackAgent {
       await this.slack.post(
         null,
         [
-          `${mentionPrefix(this.cfg.rotationGroupId ?? null)}*A question in <#${mention.channel}> went unanswered*`,
-          `<@${mention.user}> asked in thread ${mention.threadTs} and I could not answer or say so there.`,
-          "The error is in the BugBoss logs.",
+          mrkdwn`${raw(mentionPrefix(this.cfg.rotationGroupId ?? null))}*A question in ${raw(channelLink(mention.channel))} went unanswered*`,
+          mrkdwn`${raw(userMention(mention.user))} asked in thread ${mention.threadTs} and I could not answer or say so there.`,
+          "_The error is in the BugBoss logs._",
         ].join("\n"),
         alertChannel,
       );

@@ -36,6 +36,18 @@ deadline can interrupt a blocking tool. Without that, `steer` only lands
 after the current turn's tool calls finish — and the agent spends most of
 its life inside a `monitor` with an hours-long timeout.
 
+## What it writes goes straight to Slack
+
+`contact_human`, the hand-off brief, the root cause, the resolution evidence
+and the post-mortem are all posted as the agent wrote them, so the prompt
+carries the mrkdwn contract ("Writing to Slack" in `prompt.ts`). The model is
+told **not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at
+the boundary, and a model that pre-escapes would post `&amp;amp;`.
+
+The conversion is a backstop, not the mechanism. It only fires on the Markdown
+that slips through anyway, and it runs on the Slack copy alone: the stored
+root cause and post-mortem stay as the agent wrote them.
+
 ## Directives
 
 The poll in `contact_human` uses a **non-draining** read

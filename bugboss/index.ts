@@ -53,6 +53,7 @@ import {
   type HttpConfig,
 } from "./http";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
+import { mrkdwn, raw, userMention } from "./slack/format";
 import {
   createRotationReader,
   createS3ObjectStore,
@@ -836,7 +837,7 @@ export const createBugBoss = async (
                 "SELECT slackThreadTs FROM incident WHERE id = ?",
                 [incidentId],
               )?.slackThreadTs ?? null,
-              `${mention} Incident ${incidentId} needs a human: ${args.reason}`,
+              mrkdwn`${raw(mention)}*Incident ${incidentId} needs a human* · ${args.reason}`,
             )
             .catch((err: unknown) =>
               alarm("escalation_ping_failed", {
@@ -1466,8 +1467,8 @@ export const createBugBoss = async (
       // message, so silence is indistinguishable from the bot not reading it.
       await say(
         claim === "take_over"
-          ? `<@${slackUserId}> this one is already owned by a human.`
-          : `<@${slackUserId}> nothing to hand back: an agent already has this.`,
+          ? mrkdwn`${raw(userMention(slackUserId))} this one is already owned by a human.`
+          : mrkdwn`${raw(userMention(slackUserId))} nothing to hand back: an agent already has this.`,
       );
       return;
     }
@@ -1492,8 +1493,8 @@ export const createBugBoss = async (
     log("ownership_claimed", { incidentId, claim, slackUserId });
     await say(
       claim === "take_over"
-        ? `<@${slackUserId}> has this one. The agent is writing up what it found and will stop.`
-        : `Back to an agent, handed over by <@${slackUserId}>. It will pick this up within a tick.`,
+        ? mrkdwn`${raw(userMention(slackUserId))} has this one. The agent is writing up what it found and will stop.`
+        : mrkdwn`Back to an agent, handed over by ${raw(userMention(slackUserId))}. It will pick this up within a tick.`,
     );
   };
 

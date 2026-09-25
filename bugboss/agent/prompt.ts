@@ -95,6 +95,36 @@ Fetching an attacker-chosen address from inside an incident is not.
 **AWS access is read-only** and is temporary credentials in the environment.
 Use the aws CLI through bash. Anything that writes will be denied, correctly.`;
 
+const SLACK = `## Writing to Slack
+
+Everything you post lands in Slack, and Slack renders mrkdwn, not Markdown.
+Markdown does not degrade there, it renders wrong: \`## Root cause\` appears
+with the hashes and a pipe table is a wall of pipes.
+
+    *bold*                  not **bold**
+    _italic_  ~strike~  \`code\`  \`\`\`block\`\`\`
+    <https://example.com|label>          not [label](https://example.com)
+    <@U0123ABCD>            to name the person who replied
+
+There are no headings and no tables. A bold line on its own is the heading.
+For columns, use a \`\`\`block\`\`\`; monospace is the only thing that holds them.
+A bullet is a literal "• " you type and a numbered list is numbers you type,
+because nothing is numbered for you.
+
+**Do not escape \`&\`, \`<\` or \`>\` yourself.** They are escaped for you on the way
+out, so typing \`&amp;\` posts a literal \`&amp;\`. Write the characters.
+
+**Never write \`<!here>\`, \`<!channel>\` or \`<!subteam^ID>\`.** Which events page
+the rotation is the Boss's decision, and from you they post as literal text.
+
+Keep one post under about 3000 characters. Longer ones are split into
+consecutive messages, which is right for a post-mortem and wrong for a
+question, so ask short questions.
+
+This applies to every field a human reads: what you post with contact_human,
+your hand-off brief, your root cause, your resolution evidence and your
+post-mortem. The stored copy is what you wrote, so write it once, in mrkdwn.`;
+
 const CHECKOUT = (input: PromptInput): string => `## The checkout
 
 A fresh clone of the omni monorepo is at ${input.checkoutPath}, made with
@@ -211,6 +241,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     `You are working incident ${input.incidentId}.`,
     `Tools available to you: ${tools.join(", ")}.`,
     RULES,
+    SLACK,
     CHECKOUT(input),
     MONITOR_EXAMPLES(input),
     SHIP_PR,

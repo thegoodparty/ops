@@ -15,6 +15,7 @@
 import type { Db } from "../db";
 import type { Directive, IncidentOwner, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
+import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 
 const log = makeLog("slack-relay");
 
@@ -118,47 +119,74 @@ const LINK_RETRY_MS = 100;
  */
 type LinkOutcome = "linked" | "lost" | "unwritable";
 
+/**
+ * A pull request, as `<url|owner/repo#7>`. The number is what a reader is
+ * looking for and a bare GitHub URL buries it, since `unfurl_links` is off.
+ */
+const prLink = (url: string): string => {
+  const parts = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/.exec(url);
+  return parts ? link(url, `${parts[1]}#${parts[2]}`) : link(url);
+};
+
+/**
+ * Every transition has the same three parts, which is the shape the PR
+ * reviewer already uses in this channel: a bold line saying what happened, the
+ * substance, then one italic line of what it means for the reader. No
+ * headings, because Slack has none; no tables, for the same reason.
+ *
+ * The literal text here is formatting and stays unescaped. Everything
+ * interpolated is escaped: a signal title comes out of an alert annotation,
+ * which is a thing an attacker can write, and one `<` in it would otherwise
+ * eat the rest of the message with a 200 back from Slack.
+ */
 export const renderEvent = (event: RelayEvent): string => {
   switch (event.type) {
     case "opened":
       return [
-        `*Incident ${event.incidentId} opened*`,
-        event.title,
-        `${event.signalCount} signal(s). An agent is investigating. Nobody is being paged.`,
+        mrkdwn`*Incident ${event.incidentId} opened*`,
+        mrkdwn`${event.title}`,
+        mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"} · an agent is investigating · nobody is being paged_`,
       ].join("\n");
     case "merged":
       return [
-        `*Incident ${event.incidentId} merged into ${event.into}*`,
-        event.reason,
-        `Follow ${event.into} from here.`,
+        mrkdwn`*Incident ${event.incidentId} merged into ${event.into}*`,
+        toMrkdwn(event.reason),
+        mrkdwn`_Follow ${event.into} from here._`,
       ].join("\n");
     case "escalated":
       return [
-        `*Escalation on incident ${event.incidentId}*`,
-        `Reason: ${event.reason}`,
+        mrkdwn`*Escalation on incident ${event.incidentId}* · ${event.reason}`,
         "",
-        event.brief,
+        toMrkdwn(event.brief),
         "",
-        "This incident now has a human owner and no agent is running on it.",
+        "_This incident now has a human owner and no agent is running on it._",
       ].join("\n");
     case "resolved":
       return [
-        `*Incident ${event.incidentId} resolved*`,
-        event.evidence,
-        ...event.prUrls.map((url) => `Shipped: ${url}`),
-        "Post-mortem to follow. Nothing auto-closes.",
+        mrkdwn`*Incident ${event.incidentId} resolved*`,
+        toMrkdwn(event.evidence),
+        ...(event.prUrls.length
+          ? [bullets(event.prUrls.map((url) => `Shipped: ${prLink(url)}`))]
+          : []),
+        "_Post-mortem to follow. Nothing auto-closes._",
       ].join("\n");
     case "prod_critical_signal":
       return [
-        `*Prod-critical signal on incident ${event.incidentId}*`,
-        `${event.signalTitle} (${event.slug})`,
-        "An agent is working it. This is a heads up, not a handover.",
+        mrkdwn`*Prod-critical signal on incident ${event.incidentId}*`,
+        mrkdwn`${event.signalTitle} (\`${event.slug}\`)`,
+        "_An agent is working it. This is a heads up, not a handover._",
       ].join("\n");
     case "pr_needs_merge":
       return [
-        `*A PR needs review and merge for incident ${event.incidentId}*`,
-        event.prUrl,
-        "Before merging: does the RCA explain the signals, does the diff match the stated cause, is the blast radius what the analysis implies, and is there a test that would have caught this?",
+        mrkdwn`*A PR needs review and merge for incident ${event.incidentId}*`,
+        prLink(event.prUrl),
+        "Before merging:",
+        bullets([
+          "Does the RCA explain the signals?",
+          "Does the diff match the stated cause?",
+          "Is the blast radius what the analysis implies?",
+          "Is there a test that would have caught this?",
+        ]),
       ].join("\n");
   }
 };
@@ -280,7 +308,13 @@ export class SlackRelay {
         return open;
       }
 
-      const { ts } = await this.slack.post(null, body, this.cfg.channelId);
+      const parts = splitForSlack(body);
+      const { ts } = await this.slack.post(null, parts[0], this.cfg.channelId);
+      // The rest go into the thread this post just started, which is why they
+      // wait for it rather than being posted alongside.
+      for (const part of parts.slice(1)) {
+        await this.slack.post(ts, part, this.cfg.channelId);
+      }
       if ((await this.linkThread(event.incidentId, ts)) === "unwritable") {
         // The thread exists and nothing points at it, so the rest of this
         // incident will not land here. Said in the thread, which is where
@@ -288,8 +322,8 @@ export class SlackRelay {
         await this.slack.post(
           ts,
           [
-            `${ping}*Incident ${event.incidentId} is not linked to this thread*`,
-            "Recording this thread on the incident failed, so its later updates will not land here. The error is in the BugBoss logs.",
+            mrkdwn`${raw(ping)}*Incident ${event.incidentId} is not linked to this thread*`,
+            "_Recording this thread on the incident failed, so its later updates will not land here. The error is in the BugBoss logs._",
           ].join("\n"),
           this.cfg.channelId,
         );
@@ -308,16 +342,18 @@ export class SlackRelay {
         incidentId: event.incidentId,
         type: event.type,
       });
-      const { ts } = await this.slack.post(
-        null,
+      const orphan = splitForSlack(
         [
-          `${ping}*Incident ${event.incidentId} has no Slack thread*`,
-          "Its thread link is missing, so this is posting at the top level and the rest of the incident will follow it here.",
+          mrkdwn`${raw(ping)}*Incident ${event.incidentId} has no Slack thread*`,
+          "_Its thread link is missing, so this is posting at the top level and the rest of the incident will follow it here._",
           "",
           body,
         ].join("\n"),
-        this.cfg.channelId,
       );
+      const { ts } = await this.slack.post(null, orphan[0], this.cfg.channelId);
+      for (const part of orphan.slice(1)) {
+        await this.slack.post(ts, part, this.cfg.channelId);
+      }
       // Adopt this post as the thread. One recovered thread beats the loose
       // messages every later transition would otherwise add.
       const adopted = await this.linkThread(event.incidentId, ts);
@@ -329,11 +365,13 @@ export class SlackRelay {
       return ts;
     }
 
-    const { ts } = await this.slack.post(
-      threadTs,
-      (earnsMention(event) ? ping : "") + body,
-      this.cfg.channelId,
-    );
+    let first: string | null = null;
+    for (const part of splitForSlack((earnsMention(event) ? ping : "") + body)) {
+      const posted = await this.slack.post(threadTs, part, this.cfg.channelId);
+      first = first ?? posted.ts;
+    }
+    if (first === null) throw new Error("splitForSlack produced nothing to post");
+    const ts = first;
     log("posted", {
       incidentId: event.incidentId,
       type: event.type,

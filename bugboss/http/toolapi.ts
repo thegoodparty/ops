@@ -24,6 +24,7 @@ import type { Db } from "../db";
 import type { AgentCredentialProvider } from "../dispatcher/credentials";
 import type { ThreadPoster } from "../toolapi";
 import { verifyAgentToken } from "../toolapi";
+import { postProse } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
 
 const log = makeLog("boss-http");
@@ -380,7 +381,20 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     );
     if (!incident) return c.json({ error: "unknown incident" }, 404);
 
-    const { ts } = await deps.slack.post(incident.slackThreadTs, message);
+    // The agent writes mrkdwn by instruction (agent/prompt.ts) and this is
+    // where that is made true rather than hoped for: the Markdown it slips
+    // into is converted, `&`, `<` and `>` are escaped so a quoted log line
+    // cannot eat the rest of the post, and anything past one message becomes
+    // the next post in the thread instead of being truncated by Slack.
+    //
+    // Only the Slack copy is converted. What the incident stores stays as the
+    // agent wrote it, so the Slack agent reading it back later gets prose and
+    // not markup.
+    const { ts } = await postProse(
+      (part) => deps.slack.post(incident.slackThreadTs, part),
+      message,
+      { incidentId: caller.incidentId },
+    );
 
     // Fills in the ts the marker could not know when it was written. Scoped to
     // a blank one so a later post does not repoint an older question.
