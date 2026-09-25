@@ -29,6 +29,108 @@ export interface BugBossConfig {
   subnetIds: string[];
 }
 
+/**
+ * The incident agent's own permissions, and the only place its blast radius is
+ * written down. Exported so the boundary is assertable rather than described:
+ * anything added here widens what a process that reads attacker-writable log
+ * lines for a living can reach.
+ */
+export const agentInlinePolicy = {
+          Version: "2012-10-17",
+          Statement: [
+            {
+              // The child writes its own transcript: `agent/run.ts` builds an
+              // S3 session store and mirrors the JSONL per turn, which is what
+              // makes a restart resume rather than start over. Scoped to
+              // `sessions/` so `state/db` — the incident database snapshot the
+              // Boss restores from — stays out of reach of a process that
+              // reads attacker-writable log lines for a living.
+              Sid: "OwnSessionTranscript",
+              Effect: "Allow",
+              Action: ["s3:GetObject", "s3:PutObject"],
+              Resource: [`arn:aws:s3:::${BUCKET_NAME}/sessions/*`],
+            },
+            {
+              // Not decoration, and not scopable by prefix. S3 answers a GET
+              // for a key that does not exist with AccessDenied rather than
+              // NoSuchKey unless the caller holds ListBucket on the bucket,
+              // and it evaluates that on the bucket with no `s3:prefix` in
+              // context. Without this, an agent's first launch — when its
+              // session file legitimately does not exist yet — reads as a
+              // permissions failure and the child exits 1. It grants the
+              // ability to see key names, never their contents.
+              Sid: "SessionAbsenceReadsAsAbsence",
+              Effect: "Allow",
+              Action: ["s3:ListBucket"],
+              Resource: [`arn:aws:s3:::${BUCKET_NAME}`],
+            },
+            {
+              Sid: "OwnModelCalls",
+              Effect: "Allow",
+              Action: ["bedrock:InvokeModel*"],
+              Resource: [
+                "arn:aws:bedrock:*::foundation-model/*",
+                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/*`,
+                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:application-inference-profile/*`,
+              ],
+            },
+            // Service events, which say why a task failed to start or was
+            // replaced, come back in DescribeServices output.
+            {
+              Sid: "DeploymentState",
+              Effect: "Allow",
+              Action: ["ecs:Describe*", "ecs:List*"],
+              Resource: ["*"],
+            },
+            // The line is our application logs, which an agent may read,
+            // against infrastructure and security logs, which it may not:
+            // VPC flow logs, GuardDuty, RDS OS metrics and the VPN groups
+            // stay unreadable. A new prefix belongs here only if it carries
+            // logs our own code emits.
+            //
+            // Derive the prefixes from the live account rather than from the
+            // service that writes them. SST does not use `/ecs` or
+            // `/aws/ecs`, so leaving `/sst/cluster/*` out would silently
+            // exclude gp-api, election-api and people-api.
+            {
+              Sid: "ApplicationLogContent",
+              Effect: "Allow",
+              Action: [
+                "logs:FilterLogEvents",
+                "logs:GetLogEvents",
+                "logs:DescribeLogStreams",
+              ],
+              Resource: [
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/ecs/*`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/ecs/*`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/sst/cluster/*`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/*`,
+              ],
+            },
+            // Unscoped because a resource-restricted DescribeLogGroups denies
+            // the whole call rather than filtering it, which breaks discovery
+            // outright. Group names are not content.
+            {
+              Sid: "LogGroupDiscovery",
+              Effect: "Allow",
+              Action: ["logs:DescribeLogGroups"],
+              Resource: ["*"],
+            },
+            // Metrics cannot be resource-scoped meaningfully, and they are
+            // numbers rather than content.
+            {
+              Sid: "Metrics",
+              Effect: "Allow",
+              Action: [
+                "cloudwatch:GetMetricData",
+                "cloudwatch:GetMetricStatistics",
+                "cloudwatch:ListMetrics",
+              ],
+              Resource: ["*"],
+            },
+          ],
+        };
+
 export const createBugBoss = (config: BugBossConfig) => {
   const bucket = new aws.s3.Bucket("bugbossBucket", {
     bucket: BUCKET_NAME,
@@ -378,75 +480,7 @@ export const createBugBoss = (config: BugBossConfig) => {
     inlinePolicies: [
       {
         name: "inline",
-        policy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Sid: "OwnModelCalls",
-              Effect: "Allow",
-              Action: ["bedrock:InvokeModel*"],
-              Resource: [
-                "arn:aws:bedrock:*::foundation-model/*",
-                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/*`,
-                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:application-inference-profile/*`,
-              ],
-            },
-            // Service events, which say why a task failed to start or was
-            // replaced, come back in DescribeServices output.
-            {
-              Sid: "DeploymentState",
-              Effect: "Allow",
-              Action: ["ecs:Describe*", "ecs:List*"],
-              Resource: ["*"],
-            },
-            // The line is our application logs, which an agent may read,
-            // against infrastructure and security logs, which it may not:
-            // VPC flow logs, GuardDuty, RDS OS metrics and the VPN groups
-            // stay unreadable. A new prefix belongs here only if it carries
-            // logs our own code emits.
-            //
-            // Derive the prefixes from the live account rather than from the
-            // service that writes them. SST does not use `/ecs` or
-            // `/aws/ecs`, so leaving `/sst/cluster/*` out would silently
-            // exclude gp-api, election-api and people-api.
-            {
-              Sid: "ApplicationLogContent",
-              Effect: "Allow",
-              Action: [
-                "logs:FilterLogEvents",
-                "logs:GetLogEvents",
-                "logs:DescribeLogStreams",
-              ],
-              Resource: [
-                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/ecs/*`,
-                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/ecs/*`,
-                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/sst/cluster/*`,
-                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/*`,
-              ],
-            },
-            // Unscoped because a resource-restricted DescribeLogGroups denies
-            // the whole call rather than filtering it, which breaks discovery
-            // outright. Group names are not content.
-            {
-              Sid: "LogGroupDiscovery",
-              Effect: "Allow",
-              Action: ["logs:DescribeLogGroups"],
-              Resource: ["*"],
-            },
-            // Metrics cannot be resource-scoped meaningfully, and they are
-            // numbers rather than content.
-            {
-              Sid: "Metrics",
-              Effect: "Allow",
-              Action: [
-                "cloudwatch:GetMetricData",
-                "cloudwatch:GetMetricStatistics",
-                "cloudwatch:ListMetrics",
-              ],
-              Resource: ["*"],
-            },
-          ],
-        }),
+        policy: JSON.stringify(agentInlinePolicy),
       },
     ],
     tags: TAGS,

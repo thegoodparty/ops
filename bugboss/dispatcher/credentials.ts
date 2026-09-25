@@ -6,8 +6,9 @@
 // read-only agent role carrying investigation access plus
 // bedrock:InvokeModel*, and nothing else. The containment boundary is that
 // role, not a list of environment variable names someone has to keep current.
-// A fully compromised agent reads AWS and calls Bedrock; it cannot write S3,
-// read secrets, or reach the release path.
+// A fully compromised agent reads AWS, calls Bedrock, and writes its own
+// transcript under `sessions/`; it cannot reach `state/db`, read secrets, or
+// reach the release path.
 
 import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
 
