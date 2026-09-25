@@ -4,6 +4,16 @@ AI agent framework powered by the Claude Agent SDK. Lambda webhook receives Slac
 
 See `ops/CLAUDE.md` for the high-level architecture and `delegate/.env.example` for the full env contract.
 
+## `pr-reviewer` — two models, one review
+
+The PR reviewer runs two independent review passes over the same diff and posts a single review.
+
+- **Claude.** An orchestrator (opus) dispatches a `scout` subagent that turns the diff into investigation leads, then one `deep-reviewer` per lead in parallel.
+- **GPT-5.6 Sol on Bedrock.** A child process (`delegate/review/`) runs the *same* scout and deep-reviewer prompts against `us.openai.gpt-5.6-sol`, concurrently with the Claude pass. It is SigV4-signed as the ECS task role — there is no static API key — and the model must be subscribed in the account out of band, because the task role deliberately has no marketplace permission (see `scripts/enable-bedrock-models.ts`). It runs with a sanitized env and **no GitHub token**: it reads the diff the worker captured at `$PR_DIFF_FILE` and posts nothing itself.
+- **Consolidation.** The orchestrator merges both sets. Agreement across models is a confidence signal, so findings both models raise are posted; a finding only one model raises must survive an explicit adjudication pass before it is.
+
+Set `SECOND_OPINION_ENABLED=false` to fall back to the Claude-only pass. A failed or timed-out second pass degrades the same way rather than blocking the review.
+
 ## Workflow agents (PRD-to-code)
 
 Four phase agents drive a PRD → tech design → Epic → task-execution flow, each invoked by a Slack `@delegate <verb>` mention. The flow is meant to compose: a `tech-design` produces the input to `epic`, which produces task IDs for `work`. Iterations happen via continuation verbs replied in-thread.

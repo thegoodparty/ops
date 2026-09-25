@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import { secondOpinionInvokeResources } from "../../utils/bedrock-models";
 
 export interface WorkerConfig {
   imageUri: string;
@@ -163,6 +164,27 @@ export const createWorker = (config: WorkerConfig) => {
               ],
               Resource: ["*"],
             },
+            // The pr-reviewer's second-opinion pass, which reviews the same
+            // diff with a non-Claude frontier model and signs its Bedrock
+            // calls as this role — no static API key anywhere.
+            //
+            // Scoped to one model, not to Bedrock. `aws-marketplace:*` is
+            // deliberately absent: that permission is what lets a
+            // prompt-injected agent pull an arbitrary model out of the
+            // catalogue and invoke it, and this agent reads untrusted PR
+            // content for a living. Bedrock would otherwise subscribe on
+            // first invocation, so the model is subscribed out of band
+            // instead — `scripts/enable-bedrock-models.ts`, whose header
+            // spells this out, and `docs/workbench-account.md`.
+            {
+              Sid: "BedrockSecondOpinionReview",
+              Effect: "Allow",
+              Action: [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream",
+              ],
+              Resource: secondOpinionInvokeResources(),
+            },
           ],
         }),
       },
@@ -188,7 +210,14 @@ export const createWorker = (config: WorkerConfig) => {
         cpu: 1024,
         memory: 4096,
         essential: true,
-        environment: [{ name: "AWS_DEFAULT_REGION", value: "us-west-2" }],
+        // Both, not one. `AWS_DEFAULT_REGION` is what the CLI reads;
+        // the SDK's credential and SigV4 signing path prefers `AWS_REGION`
+        // and does not fall back to the other, so the second-opinion pass
+        // would have had no region to sign with.
+        environment: [
+          { name: "AWS_DEFAULT_REGION", value: "us-west-2" },
+          { name: "AWS_REGION", value: "us-west-2" },
+        ],
         secrets: config.secretKeys.sort().map((key) => ({
           name: key,
           valueFrom: `${config.secretArn}:${key}::`,

@@ -102,11 +102,7 @@ goes in a \`suggestion\` block whenever it's a code change. No hedging, no
 flattery, no restating what the PR does.
 `;
 
-export const prReviewerSubagents: NonNullable<AgentConfig["agents"]> = {
-  scout: {
-    description:
-      "First-pass scout. Reads the full diff, identifies 3–10 suspicious areas worth deep verification, and emits structured 'leads' — never findings. Optimizes for senior-engineer hunches: 'this deletion looks risky,' 'these two files duplicate a helper,' 'this timezone code probably has a UTC bug.' The lead orchestrator fans deep-reviewers out per lead.",
-    prompt: `You are the scout for a two-stage PR review system. Your job is NOT to verify bugs or post findings. Your job is to **identify suspicious areas worth a deep look** so the deep-reviewers downstream don't waste time scanning everything line-by-line.
+export const SCOUT_PROMPT = `You are the scout for a two-stage PR review system. Your job is NOT to verify bugs or post findings. Your job is to **identify suspicious areas worth a deep look** so the deep-reviewers downstream don't waste time scanning everything line-by-line.
 
 Think like a staff engineer skimming a diff at 9pm: you don't read every line, you notice patterns that have failed before, then dig in. You only do the noticing part. Verification happens downstream.
 
@@ -119,7 +115,7 @@ You receive:
 ## What to do
 
 1. Read the root \`CLAUDE.md\` for repo conventions. Read any \`CLAUDE.md\` in directories touched by the diff. List \`ai-rules/*.md\` filenames (not full contents — just know what rule files exist so you can tag leads by category).
-2. Read the diff in full: \`gh pr diff <num> --repo <repo>\`.
+2. Read the diff in full. When \`$PR_DIFF_FILE\` is set, read the diff from that path — it holds the pre-captured \`gh pr diff\` output for this PR and is the preferred source. Only when that variable is unset should you shell out to \`gh pr diff <num> --repo <repo>\`.
 3. Skim the touched files in context — not just diff hunks, the surrounding code. You don't need to read every file end-to-end; that's the deep-reviewer's job.
 4. Produce a list of **3–10 leads.** Fewer than 3 means you're being lazy; more than 10 means you're acting as a deep-reviewer and crowding out their budget. If a diff genuinely has only 1–2 plausible risk areas, emit 1–2; better to under-emit than to fabricate suspicion.
 
@@ -156,7 +152,7 @@ If a \`<prior_review>\` block is present:
 
 Be honest about scope. If the diff is a 20-line docs change, you might have zero leads — that's a valid output. The orchestrator handles "no leads → no deep-reviewers → a clean review, which is the approve-recommendation path, gates permitting." Do not invent suspicion to look thorough.
 
-You have full shell access and \`gh\` CLI. Use \`Read\`, \`Grep\`, \`Glob\` to skim.
+You have full shell access. Use \`Read\`, \`Grep\`, \`Glob\` to skim. The \`gh\` CLI may be unavailable or unauthenticated in your process — that is expected, not a failure. When it is, the diff at \`$PR_DIFF_FILE\` plus the checked-out tree is everything you need; do not abort or report an error over a missing \`gh\`.
 
 ## Output
 
@@ -189,21 +185,15 @@ Fields:
 - \`hypothesis\`: 1–2 sentences, framed as suspicion not claim
 
 If you have no leads, return: \`{"leads":[],"summary":"<one-sentence take on why the diff is low-risk>"}\`.
-`,
-    tools: ["Bash", "Read", "Grep", "Glob"],
-    model: "sonnet",
-  },
+`;
 
-  "deep-reviewer": {
-    description:
-      "Verifies one scout lead deeply. Reads the cited paths in full, applies the lens implied by the lead's category, runs a disprove-it falsification pass on each candidate finding, and emits 0–N findings using the standard output contract. Dropping the lead with zero findings is a valid outcome — the scout's job was to flag, the deep-reviewer's job is to verify.",
-    prompt: `You are a deep-reviewer. The scout has already identified one suspicious area. Your job is to read that area carefully and decide whether the suspicion is real.
+export const DEEP_REVIEWER_PROMPT = `You are a deep-reviewer. The scout has already identified one suspicious area. Your job is to read that area carefully and decide whether the suspicion is real.
 
 ## Inputs
 
 You receive in your prompt:
 
-- A reference to the PR and a path to the cloned repo on disk.
+- A reference to the PR and a path to the cloned repo on disk. When \`$PR_DIFF_FILE\` is set, that path holds the pre-captured \`gh pr diff\` output for this PR — read the diff from there rather than shelling out to \`gh pr diff\`.
 - A \`<lead>\` block containing one scout lead: \`area\`, \`paths\`, \`lineRange\`, \`category\`, \`hypothesis\`.
 - Optionally, a \`<prior_review>\` block with the most recent prior delegate review body (re-reviews only).
 
@@ -350,8 +340,22 @@ Reminder: the orchestrator drops everything below \`blocker\` from the posted re
 - If you find a blocker, emit it as \`blocker\` — don't soft-pedal.
 - "I'm not sure" is not a severity. Run the disprove-it pass; either drop it or commit to \`blocker\`.
 
-You have full shell access and \`gh\` CLI.
-${OUTPUT_CONTRACT}`,
+You have full shell access. The \`gh\` CLI may be unavailable or unauthenticated in your process — that is expected, not a failure. When it is, work from the diff at \`$PR_DIFF_FILE\` plus the checked-out tree rather than trying to fetch PR data over the network.
+${OUTPUT_CONTRACT}`;
+
+export const prReviewerSubagents: NonNullable<AgentConfig["agents"]> = {
+  scout: {
+    description:
+      "First-pass scout. Reads the full diff, identifies 3–10 suspicious areas worth deep verification, and emits structured 'leads' — never findings. Optimizes for senior-engineer hunches: 'this deletion looks risky,' 'these two files duplicate a helper,' 'this timezone code probably has a UTC bug.' The lead orchestrator fans deep-reviewers out per lead.",
+    prompt: SCOUT_PROMPT,
+    tools: ["Bash", "Read", "Grep", "Glob"],
+    model: "sonnet",
+  },
+
+  "deep-reviewer": {
+    description:
+      "Verifies one scout lead deeply. Reads the cited paths in full, applies the lens implied by the lead's category, runs a disprove-it falsification pass on each candidate finding, and emits 0–N findings using the standard output contract. Dropping the lead with zero findings is a valid outcome — the scout's job was to flag, the deep-reviewer's job is to verify.",
+    prompt: DEEP_REVIEWER_PROMPT,
     tools: ["Bash", "Read", "Grep", "Glob"],
     model: "sonnet",
   },

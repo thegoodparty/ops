@@ -1,8 +1,12 @@
 import "../agents";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import path from "node:path";
 import { WebClient } from "@slack/web-api";
 import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
+import type { SecondOpinionResult } from "../review/types";
 import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
 
 // Workflow agents (PRD-to-code) need the runbooks repo on disk and the
@@ -29,6 +33,103 @@ const reportFatal = async (job: AgentJob | undefined, message: string) => {
   } catch {
     // intentionally silent — we're already exiting
   }
+};
+
+// The second-opinion reviewer runs as a child process with a hand-built
+// environment, and this allowlist is the security-relevant part of the
+// change. That process drives a non-Claude model over untrusted PR content
+// and lets it run shell commands, so it gets what it needs to sign Bedrock
+// requests as the task role and read the already-captured diff, and nothing
+// else. No GitHub token of either App, no Anthropic key, no Slack / ClickUp /
+// Databricks / Grafana / Sentry secret — which is also why the diff is
+// captured for it up front rather than fetched by it.
+//
+// A positive allowlist rather than a blocklist, on purpose: a key added to
+// the DELEGATES secret later is excluded because nobody listed it, not
+// included because nobody remembered to exclude it.
+const SECOND_OPINION_ENV_PREFIXES = ["NODE_", "AWS_", "SECOND_OPINION_"];
+
+const SECOND_OPINION_ENV_NAMES = [
+  "PATH",
+  "HOME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  "TERM",
+  "ECS_CONTAINER_METADATA_URI_V4",
+  "PR_DIFF_FILE",
+  "REVIEW_REPO",
+  "REVIEW_PR_NUMBER",
+  "REVIEW_DIR",
+  "REVIEW_HEAD_SHA",
+];
+
+// Runs the second review pass concurrently with the Claude agent; the
+// orchestrator waits on its result file at consolidation time.
+const startSecondOpinion = (cwd?: string): ChildProcess | undefined => {
+  const resultFile =
+    process.env.SECOND_OPINION_FILE ?? "/app/second-opinion.json";
+  // The agent's own prompt reads this to find the file, so set it either way.
+  process.env.SECOND_OPINION_FILE = resultFile;
+
+  const writeResult = (
+    status: "disabled" | "failed",
+    summary: string,
+    error?: string,
+  ) => {
+    const result: SecondOpinionResult = {
+      status,
+      model: process.env.SECOND_OPINION_MODEL ?? "us.openai.gpt-5.6-sol",
+      leads: 0,
+      findings: [],
+      deepReviewersDispatched: 0,
+      deepReviewerFailures: 0,
+      scoutFailed: false,
+      summary,
+      costUsd: 0,
+      durationMs: 0,
+      error,
+    };
+    try {
+      writeFileSync(resultFile, JSON.stringify(result));
+    } catch (err) {
+      console.error("second-opinion: failed to write result file:", err);
+    }
+  };
+
+  if (process.env.SECOND_OPINION_ENABLED === "false") {
+    writeResult("disabled", "Second opinion disabled by configuration");
+    console.log("second-opinion: disabled by SECOND_OPINION_ENABLED=false");
+    return undefined;
+  }
+
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (
+      SECOND_OPINION_ENV_NAMES.includes(key) ||
+      SECOND_OPINION_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
+    ) {
+      env[key] = value;
+    }
+  }
+
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, "../review/run-second-opinion.js")],
+    { cwd, stdio: "inherit", env },
+  );
+  child.on("error", (err) => {
+    console.error("second-opinion: failed to start:", err);
+    // Short-circuits the orchestrator's bounded wait: without a result file
+    // it would sit out its full timeout for a process that never ran.
+    writeResult("failed", "Second opinion process failed to start", String(err));
+  });
+  // A wedged child must never hold the task open past the agent's own
+  // deadline.
+  child.unref();
+  return child;
 };
 
 const parseJob = (): AgentJob | undefined => {
@@ -182,9 +283,31 @@ const main = async () => {
       );
       cwd = reviewDir;
       process.env.REVIEW_HEAD_SHA = headSha;
+      process.env.REVIEW_REPO = repoFullName;
+      process.env.REVIEW_PR_NUMBER = prNumber;
       console.log(
         `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,
       );
+
+      // Capture the diff once, here, for two reasons. The second-opinion
+      // process runs with no GitHub token by design, so it cannot fetch the
+      // diff itself; and capturing it once also saves every subagent on both
+      // sides a redundant API call for the same bytes. Best-effort — on
+      // failure PR_DIFF_FILE stays unset and both prompts fall back to
+      // calling `gh pr diff` themselves.
+      const diffFile = process.env.PR_DIFF_FILE ?? "/app/pr-diff.patch";
+      try {
+        const diff = execFileSync(
+          "gh",
+          ["pr", "diff", prNumber, "--repo", repoFullName],
+          { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+        );
+        writeFileSync(diffFile, diff);
+        process.env.PR_DIFF_FILE = diffFile;
+        console.log(`PR diff captured at ${diffFile} (${diff.length} bytes)`);
+      } catch (diffErr) {
+        console.error("Failed to capture the PR diff:", diffErr);
+      }
     } catch (err) {
       console.error("Failed to check out PR for pr-reviewer:", err);
       // The re-review lambda already flipped the pr-reviewer check to pending;
@@ -376,7 +499,19 @@ const main = async () => {
     }
   }
 
-  const result = await runAgent(config, message, cwd, abortController);
+  // Started after the token swap above so the sanitized env is built from the
+  // final process environment — the child gets neither token either way.
+  const secondOpinion =
+    job.agent === "pr-reviewer" ? startSecondOpinion(cwd) : undefined;
+
+  const result = await runAgent(
+    config,
+    message,
+    cwd,
+    abortController,
+  ).finally(() => {
+    if (secondOpinion && secondOpinion.exitCode === null) secondOpinion.kill();
+  });
   clearTimeout(deadline);
 
   console.log(`Agent completed in ${(result.durationMs / 1000).toFixed(1)}s`);

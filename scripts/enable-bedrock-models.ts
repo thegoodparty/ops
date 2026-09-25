@@ -59,6 +59,19 @@
  *
  * Note `ReadOnlyAccess` cannot run it: that set has no `sts:AssumeRole`, so
  * the hop into the account is refused. Verified, not assumed.
+ *
+ * A second account, for one model. The delegate cluster's `pr-reviewer` runs
+ * a second-opinion review pass on `openai.gpt-5.6-sol`, and its task role is
+ * deliberately denied `aws-marketplace:*` for the same reason
+ * `WorkbenchAccess` is — so that subscription has to happen from outside the
+ * agent too. `BEDROCK_TARGET=delegate` points this script at the delegate
+ * account and at that one model. There is no assume-role hop on that path:
+ * the operator is already in the account, so ambient credentials are used as
+ * they are.
+ *
+ *   aws sso login --profile gp-admin
+ *   BEDROCK_TARGET=delegate AWS_PROFILE=gp-admin npm run script enable-bedrock-models
+ *   BEDROCK_TARGET=delegate AWS_PROFILE=gp-admin APPLY=1 npm run script enable-bedrock-models
  */
 import {
   BedrockClient,
@@ -70,9 +83,17 @@ import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
 import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
 import {
+  DELEGATE_ACCOUNT_ID,
+  SECOND_OPINION_MODEL,
   WORKBENCH_ACCOUNT_ID,
   WORKBENCH_MODELS,
 } from "../utils/bedrock-models";
+
+/** See the `BEDROCK_TARGET=delegate` note in the header. */
+const TARGET_DELEGATE = process.env.BEDROCK_TARGET === "delegate";
+const TARGET_ACCOUNT_ID = TARGET_DELEGATE
+  ? DELEGATE_ACCOUNT_ID
+  : WORKBENCH_ACCOUNT_ID;
 
 /**
  * The same role `deploy-workbench/index.ts` has its provider assume: the way
@@ -107,7 +128,7 @@ const PINNED_REGIONS = ["us-west-2"];
  * Models that are not cross-region only ever run where the sandbox points, so
  * they are handled separately below rather than walked across the geo set.
  */
-const MODELS = WORKBENCH_MODELS;
+const MODELS = TARGET_DELEGATE ? [SECOND_OPINION_MODEL] : WORKBENCH_MODELS;
 
 type Outcome =
   | "already-entitled"
@@ -320,8 +341,8 @@ async function resolveWorkbenchCredentials(): Promise<
     );
   } catch (err) {
     throw new Error(
-      "Could not resolve AWS credentials. Log in to the workbench account " +
-        `${WORKBENCH_ACCOUNT_ID} with AdministratorAccess, or run this as ` +
+      "Could not resolve AWS credentials. Log in to the target account " +
+        `${TARGET_ACCOUNT_ID} with AdministratorAccess, or run this as ` +
         `a role that can assume ${DEPLOY_ROLE_ARN}. WorkbenchAccess cannot ` +
         `do it: enabling models is a mutation it deliberately lacks.\n  ${
           (err as Error).message
@@ -329,7 +350,17 @@ async function resolveWorkbenchCredentials(): Promise<
     );
   }
 
-  if (ambient.Account === WORKBENCH_ACCOUNT_ID) {
+  // The delegate path has no assume-role hop — the operator is already in
+  // that account — but it keeps the account check, which is the half that
+  // matters: this creates agreements, and AWS_PROFILE is easy to get wrong.
+  if (TARGET_DELEGATE && ambient.Account !== DELEGATE_ACCOUNT_ID) {
+    throw new Error(
+      `BEDROCK_TARGET=delegate, but credentials are in account ` +
+        `${ambient.Account} as ${ambient.Arn}, not ${DELEGATE_ACCOUNT_ID}.`
+    );
+  }
+
+  if (ambient.Account === TARGET_ACCOUNT_ID) {
     console.log(`Account ${ambient.Account} as ${ambient.Arn}`);
     return undefined;
   }

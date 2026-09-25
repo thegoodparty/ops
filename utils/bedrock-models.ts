@@ -19,6 +19,14 @@
 /** The workbench account. Step 6 of `docs/workbench-account.md`. */
 export const WORKBENCH_ACCOUNT_ID = "024901689212";
 
+/**
+ * Where the delegate cluster runs: 333022194791, the management account, not
+ * the workbench. The `pr-reviewer` agent's second-opinion pass is the one
+ * thing outside the sandbox that invokes Bedrock, so this file now describes
+ * two accounts rather than one.
+ */
+export const DELEGATE_ACCOUNT_ID = "333022194791";
+
 export type BedrockModel = {
   /**
    * Base foundation-model id. This is what agreements are created against and
@@ -37,6 +45,21 @@ export type BedrockModel = {
   note?: string;
 };
 
+/**
+ * The model the `pr-reviewer` agent's second-opinion review pass runs on.
+ *
+ * Named once, here, because two unrelated things now need the same pair of
+ * ids: the workbench list below (the sandbox may select it like any other
+ * model) and the delegate task role's policy. Two literals of the same id is
+ * how one of them quietly goes stale and produces an AccessDenied that reads
+ * like an outage — the same reasoning as the one list in this file's header.
+ */
+export const SECOND_OPINION_MODEL: BedrockModel = {
+  id: "openai.gpt-5.6-sol",
+  invokeId: "us.openai.gpt-5.6-sol",
+  crossRegion: true,
+};
+
 export const WORKBENCH_MODELS: BedrockModel[] = [
   {
     id: "anthropic.claude-opus-5-5",
@@ -50,11 +73,7 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     crossRegion: true,
   },
   { id: "xai.grok-4.6", invokeId: "us.xai.grok-4.6", crossRegion: true },
-  {
-    id: "openai.gpt-5.6-sol",
-    invokeId: "us.openai.gpt-5.6-sol",
-    crossRegion: true,
-  },
+  SECOND_OPINION_MODEL,
   {
     id: "openai.gpt-5.6-terra",
     invokeId: "us.openai.gpt-5.6-terra",
@@ -101,4 +120,37 @@ export const bedrockInvokeResources = (
   ...WORKBENCH_MODELS.map(
     (m) => `arn:aws:bedrock:*::foundation-model/${m.id}`
   ),
+];
+
+/**
+ * The resource ARNs the delegate task role needs to run one model — the
+ * `pr-reviewer`'s second-opinion review pass — and nothing else.
+ *
+ * Deliberately not `bedrockInvokeResources`. That helper hands the workbench
+ * sandbox its whole catalogue, which is the right grant for a developer's
+ * inner loop and the wrong one for an agent that reads untrusted PR content:
+ * a second reviewer needs exactly one model.
+ *
+ * Three ARNs, because the Responses API needs all three:
+ *
+ * - the inference profile, which is what the request names;
+ * - the foundation model, account-less and region-wildcarded, because
+ *   cross-region inference invokes it in whichever region it routes to — the
+ *   same shape and the same reasoning as `bedrockInvokeResources` above, and
+ *   the region is wildcarded here for the same reason: the destination set is
+ *   per-model and a wrong region list fails intermittently in a way that looks
+ *   identical to missing model access;
+ * - `project/default`, which is the non-obvious one. Bedrock's
+ *   OpenAI-compatible Responses API requires `bedrock:InvokeModel` on the
+ *   account's default project in addition to the profile, and the default
+ *   project is the only one that API supports — application inference
+ *   profiles and an `OpenAI-Project` header are not options, so there is
+ *   nothing narrower to name.
+ */
+export const secondOpinionInvokeResources = (
+  accountId = DELEGATE_ACCOUNT_ID
+): string[] => [
+  `arn:aws:bedrock:*:${accountId}:inference-profile/${SECOND_OPINION_MODEL.invokeId}`,
+  `arn:aws:bedrock:*::foundation-model/${SECOND_OPINION_MODEL.id}`,
+  `arn:aws:bedrock:*:${accountId}:project/default`,
 ];
