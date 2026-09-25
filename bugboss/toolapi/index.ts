@@ -224,8 +224,12 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     allowed: IncidentStatus[],
     tool: string,
   ): string | null => {
-    if (incident.owner === "human") {
-      return `incident ${incident.id} is owned by a human; only handOff and getIncident remain`;
+    // reportAnalysis is allowed through, because the write-up is the reason a
+    // takeover asks the agent to wind down rather than killing it. Blocking
+    // it would mean the moment a person claims an incident, everything the
+    // agent found is lost -- which is exactly what the person wanted.
+    if (incident.owner === "human" && tool !== "reportAnalysis") {
+      return `incident ${incident.id} is owned by a human; only reportAnalysis, handOff and getIncident remain`;
     }
     if (!allowed.includes(incident.status)) {
       return `${tool} requires ${allowed.join(" or ")}; incident ${incident.id} is ${incident.status}`;
@@ -592,9 +596,14 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         const at = Date.now();
         const taken = w
           .prepare(
+            // No owner predicate, unlike its siblings. A person who takes an
+            // incident over gets the agent's write-up rather than losing it,
+            // which is the whole reason a takeover winds the agent down
+            // instead of killing it. The status guard still holds the
+            // transition, so a MERGED row cannot be resurrected through here.
             `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
                usersImpacted = ?, impactQuery = ?
-             WHERE id = ? AND status = 'RESOLVED' AND owner = 'agent'`,
+             WHERE id = ? AND status = 'RESOLVED'`,
           )
           .run(
             at,

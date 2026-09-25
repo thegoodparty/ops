@@ -958,3 +958,94 @@ test("no rotation configured records nothing rather than guessing", async () => 
   assert.equal(row!.rotationAtOpen, null);
   rotation.members = ["U-ada", "U-grace"];
 });
+
+// --- ownership --------------------------------------------------------------
+
+/** A reply in an incident's thread, as Slack delivers it. */
+const replyIn = (threadTs: string, text: string, user = "U-swain") => ({
+  type: "message",
+  channel: "C0TEST",
+  user,
+  text,
+  ts: `${Date.now() / 1000}`,
+  thread_ts: threadTs,
+});
+
+test("a person can take an incident over, and hand it back", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own", "checkout-errors"));
+
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own'`,
+  )!;
+  assert.ok(row.slackThreadTs, "a claim can only be made in a thread");
+
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "mine"));
+
+  assert.equal(
+    boss.db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [
+      row.id,
+    ])?.owner,
+    "human",
+  );
+  assert.equal(
+    boss.db.get<{ status: string }>("SELECT status FROM incident WHERE id = ?", [
+      row.id,
+    ])?.status,
+    "INVESTIGATING",
+    "status says where the work is; taking it over does not move the work",
+  );
+
+  // The agent is told to wind down rather than killed, because its write-up
+  // is the thing the person taking over actually wants.
+  const directives = boss.db.query<{ payload: string }>(
+    "SELECT payload FROM pending_directive WHERE incidentId = ?",
+    [row.id],
+  );
+  assert.ok(
+    directives.some((d) => JSON.parse(d.payload).type === "handoff"),
+    "a takeover asks the agent to finish and stop",
+  );
+
+  // Who did it, which owner alone cannot say.
+  assert.equal(
+    boss.db.get<{ actorId: string }>(
+      "SELECT actorId FROM incident_action WHERE incidentId = ? AND action = 'take_over'",
+      [row.id],
+    )?.actorId,
+    "U-swain",
+  );
+
+  // And back. Without this, owner only ever moves one way and no agent can
+  // reach the incident again -- escalation becomes a hole rather than a
+  // handoff.
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "back to you"));
+  assert.equal(
+    boss.db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [
+      row.id,
+    ])?.owner,
+    "agent",
+  );
+});
+
+test("a claim on an incident a person already owns changes nothing", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own-2", "search-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-2'`,
+  )!;
+
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "mine", "U-ada"));
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "mine", "U-grace"));
+
+  assert.equal(
+    boss.db.query(
+      "SELECT id FROM incident_action WHERE incidentId = ? AND action = 'take_over'",
+      [row.id],
+    ).length,
+    1,
+    "the second claim is refused, so the trail does not claim two owners",
+  );
+});

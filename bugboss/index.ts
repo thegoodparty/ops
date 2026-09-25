@@ -61,7 +61,12 @@ import {
   createS3ObjectStore,
   createSlackClient,
 } from "./slack/client";
-import { SlackRelay, type InboundRoute, type SlackEvent } from "./slack/relay";
+import {
+  SlackRelay,
+  type InboundRoute,
+  type OwnershipClaim,
+  type SlackEvent,
+} from "./slack/relay";
 import {
   applyAssign,
   AssignError,
@@ -78,6 +83,7 @@ import type {
   BugBossConfig,
   Evidence,
   IncidentDigest,
+  Directive,
   IncidentStatus,
   IncomingRequest,
   RawSignal,
@@ -1323,6 +1329,114 @@ export const createBugBoss = async (
   // Inbound Slack
   // -------------------------------------------------------------------------
 
+  /**
+   * A person claiming an incident, or handing it back.
+   *
+   * `owner` is the only axis that moves. Status says where the work is and
+   * owner says who has it, and a claim changes the second without touching
+   * the first: an incident a person takes over is still FIXING, it just is
+   * not an agent doing the fixing.
+   *
+   * A takeover does not kill the agent. It pushes `handoff`, so the agent
+   * finishes the turn it is in and writes its brief -- which is the artifact
+   * the person taking over actually wants, and the reason they are usually
+   * taking over at all. Killing it would throw that away to save a minute.
+   *
+   * Hand-back is what makes escalation a handoff rather than a hole. Without
+   * it `owner` only ever moves one way and no agent can reach the incident
+   * again, which is what the dispatcher's launch-ceiling reset already
+   * assumed was possible.
+   */
+  const claimOwnership = async (
+    incidentId: string,
+    claim: OwnershipClaim,
+    slackUserId: string,
+  ): Promise<void> => {
+    const readIncidentRow = () =>
+      db.get<{ owner: string; status: string; slackThreadTs: string | null }>(
+        "SELECT owner, status, slackThreadTs FROM incident WHERE id = ?",
+        [incidentId],
+      );
+
+    const say = (text: string) =>
+      slack
+        .post(readIncidentRow()?.slackThreadTs ?? null, text)
+        .then(() => undefined)
+        .catch((err: unknown) =>
+          alarm("ownership_post_failed", { incidentId, error: String(err) }),
+        );
+
+    const to = claim === "take_over" ? "human" : "agent";
+    const from = claim === "take_over" ? "agent" : "human";
+
+    const changed = await db.withWrite((w: Database.Database) => {
+      // Guarded in the statement, like every other transition: the read that
+      // decided this happened outside the transaction.
+      const res = w
+        .prepare(
+          `UPDATE incident SET owner = ?
+             WHERE id = ? AND owner = ?
+               AND status IN ('INVESTIGATING', 'FIXING', 'RESOLVED')`,
+        )
+        .run(to, incidentId, from);
+      if (res.changes === 0) return false;
+      w.prepare(
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES (?, 'human', ?, ?, ?, ?)`,
+      ).run(
+        incidentId,
+        slackUserId,
+        claim,
+        `owner ${from} -> ${to}`,
+        now(),
+      );
+      return true;
+    });
+
+    if (!changed) {
+      const row = readIncidentRow();
+      log("ownership_claim_ignored", {
+        incidentId,
+        claim,
+        slackUserId,
+        owner: row?.owner ?? null,
+        status: row?.status ?? null,
+      });
+      // Saying so matters more than it looks: the claim word is a normal
+      // message, so silence is indistinguishable from the bot not reading it.
+      await say(
+        claim === "take_over"
+          ? `<@${slackUserId}> this one is already owned by a human.`
+          : `<@${slackUserId}> nothing to hand back: an agent already has this.`,
+      );
+      return;
+    }
+
+    if (claim === "take_over") {
+      await db.withWrite((w: Database.Database) => {
+        w.prepare(
+          `INSERT INTO pending_directive (incidentId, payload, createdAt)
+           VALUES (?, ?, ?)`,
+        ).run(
+          incidentId,
+          JSON.stringify({
+            type: "handoff",
+            reason:
+              "a person took this over in Slack; write up what you have and stop",
+          } satisfies Directive),
+          now(),
+        );
+      });
+    }
+
+    log("ownership_claimed", { incidentId, claim, slackUserId });
+    await say(
+      claim === "take_over"
+        ? `<@${slackUserId}> has this one. The agent is writing up what it found and will stop.`
+        : `Back to an agent, handed over by <@${slackUserId}>. It will pick this up within a tick.`,
+    );
+  };
+
   const slackEventAccepted = async (
     event: SlackEvent,
   ): Promise<AcceptedSlackEvent> => {
@@ -1331,6 +1445,12 @@ export const createBugBoss = async (
     // supposed to collapse onto. The agent is a two-minute model run against
     // a three-second ack, so it cannot.
     const route = await relay.handle(event);
+    if (route.kind === "ownership_claim") {
+      return {
+        routed: route.kind,
+        settled: claimOwnership(route.incidentId, route.claim, route.slackUserId),
+      };
+    }
     if (route.kind !== "slack_agent") {
       return { routed: route.kind, settled: Promise.resolve() };
     }

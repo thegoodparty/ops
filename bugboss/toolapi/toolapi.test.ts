@@ -356,7 +356,13 @@ describe("a status check the write does not repeat", () => {
     );
   });
 
-  it("refuses a post-mortem a human takeover landed in front of", async () => {
+  // Rewritten: this asserted that a human takeover refuses the post-mortem.
+  // That was the old contract and it threw away the one artifact a takeover
+  // is usually for. A takeover now pushes `handoff` and lets the agent finish
+  // its write-up, so reportAnalysis is the single tool an owner change does
+  // not block. Every other transition still loses the race, which the three
+  // sibling tests here cover.
+  it("lets the agent's write-up land even after a human takes over", async () => {
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
     const tools = toolsFor(id);
@@ -372,9 +378,14 @@ describe("a status check the write does not repeat", () => {
     await claim;
     const res = await analysis;
 
-    assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.status, "RESOLVED");
-    assert.equal(incidentRow(id)?.postmortem, null);
+    assert.equal(res.ok, true, res.error);
+    assert.equal(incidentRow(id)?.status, "CLOSED");
+    assert.equal(incidentRow(id)?.postmortem, "p");
+    assert.equal(
+      incidentRow(id)?.owner,
+      "human",
+      "the write-up lands without taking the incident back",
+    );
   });
 
   it("refuses an impact number a human takeover landed in front of", async () => {
