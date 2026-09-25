@@ -143,12 +143,9 @@ const deps = (
 ): DispatcherDeps => ({
   config: config(),
   mintToken: (id) => `tok-${id}`,
-  credentials: async () => ({
-    accessKeyId: "ASIA-AGENT",
-    secretAccessKey: "agent-secret",
-    sessionToken: "agent-session",
-    expiresAt: T0 + 3_600_000,
-  }),
+  // What Fargate gives the parent, and so what a launch is expected to hand
+  // down. Without it every launch alarms that the child cannot reach AWS.
+  childBaseEnv: { AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/creds" },
   now: () => T0,
   ...over,
 });
@@ -571,13 +568,9 @@ describe("Dispatcher.tick", () => {
         spawn: held.spawn,
         toolApiFor,
         config: config({ maxAttempts: 2 }),
-        credentials: async (incidentId) => {
-          if (incidentId === "i1") throw new Error("AssumeRole denied");
-          return {
-            accessKeyId: "ASIA-AGENT",
-            secretAccessKey: "agent-secret",
-            sessionToken: "agent-session",
-          };
+        mintToken: (id) => {
+          if (id === "i1") throw new Error("token minting failed");
+          return `tok-${id}`;
         },
       }),
     );
@@ -824,7 +817,7 @@ describe("Dispatcher.tick", () => {
 });
 
 describe("the spawned environment", () => {
-  it("carries the agent role and not the container's task role", async () => {
+  it("carries the container credential path, and only what it was handed", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools(sqlite);
     insertIncident(sqlite, "i1");
@@ -838,8 +831,6 @@ describe("the spawned environment", () => {
         childBaseEnv: {
           PATH: "/usr/bin",
           AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/task-role",
-          AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.2/creds",
-          AWS_ACCESS_KEY_ID: "PARENT-KEY",
         },
         childCredentials: { GITHUB_TOKEN: "ghs_agent" },
       }),
@@ -847,11 +838,12 @@ describe("the spawned environment", () => {
     await d.tick();
 
     const { env } = held.contexts[0];
-    assert.equal(env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, undefined);
-    assert.equal(env.AWS_CONTAINER_CREDENTIALS_FULL_URI, undefined);
-    assert.equal(env.AWS_ACCESS_KEY_ID, "ASIA-AGENT");
-    assert.equal(env.AWS_SECRET_ACCESS_KEY, "agent-secret");
-    assert.equal(env.AWS_SESSION_TOKEN, "agent-session");
+    assert.equal(
+      env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI,
+      "/v2/credentials/task-role",
+      "the child resolves the task role through the container provider",
+    );
+    assert.equal(env.SLACK_BOT_TOKEN, undefined, "only the named sources reach a child");
     assert.equal(env.GITHUB_TOKEN, "ghs_agent");
     assert.equal(env.BUGBOSS_TOKEN, "tok-i1");
     assert.equal(env.BUGBOSS_INCIDENT_ID, "i1");
@@ -885,7 +877,10 @@ describe("the spawned environment", () => {
           modulePath: "/app/bugboss/agent/run.js",
           spawnFn: fakeSpawn,
         }),
-        childBaseEnv: { PATH: "/usr/bin" },
+        childBaseEnv: {
+          PATH: "/usr/bin",
+          AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/creds",
+        },
       }),
     );
     const result = await d.tick();
@@ -893,8 +888,7 @@ describe("the spawned environment", () => {
 
     assert.ok(captured, "the child was given an explicit environment");
     assert.equal(captured.BUGBOSS_PARENT_ONLY, undefined, "nothing is inherited");
-    assert.equal(captured.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, undefined);
-    assert.equal(captured.AWS_ACCESS_KEY_ID, "ASIA-AGENT");
+    assert.equal(captured.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, "/v2/creds");
     assert.equal(captured.PATH, "/usr/bin");
     assert.equal(result.started[0].pid, 777, "the pid is tracked for the kill path");
 

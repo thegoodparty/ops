@@ -787,80 +787,9 @@ const keepGitHubTokenFresh = async (): Promise<void> => {
   await configureGitCredentials();
 };
 
-/**
- * Keep the AWS credentials current for the whole run.
- *
- * A role's maximum session duration is twelve hours and an incident can run
- * for a day, so the credentials assumed at launch expire mid-run. Losing
- * them loses Bedrock, which does not degrade the agent, it ends it.
- *
- * The child cannot re-assume for itself — that needs credentials, and the
- * only ones available would be the task role, which can read the secret
- * holding every other credential in the system. So the parent keeps that
- * path and serves the result over the loopback API the child is already
- * authenticated on.
- *
- * Writing them back into `process.env` is enough: the SDK's env provider
- * reads `AWS_CREDENTIAL_EXPIRATION` and re-resolves from the environment
- * once it passes, so a client built at startup picks up the new values
- * without being rebuilt.
- */
-const keepAwsCredentialsFresh = async (
-  baseUrl: string,
-  incidentId: string,
-  token: string,
-): Promise<void> => {
-  const url = `${baseUrl.replace(/\/$/, "")}/incidents/${incidentId}/aws-credentials`;
-  const refresh = async () => {
-    try {
-      const res = await fetch(url, {
-        headers: { authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) throw new Error(`boss returned ${res.status}`);
-      const body = (await res.json()) as {
-        accessKeyId?: string;
-        secretAccessKey?: string;
-        sessionToken?: string;
-        expiresAt?: number;
-      };
-      if (!body.accessKeyId || !body.secretAccessKey || !body.sessionToken) {
-        throw new Error("boss returned no credentials");
-      }
-      process.env.AWS_ACCESS_KEY_ID = body.accessKeyId;
-      process.env.AWS_SECRET_ACCESS_KEY = body.secretAccessKey;
-      process.env.AWS_SESSION_TOKEN = body.sessionToken;
-      if (body.expiresAt) {
-        process.env.AWS_CREDENTIAL_EXPIRATION = new Date(
-          body.expiresAt,
-        ).toISOString();
-      }
-    } catch (error: unknown) {
-      // Not fatal on its own: the credentials in hand are good until they
-      // expire, and there are many attempts before that.
-      console.error(
-        JSON.stringify({
-          component: "agent",
-          level: "error",
-          event: "aws_credentials_refresh_failed",
-          error: String(error),
-        }),
-      );
-    }
-  };
-  await refresh();
-  setInterval(() => void refresh(), 30 * 60 * 1000).unref();
-};
-
 if (require.main === module) {
   const bootOptions = agentOptionsFromEnv(process.env);
   keepGitHubTokenFresh()
-    .then(() =>
-      keepAwsCredentialsFresh(
-        bootOptions.bossBaseUrl,
-        bootOptions.incidentId,
-        bootOptions.bossAuthToken ?? "",
-      ),
-    )
     .then(() => runIncidentAgent(bootOptions))
     .then(
     (result) => {

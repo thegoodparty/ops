@@ -9,13 +9,6 @@ const HOSTNAME = "bugboss.goodparty.org";
 const BUCKET_NAME = "bugboss-prod";
 const SECRET_NAME = "BUGBOSS";
 const CONTAINER_PORT = 3000;
-const AGENT_ROLE_NAME = "bugboss-agent";
-
-// Referenced, not constructed: naming the agent role here rather than reading
-// `agentRole.arn` is what keeps the two roles out of a dependency cycle, since
-// the agent role's trust policy has to name the task role and IAM rejects a
-// principal that does not exist yet. A Resource field takes no such check.
-const AGENT_ROLE_ARN = `arn:aws:iam::${ACCOUNT_ID}:role/${AGENT_ROLE_NAME}`;
 
 // `Environment: infra` is a protection, not a label. The EngineerAccess SSO
 // permission set grants every engineer `Action: ["*"]` on anything tagged
@@ -316,81 +309,14 @@ export const createBugBoss = (config: BugBossConfig) => {
                 `arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/bugboss/*`,
               ],
             },
-            // Agents run as child processes in this container, so the
-            // parent assumes this one role and hands the temporary
-            // credentials down. The containment boundary is the role, not a
-            // list of environment variable names someone has to keep current.
-            {
-              Sid: "AssumeAgentRole",
-              Effect: "Allow",
-              Action: ["sts:AssumeRole"],
-              Resource: [AGENT_ROLE_ARN],
-            },
-            // The only way into the container when the Boss itself is the
-            // broken thing. The `infra` tag keeps this to administrators.
-            {
-              Sid: "BreakGlassExec",
-              Effect: "Allow",
-              Action: [
-                "ssmmessages:OpenDataChannel",
-                "ssmmessages:OpenControlChannel",
-                "ssmmessages:CreateDataChannel",
-                "ssmmessages:CreateControlChannel",
-              ],
-              Resource: ["*"],
-            },
-          ],
-        }),
-      },
-    ],
-    tags: TAGS,
-  });
-
-  // What a compromised agent gets, and the design assumes one is. Primary
-  // observability is Grafana — Loki, Tempo and Prometheus over MCP — so AWS
-  // is only for the layer beneath it: a task that never started, an OOM kill,
-  // a crash that happened before anything reached Loki. That is why there is
-  // no RDS or load balancer access here; neither is reachable that way and
-  // neither was ever needed.
-  //
-  // No S3, no Secrets Manager, no ECS or ECR write, no IAM, and no
-  // `sts:AssumeRole`, so it cannot pivot. Attribution comes free from the
-  // role session name the parent sets per incident, which CloudTrail records.
-  const agentRole = new aws.iam.Role("bugbossAgentRole", {
-    name: AGENT_ROLE_NAME,
-    description:
-      "Assumed by bugboss-task-role and handed to each incident agent child process.",
-    assumeRolePolicy: pulumi.jsonStringify({
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Effect: "Allow",
-          Action: "sts:AssumeRole",
-          Principal: { AWS: taskRole.arn },
-        },
-      ],
-    }),
-    // One hour, because that is all this role can ever issue: its only
-    // trusted principal is the task role, so every AssumeRole against it is
-    // chained, and chained sessions are capped at an hour whatever this says.
-    // A larger value here would only advertise a session nobody can get.
-    maxSessionDuration: 3600,
-    inlinePolicies: [
-      {
-        name: "inline",
-        policy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Sid: "OwnModelCalls",
-              Effect: "Allow",
-              Action: ["bedrock:InvokeModel*"],
-              Resource: [
-                "arn:aws:bedrock:*::foundation-model/*",
-                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/*`,
-                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:application-inference-profile/*`,
-              ],
-            },
+            // Everything below this line is what an incident agent reads to
+            // investigate. Primary observability is Grafana (Loki, Tempo and
+            // Prometheus over MCP), so AWS is only for the layer beneath it:
+            // a task that never started, an OOM kill, a crash that happened
+            // before anything reached Loki. That is why there is no RDS or
+            // load balancer access here; neither is reachable that way and
+            // neither was ever needed.
+            //
             // Service events, which say why a task failed to start or was
             // replaced, come back in DescribeServices output.
             {
@@ -445,6 +371,19 @@ export const createBugBoss = (config: BugBossConfig) => {
               ],
               Resource: ["*"],
             },
+            // The only way into the container when the Boss itself is the
+            // broken thing. The `infra` tag keeps this to administrators.
+            {
+              Sid: "BreakGlassExec",
+              Effect: "Allow",
+              Action: [
+                "ssmmessages:OpenDataChannel",
+                "ssmmessages:OpenControlChannel",
+                "ssmmessages:CreateDataChannel",
+                "ssmmessages:CreateControlChannel",
+              ],
+              Resource: ["*"],
+            },
           ],
         }),
       },
@@ -490,7 +429,6 @@ export const createBugBoss = (config: BugBossConfig) => {
           { name: "AWS_DEFAULT_REGION", value: REGION },
           { name: "PORT", value: String(CONTAINER_PORT) },
           { name: "BUGBOSS_BUCKET", value: bucket.bucket },
-          { name: "BUGBOSS_AGENT_ROLE_ARN", value: agentRole.arn },
         ],
         // The whole secret as one JSON value rather than a key-per-env-var
         // map: the key list belongs to the application, and duplicating it
@@ -566,7 +504,6 @@ export const createBugBoss = (config: BugBossConfig) => {
     service,
     taskDefinition,
     taskRole,
-    agentRole,
     logGroup,
     loadBalancer,
     url: `https://${HOSTNAME}`,

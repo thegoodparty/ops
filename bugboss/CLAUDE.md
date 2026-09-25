@@ -49,9 +49,13 @@ across `withWrite` is a TOCTOU: the write queue serializes behind a
 synchronous S3 PUT, so the window is hundreds of milliseconds. Put the
 predicate in the `UPDATE` and reject on `changes === 0`.
 
-**The agent is untrusted.** It reads attacker-writable log lines for a
-living. Its only route to state is the loopback API with a per-launch token
-scoped to one incident, and its GitHub App cannot merge.
+**The agent is untrusted, and the container is what bounds it.** An agent
+reads attacker-writable log lines for a living, and it runs as a child of the
+Boss with the Boss's own credentials — there is no fence inside the task.
+What holds is outside it: this container reaches no database and no release
+path, and its GitHub App cannot merge. The loopback API is how an agent moves
+incident state, with a per-launch token scoped to one incident so concurrent
+agents cannot reach each other's work.
 
 ## Schema changes
 

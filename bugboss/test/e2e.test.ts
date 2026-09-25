@@ -158,13 +158,6 @@ before(async () => {
     s3: undefined,
     // Who is on call is an external fact, and a mutable one.
     rotationMembers: async () => rotation.members,
-    // STS is an external dependency too: without this the composition root
-    // would alarm and hand the child no AWS access at all.
-    credentials: async () => ({
-      accessKeyId: "test",
-      secretAccessKey: "test",
-      sessionToken: "test",
-    }),
     // The webhook bodies below carry no real signature, no timestamp and no
     // basic auth, so verification is replaced outright. This seam exists for
     // this file alone; bugBossFromEnv never sets it.
@@ -760,11 +753,6 @@ test("a delivery that cannot be written answers a failure, not ok", async () => 
     slack: fakeSlack,
     spawnAgent: fakeAgent,
     s3: refusing,
-    credentials: async () => ({
-      accessKeyId: "test",
-      secretAccessKey: "test",
-      sessionToken: "test",
-    }),
     insecureTestVerifiers: { grafana: () => {} },
   });
 

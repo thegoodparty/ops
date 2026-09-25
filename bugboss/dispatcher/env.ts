@@ -1,24 +1,19 @@
 // The environment a child agent runs with. Design spec:
-// bugboss/docs/architecture.md, Authentication.
+// bugboss/docs/architecture.md, "What bounds an agent".
 //
 // The child environment is built up from nothing rather than filtered down
-// from process.env. Agents share a container with the Slack token, the GitHub
-// token and S3 write credentials, and they read attacker-writable log lines
-// for a living, so an allowlist the composition root owns is the only thing
-// that reaches them.
+// from process.env. The container holds the Slack token, the GitHub App key
+// and the whole secret blob, and an agent has no use for any of them, so an
+// allowlist the composition root owns is what a child gets.
 //
-// WHY THIS IS NOT A BLANKET "NO AWS VARIABLES" SCRUB:
+// That allowlist is hygiene, not a boundary: the child is a process of this
+// container and can read the parent's own environment. What it buys is that
+// a credential nobody handed the agent does not end up in a log line, a
+// session transcript or a Slack post by accident.
 //
-// On Fargate the task role is delivered through
-// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, not through AWS_ACCESS_KEY_ID,
-// which is never set there. Dropping every AWS_* name would therefore remove
-// nothing that matters while also removing the agent's Bedrock access and its
-// read-only investigation access. So the boundary is an IAM role rather than
-// a list of variable names: strip every ambient credential path, then inject
-// the temporary credentials of a dedicated read-only agent role. See
-// ./credentials.ts.
-
-import type { AgentAwsCredentials } from "./credentials";
+// AWS is the deliberate exception. The child runs on the task role, resolved
+// through the container credential provider, which refreshes on its own for
+// as long as the run lasts.
 
 export interface ChildEnvInput {
   /**
@@ -32,8 +27,6 @@ export interface ChildEnvInput {
    * gets; this module only guarantees nothing else does.
    */
   credentials: Record<string, string | undefined>;
-  /** Temporary credentials for the agent role, assumed by the parent. */
-  aws: AgentAwsCredentials;
   incidentId: string;
   /** Scoped to this one incident. */
   token: string;
@@ -43,34 +36,15 @@ export interface ChildEnvInput {
   attempt: number;
 }
 
-export interface ChildEnv {
-  env: Record<string, string>;
-  /** Names dropped on the way in. Nothing is ever dropped silently. */
-  stripped: string[];
-}
-
 /**
- * Every ambient path by which a child could pick up credentials we did not
- * hand it. The first two are the ones that actually matter on Fargate: they
- * are the task role, which holds S3 write and Secrets Manager.
+ * How the AWS SDK finds the task role inside a container. On Fargate only the
+ * relative URI is ever set; the other two are how the same provider is fed
+ * outside it, and they cost nothing to carry.
  */
-export const AMBIENT_CREDENTIAL_VARS = [
+export const AWS_CREDENTIAL_PATH_VARS = [
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-  "AWS_WEB_IDENTITY_TOKEN_FILE",
-  "AWS_ROLE_ARN",
-  "AWS_PROFILE",
-  "AWS_SHARED_CREDENTIALS_FILE",
-  "AWS_CONFIG_FILE",
-] as const;
-
-/** The three we inject, listed so nothing else can smuggle them in. */
-export const INJECTED_AWS_VARS = [
-  "AWS_ACCESS_KEY_ID",
-  "AWS_SECRET_ACCESS_KEY",
-  "AWS_SESSION_TOKEN",
 ] as const;
 
 export const CHILD_BASE_ENV_NAMES = [
@@ -78,15 +52,8 @@ export const CHILD_BASE_ENV_NAMES = [
   "HOME",
   "TMPDIR",
   "LANG",
+  ...AWS_CREDENTIAL_PATH_VARS,
 ] as const;
-
-const RESERVED = new Set<string>([
-  ...AMBIENT_CREDENTIAL_VARS,
-  ...INJECTED_AWS_VARS,
-]);
-
-export const isReservedChildEnvVar = (name: string): boolean =>
-  RESERVED.has(name.toUpperCase());
 
 /** Explicit opt-in for the handful of parent variables a child needs. */
 export const pickBaseEnv = (
@@ -100,32 +67,20 @@ export const pickBaseEnv = (
   return out;
 };
 
-export const buildChildEnv = (input: ChildEnvInput): ChildEnv => {
+/** Whether a built child environment can resolve AWS credentials at all. */
+export const hasAwsCredentialPath = (env: Record<string, string>): boolean =>
+  AWS_CREDENTIAL_PATH_VARS.some((name) => env[name] !== undefined);
+
+export const buildChildEnv = (
+  input: ChildEnvInput,
+): Record<string, string> => {
   const env: Record<string, string> = {};
-  const stripped: string[] = [];
 
   for (const source of [input.base ?? {}, input.credentials]) {
     for (const [name, value] of Object.entries(source)) {
       if (value === undefined) continue;
-      if (isReservedChildEnvVar(name)) {
-        stripped.push(name);
-        continue;
-      }
       env[name] = value;
     }
-  }
-
-  env.AWS_ACCESS_KEY_ID = input.aws.accessKeyId;
-  env.AWS_SECRET_ACCESS_KEY = input.aws.secretAccessKey;
-  env.AWS_SESSION_TOKEN = input.aws.sessionToken;
-  if (input.aws.expiresAt) {
-    env.BUGBOSS_CREDENTIALS_EXPIRE_AT = String(input.aws.expiresAt);
-    // The SDK's env provider reads this to know when to re-resolve. Without
-    // it the initial credentials look permanent, so if the child's first
-    // refresh against the Boss fails, the SDK keeps presenting them past
-    // their expiry and the failure surfaces as a Bedrock rejection rather
-    // than as the credential problem it is.
-    env.AWS_CREDENTIAL_EXPIRATION = new Date(input.aws.expiresAt).toISOString();
   }
 
   env.BUGBOSS_INCIDENT_ID = input.incidentId;
@@ -134,5 +89,5 @@ export const buildChildEnv = (input: ChildEnvInput): ChildEnv => {
   env.BUGBOSS_DEADLINE_AT = String(input.deadlineAt);
   if (input.sessionRef) env.BUGBOSS_SESSION_REF = input.sessionRef;
 
-  return { env, stripped };
+  return env;
 };
