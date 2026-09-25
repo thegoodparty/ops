@@ -125,6 +125,9 @@ const fakeAgent = async (tools: AgentSpawnContext) => {
   });
 };
 
+/** Slack's user group, which changes under us and keeps no history. */
+const rotation = { members: ["U-ada", "U-grace"] as string[] | null };
+
 // --- setup -----------------------------------------------------------------
 
 let dir: string;
@@ -154,6 +157,8 @@ before(async () => {
     slack: fakeSlack,
     spawnAgent: fakeAgent,
     s3: undefined,
+    // Who is on call is an external fact, and a mutable one.
+    rotationMembers: async () => rotation.members,
     // STS is an external dependency too: without this the composition root
     // would alarm and hand the child no AWS access at all.
     credentials: async () => ({
@@ -899,4 +904,54 @@ test("a suppressed signal is finished, and the sweep does not re-triage it", asy
     before,
     "sweeping a suppression must not open an incident for it",
   );
+});
+
+// --- the rotation snapshot --------------------------------------------------
+
+test("an incident records who was on call when it opened, not who is now", async () => {
+  rotation.members = ["U-ada", "U-grace"];
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-rot", "payments-errors"));
+
+  const id = boss.db.get<{ incidentId: string }>(
+    "SELECT incidentId FROM signal WHERE sourceId = 'fp-rot'",
+  )!.incidentId;
+  assert.deepEqual(
+    JSON.parse(
+      boss.db.get<{ rotationAtOpen: string }>(
+        "SELECT rotationAtOpen FROM incident WHERE id = ?",
+        [id],
+      )!.rotationAtOpen,
+    ),
+    ["U-ada", "U-grace"],
+  );
+
+  // The group changes. The answer to "who was responsible at 2am" must not.
+  rotation.members = ["U-alan"];
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "later" });
+  await boss.ingest("grafana", grafanaBody("fp-rot-2", "payments-errors"));
+
+  assert.deepEqual(
+    JSON.parse(
+      boss.db.get<{ rotationAtOpen: string }>(
+        "SELECT rotationAtOpen FROM incident WHERE id = ?",
+        [id],
+      )!.rotationAtOpen,
+    ),
+    ["U-ada", "U-grace"],
+    "the snapshot is the point; re-reading the group later loses the answer",
+  );
+});
+
+test("no rotation configured records nothing rather than guessing", async () => {
+  rotation.members = null;
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-rot-3", "billing-errors"));
+
+  const row = boss.db.get<{ rotationAtOpen: string | null }>(
+    `SELECT i.rotationAtOpen FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-rot-3'`,
+  );
+  assert.equal(row!.rotationAtOpen, null);
+  rotation.members = ["U-ada", "U-grace"];
 });

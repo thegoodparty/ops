@@ -58,11 +58,15 @@ export interface Incident {
   usersImpacted: number | null;
   impactQuery: string | null;
 
-  firstBadEventAt: number | null;
+  /** When impact began. A lower bound: the earliest bad event the agent saw. */
+  impactStartedAt: number | null;
   firstSignalAt: number;
   fixingAt: number | null;
   resolvedAt: number | null;
   closedAt: number | null;
+
+  /** Slack user ids on the rotation when this opened. Null if none configured. */
+  rotationAtOpen: string[] | null;
 
   /** Set when correlation absorbs this incident into another. */
   mergedInto: string | null;

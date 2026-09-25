@@ -67,7 +67,7 @@ incident (
   id TEXT PRIMARY KEY, status TEXT, owner TEXT, slackThreadTs TEXT,
   rootCause TEXT, prUrls TEXT, postmortem TEXT,
   usersImpacted INTEGER, impactQuery TEXT,
-  firstBadEventAt, firstSignalAt, fixingAt, resolvedAt, closedAt,
+  impactStartedAt, firstSignalAt, fixingAt, resolvedAt, closedAt,
   mergedInto TEXT, recurrenceOf TEXT, sessionRef TEXT, attempts INTEGER,
   modelId TEXT, costUsd REAL,
   tokensIn INTEGER, tokensOut INTEGER, cacheRead INTEGER, cacheWrite INTEGER
@@ -1147,7 +1147,7 @@ for v1.
 | Metric | Computed from | Caveat |
 | --- | --- | --- |
 | Impact | `usersImpacted`, reported by the agent at `report_analysis` with the `impactQuery` that produced it | The query is stored so the number is checkable. Distinct users only if the log line carries an identifier that survives `redactLine`. |
-| Time to detect | `signal.openedAt − firstBadEventAt` | Measures our alerting, not our agents. Rules with a 10m window and `for: 1m` have a structural floor of several minutes. |
+| Time to detect | `signal.openedAt − impactStartedAt` | Measures our alerting, not our agents. Rules with a 10m window and `for: 1m` have a structural floor of several minutes. |
 | Time to resolve | `resolvedAt − firstSignalAt` | Heavily right-skewed and uncorrelated with severity. Report percentiles, never a mean. |
 | Cost and model | The Boss sums per-turn usage out of the session file and prices it from a `(provider, modelId)` table | Derived, never reported. Survives a killed process, because the session file is on disk either way. |
 | Outcome | `auto_resolved`, `human_assisted`, `human_owned`, `unresolved` | `auto_resolved` must mean no human input beyond the merge, or the metric flatters itself. |

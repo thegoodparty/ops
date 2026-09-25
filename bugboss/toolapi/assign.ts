@@ -38,6 +38,8 @@ export type AssignActor =
 export interface AssignOptions {
   /** Stamped on the incident created when target is "NEW". */
   recurrenceOf?: string;
+  /** Slack user ids on the rotation right now, snapshotted onto a new incident. */
+  rotationAtOpen?: string[];
   /** Overrides id generation, for tests. */
   newId?: () => string;
 }
@@ -63,8 +65,9 @@ const OPEN_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING"];
 
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
 
-export interface IncidentRow extends Omit<Incident, "prUrls"> {
+export interface IncidentRow extends Omit<Incident, "prUrls" | "rotationAtOpen"> {
   prUrls: string;
+  rotationAtOpen: string | null;
 }
 
 export interface SignalRow extends Omit<Signal, "labels" | "explained"> {
@@ -75,6 +78,9 @@ export interface SignalRow extends Omit<Signal, "labels" | "explained"> {
 export const rowToIncident = (row: IncidentRow): Incident => ({
   ...row,
   prUrls: JSON.parse(row.prUrls) as string[],
+  rotationAtOpen: row.rotationAtOpen
+    ? (JSON.parse(row.rotationAtOpen) as string[])
+    : null,
 });
 
 export const rowToSignal = (row: SignalRow): Signal => ({
@@ -191,12 +197,18 @@ export const assign = (
     target = opts.newId ? opts.newId() : nextIncidentId(db);
     created = true;
     db.prepare(
-      `INSERT INTO incident (id, status, owner, prUrls, firstSignalAt, recurrenceOf, attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
-       VALUES (?, 'INVESTIGATING', 'agent', '[]', ?, ?, 0, 0, 0, 0, 0, 0)`,
+      `INSERT INTO incident
+         (id, status, owner, prUrls, firstSignalAt, recurrenceOf, rotationAtOpen,
+          attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+       VALUES (?, 'INVESTIGATING', 'agent', '[]', ?, ?, ?, 0, 0, 0, 0, 0, 0)`,
     ).run(
       target,
       Math.min(...rows.map((r) => r.openedAt)),
       opts.recurrenceOf ?? null,
+      // Captured here rather than read back later: a Slack user group is
+      // mutable and keeps no history, so this is the only moment the answer
+      // exists.
+      opts.rotationAtOpen ? JSON.stringify(opts.rotationAtOpen) : null,
     );
   } else {
     const existing = getIncidentRow(db, req.target);

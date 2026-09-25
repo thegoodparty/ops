@@ -56,7 +56,11 @@ import type { BugBossMcp, HumanBugReport, McpConfig, ReportSignalResult } from "
 import { mcpConfigFromEnv } from "./mcp/config";
 import { createS3SessionStore } from "./mcp/sessions";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
-import { createS3ObjectStore, createSlackClient } from "./slack/client";
+import {
+  createRotationReader,
+  createS3ObjectStore,
+  createSlackClient,
+} from "./slack/client";
 import { SlackRelay, type InboundRoute, type SlackEvent } from "./slack/relay";
 import {
   applyAssign,
@@ -146,6 +150,11 @@ export interface BugBossSecrets {
 
 export interface CreateBugBossOptions {
   config: BugBossConfig;
+  /**
+   * Who is on the rotation right now. Absent until a rotation group exists,
+   * which is the honest state rather than a default worth inventing.
+   */
+  rotationMembers?: () => Promise<string[] | null>;
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
   model: ModelClient;
   slack: SlackClient;
@@ -892,7 +901,15 @@ export const createBugBoss = async (
   ): Promise<AssignResult> => {
     const target = decision.action === "attach" ? decision.incidentId : "NEW";
     const req = { signalIds: [signalId], target, reason: decision.reason };
-    const opts = recurrenceOf ? { recurrenceOf } : {};
+    // Read before the assign rather than inside it: a Slack user group is
+    // mutable and keeps no history, so the moment an incident opens is the
+    // only moment this answer exists. Ignored when the target is an existing
+    // incident, which already carries its own snapshot.
+    const rotationAtOpen = (await options.rotationMembers?.()) ?? undefined;
+    const opts = {
+      ...(recurrenceOf ? { recurrenceOf } : {}),
+      ...(rotationAtOpen ? { rotationAtOpen } : {}),
+    };
     try {
       return await applyAssign(db, req, { kind: "boss" }, opts);
     } catch (err) {
@@ -1565,6 +1582,14 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       region: secrets.awsRegion,
     }),
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
+    // Only when a rotation group exists. Until one does, every incident
+    // records "not known", which is true.
+    rotationMembers: secrets.slackRotationGroupId
+      ? createRotationReader(
+          secrets.slackBotToken,
+          secrets.slackRotationGroupId,
+        )
+      : undefined,
     s3: new S3Client({}),
     secrets,
     mcpConfig: mcpConfigFor(env),

@@ -20,11 +20,26 @@ CREATE TABLE IF NOT EXISTS incident (
   usersImpacted     INTEGER,
   impactQuery       TEXT,
 
-  firstBadEventAt   INTEGER,
+  -- When users started being affected, which is not when we found out. Time
+  -- to detect is (firstSignalAt - impactStartedAt), and it measures the alert
+  -- rules rather than the agents: it is the only number here BugBoss cannot
+  -- improve by being better at its job.
+  --
+  -- A lower bound, not a proven start. The agent reports the earliest bad
+  -- event it can see, which log retention and its own query both bound from
+  -- below, so treat it as "no later than this".
+  impactStartedAt   INTEGER,
   firstSignalAt     INTEGER NOT NULL,
   fixingAt          INTEGER,
   resolvedAt        INTEGER,
   closedAt          INTEGER,
+
+  -- Who was on the rotation when this opened, as a JSON array of Slack user
+  -- ids. Snapshotted rather than looked up later because a Slack user group
+  -- is mutable and keeps no history: three months on, "who was responsible
+  -- when this fired at 2am" has no other answer. Null when no rotation group
+  -- is configured, which is every incident until one exists.
+  rotationAtOpen    TEXT,
 
   mergedInto        TEXT REFERENCES incident(id),
   recurrenceOf      TEXT REFERENCES incident(id),

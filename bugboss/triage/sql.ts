@@ -21,7 +21,7 @@ export const SCHEMA_SUMMARY = `incident(
   id TEXT, status TEXT in (INVESTIGATING,FIXING,RESOLVED,CLOSED,MERGED),
   owner TEXT in (agent,human), rootCause TEXT, prUrls TEXT json, postmortem TEXT,
   usersImpacted INT, impactQuery TEXT,
-  firstBadEventAt INT, firstSignalAt INT, fixingAt INT, resolvedAt INT, closedAt INT,
+  impactStartedAt INT, firstSignalAt INT, fixingAt INT, resolvedAt INT, closedAt INT,
   mergedInto TEXT, recurrenceOf TEXT, attempts INT, costUsd REAL)
 signal(
   id TEXT, source TEXT, sourceId TEXT, kind TEXT, title TEXT, body TEXT,

@@ -107,3 +107,50 @@ export const createS3ObjectStore = (
     },
   };
 };
+
+/**
+ * Who is on the rotation right now, as Slack user ids.
+ *
+ * Cached, because this is read once per opened incident and a burst opens
+ * several at once, while the answer changes on the timescale of someone
+ * editing a user group. A stale read costs a slightly wrong snapshot; a
+ * fresh read per signal costs a Slack API call inside the placement loop.
+ *
+ * Never throws. A rotation we could not read is recorded as "not known",
+ * which is the same shape as "no rotation configured" and is the honest
+ * answer: guessing would put the wrong names in a post-mortem.
+ */
+export const createRotationReader = (
+  token: string,
+  usergroupId: string,
+  ttlMs = 5 * 60 * 1000,
+  now: () => number = Date.now,
+): (() => Promise<string[] | null>) => {
+  const web = new WebClient(token, {
+    retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+  });
+  let cached: { at: number; members: string[] } | null = null;
+
+  return async () => {
+    if (cached && now() - cached.at < ttlMs) return cached.members;
+    try {
+      const res = await web.usergroups.users.list({ usergroup: usergroupId });
+      const members = (res.users ?? []).filter(
+        (u): u is string => typeof u === "string",
+      );
+      cached = { at: now(), members };
+      return members;
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          component: "slack-client",
+          level: "error",
+          event: "rotation_read_failed",
+          usergroupId,
+          error: String(err),
+        }),
+      );
+      return cached?.members ?? null;
+    }
+  };
+};
