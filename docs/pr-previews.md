@@ -30,9 +30,11 @@ the consumer by a different workflow, and nothing sequences the two.
       done (2026-09-25, PR #90. `if: github.event_name != 'pull_request'`
       on "Configure AWS Credentials" and "Login to Amazon ECR"; the build's
       base image is public and nothing else in a PR run touches AWS).
-- [ ] 7. Narrow `github-actions-pulumi-deploy`'s ops trust entry to `main`:
-      doing (pi-pr-previews, 2026-09-25). Depends on 6 being merged (#90
-      merged 2026-09-25).
+- [x] 7. Narrow `github-actions-pulumi-deploy`'s ops trust entry to `main`:
+      done (2026-09-25, PR #94. The ops subject moved out of the `StringLike`
+      wildcard list into its own `StringEquals` statement, since `sub` under
+      both operators in one statement is ANDed and matches nothing. Other
+      eight repos left wildcarded; a regression test guards the shape).
 - [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
       Depends on 4 being applied.
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
