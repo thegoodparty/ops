@@ -7,6 +7,7 @@ const VPC_ID = "vpc-0763fa52c32ebcf6a";
 const HOSTED_ZONE_ID = "Z10392302OXMPNQLPO07K";
 const HOSTNAME = "bugboss.goodparty.org";
 const BUCKET_NAME = "bugboss-prod";
+const SECRET_NAME = "BUGBOSS";
 const CONTAINER_PORT = 3000;
 const AGENT_ROLE_NAME = "bugboss-agent";
 
@@ -83,17 +84,15 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
+  // Looked up, never declared. The secret is created and populated by hand,
+  // so declaring it here would fail the whole stack update on the first apply
+  // with ResourceExistsException, and owning the container would tie rotating
+  // a credential to running a deploy.
+  //
   // Deliberately not `DELEGATES`. That secret maps every key into every
   // container, so sharing it would give every Delegate agent BugBoss's
   // credentials and vice versa.
-  const secret = new aws.secretsmanager.Secret("bugbossSecret", {
-    name: "BUGBOSS",
-    description: "BugBoss runtime credentials. Values are set out of band.",
-    tags: TAGS,
-  });
-
-  // No SecretVersion resource. The value is written by hand and Pulumi does
-  // not manage it, so there is nothing here that could revert it.
+  const secret = aws.secretsmanager.getSecretOutput({ name: SECRET_NAME });
 
   const albSecurityGroup = new aws.ec2.SecurityGroup("bugbossAlbSg", {
     name: "bugboss-alb",
@@ -588,7 +587,6 @@ export const createBugBoss = (config: BugBossConfig) => {
     taskRole,
     agentRole,
     logGroup,
-    secret,
     loadBalancer,
     url: `https://${HOSTNAME}`,
   };
