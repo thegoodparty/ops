@@ -61,6 +61,7 @@ import {
 } from "./slack/client";
 import {
   SlackRelay,
+  mentionPrefix,
   type InboundRoute,
   type OwnershipClaim,
   type SlackEvent,
@@ -671,9 +672,9 @@ export const createBugBoss = async (
     },
   });
 
-  const mention = secrets.slackRotationGroupId
-    ? `<!subteam^${secrets.slackRotationGroupId}>`
-    : "<!here>";
+  // The relay's, so the two pings are spelled one way and carry the same
+  // trailing space.
+  const mention = mentionPrefix(secrets.slackRotationGroupId ?? null);
 
   /**
    * A thread belongs to an incident, not to the ingest that happened to open

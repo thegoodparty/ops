@@ -107,6 +107,15 @@ describe("entities", () => {
     assert.throws(() => link("   "), /needs a url/);
   });
 
+  test("only a real destination may become a link", () => {
+    assert.equal(link("mailto:a@b.test"), "<mailto:a@b.test>");
+    // Anything else inside <> is a directive, not a destination, and an agent
+    // supplies these: prUrls comes straight off a tool call.
+    for (const bad of ["!channel", "!subteam^S0ROTATION", "@U0HUMAN", "/relative"]) {
+      assert.throws(() => link(bad), /not a linkable url/, bad);
+    }
+  });
+
   test("bullets are the literal character, because Slack has no list markup", () => {
     assert.equal(bullets(["one", "two"]), "• one\n• two");
   });
@@ -171,6 +180,14 @@ describe("toMrkdwn", () => {
       toMrkdwn("<@U0HUMAN> see <https://x.test/a|here> in <#C0DEV>"),
       "<@U0HUMAN> see <https://x.test/a|here> in <#C0DEV>",
     );
+  });
+
+  test("a Markdown link cannot smuggle a broadcast past the escaping", () => {
+    // `<!channel|look>` is a real page. The link rewrite is the one place that
+    // builds an entity out of model-supplied text, so it checks the scheme.
+    assert.equal(toMrkdwn("[look](!channel)"), "[look](!channel)");
+    assert.equal(toMrkdwn("[me](@U0HUMAN)"), "[me](@U0HUMAN)");
+    assert.equal(toMrkdwn("[rel](./docs.md)"), "[rel](./docs.md)");
   });
 
   test("an agent cannot page the rotation: broadcasts render as literal text", () => {
@@ -254,6 +271,19 @@ describe("splitForSlack", () => {
     assert.ok(parts.length > 1);
     for (const part of parts) {
       assert.doesNotMatch(part.replace(/\n_\(\d+\/\d+\)_$/, ""), /wor$|^ord/);
+    }
+  });
+
+  test("a split never lands inside a link, which would leave a bare <", () => {
+    const url = `https://ci.test/runs/${"9".repeat(60)}`;
+    const line = Array.from({ length: 60 }, (_, i) => `step ${i} <${url}|run ${i}>`).join(" ");
+    for (const part of splitForSlack(line)) {
+      const body = part.replace(/\n_\(\d+\/\d+\)_$/, "");
+      assert.equal(
+        (body.match(/</g) ?? []).length,
+        (body.match(/>/g) ?? []).length,
+        body.slice(-120),
+      );
     }
   });
 

@@ -114,12 +114,23 @@ export const channelLink = (channelId: string): string => {
 };
 
 /**
+ * Anything else inside `<…>` is a Slack directive, not a destination:
+ * `<!channel>` pages everyone and `<@U123>` mentions somebody. A url is
+ * whatever the caller was handed — an agent's `prUrls`, a link in its prose —
+ * so the scheme is checked rather than assumed.
+ */
+const LINKABLE = /^(?:https?:\/\/|mailto:)/;
+
+/**
  * A link, as `<url|label>`. The label cannot contain a pipe — Slack splits on
  * the first one and there is no escape for it — so pipes in a label become
  * slashes rather than silently truncating the label at the first pipe.
  */
 export const link = (url: string, label?: string): string => {
   if (!url.trim()) throw new Error("link() needs a url");
+  if (!LINKABLE.test(url.trim())) {
+    throw new Error(`not a linkable url: ${JSON.stringify(url)}`);
+  }
   const target = escape(url.trim());
   const text = label?.trim();
   return text ? `<${target}|${escape(text).replaceAll("|", "/")}>` : `<${target}>`;
@@ -207,8 +218,15 @@ const convertProse = (text: string): string => {
   // through link(), which escapes what it is given.
   out = out.replace(
     /\[([^\]\n]*)\]\(([^)\s]+)\)/g,
-    (_match, label: string, url: string) =>
-      label.trim() ? `<${url}|${label.replaceAll("|", "/")}>` : `<${url}>`,
+    (match: string, label: string, url: string) =>
+      // Only a real destination becomes an entity. `[look](!channel)` out of a
+      // quoted log line would otherwise be the broadcast this refuses to pass
+      // through anywhere else; left alone, it renders as the text it is.
+      LINKABLE.test(url)
+        ? label.trim()
+          ? `<${url}|${label.replaceAll("|", "/")}>`
+          : `<${url}>`
+        : match,
   );
   out = out.replace(/^([ \t]*)[-*+][ \t]+/gm, "$1• ");
   return out;
@@ -255,14 +273,48 @@ const CONTINUATION_RESERVE = 16;
 /** Room for a fence the split has to close and reopen. */
 const FENCE_RESERVE = 8;
 
+/**
+ * Where the entities are. By the time a line reaches here every `<` that is
+ * not one has been escaped, so this is the whole set.
+ */
+const entityRanges = (line: string): [number, number][] => {
+  const ranges: [number, number][] = [];
+  const entity = /<[^<>\n]*>/g;
+  let found = entity.exec(line);
+  while (found !== null) {
+    ranges.push([found.index, found.index + found[0].length]);
+    found = entity.exec(line);
+  }
+  return ranges;
+};
+
+/**
+ * Break one over-long line. A cut inside `<url|label>` leaves a bare `<` that
+ * eats the rest of that message, so the cut moves off an entity even at the
+ * cost of a shorter piece.
+ */
 const hardSplit = (line: string, size: number): string[] => {
   if (line.length <= size) return [line];
   const pieces: string[] = [];
   let rest = line;
   while (rest.length > size) {
-    const window = rest.slice(0, size);
-    const space = window.lastIndexOf(" ");
-    const cut = space > size * 0.6 ? space : size;
+    const ranges = entityRanges(rest);
+    const straddled = ranges.find(([from, to]) => from < size && size < to);
+    let cut = straddled ? straddled[0] : size;
+    const space = rest.lastIndexOf(" ", cut - 1);
+    if (
+      space > size * 0.6 &&
+      !ranges.some(([from, to]) => from < space && space < to)
+    ) {
+      cut = space;
+    }
+    if (cut <= 0) {
+      // One entity longer than a whole message. Cutting it would corrupt the
+      // rest of the post, so it goes out over budget and says so rather than
+      // being quietly mangled.
+      cut = straddled ? straddled[1] : size;
+      log("oversized_entity", { chars: cut });
+    }
     pieces.push(rest.slice(0, cut));
     rest = rest.slice(cut).trimStart();
   }

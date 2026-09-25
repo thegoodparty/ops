@@ -68,7 +68,9 @@ const BODIES = {
     query: z.string().min(1),
   }),
   resolved: z.object({
-    prUrls: z.array(z.string()),
+    // A url, because it is rendered as a Slack link and anything else inside
+    // `<…>` is a directive: `<!channel>` pages everyone.
+    prUrls: z.array(z.url()),
     evidence: z.string().min(1),
   }),
   analysis: z.object({
