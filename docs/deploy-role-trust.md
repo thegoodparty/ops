@@ -172,14 +172,20 @@ Starting grant, widened only by observed failures, the discipline
 | Statement | Actions | Resource |
 | --- | --- | --- |
 | Pulumi state | `pulumiBackendReadStatements` | `omni`'s project prefixes |
-| Terraform state | `s3:GetObject`, `s3:ListBucket` | the dataplatform backend, scoped to its key prefix |
-| Terraform lock | `s3:PutObject`, `s3:DeleteObject` | the lock object only, for `gp-terraform-dataplatform` |
+| Terraform state | `s3:GetObject`, `s3:ListBucket` | `goodparty-terraform-state-us-west-2/dataplatform/*` |
+| Terraform lock | `s3:PutObject`, `s3:DeleteObject` | the `.tflock` object under that same prefix |
 | Current image | `ecs:DescribeServices`, `ecs:DescribeTaskDefinition` | `*`, which these do not scope |
 | Planned services | describe and list only | per observed plan failures |
 
-**Resolve before step 4:** whether `gp-terraform-dataplatform` uses
-`goodparty-iac-state` or its own bucket, and whether its lock is S3-native or
-DynamoDB. The lock grant differs, and a DynamoDB lock needs its own statement.
+Resolved while writing this, so step 4 does not have to find it out:
+`gp-terraform-dataplatform` uses **its own** backend bucket,
+`goodparty-terraform-state-us-west-2`, at key `dataplatform/terraform.tfstate`,
+not the Pulumi bucket. Locking is S3-native (`use_lockfile = true`), so there
+is no DynamoDB table and the lock grant is object writes on that one prefix.
+Its plan is read-only against resources: `iam:Get*`/`List*` over the roots it
+manages, `s3:GetBucket*` on the warehouse and L2 buckets, and
+`sts:GetCallerIdentity`. Databricks and Astro go through their own provider
+tokens, not IAM, so nothing is needed for them here.
 
 **Also before step 4:** `infra-cli.ts` runs `stack select --create` on the
 `diff` path. For stacks that exist this is a read, but the capability is on
@@ -211,14 +217,33 @@ What it must not hold, and these are the ones worth naming:
   secrets the stack reads, by ARN.
 - No write to any resource carrying the production tags.
 
-**The audit that decides feasibility, and step 6 does not start without it:**
-whether the resources the preview stack creates carry a predictable name
-prefix or tag. ECS services, target groups, security groups and Route53
-records are all scopable by ARN pattern if the names are prefixed, and by
-`aws:ResourceTag` if the stack tags them. If they are not prefix-predictable,
-say so and change the Pulumi program to make them so, because a scoped write
-role is not otherwise expressible and the alternative is admitting the role
-stays broad.
+**Feasibility, settled before step 6 rather than during it: scope by tag, not
+by name.** `infra-cli.ts` sets stack-wide default tags on every resource:
+
+```
+pulumi config set --path aws:defaultTags.tags.Project     gp-api
+pulumi config set --path aws:defaultTags.tags.Environment ${env}
+```
+
+So `aws:ResourceTag/Project = gp-api` and `aws:ResourceTag/Environment =
+preview` is a clean condition key, and it is the one that works. Name
+prefixing very nearly works too, since `stage` is `pr-<n>` and the cluster,
+service, ALB, security group and Route53 record all carry it, but the target
+group is created with `namePrefix: 'HTTP'` and takes an AWS-generated suffix.
+There is no name pattern that reaches it. The tag condition does, without
+changing the Pulumi program.
+
+Two things the tag condition does not cover, both needing explicit resource
+ARNs alongside it:
+
+- The ALB name is capped at 32 characters, so an ARN pattern for it needs a
+  wildcard on the trailing load balancer id even where the prefix is known.
+- Teardown's `ecs:RunTask` targets `gp-develop-fargateCluster`, which is a
+  **dev** resource tagged `Environment=dev`. It falls outside the preview tag
+  condition by construction and has to be granted by ARN. Worth its own look
+  in step 7: a preview teardown reaching into the dev cluster with the dev
+  task definition, and so dev database credentials, is the least defensible
+  part of the current preview lifecycle even after this role exists.
 
 `rds:*` on the shared preview cluster deserves its own decision. The cluster
 is shared across previews, so a grant that lets a preview create a database on
@@ -268,9 +293,9 @@ consumer to sequence against.
 
 ## Open questions
 
-- Which backend and lock type does `gp-terraform-dataplatform` use? (step 4)
 - Does the `omni` infra CLI need a preview mode to drop `stack select
   --create`, or does the plan role carry state writes? (steps 4 and 5)
-- Are the preview stack's resources prefix-predictable or tagged? (step 6)
+- Can teardown drop the preview database without running a task on the dev
+  cluster's task definition? (step 7)
 - Does `gpvpn` still deploy anything, or is step 9 a removal rather than a
   narrowing? Last push was June.
