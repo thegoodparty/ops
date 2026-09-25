@@ -26,9 +26,11 @@ export type ResponsesReply = {
 const RESPONSES_PATH = "/openai/v1/responses";
 const MAX_ATTEMPTS = 4;
 const BACKOFF_BASE_MS = 1000;
-// A hung connection would otherwise stall a deep-reviewer until the task's own
-// deadline, long past the orchestrator's bounded wait for our result file.
-const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+// The orchestrator waits 480s for our result file and then records a failure,
+// so a single request must not be able to outlast that window on its own — a
+// healthy run finishing late reads as a failed second opinion and blocks the
+// approve recommendation.
+const REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
 
 const signers = new Map<string, SignatureV4>();
 

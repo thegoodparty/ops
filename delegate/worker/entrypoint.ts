@@ -36,13 +36,17 @@ const reportFatal = async (job: AgentJob | undefined, message: string) => {
 };
 
 // The second-opinion reviewer runs as a child process with a hand-built
-// environment, and this allowlist is the security-relevant part of the
-// change. That process drives a non-Claude model over untrusted PR content
-// and lets it run shell commands, so it gets what it needs to sign Bedrock
-// requests as the task role and read the already-captured diff, and nothing
-// else. No GitHub token of either App, no Anthropic key, no Slack / ClickUp /
-// Databricks / Grafana / Sentry secret — which is also why the diff is
-// captured for it up front rather than fetched by it.
+// environment. That process drives a non-Claude model over untrusted PR
+// content, so it gets what it needs to sign Bedrock requests as the task role
+// and read the already-captured diff, and nothing else. No GitHub token of
+// either App, no Anthropic key, no Slack / ClickUp / Databricks / Grafana /
+// Sentry secret — which is also why the diff is captured for it up front
+// rather than fetched by it.
+//
+// This is defense in depth, not the boundary: the child shares our UID, so
+// anything able to execute could read our environ back out of /proc. The
+// boundary is that the child has no shell and only read-only tools confined
+// to the checkout — see delegate/review/second-opinion.ts.
 //
 // A positive allowlist rather than a blocklist, on purpose: a key added to
 // the DELEGATES secret later is excluded because nobody listed it, not
@@ -52,7 +56,6 @@ const SECOND_OPINION_ENV_PREFIXES = ["NODE_", "AWS_", "SECOND_OPINION_"];
 const SECOND_OPINION_ENV_NAMES = [
   "PATH",
   "HOME",
-  "SHELL",
   "LANG",
   "LC_ALL",
   "TMPDIR",

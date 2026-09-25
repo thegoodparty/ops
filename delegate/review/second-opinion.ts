@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import fs from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 import {
   DEEP_REVIEWER_PROMPT,
@@ -23,60 +24,277 @@ export type Lead = {
 
 const MAX_TURNS = 30;
 const MAX_OUTPUT_TOKENS = 16000;
-const BASH_TIMEOUT_MS = 60_000;
-const BASH_OUTPUT_LIMIT = 100000;
+const GREP_TIMEOUT_MS = 60_000;
+const OUTPUT_LIMIT = 100000;
 const TRUNCATION_MARKER = "\n[truncated]";
 const JSON_SCAN_LIMIT = 50;
+const LIST_ENTRY_LIMIT = 500;
+const GREP_MAX_COUNT_PER_FILE = 20;
+const GREP_MAX_LINES = 400;
 
-const BASH_TOOL: ResponsesTool = {
-  type: "function",
-  name: "bash",
-  description:
-    "Run a shell command in the PR checkout. Returns combined stdout and stderr, truncated to 100000 characters.",
-  parameters: {
-    type: "object",
-    properties: {
-      command: { type: "string", description: "The shell command to run." },
+// The Claude subagents that share these prompts run with Bash. This process
+// does not: it drives a model over PR content nobody has vetted, in a child
+// that shares the worker's UID, so an env allowlist alone would never have
+// held. Withholding execution is what makes the confinement real.
+const NO_SHELL_SUFFIX = `
+
+## Your tools
+
+This run has no shell. Your tools are \`read_file\`, \`list_files\`, \`grep\` and \`read_diff\` — all read-only, all confined to the PR checkout. Where the instructions above assume shell access, \`gh\`, or running a formatter or any other command, use these tools instead. Their absence is expected. It is not a failure, and it is not a reason to abort the review or to report that you could not do it.`;
+
+const TOOLS: ResponsesTool[] = [
+  {
+    type: "function",
+    name: "read_file",
+    description:
+      "Read a UTF-8 text file in the PR checkout. Returns the whole file unless offset/limit are given, truncated to 100000 characters.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Path relative to the PR checkout root.",
+        },
+        offset: {
+          type: "integer",
+          description: "1-indexed first line to return. Defaults to 1.",
+        },
+        limit: {
+          type: "integer",
+          description:
+            "Maximum number of lines to return. Defaults to the rest of the file.",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
     },
-    required: ["command"],
-    additionalProperties: false,
   },
-};
+  {
+    type: "function",
+    name: "list_files",
+    description:
+      "List the directory entries at a path in the PR checkout. Directories are suffixed with a slash.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description:
+            "Directory path relative to the PR checkout root. Defaults to the root.",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "grep",
+    description:
+      "Regex search the PR checkout with ripgrep. Returns file:line:match rows.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "The regex to search for." },
+        path: {
+          type: "string",
+          description:
+            "File or directory to search, relative to the PR checkout root. Defaults to the root.",
+        },
+        glob: {
+          type: "string",
+          description: "Optional glob to restrict which files are searched.",
+        },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_diff",
+    description:
+      "Read the unified diff of the PR under review, truncated to 100000 characters.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+];
 
 const execFileAsync = promisify(execFile);
 
+const errorMessage = (err: unknown): string =>
+  err instanceof Error ? err.message : String(err);
+
 const truncateOutput = (text: string): string =>
-  text.length <= BASH_OUTPUT_LIMIT
+  text.length <= OUTPUT_LIMIT
     ? text
-    : text.slice(0, BASH_OUTPUT_LIMIT - TRUNCATION_MARKER.length) +
+    : text.slice(0, OUTPUT_LIMIT - TRUNCATION_MARKER.length) +
       TRUNCATION_MARKER;
 
-const runBash = async (command: string, cwd: string): Promise<string> => {
-  try {
-    const { stdout, stderr } = await execFileAsync("bash", ["-lc", command], {
-      cwd,
-      timeout: BASH_TIMEOUT_MS,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    return truncateOutput(`${stdout}${stderr}`);
-  } catch (err) {
-    const failure = err as {
-      stdout?: string;
-      stderr?: string;
-      code?: number | string;
-      killed?: boolean;
-      message?: string;
-    };
-    const combined = `${failure.stdout ?? ""}${failure.stderr ?? ""}`;
-    const note =
-      failure.killed === true
-        ? "[command timed out]"
-        : `[command exited with code ${String(failure.code ?? "unknown")}]`;
-    const detail = combined.trim() === "" ? failure.message ?? "" : combined;
-    return truncateOutput(`${detail}\n${note}`);
+const isInside = (root: string, target: string): boolean =>
+  target === root || target.startsWith(root + path.sep);
+
+// realpathSync throws on a path that does not exist yet, which is a legitimate
+// thing for the model to ask about, so resolve the deepest existing ancestor
+// and re-attach the rest.
+const realpathOfNearestExisting = (target: string): string => {
+  const suffix: string[] = [];
+  let current = target;
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(current), ...suffix);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return target;
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
   }
 };
 
+export type ConfinedPath = { path: string } | { error: string };
+
+export const resolveInRoot = (
+  root: string,
+  candidate: string
+): ConfinedPath => {
+  const rootResolved = path.resolve(root);
+  const resolved = path.resolve(rootResolved, candidate);
+  const outside = `[error: ${candidate} resolves outside the PR checkout — every path must be inside it]`;
+
+  // Rejected before anything else, because `path.resolve` collapses `..`
+  // lexically while the kernel would walk it after each symlink. Those two
+  // disagree on `link/../x`, and reasoning about which one wins is exactly the
+  // kind of subtlety that rots into a traversal bug. Nothing here needs `..`:
+  // every path is addressed from the checkout root.
+  if (candidate.split(/[/\\]/).includes(".."))
+    return {
+      error: `[error: ${candidate} contains a '..' segment — address paths from the PR checkout root instead]`,
+    };
+
+  if (!isInside(rootResolved, resolved)) return { error: outside };
+  if (
+    !isInside(
+      realpathOfNearestExisting(rootResolved),
+      realpathOfNearestExisting(resolved)
+    )
+  )
+    return { error: outside };
+  return { path: resolved };
+};
+
+const positiveInt = (value: unknown): number | undefined => {
+  const parsed =
+    typeof value === "number" || typeof value === "string"
+      ? Number(value)
+      : Number.NaN;
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : undefined;
+};
+
+export const readFileTool = (
+  root: string,
+  args: Record<string, unknown>
+): string => {
+  const requested = typeof args.path === "string" ? args.path : "";
+  if (requested.trim() === "") return "[error: read_file needs a path]";
+  const resolved = resolveInRoot(root, requested);
+  if ("error" in resolved) return resolved.error;
+
+  try {
+    const text = fs.readFileSync(resolved.path, "utf8");
+    const offset = positiveInt(args.offset);
+    const limit = positiveInt(args.limit);
+    if (offset === undefined && limit === undefined) return truncateOutput(text);
+    const lines = text.split("\n");
+    const start = (offset ?? 1) - 1;
+    const end = limit === undefined ? lines.length : start + limit;
+    return truncateOutput(lines.slice(start, end).join("\n"));
+  } catch (err) {
+    return `[error: ${errorMessage(err)}]`;
+  }
+};
+
+const listFilesTool = (root: string, args: Record<string, unknown>): string => {
+  const requested =
+    typeof args.path === "string" && args.path.trim() !== "" ? args.path : ".";
+  const resolved = resolveInRoot(root, requested);
+  if ("error" in resolved) return resolved.error;
+
+  try {
+    const names = fs
+      .readdirSync(resolved.path, { withFileTypes: true })
+      .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name))
+      .sort();
+    const shown = names.slice(0, LIST_ENTRY_LIMIT).join("\n");
+    return names.length > LIST_ENTRY_LIMIT
+      ? `${shown}\n[truncated: ${names.length} entries, showing the first ${LIST_ENTRY_LIMIT}]`
+      : shown;
+  } catch (err) {
+    return `[error: ${errorMessage(err)}]`;
+  }
+};
+
+// execFile, never a shell: the pattern, path and glob are model-supplied and
+// arrive as argv entries, so nothing in them can be read as shell syntax.
+const grepTool = async (
+  root: string,
+  args: Record<string, unknown>
+): Promise<string> => {
+  const pattern = typeof args.pattern === "string" ? args.pattern : "";
+  if (pattern === "") return "[error: grep needs a pattern]";
+  const requested =
+    typeof args.path === "string" && args.path.trim() !== "" ? args.path : ".";
+  const resolved = resolveInRoot(root, requested);
+  if ("error" in resolved) return resolved.error;
+
+  const rgArgs = [
+    "--line-number",
+    "--with-filename",
+    "--max-count",
+    String(GREP_MAX_COUNT_PER_FILE),
+  ];
+  if (typeof args.glob === "string" && args.glob.trim() !== "")
+    rgArgs.push("--glob", args.glob);
+  rgArgs.push("--", pattern, resolved.path);
+
+  try {
+    const { stdout } = await execFileAsync("rg", rgArgs, {
+      cwd: root,
+      timeout: GREP_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const lines = stdout.split("\n");
+    return truncateOutput(
+      lines.length <= GREP_MAX_LINES
+        ? stdout
+        : `${lines.slice(0, GREP_MAX_LINES).join("\n")}\n[truncated to the first ${GREP_MAX_LINES} matching lines]`
+    );
+  } catch (err) {
+    const failure = err as {
+      code?: number | string;
+      killed?: boolean;
+      stderr?: string;
+      message?: string;
+    };
+    if (failure.code === 1) return "[no matches]";
+    if (failure.killed === true) return "[error: grep timed out]";
+    return `[error: grep failed: ${failure.stderr?.trim() || failure.message || "unknown"}]`;
+  }
+};
+
+const readDiffTool = (): string => {
+  try {
+    return truncateOutput(
+      fs.readFileSync(process.env.PR_DIFF_FILE || "/app/pr-diff.patch", "utf8")
+    );
+  } catch (err) {
+    return `[error: ${errorMessage(err)}]`;
+  }
+};
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
@@ -169,10 +387,14 @@ export const normalizeFindings = (
   return findings;
 };
 
-export const normalizeLeads = (raw: unknown, maxLeads: number): Lead[] => {
+export const normalizeLeads = (
+  raw: unknown,
+  maxLeads: number
+): { leads: Lead[]; rawCount: number } => {
+  const entries = arrayFrom(raw, "leads");
   const leads: Lead[] = [];
 
-  for (const entry of arrayFrom(raw, "leads")) {
+  for (const entry of entries) {
     if (leads.length >= maxLeads) break;
     if (!isRecord(entry)) continue;
 
@@ -200,7 +422,7 @@ export const normalizeLeads = (raw: unknown, maxLeads: number): Lead[] => {
     });
   }
 
-  return leads;
+  return { leads, rawCount: entries.length };
 };
 
 const messageText = (items: ResponsesItem[]): string =>
@@ -222,6 +444,26 @@ const messageText = (items: ResponsesItem[]): string =>
 // each. Holding a hard cap would mean serializing them, which costs more wall
 // time than the overshoot costs money.
 type Budget = { spentUsd: number };
+
+const runTool = async (
+  name: unknown,
+  rawArgs: unknown,
+  root: string
+): Promise<string> => {
+  const args = isRecord(rawArgs) ? rawArgs : {};
+  switch (name) {
+    case "read_file":
+      return readFileTool(root, args);
+    case "list_files":
+      return listFilesTool(root, args);
+    case "grep":
+      return grepTool(root, args);
+    case "read_diff":
+      return readDiffTool();
+    default:
+      return `[error: no tool named ${JSON.stringify(name)} — use read_file, list_files, grep or read_diff]`;
+  }
+};
 
 const runToolLoop = async (args: {
   region: string;
@@ -249,7 +491,7 @@ const runToolLoop = async (args: {
       model: args.model,
       instructions: args.instructions,
       input,
-      tools: [BASH_TOOL],
+      tools: TOOLS,
       maxOutputTokens: MAX_OUTPUT_TOKENS,
     });
     args.budget.spentUsd += usageCostUsd(reply.usage);
@@ -263,30 +505,20 @@ const runToolLoop = async (args: {
     if (calls.length === 0) return text !== "" ? text : lastText;
 
     for (const call of calls) {
-      const parsedArgs =
+      const callArgs =
         typeof call.arguments === "string"
-          ? (tryParse(call.arguments) as { command?: unknown } | undefined)
-          : undefined;
-      const command =
-        parsedArgs && typeof parsedArgs.command === "string"
-          ? parsedArgs.command
+          ? tryParse(call.arguments)
           : undefined;
       input.push({
         type: "function_call_output",
         call_id: call.call_id,
-        output:
-          command === undefined
-            ? "[no runnable command in the tool call arguments]"
-            : await runBash(command, args.cwd),
+        output: await runTool(call.name, callArgs, args.cwd),
       });
     }
   }
 
   return lastText;
 };
-
-const errorMessage = (err: unknown): string =>
-  err instanceof Error ? err.message : String(err);
 
 export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
   const startedAt = Date.now();
@@ -319,7 +551,7 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
     // of the tree with no diff is worse than no second opinion at all — it
     // looks like a clean pass.
     const diffFile = process.env.PR_DIFF_FILE || "/app/pr-diff.patch";
-    if (!existsSync(diffFile)) {
+    if (!fs.existsSync(diffFile)) {
       throw new Error(
         `no PR diff at ${diffFile} — the worker's diff capture must have failed`
       );
@@ -337,7 +569,7 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
         model,
         maxUsd,
         cwd,
-        instructions: SCOUT_PROMPT,
+        instructions: SCOUT_PROMPT + NO_SHELL_SUFFIX,
         userPrompt: `You are scouting PR ${prNumber} in repo ${repo}. The PR is already checked out in your current working directory, pinned to the reviewed head SHA. The full diff is at ${diffFile}. Read the root CLAUDE.md, read the diff, skim touched files in context, and emit 3–10 investigation leads per your output contract.`,
         budget,
       });
@@ -366,7 +598,11 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
       isRecord(scoutJson) && typeof scoutJson.summary === "string"
         ? scoutJson.summary
         : "";
-    const leads = normalizeLeads(scoutJson, maxLeads);
+    const { leads, rawCount } = normalizeLeads(scoutJson, maxLeads);
+    // Dropping every lead is not the same outcome as the scout finding
+    // nothing: one is a low-risk diff, the other is a pass that produced
+    // nothing usable, and only the first may satisfy the approve gate.
+    const leadsUnusable = rawCount > 0 && leads.length === 0;
 
     const settled = await Promise.allSettled(
       leads.map(async (lead) => {
@@ -375,7 +611,7 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
           model,
           maxUsd,
           cwd,
-          instructions: DEEP_REVIEWER_PROMPT,
+          instructions: DEEP_REVIEWER_PROMPT + NO_SHELL_SUFFIX,
           userPrompt: `You are deep-reviewing one lead from the scout's pass on PR ${prNumber} in repo ${repo}. The PR is already checked out in your current working directory, pinned to the reviewed head SHA. The full diff is at ${diffFile}. Read the cited paths in full, apply your category lens, run the disprove-it pass, and return findings per your output contract.
 
 <lead>
@@ -411,10 +647,15 @@ export const runSecondOpinion = async (): Promise<SecondOpinionResult> => {
       findings,
       deepReviewersDispatched: leads.length,
       deepReviewerFailures,
-      scoutFailed: false,
+      scoutFailed: leadsUnusable,
       summary,
       costUsd: budget.spentUsd,
       durationMs: Date.now() - startedAt,
+      ...(leadsUnusable
+        ? {
+            error: `the scout returned ${rawCount} lead(s) but none were usable — every entry was missing the paths a deep-reviewer needs`,
+          }
+        : {}),
     };
   } catch (err) {
     return {
