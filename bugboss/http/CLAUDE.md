@@ -23,6 +23,13 @@ throws and the route 500s so Grafana retries; a failure after it is
 recovered by the orphan sweep, which is unbounded, source-agnostic and
 survives a restart — unlike a source's willingness to retry.
 
+An `app.onError` handler alarms on anything a route throws. Hono answers
+500 on its own otherwise, which would make a failed write on the primary
+ingest path — a dropped alert — the one failure that left no trace. It is
+registered on the app, not per route, so a route added later cannot forget
+it. The 401 paths return their response rather than throwing, so a refused
+delivery stays a `log` and does not reach it.
+
 ## `/health` is deliberately flat
 
 It returns 200 whenever the process is up, and does not check the database.

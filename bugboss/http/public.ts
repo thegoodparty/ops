@@ -63,6 +63,23 @@ const settle = (work: Promise<unknown>, route: string): void => {
 export const createPublicApp = (deps: PublicAppDeps): Hono => {
   const app = new Hono();
 
+  // Hono catches anything a handler throws and answers 500 on its own, which
+  // is the one failure path that would otherwise leave no trace: a DB write
+  // failure in ingest is a dropped alert, and dropping it quietly is the
+  // thing this system exists not to do. Registered on the app rather than
+  // per route so a route added later cannot forget it. The routes that
+  // answer 401 return that response rather than throwing, so they do not
+  // come through here, and the MCP sub-app turns its own OAuthErrors into
+  // responses — anything reaching this really is unexpected.
+  app.onError((err, c) => {
+    alarm("route_failed", {
+      method: c.req.method,
+      path: c.req.path,
+      error: String(err),
+    });
+    return c.json({ ok: false, error: "internal error" }, 500);
+  });
+
   // Flat 200. The container is the only thing serving ingest, so a degraded
   // Boss still beats no Boss: failing this check would have ECS replace a
   // task that is losing alerts rather than one that cannot take them.
