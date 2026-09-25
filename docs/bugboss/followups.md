@@ -96,16 +96,27 @@ at the moment it tries to push.
 Create an App owned by `thegoodparty`, install it on the org, and give it
 only:
 
-| Permission | Level | Why |
+| Permission | Level | What needs it |
 | --- | --- | --- |
-| Contents | Read and write | Clone, branch, push |
-| Pull requests | Read and write | Open a PR and comment on it |
+| Contents | Read and write | `git clone --filter=blob:none`, branch, commit, push |
+| Pull requests | Read and write | `gh pr create`, `gh pr view`, commenting during review |
+| Actions | Read | `gh run list`, which is how the agent waits for CI |
 | Metadata | Read | Mandatory for any App |
 
-**Nothing else, and specifically no Administration and no Checks.** The
-design is explicit that the agent opens PRs and never merges them, and the
-App's permissions are the only thing actually holding that line — the agent
-runs with a real shell.
+**Nothing else, and specifically not Administration** — that would let the
+agent change the branch protection that stops it merging.
+
+**Workflows: write is deliberately absent, and it has a cost.** GitHub
+rejects any push whose diff touches `.github/workflows/`, so an incident
+whose real fix is a broken workflow ends with the agent writing the right
+patch and failing at `git push`. That is the better trade: workflow files
+are how CI gets its credentials, so write access there is close to write
+access to everything CI can reach. The agent should hand that case to a
+person rather than be able to rewrite the deploy pipeline.
+
+The merge guard is belt and braces. The prompt tells the agent it never
+merges, and `main`'s branch protection stops it server-side. Since the agent
+runs with a real shell, only the second of those is load-bearing.
 
 ## Ship regardless, and ideally first
 
