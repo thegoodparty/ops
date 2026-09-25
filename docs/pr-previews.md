@@ -20,8 +20,15 @@ workflows" in `workbench-account.md`. The grant is applied by `deploy.yml`,
 the consumer by a different workflow, and nothing sequences the two.
 
 - [x] 1. Record this plan: done (2026-09-24, PR #83).
-- [ ] 2. Audit the `ops`, `org` and `workbench` stack state for secrets: todo.
-      Gate for posting full diffs publicly; see "Secrets in the diff".
+- [x] 2. Audit the `ops`, `org` and `workbench` stack state for secrets: done
+      (2026-09-25, user admin session. `pulumi stack export --show-secrets` on
+      all three. No plaintext credentials: token-shape scan clean, and the
+      only credential-named fields are the provider's
+      `skipCredentialsValidation` (value `false`) and an empty CORS header.
+      Secret-typed wrappers: ops 17, workbench 2, org 0, all non-credential
+      raw-state fields (S3 lifecycle rules on two buckets, an ALB target
+      group's `deregistrationDelay`, and Bedrock invocation logging config),
+      which Pulumi masks as `[secret]`. Full diffs are safe to post).
 - [x] 3. Stop reading the `DELEGATES` secret value in `deploy/index.ts`:
       done (2026-09-25, PR #91. `getSecret` (DescribeSecret) for the ARN, key
       names declared in `deploy/delegate-secret.ts`, and an apply-only drift
@@ -29,7 +36,12 @@ the consumer by a different workflow, and nothing sequences the two.
       deployed `agentTaskDef` from the 2026-09-25 deploy log: 14 keys, so the
       task definition is unchanged. `.env.example` had documented only 9; the
       other 5 are now listed too).
-- [ ] 4. Create the `github-actions-pulumi-preview` role: todo.
+- [x] 4. Create the `github-actions-pulumi-preview` role: done (2026-09-25,
+      PR #99. Trusted by `repo:thegoodparty/ops:pull_request` exactly.
+      Read-only backend access for ops, org and workbench, plus
+      `DescribeSecret` on `DELEGATES` and `DescribeTaskDefinition`. No lock,
+      backup or history objects: a preview is expected not to lock, and if it
+      does, the missing grant fails closed and is added then).
 - [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
       `org`: todo. Depends on 2, 3 and 4 being applied.
 - [x] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:

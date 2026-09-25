@@ -440,6 +440,37 @@ export const githubActionsOrgDeployTrust = opsWorkflowTrust("deploy-org.yml");
 export const githubActionsWorkbenchDeployTrust =
   opsWorkflowTrust("deploy-workbench.yml");
 
+// Trust for the PR preview role. The subject is the `pull_request` subject
+// exactly: not `:*`, not `main`, and no other repository. Fork PRs cannot
+// obtain an OIDC token at all, but the workflow skips them explicitly so the
+// failure is a skip rather than a confusing assumption error.
+//
+// Unlike the scoped deploy roles this cannot also pin `job_workflow_ref`. That
+// pin protects a role from a *new* workflow file; here the workflow and the
+// Pulumi program both come from the pull request, so the pin would only name
+// `@refs/pull/N/merge` and constrain nothing. The role has to be safe to hand
+// to an unreviewed branch on that basis alone, which is what its read-only
+// policy is for. See `docs/pr-previews.md`.
+export const githubActionsPulumiPreviewTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub":
+            "repo:thegoodparty/ops:pull_request",
+        },
+      },
+    },
+  ],
+};
+
 // Every Pulumi project needs its own backend access. The shared role never had
 // to think about this because it holds s3:* on *; a scoped role does not
 // inherit that, and it does not inherit ReadOnlyAccess either.
@@ -504,6 +535,48 @@ const pulumiBackendStatements = (project: string): PolicyStatement[] => [
   // Read only, and bucket-wide because it is a single bucket-level file. It
   // already exists, so the backend reads it to check the format version and
   // writes it only when initialising an empty bucket.
+  {
+    Sid: "PulumiStateMeta",
+    Effect: "Allow",
+    Action: ["s3:GetObject"],
+    Resource: `${BUCKET}/.pulumi/meta.yaml`,
+  },
+  {
+    Sid: "PulumiStatePassphrase",
+    Effect: "Allow",
+    Action: ["ssm:GetParameter"],
+    Resource: "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
+  },
+];
+
+/**
+ * Read-only counterpart to `pulumiBackendStatements`, for the PR preview role.
+ *
+ * A separate function rather than a read-only flag on the one above, on
+ * purpose: a flag is one character of drift away from granting writes to a
+ * role any branch with push access can assume. Here the write actions in the
+ * read-write list are absent by construction, and a test asserts it.
+ *
+ * No lock objects, and no backups/history either. A preview is expected not to
+ * take the state lock or write those. If one turns out to need the lock, the
+ * missing grant fails closed with AccessDenied, and the lock objects get added
+ * then, scoped to these same projects. See `docs/pr-previews.md`, step 4.
+ */
+const pulumiBackendReadStatements = (projects: string[]): PolicyStatement[] => [
+  {
+    Sid: "PulumiStateBucket",
+    Effect: "Allow",
+    Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+    Resource: BUCKET,
+  },
+  {
+    Sid: "PulumiStateObjects",
+    Effect: "Allow",
+    Action: ["s3:GetObject"],
+    Resource: projects.map(
+      (project) => `${BUCKET}/.pulumi/stacks/${project}/*`,
+    ),
+  },
   {
     Sid: "PulumiStateMeta",
     Effect: "Allow",
@@ -737,5 +810,35 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`,
     },
     ...pulumiBackendStatements("workbench"),
+  ],
+};
+
+/**
+ * The whole grant for the PR preview role. Read-only, and only the three
+ * projects a PR can preview.
+ *
+ * Widened only by observed failures. `ecs:DescribeTaskDefinition` cannot be
+ * resource-scoped; it exists so preview mode can resolve the currently
+ * deployed delegate image rather than invent a URI. `secretsmanager` is
+ * `DescribeSecret` metadata only: the value read was removed in step 3, which
+ * is what lets this role exist without `GetSecretValue`.
+ */
+export const githubActionsPulumiPreview: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    ...pulumiBackendReadStatements(["ops", "org", "workbench"]),
+    {
+      Sid: "DelegatesSecretMetadata",
+      Effect: "Allow",
+      Action: ["secretsmanager:DescribeSecret"],
+      Resource:
+        "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
+    },
+    {
+      Sid: "CurrentTaskDefinition",
+      Effect: "Allow",
+      Action: ["ecs:DescribeTaskDefinition"],
+      Resource: "*",
+    },
   ],
 };
