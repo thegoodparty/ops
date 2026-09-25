@@ -7,6 +7,10 @@
 // Ordering follows what AWS returned. The provider parses these as JSON, so
 // serialisation does not have to match how AWS stores it, but keeping the
 // adoption diff empty is worth more than tidying the shape.
+//
+// The trust document is no longer byte-identical to what was captured: step 7
+// of `docs/pr-previews.md` pins the ops subject to `main` and to `deploy.yml`
+// (the first statement below). The policy document is still as adopted.
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
 
@@ -24,12 +28,54 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
-// Nine repositories, each matched as `:*`, which includes pull_request
-// refs. Deliberately captured as-is: narrowing this belongs in its own
-// change, not in an adoption that is meant to be a no-op.
+// Nine repositories. Ops is pinned to `main` and to one workflow file in its
+// own statement; the other eight keep the captured `:*` pattern, which includes
+// pull_request refs.
+//
+// Why two statements rather than one list. `sub` under both `StringEquals` and
+// `StringLike` in the same statement is not "either": IAM ANDs the condition
+// operators for one key, so the subject would have to be both the exact main
+// ref and one of the wildcard patterns at once, and no request would match. The
+// exact pin therefore needs its own statement.
+//
+// Why the ops statement pins `job_workflow_ref` too. `sub` is per-ref, not
+// per-workflow: every workflow on main presents the same subject, so a
+// `main`-only pin still lets any workflow file added to the repo assume this
+// role. That is the same gap `opsWorkflowTrust()` below closes for the scoped
+// roles, and this role is broader, so it needs the pin at least as much. Only
+// `deploy.yml` should hold it.
+//
+// The ops pin is only safe now. It depends on `deploy.yml` no longer requesting
+// credentials on `pull_request` (docs/pr-previews.md step 6, merged as PR #90);
+// before that, a PR run still assumed this role and would now fail. The other
+// eight stay wildcarded on purpose: omni's `publish-experiments.yml` assumes
+// this role on `pull_request`.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // No wildcard, so this matches only a `main` run in this repo. A
+          // `pull_request` run presents a `refs/pull/N/merge` subject and is
+          // refused.
+          "token.actions.githubusercontent.com:sub":
+            "repo:thegoodparty/ops:ref:refs/heads/main",
+          // Pins which workflow file the job came from. `sub` is identical for
+          // every workflow on main, so without this any workflow added to the
+          // repo could assume the role. See `opsWorkflowTrust()` for the full
+          // reasoning.
+          "token.actions.githubusercontent.com:job_workflow_ref":
+            "thegoodparty/ops/.github/workflows/deploy.yml@refs/heads/main",
+        },
+      },
+    },
     {
       Effect: "Allow",
       Principal: {
@@ -47,7 +93,6 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
             "repo:thegoodparty/election-api:*",
             "repo:thegoodparty/gp-terraform-dataplatform:*",
             "repo:thegoodparty/campaign-plan-service:*",
-            "repo:thegoodparty/ops:*",
             "repo:thegoodparty/gpvpn:*",
             "repo:thegoodparty/runbooks:*",
             "repo:thegoodparty/omni:*",
