@@ -33,8 +33,11 @@ the consumer by a different workflow, and nothing sequences the two.
 - [x] 7. Narrow `github-actions-pulumi-deploy`'s ops trust entry to `main`:
       done (2026-09-25, PR #94. The ops subject moved out of the `StringLike`
       wildcard list into its own `StringEquals` statement, since `sub` under
-      both operators in one statement is ANDed and matches nothing. Other
-      eight repos left wildcarded; a regression test guards the shape).
+      both operators in one statement is ANDed and matches nothing. It also
+      pins `job_workflow_ref` to `deploy.yml@refs/heads/main`, because `sub`
+      alone is per-ref and any workflow on main shares it. Other eight repos
+      left wildcarded; a regression test guards the shape. The
+      `job_workflow_ref` pin came from delegate review).
 - [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
       Depends on 4 being applied.
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being

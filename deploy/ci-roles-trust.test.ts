@@ -38,6 +38,22 @@ describe("githubActionsPulumiDeployTrust", () => {
     ]);
   });
 
+  // `sub` is per-ref, not per-workflow: every workflow on main shares it. The
+  // workflow pin is what stops an added, unreviewed workflow from assuming it.
+  it("pins the ops workflow file as well as the ref", () => {
+    const ops = githubActionsPulumiDeployTrust.Statement.find(
+      (s) =>
+        s.Condition.StringEquals?.[SUBJECT_KEY] ===
+        "repo:thegoodparty/ops:ref:refs/heads/main"
+    );
+    assert.equal(
+      ops?.Condition.StringEquals?.[
+        "token.actions.githubusercontent.com:job_workflow_ref"
+      ],
+      "thegoodparty/ops/.github/workflows/deploy.yml@refs/heads/main"
+    );
+  });
+
   it("keeps no wildcard ops subject", () => {
     assert.equal(
       wildcardSubjects().some((s) =>
