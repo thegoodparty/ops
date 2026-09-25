@@ -36,8 +36,14 @@ workflow at it before narrowing breaks nothing. So every repo is done in that
 order: role, then workflow, then trust.
 
 - [ ] 1. Record this plan: `doing` (role-assumption-workflow, 2026-09-25).
-- [ ] 2. Drop the five archived repositories from the trust list: `todo`.
-      No dependency on anything. Pure removal.
+- [x] 2. Drop the five archived repositories from the trust list: `done`
+      (2026-09-25, role-assumption-workflow. `gp-api`, `people-api`,
+      `election-api`, `runbooks` and `campaign-plan-service`, all confirmed
+      archived against the GitHub API rather than from this table. An archived
+      repository cannot run a workflow, so the entries granted nothing. The
+      stale notes in `ci-roles/policies.ts` are corrected in the same change,
+      and the regression test now names the five so re-adding one is
+      deliberate).
 - [ ] 3. Remove credentials from the three workflows that should not hold
       them: `todo`. Independent of 4 and 5, and worth doing first because it
       shrinks what the later roles have to cover.
