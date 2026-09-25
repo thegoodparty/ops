@@ -78,5 +78,4 @@ An incident can be `FIXING` and owned by a human: the work is at the fixing
 stage, and a person is doing it. Collapsing them would force every reader to
 decode ownership out of a status field.
 
-The detail is in [`architecture.md`](./architecture.md). What to configure
-before it can run is in [`setup.md`](./setup.md).
+The detail is in [`architecture.md`](./architecture.md).
