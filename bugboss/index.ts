@@ -1279,7 +1279,85 @@ export const createBugBoss = async (
     return childSpawn({
       ...ctx,
       env: { ...ctx.env, BUGBOSS_SESSION_REF: sessionRef },
+    }).finally(() => {
+      // After the child, not during it, and deliberately from the session
+      // file rather than from anything the agent reports: a killed agent
+      // never gets to report, and the file is on disk either way. So the
+      // numbers survive exactly the runs you most want them for.
+      void rollUpUsage(ctx.incidentId, sessionRef);
     });
+  };
+
+  /**
+   * Sum the run's token usage onto the incident.
+   *
+   * Tokens rather than dollars. Pricing is per model and changes underneath
+   * us, so a stored dollar figure would be a guess frozen at write time,
+   * while tokens plus `modelId` stay true and multiply out whenever someone
+   * asks. `costUsd` is left unwritten for that reason.
+   */
+  const rollUpUsage = async (
+    incidentId: string,
+    sessionRef: string,
+  ): Promise<void> => {
+    try {
+      const raw = await store.get(sessionRef);
+      if (!raw) return;
+      let tokensIn = 0;
+      let tokensOut = 0;
+      let cacheRead = 0;
+      let cacheWrite = 0;
+      let modelId: string | null = null;
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        let entry: {
+          usage?: {
+            input?: number;
+            output?: number;
+            cacheRead?: number;
+            cacheWrite?: number;
+          };
+          model?: string;
+          modelId?: string;
+        };
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          // A session file is appended a line at a time, so a torn last line
+          // is normal after a kill. Everything before it is still good.
+          continue;
+        }
+        if (entry.usage) {
+          tokensIn += entry.usage.input ?? 0;
+          tokensOut += entry.usage.output ?? 0;
+          cacheRead += entry.usage.cacheRead ?? 0;
+          cacheWrite += entry.usage.cacheWrite ?? 0;
+        }
+        modelId = entry.modelId ?? entry.model ?? modelId;
+      }
+      if (tokensIn + tokensOut + cacheRead + cacheWrite === 0 && !modelId) {
+        return;
+      }
+      await db.withWrite((w: Database.Database) => {
+        w.prepare(
+          `UPDATE incident
+             SET tokensIn = ?, tokensOut = ?, cacheRead = ?, cacheWrite = ?,
+                 modelId = COALESCE(?, modelId)
+           WHERE id = ?`,
+        ).run(tokensIn, tokensOut, cacheRead, cacheWrite, modelId, incidentId);
+      });
+      log("usage_rolled_up", {
+        incidentId,
+        tokensIn,
+        tokensOut,
+        cacheRead,
+        cacheWrite,
+        modelId,
+      });
+    } catch (err: unknown) {
+      // Never fatal. Losing a cost number is not worth failing a run over.
+      alarm("usage_roll_up_failed", { incidentId, error: String(err) });
+    }
   };
 
   const dispatcher = createDispatcher({

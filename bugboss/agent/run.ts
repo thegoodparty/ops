@@ -214,6 +214,12 @@ export const createBossTools = async (args: {
         impactQuery: Type.Optional(
           Type.String({ description: "The query that produced the number, so it is checkable." }),
         ),
+        impactStartedAt: Type.Optional(
+          Type.Number({
+            description:
+              "Epoch millis of the earliest bad event you found, which is when impact began rather than when we were told. Omit it if you cannot point at a specific event; a guess here is worse than nothing.",
+          }),
+        ),
       }),
       execute: async (_id: string, params: unknown) => {
         const response = await args.api.reportRootCause(

@@ -203,6 +203,13 @@ export interface ToolApi {
     explainedSignalIds: string[];
     usersImpacted?: number;
     impactQuery?: string;
+    /**
+     * When impact began, as epoch millis: the earliest bad event the agent
+     * found. Optional, because an agent that cannot pin it down should say
+     * nothing rather than invent one -- time to detect is only worth having
+     * if it is real.
+     */
+    impactStartedAt?: number;
   }): Promise<ToolResponse>;
 
   /** Callable repeatedly. Impact grows during an incident. */

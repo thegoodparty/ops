@@ -56,6 +56,7 @@ const BODIES = {
     explainedSignalIds: z.array(z.string()),
     usersImpacted: z.number().optional(),
     impactQuery: z.string().optional(),
+    impactStartedAt: z.number().int().positive().optional(),
   }),
   impact: z.object({
     usersImpacted: z.number(),

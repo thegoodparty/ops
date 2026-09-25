@@ -140,6 +140,7 @@ const incidentRow = (id: string) =>
     postmortem: string | null;
     usersImpacted: number | null;
     impactQuery: string | null;
+    impactStartedAt: number | null;
     fixingAt: number | null;
     resolvedAt: number | null;
     closedAt: number | null;
@@ -986,5 +987,37 @@ describe("when the database stops taking writes", () => {
       ),
       "the dispatcher will relaunch on this forever, which is nobody's idea of info",
     );
+  });
+});
+
+describe("time to detect", () => {
+  it("records when impact began, separately from when we heard", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    const began = 1_700_000_000_000;
+    await tools.reportRootCause({
+      cause: "the upgrade webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+      impactStartedAt: began,
+    });
+
+    // The gap between this and firstSignalAt is time to detect, and it is the
+    // one number here that measures the alert rules rather than the agents.
+    assert.equal(incidentRow(id)?.impactStartedAt, began);
+  });
+
+  it("leaves it null when the agent cannot point at an event", async () => {
+    await seed("sig-b");
+    const id = await openIncident(["sig-b"]);
+    await toolsFor(id).reportRootCause({
+      cause: "c",
+      explainedSignalIds: ["sig-b"],
+    });
+
+    // A guess would be worse than nothing: an invented start makes the metric
+    // look computed when it is fabricated.
+    assert.equal(incidentRow(id)?.impactStartedAt, null);
   });
 });

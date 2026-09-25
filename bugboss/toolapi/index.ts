@@ -386,7 +386,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           .prepare(
             `UPDATE incident SET status = 'FIXING', rootCause = ?, fixingAt = ?,
                usersImpacted = COALESCE(?, usersImpacted),
-               impactQuery = COALESCE(?, impactQuery)
+               impactQuery = COALESCE(?, impactQuery),
+               impactStartedAt = COALESCE(?, impactStartedAt)
              WHERE id = ? AND status = 'INVESTIGATING' AND owner = 'agent'`,
           )
           .run(
@@ -394,6 +395,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             Date.now(),
             args.usersImpacted ?? null,
             args.impactQuery ?? null,
+            args.impactStartedAt ?? null,
             incidentId,
           ).changes;
         if (taken === 0) return null;
