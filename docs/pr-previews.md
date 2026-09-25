@@ -31,7 +31,8 @@ the consumer by a different workflow, and nothing sequences the two.
       on "Configure AWS Credentials" and "Login to Amazon ECR"; the build's
       base image is public and nothing else in a PR run touches AWS).
 - [ ] 7. Narrow `github-actions-pulumi-deploy`'s ops trust entry to `main`:
-      todo. Depends on 6 being merged.
+      doing (pi-pr-previews, 2026-09-25). Depends on 6 being merged (#90
+      merged 2026-09-25).
 - [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
       Depends on 4 being applied.
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
