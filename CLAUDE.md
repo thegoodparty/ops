@@ -139,7 +139,10 @@ On push to `main`, the GitHub Actions workflow:
 4. Builds and pushes a Docker image to ECR
 5. Runs `pulumi up` via `deploy/deploy.sh`
 
-PRs run type-checking and builds but skip the deploy step.
+PRs run type-checking and builds but skip the deploy step, and run
+`pulumi preview` for the stacks they touch under a scoped read-only role,
+posting the result as a PR comment. See
+[`docs/pr-previews.md`](./docs/pr-previews.md).
 
 Pulumi previews on PRs, under a scoped read-only role, are in progress:
 plan, reasoning and progress checklist in

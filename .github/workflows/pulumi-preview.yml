@@ -1,0 +1,255 @@
+name: Pulumi preview
+
+# Runs `pulumi preview` for the stacks a PR touches and posts the result as a
+# PR comment, under the read-only `github-actions-pulumi-preview` role. Plan,
+# threat model and progress: docs/pr-previews.md, step 5.
+#
+# `pull_request` only, never `pull_request_target`. The latter runs against
+# fork code with the base repo's token, which is exactly the path this role
+# must not be reachable from. Fork PRs are skipped explicitly below even
+# though they cannot obtain an OIDC token.
+#
+# Third-party actions are pinned by commit SHA here, unlike the rest of the
+# repo's workflows: this job holds AWS credentials and runs PR-authored code.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "deploy-org/**"
+      - "delegate/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - ".nvmrc"
+      - ".github/workflows/pulumi-preview.yml"
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+# One run per PR. Preview is read-only and the role is granted no lock
+# objects, so it cannot acquire the state lock and cancelling a superseded run
+# cannot orphan anything. Revisit if lock grants are ever added.
+concurrency:
+  group: pulumi-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-2
+  PREVIEW_ROLE: arn:aws:iam::333022194791:role/github-actions-pulumi-preview
+
+jobs:
+  # Decide which projects the PR touched. GitHub has no per-job `paths`
+  # filter, and a job-level `if` cannot read `matrix`, so the matrix is built
+  # here from the changed files and passed to the preview job.
+  changes:
+    name: Changed projects
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: matrix
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const paths = files.map((f) => f.filename);
+            const any = (re) => paths.some((p) => re.test(p));
+            // Shared inputs any project's preview depends on.
+            const shared =
+              /^(package\.json|package-lock\.json|tsconfig\.json|\.nvmrc|\.github\/workflows\/pulumi-preview\.yml)$/;
+            const matrix = [];
+            if (any(/^(deploy\/|delegate\/)/) || any(shared)) {
+              matrix.push({ project: "ops", dir: "deploy", build: true });
+            }
+            if (any(/^deploy-org\//) || any(shared)) {
+              matrix.push({ project: "org", dir: "deploy-org", build: false });
+            }
+            core.setOutput("value", JSON.stringify(matrix));
+
+  preview:
+    name: ${{ matrix.project }} preview
+    needs: changes
+    if: needs.changes.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # The ops stack's webhook Lambda is a FileArchive of dist/lambda, so the
+      # archive hash is part of the preview. Without the build, every preview
+      # would look like a Lambda code change.
+      - if: matrix.build
+        run: npm run build
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ env.PREVIEW_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Pulumi
+        uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6
+        with:
+          pulumi-version: "^3"
+
+      - name: Preview
+        id: preview
+        working-directory: ${{ matrix.dir }}
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          set -u
+          json="/tmp/${PROJECT}.json"
+          stderr="/tmp/${PROJECT}.stderr"
+          diff="/tmp/${PROJECT}.diff"
+          comment="/tmp/${PROJECT}.comment.md"
+
+          # Pass 1: machine-readable summary and diagnostics.
+          json_status=0
+          PULUMI_MODE=preview PULUMI_PREVIEW_FORMAT=json ./deploy.sh \
+            > "$json" 2> "$stderr" || json_status=$?
+
+          # Pass 2: the human-readable body. Taken even when pass 1 failed,
+          # since its output is then the most useful thing to show.
+          PULUMI_MODE=preview ./deploy.sh > "$diff" 2>> "$stderr" || true
+
+          has_changes=false
+          has_errors=false
+
+          {
+            echo "## Pulumi preview: \`${PROJECT}\`"
+            echo
+          } > "$comment"
+
+          if ! jq -e . "$json" >/dev/null 2>&1; then
+            has_changes=true
+            has_errors=true
+            {
+              echo "⛔ **The preview failed before producing a plan** (exit ${json_status})."
+              echo
+              echo '```'
+              tail -n 40 "$stderr"
+              echo '```'
+            } >> "$comment"
+          else
+            changes=$(jq '[.changeSummary.create, .changeSummary.update, .changeSummary.delete, .changeSummary.replace | values] | add // 0' "$json")
+            errors=$(jq '[.diagnostics // [] | .[] | select(.severity == "error")] | length' "$json")
+
+            if [ "$errors" -gt 0 ]; then
+              has_changes=true
+              has_errors=true
+              {
+                echo "⛔ **${errors} error(s) during preview:**"
+                echo
+                echo '```'
+                jq -r '.diagnostics // [] | .[] | select(.severity == "error") | .message' "$json"
+                echo '```'
+                echo
+              } >> "$comment"
+            fi
+
+            if [ "$changes" -gt 0 ]; then
+              has_changes=true
+              {
+                echo "**$(jq -r '.changeSummary | to_entries | map("\(.value) \(.key)") | join(", ")' "$json")**"
+                echo
+                echo "<details><summary>Show full diff</summary>"
+                echo
+                echo '```diff'
+                # GitHub caps a comment at 65536 characters. Leave room for
+                # the rest of the body rather than failing the API call.
+                diff_bytes=$(wc -c < "$diff")
+                if [ "$diff_bytes" -gt 60000 ]; then
+                  head -c 60000 "$diff"
+                  echo
+                  echo "... truncated at 60000 of ${diff_bytes} bytes; the full diff is in the job log."
+                else
+                  cat "$diff"
+                fi
+                echo '```'
+                echo
+                echo "</details>"
+              } >> "$comment"
+            elif [ "$errors" -eq 0 ]; then
+              echo "✅ No changes" >> "$comment"
+            fi
+          fi
+
+          echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
+          echo "has_errors=$has_errors" >> "$GITHUB_OUTPUT"
+
+      # One comment per project, identified by a marker in its body. Two
+      # parallel jobs each editing a section of one shared comment would race;
+      # a per-project comment needs no coordination.
+      - name: Post or update comment
+        if: steps.preview.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          COMMENT_FILE: /tmp/${{ matrix.project }}.comment.md
+          HAS_CHANGES: ${{ steps.preview.outputs.has_changes }}
+          MARKER: "<!-- pulumi-preview:${{ matrix.project }} -->"
+        with:
+          script: |
+            const fs = require("fs");
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const marker = process.env.MARKER;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+
+            if (process.env.HAS_CHANGES === "false") {
+              if (existing) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
+              }
+              return;
+            }
+
+            const body = `${marker}\n${fs.readFileSync(process.env.COMMENT_FILE, "utf8")}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Fail if the preview reported errors
+        if: steps.preview.outputs.has_errors == 'true'
+        run: |
+          echo "::error::Pulumi preview for ${{ matrix.project }} reported errors. See the PR comment."
+          exit 1
