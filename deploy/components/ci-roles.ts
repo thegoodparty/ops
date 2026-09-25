@@ -4,6 +4,8 @@ import {
   githubActionsOrgDeployTrust,
   githubActionsPulumiDeploy,
   githubActionsPulumiDeployTrust,
+  githubActionsPulumiPreview,
+  githubActionsPulumiPreviewTrust,
   githubActionsWorkbenchDeploy,
   githubActionsWorkbenchDeployTrust,
 } from "./ci-roles/policies";
@@ -110,5 +112,33 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsWorkbenchDeploy),
   });
 
-  return { deployRole, deployPolicy, orgDeployRole, workbenchDeployRole };
+  // The PR preview role. Created rather than imported, and trusted only by
+  // `pull_request` runs in this repo. Its policy is read-only across ops, org
+  // and workbench, which is what makes it safe to hand to an unreviewed
+  // branch: the PR supplies both the workflow and the Pulumi program. See
+  // docs/pr-previews.md, step 4.
+  //
+  // No protect. Nothing outside the preview workflow depends on it yet, and it
+  // should stay easy to correct while step 5 wires that workflow up.
+  const previewRole = new aws.iam.Role("githubActionsPulumiPreview", {
+    name: "github-actions-pulumi-preview",
+    description:
+      "Read-only Pulumi previews for ops, org and workbench from pull_request runs in thegoodparty/ops.",
+    assumeRolePolicy: JSON.stringify(githubActionsPulumiPreviewTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsPulumiPreviewPolicy", {
+    name: "Preview",
+    role: previewRole.id,
+    policy: JSON.stringify(githubActionsPulumiPreview),
+  });
+
+  return {
+    deployRole,
+    deployPolicy,
+    orgDeployRole,
+    workbenchDeployRole,
+    previewRole,
+  };
 };
