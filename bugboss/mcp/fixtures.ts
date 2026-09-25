@@ -32,6 +32,7 @@ export const testConfig = (overrides: Partial<McpConfig> = {}): McpConfig => ({
   publicUrl: PUBLIC_URL,
   mcpPath: "/mcp",
   jwtSecret: "test-secret-not-a-real-one",
+  cimdAllowedOrigins: ["https://claude.ai"],
   google: {
     clientId: GOOGLE_CLIENT_ID,
     clientSecret: "google-client-secret",

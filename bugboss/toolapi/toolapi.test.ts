@@ -11,7 +11,9 @@ import { Db } from "../db";
 import type { Evidence, IncidentView, ToolApi } from "../types";
 import { applyAssign } from "./assign";
 import { createToolApi, type CorrelationMerge } from "./index";
-import { mintAgentToken } from "./token";
+import jwt from "jsonwebtoken";
+
+import { mintAgentToken, verifyAgentToken } from "./token";
 
 const SECRET = "test-secret-not-a-real-one";
 
@@ -60,7 +62,7 @@ const evidence = { load: async () => evidenceRows };
 const toolsFor = (incidentId: string): ToolApi =>
   createToolApi({
     db,
-    token: mintAgentToken(SECRET, { incidentId, attempt: 1 }),
+    token: mintAgentToken(SECRET, { incidentId, attempt: 1 }, 3600),
     tokenSecret: SECRET,
     correlator,
     slack,
@@ -617,7 +619,7 @@ describe("the scoped token", () => {
     const id = await openIncident(["sig-a"]);
     const forged = createToolApi({
       db,
-      token: mintAgentToken("a-different-secret", { incidentId: id, attempt: 1 }),
+      token: mintAgentToken("a-different-secret", { incidentId: id, attempt: 1 }, 3600),
       tokenSecret: SECRET,
       correlator,
       slack,
@@ -762,7 +764,7 @@ describe("hand off", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
       tokenSecret: SECRET,
       correlator,
       slack: {
@@ -793,7 +795,7 @@ describe("hand off", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db: writesDieAfter(0),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
       tokenSecret: SECRET,
       correlator,
       slack,
@@ -877,7 +879,7 @@ describe("getIncident", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
       tokenSecret: SECRET,
       correlator,
       slack,
@@ -935,7 +937,7 @@ describe("when the database stops taking writes", () => {
     });
     const tools = createToolApi({
       db: writesDieAfter(1),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
       tokenSecret: SECRET,
       correlator,
       slack,
@@ -966,7 +968,7 @@ describe("when the database stops taking writes", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db: writesDieAfter(0),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
       tokenSecret: SECRET,
       correlator,
       slack,
@@ -1019,5 +1021,35 @@ describe("time to detect", () => {
     // A guess would be worse than nothing: an invented start makes the metric
     // look computed when it is fabricated.
     assert.equal(incidentRow(id)?.impactStartedAt, null);
+  });
+});
+
+describe("agent tokens expire", () => {
+  it("refuses a token carrying no expiry", () => {
+    // jwt.verify rejects an `exp` in the past but accepts one that is absent,
+    // so a token minted without an expiry would verify forever. The threat is
+    // not the Boss minting one by accident; it is that a child which leaked
+    // its token keeps a working credential against the still-running Boss
+    // long after its incident closed.
+    const forever = jwt.sign({ attempt: 1 }, SECRET, {
+      algorithm: "HS256",
+      audience: "bugboss-toolapi",
+      subject: "42",
+    });
+
+    assert.throws(
+      () => verifyAgentToken(SECRET, forever),
+      /carries no expiry/,
+    );
+  });
+
+  it("refuses a token past its expiry", () => {
+    const expired = mintAgentToken(SECRET, { incidentId: "42", attempt: 1 }, -1);
+    assert.throws(() => verifyAgentToken(SECRET, expired), /invalid agent token/);
+  });
+
+  it("accepts a live one", () => {
+    const live = mintAgentToken(SECRET, { incidentId: "42", attempt: 1 }, 3600);
+    assert.equal(verifyAgentToken(SECRET, live).incidentId, "42");
   });
 });

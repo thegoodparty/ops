@@ -55,6 +55,15 @@ const oauthErrorResponse = (err: unknown): Response => {
   );
 };
 
+/** The origin, or null when the value will not parse as a URL at all. */
+const originOf = (value: string): string | null => {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+};
+
 const invalidRequest = (message: string) =>
   new OAuthError(OAuthErrorCode.InvalidRequest, message);
 
@@ -146,7 +155,27 @@ export const createAuthorizationServer = (deps: {
     if (!clientId) throw invalidRequest("client_id is required");
     const preRegistered = config.preRegisteredClients[clientId];
     if (preRegistered) return { clientId, redirectUris: preRegistered };
-    if (clientId.startsWith("https://")) return resolveViaCimd(clientId);
+    if (clientId.startsWith("https://")) {
+      // A CIMD client_id is a URL this server then fetches, and /authorize is
+      // unauthenticated by design at the start of an OAuth flow. Without an
+      // allowlist any internet caller picks the destination of an outbound
+      // request from inside the VPC, which is a server-side request forgery:
+      // the task has a public IP and unrestricted egress, so that reaches
+      // link-local metadata, internal services, and anything that acts on a
+      // GET.
+      //
+      // Allowlisted by origin, and empty means allow nothing. The spec does
+      // not require accepting an arbitrary URL — which clients are trusted is
+      // a deployment decision, and ours is a short list.
+      const origin = originOf(clientId);
+      if (!origin || !config.cimdAllowedOrigins.includes(origin)) {
+        throw new OAuthError(
+          OAuthErrorCode.InvalidClient,
+          "client_id origin is not permitted",
+        );
+      }
+      return resolveViaCimd(clientId);
+    }
     throw new OAuthError(OAuthErrorCode.InvalidClient, "unknown client_id");
   };
 

@@ -91,6 +91,37 @@ const exec = (command: string, args: string[], cwd?: string): Promise<string> =>
   });
 
 /**
+ * Teach git to authenticate as the GitHub App, for the whole run.
+ *
+ * An installation token is a password against `x-access-token`, so the
+ * natural thing is to embed it in the clone URL — and that is wrong here for
+ * two reasons: it is written into `.git/config` where every later `git`
+ * command and any `git remote -v` in a log will show it, and it freezes a
+ * credential that rotates every twenty minutes, so pushing twelve hours into
+ * an incident would fail against a URL that still holds the launch token.
+ *
+ * A credential helper reads the environment at the moment git asks, so it
+ * always presents the current token and never persists one.
+ */
+export const configureGitCredentials = async (): Promise<void> => {
+  await exec("git", [
+    "config",
+    "--global",
+    "credential.https://github.com.helper",
+    `!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f`,
+  ]);
+  // Without an identity git refuses to commit, and the failure arrives after
+  // the agent has already written the fix.
+  await exec("git", ["config", "--global", "user.name", "bugboss[bot]"]);
+  await exec("git", [
+    "config",
+    "--global",
+    "user.email",
+    "bugboss@goodparty.org",
+  ]);
+};
+
+/**
  * A partial clone, not a shallow one: investigation is half git history, and
  * `--depth 1` is blind to it. Blobs are fetched on demand.
  */
@@ -752,6 +783,8 @@ const keepGitHubTokenFresh = async (): Promise<void> => {
   };
   await refresh();
   setInterval(() => void refresh(), 20 * 60 * 1000).unref();
+  // After the first token exists, so the helper never presents an empty one.
+  await configureGitCredentials();
 };
 
 /**

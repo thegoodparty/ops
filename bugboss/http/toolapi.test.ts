@@ -60,7 +60,7 @@ const authed = (path: string, init: RequestInit = {}) =>
     ...init,
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: INCIDENT, attempt: 1 })}`,
+      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: INCIDENT, attempt: 1 }, 3600)}`,
       ...(init.headers ?? {}),
     },
   });
@@ -161,7 +161,7 @@ test("a directive cannot be consumed out of another incident's queue", async () 
   const crossed = await app.request(`/incidents/inc-other/directives/${remaining.id}`, {
     method: "DELETE",
     headers: {
-      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: INCIDENT, attempt: 1 })}`,
+      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: INCIDENT, attempt: 1 }, 3600)}`,
     },
   });
   assert.equal(crossed.status, 403);
@@ -180,7 +180,7 @@ test("the directive read is scoped by the token like every other route", async (
 
   const crossed = await app.request("/incidents/inc-other/directives", {
     headers: {
-      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: INCIDENT, attempt: 1 })}`,
+      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: INCIDENT, attempt: 1 }, 3600)}`,
     },
   });
   assert.equal(crossed.status, 403);

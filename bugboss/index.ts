@@ -102,6 +102,13 @@ const OPEN_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING", "RESOLVED"];
 
 export const DEFAULT_TRIAGE_MODEL_ID = "us.anthropic.claude-sonnet-5";
 
+/**
+ * How long an agent token outlives the deadline that kills its agent. Wide
+ * enough to cover the child's own handoff grace and the tick the parent waits
+ * before the backstop, so a token never expires under an agent still working.
+ */
+const AGENT_TOKEN_GRACE_SECONDS = 600;
+
 /** Per pass. Each one costs a triage call, so a backlog drains over ticks. */
 const ORPHAN_SWEEP_LIMIT = 25;
 
@@ -783,8 +790,14 @@ export const createBugBoss = async (
   // Process-scoped, so a token cannot outlive the agents it was minted for:
   // a restart kills every child and invalidates every token it handed out.
   const tokenSecret = randomBytes(32).toString("hex");
+  // Sized to the run, not to the process. Restart-scoped revocation does not
+  // cover the case the threat model names — a child leaking its token keeps a
+  // working credential against the still-running Boss — so the token expires
+  // shortly after the deadline that kills the agent holding it.
+  const tokenTtlSeconds =
+    config.dispatcher.agentTimeoutSeconds + AGENT_TOKEN_GRACE_SECONDS;
   const mintToken = (incidentId: string) =>
-    mintAgentToken(tokenSecret, { incidentId, attempt: 0 });
+    mintAgentToken(tokenSecret, { incidentId, attempt: 0 }, tokenTtlSeconds);
 
   const toolApiFor = (incidentId: string, token?: string): ToolApi => {
     const api = createToolApi({

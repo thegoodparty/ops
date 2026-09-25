@@ -27,6 +27,13 @@ export interface McpConfig {
    * publishes its own document; this covers anything that does not.
    */
   preRegisteredClients: Record<string, string[]>;
+  /**
+   * Origins whose CIMD documents this server will fetch. `/authorize` is
+   * unauthenticated, and a CIMD client_id is a URL the server then requests,
+   * so without this any caller chooses the destination of an outbound request
+   * from inside the VPC. Empty allows nothing.
+   */
+  cimdAllowedOrigins: string[];
   accessTokenTtlSeconds: number;
   authCodeTtlSeconds: number;
   /** Lifetime of the signed state we hand Google on the way out. */
@@ -113,6 +120,14 @@ export const mcpConfigFromEnv = (
   },
   workspaceDomain: env.BUGBOSS_WORKSPACE_DOMAIN ?? "goodparty.org",
   preRegisteredClients: parsePreRegisteredClients(env.BUGBOSS_MCP_CLIENTS),
+  // Claude Code is the only client we expect, and it publishes its document
+  // at claude.ai. Widening this is a deliberate act, not a default.
+  cimdAllowedOrigins: (
+    env.BUGBOSS_CIMD_ALLOWED_ORIGINS ?? "https://claude.ai"
+  )
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
   accessTokenTtlSeconds: optionalInt(env, "BUGBOSS_MCP_TOKEN_TTL", 3600),
   authCodeTtlSeconds: optionalInt(env, "BUGBOSS_MCP_CODE_TTL", 60),
   flowStateTtlSeconds: optionalInt(env, "BUGBOSS_MCP_FLOW_TTL", 600),

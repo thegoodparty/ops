@@ -22,16 +22,26 @@ export interface AgentTokenClaims {
 
 export class TokenError extends Error {}
 
+/**
+ * `expiresInSeconds` is required, deliberately.
+ *
+ * It used to be optional and no caller passed one, so every token was good
+ * for the life of the Boss process. The intended revocation was process
+ * scope — a restart rotates the secret — which holds for restarts and not
+ * for the case the threat model actually names: a child that leaks its token
+ * keeps a working credential against the running Boss long after its
+ * incident closed.
+ */
 export const mintAgentToken = (
   secret: string,
   claims: AgentTokenClaims,
-  expiresInSeconds?: number,
+  expiresInSeconds: number,
 ): string =>
   jwt.sign({ attempt: claims.attempt }, secret, {
     algorithm: ALGORITHM,
     audience: AUDIENCE,
     subject: claims.incidentId,
-    ...(expiresInSeconds === undefined ? {} : { expiresIn: expiresInSeconds }),
+    expiresIn: expiresInSeconds,
   });
 
 export const verifyAgentToken = (
@@ -50,6 +60,12 @@ export const verifyAgentToken = (
 
   if (typeof payload === "string" || !payload.sub) {
     throw new TokenError("agent token carries no incident");
+  }
+  // jwt.verify rejects an `exp` in the past but accepts one that is absent, so
+  // a token minted without an expiry would verify forever. Checked here rather
+  // than trusted to the mint site, since this is the gate.
+  if (typeof payload.exp !== "number") {
+    throw new TokenError("agent token carries no expiry");
   }
   return {
     incidentId: payload.sub,

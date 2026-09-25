@@ -327,6 +327,52 @@ describe("/authorize input checks", () => {
     await server.close();
   });
 
+  it("refuses a CIMD client_id from an origin that is not allowlisted", async () => {
+    const { server } = await harness();
+    const { challenge } = pkcePair();
+
+    // /authorize is unauthenticated by design, and a CIMD client_id is a URL
+    // this server then fetches. Without an allowlist the caller picks the
+    // destination of an outbound request from inside the VPC, which reaches
+    // link-local metadata and anything else the task can route to.
+    const res = await server.fetch(
+      new Request(
+        authorizeUrl(
+          {
+            client_id: "https://169.254.170.2/v2/credentials",
+            redirect_uri: REDIRECT_URI,
+          },
+          challenge,
+        ),
+      ),
+    );
+
+    // 401 rather than 400: invalid_client is an authentication failure.
+    assert.equal(res.status, 401);
+    assert.equal(
+      ((await res.json()) as { error: string }).error,
+      "invalid_client",
+    );
+    await server.close();
+  });
+
+  it("refuses a CIMD client_id that is not a URL at all", async () => {
+    const { server } = await harness();
+    const { challenge } = pkcePair();
+
+    const res = await server.fetch(
+      new Request(
+        authorizeUrl(
+          { client_id: "https://", redirect_uri: REDIRECT_URI },
+          challenge,
+        ),
+      ),
+    );
+
+    assert.equal(res.status, 401);
+    await server.close();
+  });
+
   it("refuses an unknown client_id", async () => {
     const { server } = await harness();
     const { challenge } = pkcePair();
