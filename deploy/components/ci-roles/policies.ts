@@ -28,8 +28,8 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
-// Nine repositories. Ops is pinned to `main` and to one workflow file in its
-// own statement; the other eight keep the captured `:*` pattern, which includes
+// Four repositories. Ops is pinned to `main` and to one workflow file in its
+// own statement; the other three keep the captured `:*` pattern, which includes
 // pull_request refs.
 //
 // Why two statements rather than one list. `sub` under both `StringEquals` and
@@ -47,9 +47,22 @@ export type TrustPolicyDocument = {
 //
 // The ops pin is only safe now. It depends on `deploy.yml` no longer requesting
 // credentials on `pull_request` (docs/pr-previews.md step 6, merged as PR #90);
-// before that, a PR run still assumed this role and would now fail. The other
-// eight stay wildcarded on purpose: omni's `publish-experiments.yml` assumes
-// this role on `pull_request`.
+// before that, a PR run still assumed this role and would now fail.
+//
+// Five archived repositories were removed from the wildcard list in step 2 of
+// docs/deploy-role-trust.md: gp-api, people-api, election-api, runbooks and
+// campaign-plan-service. An archived repository cannot run a workflow, so
+// their entries granted nothing and only made the list look load bearing.
+//
+// The three that remain are live and do assume this role. Correcting an
+// earlier version of this comment, which said the other eight stay wildcarded
+// because omni's `publish-experiments.yml` assumes the role on
+// `pull_request`: it does not, and has not since that workflow's publish job
+// was gated to push and workflow_dispatch. What does need `pull_request`
+// today is five other omni workflows and one in gp-terraform-dataplatform.
+// gpvpn is push-only and can be pinned independently. See
+// docs/deploy-role-trust.md for what each one does and the order to narrow
+// them in.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -88,13 +101,8 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
         },
         StringLike: {
           "token.actions.githubusercontent.com:sub": [
-            "repo:thegoodparty/gp-api:*",
-            "repo:thegoodparty/people-api:*",
-            "repo:thegoodparty/election-api:*",
             "repo:thegoodparty/gp-terraform-dataplatform:*",
-            "repo:thegoodparty/campaign-plan-service:*",
             "repo:thegoodparty/gpvpn:*",
-            "repo:thegoodparty/runbooks:*",
             "repo:thegoodparty/omni:*",
           ],
         },
