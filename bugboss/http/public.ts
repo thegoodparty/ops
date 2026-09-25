@@ -1,17 +1,16 @@
-// The public face: the three webhook paths the ALB routes, the health check
-// its target group polls, and the MCP server mounted at its own paths.
+// The public face: the webhook paths the ALB routes, and the health check its
+// target group polls.
 //
-// Design spec: bugboss/docs/architecture.md, "Topology" and "The MCP server". The
-// listener rules in deploy/components/bugboss.ts are an allowlist, so a path
-// added here also has to be added there before anything outside can reach it.
-// /health is the exception: the target group polls the task directly.
+// Design spec: bugboss/docs/architecture.md, "Topology". The listener rules in
+// deploy/components/bugboss.ts are an allowlist, so a path added here also has
+// to be added there before anything outside can reach it. /health is the
+// exception: the target group polls the task directly.
 
 import { Hono } from "hono";
 import type { Context } from "hono";
 
 import { IngestRejected } from "./errors";
 import { classifySlackEvent, type SlackConfig } from "../ingress/slack";
-import type { BugBossMcp } from "../mcp";
 import type { SlackEvent } from "../slack/relay";
 import type { IncomingRequest } from "../types";
 import { makeAlarm, makeLog } from "../logging";
@@ -41,7 +40,6 @@ export interface PublicAppDeps {
   slackEventAccepted: (event: SlackEvent) => Promise<Accepted>;
   /** The same config the slack ingress adapter was built with. */
   slackConfig: SlackConfig;
-  mcp?: BugBossMcp;
 }
 
 const incoming = async (c: Context): Promise<IncomingRequest> => ({
@@ -69,8 +67,7 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
   // thing this system exists not to do. Registered on the app rather than
   // per route so a route added later cannot forget it. The routes that
   // answer 401 return that response rather than throwing, so they do not
-  // come through here, and the MCP sub-app turns its own OAuthErrors into
-  // responses — anything reaching this really is unexpected.
+  // come through here — anything reaching this really is unexpected.
   app.onError((err, c) => {
     alarm("route_failed", {
       method: c.req.method,
@@ -141,8 +138,6 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
     if (event) settle((await deps.slackEventAccepted(event)).settled, "slack");
     return c.json({ ok: true });
   });
-
-  if (deps.mcp) app.route("/", deps.mcp.app);
 
   return app;
 };

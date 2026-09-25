@@ -26,10 +26,9 @@ export interface SessionSync {
 }
 
 /**
- * The one layout. The Slack agent's read_agent_session, the MCP session
- * reader and the S3 lifecycle rule all read this prefix, so a session written
- * anywhere else persists but is invisible to every reader and restores
- * nothing on the next launch.
+ * The one layout. The Slack agent's read_agent_session and the S3 lifecycle
+ * rule both read this prefix, so a session written anywhere else persists but
+ * is invisible to every reader and restores nothing on the next launch.
  */
 export const sessionKeyFor = (incidentId: string): string =>
   `sessions/incident/${incidentId}/session.jsonl`;

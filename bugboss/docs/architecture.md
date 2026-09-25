@@ -17,8 +17,8 @@ correctness bug rather than a tuning choice.
 
 ```
 Grafana ─┐
-Slack  ──┼─► ALB ─► container ──┬─► triage ─► assign ─► dispatcher
-MCP    ──┘                      │                          │
+         ├─► ALB ─► container ──┬─► triage ─► assign ─► dispatcher
+Slack  ──┘                      │                          │
                                 │                          ├─► agent (child)
                                 └─► SQLite ──► S3          ├─► agent (child)
                                     (every write)          └─► … up to 15
@@ -176,7 +176,6 @@ path, not the exceptional one.
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
 | `bedrock/` | A Pi provider over Bedrock `InvokeModel` |
 | `slack/` | Outbound relay and the read-only Slack agent |
-| `mcp/` | The MCP server, Google Workspace OAuth |
 | `http/` | Public routes and the loopback tool API |
 | `db/` | SQLite, and the S3 mirror |
 | `index.ts` | The composition root. The only place real services are named |

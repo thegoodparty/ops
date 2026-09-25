@@ -182,11 +182,7 @@ export const createBugBoss = (config: BugBossConfig) => {
     mostRecent: true,
   });
 
-  // An ALB rather than API Gateway because API Gateway REST renames
-  // `WWW-Authenticate` to `X-Amzn-Remapped-WWW-Authenticate`, which is the one
-  // header MCP OAuth discovery depends on. The ALB passes it through untouched.
-  //
-  // The default action is a 404: the listener rules below are an allowlist, so
+  // The default action is a 404: the listener rule below is an allowlist, so
   // a path that is not routed never reaches the process. Adding an endpoint
   // means adding it here.
   const listener = new aws.lb.Listener("bugbossListener", {
@@ -208,26 +204,10 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
-  // Split across two rules because an ALB rule permits at most five condition
-  // values, not because the two groups behave differently.
   new aws.lb.ListenerRule("bugbossIngressRoutes", {
     listenerArn: listener.arn,
     priority: 10,
-    conditions: [{ pathPattern: { values: ["/grafana", "/slack", "/mcp"] } }],
-    actions: [{ type: "forward", targetGroupArn: targetGroup.arn }],
-    tags: TAGS,
-  });
-
-  new aws.lb.ListenerRule("bugbossOauthRoutes", {
-    listenerArn: listener.arn,
-    priority: 20,
-    conditions: [
-      {
-        pathPattern: {
-          values: ["/.well-known/*", "/authorize", "/callback", "/token"],
-        },
-      },
-    ],
+    conditions: [{ pathPattern: { values: ["/grafana", "/slack"] } }],
     actions: [{ type: "forward", targetGroupArn: targetGroup.arn }],
     tags: TAGS,
   });
@@ -509,7 +489,6 @@ export const createBugBoss = (config: BugBossConfig) => {
           { name: "AWS_DEFAULT_REGION", value: REGION },
           { name: "PORT", value: String(CONTAINER_PORT) },
           { name: "BUGBOSS_BUCKET", value: bucket.bucket },
-          { name: "BUGBOSS_PUBLIC_URL", value: `https://${HOSTNAME}` },
           { name: "BUGBOSS_AGENT_ROLE_ARN", value: agentRole.arn },
         ],
         // The whole secret as one JSON value rather than a key-per-env-var

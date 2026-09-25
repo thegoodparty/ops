@@ -19,7 +19,6 @@ import {
   createBugBoss,
   createMemoryS3,
   installCrashHandlers,
-  mcpConfigFor,
   settingsEnv,
   withSlackDeadline,
   type BugBoss,
@@ -169,7 +168,7 @@ before(async () => {
     // The webhook bodies below carry no real signature, no timestamp and no
     // basic auth, so verification is replaced outright. This seam exists for
     // this file alone; bugBossFromEnv never sets it.
-    insecureTestVerifiers: { grafana: () => {} },
+    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
   });
 });
 
@@ -388,11 +387,20 @@ test("a human bug report resolves without spawning a recurrence", async () => {
     action: "new_incident",
     reason: "nobody has reported this before",
   });
-  const { incidentId } = await boss.reportSignal({
-    text: "The Pro upgrade button does nothing on Safari",
-    reportedBy: "someone@goodparty.org",
-    via: "mcp",
+  const [placed] = await boss.ingest("slack", {
+    headers: {},
+    rawBody: JSON.stringify({
+      type: "event_callback",
+      event: {
+        type: "app_mention",
+        user: "U-reporter",
+        channel: "C0BUGS",
+        ts: "1764000000.000900",
+        text: "<@B0BOSS> report The Pro upgrade button does nothing on Safari",
+      },
+    }),
   });
+  const incidentId = placed.incidentId;
   assert.ok(incidentId, "triage should have placed the report");
 
   const tools = boss.toolApiFor(incidentId!);
@@ -792,26 +800,6 @@ test("the prod-critical allowlist can be delivered in the secret blob", () => {
   // One of exactly three things the design says earns an @, and there is no
   // other way to deliver it: the task definition does not set this.
   assert.deepEqual(cfg.prodCriticalSlugs, ["pro-upgrade-errors", "checkout-5xx"]);
-});
-
-test("the MCP server mounts from the secret blob, or says nothing is set", () => {
-  const settings = {
-    BUGBOSS_PUBLIC_URL: "https://bugboss.goodparty.org/",
-    BUGBOSS_MCP_JWT_SECRET: "jwt",
-    BUGBOSS_GOOGLE_CLIENT_ID: "client",
-    BUGBOSS_GOOGLE_CLIENT_SECRET: "secret",
-  };
-  const mounted = mcpConfigFor(withBlob(settings));
-  assert.ok(mounted, "the whole OAuth leg is configured, so it mounts");
-  assert.equal(mounted?.publicUrl, "https://bugboss.goodparty.org");
-  assert.equal(mounted?.google.clientId, "client");
-
-  const { BUGBOSS_GOOGLE_CLIENT_SECRET: _omitted, ...half } = settings;
-  assert.equal(
-    mcpConfigFor(withBlob(half)),
-    undefined,
-    "half configured answers discovery and then cannot finish a login",
-  );
 });
 
 // --- the process does not die quietly --------------------------------------

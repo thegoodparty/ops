@@ -1,6 +1,6 @@
-// Two listeners, deliberately. The public one carries the webhooks, the MCP
-// endpoint and the health check; the loopback one carries the agent tool API
-// and is bound to 127.0.0.1 so it has no route from outside the task at all.
+// Two listeners, deliberately. The public one carries the webhooks and the
+// health check; the loopback one carries the agent tool API and is bound to
+// 127.0.0.1 so it has no route from outside the task at all.
 // The per-incident token is the boundary that matters, but binding is free.
 
 import { makeLog } from "../logging";

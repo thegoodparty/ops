@@ -16,7 +16,6 @@ This file is what you need before editing anything here.
 | The incident agent, its tools, resume | [`agent/CLAUDE.md`](./agent/CLAUDE.md) |
 | The Bedrock provider | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
 | Threads, relay, the Slack agent | [`slack/CLAUDE.md`](./slack/CLAUDE.md) |
-| The MCP server or its OAuth | [`mcp/CLAUDE.md`](./mcp/CLAUDE.md) |
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
 
