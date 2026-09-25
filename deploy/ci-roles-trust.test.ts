@@ -63,24 +63,20 @@ describe("githubActionsPulumiDeployTrust", () => {
     );
   });
 
-  // Left wildcarded on purpose: these repos assume the role on pull_request.
-  it("leaves the other eight repositories wildcarded", () => {
-    const wildcards = wildcardSubjects();
-    for (const repo of [
-      "gp-api",
-      "people-api",
-      "election-api",
-      "gp-terraform-dataplatform",
-      "campaign-plan-service",
-      "gpvpn",
-      "runbooks",
-      "omni",
-    ]) {
-      assert.ok(
-        wildcards.includes(`repo:thegoodparty/${repo}:*`),
-        `expected a wildcard subject for ${repo}`
-      );
-    }
+  // Exact equality, not inclusion: these eight assume the role on
+  // pull_request and must stay, but a ninth added to this near-admin role's
+  // trust should fail the test rather than pass silently.
+  it("leaves exactly the other eight repositories wildcarded", () => {
+    assert.deepEqual(wildcardSubjects(), [
+      "repo:thegoodparty/gp-api:*",
+      "repo:thegoodparty/people-api:*",
+      "repo:thegoodparty/election-api:*",
+      "repo:thegoodparty/gp-terraform-dataplatform:*",
+      "repo:thegoodparty/campaign-plan-service:*",
+      "repo:thegoodparty/gpvpn:*",
+      "repo:thegoodparty/runbooks:*",
+      "repo:thegoodparty/omni:*",
+    ]);
   });
 
   it("requires the sts audience on every statement", () => {
