@@ -36,13 +36,22 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
+      # No AWS credentials on pull_request. The docker build uses the public
+      # `node:22-alpine` base image, and both the ECR push and the deploy are
+      # already skipped, so nothing before `main` needs the deploy role. This
+      # role is near-admin (`sso:*`, `iam:*Role*`, `s3:*`,
+      # `secretsmanager:*`), and a PR run executes PR-authored code, so it must
+      # not be reachable from an unreviewed branch. See `docs/pr-previews.md`,
+      # steps 6 and 7.
       - name: Configure AWS Credentials
+        if: ${{ github.event_name != 'pull_request' }}
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-pulumi-deploy
           aws-region: us-west-2
 
       - name: Login to Amazon ECR
+        if: ${{ github.event_name != 'pull_request' }}
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Install Pulumi
