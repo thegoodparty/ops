@@ -822,6 +822,8 @@ describe("the spawned environment", () => {
     const { toolApiFor } = makeTools(sqlite);
     insertIncident(sqlite, "i1");
 
+    process.env.SLACK_BOT_TOKEN = "xoxb-parent-only";
+
     const held = heldSpawn();
     const d = createDispatcher(
       deps({
@@ -843,13 +845,18 @@ describe("the spawned environment", () => {
       "/v2/credentials/task-role",
       "the child resolves the task role through the container provider",
     );
-    assert.equal(env.SLACK_BOT_TOKEN, undefined, "only the named sources reach a child");
+    assert.equal(
+      env.SLACK_BOT_TOKEN,
+      undefined,
+      "the parent's own credentials are not part of the allowlist",
+    );
     assert.equal(env.GITHUB_TOKEN, "ghs_agent");
     assert.equal(env.BUGBOSS_TOKEN, "tok-i1");
     assert.equal(env.BUGBOSS_INCIDENT_ID, "i1");
 
     held.releaseAll();
     await d.drain();
+    delete process.env.SLACK_BOT_TOKEN;
     cleanup();
   });
 
