@@ -34,12 +34,32 @@ describe("agentInlinePolicy", () => {
     const objectActions = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"];
     const granted = objectActions.flatMap(resourcesFor);
 
+    // Without this the loop below passes on an empty list, which is how a test
+    // that enforces a boundary quietly stops enforcing anything.
+    assert.ok(granted.length > 0, "no object grants found — the check is vacuous");
+
     for (const resource of granted) {
       assert.ok(
         resource.startsWith("arn:aws:s3:::bugboss-prod/sessions/"),
         `object access to ${resource} reaches outside sessions/`,
       );
     }
+  });
+
+  // Resume reads the session back before the first turn. Asserting the write
+  // alone would let a missing read pass, and a missing read is not visible
+  // until a container restart fails to resume an incident already underway.
+  it("lets the agent read its own transcript back", () => {
+    assert.deepEqual(resourcesFor("s3:GetObject"), [
+      "arn:aws:s3:::bugboss-prod/sessions/*",
+    ]);
+  });
+
+  // Not granted today. Stated rather than assumed, because the boundary check
+  // above iterates whatever is granted and would say nothing about a delete
+  // that nobody added yet.
+  it("cannot delete anything in the bucket", () => {
+    assert.deepEqual(resourcesFor("s3:DeleteObject"), []);
   });
 
   it("grants no blanket object access to the bucket", () => {
