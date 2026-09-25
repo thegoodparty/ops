@@ -4,16 +4,14 @@
 // union: a new source is an adapter and a registry entry, not a type change.
 //
 // Note that a registry key is the INGRESS CHANNEL, while Signal.source is the
-// signal taxonomy, and the two differ for one pair on purpose. The "slack" and
-// "human" adapters both emit signals with source "human" — the spec says a
-// report is the same signal whether it arrived by @bugboss or by MCP — so
-// their dedup keys collide, which is what stops one report from opening two
-// incidents when it arrives down both paths.
+// signal taxonomy, and the two differ for one pair on purpose. The "slack"
+// adapter emits signals with source "human", so the orphan sweep needs a
+// "human" entry to look one up by before it can re-place it.
 
 import type { SignalAdapter } from "../types";
 
 import { createGrafanaAdapter, type GrafanaConfig } from "./grafana";
-import { createHumanAdapter, type HumanConfig } from "./human";
+import { createHumanAdapter } from "./human";
 import { createSlackAdapter, type SlackConfig } from "./slack";
 
 export interface IngressRegistry {
@@ -53,7 +51,6 @@ export const createIngressRegistry = (
 export interface IngressConfig {
   grafana?: GrafanaConfig;
   slack?: SlackConfig;
-  human?: HumanConfig;
 }
 
 /** The three adapters BugBoss launches with. */
@@ -61,7 +58,7 @@ export const createIngress = (config: IngressConfig = {}): IngressRegistry =>
   createIngressRegistry([
     createGrafanaAdapter(config.grafana),
     createSlackAdapter(config.slack),
-    createHumanAdapter(config.human),
+    createHumanAdapter(),
   ]);
 
 export {
@@ -109,9 +106,8 @@ export {
   HUMAN_SOURCE,
   NEVER_SUPPRESS_LABEL,
   RESOLUTION_POLICY_LABEL,
-  REPORTED_VIA_LABEL,
   SLACK_CHANNEL_LABEL,
   SLACK_THREAD_TS_LABEL,
   SLACK_MESSAGE_TS_LABEL,
 } from "./human";
-export type { HumanConfig, HumanReport, ReportedVia } from "./human";
+export type { HumanReport } from "./human";

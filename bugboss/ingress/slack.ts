@@ -274,7 +274,6 @@ export const createSlackAdapter = (config: SlackConfig = {}): SignalAdapter => {
         humanSignal({
           text: report,
           reportedBy: message.user,
-          via: "slack",
           channel: message.channel,
           threadTs: message.threadTs,
           messageTs: message.ts,
@@ -283,8 +282,8 @@ export const createSlackAdapter = (config: SlackConfig = {}): SignalAdapter => {
       ];
     },
 
-    // Keys off signal.source, which humanSignal sets to "human" — so the same
-    // report arriving over Slack and over MCP cannot open two incidents.
+    // Keys off signal.source, which humanSignal sets to "human", so a retried
+    // delivery of the same message cannot open two incidents.
     dedupKey: (signal) => `${signal.source}:${signal.sourceId}`,
 
     prefetchEvidence: async (): Promise<Evidence[]> => [],

@@ -54,8 +54,8 @@ queues behind the write queue's synchronous S3 PUT.
 
 ## Sessions and resume
 
-One layout: `sessions/incident/<id>/session.jsonl`, which the Slack agent,
-the MCP reader and the S3 lifecycle rule all expect. `BUGBOSS_SESSION_REF`
+One layout: `sessions/incident/<id>/session.jsonl`, which the Slack agent
+and the S3 lifecycle rule both expect. `BUGBOSS_SESSION_REF`
 is **required** — there is no fallback, because the old default wrote to a
 key nothing read, producing a session that appeared to persist and restored
 nothing.

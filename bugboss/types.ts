@@ -37,7 +37,7 @@ export interface Signal {
   title: string;
   body: string;
   labels: Record<string, string>;
-  /** Who filed it: a Slack user id, or a Google email via MCP. Null for machine sources. */
+  /** Who filed it: a Slack user id. Null for machine sources. */
   reportedBy: string | null;
   openedAt: number;
   closedAt: number | null;

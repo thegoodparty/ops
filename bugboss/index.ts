@@ -42,7 +42,6 @@ import {
   type SlackConfig,
   type SlackVerifier,
 } from "./ingress";
-import { humanSignal } from "./ingress/human";
 import {
   createPublicApp,
   createToolApiRoutes,
@@ -53,10 +52,6 @@ import {
   type BugBossServers,
   type HttpConfig,
 } from "./http";
-import { createMcpServer } from "./mcp";
-import type { BugBossMcp, HumanBugReport, McpConfig, ReportSignalResult } from "./mcp";
-import { mcpConfigFromEnv } from "./mcp/config";
-import { createS3SessionStore } from "./mcp/sessions";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
 import {
   createRotationReader,
@@ -126,9 +121,9 @@ const TRIAGE_CONCURRENCY = 5;
 
 /**
  * Where an incident agent's session lives. Chunk 5's own default writes to
- * `sessions/<id>.jsonl`, but the Slack agent's read_agent_session tool, the
- * MCP session reader and the S3 lifecycle rule all read
- * `sessions/incident/<id>/`, so the launch below passes this explicitly.
+ * `sessions/<id>.jsonl`, but the Slack agent's read_agent_session tool and
+ * the S3 lifecycle rule both read `sessions/incident/<id>/`, so the launch
+ * below passes this explicitly.
  */
 export const incidentSessionKey = (incidentId: string): string =>
   `sessions/incident/${incidentId}/session.jsonl`;
@@ -190,8 +185,6 @@ export interface CreateBugBossOptions {
   /** Overrides the default harness the Slack agent runs on. */
   slackAgentModel?: SlackAgentModel;
   secrets?: BugBossSecrets;
-  /** Absent means the MCP server is not mounted. */
-  mcpConfig?: McpConfig;
   http?: HttpConfig;
   /**
    * TEST ONLY. Replaces webhook signature verification outright, which is how
@@ -246,7 +239,7 @@ export interface BugBoss {
   readonly dispatcher: Dispatcher;
   readonly relay: SlackRelay;
   readonly ingress: IngressRegistry;
-  /** Webhooks, health and MCP. start() binds it; it is servable on its own. */
+  /** Webhooks and health. start() binds it; it is servable on its own. */
   readonly publicApp: Hono;
   /** The agent tool API. Bound to 127.0.0.1 by start(). */
   readonly loopbackApp: Hono;
@@ -261,8 +254,6 @@ export interface BugBoss {
   slackEvent(event: SlackEvent): Promise<void>;
   /** Relay now, answer after. What the webhook route calls. */
   slackEventAccepted(event: SlackEvent): Promise<AcceptedSlackEvent>;
-  /** The MCP report_signal tool. Same path a Slack report takes. */
-  reportSignal(report: HumanBugReport): Promise<ReportSignalResult>;
   /** One dispatcher tick, waited out. Agents normally outlive a tick. */
   dispatchOnce(): Promise<TickResult>;
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
@@ -625,7 +616,6 @@ export const createBugBoss = async (
       loki: options.loki,
     },
     slack: slackIngress,
-    human: {},
   });
 
   // -------------------------------------------------------------------------
@@ -1055,31 +1045,6 @@ export const createBugBoss = async (
     };
   };
 
-  const place = async (
-    signal: RawSignal,
-    adapter: SignalAdapter,
-  ): Promise<PlacedSignal> => {
-    const recorded = await recordSignal(signal);
-    if (!recorded.needsPlacement) {
-      log("duplicate_signal", {
-        signalId: recorded.id,
-        source: signal.source,
-        sourceId: signal.sourceId,
-      });
-      return {
-        signalId: recorded.id,
-        incidentId: recorded.incidentId,
-        action: "duplicate",
-        reason: "already ingested",
-      };
-    }
-    try {
-      return await placeRecorded(recorded.id, signal, adapter);
-    } finally {
-      placing.delete(recorded.id);
-    }
-  };
-
   const ingestAccepted = async (
     source: string,
     req: IncomingRequest,
@@ -1239,21 +1204,6 @@ export const createBugBoss = async (
       }
     }
     return replaced;
-  };
-
-  const reportSignal = async (
-    report: HumanBugReport,
-  ): Promise<ReportSignalResult> => {
-    const result = await place(
-      humanSignal({
-        text: report.text,
-        reportedBy: report.reportedBy,
-        via: "mcp",
-      }),
-      ingress.get("human"),
-    );
-    if (!result.signalId) throw new Error(`report_signal failed: ${result.reason}`);
-    return { signalId: result.signalId, incidentId: result.incidentId };
   };
 
   // -------------------------------------------------------------------------
@@ -1581,23 +1531,10 @@ export const createBugBoss = async (
   // Servers and timers
   // -------------------------------------------------------------------------
 
-  let mcp: BugBossMcp | undefined;
-  if (options.mcpConfig) {
-    mcp = createMcpServer({
-      config: options.mcpConfig,
-      db,
-      sessions: createS3SessionStore({ bucket: config.s3Bucket, s3 }),
-      reportSignal,
-    });
-  } else {
-    log("mcp_not_configured");
-  }
-
   const publicApp = createPublicApp({
     ingestAccepted,
     slackEventAccepted,
     slackConfig: slackIngress,
-    mcp,
   });
   const loopbackApp = createToolApiRoutes({
     db,
@@ -1642,7 +1579,6 @@ export const createBugBoss = async (
     resolutionTimer = null;
     servers?.close();
     servers = null;
-    void mcp?.close().catch(() => undefined);
     db.close();
     log("stopped");
   };
@@ -1660,7 +1596,6 @@ export const createBugBoss = async (
     ingestAccepted,
     slackEvent,
     slackEventAccepted,
-    reportSignal,
     dispatchOnce,
     sweepOrphans,
     ensureIncidentThreads,
@@ -1679,8 +1614,8 @@ export const createBugBoss = async (
  * carries a given key is an operational choice rather than a code one. The
  * only way to keep that true is for nothing downstream to read process.env
  * directly: a call site that does silently ignores the blob, which is how the
- * MCP server and the prod-critical allowlist ended up permanently off with no
- * error to find. Blob wins, so a secret can override a task definition.
+ * prod-critical allowlist ended up permanently off with no error to find.
+ * Blob wins, so a secret can override a task definition.
  */
 export const settingsEnv = (
   base: NodeJS.ProcessEnv = process.env,
@@ -1744,18 +1679,6 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
 };
 
 /**
- * Only mounted when the whole OAuth leg is configured. A half-configured MCP
- * server answers discovery and then cannot complete a login.
- */
-export const mcpConfigFor = (env: NodeJS.ProcessEnv): McpConfig | undefined =>
-  env.BUGBOSS_PUBLIC_URL &&
-  env.BUGBOSS_MCP_JWT_SECRET &&
-  env.BUGBOSS_GOOGLE_CLIENT_ID &&
-  env.BUGBOSS_GOOGLE_CLIENT_SECRET
-    ? mcpConfigFromEnv(env)
-    : undefined;
-
-/**
  * The container entrypoint. Nothing here is reachable from a test, which is
  * deliberate: this is the only place a real Slack workspace, a real bucket
  * and a real model are named, and the only place that must never be handed a
@@ -1788,7 +1711,6 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       : undefined,
     s3: new S3Client({}),
     secrets,
-    mcpConfig: mcpConfigFor(env),
     http: {
       publicPort: Number(env.PORT ?? DEFAULT_PUBLIC_PORT),
       loopbackPort: Number(env.BUGBOSS_LOOPBACK_PORT ?? DEFAULT_LOOPBACK_PORT),

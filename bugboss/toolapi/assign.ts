@@ -28,7 +28,7 @@ import type {
 
 /**
  * Who is asking. An agent is confined to its own incident; the Boss (triage,
- * correlation) and a human acting through Slack or MCP are not.
+ * correlation) and a human acting through Slack are not.
  */
 export type AssignActor =
   | { kind: "agent"; incidentId: string }
