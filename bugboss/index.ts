@@ -34,8 +34,10 @@ import {
 } from "./dispatcher";
 import {
   createIngress,
+  createLokiQuery,
   SLUG_LABEL,
   type GrafanaVerifier,
+  type LokiQuery,
   type IngressRegistry,
   type SlackConfig,
   type SlackVerifier,
@@ -171,6 +173,12 @@ export interface CreateBugBossOptions {
    * which is the honest state rather than a default worth inventing.
    */
   rotationMembers?: () => Promise<string[] | null>;
+  /**
+   * Runs an alert's known-cause LogQL. Injected rather than constructed here
+   * because its credentials arrive in the secret blob, which only the
+   * entrypoint has merged.
+   */
+  loki?: LokiQuery;
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
   model: ModelClient;
   slack: SlackClient;
@@ -614,6 +622,7 @@ export const createBugBoss = async (
       secret: secrets.grafanaWebhookSecret,
       basicAuthPassword: secrets.grafanaBasicAuthPassword,
       verifier: options.insecureTestVerifiers?.grafana,
+      loki: options.loki,
     },
     slack: slackIngress,
     human: {},
@@ -743,9 +752,15 @@ export const createBugBoss = async (
     );
     if (rows.length === 0) return [];
 
+    // Scoped to the incidents just selected, not every attached signal ever.
+    // Unbounded, this grows with every incident the system has ever closed,
+    // and it runs once per inbound signal.
     const titles = new Map<string, string[]>();
     for (const row of db.query<{ incidentId: string; title: string }>(
-      "SELECT incidentId, title FROM signal WHERE incidentId IS NOT NULL ORDER BY openedAt, id",
+      `SELECT incidentId, title FROM signal
+       WHERE incidentId IN (${rows.map(() => "?").join(",")})
+       ORDER BY openedAt, id`,
+      rows.map((row) => row.id),
     )) {
       const list = titles.get(row.incidentId) ?? [];
       list.push(row.title);
@@ -1759,6 +1774,10 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       region: secrets.awsRegion,
     }),
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
+    // The merged env, not process.env: Loki's credentials come from the
+    // secret blob, and settingsEnv builds a new object rather than mutating
+    // the process.
+    loki: createLokiQuery(env),
     // Only when a rotation group exists. Until one does, every incident
     // records "not known", which is true.
     rotationMembers: secrets.slackRotationGroupId

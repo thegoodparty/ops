@@ -120,6 +120,12 @@ export const buildChildEnv = (input: ChildEnvInput): ChildEnv => {
   env.AWS_SESSION_TOKEN = input.aws.sessionToken;
   if (input.aws.expiresAt) {
     env.BUGBOSS_CREDENTIALS_EXPIRE_AT = String(input.aws.expiresAt);
+    // The SDK's env provider reads this to know when to re-resolve. Without
+    // it the initial credentials look permanent, so if the child's first
+    // refresh against the Boss fails, the SDK keeps presenting them past
+    // their expiry and the failure surfaces as a Bedrock rejection rather
+    // than as the credential problem it is.
+    env.AWS_CREDENTIAL_EXPIRATION = new Date(input.aws.expiresAt).toISOString();
   }
 
   env.BUGBOSS_INCIDENT_ID = input.incidentId;

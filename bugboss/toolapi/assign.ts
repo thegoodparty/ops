@@ -61,7 +61,14 @@ export class AssignError extends Error {}
 
 const log = makeLog("toolapi");
 
-const OPEN_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING"];
+/**
+ * Statuses a signal may be attached to. Narrower than the set the dispatcher
+ * and triage digest call open, which includes RESOLVED — an incident can
+ * still have an agent on it writing a post-mortem while being closed to new
+ * signals. Named for what it gates rather than "open" so the two cannot be
+ * mistaken for each other, which is what `triage.ts` already calls ATTACHABLE.
+ */
+const ATTACHABLE_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING"];
 
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
 
@@ -217,7 +224,7 @@ export const assign = (
     // evidence the resolution was wrong, so it belongs to a recurrence and
     // not to the incident that claimed the ground. Triage judges that; this
     // is the single writer that holds it.
-    if (!OPEN_STATUSES.includes(existing.status)) {
+    if (!ATTACHABLE_STATUSES.includes(existing.status)) {
       throw new AssignError(
         `incident ${req.target} is ${existing.status} and cannot take signals`,
       );
@@ -265,7 +272,7 @@ export const assign = (
       if (left.n > 0) continue;
 
       const row = getIncidentRow(db, source);
-      if (!row || !OPEN_STATUSES.includes(row.status)) continue;
+      if (!row || !ATTACHABLE_STATUSES.includes(row.status)) continue;
 
       db.prepare(
         "UPDATE incident SET status = 'MERGED', mergedInto = ? WHERE id = ?",
@@ -281,7 +288,7 @@ export const assign = (
     !(actor.kind === "agent" && actor.incidentId === target);
   if (movedIntoRunningAgent) {
     const row = getIncidentRow(db, target);
-    if (row && row.owner === "agent" && OPEN_STATUSES.includes(row.status)) {
+    if (row && row.owner === "agent" && ATTACHABLE_STATUSES.includes(row.status)) {
       pushDirective(db, target, {
         type: "new_signals",
         count: moved.length,

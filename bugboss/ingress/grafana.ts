@@ -274,18 +274,31 @@ export const linesFrom = (payload: unknown): string[] => {
  * The default Loki client. Credentials are read at call time rather than at
  * import, so this module stays importable in a test that has no Loki.
  */
-export const createLokiQuery = (): LokiQuery => async (logql, options) => {
-  const base = process.env.LOKI_URL;
-  const user = process.env.LOKI_USER;
-  const token = process.env.LOKI_TOKEN;
+/**
+ * Takes an env rather than reading `process.env`, because the values it
+ * wants live in the `BUGBOSS_SECRETS` blob and `settingsEnv()` merges that
+ * into a new object without mutating the process. Reading the process
+ * directly makes blob-supplied Loki credentials invisible, and the symptom
+ * is "Loki credentials are not configured" on values that are configured.
+ */
+export const createLokiQuery = (
+  env: NodeJS.ProcessEnv = process.env,
+): LokiQuery => async (logql, options) => {
+  const base = env.LOKI_URL;
+  const user = env.LOKI_USER;
+  const token = env.LOKI_TOKEN;
   if (!base || !user || !token) {
     throw new Error("Loki credentials are not configured");
   }
 
   const params = new URLSearchParams({
     query: logql,
-    start: String(Math.trunc(options.start * 1_000_000)),
-    end: String(Math.trunc(options.end * 1_000_000)),
+    // BigInt because epoch-millis times a million lands outside the safe
+    // integer range. Today's values survive it only because the factor of
+    // 2^6 keeps the mantissa short enough, which is an accident of the
+    // arithmetic rather than a property worth depending on.
+    start: (BigInt(Math.trunc(options.start)) * 1_000_000n).toString(),
+    end: (BigInt(Math.trunc(options.end)) * 1_000_000n).toString(),
     limit: String(options.limit),
     // Newest first, so a truncated result is the recent end of the window
     // rather than an arbitrary slice of it.

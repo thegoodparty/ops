@@ -656,14 +656,25 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         );
       }
 
-      // Not guarded on owner. A human claiming the incident in Slack flips
-      // owner first, and the agent's last act is still to write the brief.
       try {
-        await db.withWrite((w) => {
-          w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(
-            incidentId,
-          );
-        });
+        const taken = await db.withWrite((w) =>
+          w
+            .prepare(
+              // Guarded on status, deliberately not on owner: a human who
+              // claimed the incident in Slack already flipped owner, and the
+              // agent's last act is still to write the brief.
+              //
+              // The status guard is the TOCTOU fix. Between the check above
+              // and this write, reportAnalysis or a merge can move the
+              // incident to a terminal state, and no CHECK constraint
+              // involves owner — so without it the write succeeds and hands
+              // a person an incident that is already closed.
+              `UPDATE incident SET owner = 'human'
+                 WHERE id = ? AND status NOT IN ('CLOSED', 'MERGED')`,
+            )
+            .run(incidentId).changes,
+        );
+        if (taken === 0) return raced(incidentId, "handOff");
       } catch (err) {
         // A person has just read a hand-off brief, so they believe this is
         // theirs, while the row still says otherwise and the dispatcher will

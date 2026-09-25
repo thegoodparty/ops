@@ -817,6 +817,42 @@ describe("hand off", () => {
     );
   });
 
+  it("refuses to hand off an incident that closed while the brief was posting", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = createToolApi({
+      db,
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
+      tokenSecret: SECRET,
+      correlator,
+      slack: {
+        // The TOCTOU window is exactly this await: the status read happens
+        // before the post, the write after it.
+        post: async (threadTs: string | null, text: string) => {
+          await db.withWrite((w) => {
+            w.prepare(
+              `UPDATE incident
+                  SET status = 'CLOSED', resolvedAt = 1, closedAt = 1, postmortem = 'x'
+                WHERE id = ?`,
+            ).run(id);
+          });
+          return slack.post(threadTs, text);
+        },
+      },
+      evidence,
+    });
+
+    const res = await tools.handOff({ reason: "the fix touches auth", brief: "b" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /lost a race/);
+    assert.equal(
+      incidentRow(id)?.owner,
+      "agent",
+      "a closed incident is not something to put on a person's plate",
+    );
+  });
+
   it("stops triage attaching new signals to what a human took", async () => {
     await seed("sig-a");
     await seed("sig-b");
