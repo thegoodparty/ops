@@ -632,9 +632,13 @@ version v17 it has no `organizations:` statement and no `sts:AssumeRole`
 statement. Its attached `ReadOnlyAccess` covers every Organizations read we
 need, including `DescribeCreateAccountStatus`, but no writes.
 
-We are not widening it. Its trust policy accepts nine repositories, each as
-`repo:thegoodparty/<name>:*`, which matches any ref including `pull_request`
-refs:
+We are not widening it for the organization writes. (It has since been given
+`AdministratorAccess` outright, which is a different decision reached by the
+same reasoning as the honest caveat below: the enumerated policy was never a
+boundary, only a source of failed deploys. The scoped roles this section
+argues for still stand, and the boundary work moves to the trust policy.) Its
+trust policy accepts nine repositories, each as `repo:thegoodparty/<name>:*`,
+which matches any ref including `pull_request` refs:
 
 ```
 gp-api, people-api, election-api, gp-terraform-dataplatform,

@@ -15,6 +15,7 @@ const ACCOUNT_ID = "333022194791";
 const DEPLOY_ROLE_NAME = "github-actions-pulumi-deploy";
 const DEPLOY_POLICY_ARN = `arn:aws:iam::${ACCOUNT_ID}:policy/GitHubActionsPulumiDeployPolicy`;
 const READ_ONLY_ACCESS_ARN = "arn:aws:iam::aws:policy/ReadOnlyAccess";
+const ADMINISTRATOR_ACCESS_ARN = "arn:aws:iam::aws:policy/AdministratorAccess";
 
 /**
  * Brings the CI deploy role under Pulumi.
@@ -46,8 +47,14 @@ export const createCiRoles = () => {
 
   // No protect on the policy document itself: this is the thing we now
   // deliberately edit in-repo, the same reasoning identity-center.ts applies
-  // to its inline policies. Deletion is blocked a second way regardless, by
-  // iam:DeletePolicy being absent from the role's own grants.
+  // to its inline policies.
+  //
+  // Superseded by the AdministratorAccess attachment below, and still here on
+  // purpose. Removing it has to be its own change, because the run that
+  // applies the removal authenticates with this policy and this policy has no
+  // iam:DeletePolicy: the call would 403 and take the whole update with it.
+  // Only once admin is attached does the role hold the grant its own policy's
+  // deletion needs.
   const deployPolicy = new aws.iam.Policy(
     "githubActionsPulumiDeployPolicy",
     {
@@ -57,7 +64,7 @@ export const createCiRoles = () => {
     { import: DEPLOY_POLICY_ARN },
   );
 
-  // Attachments are protected: detaching either one strips the role's
+  // Attachments are protected: detaching any one of them strips the role's
   // permissions without deleting anything, which is the quiet version of the
   // lockout above.
   new aws.iam.RolePolicyAttachment(
@@ -70,6 +77,29 @@ export const createCiRoles = () => {
     "githubActionsPulumiDeployReadOnlyAttachment",
     { role: deployRole.name, policyArn: READ_ONLY_ACCESS_ARN },
     { import: `${DEPLOY_ROLE_NAME}/${READ_ONLY_ACCESS_ARN}`, protect: true },
+  );
+
+  // AdministratorAccess is what the role actually runs on from here. The
+  // enumerated policy above was never a boundary: it grants iam:PutRolePolicy
+  // on "*", so the role can attach itself an inline document granting
+  // anything, and SelfManageDeployPolicy lets it publish new versions of its
+  // own managed policy. It could already grant itself admin in one call.
+  //
+  // What the enumeration did instead was break honest deploys. A missing
+  // iam:UpdateRoleDescription failed a run on main (see the comment on that
+  // action in ci-roles/policies.ts); a missing iam:UpdateRole failed another
+  // when a role's MaxSessionDuration changed. `pulumi up` is all-or-nothing,
+  // so one 403 on a cosmetic field discards an otherwise good update, and the
+  // fix is always the same red-then-green policy PR.
+  //
+  // The boundary belongs on who may assume the role, which is the trust
+  // policy in ci-roles/policies.ts. Eight repositories are still wildcarded
+  // there on `:*`, which includes pull_request refs; narrowing that is the
+  // follow-up this change makes worth doing.
+  new aws.iam.RolePolicyAttachment(
+    "githubActionsPulumiDeployAdminAttachment",
+    { role: deployRole.name, policyArn: ADMINISTRATOR_ACCESS_ARN },
+    { protect: true },
   );
 
   // The two scoped roles below are created, not imported, and are trusted by

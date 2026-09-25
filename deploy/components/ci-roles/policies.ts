@@ -103,6 +103,13 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   ],
 };
 
+// Superseded, and kept only until it can be deleted safely. The role now
+// carries the AWS-managed AdministratorAccess as well (ci-roles.ts), so this
+// document no longer decides anything and should not accrue new actions: an
+// action missing here stopped being an AccessDenied the moment admin
+// attached. The comment on `deployPolicy` in ci-roles.ts says why removing it
+// is a separate change rather than part of the one that attached admin.
+//
 // v18 added SelfManageDeployPolicy, without which Pulumi could import
 // this policy but never update it: the role holds no managed-policy
 // version actions otherwise. Scoped to this one ARN because the program
