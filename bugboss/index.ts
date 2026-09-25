@@ -140,7 +140,10 @@ export interface BugBossSecrets {
   grafanaUrl?: string;
   grafanaServiceAccountToken?: string;
   /** The agent's GitHub App token. Opens PRs; cannot merge. */
-  githubToken?: string;
+  /** GitHub App, so the agent can re-mint its own token over a long run. */
+  githubAppId?: string;
+  githubAppPrivateKey?: string;
+  githubAppInstallationId?: string;
   /** STS role the parent assumes for each child. Chunk 9 creates it. */
   agentRoleArn?: string;
   triageModelId?: string;
@@ -1292,8 +1295,13 @@ export const createBugBoss = async (
       ...(secrets.grafanaUrl ? { GRAFANA_URL: secrets.grafanaUrl } : {}),
     },
     childCredentials: {
-      GITHUB_TOKEN: secrets.githubToken,
-      GH_TOKEN: secrets.githubToken,
+      // The App itself, not a token minted from it. An installation token
+      // lasts an hour and an incident can run for a day, so a token handed
+      // down at launch would expire mid-investigation -- surfacing as `gh`
+      // refusing to push a branch the agent had already built.
+      GITHUB_APP_ID: secrets.githubAppId,
+      GITHUB_APP_PRIVATE_KEY: secrets.githubAppPrivateKey,
+      GITHUB_APP_INSTALLATION_ID: secrets.githubAppInstallationId,
       GRAFANA_SERVICE_ACCOUNT_TOKEN: secrets.grafanaServiceAccountToken,
     },
   });
@@ -1466,7 +1474,9 @@ const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
   grafanaBasicAuthPassword: env.GRAFANA_BASIC_AUTH_PASSWORD,
   grafanaUrl: env.GRAFANA_URL ?? "https://goodparty.grafana.net",
   grafanaServiceAccountToken: env.GRAFANA_SERVICE_ACCOUNT_TOKEN,
-  githubToken: env.GITHUB_TOKEN,
+  githubAppId: env.GITHUB_APP_ID,
+  githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
+  githubAppInstallationId: env.GITHUB_APP_INSTALLATION_ID,
   agentRoleArn: env.BUGBOSS_AGENT_ROLE_ARN,
   triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
   agentModelId: env.BUGBOSS_MODEL_ID,
@@ -1492,7 +1502,7 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
     dispatcher: {
       maxConcurrentAgents: Number(env.BUGBOSS_MAX_AGENTS ?? 15),
       tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
-      agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 1800),
+      agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 86_400),
       maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
     },
     prodCriticalSlugs: (env.BUGBOSS_PROD_CRITICAL_SLUGS ?? "")

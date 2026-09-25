@@ -5,6 +5,7 @@
 // from it is reached through a dynamic import. Types are imported normally and
 // cost nothing at runtime.
 
+import { createInstallationToken, gitHubAppFromEnv } from "../github";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
@@ -41,7 +42,7 @@ import {
 export const DEFAULT_WORK_ROOT = "/work";
 export const DEFAULT_OMNI_REPO = "https://github.com/thegoodparty/omni.git";
 export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
-export const DEFAULT_TIMEOUT_SECONDS = 1800;
+export const DEFAULT_TIMEOUT_SECONDS = 86_400;
 export const DEADLINE_GRACE_SECONDS = 180;
 export const COMPACTION_HEADROOM = 0.05;
 
@@ -697,8 +698,60 @@ const launch = async (args: {
   };
 };
 
+/**
+ * Keep GITHUB_TOKEN current for the whole run.
+ *
+ * `gh` and `git` read the token out of the environment each time they are
+ * invoked, and a child inherits whatever process.env holds at that moment, so
+ * refreshing the variable in place is enough -- nothing has to be told. The
+ * interval is well inside the one-hour expiry, and @octokit/auth-app serves
+ * the cached token until it is nearly spent, so this is one API call an hour
+ * rather than one every twenty minutes.
+ *
+ * Without this a day-long incident loses its credentials after an hour, and
+ * the way that shows up is `gh` refusing to push a branch the agent has
+ * already built and committed.
+ */
+const keepGitHubTokenFresh = async (): Promise<void> => {
+  const app = gitHubAppFromEnv(process.env);
+  if (!app) {
+    console.log(
+      JSON.stringify({
+        component: "agent",
+        event: "github_app_absent",
+        note: "no GitHub credentials; the agent can read but cannot open a PR",
+      }),
+    );
+    return;
+  }
+  const mint = createInstallationToken(app);
+  const refresh = async () => {
+    try {
+      const token = await mint();
+      process.env.GITHUB_TOKEN = token;
+      process.env.GH_TOKEN = token;
+    } catch (error: unknown) {
+      // Deliberately not fatal. The previous token is good for the rest of
+      // its hour, and an investigation that cannot open a PR is still worth
+      // more than one that stopped.
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "github_token_refresh_failed",
+          error: String(error),
+        }),
+      );
+    }
+  };
+  await refresh();
+  setInterval(() => void refresh(), 20 * 60 * 1000).unref();
+};
+
 if (require.main === module) {
-  runIncidentAgent(agentOptionsFromEnv(process.env)).then(
+  keepGitHubTokenFresh()
+    .then(() => runIncidentAgent(agentOptionsFromEnv(process.env)))
+    .then(
     (result) => {
       console.log(
         JSON.stringify({ component: "agent", event: "exit", ...result }),

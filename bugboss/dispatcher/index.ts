@@ -51,7 +51,9 @@ const alarm = makeAlarm("dispatcher");
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
   tickSeconds: 30,
-  agentTimeoutSeconds: 1800,
+  // A day. An incident waits on a review, a merge and a deploy, and those
+  // are measured in hours, so a half-hour ceiling killed agents mid-wait.
+  agentTimeoutSeconds: 86_400,
   maxAttempts: 3,
 };
 

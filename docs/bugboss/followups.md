@@ -72,16 +72,40 @@ service. Everything else is checked where it is used.
 | `BUGBOSS_SLACK_CHANNEL_ID` | **at boot** | The channel threads open in (`#dev-alerts`) |
 | `SLACK_SIGNING_SECRET` | for replies | Verifies inbound Slack events; without it the relay rejects every one |
 | `SLACK_BOT_USER_ID` | for replies | So the bot does not answer itself |
-| `SLACK_ROTATION_GROUP_ID` | optional | User-group to `@`. Falls back to `<!here>` |
-| `GRAFANA_WEBHOOK_SECRET` | for alerts | HMAC on the webhook body |
-| `GRAFANA_BASIC_AUTH_PASSWORD` | for alerts | Only if the contact point uses basic auth |
+| `SLACK_ROTATION_GROUP_ID` | optional | User-group to `@`. Falls back to `<!here>`, and fills `rotationAtOpen` |
+| `GRAFANA_WEBHOOK_SECRET` | for alerts | HMAC key, and the basic-auth password unless the next one is set |
+| `GRAFANA_BASIC_AUTH_PASSWORD` | optional | Only if the contact point sends a different password |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | for evidence | Runs the alert's own LogQL before triage |
-| `GITHUB_TOKEN` | for fixes | The agent opens PRs with it. Must not be able to merge |
+| `GITHUB_APP_ID` | for fixes | The BugBoss GitHub App |
+| `GITHUB_APP_PRIVATE_KEY` | for fixes | The App's PEM. One line is fine; the newlines are rebuilt |
+| `GITHUB_APP_INSTALLATION_ID` | for fixes | The installation on `thegoodparty` |
 | `BUGBOSS_MODEL_ID` | optional | Incident agent model. Defaults in code |
 | `BUGBOSS_TRIAGE_MODEL_ID` | optional | Defaults to `us.anthropic.claude-sonnet-5` |
 
 `BUGBOSS_BUCKET`, `BUGBOSS_AGENT_ROLE_ARN`, `BUGBOSS_PUBLIC_URL` and the
 region come from the task definition. Do not duplicate them here.
+
+### The GitHub App
+
+The agent gets the App's own credentials rather than a token minted from
+them, because an installation token lasts an hour and an incident can now
+run for a day. It re-mints its own every twenty minutes, so a long
+investigation does not lose its credentials halfway through and discover it
+at the moment it tries to push.
+
+Create an App owned by `thegoodparty`, install it on the org, and give it
+only:
+
+| Permission | Level | Why |
+| --- | --- | --- |
+| Contents | Read and write | Clone, branch, push |
+| Pull requests | Read and write | Open a PR and comment on it |
+| Metadata | Read | Mandatory for any App |
+
+**Nothing else, and specifically no Administration and no Checks.** The
+design is explicit that the agent opens PRs and never merges them, and the
+App's permissions are the only thing actually holding that line — the agent
+runs with a real shell.
 
 ## Ship regardless, and ideally first
 
