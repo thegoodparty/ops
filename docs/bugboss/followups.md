@@ -15,6 +15,7 @@ Nothing downstream works until these are done.
 | 3   | Repoint a notification-policy route at it            | Grafana UI                                         | todo     |
 | 4   | Populate the `BUGBOSS` Secrets Manager secret        | AWS console                                        | todo     |
 | 5   | Add `bugbossImageUri` config + an image build step   | `deploy/deploy.sh`, `.github/workflows/deploy.yml` | **done** |
+| 6   | Add the parallel raw Grafana route (below). Do this first | Grafana UI                                    | todo     |
 
 ### The contact point, and three settings that must be right
 
@@ -131,7 +132,6 @@ with a note on the cost, or still open.
 
 |     | What                                                                                                                                                                                                                                                  | State                                                          |
 | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| G   | `sessionKeyFor` in `bugboss/agent/session.ts` writes `sessions/<id>.jsonl`, but the Slack agent's `read_agent_session`, the MCP session reader and the S3 lifecycle rule all read `sessions/incident/<id>/`                                            | worked around: the launch overrides `BUGBOSS_SESSION_REF`. The default and its test still encode the old path |
 | H   | `RelayEvent` has a `pr_needs_merge` case, one of the three things the design says earns an `@`, but nothing can emit it: the Boss does not learn a PR exists until `report_resolved`, which is after the merge already happened                        | open. Needs either a tool-API field or the agent posting it     |
 | I   | Chunk 4's tool API posts its own transitions through `ThreadPoster` while chunk 7's relay renders the same transitions. Both are wired, split by who knows what: the relay does `opened` and `prod_critical_signal`, the tool API does the rest         | resolved, but the two renderers should be reconciled            |
 | J   | `hand_off` reaches the rotation only because `toolApiFor` wraps it and posts the mention itself. Escalation is one of the three `@`-worthy events and no chunk owned it                                                                                 | resolved in the composition root                                |
@@ -139,6 +139,14 @@ with a note on the cost, or still open.
 | L   | `SlackAgentModel` had no implementation either. The default built here loops over the same `ModelClient` and persists the transcript per thread, which does **not** carry thinking blocks across a resume the way the incident agent's Pi session does | resolved with a documented floor; replace with a Pi harness if the Slack agent starts reasoning hard |
 | M   | With no `agentRoleArn` configured, a launch hands the child empty AWS credentials and alarms, rather than refusing to launch                                                                                                                           | deliberate, so a local Boss still runs. Revisit if it ever fires in prod |
 | N   | `bugboss/db/schema.sql` is read at runtime from `__dirname` and `tsc` does not copy it into `dist/`                                                                                                                                                    | resolved: `bugboss/Dockerfile` copies it beside the compiled `db/index.js` |
+
+## Fixed since this list was written
+
+The one session-key layout (G), alarms with a fallback rate on a dead triage
+model (P), and the cross-field schema constraints (Q) all landed. Q is worth
+a line because it cannot be redone: SQLite cannot add a `CHECK` to an
+existing table and there is no migration runner here, so those constraints
+were free while the database was empty and a table rebuild afterwards.
 
 ## Found by review, deliberately not fixed before the first PR
 
@@ -148,8 +156,6 @@ These are the ones left, with the reason.
 | | What | Why it waits |
 | --- | --- | --- |
 | O | **Cost is never written.** `costUsd`, `tokensIn`, `tokensOut`, `cacheRead`, `cacheWrite` and `modelId` are set to 0 on insert and no `UPDATE` anywhere touches them. None of the nine `UPDATE incident SET` sites mentions a cost column | The Slack agent answers "what did we spend this week" with a confident **0** rather than an error, and the mandated spend-per-hour alert has no source. Either roll session usage onto the row at each transition, or delete the columns — implying a metric that does not exist is worse than not having it. `firstBadEventAt` is never written either, so time-to-detect is equally uncomputable |
-| P | **A dead triage model looks exactly like a healthy one.** Both fallbacks in `triage/triage.ts` and `triage/correlate.ts` are info-level logs in modules with no `alarm()` at all | A wrong model id or sustained throttling makes every signal fall back to `new_incident`: no dedup, no attach, no suppression. A 15-alert burst then opens 15 incidents, spawns 15 agents and trips the circuit breaker, looking busy and productive throughout. Needs an `alarm()` on `fellBack` plus a fallback-rate metric |
-| Q | **Illegal incident states are unconstrained.** Three `CHECK`s exist, all single-column enums. No cross-field check, no trigger, no Zod at the persistence boundary; `rowToIncident` is an unchecked spread | **This one is time-sensitive.** SQLite cannot `ALTER TABLE ADD CHECK`, the DDL is `CREATE TABLE IF NOT EXISTS`, and `Db.open` execs it over the restored snapshot with no migration runner. While the database is empty the constraints are free to add; after the first real alert they need a table rebuild that does not exist. Add them immediately after the in-flight fixes land, before anything is routed here |
 | R | **Ids are undefended strings, and three of nine chunks already guessed the format wrong.** Real incident ids are bare decimals; `mcp/fixtures.ts`, `dispatcher/env.test.ts` and `triage/triage.test.ts` all assume `inc-N` | `nextIncidentId` does `MAX(CAST(id AS INTEGER)) + 1`, so anyone who follows the apparent `inc-` convention silently resets the counter to 1 and hits a primary-key violation inside a transaction. A Slack thread ts is also a bare numeric string, so an incident id passed as one matches nothing rather than throwing. Branded types would have caught this at compile time |
 | S | **No human takeover exists, though the design documents one.** `owner` is written by exactly one statement repo-wide, inside `hand_off`. Nothing parses the documented `mine` reply, and `AssignActor`'s human variant is never constructed | Not a bug so much as an unbuilt feature with a comment claiming it is built. Needs a decision first: whether a human claiming an incident should also stop the running agent. Until then the comment, the directive types and the actor variant should go, or the feature should |
 
