@@ -25,6 +25,7 @@ import type {
   SignalAdapter,
 } from "../types";
 import { RESOLUTION_POLICY_LABEL } from "./human";
+import { makeAlarm } from "../alarm";
 
 export const GRAFANA_SOURCE = "grafana";
 
@@ -44,8 +45,10 @@ export const REPLAY_WINDOW_SECONDS = 300;
 // The annotation carrying the alert's known-cause registry, serialised onto
 // the rule by omni's packages/gp-api/deploy/components/alerting. THE NAME IS A
 // CONTRACT WITH THAT FILE: renaming it on either side makes every alert look
-// like it has no known causes, which fails safe but silently removes every
-// pre-fetched piece of evidence triage was going to run on.
+// like it has no known causes, which fails safe but removes every pre-fetched
+// piece of evidence triage was going to run on. A rename leaves no error to
+// find, so the share of alerts arriving with none is logged on every delivery
+// and a registry that parses but drops entries alarms.
 export const KNOWN_CAUSES_ANNOTATION = "known_causes";
 
 export const SLUG_LABEL = "alert_slug";
@@ -75,6 +78,15 @@ export const LOOKBACK_SECONDS = 3_600;
 export const QUERY_TIMEOUT_MS = 8_000;
 
 const METRIC_RESULT_TYPES = new Set(["matrix", "vector"]);
+
+// Recent alerts kept to make the known-cause share visible. Sized to a burst,
+// not to a day.
+const COVERAGE_WINDOW = 100;
+
+const log = (event: string, data?: Record<string, unknown>) =>
+  console.log(JSON.stringify({ component: "grafana", event, ...data }));
+
+const alarm = makeAlarm("grafana");
 
 export interface KnownCause {
   id: string;
@@ -161,21 +173,37 @@ const status = (value: unknown): string | null => {
   return raw ? raw.trim().toLowerCase() : null;
 };
 
-export const parseKnownCauses = (raw: string | undefined): KnownCause[] => {
-  if (!raw) return [];
+export interface ParsedKnownCauses {
+  causes: KnownCause[];
+  /** Entries the annotation carried that could never match, so were dropped. */
+  malformed: number;
+  /** The annotation was unreadable, as opposed to absent or an empty list. */
+  unreadable: boolean;
+}
+
+export const readKnownCauses = (raw: string | undefined): ParsedKnownCauses => {
+  if (!raw) return { causes: [], malformed: 0, unreadable: false };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    // A malformed annotation yields no causes, which is the same outcome as an
-    // alert that declares none: triage decides without pre-fetched evidence.
-    return [];
+    // A malformed annotation yields no causes, which is the same outcome for
+    // triage as an alert that declares none. It is not the same event, so it
+    // is reported separately: this annotation is a contract with omni's
+    // alerting component and a broken one is invisible everywhere else.
+    return { causes: [], malformed: 0, unreadable: true };
   }
-  if (!Array.isArray(parsed)) return [];
+  if (!Array.isArray(parsed)) {
+    return { causes: [], malformed: 0, unreadable: true };
+  }
 
   const causes: KnownCause[] = [];
+  let malformed = 0;
   for (const item of parsed) {
-    if (typeof item !== "object" || item === null) continue;
+    if (typeof item !== "object" || item === null) {
+      malformed++;
+      continue;
+    }
     const cause = item as Record<string, unknown>;
     const id = text(cause.id);
     const summary = text(cause.summary);
@@ -184,8 +212,14 @@ export const parseKnownCauses = (raw: string | undefined): KnownCause[] => {
     // A cause with no id cannot be named in a suppress decision and one with
     // no confirmedBy cannot be confirmed against anything, so both are dropped
     // rather than carried as a cause that can never match.
-    if (!id || !summary || !confirmedBy) continue;
-    if (action !== "suppress" && action !== "annotate") continue;
+    if (!id || !summary || !confirmedBy) {
+      malformed++;
+      continue;
+    }
+    if (action !== "suppress" && action !== "annotate") {
+      malformed++;
+      continue;
+    }
     causes.push({
       id,
       summary,
@@ -195,8 +229,12 @@ export const parseKnownCauses = (raw: string | undefined): KnownCause[] => {
       ticket: text(cause.ticket),
     });
   }
-  return causes;
+  return { causes, malformed, unreadable: false };
 };
+
+/** The causes alone, for callers with nothing to do about what was dropped. */
+export const parseKnownCauses = (raw: string | undefined): KnownCause[] =>
+  readKnownCauses(raw).causes;
 
 const truncate = (line: string): string => {
   const encoded = Buffer.from(line, "utf8");
@@ -347,6 +385,15 @@ export const createGrafanaAdapter = (
    */
   const resolved = new Set<string>();
 
+  /**
+   * Whether each recent alert arrived declaring any known cause. The share is
+   * the only place the KNOWN_CAUSES_ANNOTATION contract shows: renaming it on
+   * the omni side makes every alert look like it declares none, which removes
+   * every pre-fetched piece of evidence without erroring anywhere, so the
+   * share is logged on every delivery.
+   */
+  const causeCoverage: boolean[] = [];
+
   const verify: GrafanaVerifier =
     config.verifier ??
     ((req) => {
@@ -428,6 +475,17 @@ export const createGrafanaAdapter = (
     const groupKey = text(root.groupKey);
     const externalURL = text(root.externalURL);
 
+    const rawTruncated = Number(root.truncatedAlerts ?? 0);
+    const truncatedAlerts = Number.isFinite(rawTruncated) ? rawTruncated : 0;
+    if (truncatedAlerts > 0) {
+      alarm("alerts_truncated", {
+        truncatedAlerts,
+        receiver,
+        groupKey,
+        note: "Grafana dropped these alerts from the delivery and they arrive nowhere else; the contact point needs maxAlerts: 0",
+      });
+    }
+
     const alerts = Array.isArray(root.alerts) ? root.alerts : [];
     const signals: RawSignal[] = [];
 
@@ -460,6 +518,19 @@ export const createGrafanaAdapter = (
         ...mapping(alert.annotations),
       };
 
+      const declared = readKnownCauses(annotations[KNOWN_CAUSES_ANNOTATION]);
+      if (declared.unreadable || declared.malformed > 0) {
+        alarm("known_causes_malformed", {
+          fingerprint,
+          slug: labels[SLUG_LABEL] ?? null,
+          unreadable: declared.unreadable,
+          malformed: declared.malformed,
+          note: "these causes can never match, so triage runs without the evidence they name",
+        });
+      }
+      causeCoverage.push(declared.causes.length > 0);
+      if (causeCoverage.length > COVERAGE_WINDOW) causeCoverage.shift();
+
       const carried: Record<string, string> = { ...labels };
       for (const [key, value] of Object.entries(annotations)) {
         carried[`${ANNOTATION_PREFIX}${key}`] = value;
@@ -479,8 +550,7 @@ export const createGrafanaAdapter = (
       for (const [key, value] of Object.entries(meta)) {
         if (value) carried[`${META_PREFIX}${key}`] = value;
       }
-      const truncatedAlerts = Number(root.truncatedAlerts ?? 0);
-      if (Number.isFinite(truncatedAlerts) && truncatedAlerts > 0) {
+      if (truncatedAlerts > 0) {
         carried[`${META_PREFIX}truncated_alerts`] = String(truncatedAlerts);
       }
       // An alert stops firing on its own, which is what makes tickResolution
@@ -504,6 +574,18 @@ export const createGrafanaAdapter = (
         openedAt: Number.isFinite(startedAt) ? startedAt : now(),
       });
     }
+
+    const withCauses = causeCoverage.filter((has) => has).length;
+    log("parsed", {
+      alerts: signals.length,
+      truncatedAlerts,
+      recentAlerts: causeCoverage.length,
+      recentWithKnownCauses: withCauses,
+      zeroCauseRate:
+        causeCoverage.length === 0
+          ? 0
+          : Math.round((1 - withCauses / causeCoverage.length) * 1000) / 1000,
+    });
 
     return signals;
   };

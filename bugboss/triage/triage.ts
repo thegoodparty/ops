@@ -19,8 +19,16 @@ import {
 } from "../ingress/grafana";
 import { isNeverSuppressed } from "../ingress/human";
 import type { TriageContext, TriageDecision } from "../types";
+import { recordCall } from "./health";
 import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
-import { incidentStatus, queryTool, QUERY_TOOL, type IncidentReader } from "./sql";
+import { makeAlarm } from "../alarm";
+import {
+  incidentOwner,
+  incidentStatus,
+  queryTool,
+  QUERY_TOOL,
+  type IncidentReader,
+} from "./sql";
 
 export interface TriageDeps {
   model: ModelClient;
@@ -53,6 +61,11 @@ const RECURRABLE = ["RESOLVED", "CLOSED"];
 
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "triage", event, ...data }));
+
+const alarm = makeAlarm("triage");
+
+/** The key this module's fallback rate is tracked under. */
+const SITE = "triage";
 
 const answerSchema = z
   .object({
@@ -124,9 +137,11 @@ Rules, in priority order.
    merged later, while a wrong attach means one agent chases two causes, finds
    one, and the second has nobody on it.
 
-2. Attach only to an incident whose status is INVESTIGATING or FIXING. While a
-   fix is in review the alert keeps firing, and those signals belong on the
-   open incident.
+2. Attach only to an incident whose status is INVESTIGATING or FIXING and
+   which an agent still owns. While a fix is in review the alert keeps firing,
+   and those signals belong on the open incident. An incident a human has
+   taken over is not a candidate: its status still reads open, but no agent is
+   coming back to it.
 
 3. Never attach to a RESOLVED incident. RESOLVED means no further alerts
    should occur, so a matching signal afterwards is evidence the resolution
@@ -293,6 +308,20 @@ const applyRules = (
         `attach refused: ${target.id} is ${target.status}`,
       );
     }
+    // Status is where the work is and owner is who has it, so a handed-off
+    // incident still reads INVESTIGATING while no agent is coming back to it.
+    // Read rather than taken from the digest, because the model can name any
+    // id the query tool turns up and this guard is what the invariant rests
+    // on. Checked after the RESOLVED branch so a human-owned incident firing
+    // again is still a recurrence.
+    if (incidentOwner(deps.db, target.id) === "human") {
+      return newIncident(
+        deps,
+        ctx,
+        answer,
+        `attach refused: ${target.id} is owned by a human, so nothing attaches to it automatically`,
+      );
+    }
     return {
       decision: { action: "attach", incidentId: target.id, reason: answer.reason },
       recurrenceOf: null,
@@ -357,6 +386,7 @@ export const runTriage = async (
     });
 
     const outcome = applyRules(deps, ctx, answer);
+    recordCall(SITE, false);
     log("decided", {
       sourceId: ctx.signal.sourceId,
       proposed: answer.action,
@@ -366,11 +396,19 @@ export const runTriage = async (
     });
     return outcome;
   } catch (err) {
-    log("fell_back", {
+    const health = recordCall(SITE, true);
+    alarm("fell_back", {
       sourceId: ctx.signal.sourceId,
       error: String(err),
       ms: Date.now() - started,
+      ...health,
     });
+    if (health.sustained) {
+      alarm("triage_model_unusable", {
+        ...health,
+        note: "every signal is becoming its own incident: no dedup, no attach, no suppression",
+      });
+    }
     return {
       decision: {
         action: "new_incident",

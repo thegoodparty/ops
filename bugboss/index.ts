@@ -69,6 +69,7 @@ import {
 } from "./toolapi";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
+import { makeAlarm } from "./alarm";
 import type {
   BugBossConfig,
   Evidence,
@@ -85,10 +86,7 @@ import type {
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "boss", event, ...data }));
 
-const alarm = (event: string, data?: Record<string, unknown>) =>
-  console.error(
-    JSON.stringify({ component: "boss", level: "error", event, ...data }),
-  );
+const alarm = makeAlarm("boss");
 
 /** Statuses an incident can still take a signal on, or be merged into. */
 const OPEN_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING", "RESOLVED"];

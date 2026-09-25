@@ -10,8 +10,10 @@
 // This is the single writer for incident state, so the two invariants are
 // enforced here rather than anywhere they could be bypassed:
 //
-//   1. Every attached signal must be explained. On entering FIXING, anything
-//      the root cause does not account for is split back out.
+//   1. Every attached signal must be explained. Checked on entering FIXING
+//      and again on leaving it, because a merge or a late attach can add a
+//      signal the root cause never saw; anything unaccounted for is split
+//      back out.
 //   2. An incident cannot close over a firing signal. Deterministic, no model
 //      involved, and it splits rather than refusing.
 
@@ -40,12 +42,21 @@ import {
   type SignalRow,
 } from "./assign";
 import { verifyAgentToken } from "./token";
+import { makeAlarm } from "../alarm";
 
 export * from "./assign";
 export * from "./token";
 
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "toolapi", event, ...data }));
+
+/**
+ * For a failure nobody asked for, as opposed to a transition this module
+ * refused on purpose. A rejected call is the system working; a thrown one
+ * means a write was lost, and the dispatcher's answer to a lost write is to
+ * relaunch an agent that will lose it again.
+ */
+const alarm = makeAlarm("toolapi");
 
 // ---------------------------------------------------------------------------
 // Collaborators
@@ -137,6 +148,25 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   };
 
   /**
+   * Directive delivery is best effort. The transaction that deletes them is
+   * the only thing that can fail here, and it rolls back, so a failure means
+   * the same directives arrive on the next call rather than being lost --
+   * which is a far better outcome than telling an agent its committed
+   * transition failed.
+   */
+  const drainSafely = async (
+    incidentId: string,
+    tool: string,
+  ): Promise<Directive[]> => {
+    try {
+      return await drain(incidentId);
+    } catch (err) {
+      alarm("drain_failed", { tool, incidentId, error: String(err) });
+      return [];
+    }
+  };
+
+  /**
    * Every method goes through here, which is what makes three properties
    * unskippable: the incident comes from the token and never from an
    * argument, directives drain on the failure path as well as the success
@@ -158,13 +188,13 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     try {
       const body = await fn(incidentId);
       if (!body.ok) log("rejected", { tool, incidentId, error: body.error });
-      return { ...body, directives: await drain(incidentId) };
+      return { ...body, directives: await drainSafely(incidentId, tool) };
     } catch (err) {
-      log("failed", { tool, incidentId, error: String(err) });
+      alarm("failed", { tool, incidentId, error: String(err) });
       return {
         ok: false,
         error: (err as Error).message,
-        directives: await drain(incidentId),
+        directives: await drainSafely(incidentId, tool),
       };
     }
   };
@@ -174,7 +204,10 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       await slack.post(incident.slackThreadTs, text);
       return true;
     } catch (err) {
-      log("thread_post_failed", { incidentId: incident.id, error: String(err) });
+      alarm("thread_post_failed", {
+        incidentId: incident.id,
+        error: String(err),
+      });
       return false;
     }
   };
@@ -244,33 +277,78 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     ).run(at, incidentId);
   };
 
+  /** Correlation moves records nobody else has claimed, in either direction. */
+  const mergeable = (row: Incident | undefined): boolean =>
+    !!row &&
+    row.owner === "agent" &&
+    (row.status === "INVESTIGATING" || row.status === "FIXING");
+
+  const where = (row: Incident | undefined) =>
+    row ? { status: row.status, owner: row.owner } : { status: "gone" };
+
+  /**
+   * Declining is a decision, not a non-event: the Boss believed two
+   * incidents share a cause and we are leaving them apart, so two agents may
+   * keep working the same bug. Reported after the transaction, like
+   * logAssign, so a rolled-back attempt leaves no record of being considered.
+   */
+  type MergeOutcome =
+    | { kind: "applied"; result: AssignResult }
+    | { kind: "declined"; merge: CorrelationMerge; why: Record<string, unknown> };
+
   const applyMerge = (
     w: Database.Database,
     merge: CorrelationMerge,
-  ): AssignResult | null => {
-    if (merge.absorb === merge.into) return null;
-    const absorb = getIncidentRow(w, merge.absorb);
-    if (!absorb) return null;
-    if (absorb.status !== "INVESTIGATING" && absorb.status !== "FIXING") {
-      return null;
+  ): MergeOutcome => {
+    const declined = (why: Record<string, unknown>): MergeOutcome => ({
+      kind: "declined",
+      merge,
+      why,
+    });
+
+    if (merge.absorb === merge.into) {
+      return declined({ reason: "an incident cannot absorb itself" });
     }
-    // Skipped rather than thrown: assign refuses a target that is not open,
+
+    const absorb = getIncidentRow(w, merge.absorb);
+    if (!mergeable(absorb)) {
+      const at = where(absorb);
+      return declined({
+        reason: "the incident to absorb is no longer an agent's open work",
+        absorbStatus: at.status,
+        absorbOwner: at.owner,
+      });
+    }
+
+    // Skipped rather than thrown: assign refuses a target it may not take,
     // and a stale merge proposal must not fail the root cause that ran it.
     const into = getIncidentRow(w, merge.into);
-    if (!into || (into.status !== "INVESTIGATING" && into.status !== "FIXING")) {
-      return null;
+    if (!mergeable(into)) {
+      const at = where(into);
+      return declined({
+        reason: "the target is no longer an agent's open work",
+        intoStatus: at.status,
+        intoOwner: at.owner,
+      });
     }
+
     const signals = getSignalsFor(w, merge.absorb);
-    if (signals.length === 0) return null;
-    return assign(
-      w,
-      {
-        signalIds: signals.map((s) => s.id),
-        target: merge.into,
-        reason: merge.reason,
-      },
-      { kind: "boss" },
-    );
+    if (signals.length === 0) {
+      return declined({ reason: "the incident to absorb has no signals left" });
+    }
+
+    return {
+      kind: "applied",
+      result: assign(
+        w,
+        {
+          signalIds: signals.map((s) => s.id),
+          target: merge.into,
+          reason: merge.reason,
+        },
+        { kind: "boss" },
+      ),
+    };
   };
 
   const reportRootCause: ToolApi["reportRootCause"] = (args) =>
@@ -360,16 +438,27 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           rootCause: args.cause,
         });
       } catch (err) {
-        log("correlation_failed", { incidentId, error: String(err) });
+        alarm("correlation_failed", { incidentId, error: String(err) });
       }
 
-      const applied = merges.length
-        ? await db.withWrite((w) =>
-            merges
-              .map((m) => applyMerge(w, m))
-              .filter((r): r is AssignResult => r !== null),
-          )
+      const outcomes = merges.length
+        ? await db.withWrite((w) => merges.map((m) => applyMerge(w, m)))
         : [];
+      for (const outcome of outcomes) {
+        if (outcome.kind === "declined") {
+          log("merge_declined", {
+            incidentId,
+            absorb: outcome.merge.absorb,
+            into: outcome.merge.into,
+            proposedBecause: outcome.merge.reason,
+            ...outcome.why,
+          });
+        }
+      }
+
+      const applied = outcomes
+        .filter((o) => o.kind === "applied")
+        .map((o) => o.result);
       applied.forEach(logAssign);
 
       for (const merge of applied) {
@@ -434,7 +523,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["FIXING"], "reportResolved");
       if (stop) return reject(stop);
 
-      const applied = await db.withWrite((w) => {
+      const splits = await db.withWrite((w) => {
         const at = Date.now();
         const taken = w
           .prepare(
@@ -443,11 +532,40 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
              WHERE id = ? AND status = 'FIXING' AND owner = 'agent'`,
           )
           .run(at, JSON.stringify(args.prUrls), args.evidence, incidentId).changes;
-        if (taken === 0) return false;
+        if (taken === 0) return null;
+
+        // Invariant 1, a second time. Entering FIXING is not the last moment
+        // a signal can arrive: correlation merges move signals in and reset
+        // explained on them, and triage attaches across FIXING. Whatever
+        // this root cause never accounted for leaves before the incident
+        // claims the problem is over, and it leaves still firing, so the
+        // split happens ahead of closing what remains.
+        const unexplained = getSignalsFor(w, incidentId)
+          .filter((s) => !s.explained)
+          .map((s) =>
+            assign(
+              w,
+              {
+                signalIds: [s.id],
+                target: "NEW",
+                reason: `not explained by incident ${incidentId}: ${incident.rootCause ?? "no root cause recorded"}`,
+              },
+              { kind: "agent", incidentId },
+            ),
+          );
+
         closeOpenSignals(w, incidentId, at);
-        return true;
+        return unexplained;
       });
-      if (!applied) return raced(incidentId, "reportResolved");
+      if (splits === null) return raced(incidentId, "reportResolved");
+      splits.forEach(logAssign);
+
+      if (splits.length > 0) {
+        await notify(
+          incident,
+          `Resolving ${incidentId} left ${splits.length} signal(s) its root cause never explained. Split out as incident(s) ${splits.map((s) => s.target).join(", ")}.`,
+        );
+      }
 
       await notify(
         incident,
@@ -455,7 +573,11 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       );
       return {
         ok: true,
-        data: { incidentId, status: "RESOLVED" as IncidentStatus },
+        data: {
+          incidentId,
+          status: "RESOLVED" as IncidentStatus,
+          splitInto: splits.map((s) => s.target),
+        },
       };
     });
 
@@ -526,11 +648,24 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       // Not guarded on owner. A human claiming the incident in Slack flips
       // owner first, and the agent's last act is still to write the brief.
-      await db.withWrite((w) => {
-        w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(
-          incidentId,
+      try {
+        await db.withWrite((w) => {
+          w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(
+            incidentId,
+          );
+        });
+      } catch (err) {
+        // A person has just read a hand-off brief, so they believe this is
+        // theirs, while the row still says otherwise and the dispatcher will
+        // put another agent on it. Two agents posting into the thread they
+        // were handed reads as being ignored, so the retraction goes to the
+        // same place the brief did.
+        await notify(
+          incident,
+          `Correction on ${incidentId}: that hand-off could not be recorded, so it is still owned by the agent and nobody has been assigned. Treat the brief above as a status update.`,
         );
-      });
+        throw err;
+      }
 
       return { ok: true, data: { incidentId, owner: "human" as const } };
     });
@@ -544,7 +679,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       try {
         loaded = await evidence.load(incidentId);
       } catch (err) {
-        log("evidence_load_failed", { incidentId, error: String(err) });
+        alarm("evidence_load_failed", { incidentId, error: String(err) });
       }
 
       return {

@@ -13,7 +13,9 @@
 import { z } from "zod";
 
 import type { AssignRequest, IncidentDigest } from "../types";
+import { recordCall } from "./health";
 import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
+import { makeAlarm } from "../alarm";
 import {
   attachedSignalIds,
   queryTool,
@@ -65,6 +67,11 @@ const MERGEABLE = ["INVESTIGATING", "FIXING"];
 
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "correlate", event, ...data }));
+
+const alarm = makeAlarm("correlate");
+
+/** The key this module's fallback rate is tracked under. */
+const SITE = "correlate";
 
 const answerSchema = z.object({
   merges: z
@@ -195,7 +202,9 @@ const applyRules = (
 /**
  * Never throws. A failed model call yields no merges, which is the
  * conservative direction, and the split still happens because it does not
- * depend on a judgement.
+ * depend on a judgement. A failed read of the attached signals is the one
+ * case that yields neither, and it alarms rather than reporting an empty
+ * split it never computed.
  */
 export const runCorrelation = async (
   deps: CorrelateDeps,
@@ -204,7 +213,21 @@ export const runCorrelation = async (
   const started = Date.now();
 
   const explained = new Set(req.explainedSignalIds);
-  const attached = attachedSignalIds(deps.db, req.incidentId);
+  // Read before the try that guards the model call, because a failed read and
+  // a failed judgement are different faults: this one leaves the split
+  // arithmetic with no input at all, so there is no answer to degrade to.
+  let attached: string[];
+  try {
+    attached = attachedSignalIds(deps.db, req.incidentId);
+  } catch (err) {
+    alarm("split_read_failed", {
+      incidentId: req.incidentId,
+      error: String(err),
+      ms: Date.now() - started,
+      note: "no split was computed, so an unexplained signal may have nobody on it",
+    });
+    return { merges: [], splits: [], fellBack: true };
+  }
   const unexplained = attached.filter((id) => !explained.has(id));
 
   if (attached.length > 0 && unexplained.length === attached.length) {
@@ -249,6 +272,7 @@ export const runCorrelation = async (
     });
 
     const merges = applyRules(req, candidates, answer.merges);
+    recordCall(SITE, false);
     log("correlated", {
       incidentId: req.incidentId,
       candidates: candidates.length,
@@ -259,12 +283,22 @@ export const runCorrelation = async (
     });
     return { merges, splits, fellBack: false };
   } catch (err) {
-    log("fell_back", {
+    const health = recordCall(SITE, true);
+    alarm("fell_back", {
       incidentId: req.incidentId,
       error: String(err),
+      candidates: candidates.length,
       splits: splits.length,
       ms: Date.now() - started,
+      ...health,
+      note: "no merge was proposed because nothing was compared, which is indistinguishable downstream from comparing every candidate and finding nothing",
     });
+    if (health.sustained) {
+      alarm("correlation_model_unusable", {
+        ...health,
+        note: "two incidents sharing a cause are no longer being noticed by anything",
+      });
+    }
     return { merges: [], splits, fellBack: true };
   }
 };

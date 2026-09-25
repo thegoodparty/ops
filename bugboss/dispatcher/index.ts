@@ -27,18 +27,27 @@ import { DEADLINE_GRACE_SECONDS } from "../agent/run";
 import type { AgentCredentialProvider } from "./credentials";
 import { buildChildEnv } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
+import { makeAlarm } from "../alarm";
 
 export * from "./credentials";
 export * from "./env";
 export * from "./spawn";
 
+// `tsc` rejects a renamed or moved export outright, and the image is built
+// with `tsc && esbuild`, so prod cannot ship one. tsx does not typecheck,
+// though, so under it a rename arrives here as `undefined`, which makes
+// killAt NaN; `now < NaN` is false, so the backstop reads as already expired
+// and SIGKILLs every agent on its first tick. Fail at import instead.
+if (!Number.isFinite(DEADLINE_GRACE_SECONDS) || DEADLINE_GRACE_SECONDS <= 0) {
+  throw new Error(
+    `agent/run.ts must export DEADLINE_GRACE_SECONDS as a positive number; got ${DEADLINE_GRACE_SECONDS}. The dispatcher's kill backstop is defined relative to it.`,
+  );
+}
+
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "dispatcher", event, ...data }));
 
-const alarm = (event: string, data?: Record<string, unknown>) =>
-  console.error(
-    JSON.stringify({ component: "dispatcher", level: "error", event, ...data }),
-  );
+const alarm = makeAlarm("dispatcher");
 
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
@@ -73,6 +82,13 @@ export interface DispatcherDeps {
    * Defaults to two ticks, the shortest gap the dispatcher can even observe.
    */
   fastFailureSeconds?: number;
+  /**
+   * Launches on one incident within a single container lifetime before the
+   * dispatcher gives up and escalates. Defaults to three times maxAttempts,
+   * since a death slow enough to clear the fast-failure counter still did
+   * some work and deserves more rope than a crash loop.
+   */
+  maxLaunches?: number;
   now?: () => number;
 }
 
@@ -180,6 +196,19 @@ const crashLoopBrief = (
     `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
   ].join("\n");
 
+const stalledBrief = (row: EligibleRow, launches: number): string =>
+  [
+    "Escalated by the dispatcher. The agent did not hand off itself.",
+    "",
+    `It has been launched ${launches} times on this incident since this container came up and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
+    "",
+    "What I believe now: whatever the agent last posted in this thread.",
+    "What I ruled out: not recorded.",
+    "What I was about to do: unknown; no launch got far enough to hand off.",
+    "Side effects: check the incident for PRs an earlier launch opened.",
+    `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
+  ].join("\n");
+
 export class Dispatcher {
   private readonly db: DispatcherDb;
   private readonly config: DispatcherConfig;
@@ -190,6 +219,7 @@ export class Dispatcher {
   private readonly childCredentials: Record<string, string | undefined>;
   private readonly childBaseEnv: Record<string, string | undefined>;
   private readonly fastFailureMs: number;
+  private readonly maxLaunches: number;
   private readonly now: () => number;
 
   /** The live side of the comparison. In-process, so it is simply true. */
@@ -203,6 +233,17 @@ export class Dispatcher {
    * health's alarm rather than this counter's.
    */
   private readonly fastFailures = new Map<string, number>();
+  /**
+   * Launches per incident, total rather than consecutive, and in memory for
+   * the same reason as fastFailures: a restart is not evidence about the
+   * agent. `maxAttempts` bounds only deaths fast enough to look like a crash
+   * loop, and every exit slower than that *clears* that counter, so an agent
+   * dying just past the window — throttling, OOM, credentials expiring, a 400
+   * on a replay it cannot get through — was relaunched every tick for as long
+   * as the incident stayed open. The persisted `attempts` column cannot do
+   * this job: it counts container restarts too, and those are routine.
+   */
+  private readonly launches = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
 
   constructor(deps: DispatcherDeps) {
@@ -216,6 +257,7 @@ export class Dispatcher {
     this.childBaseEnv = deps.childBaseEnv ?? {};
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
+    this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
     this.now = deps.now ?? Date.now;
   }
 
@@ -315,6 +357,28 @@ export class Dispatcher {
         continue;
       }
 
+      const launches = this.launches.get(row.id) ?? 0;
+      if (launches >= this.maxLaunches) {
+        const ok = await this.escalate(
+          row.id,
+          `${launches} launches on this incident without finishing one`,
+          stalledBrief(row, launches),
+        );
+        // Cleared on the same rule as fastFailures, and here it is what keeps
+        // hand-back working: a human replying in the thread flips owner back
+        // to agent, and a ceiling that outlived the escalation would bounce
+        // the incident straight back at them on the next tick.
+        this.launches.delete(row.id);
+        if (ok) escalated.push(row.id);
+        else
+          alarm("stalled_escalation_failed", {
+            incidentId: row.id,
+            launches,
+            note: "nobody was told; relaunching instead of retrying the escalation",
+          });
+        continue;
+      }
+
       if (this.running.size >= this.config.maxConcurrentAgents) {
         circuitOpen = true;
         continue;
@@ -366,6 +430,7 @@ export class Dispatcher {
         "UPDATE incident SET attempts = attempts + 1, lastStartedAt = ? WHERE id = ?",
       ).run(now, row.id);
     });
+    this.launches.set(row.id, (this.launches.get(row.id) ?? 0) + 1);
 
     if (row.sessionRef) await this.emitResumedAfter(row, now);
 
@@ -451,6 +516,11 @@ export class Dispatcher {
 
     entry.done = run
       .catch((err) => {
+        // A child the dispatcher killed exits on a signal, which is a
+        // rejection now. That is not an agent failure and it already alarmed
+        // as agent_deadline_exceeded, so it would be the same event twice
+        // under a name that points at the wrong component.
+        if (entry.killed) return;
         alarm("agent_failed", {
           incidentId: row.id,
           attempt,

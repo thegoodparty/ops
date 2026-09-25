@@ -13,15 +13,13 @@
 import type { Db } from "../db";
 import type { SlackPoster } from "./relay";
 import { mentionPrefix, stripBotMention } from "./relay";
+import { makeAlarm } from "../alarm";
 
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "slack-agent", event, ...data }));
 
 /** Error level, for the failures whose only other notice is a Slack post. */
-const alarm = (event: string, data?: Record<string, unknown>) =>
-  console.error(
-    JSON.stringify({ component: "slack-agent", level: "error", event, ...data }),
-  );
+const alarm = makeAlarm("slack-agent");
 
 // ---------------------------------------------------------------------------
 // Session keys

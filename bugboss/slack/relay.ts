@@ -14,9 +14,16 @@
 
 import type { Db } from "../db";
 import type { Directive, IncidentOwner, IncidentStatus } from "../types";
+import { makeAlarm } from "../alarm";
 
 const log = (event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ component: "slack-relay", event, ...data }));
+
+/** Error level, for the failures whose only other notice is a Slack post. */
+const alarm = makeAlarm("slack-relay");
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // Injected Slack
@@ -94,8 +101,23 @@ const MENTION_EVENTS: readonly string[] = [
 export const earnsMention = (event: RelayEvent): boolean =>
   MENTION_EVENTS.includes(event.type);
 
-const mentionPrefix = (rotationGroupId: string | null): string =>
+export const mentionPrefix = (rotationGroupId: string | null): string =>
   rotationGroupId ? `<!subteam^${rotationGroupId}> ` : "<!here> ";
+
+/**
+ * The post and the write that records its ts cannot be one transaction, so the
+ * write is retried instead. Only a transient local failure is recoverable: a
+ * failed snapshot halts writes for good, and those attempts fail fast.
+ */
+const LINK_ATTEMPTS = 3;
+const LINK_RETRY_MS = 100;
+
+/**
+ * What became of a thread-ts write. `lost` means another post got there
+ * first, which is fine: the incident has one thread and this post is a loose
+ * message in the channel. Only `unwritable` leaves nothing pointing at one.
+ */
+type LinkOutcome = "linked" | "lost" | "unwritable";
 
 export const renderEvent = (event: RelayEvent): string => {
   switch (event.type) {
@@ -162,10 +184,26 @@ export interface SlackEvent {
   thread_ts?: string;
 }
 
+/** Which way ownership is being handed, per the Layer 4 actions table. */
+export type OwnershipClaim = "take_over" | "hand_back";
+
 export type InboundRoute =
   | { kind: "ignore"; reason: string }
   /** Recorded against an incident. `interrupt` means a directive went with it. */
   | { kind: "incident_reply"; incidentId: string; interrupt: boolean }
+  /**
+   * A reply claiming the incident or handing it back. Recorded and relayed
+   * like any other reply; the kind is the part that says the incident is
+   * changing hands, and it carries what a write of `owner` would need. The
+   * relay does not write `owner` and cannot: the whole flip lives elsewhere.
+   */
+  | {
+      kind: "ownership_claim";
+      incidentId: string;
+      claim: OwnershipClaim;
+      slackUserId: string;
+      ts: string;
+    }
   | {
       kind: "slack_agent";
       channel: string;
@@ -188,6 +226,29 @@ export const mentionsBot = (text: string, botUserId: string): boolean =>
 export const stripBotMention = (text: string, botUserId: string): string =>
   text.replaceAll(`<@${botUserId}>`, "").replace(/\s+/g, " ").trim();
 
+const CLAIM_WORDS: readonly (readonly [string, OwnershipClaim])[] = [
+  ["mine", "take_over"],
+  ["back to you", "hand_back"],
+];
+
+/**
+ * The whole normalized message must be the claim word. Substring matching is
+ * the wrong trade here: "not mine" and "that one is mine to fix" are ordinary
+ * incident chatter, and a false claim is the expensive direction, because
+ * owner = 'human' takes the incident out of the dispatcher's query and there
+ * is nothing that hands it back.
+ */
+export const ownershipClaim = (
+  text: string,
+  botUserId: string,
+): OwnershipClaim | null => {
+  const said = stripBotMention(text, botUserId)
+    .toLowerCase()
+    .replace(/[.!?]+$/, "")
+    .trim();
+  return CLAIM_WORDS.find(([word]) => word === said)?.[1] ?? null;
+};
+
 const ignore = (reason: string): InboundRoute => ({ kind: "ignore", reason });
 
 // ---------------------------------------------------------------------------
@@ -208,34 +269,72 @@ export class SlackRelay {
    * incident; everything else lands in that thread.
    */
   async emit(event: RelayEvent): Promise<string> {
-    const text =
-      (earnsMention(event) ? mentionPrefix(this.cfg.rotationGroupId) : "") +
-      renderEvent(event);
+    const body = renderEvent(event);
+    const ping = mentionPrefix(this.cfg.rotationGroupId);
 
     if (event.type === "opened") {
-      const { ts } = await this.slack.post(null, text, this.cfg.channelId);
-      await this.db.withWrite((d) => {
-        d.prepare("UPDATE incident SET slackThreadTs = ? WHERE id = ?").run(
+      // Posting and linking are two steps, so re-emitting has to find the
+      // thread it already opened rather than start a second one.
+      const open = this.threadTsFor(event.incidentId);
+      if (open) {
+        log("thread_already_open", { incidentId: event.incidentId, ts: open });
+        return open;
+      }
+
+      const { ts } = await this.slack.post(null, body, this.cfg.channelId);
+      if ((await this.linkThread(event.incidentId, ts)) === "unwritable") {
+        // The thread exists and nothing points at it, so the rest of this
+        // incident will not land here. Said in the thread, which is where
+        // anyone following this incident is looking.
+        await this.slack.post(
           ts,
-          event.incidentId,
+          [
+            `${ping}*Incident ${event.incidentId} is not linked to this thread*`,
+            "Recording this thread on the incident failed, so its later updates will not land here. The error is in the BugBoss logs.",
+          ].join("\n"),
+          this.cfg.channelId,
         );
-      });
+      }
       log("thread_opened", { incidentId: event.incidentId, ts });
       return ts;
     }
 
-    const row = this.db.get<{ slackThreadTs: string | null }>(
-      "SELECT slackThreadTs FROM incident WHERE id = ?",
-      [event.incidentId],
-    );
-    const threadTs = row?.slackThreadTs ?? null;
+    const threadTs = this.threadTsFor(event.incidentId);
     if (!threadTs) {
-      log("no_thread_posting_top_level", {
+      // Slack accepts a thread-less post, so the alternative to saying this
+      // out loud is an incident scattered across the channel as loose
+      // messages that nothing marks as related. It pings the rotation for the
+      // same reason a prod-critical signal does: nothing else will notice.
+      alarm("thread_link_broken", {
         incidentId: event.incidentId,
         type: event.type,
       });
+      const { ts } = await this.slack.post(
+        null,
+        [
+          `${ping}*Incident ${event.incidentId} has no Slack thread*`,
+          "Its thread link is missing, so this is posting at the top level and the rest of the incident will follow it here.",
+          "",
+          body,
+        ].join("\n"),
+        this.cfg.channelId,
+      );
+      // Adopt this post as the thread. One recovered thread beats the loose
+      // messages every later transition would otherwise add.
+      const adopted = await this.linkThread(event.incidentId, ts);
+      log("posted_top_level", {
+        incidentId: event.incidentId,
+        type: event.type,
+        adopted,
+      });
+      return ts;
     }
-    const { ts } = await this.slack.post(threadTs, text, this.cfg.channelId);
+
+    const { ts } = await this.slack.post(
+      threadTs,
+      (earnsMention(event) ? ping : "") + body,
+      this.cfg.channelId,
+    );
     log("posted", {
       incidentId: event.incidentId,
       type: event.type,
@@ -289,7 +388,12 @@ export class SlackRelay {
       incident.owner === "agent" &&
       AGENT_RUNNING_STATUSES.includes(incident.status);
 
-    if (mentioned && !agentRunning) {
+    // Checked before the Slack agent branch on purpose: that agent is
+    // read-only and its answer to a claim is to tell you to reply in the
+    // thread, which is what you just did.
+    const claim = ownershipClaim(text, this.cfg.botUserId);
+
+    if (mentioned && !agentRunning && !claim) {
       return { kind: "slack_agent", channel, threadTs, ts, user, text };
     }
 
@@ -301,19 +405,86 @@ export class SlackRelay {
     });
     if (!inserted) return ignore("duplicate delivery");
 
-    if (mentioned) {
-      await this.pushDirective(incident.id, {
-        type: "human_message",
-        from: user,
-        text,
+    // `contact_human` waits on directives alone, and the contract is that a
+    // plain reply in the thread answers it; nothing else reads thread_reply on
+    // an agent's behalf. A mention answers too, and interrupts as well.
+    await this.pushDirective(incident.id, {
+      type: "human_message",
+      from: user,
+      text,
+      ts,
+    });
+
+    if (claim) {
+      log("ownership_claim", { incidentId: incident.id, claim, user, ts });
+      return {
+        kind: "ownership_claim",
+        incidentId: incident.id,
+        claim,
+        slackUserId: user,
         ts,
-      });
-      log("interrupt_recorded", { incidentId: incident.id, ts });
-      return { kind: "incident_reply", incidentId: incident.id, interrupt: true };
+      };
     }
 
-    log("reply_recorded", { incidentId: incident.id, ts });
-    return { kind: "incident_reply", incidentId: incident.id, interrupt: false };
+    log(mentioned ? "interrupt_recorded" : "reply_recorded", {
+      incidentId: incident.id,
+      ts,
+    });
+    return {
+      kind: "incident_reply",
+      incidentId: incident.id,
+      interrupt: mentioned,
+    };
+  }
+
+  private threadTsFor(incidentId: string): string | null {
+    const row = this.db.get<{ slackThreadTs: string | null }>(
+      "SELECT slackThreadTs FROM incident WHERE id = ?",
+      [incidentId],
+    );
+    return row?.slackThreadTs ?? null;
+  }
+
+  private async linkThread(
+    incidentId: string,
+    ts: string,
+  ): Promise<LinkOutcome> {
+    for (let attempt = 1; attempt <= LINK_ATTEMPTS; attempt++) {
+      try {
+        // Guarded on NULL so two transitions racing an absent link cannot
+        // each adopt their own post and split one incident across two
+        // threads. First write wins; the loser leaves a loose message.
+        const won = await this.db.withWrite(
+          (d) =>
+            d
+              .prepare(
+                "UPDATE incident SET slackThreadTs = ? WHERE id = ? AND slackThreadTs IS NULL",
+              )
+              .run(ts, incidentId).changes > 0,
+        );
+        if (won) return "linked";
+
+        const held = this.threadTsFor(incidentId);
+        // A commit whose snapshot threw afterwards: the row already carries
+        // this ts, so the retry matched nothing and the link is fine.
+        if (held === ts) return "linked";
+        if (!held) {
+          alarm("thread_link_no_incident", { incidentId, ts });
+          return "unwritable";
+        }
+        alarm("thread_link_lost", { incidentId, ts, held });
+        return "lost";
+      } catch (err) {
+        alarm("thread_link_write_failed", {
+          incidentId,
+          ts,
+          attempt,
+          error: String(err),
+        });
+        if (attempt < LINK_ATTEMPTS) await sleep(LINK_RETRY_MS * attempt);
+      }
+    }
+    return "unwritable";
   }
 
   private incidentForThread(
