@@ -851,6 +851,11 @@ describe("hand off", () => {
       "agent",
       "a closed incident is not something to put on a person's plate",
     );
+    assert.match(
+      posts.at(-1)?.text ?? "",
+      /could not be recorded/,
+      "the brief already said it was theirs, so the thread has to take that back",
+    );
   });
 
   it("stops triage attaching new signals to what a human took", async () => {

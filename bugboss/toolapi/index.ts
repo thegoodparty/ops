@@ -656,6 +656,19 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         );
       }
 
+      // Past this point the brief is out, so a person is reading that this
+      // is theirs. Every way of not committing the hand-off has to say so in
+      // the same thread the brief went to: leaving it standing is how
+      // somebody ends up believing they own an incident that nothing
+      // assigned to them. Shared by both failure paths below so they cannot
+      // drift apart — one of them silently not retracting is exactly the
+      // bug this guards.
+      const retract = (why: string) =>
+        notify(
+          incident,
+          `Correction on ${incidentId}: that hand-off could not be recorded, so ${why} Treat the brief above as a status update.`,
+        );
+
       try {
         const taken = await db.withWrite((w) =>
           w
@@ -674,17 +687,17 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             )
             .run(incidentId).changes,
         );
-        if (taken === 0) return raced(incidentId, "handOff");
+        if (taken === 0) {
+          await retract(
+            "the incident reached a terminal state while the brief was posting and nobody has been assigned.",
+          );
+          return raced(incidentId, "handOff");
+        }
       } catch (err) {
-        // A person has just read a hand-off brief, so they believe this is
-        // theirs, while the row still says otherwise and the dispatcher will
-        // put another agent on it. Two agents posting into the thread they
-        // were handed reads as being ignored, so the retraction goes to the
-        // same place the brief did.
-        await notify(
-          incident,
-          `Correction on ${incidentId}: that hand-off could not be recorded, so it is still owned by the agent and nobody has been assigned. Treat the brief above as a status update.`,
-        );
+        // The write itself failed, so the row still says agent and the
+        // dispatcher will put another agent on it. Two agents posting into
+        // the thread somebody was handed reads as being ignored.
+        await retract("it is still owned by the agent and nobody has been assigned.");
         throw err;
       }
 
