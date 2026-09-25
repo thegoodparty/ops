@@ -370,9 +370,11 @@ export const createBugBoss = (config: BugBossConfig) => {
         },
       ],
     }),
-    // Twelve hours, the maximum. Incidents outlive the one-hour default and a
-    // credential expiry mid-investigation forces an agent restart.
-    maxSessionDuration: 43200,
+    // One hour, because that is all this role can ever issue: its only
+    // trusted principal is the task role, so every AssumeRole against it is
+    // chained, and chained sessions are capped at an hour whatever this says.
+    // A larger value here would only advertise a session nobody can get.
+    maxSessionDuration: 3600,
     inlinePolicies: [
       {
         name: "inline",

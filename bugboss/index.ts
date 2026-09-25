@@ -1215,10 +1215,13 @@ export const createBugBoss = async (
     (secrets.agentRoleArn
       ? createAssumeRoleCredentials({
           roleArn: secrets.agentRoleArn,
-          // The role's maxSessionDuration is twelve hours; ask for all of it.
-          // The child re-reads these from the loopback API well before they
-          // expire, which is what lets an incident outlive a single session.
-          durationSeconds: 43_200,
+          // No durationSeconds override: the default is the one hour that role
+          // chaining allows. A task role is itself an assumed role, so this
+          // AssumeRole is a chained one, and AWS caps those at an hour and
+          // REJECTS a longer request rather than clamping it. The role's
+          // maxSessionDuration is not the limit here and asking for it fails
+          // every launch. An incident still outlives the session because the
+          // child re-reads these from the loopback API before they expire.
         })
       : async (incidentId) => {
           alarm("no_agent_role", {
