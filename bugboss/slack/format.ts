@@ -176,46 +176,15 @@ const isDivider = (line: string): boolean => {
 
 const isTableRow = (line: string): boolean => line.trim().startsWith("|");
 
-/**
- * A pipe table is unreadable in Slack and there is no markup that fixes it, so
- * the columns are kept the only way Slack keeps columns: a monospaced block.
- * The `|---|---|` divider goes, since it is Markdown's way of marking a header
- * row and carries nothing once the table is just text.
- */
-const convertTables = (text: string): string => {
-  const lines = text.split("\n");
-  const out: string[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    if (!isTableRow(lines[i])) {
-      out.push(lines[i]);
-      i++;
-      continue;
-    }
-    let end = i;
-    while (end < lines.length && isTableRow(lines[end])) end++;
-    const block = lines.slice(i, end);
-    if (block.length >= 2 && block.some(isDivider)) {
-      out.push("```", ...block.filter((line) => !isDivider(line)), "```");
-    } else {
-      out.push(...block);
-    }
-    i = end;
-  }
-  return out.join("\n");
-};
-
-const convertProse = (text: string): string => {
-  let out = escape(text);
-  out = convertTables(out);
+const convertInline = (text: string): string => {
   // Slack has no headings at any level. A bold line on its own is the
   // substitute, and it is what the agent is told to write.
-  out = out.replace(/^([ \t]*)#{1,6}[ \t]+(.+?)[ \t]*$/gm, "$1*$2*");
+  let out = text.replace(/^([ \t]*)#{1,6}[ \t]+(.+?)[ \t]*$/gm, "$1*$2*");
   out = out.replace(/\*\*([^*\n]+)\*\*/g, "*$1*");
   out = out.replace(/__([^_\n]+)__/g, "*$1*");
   out = out.replace(/~~([^~\n]+)~~/g, "~$1~");
-  // Already escaped, so this builds the entity directly rather than going
-  // through link(), which escapes what it is given.
+  // The text is already escaped, so this builds the entity directly rather
+  // than going through link(), which escapes what it is given.
   out = out.replace(
     /\[([^\]\n]*)\]\(([^)\s]+)\)/g,
     (match: string, label: string, url: string) =>
@@ -228,8 +197,45 @@ const convertProse = (text: string): string => {
           : `<${url}>`
         : match,
   );
-  out = out.replace(/^([ \t]*)[-*+][ \t]+/gm, "$1• ");
-  return out;
+  return out.replace(/^([ \t]*)[-*+][ \t]+/gm, "$1• ");
+};
+
+/**
+ * Escape, then convert everything that is not a table.
+ *
+ * A pipe table is unreadable in Slack and there is no markup that fixes it, so
+ * the columns are kept the only way Slack keeps columns: a monospaced block.
+ * The `|---|---|` divider goes, since it is Markdown's way of marking a header
+ * row and carries nothing once the table is just text.
+ *
+ * The table is pulled out *before* the conversions rather than fenced after
+ * them, because what is inside a fence is code and a reader should see the
+ * bytes that were written. Converting first would leave a `**Endpoint**`
+ * header cell reading `*Endpoint*` inside the block that was supposed to
+ * protect it.
+ */
+const convertProse = (text: string): string => {
+  const lines = escape(text).split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!isTableRow(lines[i])) {
+      const start = i;
+      while (i < lines.length && !isTableRow(lines[i])) i++;
+      out.push(convertInline(lines.slice(start, i).join("\n")));
+      continue;
+    }
+    let end = i;
+    while (end < lines.length && isTableRow(lines[end])) end++;
+    const block = lines.slice(i, end);
+    if (block.length >= 2 && block.some(isDivider)) {
+      out.push("```", ...block.filter((line) => !isDivider(line)), "```");
+    } else {
+      out.push(convertInline(block.join("\n")));
+    }
+    i = end;
+  }
+  return out.join("\n");
 };
 
 /**

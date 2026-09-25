@@ -158,6 +158,22 @@ describe("toMrkdwn", () => {
     );
   });
 
+  test("what goes inside the fence keeps the bytes that were written", () => {
+    // Converting before fencing would leave `*Endpoint*` in the block that is
+    // supposed to protect it, which is a change the reader cannot explain.
+    assert.equal(
+      toMrkdwn("| **Endpoint** | rate |\n|---|---|\n| /a | 4% |"),
+      "```\n| **Endpoint** | rate |\n| /a | 4% |\n```",
+    );
+  });
+
+  test("prose either side of a table is still converted", () => {
+    assert.equal(
+      toMrkdwn("## Rates\n| a | b |\n|---|---|\n| 1 | 2 |\n**done**"),
+      "*Rates*\n```\n| a | b |\n| 1 | 2 |\n```\n*done*",
+    );
+  });
+
   test("pipes that are not a table are left alone", () => {
     assert.equal(toMrkdwn("| grep foo | wc -l"), "| grep foo | wc -l");
   });
