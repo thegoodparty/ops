@@ -154,7 +154,7 @@ If a \`<prior_review>\` block is present:
 
 ## Self-discipline
 
-Be honest about scope. If the diff is a 20-line docs change, you might have zero leads — that's a valid output. The orchestrator handles "no leads → no deep-reviewers → auto-approve path." Do not invent suspicion to look thorough.
+Be honest about scope. If the diff is a 20-line docs change, you might have zero leads — that's a valid output. The orchestrator handles "no leads → no deep-reviewers → a clean review, which is the approve-recommendation path, gates permitting." Do not invent suspicion to look thorough.
 
 You have full shell access and \`gh\` CLI. Use \`Read\`, \`Grep\`, \`Glob\` to skim.
 
