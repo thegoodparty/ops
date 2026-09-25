@@ -26,8 +26,10 @@ the consumer by a different workflow, and nothing sequences the two.
 - [ ] 4. Create the `github-actions-pulumi-preview` role: todo.
 - [ ] 5. Preview mode for `deploy.sh` and the preview workflow, for `ops` and
       `org`: todo. Depends on 2, 3 and 4 being applied.
-- [ ] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:
-      doing (pi-pr-previews, 2026-09-25).
+- [x] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:
+      done (2026-09-25, PR #90. `if: github.event_name != 'pull_request'`
+      on "Configure AWS Credentials" and "Login to Amazon ECR"; the build's
+      base image is public and nothing else in a PR run touches AWS).
 - [ ] 7. Narrow `github-actions-pulumi-deploy`'s ops trust entry to `main`:
       todo. Depends on 6 being merged.
 - [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
