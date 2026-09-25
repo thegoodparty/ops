@@ -25,7 +25,7 @@ import type {
   SignalAdapter,
 } from "../types";
 import { RESOLUTION_POLICY_LABEL } from "./human";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 
 export const GRAFANA_SOURCE = "grafana";
 
@@ -83,8 +83,7 @@ const METRIC_RESULT_TYPES = new Set(["matrix", "vector"]);
 // not to a day.
 const COVERAGE_WINDOW = 100;
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "grafana", event, ...data }));
+const log = makeLog("grafana");
 
 const alarm = makeAlarm("grafana");
 

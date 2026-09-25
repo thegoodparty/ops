@@ -69,7 +69,7 @@ test("a session round-trips through the store byte for byte", async () => {
   });
   await sync.flush();
   assert.equal(sync.lastError(), null);
-  assert.ok(objects.has("sessions/inc-1.jsonl"));
+  assert.ok(objects.has("sessions/incident/inc-1/session.jsonl"));
 
   const restoreDir = await mkdtemp(join(tmpdir(), "bugboss-restore-"));
   const restoredFile = join(restoreDir, "inc-1.jsonl");
@@ -123,18 +123,57 @@ test("turn_end syncs, and a store failure never ends the turn", async () => {
     },
   } as unknown as ExtensionAPI;
 
-  sessionSyncExtension(sync)(pi);
+  // A dropped sync failure is a lost investigation: the next restart restores
+  // nothing and the agent starts over. The extension has to report it.
+  const failures: Array<{ error: string; streak: number }> = [];
+  sessionSyncExtension(sync, (error, streak) =>
+    failures.push({ error: error.message, streak }),
+  )(pi);
   assert.ok(handlers.turn_end);
   assert.ok(handlers.session_shutdown);
 
   await handlers.turn_end({ type: "turn_end" }, {});
   assert.equal(puts.length, 0);
   assert.match(String(sync.lastError()), /s3 is having a day/);
+  assert.deepEqual(failures, [{ error: "s3 is having a day", streak: 1 }]);
 
   await handlers.turn_end({ type: "turn_end" }, {});
   assert.equal(puts.length, 1);
   assert.equal(sync.lastError(), null);
   assert.equal(puts[0].toString("utf8"), sessionJsonl);
+  assert.equal(failures.length, 1, "a successful flush is not reported");
+});
+
+test("consecutive sync failures are counted, and a success resets the count", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bugboss-streak-"));
+  const file = join(dir, "inc-5.jsonl");
+  await writeFile(file, sessionJsonl);
+
+  let fail = true;
+  const sync = createSessionSync({
+    store: {
+      get: async () => null,
+      put: async () => {
+        if (fail) throw new Error("no such bucket");
+      },
+    },
+    key: sessionKeyFor("inc-5"),
+    sessionFile: () => file,
+  });
+
+  await sync.flush();
+  assert.equal(sync.failureStreak(), 1);
+  await sync.flush();
+  assert.equal(sync.failureStreak(), 2);
+
+  fail = false;
+  await sync.flush();
+  assert.equal(sync.failureStreak(), 0);
+  assert.equal(sync.lastError(), null);
+});
+
+test("the session key is the layout every reader uses", () => {
+  assert.equal(sessionKeyFor("inc-1"), "sessions/incident/inc-1/session.jsonl");
 });
 
 test("a missing local session file is not a sync failure", async () => {

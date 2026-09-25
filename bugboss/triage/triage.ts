@@ -21,7 +21,7 @@ import { isNeverSuppressed } from "../ingress/human";
 import type { TriageContext, TriageDecision } from "../types";
 import { recordCall } from "./health";
 import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 import {
   incidentOwner,
   incidentStatus,
@@ -59,8 +59,7 @@ const ATTACHABLE = ["INVESTIGATING", "FIXING"];
 /** Statuses a recurrence pointer may name: both claimed the problem was over. */
 const RECURRABLE = ["RESOLVED", "CLOSED"];
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "triage", event, ...data }));
+const log = makeLog("triage");
 
 const alarm = makeAlarm("triage");
 

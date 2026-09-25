@@ -14,10 +14,9 @@ import { classifySlackEvent, type SlackConfig } from "../ingress/slack";
 import type { BugBossMcp } from "../mcp";
 import type { SlackEvent } from "../slack/relay";
 import type { IncomingRequest } from "../types";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "boss-http", event, ...data }));
+const log = makeLog("boss-http");
 
 const alarm = makeAlarm("boss-http");
 

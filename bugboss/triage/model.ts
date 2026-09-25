@@ -7,6 +7,7 @@
 // session, resume and streaming machinery; and the end-to-end test has to
 // substitute a fake without standing up Bedrock.
 
+import { makeLog } from "../logging";
 import type { ZodType } from "zod";
 
 export interface ModelToolSpec {
@@ -65,8 +66,7 @@ export interface StructuredCall<T> {
   maxTokens: number;
 }
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "triage", event, ...data }));
+const log = makeLog("triage");
 
 const withDeadline = async <T>(
   work: Promise<T>,

@@ -87,6 +87,14 @@ export const createChildProcessSpawn = (
       });
 
       child.once("error", reject);
-      child.once("exit", () => resolve());
+      // The exit status is the only thing a dying agent gets to say: run.ts
+      // exits 1 from its failure handler. Resolving on any exit made a crash
+      // byte-identical to a clean hand_off, so `agent_failed` could only ever
+      // fire for a spawn that never started at all.
+      child.once("exit", (code, signal) => {
+        if (signal) reject(new Error(`agent killed by ${signal}`));
+        else if (code !== 0) reject(new Error(`agent exited ${code}`));
+        else resolve();
+      });
     });
 };

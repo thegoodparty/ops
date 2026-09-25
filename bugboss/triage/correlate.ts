@@ -15,7 +15,7 @@ import { z } from "zod";
 import type { AssignRequest, IncidentDigest } from "../types";
 import { recordCall } from "./health";
 import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 import {
   attachedSignalIds,
   queryTool,
@@ -65,8 +65,7 @@ const MAX_CAUSE_CHARS = 6000;
 /** Only these transition to MERGED, per the status diagram. */
 const MERGEABLE = ["INVESTIGATING", "FIXING"];
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "correlate", event, ...data }));
+const log = makeLog("correlate");
 
 const alarm = makeAlarm("correlate");
 

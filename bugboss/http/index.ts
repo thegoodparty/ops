@@ -3,6 +3,7 @@
 // and is bound to 127.0.0.1 so it has no route from outside the task at all.
 // The per-incident token is the boundary that matters, but binding is free.
 
+import { makeLog } from "../logging";
 import { serve, type ServerType } from "@hono/node-server";
 import type { Hono } from "hono";
 
@@ -10,8 +11,7 @@ export { IngestRejected } from "./errors";
 export { createPublicApp, type PublicAppDeps } from "./public";
 export { createToolApiRoutes, type ToolApiHttpDeps } from "./toolapi";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "boss-http", event, ...data }));
+const log = makeLog("boss-http");
 
 export const DEFAULT_PUBLIC_PORT = 3000;
 /** Matches createBossClient's default base URL in bugboss/agent/run.ts. */

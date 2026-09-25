@@ -69,7 +69,7 @@ import {
 } from "./toolapi";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
-import { makeAlarm } from "./alarm";
+import { makeAlarm, makeLog } from "./logging";
 import type {
   BugBossConfig,
   Evidence,
@@ -83,8 +83,7 @@ import type {
   TriageDecision,
 } from "./types";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "boss", event, ...data }));
+const log = makeLog("boss");
 
 const alarm = makeAlarm("boss");
 

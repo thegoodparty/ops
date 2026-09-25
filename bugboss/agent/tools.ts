@@ -9,7 +9,7 @@
 
 import { execFile } from "node:child_process";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { Directive, ToolApi } from "../types";
+import type { Directive } from "../types";
 
 export const MONITOR_TOOL_NAME = "monitor";
 export const CONTACT_HUMAN_TOOL_NAME = "contact_human";
@@ -27,6 +27,31 @@ export const truncateOutput = (
   const tail = text.slice(-Math.floor(maxChars * 0.3));
   const dropped = text.length - head.length - tail.length;
   return `${head}\n\n[... ${dropped} characters elided ...]\n\n${tail}`;
+};
+
+/**
+ * How a directive reaches the model. The Boss tools and `contact_human` both
+ * render them, so it sits with the tools rather than with either one.
+ */
+export const renderDirectives = (directives: Directive[]): string => {
+  if (!directives.length) return "";
+  const lines = directives.map((directive) => {
+    switch (directive.type) {
+      case "stop":
+        return `STOP: ${directive.reason}`;
+      case "merged":
+        return `MERGED: this incident is now part of ${directive.into}. Stop work and exit.`;
+      case "handoff":
+        return `HANDOFF: ${directive.reason}`;
+      case "new_signals":
+        return `NEW SIGNALS (${directive.count}): ${directive.summary}`;
+      case "human_message":
+        return `MESSAGE from ${directive.from} at ${directive.ts}: ${directive.text}`;
+      case "resumed_after":
+        return `RESUMED after ${directive.seconds}s. Re-check anything time-sensitive before continuing.`;
+    }
+  });
+  return `\n\nDIRECTIVES\n${lines.join("\n")}`;
 };
 
 export interface ProbeResult {
@@ -57,6 +82,20 @@ export const shellProbe: Probe = (command, timeoutMs) =>
 
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Pi's per-call signal and the harness's deadline signal, both honoured.
+ * Preferring one would make the soft deadline unreachable: `steer` only
+ * delivers once the current turn's tool calls finish, and these tools are
+ * where an agent spends most of a long incident.
+ */
+const eitherSignal = (
+  ...signals: (AbortSignal | undefined)[]
+): AbortSignal | undefined => {
+  const live = signals.filter((signal): signal is AbortSignal => !!signal);
+  if (live.length < 2) return live[0];
+  return AbortSignal.any(live);
+};
 
 export interface MonitorDeps {
   probe?: Probe;
@@ -103,6 +142,8 @@ export const runMonitor = async (
 
 export interface PendingQuestion {
   message: string;
+  /** Empty until the post that follows the marker succeeds. */
+  messageTs: string;
   askedAt: number;
 }
 
@@ -119,9 +160,32 @@ export interface HumanContactPort {
   clearPending(): Promise<void>;
 }
 
+/** A directive still in the queue, carrying the id needed to remove just it. */
+export interface PendingDirective {
+  id: number;
+  directive: Directive;
+}
+
+/**
+ * The read the poll makes, and the reason it is not `getIncident`. Every
+ * ToolApi response drains: it deletes the directives it carries. Polling one
+ * every 30s while blocked therefore destroys the `stop`, `merged`,
+ * `new_signals` and `resumed_after` an agent has not read yet, so this read
+ * leaves them where they are and the drain stays on the calls whose result
+ * the model actually sees.
+ *
+ * `consumeDirective` is the one exception: the reply that ends a wait is
+ * removed by the wait, because it has already been delivered as that call's
+ * answer.
+ */
+export interface DirectivePeek {
+  peekDirectives(): Promise<PendingDirective[]>;
+  consumeDirective(id: number): Promise<void>;
+}
+
 export interface ContactHumanDeps {
   contact: HumanContactPort;
-  api: Pick<ToolApi, "getIncident">;
+  api: DirectivePeek;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   pollSeconds?: number;
@@ -138,26 +202,38 @@ export const directiveTimestampMillis = (ts: string): number => {
   return Number.isNaN(parsed) ? 0 : parsed;
 };
 
+type HumanReply = Extract<Directive, { type: "human_message" }>;
+
 export const firstReplyAfter = (
-  directives: Directive[],
+  pending: PendingDirective[],
   askedAt: number,
-): { from: string; text: string; ts: string } | null => {
-  const replies = directives
-    .filter(
-      (directive): directive is Extract<Directive, { type: "human_message" }> =>
-        directive.type === "human_message",
+): { id: number; directive: HumanReply } | null => {
+  const replies = pending
+    .filter((entry): entry is { id: number; directive: HumanReply } =>
+      entry.directive.type === "human_message",
     )
-    .filter((directive) => directiveTimestampMillis(directive.ts) > askedAt)
+    .filter((entry) => directiveTimestampMillis(entry.directive.ts) > askedAt)
     .sort(
-      (a, b) => directiveTimestampMillis(a.ts) - directiveTimestampMillis(b.ts),
+      (a, b) =>
+        directiveTimestampMillis(a.directive.ts) -
+        directiveTimestampMillis(b.directive.ts),
     );
   return replies[0] ?? null;
 };
 
+export interface ContactHumanResult {
+  reply: string | null;
+  timedOut: boolean;
+  /** Everything the poll saw that was not the reply. The caller renders these. */
+  directives: Directive[];
+  /** A `stop` or a `merged` arrived: the incident is no longer the agent's. */
+  terminate: boolean;
+}
+
 export const runContactHuman = async (
   args: { message: string; timeoutSeconds: number },
   deps: ContactHumanDeps,
-): Promise<{ reply: string | null; timedOut: boolean }> => {
+): Promise<ContactHumanResult> => {
   const sleep = deps.sleep ?? wait;
   const now = deps.now ?? Date.now;
   const pollMs = (deps.pollSeconds ?? CONTACT_HUMAN_POLL_SECONDS) * 1000;
@@ -166,23 +242,57 @@ export const runContactHuman = async (
   // Re-entrancy: a restart replays a tool call with no result, so this runs
   // again. The marker is recorded before the post, so the second run resumes
   // waiting on the original question instead of asking the human twice.
+  //
+  // A marker for a *different* question is the opposite case: clearPending
+  // does not run when the child is SIGKILLed mid-wait, so the marker outlives
+  // the question. Matching on the message is what stops that stale marker
+  // from swallowing the post of every later question.
+  //
+  // An empty messageTs is the third case, and the one the marker used to make
+  // permanent: recordPending and post are two calls, so a Slack failure
+  // between them left a marker for a question nobody was ever asked. Every
+  // later attempt then skipped the post by design and waited out its timeout,
+  // which is textually identical to being ignored. Re-posting can at worst
+  // ask twice; not posting cannot be recovered from at all.
   let pending = await deps.contact.getPending();
-  if (!pending) {
+  if (!pending || pending.message !== args.message || !pending.messageTs) {
     pending = await deps.contact.recordPending(args.message);
     await deps.contact.post(args.message);
   }
 
   const deadline = now() + Math.max(0, args.timeoutSeconds) * 1000;
   for (;;) {
-    const response = await deps.api.getIncident();
-    const reply = firstReplyAfter(response.directives ?? [], pending.askedAt);
-    if (reply) {
+    const entries = await deps.api.peekDirectives();
+    const reply = firstReplyAfter(entries, pending.askedAt);
+    const terminate = entries.some(
+      (entry) =>
+        entry.directive.type === "stop" || entry.directive.type === "merged",
+    );
+    const rest = entries
+      .filter((entry) => entry !== reply)
+      .map((entry) => entry.directive);
+
+    if (reply || terminate) {
       await deps.contact.clearPending();
-      return { reply: truncateOutput(reply.text, maxChars), timedOut: false };
+      // The reply answered the question this call asked and is returned as
+      // its result, so this call consumes it. Left pending, it would come
+      // back a turn later as a bare MESSAGE directive with nothing marking
+      // it as already answered, and "yes, go ahead and restart it" reads
+      // just as well as a second authorisation as a first. Everything else
+      // is addressed to the agent rather than to this question, so it stays
+      // for get_incident. Clearing the marker first: a failure after it is
+      // a duplicate post, a failure before it is a silent 24-hour wait.
+      if (reply) await deps.api.consumeDirective(reply.id);
+      return {
+        reply: reply ? truncateOutput(reply.directive.text, maxChars) : null,
+        timedOut: false,
+        directives: rest,
+        terminate,
+      };
     }
     if (deps.signal?.aborted || now() >= deadline) {
       await deps.contact.clearPending();
-      return { reply: null, timedOut: true };
+      return { reply: null, timedOut: true, directives: rest, terminate: false };
     }
     await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
   }
@@ -243,7 +353,10 @@ export const createMonitorTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MonitorArgs;
-      const result = await runMonitor(args, { ...deps, signal: signal ?? deps.signal });
+      const result = await runMonitor(args, {
+        ...deps,
+        signal: eitherSignal(signal, deps.signal),
+      });
       const header = result.timedOut
         ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
         : `Condition met: ${args.description}`;
@@ -277,14 +390,19 @@ export const createContactHumanTool = async (
       const args = params as unknown as { message: string; timeoutSeconds: number };
       const result = await runContactHuman(args, {
         ...deps,
-        signal: signal ?? deps.signal,
+        signal: eitherSignal(signal, deps.signal),
       });
       const text = result.timedOut
         ? `No reply within ${args.timeoutSeconds}s. Proceed on a stated assumption or hand off.`
-        : `Reply: ${result.reply ?? ""}`;
+        : result.reply === null
+          ? "The wait ended on a directive rather than a reply."
+          : `Reply: ${result.reply}`;
       return {
-        content: [{ type: "text", text }],
+        content: [
+          { type: "text", text: `${text}${renderDirectives(result.directives)}` },
+        ],
         details: { timedOut: result.timedOut },
+        terminate: result.terminate,
       };
     },
   } as ToolDefinition;

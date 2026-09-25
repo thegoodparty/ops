@@ -13,10 +13,9 @@
 import type { Db } from "../db";
 import type { SlackPoster } from "./relay";
 import { mentionPrefix, stripBotMention } from "./relay";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "slack-agent", event, ...data }));
+const log = makeLog("slack-agent");
 
 /** Error level, for the failures whose only other notice is a Slack post. */
 const alarm = makeAlarm("slack-agent");

@@ -42,13 +42,12 @@ import {
   type SignalRow,
 } from "./assign";
 import { verifyAgentToken } from "./token";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 
 export * from "./assign";
 export * from "./token";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "toolapi", event, ...data }));
+const log = makeLog("toolapi");
 
 /**
  * For a failure nobody asked for, as opposed to a transition this module

@@ -76,25 +76,38 @@ export const queryTool = (db: IncidentReader): LoopTool => ({
   },
 });
 
-/** Used to check a model-supplied incident id before it reaches an outcome. */
+/**
+ * Used to check a model-supplied incident id before it reaches an outcome.
+ *
+ * Throws on a failed read rather than answering null. null is the answer for
+ * "no such incident", which silently downgrades an attach to a new incident
+ * and drops a recurrence pointer, and every caller sits inside a fallback that
+ * records why it fell back -- so an exception carries strictly more
+ * information than a plausible-looking wrong answer.
+ */
 export const incidentStatus = (db: IncidentReader, id: string): string | null => {
-  try {
-    const rows = db.query<{ status: string }>(
-      "SELECT status FROM incident WHERE id = ?",
-      [id],
-    );
-    return rows[0]?.status ?? null;
-  } catch {
-    return null;
-  }
+  const rows = db.query<{ status: string }>(
+    "SELECT status FROM incident WHERE id = ?",
+    [id],
+  );
+  return rows[0]?.status ?? null;
 };
 
-export const attachedSignalIds = (db: IncidentReader, incidentId: string): string[] => {
-  try {
-    return db
-      .query<{ id: string }>("SELECT id FROM signal WHERE incidentId = ?", [incidentId])
-      .map((row) => row.id);
-  } catch {
-    return [];
-  }
+/**
+ * Who has an incident, which types.ts keeps deliberately orthogonal to its
+ * status: a handed-off incident still reads INVESTIGATING. Throws on a failed
+ * read, for the same reason as above.
+ */
+export const incidentOwner = (db: IncidentReader, id: string): string | null => {
+  const rows = db.query<{ owner: string }>(
+    "SELECT owner FROM incident WHERE id = ?",
+    [id],
+  );
+  return rows[0]?.owner ?? null;
 };
+
+/** Throws on a failed read, for the same reason: [] means "nothing attached". */
+export const attachedSignalIds = (db: IncidentReader, incidentId: string): string[] =>
+  db
+    .query<{ id: string }>("SELECT id FROM signal WHERE incidentId = ?", [incidentId])
+    .map((row) => row.id);

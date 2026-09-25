@@ -18,8 +18,11 @@ import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import {
   createContactHumanTool,
   createMonitorTool,
+  renderDirectives,
   truncateOutput,
+  type DirectivePeek,
   type HumanContactPort,
+  type PendingDirective,
   type PendingQuestion,
 } from "./tools";
 import {
@@ -28,9 +31,9 @@ import {
   readStoredPrefixFromFile,
   restoreSessionFile,
   sessionFileFor,
-  sessionKeyFor,
   sessionSyncExtension,
   PROMPT_ENTRY_TYPE,
+  SESSION_SYNC_FAILURE_LIMIT,
   type SessionStore,
   type StoredPrefix,
 } from "./session";
@@ -113,7 +116,7 @@ export const startNpmCi = (paths: AgentPaths): void => {
 // The Boss
 // ---------------------------------------------------------------------------
 
-export type BossClient = ToolApi & HumanContactPort;
+export type BossClient = ToolApi & HumanContactPort & DirectivePeek;
 
 export const createBossClient = (args: {
   baseUrl: string;
@@ -146,6 +149,9 @@ export const createBossClient = (args: {
     reportAnalysis: (payload) => call<ToolResponse>("POST", "/analysis", payload),
     handOff: (payload) => call<ToolResponse>("POST", "/handoff", payload),
     getIncident: () => call<ToolResponse<IncidentView>>("GET", ""),
+    peekDirectives: () => call<PendingDirective[]>("GET", "/directives"),
+    consumeDirective: (id) =>
+      call<void>("DELETE", `/directives/${id}`).then(() => undefined),
     getPending: () => call<PendingQuestion | null>("GET", "/pending-question"),
     recordPending: (message) =>
       call<PendingQuestion>("POST", "/pending-question", { message }),
@@ -154,26 +160,9 @@ export const createBossClient = (args: {
   };
 };
 
-export const renderDirectives = (directives: Directive[]): string => {
-  if (!directives.length) return "";
-  const lines = directives.map((directive) => {
-    switch (directive.type) {
-      case "stop":
-        return `STOP: ${directive.reason}`;
-      case "merged":
-        return `MERGED: this incident is now part of ${directive.into}. Stop work and exit.`;
-      case "handoff":
-        return `HANDOFF: ${directive.reason}`;
-      case "new_signals":
-        return `NEW SIGNALS (${directive.count}): ${directive.summary}`;
-      case "human_message":
-        return `MESSAGE from ${directive.from} at ${directive.ts}: ${directive.text}`;
-      case "resumed_after":
-        return `RESUMED after ${directive.seconds}s. Re-check anything time-sensitive before continuing.`;
-    }
-  });
-  return `\n\nDIRECTIVES\n${lines.join("\n")}`;
-};
+// Lives with the tools now: contact_human renders directives too, and tools.ts
+// cannot import from here.
+export { renderDirectives };
 
 const bossToolResult = (response: ToolResponse<unknown>, maxChars: number) => ({
   content: [
@@ -319,6 +308,43 @@ export const toolListDrift = (signed: string[], current: string[]): string | nul
   return `tool list drift: added ${JSON.stringify(added)}, removed ${JSON.stringify(removed)}; keeping the signed loadout`;
 };
 
+/** The diagnostic reason a resume against a different model produces. */
+export const MODEL_BINDING_MISMATCH = "model_binding_mismatch";
+
+/**
+ * Bedrock does not restore the model id on resume, so the session carries it
+ * and the session wins. `BUGBOSS_MODEL_ID` comes from SSM, which retunes
+ * without a deploy, and the next restart would otherwise replay every
+ * recorded thinking block against a model that did not sign it: all of them
+ * dropped, silently, with nothing but a `model_binding_mismatch` buried in a
+ * diagnostic that reads like prompt drift. So the disagreement is its own
+ * alarm rather than something to infer from degraded reasoning.
+ */
+export const pinnedSessionModel = async (args: {
+  restored: boolean;
+  sessionFile: string;
+  configuredModelId: string;
+}): Promise<{
+  storedPrefix: StoredPrefix | null;
+  modelId: string;
+  mismatch: string | null;
+}> => {
+  const storedPrefix = args.restored
+    ? await readStoredPrefixFromFile(args.sessionFile)
+    : null;
+  if (!storedPrefix) {
+    return { storedPrefix: null, modelId: args.configuredModelId, mismatch: null };
+  }
+  return {
+    storedPrefix,
+    modelId: storedPrefix.modelId,
+    mismatch:
+      storedPrefix.modelId === args.configuredModelId
+        ? null
+        : `${MODEL_BINDING_MISMATCH}: session was signed against ${storedPrefix.modelId} but the configured model is ${args.configuredModelId}; resuming on ${storedPrefix.modelId}`,
+  };
+};
+
 export const PREFIX_DRIFT_DIAGNOSTIC = "anthropic_input_transformations";
 
 export const prefixDriftExtension =
@@ -351,8 +377,12 @@ export interface RunIncidentAgentOptions {
   modelId?: string;
   timeoutSeconds?: number;
   awsRegion?: string;
-  /** Overrides the derived S3 key. The dispatcher passes it as sessionRef. */
-  sessionKey?: string;
+  /**
+   * The S3 key for the session, from the dispatcher's sessionRef. Required
+   * rather than derived: the incident row records the key the Boss chose, and
+   * a child that derives its own can write where nothing looks for it.
+   */
+  sessionKey: string;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
   store?: SessionStore;
   api?: BossClient;
@@ -373,8 +403,14 @@ export const agentOptionsFromEnv = (
   if (!incidentId) throw new Error("BUGBOSS_INCIDENT_ID is required");
   const s3Bucket = env.BUGBOSS_S3_BUCKET;
   if (!s3Bucket) throw new Error("BUGBOSS_S3_BUCKET is required");
+  const sessionKey = env.BUGBOSS_SESSION_REF;
+  if (!sessionKey) throw new Error("BUGBOSS_SESSION_REF is required");
 
-  const deadlineAt = Number(env.BUGBOSS_DEADLINE_AT);
+  // Number("") is 0, which is finite, so an unset-but-present deadline would
+  // otherwise pass the check below and yield a 60-second agent.
+  const deadlineAt = env.BUGBOSS_DEADLINE_AT
+    ? Number(env.BUGBOSS_DEADLINE_AT)
+    : Number.NaN;
   const timeoutSeconds = Number.isFinite(deadlineAt)
     ? Math.max(60, Math.round((deadlineAt - now) / 1000))
     : DEFAULT_TIMEOUT_SECONDS;
@@ -390,7 +426,7 @@ export const agentOptionsFromEnv = (
     omniRepoUrl: env.BUGBOSS_OMNI_REPO ?? DEFAULT_OMNI_REPO,
     modelId: env.BUGBOSS_MODEL_ID ?? DEFAULT_MODEL_ID,
     awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
-    sessionKey: env.BUGBOSS_SESSION_REF ?? undefined,
+    sessionKey,
     timeoutSeconds,
     ...(grafanaToken
       ? {
@@ -407,7 +443,20 @@ export interface RunIncidentAgentResult {
   sessionFile: string | undefined;
   restored: boolean;
   timedOut: boolean;
+  /** Pi's message for the last failed or aborted turn. Null on a clean end. */
+  error: string | null;
 }
+
+/**
+ * A force-aborted 30-minute investigation used to exit 0, exactly like a
+ * resolution, so the parent had nothing to act on. A timeout the agent handed
+ * off inside its grace window is still a clean end; an aborted turn is not.
+ */
+export const exitCodeFor = (result: RunIncidentAgentResult): number =>
+  result.error ? 1 : 0;
+
+export const sessionSyncFailedMessage = (streak: number): string =>
+  `Your session has failed to save ${streak} times in a row. Nothing you have done since is durable: if this container restarts you will start over from nothing. Stop investigating and call hand_off now, with a brief covering what you believe, what you ruled out and what you were about to do.`;
 
 export const resumeMessage = (): string =>
   "You were restarted. Time passed while you were down, and pull requests merge, deploys ship, alerts stop and people fix things by hand in that time. Call get_incident first: its resumed_after directive says how long. Re-run only the checks that matter for what you were in the middle of, then continue.";
@@ -423,7 +472,7 @@ export const runIncidentAgent = async (
 ): Promise<RunIncidentAgentResult> => {
   const paths = computePaths(options.workRoot ?? DEFAULT_WORK_ROOT, options.incidentId);
   const store = options.store ?? createS3SessionStore(options.s3Bucket, options.awsRegion);
-  const key = options.sessionKey ?? sessionKeyFor(options.incidentId);
+  const key = options.sessionKey;
   const api =
     options.api ??
     createBossClient({
@@ -437,10 +486,18 @@ export const runIncidentAgent = async (
     await cloneOmni(options.omniRepoUrl ?? DEFAULT_OMNI_REPO, paths.checkout);
   }
   const restored = await restoreSessionFile({ store, key, sessionFile: paths.sessionFile });
+  const pinned = await pinnedSessionModel({
+    restored,
+    sessionFile: paths.sessionFile,
+    configuredModelId: options.modelId ?? DEFAULT_MODEL_ID,
+  });
+  if (pinned.mismatch) {
+    console.warn(`[bugboss ${options.incidentId}] ${pinned.mismatch}`);
+  }
 
   const pi = await import("@earendil-works/pi-coding-agent");
   await registerBedrockInvokeModelProvider();
-  const model = await resolveBedrockModel({ id: options.modelId ?? DEFAULT_MODEL_ID });
+  const model = await resolveBedrockModel({ id: pinned.modelId });
 
   const mcp: McpToolset[] = [];
   if (options.grafana) {
@@ -458,7 +515,18 @@ export const runIncidentAgent = async (
   }
 
   try {
-    return await launch({ options, paths, store, key, api, pi, model, mcp, restored });
+    return await launch({
+      options,
+      paths,
+      store,
+      key,
+      api,
+      pi,
+      model,
+      mcp,
+      restored,
+      storedPrefix: pinned.storedPrefix,
+    });
   } finally {
     for (const set of mcp) set.close();
   }
@@ -474,20 +542,26 @@ const launch = async (args: {
   model: Awaited<ReturnType<typeof resolveBedrockModel>>;
   mcp: McpToolset[];
   restored: boolean;
+  storedPrefix: StoredPrefix | null;
 }): Promise<RunIncidentAgentResult> => {
-  const { options, paths, store, key, api, pi, model, mcp, restored } = args;
+  const { options, paths, store, key, api, pi, model, mcp, restored, storedPrefix } = args;
+
+  // Aborted when the soft deadline fires, so a tool parked in a 24h wait
+  // returns and the turn can end. `steer` only delivers between turns, so
+  // without this the graceful hand-off request never reaches an agent in the
+  // state it spends most of a long incident in.
+  const deadlineAbort = new AbortController();
 
   const bossTools = await createBossTools({ api, onRootCause: () => startNpmCi(paths) });
   const localTools = [
-    await createMonitorTool({}),
-    await createContactHumanTool({ contact: api, api }),
+    await createMonitorTool({ signal: deadlineAbort.signal }),
+    await createContactHumanTool({ contact: api, api, signal: deadlineAbort.signal }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(
     (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
   );
   const toolNames = [...BUILTIN_TOOLS, ...customTools.map((tool) => tool.name)].sort();
 
-  const storedPrefix = restored ? await readStoredPrefixFromFile(paths.sessionFile) : null;
   const prefix: StoredPrefix =
     storedPrefix ??
     (await (async () => {
@@ -522,6 +596,25 @@ const launch = async (args: {
     sessionFile: () => sessionManager.getSessionFile(),
   });
 
+  // Assigned once the session exists; the first flush cannot precede it.
+  let live: { steer: (message: string) => Promise<unknown> } | null = null;
+  const onSyncFailure = (error: Error, streak: number): void => {
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "session_sync_failed",
+        incidentId: options.incidentId,
+        key,
+        streak,
+        error: error.message,
+      }),
+    );
+    if (streak === SESSION_SYNC_FAILURE_LIMIT) {
+      void live?.steer(sessionSyncFailedMessage(streak)).catch(() => {});
+    }
+  };
+
   const settings = pi.SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: reserveTokensFor(model.contextWindow) },
   });
@@ -536,7 +629,7 @@ const launch = async (args: {
     systemPromptOverride: () => prefix.systemPrompt,
     appendSystemPromptOverride: () => [],
     extensionFactories: [
-      sessionSyncExtension(sync),
+      sessionSyncExtension(sync, onSyncFailure),
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
       // every thinking block is signed against.
@@ -564,6 +657,7 @@ const launch = async (args: {
     settingsManager: settings,
     sessionManager,
   });
+  live = session;
 
   const timeoutSeconds = options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
   let timedOut = false;
@@ -572,6 +666,7 @@ const launch = async (args: {
   // as the real backstop.
   const deadline = setTimeout(() => {
     timedOut = true;
+    deadlineAbort.abort();
     session.steer(deadlineMessage(DEADLINE_GRACE_SECONDS)).catch(() => {});
   }, timeoutSeconds * 1000);
   const hardStop = setTimeout(
@@ -579,6 +674,7 @@ const launch = async (args: {
     (timeoutSeconds + DEADLINE_GRACE_SECONDS) * 1000,
   );
 
+  let error: string | null = null;
   try {
     await session.prompt(
       restored ? resumeMessage() : kickoffMessage(options.incidentId),
@@ -587,10 +683,18 @@ const launch = async (args: {
     clearTimeout(deadline);
     clearTimeout(hardStop);
     await sync.flush();
+    const lost = sync.lastError();
+    if (lost) onSyncFailure(lost, sync.failureStreak());
+    error = session.state.errorMessage ?? null;
     session.dispose();
   }
 
-  return { sessionFile: sessionManager.getSessionFile(), restored, timedOut };
+  return {
+    sessionFile: sessionManager.getSessionFile(),
+    restored,
+    timedOut,
+    error,
+  };
 };
 
 if (require.main === module) {
@@ -599,7 +703,7 @@ if (require.main === module) {
       console.log(
         JSON.stringify({ component: "agent", event: "exit", ...result }),
       );
-      process.exit(0);
+      process.exit(exitCodeFor(result));
     },
     (error: unknown) => {
       console.error(

@@ -8,22 +8,24 @@
 // routed by the ALB: the listener rules are an allowlist and /incidents is not
 // on it, which is the second fence behind the token.
 //
-// Two of the ten routes are not ToolApi at all. contact_human needs to record
-// that a question is outstanding before it posts, so a restarted agent resumes
-// waiting instead of asking a human the same thing twice, and ToolApi has
-// nowhere to put that. It lives in the pending_question table, reached through
-// the four routes at the bottom of this file.
+// The routes at the bottom of this file are not ToolApi at all. contact_human
+// needs to record that a question is outstanding before it posts, so a
+// restarted agent resumes waiting instead of asking a human the same thing
+// twice, and ToolApi has nowhere to put that; it lives in the
+// pending_question table. It also has to watch for a reply without draining,
+// which no ToolApi call can do, so the directive read lives here too.
 
+import { makeLog } from "../logging";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { z } from "zod";
 
 import type { Db } from "../db";
 import type { ThreadPoster } from "../toolapi";
 import { verifyAgentToken } from "../toolapi";
-import type { ToolApi } from "../types";
+import type { Directive, ToolApi } from "../types";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "boss-http", event, ...data }));
+const log = makeLog("boss-http");
 
 export interface ToolApiHttpDeps {
   db: Db;
@@ -39,6 +41,48 @@ interface Caller {
   incidentId: string;
   token: string;
 }
+
+/**
+ * The trust boundary. Everything below this line arrived as JSON a model
+ * composed, so it is parsed rather than cast: typebox validates the same
+ * arguments in the child, which is the untrusted side of the socket. Without
+ * this, `reportRootCause({})` reached `args.explainedSignalIds.filter` and
+ * came back as "Cannot read properties of undefined" for the model to
+ * interpret.
+ */
+const BODIES = {
+  rootCause: z.object({
+    cause: z.string().min(1),
+    explainedSignalIds: z.array(z.string()),
+    usersImpacted: z.number().optional(),
+    impactQuery: z.string().optional(),
+  }),
+  impact: z.object({
+    usersImpacted: z.number(),
+    query: z.string().min(1),
+  }),
+  resolved: z.object({
+    prUrls: z.array(z.string()),
+    evidence: z.string().min(1),
+  }),
+  analysis: z.object({
+    postmortem: z.string().min(1),
+    usersImpacted: z.number(),
+    impactQuery: z.string().min(1),
+  }),
+  handoff: z.object({
+    reason: z.string().min(1),
+    brief: z.string().min(1),
+  }),
+  none: z.object({}),
+};
+
+const describeIssues = (error: z.ZodError): string =>
+  error.issues
+    .map((issue) =>
+      issue.path.length ? `${issue.path.join(".")}: ${issue.message}` : issue.message,
+    )
+    .join("; ");
 
 const unauthorized = (c: Context, error: string) =>
   c.json({ ok: false, error, directives: [] }, 401, {
@@ -90,17 +134,18 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
    * reads it as a tool result it can correct; an HTTP error would surface in
    * createBossClient as a thrown harness failure instead.
    */
-  const tool = (
-    run: (api: ToolApi, body: Record<string, unknown>) => Promise<unknown>,
+  const tool = <S extends z.ZodType>(
+    schema: S,
+    run: (api: ToolApi, body: z.infer<S>) => Promise<unknown>,
   ) =>
     async (c: Context) => {
       const caller = authorize(c);
       if (caller instanceof Response) return caller;
 
-      let body: Record<string, unknown> = {};
+      let raw: unknown = {};
       if (c.req.method !== "GET") {
         try {
-          body = (await c.req.json()) as Record<string, unknown>;
+          raw = await c.req.json();
         } catch {
           return c.json(
             { ok: false, error: "body was not JSON", directives: [] },
@@ -109,72 +154,126 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
         }
       }
 
+      const parsed = schema.safeParse(raw);
+      if (!parsed.success) {
+        log("invalid_arguments", {
+          path: c.req.path,
+          incidentId: caller.incidentId,
+        });
+        // 200 for the same reason a rejected transition is: the model reads
+        // it as a tool result it can correct.
+        return c.json({
+          ok: false,
+          error: `invalid arguments: ${describeIssues(parsed.error)}`,
+          directives: [],
+        });
+      }
+
       const api = deps.toolApiFor(caller.incidentId, caller.token);
-      return c.json(await run(api, body));
+      return c.json(await run(api, parsed.data));
     };
 
-  app.get("/incidents/:id", tool((api) => api.getIncident()));
+  app.get("/incidents/:id", tool(BODIES.none, (api) => api.getIncident()));
 
   app.post(
     "/incidents/:id/root-cause",
-    tool((api, body) =>
-      api.reportRootCause(
-        body as unknown as Parameters<ToolApi["reportRootCause"]>[0],
-      ),
-    ),
+    tool(BODIES.rootCause, (api, body) => api.reportRootCause(body)),
   );
 
   app.post(
     "/incidents/:id/impact",
-    tool((api, body) =>
-      api.reportImpact(body as unknown as Parameters<ToolApi["reportImpact"]>[0]),
-    ),
+    tool(BODIES.impact, (api, body) => api.reportImpact(body)),
   );
 
   app.post(
     "/incidents/:id/resolved",
-    tool((api, body) =>
-      api.reportResolved(
-        body as unknown as Parameters<ToolApi["reportResolved"]>[0],
-      ),
-    ),
+    tool(BODIES.resolved, (api, body) => api.reportResolved(body)),
   );
 
   app.post(
     "/incidents/:id/analysis",
-    tool((api, body) =>
-      api.reportAnalysis(
-        body as unknown as Parameters<ToolApi["reportAnalysis"]>[0],
-      ),
-    ),
+    tool(BODIES.analysis, (api, body) => api.reportAnalysis(body)),
   );
 
   app.post(
     "/incidents/:id/handoff",
-    tool((api, body) =>
-      api.handOff(body as unknown as Parameters<ToolApi["handOff"]>[0]),
-    ),
+    tool(BODIES.handoff, (api, body) => api.handOff(body)),
   );
 
   // -------------------------------------------------------------------------
-  // contact_human: the outstanding-question marker and the thread post
+  // contact_human: the directive poll, the outstanding-question marker and
+  // the thread post
   // -------------------------------------------------------------------------
+
+  /**
+   * Read-only, and that is the whole point. Every ToolApi response drains the
+   * pending directives, so an agent blocked in contact_human polling
+   * `getIncident` for a reply would delete the `merged`, `stop` or
+   * `resumed_after` it has not read yet. This route leaves them where they
+   * are; the drain stays on the calls whose result the model actually reads.
+   */
+  app.get("/incidents/:id/directives", (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    // db.query is the read-only connection, so a 30-second poll never queues
+    // behind the write lock and its synchronous snapshot PUT.
+    const rows = deps.db.query<{ id: number; payload: string }>(
+      "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
+      [caller.incidentId],
+    );
+    return c.json(
+      rows.map((row) => ({
+        id: row.id,
+        directive: JSON.parse(row.payload) as Directive,
+      })),
+    );
+  });
+
+  /**
+   * Removes exactly one directive. contact_human uses it for the reply that
+   * ended its wait, which it has already returned as that call's result;
+   * re-delivering that one through get_incident would put "yes, go ahead"
+   * in front of the model a second time with nothing marking it as answered.
+   * Scoped by incidentId as well as id, so a token cannot reach another
+   * incident's queue.
+   */
+  app.delete("/incidents/:id/directives/:directiveId", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    const directiveId = Number(c.req.param("directiveId"));
+    if (!Number.isInteger(directiveId)) {
+      return c.json({ error: "directiveId must be an integer" }, 400);
+    }
+    await deps.db.withWrite((w) => {
+      w.prepare(
+        "DELETE FROM pending_directive WHERE id = ? AND incidentId = ?",
+      ).run(directiveId, caller.incidentId);
+    });
+    return c.body(null, 204);
+  });
 
   app.get("/incidents/:id/pending-question", (c) => {
     const caller = authorize(c);
     if (caller instanceof Response) return caller;
-    const row = deps.db.get<{ message: string; askedAt: number }>(
-      "SELECT message, askedAt FROM pending_question WHERE incidentId = ?",
+    const row = deps.db.get<{ message: string; messageTs: string; askedAt: number }>(
+      "SELECT message, messageTs, askedAt FROM pending_question WHERE incidentId = ?",
       [caller.incidentId],
     );
     return c.json(row ?? null);
   });
 
   /**
-   * Idempotent on purpose. A restarted agent replays the tool call that has no
-   * result yet, and the second attempt has to find the first question rather
-   * than overwrite its askedAt, which is the watermark replies are matched
-   * against.
+   * Idempotent for the same question, and only for the same question. A
+   * restarted agent replays the tool call that has no result yet, and the
+   * second attempt has to find the first question rather than overwrite its
+   * askedAt, which is the watermark replies are matched against.
+   *
+   * A *different* question is the opposite case. clearPending does not run
+   * when the child is SIGKILLed mid-wait, so the marker outlives the question
+   * it was written for; leaving it in place would mean the next question is
+   * never posted and the agent waits out its whole timeout on an answer to
+   * something nobody was ever asked.
    */
   app.post("/incidents/:id/pending-question", async (c) => {
     const caller = authorize(c);
@@ -193,14 +292,23 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       // the marker has to be durable BEFORE the message exists, or a crash
       // between the two asks the human twice.
       w.prepare(
-        `INSERT OR IGNORE INTO pending_question (incidentId, messageTs, askedAt, message)
-         VALUES (?, '', ?, ?)`,
+        `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
+         VALUES (?, '', ?, ?)
+         ON CONFLICT(incidentId) DO UPDATE SET
+           messageTs = '',
+           askedAt = excluded.askedAt,
+           message = excluded.message
+         WHERE pending_question.message <> excluded.message`,
       ).run(caller.incidentId, now(), message);
       return w
         .prepare(
-          "SELECT message, askedAt FROM pending_question WHERE incidentId = ?",
+          "SELECT message, messageTs, askedAt FROM pending_question WHERE incidentId = ?",
         )
-        .get(caller.incidentId) as { message: string; askedAt: number };
+        .get(caller.incidentId) as {
+        message: string;
+        messageTs: string;
+        askedAt: number;
+      };
     });
 
     log("question_recorded", { incidentId: caller.incidentId, askedAt: row.askedAt });

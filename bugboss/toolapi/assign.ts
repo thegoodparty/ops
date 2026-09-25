@@ -15,6 +15,7 @@
 // inside Db.withWrite's transaction. A merge touches two incidents and the
 // whole point of SQL here is that it either lands on both or on neither.
 
+import { makeLog } from "../logging";
 import type Database from "better-sqlite3";
 
 import type {
@@ -56,8 +57,7 @@ export interface AssignResult {
 /** Thrown for a rejected assign. Callers turn it into a ToolResponse error. */
 export class AssignError extends Error {}
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "toolapi", event, ...data }));
+const log = makeLog("toolapi");
 
 const OPEN_STATUSES: IncidentStatus[] = ["INVESTIGATING", "FIXING"];
 
@@ -208,6 +208,16 @@ export const assign = (
     if (!OPEN_STATUSES.includes(existing.status)) {
       throw new AssignError(
         `incident ${req.target} is ${existing.status} and cannot take signals`,
+      );
+    }
+    // A hand-off does not move the work, so status still reads INVESTIGATING
+    // or FIXING and the incident still looks open. Nothing is coming back to
+    // it on its own, though -- the dispatcher skips human-owned incidents --
+    // so an automatic attach here is a signal parked where no one is looking.
+    // A person moving signals around their own incident is the exception.
+    if (existing.owner === "human" && actor.kind !== "human") {
+      throw new AssignError(
+        `incident ${req.target} is owned by a human and cannot take signals automatically`,
       );
     }
     target = req.target;

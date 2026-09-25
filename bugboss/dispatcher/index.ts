@@ -27,7 +27,7 @@ import { DEADLINE_GRACE_SECONDS } from "../agent/run";
 import type { AgentCredentialProvider } from "./credentials";
 import { buildChildEnv } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 
 export * from "./credentials";
 export * from "./env";
@@ -44,8 +44,7 @@ if (!Number.isFinite(DEADLINE_GRACE_SECONDS) || DEADLINE_GRACE_SECONDS <= 0) {
   );
 }
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "dispatcher", event, ...data }));
+const log = makeLog("dispatcher");
 
 const alarm = makeAlarm("dispatcher");
 

@@ -14,10 +14,9 @@
 
 import type { Db } from "../db";
 import type { Directive, IncidentOwner, IncidentStatus } from "../types";
-import { makeAlarm } from "../alarm";
+import { makeAlarm, makeLog } from "../logging";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "slack-relay", event, ...data }));
+const log = makeLog("slack-relay");
 
 /** Error level, for the failures whose only other notice is a Slack post. */
 const alarm = makeAlarm("slack-relay");

@@ -12,6 +12,7 @@ import {
   createGrafanaAdapter,
   linesFrom,
   parseKnownCauses,
+  readKnownCauses,
   type KnownCause,
   type LokiQuery,
 } from "./grafana";
@@ -75,6 +76,22 @@ const firing = (fingerprint: string, extra: Record<string, unknown> = {}) => ({
 
 const adapter = (overrides = {}) =>
   createGrafanaAdapter({ secret: SECRET, now, loki: async () => [], ...overrides });
+
+/** Both streams, because one fix is an alarm and the other is a visible rate. */
+const capture = async <T>(run: () => Promise<T>) => {
+  const logs: Record<string, unknown>[] = [];
+  const alarms: Record<string, unknown>[] = [];
+  const out = console.log;
+  const err = console.error;
+  console.log = (line: unknown) => logs.push(JSON.parse(String(line)));
+  console.error = (line: unknown) => alarms.push(JSON.parse(String(line)));
+  try {
+    return { result: await run(), logs, alarms };
+  } finally {
+    console.log = out;
+    console.error = err;
+  }
+};
 
 // --- verification: this is the part that must fail closed -----------------
 
@@ -511,4 +528,98 @@ test("linesFrom copes with a body it does not recognise", () => {
   assert.deepEqual(linesFrom(null), []);
   assert.deepEqual(linesFrom({}), []);
   assert.deepEqual(linesFrom({ data: { result: "nope" } }), []);
+});
+
+// --- Grafana dropping alerts is not a note in one body --------------------
+
+test("a truncated delivery alarms, because the dropped alerts arrive nowhere else", async () => {
+  const payload = { ...firing("fp-1"), truncatedAlerts: 4 };
+  const { alarms } = await capture(() => adapter().parse(request(payload)));
+
+  const [truncated] = alarms.filter((a) => a.event === "alerts_truncated");
+  assert.ok(truncated, "prose inside one signal's body is not a signal to anyone");
+  assert.equal(truncated.component, "grafana");
+  assert.equal(truncated.level, "error");
+  assert.equal(truncated.truncatedAlerts, 4);
+});
+
+test("an untruncated delivery does not alarm", async () => {
+  const { alarms } = await capture(() => adapter().parse(request(firing("fp-1"))));
+  assert.deepEqual(alarms, [], "a normal delivery must stay quiet or the alarm is worthless");
+});
+
+// --- the known_causes contract with omni ---------------------------------
+
+test("readKnownCauses counts what it drops rather than discarding it quietly", () => {
+  const parsed = readKnownCauses(
+    JSON.stringify([
+      cause("good", '{app="x"} |= "boom"'),
+      { summary: "no id", confirmedBy: "x", action: "suppress" },
+      { id: "bad-action", summary: "s", confirmedBy: "c", action: "escalate" },
+      "not an object",
+    ]),
+  );
+  assert.deepEqual(parsed.causes.map((c) => c.id), ["good"]);
+  assert.equal(parsed.malformed, 3);
+  assert.equal(parsed.unreadable, false);
+
+  assert.deepEqual(readKnownCauses("{not json"), {
+    causes: [],
+    malformed: 0,
+    unreadable: true,
+  });
+  assert.deepEqual(readKnownCauses(undefined), {
+    causes: [],
+    malformed: 0,
+    unreadable: false,
+  });
+});
+
+test("a registry entry that can never match alarms on the way in", async () => {
+  const { alarms } = await capture(() =>
+    adapter().parse(
+      request(
+        withCauses([
+          cause("good", '{app="gp-api"}'),
+          { id: "bad-action", summary: "s", confirmedBy: "c", action: "escalate" },
+        ]),
+      ),
+    ),
+  );
+
+  const [malformed] = alarms.filter((a) => a.event === "known_causes_malformed");
+  assert.ok(malformed, "a dropped cause removes the evidence triage was going to run");
+  assert.equal(malformed.level, "error");
+  assert.equal(malformed.malformed, 1);
+  assert.equal(malformed.unreadable, false);
+  assert.equal(malformed.slug, "campaigns-route-errors");
+});
+
+test("an unreadable known_causes annotation alarms", async () => {
+  const payload = firing("fp-1", {
+    annotations: { summary: "[PROD] Route errors detected", [KNOWN_CAUSES_ANNOTATION]: "{not json" },
+  });
+  const { alarms } = await capture(() => adapter().parse(request(payload)));
+
+  const [malformed] = alarms.filter((a) => a.event === "known_causes_malformed");
+  assert.ok(malformed);
+  assert.equal(malformed.unreadable, true);
+});
+
+test("the share of alerts arriving with no known causes is visible per delivery", async () => {
+  const a = adapter();
+  const { logs } = await capture(async () => {
+    await a.parse(request(withCauses([cause("good", '{app="gp-api"}')])));
+    await a.parse(request(firing("fp-2")));
+  });
+
+  const parsed = logs.filter((l) => l.event === "parsed");
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[1].recentAlerts, 2);
+  assert.equal(parsed[1].recentWithKnownCauses, 1);
+  assert.equal(
+    parsed[1].zeroCauseRate,
+    0.5,
+    "a rename on the omni side shows up here as this rate going to 1, and nowhere else",
+  );
 });

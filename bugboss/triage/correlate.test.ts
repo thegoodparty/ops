@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import type { IncidentDigest } from "../types";
 import { runCorrelation, type CorrelationRequest } from "./correlate";
+import { resetFallbackRates } from "./health";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
 import type { IncidentReader } from "./sql";
 
@@ -50,6 +51,18 @@ const fakeDb = (signalIds: string[] = []) => {
         : []) as unknown as T[],
   };
   return db;
+};
+
+/** An empty merge list is a normal answer, so the alarm is the only tell. */
+const capture = async <T>(run: () => Promise<T>) => {
+  const alarms: Record<string, unknown>[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => alarms.push(JSON.parse(String(line)));
+  try {
+    return { result: await run(), alarms };
+  } finally {
+    console.error = original;
+  }
 };
 
 test("splits out every attached signal the root cause does not explain", async () => {
@@ -149,4 +162,64 @@ test("does not call the model when there is nothing to merge into", async () => 
 
   assert.equal(requests.length, 0);
   assert.deepEqual(result, { merges: [], splits: [], fellBack: false });
+});
+
+// --- no merges must not be able to mean two different things --------------
+
+test("a model fallback alarms rather than reading as 'compared everything, found nothing'", async () => {
+  resetFallbackRates();
+  const db = fakeDb(["s1", "s2"]);
+  const model: ModelClient = {
+    complete: () => Promise.reject(new Error("bedrock threw a 500")),
+  };
+
+  const { result, alarms } = await capture(() =>
+    runCorrelation(
+      { model, db, budgetMs: 1000 },
+      request({
+        openIncidents: [
+          digest({ id: "inc-1", status: "FIXING" }),
+          digest({ id: "inc-2" }),
+        ],
+      }),
+    ),
+  );
+
+  assert.deepEqual(result.merges, []);
+  const [fellBack] = alarms.filter((a) => a.event === "fell_back");
+  assert.ok(fellBack, "an empty merge list cannot be the only trace of a dead model");
+  assert.equal(fellBack.component, "correlate");
+  assert.equal(fellBack.level, "error");
+  assert.equal(fellBack.candidates, 1, "the alarm says how many comparisons never happened");
+  assert.equal(fellBack.recentCalls, 1);
+  assert.equal(fellBack.fallbackRate, 1);
+});
+
+test("a failed attached-signal read alarms instead of reporting an empty split", async () => {
+  resetFallbackRates();
+  const db: IncidentReader = {
+    query: () => {
+      throw new Error("SQLITE_BUSY: database is locked");
+    },
+  };
+  const { model, requests } = scripted([]);
+
+  const { result, alarms } = await capture(() =>
+    runCorrelation(
+      { model, db, budgetMs: 1000 },
+      request({
+        openIncidents: [
+          digest({ id: "inc-1", status: "FIXING" }),
+          digest({ id: "inc-2" }),
+        ],
+      }),
+    ),
+  );
+
+  assert.deepEqual(result, { merges: [], splits: [], fellBack: true });
+  assert.equal(requests.length, 0, "there is nothing to correlate against an unread incident");
+  const [failed] = alarms.filter((a) => a.event === "split_read_failed");
+  assert.ok(failed, "a database failure is a different fault from a model failure");
+  assert.equal(failed.level, "error");
+  assert.match(String(failed.error), /database is locked/);
 });

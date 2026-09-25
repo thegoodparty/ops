@@ -11,6 +11,7 @@ import {
   SlackRelay,
   earnsMention,
   mentionsBot,
+  ownershipClaim,
   renderEvent,
   stripBotMention,
   type RelayEvent,
@@ -54,6 +55,27 @@ const seedIncident = (id: string, status = "INVESTIGATING", owner = "agent") =>
       "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES (?, ?, ?, ?)",
     ).run(id, status, owner, Date.now());
   });
+
+/** Reads hit the real database; every write fails the way a halted Db does. */
+const writeFailingDb = (): Db =>
+  ({
+    get: (sql: string, params: unknown[] = []) => db.get(sql, params),
+    query: (sql: string, params: unknown[] = []) => db.query(sql, params),
+    withWrite: () => Promise.reject(new Error("writes halted: s3 unreachable")),
+  }) as unknown as Db;
+
+/** The error log is the one notice that does not go through Slack. */
+const captureErrors = async (fn: () => Promise<unknown>): Promise<string[]> => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => lines.push(String(line));
+  try {
+    await fn();
+  } finally {
+    console.error = original;
+  }
+  return lines;
+};
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-relay-"));
@@ -134,6 +156,7 @@ describe("the mention policy", () => {
   });
 
   test("an ordinary transition posts with no ping token at all", async () => {
+    await seedIncident("inc-1");
     await relay.emit(ordinary[0]);
     await relay.emit(ordinary[1]);
     await relay.emit(ordinary[2]);
@@ -143,8 +166,10 @@ describe("the mention policy", () => {
   });
 
   test("an escalation pings the rotation group", async () => {
+    await seedIncident("inc-1");
+    await relay.emit(ordinary[0]);
     await relay.emit(earns[0]);
-    assert.match(slack.posts[0].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
+    assert.match(slack.posts[1].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
   });
 
   test("with no rotation group configured it falls back to here, never to silence", async () => {
@@ -154,8 +179,10 @@ describe("the mention policy", () => {
       slack: solo,
       config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: null },
     });
+    await seedIncident("inc-1");
+    await r.emit(ordinary[0]);
     await r.emit(earns[2]);
-    assert.match(solo.posts[0].text, /^<!here> /);
+    assert.match(solo.posts[1].text, /^<!here> /);
   });
 });
 
@@ -204,7 +231,7 @@ describe("inbound", () => {
     return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
   };
 
-  test("a plain reply in an incident thread is recorded for the agent to poll", async () => {
+  test("an untagged reply answers the agent waiting on it", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "message",
@@ -215,21 +242,28 @@ describe("inbound", () => {
       thread_ts: thread,
     });
 
-    assert.deepEqual(route, {
-      kind: "incident_reply",
-      incidentId: "inc-1",
-      interrupt: false,
-    });
+    assert.deepEqual(
+      route,
+      { kind: "incident_reply", incidentId: "inc-1", interrupt: false },
+      "answering is not interrupting",
+    );
     const replies = db.query<{ text: string; slackUserId: string }>(
       "SELECT text, slackUserId FROM thread_reply WHERE incidentId = 'inc-1'",
     );
     assert.equal(replies.length, 1);
     assert.equal(replies[0].slackUserId, "U0HUMAN");
-    assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
-      0,
-      "a plain reply must not interrupt an agent that is working",
+
+    // contact_human waits on directives alone, so no directive means the
+    // agent blocks until it times out and escalates over an answer it has.
+    const [directive] = db.query<{ payload: string }>(
+      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
     );
+    assert.deepEqual(JSON.parse(directive.payload), {
+      type: "human_message",
+      from: "U0HUMAN",
+      text: "yes, org X bypasses the Stripe webhook",
+      ts: "1700.1",
+    });
   });
 
   test("Slack redelivering the same event does not double-record it", async () => {
@@ -247,6 +281,11 @@ describe("inbound", () => {
 
     assert.equal(second.kind, "ignore");
     assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
+    assert.equal(
+      db.query("SELECT id FROM pending_directive").length,
+      1,
+      "and the agent is told once, not twice",
+    );
   });
 
   test("a mention interrupts a working agent with a directive", async () => {
@@ -363,6 +402,234 @@ describe("inbound", () => {
 
     assert.equal(dupe.kind, "ignore");
     assert.equal(db.query("SELECT id FROM pending_directive").length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("a broken thread link", () => {
+  const resolved: RelayEvent = {
+    type: "resolved",
+    incidentId: "inc-1",
+    evidence: "quiet for an hour",
+    prUrls: [],
+  };
+
+  test("re-emitting opened returns the thread it already opened", async () => {
+    await seedIncident("inc-1");
+    const first = await relay.emit({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "t",
+      signalCount: 1,
+    });
+    const second = await relay.emit({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "t",
+      signalCount: 1,
+    });
+
+    assert.equal(second, first);
+    assert.equal(slack.posts.length, 1, "one thread, not two");
+  });
+
+  test("a link write that keeps failing is announced, not just logged", async () => {
+    await seedIncident("inc-1");
+    const halted = new SlackRelay({
+      db: writeFailingDb(),
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+    });
+
+    const errors = await captureErrors(() =>
+      halted.emit({
+        type: "opened",
+        incidentId: "inc-1",
+        title: "t",
+        signalCount: 1,
+      }),
+    );
+
+    assert.equal(slack.posts.length, 2, "the opener, then the warning");
+    assert.equal(slack.posts[1].threadTs, "ts-1", "in the thread it opened");
+    assert.match(slack.posts[1].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
+    assert.ok(
+      errors.some((line) => line.includes("thread_link_write_failed")),
+      "and the write failure reaches the error log",
+    );
+  });
+
+  test("a transition with no thread pings the rotation instead of drifting loose", async () => {
+    await seedIncident("inc-1");
+    const errors = await captureErrors(() => relay.emit(resolved));
+
+    assert.equal(slack.posts.length, 1);
+    assert.equal(slack.posts[0].threadTs, null, "there is no thread to use");
+    assert.match(slack.posts[0].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
+    assert.match(slack.posts[0].text, /quiet for an hour/, "the news still gets out");
+    assert.ok(
+      errors.some((line) => line.includes("thread_link_broken")),
+      "a human-visible ping and an error, not an info log",
+    );
+  });
+
+  test("two transitions racing an absent link adopt once, not twice", async () => {
+    await seedIncident("inc-1");
+    await captureErrors(() =>
+      Promise.all([
+        relay.emit(resolved),
+        relay.emit({
+          type: "escalated",
+          incidentId: "inc-1",
+          reason: "deadline",
+          brief: "what I ruled out",
+        }),
+      ]),
+    );
+
+    assert.equal(slack.posts.length, 2, "both posts are already out");
+    const row = db.get<{ slackThreadTs: string | null }>(
+      "SELECT slackThreadTs FROM incident WHERE id = 'inc-1'",
+    );
+    assert.equal(row?.slackThreadTs, "ts-1", "the first write wins the row");
+
+    await relay.emit({
+      type: "merged",
+      incidentId: "inc-1",
+      into: "inc-2",
+      reason: "same cause",
+    });
+    assert.equal(
+      slack.posts[2].threadTs,
+      "ts-1",
+      "one thread from here, not two competing ones",
+    );
+  });
+
+  test("the top-level fallback adopts itself as the thread", async () => {
+    await seedIncident("inc-1");
+    await captureErrors(() => relay.emit(resolved));
+
+    const row = db.get<{ slackThreadTs: string | null }>(
+      "SELECT slackThreadTs FROM incident WHERE id = 'inc-1'",
+    );
+    assert.equal(row?.slackThreadTs, "ts-1");
+    await relay.emit({
+      type: "escalated",
+      incidentId: "inc-1",
+      reason: "deadline",
+      brief: "what I ruled out",
+    });
+    assert.equal(
+      slack.posts[1].threadTs,
+      "ts-1",
+      "one recovered thread beats a channel of loose messages",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("claiming an incident", () => {
+  const openThread = async (id: string, status = "INVESTIGATING", owner = "agent") => {
+    await seedIncident(id, status, owner);
+    return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
+  };
+
+  const reply = (thread: string, text: string, ts = "1700.1") =>
+    relay.handle({
+      type: "message",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text,
+      ts,
+      thread_ts: thread,
+    });
+
+  test("the claim words are matched whole, not found inside a sentence", () => {
+    assert.equal(ownershipClaim("mine", BOT), "take_over");
+    assert.equal(ownershipClaim("  Mine.  ", BOT), "take_over");
+    assert.equal(ownershipClaim(`<@${BOT}> mine`, BOT), "take_over");
+    assert.equal(ownershipClaim("back to you", BOT), "hand_back");
+    assert.equal(ownershipClaim("Back to you!", BOT), "hand_back");
+
+    for (const said of [
+      "not mine",
+      "that one is mine to fix",
+      "mine looks fine, yours does not",
+      "handing this back to you once CI is green",
+      "",
+    ]) {
+      assert.equal(ownershipClaim(said, BOT), null, said);
+    }
+  });
+
+  test("an untagged claim is routed as a claim and still reaches the agent", async () => {
+    const thread = await openThread("inc-1");
+    const route = await reply(thread, "mine");
+
+    assert.deepEqual(route, {
+      kind: "ownership_claim",
+      incidentId: "inc-1",
+      claim: "take_over",
+      slackUserId: "U0HUMAN",
+      ts: "1700.1",
+    });
+    assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
+    assert.equal(
+      db.query("SELECT id FROM pending_directive").length,
+      1,
+      "a claim is still an answer the agent is owed",
+    );
+  });
+
+  test("the relay does not flip owner itself", async () => {
+    const thread = await openThread("inc-1");
+    await reply(thread, "mine");
+
+    const row = db.get<{ owner: string }>(
+      "SELECT owner FROM incident WHERE id = 'inc-1'",
+    );
+    assert.equal(row?.owner, "agent", "the write belongs to the tool API");
+  });
+
+  test("handing it back is its own claim", async () => {
+    const thread = await openThread("inc-1", "INVESTIGATING", "human");
+    const route = await reply(thread, "back to you");
+
+    assert.equal(route.kind, "ownership_claim");
+    if (route.kind !== "ownership_claim") return;
+    assert.equal(route.claim, "hand_back");
+  });
+
+  test("a tagged claim is a claim, not a question for the read-only agent", async () => {
+    const thread = await openThread("inc-9", "INVESTIGATING", "human");
+    const route = await relay.handle({
+      type: "app_mention",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: `<@${BOT}> mine`,
+      ts: "1700.2",
+      thread_ts: thread,
+    });
+
+    assert.equal(
+      route.kind,
+      "ownership_claim",
+      "the Slack agent would answer that it cannot take ownership",
+    );
+  });
+
+  test("a reply that only mentions a claim word stays an ordinary reply", async () => {
+    const thread = await openThread("inc-1");
+    const route = await reply(thread, "not mine, the webhook is upstream");
+
+    assert.deepEqual(route, {
+      kind: "incident_reply",
+      incidentId: "inc-1",
+      interrupt: false,
+    });
   });
 });
 

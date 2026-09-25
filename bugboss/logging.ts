@@ -1,6 +1,7 @@
-// Structured stderr, one line per event.
+// Structured output, one line per event.
 //
-// Nine modules had grown a byte-identical copy of this, which is what
+// Nine modules had grown a byte-identical copy of the alarm helper and
+// fourteen of the log one, which is what
 // parallel authorship produces: each correctly declined to reach into
 // another module's file to share a helper. It matters that there is one
 // now, because these currently resolve to console.error into a log group

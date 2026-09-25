@@ -21,10 +21,18 @@ export interface SessionStore {
 export interface SessionSync {
   flush(): Promise<void>;
   lastError(): Error | null;
+  /** Consecutive failed flushes. Zeroed by the first success. */
+  failureStreak(): number;
 }
 
+/**
+ * The one layout. The Slack agent's read_agent_session, the MCP session
+ * reader and the S3 lifecycle rule all read this prefix, so a session written
+ * anywhere else persists but is invisible to every reader and restores
+ * nothing on the next launch.
+ */
 export const sessionKeyFor = (incidentId: string): string =>
-  `sessions/${incidentId}.jsonl`;
+  `sessions/incident/${incidentId}/session.jsonl`;
 
 export const sessionFileFor = (sessionDir: string, incidentId: string): string =>
   join(sessionDir, `${incidentId}.jsonl`);
@@ -97,6 +105,7 @@ export const createSessionSync = (args: {
 }): SessionSync => {
   let chain: Promise<void> = Promise.resolve();
   let failure: Error | null = null;
+  let streak = 0;
 
   const put = async (): Promise<void> => {
     const file = args.sessionFile();
@@ -113,31 +122,49 @@ export const createSessionSync = (args: {
 
   return {
     // A sync failure must never end a turn: losing a turn of durability is
-    // survivable, killing a live incident agent is not.
+    // survivable, killing a live incident agent is not. It must never pass
+    // unnoticed either, which is what the streak is for.
     flush: () => {
       chain = chain.then(put).then(
         () => {
           failure = null;
+          streak = 0;
         },
         (err: unknown) => {
           failure = err instanceof Error ? err : new Error(String(err));
+          streak += 1;
         },
       );
       return chain;
     },
     lastError: () => failure,
+    failureStreak: () => streak,
   };
 };
 
+/**
+ * After this many consecutive failures the session is not durable and a
+ * restart would lose the whole investigation, so the agent is told to hand
+ * off while it still has one to describe.
+ */
+export const SESSION_SYNC_FAILURE_LIMIT = 3;
+
+/**
+ * `onFailure` is required rather than optional. Both call sites used to drop
+ * the result of `flush()`, which made a silently no-op durability write the
+ * default: every turn appeared to sync, the next restart restored nothing,
+ * and the dispatcher relaunched an agent that started over from zero.
+ */
 export const sessionSyncExtension =
-  (sync: SessionSync) =>
+  (sync: SessionSync, onFailure: (error: Error, streak: number) => void) =>
   (pi: ExtensionAPI): void => {
-    pi.on("turn_end", async () => {
+    const flush = async (): Promise<void> => {
       await sync.flush();
-    });
-    pi.on("session_shutdown", async () => {
-      await sync.flush();
-    });
+      const error = sync.lastError();
+      if (error) onFailure(error, sync.failureStreak());
+    };
+    pi.on("turn_end", flush);
+    pi.on("session_shutdown", flush);
   };
 
 // The prefix the model signs over must be reproduced byte for byte on resume,

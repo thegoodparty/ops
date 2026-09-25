@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 
+import type Database from "better-sqlite3";
 import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
@@ -81,6 +82,39 @@ const goesQuiet = async (id: string) => {
     w.prepare("UPDATE signal SET closedAt = ? WHERE id = ?").run(Date.now(), id);
   });
 };
+
+/** Everything written to one console stream while fn ran. */
+const consoleDuring = async (
+  stream: "log" | "error",
+  fn: () => Promise<void>,
+): Promise<string[]> => {
+  const lines: string[] = [];
+  const real = console[stream];
+  console[stream] = (line: string) => lines.push(String(line));
+  try {
+    await fn();
+  } finally {
+    console[stream] = real;
+  }
+  return lines;
+};
+
+const alarmsDuring = (fn: () => Promise<void>) => consoleDuring("error", fn);
+const logsDuring = (fn: () => Promise<void>) => consoleDuring("log", fn);
+
+/** Reads keep working; the nth write onwards is refused, as a halted Db does. */
+const writesDieAfter = (n: number): Db =>
+  ({
+    query: (sql: string, params?: unknown[]) => db.query(sql, params),
+    get: (sql: string, params?: unknown[]) => db.get(sql, params),
+    withWrite: (() => {
+      let writes = 0;
+      return (fn: (w: Database.Database) => unknown) =>
+        ++writes > n
+          ? Promise.reject(new Error("writes halted: snapshot PUT failed"))
+          : db.withWrite(fn);
+    })(),
+  }) as unknown as Db;
 
 /** A human claiming the incident in Slack. Returned unawaited by the races. */
 const humanClaims = (id: string) =>
@@ -406,6 +440,42 @@ describe("invariant 1: every attached signal must be explained", () => {
     assert.match(res.error ?? "", /at least one attached signal/);
     assert.equal(incidentRow(id)?.status, "INVESTIGATING");
   });
+
+  it("splits what a merge left unexplained before the incident claims to be over", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    const tools = toolsFor(a);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+
+    await tools.reportRootCause({
+      cause: "pool exhaustion",
+      explainedSignalIds: ["sig-a"],
+    });
+    assert.deepEqual(signalsOn(a), ["sig-a", "sig-b"], "the merge moved b's signal in");
+    assert.equal(
+      db.get<{ explained: number }>("SELECT explained FROM signal WHERE id = 'sig-b'")
+        ?.explained,
+      0,
+      "and explained does not travel with it",
+    );
+
+    const res = await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+
+    assert.equal(res.ok, true, res.error);
+    assert.deepEqual(signalsOn(a), ["sig-a"], "the unexplained one does not ride to CLOSED");
+    const home = db.get<{ incidentId: string; closedAt: number | null }>(
+      "SELECT incidentId, closedAt FROM signal WHERE id = 'sig-b'",
+    );
+    assert.notEqual(home?.incidentId, a);
+    assert.equal(
+      incidentRow(home!.incidentId)?.status,
+      "INVESTIGATING",
+      "it gets an incident the dispatcher will staff",
+    );
+    assert.equal(home?.closedAt, null, "and it is still firing, so it stays open");
+  });
 });
 
 describe("invariant 2: resolution closes the signals it claims to have fixed", () => {
@@ -571,6 +641,30 @@ describe("directives", () => {
     assert.deepEqual(signalsOn(a), ["sig-a", "sig-b"]);
   });
 
+  it("says so when it declines a merge the correlator proposed", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await toolsFor(a).handOff({ reason: "mine now", brief: "taking this one" });
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+
+    const lines = await logsDuring(async () => {
+      const res = await toolsFor(b).reportRootCause({
+        cause: "pool exhaustion",
+        explainedSignalIds: ["sig-b"],
+      });
+      assert.equal(res.ok, true, res.error);
+    });
+
+    assert.equal(incidentRow(b)?.status, "FIXING", "the root cause still landed");
+    assert.deepEqual(signalsOn(a), ["sig-a"], "and the merge did not");
+    const declined = lines.find((line) => line.includes('"merge_declined"'));
+    assert.ok(declined, "two incidents left on one cause is not something to pass over");
+    assert.match(declined!, /"intoStatus":"INVESTIGATING"/);
+    assert.match(declined!, /"intoOwner":"human"/);
+  });
+
   it("drains on a rejected call as well as a successful one", async () => {
     await seed("sig-a");
     await seed("sig-b");
@@ -681,6 +775,72 @@ describe("hand off", () => {
     );
     assert.equal(incidentRow(id)?.status, "INVESTIGATING", "and it stays relaunchable");
   });
+
+  it("retracts the brief in the thread when the hand-off cannot be recorded", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = createToolApi({
+      db: writesDieAfter(0),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      tokenSecret: SECRET,
+      correlator,
+      slack,
+      evidence,
+    });
+
+    const res = await tools.handOff({
+      reason: "the fix touches auth",
+      brief: "What I believe now: the session cookie is dropped on refresh.",
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(incidentRow(id)?.owner, "agent", "nobody owns it but the agent");
+    assert.match(posts.at(-2)?.text ?? "", /session cookie/, "the brief went out");
+    assert.match(
+      posts.at(-1)?.text ?? "",
+      /could not be recorded/,
+      "so the same thread has to say it did not stick, rather than leaving a person to infer it",
+    );
+  });
+
+  it("stops triage attaching new signals to what a human took", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a"]);
+    await toolsFor(id).handOff({ reason: "the fix touches auth", brief: "b" });
+
+    await assert.rejects(
+      applyAssign(
+        db,
+        { signalIds: ["sig-b"], target: id, reason: "looks related" },
+        { kind: "boss" },
+      ),
+      /owned by a human/,
+    );
+    assert.equal(
+      db.get<{ incidentId: string | null }>(
+        "SELECT incidentId FROM signal WHERE id = 'sig-b'",
+      )?.incidentId,
+      null,
+      "no agent is coming back to that incident, so nothing may pile up on it",
+    );
+  });
+
+  it("still lets a person move signals into the incident they hold", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a"]);
+    await toolsFor(id).handOff({ reason: "the fix touches auth", brief: "b" });
+
+    const res = await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: id, reason: "I am working both of these" },
+      { kind: "human", slackUserId: "U1" },
+    );
+
+    assert.equal(res.target, id);
+    assert.deepEqual(signalsOn(id), ["sig-a", "sig-b"]);
+  });
 });
 
 describe("getIncident", () => {
@@ -746,6 +906,74 @@ describe("assign never attaches across RESOLVED", () => {
       )?.incidentId,
       null,
       "a signal arriving after a resolution is a recurrence, not more of that incident",
+    );
+  });
+});
+
+
+describe("when the database stops taking writes", () => {
+  it("keeps a committed transition when directive delivery fails", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    await toolsFor(id).reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await db.withWrite((w) => {
+      w.prepare(
+        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
+      ).run(id, JSON.stringify({ type: "resumed_after", seconds: 60 }), Date.now());
+    });
+    const tools = createToolApi({
+      db: writesDieAfter(1),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      tokenSecret: SECRET,
+      correlator,
+      slack,
+      evidence,
+    });
+
+    let res: Awaited<ReturnType<ToolApi["reportResolved"]>> | undefined;
+    const alarms = await alarmsDuring(async () => {
+      res = await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    });
+
+    assert.equal(res?.ok, true, "the transition committed, so it must not be reported as failed");
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+    assert.deepEqual(res?.directives, [], "delivery is deferred, not claimed");
+    assert.equal(
+      db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [id]).length,
+      1,
+      "and the directive is still queued for the next call",
+    );
+    assert.ok(
+      alarms.some((line) => line.includes('"drain_failed"')),
+      "a delivery that could not happen is worth telling someone about",
+    );
+  });
+
+  it("alarms on a lost transition instead of logging it at info", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = createToolApi({
+      db: writesDieAfter(0),
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }),
+      tokenSecret: SECRET,
+      correlator,
+      slack,
+      evidence,
+    });
+
+    let res: Awaited<ReturnType<ToolApi["reportRootCause"]>> | undefined;
+    const alarms = await alarmsDuring(async () => {
+      res = await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    });
+
+    assert.equal(res?.ok, false, "and it still reaches the model as an error, not a crash");
+    assert.match(res?.error ?? "", /writes halted/);
+    assert.equal(incidentRow(id)?.status, "INVESTIGATING", "the transition is gone");
+    assert.ok(
+      alarms.some(
+        (line) => line.includes('"level":"error"') && line.includes('"failed"'),
+      ),
+      "the dispatcher will relaunch on this forever, which is nobody's idea of info",
     );
   });
 });

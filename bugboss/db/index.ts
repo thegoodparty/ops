@@ -5,14 +5,14 @@
 // they share a process, and a write does not return until S3 has it. When an
 // agent's reportRootCause returns, the transition is durable.
 
+import { makeLog } from "../logging";
 import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 
-const log = (event: string, data?: Record<string, unknown>) =>
-  console.log(JSON.stringify({ component: "db", event, ...data }));
+const log = makeLog("db");
 
 export interface DbConfig {
   path: string;

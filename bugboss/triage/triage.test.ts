@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { resetFallbackRates } from "./health";
 import type { IncidentDigest, RawSignal, TriageContext } from "../types";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
-import { prepareQuery, type IncidentReader } from "./sql";
+import {
+  attachedSignalIds,
+  incidentStatus,
+  prepareQuery,
+  type IncidentReader,
+} from "./sql";
 import { runTriage } from "./triage";
 
 const KNOWN_CAUSES = JSON.stringify([
@@ -69,7 +75,11 @@ const scripted = (replies: ModelReply[]) => {
 };
 
 const fakeDb = (
-  opts: { signalIds?: string[]; statuses?: Record<string, string> } = {},
+  opts: {
+    signalIds?: string[];
+    statuses?: Record<string, string>;
+    owners?: Record<string, string>;
+  } = {},
 ) => {
   const queries: string[] = [];
   const db: IncidentReader = {
@@ -78,12 +88,34 @@ const fakeDb = (
       if (/from\s+signal/i.test(sql)) {
         return (opts.signalIds ?? []).map((id) => ({ id })) as unknown as T[];
       }
+      if (/select\s+owner/i.test(sql)) {
+        const owner = opts.owners?.[String(params[0])];
+        return (owner ? [{ owner }] : []) as unknown as T[];
+      }
       const status = opts.statuses?.[String(params[0])];
       return (status ? [{ status }] : []) as unknown as T[];
     },
   };
   return { db, queries };
 };
+
+/** A dead triage model must be legible as structured stderr, not as an info log. */
+const capture = async <T>(run: () => Promise<T>) => {
+  const alarms: Record<string, unknown>[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => alarms.push(JSON.parse(String(line)));
+  try {
+    return { result: await run(), alarms };
+  } finally {
+    console.error = original;
+  }
+};
+
+const broken = (message: string): IncidentReader => ({
+  query: () => {
+    throw new Error(message);
+  },
+});
 
 test("falls back to new_incident when the model call fails", async () => {
   const { db } = fakeDb();
@@ -351,4 +383,159 @@ test("the database tool takes one read and nothing else", () => {
   assert.ok("error" in prepareQuery("DELETE FROM incident"));
   assert.ok("error" in prepareQuery("SELECT 1; DROP TABLE incident"));
   assert.ok("error" in prepareQuery("   "));
+});
+
+// --- a fallback must be loud, and its rate visible ------------------------
+
+test("a fallback alarms at error level and carries the recent rate", async () => {
+  resetFallbackRates();
+  const { db } = fakeDb();
+  const model: ModelClient = {
+    complete: () => Promise.reject(new Error("model id is not available")),
+  };
+
+  const { alarms } = await capture(() =>
+    runTriage({ model, db, budgetMs: 1000 }, context()),
+  );
+
+  const fellBack = alarms.filter((a) => a.event === "fell_back");
+  assert.equal(fellBack.length, 1, "a dead model cannot be an info-level log");
+  assert.equal(fellBack[0].component, "triage");
+  assert.equal(fellBack[0].level, "error");
+  assert.equal(fellBack[0].recentFallbacks, 1);
+  assert.equal(fellBack[0].recentCalls, 1);
+  assert.equal(fellBack[0].fallbackRate, 1);
+});
+
+test("a sustained fallback rate alarms as its own event", async () => {
+  resetFallbackRates();
+  const { db } = fakeDb();
+  const model: ModelClient = {
+    complete: () => Promise.reject(new Error("ThrottlingException")),
+  };
+
+  const { alarms } = await capture(async () => {
+    for (let i = 0; i < 10; i++) {
+      await runTriage({ model, db, budgetMs: 1000 }, context());
+    }
+  });
+
+  const sustained = alarms.filter((a) => a.event === "triage_model_unusable");
+  assert.equal(sustained.length, 1, "the rate crosses the threshold once, on the tenth call");
+  assert.equal(sustained[0].fallbackRate, 1);
+  assert.equal(sustained[0].recentCalls, 10);
+});
+
+test("a healthy stream keeps the rate low, so one failure stays one event", async () => {
+  resetFallbackRates();
+  const { db } = fakeDb();
+  let calls = 0;
+  const model: ModelClient = {
+    complete: () => {
+      calls++;
+      return calls === 1
+        ? Promise.reject(new Error("one transient 500"))
+        : Promise.resolve(decideCall({ action: "new_incident", reason: "new" }));
+    },
+  };
+
+  const { alarms } = await capture(async () => {
+    for (let i = 0; i < 12; i++) {
+      await runTriage({ model, db, budgetMs: 2000 }, context());
+    }
+  });
+
+  assert.equal(alarms.filter((a) => a.event === "fell_back").length, 1);
+  assert.equal(
+    alarms.filter((a) => a.event === "triage_model_unusable").length,
+    0,
+    "a few percent is normal and must not alarm as a dead model",
+  );
+});
+
+// --- a failed read is not an answer ---------------------------------------
+
+test("a failed read throws rather than answering 'no such incident'", () => {
+  const db = broken("SQLITE_BUSY: database is locked");
+  assert.throws(() => incidentStatus(db, "3"), /database is locked/);
+  assert.throws(() => attachedSignalIds(db, "3"), /database is locked/);
+});
+
+test("a failed status read falls back loudly instead of dropping the recurrence", async () => {
+  resetFallbackRates();
+  const db = broken("SQLITE_BUSY: database is locked");
+  const { model } = scripted([
+    decideCall({ action: "new_incident", recurrenceOf: "7", reason: "back again" }),
+  ]);
+
+  const { result, alarms } = await capture(() =>
+    runTriage({ model, db, budgetMs: 2000 }, context()),
+  );
+
+  assert.equal(result.fellBack, true, "a broken database must not read as a clean decision");
+  assert.match(result.decision.reason, /database is locked/);
+  assert.equal(alarms.filter((a) => a.event === "fell_back").length, 1);
+});
+
+// --- owner is a separate axis from status --------------------------------
+
+test("refuses to attach to an incident a human has taken over", async () => {
+  const { db } = fakeDb({ owners: { "inc-7": "human" } });
+  const { model } = scripted([
+    decideCall({
+      action: "attach",
+      incidentId: "inc-7",
+      reason: "same route, same error, still firing",
+    }),
+  ]);
+
+  const outcome = await runTriage(
+    { model, db, budgetMs: 2000 },
+    context({ openIncidents: [digest({ id: "inc-7", status: "INVESTIGATING" })] }),
+  );
+
+  assert.equal(
+    outcome.decision.action,
+    "new_incident",
+    "an open status does not mean an agent is coming back to it",
+  );
+  assert.match(outcome.decision.reason, /owned by a human/);
+  assert.equal(outcome.fellBack, false);
+});
+
+test("still attaches when an agent owns the incident", async () => {
+  const { db } = fakeDb({ owners: { "inc-7": "agent" } });
+  const { model } = scripted([
+    decideCall({ action: "attach", incidentId: "inc-7", reason: "same problem" }),
+  ]);
+
+  const outcome = await runTriage(
+    { model, db, budgetMs: 2000 },
+    context({ openIncidents: [digest({ id: "inc-7", status: "FIXING" })] }),
+  );
+
+  assert.deepEqual(outcome.decision, {
+    action: "attach",
+    incidentId: "inc-7",
+    reason: "same problem",
+  });
+});
+
+test("a human-owned RESOLVED incident is still a recurrence, not an owner refusal", async () => {
+  const { db } = fakeDb({ owners: { "inc-9": "human" } });
+  const { model } = scripted([
+    decideCall({ action: "attach", incidentId: "inc-9", reason: "identical to the one we closed" }),
+  ]);
+
+  const outcome = await runTriage(
+    { model, db, budgetMs: 2000 },
+    context({ openIncidents: [digest({ id: "inc-9", status: "RESOLVED" })] }),
+  );
+
+  assert.equal(
+    outcome.recurrenceOf,
+    "inc-9",
+    "who owns it must not cost us the evidence that the resolution was wrong",
+  );
+  assert.match(outcome.decision.reason, /RESOLVED/);
 });

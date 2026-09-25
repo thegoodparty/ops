@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type { ToolApi, ToolResponse } from "../types";
@@ -8,13 +11,18 @@ import {
   computePaths,
   createBossClient,
   createBossTools,
+  DEFAULT_TIMEOUT_SECONDS,
+  MODEL_BINDING_MISMATCH,
+  exitCodeFor,
   npmCiCommand,
+  pinnedSessionModel,
   PREFIX_DRIFT_DIAGNOSTIC,
   prefixDriftExtension,
   renderDirectives,
   reserveTokensFor,
   toolListDrift,
 } from "./run";
+import { PROMPT_ENTRY_TYPE } from "./session";
 
 test("paths are derived from the incident, not the process", () => {
   const paths = computePaths("/work", "inc-7");
@@ -74,6 +82,7 @@ test("the boss client talks to the incident's endpoints", async () => {
   await api.getIncident();
   await api.reportRootCause({ cause: "bad query", explainedSignalIds: ["s1"] });
   await api.recordPending("can someone merge this");
+  await api.peekDirectives();
 
   assert.deepEqual(
     seen.map((call) => `${call.method} ${call.url}`),
@@ -81,6 +90,7 @@ test("the boss client talks to the incident's endpoints", async () => {
       "GET http://boss:8080/incidents/inc-7",
       "POST http://boss:8080/incidents/inc-7/root-cause",
       "POST http://boss:8080/incidents/inc-7/pending-question",
+      "GET http://boss:8080/incidents/inc-7/directives",
     ],
   );
   assert.deepEqual(seen[1].body, { cause: "bad query", explainedSignalIds: ["s1"] });
@@ -225,7 +235,12 @@ test("the dispatcher's environment is the whole launch contract", () => {
 
 test("an expired deadline still leaves room to hand off", () => {
   const options = agentOptionsFromEnv(
-    { BUGBOSS_INCIDENT_ID: "inc-7", BUGBOSS_S3_BUCKET: "b", BUGBOSS_DEADLINE_AT: "1" },
+    {
+      BUGBOSS_INCIDENT_ID: "inc-7",
+      BUGBOSS_S3_BUCKET: "b",
+      BUGBOSS_SESSION_REF: "sessions/incident/inc-7/session.jsonl",
+      BUGBOSS_DEADLINE_AT: "1",
+    },
     1_000_000,
   );
 
@@ -236,6 +251,20 @@ test("an expired deadline still leaves room to hand off", () => {
 test("a launch without an incident is a failure, not a default", () => {
   assert.throws(() => agentOptionsFromEnv({ BUGBOSS_S3_BUCKET: "b" }), /BUGBOSS_INCIDENT_ID/);
   assert.throws(() => agentOptionsFromEnv({ BUGBOSS_INCIDENT_ID: "i" }), /BUGBOSS_S3_BUCKET/);
+  // A derived key would write where no reader looks, so this is a failure too.
+  assert.throws(
+    () => agentOptionsFromEnv({ BUGBOSS_INCIDENT_ID: "i", BUGBOSS_S3_BUCKET: "b" }),
+    /BUGBOSS_SESSION_REF/,
+  );
+  assert.throws(
+    () =>
+      agentOptionsFromEnv({
+        BUGBOSS_INCIDENT_ID: "i",
+        BUGBOSS_S3_BUCKET: "b",
+        BUGBOSS_SESSION_REF: "",
+      }),
+    /BUGBOSS_SESSION_REF/,
+  );
 });
 
 test("a changed tool loadout is reported rather than silently signed over", () => {
@@ -243,5 +272,93 @@ test("a changed tool loadout is reported rather than silently signed over", () =
   assert.match(
     String(toolListDrift(["bash", "monitor"], ["bash", "grafana_query_loki_logs"])),
     /added \["grafana_query_loki_logs"\], removed \["monitor"\]/,
+  );
+});
+
+test("an empty deadline is no deadline, not a one-minute agent", () => {
+  const env = {
+    BUGBOSS_INCIDENT_ID: "inc-7",
+    BUGBOSS_S3_BUCKET: "b",
+    BUGBOSS_SESSION_REF: "sessions/incident/inc-7/session.jsonl",
+  };
+
+  assert.equal(
+    agentOptionsFromEnv({ ...env, BUGBOSS_DEADLINE_AT: "" }, 1_000_000).timeoutSeconds,
+    DEFAULT_TIMEOUT_SECONDS,
+  );
+  assert.equal(
+    agentOptionsFromEnv(env, 1_000_000).timeoutSeconds,
+    DEFAULT_TIMEOUT_SECONDS,
+  );
+});
+
+const sessionFileWith = async (modelId: string): Promise<string> => {
+  const dir = await mkdtemp(join(tmpdir(), "bugboss-pin-"));
+  const file = join(dir, "inc-7.jsonl");
+  await writeFile(
+    file,
+    `${[
+      JSON.stringify({ type: "session", version: 3, id: "inc-7", cwd: "/work/inc-7/omni" }),
+      JSON.stringify({
+        type: "custom",
+        id: "aa",
+        parentId: null,
+        timestamp: "2026-09-24T00:00:00.000Z",
+        customType: PROMPT_ENTRY_TYPE,
+        data: { systemPrompt: "prompt", toolNames: ["bash"], modelId },
+      }),
+    ].join("\n")}\n`,
+  );
+  return file;
+};
+
+test("a resumed session runs on the model it was signed against", async () => {
+  const sessionFile = await sessionFileWith("us.anthropic.claude-opus-5");
+
+  const pinned = await pinnedSessionModel({
+    restored: true,
+    sessionFile,
+    configuredModelId: "us.anthropic.claude-sonnet-5",
+  });
+
+  assert.equal(pinned.modelId, "us.anthropic.claude-opus-5");
+  assert.equal(pinned.storedPrefix?.modelId, "us.anthropic.claude-opus-5");
+  assert.match(String(pinned.mismatch), new RegExp(MODEL_BINDING_MISMATCH));
+  assert.match(String(pinned.mismatch), /claude-sonnet-5/);
+});
+
+test("an agreeing model id is not an alarm, and a fresh run uses the configured one", async () => {
+  const sessionFile = await sessionFileWith("us.anthropic.claude-opus-5");
+
+  const agreed = await pinnedSessionModel({
+    restored: true,
+    sessionFile,
+    configuredModelId: "us.anthropic.claude-opus-5",
+  });
+  assert.equal(agreed.mismatch, null);
+  assert.equal(agreed.modelId, "us.anthropic.claude-opus-5");
+
+  const fresh = await pinnedSessionModel({
+    restored: false,
+    sessionFile,
+    configuredModelId: "us.anthropic.claude-sonnet-5",
+  });
+  assert.equal(fresh.storedPrefix, null);
+  assert.equal(fresh.modelId, "us.anthropic.claude-sonnet-5");
+  assert.equal(fresh.mismatch, null);
+});
+
+test("a force-aborted run does not exit like a finished one", () => {
+  assert.equal(exitCodeFor({ sessionFile: "f", restored: true, timedOut: false, error: null }), 0);
+  // The deadline nudge worked and the agent handed off inside the grace window.
+  assert.equal(exitCodeFor({ sessionFile: "f", restored: true, timedOut: true, error: null }), 0);
+  assert.equal(
+    exitCodeFor({
+      sessionFile: "f",
+      restored: true,
+      timedOut: true,
+      error: "aborted by user",
+    }),
+    1,
   );
 });
