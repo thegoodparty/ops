@@ -147,6 +147,11 @@ plan, reasoning and progress checklist in
 `deploy/components/ci-roles*`, the `deploy.sh` scripts, or PR-triggered
 workflows.
 
+Narrowing that role's trust for the other repositories that assume it, and
+sizing roles for their PR-triggered workflows, is a separate plan:
+[`docs/deploy-role-trust.md`](./docs/deploy-role-trust.md). Read it alongside
+the above before editing `githubActionsPulumiDeployTrust`.
+
 ## Build Commands
 
 ```bash

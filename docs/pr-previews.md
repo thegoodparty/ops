@@ -55,7 +55,10 @@ the consumer by a different workflow, and nothing sequences the two.
       pins `job_workflow_ref` to `deploy.yml@refs/heads/main`, because `sub`
       alone is per-ref and any workflow on main shares it. Other eight repos
       left wildcarded; a regression test guards the shape. The
-      `job_workflow_ref` pin came from delegate review).
+      `job_workflow_ref` pin came from delegate review. The note left here
+      and in `ci-roles/policies.ts` about why the other eight stay wildcarded
+      is wrong on the facts; `docs/deploy-role-trust.md` records what they
+      actually use and plans their narrowing).
 - [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
       Depends on 4 being applied.
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
