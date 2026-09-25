@@ -61,13 +61,12 @@ export PULUMI_CONFIG_PASSPHRASE
 # the noise here: this is the one stack where an unexpected replace would
 # close a real account.
 if [ "$PREVIEW" = "true" ]; then
-  # Same two-pass contract as deploy/deploy.sh; see docs/pr-previews.md,
-  # step 5. --diff above applies to both passes.
-  if [ "$PULUMI_PREVIEW_FORMAT" = "json" ]; then
-    pulumi preview --json
-  else
-    pulumi preview --diff
+  # Same single-invocation, two-pass contract as deploy/deploy.sh; see
+  # docs/pr-previews.md, step 5.
+  if [ -n "$PULUMI_PREVIEW_JSON" ]; then
+    pulumi preview --json > "$PULUMI_PREVIEW_JSON" || true
   fi
+  pulumi preview --diff
   exit $?
 fi
 

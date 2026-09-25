@@ -78,7 +78,10 @@ jobs:
   preview:
     name: ${{ matrix.project }} preview
     needs: changes
-    if: needs.changes.outputs.matrix != '[]'
+    # `needs.changes.result` matters: on a fork PR the `changes` job is
+    # skipped, and without this the empty string output would still satisfy
+    # `!= '[]'` and reach `fromJSON('')`, which is an error.
+    if: needs.changes.result == 'success' && needs.changes.outputs.matrix != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -126,14 +129,12 @@ jobs:
           diff="/tmp/${PROJECT}.diff"
           comment="/tmp/${PROJECT}.comment.md"
 
-          # Pass 1: machine-readable summary and diagnostics.
-          json_status=0
-          PULUMI_MODE=preview PULUMI_PREVIEW_FORMAT=json ./deploy.sh \
-            > "$json" 2> "$stderr" || json_status=$?
-
-          # Pass 2: the human-readable body. Taken even when pass 1 failed,
-          # since its output is then the most useful thing to show.
-          PULUMI_MODE=preview ./deploy.sh > "$diff" 2>> "$stderr" || true
+          # One invocation, one setup: the deployed images the script resolves
+          # are the ones both passes use. JSON goes to a file, the
+          # human-readable diff to stdout.
+          status=0
+          PULUMI_MODE=preview PULUMI_PREVIEW_JSON="$json" ./deploy.sh \
+            > "$diff" 2> "$stderr" || status=$?
 
           has_changes=false
           has_errors=false
@@ -147,7 +148,7 @@ jobs:
             has_changes=true
             has_errors=true
             {
-              echo "⛔ **The preview failed before producing a plan** (exit ${json_status})."
+              echo "⛔ **The preview failed before producing a plan** (exit ${status})."
               echo
               echo '```'
               tail -n 40 "$stderr"
