@@ -5,7 +5,8 @@
     "delegate/**/*.ts",
     "deploy/**/*.ts",
     "deploy-org/**/*.ts",
-    "deploy-workbench/**/*.ts"
+    "deploy-workbench/**/*.ts",
+    "bugboss/**/*.ts"
   ],
   "compilerOptions": {
     "target": "ES2022",

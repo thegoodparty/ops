@@ -1,0 +1,61 @@
+## The Slack app BugBoss runs as.
+##
+## Create it at https://api.slack.com/apps -> Create New App -> From an app
+## manifest, and paste this. Checking it in means the scopes are reviewable
+## and the next person does not have to reverse-engineer them from the code.
+##
+## ORDERING: Slack verifies `request_url` the moment you save, by posting a
+## challenge to it. So either deploy BugBoss first, or delete the
+## `event_subscriptions` block below, create the app, deploy, and add it back.
+## BugBoss answers the challenge (`http/public.ts`), so verification succeeds
+## as soon as the URL is reachable.
+##
+## Scopes are derived from the three Slack API methods BugBoss actually calls
+## and the two events it handles. Nothing here is aspirational.
+
+display_information:
+  name: BugBoss
+  description: Works incidents from Grafana alerts, in a thread per incident.
+  background_color: "#1f2933"
+
+features:
+  bot_user:
+    display_name: BugBoss
+    ## Threads stay readable when the bot is not marked away mid-incident.
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      ## chat.postMessage: every incident thread, transition and question.
+      - chat:write
+      ## conversations.replies, so the Slack agent can read a thread before
+      ## answering in it. Also required to receive message.channels.
+      - channels:history
+      ## The app_mention event, which is how @bugboss reaches it.
+      - app_mentions:read
+      ## usergroups.users.list, for the rotation snapshot recorded on each
+      ## incident at open. A Slack user group keeps no history, so this is
+      ## the only moment that answer exists.
+      - usergroups:read
+
+settings:
+  event_subscriptions:
+    request_url: https://bugboss.goodparty.org/slack
+    bot_events:
+      ## A plain reply in an incident thread. This is the one that makes
+      ## contact_human answerable: the documented way to answer an agent is
+      ## to reply without tagging it.
+      - message.channels
+      ## @bugboss anywhere. Routes to the Slack agent, or interrupts the
+      ## agent working that incident.
+      - app_mention
+  ## Everything happens through replies and mentions. No slash commands, no
+  ## shortcuts, no Home tab, and no interactivity: a button would be a second
+  ## way to do something the thread already does.
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  ## BugBoss is an HTTPS endpoint behind an ALB, not a socket client.
+  socket_mode_enabled: false
+  token_rotation_enabled: false
