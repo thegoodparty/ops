@@ -235,23 +235,40 @@ test("a normal delivery is still ingested", async () => {
 
 // Reading the body is the first thing both routes do, before anything
 // authenticates the caller. So an anonymous client that declares a length and
-// then hangs up makes the handler throw. Alarming on that would let anyone
-// bury a real route_failed — the backstop for a dropped alert — under any
-// volume of identical lines.
+// then hangs up makes the read throw. Alarming on that would let anyone bury a
+// real route_failed — the backstop for a dropped alert — under any volume of
+// identical lines.
+const abortedBody = (): ReadableStream =>
+  new ReadableStream({
+    start(controller) {
+      controller.error(new Error("aborted"));
+    },
+  });
+
 test("a caller hanging up mid-body logs rather than alarming", async () => {
+  let ingested = 0;
   const app = createPublicApp(
     deps({
       ingestAccepted: async () => {
-        throw new Error("aborted");
+        ingested++;
+        return { settled: Promise.resolve(), recorded: 1 };
       },
     }),
   );
 
   const { result: res, errors } = await withCapturedErrors(async () =>
-    post(app, "/grafana", { status: "firing", alerts: [] }),
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: abortedBody(),
+      // @ts-expect-error undici requires this for a stream body; Hono's types
+      // describe the standard RequestInit, which has no such field.
+      duplex: "half",
+    }),
   );
 
   assert.equal(res.status, 400);
+  assert.equal(ingested, 0);
   assert.equal(
     errors.filter((line) => line.includes("route_failed")).length,
     0,
@@ -259,8 +276,33 @@ test("a caller hanging up mid-body logs rather than alarming", async () => {
   );
 });
 
-// The backstop itself has to keep working, or this fix would trade one silent
-// failure for another.
+// The blocker a reviewer caught on the first version of this fix. Classifying
+// disconnects by matching the error message demoted this to a log line: the
+// AWS SDK's socket failures inside db.withWrite throw the same shapes, and a
+// failed write on the ingest path IS a dropped alert. Only the body read can
+// raise BodyUnreadable now, so no message can be mistaken for one.
+test("an S3 write failure that reads like a disconnect still alarms", async () => {
+  for (const message of ["terminated", "aborted", "ECONNRESET"]) {
+    const app = createPublicApp(
+      deps({
+        ingestAccepted: async () => {
+          throw new Error(message);
+        },
+      }),
+    );
+
+    const { result: res, errors } = await withCapturedErrors(async () =>
+      post(app, "/grafana", { status: "firing", alerts: [] }),
+    );
+
+    assert.equal(res.status, 500, `${message} should not be a client disconnect`);
+    assert.ok(
+      errors.some((line) => line.includes("route_failed")),
+      `${message} must still alarm, got ${JSON.stringify(errors)}`,
+    );
+  }
+});
+
 test("a genuine route failure still alarms", async () => {
   const app = createPublicApp(
     deps({
