@@ -322,3 +322,34 @@ test("a genuine route failure still alarms", async () => {
     `expected a route_failed alarm, got ${JSON.stringify(errors)}`,
   );
 });
+
+// getReader() takes an exclusive lock on the body. Returning the 413 without
+// cancelling holds that lock, and whatever the sender is still pushing, until
+// GC — the path that enforces the limit keeping alive the resource it bounds.
+test("the oversized path cancels the reader rather than abandoning it", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  const app = createPublicApp(deps());
+
+  const { result: res } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      // @ts-expect-error undici requires this for a stream body; Hono's types
+      // describe the standard RequestInit, which has no such field.
+      duplex: "half",
+    }),
+  );
+
+  assert.equal(res.status, 413);
+  assert.ok(cancelled, "the reader must be cancelled when the limit is hit");
+});

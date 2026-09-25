@@ -143,13 +143,25 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
         const { done, value } = await reader.read();
         if (done) break;
         size += value.length;
-        if (size > MAX_BODY_BYTES) return tooLarge(c, declared);
+        if (size > MAX_BODY_BYTES) {
+          // Cancel rather than just return. getReader() takes an exclusive
+          // lock on the body, and abandoning it holds that lock and whatever
+          // the sender is still pushing until GC gets round to it — which is
+          // the resource the limit exists to bound, kept alive by the path
+          // that enforces it.
+          await reader.cancel();
+          return tooLarge(c, declared);
+        }
         chunks.push(value);
       }
     } catch (err) {
       // The caller went away mid-body. Named as a type here, where a failed
       // read is the only thing that can have happened, so the error handler
       // never has to infer it from a message.
+      //
+      // Cancelling a stream that already failed is a no-op, and it throwing
+      // must not replace the reason we are here.
+      await reader.cancel().catch(() => {});
       throw new BodyUnreadable(String(err));
     }
 
