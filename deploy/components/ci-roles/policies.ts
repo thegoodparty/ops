@@ -837,7 +837,16 @@ export const githubActionsPulumiPreview: PolicyDocument = {
     {
       Sid: "DelegatesSecretMetadata",
       Effect: "Allow",
-      Action: ["secretsmanager:DescribeSecret"],
+      // The `getSecret` data source reads the secret's resource policy along
+      // with `DescribeSecret` (tags come back from the describe itself), so a
+      // preview needs `GetResourcePolicy` too. Both are metadata; neither
+      // returns a value. Found by running the first real preview: the initial
+      // `DescribeSecret`-only grant failed with AccessDenied on
+      // `GetResourcePolicy`.
+      Action: [
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+      ],
       Resource:
         "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
     },
