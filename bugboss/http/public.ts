@@ -149,7 +149,12 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
           // the sender is still pushing until GC gets round to it — which is
           // the resource the limit exists to bound, kept alive by the path
           // that enforces it.
-          await reader.cancel();
+          //
+          // Guarded for the same reason the disconnect path is: a cancel that
+          // throws must not replace a deliberate 413 with a route_failed
+          // alarm, which would hand an anonymous caller the alarm channel that
+          // stands for a dropped alert.
+          await reader.cancel().catch(() => {});
           return tooLarge(c, declared);
         }
         chunks.push(value);

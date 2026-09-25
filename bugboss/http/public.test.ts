@@ -353,3 +353,37 @@ test("the oversized path cancels the reader rather than abandoning it", async ()
   assert.equal(res.status, 413);
   assert.ok(cancelled, "the reader must be cancelled when the limit is hit");
 });
+
+// A cancel that throws must not turn a deliberate 413 into a route_failed
+// alarm — that is the alarm standing for a dropped alert, handed to whoever
+// sends an oversized body with an awkward stream.
+test("a throwing cancel does not turn the 413 into an alarm", async () => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+    },
+    cancel() {
+      throw new Error("cancel blew up");
+    },
+  });
+
+  const app = createPublicApp(deps());
+
+  const { result: res, errors } = await withCapturedErrors(async () =>
+    app.request("/grafana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      // @ts-expect-error undici requires this for a stream body; Hono's types
+      // describe the standard RequestInit, which has no such field.
+      duplex: "half",
+    }),
+  );
+
+  assert.equal(res.status, 413);
+  assert.equal(
+    errors.filter((line) => line.includes("route_failed")).length,
+    0,
+    `a throwing cancel must not alarm, got ${JSON.stringify(errors)}`,
+  );
+});
