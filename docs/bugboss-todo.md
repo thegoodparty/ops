@@ -31,21 +31,38 @@ reset. Updated as things land. Not product documentation.
 
 ## In flight (branches targeting `integration/bugboss-v1`)
 
-| Branch | What | State |
-| --- | --- | --- |
-| `feat/bugboss-incident-links` (#121) | link incidents to their threads; + failure-alert follow-up | approved, follow-up in progress |
-| `feat/bugboss-recurrence` (#119) | detect a returning incident | approved, retargeting onto integration |
-| `feat/bugboss-wait-heartbeat` (#120) | nudge when a wait on a person stalls | retargeting onto integration |
-| `feat/bugboss-ci-rerun` | let an agent re-run failed CI, with flake discipline | in progress |
-| `feat/bugboss-incident-report` | full report as a Slack document; ~200-word thread budget; plain-terms default | in progress |
-| review audit | verify every review finding survived the merge | 4 fixes pushed, awaiting verdict |
+All agents paused 2026-09-27 evening. Nothing is lost that was pushed.
+
+| PR | Branch | Base | State when paused |
+| --- | --- | --- | --- |
+| #121 | `feat/bugboss-incident-links` | integration ✔ | approved; failure-alert follow-up pushed, second verdict pending |
+| #122 | `feat/bugboss-ci-rerun` | integration ✔ | opened, verdict pending |
+| #120 | `feat/bugboss-wait-heartbeat` | **still `main`** | approved against `main`; **needs merge of integration + retarget + fresh verdict** |
+| #119 | `feat/bugboss-recurrence` | **still `main`** | approved against `main`; **needs merge of integration + retarget + fresh verdict** |
+| — | `feat/bugboss-incident-report` | integration | in progress, no PR yet |
+| — | `feat/bugboss-test-runtime` | integration | investigation only, no PR yet |
+| — | review audit | commits direct on integration | 4 fixes pushed; last verdict pending |
+
+**Retargeting #119 and #120 is the fiddly part.** Both were cut before the
+integration branch existed, and `agent/tools.ts` has now been independently
+redesigned by four branches. Each should resolve its own merge rather than
+one actor batching them — that is where a merge that compiles and is subtly
+wrong would come from. #120's author deliberately duplicated #112's
+`HandOffPort` and `Escalation` names so the conflict resolves by deleting one
+copy.
 
 ## Open questions and known gaps
 
 - **Agents cannot run DB-backed tests — no container runtime.** ECS Fargate
-  has no Docker socket, so testcontainers cannot start a database. Being
-  worked; likely a sidecar database in the task definition or a remote
-  Docker host.
+  has no Docker socket, so testcontainers cannot start a database. Four
+  options were framed and none chosen yet: a Postgres sidecar in the task
+  definition (Fargate-native, but up to 15 agents share one task so isolation
+  is the hard part); a remote Docker host via `DOCKER_HOST` (works
+  unmodified, but a Docker daemon is root-equivalent on that host and the
+  agent is explicitly untrusted — a genuinely new capability, not one it
+  already has); Testcontainers Cloud; or accepting that CI runs the full
+  suite and making that loop faster, which is now more viable since the agent
+  has `actions: write` and can re-run jobs itself.
 - **The custom Bedrock `InvokeModel` provider is not in the path.** Live
   sessions show `"api":"bedrock-converse-stream"` and **zero thinking-block
   signatures**. The provider exists specifically because Converse drops
@@ -66,6 +83,13 @@ reset. Updated as things land. Not product documentation.
   so cost rises faster than linearly with investigation time. Levers not yet
   pulled: per-phase model routing, shorter loops.
 - **`@product-bugs` contains only one person.** Rotation is not populated.
+- **Agent output policy is agreed but only partly built.** Thread summaries
+  target ~200 words and default to plain system-behaviour language rather
+  than identifiers; post-mortems and the full report should be longer and
+  precise. #112 caps `contact_human` asks at 700 characters, but the other
+  posting paths (the loopback `/thread` route, `report_*` notifications) are
+  unbounded — agent free text measured 370–426 words against code-authored
+  messages at 7–98.
 - The GitHub App is installed on **all** org repos (`repository_selection:
   all`), which is wider than the agent's prompt claims.
 
