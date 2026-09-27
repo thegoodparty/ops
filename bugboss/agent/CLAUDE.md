@@ -36,6 +36,48 @@ polling, and it is why the prompt forbids polling with bash in a loop.
   `messageTs` is empty because the post itself failed — otherwise one Slack
   hiccup becomes a silent 24-hour wait that escalates for the wrong reason.
 
+## contact_human is not an escalation, and the harness enforces that
+
+The two tools that reach a person differ only in who owns the incident
+afterwards: `contact_human` leaves `owner: agent`, `hand_off` sets
+`owner: human`. An agent blocked on a question nobody answers is therefore
+invisible as work needing a person — the dispatcher will not relaunch an
+incident a live agent still holds, and nothing lists one owned by an agent
+as unclaimed. The first real run ended exactly there: it could not reconcile
+the alert, and asked instead of escalating.
+
+So an unanswered wait converts. `runContactHuman` calls `hand_off` itself,
+returns `terminate`, and the agent stops. Three details it rests on:
+
+- **The floor.** A requested wait below `CONTACT_HUMAN_MIN_WAIT_SECONDS` is
+  raised to it, not answered early. Without that, the escalation is opt-out:
+  ask for two minutes and no timeout ever means anything.
+- **Not on the deadline abort.** The soft deadline has its own path — the run
+  steers the model to write a real brief inside the grace window — and
+  handing off here would spend the turn that brief needs.
+- **A failed hand-off is loud.** Ownership did not move and nobody was told,
+  so the result says so and tells the model to call `hand_off` itself. The
+  prompt is where the model is asked to hand off first; this is the floor
+  under it, and the brief the harness writes is deliberately thinner.
+- **The clock runs from `askedAt`, not from process start.** A restart is not
+  an answer. A deadline of `now() + wait` hands a crash-looping agent a fresh
+  wait every time and defers the escalation for as long as the crashes last.
+- **The marker is cleared after the hand-off, and only if it landed.** Clearing
+  first and dying in between replays as a brand-new question: re-posted, with a
+  fresh `askedAt` that makes a reply already in the thread look too old to be
+  one.
+
+`message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
+refused rather than truncated — truncating would cut off the question, which
+is the part at the bottom. The evidence goes in `details`, posted as its own
+message under the ask — and posted *outside* the re-entrancy guard, because
+`messageTs` only records that the ask landed. A crash between the two posts
+leaves a marker that looks complete, so a resume re-posts the evidence rather
+than dropping it with no error and nobody aware. The split is the structure: the reader sees a
+conclusion and one request, and the proof is one scroll away rather than in
+front of it. `prompt.ts` carries the budget, the shape and a worked example
+("What a human reads"); this is what makes it more than advice.
+
 Both take the harness's deadline signal combined with Pi's own, so the soft
 deadline can interrupt a blocking tool. Without that, `steer` only lands
 after the current turn's tool calls finish — and the agent spends most of

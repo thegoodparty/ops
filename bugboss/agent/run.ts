@@ -593,7 +593,12 @@ const launch = async (args: {
   const bossTools = await createBossTools({ api, onRootCause: () => startNpmCi(paths) });
   const localTools = [
     await createMonitorTool({ signal: deadlineAbort.signal }),
-    await createContactHumanTool({ contact: api, api, signal: deadlineAbort.signal }),
+    await createContactHumanTool({
+      contact: api,
+      api,
+      escalate: api,
+      signal: deadlineAbort.signal,
+    }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(
     (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
