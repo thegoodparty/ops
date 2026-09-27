@@ -9,6 +9,7 @@
 
 import { execFile } from "node:child_process";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { choiceProblem, MAX_CHOICE_OPTIONS } from "../slack/blocks";
 import type { Directive, ToolApi } from "../types";
 
 export const MONITOR_TOOL_NAME = "monitor";
@@ -172,7 +173,12 @@ export interface PendingQuestion {
 export interface HumanContactPort {
   getPending(): Promise<PendingQuestion | null>;
   recordPending(message: string): Promise<PendingQuestion>;
-  post(message: string): Promise<void>;
+  /**
+   * Options render as buttons beside the question. Pressing one is recorded
+   * and delivered as a `human_message` directive exactly as typing it would
+   * be, so nothing below this port can tell a press from a reply.
+   */
+  post(message: string, options?: readonly string[]): Promise<void>;
   clearPending(): Promise<void>;
 }
 
@@ -223,6 +229,13 @@ export interface ContactHumanArgs {
   /** Posted as its own follow-up message, under the ask. */
   details?: string;
   timeoutSeconds: number;
+  /**
+   * Answers to render as buttons beside the ask. They change what the
+   * question looks like and nothing else: the wait floor, the deadline and
+   * the hand-off below all run exactly as they do without them, because a
+   * button nobody presses *is* an unanswered question.
+   */
+  options?: readonly string[];
 }
 
 /** What the harness did with a question nobody answered. */
@@ -277,12 +290,21 @@ export interface ContactHumanResult {
  * and nothing else — which is the reason the prompt tells the model to hand
  * off itself before it gets here.
  */
-export const unansweredBrief = (question: string, waitedMinutes: number): string =>
+export const unansweredBrief = (
+  question: string,
+  waitedMinutes: number,
+  options: readonly string[] = [],
+): string =>
   [
     `Nobody answered in ${waitedMinutes} minutes, so this is yours.`,
     "",
     "*What I asked*",
     question,
+    // The buttons are part of the question a reader saw, and the person
+    // picking this up did not see the thread before now.
+    ...(options.length
+      ? ["", "*What I offered*", ...options.map((option) => `• ${option}`)]
+      : []),
     "",
     "*Where it stands*",
     "Everything I found is in this thread. I stopped at the question rather than guessing past it.",
@@ -298,12 +320,13 @@ const escalateUnanswered = async (
   deps: ContactHumanDeps,
   question: string,
   waitedMinutes: number,
+  options: readonly string[] = [],
 ): Promise<{ outcome: Escalation; directives: Directive[] }> => {
   const reason = `no reply in ${waitedMinutes} minutes`;
   try {
     const response = await deps.escalate.handOff({
       reason,
-      brief: unansweredBrief(question, waitedMinutes),
+      brief: unansweredBrief(question, waitedMinutes, options),
     });
     return {
       outcome: response.ok
@@ -380,7 +403,7 @@ export const runContactHuman = async (
   let pending = await deps.contact.getPending();
   if (!pending || pending.message !== args.message || !pending.messageTs) {
     pending = await deps.contact.recordPending(args.message);
-    await deps.contact.post(args.message);
+    await deps.contact.post(args.message, args.options);
   }
   // A second message rather than a longer first one: the reader sees the
   // conclusion and the ask, and the evidence sits underneath for whoever wants
@@ -450,7 +473,12 @@ export const runContactHuman = async (
       const waitedMinutes = Math.round(
         Math.max(waitSeconds, (now() - pending.askedAt) / 1000) / 60,
       );
-      const escalation = await escalateUnanswered(deps, args.message, waitedMinutes);
+      const escalation = await escalateUnanswered(
+        deps,
+        args.message,
+        waitedMinutes,
+        args.options,
+      );
       // Cleared after the hand-off, and only if it landed. Clearing first and
       // dying in between replays as a brand-new question: re-posted, with a
       // fresh askedAt that makes a reply already sitting in the thread look
@@ -509,10 +537,17 @@ const CONTACT_HUMAN_DESCRIPTION = [
   "need. Everything else goes in `details`, which is posted as its own",
   "follow-up message underneath the ask.",
   "",
+  "When the answer is one of a few known choices, pass `options`: each becomes",
+  `a button in the thread. Two to ${MAX_CHOICE_OPTIONS} short labels, and the`,
+  "label is what comes back as the reply. Buttons are a shortcut, not a menu —",
+  "anyone can ignore them and type something else, including an answer you did",
+  "not list, so never ask a question that only works if a button is pressed.",
+  "",
   "If nobody answers, this hands the incident to a human for you: owner becomes",
   "human, a brief you did not write is posted, and you stop. Hand off yourself",
   "first if you can see it coming — your brief is better than the one the",
-  "harness writes.",
+  "harness writes. Buttons change nothing here: one nobody presses is silence,",
+  "and silence escalates.",
   "",
   "Safe to call again after a restart: the outstanding question is recorded",
   "before it is posted, so a repeated call resumes waiting rather than asking",
@@ -585,6 +620,11 @@ export const createContactHumanTool = async (
     timeoutSeconds: Type.Number({
       description: `How long to wait for a reply. Raised to ${minWait} if you ask for less, then the incident is handed to a human.`,
     }),
+    options: Type.Optional(
+      Type.Array(Type.String(), {
+        description: `Answers to offer as buttons. 2 to ${MAX_CHOICE_OPTIONS} labels, each at most 75 characters. Omit when the answer is open-ended.`,
+      }),
+    ),
   });
 
   return {
@@ -594,6 +634,23 @@ export const createContactHumanTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as ContactHumanArgs;
+      // Checked before anything is posted, and returned as a tool result the
+      // model can correct. The loopback route checks the same thing, because
+      // that is the side of the socket that does not trust this one.
+      if (args.options?.length) {
+        const problem = choiceProblem(args.options);
+        if (problem) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Nothing was posted: ${problem}. Ask again with usable options, or without any.`,
+              },
+            ],
+            details: { refused: true },
+          };
+        }
+      }
       const result = await runContactHuman(args, {
         ...deps,
         signal: eitherSignal(signal, deps.signal),

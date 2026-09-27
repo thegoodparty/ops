@@ -11,6 +11,12 @@ import { Db } from "../db";
 import { createMemoryS3 } from "../index";
 import { mintAgentToken } from "../toolapi";
 import type { Directive, ToolApi } from "../types";
+import {
+  CHOICE_ACTION_PREFIX,
+  CHOICE_BLOCK_ID,
+  MAX_CHOICE_OPTIONS,
+  type SlackBlock,
+} from "../slack/blocks";
 import { createToolApiRoutes } from "./toolapi";
 
 const SECRET = "test-secret";
@@ -22,6 +28,7 @@ let app: ReturnType<typeof createToolApiRoutes>;
 let clock = 1_000_000;
 let reached = 0;
 const threadPosts: string[] = [];
+const choicePosts: { text: string; blocks: readonly SlackBlock[] }[] = [];
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-http-"));
@@ -50,6 +57,15 @@ before(async () => {
       post: async (_threadTs: string | null, text: string) => {
         threadPosts.push(text);
         return { ts: "ts-1" };
+      },
+      postChoice: async (
+        _threadTs: string | null,
+        text: string,
+        blocks: readonly SlackBlock[],
+      ) => {
+        threadPosts.push(text);
+        choicePosts.push({ text, blocks });
+        return { ts: `ts-choice-${choicePosts.length}` };
       },
     },
     now: () => clock,
@@ -237,6 +253,75 @@ test("the marker says whether the question was actually posted", async () => {
   assert.equal(posted.messageTs, "ts-1");
 
   await authed("/pending-question", { method: "DELETE" });
+});
+
+test("a question with options posts buttons, and the marker points at them", async () => {
+  clock = 4_100_000;
+  await (await ask("Roll back, or wait for the next deploy?")).json();
+
+  const before = choicePosts.length;
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({
+      message: "Roll back, or wait for the next deploy?",
+      options: ["Roll back", "Wait for the next deploy"],
+    }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(choicePosts.length, before + 1, "one message, with blocks");
+
+  const posted = choicePosts.at(-1)!;
+  const actions = posted.blocks.find((block) => block.type === "actions");
+  assert.ok(actions && actions.type === "actions");
+  assert.deepEqual(
+    actions.elements.map((element) => element.value),
+    ["Roll back", "Wait for the next deploy"],
+  );
+  assert.ok(actions.elements.every((e) => e.action_id.startsWith(CHOICE_ACTION_PREFIX)));
+  assert.equal(actions.block_id, CHOICE_BLOCK_ID);
+  assert.ok(posted.text.includes("1. Roll back"), "the fallback is answerable as text");
+
+  // A press comes back quoting the message the buttons are on, and the marker
+  // is what the relay matches it against.
+  const marker = (await (await authed("/pending-question")).json()) as {
+    messageTs: string;
+  };
+  assert.equal(marker.messageTs, `ts-choice-${choicePosts.length}`);
+
+  await authed("/pending-question", { method: "DELETE" });
+});
+
+test("a question with no options still posts as plain prose", async () => {
+  const before = choicePosts.length;
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "What changed in the last hour?" }),
+  });
+  assert.equal(choicePosts.length, before, "no blocks where none were asked for");
+  assert.equal(threadPosts.at(-1), "What changed in the last hour?");
+});
+
+test("the boundary refuses options the tool would have caught, and posts nothing", async () => {
+  const before = threadPosts.length;
+  const tooMany = Array.from({ length: MAX_CHOICE_OPTIONS + 1 }, (_, i) => `o${i}`);
+
+  const many = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "Pick one", options: tooMany }),
+  });
+  assert.equal(many.status, 400);
+
+  const wrongType = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "Pick one", options: [1, 2] }),
+  });
+  assert.equal(wrongType.status, 400);
+  assert.match(
+    ((await wrongType.json()) as { error: string }).error,
+    /array of strings/,
+  );
+
+  assert.equal(threadPosts.length, before, "a refused question is never posted");
 });
 
 test("model arguments are validated before they reach a tool", async () => {

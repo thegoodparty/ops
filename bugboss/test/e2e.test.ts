@@ -24,6 +24,11 @@ import {
   type BugBoss,
 } from "../index";
 import { createBossClient } from "../agent/run";
+import {
+  CHOICE_ACTION_PREFIX,
+  CHOICE_BLOCK_ID,
+  type SlackBlock,
+} from "../slack/blocks";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { ModelReply, ModelRequest } from "../triage";
 import type { BugBossConfig, TriageDecision } from "../types";
@@ -85,6 +90,12 @@ const fakeModel = {
 /** Captures what would have been posted, so assertions can read the thread. */
 const fakeSlack = {
   posts: [] as { threadTs: string | null; text: string }[],
+  /** The question posts that carried buttons, blocks and all. */
+  choices: [] as {
+    threadTs: string | null;
+    text: string;
+    blocks: readonly SlackBlock[];
+  }[],
   /** One refused post. Slack being down for a moment is the normal case. */
   failNextPost: false,
   post(threadTs: string | null, text: string) {
@@ -92,6 +103,11 @@ const fakeSlack = {
       this.failNextPost = false;
       return Promise.reject(new Error("slack: ratelimited"));
     }
+    this.posts.push({ threadTs, text });
+    return Promise.resolve({ ts: `ts-${this.posts.length}` });
+  },
+  postChoice(threadTs: string | null, text: string, blocks: readonly SlackBlock[]) {
+    this.choices.push({ threadTs, text, blocks });
     this.posts.push({ threadTs, text });
     return Promise.resolve({ ts: `ts-${this.posts.length}` });
   },
@@ -330,6 +346,65 @@ test("contact_human records the question before it posts, and only once", async 
 
   await client.clearPending();
   assert.equal(await client.getPending(), null);
+});
+
+test("a button press answers an agent the same way typing does", async () => {
+  const incident = boss.db.get<{ id: string; slackThreadTs: string }>(
+    "SELECT id, slackThreadTs FROM incident WHERE status = 'INVESTIGATING' AND slackThreadTs IS NOT NULL LIMIT 1",
+  )!;
+  const client = bossClientFor(incident.id, boss.mintToken(incident.id));
+
+  const question = "The fix is merged. Roll back now, or wait for the deploy?";
+  await client.recordPending(question);
+  await client.post(question, ["Roll back", "Wait for the deploy"]);
+
+  const posted = fakeSlack.choices.at(-1)!;
+  const actions = posted.blocks.find((block) => block.type === "actions");
+  assert.ok(actions && actions.type === "actions");
+  assert.equal(actions.block_id, CHOICE_BLOCK_ID);
+  assert.ok(
+    posted.text.includes("1. Roll back"),
+    "the same question is answerable with the blocks thrown away",
+  );
+
+  const marker = boss.db.get<{ messageTs: string }>(
+    "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+    [incident.id],
+  )!;
+
+  const payload = JSON.stringify({
+    type: "block_actions",
+    user: { id: "U0ADA" },
+    channel: { id: "C0DEVALERTS" },
+    message: { ts: marker.messageTs, thread_ts: incident.slackThreadTs },
+    actions: [
+      {
+        action_id: `${CHOICE_ACTION_PREFIX}0`,
+        value: "Roll back",
+        action_ts: String(Date.now() / 1000),
+      },
+    ],
+  });
+  const res = await boss.publicApp.request("/slack", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ payload }).toString(),
+  });
+  assert.equal(res.status, 200);
+
+  // contact_human waits on directives alone, and this is the one it reads.
+  const directives = await client.peekDirectives();
+  const answer = directives.find(
+    (entry) => entry.directive.type === "human_message",
+  );
+  assert.ok(answer, "the press reaches the agent as an ordinary message");
+  assert.equal(
+    answer.directive.type === "human_message" ? answer.directive.text : null,
+    "Roll back",
+  );
+
+  await client.consumeDirective(answer.id);
+  await client.clearPending();
 });
 
 test("the loopback API refuses anything but this incident's own token", async () => {
@@ -665,6 +740,7 @@ test("a Slack call that never answers is bounded, not silently queued", async ()
   try {
     const stalled = withSlackDeadline({
       post: () => new Promise(() => {}),
+      postChoice: () => new Promise(() => {}),
       replies: () => new Promise(() => {}),
     });
     // The SDK retries a 429 for half an hour by default and raises nothing

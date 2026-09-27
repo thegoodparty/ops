@@ -188,7 +188,8 @@ export const createBossClient = (args: {
     recordPending: (message) =>
       call<PendingQuestion>("POST", "/pending-question", { message }),
     clearPending: () => call<void>("DELETE", "/pending-question").then(() => undefined),
-    post: (message) => call<void>("POST", "/thread", { message }).then(() => undefined),
+    post: (message, options) =>
+      call<void>("POST", "/thread", { message, options }).then(() => undefined),
   };
 };
 

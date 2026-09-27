@@ -24,6 +24,11 @@ import type { Db } from "../db";
 import type { AgentCredentialProvider } from "../dispatcher/credentials";
 import type { ThreadPoster } from "../toolapi";
 import { verifyAgentToken } from "../toolapi";
+import {
+  choiceProblem,
+  renderChoiceQuestion,
+  type ChoicePoster,
+} from "../slack/blocks";
 import { postProse } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
 
@@ -36,7 +41,8 @@ export interface ToolApiHttpDeps {
   tokenSecret: string;
   /** Built against the token the caller presented, not a freshly minted one. */
   toolApiFor: (incidentId: string, token: string) => ToolApi;
-  slack: ThreadPoster;
+  /** Posts the agent's own messages, and its questions with their buttons. */
+  slack: ThreadPoster & ChoicePoster;
   /** Mints short-lived AWS credentials for a child. Absent when no role is set. */
   credentials?: AgentCredentialProvider;
   now?: () => number;
@@ -370,12 +376,33 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     if (caller instanceof Response) return caller;
 
     let message = "";
+    let options: string[] = [];
     try {
-      message = String(((await c.req.json()) as { message?: unknown }).message ?? "");
+      const body = (await c.req.json()) as {
+        message?: unknown;
+        options?: unknown;
+      };
+      message = String(body.message ?? "");
+      if (body.options !== undefined) {
+        if (
+          !Array.isArray(body.options) ||
+          body.options.some((option) => typeof option !== "string")
+        ) {
+          return c.json({ error: "options must be an array of strings" }, 400);
+        }
+        options = body.options as string[];
+      }
     } catch {
       return c.json({ error: "body was not JSON" }, 400);
     }
     if (!message.trim()) return c.json({ error: "message is empty" }, 400);
+    // The tool checks these too, so a 400 here means something other than the
+    // tool composed the call. This is the side of the socket that does not
+    // trust the child, so it is the check that counts.
+    if (options.length) {
+      const problem = choiceProblem(options);
+      if (problem) return c.json({ error: problem }, 400);
+    }
 
     const incident = deps.db.get<{ slackThreadTs: string | null }>(
       "SELECT slackThreadTs FROM incident WHERE id = ?",
@@ -392,14 +419,35 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     // Only the Slack copy is converted. What the incident stores stays as the
     // agent wrote it, so the Slack agent reading it back later gets prose and
     // not markup.
-    const { ts } = await postProse(
-      (part) => deps.slack.post(incident.slackThreadTs, part),
-      message,
-      { incidentId: caller.incidentId },
-    );
+    let ts: string;
+    if (options.length === 0) {
+      ({ ts } = await postProse(
+        (part) => deps.slack.post(incident.slackThreadTs, part),
+        message,
+        { incidentId: caller.incidentId },
+      ));
+    } else {
+      const question = renderChoiceQuestion(message, options);
+      for (const part of question.lead) {
+        await deps.slack.post(incident.slackThreadTs, part);
+      }
+      ({ ts } = await deps.slack.postChoice(
+        incident.slackThreadTs,
+        question.text,
+        question.blocks,
+      ));
+      log("choice_posted", {
+        incidentId: caller.incidentId,
+        options: options.length,
+      });
+    }
 
     // Fills in the ts the marker could not know when it was written. Scoped to
     // a blank one so a later post does not repoint an older question.
+    //
+    // For a choice this is the ts of the message carrying the buttons, which
+    // is what a press comes back quoting: the marker is how the relay tells a
+    // press on the live question from one on a question already answered.
     await deps.db.withWrite((w) => {
       w.prepare(
         "UPDATE pending_question SET messageTs = ? WHERE incidentId = ? AND messageTs = ''",

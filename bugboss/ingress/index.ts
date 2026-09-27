@@ -88,13 +88,17 @@ export type {
 export {
   createSlackAdapter,
   classifySlackEvent,
+  classifySlackInteraction,
   createSlackVerifier,
+  isInteractionDelivery,
+  INTERACTION_CONTENT_TYPE,
   SLACK_SOURCE,
   REPORT_VERBS,
 } from "./slack";
 export type {
   SlackClassification,
   SlackConfig,
+  SlackInteraction,
   SlackMessage,
   SlackVerifier,
 } from "./slack";

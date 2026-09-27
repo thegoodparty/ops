@@ -15,6 +15,7 @@
 import type { Db } from "../db";
 import type { Directive, IncidentOwner, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
+import type { SlackChoiceClick } from "./blocks";
 import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 
 const log = makeLog("slack-relay");
@@ -239,6 +240,23 @@ export type InboundRoute =
       user: string;
       text: string;
     };
+
+/**
+ * What a button press did. `answered` is the only one that moved anything;
+ * the other two are a press that arrived too late or second, and each still
+ * earns a line in the thread, because a button that does nothing and says
+ * nothing is indistinguishable from a broken one.
+ */
+export type ChoiceRoute =
+  | { kind: "ignore"; reason: string }
+  | {
+      kind: "answered";
+      incidentId: string;
+      choice: string;
+      slackUserId: string;
+    }
+  | { kind: "stale"; incidentId: string; slackUserId: string }
+  | { kind: "duplicate"; incidentId: string; slackUserId: string };
 
 /** The statuses during which the dispatcher keeps an agent on an incident. */
 const AGENT_RUNNING_STATUSES: readonly IncidentStatus[] = [
@@ -471,6 +489,88 @@ export class SlackRelay {
       kind: "incident_reply",
       incidentId: incident.id,
       interrupt: mentioned,
+    };
+  }
+
+  /**
+   * One press of a button on a question. It is recorded and delivered exactly
+   * as a typed reply is — a `thread_reply` row and a `human_message` directive
+   * carrying the label the agent wrote — so `contact_human` cannot tell the
+   * two apart and free text stays the answer of record.
+   *
+   * Anyone in the channel may press. Both guards that keeps honest are in the
+   * statement rather than around it, like every other transition here:
+   *
+   *   EXISTS — `pending_question` holds the one question the agent is waiting
+   *   on. A marker for a different message means this question has already
+   *   been answered or has timed out, and delivering a press against it would
+   *   file "Roll back" as the answer to whatever is being asked now.
+   *
+   *   The derived id — one question takes one answer, however many people
+   *   press, and however many times Slack redelivers.
+   */
+  async handleChoice(click: SlackChoiceClick): Promise<ChoiceRoute> {
+    const incident = this.incidentForThread(click.threadTs);
+    if (!incident) {
+      return { kind: "ignore", reason: "thread is not an incident thread" };
+    }
+
+    const recorded = await this.db.withWrite(
+      (d) =>
+        d
+          .prepare(
+            `INSERT OR IGNORE INTO thread_reply
+               (id, incidentId, slackUserId, text, ts, receivedAt)
+             SELECT ?, ?, ?, ?, ?, ?
+              WHERE EXISTS (
+                SELECT 1 FROM pending_question
+                 WHERE incidentId = ? AND messageTs = ?
+              )`,
+          )
+          .run(
+            `${click.channel}:${click.messageTs}:choice`,
+            incident.id,
+            click.user,
+            click.choice,
+            click.actionTs,
+            Date.now(),
+            incident.id,
+            click.messageTs,
+          ).changes > 0,
+    );
+
+    if (!recorded) {
+      const outstanding = this.db.get<{ messageTs: string }>(
+        "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+        [incident.id],
+      );
+      const kind =
+        outstanding?.messageTs === click.messageTs ? "duplicate" : "stale";
+      log(`choice_${kind}`, {
+        incidentId: incident.id,
+        user: click.user,
+        messageTs: click.messageTs,
+      });
+      return { kind, incidentId: incident.id, slackUserId: click.user };
+    }
+
+    await this.pushDirective(incident.id, {
+      type: "human_message",
+      from: click.user,
+      text: click.choice,
+      ts: click.actionTs,
+    });
+
+    log("choice_recorded", {
+      incidentId: incident.id,
+      user: click.user,
+      ts: click.actionTs,
+    });
+    return {
+      kind: "answered",
+      incidentId: incident.id,
+      choice: click.choice,
+      slackUserId: click.user,
     };
   }
 

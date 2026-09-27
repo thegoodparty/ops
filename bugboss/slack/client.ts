@@ -8,8 +8,9 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { retryPolicies, WebClient } from "@slack/web-api";
+import { retryPolicies, WebClient, type KnownBlock } from "@slack/web-api";
 
+import type { ChoicePoster } from "./blocks";
 import type { ObjectStore, SlackClient } from "./agent";
 
 /**
@@ -22,7 +23,7 @@ const REPLIES_PAGE_LIMIT = 200;
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
-): SlackClient => {
+): SlackClient & ChoicePoster => {
   // The SDK defaults to ten retries over about thirty minutes and does not
   // reject a rate-limited call, so a 429 parks the caller inside the SDK with
   // nothing thrown and nothing logged. Posts are off the ingest request now,
@@ -37,6 +38,21 @@ export const createSlackClient = (
         channel: channel ?? defaultChannel,
         thread_ts: threadTs ?? undefined,
         text,
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+      if (!res.ts) throw new Error("chat.postMessage returned no ts");
+      return { ts: res.ts };
+    },
+    // `text` goes alongside the blocks rather than being replaced by them:
+    // without it every notification for this message reads "This content
+    // can't be displayed", which is the whole question on a phone.
+    postChoice: async (threadTs, text, blocks) => {
+      const res = await web.chat.postMessage({
+        channel: defaultChannel,
+        thread_ts: threadTs ?? undefined,
+        text,
+        blocks: blocks as KnownBlock[],
         unfurl_links: false,
         unfurl_media: false,
       });

@@ -30,6 +30,21 @@ registered on the app, not per route, so a route added later cannot forget
 it. The 401 paths return their response rather than throwing, so a refused
 delivery stays a `log` and does not reach it.
 
+## `/slack` carries two encodings
+
+Events arrive as JSON; a button press on an agent's question arrives at the
+same path as `application/x-www-form-urlencoded` with the JSON in a `payload`
+field. Same `v0=` signature over the same raw body, same three-second budget,
+different parsing — so the content type is the whole discriminator.
+
+One path rather than two because the ALB listener rules
+(`deploy/components/bugboss.ts`) are an allowlist: a second path is a Pulumi
+change and a deploy before a click can reach the process.
+
+A press answers an **empty** 200. A JSON body there is read by Slack as a
+replacement for the clicked message, which would delete the question and its
+buttons out from under the thread.
+
 ## `/health` is deliberately flat
 
 It returns 200 whenever the process is up, and does not check the database.

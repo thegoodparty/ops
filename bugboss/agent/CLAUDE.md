@@ -30,6 +30,12 @@ polling, and it is why the prompt forbids polling with bash in a loop.
   re-posts when the stored message differs from the new one, and when
   `messageTs` is empty because the post itself failed — otherwise one Slack
   hiccup becomes a silent 24-hour wait that escalates for the wrong reason.
+  Optional `options` render as buttons on the ask (`slack/blocks.ts`); they
+  change what the question looks like and nothing else. A press comes back as
+  the same `human_message` directive a typed reply does, so the wait, the
+  marker and the timeout are untouched and an answer nobody offered still
+  lands. The options are checked before anything is posted, so a refusal
+  costs no marker and no message.
 
 ## contact_human is not an escalation, and the harness enforces that
 
@@ -61,6 +67,11 @@ returns `terminate`, and the agent stops. Three details it rests on:
   first and dying in between replays as a brand-new question: re-posted, with a
   fresh `askedAt` that makes a reply already in the thread look too old to be
   one.
+- **Buttons do not opt out of any of it.** A button nobody presses is
+  silence, so a question with `options` hits the same floor, the same
+  deadline and the same hand-off. The labels go into the harness's brief,
+  because they were part of the question and whoever picks this up was not
+  watching the thread.
 
 `message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
 refused rather than truncated — truncating would cut off the question, which

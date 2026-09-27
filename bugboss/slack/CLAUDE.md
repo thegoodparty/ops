@@ -68,23 +68,83 @@ back, which is the one failure a reader cannot recover from by reading on. So
 `_(2/3)_`, and closes and reopens a code fence that a split falls inside —
 otherwise the rest of a post-mortem renders as code.
 
-## No Block Kit, deliberately
+## Block Kit for one message: a question with its answers
 
-Every message here is plain `text` mrkdwn, which is also what the delegate
-reviewer posts in this channel.
+Every message here is plain `text` mrkdwn — except an agent's `contact_human`
+question when it passes `options`, which posts as `blocks` with a button per
+option (`blocks.ts`). Nothing else earns them. Block Kit's other offering is
+visual structure, which is mostly `header` blocks: `plain_text` only and
+capped at 150 characters, so they cannot carry an incident title anyway.
 
-Block Kit buys visual structure and interactive elements. BugBoss has no use
-for the second — ownership changes by replying in the thread, on purpose, and
-a button would be a second surface next to the thread that is supposed to be
-the whole record. The first is mostly `header` blocks, which are `plain_text`
-only and capped at 150 characters, so the heading Block Kit adds cannot carry
-an incident title anyway.
+**Buttons are an affordance, never a command language.** The rule this system
+runs on is that every human interface takes natural language; a button is a
+shortcut past typing, not a thing you have to press. So the same question is
+always answerable as prose: the options are numbered in the message body, the
+`text` fallback carries the whole question, and a typed reply reaches the
+agent by the path it always did. An agent that writes a question only a
+button can answer has written the wrong question, and the tool says so.
 
-Against that: `blocks` still needs a `text` fallback or the notification reads
-"This content can't be displayed"; `section` text is mrkdwn regardless, so the
-escaping work is identical; and `SlackPoster.post` is text-only across the
-relay, the tool API, the loopback route and every fake in the tests. It is
-more moving parts and more failure surface for a thread reply.
+Three constraints hold whatever the message:
+
+- `blocks` **needs** a `text` too, or every notification for it reads "This
+  content can't be displayed" — which on a phone is the entire question.
+- `section` text is mrkdwn, so the escaping in `format.ts` applies unchanged.
+  A button *label* is `plain_text` and capped at 75 characters; it escapes for
+  display, but the `value` that comes back stays raw, because that value is
+  the answer the agent reads.
+- A section block and a Slack message share a 3,000 character ceiling, so a
+  question longer than one message posts its front half as plain text and the
+  buttons hang off the last part — the one that ends in the question.
+
+An ask is two posts: the question, then `details` underneath it. The buttons
+go on the **question**, which is also the message `pending_question.messageTs`
+records — `/thread` fills that column only while it is blank, so the later
+`details` post cannot repoint it and a press keeps matching the message it was
+made on. A press that changed nothing is still silence: the wait floor and the
+automatic hand-off in `agent/tools.ts` run exactly as they do without buttons.
+
+## A press is a reply, and is recorded as one
+
+`SlackRelay.handleChoice` writes the same `thread_reply` row and pushes the
+same `human_message` directive a typed answer does, carrying the label the
+agent wrote. So `contact_human` cannot tell the two apart, and everything
+downstream of it — including whatever classifies an answer — only ever sees
+prose.
+
+Anyone in the channel may press. The two guards that keeps honest are in the
+`INSERT` statement rather than around it:
+
+- `WHERE EXISTS (… pending_question … messageTs = ?)` — that table holds the
+  one question an agent is actually waiting on. A press quoting any other
+  message is a press on a question already answered or timed out, and filing
+  it would answer whatever is being asked *now* with a label from before.
+- the derived id `<channel>:<question ts>:choice` — one question takes one
+  answer, however many people press and however often Slack redelivers.
+
+A press that changes nothing still gets a line in the thread. A button that
+silently does nothing is indistinguishable from a broken one, and the person
+who pressed it would go on waiting for an agent that never heard them.
+
+## Interactivity arrives down `/slack`, as a form
+
+Slack posts a press to the Interactivity Request URL as
+`application/x-www-form-urlencoded` with the JSON in a `payload` field —
+different parsing from the Events API, the same `v0=` signature over the same
+raw body, the same three-second budget. The content type is the whole
+discriminator (`isInteractionDelivery`).
+
+It shares `/slack` rather than taking a path of its own because the ALB
+listener rules in `deploy/components/bugboss.ts` are an allowlist: a new path
+is a Pulumi change and a deploy before a click can reach the process at all.
+
+The route answers an **empty** 200. A JSON body there is read by Slack as a
+replacement for the message that was clicked, which would delete the question
+and its buttons out from under everyone else in the thread.
+
+`settings.interactivity` in `slack-app-manifest.yaml` is what makes any of
+this reachable, and that file is applied by a person at api.slack.com, not by
+CI. Until somebody applies it, the buttons post and render but a press shows
+the presser a Slack error; the numbered options and free text still answer.
 
 ## Ownership claims
 
