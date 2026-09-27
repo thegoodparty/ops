@@ -78,6 +78,7 @@ import {
 } from "./toolapi";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
+import { sessionKeyFor, sumSessionUsage } from "./agent/session";
 import { makeAlarm, makeLog } from "./logging";
 import type {
   BugBossConfig,
@@ -127,9 +128,12 @@ const TRIAGE_CONCURRENCY = 5;
  * `sessions/<id>.jsonl`, but the Slack agent's read_agent_session tool and
  * the S3 lifecycle rule both read `sessions/incident/<id>/`, so the launch
  * below passes this explicitly.
+ *
+ * The agent's own copy, rather than a second literal: the Boss reads this
+ * key back to sum the run's tokens, so a drift between the two would show up
+ * as a free incident and nothing else.
  */
-export const incidentSessionKey = (incidentId: string): string =>
-  `sessions/incident/${incidentId}/session.jsonl`;
+export const incidentSessionKey = sessionKeyFor;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -1280,40 +1284,36 @@ export const createBugBoss = async (
   ): Promise<void> => {
     try {
       const raw = await store.get(sessionRef);
-      if (!raw) return;
-      let tokensIn = 0;
-      let tokensOut = 0;
-      let cacheRead = 0;
-      let cacheWrite = 0;
-      let modelId: string | null = null;
-      for (const line of raw.split("\n")) {
-        if (!line.trim()) continue;
-        let entry: {
-          usage?: {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-          };
-          model?: string;
-          modelId?: string;
-        };
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          // A session file is appended a line at a time, so a torn last line
-          // is normal after a kill. Everything before it is still good.
-          continue;
-        }
-        if (entry.usage) {
-          tokensIn += entry.usage.input ?? 0;
-          tokensOut += entry.usage.output ?? 0;
-          cacheRead += entry.usage.cacheRead ?? 0;
-          cacheWrite += entry.usage.cacheWrite ?? 0;
-        }
-        modelId = entry.modelId ?? entry.model ?? modelId;
+      if (!raw) {
+        // The child is spawned before its first turn syncs, so a crash at
+        // boot legitimately leaves no session. Say so rather than writing a
+        // zero that reads as a free run.
+        log("usage_roll_up_skipped", { incidentId, sessionRef, reason: "no session file" });
+        return;
       }
-      if (tokensIn + tokensOut + cacheRead + cacheWrite === 0 && !modelId) {
+      const usage = sumSessionUsage(raw);
+      const total = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+      if (total === 0) {
+        // A zero is never written, whatever produced it. The columns already
+        // default to zero, and on a resume the row may hold real tokens an
+        // earlier launch stored -- whose session object ages out under the
+        // lifecycle rule, so overwriting it loses the only copy.
+        if (usage.turns > 0) {
+          // A turn that reached the model always spends tokens, so this is not
+          // a cheap run: it is a reader that no longer matches what Pi writes.
+          alarm("usage_missing", {
+            incidentId,
+            sessionRef,
+            turns: usage.turns,
+            modelId: usage.modelId,
+          });
+        } else {
+          log("usage_roll_up_skipped", {
+            incidentId,
+            sessionRef,
+            reason: "session holds no turns",
+          });
+        }
         return;
       }
       await db.withWrite((w: Database.Database) => {
@@ -1322,15 +1322,23 @@ export const createBugBoss = async (
              SET tokensIn = ?, tokensOut = ?, cacheRead = ?, cacheWrite = ?,
                  modelId = COALESCE(?, modelId)
            WHERE id = ?`,
-        ).run(tokensIn, tokensOut, cacheRead, cacheWrite, modelId, incidentId);
+        ).run(
+          usage.tokensIn,
+          usage.tokensOut,
+          usage.cacheRead,
+          usage.cacheWrite,
+          usage.modelId,
+          incidentId,
+        );
       });
       log("usage_rolled_up", {
         incidentId,
-        tokensIn,
-        tokensOut,
-        cacheRead,
-        cacheWrite,
-        modelId,
+        tokensIn: usage.tokensIn,
+        tokensOut: usage.tokensOut,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite,
+        turns: usage.turns,
+        modelId: usage.modelId,
       });
     } catch (err: unknown) {
       // Never fatal. Losing a cost number is not worth failing a run over.

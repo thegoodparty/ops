@@ -135,6 +135,11 @@ restart starts from scratch with the whole investigation lost, and combined
 with relaunch that is an unbounded loop of agents each beginning again. N
 consecutive failures steers the agent to hand off.
 
+The session file is also the run's **cost ledger** -- `sumSessionUsage`
+reads it back after the child exits, so the key the agent writes and the key
+the Boss reads are one function. A drift between them costs no session and no
+error, only an incident that appears to have been free.
+
 ## The notes directory
 
 `/work/<id>/notes/` is the agent's own scratch space, mirrored to
