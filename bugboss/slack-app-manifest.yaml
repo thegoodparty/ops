@@ -17,8 +17,10 @@
 ## message and any reply in the thread reaches the agent — but pressing one
 ## shows the presser a Slack error instead of answering.
 ##
-## Scopes are derived from the four Slack API methods BugBoss actually calls
-## and the two events it handles. Nothing here is aspirational.
+## Scopes are derived from the Slack API methods BugBoss actually calls and the
+## two events it handles. Nothing here is aspirational. chat.getPermalink, which
+## is how a merged or split incident links to the other thread, requires no
+## scope at all, so it adds nothing below.
 ##
 ## CHANGING THE SCOPES MEANS REINSTALLING THE APP. A scope added here does
 ## nothing until someone reinstalls BugBoss into the workspace; until then the

@@ -61,6 +61,7 @@ import {
   createRotationReader,
   createS3ObjectStore,
   createSlackClient,
+  type SlackLinker,
 } from "./slack/client";
 import {
   SlackRelay,
@@ -85,6 +86,7 @@ import {
   type AssignResult,
   type Correlator,
   type EvidenceStore,
+  type ThreadPoster,
 } from "./toolapi";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
@@ -585,8 +587,11 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
   return Promise.race([work, expiry]).finally(() => clearTimeout(timer));
 };
 
-/** Everything the Boss needs from Slack: posts, buttons, and thread reads. */
-export type BossSlackClient = SlackClient & ChoicePoster;
+/**
+ * Everything the Boss needs from Slack: posts, buttons, thread reads, and the
+ * permalink a merged or split incident links the other thread by.
+ */
+export type BossSlackClient = SlackClient & ChoicePoster & SlackLinker;
 
 export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
   post: (threadTs, text, channel) =>
@@ -595,6 +600,8 @@ export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
   postChoice: (threadTs, text, blocks) =>
     withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
+  permalink: (messageTs) =>
+    withDeadline(slack.permalink(messageTs), "chat.getPermalink"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
 });
 
@@ -850,26 +857,30 @@ export const createBugBoss = async (
   const mintToken = (incidentId: string) =>
     mintAgentToken(tokenSecret, { incidentId, attempt: 0 }, tokenTtlSeconds);
 
+  /**
+   * Slack as the tool API needs it. Opening a thread is the relay's job and
+   * the tool API cannot reach the relay, but a split creates incidents that
+   * have to be pointed at and posted into before anyone can follow them, so
+   * the capability is handed over rather than the relay.
+   */
+  const threads: ThreadPoster = {
+    post: (threadTs, text) => slack.post(threadTs, text),
+    permalink: (messageTs) => slack.permalink(messageTs),
+    openThreads: ensureIncidentThreads,
+  };
+
   const toolApiFor = (incidentId: string, token?: string): ToolApi => {
     const api = createToolApi({
       db,
       token: token ?? mintToken(incidentId),
       tokenSecret,
       correlator,
-      slack,
+      slack: threads,
       evidence,
     });
 
     return {
       ...api,
-      // Where a split happens. The incidents it creates are real incidents
-      // with agents of their own, so they need threads before those agents
-      // start posting into the channel.
-      reportRootCause: async (args) => {
-        const response = await api.reportRootCause(args);
-        await ensureIncidentThreads();
-        return response;
-      },
       // The only transition that has to reach the rotation. The tool API
       // posts the brief itself; this adds the ping, which is the one thing it
       // cannot know to do.

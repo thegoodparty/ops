@@ -38,8 +38,13 @@ export interface ToolApiHttpDeps {
   tokenSecret: string;
   /** Built against the token the caller presented, not a freshly minted one. */
   toolApiFor: (incidentId: string, token: string) => ToolApi;
-  /** Posts the agent's own messages, and its questions with their buttons. */
-  slack: ThreadPoster & ChoicePoster;
+  /**
+   * Relaying one message the agent wrote, and posting its questions with
+   * their buttons. The tool API's own posts -- and the permalinks and thread
+   * opening a merge or split needs -- are the tool API's; this route only
+   * forwards.
+   */
+  slack: Pick<ThreadPoster, "post"> & ChoicePoster;
   now?: () => number;
 }
 

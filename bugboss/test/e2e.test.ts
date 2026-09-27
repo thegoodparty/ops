@@ -136,6 +136,12 @@ const fakeSlack = {
   replies() {
     return Promise.resolve([]);
   },
+  /** What a merge or a split message points the reader at. */
+  permalink(messageTs: string) {
+    return Promise.resolve(
+      `https://goodparty.slack.com/archives/C09/p${messageTs.replaceAll(".", "")}`,
+    );
+  },
 };
 
 /**
@@ -785,6 +791,7 @@ test("a Slack call that never answers is bounded, not silently queued", async ()
       post: () => new Promise(() => {}),
       react: () => new Promise(() => {}),
       postChoice: () => new Promise(() => {}),
+      permalink: () => new Promise(() => {}),
       replies: () => new Promise(() => {}),
     });
     // The SDK retries a 429 for half an hour by default and raises nothing

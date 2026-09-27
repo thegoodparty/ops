@@ -20,10 +20,19 @@ import type { ObjectStore, SlackClient } from "./agent";
  */
 const REPLIES_PAGE_LIMIT = 200;
 
+/**
+ * A link to one message. Slack builds a permalink out of the workspace
+ * domain, which nothing in here knows, so it is an API call rather than
+ * string concatenation. `chat.getPermalink` needs no scope of its own.
+ */
+export interface SlackLinker {
+  permalink(messageTs: string): Promise<string>;
+}
+
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
-): SlackClient & ChoicePoster => {
+): SlackClient & ChoicePoster & SlackLinker => {
   // The SDK defaults to ten retries over about thirty minutes and does not
   // reject a rate-limited call, so a 429 parks the caller inside the SDK with
   // nothing thrown and nothing logged. Posts are off the ingest request now,
@@ -61,6 +70,16 @@ export const createSlackClient = (
       });
       if (!res.ts) throw new Error("chat.postMessage returned no ts");
       return { ts: res.ts };
+    },
+    permalink: async (messageTs) => {
+      const res = await web.chat.getPermalink({
+        channel: defaultChannel,
+        message_ts: messageTs,
+      });
+      if (!res.permalink) {
+        throw new Error("chat.getPermalink returned no permalink");
+      }
+      return res.permalink;
     },
     replies: async ({ channel, threadTs, oldest }) => {
       const res = await web.conversations.replies({
