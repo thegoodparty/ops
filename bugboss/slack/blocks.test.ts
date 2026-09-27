@@ -107,11 +107,26 @@ describe("escaping", () => {
     "Leave it",
   ]);
 
-  test("a label renders escaped but comes back raw", () => {
+  test("a label renders and comes back exactly as the agent wrote it", () => {
     const [first] = buttons(question.blocks);
-    assert.equal(first.text.text, "Drop &amp; recreate");
-    // The agent has to read back the label it wrote, not an escaped copy.
+    // plain_text is not parsed for Slack markup, so escaping it only puts a
+    // literal &amp; on the button face and lengthens what the cap was measured on.
+    assert.equal(first.text.text, "Drop & recreate");
     assert.equal(first.value, "Drop & recreate");
+  });
+
+  test("a label the cap accepts is still within the cap once rendered", () => {
+    // The whole point of the cap: what Slack measures is what goes on the
+    // wire. Rendered longer, chat.postMessage refuses the post -- and refuses
+    // it again on every resume, because the question never changes.
+    const atCap = `${"&".repeat(MAX_CHOICE_LABEL_CHARS - 1)}x`;
+    assert.equal(choiceProblem(["Leave it", atCap]), null);
+    const [, second] = buttons(renderChoiceQuestion("Which one?", ["Leave it", atCap]).blocks);
+    assert.equal(second.text.text.length, MAX_CHOICE_LABEL_CHARS);
+  });
+
+  test("the numbered fallback list is still escaped, because it is mrkdwn", () => {
+    assert.match(question.text, /1\. Drop &amp; recreate/);
   });
 
   test("a stray angle bracket in the question cannot eat the message", () => {

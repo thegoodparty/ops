@@ -148,10 +148,15 @@ export const renderChoiceQuestion = (
         elements: labels.map((label, index) => ({
           type: "button" as const,
           action_id: `${CHOICE_ACTION_PREFIX}${index}`,
-          text: { type: "plain_text" as const, text: escape(label), emoji: true },
-          // Unescaped on purpose: `value` is never rendered, it comes back on
-          // the click and is recorded as the answer. The agent has to read
-          // back the label it wrote, not an `&amp;`-riddled copy of it.
+          // Unescaped, like `value` below and for a second reason of its own.
+          // `plain_text` is not parsed for Slack's markup, so there is nothing
+          // for escaping to prevent -- it only renders a literal `&amp;` on the
+          // button face, and grows a label the cap was measured on before the
+          // escape. A 75-character label with one `&` became 79, and a post
+          // Slack refuses for that is refused identically on every resume.
+          text: { type: "plain_text" as const, text: label, emoji: true },
+          // The click brings this back and it is recorded as the answer. The
+          // agent has to read back the label it wrote.
           value: label,
         })),
       },
