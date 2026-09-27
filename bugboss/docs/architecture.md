@@ -135,9 +135,11 @@ saturating context on polling:
 
 - `monitor(command, interval, timeout)` — block until a read-only check
   passes. The general primitive: PR merged, deploy shipped, alert quiet
-- `contact_human(message, timeout)` — post to the thread and block for a
-  reply. Re-entrant: the marker is written before the post, so a resumed
-  agent resumes waiting rather than asking twice
+- `contact_human(message, details, timeout)` — post to the thread and block
+  for a reply. Re-entrant: the marker is written before the post, so a
+  resumed agent resumes waiting rather than asking twice. `details` is a
+  second, separate post underneath the ask, so evidence is available without
+  being the first thing read. A wait nobody answers becomes a `hand_off`
 
 ### How an agent learns things changed
 

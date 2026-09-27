@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import {
+  CONTACT_HUMAN_MESSAGE_LIMIT,
+  CONTACT_HUMAN_MIN_WAIT_SECONDS,
+} from "./tools";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -79,6 +83,28 @@ test("the load-bearing rules are all in there", () => {
   assert.match(prompt, /resumed_after/);
   assert.match(prompt, /Loki uid grafanacloud-logs/);
   assert.match(prompt, /drive delegate to Approved/);
+});
+
+test("the prompt names the difference between asking and escalating", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /I am still working, and I need one fact from you/);
+  assert.match(prompt, /I cannot take this further, it is yours/);
+  // The harness enforces this one; the prompt has to say so, or a model that
+  // reads only the prompt believes an unanswered question is survivable.
+  assert.match(prompt, /converted into a hand_off by the harness/);
+  assert.match(prompt, new RegExp(`${CONTACT_HUMAN_MIN_WAIT_SECONDS} seconds is raised to it`));
+});
+
+test("the prompt gives the report a budget, a shape and an example", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /## What a human reads/);
+  assert.match(prompt, new RegExp(`capped at ${CONTACT_HUMAN_MESSAGE_LIMIT} characters`));
+  assert.match(prompt, /Length is not a quality signal/);
+  assert.match(prompt, /posted as its own follow-up message below the ask/);
+  // An example changes model behaviour where an adjective does not.
+  assert.match(prompt, /\*What I need:\*/);
 });
 
 test("loadPromptContext reads the checkout deterministically", async () => {
