@@ -34,6 +34,7 @@ import { firstReplyAfter } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { SlackEvent } from "../slack/relay";
 import type { ModelReply, ModelRequest } from "../triage";
+import type { ReportUpload } from "../report";
 import type { BugBossConfig, Directive, TriageDecision } from "../types";
 
 type QueuedDecision = TriageDecision & { recurrenceOf?: string };
@@ -183,6 +184,15 @@ const fakeSlackAgent = {
 /** Slack's user group, which changes under us and keeps no history. */
 const rotation = { members: ["U-ada", "U-grace"] as string[] | null };
 
+/** The closing report's file upload. Captured, so the thread can be read. */
+const fakeUploader = {
+  files: [] as ReportUpload[],
+  upload(file: ReportUpload) {
+    fakeUploader.files.push(file);
+    return Promise.resolve();
+  },
+};
+
 // --- setup -----------------------------------------------------------------
 
 let dir: string;
@@ -219,6 +229,7 @@ before(async () => {
     // titled with the raw mention markup.
     secrets: { slackBotUserId: "B0BOSS" },
     slackAgentModel: fakeSlackAgent,
+    fileUploader: fakeUploader,
     // The webhook bodies below carry no real signature, no timestamp and no
     // basic auth, so verification is replaced outright. This seam exists for
     // this file alone; bugBossFromEnv never sets it.
@@ -275,6 +286,21 @@ test("a Grafana alert becomes a resolved, written-up incident", async () => {
   assert.equal(incident.usersImpacted, 3);
   assert.ok(incident.postmortem, "a post-mortem is required to reach CLOSED");
   assert.ok(incident.resolvedAt, "resolvedAt must be set before CLOSED");
+
+  // The report is published off the launch, after usage roll-up, so it is
+  // still in flight when dispatchOnce returns.
+  await until(() => fakeUploader.files.length === 1, "the closing report");
+  const [report] = fakeUploader.files;
+  assert.equal(report.threadTs, fakeSlack.posts[0].threadTs ?? "ts-1");
+  assert.match(report.content, /^# Incident /);
+  assert.match(report.content, /## Post-mortem/);
+  assert.match(report.content, /Bad column in the upgrade webhook\./);
+  assert.match(report.content, /\| Users impacted \| 3 \|/);
+  assert.match(report.content, /pull\/9999/);
+  // This fake agent never wrote a session file, so there is nothing to bill
+  // it from. The report says that rather than printing a free run.
+  assert.match(report.content, /\| Turns \| not recorded \|/);
+  assert.match(report.comment, /closing report/);
 });
 
 test("a second alert for the same cause attaches rather than opening", async () => {

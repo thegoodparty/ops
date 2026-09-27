@@ -12,6 +12,7 @@ import { retryPolicies, WebClient, type KnownBlock } from "@slack/web-api";
 
 import type { ChoicePoster } from "./blocks";
 import type { ObjectStore, SlackClient } from "./agent";
+import type { FileUploader } from "../report";
 
 /**
  * `conversations.replies` is throttled to roughly one request a minute for
@@ -94,6 +95,54 @@ export const createSlackClient = (
         text: m.text ?? "",
         ts: String(m.ts ?? ""),
       }));
+    },
+  };
+};
+
+/**
+ * Upload one file into a thread, as Slack's external upload flow.
+ *
+ * Three steps and no SDK shortcut: `files.upload` is deprecated, and
+ * `filesUploadV2` wraps this same sequence while hiding which of the three
+ * failed. The middle step is a plain POST to a signed URL -- not a Slack API
+ * call, no token on it -- so it is `fetch` rather than the WebClient.
+ *
+ * `files:write` is the scope, and it does nothing until somebody reinstalls
+ * the app. Until then `files.completeUploadExternal` answers `missing_scope`,
+ * which is a throw here and an alarm plus an inline post in `report/`.
+ */
+export const createSlackFileUploader = (token: string): FileUploader => {
+  const web = new WebClient(token, {
+    retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+  });
+  return {
+    upload: async (file) => {
+      // Byte length, not character count: Slack rejects the completion when
+      // the length it was promised does not match what arrived, and a
+      // post-mortem quoting a log line is rarely pure ASCII.
+      const body = Buffer.from(file.content, "utf8");
+      const ticket = await web.files.getUploadURLExternal({
+        filename: file.filename,
+        length: body.byteLength,
+      });
+      if (!ticket.upload_url || !ticket.file_id) {
+        throw new Error("files.getUploadURLExternal returned no upload url");
+      }
+      const uploaded = await fetch(ticket.upload_url, {
+        method: "POST",
+        body,
+      });
+      if (!uploaded.ok) {
+        throw new Error(
+          `file upload rejected: ${uploaded.status} ${uploaded.statusText}`,
+        );
+      }
+      await web.files.completeUploadExternal({
+        files: [{ id: ticket.file_id, title: file.title }],
+        channel_id: file.channel,
+        thread_ts: file.threadTs ?? undefined,
+        initial_comment: file.comment,
+      });
     },
   };
 };
