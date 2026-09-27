@@ -18,6 +18,11 @@ working. Slack is worse: a three-second ack against a two-minute model run.
 `settle()` alarms on rejection, so the deferred half cannot become a new
 silent drop.
 
+The 200 answers Slack, not the person who typed. `/slack` therefore reacts
+with :eyes: the moment `classifySlackEvent` returns, before the relay and
+before anything a model touches. `acknowledgeSlack` is typed `void` so this
+route structurally cannot await it — see `slack/CLAUDE.md`.
+
 The synchronous boundary is **verified and recorded**. A failure before it
 throws and the route 500s so Grafana retries; a failure after it is
 recovered by the orphan sweep, which is unbounded, source-agnostic and

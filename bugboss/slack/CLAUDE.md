@@ -27,6 +27,42 @@ agent waited out its full timeout.
 `mentioned` still drives `interrupt`. So a mention answers *and* interrupts;
 a plain reply answers.
 
+## The :eyes: goes on before the work, not after it
+
+`ack.ts`. Slack's three-second ack is answered by the HTTP layer and seen by
+nobody. What a person watching the channel sees is the post that follows, and
+that is seconds away for a bug report and up to two minutes away for a
+mention. For that whole window a Boss that is working looks exactly like one
+that never got the message, and the second is the likelier guess.
+
+So `http/public.ts` reacts the moment `classifySlackEvent` returns, before the
+relay, the ingest or the model. Three kinds earn it — `bug_report`, `mention`
+and `incident_reply` — and it is written as "anything but `ignored`", so a
+classification added later is acknowledged by default. `ignored` is excluded
+on purpose: an :eyes: on chatter nobody addressed to BugBoss claims it is
+working on something it will never answer.
+
+`createSlackAck` returns **`void`, not a promise**, and that is the contract.
+Slack retries any delivery it has not seen answered in three seconds and a
+retry is a second run of the same work, so a caller that cannot await the
+reaction cannot put it in front of the 200.
+
+A refused reaction never fails the message — the answer still posts — but it
+is not swallowed either. `already_reacted` is ordinary (a retry, and the two
+copies Slack sends of a threaded mention) and **logs**; everything else
+**alarms**. `missing_scope` in particular: `reactions:write` is in
+`slack-app-manifest.yaml` and does nothing until someone reinstalls the app,
+and swallowed it would look identical to a BugBoss that is working fine. The
+delegate reviewer bot swallows exactly this, which is why its broken dispatches
+are invisible.
+
+**Nothing removes the reaction.** There is no one completion event to swap it
+for: a mention is done when the answer posts, a report is done somewhere
+between triage and resolution, and a thread reply is done when an agent reads
+the directive — which is not something the HTTP edge can see at all. A ✅ would
+have to pick one and be wrong for the others, and a swap that half-fails leaves
+a reaction that lies. The :eyes: means "received", and that stays true.
+
 ## Slack renders mrkdwn, and Markdown renders wrong
 
 `format.ts` is the only place text is prepared for Slack, and everything that
