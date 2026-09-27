@@ -1195,6 +1195,16 @@ describe("a merge is told to both threads", () => {
     assert.equal(absorbing.length, 1, "the thread everyone keeps reading");
     assert.equal(absorbed.length, 1, "and the one that is about to go quiet");
 
+    // Order, not just presence. The absorbed thread is never written to again,
+    // so if a crash between the two posts lands only one, it has to be that
+    // one -- the alternative is a surviving thread announcing that a thread is
+    // closing while that thread says nothing and simply stops.
+    assert.ok(
+      posts.findIndex((post) => post.threadTs === `thread-${b}`) <
+        posts.findIndex((post) => post.threadTs === `thread-${a}`),
+      "the absorbed thread is closed out before the surviving one is told",
+    );
+
     assert.match(absorbing[0], new RegExp(`Incident ${b} is the same problem`));
     assert.match(absorbing[0], /one pool, two alerts/, "and why we believe that");
     assert.match(
