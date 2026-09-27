@@ -29,6 +29,7 @@
 // disk at any moment, so the limit is measured over the whole record.
 
 import { createHash } from "node:crypto";
+import type { Stats } from "node:fs";
 import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -134,7 +135,17 @@ export const scanNotesDir = async (dir: string): Promise<NotesScan> => {
   const skipped: string[] = [];
   let totalBytes = 0;
   for (const entry of entries.sort()) {
-    const stats = await lstat(join(dir, entry));
+    let stats: Stats;
+    try {
+      stats = await lstat(join(dir, entry));
+    } catch (err) {
+      // The agent's own shell can remove a file between the readdir above and
+      // this call. It is simply not part of this flush, and the next one sees
+      // the true state. What it must not become is a durability failure: that
+      // burns the streak and tells the agent its notes are not saving.
+      if ((err as { code?: string }).code === "ENOENT") continue;
+      throw err;
+    }
     if (stats.isDirectory()) continue;
     if (!stats.isFile()) {
       skipped.push(toPosix(entry));
@@ -298,7 +309,15 @@ export const createNotesSync = (args: {
 
     for (const file of scan.files) {
       const key = `${args.prefix}${file.path}`;
-      const body = await readFile(join(args.dir, ...file.path.split("/")));
+      let body: Buffer;
+      try {
+        body = await readFile(join(args.dir, ...file.path.split("/")));
+      } catch (err) {
+        // Same race as the walk, one step later: scanned, then removed before
+        // we read it. Not this flush's file, and not a failure.
+        if ((err as { code?: string }).code === "ENOENT") continue;
+        throw err;
+      }
       const hash = digest(body);
       if (seen.get(key)?.digest === hash) continue;
       await args.store.put(key, body, noteContentType(file.path));

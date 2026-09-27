@@ -340,6 +340,37 @@ test("a symlink is reported and never followed", async () => {
   assert.equal(objects.get("sessions/incident/inc-1/notes/real.md")?.toString(), "mine");
 });
 
+test("a note deleted mid-flush is not a durability failure", async () => {
+  const objects = new Map<string, Buffer>();
+  const dir = await notesDir();
+  await writeFile(join(dir, "a.md"), "one");
+  await writeFile(join(dir, "b.md"), "two");
+
+  // The agent's shell runs while we are mirroring, so a file can be scanned
+  // and then gone before we read it. Driven from inside `put` so the race is
+  // deterministic rather than hoped for. The walk carries the same guard for
+  // the same window one step earlier, between readdir and lstat.
+  const sync = createNotesSync({
+    store: {
+      get: async () => null,
+      list: async () => [],
+      put: async (key, body) => {
+        objects.set(key, Buffer.from(body));
+        await rm(join(dir, "b.md"), { force: true });
+      },
+    },
+    prefix: PREFIX,
+    dir,
+  });
+
+  await sync.flush();
+
+  assert.equal(sync.lastError(), null, "a vanished file must not burn the streak");
+  assert.equal(sync.failureStreak(), 0);
+  assert.equal(objects.get("sessions/incident/inc-1/notes/a.md")?.toString(), "one");
+  assert.equal(objects.has("sessions/incident/inc-1/notes/b.md"), false);
+});
+
 test("a failing upload streaks and recovers, and never throws at the caller", async () => {
   const dir = await notesDir();
   await writeFile(join(dir, "a.md"), "one");
