@@ -226,8 +226,13 @@ export const createNotesSync = (args: {
 
     // A directory that is gone is local storage we lost, not an instruction
     // to delete the copy in S3. The session sync skips on the same ENOENT for
-    // the same reason: the mirror is the safer of the two, so it wins.
-    if (!scan.present) return;
+    // the same reason: the mirror is the safer of the two, so it wins. A
+    // breach recorded before it vanished is cleared with it, or the agent
+    // keeps being told to trim files that no longer exist.
+    if (!scan.present) {
+      breach = null;
+      return;
+    }
 
     // Refuse the whole directory rather than mirroring part of it. A partial
     // mirror restores a directory the agent never had, and picking which
