@@ -160,6 +160,13 @@ nothing under `sessions/` expires.
 A resumed agent therefore gets back notes it deleted locally. The prompt says
 so, or the reappearance reads as a broken harness.
 
+The same no-deletes rule is why restore has to tolerate a name used twice. An
+agent that writes the note `findings` and later makes `findings/` a directory
+leaves both keys standing, and no filesystem holds both. Restore skips the one
+it cannot place, logs `notes_restore_conflict` and carries on: it runs before
+the session opens, so a throw there killed every relaunch of that incident on
+the same two keys, and nothing in the agent's reach could clear either.
+
 It is a **sibling** of the checkout, not a folder in it: under the checkout a
 note is one `git add -A` away from the pull request the agent asks a human to
 merge.

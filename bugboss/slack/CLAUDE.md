@@ -156,6 +156,11 @@ Conversion happens **at the Slack boundary only**. What the incident stores is
 what the agent wrote, so the Slack agent reading `postmortem` back out of the
 database gets prose and not `&lt;`-riddled markup.
 
+A `plain_text` field is **not** escaped, and that is not an oversight. Slack
+does not parse it for entities, so there is nothing to prevent — escaping only
+renders a literal `&amp;` on a button face and grows a string whose length
+limit was measured before the escape ran.
+
 ## Length is a split, never a truncation
 
 `chat.postMessage` accepts 40,000 characters and truncates past it with a 200
