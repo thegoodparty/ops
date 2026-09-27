@@ -27,6 +27,19 @@ import {
   type PendingQuestion,
 } from "./tools";
 import {
+  createNotesSync,
+  notesPrefixFor,
+  notesOverLimitMessage,
+  notesSyncExtension,
+  notesSyncFailedMessage,
+  restoreNotesDir,
+  NOTES_DIR_NAME,
+  NOTES_LIMITS,
+  NOTES_SYNC_FAILURE_LIMIT,
+  type NotesStore,
+  type NotesSync,
+} from "./notes";
+import {
   createSessionSync,
   createS3SessionStore,
   readStoredPrefixFromFile,
@@ -51,6 +64,13 @@ export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "wri
 export interface AgentPaths {
   workDir: string;
   checkout: string;
+  /**
+   * The agent's own scratch directory. A sibling of the checkout rather than
+   * a folder inside it: anything under the checkout shows up in `git status`
+   * and is one `git add -A` away from being in the pull request the agent
+   * asks a human to merge.
+   */
+  notesDir: string;
   sessionDir: string;
   sessionFile: string;
   npmCiLog: string;
@@ -65,6 +85,7 @@ export const computePaths = (workRoot: string, incidentId: string): AgentPaths =
   return {
     workDir,
     checkout,
+    notesDir: join(workDir, NOTES_DIR_NAME),
     sessionDir,
     sessionFile: sessionFileFor(sessionDir, incidentId),
     npmCiLog: join(workDir, "npm-ci.log"),
@@ -422,7 +443,7 @@ export interface RunIncidentAgentOptions {
    */
   sessionKey: string;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
-  store?: SessionStore;
+  store?: SessionStore & NotesStore;
   api?: BossClient;
   skipClone?: boolean;
 }
@@ -524,6 +545,17 @@ export const runIncidentAgent = async (
     await cloneOmni(options.omniRepoUrl ?? DEFAULT_OMNI_REPO, paths.checkout);
   }
   const restored = await restoreSessionFile({ store, key, sessionFile: paths.sessionFile });
+  const notesPrefix = notesPrefixFor(key);
+  const notes = await restoreNotesDir({ store, prefix: notesPrefix, dir: paths.notesDir });
+  console.log(
+    JSON.stringify({
+      component: "agent",
+      event: "notes_restored",
+      incidentId: options.incidentId,
+      prefix: notesPrefix,
+      files: notes.fileCount,
+    }),
+  );
   const pinned = await pinnedSessionModel({
     restored,
     sessionFile: paths.sessionFile,
@@ -563,6 +595,8 @@ export const runIncidentAgent = async (
       model,
       mcp,
       restored,
+      notesPrefix,
+      notesSeen: notes.seen,
       storedPrefix: pinned.storedPrefix,
     });
   } finally {
@@ -573,13 +607,15 @@ export const runIncidentAgent = async (
 const launch = async (args: {
   options: RunIncidentAgentOptions;
   paths: AgentPaths;
-  store: SessionStore;
+  store: SessionStore & NotesStore;
   key: string;
   api: BossClient;
   pi: typeof import("@earendil-works/pi-coding-agent");
   model: Awaited<ReturnType<typeof resolveBedrockModel>>;
   mcp: McpToolset[];
   restored: boolean;
+  notesPrefix: string;
+  notesSeen: Map<string, string>;
   storedPrefix: StoredPrefix | null;
 }): Promise<RunIncidentAgentResult> => {
   const { options, paths, store, key, api, pi, model, mcp, restored, storedPrefix } = args;
@@ -608,6 +644,8 @@ const launch = async (args: {
         systemPrompt: composeSystemPrompt({
           incidentId: options.incidentId,
           checkoutPath: paths.checkout,
+          notesDir: paths.notesDir,
+          notesLimits: NOTES_LIMITS,
           toolNames,
           npmCiDoneMarker: paths.npmCiDone,
           npmCiFailedMarker: paths.npmCiFailed,
@@ -634,6 +672,14 @@ const launch = async (args: {
     sessionFile: () => sessionManager.getSessionFile(),
   });
 
+  const notesSync = createNotesSync({
+    store,
+    prefix: args.notesPrefix,
+    dir: paths.notesDir,
+    seen: args.notesSeen,
+    limits: NOTES_LIMITS,
+  });
+
   // Assigned once the session exists; the first flush cannot precede it.
   let live: { steer: (message: string) => Promise<unknown> } | null = null;
   const onSyncFailure = (error: Error, streak: number): void => {
@@ -653,6 +699,65 @@ const launch = async (args: {
     }
   };
 
+  // Steered on the edge rather than every turn: the agent cannot act on the
+  // same sentence twice, and a repeated steer would cost a turn each time it
+  // failed to trim. Reset on the way back under, so a second breach is told
+  // about as loudly as the first.
+  let announcedOverLimit = false;
+  const onNotesFlush = (sync: NotesSync): void => {
+    const error = sync.lastError();
+    if (error) {
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "notes_sync_failed",
+          incidentId: options.incidentId,
+          prefix: args.notesPrefix,
+          streak: sync.failureStreak(),
+          error: error.message,
+        }),
+      );
+      if (sync.failureStreak() === NOTES_SYNC_FAILURE_LIMIT) {
+        void live?.steer(notesSyncFailedMessage(sync.failureStreak())).catch(() => {});
+      }
+    }
+
+    const skipped = sync.skipped();
+    if (skipped.length > 0) {
+      console.warn(
+        JSON.stringify({
+          component: "agent",
+          level: "warn",
+          event: "notes_entries_skipped",
+          incidentId: options.incidentId,
+          entries: skipped,
+        }),
+      );
+    }
+
+    const breach = sync.overLimit();
+    if (!breach) {
+      announcedOverLimit = false;
+      return;
+    }
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "notes_over_limit",
+        incidentId: options.incidentId,
+        totalBytes: breach.totalBytes,
+        fileCount: breach.fileCount,
+        limits: breach.limits,
+      }),
+    );
+    if (!announcedOverLimit) {
+      announcedOverLimit = true;
+      void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
+    }
+  };
+
   const settings = pi.SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: reserveTokensFor(model.contextWindow) },
   });
@@ -668,6 +773,7 @@ const launch = async (args: {
     appendSystemPromptOverride: () => [],
     extensionFactories: [
       sessionSyncExtension(sync, onSyncFailure),
+      notesSyncExtension(notesSync, onNotesFlush),
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
       // every thinking block is signed against.
@@ -723,6 +829,8 @@ const launch = async (args: {
     await sync.flush();
     const lost = sync.lastError();
     if (lost) onSyncFailure(lost, sync.failureStreak());
+    await notesSync.flush();
+    onNotesFlush(notesSync);
     error = session.state.errorMessage ?? null;
     session.dispose();
   }

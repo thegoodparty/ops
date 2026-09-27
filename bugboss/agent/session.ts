@@ -12,6 +12,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { NotesStore } from "./notes";
 
 export interface SessionStore {
   get(key: string): Promise<Buffer | null>;
@@ -39,7 +40,7 @@ export const sessionFileFor = (sessionDir: string, incidentId: string): string =
 export const createS3SessionStore = (
   bucket: string,
   region?: string,
-): SessionStore => {
+): SessionStore & NotesStore => {
   let clientPromise: Promise<any> | null = null;
   const client = (): Promise<any> => {
     if (!clientPromise) {
@@ -81,6 +82,38 @@ export const createS3SessionStore = (
           ContentType: "application/x-ndjson",
         }),
       );
+    },
+    // list and delete exist for the notes mirror in ./notes.ts, which is a
+    // directory rather than one object and so has to reconcile what S3 holds
+    // against what is on disk. The session itself never needs either.
+    list: async (prefix) => {
+      const [{ ListObjectsV2Command }, s3] = await Promise.all([
+        import("@aws-sdk/client-s3"),
+        client(),
+      ]);
+      const keys: string[] = [];
+      let token: string | undefined;
+      do {
+        const res = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: prefix,
+            ContinuationToken: token,
+          }),
+        );
+        for (const object of res.Contents ?? []) {
+          if (object.Key) keys.push(object.Key);
+        }
+        token = res.IsTruncated ? res.NextContinuationToken : undefined;
+      } while (token);
+      return keys;
+    },
+    delete: async (key) => {
+      const [{ DeleteObjectCommand }, s3] = await Promise.all([
+        import("@aws-sdk/client-s3"),
+        client(),
+      ]);
+      await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
     },
   };
 };
