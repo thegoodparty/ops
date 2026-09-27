@@ -231,3 +231,92 @@ export const readStoredPrefixFromFile = async (
     throw err;
   }
 };
+
+/**
+ * Token usage summed over one incident's whole session file.
+ *
+ * `turns` is not decoration. Tokens are never legitimately zero for a turn
+ * that reached the model, so a non-zero turn count next to a zero total is
+ * the signature of a reader that has drifted from Pi's entry shape -- which
+ * is exactly how this went unnoticed once already.
+ */
+export interface SessionUsage {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  modelId: string | null;
+  turns: number;
+}
+
+interface UsageFields {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+}
+
+/**
+ * Pi writes usage in two shapes, and both are spend:
+ *
+ * - `{ type: "message", message: { role: "assistant", usage } }` -- one per
+ *   model turn, and the overwhelming bulk of a run.
+ * - `{ type: "usage" | "compaction", usage }` -- out-of-band calls that are
+ *   billed but are not turns, such as the summarization compaction runs.
+ *
+ * A message entry never carries top-level `usage`, so reading the nested one
+ * first and falling back cannot double count.
+ */
+interface SessionUsageLine {
+  type?: string;
+  usage?: UsageFields;
+  model?: string;
+  modelId?: string;
+  message?: { role?: string; model?: string; usage?: UsageFields };
+}
+
+/**
+ * Sum a session file's usage. Totals are absolute over the whole file, which
+ * is what makes resume correct: a relaunched agent reopens the same restored
+ * file and appends to it, so re-reading it counts every launch once. Adding
+ * onto the stored row instead would double count every earlier launch.
+ */
+export const sumSessionUsage = (contents: string): SessionUsage => {
+  const total: SessionUsage = {
+    tokensIn: 0,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    modelId: null,
+    turns: 0,
+  };
+
+  for (const line of contents.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: SessionUsageLine;
+    try {
+      entry = JSON.parse(trimmed) as SessionUsageLine;
+    } catch {
+      // A session file is appended a line at a time, so a torn last line is
+      // normal after a kill. Everything before it is still good.
+      continue;
+    }
+
+    if (entry.type === "message" && entry.message?.role === "assistant") {
+      total.turns += 1;
+    }
+
+    const usage = entry.message?.usage ?? entry.usage;
+    if (usage) {
+      total.tokensIn += usage.input ?? 0;
+      total.tokensOut += usage.output ?? 0;
+      total.cacheRead += usage.cacheRead ?? 0;
+      total.cacheWrite += usage.cacheWrite ?? 0;
+    }
+
+    total.modelId = entry.modelId ?? entry.message?.model ?? entry.model ?? total.modelId;
+  }
+
+  return total;
+};

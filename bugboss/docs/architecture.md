@@ -199,3 +199,14 @@ results.
 **Tokens, not dollars.** Pricing moves; a stored dollar figure would be a
 guess frozen at write time, while tokens plus `modelId` multiply out
 correctly whenever asked.
+
+**Usage is read back off the session file**, after the child exits, by
+`sumSessionUsage`. Pi writes a turn's usage nested at `message.usage` and
+writes the billed non-turn calls -- compaction's summarization, a cache warm
+-- at the top level, so both are summed. The totals are absolute over the
+whole file, which is what makes resume correct: a relaunched agent appends to
+the restored file, so re-reading it counts every launch exactly once. Turns
+are counted alongside the tokens because a turn that reached the model always
+spends some, so turns above zero with tokens at zero means the reader has
+drifted from what Pi writes, and the Boss alarms rather than storing a free
+incident.

@@ -77,6 +77,11 @@ restart starts from scratch with the whole investigation lost, and combined
 with relaunch that is an unbounded loop of agents each beginning again. N
 consecutive failures steers the agent to hand off.
 
+The session file is also the run's **cost ledger** -- `sumSessionUsage`
+reads it back after the child exits, so the key the agent writes and the key
+the Boss reads are one function. A drift between them costs no session and no
+error, only an incident that appears to have been free.
+
 **The model is pinned in the session.** On resume it resolves from the
 stored prefix, not from env — Bedrock does not restore it, and the SSM
 mapping retunes without a deploy. Replaying against a different model
