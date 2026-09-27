@@ -63,7 +63,10 @@ Three rules sit in code on top of what the model said, the same way
   handover and never told its answer had not been delivered as one, which
   leaves the person believing the agent has it. The addressee half is said
   only while a question is outstanding — with nothing blocked there is no wait
-  to end and narrating it is noise.
+  to end and narrating it is noise. Asking is also **not** an else: somebody
+  who tagged `@bugboss` in a thread with no agent on it asked a question, and
+  an ambiguous handover is a footnote to that rather than a reason to answer
+  them with a clarification and nothing else.
 
 ## Slack renders mrkdwn, and Markdown renders wrong
 

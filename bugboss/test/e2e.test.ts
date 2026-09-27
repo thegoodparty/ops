@@ -137,6 +137,19 @@ const fakeAgent = async (tools: AgentSpawnContext) => {
   });
 };
 
+/**
+ * The read-only Slack agent's harness. Only what it was asked matters here:
+ * the point of the assertions below is that somebody who asked a question
+ * got as far as something that answers it.
+ */
+const fakeSlackAgent = {
+  asked: [] as string[],
+  run(req: { input: string }) {
+    fakeSlackAgent.asked.push(req.input);
+    return Promise.resolve({ text: "two incidents are open right now." });
+  },
+};
+
 /** Slack's user group, which changes under us and keeps no history. */
 const rotation = { members: ["U-ada", "U-grace"] as string[] | null };
 
@@ -175,6 +188,7 @@ before(async () => {
     // before the model reads it, and an @bugboss report opens an incident
     // titled with the raw mention markup.
     secrets: { slackBotUserId: "B0BOSS" },
+    slackAgentModel: fakeSlackAgent,
     // STS is an external dependency too: without this the composition root
     // would alarm and hand the child no AWS access at all.
     credentials: async () => ({
@@ -1121,6 +1135,55 @@ test("a message ambiguous both ways is told about both, in one post", async () =
     said[0].text,
     /the answer the agent is waiting for, tag me/,
     "the half that used to be dropped",
+  );
+});
+
+/**
+ * An ambiguous handover is a footnote, not a reason to ignore somebody. This
+ * branch used to return before the Slack agent ran, so tagging @bugboss in a
+ * thread with no agent on it and phrasing it in a way that read like a
+ * possible handover got a clarification and no answer.
+ */
+test("an ambiguous handover does not cost a tagged question its answer", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own-7", "queue-lag"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-7'`,
+  )!;
+  // A person owns it, so no agent is running and a mention is a question.
+  await boss.db.withWrite((w) => {
+    w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(row.id);
+  });
+
+  fakeModel.intents.push({ handover: "unclear", addressed: "agent" });
+  const askedBefore = fakeSlackAgent.asked.length;
+  const postsBefore = fakeSlack.posts.length;
+  await boss.slackEvent({
+    type: "app_mention",
+    channel: "C0TEST",
+    user: "U-swain",
+    text: "<@B0BOSS> should I take this one, or what did you find?",
+    ts: `${Date.now() / 1000}`,
+    thread_ts: row.slackThreadTs!,
+  });
+
+  assert.equal(
+    fakeSlackAgent.asked.length,
+    askedBefore + 1,
+    "the question still reaches something that can answer it",
+  );
+  assert.match(
+    fakeSlack.posts.slice(postsBefore).map((p) => p.text).join("\n"),
+    /taking this incident over, or handing it back/,
+    "and the handover is still asked about rather than guessed",
+  );
+  assert.equal(
+    boss.db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [
+      row.id,
+    ])?.owner,
+    "human",
+    "nothing moved on an ambiguous read",
   );
 });
 

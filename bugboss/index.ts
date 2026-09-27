@@ -1685,12 +1685,14 @@ export const createBugBoss = async (
             : []),
         ].join("\n"),
       );
-      return;
     }
 
-    // Ordinary chatter. It is recorded and the agent has it; a mention with
-    // no agent on the incident is the one case that still wants the read-only
-    // Slack agent.
+    // Independent of the above, not an else. Somebody who tags @bugboss in a
+    // thread with no agent on it has asked a question, and an ambiguous
+    // handover is a footnote to that rather than a reason to leave them
+    // without an answer. A real handover returned above, so the read-only
+    // agent still never fields a claim -- its answer to one would be to tell
+    // you to reply in the thread, which is what you just did.
     if (route.interrupt && !route.agentRunning) {
       await slackAgent.handle({
         channel: route.channel,
