@@ -88,6 +88,25 @@ test("an empty report or an unattributed one is refused", () => {
 
 // --- dedup -----------------------------------------------------------------
 
+test("a report carried by a Slack message dedups on that message's ts", () => {
+  // Slack retries a delivery it thinks failed, and the ts is unique and
+  // stable, so the retry collapses onto the first rather than opening a
+  // second incident for one sentence.
+  const report = {
+    text: "Pro upgrades look broken",
+    reportedBy: "U0HUMAN",
+    channel: "C0BUGS",
+    threadTs: "1764000000.000001",
+    messageTs: "1764000000.000200",
+    reportedAt: NOW,
+  };
+  const first = humanSignal(report);
+  const second = humanSignal(report);
+  assert.equal(first.sourceId, "slack:C0BUGS:1764000000.000200");
+  assert.equal(createHumanAdapter().dedupKey(first), createHumanAdapter().dedupKey(second));
+  assert.match(createHumanAdapter().dedupKey(first), /^human:slack:/);
+});
+
 test("a report with no message ts dedups on its content", () => {
   const report = { text: "checkout is broken", reportedBy: "U0HUMAN" };
   const a = humanSignal(report);
@@ -121,7 +140,7 @@ test("parsing a delivery as a human one is refused rather than accepted", async 
   // that answered one would be an unverified way to open an incident.
   await assert.rejects(
     createHumanAdapter().parse({ headers: {}, rawBody: "{}" }),
-    /reports arrive through the slack adapter/,
+    /reports are read out of a mention, not parsed/,
   );
 });
 
@@ -129,7 +148,9 @@ test("parsing a delivery as a human one is refused rather than accepted", async 
 
 test("the registry is keyed by source name", () => {
   const registry = createIngress({ grafana: { secret: "s" } });
-  assert.deepEqual(registry.list().sort(), ["grafana", "human", "slack"]);
+  // Slack is not an ingress channel: a report arrives as a mention and what
+  // makes it a report is a model call, not anything a body can be parsed for.
+  assert.deepEqual(registry.list().sort(), ["grafana", "human"]);
   assert.equal(registry.has("grafana"), true);
   assert.equal(registry.has("sentry"), false);
   assert.equal(registry.get("human").source, "human");
@@ -137,7 +158,7 @@ test("the registry is keyed by source name", () => {
 
 test("an unknown source names what is available", () => {
   const registry = createIngress();
-  assert.throws(() => registry.get("sentry"), /Available: grafana, slack, human/);
+  assert.throws(() => registry.get("sentry"), /Available: grafana, human/);
 });
 
 test("two adapters claiming one source is a build error, not a silent overwrite", () => {

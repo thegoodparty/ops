@@ -1,18 +1,18 @@
 // Slack ingress. Design spec: bugboss/docs/architecture.md, Job 1 and Job 5.
 //
-// Inbound Slack is three different things arriving down one webhook, and only
-// one of them is a signal:
+// This layer answers the questions a signature and an event envelope can
+// answer, and stops there:
 //
-//   incident_reply  a human talking to the agent that owns a thread. Job 5
-//                   writes it where the agent's get_incident poll finds it.
-//   mention         @bugboss somewhere else. Job 6 spawns the Slack agent.
-//   bug_report      a human reporting something broken. This one, and only
-//                   this one, becomes a RawSignal.
+//   incident_reply  the message is in a thread that belongs to an incident.
+//                   Job 5 records it where the agent's get_incident poll
+//                   finds it.
+//   mention         @bugboss anywhere else.
+//   ignored         not addressed to us, or not a message at all.
 //
-// So classifySlackEvent is exported on its own rather than hidden behind
-// parse(). Forcing a thread reply through parse() would mean returning an
-// empty array for the two cases that actually have work to do, and the relay
-// would have to re-derive what this already decided.
+// What a mention is *asking for* -- reporting something broken, or asking a
+// question -- is a model call, not a parse, and it happens off the Slack ack
+// in the composition root. Nothing here reads the words a person chose, so
+// there is no verb to learn and no phrasing that silently does nothing.
 //
 // Verification fails closed for the same reason it does on the Grafana side:
 // this endpoint is public, and an unauthenticated one lets anyone open an
@@ -20,16 +20,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-import type {
-  Evidence,
-  IncomingRequest,
-  RawSignal,
-  Signal,
-  SignalAdapter,
-} from "../types";
-import { humanSignal } from "./human";
-
-export const SLACK_SOURCE = "slack";
+import type { IncomingRequest } from "../types";
 
 export const SIGNATURE_HEADER = "X-Slack-Signature";
 export const TIMESTAMP_HEADER = "X-Slack-Request-Timestamp";
@@ -37,14 +28,6 @@ export const RETRY_HEADER = "X-Slack-Retry-Num";
 
 /** Slack's own recommended replay window. */
 export const REPLAY_WINDOW_SECONDS = 300;
-
-/**
- * What turns a mention into a report rather than a question. A deterministic
- * verb, because telling "@bugboss Pro upgrades look broken" from "@bugboss
- * what is open right now" otherwise needs a model call, and ingress is the
- * one part of this system that stays deterministic.
- */
-export const REPORT_VERBS = new Set(["report", "bug", "broken"]);
 
 export interface SlackMessage {
   channel: string;
@@ -64,7 +47,6 @@ export type SlackClassification =
   | { kind: "url_verification"; challenge: string }
   | { kind: "incident_reply"; message: SlackMessage }
   | { kind: "mention"; message: SlackMessage }
-  | { kind: "bug_report"; message: SlackMessage; report: string }
   | { kind: "ignored"; reason: string };
 
 /** Throws when the request is not an authentic Slack delivery. */
@@ -241,52 +223,5 @@ export const classifySlackEvent = async (
     return { kind: "ignored", reason: "not addressed to bugboss" };
   }
 
-  const [verb, ...rest] = message.text.split(/\s+/);
-  if (verb && REPORT_VERBS.has(verb.toLowerCase())) {
-    const report = rest.join(" ").trim();
-    // "@bugboss report" with nothing after it is somebody about to type.
-    // Treating it as a report would open an incident with an empty body.
-    if (!report) {
-      return { kind: "ignored", reason: "report verb with no description" };
-    }
-    return { kind: "bug_report", message, report };
-  }
-
   return { kind: "mention", message };
-};
-
-export const createSlackAdapter = (config: SlackConfig = {}): SignalAdapter => {
-  const now = config.now ?? Date.now;
-
-  return {
-    source: SLACK_SOURCE,
-
-    /**
-     * Only a bug report is a signal. An incident reply and a mention are
-     * consumed by the relay through classifySlackEvent, which is why both
-     * come back as an empty array here rather than as an error.
-     */
-    parse: async (req: IncomingRequest): Promise<RawSignal[]> => {
-      const classification = await classifySlackEvent(req, config);
-      if (classification.kind !== "bug_report") return [];
-      const { message, report } = classification;
-      return [
-        humanSignal({
-          text: report,
-          reportedBy: message.user,
-          channel: message.channel,
-          threadTs: message.threadTs,
-          messageTs: message.ts,
-          reportedAt: now(),
-        }),
-      ];
-    },
-
-    // Keys off signal.source, which humanSignal sets to "human", so a retried
-    // delivery of the same message cannot open two incidents.
-    dedupKey: (signal) => `${signal.source}:${signal.sourceId}`,
-
-    prefetchEvidence: async (): Promise<Evidence[]> => [],
-
-  };
 };

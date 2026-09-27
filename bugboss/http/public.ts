@@ -118,15 +118,6 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
       return c.text(classification.challenge);
     }
 
-    // A report is a signal, not a question, so it must not also reach the
-    // Slack agent: it arrives as an @bugboss mention and would otherwise be
-    // answered as one while the incident it opened runs in parallel.
-    if (classification.kind === "bug_report") {
-      const accepted = await deps.ingestAccepted("slack", req);
-      settle(accepted.settled, "slack_report");
-      return c.json({ ok: true });
-    }
-
     let event: SlackEvent | undefined;
     try {
       event = (JSON.parse(req.rawBody) as { event?: SlackEvent }).event;

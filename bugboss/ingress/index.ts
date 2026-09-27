@@ -12,7 +12,7 @@ import type { SignalAdapter } from "../types";
 
 import { createGrafanaAdapter, type GrafanaConfig } from "./grafana";
 import { createHumanAdapter } from "./human";
-import { createSlackAdapter, type SlackConfig } from "./slack";
+import type { SlackConfig } from "./slack";
 
 export interface IngressRegistry {
   get(source: string): SignalAdapter;
@@ -50,16 +50,11 @@ export const createIngressRegistry = (
 
 export interface IngressConfig {
   grafana?: GrafanaConfig;
-  slack?: SlackConfig;
 }
 
-/** The three adapters BugBoss launches with. */
+/** The two adapters BugBoss launches with. */
 export const createIngress = (config: IngressConfig = {}): IngressRegistry =>
-  createIngressRegistry([
-    createGrafanaAdapter(config.grafana),
-    createSlackAdapter(config.slack),
-    createHumanAdapter(),
-  ]);
+  createIngressRegistry([createGrafanaAdapter(config.grafana), createHumanAdapter()]);
 
 export {
   createGrafanaAdapter,
@@ -85,13 +80,7 @@ export type {
   LokiQueryOptions,
 } from "./grafana";
 
-export {
-  createSlackAdapter,
-  classifySlackEvent,
-  createSlackVerifier,
-  SLACK_SOURCE,
-  REPORT_VERBS,
-} from "./slack";
+export { classifySlackEvent, createSlackVerifier } from "./slack";
 export type {
   SlackClassification,
   SlackConfig,

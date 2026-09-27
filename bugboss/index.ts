@@ -35,9 +35,12 @@ import {
 import {
   createIngress,
   createLokiQuery,
+  humanSignal,
+  HUMAN_SOURCE,
   SLUG_LABEL,
   type GrafanaVerifier,
   type LokiQuery,
+  type HumanReport,
   type IngressRegistry,
   type SlackConfig,
   type SlackVerifier,
@@ -62,10 +65,16 @@ import {
 import {
   SlackRelay,
   mentionPrefix,
+  stripBotMention,
   type InboundRoute,
-  type OwnershipClaim,
   type SlackEvent,
 } from "./slack/relay";
+import {
+  readMentionIntent,
+  readOwnershipIntent,
+  type IntentDeps,
+  type OwnershipClaim,
+} from "./slack/intent";
 import {
   applyAssign,
   AssignError,
@@ -159,6 +168,7 @@ export interface BugBossSecrets {
   /** STS role the parent assumes for each child. Chunk 9 creates it. */
   agentRoleArn?: string;
   triageModelId?: string;
+  intentModelId?: string;
   agentModelId?: string;
   awsRegion?: string;
 }
@@ -178,6 +188,13 @@ export interface CreateBugBossOptions {
   loki?: LokiQuery;
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
   model: ModelClient;
+  /**
+   * Reads what an inbound Slack message means. Defaults to `model`, because
+   * this is the same shape of bounded call triage makes and the prompt is a
+   * few hundred tokens; a smaller model belongs here the moment one is
+   * subscribed, which is what BUGBOSS_INTENT_MODEL_ID is for.
+   */
+  intentModel?: ModelClient;
   slack: SlackClient;
   /** What a launch means. Defaults to a scrubbed child process. */
   spawnAgent?: SpawnAgent;
@@ -617,7 +634,6 @@ export const createBugBoss = async (
       verifier: options.insecureTestVerifiers?.grafana,
       loki: options.loki,
     },
-    slack: slackIngress,
   });
 
   // -------------------------------------------------------------------------
@@ -671,6 +687,14 @@ export const createBugBoss = async (
       rotationGroupId: secrets.slackRotationGroupId ?? null,
     },
   });
+
+  /**
+   * Reads what an inbound message means, for every interface a person talks
+   * to. One bounded call per message, off the Slack ack, on the same model
+   * seam triage uses -- a few hundred tokens in and a label out, so the bill
+   * is set by how much people type rather than by how many alerts fire.
+   */
+  const intent: IntentDeps = { model: options.intentModel ?? options.model };
 
   // The relay's, so the two pings are spelled one way and carry the same
   // trailing space.
@@ -1047,22 +1071,10 @@ export const createBugBoss = async (
     };
   };
 
-  const ingestAccepted = async (
-    source: string,
-    req: IncomingRequest,
+  const acceptSignals = async (
+    signals: RawSignal[],
+    adapter: SignalAdapter,
   ): Promise<AcceptedIngest> => {
-    const adapter = ingress.get(source);
-
-    // Fails closed: nothing downstream ever sees an unverified body, and the
-    // HTTP layer answers 401 rather than 500 so a misconfigured contact point
-    // is distinguishable from a broken Boss.
-    let signals: RawSignal[];
-    try {
-      signals = await adapter.parse(req);
-    } catch (err) {
-      throw new IngestRejected((err as Error).message);
-    }
-
     // Durable before the caller answers 200, so a redelivery of the same
     // burst collapses onto these rows instead of triaging it a second time.
     // A row that cannot be written has to reach the source as a failure, or
@@ -1130,6 +1142,35 @@ export const createBugBoss = async (
 
     return { recorded: recorded.length, settled };
   };
+
+  const ingestAccepted = async (
+    source: string,
+    req: IncomingRequest,
+  ): Promise<AcceptedIngest> => {
+    const adapter = ingress.get(source);
+
+    // Fails closed: nothing downstream ever sees an unverified body, and the
+    // HTTP layer answers 401 rather than 500 so a misconfigured contact point
+    // is distinguishable from a broken Boss.
+    let signals: RawSignal[];
+    try {
+      signals = await adapter.parse(req);
+    } catch (err) {
+      throw new IngestRejected((err as Error).message);
+    }
+
+    return acceptSignals(signals, adapter);
+  };
+
+  /**
+   * A mention somebody meant as a report. It has no ingress channel of its
+   * own: what makes it a report is a model call rather than anything the
+   * webhook body says, so the signal is built here and placed through the
+   * human adapter, which is also what Signal.source already points the orphan
+   * sweep at.
+   */
+  const reportAccepted = (report: HumanReport): Promise<AcceptedIngest> =>
+    acceptSignals([humanSignal(report)], ingress.get(HUMAN_SOURCE));
 
   const ingest = async (
     source: string,
@@ -1499,33 +1540,148 @@ export const createBugBoss = async (
     );
   };
 
-  const slackEventAccepted = async (
-    event: SlackEvent,
-  ): Promise<AcceptedSlackEvent> => {
-    // The relay's writes are idempotent on (channel, ts) and bounded, so they
-    // stay inside the request: recording the reply is what a Slack retry is
-    // supposed to collapse onto. The agent is a two-minute model run against
-    // a three-second ack, so it cannot.
-    const route = await relay.handle(event);
-    if (route.kind === "ownership_claim") {
-      return {
-        routed: route.kind,
-        settled: claimOwnership(route.incidentId, route.claim, route.slackUserId),
-      };
+  const sayInThread = (
+    channel: string,
+    threadTs: string,
+    text: string,
+  ): Promise<void> =>
+    slack
+      .post(threadTs, text, channel)
+      .then(() => undefined)
+      .catch((err: unknown) =>
+        alarm("intent_reply_failed", { channel, threadTs, error: String(err) }),
+      );
+
+  /**
+   * What a message in an incident's thread meant. The relay has already
+   * recorded it and already handed it to the agent as a directive, so this
+   * only decides what else it earns: the incident changing hands, a question
+   * for the read-only Slack agent, or nothing.
+   *
+   * The model reads the sentence and the UPDATE in `claimOwnership` decides
+   * whether the move is legal, which is the same split triage uses. Note what
+   * a wrong read can and cannot do: the incident comes from the thread the
+   * message arrived in, never from the message, so no wording -- including
+   * wording pasted out of a log line -- reaches a different incident.
+   */
+  const answerIncidentMessage = async (
+    route: Extract<InboundRoute, { kind: "incident_reply" }>,
+  ): Promise<void> => {
+    const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
+    const read = await readOwnershipIntent(intent, {
+      text: said,
+      owner: route.owner,
+    });
+
+    if (read.intent === "take_over" || read.intent === "hand_back") {
+      await claimOwnership(route.incidentId, read.intent, route.user);
+      return;
     }
-    if (route.kind !== "slack_agent") {
-      return { routed: route.kind, settled: Promise.resolve() };
+
+    if (read.intent === "unclear") {
+      log("ownership_unclear", {
+        incidentId: route.incidentId,
+        user: route.user,
+        ts: route.ts,
+        fellBack: read.fellBack,
+      });
+      // Asked rather than guessed. A handover this invented takes the
+      // incident out of the dispatcher's query with nothing to hand it back,
+      // so one question in a thread is the cheap side of that trade -- and
+      // saying nothing is what the old claim words did, which is the bug.
+      await sayInThread(
+        route.channel,
+        route.threadTs,
+        read.fellBack
+          ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. If you meant to take this incident over or hand it back, say so again.`
+          : mrkdwn`${raw(userMention(route.user))} I could not tell whether that hands this incident over. If you meant you are taking it on, or giving it back to an agent, say so plainly and I will move it.`,
+      );
+      return;
     }
-    return {
-      routed: route.kind,
-      settled: slackAgent.handle({
+
+    // Ordinary chatter. It is already recorded and already an answer to
+    // anything the agent asked; a mention with no agent on the incident is
+    // the one case that still wants the read-only agent.
+    if (route.interrupt && !route.agentRunning) {
+      await slackAgent.handle({
         channel: route.channel,
         threadTs: route.threadTs,
         ts: route.ts,
         user: route.user,
         text: route.text,
-      }),
-    };
+      });
+    }
+  };
+
+  /**
+   * An @bugboss mention outside any incident thread: somebody reporting
+   * something broken, or somebody asking a question. This used to turn on
+   * whether the first word was "report", "bug" or "broken", which is a magic
+   * phrase nobody can discover -- "@bugboss Pro upgrades are failing" was
+   * answered as a question and opened nothing.
+   */
+  const answerMention = async (
+    route: Extract<InboundRoute, { kind: "slack_agent" }>,
+  ): Promise<void> => {
+    const ask = () =>
+      slackAgent.handle({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        ts: route.ts,
+        user: route.user,
+        text: route.text,
+      });
+
+    const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
+    // A bare @bugboss is somebody about to type. There is no sentence to
+    // read, and a report built from it would open an incident with an empty
+    // body, so it goes to the agent that can ask what they want.
+    if (!said) return ask();
+
+    const read = await readMentionIntent(intent, { text: said });
+
+    if (read.intent === "bug_report") {
+      const accepted = await reportAccepted({
+        text: said,
+        // The verified Slack identity, never a field the body carried.
+        reportedBy: route.user,
+        channel: route.channel,
+        threadTs: route.threadTs === route.ts ? null : route.threadTs,
+        messageTs: route.ts,
+        reportedAt: now(),
+      });
+      await accepted.settled;
+      return;
+    }
+
+    if (read.intent === "question") return ask();
+
+    log("mention_unclear", { user: route.user, ts: route.ts, fellBack: read.fellBack });
+    await sayInThread(
+      route.channel,
+      route.threadTs,
+      read.fellBack
+        ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. Try me again.`
+        : mrkdwn`${raw(userMention(route.user))} I could not tell whether that is something broken you want me to put an agent on, or a question. Which is it?`,
+    );
+  };
+
+  const slackEventAccepted = async (
+    event: SlackEvent,
+  ): Promise<AcceptedSlackEvent> => {
+    // The relay's writes are idempotent on (channel, ts) and bounded, so they
+    // stay inside the request: recording the reply is what a Slack retry is
+    // supposed to collapse onto. Reading what the message meant is a model
+    // call and answering it is a two-minute agent, against a three-second
+    // ack, so both run past the response.
+    const route = await relay.handle(event);
+    if (route.kind === "incident_reply") {
+      return { routed: route.kind, settled: answerIncidentMessage(route) };
+    }
+    if (route.kind !== "slack_agent") {
+      return { routed: route.kind, settled: Promise.resolve() };
+    }
+    return { routed: route.kind, settled: answerMention(route) };
   };
 
   const slackEvent = async (event: SlackEvent): Promise<void> => {
@@ -1650,6 +1806,7 @@ const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
   githubAppInstallationId: env.GITHUB_APP_INSTALLATION_ID,
   agentRoleArn: env.BUGBOSS_AGENT_ROLE_ARN,
   triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
+  intentModelId: env.BUGBOSS_INTENT_MODEL_ID,
   agentModelId: env.BUGBOSS_MODEL_ID,
   awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
 });
@@ -1701,6 +1858,15 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       modelId: secrets.triageModelId ?? DEFAULT_TRIAGE_MODEL_ID,
       region: secrets.awsRegion,
     }),
+    // Only when a different model is named for it. Every inbound Slack
+    // message costs one of these calls, so this is the knob that takes them
+    // off the triage model without a deploy.
+    intentModel: secrets.intentModelId
+      ? createBedrockModelClient({
+          modelId: secrets.intentModelId,
+          region: secrets.awsRegion,
+        })
+      : undefined,
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
     // The merged env, not process.env: Loki's credentials come from the
     // secret blob, and settingsEnv builds a new object rather than mutating

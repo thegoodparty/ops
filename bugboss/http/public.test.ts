@@ -94,15 +94,16 @@ test("alarms when the grafana ingest write fails", async () => {
   assert.match(String(alarm.error), /s3 put failed/);
 });
 
-test("alarms when the slack report write fails", async () => {
+test("alarms when the slack relay write fails", async () => {
   // The /slack route had no try/catch at all, so a failed write here reached
   // Hono directly. Signed properly on purpose: an unsigned body answers 401
-  // long before ingest, which would make this pass without proving anything.
+  // long before the relay, which would make this pass without proving
+  // anything.
   let reached = false;
   const app = createPublicApp(
     deps({
       slackConfig: { signingSecret: SIGNING_SECRET },
-      ingestAccepted: async () => {
+      slackEventAccepted: async () => {
         reached = true;
         throw new Error("db is read-only");
       },
@@ -117,7 +118,7 @@ test("alarms when the slack report write fails", async () => {
         user: "U1",
         channel: "C1",
         ts: "1.0",
-        text: "<@B1> report checkout is down",
+        text: "<@B1> checkout is down",
       },
     }),
   );
@@ -128,6 +129,43 @@ test("alarms when the slack report write fails", async () => {
   const alarm = JSON.parse(errors[0]) as Record<string, unknown>;
   assert.equal(alarm.event, "route_failed");
   assert.equal(alarm.path, "/slack");
+});
+
+/**
+ * Reading what a mention meant is a model call and answering it is an agent,
+ * so both run past the response. What must not happen is either of them
+ * failing into silence: a rejection out there has no caller left to tell.
+ */
+test("a deferred slack answer that fails alarms rather than vanishing", async () => {
+  const app = createPublicApp(
+    deps({
+      slackConfig: { signingSecret: SIGNING_SECRET },
+      slackEventAccepted: async () => ({
+        settled: Promise.reject(new Error("bedrock: ThrottlingException")),
+      }),
+    }),
+  );
+
+  const { result: res, errors } = await withCapturedErrors(async () => {
+    const response = await signedSlack(app, {
+      type: "event_callback",
+      event: {
+        type: "app_mention",
+        user: "U1",
+        channel: "C1",
+        ts: "1.0",
+        text: "<@B1> checkout is down",
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    return response;
+  });
+
+  assert.equal(res.status, 200, "Slack still gets its ack inside three seconds");
+  assert.equal(errors.length, 1);
+  const alarm = JSON.parse(errors[0]) as Record<string, unknown>;
+  assert.equal(alarm.event, "deferred_failed");
+  assert.equal(alarm.route, "slack");
 });
 
 test("a rejected delivery answers 401 without alarming", async () => {

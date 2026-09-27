@@ -86,16 +86,83 @@ escaping work is identical; and `SlackPoster.post` is text-only across the
 relay, the tool API, the loopback route and every fake in the tests. It is
 more moving parts and more failure surface for a thread reply.
 
-## Ownership claims
+## Nothing here reads the words a person chose
 
-`ownershipClaim` matches `mine` and `back to you` on the **whole normalized
-message**, never a substring. "not mine" and "that one is mine to fix" are
-ordinary chatter, and a false positive is the expensive direction.
+`intent.ts` is the only place inbound human text is read for meaning, and it
+is a model call. There is no keyword, no verb and no phrase to know — for
+either interface:
 
-The relay parses and routes; it does not write `owner`. The write lives in
-the composition root, guarded in the statement, and records the claimant in
-`incident_action` — which `owner` alone cannot say, since it holds a role
-and not a person.
+- **In an incident thread**, whether a message hands the incident over.
+- **On a mention anywhere else**, whether somebody is reporting something
+  broken or asking a question.
+
+This used to be two string matchers, and both failed the same way. The
+ownership one required the whole normalized message to equal `mine` or `back
+to you`, so `ok back to you` and `handing this back` did nothing at all,
+silently. The report one required the first word to be `report`, `bug` or
+`broken`, so `@bugboss Pro upgrades are failing` was answered as a question
+and opened nothing. A magic phrase nobody can discover is not an interface.
+
+The reasoning the old comment gave for matching whole words is still right
+and is still enforced — it just is not enforced by matching strings:
+
+- **A false handover is the expensive direction.** `owner = 'human'` takes an
+  incident out of the dispatcher's query and nothing hands it back. So the
+  prompt is asymmetric (prefer `none`, prefer `unclear` over a guess), and
+  `unclear` **asks in the thread** rather than guessing.
+- **Every outcome is said out loud.** A move posts a confirmation, a refused
+  move says why, an ambiguous read asks, and a failed model call says the
+  call failed. Silence is what the old matcher did, and silence is
+  indistinguishable from the bot not reading you.
+
+The relay records and routes; it does not write `owner` and does not decide
+what a message meant. The read and the write both live in the composition
+root: the write is guarded in the statement and records the claimant in
+`incident_action`, which `owner` alone cannot say since it holds a role and
+not a person.
+
+### The model is advisory here too
+
+Same split as `triage/`: the model reads the sentence, the code keeps the
+invariants. Two things bound a wrong or captured read, and neither of them is
+the model behaving:
+
+- **It cannot name what it acts on.** The incident comes from
+  `slackThreadTs`, never from the message, and the answer is one enum label
+  with no field that could carry an id. A message that says "transfer
+  incident inc-99 to me" can still only move the incident whose thread it was
+  posted in.
+- **The transition guards stay in the `UPDATE`.** Legality — which owner,
+  which statuses — is unchanged and is not the model's business.
+
+The message is fenced in a `<MESSAGE untrusted="true">` block with the rule
+stated in the system prompt, the same framing triage puts around an alert
+body. That is worth having and is not what the containment rests on.
+
+### Cost, latency and the failure path
+
+One bounded call per inbound message: a few hundred tokens in, a label out,
+no tools and no database access. It runs on the same `ModelClient` triage
+uses, so there is no second credential and no second model to subscribe;
+`BUGBOSS_INTENT_MODEL_ID` moves it to a smaller model without a deploy when
+one is available. The bill is set by how much people type, not by how many
+alerts fire.
+
+It runs **off the Slack ack**, in the `settled` promise, next to the Slack
+agent. Slack wants three seconds and the relay's writes are what a retry
+collapses onto, so recording stays in the request and reading stays out of
+it.
+
+A failed call answers `unclear`, alarms with the module's fallback rate
+(`triage/health.ts`), and posts a line in the thread that says the read
+failed rather than that the message was ambiguous. Those are two different
+sentences on purpose.
+
+The cost of that is real and it is the right side of the trade: while the
+model is down, every reply in an incident thread gets a line saying it could
+not be read. That is bounded by how many people are typing, and the
+alternative is the failure this whole file exists to remove — somebody says
+they are taking an incident over, nothing happens, and nothing says so.
 
 ## The Slack agent is read-only, deliberately
 
