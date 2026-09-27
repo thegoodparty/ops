@@ -1189,6 +1189,51 @@ test("nothing the relay acts on is ignored at ingress", async () => {
   }
 });
 
+/**
+ * The invariant above is checked against a `SlackConfig` this test builds, so
+ * it holds however `createBugBoss` is wired -- and the wiring is the half
+ * that actually broke. `isIncidentThread` is what makes an untagged reply
+ * classify as `incident_reply` rather than `ignored`; delete it from the
+ * composition root and every layer stays individually correct while the
+ * reply arrives unacknowledged in production. So this one drives the real
+ * endpoint with the real config.
+ */
+test("the wired endpoint acknowledges an untagged reply in an incident thread", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-ack-2", "ack-wiring"));
+  const thread = boss.db.get<{ slackThreadTs: string | null }>(
+    `SELECT i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-ack-2'`,
+  )!.slackThreadTs!;
+
+  fakeModel.intents.push({ handover: "none", addressed: "others" });
+  const before = fakeSlack.reactions.length;
+  const res = await boss.publicApp.fetch(
+    new Request("http://boss/slack", {
+      method: "POST",
+      body: JSON.stringify({
+        type: "event_callback",
+        event: {
+          type: "message",
+          channel: "C0TEST",
+          user: "U-ada",
+          text: "yes, org X bypasses the Stripe webhook",
+          ts: "1900.1",
+          thread_ts: thread,
+        },
+      }),
+    }),
+  );
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(
+    fakeSlack.reactions.slice(before).map((r) => r.ts),
+    ["1900.1"],
+    "the reply earns its :eyes: through the config createBugBoss built",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
 // --- ownership --------------------------------------------------------------
 
 /** A reply in an incident's thread, as Slack delivers it. */
