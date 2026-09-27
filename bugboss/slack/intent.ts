@@ -23,8 +23,12 @@
 import { z } from "zod";
 
 import { makeAlarm, makeLog } from "../logging";
-import { runStructuredCall, type ModelClient, type ModelToolSpec } from "../triage";
-import { recordCall } from "../triage/health";
+import {
+  recordCall,
+  runStructuredCall,
+  type ModelClient,
+  type ModelToolSpec,
+} from "../triage";
 import type { IncidentOwner } from "../types";
 
 const log = makeLog("slack-intent");

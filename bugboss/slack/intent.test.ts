@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
 import { readMentionIntent, readOwnershipIntent, untrusted } from "./intent";
-import type { ModelClient, ModelReply, ModelRequest } from "../triage";
-import { resetFallbackRates } from "../triage/health";
+import {
+  resetFallbackRates,
+  type ModelClient,
+  type ModelReply,
+  type ModelRequest,
+} from "../triage";
 
 /** Answers with whatever is queued, and records what it was asked. */
 const fakeModel = (replies: (ModelReply | Error)[]) => {

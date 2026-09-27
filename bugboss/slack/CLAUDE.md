@@ -153,6 +153,17 @@ agent. Slack wants three seconds and the relay's writes are what a retry
 collapses onto, so recording stays in the request and reading stays out of
 it.
 
+That costs a report its durability before the ack, and the trade is worth
+stating. A report used to be a signal row written inside the request, so a
+restart between the 200 and the work could not lose it. It cannot be any
+more: what makes a mention a report is the model call, and recording every
+mention as a signal first would open an incident for every question. A
+report typed into the window between the ack and the read — this container
+restarts on every merge to ops `main`, so that window is real — is lost with
+a 200 already sent. That is the exposure a mention already had, since the
+Slack agent has always run out there, and closing it properly means a
+durable inbox rather than a different place to put the model call.
+
 A failed call answers `unclear`, alarms with the module's fallback rate
 (`triage/health.ts`), and posts a line in the thread that says the read
 failed rather than that the message was ambiguous. Those are two different
