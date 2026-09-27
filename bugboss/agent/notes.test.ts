@@ -12,6 +12,7 @@ import {
   createNotesSync,
   notesLimitBreach,
   notesOverLimitMessage,
+  noteContentType,
   notesPrefixFor,
   notesSyncExtension,
   restoreNotesDir,
@@ -22,11 +23,13 @@ import {
 const fakeStore = () => {
   const objects = new Map<string, Buffer>();
   const puts: string[] = [];
+  const types = new Map<string, string | undefined>();
   const deletes: string[] = [];
   const store: NotesStore = {
     get: async (key) => objects.get(key) ?? null,
-    put: async (key, body) => {
+    put: async (key, body, contentType) => {
       puts.push(key);
+      types.set(key, contentType);
       objects.set(key, Buffer.from(body));
     },
     list: async (prefix) =>
@@ -36,7 +39,7 @@ const fakeStore = () => {
       objects.delete(key);
     },
   };
-  return { store, objects, puts, deletes };
+  return { store, objects, puts, types, deletes };
 };
 
 const notesDir = () => mkdtemp(join(tmpdir(), "bugboss-notes-"));
@@ -70,6 +73,27 @@ test("a note reaches S3 under the incident's own prefix", async () => {
     objects.get("sessions/incident/inc-1/notes/ruled-out.md")?.toString(),
     "the alert rule, not the service",
   );
+});
+
+test("a note is stored as what it is, not as the session's NDJSON", async () => {
+  const { store, types } = fakeStore();
+  const dir = await notesDir();
+  await writeFile(join(dir, "ruled-out.md"), "#");
+  await writeFile(join(dir, "counts.txt"), "0");
+
+  await createNotesSync({ store, prefix: PREFIX, dir }).flush();
+
+  assert.equal(
+    types.get("sessions/incident/inc-1/notes/ruled-out.md"),
+    "text/markdown; charset=utf-8",
+  );
+  assert.equal(
+    types.get("sessions/incident/inc-1/notes/counts.txt"),
+    "text/plain; charset=utf-8",
+  );
+  // A note with no extension is still prose, and prose opens in a browser.
+  assert.equal(noteContentType("scratch"), "text/plain; charset=utf-8");
+  assert.equal(noteContentType("evidence.json"), "application/json; charset=utf-8");
 });
 
 test("a turn that changed nothing costs no uploads", async () => {

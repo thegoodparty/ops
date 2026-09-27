@@ -16,7 +16,8 @@ import type { NotesStore } from "./notes";
 
 export interface SessionStore {
   get(key: string): Promise<Buffer | null>;
-  put(key: string, body: Buffer): Promise<void>;
+  /** `contentType` is for ./notes.ts; the session itself is always NDJSON. */
+  put(key: string, body: Buffer, contentType?: string): Promise<void>;
 }
 
 export interface SessionSync {
@@ -69,7 +70,7 @@ export const createS3SessionStore = (
         throw err;
       }
     },
-    put: async (key, body) => {
+    put: async (key, body, contentType) => {
       const [{ PutObjectCommand }, s3] = await Promise.all([
         import("@aws-sdk/client-s3"),
         client(),
@@ -79,7 +80,9 @@ export const createS3SessionStore = (
           Bucket: bucket,
           Key: key,
           Body: body,
-          ContentType: "application/x-ndjson",
+          // The session is the only caller that does not name one, and it is
+          // the only NDJSON in the bucket.
+          ContentType: contentType ?? "application/x-ndjson",
         }),
       );
     },

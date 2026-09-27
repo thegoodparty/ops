@@ -24,7 +24,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export interface NotesStore {
   get(key: string): Promise<Buffer | null>;
-  put(key: string, body: Buffer): Promise<void>;
+  put(key: string, body: Buffer, contentType?: string): Promise<void>;
   /** Every key under the prefix, paginated to exhaustion. */
   list(prefix: string): Promise<string[]>;
   delete(key: string): Promise<void>;
@@ -64,6 +64,19 @@ export const notesPrefixFor = (sessionKey: string): string => {
 
 const digest = (body: Buffer): string =>
   createHash("sha256").update(body).digest("hex");
+
+/**
+ * The reason a note is its own object is that a human opens it out of the
+ * console or pipes it out of `aws s3 cp`. Inheriting the session's NDJSON
+ * type would hand every one of them back as a download.
+ */
+export const noteContentType = (relativePath: string): string => {
+  const extension = relativePath.slice(relativePath.lastIndexOf(".") + 1).toLowerCase();
+  if (extension === "md" || extension === "markdown") return "text/markdown; charset=utf-8";
+  if (extension === "json") return "application/json; charset=utf-8";
+  if (extension === "csv") return "text/csv; charset=utf-8";
+  return "text/plain; charset=utf-8";
+};
 
 const toPosix = (relativePath: string): string =>
   sep === "/" ? relativePath : relativePath.split(sep).join("/");
@@ -247,7 +260,7 @@ export const createNotesSync = (args: {
       const body = await readFile(join(args.dir, ...file.path.split("/")));
       const hash = digest(body);
       if (seen.get(key) === hash) continue;
-      await args.store.put(key, body);
+      await args.store.put(key, body, noteContentType(file.path));
       seen.set(key, hash);
     }
 
