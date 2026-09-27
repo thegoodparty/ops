@@ -1260,6 +1260,44 @@ describe("a merge is told to both threads", () => {
     );
   });
 
+  it("closes out the absorbed thread even when the surviving one refuses the post", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await withThread(a);
+    await withThread(b);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+    const tools = createToolApi({
+      db,
+      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
+      tokenSecret: SECRET,
+      correlator,
+      // Only the surviving thread is down. The absorbed one is the half that
+      // never gets another chance, so it cannot be the one that loses.
+      slack: {
+        ...slack,
+        post: async (threadTs: string | null, text: string) => {
+          if (threadTs === `thread-${a}`) throw new Error("slack is down");
+          return slack.post(threadTs, text);
+        },
+      },
+      evidence,
+    });
+
+    const alarms = await alarmsDuring(async () => {
+      const res = await tools.reportRootCause({
+        cause: "pool exhaustion",
+        explainedSignalIds: ["sig-b"],
+      });
+      assert.equal(res.ok, true, res.error);
+    });
+
+    assert.equal(postsIn(b).length, 1, "the thread about to go quiet was told");
+    assert.match(postsIn(b)[0], /last message in this thread/);
+    assert.ok(alarms.some((line) => line.includes('"thread_post_failed"')));
+  });
+
   it("says so when the absorbed incident has no thread to close out", async () => {
     await seed("sig-a");
     await seed("sig-b");
@@ -1387,6 +1425,54 @@ describe("a split is told to both threads", () => {
         `<https://goodparty\\.slack\\.com/archives/C09/pthread-${id}\\|its own thread>`,
       ),
       "and the back-link points at it rather than coming out blank",
+    );
+  });
+
+  it("tells both threads when a resolution sheds a signal its root cause never explained", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a"]);
+    await withThread(id);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+    // Triage attaches across FIXING, which is how an incident acquires a
+    // signal its root cause was never asked about.
+    await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: id, reason: "looked like the same thing" },
+      { kind: "boss" },
+    );
+    posts.length = 0;
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "quiet for an hour",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const born = (res.data as { splitInto: string[] }).splitInto;
+    assert.equal(born.length, 1);
+    assert.match(postsIn(id)[0], /1 signal left this incident/);
+    assert.match(
+      postsIn(id)[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${born[0]}\\|incident ${born[0]}>`,
+      ),
+    );
+    assert.equal(
+      postsIn(born[0]).length,
+      1,
+      "an incident that appears at the moment another one resolves needs its own origin",
+    );
+    assert.match(postsIn(born[0])[0], new RegExp(`split out of incident ${id}`));
+    assert.match(
+      postsIn(born[0])[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${id}\\|its own thread>`,
+      ),
     );
   });
 

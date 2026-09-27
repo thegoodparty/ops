@@ -293,17 +293,32 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     for (const absorbedId of result.merged) {
       const absorbed = readIncident(absorbedId);
       const why = toMrkdwn(result.reason);
-
-      await notify(
+      // Both links before either post. Each falls back on its own, and
+      // resolving them up front is what lets the order below be the only
+      // thing deciding which message survives a Slack failure.
+      const absorbedRef = await threadRef(
+        absorbed,
+        `incident ${absorbedId}'s thread`,
+      );
+      const intoRef = await threadRef(
         into,
-        [
-          mrkdwn`*Incident ${absorbedId} is the same problem as this one, so the two have been merged*`,
-          why,
-          mrkdwn`_Nothing further will be posted in ${raw(await threadRef(absorbed, `incident ${absorbedId}'s thread`))} · updates for both incidents arrive here from now on._`,
-        ].join("\n"),
+        `incident ${result.target}'s thread`,
       );
 
-      if (!absorbed?.slackThreadTs) {
+      // The absorbed thread goes first. It is the one that is never written
+      // to again, so if only one of these two lands it has to be that one:
+      // the alternative is a surviving thread announcing that a thread is
+      // closing while that thread says nothing and simply stops.
+      if (absorbed?.slackThreadTs) {
+        await notify(
+          absorbed,
+          [
+            mrkdwn`*This incident is the same problem as incident ${result.target}, so the two have been merged*`,
+            why,
+            mrkdwn`_This is the last message in this thread · everything from here, including the fix and the post-mortem, is in ${raw(intoRef)}._`,
+          ].join("\n"),
+        );
+      } else {
         // Nobody is left reading a thread that was never opened, so this is
         // not a lost message so much as evidence of one that was: an
         // incident reached a merge without the thread every incident gets.
@@ -311,15 +326,14 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           incidentId: absorbedId,
           into: result.target,
         });
-        continue;
       }
 
       await notify(
-        absorbed,
+        into,
         [
-          mrkdwn`*This incident is the same problem as incident ${result.target}, so the two have been merged*`,
+          mrkdwn`*Incident ${absorbedId} is the same problem as this one, so the two have been merged*`,
           why,
-          mrkdwn`_This is the last message in this thread · everything from here, including the fix and the post-mortem, is in ${raw(await threadRef(into, `incident ${result.target}'s thread`))}._`,
+          mrkdwn`_Nothing further will be posted in ${raw(absorbedRef)} · updates for both incidents arrive here from now on._`,
         ].join("\n"),
       );
     }
