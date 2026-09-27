@@ -1310,6 +1310,10 @@ export const createBugBoss = async (
           turns: usage.turns,
           modelId: usage.modelId,
         });
+        // Without the return, a broken reader on a resume would overwrite the
+        // real tokens an earlier launch stored -- destroying the one copy, since
+        // the session object it came from ages out under the lifecycle rule.
+        return;
       }
       await db.withWrite((w: Database.Database) => {
         w.prepare(
