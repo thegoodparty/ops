@@ -45,6 +45,10 @@ export { runTriage } from "./triage";
 export { runCorrelation } from "./correlate";
 export { prepareQuery, QUERY_TOOL } from "./sql";
 export { runStructuredCall } from "./model";
+// Not triage's alone: it tracks the fallback rate of every bounded model
+// call the Boss makes, including the inbound-language read in slack/.
+export { recordCall, resetFallbackRates, SUSTAINED_FALLBACK_RATE } from "./health";
+export type { FallbackRate } from "./health";
 
 export type { TriageDeps, TriageOutcome } from "./triage";
 export type {

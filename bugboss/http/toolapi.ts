@@ -1,5 +1,5 @@
 // The Boss's loopback API: how a real child agent reaches the in-process
-// ToolApi. Design spec: bugboss/docs/architecture.md, "What bounds an agent" —
+// ToolApi. Design spec: bugboss/docs/architecture.md, "The agent boundary" —
 // a scoped token on loopback HTTP, carrying incidentId -> that one incident.
 //
 // The routes here are the server side of createBossClient in

@@ -1,5 +1,5 @@
 // The environment a child agent runs with. Design spec:
-// bugboss/docs/architecture.md, "What bounds an agent".
+// bugboss/docs/architecture.md, "The agent boundary".
 //
 // The child environment is built up from nothing rather than filtered down
 // from process.env. The container holds the Slack token, the GitHub App key

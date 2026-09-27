@@ -6,7 +6,6 @@ import { CHOICE_ACTION_PREFIX } from "../slack/blocks";
 import {
   classifySlackEvent,
   classifySlackInteraction,
-  createSlackAdapter,
   isInteractionDelivery,
   type SlackConfig,
 } from "./slack";
@@ -170,14 +169,6 @@ test("header names are matched case-insensitively", async () => {
   assert.equal(result.kind, "mention");
 });
 
-test("the adapter verifies before it classifies", async () => {
-  const adapter = createSlackAdapter({ botUserId: BOT, now });
-  await assert.rejects(
-    adapter.parse(request(event())),
-    /no signing secret is configured/,
-  );
-});
-
 // --- classification --------------------------------------------------------
 
 test("a url_verification handshake is surfaced with its challenge", async () => {
@@ -188,12 +179,43 @@ test("a url_verification handshake is surfaced with its challenge", async () => 
   assert.deepEqual(result, { kind: "url_verification", challenge: "abc123" });
 });
 
-test("a reply in an incident thread is an incident_reply, not a mention", async () => {
+/**
+ * The one thing `ignored` must never swallow. An untagged reply in an
+ * incident's thread is the documented way to answer a waiting agent, and the
+ * HTTP layer decides whether a delivery earns its :eyes: by excluding
+ * `ignored` -- so calling this one ignored is how somebody answers an agent,
+ * sees no acknowledgement, and cannot tell whether it landed.
+ *
+ * It is also not a reading of the message: which thread it is in is a
+ * `slackThreadTs` lookup, which is why this survives in a layer that no
+ * longer interprets anything.
+ */
+test("an untagged reply in an incident thread is not ignored", async () => {
+  for (const text of [
+    "yes, org X bypasses the Stripe webhook",
+    "back to you",
+    "no idea, I was afk",
+  ]) {
+    const result = await classifySlackEvent(
+      request(
+        event({
+          type: "message",
+          text,
+          thread_ts: "1764000000.000001",
+          ts: "1764000000.000200",
+        }),
+      ),
+      { ...config, isIncidentThread: (_c, ts) => ts === "1764000000.000001" },
+    );
+    assert.equal(result.kind, "incident_reply", text);
+  }
+});
+
+test("a tagged reply in an incident thread is that incident's, not a new question", async () => {
   const result = await classifySlackEvent(
     request(
       event({
-        type: "message",
-        text: `<@${BOT}> I am taking this one`,
+        text: `<@${BOT}> what did you rule out?`,
         thread_ts: "1764000000.000001",
         ts: "1764000000.000200",
       }),
@@ -203,11 +225,11 @@ test("a reply in an incident thread is an incident_reply, not a mention", async 
   assert.equal(
     result.kind,
     "incident_reply",
-    "inside a live incident thread people talk to the incident agent, mention or not",
+    "the same order the relay routes in: the thread wins over the tag",
   );
 });
 
-test("a reply in a thread that is not an incident falls through", async () => {
+test("a threaded mention in a thread we do not own is a mention", async () => {
   const result = await classifySlackEvent(
     request(
       event({ thread_ts: "1764000000.000001", ts: "1764000000.000200" }),
@@ -217,33 +239,28 @@ test("a reply in a thread that is not an incident falls through", async () => {
   assert.equal(result.kind, "mention");
 });
 
-test("a plain mention spawns the Slack agent, not a signal", async () => {
-  const result = await classifySlackEvent(request(event()), config);
-  assert.equal(result.kind, "mention");
-  const signals = await createSlackAdapter(config).parse(request(event()));
-  assert.deepEqual(signals, [], "a question is not a bug report");
-});
-
-test("a report verb makes a bug report", async () => {
-  for (const verb of ["report", "bug", "broken", "REPORT"]) {
-    const result = await classifySlackEvent(
-      request(event({ text: `<@${BOT}> ${verb} Pro upgrades look broken` })),
-      config,
-    );
-    assert.equal(result.kind, "bug_report", verb);
+/**
+ * The old contract here was that the first word had to be "report", "bug" or
+ * "broken". It is gone: this layer does not read the words a person chose, so
+ * a report and a question look identical until a model reads them, which
+ * happens off the ack in the composition root.
+ */
+test("every mention classifies the same, whatever it says", async () => {
+  for (const text of [
+    `<@${BOT}> what is open right now`,
+    `<@${BOT}> report Pro upgrades look broken`,
+    `<@${BOT}> Pro upgrades are failing for everyone on Safari`,
+    `<@${BOT}> ugh the dashboard is 500ing again`,
+    `<@${BOT}> report`,
+  ]) {
+    const result = await classifySlackEvent(request(event({ text })), config);
+    assert.equal(result.kind, "mention", text);
     assert.equal(
-      result.kind === "bug_report" ? result.report : "",
-      "Pro upgrades look broken",
+      result.kind === "mention" ? result.message.text : "",
+      text.replace(`<@${BOT}>`, "").trim(),
+      "the mention markup is stripped and the sentence is passed on whole",
     );
   }
-});
-
-test("a report verb with nothing after it is ignored", async () => {
-  const result = await classifySlackEvent(
-    request(event({ text: `<@${BOT}> report` })),
-    config,
-  );
-  assert.equal(result.kind, "ignored");
 });
 
 test("bot messages are ignored so the Boss does not ingest itself", async () => {
@@ -289,46 +306,6 @@ test("an unreadable body throws rather than defaulting", async () => {
     ),
     /body was not JSON/,
   );
-});
-
-// --- the signal a report produces -----------------------------------------
-
-test("a Slack bug report becomes a human signal with its stakeholder", async () => {
-  const [signal] = await createSlackAdapter(config).parse(
-    request(
-      event({
-        text: `<@${BOT}> report Pro upgrades look broken`,
-        thread_ts: "1764000000.000001",
-        ts: "1764000000.000200",
-      }),
-    ),
-  );
-
-  assert.equal(signal.source, "human");
-  assert.equal(signal.kind, "bug_report");
-  assert.equal(signal.reportedBy, "U0HUMAN");
-  assert.equal(signal.title, "Pro upgrades look broken");
-  assert.equal(signal.sourceId, "slack:C0BUGS:1764000000.000200");
-  assert.equal(signal.labels.never_suppress, "true");
-  assert.equal(signal.labels.resolution_policy, "verification");
-  assert.equal(signal.labels.slack_channel, "C0BUGS");
-  assert.equal(signal.labels.slack_thread_ts, "1764000000.000001");
-});
-
-test("a Slack retry of the same report dedups", async () => {
-  const adapter = createSlackAdapter(config);
-  const body = event({ text: `<@${BOT}> report broken thing` });
-  const [first] = await adapter.parse(request(body));
-  const [second] = await adapter.parse(
-    request(body, { headers: { "x-slack-retry-num": "1" } }),
-  );
-  assert.equal(adapter.dedupKey(first), adapter.dedupKey(second));
-  assert.match(adapter.dedupKey(first), /^human:slack:/);
-});
-
-test("a Slack adapter pre-fetches nothing", async () => {
-  const adapter = createSlackAdapter(config);
-  assert.deepEqual(await adapter.prefetchEvidence({} as never), []);
 });
 
 // --- interactions: a different encoding, the same signature scheme ---------

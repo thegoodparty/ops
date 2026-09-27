@@ -1,18 +1,24 @@
 // Slack ingress. Design spec: bugboss/docs/architecture.md, Job 1 and Job 5.
 //
-// Inbound Slack is three different things arriving down one webhook, and only
-// one of them is a signal:
+// This layer answers what a signature, an event envelope and a thread id can
+// answer, and stops there:
 //
-//   incident_reply  a human talking to the agent that owns a thread. Job 5
-//                   writes it where the agent's get_incident poll finds it.
-//   mention         @bugboss somewhere else. Job 6 spawns the Slack agent.
-//   bug_report      a human reporting something broken. This one, and only
-//                   this one, becomes a RawSignal.
+//   incident_reply  the message is in a thread BugBoss owns. Whoever it was
+//                   for, the Boss does something with it.
+//   mention         the app was tagged anywhere else.
+//   ignored         nothing will come of this: a bot echo, an edit, a message
+//                   nobody addressed to us in a thread we do not own.
 //
-// So classifySlackEvent is exported on its own rather than hidden behind
-// parse(). Forcing a thread reply through parse() would mean returning an
-// empty array for the two cases that actually have work to do, and the relay
-// would have to re-derive what this already decided.
+// `ignored` has to keep meaning exactly that, because the HTTP layer decides
+// whether a delivery earns its :eyes: by excluding it. An untagged reply in an
+// incident thread is the documented way to answer a waiting agent, so calling
+// it ignored is how somebody answers an agent and sees nothing happen.
+//
+// What the message *means* is not here. Whether it hands the incident over,
+// whether it was for the agent, whether a mention is a report or a question
+// -- all model calls, made off the Slack ack in the composition root. Nothing
+// here reads the words a person chose, so there is no verb to learn and no
+// phrasing that silently does nothing.
 //
 // Verification fails closed for the same reason it does on the Grafana side:
 // this endpoint is public, and an unauthenticated one lets anyone open an
@@ -20,17 +26,8 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-import type {
-  Evidence,
-  IncomingRequest,
-  RawSignal,
-  Signal,
-  SignalAdapter,
-} from "../types";
+import type { IncomingRequest } from "../types";
 import { CHOICE_ACTION_PREFIX, type SlackChoiceClick } from "../slack/blocks";
-import { humanSignal } from "./human";
-
-export const SLACK_SOURCE = "slack";
 
 export const SIGNATURE_HEADER = "X-Slack-Signature";
 export const TIMESTAMP_HEADER = "X-Slack-Request-Timestamp";
@@ -38,14 +35,6 @@ export const RETRY_HEADER = "X-Slack-Retry-Num";
 
 /** Slack's own recommended replay window. */
 export const REPLAY_WINDOW_SECONDS = 300;
-
-/**
- * What turns a mention into a report rather than a question. A deterministic
- * verb, because telling "@bugboss Pro upgrades look broken" from "@bugboss
- * what is open right now" otherwise needs a model call, and ingress is the
- * one part of this system that stays deterministic.
- */
-export const REPORT_VERBS = new Set(["report", "bug", "broken"]);
 
 export interface SlackMessage {
   channel: string;
@@ -65,7 +54,6 @@ export type SlackClassification =
   | { kind: "url_verification"; challenge: string }
   | { kind: "incident_reply"; message: SlackMessage }
   | { kind: "mention"; message: SlackMessage }
-  | { kind: "bug_report"; message: SlackMessage; report: string }
   | { kind: "ignored"; reason: string };
 
 /** Throws when the request is not an authentic Slack delivery. */
@@ -78,7 +66,9 @@ export interface SlackConfig {
   botUserId?: string;
   replayWindowSeconds?: number;
   /**
-   * Whether this thread belongs to an open incident. The Boss knows, from
+   * Whether this thread belongs to an incident. A structural fact about the
+   * delivery, not a reading of it, which is why it survives in a layer that
+   * no longer interprets anything. The Boss knows, from
    * incident.slackThreadTs; ingress does not, so it is injected.
    */
   isIncidentThread?: (
@@ -150,11 +140,7 @@ export const createSlackVerifier = (config: SlackConfig): SlackVerifier => {
   };
 };
 
-/**
- * Verify and classify one inbound Slack delivery. The relay (Job 5) and the
- * Slack agent (Job 6) call this directly; the adapter's parse() is only the
- * signal-shaped slice of the same answer.
- */
+/** Verify one inbound Slack delivery and say what shape it is. */
 export const classifySlackEvent = async (
   req: IncomingRequest,
   config: SlackConfig = {},
@@ -227,9 +213,9 @@ export const classifySlackEvent = async (
     retry: Boolean(headerValue(req, RETRY_HEADER)),
   };
 
-  // Checked BEFORE the mention, deliberately. Inside a live incident thread
-  // people talk to the incident agent directly, so an @bugboss there is still
-  // a reply to that agent rather than a new Slack-agent run.
+  // Checked BEFORE the mention, deliberately, and it is the same order the
+  // relay routes in: a message in an incident's thread belongs to that
+  // incident whether or not it tagged us.
   const inIncidentThread = config.isIncidentThread ?? (() => false);
   if (threadTs && (await inIncidentThread(channel, threadTs))) {
     return { kind: "incident_reply", message };
@@ -240,17 +226,6 @@ export const classifySlackEvent = async (
     (config.botUserId ? rawText.includes(`<@${config.botUserId}>`) : false);
   if (!mentioned) {
     return { kind: "ignored", reason: "not addressed to bugboss" };
-  }
-
-  const [verb, ...rest] = message.text.split(/\s+/);
-  if (verb && REPORT_VERBS.has(verb.toLowerCase())) {
-    const report = rest.join(" ").trim();
-    // "@bugboss report" with nothing after it is somebody about to type.
-    // Treating it as a report would open an incident with an empty body.
-    if (!report) {
-      return { kind: "ignored", reason: "report verb with no description" };
-    }
-    return { kind: "bug_report", message, report };
   }
 
   return { kind: "mention", message };
@@ -337,41 +312,5 @@ export const classifySlackInteraction = (
   return {
     kind: "choice",
     click: { channel, user, messageTs, threadTs, choice, actionTs },
-  };
-};
-
-export const createSlackAdapter = (config: SlackConfig = {}): SignalAdapter => {
-  const now = config.now ?? Date.now;
-
-  return {
-    source: SLACK_SOURCE,
-
-    /**
-     * Only a bug report is a signal. An incident reply and a mention are
-     * consumed by the relay through classifySlackEvent, which is why both
-     * come back as an empty array here rather than as an error.
-     */
-    parse: async (req: IncomingRequest): Promise<RawSignal[]> => {
-      const classification = await classifySlackEvent(req, config);
-      if (classification.kind !== "bug_report") return [];
-      const { message, report } = classification;
-      return [
-        humanSignal({
-          text: report,
-          reportedBy: message.user,
-          channel: message.channel,
-          threadTs: message.threadTs,
-          messageTs: message.ts,
-          reportedAt: now(),
-        }),
-      ];
-    },
-
-    // Keys off signal.source, which humanSignal sets to "human", so a retried
-    // delivery of the same message cannot open two incidents.
-    dedupKey: (signal) => `${signal.source}:${signal.sourceId}`,
-
-    prefetchEvidence: async (): Promise<Evidence[]> => [],
-
   };
 };

@@ -1,9 +1,11 @@
 // Human reports. Design spec: bugboss/docs/architecture.md, Job 1 / Human reports.
 //
 // An employee reports the same way they do anything else: @bugboss in Slack.
-// The Slack adapter classifies the mention and builds the signal here, so a
-// report is its own kind of signal rather than a flag on the alert path. Four
-// things differ from an alert, and all four are encoded below:
+// Whether a mention is a report at all is a model call in the composition
+// root, which then builds the signal here -- so a report is its own kind of
+// signal rather than a flag on the alert path, and it is never a verb a
+// person has to know. Four things differ from an alert, and all four are
+// encoded below:
 //
 //   - No evidence to pre-fetch. The reporter's description IS the evidence.
 //   - No auto-resolution. An alert resolves when it stops firing; a report
@@ -113,16 +115,16 @@ export const isNeverSuppressed = (signal: { labels: Record<string, string> }) =>
 
 /**
  * A report has no inbound channel of its own: it arrives as an @bugboss
- * mention and the Slack adapter builds the signal. This adapter exists
- * because `humanSignal` sets `source` to "human" whatever carried it, and the
- * orphan sweep looks an adapter up by a recorded signal's source before it
- * can re-place one.
+ * mention, and the Boss builds the signal once a model has read the mention
+ * as a report. This adapter exists because `humanSignal` sets `source` to
+ * "human" whatever carried it, and the orphan sweep looks an adapter up by a
+ * recorded signal's source before it can re-place one.
  */
 export const createHumanAdapter = (): SignalAdapter => ({
   source: HUMAN_SOURCE,
 
   parse: async (): Promise<RawSignal[]> => {
-    throw new Error("human ingress: reports arrive through the slack adapter");
+    throw new Error("human ingress: reports are read out of a mention, not parsed");
   },
 
   dedupKey: (signal) => `${signal.source}:${signal.sourceId}`,
