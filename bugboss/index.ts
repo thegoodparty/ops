@@ -1299,20 +1299,27 @@ export const createBugBoss = async (
       }
       const usage = sumSessionUsage(raw);
       const total = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
-      if (total === 0 && !usage.modelId && usage.turns === 0) return;
-      if (usage.turns > 0 && total === 0) {
-        // A turn that reached the model always spends tokens. Zero across a
-        // real session means this reader no longer matches what Pi writes,
-        // and the cost of not noticing is total: it stays plausible forever.
-        alarm("usage_missing", {
-          incidentId,
-          sessionRef,
-          turns: usage.turns,
-          modelId: usage.modelId,
-        });
-        // Without the return, a broken reader on a resume would overwrite the
-        // real tokens an earlier launch stored -- destroying the one copy, since
-        // the session object it came from ages out under the lifecycle rule.
+      if (total === 0) {
+        // A zero is never written, whatever produced it. The columns already
+        // default to zero, and on a resume the row may hold real tokens an
+        // earlier launch stored -- whose session object ages out under the
+        // lifecycle rule, so overwriting it loses the only copy.
+        if (usage.turns > 0) {
+          // A turn that reached the model always spends tokens, so this is not
+          // a cheap run: it is a reader that no longer matches what Pi writes.
+          alarm("usage_missing", {
+            incidentId,
+            sessionRef,
+            turns: usage.turns,
+            modelId: usage.modelId,
+          });
+        } else {
+          log("usage_roll_up_skipped", {
+            incidentId,
+            sessionRef,
+            reason: "session holds no turns",
+          });
+        }
         return;
       }
       await db.withWrite((w: Database.Database) => {
