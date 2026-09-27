@@ -558,6 +558,21 @@ export const runIncidentAgent = async (
       files: notes.fileCount,
     }),
   );
+  if (notes.conflicts.length > 0) {
+    // A note that cannot be put back on disk. The record still has it, so this
+    // is the only place anyone learns the agent is starting without part of
+    // its own work -- and the only prompt to go and delete the stale key.
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "notes_restore_conflict",
+        incidentId: options.incidentId,
+        prefix: notesPrefix,
+        entries: notes.conflicts,
+      }),
+    );
+  }
   const pinned = await pinnedSessionModel({
     restored,
     sessionFile: paths.sessionFile,

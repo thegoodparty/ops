@@ -192,6 +192,40 @@ test("a restarted agent finds its notes where it left them", async () => {
   assert.deepEqual(puts, []);
 });
 
+test("a name reused as both a note and a directory does not kill the restore", async () => {
+  const { store, objects } = fakeStore();
+  const first = await notesDir();
+  await writeFile(join(first, "findings"), "day one");
+  await createNotesSync({ store, prefix: PREFIX, dir: first }).flush();
+
+  // The agent's own shell, doing an ordinary thing: the note it started as one
+  // file grew into a folder. Append-only keeps the old key, so the record now
+  // holds a path that is a file and a path that needs it to be a directory.
+  await rm(join(first, "findings"));
+  await mkdir(join(first, "findings"), { recursive: true });
+  await writeFile(join(first, "findings", "day2.md"), "day two");
+  await writeFile(join(first, "real.md"), "unrelated");
+  await createNotesSync({ store, prefix: PREFIX, dir: first }).flush();
+
+  assert.equal(objects.has(`${PREFIX}findings`), true);
+  assert.equal(objects.has(`${PREFIX}findings/day2.md`), true);
+
+  const second = await notesDir();
+  const restored = await restoreNotesDir({ store, prefix: PREFIX, dir: second });
+
+  // The agent starts. Before this, the throw escaped run.ts before the session
+  // opened, and every relaunch of the incident died on the same two keys.
+  assert.deepEqual(restored.conflicts, ["findings/day2.md"]);
+  assert.equal(restored.fileCount, 2);
+  assert.equal(await readFile(join(second, "findings"), "utf8"), "day one");
+  assert.equal(await readFile(join(second, "real.md"), "utf8"), "unrelated");
+
+  // Skipped on disk is not lost: the record still has it for a human to read,
+  // and the bound still counts it.
+  assert.equal(objects.has(`${PREFIX}findings/day2.md`), true);
+  assert.equal(restored.seen.has(`${PREFIX}findings/day2.md`), true);
+});
+
 test("a directory that is gone leaves the record standing", async () => {
   const { store, objects } = fakeStore();
   const dir = await notesDir();

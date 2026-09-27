@@ -242,7 +242,16 @@ export interface RestoredNotes {
    */
   seen: Map<string, NoteRecord>;
   fileCount: number;
+  /**
+   * Keys the record holds that no directory can hold at once, because another
+   * key occupies the same path as a file where this one needs a directory or
+   * the other way round. Never silent: the caller says so out loud.
+   */
+  conflicts: string[];
 }
+
+/** A path that is already a file where a directory is needed, or the reverse. */
+const PATH_CONFLICT = new Set(["EEXIST", "ENOTDIR", "EISDIR"]);
 
 /**
  * Restores the directory before the session starts, so a resumed agent finds
@@ -257,6 +266,8 @@ export const restoreNotesDir = async (args: {
 }): Promise<RestoredNotes> => {
   await mkdir(args.dir, { recursive: true });
   const seen = new Map<string, NoteRecord>();
+  const conflicts: string[] = [];
+  let fileCount = 0;
   for (const key of await args.store.list(args.prefix)) {
     const relativePath = key.slice(args.prefix.length);
     // Nothing we write produces one of these, so a key that escapes the
@@ -264,12 +275,28 @@ export const restoreNotesDir = async (args: {
     if (!relativePath || relativePath.split("/").includes("..")) continue;
     const body = await args.store.get(key);
     if (!body) continue;
-    const file = join(args.dir, ...relativePath.split("/"));
-    await mkdir(dirname(file), { recursive: true });
-    await writeFile(file, body);
+    // The record still holds it whether or not this directory can, and the
+    // bound is measured over the record. Counted before the write for that
+    // reason, and so a conflicting key cannot be uploaded a second time.
     seen.set(key, { digest: digest(body), bytes: body.byteLength });
+    const file = join(args.dir, ...relativePath.split("/"));
+    try {
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, body);
+      fileCount += 1;
+    } catch (err) {
+      // Append-only means a name the agent used for a note and later reused
+      // for a directory leaves both keys standing, and no filesystem holds
+      // both. Left to throw, this ran before the session opened and killed
+      // every relaunch of the incident on the same two keys forever, with
+      // nothing in the agent's reach able to remove either one. One note is
+      // worth less than the agent, so the conflict is reported and skipped --
+      // the key stays in S3, where a human can still read it.
+      if (!PATH_CONFLICT.has(String((err as { code?: string }).code))) throw err;
+      conflicts.push(relativePath);
+    }
   }
-  return { seen, fileCount: seen.size };
+  return { seen, fileCount, conflicts };
 };
 
 export interface NotesSync {
