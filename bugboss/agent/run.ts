@@ -152,7 +152,13 @@ export const startNpmCi = (paths: AgentPaths): void => {
 // The Boss
 // ---------------------------------------------------------------------------
 
-export type BossClient = ToolApi & HumanContactPort & DirectivePeek & WaitMarkerPort;
+export type BossClient = ToolApi &
+  HumanContactPort &
+  DirectivePeek &
+  WaitMarkerPort & {
+    /** A thread post that is not the answer to an outstanding question. */
+    postNotice(message: string): Promise<void>;
+  };
 
 export const createBossClient = (args: {
   baseUrl: string;
@@ -196,6 +202,13 @@ export const createBossClient = (args: {
     recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
     clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
     post: (message) => call<void>("POST", "/thread", { message }).then(() => undefined),
+    // Same thread, but it does not seal an outstanding question's marker. A
+    // harness nudge landing on a blank one would make a question whose Slack
+    // post had failed look sent.
+    postNotice: (message) =>
+      call<void>("POST", "/thread", { message, sealsPendingQuestion: false }).then(
+        () => undefined,
+      ),
   };
 };
 
@@ -617,7 +630,7 @@ const launch = async (args: {
       signal: deadlineAbort.signal,
       heartbeat: {
         marker: api,
-        post: (message: string) => api.post(message),
+        post: (message: string) => api.postNotice(message),
         escalate: api,
         ...(options.workingHours ? { workingHours: options.workingHours } : {}),
       },

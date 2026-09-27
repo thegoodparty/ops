@@ -334,3 +334,46 @@ test("counting a nudge against no wait is an error, not a new wait", async () =>
     "a missing marker is not invented at the moment of the fault",
   );
 });
+
+test("a harness notice does not seal a question whose post never landed", async () => {
+  clock = 7_000_000;
+  await ask("Can someone merge the PR?");
+  assert.equal(
+    db.get<{ messageTs: string }>(
+      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+      [INCIDENT],
+    )?.messageTs,
+    "",
+  );
+
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({
+      message: "Still waiting on someone: the PR to be merged",
+      sealsPendingQuestion: false,
+    }),
+  });
+  assert.equal(
+    db.get<{ messageTs: string }>(
+      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+      [INCIDENT],
+    )?.messageTs,
+    "",
+    "the nudge is not the question, so it does not make the question look sent",
+  );
+
+  // The ask itself still does.
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "Can someone merge the PR?" }),
+  });
+  assert.equal(
+    db.get<{ messageTs: string }>(
+      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+      [INCIDENT],
+    )?.messageTs,
+    "ts-1",
+  );
+
+  await authed("/pending-question", { method: "DELETE" });
+});

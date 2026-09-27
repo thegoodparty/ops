@@ -489,6 +489,8 @@ const heartbeatHarness = (args: {
   existing?: PendingWait;
   handOff?: ToolResponse;
   postFails?: boolean;
+  pingFails?: boolean;
+  clearFails?: boolean;
 }) => {
   let marker: PendingWait | null = args.existing ?? null;
   const posts: string[] = [];
@@ -507,11 +509,13 @@ const heartbeatHarness = (args: {
         return marker;
       },
       recordPing: async () => {
+        if (args.pingFails) throw new Error("the Boss said 503");
         if (!marker) throw new Error("no wait is recorded");
         marker = { ...marker, pings: marker.pings + 1, lastPingAt: args.now() };
         return marker;
       },
       clearWait: async () => {
+        if (args.clearFails) throw new Error("the Boss said 503");
         clears += 1;
         marker = null;
       },
@@ -782,4 +786,74 @@ test("a working-hours spec is parsed, and a malformed one throws", () => {
   assert.throws(() => parseWorkingHours("America/New_York:19-10"), /start<end/);
   assert.throws(() => parseWorkingHours("Mars/Olympus:10-19"), /IANA zone/);
   assert.throws(() => parseWorkingHours("UTC:10-19:9"), /days must be 0-6/);
+});
+
+test("a Boss failure while counting a nudge costs the nudge, not the wait", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, pingFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.timedOut, true);
+  // Nothing is posted when the count did not move: retried every interval
+  // with no backoff to advance, the nudge would be the spam.
+  assert.equal(harness.posts.length, 0);
+});
+
+test("a Boss failure while dropping the marker does not lose a wait that just ended", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, clearFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
+    {
+      probe: async () => ({ code: 0, output: "MERGED" }),
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: harness.deps,
+    },
+  );
+
+  assert.equal(result.timedOut, false);
+  assert.equal(result.output, "MERGED");
+});
+
+test("recording the wait is the one marker call that is allowed to fail loudly", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+  harness.deps.marker.recordWait = async () => {
+    throw new Error("the Boss said 503");
+  };
+
+  // Nothing has been waited on yet, so the model gets an error and reissues
+  // the call. Swallowing it would start a day-long wait with no marker and no
+  // heartbeat, which is the behaviour this whole file exists to end.
+  await assert.rejects(
+    runMonitor(
+      { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
+      { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    ),
+    /503/,
+  );
+});
+
+test("the hand-off brief counts the nudges that were actually sent", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 86_400 },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: { ...harness.deps, maxPings: 1 },
+    },
+  );
+
+  assert.equal(harness.posts.length, 1);
+  assert.match(harness.handOffs[0].brief, /across 1 nudges/);
 });

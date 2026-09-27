@@ -460,8 +460,21 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     if (caller instanceof Response) return caller;
 
     let message = "";
+    // Whether this post is the one an outstanding question is waiting on.
+    // It used to be positional -- the next post after the marker sealed it --
+    // which held only while every post through here was the model's. The
+    // harness posts too now (monitor's heartbeat), and one of those landing on
+    // a blank marker would make a question whose Slack post had failed look
+    // sent, so the next attempt would skip the post and wait out its timeout
+    // on an answer to something nobody was ever asked.
+    let seals = true;
     try {
-      message = String(((await c.req.json()) as { message?: unknown }).message ?? "");
+      const body = (await c.req.json()) as {
+        message?: unknown;
+        sealsPendingQuestion?: unknown;
+      };
+      message = String(body.message ?? "");
+      seals = body.sealsPendingQuestion !== false;
     } catch {
       return c.json({ error: "body was not JSON" }, 400);
     }
@@ -490,11 +503,13 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
 
     // Fills in the ts the marker could not know when it was written. Scoped to
     // a blank one so a later post does not repoint an older question.
-    await deps.db.withWrite((w) => {
-      w.prepare(
-        "UPDATE pending_question SET messageTs = ? WHERE incidentId = ? AND messageTs = ''",
-      ).run(ts, caller.incidentId);
-    });
+    if (seals) {
+      await deps.db.withWrite((w) => {
+        w.prepare(
+          "UPDATE pending_question SET messageTs = ? WHERE incidentId = ? AND messageTs = ''",
+        ).run(ts, caller.incidentId);
+      });
+    }
 
     return c.json({ ts });
   });

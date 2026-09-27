@@ -281,6 +281,11 @@ export interface WaitMarkerPort {
 
 export interface HeartbeatDeps {
   marker: WaitMarkerPort;
+  /**
+   * Not `HumanContactPort.post`. That one seals an outstanding question's
+   * marker with the ts of whatever posts next, which is right for the ask and
+   * wrong for a nudge the model did not write.
+   */
   post(message: string): Promise<void>;
   escalate: HandOffPort;
   workingHours?: WorkingHours;
@@ -335,9 +340,10 @@ export const stalledWaitBrief = (args: {
   awaitingHuman: string;
   waitedMs: number;
   status: string;
+  nudges: number;
 }): string =>
   [
-    `Nobody ended this wait in ${formatWaited(args.waitedMs)}, across ${HEARTBEAT_MAX_PINGS} nudges in the thread, so this is yours.`,
+    `Nobody ended this wait in ${formatWaited(args.waitedMs)}, across ${args.nudges} nudges in the thread, so this is yours.`,
     "",
     "*What I am waiting for*",
     `${args.description} — ${args.awaitingHuman}`,
@@ -348,6 +354,24 @@ export const stalledWaitBrief = (args: {
     "```",
     "Everything I found is in this thread. The work is done; this one step is not.",
   ].join("\n");
+
+/**
+ * Dropping the marker at the end of a wait. The failure costs nothing the
+ * next call cannot repair -- a different command replaces a stale marker, and
+ * the same one resumes a wait that is over and will exit on its first probe --
+ * whereas throwing here would lose the result of a wait that had just
+ * succeeded.
+ */
+const release = async (
+  heartbeat: HeartbeatDeps,
+  command: string,
+): Promise<void> => {
+  try {
+    await heartbeat.marker.clearWait();
+  } catch (error: unknown) {
+    alarm("wait_marker_clear_failed", { command, error: String(error) });
+  }
+};
 
 /**
  * A failure here is never swallowed: the incident stays the agent's and the
@@ -446,6 +470,11 @@ export const runMonitor = async (
   const heartbeat = ask ? deps.heartbeat : undefined;
   const firstSeconds = heartbeat?.firstSeconds ?? HEARTBEAT_FIRST_SECONDS;
   const maxPings = heartbeat?.maxPings ?? HEARTBEAT_MAX_PINGS;
+  // Not caught, unlike the two calls inside the loop, and the difference is
+  // what each failure costs. Nothing has been waited on yet, so a throw here
+  // costs one turn and the model reissues the call; swallowing it would start
+  // a day-long wait with no marker, which is the silent no-heartbeat
+  // behaviour this exists to end, with nothing in the agent's view saying so.
   let marker = heartbeat ? await heartbeat.marker.recordWait(args.command) : null;
 
   // Measured from when the wait began, not from this process start, which is
@@ -461,7 +490,7 @@ export const runMonitor = async (
     const result = await probe(args.command, probeTimeoutMs);
     last = result.output;
     if (result.code === 0) {
-      if (heartbeat) await heartbeat.marker.clearWait();
+      if (heartbeat) await release(heartbeat, args.command);
       return {
         output: truncateOutput(last, maxChars),
         timedOut: false,
@@ -470,7 +499,7 @@ export const runMonitor = async (
       };
     }
     if (deps.signal?.aborted || now() >= deadline) {
-      if (heartbeat) await heartbeat.marker.clearWait();
+      if (heartbeat) await release(heartbeat, args.command);
       return {
         output: truncateOutput(last, maxChars),
         timedOut: true,
@@ -507,12 +536,13 @@ export const runMonitor = async (
               awaitingHuman: ask,
               waitedMs,
               status: last,
+              nudges: marker.pings,
             }),
           );
           // Cleared only when the hand-off landed. Left standing after a
           // failure the marker keeps its `startedAt`, so the next attempt
           // escalates at once instead of restarting the wait.
-          if (escalated.outcome.handedOff) await heartbeat.marker.clearWait();
+          if (escalated.outcome.handedOff) await release(heartbeat, args.command);
           log("wait_escalated", {
             command: args.command,
             waitedMs,
@@ -530,7 +560,21 @@ export const runMonitor = async (
         // and the next threshold still comes; the other order re-nudges on
         // every resume, and every merge to ops `main` resumes every agent, so
         // a deploy would become a notification.
-        marker = await heartbeat.marker.recordPing();
+        //
+        // A Boss error here costs the nudge and not the wait, for the same
+        // reason the post below does. Skipping the post when the count did not
+        // move is the part that matters: retried every interval with no
+        // backoff to advance, it would be the nudge that became the spam.
+        try {
+          marker = await heartbeat.marker.recordPing();
+        } catch (error: unknown) {
+          alarm("wait_heartbeat_record_failed", {
+            command: args.command,
+            error: String(error),
+          });
+          await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
+          continue;
+        }
         const message = heartbeatMessage({
           description: args.description,
           awaitingHuman: ask,
