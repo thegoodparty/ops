@@ -54,11 +54,21 @@ returns `terminate`, and the agent stops. Three details it rests on:
   so the result says so and tells the model to call `hand_off` itself. The
   prompt is where the model is asked to hand off first; this is the floor
   under it, and the brief the harness writes is deliberately thinner.
+- **The clock runs from `askedAt`, not from process start.** A restart is not
+  an answer. A deadline of `now() + wait` hands a crash-looping agent a fresh
+  wait every time and defers the escalation for as long as the crashes last.
+- **The marker is cleared after the hand-off, and only if it landed.** Clearing
+  first and dying in between replays as a brand-new question: re-posted, with a
+  fresh `askedAt` that makes a reply already in the thread look too old to be
+  one.
 
 `message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
 refused rather than truncated — truncating would cut off the question, which
 is the part at the bottom. The evidence goes in `details`, posted as its own
-message under the ask. The split is the structure: the reader sees a
+message under the ask — and posted *outside* the re-entrancy guard, because
+`messageTs` only records that the ask landed. A crash between the two posts
+leaves a marker that looks complete, so a resume re-posts the evidence rather
+than dropping it with no error and nobody aware. The split is the structure: the reader sees a
 conclusion and one request, and the proof is one scroll away rather than in
 front of it. `prompt.ts` carries the budget, the shape and a worked example
 ("What a human reads"); this is what makes it more than advice.

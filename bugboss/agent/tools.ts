@@ -381,16 +381,26 @@ export const runContactHuman = async (
   if (!pending || pending.message !== args.message || !pending.messageTs) {
     pending = await deps.contact.recordPending(args.message);
     await deps.contact.post(args.message);
-    // A second message rather than a longer first one. The reader sees the
-    // conclusion and the ask; the evidence sits underneath for whoever wants
-    // it. Posted inside the same branch so a resumed agent does not repeat it,
-    // and after the ask so a failure here loses the evidence rather than the
-    // question — the throw reaches the model either way.
-    if (args.details?.trim()) await deps.contact.post(args.details);
   }
+  // A second message rather than a longer first one: the reader sees the
+  // conclusion and the ask, and the evidence sits underneath for whoever wants
+  // it.
+  //
+  // Posted outside the guard above, because `messageTs` only says the *ask*
+  // landed. A crash between the two posts leaves a marker that looks complete,
+  // and the resumed agent would skip both — dropping the evidence with no
+  // error, no re-post and nobody aware. So a resume posts it again: the same
+  // trade the ask itself already makes one comment up, for the same reason.
+  // At worst the evidence appears twice; losing it cannot be recovered from.
+  if (args.details?.trim()) await deps.contact.post(args.details);
 
   const waitSeconds = Math.max(minWaitSeconds, args.timeoutSeconds);
-  const deadline = now() + waitSeconds * 1000;
+  // Measured from when the question was asked, not from this process start.
+  // A restart is not an answer, and a deadline of `now() + wait` would give a
+  // crash-looping agent a fresh wait each time and defer the escalation for
+  // as long as the crashes last. `now()` only wins if the marker is somehow
+  // ahead of this clock, which is skew rather than a question from the future.
+  const deadline = Math.min(pending.askedAt, now()) + waitSeconds * 1000;
   for (;;) {
     const entries = await deps.api.peekDirectives();
     const reply = firstReplyAfter(entries, pending.askedAt);
@@ -423,11 +433,11 @@ export const runContactHuman = async (
       };
     }
     if (deps.signal?.aborted || now() >= deadline) {
-      await deps.contact.clearPending();
       // The harness deadline is already an escalation path of its own: the
       // run steers the model to write a real brief inside the grace window,
       // and handing off here would spend the turn that brief needs.
       if (deps.signal?.aborted) {
+        await deps.contact.clearPending();
         return {
           reply: null,
           timedOut: true,
@@ -441,12 +451,26 @@ export const runContactHuman = async (
         Math.max(waitSeconds, (now() - pending.askedAt) / 1000) / 60,
       );
       const escalation = await escalateUnanswered(deps, args.message, waitedMinutes);
+      // Cleared after the hand-off, and only if it landed. Clearing first and
+      // dying in between replays as a brand-new question: re-posted, with a
+      // fresh askedAt that makes a reply already sitting in the thread look
+      // too old to be one. Left standing after a failed hand-off, the marker
+      // keeps the original askedAt, so the next attempt escalates at once
+      // instead of restarting the wait.
+      if (escalation.outcome.handedOff) await deps.contact.clearPending();
       return {
         reply: null,
         timedOut: true,
         directives: [...rest, ...escalation.directives],
-        // Ownership moved, so there is nothing left for this agent to do.
-        terminate: escalation.outcome.handedOff,
+        // Ownership moved, so there is nothing left for this agent to do —
+        // and a stop or merged the hand-off drained says the same thing even
+        // when the hand-off itself failed.
+        terminate:
+          escalation.outcome.handedOff ||
+          escalation.directives.some(
+            (directive) =>
+              directive.type === "stop" || directive.type === "merged",
+          ),
         rejected: null,
         escalation: escalation.outcome,
       };

@@ -379,6 +379,114 @@ test("an ask longer than the limit is refused before anything is posted", async 
   assert.equal(escalate.calls.length, 0);
 });
 
+test("a resume re-posts the evidence rather than losing it silently", async () => {
+  const clock = fakeClock();
+  // The ask landed and set messageTs; the process died before the evidence
+  // post. The marker cannot tell the two apart, and a skipped evidence post
+  // has no error attached to it.
+  const { state, port } = fakeContact({
+    message: "can someone check #dev-alerts?",
+    messageTs: "ts-1",
+    askedAt: 1_000_000,
+  });
+  const escalate = recordingEscalate();
+  const api = directiveFeed(
+    [],
+    [{ type: "human_message", from: "U1", text: "checked", ts: "1000.500000" }],
+  );
+
+  await runContactHuman(
+    {
+      message: "can someone check #dev-alerts?",
+      details: "Zero 5xx over 24h (3.4M lines).",
+      timeoutSeconds: 3600,
+    },
+    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.deepEqual(
+    state.posts,
+    ["Zero 5xx over 24h (3.4M lines)."],
+    "the ask is not repeated; the evidence is not dropped",
+  );
+});
+
+test("the escalation clock runs from the question, not from this process", async () => {
+  const clock = fakeClock();
+  // A marker 700 seconds old: the agent asked, the container died, and the
+  // replacement replays the call. A fresh wait here would let a crash loop
+  // defer the hand-off for as long as the crashes last.
+  const { port } = fakeContact({
+    message: "anyone?",
+    messageTs: "ts-1",
+    askedAt: 1_000_000 - 700_000,
+  });
+  const escalate = recordingEscalate();
+  const api = directiveFeed([]);
+
+  const result = await runContactHuman(
+    { message: "anyone?", timeoutSeconds: 600 },
+    {
+      contact: port,
+      api,
+      escalate: escalate.port,
+      sleep: clock.sleep,
+      now: clock.now,
+      minWaitSeconds: 600,
+    },
+  );
+
+  assert.deepEqual(api.reads.length, 1, "already past the budget on the first poll");
+  assert.equal(result.escalation?.reason, "no reply in 12 minutes");
+});
+
+test("a failed hand-off keeps the marker, so the next attempt does not restart the wait", async () => {
+  const clock = fakeClock();
+  const { state, port } = fakeContact();
+  const escalate = recordingEscalate({ ok: false, error: "Slack is down" });
+  const api = directiveFeed([]);
+
+  await runContactHuman(
+    { message: "anyone?", timeoutSeconds: 600 },
+    {
+      contact: port,
+      api,
+      escalate: escalate.port,
+      sleep: clock.sleep,
+      now: clock.now,
+      minWaitSeconds: 600,
+    },
+  );
+
+  assert.equal(state.cleared, 0);
+  assert.equal(state.pending?.message, "anyone?");
+});
+
+test("a stop the failed hand-off drained still stops the agent", async () => {
+  const clock = fakeClock();
+  const { port } = fakeContact();
+  const escalate = recordingEscalate({
+    ok: false,
+    error: "Slack is down",
+    directives: [{ type: "stop", reason: "a human took it" }],
+  });
+  const api = directiveFeed([]);
+
+  const result = await runContactHuman(
+    { message: "anyone?", timeoutSeconds: 600 },
+    {
+      contact: port,
+      api,
+      escalate: escalate.port,
+      sleep: clock.sleep,
+      now: clock.now,
+      minWaitSeconds: 600,
+    },
+  );
+
+  assert.equal(result.terminate, true, "the incident is no longer the agent's either way");
+});
+
 test("the evidence is posted under the ask, as its own message", async () => {
   const clock = fakeClock();
   const { state, port } = fakeContact();
