@@ -1476,6 +1476,37 @@ describe("a split is told to both threads", () => {
     );
   });
 
+  it("posts the resolution into the thread the split had to open", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+    await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: id, reason: "looked like the same thing" },
+      { kind: "boss" },
+    );
+    posts.length = 0;
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "quiet for an hour",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    assert.equal(
+      posts.filter((p) => p.threadTs === null).length,
+      0,
+      "a message at the top of the channel is one nothing groups with the incident",
+    );
+    assert.equal(postsIn(id).length, 2, "the split notice and the resolution");
+    assert.match(postsIn(id)[1], new RegExp(`Incident ${id} resolved`));
+  });
+
   it("says so when the split incident never got a thread", async () => {
     await seed("sig-a");
     await seed("sig-b");

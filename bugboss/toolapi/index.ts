@@ -231,9 +231,19 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    * consecutive messages instead of being cut mid sentence.
    */
   const notify = async (incident: Incident, text: string): Promise<boolean> => {
+    // The thread is looked up here rather than taken from the row the caller
+    // is holding. Every transition reads its incident before it writes, and a
+    // thread can be opened in between -- openThreads does exactly that during
+    // a split. A stale null posts at the top of the channel, where nothing
+    // groups it with the incident and Slack still answers ok.
+    const threadTs =
+      db.get<{ slackThreadTs: string | null }>(
+        "SELECT slackThreadTs FROM incident WHERE id = ?",
+        [incident.id],
+      )?.slackThreadTs ?? incident.slackThreadTs;
     try {
       for (const part of splitForSlack(text)) {
-        await slack.post(incident.slackThreadTs, part);
+        await slack.post(threadTs, part);
       }
       return true;
     } catch (err) {
