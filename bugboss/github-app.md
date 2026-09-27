@@ -80,18 +80,39 @@ same run id rather than a new run, which is what `rerun_ci` reads back as
 `run_attempt` to enforce its one-attempt bound.
 
 It is not enough for every red check, and `rerun_ci` refuses these by name
-rather than letting the agent discover them as a 403:
+rather than letting the agent discover them as an undocumented 403:
 
-- **A run parked on an approval.** A fork pull request from a first-time
-  contributor, or a deployment environment protection rule, leaves a run
-  waiting for a human. Re-running does not clear that; approving does, and
-  approval is a different endpoint. The tool says so and tells the agent to
-  ask.
+- **A run parked on an approval.** GitHub's own docs claim only `201` for this
+  endpoint and document no failure at all, so whether a re-run bypasses an
+  approval gate is not something anyone can read — the one public claim that
+  it does comes from a code path its own maintainers later found had never
+  executed. So BugBoss refuses rather than finding out on a live pull request.
+  Approval is a different endpoint anyway: `POST .../runs/{id}/approve` for a
+  fork pull request (`actions: write`), `POST .../pending_deployments` for an
+  environment protection rule (`deployments: write`, which the App does not
+  have). The tool tells the agent to ask a human and says which run.
 - **A run with no failed jobs.** `success`, `cancelled` and `skipped` have
   nothing to re-run. Only `failure` and `timed_out` do.
-- **A run past the retention window.** GitHub eventually stops allowing a
-  re-run of an old run. The tool passes GitHub's own refusal through rather
-  than guessing.
+- **A run over about a month old**, which GitHub refuses outright, and a run
+  still in progress. Both come back as a 403 with a plain-English message and
+  **no** `X-Accepted-GitHub-Permissions` header, which is how the tool tells
+  them apart from a real permission failure. It does not key on the message
+  text: those strings are undocumented and have changed.
+
+A **404** is also a permission symptom here. GitHub masks a private resource an
+installation cannot see, so an App that is not on a repository is told the
+repository does not exist rather than that it is forbidden. The tool names the
+installation as one of the three things a 404 can mean.
+
+**The approval gate now reaches our own pull requests.** Since 2026-06-11
+GitHub applies it to pull requests opened by a bot even on a same-repo branch,
+and the agent opens its PRs as this App. So `action_required` is a case BugBoss
+should expect on its own work, not a fork-only curiosity.
+
+`POST .../runs/{id}/approve` is available to a GitHub App with `actions: write`
+— there is no human-only restriction. It is deliberately **not** used. An agent
+that can approve the workflow run on a pull request is an agent that can decide
+its own code gets to run, which is the gate, not a step before it.
 
 ## Installation scope, honestly
 

@@ -161,6 +161,7 @@ test("a missing permission is named, not reported as a generic failure", async (
       ok: false,
       status: 403,
       message: "Resource not accessible by integration",
+      acceptedPermissions: "actions=write",
     },
   });
 
@@ -169,14 +170,17 @@ test("a missing permission is named, not reported as a generic failure", async (
   assert.equal(result.started, false);
   assert.equal(result.refused, null);
   assert.match(result.error ?? "", /Resource not accessible by integration/);
-  assert.match(result.error ?? "", /actions: write/);
+  assert.match(result.error ?? "", /This is a permission/);
+  assert.match(result.error ?? "", /actions=write/);
   assert.match(result.error ?? "", /rerun-failed-jobs/);
   assert.match(result.error ?? "", /contact_human/);
   assert.deepEqual(h.posts, []);
 });
 
 test("nothing is announced when GitHub refuses, so the thread never sees a re-run that did not happen", async () => {
-  const h = harness({ rerun: { ok: false, status: 403, message: "nope" } });
+  const h = harness({
+    rerun: { ok: false, status: 403, message: "nope", acceptedPermissions: "actions=write" },
+  });
 
   await runRerunFailedJobs(args, h);
 
@@ -243,13 +247,15 @@ test("a timed_out run is re-runnable", async () => {
 });
 
 test("an unreadable run is reported with GitHub's own words", async () => {
-  const h = harness({ getRun: { ok: false, status: 404, message: "Not Found" } });
+  const h = harness({
+    getRun: { ok: false, status: 404, message: "Not Found", acceptedPermissions: null },
+  });
 
   const result = await runRerunFailedJobs(args, h);
 
   assert.equal(result.started, false);
   assert.match(result.error ?? "", /404/);
-  assert.match(result.error ?? "", /not installed on thegoodparty\/omni/);
+  assert.match(result.error ?? "", /cannot see\s+thegoodparty\/omni/);
   assert.deepEqual(h.reruns, []);
 });
 
@@ -308,12 +314,46 @@ test("githubMessage prefers GitHub's message and falls back to the body", () => 
   assert.equal(githubMessage(500, ""), "HTTP 500");
 });
 
-test("a non-403 refusal is passed through rather than blamed on permissions", () => {
-  const text = githubRefusalText("thegoodparty/omni", 42, 422, "run is too old");
+test("a 403 GitHub did not blame on a permission is not blamed on one here", () => {
+  // The attested bodies for this endpoint — a run still going, a run over a
+  // month old — arrive as a 403 with no X-Accepted-GitHub-Permissions header.
+  // Calling those a permission problem would send the agent to ask for a grant
+  // that changes nothing.
+  const text = githubRefusalText(
+    "thegoodparty/omni",
+    42,
+    403,
+    "Unable to retry this workflow run because it was created over a month ago",
+    null,
+  );
 
-  assert.match(text, /422/);
-  assert.match(text, /run is too old/);
-  assert.doesNotMatch(text, /actions: write/);
+  assert.match(text, /created over a month ago/);
+  assert.match(text, /did not say a permission was missing/);
+  assert.doesNotMatch(text, /actions: read/);
+  assert.doesNotMatch(text, /contact_human/);
+});
+
+test("GitHub's own answer to what was needed is what the agent is told to ask for", () => {
+  const text = githubRefusalText(
+    "thegoodparty/omni",
+    42,
+    403,
+    "Resource not accessible by integration",
+    "actions=write",
+  );
+
+  assert.match(text, /This is a permission/);
+  assert.match(text, /actions=write/);
+  assert.match(text, /rerun-failed-jobs/);
+  assert.match(text, /contact_human/);
+});
+
+test("a 404 names the installation as a candidate, because GitHub masks it as one", () => {
+  const text = githubRefusalText("thegoodparty/omni", 42, 404, "Not Found", null);
+
+  assert.match(text, /404 rather than 403/);
+  assert.match(text, /aged out/);
+  assert.match(text, /databaseId/);
 });
 
 test("the port says plainly when there is no token at all", async () => {
@@ -390,14 +430,21 @@ test("the tool keeps one budget ledger for the life of the process", async () =>
 });
 
 test("the tool result for a 403 reaches the model with the permission named", async () => {
-  const h = harness({ rerun: { ok: false, status: 403, message: "Resource not accessible by integration" } });
+  const h = harness({
+    rerun: {
+      ok: false,
+      status: 403,
+      message: "Resource not accessible by integration",
+      acceptedPermissions: "actions=write",
+    },
+  });
   const tool = await createRerunCiTool({ github: h.github, thread: h.thread });
 
   const text = await call(tool, args);
 
   assert.match(text, /Nothing was re-run/);
-  assert.match(text, /actions: write/);
-  assert.match(text, /Do not just ask a human to press the button/);
+  assert.match(text, /actions=write/);
+  assert.match(text, /Do not quietly work around this/);
 });
 
 test("a successful tool call tells the model the flake is still a defect", async () => {

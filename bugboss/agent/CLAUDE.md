@@ -53,7 +53,11 @@ polling, and it is why the prompt forbids polling with bash in a loop.
 `rerun_ci` (`rerun.ts`) re-runs one workflow run's failed jobs, once. It
 exists because incident 5 could not: the App holds `actions: read`, the
 endpoint needs `actions: write`, and the agent correctly stopped and asked a
-human rather than pretending otherwise.
+human rather than pretending otherwise. What the App may do is
+[`../github-app.md`](../github-app.md), including the cases `actions: write`
+does *not* cover — a run parked on an approval is the one to know, and since
+mid-2026 that gate applies to pull requests a bot opened on a same-repo branch,
+which is every pull request this agent opens.
 
 The permission on its own would have been the worse outcome. `gh run rerun
 --failed` is all the capability needs, and an agent holding that reaches for
@@ -77,12 +81,18 @@ affordance is the tool, and the tool carries the discipline:
   notice posted first would announce a re-run that never happened, over and
   over. A post that fails afterwards is recoverable and loud — the result
   hands the agent the text and tells it to post it.
-- **A 403 names the permission.** Not "the re-run failed". It says which
-  endpoint, which permission, that the App holds `read`, and that asking a
-  human is fine *only* if the ask says why — because a missing permission
-  nobody names is a missing permission nobody grants. GitHub's own message is
-  carried through, so once `actions: write` is granted a 403 for some other
-  reason still reads correctly.
+- **A permission refusal names the permission.** Not "the re-run failed". It
+  says which endpoint, what GitHub itself says the call needed, that the App
+  holds `read`, and that asking a human is fine *only* if the ask says why —
+  because a missing permission nobody names is a missing permission nobody
+  grants. The discriminator is the `X-Accepted-GitHub-Permissions` response
+  header, **not** the message: GitHub documents no failure for this endpoint
+  at all, every 403 body is folklore, and the two that are attested ("this
+  workflow is already running", "created over a month ago") have nothing to do
+  with permissions. A 403 without that header says so instead of sending the
+  agent to ask for a grant that would change nothing. 404 gets the same
+  treatment from the other side, because GitHub masks a repository an
+  installation cannot see rather than forbidding it.
 
 **There is no fence, and this is the honest part.** The agent has a real
 shell. `gh run rerun` is reachable the way `gh pr merge` is, and GitHub offers

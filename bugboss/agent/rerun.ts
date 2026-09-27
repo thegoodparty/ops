@@ -78,7 +78,19 @@ export interface WorkflowRunView {
 
 export type GitHubResult<T> =
   | { ok: true; data: T }
-  | { ok: false; status: number; message: string };
+  | {
+      ok: false;
+      status: number;
+      message: string;
+      /**
+       * GitHub's own answer to "what permission would this have needed",
+       * from the `X-Accepted-GitHub-Permissions` response header. Present on
+       * a permission refusal to a fine-grained actor and absent otherwise,
+       * which is the only reliable way to tell a permission 403 from the
+       * other ones — the message strings are undocumented and have changed.
+       */
+      acceptedPermissions: string | null;
+    };
 
 /**
  * The two calls this needs, named rather than a general client: the agent
@@ -153,6 +165,7 @@ export const createGitHubRunsPort = (deps: {
       return {
         ok: false,
         status: 0,
+        acceptedPermissions: null,
         message:
           "no GitHub token in this container: the App credentials did not resolve at launch, so BugBoss is running without GitHub access at all",
       };
@@ -168,11 +181,21 @@ export const createGitHubRunsPort = (deps: {
       });
       const text = await response.text();
       if (!response.ok) {
-        return { ok: false, status: response.status, message: githubMessage(response.status, text) };
+        return {
+          ok: false,
+          status: response.status,
+          message: githubMessage(response.status, text),
+          acceptedPermissions: response.headers.get("x-accepted-github-permissions"),
+        };
       }
       return { ok: true, data: (text ? JSON.parse(text) : null) as T };
     } catch (err) {
-      return { ok: false, status: 0, message: `${method} ${path} failed: ${String(err)}` };
+      return {
+        ok: false,
+        status: 0,
+        acceptedPermissions: null,
+        message: `${method} ${path} failed: ${String(err)}`,
+      };
     }
   };
 
@@ -185,44 +208,71 @@ export const createGitHubRunsPort = (deps: {
 };
 
 /**
- * What the model is told when GitHub refuses. The 403 case is the one this
- * whole change exists because of, so it never degrades into "the re-run
- * failed": it names the permission, names where the gap is, and tells the
- * agent that falling back to asking a human is right *only* if the ask says
- * why. A missing permission nobody names is a missing permission nobody
- * grants, which is how incident 5 ended.
+ * What the model is told when GitHub refuses.
  *
- * It says "likeliest" rather than "is" on purpose. Once `actions: write` is
- * granted a 403 here means something else — a run past its retention window,
- * a run with no failed jobs left — and GitHub's own message is carried
- * through so the real reason is always in front of the reader.
+ * The permission case is the one this whole change exists because of, so it
+ * never degrades into "the re-run failed": it names the permission, says where
+ * the gap is, and tells the agent that falling back to asking a human is right
+ * *only* if the ask says why. A missing permission nobody names is a missing
+ * permission nobody grants, which is how incident 5 ended.
+ *
+ * The discriminator is the `X-Accepted-GitHub-Permissions` header, not the
+ * message. GitHub documents no failure at all for this endpoint — only 201 —
+ * so every 403 body is folklore collected from other people's bug reports, and
+ * the two that are attested ("This workflow is already running", "Unable to
+ * retry this workflow run because it was created over a month ago") are
+ * nothing to do with permissions. The header is sent to fine-grained actors
+ * precisely to answer "what would this have needed", so when it is there the
+ * answer is definite and when it is not, this says so rather than blaming
+ * permissions for a run that is simply too old.
+ *
+ * 404 gets the same paragraph because GitHub deliberately masks a private
+ * resource an installation cannot see: an App that is not installed on a
+ * repository is told the repository does not exist.
  */
 export const githubRefusalText = (
   repo: string,
   runId: number,
   status: number,
   message: string,
+  acceptedPermissions: string | null,
 ): string => {
+  const endpoint = "POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs";
+  if (acceptedPermissions) {
+    return [
+      `GitHub refused with ${status}: ${message}`,
+      "",
+      `This is a permission. GitHub says the call needs \`${acceptedPermissions}\`, and`,
+      "BugBoss's GitHub App does not hold it — it has `actions: read`, which is enough",
+      "to watch a job fail and not enough to act on it.",
+      "",
+      "Do not quietly work around this. Ask a human with contact_human AND say in the",
+      `ask that the BugBoss GitHub App is missing \`${acceptedPermissions}\` for ${endpoint},`,
+      "so somebody grants it instead of clicking around it again next incident.",
+    ].join("\n");
+  }
   if (status === 403) {
     return [
       `GitHub refused with 403: ${message}`,
       "",
-      "The likeliest cause is permission. Re-running calls",
-      "POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs, which",
-      "requires `actions: write`, and BugBoss's GitHub App holds `actions: read` —",
-      "enough to watch a job fail and not enough to act on it.",
+      "GitHub did not say a permission was missing, so this is probably not one. The",
+      "two refusals it returns here are a run that is still going and a run created",
+      "more than about a month ago, which cannot be re-run at all.",
       "",
-      "Do not just ask a human to press the button. Ask with contact_human AND say",
-      "in the ask that the BugBoss GitHub App is missing `actions: write`, so",
-      "somebody grants it instead of clicking around it again next incident.",
+      "If the message does not explain it, treat the failure as real and report it",
+      "rather than trying again.",
     ].join("\n");
   }
   if (status === 404) {
     return [
       `GitHub returned 404 for run ${runId} in ${repo}: ${message}`,
       "",
-      `Either that run id does not exist, or BugBoss's GitHub App is not installed on ${repo}.`,
-      "Check the id with `gh run list` against the head SHA before trying again.",
+      "A 404 here is one of three things. The run id is wrong — check it with",
+      "`gh run list --commit <sha> --json databaseId`, and remember the run id is not",
+      "the job id. Or the run has aged out. Or BugBoss's GitHub App cannot see",
+      `${repo} at all: GitHub answers 404 rather than 403 for a private repository an`,
+      "installation is not on. If you believe the id is right, say so when you ask a",
+      "human, and name the App.",
     ].join("\n");
   }
   return `GitHub refused with ${status || "a transport error"}: ${message}`;
@@ -306,7 +356,13 @@ export const runRerunFailedJobs = async (
     return {
       refused: null,
       started: false,
-      error: githubRefusalText(args.repo, args.runId, run.status, run.message),
+      error: githubRefusalText(
+        args.repo,
+        args.runId,
+        run.status,
+        run.message,
+        run.acceptedPermissions,
+      ),
       notice: "",
       postError: null,
     };
@@ -352,7 +408,13 @@ export const runRerunFailedJobs = async (
     return {
       refused: null,
       started: false,
-      error: githubRefusalText(args.repo, args.runId, rerun.status, rerun.message),
+      error: githubRefusalText(
+        args.repo,
+        args.runId,
+        rerun.status,
+        rerun.message,
+        rerun.acceptedPermissions,
+      ),
       notice: "",
       postError: null,
     };
