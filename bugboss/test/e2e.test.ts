@@ -24,8 +24,10 @@ import {
   type BugBoss,
 } from "../index";
 import { createBossClient } from "../agent/run";
+import { classifySlackEvent, type SlackConfig } from "../ingress";
 import { firstReplyAfter } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
+import type { SlackEvent } from "../slack/relay";
 import type { ModelReply, ModelRequest } from "../triage";
 import type { BugBossConfig, Directive, TriageDecision } from "../types";
 
@@ -987,6 +989,126 @@ test("no rotation configured records nothing rather than guessing", async () => 
   );
   assert.equal(row!.rotationAtOpen, null);
   rotation.members = ["U-ada", "U-grace"];
+});
+
+// --- the two layers that decide whether anything happens ---------------------
+
+/**
+ * Ingress and the relay both answer "will the Boss do anything with this",
+ * and the HTTP layer keys the delivery acknowledgement off the first one
+ * while the second is what actually acts. When they disagree in this
+ * direction -- ingress calls it ignored, the relay works it -- somebody
+ * answers a waiting agent, sees no acknowledgement, and cannot tell whether
+ * it landed. That is how an untagged reply in an incident thread lost its
+ * :eyes: when this layer stopped reading messages.
+ *
+ * The other direction is deliberately allowed: an acknowledgement on
+ * something that turns out to be nothing is cheap.
+ */
+test("nothing the relay acts on is ignored at ingress", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-ack-1", "ack-errors"));
+  const thread = boss.db.get<{ slackThreadTs: string | null }>(
+    `SELECT i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-ack-1'`,
+  )!.slackThreadTs!;
+
+  const ingress: SlackConfig = {
+    botUserId: "B0BOSS",
+    verifier: () => undefined,
+    isIncidentThread: (_channel, ts) =>
+      boss.db.get("SELECT id FROM incident WHERE slackThreadTs = ?", [ts]) !==
+      undefined,
+  };
+
+  const deliveries: {
+    what: string;
+    event: SlackEvent & { bot_id?: string };
+    intent?: Record<string, unknown>;
+  }[] = [
+    {
+      what: "an untagged reply in an incident thread",
+      event: {
+        type: "message",
+        channel: "C0TEST",
+        user: "U-ada",
+        text: "yes, org X bypasses it",
+        ts: "1800.1",
+        thread_ts: thread,
+      },
+      intent: { handover: "none", addressed: "others" },
+    },
+    {
+      what: "a top-level mention",
+      event: {
+        type: "app_mention",
+        channel: "C0TEST",
+        user: "U-ada",
+        text: "<@B0BOSS> what is open right now",
+        ts: "1800.2",
+      },
+      intent: { intent: "question" },
+    },
+    {
+      what: "our own echo",
+      event: {
+        type: "message",
+        channel: "C0TEST",
+        bot_id: "B0BOSS",
+        user: "B0BOSS",
+        text: "anything",
+        ts: "1800.3",
+      },
+    },
+    {
+      what: "an edited message",
+      event: {
+        type: "message",
+        subtype: "message_changed",
+        channel: "C0TEST",
+        user: "U-ada",
+        text: "anything",
+        ts: "1800.4",
+      },
+    },
+    {
+      what: "channel chatter nobody addressed to us",
+      event: {
+        type: "message",
+        channel: "C0TEST",
+        user: "U-ada",
+        text: "anyone seen the deploy go out?",
+        ts: "1800.5",
+      },
+    },
+  ];
+
+  for (const { what, event, intent } of deliveries) {
+    if (intent) fakeModel.intents.push(intent);
+    const classified = await classifySlackEvent(
+      { headers: {}, rawBody: JSON.stringify({ type: "event_callback", event }) },
+      ingress,
+    );
+    const accepted = await boss.slackEventAccepted(event);
+    await accepted.settled;
+
+    if (accepted.routed !== "ignore") {
+      assert.notEqual(
+        classified.kind,
+        "ignored",
+        `${what}: the relay works it, so it has to be visible at ingress`,
+      );
+    }
+    if (classified.kind === "ignored") {
+      assert.equal(
+        accepted.routed,
+        "ignore",
+        `${what}: ingress calls it ignored, so nothing may come of it`,
+      );
+    }
+    // Queued and unused would desync every later test in this file.
+    assert.equal(fakeModel.intents.length, 0, `${what}: intents drained`);
+  }
 });
 
 // --- ownership --------------------------------------------------------------

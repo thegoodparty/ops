@@ -1,17 +1,24 @@
 // Slack ingress. Design spec: bugboss/docs/architecture.md, Job 1 and Job 5.
 //
-// This layer answers the questions a signature and an event envelope can
+// This layer answers what a signature, an event envelope and a thread id can
 // answer, and stops there:
 //
-//   mention         the app was tagged.
-//   ignored         not addressed to us, or not a message at all.
+//   incident_reply  the message is in a thread BugBoss owns. Whoever it was
+//                   for, the Boss does something with it.
+//   mention         the app was tagged anywhere else.
+//   ignored         nothing will come of this: a bot echo, an edit, a message
+//                   nobody addressed to us in a thread we do not own.
 //
-// Everything past that is the relay's: which incident a thread belongs to,
-// and what the message meant. What a mention is *asking for* -- reporting
-// something broken, or asking a question -- is a model call, not a parse, and
-// it happens off the Slack ack in the composition root. Nothing here reads
-// the words a person chose, so there is no verb to learn and no phrasing that
-// silently does nothing.
+// `ignored` has to keep meaning exactly that, because the HTTP layer decides
+// whether a delivery earns its :eyes: by excluding it. An untagged reply in an
+// incident thread is the documented way to answer a waiting agent, so calling
+// it ignored is how somebody answers an agent and sees nothing happen.
+//
+// What the message *means* is not here. Whether it hands the incident over,
+// whether it was for the agent, whether a mention is a report or a question
+// -- all model calls, made off the Slack ack in the composition root. Nothing
+// here reads the words a person chose, so there is no verb to learn and no
+// phrasing that silently does nothing.
 //
 // Verification fails closed for the same reason it does on the Grafana side:
 // this endpoint is public, and an unauthenticated one lets anyone open an
@@ -44,6 +51,7 @@ export interface SlackMessage {
 
 export type SlackClassification =
   | { kind: "url_verification"; challenge: string }
+  | { kind: "incident_reply"; message: SlackMessage }
   | { kind: "mention"; message: SlackMessage }
   | { kind: "ignored"; reason: string };
 
@@ -56,6 +64,16 @@ export interface SlackConfig {
   /** Used to spot a mention when the event arrives as a plain message. */
   botUserId?: string;
   replayWindowSeconds?: number;
+  /**
+   * Whether this thread belongs to an incident. A structural fact about the
+   * delivery, not a reading of it, which is why it survives in a layer that
+   * no longer interprets anything. The Boss knows, from
+   * incident.slackThreadTs; ingress does not, so it is injected.
+   */
+  isIncidentThread?: (
+    channel: string,
+    threadTs: string,
+  ) => boolean | Promise<boolean>;
   now?: () => number;
   /**
    * Replaces the signature check. A TEST SEAM ONLY: passing one in production
@@ -193,6 +211,14 @@ export const classifySlackEvent = async (
     rawText,
     retry: Boolean(headerValue(req, RETRY_HEADER)),
   };
+
+  // Checked BEFORE the mention, deliberately, and it is the same order the
+  // relay routes in: a message in an incident's thread belongs to that
+  // incident whether or not it tagged us.
+  const inIncidentThread = config.isIncidentThread ?? (() => false);
+  if (threadTs && (await inIncidentThread(channel, threadTs))) {
+    return { kind: "incident_reply", message };
+  }
 
   const mentioned =
     event.type === "app_mention" ||

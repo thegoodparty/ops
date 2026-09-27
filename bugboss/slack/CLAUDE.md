@@ -27,6 +27,12 @@ agent waited out its full timeout.
 `mentioned` still drives `interrupt`. So a mention answers *and* interrupts;
 a plain reply answers.
 
+A reply here also has to stay visible at ingress: `classifySlackEvent` keeps
+an `incident_reply` kind, and the HTTP layer keys its :eyes: off not being
+`ignored`. An untagged reply is the documented way to answer an agent, so it
+is the last delivery that should arrive unacknowledged. See
+`ingress/CLAUDE.md`.
+
 ### Which reply, though
 
 `contact_human` ends its wait on the **first** reply after the question. Two

@@ -20,11 +20,7 @@ except an agent, on evidence.
 Slack is **not** an adapter. A person reports something by mentioning
 `@bugboss`, and whether that mention is a report or a question is a model
 call the composition root makes off the ack (`slack/intent.ts`), not
-something a body can be parsed for. `classifySlackEvent` answers only what a
-signature and an event envelope can answer — is this authentic, is it a
-message, was the app tagged — and stops there. Which incident a thread
-belongs to is the relay's, since the relay is what reads `slackThreadTs` and
-routes on it.
+something a body can be parsed for.
 
 This used to be a verb: the first word had to be `report`, `bug` or `broken`.
 `@bugboss Pro upgrades are failing` was therefore answered as a question and
@@ -33,6 +29,28 @@ opened nothing, which is the whole problem with a magic phrase.
 So the registry holds two adapters, not three. A report's signal is built
 with `humanSignal` and placed through the `human` entry, which is what
 `Signal.source` already points the orphan sweep at.
+
+### `ignored` means nothing will come of this
+
+`classifySlackEvent` still answers what a signature, an event envelope and a
+thread id can answer — is this authentic, is it a message, is it in a thread
+BugBoss owns, was the app tagged. The thread check looks like interpretation
+and is not: it is a `slackThreadTs` lookup, injected because the Boss knows
+and ingress does not.
+
+It stays because `ignored` is load-bearing. The HTTP layer decides whether a
+delivery earns its :eyes: by excluding `ignored`, so the kind is not just a
+description — it is the difference between somebody seeing an
+acknowledgement and seeing nothing. Collapsing an untagged reply in an
+incident thread into `ignored` therefore takes the acknowledgement off the
+one message most likely to be an answer a blocked agent is waiting for, which
+is the failure the natural-language work exists to remove.
+
+The invariant, tested in `test/e2e.test.ts`: **nothing the relay acts on may
+be `ignored` here.** The reverse is allowed on purpose — an acknowledgement
+on something that turns out to be nothing is cheap. Of the places that ask
+"will anything happen with this", ingress and the relay have to agree in that
+one direction.
 
 ## Verification fails closed, everywhere
 

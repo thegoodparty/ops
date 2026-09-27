@@ -174,12 +174,56 @@ test("a url_verification handshake is surfaced with its challenge", async () => 
 });
 
 /**
- * Which incident a thread belongs to is the relay's, not this layer's: it is
- * a `slackThreadTs` lookup and the relay is what routes on it. Covered in
- * `slack/relay.test.ts`, where a mention inside an incident thread stays with
- * that incident rather than becoming a Slack-agent question.
+ * The one thing `ignored` must never swallow. An untagged reply in an
+ * incident's thread is the documented way to answer a waiting agent, and the
+ * HTTP layer decides whether a delivery earns its :eyes: by excluding
+ * `ignored` -- so calling this one ignored is how somebody answers an agent,
+ * sees no acknowledgement, and cannot tell whether it landed.
+ *
+ * It is also not a reading of the message: which thread it is in is a
+ * `slackThreadTs` lookup, which is why this survives in a layer that no
+ * longer interprets anything.
  */
-test("a threaded mention is a mention here, whatever thread it is in", async () => {
+test("an untagged reply in an incident thread is not ignored", async () => {
+  for (const text of [
+    "yes, org X bypasses the Stripe webhook",
+    "back to you",
+    "no idea, I was afk",
+  ]) {
+    const result = await classifySlackEvent(
+      request(
+        event({
+          type: "message",
+          text,
+          thread_ts: "1764000000.000001",
+          ts: "1764000000.000200",
+        }),
+      ),
+      { ...config, isIncidentThread: (_c, ts) => ts === "1764000000.000001" },
+    );
+    assert.equal(result.kind, "incident_reply", text);
+  }
+});
+
+test("a tagged reply in an incident thread is that incident's, not a new question", async () => {
+  const result = await classifySlackEvent(
+    request(
+      event({
+        text: `<@${BOT}> what did you rule out?`,
+        thread_ts: "1764000000.000001",
+        ts: "1764000000.000200",
+      }),
+    ),
+    { ...config, isIncidentThread: (_c, ts) => ts === "1764000000.000001" },
+  );
+  assert.equal(
+    result.kind,
+    "incident_reply",
+    "the same order the relay routes in: the thread wins over the tag",
+  );
+});
+
+test("a threaded mention in a thread we do not own is a mention", async () => {
   const result = await classifySlackEvent(
     request(
       event({ thread_ts: "1764000000.000001", ts: "1764000000.000200" }),
