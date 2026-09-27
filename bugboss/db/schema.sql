@@ -129,6 +129,23 @@ CREATE TABLE IF NOT EXISTS pending_question (
   message           TEXT NOT NULL DEFAULT ''
 );
 
+-- A wait on a person that monitor is sitting in. Keeps the elapsed clock and
+-- the nudge count across a container restart, so a resumed agent carries on
+-- waiting quietly instead of nudging the thread again -- every merge to ops
+-- main restarts this container, so that is the normal path.
+CREATE TABLE IF NOT EXISTS pending_wait (
+  incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  -- Matched on resume. clearWait does not run when the child is SIGKILLed
+  -- mid-wait, so a marker outlives the wait it was written for.
+  command           TEXT NOT NULL,
+  startedAt         INTEGER NOT NULL,
+  pings             INTEGER NOT NULL DEFAULT 0,
+  -- The backoff counts from the last nudge, not from the start. Without it a
+  -- wait that spanned a night would fire its whole ladder in the first three
+  -- minutes after the window opened.
+  lastPingAt        INTEGER
+);
+
 -- Slack replies the Boss has relayed, which agents poll for.
 CREATE TABLE IF NOT EXISTS thread_reply (
   id                TEXT PRIMARY KEY,

@@ -22,7 +22,11 @@ import {
   renderDirectives,
   truncateOutput,
   type DirectivePeek,
+  parseWorkingHours,
   type HumanContactPort,
+  type PendingWait,
+  type WaitMarkerPort,
+  type WorkingHours,
   type PendingDirective,
   type PendingQuestion,
 } from "./tools";
@@ -148,7 +152,7 @@ export const startNpmCi = (paths: AgentPaths): void => {
 // The Boss
 // ---------------------------------------------------------------------------
 
-export type BossClient = ToolApi & HumanContactPort & DirectivePeek;
+export type BossClient = ToolApi & HumanContactPort & DirectivePeek & WaitMarkerPort;
 
 export const createBossClient = (args: {
   baseUrl: string;
@@ -188,6 +192,9 @@ export const createBossClient = (args: {
     recordPending: (message) =>
       call<PendingQuestion>("POST", "/pending-question", { message }),
     clearPending: () => call<void>("DELETE", "/pending-question").then(() => undefined),
+    recordWait: (command) => call<PendingWait>("POST", "/pending-wait", { command }),
+    recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
+    clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
     post: (message) => call<void>("POST", "/thread", { message }).then(() => undefined),
   };
 };
@@ -421,6 +428,12 @@ export interface RunIncidentAgentOptions {
    * a child that derives its own can write where nothing looks for it.
    */
   sessionKey: string;
+  /**
+   * When monitor is allowed to nudge the thread about a wait on a person.
+   * Passed down by name rather than read here, so the composition root stays
+   * the only place a deployment's shape is decided.
+   */
+  workingHours?: WorkingHours;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
   store?: SessionStore;
   api?: BossClient;
@@ -454,6 +467,13 @@ export const agentOptionsFromEnv = (
     : DEFAULT_TIMEOUT_SECONDS;
 
   const grafanaToken = env.GRAFANA_SERVICE_ACCOUNT_TOKEN;
+  // Throws on a malformed value rather than falling back on the default. This
+  // runs once, at launch, where the failure is immediate and visible; a window
+  // nobody meant would instead deliver its nudges at the wrong hour for as
+  // long as it took somebody to doubt a value that looked configured.
+  const workingHours = env.BUGBOSS_WORKING_HOURS
+    ? parseWorkingHours(env.BUGBOSS_WORKING_HOURS)
+    : undefined;
 
   return {
     incidentId,
@@ -466,6 +486,7 @@ export const agentOptionsFromEnv = (
     awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
     sessionKey,
     timeoutSeconds,
+    ...(workingHours ? { workingHours } : {}),
     ...(grafanaToken
       ? {
           grafana: {
@@ -592,7 +613,15 @@ const launch = async (args: {
 
   const bossTools = await createBossTools({ api, onRootCause: () => startNpmCi(paths) });
   const localTools = [
-    await createMonitorTool({ signal: deadlineAbort.signal }),
+    await createMonitorTool({
+      signal: deadlineAbort.signal,
+      heartbeat: {
+        marker: api,
+        post: (message: string) => api.post(message),
+        escalate: api,
+        ...(options.workingHours ? { workingHours: options.workingHours } : {}),
+      },
+    }),
     await createContactHumanTool({ contact: api, api, signal: deadlineAbort.signal }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(

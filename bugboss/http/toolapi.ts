@@ -354,6 +354,96 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     return c.json(row);
   });
 
+  /**
+   * The wait marker monitor keeps while it is blocked on a person. Idempotent
+   * for the same command, and only for the same command: a restart replays
+   * the tool call and has to find the wait it was already in -- overwriting
+   * startedAt there would restart the elapsed clock and defer every nudge for
+   * as long as the restarts last. A different command is a different wait, and
+   * inherits neither the clock nor the nudge count.
+   */
+  app.post("/incidents/:id/pending-wait", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    let command = "";
+    try {
+      command = String(((await c.req.json()) as { command?: unknown }).command ?? "");
+    } catch {
+      return c.json({ error: "body was not JSON" }, 400);
+    }
+    if (!command.trim()) return c.json({ error: "command is empty" }, 400);
+
+    const row = await deps.db.withWrite((w) => {
+      w.prepare(
+        `INSERT INTO pending_wait (incidentId, command, startedAt, pings, lastPingAt)
+         VALUES (?, ?, ?, 0, NULL)
+         ON CONFLICT(incidentId) DO UPDATE SET
+           command = excluded.command,
+           startedAt = excluded.startedAt,
+           pings = 0,
+           lastPingAt = NULL
+         WHERE pending_wait.command <> excluded.command`,
+      ).run(caller.incidentId, command, now());
+      return w
+        .prepare(
+          "SELECT command, startedAt, pings, lastPingAt FROM pending_wait WHERE incidentId = ?",
+        )
+        .get(caller.incidentId) as {
+        command: string;
+        startedAt: number;
+        pings: number;
+        lastPingAt: number | null;
+      };
+    });
+
+    return c.json(row);
+  });
+
+  /**
+   * Counted before the nudge is posted, so a crash between the two costs one
+   * nudge rather than repeating it on every resume. A missing marker is an
+   * error rather than an upsert: there is no wait to count against, and
+   * inventing one would start the clock at the moment of the fault.
+   */
+  app.post("/incidents/:id/pending-wait/ping", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    const row = await deps.db.withWrite((w) => {
+      w.prepare(
+        "UPDATE pending_wait SET pings = pings + 1, lastPingAt = ? WHERE incidentId = ?",
+      ).run(now(), caller.incidentId);
+      return w
+        .prepare(
+          "SELECT command, startedAt, pings, lastPingAt FROM pending_wait WHERE incidentId = ?",
+        )
+        .get(caller.incidentId) as
+        | {
+            command: string;
+            startedAt: number;
+            pings: number;
+            lastPingAt: number | null;
+          }
+        | undefined;
+    });
+    if (!row) return c.json({ error: "no wait is recorded" }, 404);
+
+    log("wait_ping_recorded", { incidentId: caller.incidentId, pings: row.pings });
+    return c.json(row);
+  });
+
+  app.delete("/incidents/:id/pending-wait", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    await deps.db.withWrite((w) => {
+      w.prepare("DELETE FROM pending_wait WHERE incidentId = ?").run(
+        caller.incidentId,
+      );
+    });
+    return c.body(null, 204);
+  });
+
   app.delete("/incidents/:id/pending-question", async (c) => {
     const caller = authorize(c);
     if (caller instanceof Response) return caller;

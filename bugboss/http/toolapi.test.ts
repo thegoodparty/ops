@@ -1,5 +1,6 @@
-// The two loopback routes that are not ToolApi: the outstanding-question
-// marker and the non-draining directive read contact_human polls.
+// The loopback routes that are not ToolApi: the outstanding-question marker,
+// the wait marker monitor keeps while it is blocked on a person, and the
+// non-draining directive read contact_human polls.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -264,4 +265,72 @@ test("unknown keys are stripped rather than passed through", async () => {
   const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
   assert.equal(body.ok, true);
   assert.deepEqual(body.data, { cause: "bad column", explainedSignalIds: ["s1"] });
+});
+
+const startWait = (command: string) =>
+  authed("/pending-wait", { method: "POST", body: JSON.stringify({ command }) });
+
+type WaitRow = {
+  command: string;
+  startedAt: number;
+  pings: number;
+  lastPingAt: number | null;
+};
+
+test("a replayed wait keeps its clock and its nudge count", async () => {
+  clock = 1_000_000;
+  const first = (await (await startWait("gh pr view 2150")).json()) as WaitRow;
+  assert.deepEqual(first, {
+    command: "gh pr view 2150",
+    startedAt: 1_000_000,
+    pings: 0,
+    lastPingAt: null,
+  });
+
+  clock = 4_600_000;
+  const pinged = (await (
+    await authed("/pending-wait/ping", { method: "POST" })
+  ).json()) as WaitRow;
+  assert.equal(pinged.pings, 1);
+  assert.equal(pinged.lastPingAt, 4_600_000);
+
+  // The restart. Without this the elapsed clock would start over and the
+  // nudge count would be lost, so the resumed agent would nudge again.
+  clock = 5_000_000;
+  const replayed = (await (await startWait("gh pr view 2150")).json()) as WaitRow;
+  assert.equal(replayed.startedAt, 1_000_000);
+  assert.equal(replayed.pings, 1);
+  assert.equal(replayed.lastPingAt, 4_600_000);
+
+  // clearWait does not run when the child is SIGKILLed mid-wait, so a marker
+  // outlives its wait. A different command is a different wait and inherits
+  // neither the clock nor the count.
+  clock = 6_000_000;
+  const next = (await (await startWait("gh run list --commit abc")).json()) as WaitRow;
+  assert.deepEqual(next, {
+    command: "gh run list --commit abc",
+    startedAt: 6_000_000,
+    pings: 0,
+    lastPingAt: null,
+  });
+
+  await authed("/pending-wait", { method: "DELETE" });
+  assert.equal(
+    db.get<WaitRow>("SELECT command FROM pending_wait WHERE incidentId = ?", [
+      INCIDENT,
+    ]),
+    undefined,
+  );
+});
+
+test("counting a nudge against no wait is an error, not a new wait", async () => {
+  const res = await authed("/pending-wait/ping", { method: "POST" });
+  assert.equal(res.status, 404);
+  assert.equal(
+    db.get<WaitRow>("SELECT command FROM pending_wait WHERE incidentId = ?", [
+      INCIDENT,
+    ]),
+    undefined,
+    "a missing marker is not invented at the moment of the fault",
+  );
 });

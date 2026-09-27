@@ -25,14 +25,57 @@ polling, and it is why the prompt forbids polling with bash in a loop.
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
+- `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
+  what the wait is on, and the harness nudges the thread when they do not
+  turn up. Unset, the wait is silent, which is right for a deploy, a
+  migration or an alert going quiet: nobody is being asked for anything. The
+  argument decides it rather than the command string, because a harness that
+  pattern-matched `gh pr` would stop nudging the day somebody wrote the same
+  check differently.
 - `contact_human(message, …)` — re-entrant. The marker is written *before*
   the post, so a resumed agent resumes waiting rather than asking twice. It
   re-posts when the stored message differs from the new one, and when
   `messageTs` is empty because the post itself failed — otherwise one Slack
   hiccup becomes a silent 24-hour wait that escalates for the wrong reason.
 
-Both take the harness's deadline signal combined with Pi's own, so the soft
-deadline can interrupt a blocking tool. Without that, `steer` only lands
+## The heartbeat on a wait that needs a person
+
+An agent that posts "please merge this" and then blocks is indistinguishable
+from one that has died, and a merge nobody notices is the stall that matters
+most — the human's only job in this system is the merge. So a wait with
+`awaitingHuman` set nudges the thread on its own: due an hour in, then two,
+then four, and once the nudges run out `hand_off` sets `owner: human` and the
+agent stops. That last step is the point of the ladder — an incident blocked
+with `owner: agent` is invisible, since the dispatcher will not relaunch one
+an agent still holds and nothing lists it as unclaimed work. `hand_off` is
+also the only post in the sequence that reaches the rotation group.
+
+It lives in the wait loop rather than in the prompt for the same two reasons
+`runContactHuman`'s escalation does. It must cost **no turns** — a model asked
+to nudge itself has to come back for a turn to do it, which is the polling
+loop the tool exists to replace. And an agent that has gone quiet cannot
+notice its own silence.
+
+**Nudges are gated on working hours, and the backoff counts from the last
+nudge.** The window is `BUGBOSS_WORKING_HOURS`
+(`America/New_York:10-19:1,2,3,4,5` by default — 07:00–16:00 Pacific, so
+nobody on a continental-US team is pinged before 07:00 or after 19:00 local).
+The elapsed clock is wall clock and the window only gates the *post*, so a
+wait that spans a night stays silent and speaks on the first poll after the
+window opens. Counting the gap from the last nudge rather than from the start
+is what stops that morning from arriving as the whole ladder at once.
+
+**Re-entrancy is the `pending_wait` marker**, on the same contract as the
+question marker: idempotent for the same command, replaced by a different one.
+It holds `startedAt` and the nudge count, so a resumed agent resumes the wait
+it was in — and the timeout is measured from `startedAt`, so a crash-looping
+agent does not get a fresh day each time round. The nudge is counted *before*
+it is posted, which is the opposite order from the question and deliberate: a
+crash between the two costs one nudge, where the other order re-nudges on
+every resume, and every merge to ops `main` resumes every agent.
+
+Both blocking tools take the harness's deadline signal combined with Pi's own,
+so the soft deadline can interrupt a blocking tool. Without that, `steer` only lands
 after the current turn's tool calls finish — and the agent spends most of
 its life inside a `monitor` with an hours-long timeout.
 

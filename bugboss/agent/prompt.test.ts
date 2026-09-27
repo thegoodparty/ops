@@ -149,3 +149,15 @@ test("the agent is told to write mrkdwn, not Markdown", () => {
   assert.match(prompt, /Do not escape `&`, `<` or `>` yourself/);
   assert.match(prompt, /Never write `<!here>`/);
 });
+
+test("the agent is told which waits carry a heartbeat", () => {
+  const prompt = composeSystemPrompt(input());
+
+  // The tool description says the same thing, but the model picks the
+  // argument at the moment it writes the call and the worked example is what
+  // it copies. A wait on a person that omits the argument is silent, which is
+  // the failure this exists to stop.
+  assert.match(prompt, /say so in awaitingHuman/);
+  assert.match(prompt, /awaitingHuman: "Merge <url>/);
+  assert.match(prompt, /Leave it unset for a deploy/);
+});

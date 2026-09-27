@@ -316,4 +316,12 @@ export interface BugBossConfig {
   dispatcher: DispatcherConfig;
   /** Signals on this list ping the channel at open, in parallel with the agent. */
   prodCriticalSlugs: string[];
+  /**
+   * When an agent blocked on a person may nudge the thread, as
+   * `America/New_York:10-19` or `America/New_York:10-19:1,2,3,4,5`. Carried as
+   * the raw string because the agent that acts on it is a child process and
+   * the environment is the only channel to it; parsed at both ends, so a typo
+   * fails the Boss at boot rather than every agent at launch.
+   */
+  workingHours?: string;
 }
