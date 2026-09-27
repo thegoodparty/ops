@@ -10,8 +10,14 @@ import { Hono } from "hono";
 import type { Context, Next } from "hono";
 
 import { BodyUnreadable, IngestRejected } from "./errors";
-import { classifySlackEvent, type SlackConfig } from "../ingress/slack";
+import {
+  classifySlackEvent,
+  classifySlackInteraction,
+  isInteractionDelivery,
+  type SlackConfig,
+} from "../ingress/slack";
 import type { SlackAck } from "../slack/ack";
+import type { SlackChoiceClick } from "../slack/blocks";
 import type { SlackEvent } from "../slack/relay";
 import type { IncomingRequest } from "../types";
 import { makeAlarm, makeLog } from "../logging";
@@ -22,7 +28,6 @@ const alarm = makeAlarm("boss-http");
 
 /** Far above any real Grafana or Slack delivery. */
 const MAX_BODY_BYTES = 1024 * 1024;
-
 
 /**
  * Both webhook paths take the same handshake: the part that has to be durable
@@ -49,6 +54,8 @@ export interface PublicAppDeps {
    * slack/ack.ts.
    */
   acknowledgeSlack: (ack: SlackAck) => void;
+  /** Records a button press; saying so in the thread runs past the response. */
+  slackInteractionAccepted: (click: SlackChoiceClick) => Promise<Accepted>;
   /** The same config the slack ingress adapter was built with. */
   slackConfig: SlackConfig;
 }
@@ -215,8 +222,38 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
     return c.json({ ok: true, recorded: accepted.recorded });
   });
 
+  // One path, two payload encodings. Slack posts a button press to the
+  // Interactivity Request URL as a form body rather than as JSON, and pointing
+  // it at /slack keeps interactivity off the ALB's path allowlist: a new path
+  // would be a Pulumi change and a deploy before a click could reach the
+  // process at all. Same `v0=` signature over the same raw body either way.
   app.post("/slack", async (c) => {
     const req = await incoming(c);
+
+    if (isInteractionDelivery(req)) {
+      let interaction: ReturnType<typeof classifySlackInteraction>;
+      try {
+        interaction = classifySlackInteraction(req, deps.slackConfig);
+      } catch (err) {
+        log("slack_interaction_rejected", { error: String(err) });
+        return c.json({ ok: false, error: (err as Error).message }, 401);
+      }
+      if (interaction.kind === "choice") {
+        // The relay's write is inside the accept; the line it posts in the
+        // thread is not, because Slack wants an ack in three seconds and a
+        // rate-limited post waits minutes.
+        settle(
+          (await deps.slackInteractionAccepted(interaction.click)).settled,
+          "slack_interaction",
+        );
+      } else {
+        log("slack_interaction_ignored", { reason: interaction.reason });
+      }
+      // Deliberately empty. A JSON body here is read by Slack as a replacement
+      // for the message that was clicked, which would delete the question and
+      // its buttons out from under everyone else in the thread.
+      return c.body(null, 200);
+    }
 
     let classification: Awaited<ReturnType<typeof classifySlackEvent>>;
     try {

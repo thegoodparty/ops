@@ -27,6 +27,7 @@ import type {
   Signal,
   SignalAdapter,
 } from "../types";
+import { CHOICE_ACTION_PREFIX, type SlackChoiceClick } from "../slack/blocks";
 import { humanSignal } from "./human";
 
 export const SLACK_SOURCE = "slack";
@@ -253,6 +254,90 @@ export const classifySlackEvent = async (
   }
 
   return { kind: "mention", message };
+};
+
+// ---------------------------------------------------------------------------
+// Interactivity
+// ---------------------------------------------------------------------------
+
+/**
+ * Slack posts a button press to the same request URL as an event, signed the
+ * same `v0=` way over the same raw body, and answers on the same three-second
+ * budget. Only the encoding differs: a form body with one `payload` field
+ * holding the JSON. Nothing else BugBoss receives is form-encoded, so the
+ * content type is the whole discriminator.
+ */
+export const INTERACTION_CONTENT_TYPE = "application/x-www-form-urlencoded";
+
+export const isInteractionDelivery = (req: IncomingRequest): boolean =>
+  (headerValue(req, "Content-Type") ?? "")
+    .toLowerCase()
+    .includes(INTERACTION_CONTENT_TYPE);
+
+export type SlackInteraction =
+  | { kind: "choice"; click: SlackChoiceClick }
+  | { kind: "ignored"; reason: string };
+
+const field = (source: unknown, key: string): string => {
+  if (typeof source !== "object" || source === null) return "";
+  const value = (source as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : "";
+};
+
+/**
+ * Verify and classify one button press. Throws on an inauthentic delivery for
+ * the same reason the event path does: this endpoint is public, and an
+ * unverified one lets anyone answer an agent's question in somebody's name.
+ */
+export const classifySlackInteraction = (
+  req: IncomingRequest,
+  config: SlackConfig = {},
+): SlackInteraction => {
+  createSlackVerifier(config)(req);
+
+  const encoded = new URLSearchParams(req.rawBody).get("payload");
+  if (!encoded) throw new Error("slack ingress: interaction had no payload field");
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(encoded);
+  } catch {
+    throw new Error("slack ingress: interaction payload was not JSON");
+  }
+  if (typeof payload !== "object" || payload === null) {
+    throw new Error("slack ingress: interaction payload was not an object");
+  }
+
+  const body = payload as Record<string, unknown>;
+  if (body.type !== "block_actions") {
+    return { kind: "ignored", reason: `interaction type ${String(body.type)}` };
+  }
+
+  const actions = Array.isArray(body.actions) ? body.actions : [];
+  const action = actions.find((entry) =>
+    field(entry, "action_id").startsWith(CHOICE_ACTION_PREFIX),
+  );
+  if (!action) return { kind: "ignored", reason: "not a bugboss choice button" };
+
+  const channel = field(body.channel, "id");
+  const user = field(body.user, "id");
+  const messageTs = field(body.message, "ts");
+  // A question is always posted into the incident thread, so thread_ts is
+  // there. Falling back to the message's own ts keeps a top-level question —
+  // which only exists if the thread link broke — answerable rather than
+  // silently dropped.
+  const threadTs = field(body.message, "thread_ts") || messageTs;
+  const choice = field(action, "value");
+  const actionTs = field(action, "action_ts");
+
+  if (!channel || !user || !messageTs || !choice || !actionTs) {
+    return { kind: "ignored", reason: "incomplete interaction" };
+  }
+
+  return {
+    kind: "choice",
+    click: { channel, user, messageTs, threadTs, choice, actionTs },
+  };
 };
 
 export const createSlackAdapter = (config: SlackConfig = {}): SignalAdapter => {

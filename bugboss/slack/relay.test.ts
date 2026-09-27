@@ -7,6 +7,7 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
+import type { SlackChoiceClick } from "./blocks";
 import {
   SlackRelay,
   earnsMention,
@@ -95,6 +96,7 @@ after(() => {
 beforeEach(async () => {
   await db.withWrite((d) => {
     d.prepare("DELETE FROM pending_directive").run();
+    d.prepare("DELETE FROM pending_question").run();
     d.prepare("DELETE FROM thread_reply").run();
     d.prepare("DELETE FROM signal").run();
     d.prepare("DELETE FROM incident").run();
@@ -751,6 +753,155 @@ describe("mention text helpers", () => {
     assert.equal(
       stripBotMention(`<@${BOT}>  what is open   right now?`, BOT),
       "what is open right now?",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("a button press", () => {
+  const QUESTION_TS = "1800.5";
+
+  const askWithButtons = async (incidentId: string) => {
+    await seedIncident(incidentId);
+    const thread = await relay.emit({
+      type: "opened",
+      incidentId,
+      title: incidentId,
+      signalCount: 1,
+    });
+    await db.withWrite((d) => {
+      d.prepare(
+        "INSERT INTO pending_question (incidentId, messageTs, askedAt, message) VALUES (?, ?, ?, ?)",
+      ).run(incidentId, QUESTION_TS, Date.now(), "Roll back, or wait?");
+    });
+    return thread;
+  };
+
+  const press = (thread: string, over: Partial<SlackChoiceClick> = {}) =>
+    relay.handleChoice({
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      messageTs: QUESTION_TS,
+      threadTs: thread,
+      choice: "Roll back",
+      actionTs: "1800.9",
+      ...over,
+    });
+
+  test("is recorded and delivered exactly as a typed reply is", async () => {
+    const thread = await askWithButtons("inc-1");
+    const route = await press(thread);
+
+    assert.deepEqual(route, {
+      kind: "answered",
+      incidentId: "inc-1",
+      choice: "Roll back",
+      slackUserId: "U0HUMAN",
+    });
+
+    const replies = db.query<{ text: string; slackUserId: string }>(
+      "SELECT text, slackUserId FROM thread_reply WHERE incidentId = 'inc-1'",
+    );
+    assert.deepEqual(replies, [{ text: "Roll back", slackUserId: "U0HUMAN" }]);
+
+    // The agent waits on directives alone, and this is the one it reads. A
+    // press it cannot tell from prose is the whole contract.
+    const [directive] = db.query<{ payload: string }>(
+      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
+    );
+    assert.deepEqual(JSON.parse(directive.payload), {
+      type: "human_message",
+      from: "U0HUMAN",
+      text: "Roll back",
+      ts: "1800.9",
+    });
+  });
+
+  test("anyone in the channel may press, but a question takes one answer", async () => {
+    const thread = await askWithButtons("inc-1");
+    await press(thread);
+    const second = await press(thread, {
+      user: "U0OTHER",
+      choice: "Wait for the next deploy",
+      actionTs: "1801.0",
+    });
+
+    assert.deepEqual(second, {
+      kind: "duplicate",
+      incidentId: "inc-1",
+      slackUserId: "U0OTHER",
+    });
+    assert.equal(
+      db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-1'").length,
+      1,
+      "the second press delivers nothing",
+    );
+  });
+
+  test("a press on a question the agent has moved past changes nothing", async () => {
+    const thread = await askWithButtons("inc-1");
+    // What contact_human does once it has an answer, or once it times out.
+    await db.withWrite((d) => {
+      d.prepare("DELETE FROM pending_question WHERE incidentId = ?").run("inc-1");
+    });
+
+    const route = await press(thread);
+
+    assert.deepEqual(route, {
+      kind: "stale",
+      incidentId: "inc-1",
+      slackUserId: "U0HUMAN",
+    });
+    assert.equal(
+      db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-1'").length,
+      0,
+    );
+    assert.equal(
+      db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-1'").length,
+      0,
+      "a stale label must not be filed as the answer to whatever is asked now",
+    );
+  });
+
+  test("a press quoting an older question is stale, not an answer to this one", async () => {
+    const thread = await askWithButtons("inc-1");
+    const route = await press(thread, { messageTs: "1700.1" });
+    assert.equal(route.kind, "stale");
+  });
+
+  test("a press in a thread that is not an incident is ignored", async () => {
+    await askWithButtons("inc-1");
+    const route = await press("9999.9");
+    assert.deepEqual(route, {
+      kind: "ignore",
+      reason: "thread is not an incident thread",
+    });
+  });
+
+  test("typing the answer still works while the buttons are up", async () => {
+    const thread = await askWithButtons("inc-1");
+    const route = await relay.handle({
+      type: "message",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: "neither — the deploy is already out, just verify it",
+      ts: "1800.8",
+      thread_ts: thread,
+    });
+
+    assert.deepEqual(route, {
+      kind: "incident_reply",
+      incidentId: "inc-1",
+      interrupt: false,
+    });
+    const [directive] = db.query<{ payload: string }>(
+      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
+    );
+    assert.equal(
+      (JSON.parse(directive.payload) as { text: string }).text,
+      "neither — the deploy is already out, just verify it",
+      "an answer nobody offered as a button reaches the agent unchanged",
     );
   });
 });

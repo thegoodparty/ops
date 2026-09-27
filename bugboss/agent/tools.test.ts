@@ -13,6 +13,7 @@ import {
   runMonitor,
   shellProbe,
   truncateOutput,
+  unansweredBrief,
   type HumanContactPort,
   type PendingQuestion,
   type Probe,
@@ -118,7 +119,13 @@ test("truncateOutput leaves small output alone", () => {
 });
 
 const fakeContact = (pending: PendingQuestion | null = null) => {
-  const state = { pending, posts: [] as string[], cleared: 0, recorded: 0 };
+  const state = {
+    pending,
+    posts: [] as string[],
+    options: [] as (readonly string[] | undefined)[],
+    cleared: 0,
+    recorded: 0,
+  };
   const port: HumanContactPort = {
     getPending: async () => state.pending,
     recordPending: async (message) => {
@@ -128,8 +135,9 @@ const fakeContact = (pending: PendingQuestion | null = null) => {
         : { message, messageTs: "", askedAt: 1_000_000 };
       return state.pending;
     },
-    post: async (message) => {
+    post: async (message, options) => {
       state.posts.push(message);
+      state.options.push(options);
       if (state.pending) {
         state.pending = { ...state.pending, messageTs: `ts-${state.posts.length}` };
       }
@@ -744,5 +752,154 @@ test("the answered reply is consumed, so it cannot return as a fresh instruction
     await api.peekDirectives(),
     [{ id: 1, directive: { type: "new_signals", count: 1, summary: "one more 500" } }],
     "get_incident still owes the agent everything else, and only that",
+  );
+});
+
+// --- options are an affordance on the same ask ----------------------------
+
+test("options travel with the ask, and free text still answers it", async () => {
+  const clock = fakeClock();
+  const { state, port } = fakeContact();
+  const escalate = recordingEscalate();
+  const api = directiveFeed(
+    [],
+    // Typed, not pressed. An answer nobody offered has to land the same way.
+    [{ type: "human_message", from: "U1", text: "neither, hold", ts: "1000.500000" }],
+  );
+
+  const result = await runContactHuman(
+    {
+      message: "Roll back, or wait?",
+      details: "the migration is half applied",
+      timeoutSeconds: 3600,
+      options: ["Roll back", "Wait"],
+    },
+    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  // The buttons ride on the ask. `details` is its own post underneath, and
+  // the thing a reader answers is the one above it.
+  assert.deepEqual(state.posts, ["Roll back, or wait?", "the migration is half applied"]);
+  assert.deepEqual(state.options, [["Roll back", "Wait"], undefined]);
+  assert.equal(result.reply, "neither, hold", "free text still answers");
+  assert.equal(result.escalation, null);
+  assert.equal(state.cleared, 1, "the marker is cleared exactly as it always was");
+});
+
+test("a button nobody presses is silence, and silence still escalates", async () => {
+  const clock = fakeClock();
+  const { state, port } = fakeContact();
+  const escalate = recordingEscalate();
+  const api = directiveFeed([]);
+
+  const result = await runContactHuman(
+    {
+      message: "Roll back, or wait?",
+      timeoutSeconds: 60,
+      options: ["Roll back", "Wait for the next deploy"],
+    },
+    {
+      contact: port,
+      api,
+      escalate: escalate.port,
+      sleep: clock.sleep,
+      now: clock.now,
+      pollSeconds: 60,
+      minWaitSeconds: 600,
+    },
+  );
+
+  // The floor, the deadline and the hand-off all apply unchanged. Options
+  // that skipped any of them would be a way to ask without being escalatable.
+  assert.equal(api.reads.length, 11, "the floor is not opted out of by offering buttons");
+  assert.deepEqual(result.escalation, { handedOff: true, reason: "no reply in 10 minutes" });
+  assert.equal(result.terminate, true);
+  assert.equal(state.cleared, 1);
+});
+
+test("the harness brief carries what was offered, for whoever picks it up", async () => {
+  const clock = fakeClock();
+  const { port } = fakeContact();
+  const escalate = recordingEscalate();
+  const api = directiveFeed([]);
+
+  await runContactHuman(
+    {
+      message: "Roll back, or wait?",
+      timeoutSeconds: 600,
+      options: ["Roll back", "Wait for the next deploy"],
+    },
+    {
+      contact: port,
+      api,
+      escalate: escalate.port,
+      sleep: clock.sleep,
+      now: clock.now,
+      pollSeconds: 600,
+      minWaitSeconds: 600,
+    },
+  );
+
+  const { brief } = escalate.calls[0];
+  assert.match(brief, /What I offered/);
+  assert.match(brief, /• Roll back/);
+  assert.match(brief, /• Wait for the next deploy/);
+});
+
+test("a question asked without options says nothing about offering any", () => {
+  assert.equal(unansweredBrief("anyone?", 30).includes("What I offered"), false);
+});
+
+test("a resumed agent does not re-post a question whose buttons are already up", async () => {
+  const clock = fakeClock();
+  const { state, port } = fakeContact({
+    message: "Roll back, or wait?",
+    messageTs: "ts-1",
+    askedAt: 999_000,
+  });
+  const escalate = recordingEscalate();
+  const api = directiveFeed([
+    { type: "human_message", from: "U1", text: "Roll back", ts: "1000.000000" },
+  ]);
+
+  await runContactHuman(
+    {
+      message: "Roll back, or wait?",
+      timeoutSeconds: 3600,
+      options: ["Roll back", "Wait"],
+    },
+    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.deepEqual(state.posts, [], "a second set of buttons would be a second question");
+});
+
+test("unusable options are refused before anything is posted", async () => {
+  const clock = fakeClock();
+  const { state, port } = fakeContact();
+  const escalate = recordingEscalate();
+  const api = directiveFeed([]);
+
+  const tool = await createContactHumanTool({
+    contact: port,
+    api,
+    escalate: escalate.port,
+    sleep: clock.sleep,
+    now: clock.now,
+  });
+  const result = await tool.execute(
+    "call-1",
+    { message: "pick", timeoutSeconds: 3600, options: ["only one"] } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.deepEqual(state.posts, [], "nothing reaches the thread");
+  assert.equal(state.recorded, 0, "and no marker is left behind for it");
+  assert.equal(escalate.calls.length, 0, "a refusal is not an unanswered question");
+  assert.match(
+    String(result.content[0].type === "text" && result.content[0].text),
+    /at least two/,
   );
 });

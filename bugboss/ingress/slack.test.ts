@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test } from "node:test";
 
+import { CHOICE_ACTION_PREFIX } from "../slack/blocks";
 import {
   classifySlackEvent,
+  classifySlackInteraction,
   createSlackAdapter,
+  isInteractionDelivery,
   type SlackConfig,
 } from "./slack";
 import type { IncomingRequest } from "../types";
@@ -326,4 +329,136 @@ test("a Slack retry of the same report dedups", async () => {
 test("a Slack adapter pre-fetches nothing", async () => {
   const adapter = createSlackAdapter(config);
   assert.deepEqual(await adapter.prefetchEvidence({} as never), []);
+});
+
+// --- interactions: a different encoding, the same signature scheme ---------
+
+const CLICK = {
+  type: "block_actions",
+  user: { id: "U0HUMAN" },
+  channel: { id: "C0BUGS" },
+  message: { ts: "1764000000.000300", thread_ts: "1764000000.000001" },
+  actions: [
+    {
+      action_id: `${CHOICE_ACTION_PREFIX}0`,
+      value: "Roll back",
+      action_ts: "1764000000.000400",
+    },
+  ],
+};
+
+/** How Slack actually delivers one: a form body, not JSON. */
+const interaction = (
+  payload: unknown,
+  overrides: { signature?: string; stamp?: string } = {},
+): IncomingRequest => {
+  const rawBody = new URLSearchParams({
+    payload: JSON.stringify(payload),
+  }).toString();
+  const stamp = overrides.stamp ?? String(Math.floor(NOW / 1000));
+  return {
+    rawBody,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-slack-signature": overrides.signature ?? sign(rawBody, stamp),
+      "x-slack-request-timestamp": stamp,
+    },
+  };
+};
+
+test("an interaction is told from an event by its content type alone", () => {
+  assert.equal(isInteractionDelivery(interaction(CLICK)), true);
+  assert.equal(isInteractionDelivery(request(event())), false);
+});
+
+test("rejects a click whose signature was made with the wrong secret", () => {
+  const req = interaction(CLICK);
+  const stamp = req.headers["x-slack-request-timestamp"];
+  assert.throws(
+    () =>
+      classifySlackInteraction(
+        interaction(CLICK, { signature: sign(req.rawBody, stamp, "not-the-secret") }),
+        config,
+      ),
+    /signature mismatch/,
+  );
+});
+
+test("rejects a click signed over a different body", () => {
+  // The whole point of signing the raw body: swapping the answer after the
+  // fact has to fail, because the form encoding is what was signed.
+  const honest = interaction(CLICK);
+  const tampered = {
+    ...honest,
+    rawBody: honest.rawBody.replace("Roll+back", "Drop+the+database"),
+  };
+  assert.throws(() => classifySlackInteraction(tampered, config), /signature mismatch/);
+});
+
+test("rejects a replayed click", () => {
+  const stale = String(Math.floor(NOW / 1000) - 600);
+  assert.throws(
+    () => classifySlackInteraction(interaction(CLICK, { stamp: stale }), config),
+    /replay window/,
+  );
+});
+
+test("rejects every click when no signing secret is configured", () => {
+  assert.throws(
+    () => classifySlackInteraction(interaction(CLICK), { botUserId: BOT, now }),
+    /no signing secret is configured/,
+  );
+});
+
+test("a verified click carries the label, the question and who pressed it", () => {
+  const result = classifySlackInteraction(interaction(CLICK), config);
+  assert.equal(result.kind, "choice");
+  assert.deepEqual(result.kind === "choice" ? result.click : null, {
+    channel: "C0BUGS",
+    user: "U0HUMAN",
+    messageTs: "1764000000.000300",
+    threadTs: "1764000000.000001",
+    choice: "Roll back",
+    actionTs: "1764000000.000400",
+  });
+});
+
+test("a button that is not ours is ignored, not guessed at", () => {
+  const foreign = {
+    ...CLICK,
+    actions: [{ action_id: "someone_elses_button", value: "x", action_ts: "1.0" }],
+  };
+  const result = classifySlackInteraction(interaction(foreign), config);
+  assert.deepEqual(result, { kind: "ignored", reason: "not a bugboss choice button" });
+});
+
+test("anything but a button press is ignored", () => {
+  const submission = { ...CLICK, type: "view_submission" };
+  const result = classifySlackInteraction(interaction(submission), config);
+  assert.equal(result.kind, "ignored");
+});
+
+test("a verified but incomplete payload is ignored rather than half-read", () => {
+  const headless = { ...CLICK, message: {} };
+  const result = classifySlackInteraction(interaction(headless), config);
+  assert.deepEqual(result, { kind: "ignored", reason: "incomplete interaction" });
+});
+
+test("a form body with no payload field is a rejected delivery, not an empty one", () => {
+  const stamp = String(Math.floor(NOW / 1000));
+  assert.throws(
+    () =>
+      classifySlackInteraction(
+        {
+          rawBody: "nothing=here",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            "x-slack-signature": sign("nothing=here", stamp),
+            "x-slack-request-timestamp": stamp,
+          },
+        },
+        config,
+      ),
+    /no payload field/,
+  );
 });

@@ -52,6 +52,7 @@ import {
 } from "./http";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
 import { createSlackAck } from "./slack/ack";
+import type { ChoicePoster, SlackChoiceClick } from "./slack/blocks";
 import { mrkdwn, raw, userMention } from "./slack/format";
 import {
   createRotationReader,
@@ -61,6 +62,7 @@ import {
 import {
   SlackRelay,
   mentionPrefix,
+  type ChoiceRoute,
   type InboundRoute,
   type OwnershipClaim,
   type SlackEvent,
@@ -175,7 +177,7 @@ export interface CreateBugBossOptions {
   loki?: LokiQuery;
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
   model: ModelClient;
-  slack: SlackClient;
+  slack: BossSlackClient;
   /** What a launch means. Defaults to a child process. */
   spawnAgent?: SpawnAgent;
   /** Omitted means no S3: state stays in memory and dies with the process. */
@@ -232,6 +234,12 @@ export interface AcceptedSlackEvent {
   settled: Promise<void>;
 }
 
+/** A button press: recorded inside the ack, acknowledged in the thread after. */
+export interface AcceptedSlackInteraction {
+  routed: ChoiceRoute["kind"];
+  settled: Promise<void>;
+}
+
 export interface BugBoss {
   readonly db: Db;
   readonly dispatcher: Dispatcher;
@@ -252,6 +260,10 @@ export interface BugBoss {
   slackEvent(event: SlackEvent): Promise<void>;
   /** Relay now, answer after. What the webhook route calls. */
   slackEventAccepted(event: SlackEvent): Promise<AcceptedSlackEvent>;
+  /** Record a verified button press, then say so in the thread. */
+  slackInteractionAccepted(
+    click: SlackChoiceClick,
+  ): Promise<AcceptedSlackInteraction>;
   /** One dispatcher tick, waited out. Agents normally outlive a tick. */
   dispatchOnce(): Promise<TickResult>;
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
@@ -551,11 +563,16 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
   return Promise.race([work, expiry]).finally(() => clearTimeout(timer));
 };
 
-export const withSlackDeadline = (slack: SlackClient): SlackClient => ({
+/** Everything the Boss needs from Slack: posts, buttons, and thread reads. */
+export type BossSlackClient = SlackClient & ChoicePoster;
+
+export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
   post: (threadTs, text, channel) =>
     withDeadline(slack.post(threadTs, text, channel), "chat.postMessage"),
   react: (channel, ts, name) =>
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
+  postChoice: (threadTs, text, blocks) =>
+    withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
 });
 
@@ -1508,6 +1525,50 @@ export const createBugBoss = async (
     await (await slackEventAccepted(event)).settled;
   };
 
+  /**
+   * A button press, once the relay has decided what it was.
+   *
+   * The thread is the incident's record, so every press leaves a line in it —
+   * including the two that changed nothing. A button that silently does
+   * nothing is indistinguishable from a broken one, and the person who
+   * pressed it would reasonably go on waiting for an agent that never heard
+   * them. Each line ends by pointing at the thing that always works: typing.
+   */
+  const acknowledgeChoice = async (
+    route: ChoiceRoute,
+    click: SlackChoiceClick,
+  ): Promise<void> => {
+    if (route.kind === "ignore") {
+      log("choice_ignored", { reason: route.reason, user: click.user });
+      return;
+    }
+    const who = raw(userMention(route.slackUserId));
+    const text =
+      route.kind === "answered"
+        ? mrkdwn`${who} chose *${route.choice}*.`
+        : route.kind === "duplicate"
+          ? mrkdwn`${who} that question already has an answer. Reply in the thread to add anything else.`
+          : mrkdwn`${who} that question is closed and the agent has moved on. Reply in the thread and it will read you.`;
+    await slack
+      .post(click.threadTs, text, click.channel)
+      .then(() => undefined)
+      .catch((err: unknown) =>
+        alarm("choice_post_failed", {
+          incidentId: route.incidentId,
+          error: String(err),
+        }),
+      );
+  };
+
+  const slackInteractionAccepted = async (
+    click: SlackChoiceClick,
+  ): Promise<AcceptedSlackInteraction> => {
+    // The write is bounded and idempotent on the question's ts, so it stays
+    // inside the three seconds Slack gives an interaction. The post does not.
+    const route = await relay.handleChoice(click);
+    return { routed: route.kind, settled: acknowledgeChoice(route, click) };
+  };
+
   // -------------------------------------------------------------------------
   // Servers and timers
   // -------------------------------------------------------------------------
@@ -1519,6 +1580,7 @@ export const createBugBoss = async (
     // answers alarms on the same ten-second budget every other Slack call
     // has rather than sitting as a detached promise forever.
     acknowledgeSlack: createSlackAck(slack),
+    slackInteractionAccepted,
     slackConfig: slackIngress,
   });
   const loopbackApp = createToolApiRoutes({
@@ -1577,6 +1639,7 @@ export const createBugBoss = async (
     ingestAccepted,
     slackEvent,
     slackEventAccepted,
+    slackInteractionAccepted,
     dispatchOnce,
     sweepOrphans,
     ensureIncidentThreads,
