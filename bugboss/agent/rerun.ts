@@ -278,13 +278,23 @@ export const githubRefusalText = (
   return `GitHub refused with ${status || "a transport error"}: ${message}`;
 };
 
+/**
+ * `toMrkdwn` passes a `<…>` entity through byte for byte, so a `<`, `>` or `|`
+ * inside the workflow name would end the link early and swallow the rest of
+ * the line. The name comes from our own workflow files rather than from
+ * telemetry, so this is belt and braces — but a silently mangled post is
+ * exactly the failure this system is built not to have.
+ */
+const linkLabel = (name: string): string =>
+  name.replace(/[<>|]/g, " ").replace(/\s+/g, " ").trim() || "the workflow run";
+
 export const rerunNotice = (
   repo: string,
   run: WorkflowRunView,
   suspicion: string,
 ): string =>
   [
-    `*Re-running the failed jobs in ${repo} <${run.html_url}|${run.name}>.*`,
+    `*Re-running the failed jobs in ${repo} <${run.html_url}|${linkLabel(run.name)}>.*`,
     "",
     suspicion.trim(),
     "",

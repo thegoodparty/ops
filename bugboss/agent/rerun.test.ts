@@ -496,3 +496,15 @@ test("a body that is not JSON on a 200 is a refusal, not a crash", async () => {
 
   assert.equal(result.ok, false);
 });
+
+test("a workflow name cannot break out of the link it is the label for", () => {
+  const notice = rerunNotice(
+    "thegoodparty/omni",
+    aRun({ name: "E2E <prod> | nightly" }),
+    "flaky",
+  );
+
+  assert.match(notice, /\|E2E prod nightly>/);
+  assert.equal(notice.split("<").length, 2, "exactly one entity opens");
+  assert.equal(notice.split(">").length, 2, "and exactly one closes it");
+});
