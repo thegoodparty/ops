@@ -5,6 +5,7 @@
 // has this alert slug produced a real incident before, how did the last one
 // resolve, how often does this fire and get suppressed.
 
+import { searchIncidents, type SearchReader } from "../db/search";
 import type { LoopTool } from "./model";
 
 /** The read half of the database. `Db` from ../db satisfies it structurally. */
@@ -13,6 +14,7 @@ export interface IncidentReader {
 }
 
 export const QUERY_TOOL = "query_incidents";
+export const SEARCH_TOOL = "search_incidents";
 
 const MAX_ROWS = 50;
 const MAX_CHARS = 4000;
@@ -111,3 +113,62 @@ export const attachedSignalIds = (db: IncidentReader, incidentId: string): strin
   db
     .query<{ id: string }>("SELECT id FROM signal WHERE incidentId = ?", [incidentId])
     .map((row) => row.id);
+
+const MAX_SEARCH_RESULTS = 5;
+const MAX_SEARCH_CAUSE_CHARS = 300;
+
+/**
+ * Text search over the post-mortems of incidents that already claimed a
+ * problem was over. A tool rather than a lookup done for the caller, because
+ * a search needs a query and only something that has read the signal can
+ * write one -- and because the incident agent needs the same reach, not just
+ * triage.
+ *
+ * It catches what an exact key cannot: the same cause returning through a
+ * different alert rule. That is the premature close worth catching, and no
+ * structural key sees it.
+ */
+export const searchTool = (db: SearchReader & IncidentReader): LoopTool => ({
+  spec: {
+    name: SEARCH_TOOL,
+    description:
+      "Search the post-mortems, root causes and resolution evidence of incidents that were RESOLVED or CLOSED. Pass plain words describing the failure -- the mechanism, the component, the error text -- not a question and not SQL. Returns the best matches with an excerpt of where the query hit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description:
+            "Words from the signal: the failing operation, the component, the error. Common incident words like 'error' and 'prod' are ignored.",
+        },
+      },
+      required: ["text"],
+    },
+  },
+  run: (input) => {
+    const text = typeof input.text === "string" ? input.text : "";
+    if (text.trim().length === 0) return "error: search needs some text";
+    try {
+      const hits = searchIncidents(db, text, MAX_SEARCH_RESULTS);
+      if (hits.length === 0) {
+        return "0 matches. Nothing already closed reads like this, on these words.";
+      }
+      return hits
+        .map(
+          (hit) =>
+            `- ${hit.incidentId} | ${hit.status} | resolved ${
+              hit.resolvedAt ? new Date(hit.resolvedAt).toISOString().slice(0, 10) : "?"
+            }\n  rootCause: ${
+              hit.rootCause
+                ? hit.rootCause.slice(0, MAX_SEARCH_CAUSE_CHARS)
+                : "never established"
+            }\n  matched: ${hit.excerpt}`,
+        )
+        .join("\n");
+    } catch (err) {
+      // Never an empty result. "The search is broken" and "nothing in the
+      // corpus matches" are the two answers that must not look alike.
+      return `error: the incident search failed (${String(err)}); this is not the same as finding nothing`;
+    }
+  },
+});

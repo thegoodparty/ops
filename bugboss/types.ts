@@ -46,6 +46,16 @@ export interface Signal {
   explained: boolean;
 }
 
+/** One hit from `searchIncidents`. Produced by `db/search.ts`. */
+export interface IncidentMatch {
+  incidentId: string;
+  status: string;
+  rootCause: string | null;
+  resolvedAt: number | null;
+  /** Where the query hit in the post-mortem, with matched terms bracketed. */
+  excerpt: string;
+}
+
 export interface Incident {
   id: string;
   status: IncidentStatus;
@@ -74,6 +84,8 @@ export interface Incident {
   recurrenceOf: string | null;
 
   resolvedEvidence: string | null;
+  /** JSON `RecurrenceAnalysis`. Required to close an incident that recurred. */
+  recurrenceAnalysis: string | null;
 
   sessionRef: string | null;
   /** When the current or most recent launch started. Survives a restart. */
@@ -229,7 +241,21 @@ export interface ToolApi {
     postmortem: string;
     usersImpacted: number;
     impactQuery: string;
+    /**
+     * Required when the incident carries `recurrenceOf`, refused without it.
+     * A recurrence closes on a second question the first incident never had
+     * to answer, and the post-mortem that does not answer it leaves the next
+     * agent exactly where this one started.
+     */
+    recurrence?: RecurrenceAnalysis;
   }): Promise<ToolResponse>;
+
+  /**
+   * Read-only. Text search over the post-mortems of incidents that already
+   * claimed a problem was over -- the reach an exact signal key does not
+   * have, and the only way to find the same cause under a different alert.
+   */
+  searchIncidents(args: { text: string }): Promise<ToolResponse<IncidentMatch[]>>;
 
   /** Terminal. Sets owner: human and posts the brief. */
   handOff(args: { reason: string; brief: string }): Promise<ToolResponse>;
@@ -258,6 +284,41 @@ export interface PriorIncident {
   postmortem: string | null;
   resolvedAt: number | null;
   closedAt: number | null;
+}
+
+/**
+ * Why a resolution that met the bar did not hold.
+ *
+ * `category` is a closed set on purpose. Free text is what an agent produces
+ * when it has not decided, and the whole value of this field is that the
+ * answer is one of a few different kinds of failure -- one of which is a
+ * defect in BugBoss itself, which nothing else in the system would ever
+ * surface.
+ */
+export type RecurrenceCategory =
+  /** The recorded cause was not the cause, or was a symptom of it. */
+  | "previous_fix_wrong"
+  /** The cause was real but covered one path into the failure, not all. */
+  | "previous_fix_incomplete"
+  /** The fix held; the alert should not have fired either time. */
+  | "alert_is_wrong"
+  /** The fix held but was never deployed, or was reverted. */
+  | "fix_never_reached_production"
+  /** RESOLVED was claimed on evidence too weak to carry it. */
+  | "resolution_evidence_too_weak"
+  /** BugBoss let a premature close happen. The fix belongs in ops. */
+  | "bugboss_defect";
+
+export interface RecurrenceAnalysis {
+  category: RecurrenceCategory;
+  /** Why the earlier resolution did not hold, specifically. */
+  why: string;
+  /**
+   * What was done about *that*, as opposed to about the symptom: pull
+   * request urls, or an explicit statement that nothing was and why. An
+   * empty answer is refused; "nothing, because X" is not.
+   */
+  remedy: string;
 }
 
 export interface IncidentView {

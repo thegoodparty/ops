@@ -486,6 +486,7 @@ export class Dispatcher {
       reportAnalysis: (args) => tools.reportAnalysis(args),
       handOff: (args) => tools.handOff(args),
       getIncident: () => tools.getIncident(),
+      searchIncidents: (args) => tools.searchIncidents(args),
       incidentId: row.id,
       sessionRef: row.sessionRef,
       attempt,

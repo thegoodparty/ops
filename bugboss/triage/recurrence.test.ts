@@ -129,7 +129,6 @@ describe("recurrence: the closed-incident analogue of the open list", () => {
 
     assert.equal(found.length, 1);
     assert.equal(found[0]?.incidentId, "41");
-    assert.equal(found[0]?.match, "exact_signal");
     assert.equal(found[0]?.conclusive, true);
     assert.equal(found[0]?.daysSince, 6);
     assert.match(String(found[0]?.rootCause), /statement timeout/);
@@ -194,7 +193,7 @@ describe("recurrence: the closed-incident analogue of the open list", () => {
     assert.deepEqual(findRecurrenceCandidates(db, signal()), []);
   });
 
-  it("matches the wider slug key, and marks it as the weaker one", async () => {
+  it("ignores a sibling alert on the same slug", async () => {
     await seedClosed({
       id: "41",
       sourceId: "fp-OTHER",
@@ -202,29 +201,11 @@ describe("recurrence: the closed-incident analogue of the open list", () => {
       resolvedAt: NOW - DAY,
     });
 
-    const found = findRecurrenceCandidates(db, signal());
-
-    assert.equal(found[0]?.incidentId, "41");
-    assert.equal(found[0]?.match, "same_alert");
-    assert.equal(
-      found[0]?.conclusive,
-      false,
-      "one rule covers many instances, so a slug match is a question for the model",
+    assert.deepEqual(
+      findRecurrenceCandidates(db, signal()),
+      [],
+      "a shared rule is not a shared cause; that reach belongs to the search",
     );
-  });
-
-  it("prefers the exact match and does not list an incident twice", async () => {
-    await seedClosed({
-      id: "41",
-      sourceId: "fp-1",
-      slug: "campaigns-route-errors",
-      resolvedAt: NOW - DAY,
-    });
-
-    const found = findRecurrenceCandidates(db, signal());
-
-    assert.equal(found.length, 1);
-    assert.equal(found[0]?.match, "exact_signal");
   });
 
   it("takes the newest resolution when an alert has recurred before", async () => {
@@ -265,20 +246,6 @@ describe("recurrence: the closed-incident analogue of the open list", () => {
 
     assert.match(plan, /signal_source_idx/);
     assert.doesNotMatch(plan, /SCAN s\b/);
-  });
-
-  it("uses the expression index for the slug key", async () => {
-    const plan = db
-      .query<{ detail: string }>(
-        `EXPLAIN QUERY PLAN
-         SELECT i.id FROM signal s JOIN incident i ON i.id = s.incidentId
-         WHERE json_extract(s.labels, '$.alert_slug') = ?`,
-        ["campaigns-route-errors"],
-      )
-      .map((row) => row.detail)
-      .join(" | ");
-
-    assert.match(plan, /signal_slug_idx/);
   });
 });
 

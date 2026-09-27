@@ -43,7 +43,7 @@ export const createTriage = (config: TriageConfig): Triage => ({
 
 export { runTriage } from "./triage";
 export { runCorrelation } from "./correlate";
-export { prepareQuery, QUERY_TOOL } from "./sql";
+export { prepareQuery, QUERY_TOOL, SEARCH_TOOL, searchTool } from "./sql";
 export {
   conclusiveRecurrence,
   findRecurrenceCandidates,
@@ -61,7 +61,7 @@ export type {
   MergeProposal,
 } from "./correlate";
 export type { IncidentReader } from "./sql";
-export type { RecurrenceCandidate, RecurrenceMatch } from "./recurrence";
+export type { RecurrenceCandidate } from "./recurrence";
 export type {
   LoopTool,
   ModelClient,

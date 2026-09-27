@@ -12,7 +12,6 @@
 // already is, in the one bounded call triage was already making.
 
 import type { RawSignal } from "../types";
-import { SLUG_LABEL } from "../ingress/grafana";
 import type { IncidentReader } from "./sql";
 
 const DAY_MS = 86_400_000;
@@ -35,31 +34,29 @@ const MAX_CAUSE_CHARS = 400;
 const MAX_EVIDENCE_CHARS = 300;
 
 /**
- * How the candidate was found, strongest first.
+ * `(source, sourceId)`: the dedup key every adapter must produce, and the one
+ * the schema's partial unique index was built around -- the delivery proving
+ * a resolution was premature is the one most certain to collide with the
+ * signal that resolution closed.
  *
- * `exact_signal` is `(source, sourceId)`, the dedup key every adapter must
- * produce and the one the schema's partial unique index was built around: the
- * delivery proving a resolution was premature is the one most certain to
- * collide with the signal that resolution closed.
- *
- * `same_alert` is the same `alert_slug` on a different sourceId -- the same
- * rule firing on a different instance. Weaker, because one rule covers many
- * instances and two of them breaking is often two problems.
+ * It is the only key this module matches on. The alert slug looks like a
+ * cheaper widening and is not one: it is an optional label, one rule covers
+ * many instances, and it is structurally blind to the case that matters most
+ * -- the same cause coming back through a different alert. That case is
+ * reached by searching the post-mortems instead, which is a judgement and so
+ * belongs to the model rather than here. See `db/search.ts`.
  */
-export type RecurrenceMatch = "exact_signal" | "same_alert";
-
 export interface RecurrenceCandidate {
   incidentId: string;
   status: string;
-  match: RecurrenceMatch;
   rootCause: string | null;
   resolvedEvidence: string | null;
   resolvedAt: number;
   /** Signed: negative means the incident resolved after this signal started. */
   daysSince: number;
   /**
-   * An exact-key match inside the window. Recurrence without a judgement, so
-   * triage stamps it whether or not the model mentions it.
+   * Inside the window. Recurrence without a judgement, so triage stamps it
+   * whether or not the model mentions it.
    */
   conclusive: boolean;
   signalTitle: string;
@@ -95,7 +92,6 @@ const clip = (text: string, max: number) =>
 
 const toCandidate = (
   row: CandidateRow,
-  match: RecurrenceMatch,
   openedAt: number,
 ): RecurrenceCandidate | null => {
   if (!row.incidentId || !row.status || row.resolvedAt === null) return null;
@@ -103,7 +99,6 @@ const toCandidate = (
   return {
     incidentId: row.incidentId,
     status: row.status,
-    match,
     rootCause: row.rootCause ? clip(row.rootCause, MAX_CAUSE_CHARS) : null,
     resolvedEvidence: row.resolvedEvidence
       ? clip(row.resolvedEvidence, MAX_EVIDENCE_CHARS)
@@ -113,7 +108,7 @@ const toCandidate = (
     // A negative interval is not an error and is not excluded: an alert that
     // was still firing when the incident was marked RESOLVED is the premature
     // close in its purest form.
-    conclusive: match === "exact_signal" && sinceMs <= RECURRENCE_WINDOW_MS,
+    conclusive: sinceMs <= RECURRENCE_WINDOW_MS,
     signalTitle: row.signalTitle ?? "(no title)",
   };
 };
@@ -127,31 +122,16 @@ const toCandidate = (
 export const findRecurrenceCandidates = (
   db: IncidentReader,
   signal: RawSignal,
-): RecurrenceCandidate[] => {
-  const floor = signal.openedAt - CANDIDATE_LOOKBACK_MS;
-
-  const exact = db
-    .query<CandidateRow>(
-      `${SELECT}s.source = ? AND s.sourceId = ? ${TAIL}`,
-      [signal.source, signal.sourceId, floor, MAX_CANDIDATES],
-    )
-    .map((row) => toCandidate(row, "exact_signal", signal.openedAt))
+): RecurrenceCandidate[] =>
+  db
+    .query<CandidateRow>(`${SELECT}s.source = ? AND s.sourceId = ? ${TAIL}`, [
+      signal.source,
+      signal.sourceId,
+      signal.openedAt - CANDIDATE_LOOKBACK_MS,
+      MAX_CANDIDATES,
+    ])
+    .map((row) => toCandidate(row, signal.openedAt))
     .filter((c): c is RecurrenceCandidate => c !== null);
-
-  const slug = signal.labels[SLUG_LABEL];
-  if (!slug) return exact;
-
-  const seen = new Set(exact.map((c) => c.incidentId));
-  const wider = db
-    .query<CandidateRow>(
-      `${SELECT}json_extract(s.labels, '$.${SLUG_LABEL}') = ? AND s.sourceId <> ? ${TAIL}`,
-      [slug, signal.sourceId, floor, MAX_CANDIDATES],
-    )
-    .map((row) => toCandidate(row, "same_alert", signal.openedAt))
-    .filter((c): c is RecurrenceCandidate => c !== null && !seen.has(c.incidentId));
-
-  return [...exact, ...wider].slice(0, MAX_CANDIDATES);
-};
 
 /**
  * The one candidate triage does not need the model's opinion about. Newest
@@ -168,12 +148,8 @@ const describe = (c: RecurrenceCandidate): string => {
     c.daysSince < 0
       ? `resolved ${Math.abs(c.daysSince)}d after this signal started`
       : `resolved ${c.daysSince}d before this signal started`;
-  const how =
-    c.match === "exact_signal"
-      ? "same source and sourceId as this signal"
-      : `same ${SLUG_LABEL}, different sourceId`;
   return [
-    `- ${c.incidentId} | ${c.status} | ${when} | ${how}${c.conclusive ? " | CONCLUSIVE" : ""}`,
+    `- ${c.incidentId} | ${c.status} | ${when}${c.conclusive ? " | CONCLUSIVE" : ""}`,
     `  its signal: ${clip(c.signalTitle, 200)}`,
     `  rootCause: ${c.rootCause ?? "never established"}`,
     `  resolved because: ${c.resolvedEvidence ?? "no evidence recorded"}`,
@@ -195,7 +171,13 @@ The lookup failed, so whether an earlier incident already claimed this was
 fixed is not known here. Do not read this as "none".`;
   }
   if (candidates.length === 0) {
-    return "RECURRENCE CANDIDATES\n(no incident in the last 90 days claimed this problem was over)";
+    return `RECURRENCE CANDIDATES
+(no incident in the last 90 days closed on this exact signal)
+This only rules out the same alert returning. The same cause coming back
+through a different alert looks like nothing here, so search the post-mortems
+before you decide this is new.`;
   }
-  return `RECURRENCE CANDIDATES\n${candidates.map(describe).join("\n")}`;
+  return `RECURRENCE CANDIDATES\n${candidates.map(describe).join("\n")}
+These closed on this exact signal. A different alert carrying the same cause
+would not appear here; search the post-mortems for that.`;
 };

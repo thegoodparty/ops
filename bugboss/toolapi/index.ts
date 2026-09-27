@@ -20,13 +20,16 @@
 import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
+import { indexIncident, searchIncidents } from "../db/search";
 import type {
   Directive,
   Evidence,
   Incident,
   IncidentStatus,
+  IncidentMatch,
   IncidentView,
   PriorIncident,
+  RecurrenceAnalysis,
   Signal,
   ToolApi,
   ToolResponse,
@@ -582,6 +585,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["FIXING"], "reportResolved");
       if (stop) return reject(stop);
 
+      const repeated = repeatedEvidence(incident, args.evidence);
+      if (repeated) return reject(repeated);
+
       const splits = await db.withWrite((w) => {
         const at = Date.now();
         const taken = w
@@ -614,6 +620,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           );
 
         closeOpenSignals(w, incidentId, at);
+        // RESOLVED is already searchable ground: it claims no further alerts
+        // should occur, which is the claim a later signal contradicts.
+        indexIncident(w, incidentId);
         return unexplained;
       });
       if (splits === null) return raced(incidentId, "reportResolved");
@@ -646,6 +655,52 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       };
     });
 
+  /** Long enough to be an answer rather than an acknowledgement. */
+  const MIN_RECURRENCE_ANSWER_CHARS = 40;
+
+  /**
+   * The one invariant a `CHECK` constraint would have carried if the schema
+   * could still take one. Refused at the tool, like the over-long
+   * `contact_human` message: an agent that cannot say why the last
+   * resolution failed has not finished, and its other exit is `hand_off`,
+   * which is the correct place for a recurrence nobody can explain.
+   */
+  const recurrenceGap = (
+    incident: Incident,
+    analysis: RecurrenceAnalysis | undefined,
+  ): string | null => {
+    if (!incident.recurrenceOf) return null;
+    if (!analysis) {
+      return `incident ${incident.id} is a recurrence of ${incident.recurrenceOf}, so reportAnalysis needs a recurrence argument: why that resolution did not hold, which kind of failure it was, and what you did about that rather than about the symptom. If you cannot answer it, hand off instead of closing.`;
+    }
+    if (analysis.why.trim().length < MIN_RECURRENCE_ANSWER_CHARS) {
+      return `recurrence.why is too short to be an answer; say specifically why the resolution of ${incident.recurrenceOf} did not hold`;
+    }
+    if (analysis.remedy.trim().length < MIN_RECURRENCE_ANSWER_CHARS) {
+      return `recurrence.remedy is too short; name what you changed so this does not recur again, or state plainly that you changed nothing and why`;
+    }
+    return null;
+  };
+
+  /**
+   * Byte-identical resolution evidence on a recurrence is the failure the
+   * previous incident already made: watching the same window for the same
+   * interval and reporting the same quiet is how a premature close happens
+   * twice. Narrow on purpose -- it catches the literal repeat, not a
+   * paraphrase, and the prompt carries the rest.
+   */
+  const repeatedEvidence = (incident: Incident, evidence: string): string | null => {
+    if (!incident.recurrenceOf) return null;
+    const prior = readIncident(incident.recurrenceOf);
+    const same =
+      prior?.resolvedEvidence &&
+      prior.resolvedEvidence.trim().replace(/\s+/g, " ") ===
+        evidence.trim().replace(/\s+/g, " ");
+    return same
+      ? `this is the resolution evidence incident ${incident.recurrenceOf} was closed on, and it did not hold. Watch something the last check would have missed, or for longer, before claiming this one is resolved.`
+      : null;
+  };
+
   const reportAnalysis: ToolApi["reportAnalysis"] = (args) =>
     call("reportAnalysis", async (incidentId) => {
       const incident = readIncident(incidentId);
@@ -653,6 +708,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       const stop = blocked(incident, ["RESOLVED"], "reportAnalysis");
       if (stop) return reject(stop);
+
+      const gap = recurrenceGap(incident, args.recurrence);
+      if (gap) return reject(gap);
 
       const applied = await db.withWrite((w) => {
         const at = Date.now();
@@ -664,7 +722,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             // instead of killing it. The status guard still holds the
             // transition, so a MERGED row cannot be resurrected through here.
             `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
-               usersImpacted = ?, impactQuery = ?
+               usersImpacted = ?, impactQuery = ?, recurrenceAnalysis = ?
              WHERE id = ? AND status = 'RESOLVED'`,
           )
           .run(
@@ -672,10 +730,14 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             args.postmortem,
             args.usersImpacted,
             args.impactQuery,
+            args.recurrence ? JSON.stringify(args.recurrence) : null,
             incidentId,
           ).changes;
         if (taken === 0) return false;
         closeOpenSignals(w, incidentId, at);
+        // Same transaction as the close, so an incident that is searchable
+        // and one that is closed are never two different facts.
+        indexIncident(w, incidentId);
         return true;
       });
       if (!applied) return raced(incidentId, "reportAnalysis");
@@ -684,6 +746,23 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         incident,
         mrkdwn`*Incident ${incidentId} closed*\n_${args.usersImpacted} users impacted · post-mortem written._`,
       );
+
+      // A recurrence closes on a second answer the first incident never had
+      // to give, and that answer is the only thing here that can change the
+      // system rather than the product. Posted rather than left in a column:
+      // "BugBoss let a premature close happen" reaching nobody is the same
+      // failure one level up.
+      if (args.recurrence) {
+        const defect = args.recurrence.category === "bugboss_defect";
+        await notify(
+          incident,
+          mrkdwn`*${defect ? "BugBoss let this recur" : "Why it recurred"}* · ${incidentId} was a recurrence of ${incident.recurrenceOf ?? "an earlier incident"}\n_${args.recurrence.category}_\n\n${raw(toMrkdwn(args.recurrence.why))}\n\n*What changed*\n${raw(toMrkdwn(args.recurrence.remedy))}${
+            defect
+              ? "\n\n_The fix is in ops, which agents do not open pull requests against. This needs a person._"
+              : ""
+          }`,
+        );
+      }
 
       return {
         ok: true,
@@ -787,6 +866,28 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       };
     });
 
+  /**
+   * Read-only and outside the transition set, so it drains no directives and
+   * changes nothing. The agent gets the same reach triage has: an exact
+   * signal key finds the same alert returning, and only the post-mortems
+   * find the same cause returning through a different one.
+   */
+  const searchIncidentsTool: ToolApi["searchIncidents"] = (args) =>
+    call<IncidentMatch[]>("searchIncidents", async (incidentId) => {
+      try {
+        return { ok: true, data: searchIncidents(db, args.text) };
+      } catch (err) {
+        // Rejected rather than answered with an empty array. "The search is
+        // broken" and "nothing matches" are the two results that must never
+        // be the same value, and this one is about to be read by an agent
+        // deciding whether a problem is new.
+        alarm("search_failed", { incidentId, error: String(err) });
+        return reject(
+          `the incident search failed (${String(err)}); this is not the same as finding nothing`,
+        );
+      }
+    });
+
   return {
     reportRootCause,
     reportImpact,
@@ -794,5 +895,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     reportAnalysis,
     handOff,
     getIncident,
+    searchIncidents: searchIncidentsTool,
   };
 };

@@ -116,6 +116,7 @@ const makeTools = (sqlite: Database.Database) => {
     reportResolved: ok,
     reportAnalysis: ok,
     getIncident: ok,
+    searchIncidents: ok,
     handOff: async ({ reason, brief }) => {
       handOffs.push({ incidentId, reason, brief });
       sqlite

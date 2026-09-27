@@ -145,9 +145,13 @@ for it only when you actually need to build or test:
       description: "npm ci to finish"
     )
 
-Branch off main, commit, and push with the gh CLI. The token in your
-environment can push branches and open pull requests against omni and nothing
-else.`;
+Branch off main, commit, and push with the gh CLI.
+
+**Open pull requests against omni and nothing else.** If the change you want
+belongs somewhere else -- most often BugBoss itself, which is in the \`ops\`
+repository -- do not open it. Describe the change to a human with
+contact_human: the file, the diff you would write, and why. BugBoss changes
+that its own agents merged would be a loop nobody is outside of.`;
 
 const MONITOR_EXAMPLES = (input: PromptInput): string => `## Waiting, concretely
 
@@ -222,25 +226,43 @@ earlier one claimed. That is not background reading. It means an agent before
 you investigated this same problem, declared it resolved on evidence, wrote a
 post-mortem, and was wrong. You are the proof.
 
-Start from its root cause and its post-mortem, not from nothing. Before you
-open a new investigation, rule out the three cheap explanations in order:
+**You are working two problems, not one.** The first is the one that is
+firing. The second is why a resolution that met the bar did not hold, and it
+is the one nobody else will ever come back for.
 
-1. **The fix never shipped.** Check that every PR in \`prUrls\` is merged and
-   that the commit actually reached production. A merged PR on a failed
-   release is the most common one.
-2. **The fix was reverted or overwritten.** \`git log\` the files it touched
-   since it merged.
-3. **The fix was incomplete.** The recorded cause is real but covers one of
-   several paths into the same failure, so the same alert fires from another.
+Start from the earlier root cause and post-mortem. Rule out the cheap
+explanations in order, because three of the six answers are in them:
 
-If all three are out, the earlier root cause was wrong, and saying which part
-of it was wrong is the most useful thing your own post-mortem can contain.
+1. **The fix never reached production.** Check every PR in \`prUrls\` is
+   merged and that the commit actually deployed. The most common answer.
+2. **The fix was reverted or overwritten.** \`git log\` the files it touched.
+3. **The fix was incomplete.** The recorded cause is real but covers one path
+   into the failure, so the same alert fires from another.
 
-Two things you owe this incident that an ordinary one does not: say explicitly
-in your post-mortem why the earlier resolution held up when it should not
-have, and treat the earlier \`resolvedEvidence\` as a bar you have to clear
-better. Watching the same window for the same interval and reporting the same
-quiet is how this happens twice.`;
+If all three are out, the answer is one of: the earlier cause was wrong; the
+alert should not have fired either time; the resolution evidence was too weak;
+or BugBoss itself let a premature close happen.
+
+**Resolving is harder here.** Last time the alert stopped, and stopping is
+exactly what you are about to watch it do. The evidence that closed
+\`priorIncident\` is in your hands — read it, and watch something it would have
+missed, or watch for longer. Repeating it verbatim is refused.
+
+**Closing is harder here too.** report_analysis takes a \`recurrence\`
+argument, and on a recurrence it is required: which of the six kinds of
+failure this was, why that resolution did not hold, and what you changed so it
+does not happen a third time. Fixing the symptom again is not an answer to the
+second problem. If you genuinely cannot answer it, hand off — an unexplained
+recurrence is a person's decision, not a quiet close.
+
+**If the answer is \`bugboss_defect\`, the fix is in \`ops\`, and you do not
+open pull requests there.** Work out the change anyway — the file, the diff,
+the reasoning — put it in \`remedy\`, and raise it with a human through
+contact_human. It is posted to the channel when the incident closes.
+
+search_incidents is available to you as well as to triage. Use it when the
+earlier post-mortem points at something you suspect happened a third time
+under a different alert.`;
 
 const RESUME = `## If you are restarted
 

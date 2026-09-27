@@ -57,10 +57,34 @@ unreachable.
 
 That index cannot serve the recurrence lookup itself, though: it is partial
 on `closedAt IS NULL`, and every signal a resolution closed has a `closedAt`.
-`signal_source_idx` is the same key without the partial clause, and
-`signal_slug_idx` is an expression index over `json_extract(labels,
-'$.alert_slug')` for the wider "same rule, different instance" match. Both
-are read once per inbound delivery by `triage/recurrence.ts`.
+`signal_source_idx` is the same key without the partial clause, read once per
+inbound delivery by `triage/recurrence.ts`.
+
+## `incident_fts` is derived, not migrated
+
+FTS5 over the post-mortems, root causes and resolution evidence of incidents
+that already claimed a problem was over — the corpus `CLOSED` has always
+required and nothing read back. It is written by `reportResolved` and
+`reportAnalysis` **inside their own transactions**, so an incident that is
+closed and an incident that is searchable are never two different facts.
+
+It is also rebuilt rather than migrated. `reconcileSearchIndex` runs at boot
+and indexes every RESOLVED or CLOSED incident the table does not have, which
+does two jobs: it backfills a history older than the table, which matters
+because `schema.sql` runs over a **restored snapshot** and the first boot
+after this shipped found an empty index and a full corpus; and it repairs
+anything a transition failed to write, which keeps the per-transition index a
+fast path rather than the only one.
+
+Not an external-content table. External content keys on `rowid` and
+`incident.id` is `TEXT`, and a trigger-maintained index would have to survive
+being created over a database that already has rows.
+
+Raw text cannot reach `MATCH`. FTS5 reads `:` as a column filter, `*` as a
+prefix and an unbalanced quote as a syntax error, so a model-written sentence
+throws rather than searching. `toMatchQuery` quotes every surviving term,
+which makes each a literal token and leaves no operator reachable from the
+input.
 
 ## `schema.sql` at runtime
 
