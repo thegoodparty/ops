@@ -24,7 +24,6 @@ const fakeStore = () => {
   const objects = new Map<string, Buffer>();
   const puts: string[] = [];
   const types = new Map<string, string | undefined>();
-  const deletes: string[] = [];
   const store: NotesStore = {
     get: async (key) => objects.get(key) ?? null,
     put: async (key, body, contentType) => {
@@ -34,12 +33,8 @@ const fakeStore = () => {
     },
     list: async (prefix) =>
       [...objects.keys()].filter((key) => key.startsWith(prefix)).sort(),
-    delete: async (key) => {
-      deletes.push(key);
-      objects.delete(key);
-    },
   };
-  return { store, objects, puts, types, deletes };
+  return { store, objects, puts, types };
 };
 
 const notesDir = () => mkdtemp(join(tmpdir(), "bugboss-notes-"));
@@ -118,8 +113,8 @@ test("a turn that changed nothing costs no uploads", async () => {
   assert.deepEqual(puts.slice(2), ["sessions/incident/inc-1/notes/a.md"]);
 });
 
-test("a note the agent deleted does not come back on the next restart", async () => {
-  const { store, objects, deletes } = fakeStore();
+test("a note the agent removed locally stays in the record", async () => {
+  const { store, objects } = fakeStore();
   const dir = await notesDir();
   await writeFile(join(dir, "wrong-theory.md"), "it was the deploy");
   await writeFile(join(dir, "keep.md"), "it was not the deploy");
@@ -129,9 +124,34 @@ test("a note the agent deleted does not come back on the next restart", async ()
   await rm(join(dir, "wrong-theory.md"));
   await sync.flush();
 
-  assert.deepEqual(deletes, ["sessions/incident/inc-1/notes/wrong-theory.md"]);
-  assert.equal(objects.has("sessions/incident/inc-1/notes/wrong-theory.md"), false);
-  assert.equal(objects.has("sessions/incident/inc-1/notes/keep.md"), true);
+  // A dead end is the most useful thing an agent leaves behind, and a model
+  // tidying on instinct must not be able to take it out of the record.
+  assert.equal(sync.lastError(), null);
+  assert.equal(
+    objects.get("sessions/incident/inc-1/notes/wrong-theory.md")?.toString(),
+    "it was the deploy",
+  );
+
+  // And it is back on disk after a restart, which is why the prompt says so.
+  const next = await notesDir();
+  const restored = await restoreNotesDir({ store, prefix: PREFIX, dir: next });
+  assert.equal(restored.fileCount, 2);
+  assert.equal(
+    await readFile(join(next, "wrong-theory.md"), "utf8"),
+    "it was the deploy",
+  );
+});
+
+test("the mirror has no way to remove anything at all", () => {
+  // Structural, not a matter of the sync being careful: a store handed to the
+  // notes mirror cannot express a delete, so no future edit here can add one
+  // by accident.
+  const store: NotesStore = {
+    get: async () => null,
+    put: async () => {},
+    list: async () => [],
+  };
+  assert.deepEqual(Object.keys(store).sort(), ["get", "list", "put"]);
 });
 
 test("a restarted agent finds its notes where it left them", async () => {
@@ -172,8 +192,8 @@ test("a restarted agent finds its notes where it left them", async () => {
   assert.deepEqual(puts, []);
 });
 
-test("an emptied directory is mirrored; a lost one is not", async () => {
-  const { store, objects, deletes } = fakeStore();
+test("a directory that is gone leaves the record standing", async () => {
+  const { store, objects } = fakeStore();
   const dir = await notesDir();
   await writeFile(join(dir, "a.md"), "one");
 
@@ -181,22 +201,50 @@ test("an emptied directory is mirrored; a lost one is not", async () => {
   await sync.flush();
   assert.equal(objects.has("sessions/incident/inc-1/notes/a.md"), true);
 
-  // The agent cleaning up after itself: mirror it.
-  await rm(join(dir, "a.md"));
-  await sync.flush();
-  assert.deepEqual(deletes, ["sessions/incident/inc-1/notes/a.md"]);
-
-  await writeFile(join(dir, "b.md"), "two");
-  await sync.flush();
-  assert.equal(objects.has("sessions/incident/inc-1/notes/b.md"), true);
-
-  // The directory itself gone is lost local storage, not a deletion. The S3
-  // copy is what a restart restores from, so it must survive.
+  // Lost local storage is not an instruction, and it is the S3 copy that a
+  // restart restores from.
   await rm(dir, { recursive: true });
   await sync.flush();
   assert.equal(sync.lastError(), null);
-  assert.equal(objects.has("sessions/incident/inc-1/notes/b.md"), true);
-  assert.deepEqual(deletes, ["sessions/incident/inc-1/notes/a.md"]);
+  assert.equal(objects.get("sessions/incident/inc-1/notes/a.md")?.toString(), "one");
+});
+
+test("the breach describes the record, not a directory that is gone", async () => {
+  const { store } = fakeStore();
+  const seeded = await notesDir();
+  await writeFile(join(seeded, "a.md"), "x".repeat(40));
+  await writeFile(join(seeded, "b.md"), "y".repeat(40));
+  await createNotesSync({ store, prefix: PREFIX, dir: seeded }).flush();
+
+  // A later deploy tightens the bound, so the record restored from S3 is
+  // already over it. Nothing is deleted to get back under, by design.
+  const limits = { maxBytes: 64, maxFiles: 8 };
+  const dir = await notesDir();
+  const restored = await restoreNotesDir({ store, prefix: PREFIX, dir });
+  const sync = createNotesSync({
+    store,
+    prefix: PREFIX,
+    dir,
+    seen: restored.seen,
+    limits,
+  });
+
+  await sync.flush();
+  assert.equal(sync.overLimit()?.totalBytes, 80);
+
+  // Losing the directory does not empty the record, so the answer must stay
+  // "full" -- and it must be recomputed from what S3 holds rather than
+  // carried forward describing files that are no longer on disk.
+  await rm(dir, { recursive: true });
+  await sync.flush();
+  const after = sync.overLimit();
+  assert.equal(sync.lastError(), null);
+  assert.equal(after?.totalBytes, 80, "the record is still over the bound");
+  assert.deepEqual(
+    after?.largest.map((file) => file.path).sort(),
+    ["a.md", "b.md"],
+    "recomputed from the record, which still holds both",
+  );
 });
 
 test("a fresh run still gets the directory the prompt names", async () => {
@@ -241,7 +289,7 @@ test("over the size bound nothing is mirrored and the last good copy stands", as
   assert.equal(sync.overLimit(), null, "trimming back under resumes the mirror");
 });
 
-test("the file count is bounded too", async () => {
+test("the note count is bounded too", async () => {
   const { store, puts } = fakeStore();
   const dir = await notesDir();
   for (let i = 0; i < 4; i += 1) await writeFile(join(dir, `n${i}.md`), "x");
@@ -258,25 +306,22 @@ test("the file count is bounded too", async () => {
   assert.deepEqual(puts, []);
 });
 
-test("the over-limit message says what to do about it", () => {
+test("the over-limit message does not advise a fix that cannot work", () => {
   const breach = notesLimitBreach(
-    {
-      files: [
-        { path: "dump.txt", bytes: 8 * 1024 * 1024 },
-        { path: "notes.md", bytes: 512 },
-      ],
-      totalBytes: 8 * 1024 * 1024 + 512,
-      skipped: [],
-      present: true,
-    },
+    [
+      { path: "dump.txt", bytes: 20 * 1024 * 1024 },
+      { path: "notes.md", bytes: 512 },
+    ],
     NOTES_LIMITS,
   );
   assert.ok(breach);
 
   const message = notesOverLimitMessage(breach);
-  assert.match(message, /nothing in it is being saved/);
-  assert.match(message, /dump\.txt \(8\.0 MB\)/);
-  assert.match(message, /Delete what you no longer need/);
+  assert.match(message, /Your record is full/);
+  assert.match(message, /dump\.txt \(20\.0 MB\)/);
+  // Telling an append-only record to delete would cost a turn to find out.
+  assert.match(message, /Deleting files will not bring it back under/);
+  assert.match(message, /incident thread or in your hand-off brief/);
 });
 
 test("a symlink is reported and never followed", async () => {
@@ -295,6 +340,68 @@ test("a symlink is reported and never followed", async () => {
   assert.equal(objects.get("sessions/incident/inc-1/notes/real.md")?.toString(), "mine");
 });
 
+test("a symlink to a directory does not put that directory in the record", async () => {
+  const { store, objects, puts } = fakeStore();
+  const dir = await notesDir();
+  const outside = await notesDir();
+  await mkdir(join(outside, "deep"), { recursive: true });
+  await writeFile(join(outside, "secret.txt"), "not the agent's to publish");
+  await writeFile(join(outside, "deep", "deeper.txt"), "nor this");
+  await symlink(outside, join(dir, "elsewhere"));
+
+  await mkdir(join(dir, "real-sub"), { recursive: true });
+  await writeFile(join(dir, "real-sub", "note.md"), "mine");
+
+  const sync = createNotesSync({ store, prefix: PREFIX, dir });
+  await sync.flush();
+
+  // `readdir({ recursive: true })` descends a directory symlink and the files
+  // under it lstat as ordinary files, so a guard on the link alone would have
+  // uploaded every one of them.
+  assert.deepEqual(puts, ["sessions/incident/inc-1/notes/real-sub/note.md"]);
+  assert.deepEqual(sync.skipped(), ["elsewhere"]);
+  assert.equal(
+    [...objects.keys()].some((key) => key.includes("secret") || key.includes("deeper")),
+    false,
+  );
+  assert.equal(
+    objects.get("sessions/incident/inc-1/notes/real-sub/note.md")?.toString(),
+    "mine",
+    "a real subdirectory is still walked",
+  );
+});
+
+test("a note deleted mid-flush is not a durability failure", async () => {
+  const objects = new Map<string, Buffer>();
+  const dir = await notesDir();
+  await writeFile(join(dir, "a.md"), "one");
+  await writeFile(join(dir, "b.md"), "two");
+
+  // The agent's shell runs while we are mirroring, so a file can be scanned
+  // and then gone before we read it. Driven from inside `put` so the race is
+  // deterministic rather than hoped for. The walk carries the same guard for
+  // the same window one step earlier, between readdir and lstat.
+  const sync = createNotesSync({
+    store: {
+      get: async () => null,
+      list: async () => [],
+      put: async (key, body) => {
+        objects.set(key, Buffer.from(body));
+        await rm(join(dir, "b.md"), { force: true });
+      },
+    },
+    prefix: PREFIX,
+    dir,
+  });
+
+  await sync.flush();
+
+  assert.equal(sync.lastError(), null, "a vanished file must not burn the streak");
+  assert.equal(sync.failureStreak(), 0);
+  assert.equal(objects.get("sessions/incident/inc-1/notes/a.md")?.toString(), "one");
+  assert.equal(objects.has("sessions/incident/inc-1/notes/b.md"), false);
+});
+
 test("a failing upload streaks and recovers, and never throws at the caller", async () => {
   const dir = await notesDir();
   await writeFile(join(dir, "a.md"), "one");
@@ -304,7 +411,6 @@ test("a failing upload streaks and recovers, and never throws at the caller", as
     store: {
       get: async () => null,
       list: async () => [],
-      delete: async () => {},
       put: async () => {
         if (fail) throw new Error("no such bucket");
       },

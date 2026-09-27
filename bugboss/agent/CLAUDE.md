@@ -142,11 +142,23 @@ error, only an incident that appears to have been free.
 
 ## The notes directory
 
-`/work/<id>/notes/` is the agent's own scratch space, mirrored to
-`sessions/incident/<id>/notes/` and restored before the session opens. Pi has
-no persisted-workspace concept — a cwd and a session file are all it keeps —
-so `notes.ts` is ours, hung off the same `turn_end` and `session_shutdown`
-hooks the session sync uses so there is one durability cadence, not two.
+`/work/<id>/notes/` is where an agent keeps its own record of the work,
+mirrored to `sessions/incident/<id>/notes/` and restored before the session
+opens. Pi has no persisted-workspace concept — a cwd and a session file are
+all it keeps — so `notes.ts` is ours, hung off the same `turn_end` and
+`session_shutdown` hooks the session sync uses so there is one durability
+cadence, not two.
+
+**It is a record, not scratch space, and the mirror is append-only.**
+`NotesStore` has no `delete` and neither does the S3 store any more, so
+nothing in the agent's path can take a note out of the record — not a tidy-up
+reflex, not a bad `rm`. Agents are told in the prompt to leave their dead ends
+behind, because a dead end is what stops the next investigation walking down
+it again. A delete would also reclaim nothing: the bucket is versioned and
+nothing under `sessions/` expires.
+
+A resumed agent therefore gets back notes it deleted locally. The prompt says
+so, or the reappearance reads as a broken harness.
 
 It is a **sibling** of the checkout, not a folder in it: under the checkout a
 note is one `git add -A` away from the pull request the agent asks a human to
@@ -156,10 +168,11 @@ The prefix is derived from the session key rather than rebuilt from the
 incident id, for the same reason `BUGBOSS_SESSION_REF` is required: a second
 independent derivation is how notes come to be written where nothing reads.
 
-**The bound refuses the whole directory, not part of it.** A partial mirror
-restores a directory the agent never had, and there is no basis here for
-choosing which notes to drop. Crossing it logs, and steers the agent once on
-the edge — repeating the same sentence every turn only costs turns.
+**The bound is measured over the record, not the directory**, because with no
+deletes a rename is what grows S3. It refuses the whole directory rather than
+part of it: a partial mirror restores a state the agent never had. Crossing it
+logs and steers once on the edge, and the message does not tell the agent to
+delete, because deleting cannot bring it back under.
 
 **The model is pinned in the session.** On resume it resolves from the
 stored prefix, not from env — Bedrock does not restore it, and the SSM
