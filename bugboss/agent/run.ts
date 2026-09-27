@@ -36,6 +36,7 @@ import {
   NOTES_DIR_NAME,
   NOTES_LIMITS,
   NOTES_SYNC_FAILURE_LIMIT,
+  type NoteRecord,
   type NotesStore,
   type NotesSync,
 } from "./notes";
@@ -615,7 +616,7 @@ const launch = async (args: {
   mcp: McpToolset[];
   restored: boolean;
   notesPrefix: string;
-  notesSeen: Map<string, string>;
+  notesSeen: Map<string, NoteRecord>;
   storedPrefix: StoredPrefix | null;
 }): Promise<RunIncidentAgentResult> => {
   const { options, paths, store, key, api, pi, model, mcp, restored, storedPrefix } = args;

@@ -86,9 +86,10 @@ export const createS3SessionStore = (
         }),
       );
     },
-    // list and delete exist for the notes mirror in ./notes.ts, which is a
-    // directory rather than one object and so has to reconcile what S3 holds
-    // against what is on disk. The session itself never needs either.
+    // list exists for the notes mirror in ./notes.ts, which is a directory
+    // rather than one object and has to know what S3 already holds. There is
+    // deliberately no delete: nothing in the agent's path removes an object
+    // from this bucket.
     list: async (prefix) => {
       const [{ ListObjectsV2Command }, s3] = await Promise.all([
         import("@aws-sdk/client-s3"),
@@ -110,13 +111,6 @@ export const createS3SessionStore = (
         token = res.IsTruncated ? res.NextContinuationToken : undefined;
       } while (token);
       return keys;
-    },
-    delete: async (key) => {
-      const [{ DeleteObjectCommand }, s3] = await Promise.all([
-        import("@aws-sdk/client-s3"),
-        client(),
-      ]);
-      await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
     },
   };
 };

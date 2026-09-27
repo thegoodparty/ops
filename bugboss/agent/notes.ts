@@ -14,34 +14,48 @@
 //
 // One object per note rather than one archive, because the point of putting
 // this beside the transcript is that a human or the Slack agent can read a
-// single file out of it with `aws s3 cp`. The cost is that a deletion has to
-// be mirrored too, which is what the digest map is for.
+// single file out of it with `aws s3 cp`.
+//
+// The mirror is append-only, and there is no delete in it at all. These notes
+// are the agent's record of its own work, not scratch space it is expected to
+// tidy, and the record is worth more to the next launch, to the thread and to
+// whoever reads the incident later than the bytes are worth reclaiming. The
+// bytes would not be reclaimed anyway: the bucket is versioned and nothing
+// under `sessions/` expires, so deleting a note writes a delete marker over a
+// version that stays forever. It would cost the same and hide the note from
+// every reader.
+//
+// That moves the bound. What accumulates is what S3 holds, not what is on
+// disk at any moment, so the limit is measured over the whole record.
 
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+/** No delete. The record an agent keeps is not the agent's to unmake. */
 export interface NotesStore {
   get(key: string): Promise<Buffer | null>;
   put(key: string, body: Buffer, contentType?: string): Promise<void>;
   /** Every key under the prefix, paginated to exhaustion. */
   list(prefix: string): Promise<string[]>;
-  delete(key: string): Promise<void>;
 }
 
 export interface NotesLimits {
+  /** Total across every note the record holds, live or superseded. */
   maxBytes: number;
   maxFiles: number;
 }
 
 /**
- * Notes are prose. Four megabytes of it is more than an agent can write in a
- * day, and the file count is what keeps a per-turn walk cheap.
+ * Measured over the whole record, not over the directory as it stands: with
+ * no deletes, a rename leaves the old key behind and that is what grows.
+ * Notes are prose, so sixteen megabytes is far more than a day of writing.
+ * The file count is also what keeps the per-turn walk cheap.
  */
 export const NOTES_LIMITS: NotesLimits = {
-  maxBytes: 4 * 1024 * 1024,
-  maxFiles: 64,
+  maxBytes: 16 * 1024 * 1024,
+  maxFiles: 256,
 };
 
 export const NOTES_DIR_NAME = "notes";
@@ -140,18 +154,23 @@ export interface NotesLimitBreach {
   largest: NoteFile[];
 }
 
+/**
+ * Takes the projected record rather than the directory: a note the agent
+ * removed locally is still in S3 and still counts against what we carry.
+ */
 export const notesLimitBreach = (
-  scan: NotesScan,
+  retained: NoteFile[],
   limits: NotesLimits = NOTES_LIMITS,
 ): NotesLimitBreach | null => {
-  if (scan.totalBytes <= limits.maxBytes && scan.files.length <= limits.maxFiles) {
+  const totalBytes = retained.reduce((sum, file) => sum + file.bytes, 0);
+  if (totalBytes <= limits.maxBytes && retained.length <= limits.maxFiles) {
     return null;
   }
   return {
-    totalBytes: scan.totalBytes,
-    fileCount: scan.files.length,
+    totalBytes,
+    fileCount: retained.length,
     limits,
-    largest: [...scan.files].sort((a, b) => b.bytes - a.bytes).slice(0, 5),
+    largest: [...retained].sort((a, b) => b.bytes - a.bytes).slice(0, 5),
   };
 };
 
@@ -159,13 +178,15 @@ const mib = (bytes: number): string => `${(bytes / (1024 * 1024)).toFixed(1)} MB
 
 export const notesOverLimitMessage = (breach: NotesLimitBreach): string =>
   [
-    `Your notes directory is over its limit, so nothing in it is being saved any more.`,
-    `It holds ${breach.fileCount} files and ${mib(breach.totalBytes)}; the limit is ${breach.limits.maxFiles} files and ${mib(breach.limits.maxBytes)}.`,
-    `The copy in S3 has stopped moving, so a restart would take you back to whatever it held when you crossed the limit.`,
+    `Your record is full, so nothing more you write to your notes directory will be saved.`,
+    `It holds ${breach.fileCount} notes and ${mib(breach.totalBytes)}; the limit is ${breach.limits.maxFiles} notes and ${mib(breach.limits.maxBytes)}.`,
     breach.largest.length > 0
       ? `Largest: ${breach.largest.map((file) => `${file.path} (${mib(file.bytes)})`).join(", ")}.`
       : "",
-    `Delete what you no longer need and the next turn will save again. Do not put command output or downloaded data there; it is for notes.`,
+    // Nothing is ever deleted, so there is no way back under. Telling it to
+    // trim would be advice that cannot work, and it would spend a turn
+    // finding that out.
+    `Deleting files will not bring it back under, because the record keeps what you have already written. From here, anything that must survive belongs in the incident thread or in your hand-off brief. Notes this large usually mean command output went into a file; pipe it instead.`,
   ]
     .filter(Boolean)
     .join(" ");
@@ -173,9 +194,18 @@ export const notesOverLimitMessage = (breach: NotesLimitBreach): string =>
 export const notesSyncFailedMessage = (streak: number): string =>
   `Your notes directory has failed to save ${streak} times in a row, so treat anything in it as lost on the next restart. Your session itself is unaffected. Put anything you cannot afford to lose into the incident thread or your hand-off brief instead.`;
 
+/** What the record already holds for one key. */
+export interface NoteRecord {
+  digest: string;
+  bytes: number;
+}
+
 export interface RestoredNotes {
-  /** Digest per S3 key, so the first flush only uploads what changed. */
-  seen: Map<string, string>;
+  /**
+   * Per S3 key, so the first flush after a restart uploads nothing, and so
+   * the bound can count notes the directory no longer has.
+   */
+  seen: Map<string, NoteRecord>;
   fileCount: number;
 }
 
@@ -191,7 +221,7 @@ export const restoreNotesDir = async (args: {
   dir: string;
 }): Promise<RestoredNotes> => {
   await mkdir(args.dir, { recursive: true });
-  const seen = new Map<string, string>();
+  const seen = new Map<string, NoteRecord>();
   for (const key of await args.store.list(args.prefix)) {
     const relativePath = key.slice(args.prefix.length);
     // Nothing we write produces one of these, so a key that escapes the
@@ -202,7 +232,7 @@ export const restoreNotesDir = async (args: {
     const file = join(args.dir, ...relativePath.split("/"));
     await mkdir(dirname(file), { recursive: true });
     await writeFile(file, body);
-    seen.set(key, digest(body));
+    seen.set(key, { digest: digest(body), bytes: body.byteLength });
   }
   return { seen, fileCount: seen.size };
 };
@@ -222,11 +252,11 @@ export const createNotesSync = (args: {
   store: NotesStore;
   prefix: string;
   dir: string;
-  seen?: Map<string, string>;
+  seen?: Map<string, NoteRecord>;
   limits?: NotesLimits;
 }): NotesSync => {
   const limits = args.limits ?? NOTES_LIMITS;
-  const seen = args.seen ?? new Map<string, string>();
+  const seen = args.seen ?? new Map<string, NoteRecord>();
   let chain: Promise<void> = Promise.resolve();
   let failure: Error | null = null;
   let streak = 0;
@@ -237,37 +267,36 @@ export const createNotesSync = (args: {
     const scan = await scanNotesDir(args.dir);
     skipped = scan.skipped;
 
-    // A directory that is gone is local storage we lost, not an instruction
-    // to delete the copy in S3. The session sync skips on the same ENOENT for
-    // the same reason: the mirror is the safer of the two, so it wins. A
-    // breach recorded before it vanished is cleared with it, or the agent
-    // keeps being told to trim files that no longer exist.
-    if (!scan.present) {
-      breach = null;
-      return;
+    // A directory that is gone is local storage we lost, and there is nothing
+    // in it to mirror. The S3 copy is what a restart restores from and is
+    // never touched here. The session sync skips on the same ENOENT.
+    if (!scan.present) return;
+
+    // What the record would hold after this flush: everything already in S3,
+    // with the sizes of anything that is also on disk brought up to date. A
+    // note the agent removed locally still counts, because it is still there.
+    const projected = new Map<string, number>();
+    for (const [key, record] of seen) {
+      projected.set(key.slice(args.prefix.length), record.bytes);
     }
+    for (const file of scan.files) projected.set(file.path, file.bytes);
 
     // Refuse the whole directory rather than mirroring part of it. A partial
     // mirror restores a directory the agent never had, and picking which
     // notes to drop is a decision this code has no basis for making.
-    breach = notesLimitBreach(scan, limits);
+    breach = notesLimitBreach(
+      [...projected].map(([path, bytes]) => ({ path, bytes })),
+      limits,
+    );
     if (breach) return;
 
-    const live = new Set<string>();
     for (const file of scan.files) {
       const key = `${args.prefix}${file.path}`;
-      live.add(key);
       const body = await readFile(join(args.dir, ...file.path.split("/")));
       const hash = digest(body);
-      if (seen.get(key) === hash) continue;
+      if (seen.get(key)?.digest === hash) continue;
       await args.store.put(key, body, noteContentType(file.path));
-      seen.set(key, hash);
-    }
-
-    for (const key of [...seen.keys()]) {
-      if (live.has(key)) continue;
-      await args.store.delete(key);
-      seen.delete(key);
+      seen.set(key, { digest: hash, bytes: body.byteLength });
     }
   };
 

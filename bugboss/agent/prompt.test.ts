@@ -84,15 +84,23 @@ test("the load-bearing rules are all in there", () => {
   assert.match(prompt, /drive delegate to Approved/);
 });
 
-test("the agent is told its notes directory survives a restart", () => {
+test("the agent is told its notes are a record to keep, not scratch to tidy", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.match(prompt, /\/work\/inc-42\/notes/);
   assert.match(prompt, /survives a restart/);
-  assert.match(prompt, /restored before\nyou resume/);
+  assert.match(prompt, /restored before you resume/);
+  assert.match(prompt, /Keeping that record is part of the job/);
+  assert.match(prompt, /Leave it all behind when you finish/);
+  assert.match(prompt, /Dead ends are the most valuable thing/);
+  assert.match(prompt, /do not spend turns\ncurating/);
+  // An agent that is not told the mirror keeps what it deletes will read a
+  // note reappearing after a restart as the harness being broken.
+  assert.match(prompt, /deleting a file locally\ndoes not remove it/);
   // Without the bound in the prompt, the first the agent hears of it is a
   // steer telling it the mirror has already stopped.
-  assert.match(prompt, /at most 64 files and 4 MB/);
+  assert.match(prompt, /at most 256 notes and 16 MB/);
+  assert.match(prompt, /deleting will not win\nit back/);
   assert.match(prompt, /outside the checkout/);
 });
 

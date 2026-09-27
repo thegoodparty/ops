@@ -165,14 +165,24 @@ expire.
 Every merge to ops `main` restarts this container, so resume is the normal
 path, not the exceptional one.
 
-**An agent also gets a scratch directory that outlives the restart.** The
-transcript records what an agent said; it does not give it a cheap place to
-keep what it worked out. `/work/<id>/notes/` is mirrored to
+**An agent also keeps a written record, in a directory that outlives the
+restart.** The transcript records what an agent said; it does not give it a
+cheap place to keep what it worked out. `/work/<id>/notes/` is mirrored to
 `sessions/incident/<id>/notes/` on the same `turn_end` hook as the session and
 restored before the next one starts, so a ruled-out ledger survives a redeploy
-and costs nothing in context until the agent reads it back. It is bounded, and
-crossing the bound stops the mirror loudly rather than filling the bucket
-quietly.
+and costs nothing in context until the agent reads it back.
+
+The mirror is **append-only, and has no delete in it**. Those notes are the
+record of the work — for the next launch, for the thread, and for whoever
+opens the incident again later — and a dead end is the most useful thing in
+there. Agents are not asked to tidy up after themselves, and nothing in their
+path can remove an object from this bucket. Deleting would not reclaim
+anything anyway: the bucket is versioned and nothing under `sessions/`
+expires, so a delete writes a marker over a version that stays.
+
+That puts the bound on the record rather than on the directory, since a
+rename leaves the old key behind. Crossing it stops the mirror loudly, and
+deleting is not the way back.
 
 ## Layout
 

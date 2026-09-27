@@ -154,29 +154,38 @@ Branch off main, commit, and push with the gh CLI. The token in your
 environment can push branches and open pull requests against omni and nothing
 else.`;
 
-const NOTES = (input: PromptInput): string => `## Your notes directory
+const NOTES = (input: PromptInput): string => `## Your record of this incident
 
-${input.notesDir} is yours, and it is the only thing you write to disk that
-survives a restart. It is copied to S3 after every turn and restored before
-you resume, next to the session transcript itself.
+${input.notesDir} is where you keep your own record of this work, and it is
+the only thing you write to disk that survives a restart. It is copied to S3
+after every turn and restored before you resume, next to the session
+transcript itself.
 
-Use it for anything you would otherwise have to re-derive from context: what
-you have ruled out and the evidence that killed each one, the query that
-finally worked, where you are in a sequence you are part-way through, a
-post-mortem you are drafting across hours. Then read the file back when you
-need it instead of carrying it in every turn. Nothing there is in your context
-until you read it, which is the point.
+Keeping that record is part of the job, not housekeeping around it. Write down
+what you ruled out and the evidence that killed each one, the query that
+finally worked after the four that did not, where you are in a sequence you
+are part-way through, the post-mortem as it takes shape. Three people read it
+after you: you do, when you come back from a restart and would otherwise
+re-derive all of it; the human reading the thread; and whoever opens this
+incident again in six months.
+
+**Leave it all behind when you finish.** Dead ends are the most valuable thing
+in there, because they are what stops the next investigation walking down them
+again. Nothing here needs tidying up before you end, and a directory full of
+your working notes is the outcome we want.
+
+Two things follow from that. The record only grows: deleting a file locally
+does not remove it, and it will be back after a restart, so do not spend turns
+curating. And it holds at most ${input.notesLimits.maxFiles} notes and ${
+  input.notesLimits.maxBytes / (1024 * 1024)
+} MB in total, which is far more
+prose than an incident produces, so crossing it means something that was not
+prose went in there. Past it nothing more is saved, and deleting will not win
+it back, because what you have already written stays in the record.
 
 It sits outside the checkout deliberately, so nothing you write there can end
 up in a pull request. Use the absolute path; a relative path lands in the
-checkout.
-
-It holds at most ${input.notesLimits.maxFiles} files and ${
-  input.notesLimits.maxBytes / (1024 * 1024)
-} MB in total. Over either limit
-the mirror stops entirely, you will be told, and a restart takes you back to
-the last copy that fit. So keep it to notes: command output and downloaded
-data belong in a pipe, not in a file.`;
+checkout.`;
 
 const MONITOR_EXAMPLES = (input: PromptInput): string => `## Waiting, concretely
 
