@@ -205,14 +205,24 @@ test("a run that has not finished is not a flake yet", async () => {
 });
 
 test("a run waiting on approval is not re-runnable and says which button is", async () => {
-  const h = harness({ run: aRun({ conclusion: "action_required" }) });
+  // All three shapes GitHub uses, and none of them should send the agent into
+  // a monitor waiting for a run that is not going to move on its own.
+  const parked: Array<Partial<WorkflowRunView>> = [
+    { conclusion: "action_required" },
+    { status: "action_required", conclusion: null },
+    { status: "waiting", conclusion: null },
+  ];
 
-  const result = await runRerunFailedJobs(args, h);
+  for (const shape of parked) {
+    const h = harness({ run: aRun(shape) });
+    const result = await runRerunFailedJobs(args, h);
 
-  assert.equal(result.started, false);
-  assert.match(result.refused ?? "", /waiting on a human to approve/);
-  assert.match(result.refused ?? "", /fork pull request/);
-  assert.deepEqual(h.reruns, []);
+    assert.equal(result.started, false, JSON.stringify(shape));
+    assert.match(result.refused ?? "", /waiting on a human to approve/);
+    assert.match(result.refused ?? "", /fork pull request/);
+    assert.doesNotMatch(result.refused ?? "", /Wait for it with monitor/);
+    assert.deepEqual(h.reruns, []);
+  }
 });
 
 test("a run that succeeded or was cancelled has no failed jobs to re-run", async () => {

@@ -313,14 +313,24 @@ export const runRerunFailedJobs = async (
       `run ${args.runId} is already on attempt ${run.data.run_attempt}: its failed jobs have been re-run once. A failure that comes back on a second attempt is a finding, not a flake. Report which job, which step and what the failure says — and if it went green, the flake is still a defect worth naming. Do not re-run it again, and do not push an empty commit to buy a fresh run.`,
     );
   }
+  // Checked before "is it finished", because a run parked on an approval is
+  // not a run that is still working and telling the agent to wait for it would
+  // send it into a monitor that never returns. GitHub spells this three ways —
+  // `status: waiting` for an environment protection rule, `status` or
+  // `conclusion: action_required` for a fork pull request from a first-time
+  // contributor — and none of them are cleared by a re-run.
+  if (
+    run.data.status === "waiting" ||
+    run.data.status === "action_required" ||
+    run.data.conclusion === "action_required"
+  ) {
+    return refuse(
+      `run ${args.runId} is waiting on a human to approve it (status ${run.data.status}, conclusion ${run.data.conclusion ?? "none"}). That is what a fork pull request from a first-time contributor or an environment protection rule does, and re-running does not clear it — approval is a different button that BugBoss does not hold. Ask for the approval with contact_human, and say which run.`,
+    );
+  }
   if (run.data.status !== "completed") {
     return refuse(
       `run ${args.runId} is ${run.data.status}, so nothing has failed yet. Wait for it with monitor and look at the result before deciding it is a flake.`,
-    );
-  }
-  if (run.data.conclusion === "action_required") {
-    return refuse(
-      `run ${args.runId} concluded action_required: it is waiting on a human to approve it, which is what a fork pull request from a first-time contributor or an environment protection rule does. Re-running does not clear that and approval is a different button. Ask for the approval with contact_human and say which run.`,
     );
   }
   if (!RERUNNABLE_CONCLUSIONS.includes(run.data.conclusion ?? "")) {

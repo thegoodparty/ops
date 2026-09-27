@@ -71,6 +71,28 @@ with a bigger budget.
 - **No `members`, `organization_administration`.** Nothing here touches org
   membership.
 
+## What `actions: write` does and does not buy
+
+It is enough for the re-run itself. `rerun-failed-jobs` needs `actions: write`
+and nothing else — not `checks: write`, not anything from `contents` beyond
+what the agent already has — and re-running produces a new **attempt** of the
+same run id rather than a new run, which is what `rerun_ci` reads back as
+`run_attempt` to enforce its one-attempt bound.
+
+It is not enough for every red check, and `rerun_ci` refuses these by name
+rather than letting the agent discover them as a 403:
+
+- **A run parked on an approval.** A fork pull request from a first-time
+  contributor, or a deployment environment protection rule, leaves a run
+  waiting for a human. Re-running does not clear that; approving does, and
+  approval is a different endpoint. The tool says so and tells the agent to
+  ask.
+- **A run with no failed jobs.** `success`, `cancelled` and `skipped` have
+  nothing to re-run. Only `failure` and `timed_out` do.
+- **A run past the retention window.** GitHub eventually stops allowing a
+  re-run of an old run. The tool passes GitHub's own refusal through rather
+  than guessing.
+
 ## Installation scope, honestly
 
 `repository_selection` is `all`. The App is installed on **every repository in
