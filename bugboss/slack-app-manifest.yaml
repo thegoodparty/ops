@@ -10,8 +10,12 @@
 ## BugBoss answers the challenge (`http/public.ts`), so verification succeeds
 ## as soon as the URL is reachable.
 ##
-## Scopes are derived from the three Slack API methods BugBoss actually calls
+## Scopes are derived from the four Slack API methods BugBoss actually calls
 ## and the two events it handles. Nothing here is aspirational.
+##
+## CHANGING THE SCOPES MEANS REINSTALLING THE APP. A scope added here does
+## nothing until someone reinstalls BugBoss into the workspace; until then the
+## method behind it fails with `missing_scope` at runtime.
 
 display_information:
   name: BugBoss
@@ -34,6 +38,11 @@ oauth_config:
       - channels:history
       ## The app_mention event, which is how @bugboss reaches it.
       - app_mentions:read
+      ## reactions.add, for the :eyes: BugBoss puts on a message the moment
+      ## it takes it, before the work that answers it. The reaction is never
+      ## removed or read back, so reactions.remove and reactions:read stay
+      ## uncalled even though this scope would cover the first of them.
+      - reactions:write
       ## usergroups.users.list, for the rotation snapshot recorded on each
       ## incident at open. A Slack user group keeps no history, so this is
       ## the only moment that answer exists.

@@ -43,6 +43,9 @@ export const createSlackClient = (
       if (!res.ts) throw new Error("chat.postMessage returned no ts");
       return { ts: res.ts };
     },
+    react: async (channel, ts, name) => {
+      await web.reactions.add({ channel, timestamp: ts, name });
+    },
     replies: async ({ channel, threadTs, oldest }) => {
       const res = await web.conversations.replies({
         channel,

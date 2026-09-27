@@ -95,6 +95,12 @@ const fakeSlack = {
     this.posts.push({ threadTs, text });
     return Promise.resolve({ ts: `ts-${this.posts.length}` });
   },
+  /** The :eyes: acknowledgement. Recorded so a test can assert it happened. */
+  reactions: [] as { channel: string; ts: string; name: string }[],
+  react(channel: string, ts: string, name: string) {
+    this.reactions.push({ channel, ts, name });
+    return Promise.resolve();
+  },
   /** The Slack agent reads a thread on resume. Nothing here ever mentions it. */
   replies() {
     return Promise.resolve([]);
@@ -658,6 +664,7 @@ test("a Slack call that never answers is bounded, not silently queued", async ()
   try {
     const stalled = withSlackDeadline({
       post: () => new Promise(() => {}),
+      react: () => new Promise(() => {}),
       replies: () => new Promise(() => {}),
     });
     // The SDK retries a 429 for half an hour by default and raises nothing
@@ -1023,5 +1030,47 @@ test("a claim on an incident a person already owns changes nothing", async () =>
     ).length,
     1,
     "the second claim is refused, so the trail does not claim two owners",
+  );
+});
+
+// --- the reaction that says the message landed -----------------------------
+
+test("a verified Slack delivery is acknowledged through the real wiring", async () => {
+  // The route and the reaction are each pinned on their own elsewhere. What
+  // only the composition root can show is that it hands the route a real
+  // acknowledgeSlack: wired to nothing, both of those stay green and the
+  // channel still gets no :eyes:.
+  //
+  // A plain thread reply on purpose. It is the delivery whose feedback is
+  // worst today — `contact_human` is answered this way and nothing visible
+  // happens until the agent next polls — and the only one that reaches no
+  // model, so this asserts the ack and not a race with a deferred run.
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-ack", "upgrade-errors"));
+  const row = boss.db.get<{ slackThreadTs: string | null }>(
+    `SELECT i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-ack'`,
+  )!;
+
+  const res = await boss.publicApp.request("/slack", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      type: "event_callback",
+      event: {
+        type: "message",
+        channel: "C0TEST",
+        user: "U-swain",
+        text: "rolled it back, watch it now",
+        ts: "ack-e2e-1",
+        thread_ts: row.slackThreadTs,
+      },
+    }),
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(
+    fakeSlack.reactions.filter((r) => r.ts === "ack-e2e-1"),
+    [{ channel: "C0TEST", ts: "ack-e2e-1", name: "eyes" }],
   );
 });

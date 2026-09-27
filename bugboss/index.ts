@@ -51,6 +51,7 @@ import {
   type HttpConfig,
 } from "./http";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
+import { createSlackAck } from "./slack/ack";
 import { mrkdwn, raw, userMention } from "./slack/format";
 import {
   createRotationReader,
@@ -553,6 +554,8 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
 export const withSlackDeadline = (slack: SlackClient): SlackClient => ({
   post: (threadTs, text, channel) =>
     withDeadline(slack.post(threadTs, text, channel), "chat.postMessage"),
+  react: (channel, ts, name) =>
+    withDeadline(slack.react(channel, ts, name), "reactions.add"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
 });
 
@@ -1512,6 +1515,10 @@ export const createBugBoss = async (
   const publicApp = createPublicApp({
     ingestAccepted,
     slackEventAccepted,
+    // Bound to the deadline-wrapped client, so a reactions.add that never
+    // answers alarms on the same ten-second budget every other Slack call
+    // has rather than sitting as a detached promise forever.
+    acknowledgeSlack: createSlackAck(slack),
     slackConfig: slackIngress,
   });
   const loopbackApp = createToolApiRoutes({

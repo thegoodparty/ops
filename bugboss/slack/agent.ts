@@ -11,6 +11,7 @@
 // already does, by replying in the incident thread.
 
 import type { Db } from "../db";
+import type { SlackReactor } from "./ack";
 import type { SlackPoster } from "./relay";
 import { mentionPrefix, stripBotMention } from "./relay";
 import {
@@ -64,7 +65,15 @@ export interface SlackReader {
   }): Promise<SlackMessage[]>;
 }
 
-export type SlackClient = SlackPoster & SlackReader;
+/**
+ * What talking in a thread needs. The Slack agent takes this rather than the
+ * whole client because it never reacts: the :eyes: goes on at the edge, before
+ * anything here has been asked to run.
+ */
+export type SlackConversation = SlackPoster & SlackReader;
+
+/** Everything BugBoss does to Slack, which is what the composition root injects. */
+export type SlackClient = SlackConversation & SlackReactor;
 
 /** Whole-object S3, which is all the session wrapper ever does. */
 export interface ObjectStore {
@@ -442,7 +451,7 @@ export interface SlackAgentConfig {
 export interface SlackAgentDeps {
   db: Db;
   store: ObjectStore;
-  slack: SlackClient;
+  slack: SlackConversation;
   model: SlackAgentModel;
   config: SlackAgentConfig;
   lock?: ThreadLock;
@@ -462,7 +471,7 @@ const FAILURE_REPLY =
 
 export class SlackAgent {
   private readonly store: ObjectStore;
-  private readonly slack: SlackClient;
+  private readonly slack: SlackConversation;
   private readonly model: SlackAgentModel;
   private readonly cfg: SlackAgentConfig;
   private readonly lock: ThreadLock;

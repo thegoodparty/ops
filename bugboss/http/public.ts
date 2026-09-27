@@ -11,6 +11,7 @@ import type { Context, Next } from "hono";
 
 import { BodyUnreadable, IngestRejected } from "./errors";
 import { classifySlackEvent, type SlackConfig } from "../ingress/slack";
+import type { SlackAck } from "../slack/ack";
 import type { SlackEvent } from "../slack/relay";
 import type { IncomingRequest } from "../types";
 import { makeAlarm, makeLog } from "../logging";
@@ -42,6 +43,12 @@ export interface PublicAppDeps {
   ) => Promise<Accepted & { recorded: number }>;
   /** Relays the event; answering it, if it earns one, runs past the response. */
   slackEventAccepted: (event: SlackEvent) => Promise<Accepted>;
+  /**
+   * Puts the :eyes: on a delivery BugBoss is about to work. Synchronous and
+   * void by design, so this route cannot put it in front of the 200; see
+   * slack/ack.ts.
+   */
+  acknowledgeSlack: (ack: SlackAck) => void;
   /** The same config the slack ingress adapter was built with. */
   slackConfig: SlackConfig;
 }
@@ -221,6 +228,25 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
 
     if (classification.kind === "url_verification") {
       return c.text(classification.challenge);
+    }
+
+    // Here rather than after the work, which is the whole point: a report
+    // costs a prefetch and a triage call, a mention costs a model run of up
+    // to two minutes, and for that entire window the channel cannot tell a
+    // Boss that is thinking from one that never got the message.
+    //
+    // Written as the exclusion rather than a list of the three kinds that
+    // earn it, so a classification added later is acknowledged by default. An
+    // :eyes: on something BugBoss turns out to ignore is cheap; a delivery
+    // that silently gets none is the bug this closes. `ignored` is excluded
+    // on purpose: reacting to channel chatter nobody addressed to BugBoss
+    // would claim it is working on something it will never answer.
+    if (classification.kind !== "ignored") {
+      deps.acknowledgeSlack({
+        kind: classification.kind,
+        channel: classification.message.channel,
+        ts: classification.message.ts,
+      });
     }
 
     // A report is a signal, not a question, so it must not also reach the
