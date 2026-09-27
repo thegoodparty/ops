@@ -1081,12 +1081,71 @@ test("an ambiguous message asks in the thread instead of moving the incident", a
   const asked = fakeSlack.posts.slice(before);
   assert.equal(asked.length, 1, "it says something rather than nothing");
   assert.equal(asked[0].threadTs, row.slackThreadTs);
-  assert.match(asked[0].text, /could not tell whether that hands this incident over/);
+  assert.match(asked[0].text, /taking this incident over, or handing it back/);
   assert.equal(
     boss.db.query("SELECT id FROM thread_reply WHERE incidentId = ?", [row.id])
       .length,
     1,
     "the message is still on the record and still answers the agent",
+  );
+});
+
+/**
+ * These were two branches with a return each, so a message that was ambiguous
+ * both ways -- the common shape of one nothing could read -- was told about
+ * the handover and never told its answer had not been delivered as one. The
+ * person then reasonably believes the agent has their answer.
+ */
+test("a message ambiguous both ways is told about both, in one post", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own-5", "sync-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-5'`,
+  )!;
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
+       VALUES (?, ?, ?, ?)`,
+    ).run(row.id, "ts-q", Date.now() - 1000, "Shall I restart the worker?");
+  });
+
+  fakeModel.intents.push({ handover: "unclear", addressed: "unclear" });
+  const before = fakeSlack.posts.length;
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "ok whatever you think"));
+
+  const said = fakeSlack.posts.slice(before);
+  assert.equal(said.length, 1, "one message earns one post");
+  assert.match(said[0].text, /taking this incident over, or handing it back/);
+  assert.match(
+    said[0].text,
+    /the answer the agent is waiting for, tag me/,
+    "the half that used to be dropped",
+  );
+});
+
+/**
+ * The inverse: nothing is blocked, so there is no wait to end and no reason
+ * to narrate that the message went through as context.
+ */
+test("an unreadable addressee with nothing blocked on it says nothing extra", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own-6", "index-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-6'`,
+  )!;
+
+  fakeModel.intents.push({ handover: "none", addressed: "unclear" });
+  const before = fakeSlack.posts.length;
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "hmm"));
+
+  assert.equal(fakeSlack.posts.length, before, "no question is outstanding");
+  assert.equal(
+    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [row.id])
+      .length,
+    1,
+    "and the agent has it anyway",
   );
 });
 

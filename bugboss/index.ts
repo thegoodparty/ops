@@ -1655,29 +1655,35 @@ export const createBugBoss = async (
       return;
     }
 
-    if (read.handover === "unclear") {
-      // Asked rather than guessed. A handover this invented takes the
-      // incident out of the dispatcher's query with nothing to hand it back,
-      // so one question in a thread is the cheap side of that trade -- and
-      // saying nothing is what the old claim words did, which is the bug.
-      await sayInThread(
-        route.channel,
-        route.threadTs,
-        read.fellBack
-          ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way. If you meant to take this incident over or hand it back, say so again; if it was an answer for the agent, tag me and repeat it.`
-          : mrkdwn`${raw(userMention(route.user))} I could not tell whether that hands this incident over. If you meant you are taking it on, or giving it back to an agent, say so plainly and I will move it.`,
-      );
-      return;
-    }
+    // Everything the read could not settle, in one post. These used to be two
+    // branches with a return each, so a message that was ambiguous both ways
+    // -- which is the common shape of an unreadable message -- was told about
+    // the handover and never told its answer had not been delivered as one.
+    const unsureHandover = read.handover === "unclear";
+    // Only worth saying while something is blocked on it. With no outstanding
+    // question there is no wait to end, the directive is context either way,
+    // and narrating that is noise about nothing.
+    const unsureAddressee = addressed === "unclear" && outstanding !== null;
 
-    // An agent is blocked on a question and this message did not clearly
-    // answer it. Saying so costs a sentence; the alternative is the agent
-    // waiting out its whole timeout next to an answer it was not given.
-    if (addressed === "unclear" && outstanding !== null) {
+    if (unsureHandover || unsureAddressee) {
       await sayInThread(
         route.channel,
         route.threadTs,
-        mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent, so I passed it on as context rather than as the answer it is waiting for. If it was the answer, tag me and say it again.`,
+        [
+          read.fellBack
+            ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way.`
+            : mrkdwn`${raw(userMention(route.user))} I could not tell how to take that one. The agent has it as context either way.`,
+          ...(unsureHandover
+            ? [
+                "If you meant you are taking this incident over, or handing it back to an agent, say so plainly and I will move it.",
+              ]
+            : []),
+          ...(unsureAddressee
+            ? [
+                "And if it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
+              ]
+            : []),
+        ].join("\n"),
       );
       return;
     }

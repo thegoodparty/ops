@@ -56,9 +56,14 @@ Three rules sit in code on top of what the model said, the same way
   working while the model is down.
 - **A handover is aimed at the system by definition**, so it is delivered as
   well as acted on.
-- **`unclear` while an agent is blocked asks**, in the thread, and says the
-  message went through as context anyway. Asking costs a sentence; ending the
-  wait wrongly costs an investigation.
+- **`unclear` asks**, in the thread, and says the message went through as
+  context anyway. Asking costs a sentence; ending a wait wrongly costs an
+  investigation. Both ambiguities go in **one post**: they were two branches
+  with a return each, so a message nothing could read was told about the
+  handover and never told its answer had not been delivered as one, which
+  leaves the person believing the agent has it. The addressee half is said
+  only while a question is outstanding — with nothing blocked there is no wait
+  to end and narrating it is noise.
 
 ## Slack renders mrkdwn, and Markdown renders wrong
 
