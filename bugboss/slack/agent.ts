@@ -17,6 +17,7 @@ import type { SlackPoster } from "./relay";
 import { mentionPrefix, stripBotMention } from "./relay";
 import {
   channelLink,
+  link,
   mrkdwn,
   postProse,
   raw,
@@ -654,12 +655,27 @@ export class SlackAgent {
 
     const alertChannel = this.cfg.alertChannel;
     if (!alertChannel || alertChannel === mention.channel) return;
+
+    // Whoever reads this was not in the thread and has the least context of
+    // anyone to reconstruct it from a timestamp, so the one thing this must
+    // not be is a bare ts. Resolved before the post rather than during it:
+    // an alert about a failure must not itself be lost to a failure.
+    let where = mrkdwn`thread ${mention.threadTs}`;
+    try {
+      where = link(
+        await this.slack.permalink(mention.threadTs, mention.channel),
+        "that thread",
+      );
+    } catch (err) {
+      alarm("failure_alert_permalink_failed", { thread, error: String(err) });
+    }
+
     try {
       await this.slack.post(
         null,
         [
           mrkdwn`${raw(mentionPrefix(this.cfg.rotationGroupId ?? null))}*A question in ${raw(channelLink(mention.channel))} went unanswered*`,
-          mrkdwn`${raw(userMention(mention.user))} asked in thread ${mention.threadTs} and I could not answer or say so there.`,
+          mrkdwn`${raw(userMention(mention.user))} asked in ${raw(where)} and I could not answer or say so there.`,
           "_The error is in the BugBoss logs._",
         ].join("\n"),
         alertChannel,

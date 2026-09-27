@@ -32,11 +32,19 @@ whose thread the answer is being written into, because a link to where the
 reader already is is noise, and withholding it is what makes that reliable
 rather than an instruction the model may forget.
 
+The alert that says a question went unanswered has the same problem from a
+harsher angle: it is read in another channel by somebody who was not in the
+thread and has the least context of anyone to reconstruct it, so it links the
+thread rather than naming a timestamp. That is the one permalink taking a
+channel of its own -- incidents all live in the incident channel, but the
+Slack agent answers wherever it is mentioned.
+
 `createCachingLinker` is why an answer naming five incidents is not five
-round trips. Two messages in one channel have permalinks that differ only in
-the timestamp, so the first real answer teaches the workspace prefix and
-every later link is string work. A permalink that fails alarms and leaves the
-bare reference; nothing waits on a second attempt.
+round trips. A permalink is a workspace, a channel and a timestamp, and only
+the workspace is unknowable from here, so the first real answer teaches it
+and every later link is string work. A permalink that fails alarms and leaves
+the bare reference; nothing waits on a second attempt, and a failure is never
+cached as an answer.
 
 ## A plain reply answers; a mention also interrupts
 

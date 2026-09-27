@@ -99,11 +99,12 @@ const fakeModel = () => {
  * What Slack answers with. The ts is the only part that varies between two
  * messages in one channel, which is what the real linker relies on.
  */
-const permalinkFor = (messageTs: string): string =>
-  `https://goodparty.slack.com/archives/${CHANNEL}/p${messageTs.replaceAll(".", "")}`;
+const permalinkFor = (messageTs: string, channel = CHANNEL): string =>
+  `https://goodparty.slack.com/archives/${channel}/p${messageTs.replaceAll(".", "")}`;
 
 const fakeLinker = {
-  permalink: (messageTs: string) => Promise.resolve(permalinkFor(messageTs)),
+  permalink: (messageTs: string, channel?: string) =>
+    Promise.resolve(permalinkFor(messageTs, channel)),
 };
 
 const fakeSlack = () => {
@@ -578,8 +579,44 @@ describe("when the answer itself fails", () => {
     assert.equal(posts[0].channel, ALERT, "not through the channel that failed");
     assert.match(posts[0].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
     assert.ok(
+      posts[0].text.includes(`<${permalinkFor("100.0")}|that thread>`),
+      "whoever reads this was not there and cannot reconstruct a thread from a ts",
+    );
+    assert.ok(
       lines.some((line) => line.includes("failure_reply_failed")),
       "and the apology failing is logged on its own, not swallowed",
+    );
+  });
+
+  test("a permalink that fails costs the link, not the alert", async () => {
+    const { store } = memoryStore();
+    const posts: { channel?: string; text: string }[] = [];
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: {
+        permalink: () => Promise.reject(new Error("ratelimited")),
+        post: (_threadTs, text, channel) => {
+          if (channel === CHANNEL) {
+            return Promise.reject(new Error("channel_not_found"));
+          }
+          posts.push({ channel, text });
+          return Promise.resolve({ ts: "ts-1" });
+        },
+        replies: () => Promise.resolve([]),
+      },
+      model: { run: () => Promise.reject(new Error("bedrock said no")) },
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION },
+    });
+
+    const lines = await captureLogs(() => agent.handle(mention({ ts: "100.0" })));
+
+    assert.equal(posts.length, 1, "an alert lost to a second failure is the worst case");
+    assert.match(posts[0].text, /thread 100\.0/, "named the bare way instead");
+    assert.ok(!posts[0].text.includes("goodparty.slack.com"));
+    assert.ok(
+      lines.some((line) => line.includes("failure_alert_permalink_failed")),
+      "degrading is not swallowing",
     );
   });
 });
