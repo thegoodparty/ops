@@ -35,7 +35,8 @@ exists breaks that repo's pull requests; creating the role and pointing the
 workflow at it before narrowing breaks nothing. So every repo is done in that
 order: role, then workflow, then trust.
 
-- [ ] 1. Record this plan: `doing` (role-assumption-workflow, 2026-09-25).
+- [x] 1. Record this plan: `done` (2026-09-25, PR #104, which carried step 2
+      as well after its stacked PR was merged into this branch).
 - [x] 2. Drop the five archived repositories from the trust list: `done`
       (2026-09-25, role-assumption-workflow. `gp-api`, `people-api`,
       `election-api`, `runbooks` and `campaign-plan-service`, all confirmed
@@ -45,8 +46,12 @@ order: role, then workflow, then trust.
       and the regression test now names the five so re-adding one is
       deliberate).
 - [ ] 3. Remove credentials from the three workflows that should not hold
-      them: `todo`. Independent of 4 and 5, and worth doing first because it
-      shrinks what the later roles have to cover.
+      them: `doing` (role-assumption-workflow, 2026-09-27). One of the three,
+      `verify-vercel-registrar-token.yml`, was pulled forward and merged as
+      thegoodparty/omni#2138. The other two are thegoodparty/omni#2146:
+      `gp-ai.yml`'s build job held ECR push it never exercised on a pull
+      request, and `election-api.yml` declared `id-token: write` with no job
+      that assumes a role.
 - [ ] 4. Create `github-actions-pulumi-plan`: `todo`. Depends on 3, which
       decides the read surface.
 - [ ] 5. Point the plan-only workflows at it: `todo`. Depends on 4 applying.
