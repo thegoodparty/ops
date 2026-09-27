@@ -36,7 +36,11 @@ export interface ToolApiHttpDeps {
   tokenSecret: string;
   /** Built against the token the caller presented, not a freshly minted one. */
   toolApiFor: (incidentId: string, token: string) => ToolApi;
-  slack: ThreadPoster;
+  /**
+   * Relaying one message the agent wrote, and nothing else. The tool API's
+   * own posts are the tool API's; this route only forwards.
+   */
+  slack: Pick<ThreadPoster, "post">;
   /** Mints short-lived AWS credentials for a child. Absent when no role is set. */
   credentials?: AgentCredentialProvider;
   now?: () => number;

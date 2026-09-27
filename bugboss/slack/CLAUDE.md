@@ -16,6 +16,11 @@ even group, and Slack returns success each time. The fallback therefore
 alarms and adopts its own post as the thread, rather than logging quietly
 and fragmenting forever.
 
+A merge or a split leaves two threads that have to point at each other, and a
+thread is only findable by its permalink. `chat.getPermalink` builds one from
+the workspace domain, which is why it is an API call rather than string
+concatenation; it needs no scope of its own.
+
 ## A plain reply answers; a mention also interrupts
 
 Every recorded reply in an incident thread pushes a `human_message`

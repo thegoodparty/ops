@@ -10,8 +10,10 @@
 ## BugBoss answers the challenge (`http/public.ts`), so verification succeeds
 ## as soon as the URL is reachable.
 ##
-## Scopes are derived from the three Slack API methods BugBoss actually calls
-## and the two events it handles. Nothing here is aspirational.
+## Scopes are derived from the Slack API methods BugBoss actually calls and the
+## two events it handles. Nothing here is aspirational. chat.getPermalink, which
+## is how a merged or split incident links to the other thread, requires no
+## scope at all, so it adds nothing below.
 
 display_information:
   name: BugBoss
