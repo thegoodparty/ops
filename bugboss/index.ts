@@ -621,9 +621,6 @@ export const createBugBoss = async (
   const slackIngress: SlackConfig = {
     signingSecret: secrets.slackSigningSecret,
     botUserId: secrets.slackBotUserId,
-    isIncidentThread: (_channel, threadTs) =>
-      db.get("SELECT id FROM incident WHERE slackThreadTs = ?", [threadTs]) !==
-      undefined,
     verifier: options.insecureTestVerifiers?.slack,
   };
 

@@ -173,26 +173,13 @@ test("a url_verification handshake is surfaced with its challenge", async () => 
   assert.deepEqual(result, { kind: "url_verification", challenge: "abc123" });
 });
 
-test("a reply in an incident thread is an incident_reply, not a mention", async () => {
-  const result = await classifySlackEvent(
-    request(
-      event({
-        type: "message",
-        text: `<@${BOT}> I am taking this one`,
-        thread_ts: "1764000000.000001",
-        ts: "1764000000.000200",
-      }),
-    ),
-    { ...config, isIncidentThread: (_c, ts) => ts === "1764000000.000001" },
-  );
-  assert.equal(
-    result.kind,
-    "incident_reply",
-    "inside a live incident thread people talk to the incident agent, mention or not",
-  );
-});
-
-test("a reply in a thread that is not an incident falls through", async () => {
+/**
+ * Which incident a thread belongs to is the relay's, not this layer's: it is
+ * a `slackThreadTs` lookup and the relay is what routes on it. Covered in
+ * `slack/relay.test.ts`, where a mention inside an incident thread stays with
+ * that incident rather than becoming a Slack-agent question.
+ */
+test("a threaded mention is a mention here, whatever thread it is in", async () => {
   const result = await classifySlackEvent(
     request(
       event({ thread_ts: "1764000000.000001", ts: "1764000000.000200" }),

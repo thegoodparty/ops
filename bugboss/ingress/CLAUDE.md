@@ -22,7 +22,9 @@ Slack is **not** an adapter. A person reports something by mentioning
 call the composition root makes off the ack (`slack/intent.ts`), not
 something a body can be parsed for. `classifySlackEvent` answers only what a
 signature and an event envelope can answer — is this authentic, is it a
-message, is it in an incident thread, was the app tagged — and stops there.
+message, was the app tagged — and stops there. Which incident a thread
+belongs to is the relay's, since the relay is what reads `slackThreadTs` and
+routes on it.
 
 This used to be a verb: the first word had to be `report`, `bug` or `broken`.
 `@bugboss Pro upgrades are failing` was therefore answered as a question and

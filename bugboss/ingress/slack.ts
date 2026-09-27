@@ -3,16 +3,15 @@
 // This layer answers the questions a signature and an event envelope can
 // answer, and stops there:
 //
-//   incident_reply  the message is in a thread that belongs to an incident.
-//                   Job 5 records it where the agent's get_incident poll
-//                   finds it.
-//   mention         @bugboss anywhere else.
+//   mention         the app was tagged.
 //   ignored         not addressed to us, or not a message at all.
 //
-// What a mention is *asking for* -- reporting something broken, or asking a
-// question -- is a model call, not a parse, and it happens off the Slack ack
-// in the composition root. Nothing here reads the words a person chose, so
-// there is no verb to learn and no phrasing that silently does nothing.
+// Everything past that is the relay's: which incident a thread belongs to,
+// and what the message meant. What a mention is *asking for* -- reporting
+// something broken, or asking a question -- is a model call, not a parse, and
+// it happens off the Slack ack in the composition root. Nothing here reads
+// the words a person chose, so there is no verb to learn and no phrasing that
+// silently does nothing.
 //
 // Verification fails closed for the same reason it does on the Grafana side:
 // this endpoint is public, and an unauthenticated one lets anyone open an
@@ -45,7 +44,6 @@ export interface SlackMessage {
 
 export type SlackClassification =
   | { kind: "url_verification"; challenge: string }
-  | { kind: "incident_reply"; message: SlackMessage }
   | { kind: "mention"; message: SlackMessage }
   | { kind: "ignored"; reason: string };
 
@@ -58,14 +56,6 @@ export interface SlackConfig {
   /** Used to spot a mention when the event arrives as a plain message. */
   botUserId?: string;
   replayWindowSeconds?: number;
-  /**
-   * Whether this thread belongs to an open incident. The Boss knows, from
-   * incident.slackThreadTs; ingress does not, so it is injected.
-   */
-  isIncidentThread?: (
-    channel: string,
-    threadTs: string,
-  ) => boolean | Promise<boolean>;
   now?: () => number;
   /**
    * Replaces the signature check. A TEST SEAM ONLY: passing one in production
@@ -132,9 +122,9 @@ export const createSlackVerifier = (config: SlackConfig): SlackVerifier => {
 };
 
 /**
- * Verify and classify one inbound Slack delivery. The relay (Job 5) and the
- * Slack agent (Job 6) call this directly; the adapter's parse() is only the
- * signal-shaped slice of the same answer.
+ * Verify one inbound Slack delivery and say what shape it is. Async because
+ * it is the edge every caller already awaits, and a future source of truth
+ * for one of these answers will not be in memory.
  */
 export const classifySlackEvent = async (
   req: IncomingRequest,
@@ -207,14 +197,6 @@ export const classifySlackEvent = async (
     rawText,
     retry: Boolean(headerValue(req, RETRY_HEADER)),
   };
-
-  // Checked BEFORE the mention, deliberately. Inside a live incident thread
-  // people talk to the incident agent directly, so an @bugboss there is still
-  // a reply to that agent rather than a new Slack-agent run.
-  const inIncidentThread = config.isIncidentThread ?? (() => false);
-  if (threadTs && (await inIncidentThread(channel, threadTs))) {
-    return { kind: "incident_reply", message };
-  }
 
   const mentioned =
     event.type === "app_mention" ||
