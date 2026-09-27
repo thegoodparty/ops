@@ -25,6 +25,50 @@ pointer. It refuses only on `owner = 'human'`, not on "anything but agent" —
 a `null` owner means the row vanished mid-decision, which is a real race
 worth alarming on rather than swallowing.
 
+## Recurrence is the closed-incident half of the same question
+
+`correlate.ts` compares one incident against the **open** ones. `recurrence.ts`
+compares one signal against incidents that already claimed the problem was
+over. Same shape, opposite end of the lifecycle: two indexed reads before the
+model call, rendered into the prompt, and the model's pick validated in code.
+
+Two keys, and the stronger one is not the slug:
+
+- **`(source, sourceId)`** — the dedup key every adapter must produce, and the
+  key `signal_open_source_idx` is scoped around. The delivery that proves a
+  resolution was premature is the one most certain to collide with the signal
+  that resolution closed, which is why that index is partial. Always present.
+- **`alert_slug`, different `sourceId`** — the same rule on a different
+  instance. Weaker: one rule covers many instances, and `alert_slug` is a
+  label a rule may simply not carry.
+
+An exact match inside `RECURRENCE_WINDOW_MS` is **conclusive** and is stamped
+in code, whether or not the model mentions it and whether or not the model
+answered at all. It is a fact about the delivery, not a judgement about the
+problem. A fingerprint is stable for the life of the rule, so the window is
+what keeps "the same alert in January and again in June" out of it; past the
+window, and on every slug-only match, the candidate is offered to the model
+and nothing more.
+
+The result is a **new incident carrying `recurrenceOf`**, never a reopen of
+the closed one. `resolvedAt` and `closedAt` are the numbers a recurrence
+falsifies, and two `CHECK` constraints mean a reopen can only clear them.
+
+## "We did not check" is not "we checked and found nothing"
+
+`findRecurrenceCandidates` throws, like every other read here. `runTriage`
+gives it its own guard, outside the one the model call sits in — the same
+split `runCorrelation` makes, for the same reason. A failed lookup alarms
+(`recurrence_lookup_failed`), renders to the model as
+`RECURRENCE CANDIDATES UNAVAILABLE` rather than an empty list, and leaves
+`recurrenceChecked: false` on the outcome so `log("placed")` carries it too.
+Three channels, because the answer it would otherwise produce is exactly the
+answer a working system produces most of the time.
+
+Two outcomes drop a conclusive recurrence on the floor, and neither is quiet:
+an `attach` logs (`assign` stamps `recurrenceOf` only on an incident it
+creates, so there is no row to put it on), and a `suppress` alarms.
+
 ## A dead model must not look like a healthy one
 
 Both fallbacks (`triage.ts`, `correlate.ts`) alarm and carry a **rate**, not

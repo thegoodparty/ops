@@ -1036,6 +1036,9 @@ export const createBugBoss = async (
       action: decision.action,
       created: result.created,
       recurrenceOf: outcome.recurrenceOf,
+      // A null recurrenceOf with recurrenceChecked false is "we could not
+      // look", which is not the same fact as "nothing matched".
+      recurrenceChecked: outcome.recurrenceChecked,
       fellBack: outcome.fellBack,
     });
 

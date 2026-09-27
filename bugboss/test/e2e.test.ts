@@ -465,6 +465,63 @@ test("the same alert firing again after resolution opens a recurrence", async ()
   assert.ok(reopened, "a premature resolution has to be contradictable");
 });
 
+test("the pointer is set without the model volunteering it", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-11", "briefing-dispatch-errors"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-11')",
+  );
+
+  // No recurrenceOf queued. The delivery is an exact (source, sourceId) match
+  // against an incident closed moments ago, which is a fact about the
+  // delivery rather than a judgement about the problem -- so triage stamps it
+  // whether or not the model noticed.
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open matches",
+  });
+  await boss.ingest("grafana", grafanaBody("fp-11", "briefing-dispatch-errors"));
+
+  const reopened = boss.db.get<{ id: string; recurrenceOf: string | null }>(
+    "SELECT id, recurrenceOf FROM incident WHERE recurrenceOf = ?",
+    [first!.id],
+  );
+  assert.ok(reopened, "the recurrence must not depend on the model mentioning it");
+  assert.match(fakeModel.lastPrompt, /RECURRENCE CANDIDATES/);
+});
+
+test("the agent starts from the post-mortem that was already written", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-12", "peerly-send-failures"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string; postmortem: string | null }>(
+    "SELECT id, postmortem FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-12')",
+  );
+  assert.ok(first?.postmortem, "CLOSED requires one");
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "back again" });
+  const [placed] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-12", "peerly-send-failures"),
+  );
+
+  const view = await boss.toolApiFor(placed.incidentId!).getIncident();
+
+  assert.equal(view.data?.priorIncident?.id, first!.id);
+  assert.equal(
+    view.data?.priorIncident?.postmortem,
+    first!.postmortem,
+    "somebody already investigated this and wrote down what they concluded",
+  );
+  assert.ok(
+    (view.data?.priorIncident?.prUrls ?? []).length > 0,
+    "the fix that did not hold is the first thing to check",
+  );
+});
+
 // --- the webhook answers before it works -----------------------------------
 
 const until = async (ready: () => boolean, what: string): Promise<void> => {

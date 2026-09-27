@@ -238,10 +238,34 @@ export interface ToolApi {
   getIncident(): Promise<ToolResponse<IncidentView>>;
 }
 
+/**
+ * The incident this one recurs from, carried on `getIncident` whenever
+ * `recurrenceOf` is set.
+ *
+ * Someone already investigated this problem and wrote down what they
+ * concluded, and that conclusion was wrong in a way this incident is the
+ * proof of. It is the single most valuable thing an agent can start from, so
+ * it arrives with the first read rather than waiting to be discovered.
+ */
+export interface PriorIncident {
+  id: string;
+  status: IncidentStatus;
+  rootCause: string | null;
+  prUrls: string[];
+  /** What the earlier agent claimed it watched stop happening. */
+  resolvedEvidence: string | null;
+  /** Clipped: getIncident also carries directives, which must survive it. */
+  postmortem: string | null;
+  resolvedAt: number | null;
+  closedAt: number | null;
+}
+
 export interface IncidentView {
   incident: Incident;
   signals: Signal[];
   evidence: Evidence[];
+  /** Non-null only when this incident reopens ground that one claimed. */
+  priorIncident: PriorIncident | null;
 }
 
 // ---------------------------------------------------------------------------

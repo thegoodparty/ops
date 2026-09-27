@@ -100,11 +100,33 @@ model is advisory about the match; `applyRules` holds the invariants. It
 cannot suppress a cause the alert did not declare as suppressible, and it
 cannot attach across `RESOLVED`.
 
+Before that call, two indexed reads ask the other half of the question: has an
+incident that already claimed this problem was over carried a signal like this
+one? An exact `(source, sourceId)` match inside a two-week window of that
+resolution is stamped as `recurrenceOf` in code — it is a fact about the
+delivery, not a judgement — and a wider `alert_slug` match is offered to the
+model as a candidate. A failed lookup reaches the model as
+`RECURRENCE CANDIDATES UNAVAILABLE`, under the same rule as prefetched
+evidence: "we did not check" must never read as "we checked and found
+nothing".
+
+A recurrence opens a **new incident pointing at the old one**, never a reopen.
+`RESOLVED` and `CLOSED` are claims with timestamps attached, and two of the
+`CHECK` constraints above mean a reopen can only be done by clearing
+`resolvedAt` and `closedAt` — deleting the numbers the recurrence disproves,
+along with the only shape that can answer "how often does a resolution hold".
+
 **4. Dispatch** (`dispatcher/`) launches one agent per incident, up to 15.
 That cap is a circuit breaker, not a scheduler — hitting it means something
 is wrong. Ticks are serialized against each other: a tick awaits an S3 put
 and an STS call before recording a launch, so overlapping ticks would start
 two children on one incident, and both would write the same session file.
+
+When an incident carries `recurrenceOf`, `get_incident` returns the earlier
+incident with it: root cause, resolution evidence, PR urls and post-mortem.
+Somebody already investigated this and wrote down what they concluded, and the
+new incident is the proof they were wrong — so the agent starts from that
+rather than rediscovering it.
 
 **5. The agent** (`agent/`) runs Pi against Bedrock in the same container.
 It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP

@@ -215,6 +215,33 @@ Hand off when a human claims the incident (you will see it in your directives),
 when you have a root cause but low confidence, when a question goes unanswered
 inside your wait budget, or when your deadline is about to expire.`;
 
+const RECURRENCE = `## If this is a recurrence
+
+get_incident returns a \`priorIncident\` when this incident reopens ground an
+earlier one claimed. That is not background reading. It means an agent before
+you investigated this same problem, declared it resolved on evidence, wrote a
+post-mortem, and was wrong. You are the proof.
+
+Start from its root cause and its post-mortem, not from nothing. Before you
+open a new investigation, rule out the three cheap explanations in order:
+
+1. **The fix never shipped.** Check that every PR in \`prUrls\` is merged and
+   that the commit actually reached production. A merged PR on a failed
+   release is the most common one.
+2. **The fix was reverted or overwritten.** \`git log\` the files it touched
+   since it merged.
+3. **The fix was incomplete.** The recorded cause is real but covers one of
+   several paths into the same failure, so the same alert fires from another.
+
+If all three are out, the earlier root cause was wrong, and saying which part
+of it was wrong is the most useful thing your own post-mortem can contain.
+
+Two things you owe this incident that an ordinary one does not: say explicitly
+in your post-mortem why the earlier resolution held up when it should not
+have, and treat the earlier \`resolvedEvidence\` as a bar you have to clear
+better. Watching the same window for the same interval and reporting the same
+quiet is how this happens twice.`;
+
 const RESUME = `## If you are restarted
 
 Your container can die and be replaced. The session is replayed, so you will
@@ -246,6 +273,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     MONITOR_EXAMPLES(input),
     SHIP_PR,
     ESCALATION,
+    RECURRENCE,
     RESUME,
     "## How we log and alert",
     "Injected because it already exists and should not be rediscovered on every incident.",

@@ -74,17 +74,37 @@ const scripted = (replies: ModelReply[]) => {
   return { model, requests };
 };
 
+/** Matches the recurrence lookup, which is the only read that joins the two. */
+const RECURRENCE_SQL = /JOIN incident/i;
+
+/** The row shape `findRecurrenceCandidates` reads, as the fake serves it. */
+interface RecurrenceRow {
+  incidentId: string;
+  status: string;
+  rootCause: string | null;
+  resolvedEvidence: string | null;
+  resolvedAt: number;
+  signalTitle: string;
+}
+
 const fakeDb = (
   opts: {
     signalIds?: string[];
     statuses?: Record<string, string>;
     owners?: Record<string, string>;
+    recurrence?: RecurrenceRow[];
   } = {},
 ) => {
   const queries: string[] = [];
   const db: IncidentReader = {
     query: <T>(sql: string, params: unknown[] = []): T[] => {
       queries.push(sql);
+      // Ahead of the signal branch: the recurrence read joins signal to
+      // incident and would otherwise be answered with bare signal ids.
+      if (RECURRENCE_SQL.test(sql)) {
+        const rows = opts.recurrence ?? [];
+        return (/sourceId = \?/.test(sql) ? rows : []) as unknown as T[];
+      }
       if (/from\s+signal/i.test(sql)) {
         return (opts.signalIds ?? []).map((id) => ({ id })) as unknown as T[];
       }
@@ -373,7 +393,9 @@ test("can reach the incident database before deciding", async () => {
   const outcome = await runTriage({ model, db, budgetMs: 2000 }, context());
 
   assert.equal(outcome.decision.action, "new_incident");
-  assert.equal(queries.length, 1);
+  // The recurrence lookup is deterministic and runs before the call, so what
+  // this test is about is the reads the *model* made: exactly one.
+  assert.equal(queries.filter((sql) => !RECURRENCE_SQL.test(sql)).length, 1);
   assert.equal(requests.length, 2);
   assert.equal(requests[1].messages.at(-1)?.role, "toolResult");
 });
@@ -538,4 +560,185 @@ test("a human-owned RESOLVED incident is still a recurrence, not an owner refusa
     "who owns it must not cost us the evidence that the resolution was wrong",
   );
   assert.match(outcome.decision.reason, /RESOLVED/);
+});
+
+// --- recurrence -----------------------------------------------------------
+
+const RESOLVED_AT = 1_758_700_000_000 - 6 * 86_400_000;
+
+const priorRow = (over: Partial<RecurrenceRow> = {}): RecurrenceRow => ({
+  incidentId: "41",
+  status: "CLOSED",
+  rootCause: "the nightly refresh held a lock past its statement timeout",
+  resolvedEvidence: "zero matching lines for 90 minutes after the deploy",
+  resolvedAt: RESOLVED_AT,
+  signalTitle: "[PROD] Route errors detected",
+  ...over,
+});
+
+test("an exact-key match inside the window is a recurrence without the model", async () => {
+  const { db } = fakeDb({ recurrence: [priorRow()] });
+  const { model } = scripted([
+    decideCall({ action: "new_incident", reason: "nothing open looks like this" }),
+  ]);
+
+  const outcome = await runTriage({ model, db, budgetMs: 2000 }, context());
+
+  assert.equal(outcome.decision.action, "new_incident");
+  assert.equal(
+    outcome.recurrenceOf,
+    "41",
+    "the same signal reopening resolved ground is a fact, not a judgement",
+  );
+  assert.equal(outcome.recurrenceChecked, true);
+  assert.match(outcome.decision.reason, /recurrence of 41/);
+});
+
+test("the candidates reach the prompt, with their root causes", async () => {
+  const { db } = fakeDb({ recurrence: [priorRow()] });
+  const { model, requests } = scripted([
+    decideCall({ action: "new_incident", reason: "opening one" }),
+  ]);
+
+  await runTriage({ model, db, budgetMs: 2000 }, context());
+
+  const prompt = (() => {
+    const first = requests[0]?.messages[0];
+    return first && first.role === "user" ? first.text : "";
+  })();
+  assert.match(prompt, /RECURRENCE CANDIDATES/);
+  assert.match(prompt, /41 \| CLOSED/);
+  assert.match(prompt, /statement timeout/);
+  assert.match(prompt, /CONCLUSIVE/);
+});
+
+test("an exact match older than the window is offered, not asserted", async () => {
+  const { db } = fakeDb({
+    recurrence: [priorRow({ resolvedAt: 1_758_700_000_000 - 40 * 86_400_000 })],
+  });
+  const { model, requests } = scripted([
+    decideCall({ action: "new_incident", reason: "different shape entirely" }),
+  ]);
+
+  const outcome = await runTriage({ model, db, budgetMs: 2000 }, context());
+
+  assert.equal(
+    outcome.recurrenceOf,
+    null,
+    "a fingerprint is stable for the life of the rule, so 40 days on is history",
+  );
+  assert.doesNotMatch((() => {
+    const first = requests[0]?.messages[0];
+    return first && first.role === "user" ? first.text : "";
+  })(), /CONCLUSIVE/);
+});
+
+test("a resolution that landed while the alert was still firing still counts", async () => {
+  const { db } = fakeDb({
+    recurrence: [priorRow({ resolvedAt: 1_758_700_000_000 + 30_000 })],
+  });
+  const { model } = scripted([
+    decideCall({ action: "new_incident", reason: "still going" }),
+  ]);
+
+  const outcome = await runTriage({ model, db, budgetMs: 2000 }, context());
+
+  assert.equal(outcome.recurrenceOf, "41");
+});
+
+test("a dead model does not cost us the recurrence pointer", async () => {
+  resetFallbackRates();
+  const { db } = fakeDb({ recurrence: [priorRow()] });
+  const model: ModelClient = {
+    complete: () => Promise.reject(new Error("bedrock threw a 500")),
+  };
+
+  const { result } = await capture(() =>
+    runTriage({ model, db, budgetMs: 1000 }, context()),
+  );
+
+  assert.equal(result.fellBack, true);
+  assert.equal(
+    result.recurrenceOf,
+    "41",
+    "the pointer is computed before the call and must not depend on it",
+  );
+});
+
+test("a failed recurrence lookup alarms and never reads as 'not a recurrence'", async () => {
+  resetFallbackRates();
+  const { model } = scripted([
+    decideCall({ action: "new_incident", reason: "opening one" }),
+  ]);
+  let calls = 0;
+  const db: IncidentReader = {
+    query: <T>(sql: string): T[] => {
+      calls += 1;
+      if (RECURRENCE_SQL.test(sql)) throw new Error("SQLITE_BUSY: database is locked");
+      return [] as unknown as T[];
+    },
+  };
+
+  const { result, alarms } = await capture(() =>
+    runTriage({ model, db, budgetMs: 2000 }, context()),
+  );
+
+  assert.equal(
+    alarms.filter((a) => a.event === "recurrence_lookup_failed").length,
+    1,
+    "a broken lookup must not be indistinguishable from a clean 'nothing matched'",
+  );
+  assert.equal(result.recurrenceChecked, false);
+  assert.equal(result.decision.action, "new_incident", "the signal is still placed");
+  assert.ok(calls > 0);
+});
+
+test("an unavailable lookup says so in the prompt instead of showing an empty list", async () => {
+  resetFallbackRates();
+  const { model, requests } = scripted([
+    decideCall({ action: "new_incident", reason: "opening one" }),
+  ]);
+  const db: IncidentReader = {
+    query: <T>(sql: string): T[] => {
+      if (RECURRENCE_SQL.test(sql)) throw new Error("SQLITE_BUSY");
+      return [] as unknown as T[];
+    },
+  };
+
+  await capture(() => runTriage({ model, db, budgetMs: 2000 }, context()));
+
+  const prompt = (() => {
+    const first = requests[0]?.messages[0];
+    return first && first.role === "user" ? first.text : "";
+  })();
+  assert.match(prompt, /RECURRENCE CANDIDATES UNAVAILABLE/);
+  assert.doesNotMatch(prompt, /no incident in the last 90 days/);
+});
+
+test("suppressing a recurrence is allowed but never quiet", async () => {
+  resetFallbackRates();
+  const { db } = fakeDb({ recurrence: [priorRow()] });
+  const { model } = scripted([
+    decideCall({
+      action: "suppress",
+      knownCauseId: "statement-timeout",
+      reason: "the evidence matches the declared cause",
+    }),
+  ]);
+
+  const { result, alarms } = await capture(() =>
+    runTriage(
+      { model, db, budgetMs: 2000 },
+      context({
+        signal: signal({ labels: { annotation_known_causes: KNOWN_CAUSES } }),
+      }),
+    ),
+  );
+
+  assert.equal(result.decision.action, "suppress");
+  assert.equal(
+    alarms.filter((a) => a.event === "recurrence_suppressed").length,
+    1,
+    "dropping the one delivery that contradicts a resolution is the failure this exists to catch",
+  );
 });

@@ -26,6 +26,7 @@ import type {
   Incident,
   IncidentStatus,
   IncidentView,
+  PriorIncident,
   Signal,
   ToolApi,
   ToolResponse,
@@ -120,6 +121,42 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   const readIncident = (id: string): Incident | undefined => {
     const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [id]);
     return row ? rowToIncident(row) : undefined;
+  };
+
+  /**
+   * The post-mortem is the whole point of carrying this, and it is the one
+   * field with no bound on it. getIncident renders as JSON followed by the
+   * pending directives, and the agent's truncation keeps a head and a tail --
+   * so an unbounded post-mortem eats the middle of the incident rather than
+   * itself. Clipped here, where the size is known, instead.
+   */
+  const MAX_PRIOR_POSTMORTEM_CHARS = 6000;
+
+  const readPriorIncident = (id: string | null): PriorIncident | null => {
+    if (!id) return null;
+    const prior = readIncident(id);
+    // A dangling pointer is a real fault: recurrenceOf is a foreign key, so
+    // the row cannot simply be missing. Never a silent null.
+    if (!prior) {
+      alarm("prior_incident_missing", {
+        recurrenceOf: id,
+        note: "the incident this one recurs from cannot be read, so the agent starts without the post-mortem that explains it",
+      });
+      return null;
+    }
+    return {
+      id: prior.id,
+      status: prior.status,
+      rootCause: prior.rootCause,
+      prUrls: prior.prUrls,
+      resolvedEvidence: prior.resolvedEvidence,
+      postmortem:
+        prior.postmortem && prior.postmortem.length > MAX_PRIOR_POSTMORTEM_CHARS
+          ? `${prior.postmortem.slice(0, MAX_PRIOR_POSTMORTEM_CHARS)}...[truncated; the full text is in the incident database]`
+          : prior.postmortem,
+      resolvedAt: prior.resolvedAt,
+      closedAt: prior.closedAt,
+    };
   };
 
   const readSignals = (id: string): Signal[] =>
@@ -745,6 +782,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           incident,
           signals: readSignals(incidentId),
           evidence: loaded,
+          priorIncident: readPriorIncident(incident.recurrenceOf),
         },
       };
     });

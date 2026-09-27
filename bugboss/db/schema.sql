@@ -118,6 +118,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS signal_open_source_idx
 CREATE INDEX IF NOT EXISTS incident_status_idx ON incident (status);
 CREATE INDEX IF NOT EXISTS signal_incident_idx ON signal (incidentId);
 
+-- Recurrence. Triage asks, on every delivery, whether an incident that
+-- already claimed this problem was over carried a signal like this one. Both
+-- reads join signal to incident, so both need the signal side indexed or the
+-- cost of the question grows with every alert the system has ever seen.
+--
+-- signal_open_source_idx cannot serve this: it is partial on closedAt IS
+-- NULL, and every signal a resolution closed has a closedAt. The exact key is
+-- the same (source, sourceId) though, which is the point -- the delivery that
+-- proves a resolution was premature is the one most certain to match the
+-- signal that resolution closed.
+CREATE INDEX IF NOT EXISTS signal_source_idx ON signal (source, sourceId);
+
+-- The wider key: the same alert rule firing on a different instance. An
+-- expression index because the slug lives inside the labels JSON, and
+-- json_extract is deterministic, which is what SQLite requires of one.
+CREATE INDEX IF NOT EXISTS signal_slug_idx
+  ON signal (json_extract(labels, '$.alert_slug'));
+
 -- A question asked by contact_human that has not been answered yet. Lets a
 -- resumed agent find the message it already posted rather than asking twice.
 CREATE TABLE IF NOT EXISTS pending_question (
