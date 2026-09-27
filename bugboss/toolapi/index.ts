@@ -346,6 +346,12 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       });
     }
 
+    // Re-read after opening threads. The row this was called with was read
+    // before the transition, and the incident being split can be the one
+    // openThreads just gave a thread to -- in which case the stale copy sends
+    // its own announcement to the top level and leaves the back-link blank.
+    const from = readIncident(source.id) ?? source;
+
     const one = splits.length === 1;
     const refs = await Promise.all(
       splits.map((split) =>
@@ -354,7 +360,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     );
 
     await notify(
-      source,
+      from,
       [
         mrkdwn`*${splits.length} signal${one ? "" : "s"} left this incident, because its root cause does not explain ${one ? "it" : "them"}*`,
         mrkdwn`_Now worked separately as ${raw(refs.join(", "))}, with a new agent on ${one ? "it" : "each"} · this incident keeps the signals its root cause does explain._`,
@@ -366,16 +372,16 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (!born?.slackThreadTs) {
         alarm("split_thread_missing", {
           incidentId: split.target,
-          from: source.id,
+          from: from.id,
         });
         continue;
       }
       await notify(
         born,
         [
-          mrkdwn`*This incident was split out of incident ${source.id}*`,
-          mrkdwn`Incident ${source.id} found a root cause that does not account for what is here, so this is worked on its own from now on.`,
-          mrkdwn`_A separate agent is on this one · incident ${source.id} carries on in ${raw(await threadRef(source, "its own thread"))}._`,
+          mrkdwn`*This incident was split out of incident ${from.id}*`,
+          mrkdwn`Incident ${from.id} found a root cause that does not account for what is here, so this is worked on its own from now on.`,
+          mrkdwn`_A separate agent is on this one · incident ${from.id} carries on in ${raw(await threadRef(from, "its own thread"))}._`,
         ].join("\n"),
       );
     }

@@ -1364,6 +1364,32 @@ describe("a split is told to both threads", () => {
     );
   });
 
+  it("uses the thread openThreads had to open for the incident being split", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a", "sig-b"]);
+
+    const res = await toolsFor(id).reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const born = (res.data as { splitInto: string[] }).splitInto;
+    assert.equal(
+      postsIn(id).length,
+      1,
+      "the incident got its thread here, so the announcement belongs in it and not at the top level",
+    );
+    assert.match(
+      postsIn(born[0])[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${id}\\|its own thread>`,
+      ),
+      "and the back-link points at it rather than coming out blank",
+    );
+  });
+
   it("says so when the split incident never got a thread", async () => {
     await seed("sig-a");
     await seed("sig-b");
