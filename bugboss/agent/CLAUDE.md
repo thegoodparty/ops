@@ -21,6 +21,12 @@ run for a day, so a token handed down at launch would expire
 mid-investigation and surface as `gh` refusing to push a branch the agent
 had already built.
 
+What that token may do is [`../github-app.md`](../github-app.md), which is the
+GitHub counterpart to the checked-in Slack manifest. Read it before assuming
+a capability: the App is installed org-wide with `contents: write`, so the
+token reaches every repository in the organisation and not only omni. The
+prompt used to say otherwise and was wrong.
+
 ## The two blocking tools
 
 `monitor` and `contact_human` each cost **one turn** no matter how long they
@@ -41,6 +47,49 @@ polling, and it is why the prompt forbids polling with bash in a loop.
   marker and the timeout are untouched and an answer nobody offered still
   lands. The options are checked before anything is posted, so a refusal
   costs no marker and no message.
+
+## Re-running CI: the capability and its bound are one object
+
+`rerun_ci` (`rerun.ts`) re-runs one workflow run's failed jobs, once. It
+exists because incident 5 could not: the App holds `actions: read`, the
+endpoint needs `actions: write`, and the agent correctly stopped and asked a
+human rather than pretending otherwise.
+
+The permission on its own would have been the worse outcome. `gh run rerun
+--failed` is all the capability needs, and an agent holding that reaches for
+a re-run the moment anything is red — retry as a fix, automated. So the
+affordance is the tool, and the tool carries the discipline:
+
+- **One attempt per run, read from GitHub's `run_attempt`.** Not from
+  anything we store, which is what makes it survive a restart *and* makes the
+  tool safe to replay: a restarted agent's recorded call runs again, finds
+  attempt 2 and refuses instead of re-running twice. It also refuses a run a
+  human already re-ran, which is right.
+- **A budget across the incident**, so "push something small, re-run, repeat"
+  runs out. Process-scoped, and a restart hands it back — but every run
+  already re-run is still at attempt 2, so what a restart buys is only runs it
+  has not touched.
+- **The thread is told by the tool, not by the model.** The `suspicion`
+  argument is required and is posted verbatim, so a human reading the thread
+  can say "that is not a flake, that is your change". Posted *after* the
+  re-run rather than before it, which is the opposite of `contact_human`'s
+  marker: until the permission is granted every call ends in a 403, and a
+  notice posted first would announce a re-run that never happened, over and
+  over. A post that fails afterwards is recoverable and loud — the result
+  hands the agent the text and tells it to post it.
+- **A 403 names the permission.** Not "the re-run failed". It says which
+  endpoint, which permission, that the App holds `read`, and that asking a
+  human is fine *only* if the ask says why — because a missing permission
+  nobody names is a missing permission nobody grants. GitHub's own message is
+  carried through, so once `actions: write` is granted a 403 for some other
+  reason still reads correctly.
+
+**There is no fence, and this is the honest part.** The agent has a real
+shell. `gh run rerun` is reachable the way `gh pr merge` is, and GitHub offers
+no server-side equivalent of branch protection for a re-run. The prompt
+forbids it; that is advice, not a control. If a reviewer wants this closed,
+the only real answer is a second, narrower token for the agent's shell, which
+is a bigger change than this one.
 
 ## contact_human is not an escalation, and the harness enforces that
 
