@@ -121,11 +121,7 @@ export const createSlackVerifier = (config: SlackConfig): SlackVerifier => {
   };
 };
 
-/**
- * Verify one inbound Slack delivery and say what shape it is. Async because
- * it is the edge every caller already awaits, and a future source of truth
- * for one of these answers will not be in memory.
- */
+/** Verify one inbound Slack delivery and say what shape it is. */
 export const classifySlackEvent = async (
   req: IncomingRequest,
   config: SlackConfig = {},
