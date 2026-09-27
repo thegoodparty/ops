@@ -157,15 +157,23 @@ export const createGitHubRunsPort = (deps: {
           "no GitHub token in this container: the App credentials did not resolve at launch, so BugBoss is running without GitHub access at all",
       };
     }
-    const response = await http(`${base}${path}`, {
-      method,
-      headers: githubHeaders(token),
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      return { ok: false, status: response.status, message: githubMessage(response.status, text) };
+    // A thrown fetch is a result here rather than an exception out of the tool,
+    // so the model reads a sentence it can act on instead of a stack. It is
+    // safe to report a failed POST that may in fact have landed: the retry
+    // reads `run_attempt` first and refuses a run that was already re-run.
+    try {
+      const response = await http(`${base}${path}`, {
+        method,
+        headers: githubHeaders(token),
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        return { ok: false, status: response.status, message: githubMessage(response.status, text) };
+      }
+      return { ok: true, data: (text ? JSON.parse(text) : null) as T };
+    } catch (err) {
+      return { ok: false, status: 0, message: `${method} ${path} failed: ${String(err)}` };
     }
-    return { ok: true, data: (text ? JSON.parse(text) : null) as T };
   };
 
   return {

@@ -421,3 +421,31 @@ test("a tool call whose announcement fails hands the model the text to post", as
   assert.match(text, /slack 503/);
   assert.match(text, /Post this yourself now/);
 });
+
+test("a thrown fetch becomes a result the model can act on, not a stack", async () => {
+  const port = createGitHubRunsPort({
+    token: () => "t",
+    fetchImpl: async () => {
+      throw new Error("ECONNRESET");
+    },
+  });
+
+  const result = await port.rerunFailedJobs("thegoodparty/omni", 42);
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.status, 0);
+  assert.match(result.message, /ECONNRESET/);
+  assert.match(result.message, /rerun-failed-jobs/);
+});
+
+test("a body that is not JSON on a 200 is a refusal, not a crash", async () => {
+  const port = createGitHubRunsPort({
+    token: () => "t",
+    fetchImpl: async () => new Response("<html>hi</html>", { status: 200 }),
+  });
+
+  const result = await port.getRun("thegoodparty/omni", 42);
+
+  assert.equal(result.ok, false);
+});
