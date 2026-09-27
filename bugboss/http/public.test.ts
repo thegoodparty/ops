@@ -99,15 +99,16 @@ test("alarms when the grafana ingest write fails", async () => {
   assert.match(String(alarm.error), /s3 put failed/);
 });
 
-test("alarms when the slack report write fails", async () => {
+test("alarms when the slack relay write fails", async () => {
   // The /slack route had no try/catch at all, so a failed write here reached
   // Hono directly. Signed properly on purpose: an unsigned body answers 401
-  // long before ingest, which would make this pass without proving anything.
+  // long before the relay, which would make this pass without proving
+  // anything.
   let reached = false;
   const app = createPublicApp(
     deps({
       slackConfig: { signingSecret: SIGNING_SECRET },
-      ingestAccepted: async () => {
+      slackEventAccepted: async () => {
         reached = true;
         throw new Error("db is read-only");
       },
@@ -122,7 +123,7 @@ test("alarms when the slack report write fails", async () => {
         user: "U1",
         channel: "C1",
         ts: "1.0",
-        text: "<@B1> report checkout is down",
+        text: "<@B1> checkout is down",
       },
     }),
   );
@@ -133,6 +134,43 @@ test("alarms when the slack report write fails", async () => {
   const alarm = JSON.parse(errors[0]) as Record<string, unknown>;
   assert.equal(alarm.event, "route_failed");
   assert.equal(alarm.path, "/slack");
+});
+
+/**
+ * Reading what a mention meant is a model call and answering it is an agent,
+ * so both run past the response. What must not happen is either of them
+ * failing into silence: a rejection out there has no caller left to tell.
+ */
+test("a deferred slack answer that fails alarms rather than vanishing", async () => {
+  const app = createPublicApp(
+    deps({
+      slackConfig: { signingSecret: SIGNING_SECRET },
+      slackEventAccepted: async () => ({
+        settled: Promise.reject(new Error("bedrock: ThrottlingException")),
+      }),
+    }),
+  );
+
+  const { result: res, errors } = await withCapturedErrors(async () => {
+    const response = await signedSlack(app, {
+      type: "event_callback",
+      event: {
+        type: "app_mention",
+        user: "U1",
+        channel: "C1",
+        ts: "1.0",
+        text: "<@B1> checkout is down",
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    return response;
+  });
+
+  assert.equal(res.status, 200, "Slack still gets its ack inside three seconds");
+  assert.equal(errors.length, 1);
+  const alarm = JSON.parse(errors[0]) as Record<string, unknown>;
+  assert.equal(alarm.event, "deferred_failed");
+  assert.equal(alarm.route, "slack");
 });
 
 test("a rejected delivery answers 401 without alarming", async () => {
@@ -213,9 +251,14 @@ test("a mention is acknowledged before the agent that answers it runs", async ()
   assert.deepEqual(order, ["ack", "work"]);
 });
 
-test("a bug report is acknowledged before the signal is written", async () => {
+test("a report-shaped mention is acknowledged before the work behind it", async () => {
+  // Ingress stopped reading verbs, so "report ..." is a mention like any
+  // other and what it is asking for is a model call further in. What still
+  // has to hold is that the reaction lands before that work, and that no
+  // report is routed straight into ingest from this layer any more.
   const acknowledged: SlackAck[] = [];
   const order: string[] = [];
+  let ingested = 0;
   const app = createPublicApp(
     slackDeps(acknowledged, {
       acknowledgeSlack: (ack) => {
@@ -223,8 +266,12 @@ test("a bug report is acknowledged before the signal is written", async () => {
         acknowledged.push(ack);
       },
       ingestAccepted: async () => {
-        order.push("ingest");
+        ingested += 1;
         return { settled: Promise.resolve(), recorded: 1 };
+      },
+      slackEventAccepted: async () => {
+        order.push("work");
+        return { settled: Promise.resolve() };
       },
     }),
   );
@@ -232,7 +279,7 @@ test("a bug report is acknowledged before the signal is written", async () => {
   const res = await signedSlack(app, {
     type: "event_callback",
     event: {
-      type: "app_mention",
+      type: "message",
       user: "U1",
       channel: "C1",
       ts: "2.0",
@@ -241,22 +288,25 @@ test("a bug report is acknowledged before the signal is written", async () => {
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(acknowledged, [
-    { kind: "bug_report", channel: "C1", ts: "2.0" },
-  ]);
-  assert.deepEqual(order, ["ack", "ingest"]);
+  assert.deepEqual(acknowledged, [{ kind: "mention", channel: "C1", ts: "2.0" }]);
+  assert.deepEqual(order, ["ack", "work"]);
+  assert.equal(ingested, 0, "what a mention means is decided past this layer");
 });
 
-test("a reply in an incident thread is acknowledged", async () => {
-  // The case with the worst feedback today: contact_human is answered by a
-  // plain reply, and nothing visible happens until the agent next polls.
+test("an untagged reply in a thread reaches the relay but gets no reaction", async () => {
+  // Ingress can no longer tell an incident thread from any other one -- that
+  // is the relay's to know -- so an untagged reply classifies as `ignored`
+  // and misses the :eyes: even though the relay does act on it. The reply
+  // itself is not lost, which is the half that matters most and the half
+  // this pins. Closing the rest means acknowledging after the relay has
+  // resolved the thread; see slack/CLAUDE.md.
   const acknowledged: SlackAck[] = [];
+  let relayed = 0;
   const app = createPublicApp(
     slackDeps(acknowledged, {
-      slackConfig: {
-        signingSecret: SIGNING_SECRET,
-        botUserId: "B1",
-        isIncidentThread: () => true,
+      slackEventAccepted: async () => {
+        relayed += 1;
+        return { settled: Promise.resolve() };
       },
     }),
   );
@@ -274,9 +324,8 @@ test("a reply in an incident thread is acknowledged", async () => {
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(acknowledged, [
-    { kind: "incident_reply", channel: "C1", ts: "3.1" },
-  ]);
+  assert.equal(relayed, 1, "the answer still reaches the agent waiting on it");
+  assert.deepEqual(acknowledged, []);
 });
 
 test("channel chatter BugBoss ignores gets no reaction", async () => {

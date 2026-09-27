@@ -12,7 +12,6 @@ import {
   SlackRelay,
   earnsMention,
   mentionsBot,
-  ownershipClaim,
   renderEvent,
   stripBotMention,
   type RelayEvent,
@@ -338,7 +337,7 @@ describe("inbound", () => {
     return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
   };
 
-  test("an untagged reply answers the agent waiting on it", async () => {
+  test("an untagged reply is recorded against the incident", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "message",
@@ -349,28 +348,26 @@ describe("inbound", () => {
       thread_ts: thread,
     });
 
-    assert.deepEqual(
-      route,
-      { kind: "incident_reply", incidentId: "inc-1", interrupt: false },
-      "answering is not interrupting",
-    );
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.interrupt, false, "answering is not interrupting");
+    assert.equal(route.incidentId, "inc-1");
     const replies = db.query<{ text: string; slackUserId: string }>(
       "SELECT text, slackUserId FROM thread_reply WHERE incidentId = 'inc-1'",
     );
     assert.equal(replies.length, 1);
     assert.equal(replies[0].slackUserId, "U0HUMAN");
 
-    // contact_human waits on directives alone, so no directive means the
-    // agent blocks until it times out and escalates over an answer it has.
-    const [directive] = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
+    // Handing it to the agent is the caller's, because whether it answers
+    // the agent, hands the incident over, or is two people talking is a model
+    // call and this has to be back inside Slack's three seconds. Covered end
+    // to end in test/e2e.test.ts.
+    assert.equal(
+      db.query("SELECT id FROM pending_directive").length,
+      0,
+      "the relay records; it does not decide what a message meant",
     );
-    assert.deepEqual(JSON.parse(directive.payload), {
-      type: "human_message",
-      from: "U0HUMAN",
-      text: "yes, org X bypasses the Stripe webhook",
-      ts: "1700.1",
-    });
+    assert.equal(route.text, "yes, org X bypasses the Stripe webhook");
   });
 
   test("Slack redelivering the same event does not double-record it", async () => {
@@ -387,15 +384,14 @@ describe("inbound", () => {
     const second = await relay.handle(event);
 
     assert.equal(second.kind, "ignore");
-    assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
     assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
+      db.query("SELECT id FROM thread_reply").length,
       1,
-      "and the agent is told once, not twice",
+      "the insert is what a Slack retry collapses onto, so the caller reads it once",
     );
   });
 
-  test("a mention interrupts a working agent with a directive", async () => {
+  test("a mention is marked as an interrupt on the route", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "app_mention",
@@ -406,23 +402,14 @@ describe("inbound", () => {
       thread_ts: thread,
     });
 
-    assert.deepEqual(route, {
-      kind: "incident_reply",
-      incidentId: "inc-1",
-      interrupt: true,
-    });
-    const [directive] = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
-    );
-    assert.deepEqual(JSON.parse(directive.payload), {
-      type: "human_message",
-      from: "U0HUMAN",
-      text: `<@${BOT}> stop, this is expected`,
-      ts: "1700.2",
-    });
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.interrupt, true);
+    assert.equal(route.incidentId, "inc-1");
+    assert.equal(route.text, `<@${BOT}> stop, this is expected`);
   });
 
-  test("a mention in a thread with no agent running goes to the Slack agent", async () => {
+  test("a mention in a thread with no agent running says so on the route", async () => {
     const thread = await openThread("inc-9", "INVESTIGATING", "human");
     const route = await relay.handle({
       type: "app_mention",
@@ -433,12 +420,13 @@ describe("inbound", () => {
       thread_ts: thread,
     });
 
-    assert.equal(route.kind, "slack_agent");
-    assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
-      0,
-      "there is no agent to interrupt",
-    );
+    // The relay no longer decides that this is a question rather than a
+    // handover -- that is a model call the caller makes off the ack -- so it
+    // hands up the two facts that decide it.
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.interrupt, true, "it was addressed to us");
+    assert.equal(route.agentRunning, false, "and there is no agent to interrupt");
   });
 
   test("a channel-level mention opens a new Slack agent thread on itself", async () => {
@@ -508,7 +496,7 @@ describe("inbound", () => {
     const dupe = await relay.handle({ ...shared, type: "message" });
 
     assert.equal(dupe.kind, "ignore");
-    assert.equal(db.query("SELECT id FROM pending_directive").length, 1);
+    assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
   });
 });
 
@@ -638,7 +626,7 @@ describe("a broken thread link", () => {
 
 // ---------------------------------------------------------------------------
 
-describe("claiming an incident", () => {
+describe("a message in an incident thread", () => {
   const openThread = async (id: string, status = "INVESTIGATING", owner = "agent") => {
     await seedIncident(id, status, owner);
     return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
@@ -654,41 +642,42 @@ describe("claiming an incident", () => {
       thread_ts: thread,
     });
 
-  test("the claim words are matched whole, not found inside a sentence", () => {
-    assert.equal(ownershipClaim("mine", BOT), "take_over");
-    assert.equal(ownershipClaim("  Mine.  ", BOT), "take_over");
-    assert.equal(ownershipClaim(`<@${BOT}> mine`, BOT), "take_over");
-    assert.equal(ownershipClaim("back to you", BOT), "hand_back");
-    assert.equal(ownershipClaim("Back to you!", BOT), "hand_back");
-
+  /**
+   * The relay used to decide this itself, by requiring the whole normalized
+   * message to equal "mine" or "back to you". That made "ok back to you" and
+   * "handing this back" do nothing at all, silently. It now records the
+   * message and hands it up with the context a model needs to read it, and
+   * nothing here looks at the words.
+   */
+  test("every message routes the same way, whatever it says", async () => {
+    const thread = await openThread("inc-1");
     for (const said of [
-      "not mine",
-      "that one is mine to fix",
-      "mine looks fine, yours does not",
-      "handing this back to you once CI is green",
-      "",
+      "mine",
+      "ok back to you",
+      "not mine, the webhook is upstream",
+      "handing this back once CI is green",
     ]) {
-      assert.equal(ownershipClaim(said, BOT), null, said);
+      const route = await reply(thread, said, `1700.${said.length}`);
+      assert.equal(route.kind, "incident_reply", said);
+      if (route.kind !== "incident_reply") return;
+      assert.equal(route.text, said, "the sentence travels whole, unnormalized");
+      assert.equal(route.incidentId, "inc-1");
+      assert.equal(route.user, "U0HUMAN");
+      assert.equal(route.threadTs, thread);
+      assert.equal(route.channel, CHANNEL);
     }
   });
 
-  test("an untagged claim is routed as a claim and still reaches the agent", async () => {
+  test("a reply is recorded and owed to the agent before anything reads it", async () => {
     const thread = await openThread("inc-1");
-    const route = await reply(thread, "mine");
+    const route = await reply(thread, "I've got this one from here");
 
-    assert.deepEqual(route, {
-      kind: "ownership_claim",
-      incidentId: "inc-1",
-      claim: "take_over",
-      slackUserId: "U0HUMAN",
-      ts: "1700.1",
-    });
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.interrupt, false);
+    assert.equal(route.owner, "agent");
+    assert.equal(route.agentRunning, true);
     assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
-    assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
-      1,
-      "a claim is still an answer the agent is owed",
-    );
   });
 
   test("the relay does not flip owner itself", async () => {
@@ -698,45 +687,67 @@ describe("claiming an incident", () => {
     const row = db.get<{ owner: string }>(
       "SELECT owner FROM incident WHERE id = 'inc-1'",
     );
-    assert.equal(row?.owner, "agent", "the write belongs to the tool API");
+    assert.equal(row?.owner, "agent", "the write belongs to the composition root");
   });
 
-  test("handing it back is its own claim", async () => {
-    const thread = await openThread("inc-1", "INVESTIGATING", "human");
-    const route = await reply(thread, "back to you");
-
-    assert.equal(route.kind, "ownership_claim");
-    if (route.kind !== "ownership_claim") return;
-    assert.equal(route.claim, "hand_back");
-  });
-
-  test("a tagged claim is a claim, not a question for the read-only agent", async () => {
+  test("who has it travels with the message, because it changes what it means", async () => {
     const thread = await openThread("inc-9", "INVESTIGATING", "human");
+    const route = await reply(thread, "all yours again");
+
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.owner, "human");
+    assert.equal(
+      route.agentRunning,
+      false,
+      "no agent is on a human-owned incident, so a mention here is a question",
+    );
+  });
+
+  test("a mention is marked as one so it interrupts as well as answers", async () => {
+    const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "app_mention",
       channel: CHANNEL,
       user: "U0HUMAN",
-      text: `<@${BOT}> mine`,
+      text: `<@${BOT}> what have you tried`,
       ts: "1700.2",
       thread_ts: thread,
     });
 
-    assert.equal(
-      route.kind,
-      "ownership_claim",
-      "the Slack agent would answer that it cannot take ownership",
-    );
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.interrupt, true);
+    assert.equal(route.agentRunning, true);
   });
 
-  test("a reply that only mentions a claim word stays an ordinary reply", async () => {
-    const thread = await openThread("inc-1");
-    const route = await reply(thread, "not mine, the webhook is upstream");
-
-    assert.deepEqual(route, {
-      kind: "incident_reply",
-      incidentId: "inc-1",
-      interrupt: false,
+  /**
+   * The old code returned before the insert for this one case, so Slack's
+   * retry of a mention in a thread with no agent ran the Slack agent twice
+   * on one question.
+   */
+  test("a mention with no agent on the incident is recorded, so a retry collapses", async () => {
+    const thread = await openThread("inc-9", "INVESTIGATING", "human");
+    const first = await relay.handle({
+      type: "app_mention",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: `<@${BOT}> what happened here`,
+      ts: "1700.3",
+      thread_ts: thread,
     });
+    assert.equal(first.kind, "incident_reply");
+
+    const retry = await relay.handle({
+      type: "app_mention",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: `<@${BOT}> what happened here`,
+      ts: "1700.3",
+      thread_ts: thread,
+    });
+    assert.deepEqual(retry, { kind: "ignore", reason: "duplicate delivery" });
+    assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
   });
 });
 
@@ -815,6 +826,9 @@ describe("a button press", () => {
       from: "U0HUMAN",
       text: "Roll back",
       ts: "1800.9",
+      // Pressing the agent's own button is addressed to it by construction,
+      // so this is the one human_message nothing has to read first.
+      addressed: "agent",
     });
   });
 
@@ -894,14 +908,24 @@ describe("a button press", () => {
       kind: "incident_reply",
       incidentId: "inc-1",
       interrupt: false,
+      owner: "agent",
+      agentRunning: true,
+      channel: CHANNEL,
+      threadTs: thread,
+      ts: "1800.8",
+      user: "U0HUMAN",
+      text: "neither — the deploy is already out, just verify it",
     });
-    const [directive] = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
+    // A typed reply's directive is the composition root's to write, once the
+    // intent read says who it was for. The relay's half is the record, and
+    // that is what this can see.
+    const replies = db.query<{ text: string }>(
+      "SELECT text FROM thread_reply WHERE incidentId = 'inc-1'",
     );
-    assert.equal(
-      (JSON.parse(directive.payload) as { text: string }).text,
-      "neither — the deploy is already out, just verify it",
-      "an answer nobody offered as a button reaches the agent unchanged",
+    assert.deepEqual(
+      replies,
+      [{ text: "neither — the deploy is already out, just verify it" }],
+      "an answer nobody offered as a button is recorded unchanged",
     );
   });
 });

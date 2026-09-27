@@ -212,25 +212,31 @@ export interface SlackEvent {
   thread_ts?: string;
 }
 
-/** Which way ownership is being handed, per the Layer 4 actions table. */
-export type OwnershipClaim = "take_over" | "hand_back";
-
 export type InboundRoute =
   | { kind: "ignore"; reason: string }
-  /** Recorded against an incident. `interrupt` means a directive went with it. */
-  | { kind: "incident_reply"; incidentId: string; interrupt: boolean }
   /**
-   * A reply claiming the incident or handing it back. Recorded and relayed
-   * like any other reply; the kind is the part that says the incident is
-   * changing hands, and it carries what a write of `owner` would need. The
-   * relay does not write `owner` and cannot: the whole flip lives elsewhere.
+   * A message in an incident's thread, already recorded and already pushed to
+   * the agent as a directive. What it *means* -- an answer, a question, or the
+   * incident changing hands -- is a model call the caller makes off the Slack
+   * ack, so everything that read needs travels on the route.
+   *
+   * The relay does not write `owner` and cannot: the whole flip lives in the
+   * composition root, guarded in the statement.
    */
   | {
-      kind: "ownership_claim";
+      kind: "incident_reply";
       incidentId: string;
-      claim: OwnershipClaim;
-      slackUserId: string;
+      /** The message tagged the bot, so a directive interrupts as well. */
+      interrupt: boolean;
+      /** Who has the incident right now. Context for reading the message. */
+      owner: IncidentOwner;
+      /** False when no agent is on it, so a mention is a question for Job 6. */
+      agentRunning: boolean;
+      channel: string;
+      threadTs: string;
       ts: string;
+      user: string;
+      text: string;
     }
   | {
       kind: "slack_agent";
@@ -270,29 +276,6 @@ export const mentionsBot = (text: string, botUserId: string): boolean =>
 
 export const stripBotMention = (text: string, botUserId: string): string =>
   text.replaceAll(`<@${botUserId}>`, "").replace(/\s+/g, " ").trim();
-
-const CLAIM_WORDS: readonly (readonly [string, OwnershipClaim])[] = [
-  ["mine", "take_over"],
-  ["back to you", "hand_back"],
-];
-
-/**
- * The whole normalized message must be the claim word. Substring matching is
- * the wrong trade here: "not mine" and "that one is mine to fix" are ordinary
- * incident chatter, and a false claim is the expensive direction, because
- * owner = 'human' takes the incident out of the dispatcher's query and there
- * is nothing that hands it back.
- */
-export const ownershipClaim = (
-  text: string,
-  botUserId: string,
-): OwnershipClaim | null => {
-  const said = stripBotMention(text, botUserId)
-    .toLowerCase()
-    .replace(/[.!?]+$/, "")
-    .trim();
-  return CLAIM_WORDS.find(([word]) => word === said)?.[1] ?? null;
-};
 
 const ignore = (reason: string): InboundRoute => ({ kind: "ignore", reason });
 
@@ -417,7 +400,12 @@ export class SlackRelay {
     const text = event.text ?? "";
     if (!channel || !ts || !user) return ignore("incomplete event");
 
-    const mentioned = mentionsBot(text, this.cfg.botUserId);
+    // Slack only delivers app_mention when the app was tagged, so the event
+    // type is a mention on its own. Resting this on the literal `<@id>` alone
+    // made the whole mention path depend on botUserId being configured, and
+    // an optional field nobody sets is a fix that only exists in the source.
+    const mentioned =
+      event.type === "app_mention" || mentionsBot(text, this.cfg.botUserId);
 
     // Slack delivers a threaded mention twice when the app subscribes to both
     // message.channels and app_mention. app_mention is the authoritative copy.
@@ -443,15 +431,11 @@ export class SlackRelay {
       incident.owner === "agent" &&
       AGENT_RUNNING_STATUSES.includes(incident.status);
 
-    // Checked before the Slack agent branch on purpose: that agent is
-    // read-only and its answer to a claim is to tell you to reply in the
-    // thread, which is what you just did.
-    const claim = ownershipClaim(text, this.cfg.botUserId);
-
-    if (mentioned && !agentRunning && !claim) {
-      return { kind: "slack_agent", channel, threadTs, ts, user, text };
-    }
-
+    // Recorded before anything decides what it meant, including a mention
+    // this incident has no agent for. Two reasons. The thread is the record,
+    // so a message in it belongs in thread_reply whoever ends up answering;
+    // and the insert is what collapses a Slack retry, so a delivery that used
+    // to skip it could run the Slack agent twice on one question.
     const inserted = await this.recordReply(incident.id, {
       channel,
       user,
@@ -460,27 +444,9 @@ export class SlackRelay {
     });
     if (!inserted) return ignore("duplicate delivery");
 
-    // `contact_human` waits on directives alone, and the contract is that a
-    // plain reply in the thread answers it; nothing else reads thread_reply on
-    // an agent's behalf. A mention answers too, and interrupts as well.
-    await this.pushDirective(incident.id, {
-      type: "human_message",
-      from: user,
-      text,
-      ts,
-    });
-
-    if (claim) {
-      log("ownership_claim", { incidentId: incident.id, claim, user, ts });
-      return {
-        kind: "ownership_claim",
-        incidentId: incident.id,
-        claim,
-        slackUserId: user,
-        ts,
-      };
-    }
-
+    // Handing it to the agent is the caller's, because whether it is an
+    // answer, a handover or two people talking to each other is a model call
+    // and this has to be back inside Slack's three seconds.
     log(mentioned ? "interrupt_recorded" : "reply_recorded", {
       incidentId: incident.id,
       ts,
@@ -489,6 +455,13 @@ export class SlackRelay {
       kind: "incident_reply",
       incidentId: incident.id,
       interrupt: mentioned,
+      owner: incident.owner,
+      agentRunning,
+      channel,
+      threadTs,
+      ts,
+      user,
+      text,
     };
   }
 
@@ -554,11 +527,25 @@ export class SlackRelay {
       return { kind, incidentId: incident.id, slackUserId: click.user };
     }
 
-    await this.pushDirective(incident.id, {
-      type: "human_message",
-      from: click.user,
-      text: click.choice,
-      ts: click.actionTs,
+    // Pressing an agent's own button is addressed to it by construction, so
+    // unlike a typed reply there is nothing here for a model to read and this
+    // stays inside the relay's write rather than moving to the composition
+    // root with the rest of the directive push.
+    await this.db.withWrite((d) => {
+      d.prepare(
+        `INSERT INTO pending_directive (incidentId, payload, createdAt)
+         VALUES (?, ?, ?)`,
+      ).run(
+        incident.id,
+        JSON.stringify({
+          type: "human_message",
+          from: click.user,
+          text: click.choice,
+          ts: click.actionTs,
+          addressed: "agent",
+        } satisfies Directive),
+        Date.now(),
+      );
     });
 
     log("choice_recorded", {
@@ -664,15 +651,4 @@ export class SlackRelay {
     });
   }
 
-  private async pushDirective(
-    incidentId: string,
-    directive: Directive,
-  ): Promise<void> {
-    await this.db.withWrite((d) => {
-      d.prepare(
-        `INSERT INTO pending_directive (incidentId, payload, createdAt)
-         VALUES (?, ?, ?)`,
-      ).run(incidentId, JSON.stringify(directive), Date.now());
-    });
-  }
 }

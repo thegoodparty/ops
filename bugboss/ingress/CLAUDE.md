@@ -15,6 +15,25 @@ Three functions (`types.ts`):
 There is deliberately no `isResolved`. Nothing decides an alert is over
 except an agent, on evidence.
 
+## Ingress does not read what a message says
+
+Slack is **not** an adapter. A person reports something by mentioning
+`@bugboss`, and whether that mention is a report or a question is a model
+call the composition root makes off the ack (`slack/intent.ts`), not
+something a body can be parsed for. `classifySlackEvent` answers only what a
+signature and an event envelope can answer — is this authentic, is it a
+message, was the app tagged — and stops there. Which incident a thread
+belongs to is the relay's, since the relay is what reads `slackThreadTs` and
+routes on it.
+
+This used to be a verb: the first word had to be `report`, `bug` or `broken`.
+`@bugboss Pro upgrades are failing` was therefore answered as a question and
+opened nothing, which is the whole problem with a magic phrase.
+
+So the registry holds two adapters, not three. A report's signal is built
+with `humanSignal` and placed through the `human` entry, which is what
+`Signal.source` already points the orphan sweep at.
+
 ## Verification fails closed, everywhere
 
 Grafana: missing secret, missing signature, missing or non-numeric

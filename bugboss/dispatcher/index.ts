@@ -1,5 +1,5 @@
 // The dispatcher. Design spec: bugboss/docs/architecture.md, Job 3, plus
-// "What bounds an agent" for the child environment.
+// "The agent boundary" for the child environment.
 //
 // One question, every 30 seconds: does every incident that should have an
 // agent have a live one? Both sides of that comparison are in this process,

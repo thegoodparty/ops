@@ -267,32 +267,24 @@ export const createPublicApp = (deps: PublicAppDeps): Hono => {
       return c.text(classification.challenge);
     }
 
-    // Here rather than after the work, which is the whole point: a report
-    // costs a prefetch and a triage call, a mention costs a model run of up
-    // to two minutes, and for that entire window the channel cannot tell a
-    // Boss that is thinking from one that never got the message.
+    // Here rather than after the work, which is the whole point: what a
+    // mention turns out to be asking for is itself a model call now, and the
+    // run behind it takes up to two minutes. For that entire window the
+    // channel cannot tell a Boss that is thinking from one that never got
+    // the message.
     //
-    // Written as the exclusion rather than a list of the three kinds that
-    // earn it, so a classification added later is acknowledged by default. An
-    // :eyes: on something BugBoss turns out to ignore is cheap; a delivery
-    // that silently gets none is the bug this closes. `ignored` is excluded
-    // on purpose: reacting to channel chatter nobody addressed to BugBoss
-    // would claim it is working on something it will never answer.
+    // Written as the exclusion rather than a list of the kinds that earn it,
+    // so a classification added later is acknowledged by default. An :eyes:
+    // on something BugBoss turns out to ignore is cheap; a delivery that
+    // silently gets none is the bug this closes. `ignored` is excluded on
+    // purpose: reacting to channel chatter nobody addressed to BugBoss would
+    // claim it is working on something it will never answer.
     if (classification.kind !== "ignored") {
       deps.acknowledgeSlack({
         kind: classification.kind,
         channel: classification.message.channel,
         ts: classification.message.ts,
       });
-    }
-
-    // A report is a signal, not a question, so it must not also reach the
-    // Slack agent: it arrives as an @bugboss mention and would otherwise be
-    // answered as one while the incident it opened runs in parallel.
-    if (classification.kind === "bug_report") {
-      const accepted = await deps.ingestAccepted("slack", req);
-      settle(accepted.settled, "slack_report");
-      return c.json({ ok: true });
     }
 
     let event: SlackEvent | undefined;
