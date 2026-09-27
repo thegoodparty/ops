@@ -335,7 +335,7 @@ describe("inbound", () => {
     return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
   };
 
-  test("an untagged reply answers the agent waiting on it", async () => {
+  test("an untagged reply is recorded against the incident", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "message",
@@ -356,17 +356,16 @@ describe("inbound", () => {
     assert.equal(replies.length, 1);
     assert.equal(replies[0].slackUserId, "U0HUMAN");
 
-    // contact_human waits on directives alone, so no directive means the
-    // agent blocks until it times out and escalates over an answer it has.
-    const [directive] = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
+    // Handing it to the agent is the caller's, because whether it answers
+    // the agent, hands the incident over, or is two people talking is a model
+    // call and this has to be back inside Slack's three seconds. Covered end
+    // to end in test/e2e.test.ts.
+    assert.equal(
+      db.query("SELECT id FROM pending_directive").length,
+      0,
+      "the relay records; it does not decide what a message meant",
     );
-    assert.deepEqual(JSON.parse(directive.payload), {
-      type: "human_message",
-      from: "U0HUMAN",
-      text: "yes, org X bypasses the Stripe webhook",
-      ts: "1700.1",
-    });
+    assert.equal(route.text, "yes, org X bypasses the Stripe webhook");
   });
 
   test("Slack redelivering the same event does not double-record it", async () => {
@@ -383,15 +382,14 @@ describe("inbound", () => {
     const second = await relay.handle(event);
 
     assert.equal(second.kind, "ignore");
-    assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
     assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
+      db.query("SELECT id FROM thread_reply").length,
       1,
-      "and the agent is told once, not twice",
+      "the insert is what a Slack retry collapses onto, so the caller reads it once",
     );
   });
 
-  test("a mention interrupts a working agent with a directive", async () => {
+  test("a mention is marked as an interrupt on the route", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "app_mention",
@@ -406,15 +404,7 @@ describe("inbound", () => {
     if (route.kind !== "incident_reply") return;
     assert.equal(route.interrupt, true);
     assert.equal(route.incidentId, "inc-1");
-    const [directive] = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
-    );
-    assert.deepEqual(JSON.parse(directive.payload), {
-      type: "human_message",
-      from: "U0HUMAN",
-      text: `<@${BOT}> stop, this is expected`,
-      ts: "1700.2",
-    });
+    assert.equal(route.text, `<@${BOT}> stop, this is expected`);
   });
 
   test("a mention in a thread with no agent running says so on the route", async () => {
@@ -504,7 +494,7 @@ describe("inbound", () => {
     const dupe = await relay.handle({ ...shared, type: "message" });
 
     assert.equal(dupe.kind, "ignore");
-    assert.equal(db.query("SELECT id FROM pending_directive").length, 1);
+    assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
   });
 });
 
@@ -686,11 +676,6 @@ describe("a message in an incident thread", () => {
     assert.equal(route.owner, "agent");
     assert.equal(route.agentRunning, true);
     assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
-    assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
-      1,
-      "a handover is still an answer the agent is owed",
-    );
   });
 
   test("the relay does not flip owner itself", async () => {

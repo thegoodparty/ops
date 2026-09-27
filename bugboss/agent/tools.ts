@@ -204,6 +204,13 @@ export const directiveTimestampMillis = (ts: string): number => {
 
 type HumanReply = Extract<Directive, { type: "human_message" }>;
 
+/**
+ * The reply that ends a wait. A message somebody addressed to other people in
+ * the thread is not one: it is still delivered, as an ordinary directive the
+ * agent reads as context, but ending the wait on it sends an investigation
+ * down whatever an offhand remark happened to say. Who a message was for is
+ * read by `slack/intent.ts` and recorded on the directive.
+ */
 export const firstReplyAfter = (
   pending: PendingDirective[],
   askedAt: number,
@@ -212,6 +219,7 @@ export const firstReplyAfter = (
     .filter((entry): entry is { id: number; directive: HumanReply } =>
       entry.directive.type === "human_message",
     )
+    .filter((entry) => entry.directive.addressed !== "others")
     .filter((entry) => directiveTimestampMillis(entry.directive.ts) > askedAt)
     .sort(
       (a, b) =>

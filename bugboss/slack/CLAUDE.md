@@ -18,7 +18,7 @@ and fragmenting forever.
 
 ## A plain reply answers; a mention also interrupts
 
-Every recorded reply in an incident thread pushes a `human_message`
+Every message in an incident thread becomes a `human_message`
 directive. `contact_human` waits on directives alone and nothing else reads
 `thread_reply` on an agent's behalf, so without this the documented way to
 answer an agent — reply in thread, no tag — did nothing at all, and the
@@ -26,6 +26,39 @@ agent waited out its full timeout.
 
 `mentioned` still drives `interrupt`. So a mention answers *and* interrupts;
 a plain reply answers.
+
+### Which reply, though
+
+`contact_human` ends its wait on the **first** reply after the question. Two
+people talking to each other while an agent is blocked therefore ended it on
+whichever of them spoke first, and unlike a wrong ownership move there is no
+field anywhere that records it — the investigation just turns on an offhand
+remark and nothing downstream can tell.
+
+The fix is not syntax. Requiring an `@bugboss` tag to answer would make the
+common case ceremony, and answering a direct question should not need any. So
+the message is read: `intent.ts` answers **who it was for** alongside what it
+does, the directive carries `addressed`, and `firstReplyAfter` skips
+`addressed: "others"`.
+
+**Recording is not consuming.** Chatter is still recorded in `thread_reply`
+and still delivered as a directive, so it stays in the incident's history and
+the agent reads it as context. What it loses is the right to end a wait.
+Nothing is ever dropped, including a message no model could read — that one
+arrives as `others`, which is the safe direction.
+
+Three rules sit in code on top of what the model said, the same way
+`applyRules` does in triage:
+
+- **An explicit `@bugboss` always means "this is for you".** That is the
+  escape hatch for somebody who wants certainty, and because it is decided in
+  the composition root rather than by the model, it is the one path that keeps
+  working while the model is down.
+- **A handover is aimed at the system by definition**, so it is delivered as
+  well as acted on.
+- **`unclear` while an agent is blocked asks**, in the thread, and says the
+  message went through as context anyway. Asking costs a sentence; ending the
+  wait wrongly costs an investigation.
 
 ## Slack renders mrkdwn, and Markdown renders wrong
 
@@ -92,7 +125,9 @@ more moving parts and more failure surface for a thread reply.
 is a model call. There is no keyword, no verb and no phrase to know — for
 either interface:
 
-- **In an incident thread**, whether a message hands the incident over.
+- **In an incident thread**, whether a message hands the incident over, and
+  whether it was for the agent at all. Two fields, one call, because it is one
+  message.
 - **On a mention anywhere else**, whether somebody is reporting something
   broken or asking a question.
 
@@ -141,8 +176,10 @@ body. That is worth having and is not what the containment rests on.
 
 ### Cost, latency and the failure path
 
-One bounded call per inbound message: a few hundred tokens in, a label out,
-no tools and no database access. It runs on the same `ModelClient` triage
+One bounded call per inbound message: a few hundred tokens in, a label or two
+out, no tools and no database access. The agent's outstanding question goes
+into the prompt when there is one, because whether a message answers it is
+most of what `addressed` is asking. It runs on the same `ModelClient` triage
 uses, so there is no second credential and no second model to subscribe;
 `BUGBOSS_INTENT_MODEL_ID` moves it to a smaller model without a deploy when
 one is available. The bill is set by how much people type, not by how many

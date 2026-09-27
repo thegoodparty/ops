@@ -13,7 +13,7 @@
 // broadcasting them, so one agent's answer could arrive on another's socket.
 
 import type { Db } from "../db";
-import type { Directive, IncidentOwner, IncidentStatus } from "../types";
+import type { IncidentOwner, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
 import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 
@@ -426,16 +426,9 @@ export class SlackRelay {
     });
     if (!inserted) return ignore("duplicate delivery");
 
-    // `contact_human` waits on directives alone, and the contract is that a
-    // plain reply in the thread answers it; nothing else reads thread_reply on
-    // an agent's behalf. A mention answers too, and interrupts as well.
-    await this.pushDirective(incident.id, {
-      type: "human_message",
-      from: user,
-      text,
-      ts,
-    });
-
+    // Handing it to the agent is the caller's, because whether it is an
+    // answer, a handover or two people talking to each other is a model call
+    // and this has to be back inside Slack's three seconds.
     log(mentioned ? "interrupt_recorded" : "reply_recorded", {
       incidentId: incident.id,
       ts,
@@ -544,15 +537,4 @@ export class SlackRelay {
     });
   }
 
-  private async pushDirective(
-    incidentId: string,
-    directive: Directive,
-  ): Promise<void> {
-    await this.db.withWrite((d) => {
-      d.prepare(
-        `INSERT INTO pending_directive (incidentId, payload, createdAt)
-         VALUES (?, ?, ?)`,
-      ).run(incidentId, JSON.stringify(directive), Date.now());
-    });
-  }
 }

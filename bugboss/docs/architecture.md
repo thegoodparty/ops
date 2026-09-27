@@ -118,11 +118,20 @@ slash command, no button and no phrase to learn: inbound Slack text is read
 by a bounded model call (`slack/intent.ts`) which answers one label, and
 that is the only thing in this system that reads what a person wrote.
 
-Two interfaces use it. In an incident thread it answers whether the message
-hands the incident between a person and an agent. On a mention anywhere else
-it answers whether somebody is reporting something broken or asking a
-question — the two things a mention can be, and previously the difference
-between a first word of `report` and any other first word.
+Two interfaces use it. In an incident thread it answers two things about one
+message: whether it hands the incident between a person and an agent, and
+whether it was for the agent at all. On a mention anywhere else it answers
+whether somebody is reporting something broken or asking a question — the two
+things a mention can be, and previously the difference between a first word of
+`report` and any other first word.
+
+The second question exists because `contact_human` ends its wait on the first
+reply after its question, so two people talking to each other while an agent
+was blocked ended it on whichever of them spoke first. A message somebody sent
+to the thread rather than to the agent is still recorded and still delivered;
+it just cannot end a wait. An explicit `@bugboss` overrides the read and
+always means "this is for you", decided in code so it survives the model being
+down.
 
 It is advisory, on the same split as triage. The model reads the sentence;
 the code holds the invariants. A wrong read is bounded structurally rather
@@ -161,8 +170,9 @@ saturating context on polling:
 - `monitor(command, interval, timeout)` — block until a read-only check
   passes. The general primitive: PR merged, deploy shipped, alert quiet
 - `contact_human(message, timeout)` — post to the thread and block for a
-  reply. Re-entrant: the marker is written before the post, so a resumed
-  agent resumes waiting rather than asking twice
+  reply that was **for the agent**; see "The human boundary". Re-entrant: the
+  marker is written before the post, so a resumed agent resumes waiting rather
+  than asking twice
 
 ### How an agent learns things changed
 

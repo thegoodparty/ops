@@ -24,9 +24,10 @@ import {
   type BugBoss,
 } from "../index";
 import { createBossClient } from "../agent/run";
+import { firstReplyAfter } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { ModelReply, ModelRequest } from "../triage";
-import type { BugBossConfig, TriageDecision } from "../types";
+import type { BugBossConfig, Directive, TriageDecision } from "../types";
 
 type QueuedDecision = TriageDecision & { recurrenceOf?: string };
 
@@ -46,7 +47,7 @@ const fakeModel = {
    * than inferred, so a test says what the model decided and the real routing
    * and the real ownership guard run against it.
    */
-  intents: [] as (string | Error)[],
+  intents: [] as (Record<string, unknown> | Error)[],
   /** Held, every triage call blocks on it. Stands in for a slow model. */
   gate: null as Promise<void> | null,
   /** Runs once, inside a triage call, after its digest of open incidents. */
@@ -75,7 +76,7 @@ const fakeModel = {
       const next = this.intents.shift();
       if (!next) throw new Error("fakeModel: no intent queued");
       if (next instanceof Error) throw next;
-      return call("read_intent", { intent: next, reason: "test" });
+      return call("read_intent", { reason: "test", ...next });
     }
     this.lastPrompt = JSON.stringify(request.messages);
     this.inFlight++;
@@ -404,7 +405,7 @@ const grafanaBody = (
  * question and opened nothing.
  */
 test("a human bug report resolves without spawning a recurrence", async () => {
-  fakeModel.intents.push("bug_report");
+  fakeModel.intents.push({ intent: "bug_report" });
   fakeModel.triageDecisions.push({
     action: "new_incident",
     reason: "nobody has reported this before",
@@ -998,7 +999,7 @@ test("a person can take an incident over, and hand it back", async () => {
 
   // A whole sentence, not a magic word. The old matcher required the message
   // to be exactly "mine" and did nothing, silently, for anything else.
-  fakeModel.intents.push("take_over");
+  fakeModel.intents.push({ handover: "take_over", addressed: "agent" });
   await boss.slackEvent(
     replyIn(row.slackThreadTs!, "ok I've got this one from here, stand down"),
   );
@@ -1040,7 +1041,7 @@ test("a person can take an incident over, and hand it back", async () => {
   // And back. Without this, owner only ever moves one way and no agent can
   // reach the incident again -- escalation becomes a hole rather than a
   // handoff.
-  fakeModel.intents.push("hand_back");
+  fakeModel.intents.push({ handover: "hand_back", addressed: "agent" });
   await boss.slackEvent(replyIn(row.slackThreadTs!, "ok, back to you please"));
   assert.equal(
     boss.db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [
@@ -1064,7 +1065,7 @@ test("an ambiguous message asks in the thread instead of moving the incident", a
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-3'`,
   )!;
 
-  fakeModel.intents.push("unclear");
+  fakeModel.intents.push({ handover: "unclear", addressed: "unclear" });
   const before = fakeSlack.posts.length;
   await boss.slackEvent(
     replyIn(row.slackThreadTs!, "handing this back once CI is green"),
@@ -1124,6 +1125,153 @@ test("a message nothing could read is said out loud, not swallowed", async () =>
   assert.match(said[0].text, /the error is in the BugBoss logs/);
 });
 
+// --- who a reply was for ----------------------------------------------------
+
+/**
+ * `contact_human` ends its wait on the first reply it sees. Two people
+ * talking to each other while an agent is blocked therefore used to end that
+ * wait on whichever of them spoke first, and unlike a wrong ownership move
+ * there is no field anywhere that says it happened -- the investigation just
+ * turns on an offhand remark.
+ */
+test("two people talking do not end an agent's wait, but the agent still sees it", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-addr-1", "webhook-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-addr-1'`,
+  )!;
+
+  const askedAt = Date.now() - 1000;
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
+       VALUES (?, ?, ?, ?)`,
+    ).run(row.id, "ts-q", askedAt, "Does org X bypass the Stripe webhook?");
+  });
+
+  fakeModel.intents.push({ handover: "none", addressed: "others" });
+  await boss.slackEvent(
+    replyIn(row.slackThreadTs!, "did anyone check org X?", "U-ada"),
+  );
+
+  fakeModel.intents.push({ handover: "none", addressed: "agent" });
+  await boss.slackEvent(
+    replyIn(row.slackThreadTs!, "yes, org X bypasses it", "U-grace"),
+  );
+
+  const pending = boss.db
+    .query<{ id: number; payload: string }>(
+      "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
+      [row.id],
+    )
+    .map((d) => ({ id: d.id, directive: JSON.parse(d.payload) as Directive }));
+
+  assert.equal(pending.length, 2, "both messages reach the agent");
+  assert.equal(
+    boss.db.query("SELECT id FROM thread_reply WHERE incidentId = ?", [row.id])
+      .length,
+    2,
+    "and both are on the incident's record",
+  );
+
+  const ended = firstReplyAfter(pending, askedAt);
+  assert.ok(ended, "the wait does end");
+  assert.equal(
+    ended.directive.text,
+    "yes, org X bypasses it",
+    "on the message that was for the agent, not the one that came first",
+  );
+});
+
+/**
+ * The escape hatch. Requiring a tag for everything makes answering a direct
+ * question ceremony, so it is not required -- but when somebody wants
+ * certainty it is absolute, and because it is applied in code rather than by
+ * the model it is the one path that still works while the model is down.
+ */
+test("tagging the bot always means the message is for the agent", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-addr-2", "import-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-addr-2'`,
+  )!;
+
+  const askedAt = Date.now() - 1000;
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
+       VALUES (?, ?, ?, ?)`,
+    ).run(row.id, "ts-q", askedAt, "Shall I restart the worker?");
+  });
+
+  // The model is down. The tag is still the answer.
+  fakeModel.intents.push(new Error("bedrock: ThrottlingException"));
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => errors.push(String(line));
+  try {
+    await boss.slackEvent({
+      type: "app_mention",
+      channel: "C0TEST",
+      user: "U-swain",
+      text: "<@B0BOSS> yes, go ahead and restart it",
+      ts: `${Date.now() / 1000}`,
+      thread_ts: row.slackThreadTs!,
+    });
+  } finally {
+    console.error = original;
+  }
+
+  const pending = boss.db
+    .query<{ id: number; payload: string }>(
+      "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
+      [row.id],
+    )
+    .map((d) => ({ id: d.id, directive: JSON.parse(d.payload) as Directive }));
+
+  const ended = firstReplyAfter(pending, askedAt);
+  assert.ok(ended, "a tagged message ends the wait with no model in the loop");
+  assert.match(ended.directive.text, /go ahead and restart it/);
+  assert.ok(
+    errors.some((line) => line.includes('"event":"unreadable"')),
+    "and the failed read is still said out loud",
+  );
+});
+
+test("a message nothing could read still reaches the agent as context", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-addr-3", "render-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-addr-3'`,
+  )!;
+
+  fakeModel.intents.push(new Error("bedrock: ThrottlingException"));
+  const original = console.error;
+  console.error = () => undefined;
+  try {
+    await boss.slackEvent(replyIn(row.slackThreadTs!, "it started at 09:12"));
+  } finally {
+    console.error = original;
+  }
+
+  const [directive] = boss.db.query<{ payload: string }>(
+    "SELECT payload FROM pending_directive WHERE incidentId = ?",
+    [row.id],
+  );
+  const parsed = JSON.parse(directive.payload) as Directive & {
+    addressed?: string;
+  };
+  assert.equal(parsed.type, "human_message");
+  assert.equal(
+    parsed.addressed,
+    "others",
+    "a message nobody could read is context, never the answer to a pending question",
+  );
+});
+
 /**
  * The classifier reads attacker-influenceable text and its answer changes
  * incident state, so the thing that must hold is structural: the incident
@@ -1146,7 +1294,7 @@ test("a message cannot hand over an incident it names", async () => {
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-inj-2'`,
   )!;
 
-  fakeModel.intents.push("take_over");
+  fakeModel.intents.push({ handover: "take_over", addressed: "agent" });
   await boss.slackEvent(
     replyIn(
       mine.slackThreadTs!,
@@ -1178,7 +1326,10 @@ test("a claim on an incident a person already owns changes nothing", async () =>
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-2'`,
   )!;
 
-  fakeModel.intents.push("take_over", "take_over");
+  fakeModel.intents.push(
+    { handover: "take_over", addressed: "agent" },
+    { handover: "take_over", addressed: "agent" },
+  );
   await boss.slackEvent(replyIn(row.slackThreadTs!, "taking this one", "U-ada"));
   await boss.slackEvent(replyIn(row.slackThreadTs!, "I'll take it", "U-grace"));
 

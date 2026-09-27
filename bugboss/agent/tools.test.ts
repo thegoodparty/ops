@@ -250,6 +250,57 @@ test("replies older than the question are not answers to it", () => {
   assert.equal(firstReplyAfter([pending[0]], 1_000_000), null);
 });
 
+/**
+ * The wait used to end on whichever human spoke first after the question,
+ * which meant two people talking to each other could answer a question that
+ * was never put to them. Who a message was for is read at the Slack boundary
+ * and recorded on the directive; this is the half that acts on it.
+ */
+test("a message people sent each other does not end the wait", () => {
+  const pending: PendingDirective[] = [
+    {
+      id: 1,
+      directive: {
+        type: "human_message",
+        from: "U1",
+        text: "did anyone check org X?",
+        ts: "1100.000000",
+        addressed: "others",
+      },
+    },
+    {
+      id: 2,
+      directive: {
+        type: "human_message",
+        from: "U2",
+        text: "yes, org X bypasses it",
+        ts: "1200.000000",
+        addressed: "agent",
+      },
+    },
+  ];
+
+  const found = firstReplyAfter(pending, 1_000_000);
+  assert.equal(found?.id, 2, "the first message for the agent, not the first message");
+  assert.equal(
+    firstReplyAfter([pending[0]], 1_000_000),
+    null,
+    "chatter alone leaves the agent waiting rather than answering it wrongly",
+  );
+});
+
+test("a directive written before addressed existed still ends a wait", () => {
+  // Rows in flight across the deploy that added the field. They meant "for
+  // the agent", which was the only thing a reply could be.
+  const pending: PendingDirective[] = [
+    {
+      id: 7,
+      directive: { type: "human_message", from: "U1", text: "go ahead", ts: "1100.000000" },
+    },
+  ];
+  assert.equal(firstReplyAfter(pending, 1_000_000)?.id, 7);
+});
+
 test("slack and millisecond timestamps both compare", () => {
   assert.equal(directiveTimestampMillis("1758700000.000200"), 1758700000000.2);
   assert.equal(directiveTimestampMillis("1758700000000"), 1758700000000);

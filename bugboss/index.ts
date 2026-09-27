@@ -71,7 +71,8 @@ import {
 } from "./slack/relay";
 import {
   readMentionIntent,
-  readOwnershipIntent,
+  readReplyIntent,
+  type Addressed,
   type IntentDeps,
   type OwnershipClaim,
 } from "./slack/intent";
@@ -1537,6 +1538,41 @@ export const createBugBoss = async (
     );
   };
 
+  /**
+   * The one thing that reaches a running agent from Slack. `contact_human`
+   * waits on directives alone and nothing else reads `thread_reply` on an
+   * agent's behalf, so a message that never becomes one is a message the
+   * agent does not have -- which is why this happens whatever the read said,
+   * and only `addressed` varies.
+   *
+   * The relay recorded the reply inside the request and this runs after it,
+   * so a task replaced in that window leaves the message on the record with
+   * no directive: the agent waits out its timeout and escalates to a person,
+   * which is visible. The alternative is labelling a message before knowing
+   * what it is.
+   */
+  const pushHumanMessage = async (
+    route: Extract<InboundRoute, { kind: "incident_reply" }>,
+    addressed: "agent" | "others",
+  ): Promise<void> => {
+    await db.withWrite((w: Database.Database) => {
+      w.prepare(
+        `INSERT INTO pending_directive (incidentId, payload, createdAt)
+         VALUES (?, ?, ?)`,
+      ).run(
+        route.incidentId,
+        JSON.stringify({
+          type: "human_message",
+          from: route.user,
+          text: route.text,
+          ts: route.ts,
+          addressed,
+        } satisfies Directive),
+        now(),
+      );
+    });
+  };
+
   const sayInThread = (
     channel: string,
     threadTs: string,
@@ -1550,38 +1586,76 @@ export const createBugBoss = async (
       );
 
   /**
-   * What a message in an incident's thread meant. The relay has already
-   * recorded it and already handed it to the agent as a directive, so this
-   * only decides what else it earns: the incident changing hands, a question
-   * for the read-only Slack agent, or nothing.
+   * Something a person said in an incident's thread. The relay has recorded
+   * it; this decides what it meant, off the Slack ack.
    *
-   * The model reads the sentence and the UPDATE in `claimOwnership` decides
-   * whether the move is legal, which is the same split triage uses. Note what
-   * a wrong read can and cannot do: the incident comes from the thread the
-   * message arrived in, never from the message, so no wording -- including
-   * wording pasted out of a log line -- reaches a different incident.
+   * Two questions, one model call. Does it hand the incident over, and was it
+   * for the agent at all -- because `contact_human` ends its wait on the
+   * first reply it sees, and two people talking to each other while an agent
+   * is blocked used to end that wait on whichever of them spoke first. The
+   * answer to that is not syntax: answering a direct question should not need
+   * ceremony, so the message is read rather than required to carry a tag.
+   *
+   * Three rules sit in code, on top of what the model says, for the same
+   * reason `applyRules` does in triage:
+   *
+   *   - An explicit @bugboss always means "this is for you". That is the
+   *     escape hatch for somebody who wants certainty, and because it is
+   *     decided here rather than by the model it keeps working while the
+   *     model is down.
+   *   - A handover is aimed at the system by definition, so it is delivered
+   *     as well as acted on.
+   *   - Nothing is ever dropped. A message that could not be read is still
+   *     delivered as context; what it loses is the right to end a wait.
+   *
+   * And the incident comes from the thread the message arrived in, never from
+   * the message, so no wording -- including wording pasted out of a log line
+   * -- reaches a different incident.
    */
   const answerIncidentMessage = async (
     route: Extract<InboundRoute, { kind: "incident_reply" }>,
   ): Promise<void> => {
     const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
-    const read = await readOwnershipIntent(intent, {
+    const outstanding =
+      db.get<{ message: string }>(
+        "SELECT message FROM pending_question WHERE incidentId = ?",
+        [route.incidentId],
+      )?.message ?? null;
+
+    const read = await readReplyIntent(intent, {
       text: said,
       owner: route.owner,
+      outstandingQuestion: outstanding,
     });
 
-    if (read.intent === "take_over" || read.intent === "hand_back") {
-      await claimOwnership(route.incidentId, read.intent, route.user);
+    const handingOver: OwnershipClaim | null =
+      read.handover === "take_over" || read.handover === "hand_back"
+        ? read.handover
+        : null;
+    const addressed: Addressed =
+      route.interrupt || handingOver ? "agent" : read.addressed;
+
+    // Delivered before anything else, so the agent has what was said whatever
+    // the rest of this decides. `others` and `unclear` ride through as
+    // context; only `agent` can end a wait.
+    await pushHumanMessage(route, addressed === "agent" ? "agent" : "others");
+
+    log("reply_read", {
+      incidentId: route.incidentId,
+      handover: read.handover,
+      addressed,
+      modelAddressed: read.addressed,
+      tagged: route.interrupt,
+      blocked: outstanding !== null,
+      fellBack: read.fellBack,
+    });
+
+    if (handingOver) {
+      await claimOwnership(route.incidentId, handingOver, route.user);
       return;
     }
 
-    if (read.intent === "unclear") {
-      log("ownership_unclear", {
-        incidentId: route.incidentId,
-        user: route.user,
-        ts: route.ts,
-        fellBack: read.fellBack,
-      });
+    if (read.handover === "unclear") {
       // Asked rather than guessed. A handover this invented takes the
       // incident out of the dispatcher's query with nothing to hand it back,
       // so one question in a thread is the cheap side of that trade -- and
@@ -1590,15 +1664,27 @@ export const createBugBoss = async (
         route.channel,
         route.threadTs,
         read.fellBack
-          ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. If you meant to take this incident over or hand it back, say so again.`
+          ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way. If you meant to take this incident over or hand it back, say so again; if it was an answer for the agent, tag me and repeat it.`
           : mrkdwn`${raw(userMention(route.user))} I could not tell whether that hands this incident over. If you meant you are taking it on, or giving it back to an agent, say so plainly and I will move it.`,
       );
       return;
     }
 
-    // Ordinary chatter. It is already recorded and already an answer to
-    // anything the agent asked; a mention with no agent on the incident is
-    // the one case that still wants the read-only agent.
+    // An agent is blocked on a question and this message did not clearly
+    // answer it. Saying so costs a sentence; the alternative is the agent
+    // waiting out its whole timeout next to an answer it was not given.
+    if (addressed === "unclear" && outstanding !== null) {
+      await sayInThread(
+        route.channel,
+        route.threadTs,
+        mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent, so I passed it on as context rather than as the answer it is waiting for. If it was the answer, tag me and say it again.`,
+      );
+      return;
+    }
+
+    // Ordinary chatter. It is recorded and the agent has it; a mention with
+    // no agent on the incident is the one case that still wants the read-only
+    // Slack agent.
     if (route.interrupt && !route.agentRunning) {
       await slackAgent.handle({
         channel: route.channel,
