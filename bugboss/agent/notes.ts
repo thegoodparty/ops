@@ -267,27 +267,33 @@ export const createNotesSync = (args: {
     const scan = await scanNotesDir(args.dir);
     skipped = scan.skipped;
 
-    // A directory that is gone is local storage we lost, and there is nothing
-    // in it to mirror. The S3 copy is what a restart restores from and is
-    // never touched here. The session sync skips on the same ENOENT.
-    if (!scan.present) return;
-
     // What the record would hold after this flush: everything already in S3,
     // with the sizes of anything that is also on disk brought up to date. A
     // note the agent removed locally still counts, because it is still there.
+    //
+    // Recomputed on every flush including the one where the directory has
+    // gone, because what the record holds does not depend on the directory
+    // still being there. Carrying the previous answer forward would keep
+    // naming files that no longer exist; discarding it would claim room that
+    // the record does not have.
     const projected = new Map<string, number>();
     for (const [key, record] of seen) {
       projected.set(key.slice(args.prefix.length), record.bytes);
     }
     for (const file of scan.files) projected.set(file.path, file.bytes);
-
-    // Refuse the whole directory rather than mirroring part of it. A partial
-    // mirror restores a directory the agent never had, and picking which
-    // notes to drop is a decision this code has no basis for making.
     breach = notesLimitBreach(
       [...projected].map(([path, bytes]) => ({ path, bytes })),
       limits,
     );
+
+    // A directory that is gone is local storage we lost, and there is nothing
+    // in it to mirror. The S3 copy is what a restart restores from and is
+    // never touched here. The session sync skips on the same ENOENT.
+    if (!scan.present) return;
+
+    // Refuse the whole directory rather than mirroring part of it. A partial
+    // mirror restores a directory the agent never had, and picking which
+    // notes to drop is a decision this code has no basis for making.
     if (breach) return;
 
     for (const file of scan.files) {

@@ -700,10 +700,12 @@ const launch = async (args: {
     }
   };
 
-  // Steered on the edge rather than every turn: the agent cannot act on the
-  // same sentence twice, and a repeated steer would cost a turn each time it
-  // failed to trim. Reset on the way back under, so a second breach is told
-  // about as loudly as the first.
+  // Reported on the edge rather than every turn, for the log as much as for
+  // the steer: the agent cannot act on the same sentence twice, and an error
+  // line repeated once a turn for a day says no more than the first one did
+  // while making the run look like it is failing continuously. Cleared on the
+  // way back under, so a second breach is as loud as the first and an
+  // operator can see it recover.
   let announcedOverLimit = false;
   const onNotesFlush = (sync: NotesSync): void => {
     const error = sync.lastError();
@@ -739,9 +741,20 @@ const launch = async (args: {
 
     const breach = sync.overLimit();
     if (!breach) {
-      announcedOverLimit = false;
+      if (announcedOverLimit) {
+        announcedOverLimit = false;
+        console.log(
+          JSON.stringify({
+            component: "agent",
+            event: "notes_within_limit",
+            incidentId: options.incidentId,
+          }),
+        );
+      }
       return;
     }
+    if (announcedOverLimit) return;
+    announcedOverLimit = true;
     console.error(
       JSON.stringify({
         component: "agent",
@@ -753,10 +766,7 @@ const launch = async (args: {
         limits: breach.limits,
       }),
     );
-    if (!announcedOverLimit) {
-      announcedOverLimit = true;
-      void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
-    }
+    void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
   };
 
   const settings = pi.SettingsManager.inMemory({

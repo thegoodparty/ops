@@ -209,6 +209,44 @@ test("a directory that is gone leaves the record standing", async () => {
   assert.equal(objects.get("sessions/incident/inc-1/notes/a.md")?.toString(), "one");
 });
 
+test("the breach describes the record, not a directory that is gone", async () => {
+  const { store } = fakeStore();
+  const seeded = await notesDir();
+  await writeFile(join(seeded, "a.md"), "x".repeat(40));
+  await writeFile(join(seeded, "b.md"), "y".repeat(40));
+  await createNotesSync({ store, prefix: PREFIX, dir: seeded }).flush();
+
+  // A later deploy tightens the bound, so the record restored from S3 is
+  // already over it. Nothing is deleted to get back under, by design.
+  const limits = { maxBytes: 64, maxFiles: 8 };
+  const dir = await notesDir();
+  const restored = await restoreNotesDir({ store, prefix: PREFIX, dir });
+  const sync = createNotesSync({
+    store,
+    prefix: PREFIX,
+    dir,
+    seen: restored.seen,
+    limits,
+  });
+
+  await sync.flush();
+  assert.equal(sync.overLimit()?.totalBytes, 80);
+
+  // Losing the directory does not empty the record, so the answer must stay
+  // "full" -- and it must be recomputed from what S3 holds rather than
+  // carried forward describing files that are no longer on disk.
+  await rm(dir, { recursive: true });
+  await sync.flush();
+  const after = sync.overLimit();
+  assert.equal(sync.lastError(), null);
+  assert.equal(after?.totalBytes, 80, "the record is still over the bound");
+  assert.deepEqual(
+    after?.largest.map((file) => file.path).sort(),
+    ["a.md", "b.md"],
+    "recomputed from the record, which still holds both",
+  );
+});
+
 test("a fresh run still gets the directory the prompt names", async () => {
   const { store } = fakeStore();
   const dir = join(await notesDir(), "nested", "notes");
