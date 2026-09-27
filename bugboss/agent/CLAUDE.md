@@ -36,6 +36,20 @@ deadline can interrupt a blocking tool. Without that, `steer` only lands
 after the current turn's tool calls finish — and the agent spends most of
 its life inside a `monitor` with an hours-long timeout.
 
+## A recurrence arrives with its own history
+
+When the incident carries `recurrenceOf`, `get_incident` returns
+`priorIncident` beside the signals: the earlier incident's root cause,
+resolution evidence, PR urls and post-mortem. An agent before this one
+investigated the same problem, declared it resolved on evidence, and was
+wrong — so the prompt tells this one to rule out "never shipped", "reverted"
+and "incomplete" before opening a fresh investigation.
+
+The post-mortem is clipped in `toolapi`, not here. `get_incident` renders as
+JSON followed by the pending directives, and the truncation that would
+otherwise apply keeps a head and a tail — so an unbounded post-mortem eats
+the middle of the incident rather than itself.
+
 ## What it writes goes straight to Slack
 
 `contact_human`, the hand-off brief, the root cause, the resolution evidence

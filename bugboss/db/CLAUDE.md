@@ -55,6 +55,13 @@ key meant the second time an alert ever fired it was dropped as a duplicate
 — and recurrence, which depends on exactly that delivery, became
 unreachable.
 
+That index cannot serve the recurrence lookup itself, though: it is partial
+on `closedAt IS NULL`, and every signal a resolution closed has a `closedAt`.
+`signal_source_idx` is the same key without the partial clause, and
+`signal_slug_idx` is an expression index over `json_extract(labels,
+'$.alert_slug')` for the wider "same rule, different instance" match. Both
+are read once per inbound delivery by `triage/recurrence.ts`.
+
 ## `schema.sql` at runtime
 
 It is read from `__dirname` at boot, and `tsc` copies no non-TypeScript
