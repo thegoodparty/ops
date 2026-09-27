@@ -340,6 +340,37 @@ test("a symlink is reported and never followed", async () => {
   assert.equal(objects.get("sessions/incident/inc-1/notes/real.md")?.toString(), "mine");
 });
 
+test("a symlink to a directory does not put that directory in the record", async () => {
+  const { store, objects, puts } = fakeStore();
+  const dir = await notesDir();
+  const outside = await notesDir();
+  await mkdir(join(outside, "deep"), { recursive: true });
+  await writeFile(join(outside, "secret.txt"), "not the agent's to publish");
+  await writeFile(join(outside, "deep", "deeper.txt"), "nor this");
+  await symlink(outside, join(dir, "elsewhere"));
+
+  await mkdir(join(dir, "real-sub"), { recursive: true });
+  await writeFile(join(dir, "real-sub", "note.md"), "mine");
+
+  const sync = createNotesSync({ store, prefix: PREFIX, dir });
+  await sync.flush();
+
+  // `readdir({ recursive: true })` descends a directory symlink and the files
+  // under it lstat as ordinary files, so a guard on the link alone would have
+  // uploaded every one of them.
+  assert.deepEqual(puts, ["sessions/incident/inc-1/notes/real-sub/note.md"]);
+  assert.deepEqual(sync.skipped(), ["elsewhere"]);
+  assert.equal(
+    [...objects.keys()].some((key) => key.includes("secret") || key.includes("deeper")),
+    false,
+  );
+  assert.equal(
+    objects.get("sessions/incident/inc-1/notes/real-sub/note.md")?.toString(),
+    "mine",
+    "a real subdirectory is still walked",
+  );
+});
+
 test("a note deleted mid-flush is not a durability failure", async () => {
   const objects = new Map<string, Buffer>();
   const dir = await notesDir();

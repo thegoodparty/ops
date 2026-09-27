@@ -29,9 +29,9 @@
 // disk at any moment, so the limit is measured over the whole record.
 
 import { createHash } from "node:crypto";
-import type { Stats } from "node:fs";
+import type { Dirent } from "node:fs";
 import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, sep } from "node:path";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** No delete. The record an agent keeps is not the agent's to unmake. */
@@ -93,9 +93,6 @@ export const noteContentType = (relativePath: string): string => {
   return "text/plain; charset=utf-8";
 };
 
-const toPosix = (relativePath: string): string =>
-  sep === "/" ? relativePath : relativePath.split(sep).join("/");
-
 export interface NoteFile {
   /** Relative to the notes directory, always with forward slashes. */
   path: string;
@@ -115,46 +112,73 @@ export interface NotesScan {
   skipped: string[];
 }
 
-/**
- * Symlinks are skipped rather than followed: a link out of the directory
- * would put a file the agent never wrote into the incident's own prefix, and
- * a link into it would make the size bound meaningless.
- */
-export const scanNotesDir = async (dir: string): Promise<NotesScan> => {
-  let entries: string[];
-  try {
-    entries = await readdir(dir, { recursive: true });
-  } catch (err) {
-    if ((err as { code?: string }).code === "ENOENT") {
-      return { present: false, files: [], totalBytes: 0, skipped: [] };
-    }
-    throw err;
-  }
+const byName = (a: Dirent, b: Dirent): number =>
+  a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 
-  const files: NoteFile[] = [];
-  const skipped: string[] = [];
-  let totalBytes = 0;
-  for (const entry of entries.sort()) {
-    let stats: Stats;
+/**
+ * Walks by hand rather than with `readdir({ recursive: true })`, because that
+ * option descends through a symlink to a directory and the files underneath
+ * then `lstat` as ordinary files -- a guard on the link itself never sees
+ * them, and `ln -s /etc notes/x` would put /etc in the incident's record.
+ *
+ * A Dirent uses lstat semantics, so a symlink is never `isDirectory()`. The
+ * walk therefore cannot cross one, whatever it points at, and the link is
+ * reported instead.
+ */
+const walk = async (
+  dir: string,
+  base: string,
+  files: NoteFile[],
+  skipped: string[],
+): Promise<void> => {
+  for (const entry of (await readdir(dir, { withFileTypes: true })).sort(byName)) {
+    const relativePath = base ? `${base}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      try {
+        await walk(join(dir, entry.name), relativePath, files, skipped);
+      } catch (err) {
+        // Caught here rather than at the root, or a subdirectory removed
+        // mid-walk would report the whole notes directory as gone and skip
+        // the flush.
+        if ((err as { code?: string }).code !== "ENOENT") throw err;
+      }
+      continue;
+    }
+    if (!entry.isFile()) {
+      skipped.push(relativePath);
+      continue;
+    }
     try {
-      stats = await lstat(join(dir, entry));
+      const stats = await lstat(join(dir, entry.name));
+      files.push({ path: relativePath, bytes: stats.size });
     } catch (err) {
       // The agent's own shell can remove a file between the readdir above and
       // this call. It is simply not part of this flush, and the next one sees
       // the true state. What it must not become is a durability failure: that
       // burns the streak and tells the agent its notes are not saving.
-      if ((err as { code?: string }).code === "ENOENT") continue;
-      throw err;
+      if ((err as { code?: string }).code !== "ENOENT") throw err;
     }
-    if (stats.isDirectory()) continue;
-    if (!stats.isFile()) {
-      skipped.push(toPosix(entry));
-      continue;
-    }
-    files.push({ path: toPosix(entry), bytes: stats.size });
-    totalBytes += stats.size;
   }
-  return { present: true, files, totalBytes, skipped };
+};
+
+export const scanNotesDir = async (dir: string): Promise<NotesScan> => {
+  const files: NoteFile[] = [];
+  const skipped: string[] = [];
+  try {
+    await walk(dir, "", files, skipped);
+  } catch (err) {
+    // Only the root readdir reaches here; deeper ones are handled in `walk`.
+    if ((err as { code?: string }).code === "ENOENT") {
+      return { present: false, files: [], totalBytes: 0, skipped: [] };
+    }
+    throw err;
+  }
+  return {
+    present: true,
+    files,
+    totalBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+    skipped,
+  };
 };
 
 export interface NotesLimitBreach {
