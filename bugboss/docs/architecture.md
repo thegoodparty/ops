@@ -182,6 +182,15 @@ expire.
 Every merge to ops `main` restarts this container, so resume is the normal
 path, not the exceptional one.
 
+**An agent also gets a scratch directory that outlives the restart.** The
+transcript records what an agent said; it does not give it a cheap place to
+keep what it worked out. `/work/<id>/notes/` is mirrored to
+`sessions/incident/<id>/notes/` on the same `turn_end` hook as the session and
+restored before the next one starts, so a ruled-out ledger survives a redeploy
+and costs nothing in context until the agent reads it back. It is bounded, and
+crossing the bound stops the mirror loudly rather than filling the bucket
+quietly.
+
 ## Layout
 
 | Directory | What |

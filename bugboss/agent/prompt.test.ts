@@ -16,10 +16,13 @@ import {
   SHIP_PR_SKILL_PATH,
   type PromptInput,
 } from "./prompt";
+import { NOTES_LIMITS } from "./notes";
 
 const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
   incidentId: "inc-42",
   checkoutPath: "/work/inc-42/omni",
+  notesDir: "/work/inc-42/notes",
+  notesLimits: NOTES_LIMITS,
   observabilityDocs: [
     { path: "docs/observability.md", content: "Loki uid grafanacloud-logs" },
     { path: "packages/gp-api/docs/observability.md", content: "route alerts are per-controller" },
@@ -105,6 +108,18 @@ test("the prompt gives the report a budget, a shape and an example", () => {
   assert.match(prompt, /posted as its own follow-up message below the ask/);
   // An example changes model behaviour where an adjective does not.
   assert.match(prompt, /\*What I need:\*/);
+});
+
+test("the agent is told its notes directory survives a restart", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /\/work\/inc-42\/notes/);
+  assert.match(prompt, /survives a restart/);
+  assert.match(prompt, /restored before\nyou resume/);
+  // Without the bound in the prompt, the first the agent hears of it is a
+  // steer telling it the mirror has already stopped.
+  assert.match(prompt, /at most 64 files and 4 MB/);
+  assert.match(prompt, /outside the checkout/);
 });
 
 test("loadPromptContext reads the checkout deterministically", async () => {

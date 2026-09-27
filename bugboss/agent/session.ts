@@ -12,10 +12,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { NotesStore } from "./notes";
 
 export interface SessionStore {
   get(key: string): Promise<Buffer | null>;
-  put(key: string, body: Buffer): Promise<void>;
+  /** `contentType` is for ./notes.ts; the session itself is always NDJSON. */
+  put(key: string, body: Buffer, contentType?: string): Promise<void>;
 }
 
 export interface SessionSync {
@@ -39,7 +41,7 @@ export const sessionFileFor = (sessionDir: string, incidentId: string): string =
 export const createS3SessionStore = (
   bucket: string,
   region?: string,
-): SessionStore => {
+): SessionStore & NotesStore => {
   let clientPromise: Promise<any> | null = null;
   const client = (): Promise<any> => {
     if (!clientPromise) {
@@ -68,7 +70,7 @@ export const createS3SessionStore = (
         throw err;
       }
     },
-    put: async (key, body) => {
+    put: async (key, body, contentType) => {
       const [{ PutObjectCommand }, s3] = await Promise.all([
         import("@aws-sdk/client-s3"),
         client(),
@@ -78,9 +80,43 @@ export const createS3SessionStore = (
           Bucket: bucket,
           Key: key,
           Body: body,
-          ContentType: "application/x-ndjson",
+          // The session is the only caller that does not name one, and it is
+          // the only NDJSON in the bucket.
+          ContentType: contentType ?? "application/x-ndjson",
         }),
       );
+    },
+    // list and delete exist for the notes mirror in ./notes.ts, which is a
+    // directory rather than one object and so has to reconcile what S3 holds
+    // against what is on disk. The session itself never needs either.
+    list: async (prefix) => {
+      const [{ ListObjectsV2Command }, s3] = await Promise.all([
+        import("@aws-sdk/client-s3"),
+        client(),
+      ]);
+      const keys: string[] = [];
+      let token: string | undefined;
+      do {
+        const res = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: prefix,
+            ContinuationToken: token,
+          }),
+        );
+        for (const object of res.Contents ?? []) {
+          if (object.Key) keys.push(object.Key);
+        }
+        token = res.IsTruncated ? res.NextContinuationToken : undefined;
+      } while (token);
+      return keys;
+    },
+    delete: async (key) => {
+      const [{ DeleteObjectCommand }, s3] = await Promise.all([
+        import("@aws-sdk/client-s3"),
+        client(),
+      ]);
+      await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
     },
   };
 };

@@ -11,6 +11,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CONTACT_HUMAN_MESSAGE_LIMIT, CONTACT_HUMAN_MIN_WAIT_SECONDS } from "./tools";
+import type { NotesLimits } from "./notes";
 
 export interface PromptDoc {
   path: string;
@@ -21,6 +22,9 @@ export interface PromptInput {
   incidentId: string;
   /** Deterministic per incident. Never process.cwd(). */
   checkoutPath: string;
+  /** The scratch directory that is mirrored to S3 and restored on resume. */
+  notesDir: string;
+  notesLimits: NotesLimits;
   observabilityDocs: PromptDoc[];
   alertDefinitions: PromptDoc[];
   shipPrSkill: string;
@@ -168,6 +172,30 @@ Branch off main, commit, and push with the gh CLI. The token in your
 environment can push branches and open pull requests against omni and nothing
 else.`;
 
+const NOTES = (input: PromptInput): string => `## Your notes directory
+
+${input.notesDir} is yours, and it is the only thing you write to disk that
+survives a restart. It is copied to S3 after every turn and restored before
+you resume, next to the session transcript itself.
+
+Use it for anything you would otherwise have to re-derive from context: what
+you have ruled out and the evidence that killed each one, the query that
+finally worked, where you are in a sequence you are part-way through, a
+post-mortem you are drafting across hours. Then read the file back when you
+need it instead of carrying it in every turn. Nothing there is in your context
+until you read it, which is the point.
+
+It sits outside the checkout deliberately, so nothing you write there can end
+up in a pull request. Use the absolute path; a relative path lands in the
+checkout.
+
+It holds at most ${input.notesLimits.maxFiles} files and ${
+  input.notesLimits.maxBytes / (1024 * 1024)
+} MB in total. Over either limit
+the mirror stops entirely, you will be told, and a restart takes you back to
+the last copy that fit. So keep it to notes: command output and downloaded
+data belong in a pipe, not in a file.`;
+
 const MONITOR_EXAMPLES = (input: PromptInput): string => `## Waiting, concretely
 
     monitor("gh pr view <url> --json state -q .state | grep -qE 'MERGED|CLOSED'",
@@ -314,6 +342,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     RULES,
     SLACK,
     CHECKOUT(input),
+    NOTES(input),
     MONITOR_EXAMPLES(input),
     SHIP_PR,
     REPORTING,
