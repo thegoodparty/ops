@@ -895,3 +895,164 @@ export const githubActionsPulumiPreview: PolicyDocument = {
     },
   ],
 };
+
+// ---------------------------------------------------------------------------
+// The Terraform plan role (step 4 of docs/deploy-role-trust.md)
+//
+// Two repositories plan Terraform on pull requests today and assume the shared
+// admin deploy role to do it: omni's `gp-ai.yml` (its `terraform-plan` job,
+// eleven dev roots) and gp-terraform-dataplatform's `on-pull-request.yaml`.
+// Neither applies anything, and neither touches Pulumi.
+//
+// Two subjects on one role, which the rest of this plan argues against for the
+// preview roles. It is right here because the separation that matters is plan
+// versus apply, not repository: both subjects are read-only, and the denies
+// below mean neither can reach anything the other owns.
+//
+// gp-api's diff workflow is deliberately NOT on this role. Its Pulumi program
+// reads secret values at program time, so it cannot run without
+// GetSecretValue on a production secret. That is step 4b.
+
+const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
+
+export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // Multiple values for one key under one operator are ORed, so this
+          // is a single statement. Exact matches, not `:*`: main runs keep the
+          // deploy role, and no other ref should hold this one.
+          //
+          // No `job_workflow_ref` pin, unlike the scoped roles above. It would
+          // name `@refs/pull/N/merge` and constrain nothing, because the
+          // workflow file comes from the pull request too.
+          "token.actions.githubusercontent.com:sub": [
+            "repo:thegoodparty/omni:pull_request",
+            "repo:thegoodparty/gp-terraform-dataplatform:pull_request",
+          ],
+        },
+      },
+    },
+  ],
+};
+
+/**
+ * Inline half of the plan role. The other half is the AWS-managed
+ * `ReadOnlyAccess`, attached in ci-roles.ts.
+ *
+ * Why a managed policy plus denies, rather than the enumerate-and-widen
+ * discipline the preview role above uses. `terraform plan` reads whatever its
+ * roots manage, and these twelve roots span Lambda, ECS, SQS, SNS, DynamoDB,
+ * EventBridge, S3, IAM and VPC endpoints. Enumerating that surface means
+ * several rounds of red pull requests in omni, each needing a deploy here
+ * first, and it silently breaks again every time a root is added.
+ *
+ * The objection `pr-previews.md` raises to `ReadOnlyAccess` is precise and
+ * still stands: it carries broad `s3:Get*` and `ssm:Get*`, which together read
+ * every project's Pulumi state and the passphrase that decrypts it. The denies
+ * below remove exactly that, and cost these two subjects nothing, because a
+ * Terraform plan needs no Pulumi state, no secret values and no passphrase.
+ * An explicit Deny beats an Allow from any attached policy, so this holds even
+ * if AWS widens `ReadOnlyAccess` later.
+ */
+export const githubActionsPulumiPlan: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "TerraformStateBucket",
+      Effect: "Allow",
+      Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+      Resource: TF_BUCKET,
+    },
+    {
+      // Scoped to the states these two actually plan. gp-ai plans only its
+      // dev roots on a pull request ("Only dev is planned" in gp-ai.yml), so
+      // the prod states are not reachable from here.
+      Sid: "TerraformStateObjects",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [
+        `${TF_BUCKET}/*/dev/terraform.tfstate`,
+        `${TF_BUCKET}/dataplatform/terraform.tfstate`,
+      ],
+    },
+    {
+      // gp-terraform-dataplatform plans without `-lock=false`, so it takes the
+      // real lock. Its backend sets `use_lockfile = true`, so the lock is an
+      // S3 object rather than a DynamoDB item, and this is the whole grant.
+      // gp-ai passes `-lock=false` and needs none of it.
+      Sid: "DataplatformStateLock",
+      Effect: "Allow",
+      Action: ["s3:PutObject", "s3:DeleteObject"],
+      Resource: `${TF_BUCKET}/dataplatform/terraform.tfstate.tflock`,
+    },
+    {
+      // The Pulumi backend, denied outright. Nothing on this role plans
+      // Pulumi, and this is the bucket `ReadOnlyAccess` would otherwise open.
+      Sid: "DenyPulumiState",
+      Effect: "Deny",
+      Action: "s3:*",
+      Resource: [BUCKET, `${BUCKET}/*`],
+    },
+    {
+      // The one secret a plan on this role may read, and the reason the deny
+      // below is a NotResource rather than a blanket `*`.
+      //
+      // gp-ai's `dev/shared-infra` root and its `autopilot-bot` module both
+      // carry `data "aws_secretsmanager_secret_version" "ai_secrets"` with
+      // `secret_id = "AI_SECRETS_${upper(var.environment)}"`, and jsondecode
+      // the result. A data source is read at plan time, so a plan cannot run
+      // without this. It is gp-ai's version of the gp-api problem recorded in
+      // docs/deploy-role-trust.md under "What step 4 found", and it has the
+      // same right answer: stop reading the value at plan time. Until then
+      // this is the honest grant, and it is the whole residual risk of this
+      // role. Scoped to DEV: the prod blob is unreachable because gp-ai plans
+      // only its dev roots on a pull request.
+      Sid: "AiSecretsDevForPlan",
+      Effect: "Allow",
+      Action: ["secretsmanager:GetSecretValue"],
+      Resource:
+        "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+    },
+    {
+      // Everything except the one secret above. NotResource rather than a
+      // blanket deny because an explicit Deny beats the Allow above, so a
+      // `Resource: "*"` here would refuse the plan it is meant to permit.
+      Sid: "DenySecretValues",
+      Effect: "Deny",
+      Action: ["secretsmanager:GetSecretValue"],
+      NotResource:
+        "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+    },
+    {
+      // Blanket, matching the shape above. `ReadOnlyAccess` grants
+      // `ssm:GetParameter*` on `*`, and neither planner reads an SSM
+      // parameter: there is no `aws_ssm_parameter` data source in gp-ai's
+      // roots or in gp-terraform-dataplatform, checked rather than assumed.
+      // Naming the passphrase and the Grafana tokens specifically would leave
+      // every other parameter, and every one added later, readable by
+      // PR-authored code.
+      //
+      // `GetParameterHistory` is in the list because it returns prior
+      // versions including current SecureString values in plaintext, so
+      // denying only the three obvious reads leaves the passphrase reachable.
+      Sid: "DenySensitiveParameters",
+      Effect: "Deny",
+      Action: [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:GetParameterHistory",
+      ],
+      Resource: "*",
+    },
+  ],
+};

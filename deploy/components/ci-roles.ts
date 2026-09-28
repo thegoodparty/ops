@@ -4,6 +4,8 @@ import {
   githubActionsOrgDeployTrust,
   githubActionsPulumiDeploy,
   githubActionsPulumiDeployTrust,
+  githubActionsPulumiPlan,
+  githubActionsPulumiPlanTrust,
   githubActionsPulumiPreview,
   githubActionsPulumiPreviewTrust,
   githubActionsWorkbenchDeploy,
@@ -164,11 +166,43 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsPulumiPreview),
   });
 
+  // The Terraform plan role, step 4 of docs/deploy-role-trust.md. Trusted by
+  // `pull_request` in omni and gp-terraform-dataplatform, which plan Terraform
+  // on PRs and today assume the shared admin role to do it.
+  //
+  // Unlike the preview role above, this one carries a managed policy as well
+  // as its inline document. `terraform plan` reads whatever its roots manage,
+  // across a dozen services, and enumerating that is a standing breakage every
+  // time a root is added. `ReadOnlyAccess` covers the reads; the inline
+  // document's denies remove the two things that make ReadOnlyAccess unsafe
+  // here, Pulumi state and secret material, neither of which a plan needs.
+  //
+  // No protect. Nothing depends on it until step 5 points the workflows at it.
+  const planRole = new aws.iam.Role("githubActionsPulumiPlan", {
+    name: "github-actions-pulumi-plan",
+    description:
+      "Read-only Terraform plans from pull_request runs in thegoodparty/omni and thegoodparty/gp-terraform-dataplatform.",
+    assumeRolePolicy: JSON.stringify(githubActionsPulumiPlanTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsPulumiPlanPolicy", {
+    name: "Plan",
+    role: planRole.id,
+    policy: JSON.stringify(githubActionsPulumiPlan),
+  });
+
+  new aws.iam.RolePolicyAttachment("githubActionsPulumiPlanReadOnlyAttachment", {
+    role: planRole.name,
+    policyArn: READ_ONLY_ACCESS_ARN,
+  });
+
   return {
     deployRole,
     deployPolicy,
     orgDeployRole,
     workbenchDeployRole,
     previewRole,
+    planRole,
   };
 };

@@ -51,7 +51,8 @@ order: role, then workflow, then trust.
       and `election-api.yml`'s unused `id-token: write` as
       thegoodparty/omni#2146).
 - [ ] 4. Create `github-actions-pulumi-plan` for the **Terraform** planners:
-      `todo`. Split out from the original step 4; see "What step 4 found".
+      `doing` (role-assumption-workflow, 2026-09-28). Split out from the
+      original step 4; see "What step 4 found".
       Covers `gp-ai.yml`'s `terraform-plan` job and
       `gp-terraform-dataplatform`. Needs no Pulumi state and no secrets.
 - [ ] 5. Point those two planners at it: `todo`. Depends on 4 applying.
@@ -62,6 +63,11 @@ order: role, then workflow, then trust.
       found".
 - [ ] 5b. Create the gp-api plan role and point the diff workflow at it:
       `todo`. Depends on 4b.
+- [ ] 4c. Stop gp-ai's Terraform reading `AI_SECRETS_DEV` at plan time:
+      `todo`. The same problem as 4b in a different tool, found while
+      building step 4 and not fixed by it. Until it lands, the plan role
+      carries one `GetSecretValue` grant, and that grant is the role's whole
+      residual risk.
 - [ ] 6. Create `github-actions-preview-deploy`: `todo`. Depends on the
       naming audit in "The preview-deploy role" below.
 - [ ] 7. Point `gp-api.yml` and `gp-api-teardown-preview.yml` at it: `todo`.
@@ -205,10 +211,32 @@ and gp-api's diff moves behind a new step 4b that changes the program first.
 It is the same class as `verify-vercel-registrar-token.yml` (fixed in
 thegoodparty/omni#2138) but reaches production secret material, and unlike
 that one it cannot be fixed by deleting a trigger, because the diff is the
-point of the workflow. The options are on the record in the pull request that
-adds this section; the cheap mitigation is to stop diffing `prod` on pull
-requests, which is the trade `gp-ai.yml` already makes for the same reason
-("Only dev is planned ... would read AI_SECRETS_PROD on every infra PR").
+point of the workflow.
+
+**Decided (2026-09-28, swain): leave it and fix it properly in 4b.** The cheap
+mitigation was to stop diffing `prod` on pull requests, the trade `gp-ai.yml`
+already makes for the same reason ("Only dev is planned ... would read
+AI_SECRETS_PROD on every infra PR"). Rejected here because gp-api's `prod`
+stack diverges from `dev` in ways gp-ai's roots do not (`prod` owns the VPC),
+so dropping the prod diff gives up review signal that the dev diff does not
+replace, in exchange for shortening an exposure that 4b removes outright.
+Recorded so the interim is a choice with a reason rather than an oversight:
+until 4b lands, a pull request touching `packages/gp-api/deploy/**` runs
+PR-authored Pulumi that reads production secret material.
+
+**The same problem exists in gp-ai's Terraform, and step 4 could not avoid
+it.** `dev/shared-infra` and the `autopilot-bot` module both carry
+`data "aws_secretsmanager_secret_version" "ai_secrets"` against
+`AI_SECRETS_${upper(var.environment)}` and `jsondecode` the result. A data
+source is read at plan time, so `terraform plan` cannot run without
+`GetSecretValue` on `AI_SECRETS_DEV`.
+
+Unlike gp-api's, this one is dev-only, because gp-ai plans only its dev roots
+on a pull request. So step 4 ships with one narrowly scoped `GetSecretValue`
+allow and denies every other secret by `NotResource`. That grant is the plan
+role's entire residual risk and it is tracked as step 4c. Recorded here rather
+than left in a policy comment, because it is the one place this role is not
+what its name implies.
 
 **Resolved on the way past:** `pulumi stack select --create` does not write to
 the backend for a stack that already exists, so it does not force a state
@@ -356,8 +384,11 @@ consumer to sequence against.
 
 ## Open questions
 
-- Should `gp-api-infrastructure-diffs.yml` stop diffing `prod` on pull
-  requests, or is the prod diff worth keeping until 4b lands? (step 4b)
+- How does the gp-api program stop needing `DB_PASSWORD` at program time?
+  The key-name half is `pr-previews.md` step 3's declared list, but
+  `masterPassword` on the Aurora cluster is a real value, so that half needs
+  its own answer (AWS-managed master password, or keeping the cluster out of
+  the previewed program). (step 4b)
 - Can teardown drop the preview database without running a task on the dev
   cluster's task definition? (step 7)
 - Does `gpvpn` still deploy anything, or is step 9 a removal rather than a
