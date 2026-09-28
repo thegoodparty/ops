@@ -50,7 +50,81 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
+      conflicted: ${{ steps.guard.outputs.value }}
     steps:
+      # A PR with conflicts has no `refs/pull/N/merge` for GitHub to build, so
+      # `actions/checkout` falls back to the head and the plan is not the merge
+      # the PR would produce. Detect that before a preview runs and skip.
+      # `mergeable` is computed lazily, so poll before deciding; if it never
+      # resolves, skip rather than preview the wrong tree.
+      - name: Is the PR mergeable?
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: guard
+        with:
+          script: |
+            let mergeable = null;
+            for (let i = 0; i < 6 && mergeable === null; i++) {
+              if (i > 0) await new Promise((resolve) => setTimeout(resolve, 5000));
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+              });
+              mergeable = data.mergeable;
+            }
+            core.setOutput("value", mergeable === true ? "false" : "true");
+
+      - name: Handle conflict comment
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          CONFLICTED: ${{ steps.guard.outputs.value }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const conflictMarker = "<!-- pulumi-preview:conflict -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const conflict = comments.find((c) => c.body && c.body.includes(conflictMarker));
+
+            if (process.env.CONFLICTED !== "true") {
+              if (conflict) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: conflict.id });
+              }
+              return;
+            }
+
+            // Drop any plan from an earlier, mergeable run: with conflicts the
+            // head is not the proposed change, so the plan now misrepresents it.
+            for (const c of comments) {
+              if (
+                c.body &&
+                c.body.includes("<!-- pulumi-preview:") &&
+                !c.body.includes(conflictMarker)
+              ) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+              }
+            }
+
+            const body = [
+              conflictMarker,
+              "## Pulumi preview",
+              "",
+              "⏸️ **Skipped: this PR has merge conflicts.**",
+              "",
+              "The preview runs against the merge of the head into the base. With conflicts GitHub has no merge to build, and checking out the head would show a plan that is not the change this PR proposes. Merge `main` into the branch (or rebase onto it) and the next push previews again.",
+            ].join("\n");
+
+            if (conflict) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: conflict.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
       - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: matrix
         with:
@@ -80,8 +154,9 @@ jobs:
     needs: changes
     # `needs.changes.result` matters: on a fork PR the `changes` job is
     # skipped, and without this the empty string output would still satisfy
-    # `!= '[]'` and reach `fromJSON('')`, which is an error.
-    if: needs.changes.result == 'success' && needs.changes.outputs.matrix != '[]'
+    # `!= '[]'` and reach `fromJSON('')`, which is an error. `conflicted` keeps
+    # the preview off a PR whose head is not the proposed merge.
+    if: needs.changes.result == 'success' && needs.changes.outputs.conflicted != 'true' && needs.changes.outputs.matrix != '[]'
     strategy:
       fail-fast: false
       matrix:

@@ -232,8 +232,12 @@ bearing, since trust is by `sub` only, but keep it stable):
   skip explicit instead of a confusing failure.
 - `permissions: contents: read, id-token: write, pull-requests: write`.
 - `actions/checkout` with `persist-credentials: false`.
-- One job per project with path filters, each writing its own section of one
-  comment (or one comment per project; decide when implementing).
+- One job per project with path filters, each posting its own
+  marker-identified comment, so the parallel jobs never write the same comment.
+- Skip when the PR is not mergeable. GitHub cannot build `refs/pull/N/merge`
+  for a conflicted PR, so `actions/checkout` would silently fall back to the
+  head and the plan would not be the proposed merge. A marker-identified
+  comment says it was skipped, and any plan from an earlier run is deleted.
 - Concurrency per PR with `cancel-in-progress: true`, only if the lock check
   in step 4 confirms preview is read-only.
 - Comment handling as omni does it. Pin third-party actions by SHA: this is a
