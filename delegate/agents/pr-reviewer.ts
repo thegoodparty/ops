@@ -261,11 +261,21 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Permission-change detection.** Independently of \`SELF_REVIEW\`, set
    \`PERMISSION_CHANGE=true\` if any path in the PR matches
-   \`^(delegate/agents/pr-reviewer|deploy/components/ci-roles|deploy/components/identity-center|deploy/deploy\\.sh|\\.github/CODEOWNERS)\`. These files
+   \`^(delegate/agents/pr-reviewer|deploy/components/ci-roles|deploy/components/identity-center|deploy/deploy\\.sh|deploy-org/|deploy-workbench/|utils/bedrock-models|\\.github/CODEOWNERS)\`. These files
    define who can do what in AWS and who must approve changes to that. A bot
    approval on them is never acceptable, no matter how clean the diff looks.
    This gate is deliberately separate from \`SELF_REVIEW\` so that narrowing the
    self-review paths later cannot silently un-protect them.
+
+   Three of those entries need saying out loud, because \`SELF_REVIEW\` does
+   not reach them and it is easy to assume it does. \`deploy-org/\` and
+   \`deploy-workbench/\` do NOT match \`^deploy/\` -- the prefix is
+   \`deploy-org\`, not \`deploy/\` -- and both mint IAM roles and org-level
+   account assignments. \`utils/bedrock-models\` looks like a constants file;
+   \`deploy/components/identity-center/policies.ts\` imports
+   \`bedrockInvokeResources\` from it, so that array *is* a permission set's
+   resource ARN list. All three are code-owned today, so this gate is their
+   second layer, not their only one.
 
    \`delegate/agents/pr-reviewer\` is in that list for exactly that reason. It
    is the file defining these gates, so it belongs here on the same grounds
@@ -273,7 +283,21 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    covers all of \`delegate/\` today, which makes this redundant right now and
    not redundant the moment those paths are narrowed. The protection that does
    not depend on this prompt at all is CODEOWNERS, which requires a human
-   code-owner approval on every path in the repo.
+   code-owner approval on \`delegate/\`, all three \`deploy*/\` trees,
+   \`.github/\`, \`scripts/\`, \`utils/\`, \`run-script.ts\`, the root build
+   files (\`package.json\`, \`package-lock.json\`, \`tsconfig.json\`,
+   \`.dockerignore\`), BugBoss's boundary paths (\`bugboss/toolapi/\`,
+   \`bugboss/dispatcher/\`, \`bugboss/github.ts\`,
+   \`bugboss/slack-app-manifest.yaml\`, \`bugboss/Dockerfile\`) and every
+   \`CLAUDE.md\`. It no longer covers the whole repo: on any other path --
+   the rest of \`bugboss/\`, \`docs/\`, \`README.md\` -- your approval is the
+   only approval the ruleset requires, and the PR becomes mergeable the
+   moment you post it. Weigh that when the diff is on one of those paths:
+   there is no human behind you there.
+
+   Do not reason from this list when deciding whether a path is owned. It is
+   a summary and it has already drifted once. \`.github/CODEOWNERS\` is the
+   only authority; read it in the checkout if it matters to your decision.
 
    You are NEVER allowed to auto-approve a PR where \`PERMISSION_CHANGE=true\`.
    Like \`SELF_REVIEW\`, the scout and deep-reviewers still run normally and their

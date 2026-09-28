@@ -38,6 +38,51 @@ whole suite with `npm test`.
 **Commit with `--no-verify`.** Explain *why* in PR bodies, not what. No
 "test plan" section, no Co-Authored-By.
 
+## Review and approval
+
+Who has to approve a PR here depends on which paths it touches. The default
+branch requires one approving review plus code-owner review, and
+`.github/CODEOWNERS` names owners for some trees and not others. A path with
+no owner satisfies the code-owner half vacuously, so on those paths a
+`delegate-reviewer[bot]` approval is enough to merge, with no human behind it.
+
+**A human on `@thegoodparty/gp-contrib` must approve** a PR touching:
+
+- `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/` —
+  the trees that define IAM, CI and the reviewer itself
+- `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling
+  code but are reached by IaC and by a credentialled workflow. See below.
+- `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore`
+- `bugboss/toolapi/`, `bugboss/dispatcher/`, `bugboss/github.ts`,
+  `bugboss/slack-app-manifest.yaml`, `bugboss/Dockerfile` — BugBoss's security
+  boundaries, as opposed to its application code
+- `CLAUDE.md`, at the root and in any directory — the reviewer is told to
+  read these as authoritative for conventions, so they shape what it accepts
+
+**Everything else merges on a bot approval** — the rest of `bugboss/`,
+`docs/`, and `README.md`.
+
+Keep changes that need a human in their own PR: one file under an owned path
+pulls the whole PR into human review.
+
+**The non-obvious part.** Three of those entries are owned because something
+outside their directory reaches in, and you cannot see it from the file:
+`deploy/components/identity-center/policies.ts` imports its permission-set
+resource ARNs from `utils/bedrock-models.ts`; `deploy-workbench.yml` runs
+`scripts/enable-bedrock-models.ts` under a deploy role; and `run-script.ts`
+dynamically imports anything in `scripts/`. Before you assume a file is
+harmless, check what executes it, or what reads it: `CLAUDE.md` is owned for
+the second reason rather than the first.
+
+The same applies to CI ordering. `deploy.yml` runs install, test and build
+**strictly before** the Configure AWS Credentials step, because the deploy
+role carries `AdministratorAccess` and `npm test` executes
+`bugboss/**/*.test.ts` — unowned files. Do not move a step that runs
+repository code below that credentials step.
+
+Both halves are explained at length in `.github/CODEOWNERS`. Read it before
+adding a path to either side; scope by directory, not by file.
+
 ## Scripts
 
 Scripts are standalone TypeScript modules in `scripts/`, each exporting a default async function. Run with:
