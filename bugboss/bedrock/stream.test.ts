@@ -461,3 +461,50 @@ test("a deliberate short retention is never held to the 1h tier", async () => {
 
   assert.deepEqual(reports, []);
 });
+
+test("a partial downgrade is reported, not written off as good enough", async () => {
+  // 90k of this write went to the 5m tier. An earlier cut returned early on
+  // any non-zero 1h share and reported nothing here, which is the same silence
+  // the check exists to break.
+  const { reports } = await retentionReports({
+    input_tokens: 2,
+    cache_creation_input_tokens: 190000,
+    cache_read_input_tokens: 0,
+    cache_creation: { ephemeral_5m_input_tokens: 90000, ephemeral_1h_input_tokens: 100000 },
+  });
+
+  assert.deepEqual(reports, [
+    { requested: "long", written: 190000, written1h: 100000, written5m: 90000 },
+  ]);
+});
+
+test("the bedrock metrics backstop never reports a downgrade", async () => {
+  // `amazon-bedrock-invocationMetrics` carries no cache_creation split by
+  // construction, so a check here would fire on every stream that fell back to
+  // it and never on a real downgrade.
+  const output = newOutput();
+  const reports: CacheRetentionReport[] = [];
+  await consumeAnthropicStream({
+    events: (async function* () {
+      yield { type: "message_delta", delta: { stop_reason: "end_turn" } };
+      yield {
+        type: "message_stop",
+        "amazon-bedrock-invocationMetrics": {
+          inputTokenCount: 2,
+          outputTokenCount: 5,
+          cacheReadInputTokenCount: 0,
+          cacheWriteInputTokenCount: 190000,
+        },
+      };
+    })(),
+    output,
+    push: () => {},
+    applyCost: () => {},
+    parseJson: () => ({}),
+    cacheRetention: "long",
+    onUnhonouredCacheRetention: (report) => reports.push(report),
+  });
+
+  assert.equal(output.usage.cacheWrite, 190000);
+  assert.deepEqual(reports, []);
+});
