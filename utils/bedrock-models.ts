@@ -60,11 +60,6 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     crossRegion: true,
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and the geo profile is mandatory",
   },
-  {
-    id: "anthropic.claude-sonnet-5",
-    invokeId: "us.anthropic.claude-sonnet-5",
-    crossRegion: true,
-  },
   { id: "xai.grok-4.6", invokeId: "us.xai.grok-4.6", crossRegion: true },
   {
     id: "openai.gpt-5.6-sol",
