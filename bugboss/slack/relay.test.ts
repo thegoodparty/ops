@@ -928,4 +928,43 @@ describe("a button press", () => {
       "an answer nobody offered as a button is recorded unchanged",
     );
   });
+
+  test("a crash after the reply row leaves neither the reply nor the directive", async () => {
+    const thread = await askWithButtons("inc-1");
+
+    // The seam this covers is the one a press used to be split across: the
+    // reply row and the directive were two `withWrite` calls, so a failure
+    // between them committed the first and lost the second. Renaming the
+    // directive table makes that second statement throw exactly where a
+    // crash would land, without stubbing anything the relay reaches through.
+    await db.withWrite((d) => {
+      d.exec("ALTER TABLE pending_directive RENAME TO pending_directive_gone");
+    });
+
+    await assert.rejects(() => press(thread), /pending_directive/);
+
+    const orphaned = db.query(
+      "SELECT text FROM thread_reply WHERE incidentId = 'inc-1'",
+    );
+    assert.deepEqual(
+      orphaned,
+      [],
+      "a reply recorded without its directive is an incident that looks answered and is not acting on the answer",
+    );
+
+    await db.withWrite((d) => {
+      d.exec("ALTER TABLE pending_directive_gone RENAME TO pending_directive");
+    });
+
+    // Nothing was committed, so the question is still answerable. That is
+    // the recovery the split version did not have: there, the press was
+    // already filed and the button would only ever report a duplicate.
+    const retried = await press(thread);
+    assert.equal(retried.kind, "answered");
+    assert.equal(
+      db.query("SELECT 1 FROM pending_directive WHERE incidentId = 'inc-1'")
+        .length,
+      1,
+    );
+  });
 });

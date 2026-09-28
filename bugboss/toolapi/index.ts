@@ -20,7 +20,7 @@
 import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
-import { indexIncident, searchIncidents } from "../db/search";
+import { indexIncident, searchIncidents, UnsearchableQuery } from "../db/search";
 import type {
   Directive,
   Evidence,
@@ -1070,6 +1070,15 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         // broken" and "nothing matches" are the two results that must never
         // be the same value, and this one is about to be read by an agent
         // deciding whether a problem is new.
+        if (err instanceof UnsearchableQuery) {
+          // Logged, not alarmed: nothing is broken, the words were the
+          // problem, and an alarm that fires on ordinary input teaches
+          // people to ignore alarms.
+          log("search_unsearchable", { incidentId, text: args.text });
+          return reject(
+            `${(err as Error).message} Nothing was compared against the corpus, so this is not the same as finding nothing -- search again with the failing operation, the component or the error text.`,
+          );
+        }
         alarm("search_failed", { incidentId, error: String(err) });
         return reject(
           `the incident search failed (${String(err)}); this is not the same as finding nothing`,

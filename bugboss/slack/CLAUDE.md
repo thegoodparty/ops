@@ -274,6 +274,12 @@ agent wrote. So `contact_human` cannot tell the two apart, and everything
 downstream of it — including whatever classifies an answer — only ever sees
 prose.
 
+Both writes are **one `withWrite`**, so they are one transaction. They were
+two, and the gap between them had no reconciler: the reply row is what the
+thread shows and the directive is the only thing the agent waits on, so
+committing the first and losing the second stalls the incident looking
+answered. Keep them in the same callback.
+
 Anyone in the channel may press. The two guards that keeps honest are in the
 `INSERT` statement rather than around it:
 
