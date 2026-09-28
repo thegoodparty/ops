@@ -1,25 +1,71 @@
-# Every change to this repo must be approved by a human. The ruleset on the
-# default branch requires code-owner review, and the single rule below makes
-# gp-contrib the owner of every path.
+# Who must approve what in this repo.
 #
-# delegate[bot] is a GitHub App and cannot be a team member, so a code-owner
-# requirement naming a team is structurally unsatisfiable by it. That is what
-# lets delegate review this repo: a bot approval is a signal to humans, never
-# sufficient to merge.
+# The ruleset on the default branch requires one approving review and
+# code-owner review. Code owners are listed below by path; every path NOT
+# listed has no owner, so the code-owner requirement is satisfied vacuously
+# and the single required approval can come from anyone who can review --
+# including delegate-reviewer[bot], whose approvals are real approvals.
+#
+# So the list below is the whole boundary. A path on it needs a human; a path
+# off it can merge on a bot approval alone.
 #
 # gp-contrib is used because it is the only team with write access to this
 # repo; gp-secops has read only, and GitHub silently ignores code owners
 # without write access.
 #
-# If this is ever narrowed from `*` to a list of paths, the list must cover at
-# least: the bot and its review gates (all of /delegate/, not just
-# pr-reviewer.ts, since the framework, worker, and subagent prompts all shape
-# its behaviour); AWS permissions (/deploy/components/ci-roles*,
-# /deploy/components/identity-center*, /deploy/deploy.sh); account-level IaC
-# (/deploy-org/, /deploy-workbench/); all of /.github/workflows/, since the
-# OIDC trust policies key on the ref, not the workflow file, so a newly added
-# workflow on main can assume the deploy roles; and this file. Scope each by
-# directory rather than by file: a narrower gate leaves the same hole one file
-# over.
+# ## What is on the list, and why
+#
+# The test is Jeff's: scoped access that does not touch security posture does
+# not need a human. Everything below either defines the posture or can change
+# what the reviewer itself does.
+#
+# `/.github/` -- all of it, not just the workflows that deploy. The OIDC trust
+# policies key on the ref, not the workflow file, so a newly added workflow on
+# main can assume the deploy roles. This file is here for the obvious reason:
+# it decides who must approve.
+#
+# `/delegate/` -- all of it, not just `agents/pr-reviewer.ts`. The framework,
+# the lambda dispatcher, the worker entrypoint and the subagent prompts all
+# shape what the reviewer does, and every delegate agent shares one worker
+# runtime and one GitHub App installation token with write access to the
+# product repos. Letting the reviewer's approval merge a change to the
+# reviewer collapses the boundary between coder and reviewer.
+#
+# `/deploy/`, `/deploy-org/`, `/deploy-workbench/` -- all three Pulumi
+# projects, not just the role and permission-set files. A new component that
+# mints an IAM role is one `index.ts` import away, and the bugboss task role
+# lives in `deploy/components/bugboss.ts`. Gating the whole tree is what keeps
+# the bugboss carve-out below honest: bugboss code is open, bugboss's
+# permissions are not.
+#
+# `/package.json`, `/package-lock.json` -- one `package.json` serves every
+# image in this repo, so a dependency added for bugboss also installs into the
+# delegate worker that holds the GitHub App token. That is a supply-chain path
+# into the reviewer's own runtime.
+#
+# ## What is deliberately off the list
+#
+# `/bugboss/`, `/scripts/`, `/utils/`, `/docs/` and the root docs. BugBoss
+# holds GitHub App credentials and can open PRs, but those PRs face the target
+# repo's own review gates, and its AWS reach is a finite set of read
+# permissions fixed in `deploy/components/bugboss.ts`, which is owned above.
+# Application code cannot widen it.
+#
+# ## Rules for editing this list
+#
+# Scope by directory, never by file. A file-scoped gate leaves the same hole
+# one file over: adding `deploy/components/evil.ts` touches no file-scoped
+# path, so it would need no human review. This repo has already been bitten by
+# that once -- see the `job_workflow_ref` comment in
+# `deploy/components/ci-roles/policies.ts`.
+#
+# Narrowing this list is a security change. It is also, by construction, a
+# change to a path on the list, so it needs a human.
 
-*    @thegoodparty/gp-contrib
+/.github/              @thegoodparty/gp-contrib
+/delegate/             @thegoodparty/gp-contrib
+/deploy/               @thegoodparty/gp-contrib
+/deploy-org/           @thegoodparty/gp-contrib
+/deploy-workbench/     @thegoodparty/gp-contrib
+/package.json          @thegoodparty/gp-contrib
+/package-lock.json     @thegoodparty/gp-contrib

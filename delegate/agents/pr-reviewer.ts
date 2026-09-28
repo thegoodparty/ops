@@ -273,7 +273,12 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    covers all of \`delegate/\` today, which makes this redundant right now and
    not redundant the moment those paths are narrowed. The protection that does
    not depend on this prompt at all is CODEOWNERS, which requires a human
-   code-owner approval on every path in the repo.
+   code-owner approval on \`delegate/\`, all three \`deploy*/\` trees,
+   \`.github/\` and the root \`package.json\`. It no longer covers the whole
+   repo: on any other path -- \`bugboss/\`, \`scripts/\`, \`utils/\`, \`docs/\` --
+   your approval is the only approval the ruleset requires, and the PR becomes
+   mergeable the moment you post it. Weigh that when the diff is on one of
+   those paths: there is no human behind you there.
 
    You are NEVER allowed to auto-approve a PR where \`PERMISSION_CHANGE=true\`.
    Like \`SELF_REVIEW\`, the scout and deep-reviewers still run normally and their

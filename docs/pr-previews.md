@@ -230,7 +230,8 @@ bearing, since trust is by `sub` only, but keep it stable):
 - Comment handling as omni does it. Pin third-party actions by SHA: this is a
   public repo and the job holds AWS credentials.
 - Update `CLAUDE.md` ("PRs run type-checking and builds but skip the deploy
-  step") and the `CODEOWNERS` comment's list of permission-bearing paths.
+  step"). No `CODEOWNERS` change: the new workflow lands under `/.github/`,
+  which is already code-owned.
 
 ### Secrets in the diff
 

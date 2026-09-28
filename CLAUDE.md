@@ -38,6 +38,33 @@ whole suite with `npm test`.
 **Commit with `--no-verify`.** Explain *why* in PR bodies, not what. No
 "test plan" section, no Co-Authored-By.
 
+## Review and approval
+
+Who has to approve a PR here depends on which paths it touches. The default
+branch requires one approving review plus code-owner review, and
+`.github/CODEOWNERS` names owners for some trees and not others.
+
+**A human on `@thegoodparty/gp-contrib` must approve** a PR touching any of:
+
+- `.github/` — workflows can assume the deploy roles, since OIDC trust keys on
+  the ref, not the filename; and `CODEOWNERS` itself
+- `delegate/` — all of it. Every agent shares one worker runtime and one
+  GitHub App token, and the reviewer must not be able to approve changes to
+  the reviewer
+- `deploy/`, `deploy-org/`, `deploy-workbench/` — the Pulumi IaC that defines
+  every IAM role and permission set
+- `package.json`, `package-lock.json` — one `package.json` builds every image,
+  so a dependency reaches the delegate worker
+
+**Everything else can merge on a `delegate-reviewer[bot]` approval alone** —
+`bugboss/`, `scripts/`, `utils/`, `docs/` and the root docs. There is no human
+behind the bot on those paths. Review accordingly, and keep changes that need
+a human in their own PR: one file under an owned path pulls the whole PR into
+human review.
+
+Both halves are explained in `.github/CODEOWNERS`. Read it before adding a
+path to either side; scope by directory, never by file.
+
 ## Scripts
 
 Scripts are standalone TypeScript modules in `scripts/`, each exporting a default async function. Run with:
