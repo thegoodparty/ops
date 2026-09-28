@@ -255,7 +255,10 @@ describe("SQL access is read-only", () => {
     assert.equal(out.split("\n").length, MAX_SQL_ROWS + 1, "rows are capped");
     assert.match(out, /first 50 shown/);
     for (const line of out.split("\n").slice(0, MAX_SQL_ROWS)) {
-      assert.ok(line.length < 2200, "each row is capped");
+      // 2000 exactly, not "under 2200". The old slack-agent truncate sliced
+      // to the cap and then appended its marker on top, so the slack the
+      // number carried was the overshoot, and it grew with the row.
+      assert.ok(line.length <= 2000, `each row is capped: ${line.length}`);
     }
   });
 });
@@ -1198,6 +1201,22 @@ describe("read_agent_session", () => {
   test("says a run was killed rather than leaving the reader to infer it", async () => {
     const out = await readSession([turn("checks are green, asking for a merge")]);
     assert.match(out, /was killed after 1 turns/);
+  });
+
+  // Two bounds compose here: the exit-record line this PR prepends to the
+  // header, and the session reader's own cap. Asserted at a size nobody
+  // would choose, because a bound checked at a plausible input is a bound
+  // that holds until somebody waits longer.
+  test("the outcome line comes out of the session budget, not on top of it", async () => {
+    const out = await readSession(
+      Array.from({ length: 20_000 }, (_, i) => turn(`${i} ${"x".repeat(500)}`)),
+    );
+    assert.ok(
+      out.length <= 24_000,
+      `MAX_SESSION_CHARS is 24000 but the reader returned ${out.length}`,
+    );
+    // And it survives the cut, because it is in the head the cap keeps.
+    assert.match(out, /was killed after 20000 turns/);
   });
 
   test("says a run ended on purpose when it did", async () => {

@@ -355,7 +355,7 @@ test("the clamp notice comes out of the output budget, not on top of it", async 
     const [tool] = executable(set);
     const out = await tool.execute("c1", {
       // Echoed back, so this is what makes the result long enough to truncate.
-      logql: "x".repeat(5000),
+      logql: "x".repeat(2_000_000),
       startRfc3339: "now-30d",
       endRfc3339: "now",
     });
