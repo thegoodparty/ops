@@ -63,10 +63,13 @@ order: role, then workflow, then trust.
       found".
 - [ ] 5b. Create the gp-api plan role and point the diff workflow at it:
       `todo`. Depends on 4b.
-- [ ] 4c. Stop gp-ai's Terraform reading `AI_SECRETS_DEV` at plan time:
+- [ ] 4c. Stop gp-ai's Terraform reading dev secret values at plan time:
       `todo`. The same problem as 4b in a different tool, found while
-      building step 4 and not fixed by it. Until it lands, the plan role
-      carries one `GetSecretValue` grant, and that grant is the role's whole
+      building step 4 and not fixed by it. Three secrets, not one:
+      `AI_SECRETS_DEV` through a data source, and `broker-dev` and
+      `broker-service-tokens-dev` because a managed
+      `aws_secretsmanager_secret_version` is refreshed during plan. Until it
+      lands, those three `GetSecretValue` grants are the role's whole
       residual risk.
 - [ ] 6. Create `github-actions-preview-deploy`: `todo`. Depends on the
       naming audit in "The preview-deploy role" below.
@@ -223,6 +226,19 @@ replace, in exchange for shortening an exposure that 4b removes outright.
 Recorded so the interim is a choice with a reason rather than an oversight:
 until 4b lands, a pull request touching `packages/gp-api/deploy/**` runs
 PR-authored Pulumi that reads production secret material.
+
+**A managed resource is read at plan time too, not just a data source.**
+Step 4 sized that grant by searching for `data "aws_secretsmanager_secret_version"`,
+which finds `AI_SECRETS_DEV` and nothing else, and the first real plan under
+the role then failed on two more. `broker-dev` and `broker-service-tokens-dev`
+are declared as **resources**, and Terraform refreshes a managed resource
+during plan, which calls `GetSecretValue` just the same. When sizing a
+plan-time grant, search for the resource type, not only the data source.
+
+A consequence worth stating: adding a secret to a gp-ai dev root now needs a
+grant in this repo first, merged and applied, before that root can plan. The
+failure without one is a clean `AccessDenied`, which is the intended
+fail-closed behaviour, but it is a new cross-repo step for a gp-ai author.
 
 **The same problem exists in gp-ai's Terraform, and step 4 could not avoid
 it.** `dev/shared-infra` and the `autopilot-bot` module both carry
