@@ -17,6 +17,7 @@ import {
   type PromptInput,
 } from "./prompt";
 import { NOTES_LIMITS } from "./notes";
+import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
 
 const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
   incidentId: "inc-42",
@@ -197,4 +198,38 @@ test("the agent is told to write mrkdwn, not Markdown", () => {
   assert.ok(prompt.includes("There are no headings and no tables."));
   assert.match(prompt, /Do not escape `&`, `<` or `>` yourself/);
   assert.match(prompt, /Never write `<!here>`/);
+});
+
+test("the agent is told which waits carry a heartbeat", () => {
+  const prompt = composeSystemPrompt(input());
+
+  // The tool description says the same thing, but the model picks the
+  // argument at the moment it writes the call and the worked example is what
+  // it copies. A wait on a person that omits the argument is silent, which is
+  // the failure this exists to stop.
+  assert.match(prompt, /say so in awaitingHuman/);
+  assert.match(prompt, /awaitingHuman: "Merge <url>/);
+  assert.match(prompt, /Leave it unset for a deploy/);
+});
+
+test("the prompt makes a re-run a confirmation, never a way to get green", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /A red check is not a flake until you have read it/);
+  assert.match(prompt, /rerun_ci/);
+  assert.match(prompt, /Never\s+re-run with bash/);
+  assert.match(prompt, new RegExp(`${MAX_RERUNS_PER_INCIDENT} runs per incident`));
+  assert.match(prompt, /comes back on the second attempt is a finding/);
+  assert.match(prompt, /empty commit/);
+  assert.match(prompt, /A flake you confirm is a defect/);
+});
+
+test("the prompt does not understate how far the GitHub token reaches", () => {
+  const prompt = composeSystemPrompt(input());
+
+  // It used to claim the token reached "omni and nothing else". The App is
+  // installed org-wide, so that was a promise the agent could act on and be
+  // wrong about. See bugboss/github-app.md.
+  assert.doesNotMatch(prompt, /omni and nothing\s+else/);
+  assert.match(prompt, /every repository in the thegoodparty/);
 });

@@ -1,21 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { Directive } from "../types";
+import type { Directive, ToolResponse } from "../types";
 import type { PendingDirective } from "./tools";
 import {
   CONTACT_HUMAN_MESSAGE_LIMIT,
   createContactHumanTool,
   createMonitorTool,
+  HEARTBEAT_MAX_PINGS,
   directiveTimestampMillis,
   firstReplyAfter,
+  insideWorkingHours,
+  parseWorkingHours,
   runContactHuman,
   runMonitor,
   shellProbe,
   truncateOutput,
   unansweredBrief,
+  type HeartbeatDeps,
   type HumanContactPort,
   type PendingQuestion,
+  type PendingWait,
   type Probe,
 } from "./tools";
 
@@ -45,7 +50,12 @@ test("monitor returns as soon as the command exits 0", async () => {
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.deepEqual(result, { output: "MERGED\n", timedOut: false });
+  assert.deepEqual(result, {
+    output: "MERGED\n",
+    timedOut: false,
+    escalation: null,
+    directives: [],
+  });
   assert.equal(calls.length, 1);
 });
 
@@ -953,4 +963,393 @@ test("unusable options are refused before anything is posted", async () => {
     String(result.content[0].type === "text" && result.content[0].text),
     /at least two/,
   );
+});
+
+
+// ---------------------------------------------------------------------------
+// The heartbeat on a wait that needs a person
+// ---------------------------------------------------------------------------
+
+const clockAt = (iso: string) => {
+  let now = Date.parse(iso);
+  return {
+    now: () => now,
+    sleep: async (ms: number) => {
+      now += ms;
+    },
+  };
+};
+
+const heartbeatHarness = (args: {
+  now: () => number;
+  existing?: PendingWait;
+  handOff?: ToolResponse;
+  postFails?: boolean;
+  pingFails?: boolean;
+  clearFails?: boolean;
+}) => {
+  let marker: PendingWait | null = args.existing ?? null;
+  const posts: string[] = [];
+  const postTimes: string[] = [];
+  const handOffs: { reason: string; brief: string }[] = [];
+  let recordWaitCalls = 0;
+  let clears = 0;
+
+  const deps: HeartbeatDeps = {
+    marker: {
+      recordWait: async (command) => {
+        recordWaitCalls += 1;
+        if (!marker || marker.command !== command) {
+          marker = { command, startedAt: args.now(), pings: 0, lastPingAt: null };
+        }
+        return marker;
+      },
+      recordPing: async () => {
+        if (args.pingFails) throw new Error("the Boss said 503");
+        if (!marker) throw new Error("no wait is recorded");
+        marker = { ...marker, pings: marker.pings + 1, lastPingAt: args.now() };
+        return marker;
+      },
+      clearWait: async () => {
+        if (args.clearFails) throw new Error("the Boss said 503");
+        clears += 1;
+        marker = null;
+      },
+    },
+    post: async (message) => {
+      if (args.postFails) throw new Error("slack said no");
+      posts.push(message);
+      postTimes.push(new Date(args.now()).toISOString());
+    },
+    escalate: {
+      handOff: async (payload) => {
+        handOffs.push(payload);
+        return args.handOff ?? { ok: true, directives: [] };
+      },
+    },
+  };
+
+  return {
+    deps,
+    posts,
+    postTimes,
+    handOffs,
+    clears: () => clears,
+    recordWaitCalls: () => recordWaitCalls,
+  };
+};
+
+const stalled: Probe = async () => ({ code: 1, output: '{"state":"OPEN"}' });
+
+const PR_WAIT = {
+  command: "gh pr view 2150 --json state -q .state | grep -q MERGED",
+  description: "the PR to be merged",
+  awaitingHuman:
+    "Merge <https://github.com/thegoodparty/omni/pull/2150|omni#2150>. I cannot merge it myself.",
+};
+
+test("a wait on a person nudges the thread once it has gone an hour inside working hours", async () => {
+  // Monday, 11:00 in New York.
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.escalation, null);
+  assert.equal(harness.posts.length, 1);
+  assert.match(harness.posts[0], /Still waiting on someone: the PR to be merged/);
+  assert.match(harness.posts[0], /1h so far/);
+  assert.match(harness.posts[0], /omni#2150/);
+  // The check's own current answer, which is the only part that can have
+  // changed since the ask.
+  assert.match(harness.posts[0], /"state":"OPEN"/);
+  assert.match(harness.posts[0], /Next nudge in 2h/);
+});
+
+test("a wait that spans a night is silent until the window opens", async () => {
+  // Monday, 18:00 in New York: one hour inside the window, then fifteen out.
+  const clock = clockAt("2026-09-28T22:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 3600, timeoutSeconds: 72_000 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  // Not one post overnight, then one as the window opens on Tuesday and a
+  // second two hours later, rather than the whole ladder at once.
+  assert.deepEqual(harness.postTimes, [
+    "2026-09-29T14:00:00.000Z",
+    "2026-09-29T16:00:00.000Z",
+  ]);
+  assert.match(harness.posts[0], /16h so far/);
+});
+
+test("a resumed agent carries on waiting instead of nudging again", async () => {
+  // Monday, 12:00 in New York. The wait began ninety minutes ago and was
+  // nudged thirty minutes ago; the container restarted in between.
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    existing: {
+      ...PR_WAIT,
+      startedAt: started - 5_400_000,
+      pings: 1,
+      lastPingAt: started - 1_800_000,
+    },
+  });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 600, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(harness.posts.length, 0);
+  assert.equal(result.timedOut, true);
+  // The timeout is measured from when the wait began, not from this process,
+  // so the restart did not buy another two hours.
+  assert.equal(clock.now() - started, 1_800_000);
+});
+
+test("a wait with nobody to nudge posts nothing and records no marker", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  const result = await runMonitor(
+    {
+      command: "gh run list --commit abc123 -q '.[0].conclusion' | grep -q success",
+      intervalSeconds: 1800,
+      timeoutSeconds: 14_400,
+      description: "the release train to deploy abc123",
+    },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(harness.posts.length, 0);
+  assert.equal(harness.recordWaitCalls(), 0);
+});
+
+test("the nudges run out and the incident is handed to a human", async () => {
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    existing: {
+      ...PR_WAIT,
+      startedAt: started - 15 * 3_600_000,
+      pings: HEARTBEAT_MAX_PINGS,
+      lastPingAt: started - 8 * 3_600_000,
+    },
+  });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.deepEqual(result.escalation, {
+    handedOff: true,
+    reason: "nobody ended a 15h wait after 3 nudges",
+  });
+  assert.equal(harness.handOffs.length, 1);
+  assert.match(harness.handOffs[0].brief, /so this is yours/);
+  assert.match(harness.handOffs[0].brief, /the PR to be merged/);
+  // A fourth nudge in the thread is not what a stalled wait needs; hand_off
+  // is the post that reaches the rotation.
+  assert.equal(harness.posts.length, 0);
+  assert.equal(harness.clears(), 1);
+});
+
+test("a hand-off that fails leaves the incident with the agent and says so", async () => {
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    handOff: { ok: false, error: "already owned by a human", directives: [] },
+    existing: {
+      ...PR_WAIT,
+      startedAt: started - 15 * 3_600_000,
+      pings: HEARTBEAT_MAX_PINGS,
+      lastPingAt: started - 8 * 3_600_000,
+    },
+  });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.escalation?.handedOff, false);
+  // The marker keeps its startedAt, so the next attempt escalates at once
+  // rather than starting the wait over.
+  assert.equal(harness.clears(), 0);
+
+  const tool = await createMonitorTool({
+    probe: stalled,
+    sleep: clock.sleep,
+    now: clock.now,
+    heartbeat: harness.deps,
+  });
+  const out = await tool.execute(
+    "call-1",
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+  const text = String(out.content[0].type === "text" && out.content[0].text);
+  assert.match(text, /Call hand_off yourself now/);
+  assert.equal(out.terminate, false);
+});
+
+test("a hand-off that lands stops the agent", async () => {
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    existing: {
+      ...PR_WAIT,
+      startedAt: started - 15 * 3_600_000,
+      pings: HEARTBEAT_MAX_PINGS,
+      lastPingAt: started - 8 * 3_600_000,
+    },
+  });
+
+  const tool = await createMonitorTool({
+    probe: stalled,
+    sleep: clock.sleep,
+    now: clock.now,
+    heartbeat: harness.deps,
+  });
+  const out = await tool.execute(
+    "call-1",
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+  const text = String(out.content[0].type === "text" && out.content[0].text);
+
+  assert.match(text, /HANDED OFF/);
+  assert.equal(out.terminate, true);
+});
+
+test("a Slack failure costs the nudge, not the wait", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, postFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(harness.posts.length, 0);
+});
+
+test("working hours are a window in one zone, and a weekend is outside it", () => {
+  assert.equal(insideWorkingHours(Date.parse("2026-09-28T15:00:00Z")), true);
+  assert.equal(insideWorkingHours(Date.parse("2026-09-28T13:00:00Z")), false);
+  // The end hour is exclusive: 19:00 in New York is already out.
+  assert.equal(insideWorkingHours(Date.parse("2026-09-28T23:00:00Z")), false);
+  assert.equal(insideWorkingHours(Date.parse("2026-09-26T16:00:00Z")), false);
+});
+
+test("working hours follow the zone through a DST change", () => {
+  // Eastern is UTC-4 in September and UTC-5 in November, so the same UTC
+  // instant is inside the window in one and outside it in the other.
+  assert.equal(insideWorkingHours(Date.parse("2026-09-28T14:00:00Z")), true);
+  assert.equal(insideWorkingHours(Date.parse("2026-11-02T14:00:00Z")), false);
+  assert.equal(insideWorkingHours(Date.parse("2026-11-02T15:00:00Z")), true);
+});
+
+test("a working-hours spec is parsed, and a malformed one throws", () => {
+  assert.deepEqual(parseWorkingHours("America/Los_Angeles:9-17"), {
+    timeZone: "America/Los_Angeles",
+    startHour: 9,
+    endHour: 17,
+    days: [1, 2, 3, 4, 5],
+  });
+  assert.deepEqual(parseWorkingHours("UTC:0-24:0,6").days, [0, 6]);
+
+  assert.throws(() => parseWorkingHours("America/New_York"), /must look like/);
+  assert.throws(() => parseWorkingHours("America/New_York:19-10"), /start<end/);
+  assert.throws(() => parseWorkingHours("Mars/Olympus:10-19"), /IANA zone/);
+  assert.throws(() => parseWorkingHours("UTC:10-19:9"), /days must be 0-6/);
+});
+
+test("a Boss failure while counting a nudge costs the nudge, not the wait", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, pingFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.timedOut, true);
+  // Nothing is posted when the count did not move: retried every interval
+  // with no backoff to advance, the nudge would be the spam.
+  assert.equal(harness.posts.length, 0);
+});
+
+test("a Boss failure while dropping the marker does not lose a wait that just ended", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, clearFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
+    {
+      probe: async () => ({ code: 0, output: "MERGED" }),
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: harness.deps,
+    },
+  );
+
+  assert.equal(result.timedOut, false);
+  assert.equal(result.output, "MERGED");
+});
+
+test("recording the wait is the one marker call that is allowed to fail loudly", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+  harness.deps.marker.recordWait = async () => {
+    throw new Error("the Boss said 503");
+  };
+
+  // Nothing has been waited on yet, so the model gets an error and reissues
+  // the call. Swallowing it would start a day-long wait with no marker and no
+  // heartbeat, which is the behaviour this whole file exists to end.
+  await assert.rejects(
+    runMonitor(
+      { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
+      { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    ),
+    /503/,
+  );
+});
+
+test("the hand-off brief counts the nudges that were actually sent", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 86_400 },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: { ...harness.deps, maxPings: 1 },
+    },
+  );
+
+  assert.equal(harness.posts.length, 1);
+  assert.match(harness.handOffs[0].brief, /across 1 nudges/);
 });

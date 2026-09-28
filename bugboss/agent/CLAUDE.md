@@ -21,6 +21,12 @@ run for a day, so a token handed down at launch would expire
 mid-investigation and surface as `gh` refusing to push a branch the agent
 had already built.
 
+What that token may do is [`../github-app.md`](../github-app.md), which is the
+GitHub counterpart to the checked-in Slack manifest. Read it before assuming
+a capability: the App is installed org-wide with `contents: write`, so the
+token reaches every repository in the organisation and not only omni. The
+prompt used to say otherwise and was wrong.
+
 ## The two blocking tools
 
 `monitor` and `contact_human` each cost **one turn** no matter how long they
@@ -30,6 +36,13 @@ polling, and it is why the prompt forbids polling with bash in a loop.
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
+- `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
+  what the wait is on, and the harness nudges the thread when they do not
+  turn up. Unset, the wait is silent, which is right for a deploy, a
+  migration or an alert going quiet: nobody is being asked for anything. The
+  argument decides it rather than the command string, because a harness that
+  pattern-matched `gh pr` would stop nudging the day somebody wrote the same
+  check differently.
 - `contact_human(message, …)` — re-entrant. The marker is written *before*
   the post, so a resumed agent resumes waiting rather than asking twice. It
   re-posts when the stored message differs from the new one, and when
@@ -41,6 +54,59 @@ polling, and it is why the prompt forbids polling with bash in a loop.
   marker and the timeout are untouched and an answer nobody offered still
   lands. The options are checked before anything is posted, so a refusal
   costs no marker and no message.
+
+## Re-running CI: the capability and its bound are one object
+
+`rerun_ci` (`rerun.ts`) re-runs one workflow run's failed jobs, once. It
+exists because incident 5 could not: the App holds `actions: read`, the
+endpoint needs `actions: write`, and the agent correctly stopped and asked a
+human rather than pretending otherwise. What the App may do is
+[`../github-app.md`](../github-app.md), including the cases `actions: write`
+does *not* cover — a run parked on an approval is the one to know, and since
+mid-2026 that gate applies to pull requests a bot opened on a same-repo branch,
+which is every pull request this agent opens.
+
+The permission on its own would have been the worse outcome. `gh run rerun
+--failed` is all the capability needs, and an agent holding that reaches for
+a re-run the moment anything is red — retry as a fix, automated. So the
+affordance is the tool, and the tool carries the discipline:
+
+- **One attempt per run, read from GitHub's `run_attempt`.** Not from
+  anything we store, which is what makes it survive a restart *and* makes the
+  tool safe to replay: a restarted agent's recorded call runs again, finds
+  attempt 2 and refuses instead of re-running twice. It also refuses a run a
+  human already re-ran, which is right.
+- **A budget across the incident**, so "push something small, re-run, repeat"
+  runs out. Process-scoped, and a restart hands it back — but every run
+  already re-run is still at attempt 2, so what a restart buys is only runs it
+  has not touched.
+- **The thread is told by the tool, not by the model.** The `suspicion`
+  argument is required and is posted verbatim, so a human reading the thread
+  can say "that is not a flake, that is your change". Posted *after* the
+  re-run rather than before it, which is the opposite of `contact_human`'s
+  marker: until the permission is granted every call ends in a 403, and a
+  notice posted first would announce a re-run that never happened, over and
+  over. A post that fails afterwards is recoverable and loud — the result
+  hands the agent the text and tells it to post it.
+- **A permission refusal names the permission.** Not "the re-run failed". It
+  says which endpoint, what GitHub itself says the call needed, that the App
+  holds `read`, and that asking a human is fine *only* if the ask says why —
+  because a missing permission nobody names is a missing permission nobody
+  grants. The discriminator is the `X-Accepted-GitHub-Permissions` response
+  header, **not** the message: GitHub documents no failure for this endpoint
+  at all, every 403 body is folklore, and the two that are attested ("this
+  workflow is already running", "created over a month ago") have nothing to do
+  with permissions. A 403 without that header says so instead of sending the
+  agent to ask for a grant that would change nothing. 404 gets the same
+  treatment from the other side, because GitHub masks a repository an
+  installation cannot see rather than forbidding it.
+
+**There is no fence, and this is the honest part.** The agent has a real
+shell. `gh run rerun` is reachable the way `gh pr merge` is, and GitHub offers
+no server-side equivalent of branch protection for a re-run. The prompt
+forbids it; that is advice, not a control. If a reviewer wants this closed,
+the only real answer is a second, narrower token for the agent's shell, which
+is a bigger change than this one.
 
 ## contact_human is not an escalation, and the harness enforces that
 
@@ -89,8 +155,44 @@ conclusion and one request, and the proof is one scroll away rather than in
 front of it. `prompt.ts` carries the budget, the shape and a worked example
 ("What a human reads"); this is what makes it more than advice.
 
-Both take the harness's deadline signal combined with Pi's own, so the soft
-deadline can interrupt a blocking tool. Without that, `steer` only lands
+## The heartbeat on a wait that needs a person
+
+An agent that posts "please merge this" and then blocks is indistinguishable
+from one that has died, and a merge nobody notices is the stall that matters
+most — the human's only job in this system is the merge. So a wait with
+`awaitingHuman` set nudges the thread on its own: due an hour in, then two,
+then four, and once the nudges run out `hand_off` sets `owner: human` and the
+agent stops. That last step is the point of the ladder — an incident blocked
+with `owner: agent` is invisible, since the dispatcher will not relaunch one
+an agent still holds and nothing lists it as unclaimed work. `hand_off` is
+also the only post in the sequence that reaches the rotation group.
+
+It lives in the wait loop rather than in the prompt for the same two reasons
+`runContactHuman`'s escalation does. It must cost **no turns** — a model asked
+to nudge itself has to come back for a turn to do it, which is the polling
+loop the tool exists to replace. And an agent that has gone quiet cannot
+notice its own silence.
+
+**Nudges are gated on working hours, and the backoff counts from the last
+nudge.** The window is `BUGBOSS_WORKING_HOURS`
+(`America/New_York:10-19:1,2,3,4,5` by default — 07:00–16:00 Pacific, so
+nobody on a continental-US team is pinged before 07:00 or after 19:00 local).
+The elapsed clock is wall clock and the window only gates the *post*, so a
+wait that spans a night stays silent and speaks on the first poll after the
+window opens. Counting the gap from the last nudge rather than from the start
+is what stops that morning from arriving as the whole ladder at once.
+
+**Re-entrancy is the `pending_wait` marker**, on the same contract as the
+question marker: idempotent for the same command, replaced by a different one.
+It holds `startedAt` and the nudge count, so a resumed agent resumes the wait
+it was in — and the timeout is measured from `startedAt`, so a crash-looping
+agent does not get a fresh day each time round. The nudge is counted *before*
+it is posted, which is the opposite order from the question and deliberate: a
+crash between the two costs one nudge, where the other order re-nudges on
+every resume, and every merge to ops `main` resumes every agent.
+
+Both blocking tools take the harness's deadline signal combined with Pi's own,
+so the soft deadline can interrupt a blocking tool. Without that, `steer` only lands
 after the current turn's tool calls finish — and the agent spends most of
 its life inside a `monitor` with an hours-long timeout.
 

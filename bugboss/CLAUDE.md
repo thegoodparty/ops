@@ -19,6 +19,7 @@ This file is what you need before editing anything here.
 | The closing report an incident ends with | [`report/CLAUDE.md`](./report/CLAUDE.md) |
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
+| What the GitHub App may do, and why | [`github-app.md`](./github-app.md) |
 
 `index.ts` is the composition root — the only place real services are
 named. `types.ts` is the contract everything else is built against.
@@ -73,6 +74,15 @@ What holds is outside it: this container reaches no database and no release
 path, and its GitHub App cannot merge. The loopback API is how an agent moves
 incident state, with a per-launch token scoped to one incident so concurrent
 agents cannot reach each other's work.
+
+Where GitHub offers no such fence, the bound goes in the tool and the gap is
+written down rather than implied. Re-running a failed CI job is the case:
+`gh run rerun` in bash is reachable the way `gh pr merge` is, so `rerun_ci`
+(`agent/rerun.ts`) is an affordance with its discipline attached — one attempt
+per run, read from GitHub's own `run_attempt`; a budget across the incident;
+and a notice posted to the thread by the tool rather than by the model
+remembering to mention it. What the App holds and what it deliberately does
+not is [`github-app.md`](./github-app.md).
 
 ## Schema changes
 

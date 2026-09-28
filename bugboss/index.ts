@@ -53,6 +53,7 @@ import {
   type BugBossServers,
   type HttpConfig,
 } from "./http";
+import { parseWorkingHours } from "./agent/tools";
 import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
 import { createSlackAck } from "./slack/ack";
 import type { ChoicePoster, SlackChoiceClick } from "./slack/blocks";
@@ -623,8 +624,8 @@ export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
   postChoice: (threadTs, text, blocks) =>
     withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
-  permalink: (messageTs) =>
-    withDeadline(slack.permalink(messageTs), "chat.getPermalink"),
+  permalink: (messageTs, channel) =>
+    withDeadline(slack.permalink(messageTs, channel), "chat.getPermalink"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
 });
 
@@ -1470,6 +1471,9 @@ export const createBugBoss = async (
       }`,
       BUGBOSS_S3_BUCKET: config.s3Bucket,
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
+      ...(config.workingHours
+        ? { BUGBOSS_WORKING_HOURS: config.workingHours }
+        : {}),
       ...(secrets.grafanaUrl ? { GRAFANA_URL: secrets.grafanaUrl } : {}),
     },
     childCredentials: {
@@ -2050,6 +2054,17 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       .split(",")
       .map((slug) => slug.trim())
       .filter(Boolean),
+    // Parsed and discarded: the child re-parses the string it is handed, and
+    // this is here so a typo stops the container at boot rather than killing
+    // every agent one launch at a time.
+    ...(env.BUGBOSS_WORKING_HOURS
+      ? {
+          workingHours: (() => {
+            parseWorkingHours(env.BUGBOSS_WORKING_HOURS);
+            return env.BUGBOSS_WORKING_HOURS;
+          })(),
+        }
+      : {}),
   };
 };
 
