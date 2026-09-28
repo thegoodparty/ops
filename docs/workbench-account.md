@@ -370,8 +370,8 @@ Facts discovered during implementation go here as they are learned:
 - **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
   list imported by both the IAM policy that permits them and the script that
   subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5-5`,
-  `anthropic.claude-sonnet-5`, `xai.grok-4.6`, `openai.gpt-5.6-sol`,
-  `openai.gpt-5.6-terra`, `moonshotai.kimi-k3`, plus `zai.glm-5` and
+  `xai.grok-4.6`, `openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`,
+  `moonshotai.kimi-k3`, plus `zai.glm-5` and
   `deepseek.v3.2` kept region-pinned by choice. One entry is neither a geo
   profile nor region-pinned: `anthropic.claude-sonnet-5-5` is offered only as
   `global.anthropic.claude-sonnet-5-5`, the one model here that routes
@@ -1429,8 +1429,10 @@ permission set limit. Not 3698: the replacement's id is four characters longer
 across its two ARNs, which is the kind of detail worth getting right in a document
 that asks people to check numbers. Re-measured on 2026-09-28 after the
 invocation-logging and `cloudwatch:GenerateQuery` changes, those same 14 ARNs
-compose to 3729, and Sonnet 5.5's two bring it to 16 ARNs and 3881 bytes. So
-there is room for roughly forty more models before the
+compose to 3729, and Sonnet 5.5's two bring it to 16 ARNs and 3881 bytes.
+Retiring Sonnet 5 on 2026-09-28, once 5.5 had replaced it in `gp-pi`, brought
+that back to 14 ARNs at 3737. So there is room for roughly forty more models
+before the
 limit is the thing to think about, which is worth knowing mainly so nobody trims
 the list to save space.
 
@@ -1440,6 +1442,12 @@ The reverse of adding is one edit too, and the order reverses with it: `gp-pi`
 stops offering the model first, then this list drops it. Doing it the other way
 round takes the model away from a picker that still offers it, which an engineer
 experiences as a working model that suddenly returns AccessDenied.
+
+Claude Sonnet 5 was retired by this path on 2026-09-28, once 5.5 had replaced
+it in `gp-pi` (`f33f0f7`, "Offer Claude Sonnet 5.5 instead of Sonnet 5"). The
+`ops` half is this file and the two workflows; there was no console or
+console-adjacent step to remember, which is the property the ordering exists to
+preserve.
 
 What removal does is revoke IAM. The entry disappears from
 `bedrockInvokeResources()`, `deploy.yml` applies the narrowed permission set, and
