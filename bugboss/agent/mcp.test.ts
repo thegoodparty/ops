@@ -337,3 +337,35 @@ test("the allowlist is reads only, and the server is told the same thing", () =>
   assert.ok(GRAFANA_MCP_ARGS.some((arg) => arg.startsWith("--enabled-tools=")));
   assert.ok(GRAFANA_MCP_ARGS.some((arg) => arg.startsWith("--loki-guardrail-mode=")));
 });
+
+// The notice is an explanation of a bound, so it must not break a different
+// one. Adding it after the truncation is the same defect truncateOutput was
+// just fixed for, one layer up.
+test("the clamp notice comes out of the output budget, not on top of it", async () => {
+  const maxOutputChars = 900;
+  const set = await connectMcpToolset({
+    name: "grafana",
+    command: process.execPath,
+    args: ["-e", FAKE_SERVER],
+    env: { FAKE_TOOLS: JSON.stringify([LOKI_TOOL]) },
+    allowedTools: [LOKI_TOOL.name],
+    maxOutputChars,
+  });
+  try {
+    const [tool] = executable(set);
+    const out = await tool.execute("c1", {
+      // Echoed back, so this is what makes the result long enough to truncate.
+      logql: "x".repeat(5000),
+      startRfc3339: "now-30d",
+      endRfc3339: "now",
+    });
+    const text = out.content[0].text;
+    assert.match(text, /^\[bugboss\]/, "the notice still leads");
+    assert.ok(
+      text.length <= maxOutputChars,
+      `capped at ${maxOutputChars} but came back as ${text.length}`,
+    );
+  } finally {
+    set.close();
+  }
+});

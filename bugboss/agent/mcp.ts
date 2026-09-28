@@ -457,15 +457,17 @@ export const connectMcpToolset = async (
           arguments: clamped.arguments,
         });
         // Prepended, because truncateOutput keeps the head: a notice at the
-        // end is the first thing a long result loses.
-        const text = truncateOutput(mcpResultToText(result), maxChars);
+        // end is the first thing a long result loses. Its room comes out of
+        // the budget rather than on top of it -- the description promises a
+        // cap, and a notice added after the truncation is the same defect
+        // truncateOutput itself was just fixed for.
+        const notice = clamped.notice ? `${clamped.notice}\n\n` : "";
+        const text = truncateOutput(
+          mcpResultToText(result),
+          Math.max(0, maxChars - notice.length),
+        );
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: clamped.notice ? `${clamped.notice}\n\n${text}` : text,
-            },
-          ],
+          content: [{ type: "text" as const, text: `${notice}${text}` }],
           details: undefined,
         };
       },
