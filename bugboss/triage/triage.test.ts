@@ -220,6 +220,36 @@ test("never attaches across RESOLVED; it is a recurrence instead", async () => {
   assert.match(outcome.decision.reason, /RESOLVED/);
 });
 
+test("a conclusive match outranks the RESOLVED incident the model picked", async () => {
+  // The two pointers come from different places: the model names whatever
+  // RESOLVED incident it found in the digest, while a conclusive candidate is
+  // an exact (source, sourceId) match in the db. This path used to stamp the
+  // model's choice inline and drop the fact, sending the agent to the wrong
+  // post-mortem.
+  const { db } = fakeDb({ recurrence: [priorRow()] });
+  const { model } = scripted([
+    decideCall({
+      action: "attach",
+      incidentId: "inc-9",
+      reason: "identical to the incident we just closed out",
+    }),
+  ]);
+
+  const outcome = await runTriage(
+    { model, db, budgetMs: 2000 },
+    context({ openIncidents: [digest({ id: "inc-9", status: "RESOLVED" })] }),
+  );
+
+  assert.equal(outcome.decision.action, "new_incident");
+  assert.equal(
+    outcome.recurrenceOf,
+    "41",
+    "the exact-key match is a fact about the delivery; the attach target is a judgement",
+  );
+  assert.match(outcome.decision.reason, /RESOLVED/);
+  assert.match(outcome.decision.reason, /recurrence of 41/);
+});
+
 test("refuses to attach to an incident that is not open", async () => {
   const { db } = fakeDb();
   const { model } = scripted([

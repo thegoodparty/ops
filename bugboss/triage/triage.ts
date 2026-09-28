@@ -348,15 +348,20 @@ const applyRules = (
       );
     }
     if (target.status === "RESOLVED") {
-      return {
-        decision: {
-          action: "new_incident",
-          reason: `${answer.reason} [attach refused: ${target.id} is RESOLVED, so this signal is evidence the resolution was wrong]`,
-        },
-        recurrenceOf: target.id,
-        recurrenceChecked: checked,
-        fellBack: false,
-      };
+      // Through newIncident like every other refusal, rather than stamping
+      // target.id inline. The model names any RESOLVED incident it found; a
+      // conclusive candidate is an exact (source, sourceId) match in the db
+      // and outranks it. Built inline, this path silently dropped that
+      // pointer whenever the two disagreed and sent the agent to the wrong
+      // post-mortem. target.id stays as the hint, so it still wins when
+      // there is no conclusive candidate.
+      return newIncident(
+        deps,
+        ctx,
+        { ...answer, recurrenceOf: target.id },
+        recurrence,
+        `attach refused: ${target.id} is RESOLVED, so this signal is evidence the resolution was wrong`,
+      );
     }
     if (!ATTACHABLE.includes(target.status)) {
       return newIncident(
