@@ -978,23 +978,56 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Resource: [BUCKET, `${BUCKET}/*`],
     },
     {
+      // The one secret a plan on this role may read, and the reason the deny
+      // below is a NotResource rather than a blanket `*`.
+      //
+      // gp-ai's `dev/shared-infra` root and its `autopilot-bot` module both
+      // carry `data "aws_secretsmanager_secret_version" "ai_secrets"` with
+      // `secret_id = "AI_SECRETS_${upper(var.environment)}"`, and jsondecode
+      // the result. A data source is read at plan time, so a plan cannot run
+      // without this. It is gp-ai's version of the gp-api problem recorded in
+      // docs/deploy-role-trust.md under "What step 4 found", and it has the
+      // same right answer: stop reading the value at plan time. Until then
+      // this is the honest grant, and it is the whole residual risk of this
+      // role. Scoped to DEV: the prod blob is unreachable because gp-ai plans
+      // only its dev roots on a pull request.
+      Sid: "AiSecretsDevForPlan",
+      Effect: "Allow",
+      Action: ["secretsmanager:GetSecretValue"],
+      Resource:
+        "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+    },
+    {
+      // Everything except the one secret above. NotResource rather than a
+      // blanket deny because an explicit Deny beats the Allow above, so a
+      // `Resource: "*"` here would refuse the plan it is meant to permit.
       Sid: "DenySecretValues",
       Effect: "Deny",
       Action: ["secretsmanager:GetSecretValue"],
-      Resource: "*",
+      NotResource:
+        "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
     },
     {
-      // The passphrase decrypts every project's state, and the Grafana tokens
-      // are live credentials that gp-api's CLI reads on its own deploy path.
-      // None of the three is needed to plan Terraform.
+      // Blanket, matching the shape above. `ReadOnlyAccess` grants
+      // `ssm:GetParameter*` on `*`, and neither planner reads an SSM
+      // parameter: there is no `aws_ssm_parameter` data source in gp-ai's
+      // roots or in gp-terraform-dataplatform, checked rather than assumed.
+      // Naming the passphrase and the Grafana tokens specifically would leave
+      // every other parameter, and every one added later, readable by
+      // PR-authored code.
+      //
+      // `GetParameterHistory` is in the list because it returns prior
+      // versions including current SecureString values in plaintext, so
+      // denying only the three obvious reads leaves the passphrase reachable.
       Sid: "DenySensitiveParameters",
       Effect: "Deny",
-      Action: ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"],
-      Resource: [
-        "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
-        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
-        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+      Action: [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:GetParameterHistory",
       ],
+      Resource: "*",
     },
   ],
 };

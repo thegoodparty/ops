@@ -64,21 +64,53 @@ describe("githubActionsPulumiPlan", () => {
     ]);
   });
 
-  it("denies secret values", () => {
+  const AI_SECRETS_DEV =
+    "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????";
+
+  // The single documented exception, and the whole residual risk of the role.
+  // Pinned to DEV: gp-ai plans only its dev roots on a pull request, and the
+  // prod blob must stay unreachable.
+  it("allows exactly one secret value, the dev AI secrets", () => {
+    const allow = statement("AiSecretsDevForPlan");
+    assert.equal(allow.Effect, "Allow");
+    assert.equal(allow.Resource, AI_SECRETS_DEV);
+    assert.ok(!String(allow.Resource).includes("PROD"));
+  });
+
+  // NotResource, not Resource: an explicit Deny beats the Allow above, so a
+  // blanket deny here would refuse the plan the role exists to run.
+  it("denies every other secret value", () => {
     const deny = statement("DenySecretValues");
     assert.equal(deny.Effect, "Deny");
     assert.ok(asList(deny.Action).includes("secretsmanager:GetSecretValue"));
-    assert.equal(deny.Resource, "*");
+    assert.equal(deny.Resource, undefined);
+    assert.equal(deny.NotResource, AI_SECRETS_DEV);
   });
 
-  it("denies the passphrase and the Grafana tokens", () => {
+  // Blanket, and including GetParameterHistory: it returns prior versions
+  // with current SecureString values in plaintext, so denying only the three
+  // obvious reads leaves the Pulumi passphrase reachable.
+  it("denies every SSM parameter read, history included", () => {
     const deny = statement("DenySensitiveParameters");
     assert.equal(deny.Effect, "Deny");
-    assert.deepEqual(asList(deny.Resource), [
-      "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
-      "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
-      "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
-    ]);
+    assert.equal(deny.Resource, "*");
+    for (const action of [
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+      "ssm:GetParameterHistory",
+    ]) {
+      assert.ok(asList(deny.Action).includes(action), `missing ${action}`);
+    }
+  });
+
+  it("lists only the Terraform state bucket, not all buckets", () => {
+    const allow = statement("TerraformStateBucket");
+    assert.equal(allow.Effect, "Allow");
+    assert.equal(
+      allow.Resource,
+      "arn:aws:s3:::goodparty-terraform-state-us-west-2"
+    );
   });
 
   // gp-ai plans only its dev roots on a pull request. Reaching a prod state

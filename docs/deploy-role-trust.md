@@ -63,6 +63,11 @@ order: role, then workflow, then trust.
       found".
 - [ ] 5b. Create the gp-api plan role and point the diff workflow at it:
       `todo`. Depends on 4b.
+- [ ] 4c. Stop gp-ai's Terraform reading `AI_SECRETS_DEV` at plan time:
+      `todo`. The same problem as 4b in a different tool, found while
+      building step 4 and not fixed by it. Until it lands, the plan role
+      carries one `GetSecretValue` grant, and that grant is the role's whole
+      residual risk.
 - [ ] 6. Create `github-actions-preview-deploy`: `todo`. Depends on the
       naming audit in "The preview-deploy role" below.
 - [ ] 7. Point `gp-api.yml` and `gp-api-teardown-preview.yml` at it: `todo`.
@@ -218,6 +223,20 @@ replace, in exchange for shortening an exposure that 4b removes outright.
 Recorded so the interim is a choice with a reason rather than an oversight:
 until 4b lands, a pull request touching `packages/gp-api/deploy/**` runs
 PR-authored Pulumi that reads production secret material.
+
+**The same problem exists in gp-ai's Terraform, and step 4 could not avoid
+it.** `dev/shared-infra` and the `autopilot-bot` module both carry
+`data "aws_secretsmanager_secret_version" "ai_secrets"` against
+`AI_SECRETS_${upper(var.environment)}` and `jsondecode` the result. A data
+source is read at plan time, so `terraform plan` cannot run without
+`GetSecretValue` on `AI_SECRETS_DEV`.
+
+Unlike gp-api's, this one is dev-only, because gp-ai plans only its dev roots
+on a pull request. So step 4 ships with one narrowly scoped `GetSecretValue`
+allow and denies every other secret by `NotResource`. That grant is the plan
+role's entire residual risk and it is tracked as step 4c. Recorded here rather
+than left in a policy comment, because it is the one place this role is not
+what its name implies.
 
 **Resolved on the way past:** `pulumi stack select --create` does not write to
 the backend for a stack that already exists, so it does not force a state
