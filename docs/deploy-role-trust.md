@@ -45,16 +45,23 @@ order: role, then workflow, then trust.
       stale notes in `ci-roles/policies.ts` are corrected in the same change,
       and the regression test now names the five so re-adding one is
       deliberate).
-- [ ] 3. Remove credentials from the three workflows that should not hold
-      them: `doing` (role-assumption-workflow, 2026-09-27). One of the three,
-      `verify-vercel-registrar-token.yml`, was pulled forward and merged as
-      thegoodparty/omni#2138. The other two are thegoodparty/omni#2146:
-      `gp-ai.yml`'s build job held ECR push it never exercised on a pull
-      request, and `election-api.yml` declared `id-token: write` with no job
-      that assumes a role.
-- [ ] 4. Create `github-actions-pulumi-plan`: `todo`. Depends on 3, which
-      decides the read surface.
-- [ ] 5. Point the plan-only workflows at it: `todo`. Depends on 4 applying.
+- [x] 3. Remove credentials from the three workflows that should not hold
+      them: `done` (2026-09-27. `verify-vercel-registrar-token.yml` pulled
+      forward as thegoodparty/omni#2138; `gp-ai.yml`'s unexercised ECR push
+      and `election-api.yml`'s unused `id-token: write` as
+      thegoodparty/omni#2146).
+- [ ] 4. Create `github-actions-pulumi-plan` for the **Terraform** planners:
+      `todo`. Split out from the original step 4; see "What step 4 found".
+      Covers `gp-ai.yml`'s `terraform-plan` job and
+      `gp-terraform-dataplatform`. Needs no Pulumi state and no secrets.
+- [ ] 5. Point those two planners at it: `todo`. Depends on 4 applying.
+- [ ] 4b. Stop `gp-api`'s Pulumi program reading secret **values** at program
+      time: `todo`. Prerequisite for any read-only role covering
+      `gp-api-infrastructure-diffs.yml`. This is omni's version of
+      `pr-previews.md` step 3 and needs its own design; see "What step 4
+      found".
+- [ ] 5b. Create the gp-api plan role and point the diff workflow at it:
+      `todo`. Depends on 4b.
 - [ ] 6. Create `github-actions-preview-deploy`: `todo`. Depends on the
       naming audit in "The preview-deploy role" below.
 - [ ] 7. Point `gp-api.yml` and `gp-api-teardown-preview.yml` at it: `todo`.
@@ -163,6 +170,50 @@ shared document is a write, that property is gone for every subject on it.
 Against this the only argument is duplication, and a sibling role is about
 fifteen lines in the same `ci-roles.ts`, built from the same helpers. Reuse
 the code, not the identity.
+
+## What step 4 found
+
+Writing step 4 turned up a blocker the plan did not anticipate, and it splits
+the step in two.
+
+**`gp-api`'s Pulumi program reads secret values at program time.**
+`packages/gp-api/deploy/index.ts` calls
+`aws.secretsmanager.getSecretVersion({ secretId })` and parses the result.
+That is an invoke, so it runs on preview exactly as it runs on apply. The
+value is genuinely used: `secret.DB_PASSWORD` becomes the Aurora cluster's
+`masterPassword`. The rest of the blob is used only for its **key names**, to
+build the task definition's `secrets` list and a `SECRET_NAMES` variable, so
+that part is the same shape `pr-previews.md` step 3 solved here with a
+declared key list.
+
+`gp-api-infrastructure-diffs.yml` diffs **both `dev` and `prod`** on every
+pull request touching `packages/gp-api/deploy/**`. So the secret read on that
+path is `GP_API_PROD`, the full gp-api credential blob. `infra-cli.ts` also
+pulls two Grafana tokens from SSM on the same path.
+
+Two consequences.
+
+**For the plan, step 4 cannot cover the gp-api diff workflow.** A role that
+can run that preview needs `secretsmanager:GetSecretValue` on the production
+secret, which is the one grant the threat model rules out, since the program
+and the workflow both come from the pull request. So step 4 now creates the
+role for the Terraform planners, which need neither Pulumi state nor secrets,
+and gp-api's diff moves behind a new step 4b that changes the program first.
+
+**Independently of the plan, this is a live exposure worth its own decision.**
+It is the same class as `verify-vercel-registrar-token.yml` (fixed in
+thegoodparty/omni#2138) but reaches production secret material, and unlike
+that one it cannot be fixed by deleting a trigger, because the diff is the
+point of the workflow. The options are on the record in the pull request that
+adds this section; the cheap mitigation is to stop diffing `prod` on pull
+requests, which is the trade `gp-ai.yml` already makes for the same reason
+("Only dev is planned ... would read AI_SECRETS_PROD on every infra PR").
+
+**Resolved on the way past:** `pulumi stack select --create` does not write to
+the backend for a stack that already exists, so it does not force a state
+write grant. A genuinely new stack fails closed, which is the right outcome
+for a plan role. That closes one of the plan's open questions without a code
+change.
 
 ## Design: `github-actions-pulumi-plan`
 
@@ -304,8 +355,8 @@ consumer to sequence against.
 
 ## Open questions
 
-- Does the `omni` infra CLI need a preview mode to drop `stack select
-  --create`, or does the plan role carry state writes? (steps 4 and 5)
+- Should `gp-api-infrastructure-diffs.yml` stop diffing `prod` on pull
+  requests, or is the prod diff worth keeping until 4b lands? (step 4b)
 - Can teardown drop the preview database without running a task on the dev
   cluster's task definition? (step 7)
 - Does `gpvpn` still deploy anything, or is step 9 a removal rather than a
