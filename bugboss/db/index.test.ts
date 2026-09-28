@@ -12,7 +12,7 @@ import { after, before, describe, it } from "node:test";
 import Database from "better-sqlite3";
 import type { S3Client } from "@aws-sdk/client-s3";
 
-import { Db } from ".";
+import { Db, type LateColumn } from ".";
 
 const SCHEMA = join(__dirname, "schema.sql");
 
@@ -136,6 +136,193 @@ describe("a column added after its table shipped", () => {
       );
     } finally {
       second.close();
+    }
+  });
+});
+
+/**
+ * A snapshot built from the live DDL with some declaration rewritten, which
+ * is how a database that predates a schema change is reproduced without
+ * pinning a copy of the old schema that would stop tracking this one.
+ */
+const snapshotWith = (
+  dir: string,
+  name: string,
+  rewrite: (ddl: string) => string,
+): Buffer => {
+  const ddl = rewrite(readFileSync(SCHEMA, "utf8"));
+  assert.notEqual(
+    ddl,
+    readFileSync(SCHEMA, "utf8"),
+    "the declaration this fixture rewrites has moved; it no longer builds an old snapshot",
+  );
+  const path = join(dir, name);
+  const old = new Database(path);
+  old.exec(ddl);
+  old.close();
+  return readFileSync(path);
+};
+
+/** `alarm` is console.error, so this is how a boot-time alarm is observed. */
+const alarmsDuring = async (fn: () => Promise<Db>) => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: string) => void lines.push(line);
+  try {
+    const db = await fn();
+    return {
+      db,
+      alarms: lines.map(
+        (l) => JSON.parse(l) as { event: string; columns?: string[] },
+      ),
+    };
+  } finally {
+    console.error = original;
+  }
+};
+
+describe("a LATE_COLUMNS entry that cannot be applied", () => {
+  let dir: string;
+  let snapshot: Buffer;
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "bugboss-db-late-"));
+    snapshot = preColumnSnapshot(dir);
+  });
+
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const openWith = async (name: string, lateColumns: LateColumn[]) =>
+    Db.open({
+      path: join(dir, name),
+      bucket: "b",
+      key: "k",
+      s3: s3Holding(snapshot) as unknown as S3Client,
+      lateColumns,
+    });
+
+  it("names itself rather than leaving SQLite to say 'no such table'", async () => {
+    // PRAGMA table_info answers a missing table with an empty list, so the
+    // entry looks exactly like a column waiting to be added. Today the ALTER
+    // is what fails, and only because schema.sql happens to run first.
+    await assert.rejects(
+      openWith("ghost.db", [
+        { table: "ghost_table", column: "whatever", type: "TEXT" },
+      ]),
+      (err: Error) =>
+        /LATE_COLUMNS names ghost_table\.whatever/.test(err.message) &&
+        /no table ghost_table/.test(err.message),
+    );
+  });
+
+  it("still adds a column to a table that does exist", async () => {
+    const { db } = await alarmsDuring(() =>
+      openWith("added.db", [
+        { table: "signal", column: "lateArrival", type: "TEXT" },
+      ]),
+    );
+    try {
+      assert.ok(
+        db
+          .query<{ name: string }>("PRAGMA table_info(signal)")
+          .some((c) => c.name === "lateArrival"),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("still leaves a column that is already there alone", async () => {
+    const entry: LateColumn[] = [
+      { table: "signal", column: "twice", type: "TEXT" },
+    ];
+    const first = await alarmsDuring(() => openWith("twice.db", entry));
+    first.db.close();
+    // SQLite refuses a duplicate ADD COLUMN rather than ignoring it, so a
+    // second boot over the same file proves the presence check still guards.
+    const second = await alarmsDuring(() => openWith("twice.db", entry));
+    try {
+      assert.equal(
+        second.db
+          .query<{ name: string }>("PRAGMA table_info(signal)")
+          .filter((c) => c.name === "twice").length,
+        1,
+      );
+    } finally {
+      second.db.close();
+    }
+  });
+});
+
+describe("a column schema.sql declares that the live database lacks", () => {
+  let dir: string;
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "bugboss-db-drift-"));
+  });
+
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const openOver = (name: string, snapshot: Buffer) =>
+    alarmsDuring(() =>
+      Db.open({
+        path: join(dir, name),
+        bucket: "b",
+        key: "k",
+        s3: s3Holding(snapshot) as unknown as S3Client,
+      }),
+    );
+
+  it("is named at boot when nobody added it to LATE_COLUMNS", async () => {
+    // The documented two-edits-not-one hazard, reproduced: resolvedEvidence
+    // is declared in schema.sql and is not in LATE_COLUMNS, so a snapshot
+    // taken before it existed never gets it and every close that writes it
+    // rolls back -- invisibly, because every test opens a fresh file.
+    const snapshot = snapshotWith(dir, "no-evidence.db", (ddl) =>
+      ddl.replace(/^\s*resolvedEvidence\s+TEXT,\s*$/m, ""),
+    );
+    const { db, alarms } = await openOver("drift.db", snapshot);
+    try {
+      const drift = alarms.find((a) => a.event === "schema_drift");
+      assert.ok(drift, "a column missing in prod and present in every test");
+      assert.deepEqual(drift.columns, ["incident.resolvedEvidence"]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("is named when it exists with a different declared type", async () => {
+    const snapshot = snapshotWith(dir, "retyped.db", (ddl) =>
+      ddl.replace(/^(\s*usersImpacted\s+)INTEGER,(\s*)$/m, "$1TEXT,$2"),
+    );
+    const { db, alarms } = await openOver("retyped-live.db", snapshot);
+    try {
+      const drift = alarms.find((a) => a.event === "schema_drift");
+      assert.ok(drift);
+      assert.deepEqual(drift.columns, [
+        "incident.usersImpacted (declared INTEGER, live TEXT)",
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not fire on a database the late-column pass has just repaired", async () => {
+    // The false-alarm case, and the reason this check is worth having: an
+    // alarm that fires during normal operation teaches people to ignore
+    // alarms. recurrenceAnalysis is missing from this snapshot and is in
+    // LATE_COLUMNS, so by the time the check runs there is nothing to say.
+    const { db, alarms } = await openOver(
+      "clean.db",
+      preColumnSnapshot(dir),
+    );
+    try {
+      assert.deepEqual(
+        alarms.filter((a) => a.event === "schema_drift"),
+        [],
+      );
+    } finally {
+      db.close();
     }
   });
 });
