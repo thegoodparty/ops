@@ -274,6 +274,21 @@ export const HEARTBEAT_STATUS_CHARS = 400;
 export const HARNESS_BRIEF_ECHO_CHARS = 350;
 
 /**
+ * The same clamp for a nudge, and smaller, because a nudge spends its budget
+ * differently: it echoes *two* of the model's fields and then carries the
+ * whole status block underneath, where a brief echoes one. The fixed cost of
+ * `heartbeatMessage` plus a full status block is a little under 600 against a
+ * budget of 1,200, so 280 each fits with room and 350 each would not -- two
+ * of those composes past the budget and the nudge would be refused.
+ *
+ * Being refused is the whole reason this exists. A nudge nobody can shorten
+ * is dropped on a failed post by design, so an over-long one would mean an
+ * incident that waits all day, nudges nobody, and then hands off saying it
+ * nudged three times.
+ */
+export const HEARTBEAT_ECHO_CHARS = 280;
+
+/**
  * Quiet seconds owed before the next nudge, given how many have gone already.
  * Measured from the last nudge rather than from the start, which is what
  * keeps a wait that spanned a night from firing its whole ladder in three
@@ -352,8 +367,8 @@ export const heartbeatMessage = (args: {
   nextSeconds: number | null;
 }): string =>
   [
-    `*Still waiting on someone: ${args.description}*`,
-    `${formatWaited(args.waitedMs)} so far, and it is the only thing outstanding. ${args.awaitingHuman}`,
+    `*Still waiting on someone: ${truncateOutput(args.description, HEARTBEAT_ECHO_CHARS)}*`,
+    `${formatWaited(args.waitedMs)} so far, and it is the only thing outstanding. ${truncateOutput(args.awaitingHuman, HEARTBEAT_ECHO_CHARS)}`,
     "",
     "*What the check says now*",
     "```",

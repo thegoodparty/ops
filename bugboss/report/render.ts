@@ -113,7 +113,8 @@ export const timestamp = (at: number): string => {
 };
 
 /**
- * Two units at most: "1h 4m", "3d 2h", "47s". Past a day, minutes are noise.
+ * Two units at most: "1h 4m", "3d 2h", "47s"; under a second, "<1s". Past a
+ * day, minutes are noise.
  *
  * This takes a length, not a difference. Deciding what a backwards interval
  * means belongs to `interval` below, so nothing here turns a negative into a
@@ -124,6 +125,11 @@ export const timestamp = (at: number): string => {
 export const duration = (ms: number): string => {
   if (!Number.isFinite(ms)) return "unknown";
   if (ms < 0) return `-${duration(-ms)}`;
+  // Whole seconds round a real gap down to "0s", which reads as no gap at
+  // all. The caller that cannot afford that is `interval`'s backwards branch:
+  // it calls a timeline self-contradictory and then prints zero as the
+  // contradiction, which is an argument against itself.
+  if (ms > 0 && ms < 1000) return "<1s";
   const seconds = Math.round(ms / 1000);
   const units: [number, string][] = [
     [86400, "d"],
@@ -145,16 +151,36 @@ export const duration = (ms: number): string => {
 };
 
 /**
+ * Past this, a difference between two of one incident's own timestamps is not
+ * a measurement. Nothing BugBoss handles runs for months: triage stops even
+ * looking for a related incident at ninety days, so anything wider than the
+ * window in which two incidents can still be the same incident is not a slow
+ * incident, it is two numbers that were not written on the same scale. The
+ * ceiling is deliberately set where a real incident stops being conceivable
+ * rather than near the mistake it catches -- a seconds-for-millis mix-up
+ * lands about fifty years wide, so every value in between is caught too, and
+ * the constant does not have to be re-tuned each time a new way of getting
+ * the unit wrong turns up.
+ */
+const IMPLAUSIBLE_MS = 90 * 86_400_000;
+
+/**
  * One of the report's measured intervals, or a sentence saying why there is
  * no number.
  *
- * Three answers, not two, because there are three states and they are not
- * the same news. `null` means one of the two moments was never recorded.
- * A negative means both were recorded and they disagree about which came
- * first -- the incident's own timeline contradicts itself. Printing one word
- * for both throws away the only clue that something upstream is wrong, and a
- * number that cannot be right is exactly as worth saying out loud as an
- * exception is.
+ * Four answers, not two, because there are four states and they are not the
+ * same news. `null`, or a number that is not one, means one of the two
+ * moments was never recorded. A negative means both were recorded and they
+ * disagree about which came first -- the incident's own timeline contradicts
+ * itself. A magnitude past `IMPLAUSIBLE_MS` means both were recorded and
+ * they are not on the same scale, which is the state that renders a
+ * plausibly-shaped number and so the one a reader cannot catch unaided.
+ * Printing one word for all of them throws away the only clue that something
+ * upstream is wrong, and a number that cannot be right is exactly as worth
+ * saying out loud as an exception is.
+ *
+ * The magnitude is read before the sign, deliberately: at fifty years apart,
+ * which of the two came first is not information either.
  */
 export const interval = (
   ms: number | null,
@@ -164,6 +190,15 @@ export const interval = (
     /** When they are both there and in the wrong order. `gap` is the size. */
     backwards: (gap: string) => string;
     /**
+     * When they are both there and too far apart to be one incident. Falls
+     * back to `backwards`, so a caller that has not distinguished the two
+     * still refuses the number rather than printing it -- which is why `gap`
+     * is here, unsigned, despite no caller wanting it: a length nothing can
+     * have measured is not a fact about the incident, and putting it on the
+     * page invites the same misreading the branch exists to stop.
+     */
+    implausible?: (gap: string) => string;
+    /**
      * When there is a number. Defaults to the number on its own, which is
      * what a labelled table cell wants; a sentence in a thread wants "detected
      * in 6h 15m" and passes that.
@@ -171,7 +206,10 @@ export const interval = (
     measured?: (length: string) => string;
   },
 ): string => {
-  if (ms === null) return say.absent;
+  if (ms === null || !Number.isFinite(ms)) return say.absent;
+  if (Math.abs(ms) > IMPLAUSIBLE_MS) {
+    return (say.implausible ?? say.backwards)(duration(Math.abs(ms)));
+  }
   if (ms < 0) return say.backwards(duration(-ms));
   const length = duration(ms);
   return say.measured ? say.measured(length) : length;
@@ -303,6 +341,8 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
         absent: "not known — when impact began was never recorded",
         backwards: (gap) =>
           `not usable — impact is recorded as beginning ${gap} after the first signal arrived, so one of the two times is wrong`,
+        implausible: () =>
+          "not usable — impact and the first signal are recorded further apart than any incident lasts, so one of the two times was written in the wrong unit",
       }),
     ],
     [
@@ -311,6 +351,8 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
         absent: "not known — no resolved time was recorded",
         backwards: (gap) =>
           `not usable — the incident is recorded as resolved ${gap} before its first signal arrived, so one of the two times is wrong`,
+        implausible: () =>
+          "not usable — the first signal and the resolution are recorded further apart than any incident lasts, so one of the two times was written in the wrong unit",
       }),
     ],
     [
@@ -319,6 +361,8 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
         absent: "not known — no close time was recorded",
         backwards: (gap) =>
           `not usable — the incident is recorded as closed ${gap} before its first signal arrived, so one of the two times is wrong`,
+        implausible: () =>
+          "not usable — the first signal and the close are recorded further apart than any incident lasts, so one of the two times was written in the wrong unit",
       }),
     ],
     ["First signal", timestamp(incident.firstSignalAt)],
@@ -548,11 +592,15 @@ export const renderThreadSummary = (
       absent: "time to detect not recorded",
       backwards: () =>
         "detection time inconsistent (impact recorded as starting after the signal)",
+      implausible: () =>
+        "detection time not usable (impact and the signal too far apart to be one incident)",
     }),
     interval(metrics.timeToResolveMs, {
       measured: (length) => `resolved in ${length}`,
       absent: "time to resolve not recorded",
       backwards: () => "resolve time inconsistent (resolved before the signal)",
+      implausible: () =>
+        "resolve time not usable (the signal and the resolution too far apart to be one incident)",
     }),
   ].join(" · ");
 

@@ -28,6 +28,18 @@ type Answer =
   | { throws: unknown };
 
 /**
+ * One `logging.ts` line, cut down to the parts these tests are about. The
+ * level is the claim being made -- `error` says a human has to change
+ * something, `info` says a request went badly once -- and the two are worth
+ * pinning because the result is identical either way, so nothing else in the
+ * suite can tell them apart.
+ */
+interface Emitted {
+  level: string;
+  event: string;
+}
+
+/**
  * Runs one lookup against a stubbed fetch. `answers` is keyed by PR number,
  * so a single call can be asked about several PRs with different outcomes --
  * which is the real shape, since an incident's `prUrls` is a list.
@@ -40,9 +52,19 @@ const read = async (
   states: Record<string, string | null>;
   sent: Sent[];
   tokens: number;
+  emitted: Emitted[];
 }> => {
   const original = globalThis.fetch;
+  const originalError = console.error;
+  const originalLog = console.log;
   const sent: Sent[] = [];
+  const emitted: Emitted[] = [];
+  const capture = (line: string) => {
+    const parsed = JSON.parse(line) as Emitted;
+    emitted.push({ level: parsed.level, event: parsed.event });
+  };
+  console.error = capture;
+  console.log = capture;
   let tokens = 0;
   globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
@@ -65,9 +87,11 @@ const read = async (
       return token();
     });
     const states = (await reader.states(urls)) as Record<string, string | null>;
-    return { states, sent, tokens };
+    return { states, sent, tokens, emitted };
   } finally {
     globalThis.fetch = original;
+    console.error = originalError;
+    console.log = originalLog;
   }
 };
 
@@ -135,6 +159,78 @@ test("a request that outlives its bound is a missing state, not a hung report", 
   const { states } = await read([pr(7)], { "7": { throws: aborted } });
 
   assert.deepEqual(states, {});
+});
+
+// The degradation is the same in all six cases below -- the state is absent
+// and the report says "state not known". What differs is whether anyone
+// should be woken, and since the result carries no trace of the difference,
+// the level is the only place it exists.
+
+test("a 401 is a rotated key, not news about this PR", async () => {
+  const { states, emitted } = await read([pr(16)], {
+    "16": { status: 401, body: { message: "Bad credentials" } },
+  });
+
+  assert.deepEqual(states, {});
+  assert.deepEqual(emitted, [
+    { level: "error", event: "pr_state_unavailable" },
+  ]);
+});
+
+test("a 403 is a suspended or throttled installation and reads the same way", async () => {
+  const { states, emitted } = await read([pr(17)], {
+    "17": { status: 403, body: { message: "Resource not accessible" } },
+  });
+
+  assert.deepEqual(states, {});
+  assert.deepEqual(emitted, [
+    { level: "error", event: "pr_state_unavailable" },
+  ]);
+});
+
+test("a 404 is the App missing from the repository, which is also somebody's to fix", async () => {
+  // GitHub masks a repository an installation cannot see as 404, so this is
+  // indistinguishable from a wrong number here -- and a wrong number the
+  // model invented is still worth a human's attention.
+  const { states, emitted } = await read([pr(18)], {
+    "18": { status: 404, body: { message: "Not Found" } },
+  });
+
+  assert.deepEqual(states, {});
+  assert.deepEqual(emitted, [
+    { level: "error", event: "pr_state_unavailable" },
+  ]);
+});
+
+test("a 5xx from GitHub is weather and stays at log level", async () => {
+  const { states, emitted } = await read([pr(19)], {
+    "19": { status: 500, body: { message: "Server Error" } },
+  });
+
+  assert.deepEqual(states, {});
+  assert.deepEqual(emitted, [{ level: "info", event: "pr_state_unavailable" }]);
+});
+
+test("the bound firing is the bound doing its job, not a failure nobody asked for", async () => {
+  const timedOut = new Error("The operation was aborted due to timeout");
+  timedOut.name = "TimeoutError";
+  const { states, emitted } = await read([pr(20)], {
+    "20": { throws: timedOut },
+  });
+
+  assert.deepEqual(states, {});
+  assert.deepEqual(emitted, [{ level: "info", event: "pr_state_unavailable" }]);
+});
+
+test("a transport error that is not the bound is a failure nobody asked for", async () => {
+  const { states, emitted } = await read([pr(21)], {
+    "21": { throws: new Error("ECONNRESET") },
+  });
+
+  assert.deepEqual(states, {});
+  assert.deepEqual(emitted, [
+    { level: "error", event: "pr_state_unavailable" },
+  ]);
 });
 
 test("one PR failing does not cost the report the others", async () => {

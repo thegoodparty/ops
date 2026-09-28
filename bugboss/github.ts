@@ -11,10 +11,11 @@
 
 import { createAppAuth } from "@octokit/auth-app";
 
-import { makeLog } from "./logging";
+import { makeAlarm, makeLog } from "./logging";
 
 import type { PrStateReader, ReportPr } from "./report";
 
+const alarm = makeAlarm("github");
 const log = makeLog("github");
 
 /**
@@ -119,7 +120,20 @@ export const createPrStateReader = (
             },
           );
           if (!res.ok) {
-            log("pr_state_unavailable", { url, status: res.status });
+            // 401, 403 and 404 are not this PR's bad luck. A rotated private
+            // key, a suspended installation, or an App that was never put on
+            // the repository will answer the same way for every PR on every
+            // incident until a human changes something -- and GitHub masks a
+            // repository an installation cannot see as 404 rather than 403,
+            // which is the same trap `agent/rerun.ts` has to explain to the
+            // agent. A 5xx is weather: the next report will be fine. Only the
+            // first kind is a failure nobody asked for.
+            const durable =
+              res.status === 401 || res.status === 403 || res.status === 404;
+            (durable ? alarm : log)("pr_state_unavailable", {
+              url,
+              status: res.status,
+            });
             return;
           }
           const body = (await res.json()) as PullRequestBody;
@@ -134,7 +148,18 @@ export const createPrStateReader = (
           // Left absent, which renders as "state not known" -- but said out
           // loud, because a report that quietly stops naming PR outcomes
           // reads exactly like a report for an incident that opened none.
-          log("pr_state_unavailable", { url, error: String(err) });
+          //
+          // The bound firing is the bound doing the job it was given, so it
+          // is news about this one request and nothing more. Anything else
+          // thrown here is a request that never got an answer for a reason
+          // nobody chose, and is worth waking someone for on the same
+          // grounds as a 401 above.
+          const name = (err as { name?: string }).name;
+          const transient = name === "TimeoutError" || name === "AbortError";
+          (transient ? log : alarm)("pr_state_unavailable", {
+            url,
+            error: String(err),
+          });
         }
       }),
     );
