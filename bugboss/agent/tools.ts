@@ -274,19 +274,28 @@ export const HEARTBEAT_STATUS_CHARS = 400;
 export const HARNESS_BRIEF_ECHO_CHARS = 350;
 
 /**
- * The same clamp for a nudge, and smaller, because a nudge spends its budget
- * differently: it echoes *two* of the model's fields and then carries the
- * whole status block underneath, where a brief echoes one. The fixed cost of
- * `heartbeatMessage` plus a full status block is a little under 600 against a
- * budget of 1,200, so 280 each fits with room and 350 each would not -- two
- * of those composes past the budget and the nudge would be refused.
+ * The same clamp for a nudge, and much smaller, because a nudge spends its
+ * budget differently: it echoes *two* of the model's fields and then carries
+ * the whole status block underneath, where a brief echoes one.
  *
  * Being refused is the whole reason this exists. A nudge nobody can shorten
  * is dropped on a failed post by design, so an over-long one would mean an
  * incident that waits all day, nudges nobody, and then hands off saying it
  * nudged three times.
+ *
+ * The number is low because the margin is not a constant. `truncateOutput`
+ * returns *more* than the max it is given -- head, tail, and a marker naming
+ * how much went -- and that marker grows with the size of what it elided, so
+ * a bigger input buys a wider nudge. `formatWaited` grows with the wait the
+ * same way. At 280 each the composed worst case left 51 characters against a
+ * budget of 1,200 for a five-thousand-character field and 27 for an absurd
+ * one, which is a bound that holds by arithmetic nobody will redo after the
+ * next wording change. At 200 it is comfortable, and 200 characters is still
+ * a whole sentence for a field the schema asks for in one line.
+ * `tools.test.ts` asserts it at inputs no model could produce, not at
+ * plausible ones.
  */
-export const HEARTBEAT_ECHO_CHARS = 280;
+export const HEARTBEAT_ECHO_CHARS = 200;
 
 /**
  * Quiet seconds owed before the next nudge, given how many have gone already.
