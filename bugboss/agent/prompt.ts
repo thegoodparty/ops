@@ -106,6 +106,14 @@ one turn whether it returns in ten seconds or two days. The command you give it
 must be a read-only check, because a container restart replays the call and
 runs it again.
 
+**When a person is what you are waiting for, say so in awaitingHuman.** A
+merge, a flag, a restart someone else has to do. Write what they have to do and
+include the link. The thread is then nudged for you once the wait passes an
+hour inside working hours, with the gap doubling each time, and if the nudges
+run out the incident is handed to a human and you stop. It costs you no turns.
+Leave it unset for a deploy, a migration, npm ci or an alert going quiet:
+nobody is being asked for anything, so nothing is posted.
+
 **Keep tool output small.** Compaction only fires at 95% of the context window,
 so a single unbounded result is what would blow past it. Ask Loki for counts
 and samples rather than raw streams, add a limit to every query, read the part
@@ -219,7 +227,8 @@ const MONITOR_EXAMPLES = (input: PromptInput): string => `## Waiting, concretely
 
     monitor("gh pr view <url> --json state -q .state | grep -qE 'MERGED|CLOSED'",
             intervalSeconds: 60, timeoutSeconds: 86400,
-            description: "the PR to be merged")
+            description: "the PR to be merged",
+            awaitingHuman: "Merge <url>. Checks are green and it is approved; I cannot merge.")
 
     monitor("gh run list --commit <sha> --json conclusion -q '.[0].conclusion' | grep -q success",
             intervalSeconds: 30, timeoutSeconds: 3600,

@@ -355,6 +355,96 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     return c.json(row);
   });
 
+  /**
+   * The wait marker monitor keeps while it is blocked on a person. Idempotent
+   * for the same command, and only for the same command: a restart replays
+   * the tool call and has to find the wait it was already in -- overwriting
+   * startedAt there would restart the elapsed clock and defer every nudge for
+   * as long as the restarts last. A different command is a different wait, and
+   * inherits neither the clock nor the nudge count.
+   */
+  app.post("/incidents/:id/pending-wait", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    let command = "";
+    try {
+      command = String(((await c.req.json()) as { command?: unknown }).command ?? "");
+    } catch {
+      return c.json({ error: "body was not JSON" }, 400);
+    }
+    if (!command.trim()) return c.json({ error: "command is empty" }, 400);
+
+    const row = await deps.db.withWrite((w) => {
+      w.prepare(
+        `INSERT INTO pending_wait (incidentId, command, startedAt, pings, lastPingAt)
+         VALUES (?, ?, ?, 0, NULL)
+         ON CONFLICT(incidentId) DO UPDATE SET
+           command = excluded.command,
+           startedAt = excluded.startedAt,
+           pings = 0,
+           lastPingAt = NULL
+         WHERE pending_wait.command <> excluded.command`,
+      ).run(caller.incidentId, command, now());
+      return w
+        .prepare(
+          "SELECT command, startedAt, pings, lastPingAt FROM pending_wait WHERE incidentId = ?",
+        )
+        .get(caller.incidentId) as {
+        command: string;
+        startedAt: number;
+        pings: number;
+        lastPingAt: number | null;
+      };
+    });
+
+    return c.json(row);
+  });
+
+  /**
+   * Counted before the nudge is posted, so a crash between the two costs one
+   * nudge rather than repeating it on every resume. A missing marker is an
+   * error rather than an upsert: there is no wait to count against, and
+   * inventing one would start the clock at the moment of the fault.
+   */
+  app.post("/incidents/:id/pending-wait/ping", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    const row = await deps.db.withWrite((w) => {
+      w.prepare(
+        "UPDATE pending_wait SET pings = pings + 1, lastPingAt = ? WHERE incidentId = ?",
+      ).run(now(), caller.incidentId);
+      return w
+        .prepare(
+          "SELECT command, startedAt, pings, lastPingAt FROM pending_wait WHERE incidentId = ?",
+        )
+        .get(caller.incidentId) as
+        | {
+            command: string;
+            startedAt: number;
+            pings: number;
+            lastPingAt: number | null;
+          }
+        | undefined;
+    });
+    if (!row) return c.json({ error: "no wait is recorded" }, 404);
+
+    log("wait_ping_recorded", { incidentId: caller.incidentId, pings: row.pings });
+    return c.json(row);
+  });
+
+  app.delete("/incidents/:id/pending-wait", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    await deps.db.withWrite((w) => {
+      w.prepare("DELETE FROM pending_wait WHERE incidentId = ?").run(
+        caller.incidentId,
+      );
+    });
+    return c.body(null, 204);
+  });
+
   app.delete("/incidents/:id/pending-question", async (c) => {
     const caller = authorize(c);
     if (caller instanceof Response) return caller;
@@ -371,13 +461,23 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     if (caller instanceof Response) return caller;
 
     let message = "";
+    // Whether this post is the one an outstanding question is waiting on.
+    // It used to be positional -- the next post after the marker sealed it --
+    // which held only while every post through here was the model's. The
+    // harness posts too now (monitor's heartbeat), and one of those landing on
+    // a blank marker would make a question whose Slack post had failed look
+    // sent, so the next attempt would skip the post and wait out its timeout
+    // on an answer to something nobody was ever asked.
+    let seals = true;
     let options: string[] = [];
     try {
       const body = (await c.req.json()) as {
         message?: unknown;
         options?: unknown;
+        sealsPendingQuestion?: unknown;
       };
       message = String(body.message ?? "");
+      seals = body.sealsPendingQuestion !== false;
       if (body.options !== undefined) {
         if (
           !Array.isArray(body.options) ||
@@ -443,11 +543,13 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     // For a choice this is the ts of the message carrying the buttons, which
     // is what a press comes back quoting: the marker is how the relay tells a
     // press on the live question from one on a question already answered.
-    await deps.db.withWrite((w) => {
-      w.prepare(
-        "UPDATE pending_question SET messageTs = ? WHERE incidentId = ? AND messageTs = ''",
-      ).run(ts, caller.incidentId);
-    });
+    if (seals) {
+      await deps.db.withWrite((w) => {
+        w.prepare(
+          "UPDATE pending_question SET messageTs = ? WHERE incidentId = ? AND messageTs = ''",
+        ).run(ts, caller.incidentId);
+      });
+    }
 
     return c.json({ ts });
   });

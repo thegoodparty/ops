@@ -228,8 +228,12 @@ Plus two blocking tools that live in the harness, each costing one turn no
 matter how long it waits — which is what keeps a multi-day incident from
 saturating context on polling:
 
-- `monitor(command, interval, timeout)` — block until a read-only check
-  passes. The general primitive: PR merged, deploy shipped, alert quiet
+- `monitor(command, interval, timeout, awaitingHuman?)` — block until a
+  read-only check passes. The general primitive: PR merged, deploy shipped,
+  alert quiet. With `awaitingHuman` set it nudges the thread inside working
+  hours when the person does not turn up, backing off 1h/2h/4h and then
+  handing the incident over; without it the wait is silent, because nobody is
+  being asked for anything
 - `contact_human(message, details, timeout, options?)` — post to the thread
   and block for a reply that was **for the agent**; see "The human boundary".
   Re-entrant: the marker is written before the post, so a resumed agent
