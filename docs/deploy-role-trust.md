@@ -68,8 +68,19 @@ order: role, then workflow, then trust.
       building step 4 and not fixed by it. Until it lands, the plan role
       carries one `GetSecretValue` grant, and that grant is the role's whole
       residual risk.
-- [ ] 6. Create `github-actions-preview-deploy`: `todo`. Depends on the
-      naming audit in "The preview-deploy role" below.
+- [ ] 6. Create `github-actions-preview-deploy`: `todo`. The audit is done;
+      see "What the preview audit found". Blocked on 6a, because the role
+      cannot safely hold `iam:PutRolePolicy` until the roles it writes are
+      bounded.
+- [ ] 6a. Attach a permissions boundary to the roles the preview stack
+      creates: `todo`. Prerequisite for 6.
+- [ ] 6b. Scope the gp-api execution role's inline policy: `todo`. It grants
+      `secretsmanager:GetSecretValue` and `ssm:GetParameter*` on `*` in
+      **every** environment including prod. Independent of this plan and
+      worth doing on its own; it also removes the worst case in 6.
+- [ ] 6c. Stop the preview path reading the two Grafana tokens: `todo`.
+      `infra-cli.ts` reads them on every run, but preview creates no Grafana
+      resources. Removes two grants from the step 6 role before it is written.
 - [ ] 7. Point `gp-api.yml` and `gp-api-teardown-preview.yml` at it: `todo`.
       Depends on 6 applying.
 - [ ] 8. Narrow `omni` and `gp-terraform-dataplatform` to main: `todo`.
@@ -284,6 +295,72 @@ the path, and a plan role must not carry `s3:PutObject` on state. Either the
 CLI grows a mode that skips `--create`, mirroring `PULUMI_MODE=preview` in
 this repo's `deploy.sh`, or the grant is added and the role stops being
 read-only. Prefer the first. It is an `omni` change and belongs in step 5.
+
+## What the preview audit found
+
+Read before designing step 6. Everything here is from the code on `main`, not
+inferred.
+
+**The preview stack is much smaller than the deploy role implies.** It creates
+ECS (cluster, task definition, service), an ALB with two listeners and a
+target group, one security group, a log group, two SQS queues, two S3 buckets
+with public-access blocks, two Route53 records and two IAM roles. Explicitly
+not created on preview: the VPC (prod only), all RDS resources
+(`skipPerPrRds = environment === 'preview'`), the shared preview cluster (dev
+owns it), the assets bucket and CloudFront router, and all Grafana resources.
+So the `rds:*` scoping problem this plan anticipated does not exist.
+
+**Tag scoping works.** `infra-cli.ts` sets `aws:defaultTags.tags.Environment`
+and `.Project`, which on this path resolve to exactly `preview` and `gp-api`.
+No resource on the path sets its own `tags:`, so nothing escapes the defaults
+today. The provider merges rather than replaces, and a resource-level key of
+the same name wins, so a later `tags: { Environment: ... }` would silently
+punch a hole in a tag-scoped policy. Worth a test if step 6 relies on it.
+
+**Three grants are unavoidable and are not tag-scopable:**
+
+- `rds:DescribeDBClusters` on `gp-api-preview-shared-db`. `aws.rds.getCluster`
+  runs at program time, and only on preview.
+- `secretsmanager:GetSecretValue` on `GP_API_DEV`, read at program time, the
+  same class as 4b and 4c.
+- `s3:PutObject` on `.pulumi/stacks/gp-api/*`. Unlike the diff path,
+  `stack select --create` here genuinely creates state: a new PR's stack does
+  not exist.
+
+**`iam:PutRolePolicy` is the blocker, and ARN scoping does not fix it.** The
+preview stack creates two roles, and their names are prefix-predictable, so
+the actions can be scoped to `gp-pr-*`. That is not enough. The policy *body*
+is a Pulumi expression evaluated from the pull request's own branch, so a PR
+can write any document onto a role it creates and then pass that role to a
+task. No resource scoping on `PutRolePolicy` constrains what the document
+says.
+
+Worse, no edit is even required. The execution role's inline policy today is:
+
+```
+Action: ["ssm:GetParameters", "ssm:GetParameterHistory",
+         "ssm:GetParameter", "secretsmanager:GetSecretValue"]
+Resource: "*"
+```
+
+So the role the preview stack creates can already read every secret and every
+SSM parameter in the account, including the Pulumi passphrase, and a preview
+task runs with it. That is step 6b, and it is live in dev and prod too, not
+just preview.
+
+The fix for step 6 is a **permissions boundary**: condition `iam:CreateRole`
+and `iam:PutRolePolicy` on `iam:PermissionsBoundary` matching a managed policy
+this repo owns, so every role the preview path creates is capped regardless of
+what a pull request writes into it. That is step 6a, and step 6 waits on it.
+
+**Teardown does not fit inside a preview boundary.** `pulumi destroy` needs
+delete on everything above, plus `logs:DeleteLogGroup` on the Container
+Insights group and state writes for `pulumi cancel` and `stack rm`. Beyond
+that it runs `ecs run-task` against the **dev** cluster and the **dev** task
+definition family, which needs `iam:PassRole` on the two dev roles. Those are
+explicit holes through the preview-tag boundary and they are the grants a
+pull request could most plausibly abuse, so step 7 decides them on their own
+rather than inheriting them.
 
 ## Design: `github-actions-preview-deploy`
 
