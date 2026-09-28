@@ -204,10 +204,18 @@ and gp-api's diff moves behind a new step 4b that changes the program first.
 It is the same class as `verify-vercel-registrar-token.yml` (fixed in
 thegoodparty/omni#2138) but reaches production secret material, and unlike
 that one it cannot be fixed by deleting a trigger, because the diff is the
-point of the workflow. The options are on the record in the pull request that
-adds this section; the cheap mitigation is to stop diffing `prod` on pull
-requests, which is the trade `gp-ai.yml` already makes for the same reason
-("Only dev is planned ... would read AI_SECRETS_PROD on every infra PR").
+point of the workflow.
+
+**Decided (2026-09-28, swain): leave it and fix it properly in 4b.** The cheap
+mitigation was to stop diffing `prod` on pull requests, the trade `gp-ai.yml`
+already makes for the same reason ("Only dev is planned ... would read
+AI_SECRETS_PROD on every infra PR"). Rejected here because gp-api's `prod`
+stack diverges from `dev` in ways gp-ai's roots do not (`prod` owns the VPC),
+so dropping the prod diff gives up review signal that the dev diff does not
+replace, in exchange for shortening an exposure that 4b removes outright.
+Recorded so the interim is a choice with a reason rather than an oversight:
+until 4b lands, a pull request touching `packages/gp-api/deploy/**` runs
+PR-authored Pulumi that reads production secret material.
 
 **Resolved on the way past:** `pulumi stack select --create` does not write to
 the backend for a stack that already exists, so it does not force a state
@@ -355,8 +363,11 @@ consumer to sequence against.
 
 ## Open questions
 
-- Should `gp-api-infrastructure-diffs.yml` stop diffing `prod` on pull
-  requests, or is the prod diff worth keeping until 4b lands? (step 4b)
+- How does the gp-api program stop needing `DB_PASSWORD` at program time?
+  The key-name half is `pr-previews.md` step 3's declared list, but
+  `masterPassword` on the Aurora cluster is a real value, so that half needs
+  its own answer (AWS-managed master password, or keeping the cluster out of
+  the previewed program). (step 4b)
 - Can teardown drop the preview database without running a task on the dev
   cluster's task definition? (step 7)
 - Does `gpvpn` still deploy anything, or is step 9 a removal rather than a
