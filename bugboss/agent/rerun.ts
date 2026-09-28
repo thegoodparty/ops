@@ -46,7 +46,6 @@
 // `CLAUDE.md` in this directory before widening it.
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { HumanContactPort } from "./tools";
 import { truncateOutput, DEFAULT_MAX_TOOL_CHARS } from "./tools";
 
 export const RERUN_TOOL_NAME = "rerun_ci";
@@ -102,7 +101,22 @@ export interface GitHubRunsPort {
   rerunFailedJobs(repo: string, runId: number): Promise<GitHubResult<null>>;
 }
 
-export type ThreadPort = Pick<HumanContactPort, "post">;
+/**
+ * Deliberately not `HumanContactPort.post`, and for the same reason
+ * `HeartbeatDeps.post` is its own thing: that one seals an outstanding
+ * question's marker with the ts of whatever posts next, which is right for
+ * the ask and wrong for a notice the model did not write.
+ *
+ * `contact_human` records its marker before it posts, so a Slack failure
+ * between the two leaves a marker with a blank `messageTs` -- the one state
+ * that tells the next attempt to post the question again. A re-run notice
+ * going through the sealing route fills that blank in with its own ts, the
+ * question then looks sent, and the agent waits out its whole timeout on
+ * something nobody was ever asked.
+ */
+export interface ThreadPort {
+  postNotice(message: string): Promise<void>;
+}
 
 export interface RerunArgs {
   repo: string;
@@ -458,7 +472,7 @@ export const runRerunFailedJobs = async (
   const notice = rerunNotice(args.repo, run.data, suspicion);
   let postError: string | null = null;
   try {
-    await deps.thread.post(notice);
+    await deps.thread.postNotice(notice);
   } catch (err) {
     postError = String(err);
   }

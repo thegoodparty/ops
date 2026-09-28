@@ -629,6 +629,40 @@ test("a message people sent each other does not end the wait", () => {
   );
 });
 
+/**
+ * `unclear` is the label `slack/intent.ts` coaches the model towards whenever
+ * it cannot tell, on the stated grounds that being unsure "costs somebody
+ * re-sending one sentence". It costs that only while it leaves the agent
+ * waiting; ending the wait on it is the wrong-`agent` outcome the coaching
+ * exists to avoid, reached by the label meant to avoid it.
+ */
+test("a message nobody could place does not end the wait", () => {
+  // Built the way a real one arrives: `JSON.parse` of a `pending_directive`
+  // row. Nothing validates the payload against `Directive` on the way in, so
+  // what ends a wait is decided by the label that was written, not by the
+  // type that was meant.
+  const pending: PendingDirective[] = [
+    {
+      id: 4,
+      directive: JSON.parse(
+        JSON.stringify({
+          type: "human_message",
+          from: "U1",
+          text: "yeah, roll it back",
+          ts: "1100.000000",
+          addressed: "unclear",
+        }),
+      ) as Directive,
+    },
+  ];
+
+  assert.equal(
+    firstReplyAfter(pending, 1_000_000),
+    null,
+    "an offhand remark the read could not place is context, not an answer",
+  );
+});
+
 test("a directive written before addressed existed still ends a wait", () => {
   // Rows in flight across the deploy that added the field. They meant "for
   // the agent", which was the only thing a reply could be.
