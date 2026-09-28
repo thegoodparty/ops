@@ -274,6 +274,28 @@ reads it back after the child exits, so the key the agent writes and the key
 the Boss reads are one function. A drift between them costs no session and no
 error, only an incident that appears to have been free.
 
+## The exit record
+
+The last entry a launch writes is a `bugboss_exit` custom entry naming how
+the run ended: `completed`, `timed_out`, `turn_error` or `signal`. Without it
+a killed run and a finished one are the same shape on disk -- the writer
+appends per event and the file closes with the last one, and S3
+`LastModified` sits within a second of it either way. Three of seven real
+runs died mid-turn and read exactly like the four that did not; the longest
+was 9.5 hours and $42.71, with an approved PR and green checks waiting, and
+nobody knew to finish it.
+
+`readSessionOutcome` is the reader. **It is not last-record-wins**: every
+launch writes its own record, so a restored file carries an older one under
+the turns that followed it, and a record with session events after it means
+the run carried on past it and then died. `empty` is kept separate from
+`killed`, because a child killed before its first turn synced has lost
+nothing and alarming on it would alarm on every crash at boot.
+
+`SIGTERM` and `SIGINT` write one too. `SIGKILL` cannot, and the dispatcher's
+backstop uses it, so the absence of a record is still the common signature of
+a kill -- which is exactly what `killed` means.
+
 ## The notes directory
 
 `/work/<id>/notes/` is where an agent keeps its own record of the work,

@@ -14,6 +14,7 @@ import {
   DEFAULT_TIMEOUT_SECONDS,
   MODEL_BINDING_MISMATCH,
   exitCodeFor,
+  exitRecordFor,
   npmCiCommand,
   pinnedSessionModel,
   PREFIX_DRIFT_DIAGNOSTIC,
@@ -380,4 +381,35 @@ test("a force-aborted run does not exit like a finished one", () => {
     }),
     1,
   );
+});
+
+test("the exit record names a timeout even when the aborted turn also errored", () => {
+  assert.deepEqual(
+    exitRecordFor({ timedOut: true, error: "aborted", attempt: 3, at: 5 }),
+    { reason: "timed_out", at: 5, attempt: 3, error: "aborted" },
+  );
+  assert.deepEqual(exitRecordFor({ timedOut: false, error: "boom", attempt: 1, at: 5 }), {
+    reason: "turn_error",
+    at: 5,
+    attempt: 1,
+    error: "boom",
+  });
+  assert.deepEqual(exitRecordFor({ timedOut: false, error: null, attempt: 1, at: 5 }), {
+    reason: "completed",
+    at: 5,
+    attempt: 1,
+  });
+});
+
+// Carried purely so the exit record can name the launch. Reading a session
+// back, "attempt 3 was killed" is a different story from "attempt 1 was".
+test("the attempt reaches the agent from the dispatcher's environment", () => {
+  const base = {
+    BUGBOSS_INCIDENT_ID: "i1",
+    BUGBOSS_S3_BUCKET: "b",
+    BUGBOSS_SESSION_REF: "sessions/incident/i1/session.jsonl",
+  };
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ATTEMPT: "3" }).attempt, 3);
+  assert.equal(agentOptionsFromEnv(base).attempt, undefined);
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ATTEMPT: "" }).attempt, undefined);
 });

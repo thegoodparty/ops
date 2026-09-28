@@ -1174,3 +1174,41 @@ describe("asking the right tool", () => {
     assert.match(SLACK_AGENT_SYSTEM, /Plain terms/);
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describe("read_agent_session", () => {
+  const sessionKeyFor = (id: string) => `sessions/incident/${id}/session.jsonl`;
+
+  const turn = (text: string) =>
+    JSON.stringify({ type: "message", message: { role: "assistant", content: text } });
+
+  const readSession = async (lines: string[]) => {
+    const { store, objects } = memoryStore();
+    objects.set(sessionKeyFor("inc-1"), lines.join("\n"));
+    const tools = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const tool = tools.find((t) => t.name === "read_agent_session");
+    assert.ok(tool);
+    return tool.run({ incidentId: "inc-1" });
+  };
+
+  // The whole reason a 9.5-hour run sat dead: the tail of a killed transcript
+  // and the tail of a finished one read the same, so a human asking what
+  // happened got the last turn and had to guess.
+  test("says a run was killed rather than leaving the reader to infer it", async () => {
+    const out = await readSession([turn("checks are green, asking for a merge")]);
+    assert.match(out, /was killed after 1 turns/);
+  });
+
+  test("says a run ended on purpose when it did", async () => {
+    const out = await readSession([
+      turn("closing this out"),
+      JSON.stringify({
+        type: "custom",
+        customType: "bugboss_exit",
+        data: { reason: "completed", at: 1, attempt: 1 },
+      }),
+    ]);
+    assert.match(out, /ended on purpose \(completed\)/);
+  });
+});

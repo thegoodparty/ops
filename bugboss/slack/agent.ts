@@ -23,6 +23,7 @@ import {
   raw,
   userMention,
 } from "./format";
+import { describeOutcome, readSessionOutcome } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
 
 const log = makeLog("slack-agent");
@@ -440,8 +441,14 @@ export const buildTools = ({
         );
         const lines = body.split("\n").filter((l) => l.trim().length > 0);
         const slice = lines.slice(-tail);
+        // Without this the tail of a killed run and the tail of a finished
+        // one read the same: both stop on an ordinary entry, and the reader
+        // is left inferring from the content of the last turn. That is the
+        // inference that let a 9.5-hour run sit dead behind a last message
+        // which was still true.
+        const outcome = describeOutcome(readSessionOutcome(body));
         return truncate(
-          `${key}: ${lines.length} entries, last ${slice.length}\n${slice.join("\n")}`,
+          `${key}: ${lines.length} entries, last ${slice.length} -- ${outcome}\n${slice.join("\n")}`,
           MAX_SESSION_CHARS,
         );
       },
