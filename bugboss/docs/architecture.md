@@ -267,6 +267,14 @@ the one place `alarm` and `log` are defined.
 blocks that have empty text but live signatures, which is exactly the shape
 Opus 5 produces. Resume depends on those surviving.
 
+**The provider is reached by wrapping Pi's Bedrock provider, not by claiming
+an api id.** Pi looks a provider up by `model.provider`, and installs its
+builtin untouched when that id has no `models.json` entry and no registered
+extension -- so the registry that `model.api` indexes is never consulted, and
+the builtin serves Converse to every model it owns. `bedrock/runtime.ts`
+registers a native provider that dispatches on `model.api` instead, and
+`agent/run.ts` asserts the routing before the session starts.
+
 **Wall-clock timeout, not budget caps.** A deadline is external, so it costs
 nothing in harness capability. Two layers: the child steers itself to write
 a brief at the soft deadline, and the parent SIGKILLs strictly later.
