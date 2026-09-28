@@ -119,6 +119,33 @@ describe("toMatchQuery: model text in, a safe MATCH expression out", () => {
     await seed({ id: "1", rootCause: "the pool", postmortem: "## Summary\npool" });
     assert.doesNotThrow(() => searchIncidents(db, 'rootCause: pool" ('));
   });
+
+  it("an identifier keeps its underscore, and still finds the prose", async () => {
+    // A quoted term is an FTS5 phrase, not a literal: the query goes through
+    // the same tokenizer as the corpus, so "connection_pool" becomes the
+    // phrase `connection pool` and matches either spelling. Keeping the
+    // underscore is what makes it a phrase rather than two OR'd words, so a
+    // model pasting an identifier gets adjacency instead of every incident
+    // that said "pool".
+    assert.equal(toMatchQuery("connection_pool sized"), '"connection_pool" OR "sized"');
+    await seed({
+      id: "under-1",
+      rootCause: "the connection_pool was sized for the old traffic shape",
+      postmortem: "## Summary\nthe connection_pool was too small",
+    });
+    await seed({
+      id: "under-2",
+      rootCause: "the connection pool was sized for the old traffic shape",
+      postmortem: "## Summary\nthe connection pool was too small",
+    });
+
+    const hits = searchIncidents(db, "connection_pool").map((h) => h.incidentId);
+    assert.deepEqual(
+      [...hits].sort(),
+      ["under-1", "under-2"],
+      "the underscore spelling and the spaced one are the same phrase to FTS5",
+    );
+  });
 });
 
 describe("searchIncidents: the reach a signal key does not have", () => {

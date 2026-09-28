@@ -766,6 +766,19 @@ test("suppressing a recurrence is allowed but never quiet", async () => {
   );
 
   assert.equal(result.decision.action, "suppress");
+  // The two fields are the downstream contract, and they are what tells a
+  // suppressed recurrence from a lookup that never ran: checked with no
+  // pointer means the registry said suppress, not that we failed to look.
+  assert.equal(
+    result.recurrenceChecked,
+    true,
+    "the lookup ran -- the pointer is dropped because the registry says suppress, not because we failed to check",
+  );
+  assert.equal(
+    result.recurrenceOf,
+    null,
+    "suppress keeps recurrenceOf null: assign has nowhere to store it and the alarm is the record",
+  );
   assert.equal(
     alarms.filter((a) => a.event === "recurrence_suppressed").length,
     1,
