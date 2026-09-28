@@ -40,15 +40,53 @@ export const CONTACT_HUMAN_MESSAGE_LIMIT = 700;
  */
 export const CONTACT_HUMAN_MIN_WAIT_SECONDS = 1800;
 
+const elisionMarker = (dropped: number): string =>
+  `\n\n[... ${dropped} characters elided ...]\n\n`;
+
+/**
+ * A cap that is one: `truncateOutput(text, n).length <= n` for every text
+ * and every n. It used to overshoot, and by an amount that *grew* with the
+ * input rather than a constant one, because the marker naming what went is
+ * part of the output and the slices were sized as if it were not. So every
+ * caller's margin shrank as its inputs grew, which is the opposite of what
+ * a margin is for, and `HEARTBEAT_ECHO_CHARS` below was set low to absorb
+ * it.
+ *
+ * The marker never goes. Truncation a reader cannot see is the silent
+ * failure this whole file is built against, so the head and the tail shrink
+ * to make room for it rather than the other way round -- and they stay
+ * roughly two to one, which is the shape callers read.
+ *
+ * Sizing it is circular: the marker names how much was dropped, and how much
+ * is dropped depends on how much room the marker takes. Reserving against
+ * `text.length` -- the largest number the marker could ever print -- settles
+ * it in a single pass, because dropping fewer characters can only ever mean
+ * the same digits or fewer, so the marker finally written is never longer
+ * than the space held for it.
+ */
 export const truncateOutput = (
   text: string,
   maxChars = DEFAULT_MAX_TOOL_CHARS,
 ): string => {
   if (text.length <= maxChars) return text;
-  const head = text.slice(0, Math.floor(maxChars * 0.6));
-  const tail = text.slice(-Math.floor(maxChars * 0.3));
+
+  const reserved = elisionMarker(text.length).length;
+  if (maxChars < reserved) {
+    // A budget too small to hold the bare marker is a caller bug, not an
+    // input: the tightest clamp here is 200 against a marker of about 40.
+    // Honour the cap anyway, keep an ellipsis so the cut is still visible to
+    // the reader, and alarm so the mis-sized budget is visible to us --
+    // returning a count nobody has room for would only move the overshoot.
+    alarm("truncate_budget_below_marker", { maxChars, reserved });
+    return maxChars > 0 ? `${text.slice(0, maxChars - 1)}\u2026` : "";
+  }
+
+  const room = maxChars - reserved;
+  const head = text.slice(0, Math.floor((room * 2) / 3));
+  const tailChars = room - head.length;
+  const tail = tailChars ? text.slice(-tailChars) : "";
   const dropped = text.length - head.length - tail.length;
-  return `${head}\n\n[... ${dropped} characters elided ...]\n\n${tail}`;
+  return `${head}${elisionMarker(dropped)}${tail}`;
 };
 
 /**
@@ -283,15 +321,16 @@ export const HARNESS_BRIEF_ECHO_CHARS = 350;
  * incident that waits all day, nudges nobody, and then hands off saying it
  * nudged three times.
  *
- * The number is low because the margin is not a constant. `truncateOutput`
- * returns *more* than the max it is given -- head, tail, and a marker naming
- * how much went -- and that marker grows with the size of what it elided, so
- * a bigger input buys a wider nudge. `formatWaited` grows with the wait the
- * same way. At 280 each the composed worst case left 51 characters against a
- * budget of 1,200 for a five-thousand-character field and 27 for an absurd
- * one, which is a bound that holds by arithmetic nobody will redo after the
- * next wording change. At 200 it is comfortable, and 200 characters is still
- * a whole sentence for a field the schema asks for in one line.
+ * The number is low for headroom now, not for arithmetic. It was set here
+ * when `truncateOutput` returned *more* than the cap it was given by an
+ * amount that grew with the input, so no composed bound stayed true as
+ * inputs grew. That is fixed -- the cap is exact -- and `formatWaited` is
+ * the only part left that varies, bounded at fifteen characters by the
+ * largest wait a clock can express. So the composed worst case is a
+ * constant: under 1,000 against a budget of 1,200 at 200 each, and 300 each
+ * is the most that still fits at all. 200 stays because it leaves the next
+ * wording change somewhere to go, and because 200 characters is still a
+ * whole sentence for a field the schema asks for in one line.
  * `tools.test.ts` asserts it at inputs no model could produce, not at
  * plausible ones.
  */
