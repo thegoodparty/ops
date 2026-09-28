@@ -55,7 +55,13 @@ import {
   type HttpConfig,
 } from "./http";
 import { parseWorkingHours } from "./agent/tools";
-import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
+import {
+  SLACK_AGENT_BUDGET_MS,
+  SlackAgent,
+  type ObjectStore,
+  type SlackAgentModel,
+  type SlackClient,
+} from "./slack/agent";
 import { createSlackAck } from "./slack/ack";
 import type { ChoicePoster, SlackChoiceClick } from "./slack/blocks";
 import { mrkdwn, raw, userMention } from "./slack/format";
@@ -501,7 +507,30 @@ export const createBedrockModelClient = (
   };
 };
 
-const SLACK_AGENT_BUDGET_MS = 120_000;
+/**
+ * Sent when the turn budget runs out with tool calls still outstanding.
+ * Everything the run read is still in the transcript, and throwing it away to
+ * post an apology is a silent failure wearing a message: the person waited,
+ * the work was paid for, and they learn nothing. So one more call, with no
+ * tools, turns what it already has into an answer that names its own gaps.
+ *
+ * It rides on the system prompt rather than as a final user turn, because the
+ * transcript at that point ends in tool results -- which are a user message --
+ * and a second one behind them is a shape nothing here needs to produce.
+ */
+const WRAP_UP_SYSTEM = [
+  "You have used your whole turn budget. This is your last message and you cannot call another tool.",
+  "Answer the question now from what you have already read. Say what you found, and say plainly which part of the question you did not reach.",
+  "Do not apologise and do not offer to keep looking.",
+].join(" ");
+
+/**
+ * Reached only when the wrap-up produced nothing either. It says what
+ * happened and what to do next, because somebody is waiting on this and
+ * "sorry" tells them neither.
+ */
+const NO_ANSWER_REPLY =
+  "I could not get to an answer for that one and I have nothing partial worth posting. What I did is in the BugBoss logs. Ask me again, or narrow the question.";
 
 /**
  * The Slack agent's harness, built on the same ModelClient everything else
@@ -538,6 +567,7 @@ export const createSlackAgentModel = (
     }));
 
     let answer = "";
+    let exhausted = false;
     for (let turn = 0; turn < req.maxTurns; turn++) {
       const reply = await model.complete({
         system: req.system,
@@ -565,12 +595,58 @@ export const createSlackAgentModel = (
             : `Unknown tool ${call.name}.`,
         });
       }
+      exhausted = turn === req.maxTurns - 1;
+    }
+
+    // Loud, because a question that needed more turns than it was given is
+    // how somebody gets a partial answer, and the budget is the thing to
+    // change. The tool results from the last turn are already on the
+    // transcript, so the wrap-up reads them before it writes.
+    if (exhausted) {
+      alarm("slack_agent_turns_exhausted", {
+        sessionKey: req.sessionKey,
+        turns: req.maxTurns,
+      });
+      try {
+        const wrapUp = await model.complete({
+          system: `${req.system}\n\n${WRAP_UP_SYSTEM}`,
+          messages: [...messages],
+          tools: [],
+          maxTokens: 4096,
+          signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
+        });
+        messages.push({
+          role: "assistant",
+          text: wrapUp.text,
+          toolCalls: wrapUp.toolCalls,
+        });
+        if (wrapUp.text) answer = wrapUp.text;
+      } catch (err) {
+        alarm("slack_agent_wrap_up_failed", {
+          sessionKey: req.sessionKey,
+          error: String(err),
+        });
+      }
+    }
+
+    const text = answer || NO_ANSWER_REPLY;
+    if (!answer) alarm("slack_agent_no_answer", { sessionKey: req.sessionKey });
+
+    // The transcript has to end on the assistant, because that is how the
+    // conversation ended: whatever is returned here is posted in the thread.
+    // A resume loads this and pushes the next question straight behind it, so
+    // a transcript left ending in tool results -- which a failed or skipped
+    // wrap-up does -- puts two user turns together and the next mention
+    // cannot load at all. That break surfaces hours later in another process
+    // with nothing pointing back at the run that caused it, so it is closed
+    // by construction rather than on the one branch that was noticed.
+    const last = messages[messages.length - 1];
+    if (last?.role !== "assistant") {
+      messages.push({ role: "assistant", text, toolCalls: [] });
     }
 
     await store.put(key, JSON.stringify(messages));
-    return {
-      text: answer || "I ran out of turns before I had an answer for that.",
-    };
+    return { text };
   },
 });
 

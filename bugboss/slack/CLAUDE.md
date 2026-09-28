@@ -381,6 +381,65 @@ identically.
 optional field nobody sets is a fix that exists in the source and not in
 production, which had already happened three times here.
 
+## A budget spent reading is a question left unanswered
+
+Every tool call costs the Slack agent a turn, and the run stops when the
+budget does. Asked what the state of all the incidents was by somebody on
+call, it read eleven incidents one at a time, ran out, and posted "I ran out
+of turns before I had an answer for that" — worse than silence, because
+silence does not claim the question was understood and then abandoned.
+
+Three things were wrong and all three had to change; fixing any one alone
+just makes the other two cheaper.
+
+**A question about more than one incident is one `query_incidents` call.**
+`get_incident` is depth on one. The prompt carries the open-incident query as
+a worked example rather than an instruction to choose well, because an
+example changes what the model does where an adjective does not — the same
+reason the incident agent's prompt is written that way.
+
+**`SLACK_AGENT_MAX_TURNS` covers the work a reasonable question implies.**
+The widest reasonable one is "tell me about everything": a query across the
+open incidents, then depth on the few that need it, then the answer. Twelve
+did not cover eleven incidents. What bounds this is how long somebody will
+sit in a thread waiting, not the bill — this surface is read-only and runs
+on the same model triage does, nowhere near what an incident agent costs.
+
+**The thread lock is derived from that budget, not chosen.** A lock that
+expires mid-run is not a lock: the next mention takes the thread and two runs
+write one transcript key. `SLACK_AGENT_LOCK_TTL_MS` is every turn plus the
+wrap-up, each spending its whole call budget, so raising the turns raises the
+lease with it. Long is the safe direction — `handle` releases in a `finally`,
+so the lease only ever covers a run that never settles, and telling the next
+person the thread is busy beats corrupting the session they are asking about.
+
+**Exhaustion no longer throws the run's work away.** Everything it read is
+still on the transcript, so the harness (`createSlackAgentModel`, in
+`index.ts`) spends one more call with no tools attached, which the model
+cannot answer any way but from what it already has. It is told to name the
+part of the question it did not reach, so the gaps are in the answer rather
+than implied by its shortness. Running out is still a real event and still
+**alarms** — visible to whoever owns the budget, not to whoever asked the
+question. The bare apology is gone; what is left when even the wrap-up
+produces nothing says what happened and what to do instead.
+
+**The transcript always ends on the assistant**, whatever happened. Whatever
+the harness returns is what gets posted, so it is recorded as the turn it
+was. Left ending in tool results — which a wrap-up that threw does — the next
+mention pushes its question straight behind them, and tool results and a
+question are both user messages to the model, so the resume is rejected
+before it starts. That break surfaces hours later in another process with
+nothing pointing back at the run that caused it, which is why it is closed by
+construction rather than on the one branch somebody noticed.
+
+**An on-call answer has a shape**, and it is the commonest question this
+surface gets: what is blocked on a person and what that person has to do,
+what is running and needs nothing, and the count first so the reader knows
+the size of it. Around 200 words, in plain terms — what the system is doing
+and what users see, not file paths, function names or column names. Plain is
+not vague: the numbers stay, the identifiers go, and depth comes when
+somebody asks for it.
+
 ## Rate limits
 
 `chat.postMessage` is limited per channel at roughly one a second, and every
