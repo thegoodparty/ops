@@ -129,6 +129,10 @@ export interface CacheRetentionReport {
  * downgrade is an observed number rather than an inference -- and an absent
  * split is reported too, because `calculateCost` reads a missing 1h share as
  * zero and would then bill a 1h write at the 5m rate.
+ *
+ * Any 5m share at all counts, not just a wholly downgraded write. A partial
+ * split is still tokens billed at a retention nobody asked for, and treating
+ * it as acceptable would be the same silence this whole check exists to break.
  */
 const unhonouredRetention = (
   retention: CacheRetention,
@@ -137,9 +141,10 @@ const unhonouredRetention = (
 ): CacheRetentionReport | undefined => {
   if (retention !== "long" || written === 0) return undefined;
   const split = usage.cache_creation;
-  const written1h = split?.ephemeral_1h_input_tokens ?? null;
-  const written5m = split?.ephemeral_5m_input_tokens ?? null;
-  if (written1h !== null && written1h > 0) return undefined;
+  if (!split) return { requested: retention, written, written1h: null, written5m: null };
+  const written1h = split.ephemeral_1h_input_tokens ?? 0;
+  const written5m = split.ephemeral_5m_input_tokens ?? 0;
+  if (written5m === 0 && written1h > 0) return undefined;
   return { requested: retention, written, written1h, written5m };
 };
 
@@ -374,17 +379,16 @@ export const consumeAnthropicStream = async ({
       // splits cache reads from writes.
       const metrics = event["amazon-bedrock-invocationMetrics"];
       if (metrics && output.usage.totalTokens === 0) {
-        applyUsage(
-          output,
-          {
-            input_tokens: metrics.inputTokenCount,
-            output_tokens: metrics.outputTokenCount,
-            cache_read_input_tokens: metrics.cacheReadInputTokenCount,
-            cache_creation_input_tokens: metrics.cacheWriteInputTokenCount,
-          },
-          cacheRetention,
-          onUnhonouredCacheRetention,
-        );
+        // No retention check here on purpose. These are Bedrock's own
+        // invocation metrics, which carry no `cache_creation` split at all, so
+        // holding them to the 1h tier would report a billing fault on every
+        // stream that fell back to them rather than on a real downgrade.
+        applyUsage(output, {
+          input_tokens: metrics.inputTokenCount,
+          output_tokens: metrics.outputTokenCount,
+          cache_read_input_tokens: metrics.cacheReadInputTokenCount,
+          cache_creation_input_tokens: metrics.cacheWriteInputTokenCount,
+        });
         applyCost();
       }
     }

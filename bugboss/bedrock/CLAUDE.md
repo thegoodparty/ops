@@ -113,9 +113,16 @@ So the response is held to the request. Bedrock returns both halves of the
 `cache_creation` split on `us.anthropic.claude-opus-5`, so a downgrade is an
 observed number, and `stream.ts` reports one as
 `event: "cache_retention_not_honoured"`, once per provider, since it would
-otherwise repeat on all ~90 turns of an incident. An *absent* split is
-reported too: `calculateCost` reads a missing 1h share as zero and would bill
-a 1h write at the 5m rate.
+otherwise repeat on all ~90 turns of an incident. Any 5m share counts, not
+only a wholly downgraded write: a partial split is still tokens billed at a
+retention nobody asked for. An *absent* split is reported too, because
+`calculateCost` reads a missing 1h share as zero and would bill a 1h write at
+the 5m rate.
+
+One path is deliberately exempt. The `message_stop` backstop synthesizes usage
+from `amazon-bedrock-invocationMetrics`, which carry no split by construction,
+so checking it would report a fault on every stream that fell back to it and
+never on a real downgrade.
 
 Deliberately a loud log and not a throw. This is a billing fault, and
 crashing an agent that is working a production incident over one would be the
