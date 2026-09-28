@@ -96,3 +96,96 @@ or `contact_human`.
 Levers not yet pulled: per-phase model routing, shorter loops. Cache *write*
 grows with run length, so cost still rises faster than linearly with
 investigation time.
+
+## What reading a real run taught us
+
+From a full read of incident 1's transcript (9h18m, 92 turns), with incidents
+2, 5, 8, 9, 10 and 11 as comparison. These are behavioural findings. None of
+them would be caught by a test.
+
+- **The agent stated a wrong root cause with confidence, shipped it, and
+  caught it by luck.** It blamed `execErrState: 'Alerting'` for converting a
+  Loki failure into a false page — coherent, well-evidenced, wrong. It
+  survived two rounds of human contact and a delegate approval. What broke it
+  was happening to find a second firing on waking from an 8-hour wait, testing
+  the story against it, and watching it fail four ways.
+
+  The transferable trap: **an `Error` annotation persists, so it proves a rule
+  failed at some point, not when it notified.** The agent had `activeAt` two
+  days before the page in hand on turn two and reasoned past it for forty
+  minutes.
+
+  Nothing forced it to ask whether its mechanism explained the *delivery* or
+  only the *state*. A candidate fix is requiring a stated, checkable
+  prediction before `report_root_cause` is accepted. Unvalidated.
+
+- **Turn efficiency is not a cost lever.** 47 bash calls, 47 distinct, zero
+  exact repeats, zero overlapping file reads, roughly 4 wasted turns of 92.
+  There is no hidden thrash behind the cost table. Shortening the loop will
+  not pay; the cache work was the right target.
+
+- **Blocked on a human, the agent does nothing, and the prompt tells it that
+  is free.** The 8-hour `contact_human` block is exactly one turn: no further
+  investigation, no pre-drafted post-mortem, no periodic PR check. The prompt
+  says *"monitor costs one turn whether it returns in ten seconds or two
+  days"* — true for turn accounting, false for cost, and the 1h TTL only
+  moves the boundary rather than removing it. **That line should not survive
+  as written.**
+
+  Incident 5 shows the better behaviour is available rather than absent: same
+  situation, same hour, it chose to wait rather than ask a third time, then
+  refreshed impact, confirmed nothing was escalating, and posted state to the
+  thread.
+
+## Process notes
+
+- **An approving delegate round is not the same as earlier findings being
+  withdrawn.** Twice in one hour a first pass raised a fault, a later run
+  approved without it being fixed, and the fault landed: #127's retention
+  checks and #123's `WebClient` retry policy. Both were caught afterwards by
+  the authoring agent reviewing its own merged diff. Read the earlier rounds.
+
+- **Do not re-merge the base into a branch under review unless it conflicts.**
+  The base moved six times during this effort against 6-13 minute reviews.
+  Re-merging on each clean move supersedes the in-flight review and never
+  converges. GitHub computes the PR diff against the current base anyway.
+
+- **A watcher that can only report good news is indistinguishable from a
+  broken one.** Two monitors failed silently here in opposite ways: a filter
+  on `delegate-reviewer` that never matched `delegate-reviewer[bot]`, and a
+  `// "none"` default that never fired on an empty string. Both looked like
+  patience. Filters need a negative case, or silence has to be treated as
+  unknown rather than as "not yet".
+
+- **`LATE_COLUMNS` in `Db.open` is BugBoss's only migration path** and holds
+  one entry. It silently does nothing for a column added to a table that does
+  not exist yet. Fine today because `schema.sql` creates every table first; if
+  that ordering ever changes, the failure is invisible.
+
+- **`truncateOutput` returns more than the max it is handed.** It appends head,
+  tail and a marker naming how much it dropped, and that marker grows with the
+  size of what it elided. So every caller holding it to a budget has a margin
+  that shrinks as inputs grow, rather than a constant one. Found while clamping
+  the heartbeat nudge; the three callers there are now clamped with worst-case
+  tests asserted at absurd inputs. The overshoot itself is unfixed and affects
+  every other caller. A bound checked at a size somebody chose is a bound that
+  holds until somebody waits longer.
+
+- **A killed agent session is indistinguishable from one that finished.** The
+  session writer appends per event and the file closes with the last one: no
+  exit record, no error entry, no signal or deadline marker. S3 `LastModified`
+  sits within a second of the last event for both a clean exit and a kill.
+  A 9.5-hour, $42.71 run that died reads exactly like one that completed.
+
+- **Three of seven runs were killed at the same lifecycle position**: checks
+  green, PR approved, about to involve a human on the merge. Two state the
+  intent in the turn immediately before dying. Durations were 0.62h, 0.65h and
+  9.52h, so a 15x spread rules out a single wall-clock deadline and points at
+  the transition into the merge wait. Going further needs ECS task exit codes
+  or Boss-side logs; the session files do not carry a cause.
+
+- **Nothing knows to resume a killed run.** Incident 5's deliverable survived
+  intact — PR approved, 35/35 checks green, root cause recorded — and a fresh
+  session could finish it for an estimated $2-3. But its thread's last message
+  is *true*, so the silence reads as patience and nobody picks it up. The loss
+  is not the 291k tokens of context, it is that the run is never noticed dead.
