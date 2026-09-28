@@ -51,6 +51,7 @@ import {
   escape,
   link,
   mrkdwn,
+  overThreadBudget,
   raw,
   splitForSlack,
   toMrkdwn,
@@ -758,6 +759,13 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const stop = blocked(incident, ["FIXING"], "reportResolved");
       if (stop) return reject(stop);
 
+      // Ahead of the write, not after it: the evidence goes to the thread and
+      // this is the model's own prose, so it is the model that has to shorten
+      // it, and it cannot be asked to once the incident has already moved to
+      // RESOLVED.
+      const longEvidence = overThreadBudget("evidence", args.evidence);
+      if (longEvidence) return reject(longEvidence);
+
       const repeated = repeatedEvidence(incident, args.evidence);
       if (repeated) return reject(repeated);
 
@@ -869,6 +877,11 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       : null;
   };
 
+  // No budget on `postmortem`, deliberately, and this is the one transition
+  // where that is true. It is not posted as thread text -- it becomes the
+  // closing report, a Markdown file in the thread -- so the thread stays
+  // short by the document being somewhere else rather than by the write-up
+  // being shorter. The thread post below is the Boss's own one-liner.
   const reportAnalysis: ToolApi["reportAnalysis"] = (args) =>
     call("reportAnalysis", async (incidentId) => {
       const incident = readIncident(incidentId);
@@ -948,6 +961,14 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           `incident ${incidentId} is ${incident.status}; there is nothing to hand off`,
         );
       }
+
+      // The brief is the first thing the person picking this up reads, on a
+      // phone, so it answers to the thread budget like every other post. The
+      // harness writes briefs too and cannot be asked to shorten one, which
+      // is why `unansweredBrief` clamps the question it echoes rather than
+      // relying on this staying generous.
+      const longBrief = overThreadBudget("brief", args.brief);
+      if (longBrief) return reject(longBrief);
 
       // The post comes first because it is the part that cannot be retried
       // from anywhere else. Once owner is 'human' the dispatcher stops

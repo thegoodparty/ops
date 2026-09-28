@@ -69,6 +69,7 @@ import {
   createRotationReader,
   createS3ObjectStore,
   createSlackClient,
+  createSlackFileUploader,
   type SlackLinker,
 } from "./slack/client";
 import {
@@ -97,6 +98,13 @@ import {
   type ThreadPoster,
 } from "./toolapi";
 import {
+  publishIncidentReport,
+  publishPendingReports,
+  type FileUploader,
+  type PrStateReader,
+  type ReportDeps,
+} from "./report";
+import {
   TEST_DB_ENV_VAR,
   TEST_DB_READY_DEADLINE_MS,
   awaitTestDatabase,
@@ -105,6 +113,7 @@ import {
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
 import { sessionKeyFor, sumSessionUsage } from "./agent/session";
+import { createInstallationToken, createPrStateReader } from "./github";
 import { makeAlarm, makeLog } from "./logging";
 import type {
   BugBossConfig,
@@ -223,6 +232,18 @@ export interface CreateBugBossOptions {
   s3?: S3Client;
   /** Overrides the default harness the Slack agent runs on. */
   slackAgentModel?: SlackAgentModel;
+  /**
+   * Uploads the closing report into an incident thread. Absent means the
+   * report is posted as text instead, which is the fallback and not a
+   * failure: a workspace where `files:write` was never granted still gets
+   * every word of it.
+   */
+  fileUploader?: FileUploader;
+  /**
+   * Looks up what became of the PRs an agent opened, for the closing report.
+   * Absent leaves every PR rendered as "state not known".
+   */
+  prStates?: PrStateReader;
   secrets?: BugBossSecrets;
   http?: HttpConfig;
   /**
@@ -310,6 +331,8 @@ export interface BugBoss {
   sweepOrphans(): Promise<number>;
   /** Open a Slack thread for any incident still without one. */
   ensureIncidentThreads(): Promise<number>;
+  /** Post the closing report for any incident that closed without one. */
+  sweepReports(): Promise<number>;
   start(): void;
   stop(): void;
 }
@@ -1427,7 +1450,14 @@ export const createBugBoss = async (
       // file rather than from anything the agent reports: a killed agent
       // never gets to report, and the file is on disk either way. So the
       // numbers survive exactly the runs you most want them for.
-      void rollUpUsage(ctx.incidentId, sessionRef);
+      //
+      // The closing report follows the roll-up rather than running beside
+      // it, because the tokens it quotes are the ones roll-up just wrote.
+      // It is a no-op unless this launch was the one that closed the
+      // incident.
+      void rollUpUsage(ctx.incidentId, sessionRef).then(() =>
+        publishReport(ctx.incidentId),
+      );
     });
   };
 
@@ -1506,6 +1536,32 @@ export const createBugBoss = async (
       alarm("usage_roll_up_failed", { incidentId, error: String(err) });
     }
   };
+
+  // -------------------------------------------------------------------------
+  // The closing report
+  // -------------------------------------------------------------------------
+
+  const reportDeps: ReportDeps = {
+    db,
+    sessions: store,
+    post: (threadTs, text) => slack.post(threadTs, text),
+    channel: config.slackChannelId,
+    uploader: options.fileUploader,
+    prStates: options.prStates,
+    now,
+  };
+
+  /**
+   * After the agent exits and after its usage is on the row, because the
+   * report quotes both. Never awaited by the dispatcher and never able to
+   * fail a launch: the transition it reports on committed long ago.
+   */
+  const publishReport = (incidentId: string): Promise<unknown> =>
+    publishIncidentReport(reportDeps, incidentId).catch((err: unknown) =>
+      alarm("report_publish_failed", { incidentId, error: String(err) }),
+    );
+
+  const sweepReports = (): Promise<number> => publishPendingReports(reportDeps);
 
   const dispatcher = createDispatcher({
     db,
@@ -1995,9 +2051,14 @@ export const createBugBoss = async (
     // signal and every threadless incident on disk is real rather than young.
     background("startup_sweep", sweepOrphans);
     background("startup_threads", ensureIncidentThreads);
+    background("startup_reports", sweepReports);
     resolutionTimer = setInterval(() => {
       background("orphan_sweep", sweepOrphans);
       background("thread_sweep", ensureIncidentThreads);
+      // Nothing relaunches an agent on a CLOSED incident, so a container
+      // replaced between the close and its report is the one case where the
+      // report has no other way out.
+      background("report_sweep", sweepReports);
     }, config.dispatcher.tickSeconds * 1000);
     resolutionTimer.unref();
     log("started", { env: config.env, bucket: config.s3Bucket });
@@ -2030,6 +2091,7 @@ export const createBugBoss = async (
     dispatchOnce,
     sweepOrphans,
     ensureIncidentThreads,
+    sweepReports,
     start,
     stop,
   };
@@ -2199,6 +2261,26 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
         })
       : undefined,
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
+    // The closing report uploads as a file. Same token as every other post,
+    // but the `files:write` scope it needs is granted only when somebody
+    // reinstalls the app -- until then the upload throws and the report goes
+    // out inline, which is exactly what should happen.
+    fileUploader: createSlackFileUploader(secrets.slackBotToken),
+    // Only when the App is configured. The Boss otherwise never mints a
+    // GitHub token of its own; this is the one thing it asks GitHub for, and
+    // a report without PR states is still a report.
+    prStates:
+      secrets.githubAppId &&
+      secrets.githubAppPrivateKey &&
+      secrets.githubAppInstallationId
+        ? createPrStateReader(
+            createInstallationToken({
+              appId: secrets.githubAppId,
+              privateKey: secrets.githubAppPrivateKey,
+              installationId: secrets.githubAppInstallationId,
+            }),
+          )
+        : undefined,
     // The merged env, not process.env: Loki's credentials come from the
     // secret blob, and settingsEnv builds a new object rather than mutating
     // the process.

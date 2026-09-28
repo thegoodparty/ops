@@ -14,6 +14,7 @@ import { createToolApi, type CorrelationMerge } from "./index";
 import jwt from "jsonwebtoken";
 
 import { mintAgentToken, verifyAgentToken } from "./token";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 
 const SECRET = "test-secret-not-a-real-one";
 
@@ -524,6 +525,66 @@ describe("invariant 1: every attached signal must be explained", () => {
   });
 });
 
+describe("resolution evidence answers to the thread budget", () => {
+  // The refusal matters more than the cap does. This evidence is posted into
+  // the thread, so it is bounded like every other post -- but the check runs
+  // ahead of the write, and a threshold that drifted the wrong way would stop
+  // an agent resolving anything at all while every test about resolving
+  // still passed. So both sides of the boundary are pinned here.
+  it("refuses evidence past the budget, leaving the incident resolvable", async () => {
+    await seed("sig-long-ev");
+    const id = await openIncident(["sig-long-ev"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "bad deploy",
+      explainedSignalIds: ["sig-long-ev"],
+    });
+
+    const before = posts.length;
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "x".repeat(THREAD_PROSE_CHARS + 1),
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /evidence is \d+ characters/);
+    assert.match(res.error ?? "", /post-mortem/);
+    assert.equal(posts.length, before, "refused ahead of the post");
+    // The transition must not have happened, or the agent is stuck holding a
+    // FIXING incident it has already been told it cannot resolve.
+    const row = incidentRow(id);
+    assert.equal(row?.status, "FIXING");
+    assert.equal(row?.resolvedAt, null);
+
+    // And the refusal is recoverable: shortening it resolves.
+    const retry = await tools.reportResolved({
+      prUrls: [],
+      evidence: "the alert went quiet and stayed quiet for an hour",
+    });
+    assert.equal(retry.ok, true, retry.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+  });
+
+  it("accepts evidence exactly at the budget", async () => {
+    // The off-by-one that would refuse a resolution somebody trimmed to fit.
+    await seed("sig-edge-ev");
+    const id = await openIncident(["sig-edge-ev"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "bad deploy",
+      explainedSignalIds: ["sig-edge-ev"],
+    });
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "x".repeat(THREAD_PROSE_CHARS),
+    });
+
+    assert.equal(res.ok, true, res.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+  });
+});
+
 describe("invariant 2: resolution closes the signals it claims to have fixed", () => {
   // The tool API used to split any signal without a resolve notification out
   // into a recurrence. That asked whether we had heard the alert stop, not
@@ -779,24 +840,61 @@ describe("hand off", () => {
     assert.doesNotMatch(text, /\*\*/);
   });
 
-  it("splits a brief too long for one message rather than losing its tail", async () => {
+  it("splits a brief that escaping pushes past one message, keeping its tail", async () => {
     await seed("sig-long");
     const id = await openIncident(["sig-long"]);
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-long"] });
 
+    // Inside the thread budget as written; conversion multiplies it past what
+    // one message holds. A split for that reason is not the model writing too
+    // much, so it still goes out whole.
+    const brief = Array.from(
+      { length: 34 },
+      (_, i) => `- ruled out ${i} ${"&".repeat(18)}`,
+    ).join("\n");
+    assert.ok(brief.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
+
     const before = posts.length;
-    await tools.handOff({
+    await tools.handOff({ reason: "deadline", brief });
+
+    const sent = posts.slice(before);
+    assert.ok(sent.length > 1, `expected a split, got ${sent.length}`);
+    assert.ok(
+      sent.map((p) => p.text).join("").includes("ruled out 33"),
+      "the tail is not dropped",
+    );
+  });
+
+  it("refuses a brief past the thread budget instead of handing off anyway", async () => {
+    await seed("sig-budget");
+    const id = await openIncident(["sig-budget"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "auth change",
+      explainedSignalIds: ["sig-budget"],
+    });
+
+    const before = posts.length;
+    const res = await tools.handOff({
       reason: "deadline",
       brief: Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n"),
     });
 
-    const brief = posts.slice(before);
-    assert.ok(brief.length > 1, `expected a split, got ${brief.length}`);
-    assert.ok(
-      brief.map((p) => p.text).join("").includes("ruled out 399"),
-      "the tail is not dropped",
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /brief is \d+ characters/);
+    assert.match(res.error ?? "", /post-mortem/);
+    assert.equal(posts.length, before, "refused ahead of the post");
+    // The refusal has to leave the incident retryable: an escalation the
+    // model was told to rewrite is useless if the incident already stopped
+    // being its problem.
+    const row = db.get<{ owner: string; status: string }>(
+      "SELECT owner, status FROM incident WHERE id = ?",
+      [id],
     );
+    assert.ok(row);
+    assert.equal(row.owner, "agent");
+    assert.equal(row.status, "FIXING");
   });
 
   it("is terminal for the agent and leaves the incident open", async () => {

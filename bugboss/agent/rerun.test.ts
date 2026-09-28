@@ -14,6 +14,7 @@ import {
   type GitHubRunsPort,
   type WorkflowRunView,
 } from "./rerun";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 
 const aRun = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView => ({
   id: 42,
@@ -507,4 +508,32 @@ test("a workflow name cannot break out of the link it is the label for", () => {
   assert.match(notice, /\|E2E prod nightly>/);
   assert.equal(notice.split("<").length, 2, "exactly one entity opens");
   assert.equal(notice.split(">").length, 2, "and exactly one closes it");
+});
+
+test("the notice fits a thread post even at its worst", () => {
+  // The notice goes out through the thread, which refuses a post past
+  // THREAD_PROSE_CHARS. The suspicion has its own limit, so the only other
+  // thing here that can run long is a name GitHub handed us -- and before it
+  // was clamped, a 200-character workflow name plus a maximal suspicion came
+  // to 1,205 against a budget of 1,200. That would have been a rerun_ci that
+  // fails on a workflow with a verbose name, which is nobody's idea of a
+  // reason.
+  const notice = rerunNotice(
+    "thegoodparty/omni",
+    aRun({ name: "nightly end to end suite ".repeat(12) }),
+    "s".repeat(RERUN_SUSPICION_LIMIT),
+  );
+
+  assert.ok(
+    notice.length <= THREAD_PROSE_CHARS,
+    `${notice.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
+  );
+  assert.match(notice, /…\|?>/, "the name is clamped where it ran long");
+});
+
+test("a workflow name short enough to read is left alone", () => {
+  const notice = rerunNotice("thegoodparty/omni", aRun({ name: "E2E" }), "flaky");
+
+  assert.match(notice, /\|E2E>/);
+  assert.doesNotMatch(notice, /…/);
 });

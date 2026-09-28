@@ -285,8 +285,24 @@ export const githubRefusalText = (
  * telemetry, so this is belt and braces — but a silently mangled post is
  * exactly the failure this system is built not to have.
  */
-const linkLabel = (name: string): string =>
-  name.replace(/[<>|]/g, " ").replace(/\s+/g, " ").trim() || "the workflow run";
+/**
+ * How much of a workflow name a link label carries.
+ *
+ * The notice is a thread post and the thread refuses one past
+ * `THREAD_PROSE_CHARS`. The suspicion already has its own limit, so the only
+ * other thing in here that can run long is a name GitHub gave us -- and a
+ * link label nobody can read to the end is not worth the budget it spends.
+ * `rerun.test.ts` composes the worst case so this stays true.
+ */
+const LINK_LABEL_CHARS = 80;
+
+const linkLabel = (name: string): string => {
+  const clean = name.replace(/[<>|]/g, " ").replace(/\s+/g, " ").trim();
+  if (!clean) return "the workflow run";
+  return clean.length <= LINK_LABEL_CHARS
+    ? clean
+    : `${clean.slice(0, LINK_LABEL_CHARS - 1).trimEnd()}…`;
+};
 
 export const rerunNotice = (
   repo: string,

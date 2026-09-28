@@ -52,6 +52,19 @@ oauth_config:
       ## removed or read back, so reactions.remove and reactions:read stay
       ## uncalled even though this scope would cover the first of them.
       - reactions:write
+      ## files.getUploadURLExternal and files.completeUploadExternal, for the
+      ## closing report BugBoss posts into an incident thread as a Markdown
+      ## file when the incident reaches CLOSED. (files.upload is deprecated;
+      ## the two-call external flow is what replaced it, and both calls sit
+      ## behind this one scope.) Without it the upload fails with
+      ## missing_scope and the report is posted as thread text instead --
+      ## nothing is lost, it is just longer to read.
+      ##
+      ## files:read is deliberately not requested. Nothing here reads a file
+      ## back: the Boss writes the report and the reader opens it in Slack.
+      ## Every scope in this file is one something calls, so that reinstalling
+      ## from the manifest is a decision rather than a diff nobody reads.
+      - files:write
       ## usergroups.users.list, for the rotation snapshot recorded on each
       ## incident at open. A Slack user group keeps no history, so this is
       ## the only moment that answer exists.

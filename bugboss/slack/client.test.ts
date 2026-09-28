@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { createCachingLinker } from "./client";
+import axios, { type AxiosResponse, type InternalAxiosRequestConfig } from "axios";
+
+import { createCachingLinker, createSlackFileUploader } from "./client";
+import type { ReportUpload } from "../report";
 
 const INCIDENTS = "C0DEVALERTS";
 const ELSEWHERE = "C0RANDOM";
@@ -161,5 +164,259 @@ describe("a permalink is paid for once", () => {
 
     assert.equal(asked.length, 2);
     assert.ok(lines.some((line) => line.includes('"permalink_shape_unknown"')));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The upload
+// ---------------------------------------------------------------------------
+
+/**
+ * `createSlackFileUploader` is the one thing in this file that talks to Slack
+ * for real, and it does so over two different transports on purpose: the two
+ * API calls go through the WebClient, which is axios underneath, and the POST
+ * to the signed url is a bare `fetch` because that host is not Slack and
+ * takes no token. So both are stubbed. Replacing only `globalThis.fetch`
+ * would leave `files.getUploadURLExternal` reaching out to slack.com from the
+ * test suite, and replacing only the axios adapter would let the POST out.
+ *
+ * What is worth covering here is everything the three steps promise each
+ * other: the bound on the middle one, the byte count the first one promises
+ * and the last one is checked against, and the rule that a POST which did not
+ * land must never be completed. None of that is visible from `report/`, which
+ * sees one `upload()` that either resolved or did not.
+ */
+
+const SIGNED_URL = "https://files.slack.test/upload?t=abc";
+
+interface ApiCall {
+  /** The bare method name, e.g. `files.completeUploadExternal`. */
+  method: string;
+  params: URLSearchParams;
+  /** The WebClient's own bound. Zero is the SDK default, i.e. none. */
+  timeout: number;
+}
+
+interface Attempt {
+  url: string;
+  method: string;
+  signal: AbortSignal | null;
+  /**
+   * Read inside the stub rather than afterwards. A signal already aborted
+   * when the request was handed over would mean the POST never went at all,
+   * and that is indistinguishable from a healthy one once the call returns.
+   */
+  abortedAtCall: boolean;
+  bytes: number;
+}
+
+interface UploadRun {
+  api: ApiCall[];
+  posts: Attempt[];
+  /**
+   * Captured rather than asserted with `assert.rejects` because every failure
+   * here is also a claim about which API calls did and did not happen, and
+   * those live on the same run.
+   */
+  error: Error | null;
+}
+
+interface Ticket {
+  ok: boolean;
+  upload_url?: string;
+  file_id?: string;
+}
+
+const A_FILE: ReportUpload = {
+  channel: "C0DEVALERTS",
+  threadTs: "100.000200",
+  filename: "inc-1.md",
+  title: "inc-1 post-mortem",
+  content: "the document",
+  comment: "post-mortem attached",
+};
+
+const drive = async (
+  file: ReportUpload,
+  options: {
+    ticket?: Ticket;
+    upload?: () => Promise<Response>;
+  } = {},
+): Promise<UploadRun> => {
+  const api: ApiCall[] = [];
+  const posts: Attempt[] = [];
+  const realAdapter = axios.defaults.adapter;
+  const realFetch = globalThis.fetch;
+  let error: Error | null = null;
+
+  axios.defaults.adapter = ((config: InternalAxiosRequestConfig) => {
+    const url = `${config.baseURL ?? ""}${config.url ?? ""}`;
+    const method = url.slice(url.lastIndexOf("/") + 1);
+    api.push({
+      method,
+      params: new URLSearchParams(String(config.data ?? "")),
+      timeout: config.timeout ?? 0,
+    });
+    const data: Ticket =
+      method === "files.getUploadURLExternal"
+        ? (options.ticket ?? { ok: true, upload_url: SIGNED_URL, file_id: "F0DOC" })
+        : { ok: true };
+    return Promise.resolve({
+      data,
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+      // `buildResult` reads this to spot the one method that answers with a
+      // file rather than JSON, and dies on an adapter that omits it.
+      request: { path: `/api/${method}` },
+    } as AxiosResponse<Ticket>);
+  }) as typeof axios.defaults.adapter;
+
+  globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+    const signal = init?.signal ?? null;
+    posts.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      signal,
+      abortedAtCall: signal !== null && signal.aborted,
+      bytes: Buffer.isBuffer(init?.body) ? init.body.byteLength : -1,
+    });
+    return options.upload ? options.upload() : new Response("OK", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    await createSlackFileUploader("xoxb-test").upload(file);
+  } catch (err) {
+    error = err as Error;
+  } finally {
+    axios.defaults.adapter = realAdapter;
+    globalThis.fetch = realFetch;
+  }
+
+  return { api, posts, error };
+};
+
+const methods = (run: UploadRun): string[] => run.api.map((call) => call.method);
+
+const paramsFor = (run: UploadRun, method: string): URLSearchParams => {
+  const call = run.api.find((each) => each.method === method);
+  if (!call) throw new Error(`${method} was never called: ${methods(run).join(", ")}`);
+  return call.params;
+};
+
+describe("an upload is bounded, or it is not an upload", () => {
+  test("the POST to the signed url carries a live abort signal", async () => {
+    const run = await drive(A_FILE);
+
+    assert.equal(run.error, null);
+    assert.equal(run.posts.length, 1);
+    const [post] = run.posts;
+    assert.equal(post.url, SIGNED_URL);
+    assert.equal(post.method, "POST");
+    // The signal is the whole point of this test. Deleting it is a one-line
+    // change that nothing else in the suite would notice, and it puts the
+    // report sweep back to waiting for as long as somebody else's host cares
+    // to hold the socket -- which is strictly worse than the inline fallback.
+    assert.ok(post.signal instanceof AbortSignal, "the POST has no timeout");
+    assert.equal(post.abortedAtCall, false, "a dead signal means it never went");
+    // The two API calls either side are bounded too, and by the same number.
+    // The SDK's default is zero, so an unbounded WebClient looks like a
+    // working one right up until Slack stops answering.
+    for (const call of run.api) {
+      assert.ok(call.timeout > 0, `${call.method} is unbounded`);
+      assert.equal(call.timeout, run.api[0].timeout);
+    }
+  });
+
+  test("an upload that outlives its bound fails rather than completing", async () => {
+    const run = await drive(A_FILE, {
+      upload: () => {
+        // The shape `AbortSignal.timeout` actually rejects with.
+        const timedOut = new Error("The operation was aborted due to timeout");
+        timedOut.name = "TimeoutError";
+        return Promise.reject(timedOut);
+      },
+    });
+
+    assert.equal(run.error?.name, "TimeoutError");
+    assert.equal(run.posts.length, 1, "the POST was attempted");
+    // Completing an upload whose bytes never arrived is the one outcome worse
+    // than failing: Slack publishes a file the reader cannot open, and the
+    // inline fallback never runs because nothing threw.
+    assert.deepEqual(methods(run), ["files.getUploadURLExternal"]);
+  });
+
+  test("a rejection from the signed url says which status, and completes nothing", async () => {
+    const run = await drive(A_FILE, {
+      upload: () =>
+        Promise.resolve(
+          new Response("too big", { status: 413, statusText: "Payload Too Large" }),
+        ),
+    });
+
+    // The status is the only part of this a human can act on: 413 is a
+    // document to shorten, 403 is an expired ticket, 500 is Slack's problem.
+    assert.match(String(run.error?.message), /413/);
+    assert.deepEqual(methods(run), ["files.getUploadURLExternal"]);
+  });
+
+  test("a ticket missing either half of itself throws before any POST", async () => {
+    for (const ticket of [
+      { ok: true, file_id: "F0DOC" },
+      { ok: true, upload_url: SIGNED_URL },
+      { ok: true },
+    ]) {
+      const run = await drive(A_FILE, { ticket });
+
+      assert.match(String(run.error?.message), /no upload url/, JSON.stringify(ticket));
+      // Posting a body to `undefined` resolves against nothing useful and the
+      // failure would be reported as whatever that host answered.
+      assert.equal(run.posts.length, 0, JSON.stringify(ticket));
+      assert.deepEqual(methods(run), ["files.getUploadURLExternal"]);
+    }
+  });
+
+  test("the length promised is bytes, not characters", async () => {
+    // A post-mortem quoting a log line is rarely pure ASCII, and Slack
+    // rejects the completion when the promised length does not match what
+    // arrived -- so a character count fails only on the documents that
+    // contain the interesting part.
+    const content = "rate rose 4% — timeouts on /café 🎉";
+    const run = await drive({ ...A_FILE, content });
+
+    const promised = Number(paramsFor(run, "files.getUploadURLExternal").get("length"));
+    assert.equal(promised, Buffer.byteLength(content, "utf8"));
+    assert.ok(
+      promised > content.length,
+      `${promised} vs ${content.length}: the fixture has no multi-byte characters`,
+    );
+    assert.equal(run.posts[0]?.bytes, promised, "what was sent is what was promised");
+    assert.equal(run.error, null);
+  });
+
+  test("the completion names the thread the incident is already in", async () => {
+    const run = await drive(A_FILE);
+
+    const done = paramsFor(run, "files.completeUploadExternal");
+    // Without these the file lands in the channel root as a message nobody is
+    // watching, detached from the incident it explains.
+    assert.equal(done.get("channel_id"), "C0DEVALERTS");
+    assert.equal(done.get("thread_ts"), "100.000200");
+    assert.equal(done.get("initial_comment"), "post-mortem attached");
+    assert.equal(
+      done.get("files"),
+      JSON.stringify([{ id: "F0DOC", title: "inc-1 post-mortem" }]),
+      "the file id comes from the ticket, not from anything the caller knows",
+    );
+  });
+
+  test("a report with no thread still uploads, into the channel", async () => {
+    const run = await drive({ ...A_FILE, threadTs: null });
+
+    assert.equal(run.error, null);
+    const done = paramsFor(run, "files.completeUploadExternal");
+    assert.equal(done.get("channel_id"), "C0DEVALERTS");
+    assert.equal(done.get("thread_ts"), null, "absent, not the string \"null\"");
   });
 });

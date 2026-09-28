@@ -277,6 +277,16 @@ export interface SessionUsage {
   cacheWrite: number;
   modelId: string | null;
   turns: number;
+  /**
+   * What Pi priced this file at as it ran, summed over the same entries.
+   *
+   * Not a substitute for the tokens, and not what the incident row stores:
+   * the record is tokens plus `modelId`, because those still multiply out
+   * correctly after a price change. This is the arithmetic done at the time,
+   * carried so a reader gets a figure without a price list -- and it is only
+   * ever presented as derived. Zero when the provider reported no prices.
+   */
+  costUsd: number;
 }
 
 interface UsageFields {
@@ -284,6 +294,7 @@ interface UsageFields {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  cost?: { total?: number };
 }
 
 /**
@@ -319,6 +330,7 @@ export const sumSessionUsage = (contents: string): SessionUsage => {
     cacheWrite: 0,
     modelId: null,
     turns: 0,
+    costUsd: 0,
   };
 
   for (const line of contents.split("\n")) {
@@ -343,6 +355,7 @@ export const sumSessionUsage = (contents: string): SessionUsage => {
       total.tokensOut += usage.output ?? 0;
       total.cacheRead += usage.cacheRead ?? 0;
       total.cacheWrite += usage.cacheWrite ?? 0;
+      total.costUsd += usage.cost?.total ?? 0;
     }
 
     total.modelId = entry.modelId ?? entry.message?.model ?? entry.model ?? total.modelId;

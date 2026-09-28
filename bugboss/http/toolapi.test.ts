@@ -11,6 +11,7 @@ import { after, before, test } from "node:test";
 import { Db } from "../db";
 import { createMemoryS3 } from "../index";
 import { mintAgentToken } from "../toolapi";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
 import {
   CHOICE_ACTION_PREFIX,
@@ -222,17 +223,50 @@ test("what the agent writes is converted for Slack and never truncated", async (
   assert.ok(posted.includes("• *the cache*"), posted);
   assert.ok(posted.includes("`near &lt;Set-Cookie&gt;`"), posted);
 
+  // Inside the thread budget, but escaping multiplies it past what one
+  // message holds. Still a split and still the whole tail: the budget is
+  // about what a person will read, and conversion happening to need two
+  // messages is not the model writing too much.
+  const expands = Array.from(
+    { length: 34 },
+    (_, i) => `- ruled out ${i} ${"&".repeat(18)}`,
+  ).join("\n");
+  assert.ok(expands.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: expands }),
+  });
+  assert.equal(res.status, 200);
+  const parts = threadPosts.slice(before + 1);
+  assert.ok(parts.length > 1, `expected a split, got ${parts.length}`);
+  assert.ok(parts.join("").includes("ruled out 33"), "the tail is not dropped");
+
+  await authed("/pending-question", { method: "DELETE" });
+});
+
+test("a post past the thread budget is refused, not split into two long ones", async () => {
+  // Every post to a thread arrives through here -- the ask, the evidence
+  // under it, the rerun notice, the wait heartbeat -- so this is where the
+  // budget is a budget rather than a rule one of four callers follows.
+  const before = threadPosts.length;
   const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
   const res = await authed("/thread", {
     method: "POST",
     body: JSON.stringify({ message: long }),
   });
-  assert.equal(res.status, 200);
-  const parts = threadPosts.slice(before + 1);
-  assert.ok(parts.length > 1, `expected a split, got ${parts.length}`);
-  assert.ok(parts.join("").includes("ruled out 399"), "the tail is not dropped");
 
-  await authed("/pending-question", { method: "DELETE" });
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: string };
+  assert.match(body.error, /message is \d+ characters/);
+  assert.match(body.error, new RegExp(String(THREAD_PROSE_CHARS)));
+  // A refusal nobody can act on is a dead end, so it says where the long
+  // version goes instead of only that this one is too long.
+  assert.match(body.error, /post-mortem/);
+  assert.equal(
+    threadPosts.length,
+    before,
+    "refused before posting, so there is no half-delivered write-up",
+  );
 });
 
 test("the marker says whether the question was actually posted", async () => {

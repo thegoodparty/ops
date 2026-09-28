@@ -186,13 +186,45 @@ does not parse it for entities, so there is nothing to prevent — escaping only
 renders a literal `&amp;` on a button face and grows a string whose length
 limit was measured before the escape ran.
 
-## Length is a split, never a truncation
+## Two length rules, and they answer to different people
 
-`chat.postMessage` accepts 40,000 characters and truncates past it with a 200
-back, which is the one failure a reader cannot recover from by reading on. So
-`splitForSlack` cuts on line boundaries at 3,000 characters, marks each part
-`_(2/3)_`, and closes and reopens a code fence that a split falls inside —
-otherwise the rest of a post-mortem renders as code.
+`MAX_MESSAGE_CHARS` is Slack's problem. `chat.postMessage` accepts 40,000
+characters and truncates past it with a 200 back, which is the one failure a
+reader cannot recover from by reading on. So `splitForSlack` cuts on line
+boundaries at 3,000 characters, marks each part `_(2/3)_`, and closes and
+reopens a code fence that a split falls inside — otherwise the rest of a
+post-mortem renders as code. **Never a truncation.**
+
+`THREAD_PROSE_CHARS` is the reader's problem, and it is a **refusal**. A real
+thread measured 7 to 98 words for every message this codebase composes and 370
+to 426 for the agent's own free text, in the place least able to carry it, so a
+thread post is capped at about 200 words and a longer one is handed back. The
+two numbers are not alternatives and should not be merged: splitting a 400-word
+post into two 200-word posts does not make it shorter.
+
+The budget binds **every** path into a thread, which is the only way it is a
+budget rather than a habit one of four callers keeps:
+
+| Path | Bound |
+| --- | --- |
+| `contact_human`'s ask | 700, tighter still, refused (`tools.ts`) |
+| the loopback `/thread` route | `THREAD_PROSE_CHARS`, refused with a 400 |
+| `report_resolved`'s evidence, `hand_off`'s brief | `THREAD_PROSE_CHARS`, rejected ahead of the transition |
+| `report_analysis`'s post-mortem | **none** |
+
+**The thread is short; the document is complete.** The post-mortem is the
+exemption because it does not go to the thread as text — it leaves as the
+closing report, a Markdown file (`report/CLAUDE.md`). The one place the
+document does reach the thread is the degraded path when the upload fails, and
+that call is `postDocument` rather than `postProse` so the exemption is a name
+somebody can grep for instead of a check somebody forgot.
+
+A harness-written brief is the exception to the exception: `unansweredBrief`
+and `stalledWaitBrief` are composed when the model is no longer in the loop, so
+there is nobody to refuse them to. They clamp the text they echo — which is
+already in the thread directly above — small enough that the composed brief
+provably fits, and `tools.test.ts` composes the worst case of each to keep that
+true.
 
 ## Block Kit for one message: a question with its answers
 

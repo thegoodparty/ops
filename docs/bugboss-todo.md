@@ -39,7 +39,7 @@ All agents paused 2026-09-27 evening. Nothing is lost that was pushed.
 | #122 | `feat/bugboss-ci-rerun` | integration ✔ | opened, verdict pending |
 | #120 | `feat/bugboss-wait-heartbeat` | **still `main`** | approved against `main`; **needs merge of integration + retarget + fresh verdict** |
 | #119 | `feat/bugboss-recurrence` | **still `main`** | approved against `main`; **needs merge of integration + retarget + fresh verdict** |
-| — | `feat/bugboss-incident-report` | integration | in progress, no PR yet |
+| #123 | `feat/bugboss-incident-report` | integration | three review blockers closed, verdict pending |
 | — | `feat/bugboss-test-runtime` | integration | investigation only, no PR yet |
 | — | review audit | commits direct on integration | 4 fixes pushed; last verdict pending |
 
@@ -78,13 +78,16 @@ copy.
   so cost rises faster than linearly with investigation time. Levers not yet
   pulled: per-phase model routing, shorter loops.
 - **`@product-bugs` contains only one person.** Rotation is not populated.
-- **Agent output policy is agreed but only partly built.** Thread summaries
-  target ~200 words and default to plain system-behaviour language rather
-  than identifiers; post-mortems and the full report should be longer and
-  precise. #112 caps `contact_human` asks at 700 characters, but the other
-  posting paths (the loopback `/thread` route, `report_*` notifications) are
-  unbounded — agent free text measured 370–426 words against code-authored
-  messages at 7–98.
+- ~~**Agent output policy is agreed but only partly built.**~~ Built in #123.
+  Every path into a thread is now capped at `THREAD_PROSE_CHARS` (~200 words)
+  and refuses rather than splits: the `/thread` route 400s, `report_resolved`'s
+  evidence and `hand_off`'s brief reject ahead of their transition, and
+  `contact_human`'s ask keeps its tighter 700. The post-mortem is the one
+  uncapped field, because it leaves as the closing report file rather than as
+  thread text. The prompt carries the rule and a worked
+  identifiers-vs-behaviour pair. What is **not** done: nothing measures the
+  word counts of live threads, so whether the real output actually moved from
+  370–426 words down toward 200 is still unobserved.
 - The GitHub App is installed on **all** org repos (`repository_selection:
   all`), which is wider than the agent's prompt claims.
 

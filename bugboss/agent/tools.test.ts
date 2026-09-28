@@ -3,6 +3,8 @@ import { test } from "node:test";
 
 import type { Directive, ToolResponse } from "../types";
 import type { PendingDirective } from "./tools";
+import { MAX_CHOICE_OPTIONS } from "../slack/blocks";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 import {
   CONTACT_HUMAN_MESSAGE_LIMIT,
   createContactHumanTool,
@@ -15,6 +17,7 @@ import {
   runContactHuman,
   runMonitor,
   shellProbe,
+  stalledWaitBrief,
   truncateOutput,
   unansweredBrief,
   type HeartbeatDeps,
@@ -395,6 +398,51 @@ test("an ask longer than the limit is refused before anything is posted", async 
   assert.deepEqual(state.posts, [], "a refused ask is not a half-posted one");
   assert.equal(state.recorded, 0);
   assert.equal(escalate.calls.length, 0);
+});
+
+test("details longer than a thread post is refused before the ask goes out", async () => {
+  // The order is what makes this worth a test of its own. `details` is posted
+  // after the ask and after the marker, so leaving the check to the loopback
+  // route would 400 with the question already in the thread and no wait
+  // started -- an ask nobody is waiting on, which is the failure this whole
+  // tool is built around.
+  const clock = fakeClock();
+  const { state, port } = fakeContact();
+  const escalate = recordingEscalate();
+  const api = directiveFeed([]);
+
+  const result = await runContactHuman(
+    {
+      message: "Is the rollback safe?",
+      details: "x".repeat(THREAD_PROSE_CHARS + 1),
+      timeoutSeconds: 3600,
+    },
+    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.match(String(result.rejected), /details is \d+ characters/);
+  assert.match(String(result.rejected), /post-mortem/);
+  assert.deepEqual(state.posts, [], "the ask is not posted either");
+  assert.equal(state.recorded, 0, "and no marker is left behind to resume on");
+  assert.equal(escalate.calls.length, 0);
+});
+
+test("details that fit go out as their own post under the ask", async () => {
+  const clock = fakeClock();
+  const { state, port } = fakeContact();
+  const escalate = recordingEscalate();
+  const api = directiveFeed([]);
+
+  await runContactHuman(
+    {
+      message: "Is the rollback safe?",
+      details: "x".repeat(THREAD_PROSE_CHARS),
+      timeoutSeconds: 0,
+    },
+    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.equal(state.posts.length, 2, "the ask, then the evidence beneath it");
 });
 
 test("a resume re-posts the evidence rather than losing it silently", async () => {
@@ -1352,4 +1400,54 @@ test("the hand-off brief counts the nudges that were actually sent", async () =>
 
   assert.equal(harness.posts.length, 1);
   assert.match(harness.handOffs[0].brief, /across 1 nudges/);
+});
+
+// A brief the harness writes has nobody to refuse it to: the model is not in
+// the loop by the time either of these is composed, and `hand_off` now
+// rejects a brief past the thread budget. So the worst case each of them can
+// produce has to fit, and these are the tests that keep that true instead of
+// merely written down in a comment.
+
+test("the harness's unanswered brief fits the thread budget at its worst", () => {
+  const brief = unansweredBrief(
+    "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT),
+    30,
+    Array.from({ length: MAX_CHOICE_OPTIONS }, (_, i) => `${i}`.padEnd(75, "o")),
+  );
+
+  assert.ok(
+    brief.length <= THREAD_PROSE_CHARS,
+    `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
+  );
+  // The question is echoed, not reproduced: it is already in the thread
+  // directly above, verbatim, so the elision costs the reader nothing and is
+  // marked where it happens.
+  assert.match(brief, /characters elided/);
+  assert.ok(brief.includes("What I offered"), "the buttons a reader saw survive");
+});
+
+test("the harness's stalled-wait brief fits the thread budget at its worst", () => {
+  const brief = stalledWaitBrief({
+    description: "d".repeat(2_000),
+    awaitingHuman: "a".repeat(2_000),
+    waitedMs: 86_400_000,
+    status: "s".repeat(10_000),
+    nudges: 4,
+  });
+
+  assert.ok(
+    brief.length <= THREAD_PROSE_CHARS,
+    `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
+  );
+  assert.match(brief, /characters elided/);
+});
+
+test("a short harness brief is left exactly as written", () => {
+  // The clamp must not be visible on the normal path, which is every real
+  // one: a reader seeing an elision marker on a two-line brief would go
+  // looking for text that was never there.
+  const brief = unansweredBrief("Is the rollback safe?", 30);
+
+  assert.ok(brief.includes("Is the rollback safe?"));
+  assert.doesNotMatch(brief, /elided/);
 });
