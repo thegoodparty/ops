@@ -24,7 +24,7 @@ import type Database from "better-sqlite3";
 import type { Db } from "../db";
 import { sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
-import { postDocument, splitForSlack } from "../slack/format";
+import { mrkdwn, postDocument, splitForSlack } from "../slack/format";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
 import type { RecurrenceAnalysis } from "../types";
 import {
@@ -62,6 +62,20 @@ export const REPORT_SWEEP_GRACE_MS = 5 * 60 * 1000;
 
 /** Per pass, so a backlog after a long outage drains over ticks. */
 const REPORT_SWEEP_LIMIT = 10;
+
+/**
+ * How long a report that cannot be built keeps being retried before the
+ * thread gets a line instead.
+ *
+ * Retrying is right for weather and wrong for a row this code cannot read.
+ * The sweep takes the ten oldest unpublished closes, so an incident that
+ * fails deterministically holds a slot in that queue on every tick forever --
+ * ten of them and no report publishes again, with two alarms repeating every
+ * thirty seconds as the only sign. An hour is long enough for a transient
+ * cause to clear or for somebody to repair the row, and short enough that
+ * giving up is still same-day.
+ */
+export const REPORT_GIVE_UP_MS = 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Collaborators
@@ -282,6 +296,26 @@ const claim = (db: Db, incidentId: string, at: number): Promise<boolean> =>
   });
 
 /**
+ * Hand the claim back, for the one case that earns it: nothing reached the
+ * thread, so the marker says a report was posted that was not, and the sweep
+ * should come round again.
+ *
+ * Deliberately not done after a partial post. `contact_human` can re-ask
+ * because an unposted question is detectable -- its marker carries an empty
+ * `messageTs` -- and a report has no equivalent, so the choice here is
+ * between half a report somebody can see and a duplicate they have to
+ * reconcile. Half wins.
+ */
+const release = (db: Db, incidentId: string): Promise<void> =>
+  db
+    .withWrite((w: Database.Database) => {
+      w.prepare(
+        "DELETE FROM incident_action WHERE incidentId = ? AND action = ?",
+      ).run(incidentId, REPORT_PUBLISHED_ACTION);
+    })
+    .then(() => undefined);
+
+/**
  * Post the report into the incident thread, once.
  *
  * Returns what happened rather than throwing. The caller is a `finally`
@@ -326,8 +360,27 @@ export const publishIncidentReport = async (
     document = renderReportDocument(data);
     summary = renderThreadSummary(data);
   } catch (err) {
-    alarm("render_failed", { incidentId, error: String(err) });
-    return "skipped";
+    // Rendering is a pure function of the row, so this fails again on every
+    // tick for as long as the row is what it is. Retried for an hour in case
+    // something repairs it, and after that answered rather than repeated: the
+    // thread is told the report is missing, which is the one thing a
+    // repeating alarm never does.
+    const stuck = data.incident.closedAt !== null &&
+      now() - data.incident.closedAt > REPORT_GIVE_UP_MS;
+    alarm("render_failed", { incidentId, error: String(err), givingUp: stuck });
+    if (!stuck) return "skipped";
+    if (!(await claim(deps.db, incidentId, now()))) return "skipped";
+    try {
+      await deps.post(
+        data.incident.slackThreadTs,
+        mrkdwn`*Incident ${incidentId} is closed, but its closing report could not be written.*\n_Everything the incident recorded is intact; it is the report that failed._`,
+      );
+      return "degraded";
+    } catch (postErr) {
+      await release(deps.db, incidentId);
+      alarm("publish_failed", { incidentId, error: String(postErr) });
+      return "skipped";
+    }
   }
 
   if (!(await claim(deps.db, incidentId, now()))) {
@@ -339,12 +392,17 @@ export const publishIncidentReport = async (
   const threadTs = data.incident.slackThreadTs;
 
   const degrade = async (note: string): Promise<PublishOutcome> => {
+    // Counted because it decides whether the claim was earned. A thread that
+    // took nothing at all leaves a marker asserting a report exists when none
+    // does, and that marker is what stops the sweep ever trying again.
+    let landed = 0;
     try {
       // The summary is already mrkdwn, built by the `mrkdwn` tag; the
       // document is raw Markdown and needs converting. Two texts, two paths,
       // which is the split slack/format.ts draws.
       for (const part of splitForSlack(renderThreadSummary(data, note))) {
         await deps.post(threadTs, part);
+        landed++;
       }
       // postDocument, not postProse: this is the one text exempt from the
       // thread's length budget, and the exemption is supposed to be a name
@@ -352,7 +410,13 @@ export const publishIncidentReport = async (
       await postDocument((text) => deps.post(threadTs, text), document, { incidentId });
       return "degraded";
     } catch (err) {
-      alarm("publish_failed", { incidentId, error: String(err) });
+      if (landed === 0) await release(deps.db, incidentId);
+      alarm("publish_failed", {
+        incidentId,
+        error: String(err),
+        landed,
+        retryable: landed === 0,
+      });
       return "skipped";
     }
   };

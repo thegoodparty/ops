@@ -15,11 +15,12 @@ import {
   renderThreadSummary,
   reportMetrics,
   REPORT_PUBLISHED_ACTION,
+  REPORT_GIVE_UP_MS,
   REPORT_SWEEP_GRACE_MS,
   type ReportDeps,
   type ReportUpload,
 } from "./index";
-import { duration } from "./render";
+import { duration, interval } from "./render";
 
 const fakeS3 = () => {
   const objects = new Map<string, Buffer>();
@@ -401,7 +402,7 @@ describe("a failed upload degrades instead of breaking the close", () => {
     assert.match(posts[0].text, /no file upload configured/);
   });
 
-  it("still marks the report published when even the fallback post fails", async () => {
+  it("hands the claim back when the thread took nothing at all", async () => {
     await seed("inc-9");
     uploadFails = true;
 
@@ -413,10 +414,47 @@ describe("a failed upload degrades instead of breaking the close", () => {
       }),
       "inc-9",
     );
+
     assert.equal(outcome, "skipped");
-    // Claimed before posting, deliberately: a retry here would be a second
-    // copy far more often than a rescue, and the alarm is what says so.
-    assert.equal(markers("inc-9"), 1);
+    // The claim is what stops the sweep ever coming back, so leaving it
+    // standing here would lose the report for good -- nothing relaunches an
+    // agent on a CLOSED incident. Nothing landed, so a retry cannot post a
+    // second copy, and `contact_human` already settled this trade for the
+    // whole codebase: re-posting can at worst say it twice, not posting
+    // cannot be recovered from at all.
+    assert.equal(markers("inc-9"), 0);
+    assert.equal(
+      db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'inc-9'")
+        ?.status,
+      "CLOSED",
+      "and the transition is still untouched",
+    );
+  });
+
+  it("keeps the claim when the thread took part of it", async () => {
+    await seed("inc-9b");
+    uploadFails = true;
+
+    // The summary posts, the document underneath it does not. This is the
+    // case the old ordering was right about: a retry would append a second
+    // copy of a report a reader can already see half of, and half a report
+    // somebody can read beats a duplicate they have to reconcile.
+    let posted = 0;
+    const outcome = await publishIncidentReport(
+      deps({
+        post: async (threadTs, text) => {
+          posted++;
+          if (posted > 1) throw new Error("slack: ratelimited");
+          posts.push({ threadTs, text });
+          return { ts: "ts-1" };
+        },
+      }),
+      "inc-9b",
+    );
+
+    assert.equal(outcome, "skipped");
+    assert.equal(posted, 2, "it got past the summary and failed on the document");
+    assert.equal(markers("inc-9b"), 1, "so the claim stands and nothing retries");
   });
 });
 
@@ -807,5 +845,212 @@ describe("a report that cannot be rendered is not a report that is lost", () => 
     const before = posts.length;
     assert.equal(await publishIncidentReport(deps(), "inc-41"), "skipped");
     assert.equal(posts.length, before, "no second copy in the thread");
+  });
+});
+
+describe("an interval too wide to be one incident is named, not printed", () => {
+  it("refuses a detect time computed from a seconds epoch", async () => {
+    // `impactStartedAt` is validated as a positive integer and documented as
+    // epoch millis, so a model handing back seconds passes validation clean.
+    // Nothing downstream can tell: the subtraction succeeds, both times are
+    // present and in the right order, and the most consequential row in the
+    // table renders a confident answer twenty thousand days wide.
+    const asSeconds = Math.round(OPENED / 1000);
+    await seed("inc-50", { impactStartedAt: asSeconds });
+
+    const data = await readReportData(deps(), "inc-50");
+    assert.ok(data);
+    const gap = reportMetrics(data).timeToDetectMs;
+    assert.ok(gap !== null && gap > 0, "the sign is right, which is why nothing caught it");
+
+    const row = await glanceRow("inc-50", "Time to detect");
+    assert.match(row, /not usable/);
+    assert.match(row, /further apart than any incident lasts/);
+    assert.match(row, /written in the wrong unit/);
+    // This is the whole point of the branch, and the assertion the others
+    // rest on. A plausibly-shaped duration on this row gets read as a
+    // detection time and acted on, and it is wrong by a factor of a
+    // thousand -- so the number must not reach the page at all, not even
+    // inside a sentence disowning it.
+    assert.ok(!row.includes(duration(gap)), "the number that cannot be right is absent");
+    assert.doesNotMatch(row, /\d+d/);
+    // And it is still one cell: a raw pipe would shift every row under it.
+    assert.equal((row.match(/(?<!\\)\|/g) ?? []).length, 3);
+  });
+
+  it("says something different again than for an absent or a backwards time", async () => {
+    await seed("inc-51", { impactStartedAt: null });
+    await seed("inc-52", { impactStartedAt: OPENED + 12 * 60_000 });
+    await seed("inc-53", { impactStartedAt: Math.round(OPENED / 1000) });
+
+    const absent = await glanceRow("inc-51", "Time to detect");
+    const backwards = await glanceRow("inc-52", "Time to detect");
+    const implausible = await glanceRow("inc-53", "Time to detect");
+
+    // Three states, three sentences, and collapsing any pair of them costs
+    // the reader the only thing this row can tell them: whether to go
+    // looking for a writer that never ran, two clocks that disagree, or a
+    // caller passing the wrong unit. They are different repairs.
+    assert.notEqual(implausible, absent);
+    assert.notEqual(implausible, backwards);
+    assert.notEqual(absent, backwards);
+  });
+
+  it("carries the implausible case into the thread summary too", async () => {
+    await seed("inc-54", { impactStartedAt: Math.round(OPENED / 1000) });
+
+    const data = await readReportData(deps(), "inc-54");
+    assert.ok(data);
+    const summary = renderThreadSummary(data);
+    assert.match(summary, /detection time not usable/);
+    // Most people only ever read the thread, so "detected in 20337d" there
+    // is the same wrong number with the wider audience.
+    assert.doesNotMatch(summary, /detected in/);
+    assert.doesNotMatch(summary, /\d+d \d+h/);
+    // Not the backwards wording either. These two times are in order; it is
+    // the distance between them that is impossible, and someone told they
+    // are out of order goes looking at the wrong thing.
+    assert.doesNotMatch(summary, /detection time inconsistent/);
+  });
+
+  it("still measures an incident that genuinely ran for weeks", async () => {
+    // The ceiling has to sit well above anything real, or it turns a slow
+    // incident into a fabricated data error -- the same failure pointing the
+    // other way, and a harder one to argue with because it reads as rigour.
+    await seed("inc-56", { impactStartedAt: OPENED - 30 * 86_400_000 });
+
+    const row = await glanceRow("inc-56", "Time to detect");
+    assert.equal(row, "| Time to detect | 30d |");
+  });
+
+  it("does not report a sub-second contradiction as no contradiction", async () => {
+    // Both times are recorded and 400ms out of order. Whole seconds rounded
+    // that to "0s", so the row declared the timeline self-contradictory and
+    // then gave the contradiction as zero -- which reads as an argument
+    // against its own finding, and invites the reader to dismiss it.
+    await seed("inc-55", { impactStartedAt: OPENED + 400 });
+
+    const data = await readReportData(deps(), "inc-55");
+    assert.ok(data);
+    assert.equal(reportMetrics(data).timeToDetectMs, -400);
+
+    const row = await glanceRow("inc-55", "Time to detect");
+    assert.match(row, /not usable/);
+    assert.match(row, /beginning <1s after the first signal arrived/);
+    assert.doesNotMatch(row, /beginning 0s/);
+  });
+});
+
+describe("duration tells a short length from no length", () => {
+  it("reads a gap under a second as one rather than rounding it away", () => {
+    // "0s" is not a smaller number than "<1s", it is a different claim: it
+    // says the two moments coincide. The caller that cannot afford that is
+    // `interval`'s backwards branch, which prints the size of a
+    // contradiction it has just declared.
+    assert.equal(duration(1), "<1s");
+    assert.equal(duration(400), "<1s");
+    assert.equal(duration(999), "<1s");
+    // Zero is untouched, because nothing was rounded and so nothing is
+    // being hidden: the two moments really are the same moment.
+    assert.equal(duration(0), "0s");
+    assert.equal(duration(1_000), "1s");
+  });
+
+  it("keeps the sign on a sub-second negative as on any other", () => {
+    assert.equal(duration(-400), "-<1s");
+    assert.equal(duration(-12 * 60_000), "-12m");
+  });
+
+  it("still refuses to print a number that is not one", () => {
+    assert.equal(duration(Number.NaN), "unknown");
+    assert.equal(duration(Number.POSITIVE_INFINITY), "unknown");
+  });
+});
+
+describe("interval decides what a difference means before anyone prints it", () => {
+  it("sends a difference that is not a number to the absent sentence", () => {
+    // `duration` answers "unknown" for a NaN, which is the bare word this
+    // file exists to argue against: it tells the reader nothing about which
+    // of the two moments to go and look at. A difference that is not a
+    // number means one of them was not one either, which is what `absent`
+    // already says in a sentence.
+    const say = {
+      absent: "not known — when impact began was never recorded",
+      backwards: (gap: string) => `backwards by ${gap}`,
+      implausible: () => "too far apart to be one incident",
+    };
+    assert.equal(interval(Number.NaN, say), say.absent);
+    assert.equal(interval(Number.POSITIVE_INFINITY, say), say.absent);
+    assert.equal(interval(Number.NEGATIVE_INFINITY, say), say.absent);
+  });
+
+  it("falls back to the backwards sentence for a caller that did not distinguish", () => {
+    // The default is what lets a new call site be added without being taught
+    // this state. Worst case its reader gets the wrong reason; they never
+    // get the number, which is the failure that matters.
+    const said = interval(400 * 86_400_000, {
+      absent: "absent",
+      backwards: (gap) => `not usable — ${gap} out of order`,
+    });
+    assert.match(said, /not usable/);
+    assert.notEqual(said, "absent");
+  });
+});
+
+describe("a row that can never be rendered stops being retried", () => {
+  it("answers in the thread once retrying has stopped being useful", async () => {
+    // Rendering is pure, so a row it cannot read fails identically on every
+    // tick -- and the sweep takes the ten oldest unpublished closes, so ten
+    // rows like this and no report publishes again, with a pair of alarms
+    // every thirty seconds as the only sign. After the window it is answered
+    // instead of repeated, which is the one thing a repeating alarm never
+    // does.
+    await seed("inc-42", { closedAt: NOW - REPORT_GIVE_UP_MS - 60_000 });
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-42'").run();
+    });
+
+    assert.equal(await publishIncidentReport(deps(), "inc-42"), "degraded");
+    assert.equal(uploads.length, 0, "there was no document to upload");
+    assert.equal(posts.length, 1, "one line, not a partial report");
+    assert.match(posts[0].text, /could not be written/);
+    assert.match(posts[0].text, /inc-42/);
+    assert.equal(markers("inc-42"), 1, "claimed, so it stops coming round");
+
+    // And it stays stopped.
+    assert.equal(await publishIncidentReport(deps(), "inc-42"), "skipped");
+    assert.equal(posts.length, 1);
+  });
+
+  it("keeps retrying inside the window, in case the row is repaired", async () => {
+    await seed("inc-43", { closedAt: NOW - 60_000 });
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-43'").run();
+    });
+
+    assert.equal(await publishIncidentReport(deps(), "inc-43"), "skipped");
+    assert.equal(posts.length, 0, "nothing said yet; it may still come good");
+    assert.equal(markers("inc-43"), 0, "and nothing durable to suppress the retry");
+  });
+
+  it("gives up without a thread to give up into, and says so rather than looping", async () => {
+    // A thread that will not take even the one line leaves the claim off, so
+    // the sweep is free to try again -- the same rule the degraded path uses.
+    await seed("inc-44", { closedAt: NOW - REPORT_GIVE_UP_MS - 60_000 });
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-44'").run();
+    });
+
+    const outcome = await publishIncidentReport(
+      deps({
+        post: async () => {
+          throw new Error("slack: channel_not_found");
+        },
+      }),
+      "inc-44",
+    );
+
+    assert.equal(outcome, "skipped");
+    assert.equal(markers("inc-44"), 0);
   });
 });

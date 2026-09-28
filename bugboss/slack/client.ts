@@ -31,16 +31,19 @@ const log = makeLog("slack-client");
 const REPLIES_PAGE_LIMIT = 200;
 
 /**
- * The signed upload URL is somebody else's host, and the POST to it is the
- * one request here that carries a body. Unbounded it would hold the report
- * sweep open for as long as that host cared to keep the socket, which is
- * the worst outcome available: the inline fallback is strictly better than
- * waiting. Fifteen seconds is above the 8s a Loki read gets -- this one
- * uploads rather than reads -- and well inside the 30s dispatcher tick, so
- * an upload endpoint that is simply gone degrades to thread text within the
- * same tick that noticed the close.
+ * One call in the upload flow, and there are three of them.
+ *
+ * The guarantee this serves is about the whole flow, not one request: a
+ * Slack that will not take the file degrades to thread text on the tick that
+ * noticed the close, and the dispatcher tick is 30 seconds. A per-request
+ * bound only delivers that if the requests cannot repeat, which is why the
+ * retry policy below is what it is -- 8s x 3 steps is 24s of worst case,
+ * inside the tick, and nothing about that arithmetic survives a retry.
+ *
+ * Eight seconds is what a Loki read gets. The body here is a post-mortem,
+ * measured in kilobytes, so it does not need more.
  */
-const UPLOAD_TIMEOUT_MS = 15_000;
+const UPLOAD_CALL_TIMEOUT_MS = 8_000;
 
 /**
  * A link to one message. Slack builds a permalink out of the workspace
@@ -203,8 +206,15 @@ export const createSlackClient = (
  */
 export const createSlackFileUploader = (token: string): FileUploader => {
   const web = new WebClient(token, {
-    retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
-    timeout: UPLOAD_TIMEOUT_MS,
+    // No retries, deliberately, and this is the one WebClient here without
+    // them. The SDK's default spreads five attempts over five minutes, which
+    // is ten dispatcher ticks spent holding the report sweep open while every
+    // individual request still looks bounded -- and it buys nothing, because
+    // the thing on the other side of a failure here is not a lost report. It
+    // is the same report, in the thread, as text. Waiting minutes to avoid
+    // that is the wrong way round.
+    retryConfig: { retries: 0 },
+    timeout: UPLOAD_CALL_TIMEOUT_MS,
   });
   return {
     upload: async (file) => {
@@ -222,7 +232,7 @@ export const createSlackFileUploader = (token: string): FileUploader => {
       const uploaded = await fetch(ticket.upload_url, {
         method: "POST",
         body,
-        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+        signal: AbortSignal.timeout(UPLOAD_CALL_TIMEOUT_MS),
       });
       if (!uploaded.ok) {
         throw new Error(

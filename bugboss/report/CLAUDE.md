@@ -58,6 +58,23 @@ race, against a report lost for good. This is the failure that would not show
 up in the run that caused it: the marker persists, the next container sees it,
 and nothing is ever posted.
 
+The claim is handed **back** in exactly one case: the thread took nothing at
+all. Then the marker asserts a report that does not exist, and it is the marker
+that stops the sweep ever returning -- so leaving it would lose the report for
+good. A retry cannot duplicate what never landed, and `contact_human` settled
+this trade for the whole codebase: re-posting can at worst say it twice, not
+posting cannot be recovered from at all. A *partial* post keeps its claim, and
+that is the case the ordering was always right about -- half a report somebody
+can read beats a duplicate they have to reconcile.
+
+A row this code cannot render is the other bounded case. Rendering is pure, so
+it fails identically on every tick, and the sweep takes the ten oldest
+unpublished closes -- ten rows like that and no report publishes again, with a
+pair of alarms repeating every thirty seconds as the only sign. So it is
+retried for `REPORT_GIVE_UP_MS` in case something repairs the row, and after
+that answered instead of repeated: the thread is told the report could not be
+written, which is the one thing a repeating alarm never does.
+
 It is a row rather than a column because `db/schema.sql` runs as
 `CREATE TABLE IF NOT EXISTS` over a restored snapshot with no migration
 runner: a column added to a live table would exist in the file and never in

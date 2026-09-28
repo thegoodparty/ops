@@ -36,14 +36,23 @@ reset. Updated as things land. Not product documentation.
 - Grafana `dev-alerts` webhook contact point: timestamp header, basic auth,
   `maxAlerts: 0`, resolve messages off.
 - The secret is clickops and is **not** declared in Pulumi. IaC looks it up.
+- `npm test` now also globs `bugboss/*.test.ts`. The old glob expanded as
+  `bugboss/*/*.test.ts` under `sh`, so a top-level test file was silently
+  skipped; `bugboss/github.test.ts` is the first one and would have been.
+- **Agent output policy is built** (#123). Every path into a thread is capped
+  at `THREAD_PROSE_CHARS` (~200 words) and **refuses** rather than splits: the
+  loopback `/thread` route 400s, `report_resolved`'s evidence and `hand_off`'s
+  brief reject ahead of their transition, and `contact_human`'s ask keeps its
+  tighter 700. The post-mortem is the one uncapped field, because it leaves as
+  the closing report file rather than as thread text — `postDocument` is that
+  exemption, named so it is greppable. Harness-composed posts clamp the text
+  they echo instead, since a refusal has nobody to reach. The prompt carries
+  the rule and a worked identifiers-vs-behaviour pair. What is **not** done:
+  nothing measures live threads, so whether real output moved from the
+  measured 370–426 words down toward 200 is still unobserved.
 
 ## Known gaps
 
-- **A top-level `bugboss/*.test.ts` never runs.** `npm test`'s glob is
-  `bugboss/**/*.test.ts`, which `sh` expands as `bugboss/*/*.test.ts`. A test
-  file at the top of `bugboss/` is silently skipped. Verified with a canary.
-  Every test today is in a subdirectory, so nothing is being missed — but the
-  next person to add one at the top level loses it with no error.
 - **The sidecar's `max_connections=400` covers one suite per agent, not two.**
   Measured rather than assumed. gp-api caps Prisma at `connection_limit=5`
   across 4 workers; election-api sets no `maxWorkers` but has only 5 DB-backed
