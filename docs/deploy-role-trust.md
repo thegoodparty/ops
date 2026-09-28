@@ -51,7 +51,8 @@ order: role, then workflow, then trust.
       and `election-api.yml`'s unused `id-token: write` as
       thegoodparty/omni#2146).
 - [ ] 4. Create `github-actions-pulumi-plan` for the **Terraform** planners:
-      `todo`. Split out from the original step 4; see "What step 4 found".
+      `doing` (role-assumption-workflow, 2026-09-28). Split out from the
+      original step 4; see "What step 4 found".
       Covers `gp-ai.yml`'s `terraform-plan` job and
       `gp-terraform-dataplatform`. Needs no Pulumi state and no secrets.
 - [ ] 5. Point those two planners at it: `todo`. Depends on 4 applying.
