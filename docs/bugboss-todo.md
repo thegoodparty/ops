@@ -5,37 +5,25 @@ reset. Updated as things land. Not product documentation.
 
 ## Blocked on a human
 
-- **After #118 merges: make BugBoss carry the new observability guidance.**
-  An omni PR is rewriting `docs/observability.md`, which BugBoss injects
-  verbatim into every incident agent via `OBSERVABILITY_DOC_PATHS`. That file
-  currently teaches the behaviour that caused the 2026-09-28 query overage:
-  unbounded stream selectors in every example, "narrow the time window" at
-  step 3 after the first broad pull, and a closing line telling the reader to
-  use the MCPs liberally. Four things to do here, none of which the omni PR
-  can cover:
+- **Confirm BugBoss picks up the rewritten observability doc.** An omni PR is
+  rewriting `docs/observability.md`, which BugBoss injects verbatim into every
+  incident agent via `OBSERVABILITY_DOC_PATHS`. The text that taught the
+  behaviour behind the 2026-09-28 query overage is still what ships until that
+  lands. Establish how `OBSERVABILITY_DOC_PATHS` resolves at runtime -- baked
+  into the image, fetched, or checked out -- and verify BugBoss reads the new
+  text rather than a stale copy.
 
-  1. **Confirm the injected copy is the rewritten one.** Establish how
-     `OBSERVABILITY_DOC_PATHS` resolves at runtime — baked into the image,
-     fetched, or checked out — and verify BugBoss actually picks up the new
-     text rather than a stale copy.
-  2. **Delete the prompt's "add a limit to every query" line.** It is wrong:
-     `limit` caps rows *returned*, Loki bills bytes *scanned*. A
-     `count_over_time` over 30 days returns one number and reads 149 GB.
-     Someone following it believes they are being frugal and is not, and it
-     contradicts the doc shipped beside it.
-  3. **Give the agent's MCP surface a tool allowlist and a time-range
-     ceiling.** `bugboss/agent/mcp.ts` calls `tools/list` and exposes the
-     whole ~80-tool mcp-grafana surface unfiltered. mcp-grafana supports
-     `--enabled-tools`. Ceiling: 6h default, 24h hard maximum — the alerts
-     these agents investigate use a 10-minute window, so the incident is
-     minutes old, and nothing in the loop needs 30 days.
-  4. **Enforce it server-side, not in the prompt.** The 20,000-char output cap
-     bounds bytes returned, not bytes scanned, so it does nothing here. A
-     prompt instruction is advisory and an agent can ignore it.
-
-  `bugboss/ingress/grafana.ts` already does this correctly for its non-MCP
-  path (`MAX_QUERIES_PER_ALERT = 6`, `LOOKBACK_SECONDS = 3600`). The pattern
-  exists in this codebase; it just does not cover the MCP path.
+  The rest of that item is built. The agent's Grafana MCP surface is now an
+  allowlist enforced twice (`--enabled-tools` plus our own filter of
+  `tools/list`), the time range is clamped in our wrapper at 6h default and 24h
+  maximum with the model told when it was widened, and the prompt's "add a
+  limit to every query" line is gone. Two things the build established that
+  the plan had wrong: `--enabled-tools` takes *categories*, not tool names,
+  which is why the real allowlist lives in our filter; and the `alerting`
+  category was dropped whole rather than restricted to reads, because in
+  mcp-grafana 1.6.1 reading and mutating a rule are one tool and
+  `--disable-write` does not remove it. The firing alert already arrives in
+  full through `ingress/grafana.ts`.
 
 
 - **Purge the 2026-09-28 alert-storm incidents from the database.** Between
@@ -198,10 +186,14 @@ them would be caught by a test.
 - **Blocked on a human, the agent does nothing, and the prompt tells it that
   is free.** The 8-hour `contact_human` block is exactly one turn: no further
   investigation, no pre-drafted post-mortem, no periodic PR check. The prompt
-  says *"monitor costs one turn whether it returns in ten seconds or two
-  days"* — true for turn accounting, false for cost, and the 1h TTL only
-  moves the boundary rather than removing it. **That line should not survive
-  as written.**
+  said *"monitor costs one turn whether it returns in ten seconds or two
+  days"* — true for turn accounting, false for cost. That line is gone. The
+  prompt now says what the far side of a long block actually costs, and the
+  waiting section says what is worth doing before settling into one: refresh
+  impact, confirm nothing is escalating, post state, start the post-mortem.
+  It also names the two things that are worse than one long block -- splitting
+  it into re-issued short waits, and re-asking somebody who has already
+  answered twice.
 
   Incident 5 shows the better behaviour is available rather than absent: same
   situation, same hour, it chose to wait rather than ask a third time, then
@@ -228,25 +220,41 @@ them would be caught by a test.
   patience. Filters need a negative case, or silence has to be treated as
   unknown rather than as "not yet".
 
-- **`LATE_COLUMNS` in `Db.open` is BugBoss's only migration path** and holds
-  one entry. It silently does nothing for a column added to a table that does
-  not exist yet. Fine today because `schema.sql` creates every table first; if
-  that ordering ever changes, the failure is invisible.
+- **`LATE_COLUMNS` was loud by accident, not by design.** Measured rather than
+  reasoned: `ALTER TABLE` on a missing table throws, `Db.open` rejects and the
+  Boss exits 1 -- but only because `schema.sql` happens to run first, and the
+  message named neither `LATE_COLUMNS` nor the entry. It now throws with the
+  entry named. The real silence was elsewhere and had no detection at all: a
+  column declared in `schema.sql` that nobody added to `LATE_COLUMNS` is absent
+  in prod while the suite stays green. `Db.open` now builds a throwaway
+  `:memory:` database from the same DDL and diffs it against the live one,
+  alarming on every column the live database lacks. That one alarms rather
+  than refusing to boot, because it is reachable only in prod and a Boss that
+  will not start cannot investigate why.
 
-- **`truncateOutput` returns more than the max it is handed.** It appends head,
-  tail and a marker naming how much it dropped, and that marker grows with the
-  size of what it elided. So every caller holding it to a budget has a margin
-  that shrinks as inputs grow, rather than a constant one. Found while clamping
-  the heartbeat nudge; the three callers there are now clamped with worst-case
-  tests asserted at absurd inputs. The overshoot itself is unfixed and affects
-  every other caller. A bound checked at a size somebody chose is a bound that
-  holds until somebody waits longer.
+- **`truncateOutput` now honours its maximum.** It used to append head, tail
+  and a marker naming how much it dropped, and that marker grew with the size
+  of what it elided. Head and tail now shrink around the marker instead, with
+  room reserved against `text.length` -- the largest number the marker could
+  ever print -- so the fixed point resolves in one pass. A budget smaller than
+  the marker alarms and still honours the cap.
 
-- **A killed agent session is indistinguishable from one that finished.** The
-  session writer appends per event and the file closes with the last one: no
-  exit record, no error entry, no signal or deadline marker. S3 `LastModified`
-  sits within a second of the last event for both a clean exit and a kill.
-  A 9.5-hour, $42.71 run that died reads exactly like one that completed.
+  Correcting the premise: this was a *small-budget* bug, not a large-input one.
+  The old slices summed to 0.9x the budget, so the overshoot only bit below
+  roughly 390 characters, which is exactly why it surfaced at the heartbeat
+  clamps. None of the three defensive clamps was relaxed: measuring the
+  composed worst case showed `HEARTBEAT_ECHO_CHARS` at 200 was never forced by
+  the overshoot, and the other two were sized against the thread budget for
+  reasons the fix does not touch.
+
+- **A killed agent session used to be indistinguishable from one that
+  finished.** Every launch now writes a `bugboss_exit` entry naming how it
+  ended, `SIGTERM`/`SIGINT` write one on the way out, and `readSessionOutcome`
+  reads it back -- deliberately not last-record-wins, because a resumed file
+  carries the previous launch's record under the turns that followed it.
+  `read_agent_session` says which it was, so a human asking what happened no
+  longer has to infer it from the last turn. `SIGKILL` still writes nothing,
+  which is the point: the absence of a record is now evidence.
 
 - **Three of seven runs were killed at the same lifecycle position**: checks
   green, PR approved, about to involve a human on the merge. Two state the
@@ -255,8 +263,14 @@ them would be caught by a test.
   the transition into the merge wait. Going further needs ECS task exit codes
   or Boss-side logs; the session files do not carry a cause.
 
-- **Nothing knows to resume a killed run.** Incident 5's deliverable survived
-  intact — PR approved, 35/35 checks green, root cause recorded — and a fresh
-  session could finish it for an estimated $2-3. But its thread's last message
-  is *true*, so the silence reads as patience and nobody picks it up. The loss
-  is not the 291k tokens of context, it is that the run is never noticed dead.
+- **Resume was never the missing piece; saying so was.** The dispatcher
+  already relaunches an agent-owned incident on its next tick whatever killed
+  the last one, so incident 5 was not un-resumable -- it was un-noticed. A gap
+  longer than `RESUME_NOTICE_SECONDS` now alarms and posts to the thread, and
+  a killed run alarms when its child exits. Shorter gaps stay quiet on purpose:
+  a deploy puts every agent back within a tick or two, and announcing that
+  would teach people to skip the message that matters.
+
+  Still open: nothing outside the container watches the container. If the Boss
+  itself is down, no in-process detection fires. That needs infrastructure,
+  which is a `deploy/` change and deliberately out of this round.
