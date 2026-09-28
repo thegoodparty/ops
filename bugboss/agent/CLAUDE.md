@@ -27,6 +27,38 @@ a capability: the App is installed org-wide with `contents: write`, so the
 token reaches every repository in the organisation and not only omni. The
 prompt used to say otherwise and was wrong.
 
+## The Grafana MCP surface is bounded twice, in code
+
+`mcp.ts` exposes mcp-grafana, which ships ~80 tools, and fifteen agents can
+hold it at once. On 2026-09-28 a third of all Loki read volume was ad-hoc MCP
+queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
+
+- **`GRAFANA_READ_TOOLS` is the surface.** Reads only: Loki, Prometheus,
+  Tempo, datasources, dashboards. Alert-*rule* reads are absent because
+  mcp-grafana v1.6.1 puts reading and creating a rule in one tool
+  (`alerting_manage_rules`); the firing alert already arrives through
+  `ingress/grafana.ts` and the rules are checked into omni.
+- **`GRAFANA_MCP_ARGS` tells the server the same thing**, and is the weaker
+  half: `--enabled-tools` is category-granular, so tool names in it disable
+  everything. `--disable-write` and `--disable-api` do the real work there,
+  and `--loki-guardrail-*` catches what our clamp cannot — a range-vector
+  duration inside the query, `count_over_time(…[30d])` in a 6h window.
+- **A dropped tool is `log`, a missing one is `alarm`.** The flag over-delivers
+  by design, so the filter dropping something is normal. An allowlisted tool
+  the server no longer lists is a capability that vanished — a rename, a
+  version bump — and nothing else in the run would mention it.
+- **The time range is clamped in `execute`, not asked for in the prompt.**
+  `DEFAULT_LOOKBACK_HOURS` 6, `MAX_LOOKBACK_HOURS` 24, and a widened request is
+  rewritten *and* announced in the tool result, because an agent that thinks it
+  read a month and read a day reports a negative on evidence it never had. The
+  argument names come from each tool's own `inputSchema`
+  (`startRfc3339`/`endRfc3339`, `startTime`/`endTime`, `start`/`end`); a shape
+  not in `TIME_RANGE_SHAPES` is not clamped, so adding a tool to the allowlist
+  means adding its shape in the same change.
+
+The 20,000-char output cap does not help with any of this. It bounds bytes
+returned; Loki bills bytes scanned.
+
 ## The two blocking tools
 
 `monitor` and `contact_human` each cost **one turn** no matter how long they
