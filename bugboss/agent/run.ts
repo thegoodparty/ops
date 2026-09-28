@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
   Directive,
   IncidentMatch,
@@ -19,7 +19,8 @@ import type {
   ToolApi,
   ToolResponse,
 } from "../types";
-import { resolveBedrockModel, registerBedrockInvokeModelProvider } from "../bedrock";
+import { resolveBedrockModel } from "../bedrock";
+import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
 import { connectMcpToolset, type McpToolset } from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
@@ -673,8 +674,22 @@ export const runIncidentAgent = async (
   }
 
   const pi = await import("@earendil-works/pi-coding-agent");
-  await registerBedrockInvokeModelProvider();
   const model = await resolveBedrockModel({ id: pinned.modelId });
+
+  // Built here rather than left to createAgentSession, because the router has
+  // to be installed on the runtime the session will actually stream through.
+  const modelRuntime = await pi.ModelRuntime.create({});
+  await registerBedrockRouting({ runtime: modelRuntime });
+  assertBedrockInvokeModelRouting(modelRuntime, model);
+  console.log(
+    JSON.stringify({
+      component: "agent",
+      event: "model_provider_selected",
+      incidentId: options.incidentId,
+      modelId: model.id,
+      api: model.api,
+    }),
+  );
 
   const mcp: McpToolset[] = [];
   if (options.grafana) {
@@ -700,6 +715,7 @@ export const runIncidentAgent = async (
       api,
       pi,
       model,
+      modelRuntime,
       mcp,
       restored,
       notesPrefix,
@@ -719,13 +735,15 @@ const launch = async (args: {
   api: BossClient;
   pi: typeof import("@earendil-works/pi-coding-agent");
   model: Awaited<ReturnType<typeof resolveBedrockModel>>;
+  modelRuntime: ModelRuntime;
   mcp: McpToolset[];
   restored: boolean;
   notesPrefix: string;
   notesSeen: Map<string, NoteRecord>;
   storedPrefix: StoredPrefix | null;
 }): Promise<RunIncidentAgentResult> => {
-  const { options, paths, store, key, api, pi, model, mcp, restored, storedPrefix } = args;
+  const { options, paths, store, key, api, pi, model, modelRuntime, mcp, restored, storedPrefix } =
+    args;
 
   // Aborted when the soft deadline fires, so a tool parked in a 24h wait
   // returns and the turn can end. `steer` only delivers between turns, so
@@ -931,6 +949,7 @@ const launch = async (args: {
   const { session } = await pi.createAgentSession({
     cwd: paths.checkout,
     model,
+    modelRuntime,
     thinkingLevel: "high",
     tools: prefix.toolNames,
     customTools,
