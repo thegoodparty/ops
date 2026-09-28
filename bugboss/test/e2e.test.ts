@@ -65,6 +65,10 @@ const fakeModel = {
   maxInFlight: 0,
   /** The last triage prompt, so a test can assert what triage was offered. */
   lastPrompt: "",
+  /** When set, the next triage call searches with this before deciding. */
+  searchBefore: null as string | null,
+  /** What the real search tool answered, so a test can assert it worked. */
+  lastSearchResult: "",
   next(): QueuedDecision {
     const d = this.triageDecisions.shift();
     if (!d) throw new Error("fakeModel: no triage decision queued");
@@ -95,6 +99,15 @@ const fakeModel = {
         this.beforeDecide = null;
         await hook();
       }
+      // Exercises the real search tool inside the real loop, rather than
+      // asserting against a rendered prompt that nothing ever ran.
+      if (this.searchBefore && !request.messages.some((m) => m.role === "toolResult")) {
+        const text = this.searchBefore;
+        this.searchBefore = null;
+        return call("search_incidents", { text });
+      }
+      const last = request.messages.at(-1);
+      if (last?.role === "toolResult") this.lastSearchResult = last.text;
       if (this.gate) await this.gate;
       return call("decide", { ...this.next() });
     } finally {
@@ -589,6 +602,94 @@ test("the same alert firing again after resolution opens a recurrence", async ()
     [first!.id],
   );
   assert.ok(reopened, "a premature resolution has to be contradictable");
+});
+
+test("the pointer is set without the model volunteering it", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-11", "briefing-dispatch-errors"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-11')",
+  );
+
+  // No recurrenceOf queued. The delivery is an exact (source, sourceId) match
+  // against an incident closed moments ago, which is a fact about the
+  // delivery rather than a judgement about the problem -- so triage stamps it
+  // whether or not the model noticed.
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open matches",
+  });
+  await boss.ingest("grafana", grafanaBody("fp-11", "briefing-dispatch-errors"));
+
+  const reopened = boss.db.get<{ id: string; recurrenceOf: string | null }>(
+    "SELECT id, recurrenceOf FROM incident WHERE recurrenceOf = ?",
+    [first!.id],
+  );
+  assert.ok(reopened, "the recurrence must not depend on the model mentioning it");
+  assert.match(fakeModel.lastPrompt, /RECURRENCE CANDIDATES/);
+});
+
+test("triage can reach the post-mortems through the real search tool", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-13", "webhook-write-errors"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-13')",
+  );
+
+  // A different alert entirely: no shared fingerprint, so RECURRENCE
+  // CANDIDATES is empty and the search is the only thing that can find it.
+  fakeModel.beforeDecide = async () => {};
+  fakeModel.searchBefore = "Pro upgrade webhook wrote to the wrong column";
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "the search turned up the same cause under another alert",
+    recurrenceOf: first!.id,
+  });
+  await boss.ingest("grafana", grafanaBody("fp-14", "campaign-save-errors"));
+
+  assert.ok(
+    fakeModel.lastSearchResult.includes(first!.id),
+    `the real FTS index should have found ${first!.id}, got: ${fakeModel.lastSearchResult}`,
+  );
+  const reopened = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE recurrenceOf = ?",
+    [first!.id],
+  );
+  assert.ok(reopened, "a cause returning under a different alert is still a recurrence");
+});
+
+test("the agent starts from the post-mortem that was already written", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-12", "peerly-send-failures"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string; postmortem: string | null }>(
+    "SELECT id, postmortem FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-12')",
+  );
+  assert.ok(first?.postmortem, "CLOSED requires one");
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "back again" });
+  const [placed] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-12", "peerly-send-failures"),
+  );
+
+  const view = await boss.toolApiFor(placed.incidentId!).getIncident();
+
+  assert.equal(view.data?.priorIncident?.id, first!.id);
+  assert.equal(
+    view.data?.priorIncident?.postmortem,
+    first!.postmortem,
+    "somebody already investigated this and wrote down what they concluded",
+  );
+  assert.ok(
+    (view.data?.priorIncident?.prUrls ?? []).length > 0,
+    "the fix that did not hold is the first thing to check",
+  );
 });
 
 // --- the webhook answers before it works -----------------------------------

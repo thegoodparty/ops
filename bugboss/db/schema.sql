@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS incident (
   -- claim, so the evidence has to outlive the Slack message that carried it.
   resolvedEvidence  TEXT,
 
+  -- Why this incident happened again after an earlier one was closed on the
+  -- bar that no further alerts should occur, and what was done about that
+  -- rather than about the symptom. Required by reportAnalysis whenever
+  -- recurrenceOf is set, and refused at the tool rather than here: SQLite
+  -- cannot add a CHECK to an existing table, and this column arrives after
+  -- the table exists.
+  recurrenceAnalysis TEXT,
+
   -- Cross-field constraints, which are the difference between an invariant
   -- and a comment. Every one of these was reachable at some point today: a
   -- resurrected MERGED row, a RESOLVED incident whose evidence lived only in
@@ -117,6 +125,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS signal_open_source_idx
 -- The open list, which is the only query the control plane itself makes often.
 CREATE INDEX IF NOT EXISTS incident_status_idx ON incident (status);
 CREATE INDEX IF NOT EXISTS signal_incident_idx ON signal (incidentId);
+
+-- Recurrence. Triage asks, on every delivery, whether an incident that
+-- already claimed this problem was over carried a signal like this one. Both
+-- reads join signal to incident, so both need the signal side indexed or the
+-- cost of the question grows with every alert the system has ever seen.
+--
+-- signal_open_source_idx cannot serve this: it is partial on closedAt IS
+-- NULL, and every signal a resolution closed has a closedAt. The exact key is
+-- the same (source, sourceId) though, which is the point -- the delivery that
+-- proves a resolution was premature is the one most certain to match the
+-- signal that resolution closed.
+CREATE INDEX IF NOT EXISTS signal_source_idx ON signal (source, sourceId);
+
+
+-- Text search over incidents that already claimed a problem was over.
+--
+-- The corpus is the post-mortems CLOSED has always required and nothing ever
+-- read back. FTS5 rather than embeddings on purpose: it is in-process, needs
+-- no service and no similarity threshold, and a wrong answer can be explained
+-- by reading the query.
+--
+-- Not an external-content table. External content keys on rowid and
+-- incident.id is TEXT, and a trigger-maintained index would have to survive
+-- being created over a restored snapshot that already has rows. This one is
+-- written by reportResolved and reportAnalysis inside their own transactions
+-- and reconciled at boot, which backfills the history for free.
+CREATE VIRTUAL TABLE IF NOT EXISTS incident_fts USING fts5(
+  incidentId UNINDEXED,
+  titles,
+  rootCause,
+  resolvedEvidence,
+  postmortem,
+  tokenize = 'porter unicode61'
+);
 
 -- A question asked by contact_human that has not been answered yet. Lets a
 -- resumed agent find the message it already posted rather than asking twice.

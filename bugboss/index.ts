@@ -22,6 +22,7 @@ import type Database from "better-sqlite3";
 import type { Hono } from "hono";
 
 import { Db } from "./db";
+import { reconcileSearchIndex } from "./db/search";
 import {
   createChildProcessSpawn,
   createDispatcher,
@@ -649,6 +650,26 @@ export const createBugBoss = async (
   });
   const store = createS3ObjectStore(config.s3Bucket, s3);
 
+  // The search index is derived state, so it is rebuilt from the incidents
+  // rather than migrated. That is what makes a corpus older than the table
+  // searchable at all -- schema.sql runs over a restored snapshot, so the
+  // first boot after this ships finds an empty index and a full history --
+  // and it repairs anything a transition failed to write, which keeps the
+  // per-transition index a fast path rather than a single point of loss.
+  try {
+    const { indexed } = await reconcileSearchIndex(db);
+    if (indexed > 0) log("search_index_backfilled", { indexed });
+  } catch (err) {
+    // Not fatal: every other job still works, and the next boot tries again.
+    // Loud, though, because the visible symptom is a search that quietly
+    // finds nothing, which reads exactly like a problem that has never
+    // happened before.
+    alarm("search_index_backfill_failed", {
+      error: String(err),
+      note: "recurrence search may miss incidents closed before this boot",
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Ingress
   // -------------------------------------------------------------------------
@@ -1099,6 +1120,9 @@ export const createBugBoss = async (
       action: decision.action,
       created: result.created,
       recurrenceOf: outcome.recurrenceOf,
+      // A null recurrenceOf with recurrenceChecked false is "we could not
+      // look", which is not the same fact as "nothing matched".
+      recurrenceChecked: outcome.recurrenceChecked,
       fellBack: outcome.fellBack,
     });
 

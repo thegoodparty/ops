@@ -1549,3 +1549,185 @@ describe("a split is told to both threads", () => {
     assert.ok(alarms.some((line) => line.includes('"split_thread_missing"')));
   });
 });
+
+describe("a recurrence closes on a second question", () => {
+  /** An incident already closed, and a live one that reopens its ground. */
+  const recurrencePair = async () => {
+    await seed("sig-old");
+    const first = await openIncident(["sig-old"]);
+    const firstTools = toolsFor(first);
+    await firstTools.reportRootCause({
+      cause: "the connection pool was sized for the old traffic shape",
+      explainedSignalIds: ["sig-old"],
+    });
+    await firstTools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
+      evidence: "zero matching lines for 90 minutes after the deploy",
+    });
+    await firstTools.reportAnalysis({
+      postmortem: "## Summary\nthe pool was too small",
+      usersImpacted: 3,
+      impactQuery: "q",
+    });
+
+    await seed("sig-new");
+    const second = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-new"], target: "NEW", reason: "it is back" },
+        { kind: "boss" },
+        { recurrenceOf: first },
+      )
+    ).target;
+    const secondTools = toolsFor(second);
+    await secondTools.reportRootCause({
+      cause: "the pool is still too small on the write path",
+      explainedSignalIds: ["sig-new"],
+    });
+    return { first, second, tools: secondTools };
+  };
+
+  it("refuses to close without an answer to why the last resolution failed", async () => {
+    const { first, second, tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nsized the pool again",
+      usersImpacted: 4,
+      impactQuery: "q",
+    });
+
+    assert.equal(closed.ok, false);
+    assert.match(String(closed.error), new RegExp(`recurrence of ${first}`));
+    assert.equal(
+      incidentRow(second)?.status,
+      "RESOLVED",
+      "an unexplained recurrence stays open; hand_off is the other exit",
+    );
+  });
+
+  it("refuses an answer too short to be one", async () => {
+    const { tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nagain",
+      usersImpacted: 4,
+      impactQuery: "q",
+      recurrence: {
+        category: "previous_fix_incomplete",
+        why: "too small",
+        remedy: "fixed it",
+      },
+    });
+
+    assert.equal(closed.ok, false);
+    assert.match(String(closed.error), /recurrence\.why is too short/);
+  });
+
+  it("closes with one, and stores it", async () => {
+    const { second, tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nsized the pool on both paths",
+      usersImpacted: 4,
+      impactQuery: "q",
+      recurrence: {
+        category: "previous_fix_incomplete",
+        why: "the earlier fix sized the read pool only, and the write path has its own",
+        remedy: "sized both pools and added an assertion that they are configured together",
+      },
+    });
+
+    assert.equal(closed.ok, true, closed.error);
+    const stored = db.get<{ recurrenceAnalysis: string | null }>(
+      "SELECT recurrenceAnalysis FROM incident WHERE id = ?",
+      [second],
+    );
+    assert.equal(
+      JSON.parse(String(stored?.recurrenceAnalysis)).category,
+      "previous_fix_incomplete",
+    );
+    assert.ok(
+      posts.some((p) => p.text.includes("Why it recurred")),
+      "the answer reaches the thread, not only a column",
+    );
+  });
+
+  it("says plainly when the fix belongs in BugBoss, which agents cannot open PRs against", async () => {
+    const { tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    await tools.reportAnalysis({
+      postmortem: "## Summary\nsized the pool",
+      usersImpacted: 4,
+      impactQuery: "q",
+      recurrence: {
+        category: "bugboss_defect",
+        why: "triage attached the second firing to the resolved incident, so nobody re-investigated",
+        remedy: "proposed tightening the attach guard in triage/triage.ts and raised it in the thread",
+      },
+    });
+
+    const post = posts.find((p) => p.text.includes("BugBoss let this recur"));
+    assert.ok(post, "a defect in the system itself must not end in a closed column");
+    assert.match(post!.text, /needs a person/);
+  });
+
+  it("refuses the resolution evidence the last one was closed on", async () => {
+    const { tools } = await recurrencePair();
+
+    const resolved = await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "zero matching lines for 90 minutes after the deploy",
+    });
+
+    assert.equal(resolved.ok, false);
+    assert.match(String(resolved.error), /did not hold/);
+  });
+
+  it("leaves an ordinary incident alone", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "a cause", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
+      evidence: "quiet for an hour",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nfine",
+      usersImpacted: 1,
+      impactQuery: "q",
+    });
+
+    assert.equal(closed.ok, true, closed.error);
+  });
+
+  it("makes a closed incident searchable without waiting for a restart", async () => {
+    const { first, tools } = await recurrencePair();
+    const hits = await tools.searchIncidents({
+      text: "connection pool sized for old traffic",
+    });
+
+    assert.equal(hits.ok, true, hits.error);
+    assert.ok(
+      (hits.data ?? []).some((hit) => hit.incidentId === first),
+      "the index is written in the same transaction as the close",
+    );
+  });
+});

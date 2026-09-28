@@ -87,13 +87,19 @@ not is [`github-app.md`](./github-app.md).
 ## Schema changes
 
 `db/schema.sql` runs as `CREATE TABLE IF NOT EXISTS` over a restored S3
-snapshot. There is no migration runner.
+snapshot. There is no migration runner, so editing a `CREATE TABLE` body
+changes only a database that does not exist yet.
 
-- Adding a **column** is fine.
-- Adding a **`CHECK` constraint** is not. SQLite cannot add one to an
-  existing table, so it needs a table rebuild that does not exist here. The
-  cross-field constraints landed while the database was empty; that window
-  closes the moment anything is routed at this.
+- Adding a **column** takes two edits, not one. Declare it in `schema.sql`,
+  which is what a fresh database gets, and add it to `LATE_COLUMNS` in
+  `db/index.ts`, which is what every database that already exists gets. Miss
+  the second and the column is absent in prod while the suite stays green,
+  because a test opens a new file and prod restores a snapshot.
+- Adding a **`CHECK` constraint** is not possible at all. SQLite cannot add
+  one to an existing table, so it needs a table rebuild that does not exist
+  here. The cross-field constraints landed while the database was empty; that
+  window closes the moment anything is routed at this. Enforce it at the tool
+  instead, and say so where the column is declared.
 
 ## Testing
 

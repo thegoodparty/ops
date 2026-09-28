@@ -100,11 +100,56 @@ model is advisory about the match; `applyRules` holds the invariants. It
 cannot suppress a cause the alert did not declare as suppressible, and it
 cannot attach across `RESOLVED`.
 
+It also asks the other half of the question: has an incident that already
+claimed this problem was over come back? Split on whether the answer is a fact
+or a judgement.
+
+One indexed read before the call matches `(source, sourceId)`. Inside a
+two-week window of that resolution it is stamped as `recurrenceOf` in code —
+the same alert returning is a fact about the delivery, not an opinion about
+the problem. A failed lookup reaches the model as `RECURRENCE CANDIDATES
+UNAVAILABLE`, under the same rule as prefetched evidence: "we did not check"
+must never read as "we checked and found nothing".
+
+`search_incidents` covers what no key can. FTS5 over the post-mortems, root
+causes and resolution evidence of every RESOLVED or CLOSED incident, offered
+as a tool because a search needs a query and only something that has read the
+signal can write one. It is how the same cause returning through a *different*
+alert is found, which is the premature close most worth catching and the one
+a structural key is blind to. The agent has the same tool.
+
+A recurrence opens a **new incident pointing at the old one**, never a reopen.
+`RESOLVED` and `CLOSED` are claims with timestamps attached, and two of the
+`CHECK` constraints above mean a reopen can only be done by clearing
+`resolvedAt` and `closedAt` — deleting the numbers the recurrence disproves,
+along with the only shape that can answer "how often does a resolution hold".
+
 **4. Dispatch** (`dispatcher/`) launches one agent per incident, up to 15.
 That cap is a circuit breaker, not a scheduler — hitting it means something
 is wrong. Ticks are serialized against each other: a tick awaits an S3 put
 and an STS call before recording a launch, so overlapping ticks would start
 two children on one incident, and both would write the same session file.
+
+When an incident carries `recurrenceOf`, `get_incident` returns the earlier
+incident with it: root cause, resolution evidence, PR urls and post-mortem.
+Somebody already investigated this and wrote down what they concluded, and the
+new incident is the proof they were wrong — so the agent starts from that
+rather than rediscovering it.
+
+**A recurrence carries a second question**, and closing it answers both.
+`report_analysis` takes a `recurrence` argument that is required whenever
+`recurrenceOf` is set and refused without one: which of six kinds of failure
+let the earlier resolution stand, why, and what changed so it does not happen
+again. One of the six is `bugboss_defect` — the fix belongs in this
+repository rather than the product — and that answer is posted to the channel
+rather than left in a column, because "BugBoss let a premature close happen"
+reaching nobody is the same failure one level up. Agents do not open pull
+requests against `ops`, so a defect leaves here as a proposal for a person.
+
+That constraint is the one `CLOSED` would carry if the schema could still
+take a `CHECK`. It cannot, so it is refused at the tool instead — and an
+agent that cannot answer has `hand_off`, which is the right end for a
+recurrence nobody can explain.
 
 **5. The agent** (`agent/`) runs Pi against Bedrock in the same container.
 It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP
@@ -168,10 +213,11 @@ minted per launch; the incident is derived from the token and then checked
 against the path, so a valid token for incident A cannot be aimed at B. That
 check is what keeps fifteen concurrent agents out of each other's incidents.
 
-Five state-changing tools, each a transition:
+Five state-changing tools, each a transition, plus two reads:
 
 | Tool | Transition |
 | --- | --- |
+| `search_incidents` | None. Text search over closed incidents' post-mortems |
 | `report_root_cause` | `INVESTIGATING → FIXING`. Triggers correlation, splits the unexplained |
 | `report_impact` | Repeatable; impact grows during an incident |
 | `report_resolved` | `FIXING → RESOLVED`, with evidence |
