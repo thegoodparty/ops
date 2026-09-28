@@ -763,6 +763,15 @@ type HumanReply = Extract<Directive, { type: "human_message" }>;
  * agent reads as context, but ending the wait on it sends an investigation
  * down whatever an offhand remark happened to say. Who a message was for is
  * read by `slack/intent.ts` and recorded on the directive.
+ *
+ * An allow-list rather than "not `others`", because `Addressed` has a third
+ * label and it is the one the read is coached to prefer. `slack/intent.ts`
+ * tells the model to answer `unclear` over a wrong `agent` on the grounds
+ * that being unsure "costs somebody re-sending one sentence" -- which is only
+ * true if `unclear` does not end the wait. A deny-list makes that sentence a
+ * lie for whichever producer forgets to collapse the label, and a directive
+ * arrives here as `JSON.parse` of a row rather than as a checked type, so the
+ * label this acts on is whatever was written.
  */
 export const firstReplyAfter = (
   pending: PendingDirective[],
@@ -772,7 +781,11 @@ export const firstReplyAfter = (
     .filter((entry): entry is { id: number; directive: HumanReply } =>
       entry.directive.type === "human_message",
     )
-    .filter((entry) => entry.directive.addressed !== "others")
+    .filter(
+      (entry) =>
+        entry.directive.addressed === "agent" ||
+        entry.directive.addressed === undefined,
+    )
     .filter((entry) => directiveTimestampMillis(entry.directive.ts) > askedAt)
     .sort(
       (a, b) =>

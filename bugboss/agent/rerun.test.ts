@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
+import { Db } from "../db";
+import { createMemoryS3 } from "../index";
+import { createToolApiRoutes } from "../http/toolapi";
+import { mintAgentToken } from "../toolapi";
+import { createBossClient } from "./run";
+import type { ToolApi } from "../types";
 import {
   MAX_RERUNS_PER_INCIDENT,
   RERUN_SUSPICION_LIMIT,
@@ -28,7 +37,7 @@ const aRun = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView => ({
 
 interface Harness {
   github: GitHubRunsPort;
-  thread: { post: (message: string) => Promise<void> };
+  thread: { postNotice: (message: string) => Promise<void> };
   attempted: Set<string>;
   posts: string[];
   reruns: string[];
@@ -55,7 +64,7 @@ const harness = (options: {
       },
     },
     thread: {
-      post: async (message: string) => {
+      postNotice: async (message: string) => {
         if (options.postFails) throw new Error(options.postFails);
         posts.push(message);
       },
@@ -106,7 +115,7 @@ test("the attempt bound survives a replay, because it is read from GitHub", asyn
   const reruns: string[] = [];
   const deps = {
     attempted: new Set<string>(),
-    thread: { post: async () => {} },
+    thread: { postNotice: async () => {} },
     github: {
       getRun: async (): Promise<GitHubResult<WorkflowRunView>> => ({
         ok: true,
@@ -536,4 +545,81 @@ test("a workflow name short enough to read is left alone", () => {
 
   assert.match(notice, /\|E2E>/);
   assert.doesNotMatch(notice, /…/);
+});
+
+/**
+ * The wiring, not the tool. `runRerunFailedJobs` is honest about needing a
+ * port that does not seal; whether the one it is handed at launch is that
+ * port is a fact about `agent/run.ts` and the `/thread` route, so this drives
+ * all three.
+ *
+ * The state under test is the one `contact_human` leaves when Slack throws
+ * between recording the marker and posting the ask: a `pending_question` row
+ * with a blank `messageTs`. That blank is the only thing telling the next
+ * attempt to post the question again. Anything that fills it in makes a
+ * question nobody was ever asked look sent, and the agent then waits out its
+ * whole timeout on it -- quietly, which is the failure mode this repo does
+ * not allow.
+ */
+test("the re-run notice does not seal a question whose Slack post never landed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bugboss-rerun-"));
+  const incidentId = "inc-rerun";
+  const secret = "test-secret";
+  const db = await Db.open({
+    path: join(dir, "test.db"),
+    bucket: "bugboss-test",
+    key: "db/test.db",
+    s3: createMemoryS3(),
+  });
+
+  try {
+    await db.withWrite((w) => {
+      w.prepare(
+        "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES (?, 'INVESTIGATING', 'agent', ?)",
+      ).run(incidentId, 1_000_000);
+      w.prepare(
+        `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
+         VALUES (?, '', ?, ?)`,
+      ).run(incidentId, 1_000_000, "Shall I roll the deploy back?");
+    });
+
+    const app = createToolApiRoutes({
+      db,
+      tokenSecret: secret,
+      toolApiFor: () => ({}) as unknown as ToolApi,
+      slack: {
+        post: async () => ({ ts: "ts-rerun-notice" }),
+        postChoice: async () => ({ ts: "ts-choice" }),
+      },
+      now: () => 2_000_000,
+    });
+
+    const thread = createBossClient({
+      baseUrl: "http://boss.local",
+      incidentId,
+      authToken: mintAgentToken(secret, { incidentId, attempt: 1 }, 3600),
+      fetchImpl: ((input: string, init?: RequestInit) =>
+        app.fetch(new Request(input, init))) as typeof fetch,
+    });
+
+    const result = await runRerunFailedJobs(args, {
+      github: harness().github,
+      thread,
+      attempted: new Set<string>(),
+    });
+
+    assert.equal(result.started, true);
+    assert.equal(result.postError, null, "the notice reached the thread");
+    assert.equal(
+      db.get<{ messageTs: string }>(
+        "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+        [incidentId],
+      )?.messageTs,
+      "",
+      "and the undelivered question still looks undelivered, so it is asked again",
+    );
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
