@@ -111,13 +111,62 @@ It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP
 toolset, and a scoped token for the Boss's loopback API. It investigates,
 fixes, opens a PR, waits for a merge and a deploy, and writes a post-mortem.
 
+## The human boundary
+
+Everything a person says to BugBoss is a sentence, not a command. There is no
+slash command, no button and no phrase to learn: inbound Slack text is read
+by a bounded model call (`slack/intent.ts`) which answers one label, and
+that is the only thing in this system that reads what a person wrote.
+
+Two interfaces use it. In an incident thread it answers two things about one
+message: whether it hands the incident between a person and an agent, and
+whether it was for the agent at all. On a mention anywhere else it answers
+whether somebody is reporting something broken or asking a question — the two
+things a mention can be, and previously the difference between a first word of
+`report` and any other first word.
+
+The second question exists because `contact_human` ends its wait on the first
+reply after its question, so two people talking to each other while an agent
+was blocked ended it on whichever of them spoke first. A message somebody sent
+to the thread rather than to the agent is still recorded and still delivered;
+it just cannot end a wait. An explicit `@bugboss` overrides the read and
+always means "this is for you", decided in code so it survives the model being
+down.
+
+It is advisory, on the same split as triage. The model reads the sentence;
+the code holds the invariants. A wrong read is bounded structurally rather
+than by the model behaving: the incident comes from the thread the message
+arrived in and never from the message, the answer is a bare enum with no
+field that could name one, and the ownership move is still the guarded
+`UPDATE` in the composition root. An ambiguous read asks in the thread, and a
+failed call says the read failed. Nothing goes quiet, which is what the old
+string matchers did whenever somebody phrased it their own way.
+
+The read runs off the Slack ack, beside the Slack agent, for the reason the
+webhook acknowledges before it works.
+
 ## The agent boundary
 
-An agent reaches incident state through **one HTTP API on loopback**, with a
-bearer token minted per launch. The incident is derived from the token and
-then checked against the path, so a valid token for incident A cannot be
-aimed at B. That containment matters because the agent reads
-attacker-writable log lines for a living.
+An agent is a child process of the Boss, running as the same user. It
+resolves the task role through the container credential provider, exactly as
+its parent does, so whatever the Boss can reach in AWS an agent can reach
+too. There is no privilege boundary inside the container — a child can read
+the parent's own environment — so anything claimed at that line would be a
+claim rather than a control.
+
+The boundary that is real is the task. This container holds no database
+credentials, no deploy role and no merge rights. Its AWS identity reads logs,
+metrics and ECS state, calls Bedrock, and writes its own bucket; it cannot
+reach RDS, the release path, or any secret but its own. The GitHub App opens
+pull requests and cannot merge one, enforced by branch protection on `main`
+rather than by the prompt. So every effect an agent can have on the platform
+arrives as a pull request a human approves.
+
+The loopback API is the **interface** to incident state, not a fence around
+it. Every transition is one HTTP call on `127.0.0.1` carrying a bearer token
+minted per launch; the incident is derived from the token and then checked
+against the path, so a valid token for incident A cannot be aimed at B. That
+check is what keeps fifteen concurrent agents out of each other's incidents.
 
 Five state-changing tools, each a transition:
 
@@ -139,9 +188,15 @@ saturating context on polling:
   hours when the person does not turn up, backing off 1h/2h/4h and then
   handing the incident over; without it the wait is silent, because nobody is
   being asked for anything
-- `contact_human(message, timeout)` — post to the thread and block for a
-  reply. Re-entrant: the marker is written before the post, so a resumed
-  agent resumes waiting rather than asking twice
+- `contact_human(message, details, timeout, options?)` — post to the thread
+  and block for a reply that was **for the agent**; see "The human boundary".
+  Re-entrant: the marker is written before the post, so a resumed agent
+  resumes waiting rather than asking twice. `details` is a second, separate
+  post underneath the ask, so evidence is available without being the first
+  thing read. `options` render as buttons on the ask; pressing one is recorded
+  and delivered as an ordinary reply, typing something else always works, and
+  a button nobody presses is an unanswered question like any other. A wait
+  nobody answers becomes a `hand_off`
 
 ### How an agent learns things changed
 
@@ -169,6 +224,25 @@ expire.
 Every merge to ops `main` restarts this container, so resume is the normal
 path, not the exceptional one.
 
+**An agent also keeps a written record, in a directory that outlives the
+restart.** The transcript records what an agent said; it does not give it a
+cheap place to keep what it worked out. `/work/<id>/notes/` is mirrored to
+`sessions/incident/<id>/notes/` on the same `turn_end` hook as the session and
+restored before the next one starts, so a ruled-out ledger survives a redeploy
+and costs nothing in context until the agent reads it back.
+
+The mirror is **append-only, and has no delete in it**. Those notes are the
+record of the work — for the next launch, for the thread, and for whoever
+opens the incident again later — and a dead end is the most useful thing in
+there. Agents are not asked to tidy up after themselves, and nothing in their
+path can remove an object from this bucket. Deleting would not reclaim
+anything anyway: the bucket is versioned and nothing under `sessions/`
+expires, so a delete writes a marker over a version that stays.
+
+That puts the bound on the record rather than on the directory, since a
+rename leaves the old key behind. Crossing it stops the mirror loudly, and
+deleting is not the way back.
+
 ## Layout
 
 | Directory | What |
@@ -179,7 +253,7 @@ path, not the exceptional one.
 | `dispatcher/` | Launch, deadlines, escalation, the circuit breaker |
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
 | `bedrock/` | A Pi provider over Bedrock `InvokeModel` |
-| `slack/` | Outbound relay and the read-only Slack agent |
+| `slack/` | Outbound relay, inbound intent, and the read-only Slack agent |
 | `http/` | Public routes and the loopback tool API |
 | `db/` | SQLite, and the S3 mirror |
 | `index.ts` | The composition root. The only place real services are named |
@@ -203,3 +277,14 @@ results.
 **Tokens, not dollars.** Pricing moves; a stored dollar figure would be a
 guess frozen at write time, while tokens plus `modelId` multiply out
 correctly whenever asked.
+
+**Usage is read back off the session file**, after the child exits, by
+`sumSessionUsage`. Pi writes a turn's usage nested at `message.usage` and
+writes the billed non-turn calls -- compaction's summarization, a cache warm
+-- at the top level, so both are summed. The totals are absolute over the
+whole file, which is what makes resume correct: a relaunched agent appends to
+the restored file, so re-reading it counts every launch exactly once. Turns
+are counted alongside the tokens because a turn that reached the model always
+spends some, so turns above zero with tokens at zero means the reader has
+drifted from what Pi writes, and the Boss alarms rather than storing a free
+incident.

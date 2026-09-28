@@ -44,6 +44,7 @@ import {
 import { verifyAgentToken } from "./token";
 import {
   bullets,
+  escape,
   link,
   mrkdwn,
   raw,
@@ -91,6 +92,22 @@ export interface Correlator {
 /** Job 5. The Boss posts status transitions; the agent posts its own work. */
 export interface ThreadPoster {
   post(threadTs: string | null, text: string): Promise<{ ts: string }>;
+  /**
+   * A link to one message, which is the only way a thread can point at
+   * another one. Slack builds it from the workspace domain, so it is an API
+   * call and not string concatenation.
+   */
+  permalink(messageTs: string): Promise<string>;
+  /**
+   * Open a Slack thread for every open incident that has none yet.
+   *
+   * A split creates incidents inside the same transaction as the transition,
+   * and their threads are opened afterwards by the relay. Without this the
+   * message telling the new incident where it came from would have nowhere
+   * to go and the one telling the old incident where its signals went would
+   * have nothing to link to.
+   */
+  openThreads(): Promise<unknown>;
 }
 
 /** Pre-fetched evidence, which lives in S3 rather than on the incident row. */
@@ -214,9 +231,19 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    * consecutive messages instead of being cut mid sentence.
    */
   const notify = async (incident: Incident, text: string): Promise<boolean> => {
+    // The thread is looked up here rather than taken from the row the caller
+    // is holding. Every transition reads its incident before it writes, and a
+    // thread can be opened in between -- openThreads does exactly that during
+    // a split. A stale null posts at the top of the channel, where nothing
+    // groups it with the incident and Slack still answers ok.
+    const threadTs =
+      db.get<{ slackThreadTs: string | null }>(
+        "SELECT slackThreadTs FROM incident WHERE id = ?",
+        [incident.id],
+      )?.slackThreadTs ?? incident.slackThreadTs;
     try {
       for (const part of splitForSlack(text)) {
-        await slack.post(incident.slackThreadTs, part);
+        await slack.post(threadTs, part);
       }
       return true;
     } catch (err) {
@@ -225,6 +252,162 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         error: String(err),
       });
       return false;
+    }
+  };
+
+  /**
+   * A reference to another incident's thread, as mrkdwn. Both branches are
+   * escaped already, so interpolate it with raw().
+   *
+   * Losing the link is not losing the message: a thread nobody can find is
+   * what this is here to fix, so a permalink that fails says so and the
+   * sentence still reads.
+   */
+  const threadRef = async (
+    incident: Incident | undefined,
+    label: string,
+  ): Promise<string> => {
+    if (!incident?.slackThreadTs) return escape(label);
+    try {
+      return link(await slack.permalink(incident.slackThreadTs), label);
+    } catch (err) {
+      alarm("permalink_failed", { incidentId: incident.id, error: String(err) });
+      return escape(label);
+    }
+  };
+
+  /**
+   * Both sides of a merge, written for somebody who has never used this
+   * system and is reading one of these threads at 2am.
+   *
+   * The absorbed incident's thread is the half that cannot be skipped. After
+   * this it is never written to again, and a thread that simply goes quiet
+   * forever is indistinguishable from the Boss having died -- which is what
+   * the reader is left to guess when the only message goes to the other
+   * thread.
+   *
+   * The merge is already committed and durable by the time this runs, so a
+   * post that fails alarms inside notify and the rest still goes out. A
+   * notification is not worth rolling a re-partition back for.
+   */
+  const announceMerge = async (result: AssignResult): Promise<void> => {
+    const into = readIncident(result.target);
+    if (!into) {
+      alarm("merge_target_gone", {
+        target: result.target,
+        merged: result.merged,
+      });
+      return;
+    }
+
+    for (const absorbedId of result.merged) {
+      const absorbed = readIncident(absorbedId);
+      const why = toMrkdwn(result.reason);
+      // Both links before either post. Each falls back on its own, and
+      // resolving them up front is what lets the order below be the only
+      // thing deciding which message survives a Slack failure.
+      const absorbedRef = await threadRef(
+        absorbed,
+        `incident ${absorbedId}'s thread`,
+      );
+      const intoRef = await threadRef(
+        into,
+        `incident ${result.target}'s thread`,
+      );
+
+      // The absorbed thread goes first. It is the one that is never written
+      // to again, so if only one of these two lands it has to be that one:
+      // the alternative is a surviving thread announcing that a thread is
+      // closing while that thread says nothing and simply stops.
+      if (absorbed?.slackThreadTs) {
+        await notify(
+          absorbed,
+          [
+            mrkdwn`*This incident is the same problem as incident ${result.target}, so the two have been merged*`,
+            why,
+            mrkdwn`_This is the last message in this thread · everything from here, including the fix and the post-mortem, is in ${raw(intoRef)}._`,
+          ].join("\n"),
+        );
+      } else {
+        // Nobody is left reading a thread that was never opened, so this is
+        // not a lost message so much as evidence of one that was: an
+        // incident reached a merge without the thread every incident gets.
+        alarm("absorbed_thread_missing", {
+          incidentId: absorbedId,
+          into: result.target,
+        });
+      }
+
+      await notify(
+        into,
+        [
+          mrkdwn`*Incident ${absorbedId} is the same problem as this one, so the two have been merged*`,
+          why,
+          mrkdwn`_Nothing further will be posted in ${raw(absorbedRef)} · updates for both incidents arrive here from now on._`,
+        ].join("\n"),
+      );
+    }
+  };
+
+  /**
+   * Both sides of a split, which asks the same two questions a merge does
+   * from the other end: where did these signals go, and where did this
+   * incident come from. A thread that opens with no answer to the second
+   * reads as an incident that appeared out of nowhere.
+   */
+  const announceSplit = async (
+    source: Incident,
+    splits: AssignResult[],
+  ): Promise<void> => {
+    // The incidents this call just created have no thread yet, and a thread
+    // that does not exist can be neither linked nor posted into.
+    try {
+      await slack.openThreads();
+    } catch (err) {
+      alarm("split_threads_unopened", {
+        incidentId: source.id,
+        error: String(err),
+      });
+    }
+
+    // Re-read after opening threads. The row this was called with was read
+    // before the transition, and the incident being split can be the one
+    // openThreads just gave a thread to -- in which case the stale copy sends
+    // its own announcement to the top level and leaves the back-link blank.
+    const from = readIncident(source.id) ?? source;
+
+    const one = splits.length === 1;
+    const refs = await Promise.all(
+      splits.map((split) =>
+        threadRef(readIncident(split.target), `incident ${split.target}`),
+      ),
+    );
+
+    await notify(
+      from,
+      [
+        mrkdwn`*${splits.length} signal${one ? "" : "s"} left this incident, because its root cause does not explain ${one ? "it" : "them"}*`,
+        mrkdwn`_Now worked separately as ${raw(refs.join(", "))}, with a new agent on ${one ? "it" : "each"} · this incident keeps the signals its root cause does explain._`,
+      ].join("\n"),
+    );
+
+    for (const split of splits) {
+      const born = readIncident(split.target);
+      if (!born?.slackThreadTs) {
+        alarm("split_thread_missing", {
+          incidentId: split.target,
+          from: from.id,
+        });
+        continue;
+      }
+      await notify(
+        born,
+        [
+          mrkdwn`*This incident was split out of incident ${from.id}*`,
+          mrkdwn`Incident ${from.id} found a root cause that does not account for what is here, so this is worked on its own from now on.`,
+          mrkdwn`_A separate agent is on this one · incident ${from.id} carries on in ${raw(await threadRef(from, "its own thread"))}._`,
+        ].join("\n"),
+      );
     }
   };
 
@@ -444,12 +627,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (splits === null) return raced(incidentId, "reportRootCause");
       splits.forEach(logAssign);
 
-      if (splits.length > 0) {
-        await notify(
-          incident,
-          mrkdwn`*Root cause on ${incidentId} does not explain ${splits.length} attached signal${splits.length === 1 ? "" : "s"}*\n_Split out as ${splits.map((s) => s.target).join(", ")}._`,
-        );
-      }
+      if (splits.length > 0) await announceSplit(incident, splits);
 
       // Correlation runs after the transition is durable. It is the Boss's
       // job and a failure in it must not cost the agent its root cause.
@@ -483,12 +661,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         .map((o) => o.result);
       applied.forEach(logAssign);
 
-      for (const merge of applied) {
-        await notify(
-          incident,
-          mrkdwn`*Merged ${merge.merged.join(", ")} into ${merge.target}*\n${raw(toMrkdwn(merge.reason))}`,
-        );
-      }
+      for (const merge of applied) await announceMerge(merge);
 
       return {
         ok: true,
@@ -582,12 +755,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (splits === null) return raced(incidentId, "reportResolved");
       splits.forEach(logAssign);
 
-      if (splits.length > 0) {
-        await notify(
-          incident,
-          mrkdwn`*Resolving ${incidentId} left ${splits.length} signal${splits.length === 1 ? "" : "s"} its root cause never explained*\n_Split out as ${splits.map((s) => s.target).join(", ")}._`,
-        );
-      }
+      if (splits.length > 0) await announceSplit(incident, splits);
 
       await notify(
         incident,

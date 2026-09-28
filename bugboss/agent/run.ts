@@ -31,6 +31,20 @@ import {
   type PendingQuestion,
 } from "./tools";
 import {
+  createNotesSync,
+  notesPrefixFor,
+  notesOverLimitMessage,
+  notesSyncExtension,
+  notesSyncFailedMessage,
+  restoreNotesDir,
+  NOTES_DIR_NAME,
+  NOTES_LIMITS,
+  NOTES_SYNC_FAILURE_LIMIT,
+  type NoteRecord,
+  type NotesStore,
+  type NotesSync,
+} from "./notes";
+import {
   createSessionSync,
   createS3SessionStore,
   readStoredPrefixFromFile,
@@ -55,6 +69,13 @@ export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "wri
 export interface AgentPaths {
   workDir: string;
   checkout: string;
+  /**
+   * The agent's own scratch directory. A sibling of the checkout rather than
+   * a folder inside it: anything under the checkout shows up in `git status`
+   * and is one `git add -A` away from being in the pull request the agent
+   * asks a human to merge.
+   */
+  notesDir: string;
   sessionDir: string;
   sessionFile: string;
   npmCiLog: string;
@@ -69,6 +90,7 @@ export const computePaths = (workRoot: string, incidentId: string): AgentPaths =
   return {
     workDir,
     checkout,
+    notesDir: join(workDir, NOTES_DIR_NAME),
     sessionDir,
     sessionFile: sessionFileFor(sessionDir, incidentId),
     npmCiLog: join(workDir, "npm-ci.log"),
@@ -201,7 +223,8 @@ export const createBossClient = (args: {
     recordWait: (command) => call<PendingWait>("POST", "/pending-wait", { command }),
     recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
     clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
-    post: (message) => call<void>("POST", "/thread", { message }).then(() => undefined),
+    post: (message, options) =>
+      call<void>("POST", "/thread", { message, options }).then(() => undefined),
     // Same thread, but it does not seal an outstanding question's marker. A
     // harness nudge landing on a blank one would make a question whose Slack
     // post had failed look sent.
@@ -448,7 +471,7 @@ export interface RunIncidentAgentOptions {
    */
   workingHours?: WorkingHours;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
-  store?: SessionStore;
+  store?: SessionStore & NotesStore;
   api?: BossClient;
   skipClone?: boolean;
 }
@@ -558,6 +581,32 @@ export const runIncidentAgent = async (
     await cloneOmni(options.omniRepoUrl ?? DEFAULT_OMNI_REPO, paths.checkout);
   }
   const restored = await restoreSessionFile({ store, key, sessionFile: paths.sessionFile });
+  const notesPrefix = notesPrefixFor(key);
+  const notes = await restoreNotesDir({ store, prefix: notesPrefix, dir: paths.notesDir });
+  console.log(
+    JSON.stringify({
+      component: "agent",
+      event: "notes_restored",
+      incidentId: options.incidentId,
+      prefix: notesPrefix,
+      files: notes.fileCount,
+    }),
+  );
+  if (notes.conflicts.length > 0) {
+    // A note that cannot be put back on disk. The record still has it, so this
+    // is the only place anyone learns the agent is starting without part of
+    // its own work -- and the only prompt to go and delete the stale key.
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "notes_restore_conflict",
+        incidentId: options.incidentId,
+        prefix: notesPrefix,
+        entries: notes.conflicts,
+      }),
+    );
+  }
   const pinned = await pinnedSessionModel({
     restored,
     sessionFile: paths.sessionFile,
@@ -597,6 +646,8 @@ export const runIncidentAgent = async (
       model,
       mcp,
       restored,
+      notesPrefix,
+      notesSeen: notes.seen,
       storedPrefix: pinned.storedPrefix,
     });
   } finally {
@@ -607,13 +658,15 @@ export const runIncidentAgent = async (
 const launch = async (args: {
   options: RunIncidentAgentOptions;
   paths: AgentPaths;
-  store: SessionStore;
+  store: SessionStore & NotesStore;
   key: string;
   api: BossClient;
   pi: typeof import("@earendil-works/pi-coding-agent");
   model: Awaited<ReturnType<typeof resolveBedrockModel>>;
   mcp: McpToolset[];
   restored: boolean;
+  notesPrefix: string;
+  notesSeen: Map<string, NoteRecord>;
   storedPrefix: StoredPrefix | null;
 }): Promise<RunIncidentAgentResult> => {
   const { options, paths, store, key, api, pi, model, mcp, restored, storedPrefix } = args;
@@ -635,7 +688,12 @@ const launch = async (args: {
         ...(options.workingHours ? { workingHours: options.workingHours } : {}),
       },
     }),
-    await createContactHumanTool({ contact: api, api, signal: deadlineAbort.signal }),
+    await createContactHumanTool({
+      contact: api,
+      api,
+      escalate: api,
+      signal: deadlineAbort.signal,
+    }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(
     (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
@@ -650,6 +708,8 @@ const launch = async (args: {
         systemPrompt: composeSystemPrompt({
           incidentId: options.incidentId,
           checkoutPath: paths.checkout,
+          notesDir: paths.notesDir,
+          notesLimits: NOTES_LIMITS,
           toolNames,
           npmCiDoneMarker: paths.npmCiDone,
           npmCiFailedMarker: paths.npmCiFailed,
@@ -676,6 +736,14 @@ const launch = async (args: {
     sessionFile: () => sessionManager.getSessionFile(),
   });
 
+  const notesSync = createNotesSync({
+    store,
+    prefix: args.notesPrefix,
+    dir: paths.notesDir,
+    seen: args.notesSeen,
+    limits: NOTES_LIMITS,
+  });
+
   // Assigned once the session exists; the first flush cannot precede it.
   let live: { steer: (message: string) => Promise<unknown> } | null = null;
   const onSyncFailure = (error: Error, streak: number): void => {
@@ -695,6 +763,75 @@ const launch = async (args: {
     }
   };
 
+  // Reported on the edge rather than every turn, for the log as much as for
+  // the steer: the agent cannot act on the same sentence twice, and an error
+  // line repeated once a turn for a day says no more than the first one did
+  // while making the run look like it is failing continuously. Cleared on the
+  // way back under, so a second breach is as loud as the first and an
+  // operator can see it recover.
+  let announcedOverLimit = false;
+  const onNotesFlush = (sync: NotesSync): void => {
+    const error = sync.lastError();
+    if (error) {
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "notes_sync_failed",
+          incidentId: options.incidentId,
+          prefix: args.notesPrefix,
+          streak: sync.failureStreak(),
+          error: error.message,
+        }),
+      );
+      if (sync.failureStreak() === NOTES_SYNC_FAILURE_LIMIT) {
+        void live?.steer(notesSyncFailedMessage(sync.failureStreak())).catch(() => {});
+      }
+    }
+
+    const skipped = sync.skipped();
+    if (skipped.length > 0) {
+      console.warn(
+        JSON.stringify({
+          component: "agent",
+          level: "warn",
+          event: "notes_entries_skipped",
+          incidentId: options.incidentId,
+          entries: skipped,
+        }),
+      );
+    }
+
+    const breach = sync.overLimit();
+    if (!breach) {
+      if (announcedOverLimit) {
+        announcedOverLimit = false;
+        console.log(
+          JSON.stringify({
+            component: "agent",
+            event: "notes_within_limit",
+            incidentId: options.incidentId,
+          }),
+        );
+      }
+      return;
+    }
+    if (announcedOverLimit) return;
+    announcedOverLimit = true;
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "notes_over_limit",
+        incidentId: options.incidentId,
+        totalBytes: breach.totalBytes,
+        fileCount: breach.fileCount,
+        limits: breach.limits,
+      }),
+    );
+    void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
+  };
+
   const settings = pi.SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: reserveTokensFor(model.contextWindow) },
   });
@@ -710,6 +847,7 @@ const launch = async (args: {
     appendSystemPromptOverride: () => [],
     extensionFactories: [
       sessionSyncExtension(sync, onSyncFailure),
+      notesSyncExtension(notesSync, onNotesFlush),
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
       // every thinking block is signed against.
@@ -765,6 +903,8 @@ const launch = async (args: {
     await sync.flush();
     const lost = sync.lastError();
     if (lost) onSyncFailure(lost, sync.failureStreak());
+    await notesSync.flush();
+    onNotesFlush(notesSync);
     error = session.state.errorMessage ?? null;
     session.dispose();
   }
@@ -829,80 +969,9 @@ const keepGitHubTokenFresh = async (): Promise<void> => {
   await configureGitCredentials();
 };
 
-/**
- * Keep the AWS credentials current for the whole run.
- *
- * A role's maximum session duration is twelve hours and an incident can run
- * for a day, so the credentials assumed at launch expire mid-run. Losing
- * them loses Bedrock, which does not degrade the agent, it ends it.
- *
- * The child cannot re-assume for itself — that needs credentials, and the
- * only ones available would be the task role, which can read the secret
- * holding every other credential in the system. So the parent keeps that
- * path and serves the result over the loopback API the child is already
- * authenticated on.
- *
- * Writing them back into `process.env` is enough: the SDK's env provider
- * reads `AWS_CREDENTIAL_EXPIRATION` and re-resolves from the environment
- * once it passes, so a client built at startup picks up the new values
- * without being rebuilt.
- */
-const keepAwsCredentialsFresh = async (
-  baseUrl: string,
-  incidentId: string,
-  token: string,
-): Promise<void> => {
-  const url = `${baseUrl.replace(/\/$/, "")}/incidents/${incidentId}/aws-credentials`;
-  const refresh = async () => {
-    try {
-      const res = await fetch(url, {
-        headers: { authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) throw new Error(`boss returned ${res.status}`);
-      const body = (await res.json()) as {
-        accessKeyId?: string;
-        secretAccessKey?: string;
-        sessionToken?: string;
-        expiresAt?: number;
-      };
-      if (!body.accessKeyId || !body.secretAccessKey || !body.sessionToken) {
-        throw new Error("boss returned no credentials");
-      }
-      process.env.AWS_ACCESS_KEY_ID = body.accessKeyId;
-      process.env.AWS_SECRET_ACCESS_KEY = body.secretAccessKey;
-      process.env.AWS_SESSION_TOKEN = body.sessionToken;
-      if (body.expiresAt) {
-        process.env.AWS_CREDENTIAL_EXPIRATION = new Date(
-          body.expiresAt,
-        ).toISOString();
-      }
-    } catch (error: unknown) {
-      // Not fatal on its own: the credentials in hand are good until they
-      // expire, and there are many attempts before that.
-      console.error(
-        JSON.stringify({
-          component: "agent",
-          level: "error",
-          event: "aws_credentials_refresh_failed",
-          error: String(error),
-        }),
-      );
-    }
-  };
-  await refresh();
-  setInterval(() => void refresh(), 30 * 60 * 1000).unref();
-};
-
 if (require.main === module) {
   const bootOptions = agentOptionsFromEnv(process.env);
   keepGitHubTokenFresh()
-    .then(() =>
-      keepAwsCredentialsFresh(
-        bootOptions.bossBaseUrl,
-        bootOptions.incidentId,
-        bootOptions.bossAuthToken ?? "",
-      ),
-    )
     .then(() => runIncidentAgent(bootOptions))
     .then(
     (result) => {

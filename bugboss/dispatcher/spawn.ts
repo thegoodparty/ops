@@ -68,8 +68,8 @@ export const createChildProcessSpawn = (
         [cfg.modulePath, ...(cfg.args ?? [])],
         {
           cwd: cfg.cwd,
-          // Passing env explicitly is the scrub: node does not merge it with
-          // the parent's environment.
+          // Passing env explicitly is what makes the allowlist real: node
+          // does not merge it with the parent's environment.
           env: ctx.env,
           stdio: ["ignore", "inherit", "inherit"],
         },

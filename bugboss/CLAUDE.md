@@ -31,6 +31,22 @@ working week. Use `alarm` for a failure nobody asked for and `log` for a
 thing that happened, including a transition a module refused on purpose. An
 alarm that fires during normal operation teaches people to ignore alarms.
 
+**Every interface a person talks to is natural language.** Nothing here
+decides what somebody wants by matching their words against a list. Two
+things did — the ownership claim and the bug-report verb — and both were a
+magic phrase nobody could discover and everybody mistyped, failing silently
+when they did. Intent is a model call (`slack/intent.ts`), advisory the way
+triage is: the model reads the sentence, the code keeps the invariants, and
+an ambiguous read asks in the thread rather than guessing. Who a message was
+for is read the same way, because requiring a tag to answer a direct question
+is the same mistake in the other direction.
+
+An entity check — "does this text contain `<@U…>`", "is this string empty" —
+is not a language interface. One of those is load-bearing: an explicit
+`@bugboss` always means "this is for you", and because code decides that
+rather than the model, it is the escape hatch that still works when the model
+does not.
+
 **Nothing auto-closes.** The Boss may decide an alert needs no incident, but
 every incident ends in an outcome a person can see. A quiet signal is
 evidence an agent reads, never a transition the Boss makes.
@@ -49,9 +65,13 @@ across `withWrite` is a TOCTOU: the write queue serializes behind a
 synchronous S3 PUT, so the window is hundreds of milliseconds. Put the
 predicate in the `UPDATE` and reject on `changes === 0`.
 
-**The agent is untrusted.** It reads attacker-writable log lines for a
-living. Its only route to state is the loopback API with a per-launch token
-scoped to one incident, and its GitHub App cannot merge.
+**The agent is untrusted, and the container is what bounds it.** An agent
+reads attacker-writable log lines for a living, and it runs as a child of the
+Boss with the Boss's own credentials — there is no fence inside the task.
+What holds is outside it: this container reaches no database and no release
+path, and its GitHub App cannot merge. The loopback API is how an agent moves
+incident state, with a per-launch token scoped to one incident so concurrent
+agents cannot reach each other's work.
 
 ## Schema changes
 
