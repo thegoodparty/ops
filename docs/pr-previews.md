@@ -64,8 +64,9 @@ the consumer by a different workflow, and nothing sequences the two.
       and in `ci-roles/policies.ts` about why the other eight stay wildcarded
       is wrong on the facts; `docs/deploy-role-trust.md` records what they
       actually use and plans their narrowing).
-- [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
-      Depends on 4 being applied.
+- [ ] 8. Workbench-side preview role, and a configurable provider role: doing
+      (pi-pr-previews, 2026-09-28). Depends on 4 being applied (it is) and on
+      5 being merged (#101), whose workflow step 9 extends.
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
       applied.
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
