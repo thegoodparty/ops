@@ -882,13 +882,15 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       Resource: "*",
     },
     {
-      Sid: "CertificateDescribe",
+      Sid: "CertificateRead",
       Effect: "Allow",
-      // The describe half of the same lookup. Unlike the list, it is
-      // resource-scoped, so it is its own statement rather than sharing the
-      // `*` above. The data source always describes the certificate it chose,
-      // so this is part of the same call, not a speculative widening.
-      Action: ["acm:DescribeCertificate"],
+      // The read half of the same lookup. The data source describes the
+      // certificate it chose and, because it filters to `ISSUED`, fetches that
+      // certificate's PEM and chain. Both accept the certificate ARN, so they
+      // share one scoped statement. `GetCertificate` returns the public
+      // certificate and chain, not the private key. Part of the same call, not
+      // a speculative widening.
+      Action: ["acm:DescribeCertificate", "acm:GetCertificate"],
       Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
     },
   ],

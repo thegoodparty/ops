@@ -41,7 +41,7 @@ describe("githubActionsPulumiPreview", () => {
   // cannot slip in without failing here.
   it("grants read-only actions and nothing else", () => {
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|List))/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List))/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
@@ -86,7 +86,7 @@ describe("githubActionsPulumiPreview", () => {
     ]);
   });
 
-  it("lists certificates on * but scopes the describe to this account", () => {
+  it("lists certificates on * but scopes the certificate reads to this account", () => {
     const list = githubActionsPulumiPreview.Statement.find((s) =>
       (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
         "acm:ListCertificates"
@@ -96,14 +96,18 @@ describe("githubActionsPulumiPreview", () => {
     // ListCertificates does not accept a resource, so this one cannot narrow.
     assert.equal(list.Resource, "*");
 
-    const describe = githubActionsPulumiPreview.Statement.find((s) =>
+    const read = githubActionsPulumiPreview.Statement.find((s) =>
       (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
         "acm:DescribeCertificate"
       )
     );
-    assert.ok(describe);
+    assert.ok(read);
+    assert.deepEqual(read.Action, [
+      "acm:DescribeCertificate",
+      "acm:GetCertificate",
+    ]);
     assert.equal(
-      describe.Resource,
+      read.Resource,
       "arn:aws:acm:us-west-2:333022194791:certificate/*"
     );
   });
