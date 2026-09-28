@@ -98,18 +98,6 @@ jobs:
               return;
             }
 
-            // Drop any plan from an earlier, mergeable run: with conflicts the
-            // head is not the proposed change, so the plan now misrepresents it.
-            for (const c of comments) {
-              if (
-                c.body &&
-                c.body.includes("<!-- pulumi-preview:") &&
-                !c.body.includes(conflictMarker)
-              ) {
-                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
-              }
-            }
-
             const body = [
               conflictMarker,
               "## Pulumi preview",
@@ -148,35 +136,6 @@ jobs:
               matrix.push({ project: "org", dir: "deploy-org", build: false });
             }
             core.setOutput("value", JSON.stringify(matrix));
-
-      # A project that fell out of the matrix will not run, so a comment from an
-      # earlier run would keep describing a plan this PR no longer contains.
-      # The preview job only deletes its own comment when it runs and finds no
-      # changes, which never happens for a dropped project.
-      - name: Handle dropped projects
-        if: steps.guard.outputs.value != 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          MATRIX: ${{ steps.matrix.outputs.value }}
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
-            const projects = new Set(
-              JSON.parse(process.env.MATRIX).map((m) => m.project)
-            );
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number,
-              per_page: 100,
-            });
-            for (const c of comments) {
-              const match = c.body && c.body.match(/<!-- pulumi-preview:([a-z]+) -->/);
-              if (match && match[1] !== "conflict" && !projects.has(match[1])) {
-                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
-              }
-            }
 
   preview:
     name: ${{ matrix.project }} preview
@@ -226,6 +185,8 @@ jobs:
         working-directory: ${{ matrix.dir }}
         env:
           PROJECT: ${{ matrix.project }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u
           json="/tmp/${PROJECT}.json"
@@ -240,16 +201,17 @@ jobs:
           PULUMI_MODE=preview PULUMI_PREVIEW_JSON="$json" ./deploy.sh \
             > "$diff" 2> "$stderr" || status=$?
 
-          has_changes=false
           has_errors=false
 
           {
+            echo "<!-- pulumi-preview:${PROJECT} -->"
             echo "## Pulumi preview: \`${PROJECT}\`"
+            echo
+            echo "<sub>commit \`${PR_SHA:0:7}\` · [run](${RUN_URL})</sub>"
             echo
           } > "$comment"
 
           if ! jq -e . "$json" >/dev/null 2>&1; then
-            has_changes=true
             has_errors=true
             {
               echo "⛔ **The preview failed before producing a plan** (exit ${status})."
@@ -263,7 +225,6 @@ jobs:
             errors=$(jq '[.diagnostics // [] | .[] | select(.severity == "error")] | length' "$json")
 
             if [ "$errors" -gt 0 ]; then
-              has_changes=true
               has_errors=true
               {
                 echo "⛔ **${errors} error(s) during preview:**"
@@ -276,82 +237,55 @@ jobs:
             fi
 
             if [ "$changes" -gt 0 ]; then
-              has_changes=true
-              {
-                echo "**$(jq -r '.changeSummary | to_entries | map("\(.value) \(.key)") | join(", ")' "$json")**"
-                echo
-                echo "<details><summary>Show full diff</summary>"
-                echo
-                echo '```diff'
-                # GitHub caps a comment at 65536 characters. Leave room for
-                # the rest of the body rather than failing the API call.
-                diff_bytes=$(wc -c < "$diff")
-                if [ "$diff_bytes" -gt 60000 ]; then
-                  head -c 60000 "$diff"
-                  echo
-                  echo "... truncated at 60000 of ${diff_bytes} bytes; the full diff is in the job log."
-                else
-                  cat "$diff"
-                fi
-                echo '```'
-                echo
-                echo "</details>"
-              } >> "$comment"
-            elif [ "$errors" -eq 0 ]; then
+              echo "**$(jq -r '.changeSummary | to_entries | map("\(.value) \(.key)") | join(", ")' "$json")**" >> "$comment"
+            else
               echo "✅ No changes" >> "$comment"
             fi
+
+            # Always show the plan. A successful run should leave the diff on
+            # the PR even when there is nothing to change, so the comment is
+            # evidence the preview ran rather than an absence.
+            {
+              echo
+              echo "<details><summary>Show full diff</summary>"
+              echo
+              echo '```diff'
+              # GitHub caps a comment at 65536 characters. Leave room for
+              # the rest of the body rather than failing the API call.
+              diff_bytes=$(wc -c < "$diff")
+              if [ "$diff_bytes" -gt 60000 ]; then
+                head -c 60000 "$diff"
+                echo
+                echo "... truncated at 60000 of ${diff_bytes} bytes; the full diff is in the job log."
+              else
+                cat "$diff"
+              fi
+              echo '```'
+              echo
+              echo "</details>"
+            } >> "$comment"
           fi
 
-          echo "has_changes=$has_changes" >> "$GITHUB_OUTPUT"
           echo "has_errors=$has_errors" >> "$GITHUB_OUTPUT"
 
-      # One comment per project, identified by a marker in its body. Two
-      # parallel jobs each editing a section of one shared comment would race;
-      # a per-project comment needs no coordination.
-      - name: Post or update comment
+      # Each run posts a new comment, so a project's plan history stays on the
+      # PR. Nothing is edited or deleted; the commit in the header says which
+      # run a plan belongs to.
+      - name: Post comment
         if: steps.preview.outcome == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           COMMENT_FILE: /tmp/${{ matrix.project }}.comment.md
-          HAS_CHANGES: ${{ steps.preview.outputs.has_changes }}
-          MARKER: "<!-- pulumi-preview:${{ matrix.project }} -->"
         with:
           script: |
             const fs = require("fs");
             const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
-            const marker = process.env.MARKER;
-            const comments = await github.paginate(github.rest.issues.listComments, {
+            await github.rest.issues.createComment({
               owner,
               repo,
-              issue_number,
-              per_page: 100,
+              issue_number: context.payload.pull_request.number,
+              body: fs.readFileSync(process.env.COMMENT_FILE, "utf8"),
             });
-            const existing = comments.find((c) => c.body && c.body.includes(marker));
-
-            if (process.env.HAS_CHANGES === "false") {
-              if (existing) {
-                await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
-              }
-              return;
-            }
-
-            const body = `${marker}\n${fs.readFileSync(process.env.COMMENT_FILE, "utf8")}`;
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner,
-                repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number,
-                body,
-              });
-            }
 
       - name: Fail if the preview reported errors
         if: steps.preview.outputs.has_errors == 'true'

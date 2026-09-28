@@ -46,7 +46,7 @@ the consumer by a different workflow, and nothing sequences the two.
       `org`: done (2026-09-25, PR #101. `PULUMI_MODE=preview` in both scripts,
       no `--create` and no `up`; ops reuses the deployed image; the workflow
       assumes `github-actions-pulumi-preview`, skips forks, pins actions by
-      SHA, and posts one marker-identified comment per project. Actions
+      SHA, and posts a marker-identified comment per project per run. Actions
       pinned, YAML and embedded scripts checked, tests green. The first live
       preview after merge settles the state-lock question).
 - [x] 6. Remove AWS credentials from `pull_request` runs of `deploy.yml`:
@@ -232,18 +232,19 @@ bearing, since trust is by `sub` only, but keep it stable):
   skip explicit instead of a confusing failure.
 - `permissions: contents: read, id-token: write, pull-requests: write`.
 - `actions/checkout` with `persist-credentials: false`.
-- One job per project with path filters, each posting its own
-  marker-identified comment, so the parallel jobs never write the same comment.
-  A project that drops out of the matrix has its old comment deleted, since its
-  job no longer runs to clear it.
+- One job per project with path filters. Each run posts a **new**
+  marker-identified comment, with the commit in the header, so a project's plan
+  history stays on the PR; nothing is edited or deleted. A project that drops
+  out of the matrix keeps its last plan, labeled with the commit it ran
+  against, rather than having it removed.
 - Skip when the PR is not mergeable. GitHub cannot build `refs/pull/N/merge`
   for a conflicted PR, so `actions/checkout` would silently fall back to the
   head and the plan would not be the proposed merge. A marker-identified
-  comment says it was skipped, and any plan from an earlier run is deleted.
+  comment says it was skipped; the earlier plans stay as history.
 - Concurrency per PR with `cancel-in-progress: true`, only if the lock check
   in step 4 confirms preview is read-only.
-- Comment handling as omni does it. Pin third-party actions by SHA: this is a
-  public repo and the job holds AWS credentials.
+- Pin third-party actions by SHA: this is a public repo and the job holds AWS
+  credentials.
 - Update `CLAUDE.md` ("PRs run type-checking and builds but skip the deploy
   step"). No `CODEOWNERS` change: the new workflow lands under `/.github/`,
   which is already code-owned.
@@ -351,8 +352,10 @@ decision: step 10 adds only the workbench hop.
 - Does a DIY-backend preview lock? (step 4)
 - Does a change to the workbench provider's role ARN cascade? (step 8)
 - ~~One comment per project or one combined comment?~~ Decided at step 5:
-  one comment per project, marker-identified. Two parallel jobs editing one
-  shared comment would race; a per-project comment needs no coordination.
+  one comment per project. Two parallel jobs editing one shared comment would
+  race; a per-project comment needs no coordination. Revisited after use: each
+  run posts a new comment instead of editing the last one, so the PR keeps a
+  per-commit history of the plans and a clean run still leaves the diff up.
 - Is the passphrase parameter tagged `Environment=prod`? If so,
   `ReadOnlyAccess`'s inline deny blocks it and step 10 needs an exception.
   (step 10)
