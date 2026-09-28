@@ -1,6 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
+import { createPreviewRole } from "./preview-role";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -73,15 +74,32 @@ const WORKBENCH_ACCOUNT_ID = "024901689212";
  */
 const REGION = "us-west-2";
 
+/**
+ * The role the provider assumes into this account.
+ *
+ * Apply uses the admin deploy role. Preview mode sets this to the read-only
+ * `pulumi-preview` in `deploy.sh`, so a PR preview never holds admin here.
+ * `deploy.sh` sets it explicitly either way rather than leaving it to the
+ * default, so a local preview followed by a local apply cannot leave the
+ * preview role in the stack's config and repoint an apply at it.
+ *
+ * The default is the deploy role, so an apply that predates this config is
+ * identical to the hardcoded ARN it replaced. See pr-previews step 8 for the
+ * cascade check: changing `roleArn` was an in-place provider update at step
+ * 10's cutover, not a replacement of the resources behind it.
+ */
+const config = new pulumi.Config();
+const providerRoleName = config.get("providerRoleName") ?? DEPLOY_ROLE_NAME;
+
 const provider = new aws.Provider("workbench", {
   region: REGION,
   assumeRoles: [
     {
-      // DEPLOY_ROLE_NAME rather than a literal: the grant in
-      // deploy/components/ci-roles/policies.ts and the trust in
-      // deploy-role.ts spell the same ARN out, and a drift between the
-      // three is an assume failure that reads as a trust problem.
-      roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/${DEPLOY_ROLE_NAME}`,
+      // The role name comes from config: `pulumi-deploy` for an apply,
+      // `pulumi-preview` for a preview, both set in deploy.sh. The name is
+      // also spelled in the two role files and the grant in
+      // deploy/components/ci-roles/policies.ts has to agree with it.
+      roleArn: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/${providerRoleName}`,
       // Shows up in the workbench account's CloudTrail as the session name.
       // Worth setting for an assume this privileged: it separates the apply
       // from the enable script's assume, which sets its own name.
@@ -334,3 +352,12 @@ const deployRole = createDeployRole({ provider });
 
 /** Evidence for the step 10 entry: the apply log should show this ARN. */
 export const deployRoleArn = deployRole.arn;
+
+// ---------------------------------------------------------------------------
+// The preview role: what a `pulumi preview` assumes after step 8, so a PR
+// never reaches this account as the admin apply role. In its own file for the
+// same reason as the deploy role: the trust is the design record.
+const previewRole = createPreviewRole({ provider });
+
+/** Evidence for the step 8 entry: the apply log should show this ARN. */
+export const previewRoleArn = previewRole.arn;
