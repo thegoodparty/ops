@@ -89,6 +89,12 @@ import {
   type EvidenceStore,
   type ThreadPoster,
 } from "./toolapi";
+import {
+  TEST_DB_ENV_VAR,
+  TEST_DB_READY_DEADLINE_MS,
+  awaitTestDatabase,
+  resolveTestDatabase,
+} from "./testdb";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
 import { sessionKeyFor, sumSessionUsage } from "./agent/session";
@@ -103,6 +109,7 @@ import type {
   RawSignal,
   Signal,
   SignalAdapter,
+  TestDatabase,
   ToolApi,
   TriageDecision,
 } from "./types";
@@ -1414,6 +1421,13 @@ export const createBugBoss = async (
         options.http?.loopbackPort ?? DEFAULT_LOOPBACK_PORT
       }`,
       BUGBOSS_S3_BUCKET: config.s3Bucket,
+      // Only when it resolved. A refused URL is withheld deliberately: with
+      // this unset omni's harness goes back to starting its own container and
+      // says so, which is a better answer for fifteen agents than whatever a
+      // bad URL named.
+      ...(config.testDatabase.state === "configured"
+        ? { [TEST_DB_ENV_VAR]: config.testDatabase.url }
+        : {}),
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
       ...(config.workingHours
         ? { BUGBOSS_WORKING_HOURS: config.workingHours }
@@ -2003,7 +2017,52 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
           })(),
         }
       : {}),
+    testDatabase: resolveTestDatabase(env),
   };
+};
+
+/**
+ * Say, once at boot, whether agents can run omni's database-backed tests.
+ *
+ * The prompt cannot carry this. A thinking block is bound to the system
+ * prompt, so a section that read "the database is up" on the first launch and
+ * something else after a restart would invalidate every block that followed
+ * it. The prompt therefore states the contract and this states the fact, and
+ * the failure an agent actually meets is the one omni's harness reports by
+ * name at the moment a suite runs.
+ *
+ * Never fatal, and there is no container dependency in the task definition
+ * either. An incident system that refuses to start because a test database is
+ * missing is worse than one that works alerts without a local test loop.
+ */
+export const reportTestDatabase = async (
+  testDatabase: TestDatabase,
+  deadlineMs = TEST_DB_READY_DEADLINE_MS,
+): Promise<void> => {
+  if (testDatabase.state === "absent") {
+    log("test_database_absent", { variable: TEST_DB_ENV_VAR });
+    return;
+  }
+  if (testDatabase.state === "refused") {
+    alarm("test_database_refused", { reason: testDatabase.reason });
+    return;
+  }
+
+  // Waits out initdb rather than reading a cold start as a failure. Both
+  // containers start together and Postgres binds TCP last, so a single probe
+  // here would alarm on every deploy.
+  const { host, port } = testDatabase;
+  const probe = await awaitTestDatabase({ host, port }, deadlineMs);
+  if (probe.reachable) {
+    log("test_database_ready", { host, port, waitedMs: probe.waitedMs });
+    return;
+  }
+  alarm("test_database_unreachable", {
+    host,
+    port,
+    waitedMs: probe.waitedMs,
+    error: probe.error,
+  });
 };
 
 /**
@@ -2017,6 +2076,12 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
   const secrets = readSecrets(env);
   const config = bossConfigFromEnv(env);
   if (!secrets.slackBotToken) throw new Error("SLACK_BOT_TOKEN is required");
+  // Started, not awaited. The wait above is up to ninety seconds and alert
+  // ingest is what this container exists for; a test database is never worth
+  // delaying it. Nothing downstream reads the result -- it is a log line.
+  void reportTestDatabase(config.testDatabase).catch((error: unknown) =>
+    alarm("test_database_report_failed", { error: String(error) }),
+  );
 
   return createBugBoss({
     config,

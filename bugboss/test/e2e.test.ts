@@ -16,6 +16,7 @@ import { after, before, mock, test } from "node:test";
 
 import {
   bossConfigFromEnv,
+  reportTestDatabase,
   createBugBoss,
   createMemoryS3,
   installCrashHandlers,
@@ -193,6 +194,7 @@ const config = (path: string): BugBossConfig => ({
   s3Bucket: "bugboss-test",
   dbPath: path,
   slackChannelId: "C0TEST",
+  testDatabase: { state: "absent" },
   dispatcher: {
     maxConcurrentAgents: 15,
     tickSeconds: 30,
@@ -922,6 +924,81 @@ test("the prod-critical allowlist can be delivered in the secret blob", () => {
   // One of exactly three things the design says earns an @, and there is no
   // other way to deliver it: the task definition does not set this.
   assert.deepEqual(cfg.prodCriticalSlugs, ["pro-upgrade-errors", "checkout-5xx"]);
+});
+
+// --- the test database says something, whatever state it is in -------------
+
+const captureConsole = async (
+  run: () => Promise<void>,
+): Promise<{ out: string[]; err: string[] }> => {
+  const out: string[] = [];
+  const err: string[] = [];
+  const realLog = console.log;
+  const realError = console.error;
+  console.log = (line: string) => out.push(line);
+  console.error = (line: string) => err.push(line);
+  try {
+    await run();
+  } finally {
+    console.log = realLog;
+    console.error = realError;
+  }
+  return { out, err };
+};
+
+const baseEnv = {
+  BUGBOSS_BUCKET: "bugboss-prod",
+  BUGBOSS_SLACK_CHANNEL_ID: "C0PROD",
+};
+
+test("a test database URL off loopback is refused and alarmed, never passed on", async () => {
+  // The failure this exists for is a container definition typo, which would
+  // otherwise point fifteen agents' migration replay and DROP DATABASE at a
+  // real cluster.
+  const cfg = bossConfigFromEnv({
+    ...baseEnv,
+    OMNI_TEST_POSTGRES_URL:
+      "postgresql://gpuser:pw@gp-api-db-prod.cluster-x.us-west-2.rds.amazonaws.com:5432/postgres",
+  });
+  assert.equal(cfg.testDatabase.state, "refused");
+
+  const { err } = await captureConsole(() => reportTestDatabase(cfg.testDatabase));
+  assert.equal(err.length, 1);
+  assert.match(err[0], /test_database_refused/);
+  assert.match(err[0], /"level":"error"/);
+});
+
+test("a configured test database nothing answers on alarms rather than passing quietly", async () => {
+  // essential: false means ECS will not tell anyone this container died, so
+  // this is the only place a missing sidecar is noticed at boot.
+  const cfg = bossConfigFromEnv({
+    ...baseEnv,
+    // Reserved for documentation, so nothing is listening and nothing can be.
+    OMNI_TEST_POSTGRES_URL: "postgresql://test_user:pw@127.0.0.1:1/postgres",
+  });
+  assert.equal(cfg.testDatabase.state, "configured");
+
+  // A short deadline rather than the ninety-second default. What is under
+  // test is that silence eventually alarms, not how long it waits first.
+  const { err } = await captureConsole(() =>
+    reportTestDatabase(cfg.testDatabase, 100),
+  );
+  assert.equal(err.length, 1);
+  assert.match(err[0], /test_database_unreachable/);
+  assert.match(err[0], /waitedMs/);
+});
+
+test("no test database at all is said out loud too, at info", async () => {
+  const cfg = bossConfigFromEnv(baseEnv);
+  assert.deepEqual(cfg.testDatabase, { state: "absent" });
+
+  const { out, err } = await captureConsole(() => reportTestDatabase(cfg.testDatabase));
+  assert.deepEqual(err, []);
+  assert.equal(out.length, 1);
+  assert.match(out[0], /test_database_absent/);
+  // Names the variable, so the log says what to set and not merely that
+  // something is missing.
+  assert.match(out[0], /OMNI_TEST_POSTGRES_URL/);
 });
 
 // --- the process does not die quietly --------------------------------------

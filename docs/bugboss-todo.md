@@ -53,16 +53,11 @@ copy.
 
 ## Open questions and known gaps
 
-- **Agents cannot run DB-backed tests — no container runtime.** ECS Fargate
-  has no Docker socket, so testcontainers cannot start a database. Four
-  options were framed and none chosen yet: a Postgres sidecar in the task
-  definition (Fargate-native, but up to 15 agents share one task so isolation
-  is the hard part); a remote Docker host via `DOCKER_HOST` (works
-  unmodified, but a Docker daemon is root-equivalent on that host and the
-  agent is explicitly untrusted — a genuinely new capability, not one it
-  already has); Testcontainers Cloud; or accepting that CI runs the full
-  suite and making that loop faster, which is now more viable since the agent
-  has `actions: write` and can re-run jobs itself.
+- **A top-level `bugboss/*.test.ts` never runs.** `npm test`'s glob is
+  `bugboss/**/*.test.ts`, which `sh` expands as `bugboss/*/*.test.ts`. A test
+  file at the top of `bugboss/` is silently skipped. Verified with a canary.
+  Every test today is in a subdirectory, so nothing is being missed — but the
+  next person to add one at the top level loses it with no error.
 - **The custom Bedrock `InvokeModel` provider is not in the path.** Live
   sessions show `"api":"bedrock-converse-stream"` and **zero thinking-block
   signatures**. The provider exists specifically because Converse drops
@@ -92,6 +87,20 @@ copy.
   messages at 7–98.
 - The GitHub App is installed on **all** org repos (`repository_selection:
   all`), which is wider than the agent's prompt claims.
+
+## Decided
+
+- **Agents run omni's DB-backed tests against a Postgres sidecar** in the
+  BugBoss task, reachable on loopback because containers in one task share a
+  network namespace. Chosen over a remote Docker host (root-equivalent on a
+  persistent host, for an agent that reads attacker-writable log lines —
+  a genuinely new capability rather than one it already had), Testcontainers
+  Cloud (a vendor, a credential, and the same capability moved elsewhere) and
+  CI-only (still the authority, but a ~14 minute loop per iteration). It costs
+  nothing: the task already bills for 4 vCPU and 16 GB. Isolation across the
+  fifteen agents is omni's harness, unchanged — it was already built for
+  concurrent checkouts on one machine. Needs the companion omni PR that lets
+  the harness take a Postgres it did not start.
 
 ## Deploy state
 

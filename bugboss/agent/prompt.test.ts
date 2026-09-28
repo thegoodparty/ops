@@ -18,6 +18,7 @@ import {
 } from "./prompt";
 import { NOTES_LIMITS } from "./notes";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { TEST_DB_ENV_VAR } from "../testdb";
 
 const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
   incidentId: "inc-42",
@@ -232,4 +233,26 @@ test("the prompt does not understate how far the GitHub token reaches", () => {
   // wrong about. See bugboss/github-app.md.
   assert.doesNotMatch(prompt, /omni and nothing\s+else/);
   assert.match(prompt, /every repository in the thegoodparty/);
+});
+
+test("the prompt names the variable a database failure will be reported under", () => {
+  // The one thing that stops an agent reading a connection error as a failing
+  // test and editing code that is fine. It is the same constant the Boss puts
+  // in the child environment, so the two cannot drift.
+  const prompt = composeSystemPrompt(input());
+
+  assert.ok(prompt.includes(TEST_DB_ENV_VAR));
+  assert.match(prompt, /infrastructure, not your change/);
+});
+
+test("the prompt says there is no container runtime", () => {
+  // An agent told only "run the tests" reaches for docker, gets an error that
+  // reads like a broken checkout, and spends turns on it.
+  assert.match(composeSystemPrompt(input()), /no container runtime here/);
+});
+
+test("the test guidance carries the incident's own checkout path", () => {
+  const prompt = composeSystemPrompt(input({ checkoutPath: "/work/inc-7/omni" }));
+
+  assert.ok(prompt.includes("/work/inc-7/omni/packages/gp-api"));
 });
