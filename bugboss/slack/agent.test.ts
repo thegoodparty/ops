@@ -7,8 +7,15 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
+// The turn loop this agent runs on is named in the composition root, next to
+// the Bedrock client it drives. Its behaviour is the Slack agent's behaviour,
+// so it is tested here with the rest of that surface.
+import { createSlackAgentModel } from "../index";
+import type { ModelClient, ModelReply, ModelRequest } from "../triage";
 import {
   MAX_SQL_ROWS,
+  SLACK_AGENT_BUDGET_MS,
+  SLACK_AGENT_MAX_TURNS,
   SLACK_AGENT_SYSTEM,
   SlackAgent,
   assertReadOnlySql,
@@ -18,6 +25,7 @@ import {
   slackSessionPrefix,
   type ObjectStore,
   type SlackAgentRun,
+  type SlackAgentTool,
   type SlackMention,
   tsAfter,
   type SlackMessage,
@@ -854,5 +862,315 @@ describe("an incident named outside its own thread is linkable", () => {
   test("the prompt still tells the model to link", () => {
     assert.match(SLACK_AGENT_SYSTEM, /threadPermalink/);
     assert.match(SLACK_AGENT_SYSTEM, /<permalink\|incident 4>/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/** One tool, so a run can be scripted turn by turn without a database. */
+const countingTool = (results: string[]) => ({
+  name: "get_incident",
+  description: "Read one incident in full.",
+  inputSchema: { type: "object" } as Record<string, unknown>,
+  run: (input: Record<string, unknown>) => {
+    results.push(String(input.incidentId));
+    return Promise.resolve(`${String(input.incidentId)} is FIXING, owner agent`);
+  },
+});
+
+const runRequest = (
+  tools: SlackAgentTool[],
+  maxTurns: number,
+): SlackAgentRun => ({
+  system: SLACK_AGENT_SYSTEM,
+  tools,
+  sessionKey: "sessions/slack/C0DEVALERTS/100.0/",
+  fresh: true,
+  input: "<@U0HUMAN> asks: what is the state of the various incidents?",
+  maxTurns,
+});
+
+describe("a run that uses its whole budget", () => {
+  test("answers with what it read instead of an apology", async () => {
+    const { store } = memoryStore();
+    const requests: ModelRequest[] = [];
+    const model: ModelClient = {
+      complete: (request) => {
+        requests.push(request);
+        // The wrap-up is the call that arrives with nothing to call.
+        if (request.tools.length === 0) {
+          return Promise.resolve({
+            text: "Two of the three are open and I read inc-1; I did not reach inc-2.",
+            toolCalls: [],
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: "",
+          toolCalls: [
+            {
+              id: `call-${requests.length}`,
+              name: "get_incident",
+              input: { incidentId: "inc-1" },
+            },
+          ],
+        } satisfies ModelReply);
+      },
+    };
+
+    const reads: string[] = [];
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run(
+        runRequest([countingTool(reads)], 3),
+      );
+      answer = result.text;
+    });
+
+    assert.equal(requests.length, 4, "three turns, then one wrap-up");
+    assert.deepEqual(requests[3].tools, [], "the wrap-up cannot call another tool");
+    assert.match(requests[3].system, /you cannot call another tool/);
+    assert.equal(
+      requests[3].messages.filter((m) => m.role === "user").length,
+      1,
+      "the wrap-up rides on the system prompt, not a user turn behind tool results",
+    );
+    assert.ok(
+      requests[3].messages.some(
+        (m) => m.role === "toolResult" && m.text.includes("inc-1 is FIXING"),
+      ),
+      "the wrap-up is written from what the run had already read",
+    );
+    assert.match(answer, /did not reach inc-2/);
+    assert.doesNotMatch(answer, /ran out of turns/);
+    assert.ok(
+      lines.some((l) => l.includes("slack_agent_turns_exhausted")),
+      "running out of turns is still a visible event",
+    );
+  });
+
+  test("keeps its own prose when the wrap-up itself fails", async () => {
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: (request) => {
+        if (request.tools.length === 0) {
+          return Promise.reject(new Error("bedrock throttled"));
+        }
+        return Promise.resolve({
+          text: "So far: inc-1 is being worked by an agent.",
+          toolCalls: [
+            { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+          ],
+        } satisfies ModelReply);
+      },
+    };
+
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run(
+        runRequest([countingTool([])], 2),
+      );
+      answer = result.text;
+    });
+
+    assert.match(answer, /inc-1 is being worked/);
+    assert.ok(lines.some((l) => l.includes("slack_agent_wrap_up_failed")));
+  });
+
+  test("leaves a transcript the next mention can still resume", async () => {
+    const { store } = memoryStore();
+    const seen: ModelRequest[] = [];
+    let wrapUpFails = true;
+    const model: ModelClient = {
+      complete: (request) => {
+        seen.push(request);
+        if (request.tools.length === 0) {
+          return wrapUpFails
+            ? Promise.reject(new Error("bedrock throttled"))
+            : Promise.resolve({ text: "", toolCalls: [] } satisfies ModelReply);
+        }
+        // The second mention answers straight away, so what it is asked with
+        // is the transcript the failed run left behind.
+        if (!wrapUpFails) {
+          return Promise.resolve({
+            text: "inc-1 is still being worked.",
+            toolCalls: [],
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: "",
+          toolCalls: [
+            { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+          ],
+        } satisfies ModelReply);
+      },
+    };
+
+    const harness = createSlackAgentModel(model, store);
+    await captureLogs(() => harness.run(runRequest([countingTool([])], 2)));
+
+    wrapUpFails = false;
+    seen.length = 0;
+    await captureLogs(() =>
+      harness.run({ ...runRequest([countingTool([])], 2), fresh: false }),
+    );
+
+    // Tool results and a question are both user messages to the model, so a
+    // question sitting directly behind them is two user turns in a row and
+    // the call is rejected before it starts.
+    const resumed = seen[0].messages;
+    const question = resumed.map((m) => m.role).lastIndexOf("user");
+    assert.ok(question > 0, "the resumed run asked its question");
+    assert.equal(
+      resumed[question - 1].role,
+      "assistant",
+      "the next question lands behind an assistant turn, not behind tool results",
+    );
+  });
+
+  test("says what happened when the wrap-up has nothing to say either", async () => {
+    const { store } = memoryStore();
+    // Burns every turn on tool calls, so the budget really does run out, and
+    // then answers the wrap-up with nothing.
+    const model: ModelClient = {
+      complete: (request) =>
+        Promise.resolve(
+          request.tools.length === 0
+            ? ({ text: "", toolCalls: [] } satisfies ModelReply)
+            : ({
+                text: "",
+                toolCalls: [
+                  { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+                ],
+              } satisfies ModelReply),
+        ),
+    };
+
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run(
+        runRequest([countingTool([])], 4),
+      );
+      answer = result.text;
+    });
+
+    assert.match(answer, /narrow the question/);
+    assert.ok(lines.some((l) => l.includes("slack_agent_turns_exhausted")));
+    assert.ok(lines.some((l) => l.includes("slack_agent_no_answer")));
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("the turn budget", () => {
+  /** What was open the day a question about all of them went unanswered. */
+  const OPEN_INCIDENTS = 11;
+
+  test("covers reading every open incident and still answering", async () => {
+    const { store } = memoryStore();
+    const reads: string[] = [];
+    let turn = 0;
+    const model: ModelClient = {
+      complete: () => {
+        turn++;
+        // The shape the real run took: one broad query, then depth on each
+        // open incident, then the answer.
+        if (turn === 1 || turn > OPEN_INCIDENTS + 1) {
+          return Promise.resolve({
+            text: `All ${OPEN_INCIDENTS} are accounted for.`,
+            toolCalls: turn === 1
+              ? [{ id: "q", name: "get_incident", input: { incidentId: "inc-0" } }]
+              : [],
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: "",
+          toolCalls: [
+            {
+              id: `call-${turn}`,
+              name: "get_incident",
+              input: { incidentId: `inc-${turn}` },
+            },
+          ],
+        } satisfies ModelReply);
+      },
+    };
+
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run(
+        runRequest([countingTool(reads)], SLACK_AGENT_MAX_TURNS),
+      );
+      answer = result.text;
+    });
+
+    assert.equal(reads.length, OPEN_INCIDENTS + 1);
+    assert.match(answer, new RegExp(`All ${OPEN_INCIDENTS} are accounted for`));
+    assert.ok(
+      !lines.some((l) => l.includes("slack_agent_turns_exhausted")),
+      "the worst reasonable shape fits inside the budget",
+    );
+  });
+
+  test("the thread lock outlives the longest run the budget allows", async () => {
+    const model = fakeModel();
+    const slack = fakeSlack();
+    const { store } = memoryStore();
+    const leases: number[] = [];
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: slack.client,
+      model: model.model,
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      lock: {
+        acquire: (_key, ttlMs) => {
+          leases.push(ttlMs);
+          return Promise.resolve(true);
+        },
+        release: () => Promise.resolve(),
+      },
+    });
+
+    await agent.handle(mention());
+
+    assert.equal(
+      leases[0],
+      (SLACK_AGENT_MAX_TURNS + 1) * SLACK_AGENT_BUDGET_MS,
+      "a lease shorter than the run lets a second mention corrupt the session",
+    );
+  });
+
+  test("is what the agent asks for when nothing overrides it", async () => {
+    const model = fakeModel();
+    const slack = fakeSlack();
+    const { store } = memoryStore();
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: slack.client,
+      model: model.model,
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+    });
+
+    await agent.handle(mention());
+
+    assert.equal(model.runs[0].maxTurns, SLACK_AGENT_MAX_TURNS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("asking the right tool", () => {
+  test("the prompt sends a many-incident question to one query", () => {
+    assert.match(SLACK_AGENT_SYSTEM, /more than one incident is a query_incidents question/i);
+    assert.match(SLACK_AGENT_SYSTEM, /FROM incident i/);
+    assert.match(SLACK_AGENT_SYSTEM, /WHERE i\.status IN \('INVESTIGATING','FIXING'\)/);
+  });
+
+  test("the prompt says what an on-call answer contains", () => {
+    assert.match(SLACK_AGENT_SYSTEM, /blocked on a person/i);
+    assert.match(SLACK_AGENT_SYSTEM, /needs nothing from them/i);
+    assert.match(SLACK_AGENT_SYSTEM, /About 200 words/);
+    assert.match(SLACK_AGENT_SYSTEM, /Plain terms/);
   });
 });
