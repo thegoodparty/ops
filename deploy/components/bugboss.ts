@@ -516,7 +516,13 @@ export const createBugBoss = (config: BugBossConfig) => {
     name: "bugboss",
     cluster: cluster.arn,
     taskDefinition: taskDefinition.arn,
-    desiredCount: 1,
+    // Held at zero deliberately. BugBoss is stopped while the Loki query
+    // overage that its incident agents can contribute to is fixed, and while
+    // its own bounds on that are still in review. Scaling it down live was
+    // not enough: Pulumi holds the desired count, so every ops deploy put it
+    // back and it restarted twice before this landed. Set it to 1 when
+    // turning it back on, rather than scaling the service by hand.
+    desiredCount: 0,
     launchType: "FARGATE",
     // Stop-then-start, and this is the one invariant the whole design rests
     // on: two tasks would put two processes on the same SQLite file and the
