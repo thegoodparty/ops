@@ -5,6 +5,39 @@ reset. Updated as things land. Not product documentation.
 
 ## Blocked on a human
 
+- **After #118 merges: make BugBoss carry the new observability guidance.**
+  An omni PR is rewriting `docs/observability.md`, which BugBoss injects
+  verbatim into every incident agent via `OBSERVABILITY_DOC_PATHS`. That file
+  currently teaches the behaviour that caused the 2026-09-28 query overage:
+  unbounded stream selectors in every example, "narrow the time window" at
+  step 3 after the first broad pull, and a closing line telling the reader to
+  use the MCPs liberally. Four things to do here, none of which the omni PR
+  can cover:
+
+  1. **Confirm the injected copy is the rewritten one.** Establish how
+     `OBSERVABILITY_DOC_PATHS` resolves at runtime — baked into the image,
+     fetched, or checked out — and verify BugBoss actually picks up the new
+     text rather than a stale copy.
+  2. **Delete the prompt's "add a limit to every query" line.** It is wrong:
+     `limit` caps rows *returned*, Loki bills bytes *scanned*. A
+     `count_over_time` over 30 days returns one number and reads 149 GB.
+     Someone following it believes they are being frugal and is not, and it
+     contradicts the doc shipped beside it.
+  3. **Give the agent's MCP surface a tool allowlist and a time-range
+     ceiling.** `bugboss/agent/mcp.ts` calls `tools/list` and exposes the
+     whole ~80-tool mcp-grafana surface unfiltered. mcp-grafana supports
+     `--enabled-tools`. Ceiling: 6h default, 24h hard maximum — the alerts
+     these agents investigate use a 10-minute window, so the incident is
+     minutes old, and nothing in the loop needs 30 days.
+  4. **Enforce it server-side, not in the prompt.** The 20,000-char output cap
+     bounds bytes returned, not bytes scanned, so it does nothing here. A
+     prompt instruction is advisory and an agent can ignore it.
+
+  `bugboss/ingress/grafana.ts` already does this correctly for its non-MCP
+  path (`MAX_QUERIES_PER_ALERT = 6`, `LOOKBACK_SECONDS = 3600`). The pattern
+  exists in this codebase; it just does not cover the MCP path.
+
+
 - **Purge the 2026-09-28 alert-storm incidents from the database.** Between
   **13:17:09 and 13:22:30 EDT** BugBoss opened **incidents 13-79** — 67 in
   five and a half minutes — one per Grafana rule, each spawning an
