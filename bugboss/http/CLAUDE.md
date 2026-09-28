@@ -18,6 +18,11 @@ working. Slack is worse: a three-second ack against a two-minute model run.
 `settle()` alarms on rejection, so the deferred half cannot become a new
 silent drop.
 
+The 200 answers Slack, not the person who typed. `/slack` therefore reacts
+with :eyes: the moment `classifySlackEvent` returns, before the relay and
+before anything a model touches. `acknowledgeSlack` is typed `void` so this
+route structurally cannot await it — see `slack/CLAUDE.md`.
+
 The synchronous boundary is **verified and recorded**. A failure before it
 throws and the route 500s so Grafana retries; a failure after it is
 recovered by the orphan sweep, which is unbounded, source-agnostic and
@@ -29,6 +34,21 @@ ingest path — a dropped alert — the one failure that left no trace. It is
 registered on the app, not per route, so a route added later cannot forget
 it. The 401 paths return their response rather than throwing, so a refused
 delivery stays a `log` and does not reach it.
+
+## `/slack` carries two encodings
+
+Events arrive as JSON; a button press on an agent's question arrives at the
+same path as `application/x-www-form-urlencoded` with the JSON in a `payload`
+field. Same `v0=` signature over the same raw body, same three-second budget,
+different parsing — so the content type is the whole discriminator.
+
+One path rather than two because the ALB listener rules
+(`deploy/components/bugboss.ts`) are an allowlist: a second path is a Pulumi
+change and a deploy before a click can reach the process.
+
+A press answers an **empty** 200. A JSON body there is read by Slack as a
+replacement for the clicked message, which would delete the question and its
+buttons out from under the thread.
 
 ## `/health` is deliberately flat
 
@@ -45,9 +65,10 @@ answers 200.
 Bound to `127.0.0.1`, never through the ALB. Bearer token minted per launch.
 
 **The incident comes from the token, then is checked against the path.** A
-valid token for incident A aimed at B gets a 403, not a wrong answer. That
-containment is the whole story for a process that reads attacker-writable
-log lines for a living.
+valid token for incident A aimed at B gets a 403, not a wrong answer. That is
+what keeps fifteen concurrent agents out of each other's incidents. It is not
+a privilege boundary: a child runs with the Boss's own credentials, and what
+bounds it is the deployment boundary of the whole task.
 
 - No token → 401 with a `WWW-Authenticate` challenge
 - Wrong incident → 403
@@ -62,10 +83,8 @@ schemas.
 Those schemas are the trust boundary. The child validates too, but that is
 the untrusted side, so validation here is the one that counts.
 
-## Two routes that are not tools
+## One route that is not a tool
 
 `GET /incidents/:id/directives` is a **non-draining** read on the read-only
 connection, because the `contact_human` poll would otherwise destroy
-directives it has not read. `GET /incidents/:id/aws-credentials` mints fresh
-AWS credentials, because a role session is capped at twelve hours and an
-incident can run for a day.
+directives it has not read.

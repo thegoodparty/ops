@@ -10,8 +10,21 @@
 ## BugBoss answers the challenge (`http/public.ts`), so verification succeeds
 ## as soon as the URL is reachable.
 ##
-## Scopes are derived from the three Slack API methods BugBoss actually calls
-## and the two events it handles. Nothing here is aspirational.
+## This file is not applied by anything. Changing it changes nothing until
+## somebody pastes it into the live app at api.slack.com. Until the
+## interactivity block below is applied there, an agent's buttons still post
+## and the question is still answerable — the options are numbered in the
+## message and any reply in the thread reaches the agent — but pressing one
+## shows the presser a Slack error instead of answering.
+##
+## Scopes are derived from the Slack API methods BugBoss actually calls and the
+## two events it handles. Nothing here is aspirational. chat.getPermalink, which
+## is how a merged or split incident links to the other thread, requires no
+## scope at all, so it adds nothing below.
+##
+## CHANGING THE SCOPES MEANS REINSTALLING THE APP. A scope added here does
+## nothing until someone reinstalls BugBoss into the workspace; until then the
+## method behind it fails with `missing_scope` at runtime.
 
 display_information:
   name: BugBoss
@@ -34,6 +47,11 @@ oauth_config:
       - channels:history
       ## The app_mention event, which is how @bugboss reaches it.
       - app_mentions:read
+      ## reactions.add, for the :eyes: BugBoss puts on a message the moment
+      ## it takes it, before the work that answers it. The reaction is never
+      ## removed or read back, so reactions.remove and reactions:read stay
+      ## uncalled even though this scope would cover the first of them.
+      - reactions:write
       ## usergroups.users.list, for the rotation snapshot recorded on each
       ## incident at open. A Slack user group keeps no history, so this is
       ## the only moment that answer exists.
@@ -50,11 +68,15 @@ settings:
       ## @bugboss anywhere. Routes to the Slack agent, or interrupts the
       ## agent working that incident.
       - app_mention
-  ## Everything happens through replies and mentions. No slash commands, no
-  ## shortcuts, no Home tab, and no interactivity: a button would be a second
-  ## way to do something the thread already does.
+  ## Buttons on an agent's question, and nothing else. No slash commands, no
+  ## shortcuts, no Home tab: those would be a second surface next to the
+  ## thread, while a button lives in the thread and answers by the same path a
+  ## typed reply does. Same URL as the events, because the ALB routes a fixed
+  ## allowlist of paths and a second one would be an infrastructure change
+  ## before a click could land.
   interactivity:
-    is_enabled: false
+    is_enabled: true
+    request_url: https://bugboss.goodparty.org/slack
   org_deploy_enabled: false
   ## BugBoss is an HTTPS endpoint behind an ALB, not a socket client.
   socket_mode_enabled: false

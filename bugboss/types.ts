@@ -204,7 +204,23 @@ export type Directive =
   | { type: "merged"; into: string }
   | { type: "handoff"; reason: string }
   | { type: "new_signals"; count: number; summary: string }
-  | { type: "human_message"; from: string; text: string; ts: string }
+  /**
+   * Something a person said in the incident thread. `addressed` is whether it
+   * was for the agent: `contact_human` ends its wait on a reply that was, and
+   * carries one that was not through as context. Two people talking to each
+   * other while an agent is blocked used to end the wait on whichever of them
+   * spoke first.
+   *
+   * Optional only for the rows in flight across the deploy that added it. A
+   * missing value reads as "for the agent", which is what those rows meant.
+   */
+  | {
+      type: "human_message";
+      from: string;
+      text: string;
+      ts: string;
+      addressed?: "agent" | "others";
+    }
   /** Carries how long the agent was gone, so it can re-check before continuing. */
   | { type: "resumed_after"; seconds: number };
 

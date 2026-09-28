@@ -52,6 +52,10 @@ export {
   RECURRENCE_WINDOW_MS,
 } from "./recurrence";
 export { runStructuredCall } from "./model";
+// Not triage's alone: it tracks the fallback rate of every bounded model
+// call the Boss makes, including the inbound-language read in slack/.
+export { recordCall, resetFallbackRates, SUSTAINED_FALLBACK_RATE } from "./health";
+export type { FallbackRate } from "./health";
 
 export type { TriageDeps, TriageOutcome } from "./triage";
 export type {

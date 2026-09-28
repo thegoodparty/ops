@@ -1,4 +1,5 @@
-// Scoped agent tokens. Design spec: bugboss/docs/architecture.md, "Authentication":
+// Scoped agent tokens. Design spec: bugboss/docs/architecture.md, "What
+// bounds an agent":
 // "A scoped token on a local socket or loopback HTTP, carrying incidentId ->
 // that one incident."
 //
