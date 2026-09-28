@@ -95,7 +95,14 @@ changes only a database that does not exist yet.
   which is what a fresh database gets, and add it to `LATE_COLUMNS` in
   `db/index.ts`, which is what every database that already exists gets. Miss
   the second and the column is absent in prod while the suite stays green,
-  because a test opens a new file and prod restores a snapshot.
+  because a test opens a new file and prod restores a snapshot. `Db.open`
+  now names that gap at boot rather than leaving it to the first rolled-back
+  transaction: a `schema_drift` alarm lists every column `schema.sql`
+  declares that the live database does not have. It does not fix it, so the
+  second edit is still yours.
+- A `LATE_COLUMNS` entry naming a table that does not exist **refuses the
+  boot**. That is a defect in the list, identical on every boot, so it never
+  reaches prod.
 - Adding a **`CHECK` constraint** is not possible at all. SQLite cannot add
   one to an existing table, so it needs a table rebuild that does not exist
   here. The cross-field constraints landed while the database was empty; that
