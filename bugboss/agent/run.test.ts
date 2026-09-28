@@ -21,6 +21,7 @@ import {
   prefixDriftExtension,
   renderDirectives,
   reserveTokensFor,
+  signalExitCode,
   toolListDrift,
 } from "./run";
 import { notesPrefixFor } from "./notes";
@@ -412,4 +413,13 @@ test("the attempt reaches the agent from the dispatcher's environment", () => {
   assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ATTEMPT: "3" }).attempt, 3);
   assert.equal(agentOptionsFromEnv(base).attempt, undefined);
   assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ATTEMPT: "" }).attempt, undefined);
+});
+
+// ECS draining a task is routine, and the most orderly shutdown available
+// here: the exit record is written and the session is flushed. Reporting it
+// as a failure alarms on every deploy, and inside the fast-failure window it
+// walked a rolling deploy to a crash-loop escalation in three bounces.
+test("a drained agent exits clean and an interrupted one does not", () => {
+  assert.equal(signalExitCode("SIGTERM"), 0);
+  assert.equal(signalExitCode("SIGINT"), 1);
 });

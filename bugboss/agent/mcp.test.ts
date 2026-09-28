@@ -369,3 +369,40 @@ test("the clamp notice comes out of the output budget, not on top of it", async 
     set.close();
   }
 });
+
+// A window's position bounds what it can find just as its width bounds what
+// it costs. A future window matches nothing, and nothing reads exactly like
+// a problem that has stopped -- so this is an evidence bug, not a cost one.
+test("a window entirely in the future is pulled back to now and the agent is told", () => {
+  const now = Date.UTC(2026, 8, 28, 12, 0, 0);
+  const shape = { start: "startRfc3339", end: "endRfc3339" } as const;
+
+  const clamped = clampTimeRange(
+    { startRfc3339: "now+6d", endRfc3339: "now+7d" },
+    shape,
+    now,
+  );
+
+  assert.ok(clamped.notice, "a silently empty answer is the whole hazard");
+  assert.match(clamped.notice ?? "", /future/);
+  const end = Date.parse(String(clamped.arguments.endRfc3339));
+  const start = Date.parse(String(clamped.arguments.startRfc3339));
+  assert.ok(end <= now, `end ${new Date(end).toISOString()} is still ahead of now`);
+  assert.ok(start < end, "and the window is not inverted or empty");
+});
+
+test("a future end with a real start keeps the start and pulls the end back", () => {
+  const now = Date.UTC(2026, 8, 28, 12, 0, 0);
+  const clamped = clampTimeRange(
+    { startRfc3339: "now-2h", endRfc3339: "now+5h" },
+    { start: "startRfc3339", end: "endRfc3339" },
+    now,
+  );
+  assert.match(clamped.notice ?? "", /future/);
+  assert.equal(Date.parse(String(clamped.arguments.endRfc3339)), now);
+  assert.equal(
+    Date.parse(String(clamped.arguments.startRfc3339)),
+    now - 2 * HOUR,
+    "the half the agent got right is left alone",
+  );
+});

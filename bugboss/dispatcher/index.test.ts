@@ -308,9 +308,13 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let launches = 0;
-    // Exits the instant it starts, which is what a crash loop looks like.
+    // Dies the instant it starts, and dies badly: run.ts exits non-zero and
+    // the spawn wrapper turns that into a rejection. Both halves matter now
+    // -- a short exit that succeeded is a deploy draining an agent, not a
+    // crash, and counting it walked a rolling deploy to this escalation.
     const spawn: SpawnAgent = async () => {
       launches += 1;
+      throw new Error("agent exited 1");
     };
 
     const d = createDispatcher(
@@ -336,6 +340,34 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  // The rolling-deploy case. Before SIGTERM exited zero and the counter
+  // required a failure, three bounces of a freshly-launched agent handed a
+  // human a crash-loop brief for a deploy that worked.
+  it("does not count a short clean exit as a crash", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let launches = 0;
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+    };
+
+    const d = createDispatcher(
+      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
+    );
+
+    for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
+
+    assert.equal(launches, 5, "it keeps relaunching rather than giving up");
+    assert.deepEqual(handOffs, [], "and nobody is handed a crash-loop brief");
+    assert.equal(
+      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
+      "agent",
+    );
+    cleanup();
+  });
+
   it("falls back to relaunching when the crash-loop escalation fails", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, handOffs } = makeTools(sqlite);
@@ -344,6 +376,7 @@ describe("Dispatcher.tick", () => {
     let launches = 0;
     const spawn: SpawnAgent = async () => {
       launches += 1;
+      throw new Error("agent exited 1");
     };
 
     let handOffFails = true;

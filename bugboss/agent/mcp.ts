@@ -268,7 +268,13 @@ export const clampTimeRange = (
     ...(givenEnd && parsedEnd === null ? [`${shape.end}="${rawEnd}"`] : []),
   ];
 
-  const end = parsedEnd ?? now;
+  // Anchored at `now`, because a window's position bounds what it can find
+  // just as its width bounds what it costs. A future end returns nothing,
+  // and nothing is the same shape as "the problem stopped" -- so an agent
+  // that queried tomorrow would report a negative on evidence it never had.
+  const requestedEnd = parsedEnd ?? now;
+  const end = Math.min(requestedEnd, now);
+  const endWasFuture = requestedEnd > now;
   const defaultStart = end - DEFAULT_LOOKBACK_HOURS * 3_600_000;
   const rewrite = (start: number, why: string): ClampedRange => ({
     arguments: {
@@ -292,13 +298,26 @@ export const clampTimeRange = (
     );
   }
 
-  const span = end - parsedStart;
+  const futureNote = endWasFuture
+    ? `The end time you gave is in the future, so it was pulled back to now; a future window matches nothing, which reads the same as a problem that stopped.`
+    : "";
+
+  const span = end - Math.min(parsedStart, end);
   if (span > MAX_LOOKBACK_HOURS * 3_600_000) {
     return rewrite(
       end - MAX_LOOKBACK_HOURS * 3_600_000,
-      `You asked for ${describeSpan(span)} and the ceiling is ${MAX_LOOKBACK_HOURS}h, so the range was clamped.`,
+      `${futureNote} You asked for ${describeSpan(span)} and the ceiling is ${MAX_LOOKBACK_HOURS}h, so the range was clamped.`.trim(),
     );
   }
+  // A start that is also in the future collapses to an empty window once the
+  // end is pulled back, so it gets the default rather than an inverted range.
+  if (parsedStart >= end) {
+    return rewrite(
+      defaultStart,
+      `${futureNote} The start you gave is not before that, so the default ${DEFAULT_LOOKBACK_HOURS}h window was used instead.`.trim(),
+    );
+  }
+  if (endWasFuture) return rewrite(parsedStart, futureNote);
   return { arguments: args, notice: null };
 };
 

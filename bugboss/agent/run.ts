@@ -87,6 +87,17 @@ export const DEADLINE_GRACE_SECONDS = 180;
  * visible.
  */
 export const SIGNAL_FLUSH_GRACE_MS = 5000;
+
+/**
+ * Zero for SIGTERM. That is ECS draining the task -- routine, and the most
+ * orderly shutdown available here, since the exit record is written and the
+ * session flushed before we go. Reporting it as a failure alarms on every
+ * deploy, and inside the dispatcher's fast-failure window it walked a
+ * rolling deploy to a crash-loop escalation in three bounces. SIGINT is not
+ * routine outside a terminal, so it keeps its 1.
+ */
+export const signalExitCode = (signal: NodeJS.Signals): number =>
+  signal === "SIGTERM" ? 0 : 1;
 export const COMPACTION_HEADROOM = 0.05;
 
 export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "write"];
@@ -916,7 +927,7 @@ const launch = async (args: {
     // Installing a handler suppresses the default terminate, so this has to
     // exit itself -- and on a timer as well as on the flush, because a hung
     // PUT must not be what keeps a draining container alive.
-    const quit = (): void => process.exit(1);
+    const quit = (): void => process.exit(signalExitCode(signal));
     void sync.flush().then(quit, quit);
     setTimeout(quit, SIGNAL_FLUSH_GRACE_MS).unref();
   };

@@ -540,8 +540,15 @@ export class Dispatcher {
       run = Promise.reject(err);
     }
 
+    // Set by the catch below, and read by the then after it. A crash loop is
+    // made of crashes: an exit code of zero inside the window is a short run,
+    // not a failing one, and counting it was what let a rolling deploy walk
+    // a freshly-launched incident to a crash-loop escalation in three
+    // bounces. SIGTERM exits zero for exactly this reason.
+    let failed = false;
     entry.done = run
       .catch((err) => {
+        failed = true;
         // A child the dispatcher killed exits on a signal, which is a
         // rejection now. That is not an agent failure and it already alarmed
         // as agent_deadline_exceeded, so it would be the same event twice
@@ -558,10 +565,11 @@ export class Dispatcher {
         const exitedAt = this.now();
         this.lastExitAt.set(row.id, exitedAt);
 
-        // A crash loop dies quickly after starting; a deploy-killed agent was
-        // running fine for a while. Only the first should ever escalate.
+        // A crash loop dies quickly after starting *and* dies badly. A
+        // deploy-killed agent was either running fine for a while or shut
+        // down in good order; neither should escalate.
         const ranMs = exitedAt - entry.startedAt;
-        const fast = !entry.killed && ranMs < this.fastFailureMs;
+        const fast = !entry.killed && failed && ranMs < this.fastFailureMs;
         const failures = fast ? (this.fastFailures.get(row.id) ?? 0) + 1 : 0;
         if (fast) this.fastFailures.set(row.id, failures);
         else this.fastFailures.delete(row.id);
@@ -571,6 +579,7 @@ export class Dispatcher {
           attempt,
           pid: entry.pid,
           killed: entry.killed,
+          failed,
           ranSeconds: Math.round(ranMs / 1000),
           consecutiveFastFailures: failures,
         });
