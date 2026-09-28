@@ -113,18 +113,31 @@ describe("githubActionsPulumiPlan", () => {
     );
   });
 
-  // gp-ai plans only its dev roots on a pull request. Reaching a prod state
-  // would be a widening, so the absence of `*/prod/*` is asserted, not assumed.
-  it("reads only dev Terraform state, plus dataplatform's single state", () => {
+  const READABLE = [
+    "arn:aws:s3:::goodparty-terraform-state-us-west-2/*/dev/terraform.tfstate",
+    "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate",
+    "arn:aws:s3:::goodparty-terraform-state-us-west-2/shared/slack-notifier/terraform.tfstate",
+  ];
+
+  it("reads only the listed Terraform states", () => {
     const allow = statement("TerraformStateObjects");
     assert.equal(allow.Effect, "Allow");
-    assert.deepEqual(asList(allow.Resource), [
-      "arn:aws:s3:::goodparty-terraform-state-us-west-2/*/dev/terraform.tfstate",
-      "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate",
-    ]);
+    assert.deepEqual(asList(allow.Resource), READABLE);
     for (const one of asList(allow.Resource)) {
       assert.equal(one.includes("/prod/"), false);
     }
+  });
+
+  // The allow above scopes nothing on its own, because ReadOnlyAccess grants
+  // s3:GetObject on *. This deny is what makes the scope real, and its
+  // NotResource must stay identical to the allow or one of the two is a lie.
+  // Checked against the live role once: without it, broker/prod/terraform.tfstate
+  // simulated as `allowed`.
+  it("denies every S3 object outside that list", () => {
+    const deny = statement("DenyOtherS3Objects");
+    assert.equal(deny.Effect, "Deny");
+    assert.equal(deny.Resource, undefined);
+    assert.deepEqual(asList(deny.NotResource), READABLE);
   });
 
   // dataplatform plans with the lock held; gp-ai passes -lock=false. The only

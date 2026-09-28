@@ -915,6 +915,18 @@ export const githubActionsPulumiPreview: PolicyDocument = {
 
 const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 
+// Every state object a plan on this role may read, allowed below and used
+// again as the NotResource of the deny that makes the allow meaningful.
+//
+// `shared/slack-notifier` is not a `*/dev/*` key and is easy to miss: gp-ai's
+// dev roots reach it through `data "terraform_remote_state"`. It read fine
+// before the deny existed, because ReadOnlyAccess covered it.
+const TF_STATE_READABLE = [
+  `${TF_BUCKET}/*/dev/terraform.tfstate`,
+  `${TF_BUCKET}/dataplatform/terraform.tfstate`,
+  `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
+];
+
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -979,10 +991,29 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Sid: "TerraformStateObjects",
       Effect: "Allow",
       Action: ["s3:GetObject"],
-      Resource: [
-        `${TF_BUCKET}/*/dev/terraform.tfstate`,
-        `${TF_BUCKET}/dataplatform/terraform.tfstate`,
-      ],
+      Resource: TF_STATE_READABLE,
+    },
+    {
+      // The allow above is not the whole story, and this is the statement that
+      // makes it one. `ReadOnlyAccess` grants `s3:GetObject` on `*`, so
+      // scoping the allow scopes nothing: without this deny the role reads
+      // every object in the account, including `*/prod/terraform.tfstate`.
+      // Terraform state stores resource attributes in plaintext, and gp-ai's
+      // prod roots put values derived from AI_SECRETS_PROD into theirs, so
+      // that is a production secret read by another name.
+      //
+      // Verified against the live role by `iam simulate-principal-policy`
+      // rather than reasoned about: before this statement,
+      // `broker/prod/terraform.tfstate` evaluated to `allowed`.
+      //
+      // NotResource, so anything not on the list is denied, including buckets
+      // that do not exist yet. Terraform plans read no other S3 object: there
+      // is no `aws_s3_object` data source in either repo, and every
+      // `terraform_remote_state` key is on the list.
+      Sid: "DenyOtherS3Objects",
+      Effect: "Deny",
+      Action: ["s3:GetObject"],
+      NotResource: TF_STATE_READABLE,
     },
     {
       // gp-terraform-dataplatform plans without `-lock=false`, so it takes the
