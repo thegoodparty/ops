@@ -17,6 +17,29 @@ restarted agent cannot continue its own session. Since every merge to ops
 So this module exists to keep the raw Anthropic message shape intact end to
 end.
 
+## Claiming an api id does not route anything
+
+`registerApiProvider()` puts this provider in pi-ai's registry, and
+`resolveBedrockModel()` stamps `bedrock-invoke-model` onto the model. Neither
+selects an implementation. Pi's `ModelRuntime` resolves a provider by
+`model.provider`, and `recomposeProvider()` installs the builtin *untouched*
+when that id has no `models.json` entry and no registered extension -- which
+is our configuration, so `composeModelProvider()`, the only code that reads
+the registry, is never built. The builtin is a single-api provider, and
+`createProvider()` serves its one api to every model without reading
+`model.api`.
+
+That combination cannot report itself: `createProvider()`'s only "no API
+implementation" error belongs to the multi-api branch a single-api provider
+never takes. Production ran on Converse for days.
+
+`runtime.ts` is the fix. It wraps the builtin in a provider that dispatches on
+`model.api` and registers that natively, so Converse keeps Nova, Llama,
+Mistral and DeepSeek while our models reach `InvokeModel`.
+`assertBedrockInvokeModelRouting()` proves it before the session starts, and
+`runtime.test.ts` proves it against a real `ModelRuntime` -- which the tests
+next to it do not, since they drive the provider directly.
+
 ## Usage is the cost record
 
 Per-turn usage is what the Boss sums out of the session file after a child

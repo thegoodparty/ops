@@ -26,6 +26,7 @@ import { sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
 import { postDocument, splitForSlack } from "../slack/format";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
+import type { RecurrenceAnalysis } from "../types";
 import {
   renderReportDocument,
   renderThreadSummary,
@@ -177,6 +178,18 @@ export const readReportData = async (
     }
   }
 
+  // A recurrence closes on an answer the first incident never had, and this
+  // is the only place it is ever read back. Parsed defensively: a row whose
+  // JSON will not load is a worse report, not a reason to withhold one.
+  let recurrence: RecurrenceAnalysis | null = null;
+  if (incident.recurrenceAnalysis) {
+    try {
+      recurrence = JSON.parse(incident.recurrenceAnalysis) as RecurrenceAnalysis;
+    } catch (err) {
+      alarm("recurrence_unreadable", { incidentId, error: String(err) });
+    }
+  }
+
   let states: Record<string, ReportPr["state"]> = {};
   if (deps.prStates && incident.prUrls.length > 0) {
     try {
@@ -192,6 +205,7 @@ export const readReportData = async (
     mergedIn,
     actions,
     prs: incident.prUrls.map((url) => ({ url, state: states[url] ?? null })),
+    recurrence,
     run: {
       modelId: incident.modelId,
       tokensIn: incident.tokensIn,

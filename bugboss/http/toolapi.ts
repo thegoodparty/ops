@@ -83,6 +83,23 @@ const BODIES = {
     postmortem: z.string().min(1),
     usersImpacted: z.number(),
     impactQuery: z.string().min(1),
+    recurrence: z
+      .object({
+        category: z.enum([
+          "previous_fix_wrong",
+          "previous_fix_incomplete",
+          "alert_is_wrong",
+          "fix_never_reached_production",
+          "resolution_evidence_too_weak",
+          "bugboss_defect",
+        ]),
+        why: z.string().min(1),
+        remedy: z.string().min(1),
+      })
+      .optional(),
+  }),
+  search: z.object({
+    text: z.string().min(1),
   }),
   handoff: z.object({
     reason: z.string().min(1),
@@ -212,6 +229,15 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   app.post(
     "/incidents/:id/handoff",
     tool(BODIES.handoff, (api, body) => api.handOff(body)),
+  );
+
+  // POST rather than GET because the query is a body, not a path. It still
+  // changes nothing, and it drains directives like every other tool call --
+  // which is correct here: unlike the directive poll, its result is read by
+  // the model on the turn it returns.
+  app.post(
+    "/incidents/:id/search",
+    tool(BODIES.search, (api, body) => api.searchIncidents(body)),
   );
 
   // -------------------------------------------------------------------------

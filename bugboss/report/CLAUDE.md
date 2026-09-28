@@ -68,6 +68,19 @@ price list, and `costUsd` on the incident row stays unwritten.
 under the S3 lifecycle rule while the row's tokens survive. Missing renders as
 "not recorded" — never as zero, which reads as a free run.
 
+## It is the only reader of the recurrence answer
+
+An incident that came back closes on a question its first report could not have
+asked: which kind of failure the last resolution was, why it did not hold, and
+what was done about *that* rather than about the symptom. `report_analysis`
+refuses to close a recurrence without one, and until the report existed nothing
+read it back. The category is stored as a slug because the set is closed on
+purpose, and rendered as a sentence because a reader should not have to know the
+set -- least of all for the one that says the defect is in BugBoss.
+
+An answer whose JSON will not load leaves the section in place saying so. A
+section that quietly vanished would read as an incident that never recurred.
+
 ## Two texts, two escaping rules
 
 This is the trap, and it is why rendering is one file with the rule at the top

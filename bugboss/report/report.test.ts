@@ -121,6 +121,9 @@ interface SeedOptions {
   impactStartedAt?: number | null;
   resolvedAt?: number | null;
   prUrls?: string[];
+  /** The incident this one is the return of, and the answer recorded at close. */
+  recurrenceOf?: string;
+  recurrenceAnalysis?: string;
 }
 
 const seed = async (id: string, opts: SeedOptions = {}) => {
@@ -165,6 +168,11 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
       OPENED,
       "Errors stopped at 11:02; the alert cleared.",
     );
+    if (opts.recurrenceOf !== undefined || opts.recurrenceAnalysis !== undefined) {
+      w.prepare(
+        "UPDATE incident SET recurrenceOf = ?, recurrenceAnalysis = ? WHERE id = ?",
+      ).run(opts.recurrenceOf ?? null, opts.recurrenceAnalysis ?? null, id);
+    }
     w.prepare(
       `INSERT INTO signal (id, source, sourceId, kind, title, body, labels, reportedBy, openedAt, closedAt, incidentId, explained)
        VALUES (?, 'grafana', ?, 'alert', ?, '', '{}', NULL, ?, ?, ?, 1)`,
@@ -644,5 +652,82 @@ describe("the report survives GitHub being unreachable", () => {
     assert.match(doc, /pull\/42 — open/);
     assert.match(doc, /pull\/43 — state not known/);
     assert.match(doc, /\| Pull requests \| 2 \(0 merged\) \|/);
+  });
+});
+
+describe("an incident that came back explains itself", () => {
+  it("carries the recorded answer, in words rather than as a slug", async () => {
+    // The whole value of the recurrence answer is that it was written at
+    // close and, before this, read back by nobody.
+    // recurrenceOf is a foreign key, so the incident it points at is real.
+    await seed("inc-30-prior");
+    await seed("inc-30", {
+      recurrenceOf: "inc-30-prior",
+      recurrenceAnalysis: JSON.stringify({
+        category: "previous_fix_incomplete",
+        why: "The pool limit was raised on the web dynos and not on the worker, which opens the same pool.",
+        remedy: "Raised it in the shared config both read, and added a check that they cannot diverge.",
+      }),
+    });
+
+    const data = await readReportData(deps(), "inc-30");
+    assert.ok(data);
+    const doc = renderReportDocument(data);
+
+    assert.match(doc, /^## Why it came back$/m);
+    assert.match(doc, /A recurrence of inc-30-prior: the cause was right but only one way into the failure was closed\./);
+    assert.match(doc, /not on the worker/);
+    assert.match(doc, /added a check that they cannot diverge/);
+    // A reader should not have to know the closed set to read the report.
+    assert.doesNotMatch(doc, /previous_fix_incomplete/);
+  });
+
+  it("says plainly when the recurrence was BugBoss's own fault", async () => {
+    // The one category nothing else in the system would ever surface.
+    await seed("inc-31-prior");
+    await seed("inc-31", {
+      recurrenceOf: "inc-31-prior",
+      recurrenceAnalysis: JSON.stringify({
+        category: "bugboss_defect",
+        why: "The close ran before the sweep had confirmed the alert stayed clear.",
+        remedy: "Nothing yet; it needs a change in ops and the incident is filed there.",
+      }),
+    });
+
+    const data = await readReportData(deps(), "inc-31");
+    assert.ok(data);
+    assert.match(
+      renderReportDocument(data),
+      /BugBoss let a premature close happen; the fix belongs in ops/,
+    );
+  });
+
+  it("publishes a report even when the stored answer will not parse", async () => {
+    await seed("inc-32-prior");
+    await seed("inc-32", {
+      recurrenceOf: "inc-32-prior",
+      recurrenceAnalysis: "{not json",
+    });
+
+    const data = await readReportData(deps(), "inc-32");
+    assert.ok(data);
+    assert.equal(data.recurrence, null);
+
+    const doc = renderReportDocument(data);
+    // Missing rather than wrong, and said so: a recurrence section that
+    // quietly vanished would read as an incident that never recurred.
+    assert.match(doc, /^## Why it came back$/m);
+    assert.match(doc, /could not be read back, so it is missing here rather than wrong/);
+    assert.match(doc, /## Post-mortem/, "the rest of the report is untouched");
+    assert.equal(await publishIncidentReport(deps(), "inc-32"), "published");
+  });
+
+  it("says nothing at all for an incident that did not come back", async () => {
+    await seed("inc-33");
+
+    const data = await readReportData(deps(), "inc-33");
+    assert.ok(data);
+    assert.equal(data.recurrence, null);
+    assert.doesNotMatch(renderReportDocument(data), /Why it came back/);
   });
 });

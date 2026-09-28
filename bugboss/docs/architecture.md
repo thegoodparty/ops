@@ -100,11 +100,56 @@ model is advisory about the match; `applyRules` holds the invariants. It
 cannot suppress a cause the alert did not declare as suppressible, and it
 cannot attach across `RESOLVED`.
 
+It also asks the other half of the question: has an incident that already
+claimed this problem was over come back? Split on whether the answer is a fact
+or a judgement.
+
+One indexed read before the call matches `(source, sourceId)`. Inside a
+two-week window of that resolution it is stamped as `recurrenceOf` in code —
+the same alert returning is a fact about the delivery, not an opinion about
+the problem. A failed lookup reaches the model as `RECURRENCE CANDIDATES
+UNAVAILABLE`, under the same rule as prefetched evidence: "we did not check"
+must never read as "we checked and found nothing".
+
+`search_incidents` covers what no key can. FTS5 over the post-mortems, root
+causes and resolution evidence of every RESOLVED or CLOSED incident, offered
+as a tool because a search needs a query and only something that has read the
+signal can write one. It is how the same cause returning through a *different*
+alert is found, which is the premature close most worth catching and the one
+a structural key is blind to. The agent has the same tool.
+
+A recurrence opens a **new incident pointing at the old one**, never a reopen.
+`RESOLVED` and `CLOSED` are claims with timestamps attached, and two of the
+`CHECK` constraints above mean a reopen can only be done by clearing
+`resolvedAt` and `closedAt` — deleting the numbers the recurrence disproves,
+along with the only shape that can answer "how often does a resolution hold".
+
 **4. Dispatch** (`dispatcher/`) launches one agent per incident, up to 15.
 That cap is a circuit breaker, not a scheduler — hitting it means something
 is wrong. Ticks are serialized against each other: a tick awaits an S3 put
 and an STS call before recording a launch, so overlapping ticks would start
 two children on one incident, and both would write the same session file.
+
+When an incident carries `recurrenceOf`, `get_incident` returns the earlier
+incident with it: root cause, resolution evidence, PR urls and post-mortem.
+Somebody already investigated this and wrote down what they concluded, and the
+new incident is the proof they were wrong — so the agent starts from that
+rather than rediscovering it.
+
+**A recurrence carries a second question**, and closing it answers both.
+`report_analysis` takes a `recurrence` argument that is required whenever
+`recurrenceOf` is set and refused without one: which of six kinds of failure
+let the earlier resolution stand, why, and what changed so it does not happen
+again. One of the six is `bugboss_defect` — the fix belongs in this
+repository rather than the product — and that answer is posted to the channel
+rather than left in a column, because "BugBoss let a premature close happen"
+reaching nobody is the same failure one level up. Agents do not open pull
+requests against `ops`, so a defect leaves here as a proposal for a person.
+
+That constraint is the one `CLOSED` would carry if the schema could still
+take a `CHECK`. It cannot, so it is refused at the tool instead — and an
+agent that cannot answer has `hand_off`, which is the right end for a
+recurrence nobody can explain.
 
 **5. The agent** (`agent/`) runs Pi against Bedrock in the same container.
 It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP
@@ -168,10 +213,11 @@ minted per launch; the incident is derived from the token and then checked
 against the path, so a valid token for incident A cannot be aimed at B. That
 check is what keeps fifteen concurrent agents out of each other's incidents.
 
-Five state-changing tools, each a transition:
+Five state-changing tools, each a transition, plus two reads:
 
 | Tool | Transition |
 | --- | --- |
+| `search_incidents` | None. Text search over closed incidents' post-mortems |
 | `report_root_cause` | `INVESTIGATING → FIXING`. Triggers correlation, splits the unexplained |
 | `report_impact` | Repeatable; impact grows during an incident |
 | `report_resolved` | `FIXING → RESOLVED`, with evidence |
@@ -203,6 +249,44 @@ saturating context on polling:
 There is no push channel and an agent is never addressable. Directives ride
 back on responses to calls the agent was already making — `stop`, `merged`,
 `handoff`, `new_signals`, `human_message`, `resumed_after`.
+
+## Running omni's tests
+
+An agent that writes a fix it cannot run is proposing a change on reasoning
+alone. Until it could run them, 200 of gp-api's 576 test files were out of
+reach and the only check on a fix was a CI round trip.
+
+omni starts its test Postgres with testcontainers, which needs a Docker
+socket. **Fargate has none** — no socket, no privileged mode, no
+Docker-in-Docker. That is the platform, not a missing package, so the answer
+had to come from somewhere other than a container runtime.
+
+**A Postgres sidecar in the task definition.** Containers in one task share a
+network namespace, so it is reachable on `127.0.0.1:5432`, and omni's harness
+takes it by URL instead of starting one. It needs no host, no daemon and no
+credential, and it costs nothing: the task already bills for 4 vCPU and 16 GB
+whether or not part of it runs a database.
+
+It is **not essential** and nothing depends on it. An essential container that
+exits stops the task, and a test database is not worth the incident system.
+The cost of that is that its absence is quiet, so it is said twice: the Boss
+probes it at boot and alarms, and the failure an agent actually reads is
+omni's, which names `OMNI_TEST_POSTGRES_URL` at the moment a suite runs. An
+agent must never read a connection error as a failing test and fix code that
+is fine.
+
+Isolating the fifteen agents that share it is **omni's job**, and its harness
+already does it — a template named for a digest of the migrations it holds, a
+per-suite clone the suite drops, an age-gated sweep for what a killed run left
+behind. That was built for "one container serves every checkout on the
+machine", and this task is that machine. Nothing here creates or drops a
+database.
+
+The data lives on the task's ephemeral storage and every merge to ops `main`
+replaces the task, so nothing accumulates across deploys.
+
+This does not replace CI, and the prompt says so. CI is still what has to be
+green at the approval SHA; what it cannot give an agent is the short loop.
 
 ## Durability
 
@@ -257,6 +341,7 @@ deleting is not the way back.
 | `report/` | The closing report: assemble, render, publish once |
 | `http/` | Public routes and the loopback tool API |
 | `db/` | SQLite, and the S3 mirror |
+| `testdb/` | The test Postgres URL, its guard and its boot probe |
 | `index.ts` | The composition root. The only place real services are named |
 
 `types.ts` is the contract every module is built against. `logging.ts` is
@@ -267,6 +352,14 @@ the one place `alarm` and `log` are defined.
 **Bedrock via `InvokeModel`, not `Converse`.** Converse drops thinking
 blocks that have empty text but live signatures, which is exactly the shape
 Opus 5 produces. Resume depends on those surviving.
+
+**The provider is reached by wrapping Pi's Bedrock provider, not by claiming
+an api id.** Pi looks a provider up by `model.provider`, and installs its
+builtin untouched when that id has no `models.json` entry and no registered
+extension -- so the registry that `model.api` indexes is never consulted, and
+the builtin serves Converse to every model it owns. `bedrock/runtime.ts`
+registers a native provider that dispatches on `model.api` instead, and
+`agent/run.ts` asserts the routing before the session starts.
 
 **Wall-clock timeout, not budget caps.** A deadline is external, so it costs
 nothing in harness capability. Two layers: the child steers itself to write

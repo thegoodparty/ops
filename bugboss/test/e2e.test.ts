@@ -16,6 +16,7 @@ import { after, before, mock, test } from "node:test";
 
 import {
   bossConfigFromEnv,
+  reportTestDatabase,
   createBugBoss,
   createMemoryS3,
   installCrashHandlers,
@@ -65,6 +66,10 @@ const fakeModel = {
   maxInFlight: 0,
   /** The last triage prompt, so a test can assert what triage was offered. */
   lastPrompt: "",
+  /** When set, the next triage call searches with this before deciding. */
+  searchBefore: null as string | null,
+  /** What the real search tool answered, so a test can assert it worked. */
+  lastSearchResult: "",
   next(): QueuedDecision {
     const d = this.triageDecisions.shift();
     if (!d) throw new Error("fakeModel: no triage decision queued");
@@ -95,6 +100,15 @@ const fakeModel = {
         this.beforeDecide = null;
         await hook();
       }
+      // Exercises the real search tool inside the real loop, rather than
+      // asserting against a rendered prompt that nothing ever ran.
+      if (this.searchBefore && !request.messages.some((m) => m.role === "toolResult")) {
+        const text = this.searchBefore;
+        this.searchBefore = null;
+        return call("search_incidents", { text });
+      }
+      const last = request.messages.at(-1);
+      if (last?.role === "toolResult") this.lastSearchResult = last.text;
       if (this.gate) await this.gate;
       return call("decide", { ...this.next() });
     } finally {
@@ -203,6 +217,7 @@ const config = (path: string): BugBossConfig => ({
   s3Bucket: "bugboss-test",
   dbPath: path,
   slackChannelId: "C0TEST",
+  testDatabase: { state: "absent" },
   dispatcher: {
     maxConcurrentAgents: 15,
     tickSeconds: 30,
@@ -615,6 +630,94 @@ test("the same alert firing again after resolution opens a recurrence", async ()
   assert.ok(reopened, "a premature resolution has to be contradictable");
 });
 
+test("the pointer is set without the model volunteering it", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-11", "briefing-dispatch-errors"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-11')",
+  );
+
+  // No recurrenceOf queued. The delivery is an exact (source, sourceId) match
+  // against an incident closed moments ago, which is a fact about the
+  // delivery rather than a judgement about the problem -- so triage stamps it
+  // whether or not the model noticed.
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open matches",
+  });
+  await boss.ingest("grafana", grafanaBody("fp-11", "briefing-dispatch-errors"));
+
+  const reopened = boss.db.get<{ id: string; recurrenceOf: string | null }>(
+    "SELECT id, recurrenceOf FROM incident WHERE recurrenceOf = ?",
+    [first!.id],
+  );
+  assert.ok(reopened, "the recurrence must not depend on the model mentioning it");
+  assert.match(fakeModel.lastPrompt, /RECURRENCE CANDIDATES/);
+});
+
+test("triage can reach the post-mortems through the real search tool", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-13", "webhook-write-errors"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-13')",
+  );
+
+  // A different alert entirely: no shared fingerprint, so RECURRENCE
+  // CANDIDATES is empty and the search is the only thing that can find it.
+  fakeModel.beforeDecide = async () => {};
+  fakeModel.searchBefore = "Pro upgrade webhook wrote to the wrong column";
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "the search turned up the same cause under another alert",
+    recurrenceOf: first!.id,
+  });
+  await boss.ingest("grafana", grafanaBody("fp-14", "campaign-save-errors"));
+
+  assert.ok(
+    fakeModel.lastSearchResult.includes(first!.id),
+    `the real FTS index should have found ${first!.id}, got: ${fakeModel.lastSearchResult}`,
+  );
+  const reopened = boss.db.get<{ id: string }>(
+    "SELECT id FROM incident WHERE recurrenceOf = ?",
+    [first!.id],
+  );
+  assert.ok(reopened, "a cause returning under a different alert is still a recurrence");
+});
+
+test("the agent starts from the post-mortem that was already written", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first time" });
+  await boss.ingest("grafana", grafanaBody("fp-12", "peerly-send-failures"));
+  await boss.dispatchOnce();
+
+  const first = boss.db.get<{ id: string; postmortem: string | null }>(
+    "SELECT id, postmortem FROM incident WHERE id = (SELECT incidentId FROM signal WHERE sourceId = 'fp-12')",
+  );
+  assert.ok(first?.postmortem, "CLOSED requires one");
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "back again" });
+  const [placed] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-12", "peerly-send-failures"),
+  );
+
+  const view = await boss.toolApiFor(placed.incidentId!).getIncident();
+
+  assert.equal(view.data?.priorIncident?.id, first!.id);
+  assert.equal(
+    view.data?.priorIncident?.postmortem,
+    first!.postmortem,
+    "somebody already investigated this and wrote down what they concluded",
+  );
+  assert.ok(
+    (view.data?.priorIncident?.prUrls ?? []).length > 0,
+    "the fix that did not hold is the first thing to check",
+  );
+});
+
 // --- the webhook answers before it works -----------------------------------
 
 const until = async (ready: () => boolean, what: string): Promise<void> => {
@@ -948,6 +1051,81 @@ test("the prod-critical allowlist can be delivered in the secret blob", () => {
   // One of exactly three things the design says earns an @, and there is no
   // other way to deliver it: the task definition does not set this.
   assert.deepEqual(cfg.prodCriticalSlugs, ["pro-upgrade-errors", "checkout-5xx"]);
+});
+
+// --- the test database says something, whatever state it is in -------------
+
+const captureConsole = async (
+  run: () => Promise<void>,
+): Promise<{ out: string[]; err: string[] }> => {
+  const out: string[] = [];
+  const err: string[] = [];
+  const realLog = console.log;
+  const realError = console.error;
+  console.log = (line: string) => out.push(line);
+  console.error = (line: string) => err.push(line);
+  try {
+    await run();
+  } finally {
+    console.log = realLog;
+    console.error = realError;
+  }
+  return { out, err };
+};
+
+const baseEnv = {
+  BUGBOSS_BUCKET: "bugboss-prod",
+  BUGBOSS_SLACK_CHANNEL_ID: "C0PROD",
+};
+
+test("a test database URL off loopback is refused and alarmed, never passed on", async () => {
+  // The failure this exists for is a container definition typo, which would
+  // otherwise point fifteen agents' migration replay and DROP DATABASE at a
+  // real cluster.
+  const cfg = bossConfigFromEnv({
+    ...baseEnv,
+    OMNI_TEST_POSTGRES_URL:
+      "postgresql://gpuser:pw@gp-api-db-prod.cluster-x.us-west-2.rds.amazonaws.com:5432/postgres",
+  });
+  assert.equal(cfg.testDatabase.state, "refused");
+
+  const { err } = await captureConsole(() => reportTestDatabase(cfg.testDatabase));
+  assert.equal(err.length, 1);
+  assert.match(err[0], /test_database_refused/);
+  assert.match(err[0], /"level":"error"/);
+});
+
+test("a configured test database nothing answers on alarms rather than passing quietly", async () => {
+  // essential: false means ECS will not tell anyone this container died, so
+  // this is the only place a missing sidecar is noticed at boot.
+  const cfg = bossConfigFromEnv({
+    ...baseEnv,
+    // Reserved for documentation, so nothing is listening and nothing can be.
+    OMNI_TEST_POSTGRES_URL: "postgresql://test_user:pw@127.0.0.1:1/postgres",
+  });
+  assert.equal(cfg.testDatabase.state, "configured");
+
+  // A short deadline rather than the ninety-second default. What is under
+  // test is that silence eventually alarms, not how long it waits first.
+  const { err } = await captureConsole(() =>
+    reportTestDatabase(cfg.testDatabase, 100),
+  );
+  assert.equal(err.length, 1);
+  assert.match(err[0], /test_database_unreachable/);
+  assert.match(err[0], /waitedMs/);
+});
+
+test("no test database at all is said out loud too, at info", async () => {
+  const cfg = bossConfigFromEnv(baseEnv);
+  assert.deepEqual(cfg.testDatabase, { state: "absent" });
+
+  const { out, err } = await captureConsole(() => reportTestDatabase(cfg.testDatabase));
+  assert.deepEqual(err, []);
+  assert.equal(out.length, 1);
+  assert.match(out[0], /test_database_absent/);
+  // Names the variable, so the log says what to set and not merely that
+  // something is missing.
+  assert.match(out[0], /OMNI_TEST_POSTGRES_URL/);
 });
 
 // --- the process does not die quietly --------------------------------------

@@ -11,9 +11,16 @@ import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { Directive, IncidentView, ToolApi, ToolResponse } from "../types";
-import { resolveBedrockModel, registerBedrockInvokeModelProvider } from "../bedrock";
+import type { ExtensionAPI, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+  Directive,
+  IncidentMatch,
+  IncidentView,
+  ToolApi,
+  ToolResponse,
+} from "../types";
+import { resolveBedrockModel } from "../bedrock";
+import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
 import { connectMcpToolset, type McpToolset } from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
@@ -214,6 +221,8 @@ export const createBossClient = (args: {
     reportAnalysis: (payload) => call<ToolResponse>("POST", "/analysis", payload),
     handOff: (payload) => call<ToolResponse>("POST", "/handoff", payload),
     getIncident: () => call<ToolResponse<IncidentView>>("GET", ""),
+    searchIncidents: (payload) =>
+      call<ToolResponse<IncidentMatch[]>>("POST", "/search", payload),
     peekDirectives: () => call<PendingDirective[]>("GET", "/directives"),
     consumeDirective: (id) =>
       call<void>("DELETE", `/directives/${id}`).then(() => undefined),
@@ -305,6 +314,24 @@ export const createBossTools = async (args: {
       },
     },
     {
+      name: "search_incidents",
+      label: "Search incidents",
+      description:
+        "Search the post-mortems, root causes and resolution evidence of incidents that were RESOLVED or CLOSED. Plain words describing the failure, not a question and not SQL. The only way to find the same cause returning under a different alert.",
+      parameters: Type.Object({
+        text: Type.String({
+          description: "The failing operation, the component, the error text.",
+        }),
+      }),
+      execute: async (_id: string, params: unknown) =>
+        bossToolResult(
+          await args.api.searchIncidents(
+            params as unknown as Parameters<ToolApi["searchIncidents"]>[0],
+          ),
+          maxChars,
+        ),
+    },
+    {
       name: "report_impact",
       label: "Report impact",
       description:
@@ -340,11 +367,40 @@ export const createBossTools = async (args: {
       name: "report_analysis",
       label: "Report analysis",
       description:
-        "RESOLVED -> CLOSED, and your last act. Markdown post-mortem: summary, timeline, humans involved, impact, root cause analysis with five whys, and owned prevention items.",
+        "RESOLVED -> CLOSED, and your last act. Markdown post-mortem: summary, timeline, humans involved, impact, root cause analysis with five whys, and owned prevention items. On a recurrence the recurrence argument is required and the call is refused without it.",
       parameters: Type.Object({
         postmortem: Type.String(),
         usersImpacted: Type.Number(),
         impactQuery: Type.String(),
+        recurrence: Type.Optional(
+          Type.Object(
+            {
+              category: Type.Union(
+                [
+                  Type.Literal("previous_fix_wrong"),
+                  Type.Literal("previous_fix_incomplete"),
+                  Type.Literal("alert_is_wrong"),
+                  Type.Literal("fix_never_reached_production"),
+                  Type.Literal("resolution_evidence_too_weak"),
+                  Type.Literal("bugboss_defect"),
+                ],
+                { description: "Which kind of failure let the earlier resolution stand." },
+              ),
+              why: Type.String({
+                description:
+                  "Why that resolution did not hold, specifically. Not why the bug happened.",
+              }),
+              remedy: Type.String({
+                description:
+                  "What you changed so it does not recur again, or plainly that you changed nothing and why. For a bugboss_defect, the change you would make in ops and who you raised it with.",
+              }),
+            },
+            {
+              description:
+                "Required when this incident recurred. Answers the second question a recurrence carries.",
+            },
+          ),
+        ),
       }),
       execute: async (_id: string, params: unknown) =>
         bossToolResult(
@@ -618,8 +674,22 @@ export const runIncidentAgent = async (
   }
 
   const pi = await import("@earendil-works/pi-coding-agent");
-  await registerBedrockInvokeModelProvider();
   const model = await resolveBedrockModel({ id: pinned.modelId });
+
+  // Built here rather than left to createAgentSession, because the router has
+  // to be installed on the runtime the session will actually stream through.
+  const modelRuntime = await pi.ModelRuntime.create({});
+  await registerBedrockRouting({ runtime: modelRuntime });
+  assertBedrockInvokeModelRouting(modelRuntime, model);
+  console.log(
+    JSON.stringify({
+      component: "agent",
+      event: "model_provider_selected",
+      incidentId: options.incidentId,
+      modelId: model.id,
+      api: model.api,
+    }),
+  );
 
   const mcp: McpToolset[] = [];
   if (options.grafana) {
@@ -645,6 +715,7 @@ export const runIncidentAgent = async (
       api,
       pi,
       model,
+      modelRuntime,
       mcp,
       restored,
       notesPrefix,
@@ -664,13 +735,15 @@ const launch = async (args: {
   api: BossClient;
   pi: typeof import("@earendil-works/pi-coding-agent");
   model: Awaited<ReturnType<typeof resolveBedrockModel>>;
+  modelRuntime: ModelRuntime;
   mcp: McpToolset[];
   restored: boolean;
   notesPrefix: string;
   notesSeen: Map<string, NoteRecord>;
   storedPrefix: StoredPrefix | null;
 }): Promise<RunIncidentAgentResult> => {
-  const { options, paths, store, key, api, pi, model, mcp, restored, storedPrefix } = args;
+  const { options, paths, store, key, api, pi, model, modelRuntime, mcp, restored, storedPrefix } =
+    args;
 
   // Aborted when the soft deadline fires, so a tool parked in a 24h wait
   // returns and the turn can end. `steer` only delivers between turns, so
@@ -876,6 +949,7 @@ const launch = async (args: {
   const { session } = await pi.createAgentSession({
     cwd: paths.checkout,
     model,
+    modelRuntime,
     thinkingLevel: "high",
     tools: prefix.toolNames,
     customTools,

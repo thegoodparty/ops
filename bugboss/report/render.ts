@@ -20,7 +20,7 @@
 // deliberate. The same root cause string goes down both paths, and a reader
 // working out which rules apply where is a reader about to get it wrong.
 
-import type { Incident } from "../types";
+import type { Incident, RecurrenceAnalysis, RecurrenceCategory } from "../types";
 import { mrkdwn, raw, toMrkdwn } from "../slack/format";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,13 @@ export interface ReportData {
   prs: ReportPr[];
   actions: ReportAction[];
   run: ReportRun;
+  /**
+   * Why an earlier resolution did not hold, for an incident that came back.
+   * Null for the ordinary case, and also when the stored answer could not be
+   * read -- which is a worse report and is alarmed at the point it happens,
+   * rather than a reason not to publish one.
+   */
+  recurrence: RecurrenceAnalysis | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +232,23 @@ const section = (heading: string, body: string): string[] =>
   body.trim() ? [`## ${heading}`, "", nest(body.trim()), ""] : [];
 
 const prLabel = (pr: ReportPr): string => pr.state ?? "state not known";
+
+/**
+ * The category as a sentence. The stored value is a slug because the set is
+ * closed on purpose, but a reader should not have to know the set -- and one
+ * of the six says the defect is in BugBoss, which is the one nobody would
+ * guess from `bugboss_defect` sitting alone on a line.
+ */
+const RECURRENCE_REASON: Record<RecurrenceCategory, string> = {
+  previous_fix_wrong: "the cause recorded last time was not the cause",
+  previous_fix_incomplete:
+    "the cause was right but only one way into the failure was closed",
+  alert_is_wrong: "the fix held, and the alert should not have fired either time",
+  fix_never_reached_production: "the fix held but never reached production",
+  resolution_evidence_too_weak:
+    "it was called resolved on evidence too weak to carry it",
+  bugboss_defect: "BugBoss let a premature close happen; the fix belongs in ops",
+};
 
 // ---------------------------------------------------------------------------
 // Derived metrics
@@ -417,6 +441,41 @@ const resolution = (data: ReportData): string[] => {
 };
 
 /**
+ * Why an incident came back, which is the one question its first report could
+ * not have answered. It is a section rather than a glance row because the
+ * answer is three things -- which kind of failure, why the last fix did not
+ * hold, and what was done about that -- and because a recurrence is the most
+ * important fact about an incident that has one.
+ */
+const recurrence = (data: ReportData): string[] => {
+  const { incident } = data;
+  if (!incident.recurrenceOf) return [];
+  if (!data.recurrence) {
+    return [
+      "## Why it came back",
+      "",
+      `A recurrence of ${incident.id === incident.recurrenceOf ? "itself" : incident.recurrenceOf}. The answer recorded at close could not be read back, so it is missing here rather than wrong.`,
+      "",
+    ];
+  }
+  const { category, why, remedy } = data.recurrence;
+  return [
+    "## Why it came back",
+    "",
+    `A recurrence of ${incident.recurrenceOf}: ${RECURRENCE_REASON[category] ?? category}.`,
+    "",
+    "**Why the earlier resolution did not hold**",
+    "",
+    why.trim(),
+    "",
+    "**What was done about that, rather than about the symptom**",
+    "",
+    remedy.trim(),
+    "",
+  ];
+};
+
+/**
  * The whole report, as a Markdown file.
  *
  * Ordered for someone who opens it once: the numbers first, then the cause,
@@ -437,6 +496,7 @@ export const renderReportDocument = (data: ReportData): string => {
     "",
     ...glance(data, metrics),
     ...section("Root cause", incident.rootCause ?? ""),
+    ...recurrence(data),
     ...section("Post-mortem", incident.postmortem ?? ""),
     ...section(
       "Impact",

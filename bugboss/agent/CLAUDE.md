@@ -196,6 +196,38 @@ so the soft deadline can interrupt a blocking tool. Without that, `steer` only l
 after the current turn's tool calls finish — and the agent spends most of
 its life inside a `monitor` with an hours-long timeout.
 
+## A recurrence arrives with its own history, and a second job
+
+When the incident carries `recurrenceOf`, `get_incident` returns
+`priorIncident` beside the signals: the earlier incident's root cause,
+resolution evidence, PR urls and post-mortem. An agent before this one
+investigated the same problem, declared it resolved on evidence, and was
+wrong — this incident is the proof.
+
+So the agent is working two problems. The firing one, and why a resolution
+that met the bar did not hold. Three constraints carry the second:
+
+- **`report_resolved` refuses the evidence the previous incident was closed
+  on**, byte-for-byte after whitespace. Narrow on purpose: it catches the
+  literal repeat — watching the same window for the same interval and
+  reporting the same quiet — not a paraphrase. The prompt carries the rest.
+- **`report_analysis` requires a `recurrence` argument** and refuses without
+  one: which of six kinds of failure, why, and what changed. `hand_off` is
+  the other exit, and an unexplained recurrence belongs there.
+- **`bugboss_defect` is one of the six.** The fix is in `ops`, and agents do
+  not open pull requests against it, so the answer leaves as a proposal
+  posted to the channel. The prompt says so; see the note in the PR that
+  added this about why a prompt is not the control here either.
+
+`search_incidents` is the agent's, not only triage's — the earlier
+post-mortem often points at something that happened a third time under a
+different alert, and no key finds that.
+
+The post-mortem is clipped in `toolapi`, not here. `get_incident` renders as
+JSON followed by the pending directives, and the truncation that would
+otherwise apply keeps a head and a tail — so an unbounded post-mortem eats
+the middle of the incident rather than itself.
+
 ## What it writes goes straight to Slack
 
 `contact_human`, the hand-off brief, the root cause, the resolution evidence
