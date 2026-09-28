@@ -16,6 +16,7 @@ import {
   parseWorkingHours,
   runContactHuman,
   runMonitor,
+  heartbeatMessage,
   shellProbe,
   stalledWaitBrief,
   truncateOutput,
@@ -1408,10 +1409,55 @@ test("the hand-off brief counts the nudges that were actually sent", async () =>
 // produce has to fit, and these are the tests that keep that true instead of
 // merely written down in a comment.
 
+test("the harness's nudge fits the thread budget at its worst", () => {
+  // The nudge is the one harness-composed thread post that carries two of the
+  // model's own fields *and* the status block, so it is the tightest of the
+  // three and the one that would fail first. A refused nudge is dropped on
+  // purpose -- losing a day-long wait to a 503 is the worse trade -- which
+  // means an over-long one produces an incident that waits all day, nudges
+  // nobody, and then hands off claiming it nudged three times.
+  // Absurd inputs on purpose. The margin here is not a constant: the elision
+  // marker `truncateOutput` adds names how much it dropped, so it grows with
+  // the input, and `formatWaited` grows with the wait. A bound checked only
+  // at plausible sizes is a bound that holds until somebody waits longer.
+  const nudge = heartbeatMessage({
+    description: "d".repeat(100_000_000),
+    awaitingHuman: "a".repeat(100_000_000),
+    waitedMs: Number.MAX_SAFE_INTEGER,
+    status: "s".repeat(100_000_000),
+    // The hand-off sentence is the longer of the two tails.
+    nextSeconds: null,
+  });
+
+  assert.ok(
+    nudge.length <= THREAD_PROSE_CHARS,
+    `a maximal nudge is ${nudge.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
+  );
+  assert.match(nudge, /characters elided/);
+});
+
+test("an ordinary nudge is left exactly as written", () => {
+  // The clamp must be invisible on every real nudge: an elision marker on a
+  // one-line wait would send a reader looking for text that never existed.
+  const nudge = heartbeatMessage({
+    description: "the preview deploy for PR 42",
+    awaitingHuman: "someone needs to merge it",
+    waitedMs: 3_600_000,
+    status: "pending",
+    nextSeconds: 1_800,
+  });
+
+  assert.ok(nudge.includes("the preview deploy for PR 42"));
+  assert.ok(nudge.includes("someone needs to merge it"));
+  assert.doesNotMatch(nudge, /elided/);
+});
+
 test("the harness's unanswered brief fits the thread budget at its worst", () => {
+  // The question is already capped by the tool, so this is its true maximum;
+  // the minute count is not capped anywhere, so it gets an absurd one.
   const brief = unansweredBrief(
     "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT),
-    30,
+    999_999_999,
     Array.from({ length: MAX_CHOICE_OPTIONS }, (_, i) => `${i}`.padEnd(75, "o")),
   );
 
@@ -1427,12 +1473,15 @@ test("the harness's unanswered brief fits the thread budget at its worst", () =>
 });
 
 test("the harness's stalled-wait brief fits the thread budget at its worst", () => {
+  // Absurd inputs, for the same reason as the nudge above: the elision marker
+  // grows with what it elided and `formatWaited` grows with the wait, so a
+  // bound checked at plausible sizes is a bound that holds until it does not.
   const brief = stalledWaitBrief({
-    description: "d".repeat(2_000),
-    awaitingHuman: "a".repeat(2_000),
-    waitedMs: 86_400_000,
-    status: "s".repeat(10_000),
-    nudges: 4,
+    description: "d".repeat(100_000_000),
+    awaitingHuman: "a".repeat(100_000_000),
+    waitedMs: Number.MAX_SAFE_INTEGER,
+    status: "s".repeat(100_000_000),
+    nudges: 999_999,
   });
 
   assert.ok(

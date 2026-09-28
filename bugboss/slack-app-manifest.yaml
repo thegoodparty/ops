@@ -59,12 +59,14 @@ oauth_config:
       ## behind this one scope.) Without it the upload fails with
       ## missing_scope and the report is posted as thread text instead --
       ## nothing is lost, it is just longer to read.
-      ##
-      ## files:read is deliberately not requested. Nothing here reads a file
-      ## back: the Boss writes the report and the reader opens it in Slack.
-      ## Every scope in this file is one something calls, so that reinstalling
-      ## from the manifest is a decision rather than a diff nobody reads.
       - files:write
+      ## Granted on the installed app already (docs/bugboss-todo.md), and
+      ## listed here because this file is what a reinstall applies -- leaving
+      ## it out would quietly drop a live scope the next time somebody
+      ## reinstalls. Nothing calls it yet: the Boss writes the report and a
+      ## person opens it. It is the scope a future reader of the thread's own
+      ## files would need.
+      - files:read
       ## usergroups.users.list, for the rotation snapshot recorded on each
       ## incident at open. A Slack user group keeps no history, so this is
       ## the only moment that answer exists.

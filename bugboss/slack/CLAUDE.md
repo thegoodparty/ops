@@ -219,12 +219,17 @@ document does reach the thread is the degraded path when the upload fails, and
 that call is `postDocument` rather than `postProse` so the exemption is a name
 somebody can grep for instead of a check somebody forgot.
 
-A harness-written brief is the exception to the exception: `unansweredBrief`
-and `stalledWaitBrief` are composed when the model is no longer in the loop, so
-there is nobody to refuse them to. They clamp the text they echo — which is
-already in the thread directly above — small enough that the composed brief
-provably fits, and `tools.test.ts` composes the worst case of each to keep that
-true.
+Harness-written posts are the exception to the exception: `unansweredBrief`,
+`stalledWaitBrief` and `heartbeatMessage` are composed when the model is no
+longer in the loop, so there is nobody to refuse them to — and the wait nudge
+is *dropped* on a failed post by design, because losing a day-long wait to a
+503 is the worse trade. An over-long one would therefore mean an incident that
+waits all day, nudges nobody, and then hands off claiming it nudged three
+times. So they clamp the text they echo — which is already in the thread
+directly above — small enough that the composed post provably fits, and
+`tools.test.ts` composes the worst case of each to keep that true. The nudge
+gets a smaller clamp than the briefs because it carries two echoes plus the
+whole status block where they carry one.
 
 ## Block Kit for one message: a question with its answers
 

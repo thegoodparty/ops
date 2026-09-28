@@ -241,6 +241,8 @@ const drive = async (
   options: {
     ticket?: Ticket;
     upload?: () => Promise<Response>;
+    /** A status the API answers with, for the retry question. */
+    apiStatus?: number;
   } = {},
 ): Promise<UploadRun> => {
   const api: ApiCall[] = [];
@@ -263,8 +265,8 @@ const drive = async (
         : { ok: true };
     return Promise.resolve({
       data,
-      status: 200,
-      statusText: "OK",
+      status: options.apiStatus ?? 200,
+      statusText: options.apiStatus ? "Server Error" : "OK",
       headers: {},
       config,
       // `buildResult` reads this to spot the one method that answers with a
@@ -418,5 +420,41 @@ describe("an upload is bounded, or it is not an upload", () => {
     const done = paramsFor(run, "files.completeUploadExternal");
     assert.equal(done.get("channel_id"), "C0DEVALERTS");
     assert.equal(done.get("thread_ts"), null, "absent, not the string \"null\"");
+  });
+});
+
+describe("the upload does not retry its way past the tick it has", () => {
+  test("a retryable failure is attempted once, not five times over five minutes", async () => {
+    // This is the bound that is easy to get wrong because every individual
+    // request still looks bounded. The SDK's default policy spreads five
+    // attempts over five minutes, which is ten dispatcher ticks of the report
+    // sweep held open -- against a documented guarantee that a Slack which
+    // will not take the file degrades to thread text on the tick that noticed
+    // the close. Retrying also buys nothing here: the other side of this
+    // failure is the same report, in the thread, as text.
+    const run = await drive(A_FILE, { apiStatus: 500 });
+
+    assert.ok(run.error, "a 500 from Slack fails the upload");
+    assert.deepEqual(
+      methods(run),
+      ["files.getUploadURLExternal"],
+      "one attempt, and nothing downstream of it",
+    );
+    assert.deepEqual(run.posts, [], "no POST to a signed url it never received");
+  });
+
+  test("every API call carries the same per-call bound", async () => {
+    // Zero is the SDK default and means unbounded. With retries off, the
+    // per-call bound is the whole story: three steps at 8s is 24s of worst
+    // case, inside the 30s tick.
+    const run = await drive(A_FILE);
+
+    const bounds = [...new Set(run.api.map((call) => call.timeout))];
+    assert.equal(bounds.length, 1, `mixed bounds: ${bounds.join(", ")}`);
+    assert.ok(bounds[0] > 0, "an unbounded WebClient call is the defect");
+    assert.ok(
+      run.api.length * bounds[0] < 30_000,
+      `${run.api.length} calls at ${bounds[0]}ms must fit one 30s tick`,
+    );
   });
 });

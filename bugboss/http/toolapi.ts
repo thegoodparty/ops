@@ -498,13 +498,16 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       const problem = choiceProblem(options);
       if (problem) return c.json({ error: problem }, 400);
     }
-    // Every post that reaches a thread comes through here -- the ask, the
-    // evidence under it, the rerun notice, the wait heartbeat -- so this is
-    // the only place a thread budget can be a budget rather than a rule one
-    // of four callers happens to follow. It refuses instead of splitting:
-    // two posts of 200 words are not shorter than one of 400, they are
-    // worse. The uncapped long form is the post-mortem, which leaves as a
-    // file rather than as thread text.
+    // Every post the *agent* causes comes through here -- the ask, the
+    // evidence under it, the rerun notice, the wait heartbeat -- which is
+    // what makes this the place the budget can be one thing rather than a
+    // rule four callers each keep separately. The Boss's own posts do not
+    // come through here; they go out via `notify` and the relay, and they
+    // split rather than refuse, because there is nobody to refuse them to.
+    //
+    // It refuses instead of splitting: two posts of 200 words are not
+    // shorter than one of 400, they are worse. The uncapped long form is the
+    // post-mortem, which leaves as a file rather than as thread text.
     const tooLong = overThreadBudget("message", message);
     if (tooLong) return c.json({ error: tooLong }, 400);
 
