@@ -33,9 +33,14 @@ import {
   type BedrockInvokeModelApi,
   type BedrockInvokeModelOptions,
   mapThinkingLevelToEffort,
+  resolveCacheRetention,
 } from "./options";
 import { regionFromModelId } from "./model";
-import { type AnthropicStreamEvent, consumeAnthropicStream } from "./stream";
+import {
+  type AnthropicStreamEvent,
+  type CacheRetentionReport,
+  consumeAnthropicStream,
+} from "./stream";
 
 export * from "./options";
 export * from "./model";
@@ -102,6 +107,32 @@ const defaultInvoke: BedrockInvoke = async (input, { signal, region }) => {
 
 const decoder = new TextDecoder();
 
+/**
+ * Reported once per provider, not once per turn. A downgrade is a property of
+ * the deployment rather than of a turn, and an incident runs ~90 of them; 90
+ * copies would bury the line an alert is meant to catch.
+ */
+const reportUnhonouredCacheRetention = (
+  modelId: string,
+  report: CacheRetentionReport,
+): void => {
+  console.error(
+    JSON.stringify({
+      component: "bedrock",
+      event: "cache_retention_not_honoured",
+      modelId,
+      requested: report.requested,
+      cacheWrite: report.written,
+      cacheWrite1h: report.written1h,
+      cacheWrite5m: report.written5m,
+      detail:
+        report.written1h === null
+          ? "the response carried no cache_creation split, so the 1h ttl could not be confirmed and this write is being costed at the 5m rate"
+          : "the 1h ttl was requested but the whole write was billed at the 5m rate, so blocking waits will keep rebuilding the prefix",
+    }),
+  );
+};
+
 const decodeEvents = async function* (
   body: AsyncIterable<BedrockStreamItem>,
 ): AsyncGenerator<AnthropicStreamEvent> {
@@ -143,6 +174,7 @@ export const createBedrockInvokeModelProvider = async ({
   ApiProvider<BedrockInvokeModelApi, BedrockInvokeModelOptions>
 > => {
   const pi = await import("@earendil-works/pi-ai");
+  let reportedUnhonouredRetention = false;
 
   const stream: StreamFunction<BedrockInvokeModelApi, BedrockInvokeModelOptions> = (
     model,
@@ -165,6 +197,8 @@ export const createBedrockInvokeModelProvider = async ({
 
     void (async () => {
       try {
+        const requestedCacheRetention = resolveCacheRetention(options);
+
         // The native body carries one top-level system prompt, so later system
         // messages are replayed into the leading one rather than dropped.
         const collapsed = pi.collapseSystemMessages(context);
@@ -212,6 +246,12 @@ export const createBedrockInvokeModelProvider = async ({
             pi.calculateCost(model, output.usage);
           },
           parseJson: (partial) => pi.parseStreamingJson(partial),
+          cacheRetention: requestedCacheRetention,
+          onUnhonouredCacheRetention: (report) => {
+            if (reportedUnhonouredRetention) return;
+            reportedUnhonouredRetention = true;
+            reportUnhonouredCacheRetention(model.id, report);
+          },
           signal: options.signal,
         });
 

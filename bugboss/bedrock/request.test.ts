@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { AssistantMessage, Message, Model, Tool } from "@earendil-works/pi-ai";
 
 import { buildInvokeModelBody, convertMessages, resolveCacheControl } from "./request";
+import { resolveCacheRetention } from "./options";
 import { BEDROCK_INVOKE_MODEL_API, type BedrockInvokeModelApi } from "./options";
 
 const model: Model<BedrockInvokeModelApi> = {
@@ -179,7 +180,7 @@ test("consecutive tool results are coalesced into one user message", () => {
     tool_use_id: "t2",
     content: [{ type: "text", text: "boom" }],
     is_error: true,
-    cache_control: { type: "ephemeral" },
+    cache_control: { type: "ephemeral", ttl: "1h" },
   });
 });
 
@@ -228,10 +229,10 @@ test("system text and tools carry a cache breakpoint", () => {
     {
       type: "text",
       text: "You are the incident agent.",
-      cache_control: { type: "ephemeral" },
+      cache_control: { type: "ephemeral", ttl: "1h" },
     },
   ]);
-  assert.equal(body.tools?.[0].cache_control?.type, "ephemeral");
+  assert.deepEqual(body.tools?.[0].cache_control, { type: "ephemeral", ttl: "1h" });
   assert.deepEqual(body.tools?.[0].input_schema, {
     type: "object",
     properties: { id: { type: "string" } },
@@ -243,6 +244,71 @@ test("long retention asks for the 1h cache ttl", () => {
   assert.deepEqual(resolveCacheControl("long"), { type: "ephemeral", ttl: "1h" });
   assert.deepEqual(resolveCacheControl("short"), { type: "ephemeral" });
   assert.equal(resolveCacheControl("none"), undefined);
+});
+
+// The regression these pin is the one that cost $7.53 on incident 1: a body
+// built with no explicit retention asked for the 5m tier, and every blocking
+// wait longer than five minutes rebuilt the whole prefix. Asserting the ttl on
+// each of the three breakpoints separately is deliberate -- a default that
+// reached the system prompt but not the conversation tail would still rewrite
+// the expensive part on every miss.
+test("a body built with no explicit retention asks for the 1h ttl everywhere", () => {
+  const tools: Tool[] = [
+    {
+      name: "monitor",
+      description: "wait for something to change",
+      parameters: { type: "object", properties: {}, required: [] },
+    } as unknown as Tool,
+  ];
+
+  const body = buildInvokeModelBody({
+    model,
+    messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
+    initialSystemMessage: undefined,
+    systemText: "You are the incident agent.",
+    tools,
+    options: {},
+  });
+
+  const expected = { type: "ephemeral", ttl: "1h" };
+  assert.deepEqual(body.system?.[0].cache_control, expected);
+  assert.deepEqual(body.tools?.[body.tools.length - 1].cache_control, expected);
+  const tail = body.messages[body.messages.length - 1];
+  const tailBlock = tail.content[tail.content.length - 1];
+  assert.equal(tailBlock.type, "text");
+  assert.deepEqual(tailBlock.type === "text" ? tailBlock.cache_control : undefined, expected);
+});
+
+test("resolveCacheRetention defaults to long and yields to an explicit choice", () => {
+  assert.equal(resolveCacheRetention({}), "long");
+  assert.equal(resolveCacheRetention({ cacheRetention: "short" }), "short");
+  assert.equal(resolveCacheRetention({ cacheRetention: "none" }), "none");
+});
+
+test("an explicit short retention still gets the 5m ttl", () => {
+  const body = buildInvokeModelBody({
+    model,
+    messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
+    initialSystemMessage: undefined,
+    systemText: "You are the incident agent.",
+    tools: [],
+    options: { cacheRetention: "short" },
+  });
+
+  assert.deepEqual(body.system?.[0].cache_control, { type: "ephemeral" });
+});
+
+test("an explicit none retention sets no breakpoint at all", () => {
+  const body = buildInvokeModelBody({
+    model,
+    messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
+    initialSystemMessage: undefined,
+    systemText: "You are the incident agent.",
+    tools: [],
+    options: { cacheRetention: "none" },
+  });
+
+  assert.equal(body.system?.[0].cache_control, undefined);
 });
 
 test("the trailing conversation block gets the cache breakpoint", () => {

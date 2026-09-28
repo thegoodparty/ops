@@ -76,3 +76,53 @@ distinctly when the environment disagrees.
 There is no backoff anywhere in this module, deliberately: Pi owns the
 retry loop, and a second layer underneath it would multiply attempts
 invisibly.
+
+## The cache is written with a 1h ttl
+
+`monitor` and `contact_human` each cost one turn however long they block.
+That is what keeps a multi-day incident from saturating context, and it is
+also what guarantees a cache miss on a 5-minute cache, because a tool that
+blocks for ten minutes resumes into a dead prefix and rebuilds all ~190k
+tokens of it.
+
+Measured over seven production incidents: 32 misses, every one of them
+straight after one of those two tools. No turn whose gap was under 216s ever
+missed; no turn whose gap was over 331s ever hit. The rewrites were 27–41% of
+each run, and $7.53 of incident 1's $18.51.
+
+So `DEFAULT_CACHE_RETENTION` is `"long"`, and `resolveCacheRetention()` in
+`options.ts` is the only place that default is applied. A 1h write costs 2×
+base input against 1.25× for 5m, so avoiding one 190k rewrite pays that
+premium on ~291k written tokens, which is more than a whole run writes. A run that
+never blocks for more than five minutes pays about 0.5–1.2% more; every
+measured run had at least two blocking waits.
+
+Pi cannot carry this for us. `cacheRetention` has no path in through
+`createAgentSession`, and Pi's `PI_CACHE_RETENTION` env fallback is read by
+Pi's own providers, not by `resolveCacheControl()` here.
+
+### A downgrade is never silent
+
+A request that asks for 1h and is served 5m rebuilds its prefix on exactly
+the same schedule at exactly the same price, and reports nothing. It looks
+identical to the bug above. Pi's own Anthropic path can do this: it drops the
+ttl when `compat.supportsLongCacheRetention` is false, and still reports the
+retention it wanted.
+
+So the response is held to the request. Bedrock returns both halves of the
+`cache_creation` split on `us.anthropic.claude-opus-5`, so a downgrade is an
+observed number, and `stream.ts` reports one as
+`event: "cache_retention_not_honoured"`, once per provider, since it would
+otherwise repeat on all ~90 turns of an incident. An *absent* split is
+reported too: `calculateCost` reads a missing 1h share as zero and would bill
+a 1h write at the 5m rate.
+
+Deliberately a loud log and not a throw. This is a billing fault, and
+crashing an agent that is working a production incident over one would be the
+wrong trade.
+
+### What it does not fix
+
+A gap longer than an hour is beyond any ttl. Incident 1's last miss followed
+a 28,809s `contact_human` timeout that expired with no reply. That case wants
+a keep-alive or a shorter default timeout, not a longer cache.

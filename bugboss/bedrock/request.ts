@@ -18,7 +18,11 @@ import type {
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
 
-import type { BedrockInvokeModelApi, BedrockInvokeModelOptions } from "./options";
+import {
+  type BedrockInvokeModelApi,
+  type BedrockInvokeModelOptions,
+  resolveCacheRetention,
+} from "./options";
 
 export const ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31";
 
@@ -296,7 +300,7 @@ export const buildInvokeModelBody = ({
   tools,
   options,
 }: BuildBodyInput): InvokeModelBody => {
-  const cacheControl = resolveCacheControl(options.cacheRetention);
+  const cacheControl = resolveCacheControl(resolveCacheRetention(options));
 
   const body: InvokeModelBody = {
     anthropic_version: ANTHROPIC_BEDROCK_VERSION,
