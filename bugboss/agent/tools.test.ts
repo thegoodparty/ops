@@ -9,6 +9,7 @@ import {
   CONTACT_HUMAN_MESSAGE_LIMIT,
   createContactHumanTool,
   createMonitorTool,
+  HEARTBEAT_ECHO_CHARS,
   HEARTBEAT_MAX_PINGS,
   directiveTimestampMillis,
   firstReplyAfter,
@@ -118,7 +119,10 @@ test("monitor output is capped", async () => {
     { probe: async () => ({ code: 0, output: "x".repeat(50000) }), maxOutputChars: 1000 },
   );
 
-  assert.ok(result.output.length < 1200);
+  // Against the cap itself, not a loose multiple of it: `truncateOutput`
+  // holds its cap exactly, and a caller that checks a looser number is a
+  // caller that would not notice it slipping again.
+  assert.ok(result.output.length <= 1000, `capped output was ${result.output.length}`);
   assert.match(result.output, /characters elided/);
 });
 
@@ -130,6 +134,70 @@ test("the real probe reports exit codes from the shell", async () => {
 
 test("truncateOutput leaves small output alone", () => {
   assert.equal(truncateOutput("short", 1000), "short");
+});
+
+test("truncateOutput holds its cap at every size and budget", () => {
+  // The contract, asserted directly rather than at whichever input somebody
+  // happened to have in hand. The old cap overshot by the length of the
+  // marker naming what it dropped, and that marker grows with the number it
+  // prints -- so every caller's margin shrank as its inputs grew, which is
+  // the opposite of what a margin is for.
+  const sizes = [0, 1, 39, 199, 1000, 100_000, 10_000_000];
+  const budgets = [0, 1, 10, 30, 39, 40, 200, 400, 1000, 20_000];
+
+  for (const size of sizes) {
+    const text = "z".repeat(size);
+    for (const maxChars of budgets) {
+      const capped = truncateOutput(text, maxChars);
+      assert.ok(
+        capped.length <= maxChars,
+        `${size} characters capped at ${maxChars} came back as ${capped.length}`,
+      );
+      // At or under the cap nothing is a truncation, so nothing may change:
+      // an elision marker on an output that fits sends a reader looking for
+      // text that never existed.
+      if (size <= maxChars) assert.equal(capped, text);
+    }
+  }
+});
+
+test("truncateOutput still marks the cut when the marker outgrows the budget", () => {
+  // Nothing here passes a budget this small -- the tightest clamp in this
+  // file is 200 -- so it is a caller bug rather than an input, and the
+  // answer to one is to be loud about it, not to quietly hand back more
+  // than was asked for or a cut nobody can see.
+  for (const maxChars of [40, 30, 10, 1]) {
+    const capped = truncateOutput("y".repeat(5000), maxChars);
+    assert.equal(capped.length, maxChars, `cap ${maxChars} was not honoured`);
+    assert.ok(
+      /characters elided/.test(capped) || capped.endsWith("…"),
+      `cap ${maxChars} truncated without saying so: ${JSON.stringify(capped)}`,
+    );
+  }
+  assert.equal(truncateOutput("y".repeat(5000), 0), "");
+});
+
+test("truncateOutput's marker names the count it actually dropped", () => {
+  // Sized at the heartbeat echo clamp, which is where the old overshoot
+  // actually bit: the marker is a fixed ~39 characters and the old slices
+  // left it a tenth of the budget, so a small cap overshot every time.
+  // The marker has to survive the fix -- truncation a reader cannot see is
+  // the silent failure this file is built against -- and it has to keep
+  // telling the truth once the slices are sized around it.
+  const text = "q".repeat(5000);
+  const capped = truncateOutput(text, HEARTBEAT_ECHO_CHARS);
+  const split = /\n\n\[\.\.\. (\d+) characters elided \.\.\.\]\n\n/.exec(capped);
+
+  assert.ok(split, `no elision marker in ${JSON.stringify(capped)}`);
+  assert.ok(capped.length <= HEARTBEAT_ECHO_CHARS);
+
+  const head = capped.slice(0, split.index);
+  const tail = capped.slice(split.index + split[0].length);
+  assert.ok(text.startsWith(head), "the head is the start of the input");
+  assert.ok(text.endsWith(tail), "the tail is the end of the input");
+  assert.equal(Number(split[1]), text.length - head.length - tail.length);
+  // Roughly twice as much head as tail, which is the shape callers read.
+  assert.ok(head.length > tail.length);
 });
 
 const fakeContact = (pending: PendingQuestion | null = null) => {
