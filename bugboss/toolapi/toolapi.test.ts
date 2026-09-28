@@ -525,6 +525,66 @@ describe("invariant 1: every attached signal must be explained", () => {
   });
 });
 
+describe("resolution evidence answers to the thread budget", () => {
+  // The refusal matters more than the cap does. This evidence is posted into
+  // the thread, so it is bounded like every other post -- but the check runs
+  // ahead of the write, and a threshold that drifted the wrong way would stop
+  // an agent resolving anything at all while every test about resolving
+  // still passed. So both sides of the boundary are pinned here.
+  it("refuses evidence past the budget, leaving the incident resolvable", async () => {
+    await seed("sig-long-ev");
+    const id = await openIncident(["sig-long-ev"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "bad deploy",
+      explainedSignalIds: ["sig-long-ev"],
+    });
+
+    const before = posts.length;
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "x".repeat(THREAD_PROSE_CHARS + 1),
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /evidence is \d+ characters/);
+    assert.match(res.error ?? "", /post-mortem/);
+    assert.equal(posts.length, before, "refused ahead of the post");
+    // The transition must not have happened, or the agent is stuck holding a
+    // FIXING incident it has already been told it cannot resolve.
+    const row = incidentRow(id);
+    assert.equal(row?.status, "FIXING");
+    assert.equal(row?.resolvedAt, null);
+
+    // And the refusal is recoverable: shortening it resolves.
+    const retry = await tools.reportResolved({
+      prUrls: [],
+      evidence: "the alert went quiet and stayed quiet for an hour",
+    });
+    assert.equal(retry.ok, true, retry.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+  });
+
+  it("accepts evidence exactly at the budget", async () => {
+    // The off-by-one that would refuse a resolution somebody trimmed to fit.
+    await seed("sig-edge-ev");
+    const id = await openIncident(["sig-edge-ev"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "bad deploy",
+      explainedSignalIds: ["sig-edge-ev"],
+    });
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "x".repeat(THREAD_PROSE_CHARS),
+    });
+
+    assert.equal(res.ok, true, res.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+  });
+});
+
 describe("invariant 2: resolution closes the signals it claims to have fixed", () => {
   // The tool API used to split any signal without a resolve notification out
   // into a recurrence. That asked whether we had heard the alert stop, not

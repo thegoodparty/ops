@@ -752,3 +752,60 @@ describe("an incident that came back explains itself", () => {
     assert.doesNotMatch(renderReportDocument(data), /Why it came back/);
   });
 });
+
+describe("a report that cannot be rendered is not a report that is lost", () => {
+  it("leaves no claim behind, so a later attempt still publishes", async () => {
+    // The claim is durable and the sweep will not revisit an incident that
+    // carries one, so the order of render and claim decides whether a bad row
+    // costs one attempt or the report itself. This is the failure that does
+    // not show up in the run that causes it: the marker persists, and the
+    // next container comes up, sees it, and stays quiet forever.
+    //
+    // `rotationAtOpen` holds JSON written by another module. Valid JSON that
+    // is not a list is the cheapest way to reach a throw inside rendering.
+    await seed("inc-40");
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-40'").run();
+    });
+
+    assert.equal(await publishIncidentReport(deps(), "inc-40"), "skipped");
+    assert.equal(uploads.length, 0);
+    assert.equal(posts.length, 0, "nothing half-posted either");
+    assert.equal(markers("inc-40"), 0, "and nothing durable to suppress a retry");
+
+    // The sweep would pick it up again on the next tick, and once the row is
+    // readable the report goes out in full.
+    await db.withWrite((w) => {
+      w.prepare(
+        `UPDATE incident SET rotationAtOpen = '["U-ONCALL"]' WHERE id = 'inc-40'`,
+      ).run();
+    });
+
+    assert.equal(await publishIncidentReport(deps(), "inc-40"), "published");
+    assert.equal(uploads.length, 1);
+    assert.match(uploads[0].content, /\| On call at open \| U-ONCALL \|/);
+    assert.equal(markers("inc-40"), 1);
+  });
+
+  it("a failed upload leaves the incident closed and the claim standing", async () => {
+    // The degraded path is the one that persists a marker without a file, so
+    // what matters is that nothing else was disturbed: the transition is
+    // untouched and the next resume reads a CLOSED incident with a report
+    // already accounted for, rather than re-posting one.
+    await seed("inc-41");
+    uploadFails = true;
+
+    assert.equal(await publishIncidentReport(deps(), "inc-41"), "degraded");
+    assert.equal(markers("inc-41"), 1);
+    assert.equal(
+      db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'inc-41'")
+        ?.status,
+      "CLOSED",
+    );
+
+    // A second pass -- a restart, or the sweep -- reads that marker and stops.
+    const before = posts.length;
+    assert.equal(await publishIncidentReport(deps(), "inc-41"), "skipped");
+    assert.equal(posts.length, before, "no second copy in the thread");
+  });
+});

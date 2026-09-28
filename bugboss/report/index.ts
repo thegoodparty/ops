@@ -313,6 +313,23 @@ export const publishIncidentReport = async (
     return "skipped";
   }
 
+  // Rendered before the claim, for the same reason the read is. The claim is
+  // durable and the sweep will not revisit an incident that carries it, so
+  // anything able to throw has to throw while the report can still be
+  // published later. Rendering is where hostile row data lands -- an
+  // on-call list that is not a list, a metric that is not a number -- and
+  // the cost of doing it early is a wasted render when two publishers race,
+  // against a report lost for good.
+  let document: string;
+  let summary: string;
+  try {
+    document = renderReportDocument(data);
+    summary = renderThreadSummary(data);
+  } catch (err) {
+    alarm("render_failed", { incidentId, error: String(err) });
+    return "skipped";
+  }
+
   if (!(await claim(deps.db, incidentId, now()))) {
     log("publish_skipped", { incidentId, reason: "already published" });
     return "skipped";
@@ -320,7 +337,6 @@ export const publishIncidentReport = async (
   log("publish_claimed", { incidentId });
 
   const threadTs = data.incident.slackThreadTs;
-  const document = renderReportDocument(data);
 
   const degrade = async (note: string): Promise<PublishOutcome> => {
     try {
@@ -355,7 +371,7 @@ export const publishIncidentReport = async (
       filename: `incident-${data.incident.id}.md`,
       title: `Incident ${data.incident.id} — closing report`,
       content: document,
-      comment: renderThreadSummary(data),
+      comment: summary,
     });
     log("published", {
       incidentId,

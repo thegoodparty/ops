@@ -49,6 +49,15 @@ in normal operation (the launch's `finally` and the tick's sweep), and the
 write queue plus the `NOT EXISTS` predicate inside the statement is what
 orders them.
 
+Read and **rendered** before the claim, both for the same reason. The claim is
+durable and the sweep will not revisit an incident carrying one, so anything
+able to throw has to throw while the report can still be published later.
+Rendering is where hostile row data lands -- an on-call list that is not a
+list -- and the cost of doing it early is a wasted render when two publishers
+race, against a report lost for good. This is the failure that would not show
+up in the run that caused it: the marker persists, the next container sees it,
+and nothing is ever posted.
+
 It is a row rather than a column because `db/schema.sql` runs as
 `CREATE TABLE IF NOT EXISTS` over a restored snapshot with no migration
 runner: a column added to a live table would exist in the file and never in
