@@ -922,6 +922,7 @@ export const githubActionsPulumiPreview: PolicyDocument = {
 // GetSecretValue on a production secret. That is step 4b.
 
 const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
+
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
