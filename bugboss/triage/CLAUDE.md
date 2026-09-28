@@ -48,6 +48,13 @@ model**: a search needs a query, only something that has read the signal can
 write one, and the same reach has to be available to the incident agent,
 which is looking for a third incident nobody pointed it at.
 
+It answers three different ways and they must stay three. Hits are hits, an
+empty array is "the corpus has nothing like this", and `UnsearchableQuery` is
+"no query was put to FTS5 at all" — which is what a sentence made entirely of
+stopwords reduces to. Collapsing the third into the second is the worst of
+the three, because the caller is deciding whether a problem is new and an
+empty array reads as a confident no.
+
 There is deliberately **no `alert_slug` key**. It looks like a cheap
 widening and is not one — it is an optional label, one rule covers many
 instances, and it is structurally blind to the case worth catching: the same

@@ -5,7 +5,7 @@
 // they share a process, and a write does not return until S3 has it. When an
 // agent's reportRootCause returns, the transition is durable.
 
-import { makeLog } from "../logging";
+import { makeAlarm, makeLog } from "../logging";
 import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -13,6 +13,14 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 
 const log = makeLog("db");
+
+const alarm = makeAlarm("db");
+
+export interface LateColumn {
+  table: string;
+  column: string;
+  type: string;
+}
 
 /**
  * Columns that arrived after their table shipped, and the reason they need
@@ -26,18 +34,89 @@ const log = makeLog("db");
  * Keep the declaration in `schema.sql` too: that is what a fresh database
  * gets, and it is where the column is documented.
  */
-const LATE_COLUMNS: { table: string; column: string; type: string }[] = [
+export const LATE_COLUMNS: LateColumn[] = [
   { table: "incident", column: "recurrenceAnalysis", type: "TEXT" },
 ];
 
-const addLateColumns = (w: Database.Database): void => {
-  for (const { table, column, type } of LATE_COLUMNS) {
-    const present = (
-      w.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
-    ).some((c) => c.name === column);
-    if (present) continue;
+const columnsOf = (db: Database.Database, table: string) =>
+  db.prepare(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+    type: string;
+  }[];
+
+export const addLateColumns = (
+  w: Database.Database,
+  late: LateColumn[] = LATE_COLUMNS,
+): void => {
+  for (const { table, column, type } of late) {
+    const existing = columnsOf(w, table);
+    // `PRAGMA table_info` answers a missing table with an empty list, so
+    // "this table has no such column" and "there is no such table" are the
+    // same answer here. Left to fall through, the ALTER below fails with
+    // SQLite's own "no such table", which names neither this list nor the
+    // entry that is wrong -- and it only fails at all because schema.sql
+    // happens to run first, which is an ordering nothing enforces.
+    //
+    // Throwing is deliberate. A wrong entry is a defect in this file, not a
+    // state the world can reach: it is identical on every boot, so the suite
+    // and the first dev run catch it and it never ships. Refusing to boot on
+    // it therefore costs nothing, where booting past it leaves a column
+    // missing that every statement naming it will roll back.
+    if (existing.length === 0) {
+      throw new Error(
+        `LATE_COLUMNS names ${table}.${column}, but there is no table ` +
+          `${table}; either the name is wrong or schema.sql never declared it`,
+      );
+    }
+    if (existing.some((c) => c.name === column)) continue;
     w.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
     log("late_column_added", { table, column });
+  }
+};
+
+/**
+ * Every column `schema.sql` declares that the live database does not have,
+ * plus every one whose declared type disagrees. This is the hazard the
+ * two-edits-not-one rule describes, caught rather than written down: a column
+ * added to `schema.sql` and missed in `LATE_COLUMNS` is present in every test
+ * -- which opens a fresh file -- and absent in prod, which restores a
+ * snapshot, until the first statement naming it rolls its transaction back.
+ *
+ * The reference is a throwaway in-memory database built from the same DDL
+ * that just ran, so SQLite parses the schema rather than a regex here. No
+ * comment, table-level `CHECK` or virtual-table directive can be mistaken for
+ * a column, which is what keeps a finding always real: the only way to
+ * produce one is a table that predates the column in the restored snapshot.
+ *
+ * Only the declared type is compared. SQLite forbids `ADD COLUMN NOT NULL`
+ * without a default, so nullability and defaults legitimately differ between
+ * a fresh database and a migrated one and comparing them would alarm on a
+ * correct database.
+ */
+const schemaDrift = (w: Database.Database, ddl: string): string[] => {
+  const reference = new Database(":memory:");
+  try {
+    reference.exec(ddl);
+    const tables = reference
+      .prepare(
+        `SELECT name FROM sqlite_master
+          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+      )
+      .all() as { name: string }[];
+
+    const drift: string[] = [];
+    for (const { name: table } of tables) {
+      const live = new Map(columnsOf(w, table).map((c) => [c.name, c.type]));
+      for (const { name, type } of columnsOf(reference, table)) {
+        const found = live.get(name);
+        if (found === undefined) drift.push(`${table}.${name}`);
+        else if (found.toUpperCase() !== type.toUpperCase())
+          drift.push(`${table}.${name} (declared ${type}, live ${found})`);
+      }
+    }
+    return drift;
+  } finally {
+    reference.close();
   }
 };
 
@@ -47,6 +126,12 @@ export interface DbConfig {
   /** Key for the snapshot. Restored on boot, overwritten on every write. */
   key: string;
   s3?: S3Client;
+  /**
+   * Overrides `LATE_COLUMNS`. Here so a test can drive the real boot path:
+   * the ordering between `schema.sql` and the late-column pass is the thing
+   * worth covering, and it exists nowhere but inside `Db.open`.
+   */
+  lateColumns?: LateColumn[];
 }
 
 export class Db {
@@ -89,8 +174,23 @@ export class Db {
     }
 
     const db = new Db(cfg, s3);
-    db.write.exec(readFileSync(join(__dirname, "schema.sql"), "utf8"));
-    addLateColumns(db.write);
+    const ddl = readFileSync(join(__dirname, "schema.sql"), "utf8");
+    db.write.exec(ddl);
+    addLateColumns(db.write, cfg.lateColumns);
+
+    // Alarm rather than throw, unlike a bad LATE_COLUMNS entry above. This
+    // one is reachable only in prod -- every test opens a fresh file, where
+    // there is nothing to drift from -- so refusing to boot on it turns one
+    // rolled-back statement into a Boss that cannot investigate why. It is
+    // also the shape index.ts already uses for the search-index backfill:
+    // loud, named, and not fatal. The columns are the whole fix.
+    const drift = schemaDrift(db.write, ddl);
+    if (drift.length > 0)
+      alarm("schema_drift", {
+        columns: drift,
+        note: "declared in schema.sql, missing or differently typed in the live database; add each to LATE_COLUMNS",
+      });
+
     return db;
   }
 

@@ -488,8 +488,14 @@ export class SlackRelay {
       return { kind: "ignore", reason: "thread is not an incident thread" };
     }
 
-    const recorded = await this.db.withWrite(
-      (d) =>
+    // Both writes are one transaction because they are one act. The reply row
+    // is what the thread shows and the directive is the only thing the agent
+    // waits on, so a press that commits the first and loses the second leaves
+    // an incident that looks answered and is not acting on the answer, with
+    // nothing downstream to reconcile it. `withWrite` wraps the callback in a
+    // SQLite transaction, so a throw here rolls the reply back with it.
+    const recorded = await this.db.withWrite((d) => {
+      const inserted =
         d
           .prepare(
             `INSERT OR IGNORE INTO thread_reply
@@ -509,8 +515,29 @@ export class SlackRelay {
             Date.now(),
             incident.id,
             click.messageTs,
-          ).changes > 0,
-    );
+          ).changes > 0;
+      if (!inserted) return false;
+
+      // Pressing an agent's own button is addressed to it by construction, so
+      // unlike a typed reply there is nothing here for a model to read and this
+      // stays inside the relay's write rather than moving to the composition
+      // root with the rest of the directive push.
+      d.prepare(
+        `INSERT INTO pending_directive (incidentId, payload, createdAt)
+         VALUES (?, ?, ?)`,
+      ).run(
+        incident.id,
+        JSON.stringify({
+          type: "human_message",
+          from: click.user,
+          text: click.choice,
+          ts: click.actionTs,
+          addressed: "agent",
+        } satisfies Directive),
+        Date.now(),
+      );
+      return true;
+    });
 
     if (!recorded) {
       const outstanding = this.db.get<{ messageTs: string }>(
@@ -526,27 +553,6 @@ export class SlackRelay {
       });
       return { kind, incidentId: incident.id, slackUserId: click.user };
     }
-
-    // Pressing an agent's own button is addressed to it by construction, so
-    // unlike a typed reply there is nothing here for a model to read and this
-    // stays inside the relay's write rather than moving to the composition
-    // root with the rest of the directive push.
-    await this.db.withWrite((d) => {
-      d.prepare(
-        `INSERT INTO pending_directive (incidentId, payload, createdAt)
-         VALUES (?, ?, ?)`,
-      ).run(
-        incident.id,
-        JSON.stringify({
-          type: "human_message",
-          from: click.user,
-          text: click.choice,
-          ts: click.actionTs,
-          addressed: "agent",
-        } satisfies Directive),
-        Date.now(),
-      );
-    });
 
     log("choice_recorded", {
       incidentId: incident.id,

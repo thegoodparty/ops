@@ -137,8 +137,27 @@ export const reconcileSearchIndex = async (db: {
 };
 
 /**
+ * Raised when the text carries nothing that can be searched on, so no query
+ * was ever put to FTS5. It is an error rather than an empty result for the
+ * same reason a failed read is: the caller is deciding whether a problem is
+ * new, and "I searched and found nothing" has to stay distinguishable from
+ * "I could not search". It is not an `alarm` at any call site -- the module
+ * refused on purpose and the fix is different words, not an operator.
+ */
+export class UnsearchableQuery extends Error {
+  constructor(readonly text: string) {
+    super(
+      `no searchable terms in ${JSON.stringify(text)}: every word was under ` +
+        `${MIN_TERM_CHARS} characters or too common to rank. The search did not run.`,
+    );
+    this.name = "UnsearchableQuery";
+  }
+}
+
+/**
  * Throws on a failed read, like every other helper that answers a question
- * about recurrence. An empty array means "nothing in the corpus matches",
+ * about recurrence, and throws `UnsearchableQuery` when the text reduces to
+ * no terms at all. An empty array means "nothing in the corpus matches",
  * which is the one answer a broken search must never be able to produce.
  */
 export const searchIncidents = (
@@ -147,7 +166,7 @@ export const searchIncidents = (
   limit = DEFAULT_LIMIT,
 ): IncidentMatch[] => {
   const match = toMatchQuery(text);
-  if (!match) return [];
+  if (!match) throw new UnsearchableQuery(text);
 
   return db.query<IncidentMatch>(
     // bm25 takes one weight per column, unindexed ones included, so the

@@ -112,7 +112,11 @@ import {
 } from "./testdb";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
-import { sessionKeyFor, sumSessionUsage } from "./agent/session";
+import {
+  readSessionOutcome,
+  sessionKeyFor,
+  sumSessionUsage,
+} from "./agent/session";
 import { createInstallationToken, createPrStateReader } from "./github";
 import { makeAlarm, makeLog } from "./logging";
 import type {
@@ -1455,10 +1459,72 @@ export const createBugBoss = async (
       // it, because the tokens it quotes are the ones roll-up just wrote.
       // It is a no-op unless this launch was the one that closed the
       // incident.
+      void noteRunOutcome(ctx.incidentId, sessionRef);
       void rollUpUsage(ctx.incidentId, sessionRef).then(() =>
         publishReport(ctx.incidentId),
       );
     });
+  };
+
+  /**
+   * Say how the run that just exited ended.
+   *
+   * The session file is the only artifact a killed agent leaves, and until
+   * the agent started writing an exit record it said nothing: a run killed
+   * mid-turn and a run that closed its incident were the same shape, so three
+   * of seven real runs died invisibly and the longest of them -- 9.5 hours and
+   * $42.71, with an approved PR and green checks waiting -- read as patience
+   * for as long as anyone cared to wait.
+   *
+   * This does not resume anything. The dispatcher already relaunches an
+   * agent-owned incident on its next tick, and that is the recovery. What was
+   * missing is that the relaunch, and the death before it, were both silent.
+   */
+  const noteRunOutcome = async (
+    incidentId: string,
+    sessionRef: string,
+  ): Promise<void> => {
+    try {
+      const raw = await store.get(sessionRef);
+      if (!raw) {
+        log("run_outcome_unknown", { incidentId, sessionRef, reason: "no session file" });
+        return;
+      }
+      const outcome = readSessionOutcome(raw);
+      if (outcome.kind !== "killed") {
+        log("agent_run_ended", {
+          incidentId,
+          sessionRef,
+          outcome: outcome.kind,
+          ...(outcome.kind === "ended" ? { reason: outcome.exit.reason } : {}),
+        });
+        return;
+      }
+
+      // Whether the kill cost anything is a different question from whether
+      // it happened. An agent killed after handing off has already put the
+      // incident somewhere a person can see; one killed while it still owns
+      // an open incident has not, and that is the stranding case.
+      const row = db.get<{ status: IncidentStatus; owner: string }>(
+        "SELECT status, owner FROM incident WHERE id = ?",
+        [incidentId],
+      );
+      const stranded =
+        !!row && row.owner === "agent" && OPEN_STATUSES.includes(row.status);
+      alarm("agent_run_killed", {
+        incidentId,
+        sessionRef,
+        turns: outcome.turns,
+        status: row?.status ?? null,
+        owner: row?.owner ?? null,
+        stranded,
+        note: stranded
+          ? "the incident is still the agent's and still open; the next dispatcher tick should relaunch it, and if none does it is stranded"
+          : "the work had already left the agent, so nothing is waiting on this",
+      });
+    } catch (err: unknown) {
+      alarm("run_outcome_read_failed", { incidentId, sessionRef, error: String(err) });
+    }
   };
 
   /**
@@ -1569,6 +1635,31 @@ export const createBugBoss = async (
     spawn,
     toolApiFor,
     mintToken,
+    // The dispatcher has no Slack of its own and the tool API cannot say
+    // anything that is not a transition, so the one thing it needs to tell a
+    // human -- that the agent they were waiting on had been dead for an hour
+    // -- is handed over the same way the tool API's thread poster is.
+    postNotice: async (incidentId, text) => {
+      const threadTs =
+        db.get<{ slackThreadTs: string | null }>(
+          "SELECT slackThreadTs FROM incident WHERE id = ?",
+          [incidentId],
+        )?.slackThreadTs ?? null;
+      // A threadless incident is a real state -- opening one can fail, and
+      // it can fail for good. `slack.post(null, ...)` is a top-level channel
+      // message, so posting anyway would put "the agent on this incident
+      // stopped" in the channel with nothing saying which incident. Alarming
+      // is the same answer the dispatcher gives when no poster is wired in
+      // at all: the event still reaches somebody, out of context does not.
+      if (!threadTs) {
+        alarm("resume_notice_undeliverable", {
+          incidentId,
+          note: "the incident has no Slack thread, so the resume was not announced where anyone is watching",
+        });
+        return;
+      }
+      await slack.post(threadTs, text);
+    },
     childBaseEnv: {
       ...pickBaseEnv(process.env),
       AWS_REGION: secrets.awsRegion ?? process.env.AWS_REGION,

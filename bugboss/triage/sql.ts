@@ -5,7 +5,7 @@
 // has this alert slug produced a real incident before, how did the last one
 // resolve, how often does this fire and get suppressed.
 
-import { searchIncidents, type SearchReader } from "../db/search";
+import { searchIncidents, UnsearchableQuery, type SearchReader } from "../db/search";
 import type { LoopTool } from "./model";
 
 /** The read half of the database. `Db` from ../db satisfies it structurally. */
@@ -167,7 +167,11 @@ export const searchTool = (db: SearchReader & IncidentReader): LoopTool => ({
         .join("\n");
     } catch (err) {
       // Never an empty result. "The search is broken" and "nothing in the
-      // corpus matches" are the two answers that must not look alike.
+      // corpus matches" are the two answers that must not look alike, and
+      // "the query never ran" is a third that must not look like either.
+      if (err instanceof UnsearchableQuery) {
+        return `error: ${(err as Error).message} Nothing was compared against the corpus -- search again with the failing operation, the component or the error text.`;
+      }
       return `error: the incident search failed (${String(err)}); this is not the same as finding nothing`;
     }
   },

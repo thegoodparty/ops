@@ -10,11 +10,13 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from ".";
+import { searchTool } from "../triage/sql";
 import {
   indexIncident,
   reconcileSearchIndex,
   searchIncidents,
   toMatchQuery,
+  UnsearchableQuery,
 } from "./search";
 
 const fakeS3 = () => {
@@ -255,5 +257,59 @@ describe("reconcileSearchIndex: a corpus older than the index", () => {
     await db.withWrite((w) => indexIncident(w, "10"));
 
     assert.equal(searchIncidents(db, "lock refresh").length, 1);
+  });
+});
+
+describe("a query that never ran is not a query that found nothing", () => {
+  // The whole point of this corpus is an agent asking "has this happened
+  // before". An empty array is an answer it acts on -- it stops looking and
+  // reports a recurrence as novel -- so the one input that produces no query
+  // at all must not be able to produce that answer.
+  const STOPWORDS_ONLY = "the error in production after the alert failed";
+
+  it("throws rather than answering empty when no term survives", async () => {
+    await seed({
+      id: "1",
+      rootCause: "the connection pool was exhausted",
+      postmortem: "## Summary\nthe pool ran out",
+    });
+
+    assert.equal(toMatchQuery(STOPWORDS_ONLY), null);
+    assert.throws(
+      () => searchIncidents(db, STOPWORDS_ONLY),
+      (err: unknown) =>
+        err instanceof UnsearchableQuery && /did not run/.test(String(err)),
+    );
+  });
+
+  it("still answers empty when the query ran and matched nothing", async () => {
+    await seed({
+      id: "1",
+      rootCause: "the connection pool was exhausted",
+      postmortem: "## Summary\nthe pool ran out",
+    });
+
+    assert.deepEqual(searchIncidents(db, "certificate rotation expiry"), []);
+  });
+
+  it("triage's tool tells the agent the search did not happen", async () => {
+    await seed({
+      id: "1",
+      rootCause: "the connection pool was exhausted",
+      postmortem: "## Summary\nthe pool ran out",
+    });
+    const tool = searchTool(db);
+
+    const unsearchable = String(await tool.run({ text: STOPWORDS_ONLY }));
+    const empty = String(await tool.run({ text: "certificate rotation expiry" }));
+
+    assert.match(unsearchable, /^error:/);
+    assert.match(unsearchable, /did not run/);
+    assert.match(empty, /^0 matches/);
+    assert.notEqual(
+      unsearchable,
+      empty,
+      "the same answer for both is the bug: the agent cannot tell it failed to search",
+    );
   });
 });

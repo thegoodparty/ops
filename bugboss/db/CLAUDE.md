@@ -49,6 +49,20 @@ is applied nowhere that matters.
   written down: every test opens a new file and passes, and prod restores a
   snapshot where the column never arrives, so the first statement naming it
   rolls its transaction back.
+
+  Two boot-time checks make that miss visible instead. An entry naming a
+  table that does not exist **throws**, because `PRAGMA table_info` answers a
+  missing table with an empty list, so the entry is indistinguishable from a
+  column waiting to be added and the `ALTER` only fails today because
+  `schema.sql` happens to run first. That is a defect in the list rather than
+  a state the world reaches, so the suite catches it and refusing the boot
+  costs nothing. Every column `schema.sql` declares that the live database
+  lacks, or has under a different declared type, **alarms** as
+  `schema_drift` and boots anyway: that one is reachable only in prod, and a
+  Boss that will not start cannot investigate why. The comparison is against
+  a throwaway in-memory database built from the same DDL, so SQLite parses
+  the schema and no comment, table-level `CHECK` or virtual-table directive
+  can be mistaken for a column.
 - **`CHECK` constraints cannot** be added at all. SQLite has no `ALTER TABLE
   ADD CHECK`, so adding one needs a table rebuild that does not exist here.
   The cross-field constraints landed while the database was empty; that

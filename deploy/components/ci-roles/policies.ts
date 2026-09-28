@@ -885,12 +885,20 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       Sid: "CertificateRead",
       Effect: "Allow",
       // The read half of the same lookup. The data source describes the
-      // certificate it chose and, because it filters to `ISSUED`, fetches that
-      // certificate's PEM and chain. Both accept the certificate ARN, so they
-      // share one scoped statement. `GetCertificate` returns the public
-      // certificate and chain, not the private key. Part of the same call, not
-      // a speculative widening.
-      Action: ["acm:DescribeCertificate", "acm:GetCertificate"],
+      // certificate it chose, lists its tags to match the provider default
+      // tags the ops stack sets (`Environment`, `Project`), and, because it
+      // filters to `ISSUED`, fetches that certificate's PEM and chain. All
+      // three accept the certificate ARN, so they share one scoped statement.
+      // `GetCertificate` returns the public certificate and chain, not the
+      // private key. `ListTagsForCertificate` is the one Bugbot named on #133:
+      // the data source passes its `tags` argument through as a filter, and
+      // the default tags make that non-empty even though BugBoss passes no
+      // explicit `tags`.
+      Action: [
+        "acm:DescribeCertificate",
+        "acm:GetCertificate",
+        "acm:ListTagsForCertificate",
+      ],
       Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
     },
   ],

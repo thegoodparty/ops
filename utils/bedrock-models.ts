@@ -28,8 +28,9 @@ export type BedrockModel = {
   id: string;
   /**
    * What the sandbox actually selects, which is not always the same thing. A
-   * `us.` geo inference profile for most of these, and the bare model id for
-   * the two deliberately kept in one region.
+   * `us.` geo inference profile for most of these, the bare model id for the
+   * two deliberately kept in one region, and for Claude Sonnet 5.5 the
+   * `global.` profile, which is the only inference profile AWS offers for it.
    */
   invokeId: string;
   /** True when `invokeId` is a cross-region inference profile. */
@@ -39,15 +40,25 @@ export type BedrockModel = {
 
 export const WORKBENCH_MODELS: BedrockModel[] = [
   {
+    // The one entry that leaves the US. `GetFoundationModelAvailability`
+    // aside, the check here is the public model card: for every other
+    // cross-region model it lists a `us.` geo inference profile, and for this
+    // one the Geo column is `N/A` in every commercial region, leaving
+    // `global.anthropic.claude-sonnet-5-5` as the only profile. That profile
+    // routes by capacity anywhere in the world, not among US regions, so
+    // enabling this model is a data-residency decision rather than a list
+    // entry. See `docs/workbench-account.md` under "Adding a Bedrock model
+    // later".
+    id: "anthropic.claude-sonnet-5-5",
+    invokeId: "global.anthropic.claude-sonnet-5-5",
+    crossRegion: true,
+    note: "global-only: no In-Region or Geo inference profile is offered in any commercial region, so this routes outside US geography unlike every other cross-region model here",
+  },
+  {
     id: "anthropic.claude-opus-5-5",
     invokeId: "us.anthropic.claude-opus-5-5",
     crossRegion: true,
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and the geo profile is mandatory",
-  },
-  {
-    id: "anthropic.claude-sonnet-5",
-    invokeId: "us.anthropic.claude-sonnet-5",
-    crossRegion: true,
   },
   { id: "xai.grok-4.6", invokeId: "us.xai.grok-4.6", crossRegion: true },
   {

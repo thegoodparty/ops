@@ -21,7 +21,12 @@ import type {
 } from "../types";
 import { resolveBedrockModel } from "../bedrock";
 import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
-import { connectMcpToolset, type McpToolset } from "./mcp";
+import {
+  connectMcpToolset,
+  GRAFANA_MCP_ARGS,
+  GRAFANA_READ_TOOLS,
+  type McpToolset,
+} from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import {
@@ -53,6 +58,7 @@ import {
   type NotesSync,
 } from "./notes";
 import {
+  EXIT_ENTRY_TYPE,
   createSessionSync,
   createS3SessionStore,
   readStoredPrefixFromFile,
@@ -62,6 +68,7 @@ import {
   PROMPT_ENTRY_TYPE,
   SESSION_SYNC_FAILURE_LIMIT,
   type SessionStore,
+  type StoredExit,
   type StoredPrefix,
 } from "./session";
 
@@ -70,6 +77,65 @@ export const DEFAULT_OMNI_REPO = "https://github.com/thegoodparty/omni.git";
 export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
 export const DEFAULT_TIMEOUT_SECONDS = 86_400;
 export const DEADLINE_GRACE_SECONDS = 180;
+
+/**
+ * How long a signalled exit waits for its last session flush to reach S3.
+ *
+ * Well inside ECS's 30-second default stop timeout, because the flush is one
+ * PUT and the alternative to bounding it is a child that ignores a SIGTERM
+ * until the kernel escalates -- which is the very kill this is here to make
+ * visible.
+ */
+export const SIGNAL_FLUSH_GRACE_MS = 5000;
+
+/**
+ * Zero for SIGTERM. That is ECS draining the task -- routine, and the most
+ * orderly shutdown available here, since the exit record is written and the
+ * session flushed before we go. Reporting it as a failure alarms on every
+ * deploy, and inside the dispatcher's fast-failure window it walked a
+ * rolling deploy to a crash-loop escalation in three bounces. SIGINT is not
+ * routine outside a terminal, so it keeps its 1.
+ */
+export const signalExitCode = (signal: NodeJS.Signals): number =>
+  signal === "SIGTERM" ? 0 : 1;
+
+/**
+ * Everything that has to reach S3 before the process goes.
+ *
+ * Both, in parallel. The session and the notes sync on the same `turn_end`
+ * -- one durability cadence, not two -- and neither that event nor
+ * `session_shutdown` fires on the way out of a signal handler. Flushing only
+ * the session loses every note written since the last turn, which is the
+ * half of the run a reader most wants after a kill.
+ *
+ * `allSettled`, because one failing store must not stop the other from
+ * trying, and because a rejection here would leave the process alive with
+ * nothing scheduled to end it.
+ */
+/**
+ * Wraps a shutdown so only the first signal runs it.
+ *
+ * A second signal before the exit lands -- SIGTERM from a draining task,
+ * then an impatient Ctrl-C -- re-enters the handler concurrently, and two
+ * whole-file PUTs on the same key at once is how the exit record this exists
+ * to write gets corrupted by the act of writing it.
+ */
+export const onceOnly = <T extends unknown[]>(
+  fn: (...args: T) => void,
+): ((...args: T) => void) => {
+  let ran = false;
+  return (...args: T) => {
+    if (ran) return;
+    ran = true;
+    fn(...args);
+  };
+};
+
+export const flushDurable = async (
+  ...syncs: readonly { flush: () => Promise<void> }[]
+): Promise<void> => {
+  await Promise.allSettled(syncs.map((sync) => sync.flush()));
+};
 export const COMPACTION_HEADROOM = 0.05;
 
 export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "write"];
@@ -527,6 +593,12 @@ export interface RunIncidentAgentOptions {
    * the only place a deployment's shape is decided.
    */
   workingHours?: WorkingHours;
+  /**
+   * Which launch this is, from the dispatcher. Carried only so the exit
+   * record can name it: reading a session back, "attempt 3 was killed" is
+   * the difference between one bad launch and a run that keeps dying.
+   */
+  attempt?: number;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
   store?: SessionStore & NotesStore;
   api?: BossClient;
@@ -568,6 +640,8 @@ export const agentOptionsFromEnv = (
     ? parseWorkingHours(env.BUGBOSS_WORKING_HOURS)
     : undefined;
 
+  const attempt = Number(env.BUGBOSS_ATTEMPT);
+
   return {
     incidentId,
     s3Bucket,
@@ -579,6 +653,7 @@ export const agentOptionsFromEnv = (
     awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
     sessionKey,
     timeoutSeconds,
+    ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
     ...(grafanaToken
       ? {
@@ -615,6 +690,26 @@ export const resumeMessage = (): string =>
 
 export const kickoffMessage = (incidentId: string): string =>
   `Incident ${incidentId} is yours. Call get_incident to read the signals and the evidence that was prefetched for you, then work it to a conclusion.`;
+
+/**
+ * Which of the four endings this was.
+ *
+ * A timeout the agent handed off inside its grace still exits 0 -- see
+ * `exitCodeFor` -- but it is a timeout, and calling it `completed` would hide
+ * the one ending a reader most wants to distinguish from a clean close. A
+ * timeout that also errored is a timeout first: `error` carries the rest.
+ */
+export const exitRecordFor = (args: {
+  timedOut: boolean;
+  error: string | null;
+  attempt: number | null;
+  at: number;
+}): StoredExit => ({
+  reason: args.timedOut ? "timed_out" : args.error ? "turn_error" : "completed",
+  at: args.at,
+  attempt: args.attempt,
+  ...(args.error ? { error: args.error } : {}),
+});
 
 export const deadlineMessage = (graceSeconds: number): string =>
   `Your wall-clock deadline has expired. Stop investigating. Within the next ${graceSeconds} seconds, call hand_off with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing.`;
@@ -697,11 +792,12 @@ export const runIncidentAgent = async (
       await connectMcpToolset({
         name: "grafana",
         command: options.grafana.command ?? "uvx",
-        args: options.grafana.args ?? ["mcp-grafana"],
+        args: options.grafana.args ?? GRAFANA_MCP_ARGS,
         env: {
           GRAFANA_URL: options.grafana.url,
           GRAFANA_SERVICE_ACCOUNT_TOKEN: options.grafana.token,
         },
+        allowedTools: GRAFANA_READ_TOOLS,
       }),
     );
   }
@@ -817,6 +913,37 @@ const launch = async (args: {
     sessionFile: () => sessionManager.getSessionFile(),
   });
 
+  const attempt = options.attempt ?? null;
+
+  // How this launch ended, written into the session itself. Without it a
+  // killed run and a finished one are the same shape on disk, which is how a
+  // 9.5-hour run died with its deliverable intact and nobody noticed.
+  //
+  // `appendCustomEntry` is synchronous, so the record is on local disk before
+  // the whole-file PUT that carries it -- including from inside the signal
+  // handler below, where there is no room for anything that is not.
+  let exitRecorded = false;
+  const recordExit = (exit: StoredExit): void => {
+    if (exitRecorded) return;
+    exitRecorded = true;
+    try {
+      sessionManager.appendCustomEntry(EXIT_ENTRY_TYPE, exit);
+    } catch (err: unknown) {
+      // Never fatal. An unwritable exit record costs a reader the reason;
+      // throwing here would cost them the session flush that follows it.
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "exit_record_failed",
+          incidentId: options.incidentId,
+          reason: exit.reason,
+          error: String(err),
+        }),
+      );
+    }
+  };
+
   const notesSync = createNotesSync({
     store,
     prefix: args.notesPrefix,
@@ -824,6 +951,42 @@ const launch = async (args: {
     seen: args.notesSeen,
     limits: NOTES_LIMITS,
   });
+
+  // SIGKILL cannot be caught and the dispatcher's backstop uses it, so this
+  // upgrades only the kills that arrive politely: a container stopping, a
+  // deploy draining, an operator scaling the service down. Those are the
+  // common ones, and the record is the only thing that tells them apart from
+  // a run that finished.
+  const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
+  // One shot. A second signal before the exit lands -- SIGTERM from a
+  // draining task, then an impatient Ctrl-C -- would otherwise re-enter this
+  // concurrently and put two whole-file PUTs on the same key at once, which
+  // is how the exit record this exists to write gets corrupted by the act of
+  // writing it. Two quit timers racing to call process.exit is the milder
+  // half of the same bug.
+  const onSignal = onceOnly((signal: NodeJS.Signals): void => {
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "agent_signalled",
+        incidentId: options.incidentId,
+        attempt,
+        signal,
+      }),
+    );
+    recordExit({ reason: "signal", at: Date.now(), attempt, signal });
+    // Installing a handler suppresses the default terminate, so this has to
+    // exit itself -- and on a timer as well as on the flush, because a hung
+    // PUT must not be what keeps a draining container alive.
+    const quit = (): void => process.exit(signalExitCode(signal));
+    void flushDurable(sync, notesSync).then(quit, quit);
+    setTimeout(quit, SIGNAL_FLUSH_GRACE_MS).unref();
+  });
+  for (const signal of signals) process.on(signal, onSignal);
+  const releaseSignals = (): void => {
+    for (const signal of signals) process.off(signal, onSignal);
+  };
 
   // Assigned once the session exists; the first flush cannot precede it.
   let live: { steer: (message: string) => Promise<unknown> } | null = null;
@@ -982,12 +1145,18 @@ const launch = async (args: {
   } finally {
     clearTimeout(deadline);
     clearTimeout(hardStop);
+    releaseSignals();
+    error = session.state.errorMessage ?? null;
+    // Before the flush, not after: the sync is a whole-file PUT, so a record
+    // written afterwards stays on a disk that is about to go away. A timeout
+    // the agent handed off inside its grace is still a timeout -- that is the
+    // more specific cause, and `error` carries the rest.
+    recordExit(exitRecordFor({ timedOut, error, attempt, at: Date.now() }));
     await sync.flush();
     const lost = sync.lastError();
     if (lost) onSyncFailure(lost, sync.failureStreak());
     await notesSync.flush();
     onNotesFlush(notesSync);
-    error = session.state.errorMessage ?? null;
     session.dispose();
   }
 

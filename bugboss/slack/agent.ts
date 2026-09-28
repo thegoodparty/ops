@@ -23,6 +23,7 @@ import {
   raw,
   userMention,
 } from "./format";
+import { describeOutcome, readSessionOutcome } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
 
 const log = makeLog("slack-agent");
@@ -230,8 +231,31 @@ export const assertReadOnlySql = (sql: string): string => {
   return sql.trim();
 };
 
-const truncate = (s: string, max: number): string =>
-  s.length <= max ? s : `${s.slice(0, max)}... [truncated, ${s.length} chars]`;
+const truncationSuffix = (total: number): string =>
+  `... [truncated, ${total} chars]`;
+
+/**
+ * A cap that is one: `truncate(s, n).length <= n` for every s and every n.
+ *
+ * It used to slice to the full width and then append the suffix on top, so
+ * it returned `max` plus a marker that grew with the input -- the same defect
+ * `truncateOutput` carried, in a second function nobody thought to look at
+ * when that one was fixed. The suffix names `s.length` rather than how much
+ * went, so unlike there its width is known before the slice is taken and
+ * simply comes out of the budget.
+ */
+const truncate = (s: string, max: number): string => {
+  if (s.length <= max) return s;
+  const suffix = truncationSuffix(s.length);
+  if (max < suffix.length) {
+    // Unreachable from the callers here -- the tightest is 2000 against a
+    // suffix of about 30 -- but a cap honoured only for budgets somebody
+    // happened to choose is not a cap.
+    alarm("truncate_budget_below_suffix", { max, suffix: suffix.length });
+    return max > 0 ? `${s.slice(0, max - 1)}\u2026` : "";
+  }
+  return `${s.slice(0, max - suffix.length)}${suffix}`;
+};
 
 /**
  * A Slack ts is "<seconds>.<microseconds>". Comparing the whole thing as a
@@ -440,8 +464,14 @@ export const buildTools = ({
         );
         const lines = body.split("\n").filter((l) => l.trim().length > 0);
         const slice = lines.slice(-tail);
+        // Without this the tail of a killed run and the tail of a finished
+        // one read the same: both stop on an ordinary entry, and the reader
+        // is left inferring from the content of the last turn. That is the
+        // inference that let a 9.5-hour run sit dead behind a last message
+        // which was still true.
+        const outcome = describeOutcome(readSessionOutcome(body));
         return truncate(
-          `${key}: ${lines.length} entries, last ${slice.length}\n${slice.join("\n")}`,
+          `${key}: ${lines.length} entries, last ${slice.length} -- ${outcome}\n${slice.join("\n")}`,
           MAX_SESSION_CHARS,
         );
       },

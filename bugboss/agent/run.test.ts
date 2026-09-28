@@ -14,12 +14,16 @@ import {
   DEFAULT_TIMEOUT_SECONDS,
   MODEL_BINDING_MISMATCH,
   exitCodeFor,
+  exitRecordFor,
+  flushDurable,
+  onceOnly,
   npmCiCommand,
   pinnedSessionModel,
   PREFIX_DRIFT_DIAGNOSTIC,
   prefixDriftExtension,
   renderDirectives,
   reserveTokensFor,
+  signalExitCode,
   toolListDrift,
 } from "./run";
 import { notesPrefixFor } from "./notes";
@@ -380,4 +384,84 @@ test("a force-aborted run does not exit like a finished one", () => {
     }),
     1,
   );
+});
+
+test("the exit record names a timeout even when the aborted turn also errored", () => {
+  assert.deepEqual(
+    exitRecordFor({ timedOut: true, error: "aborted", attempt: 3, at: 5 }),
+    { reason: "timed_out", at: 5, attempt: 3, error: "aborted" },
+  );
+  assert.deepEqual(exitRecordFor({ timedOut: false, error: "boom", attempt: 1, at: 5 }), {
+    reason: "turn_error",
+    at: 5,
+    attempt: 1,
+    error: "boom",
+  });
+  assert.deepEqual(exitRecordFor({ timedOut: false, error: null, attempt: 1, at: 5 }), {
+    reason: "completed",
+    at: 5,
+    attempt: 1,
+  });
+});
+
+// Carried purely so the exit record can name the launch. Reading a session
+// back, "attempt 3 was killed" is a different story from "attempt 1 was".
+test("the attempt reaches the agent from the dispatcher's environment", () => {
+  const base = {
+    BUGBOSS_INCIDENT_ID: "i1",
+    BUGBOSS_S3_BUCKET: "b",
+    BUGBOSS_SESSION_REF: "sessions/incident/i1/session.jsonl",
+  };
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ATTEMPT: "3" }).attempt, 3);
+  assert.equal(agentOptionsFromEnv(base).attempt, undefined);
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ATTEMPT: "" }).attempt, undefined);
+});
+
+// ECS draining a task is routine, and the most orderly shutdown available
+// here: the exit record is written and the session is flushed. Reporting it
+// as a failure alarms on every deploy, and inside the fast-failure window it
+// walked a rolling deploy to a crash-loop escalation in three bounces.
+test("a drained agent exits clean and an interrupted one does not", () => {
+  assert.equal(signalExitCode("SIGTERM"), 0);
+  assert.equal(signalExitCode("SIGINT"), 1);
+});
+
+// The notes are the other half of what a killed run leaves behind, and they
+// ride the same turn_end the session does. Neither event fires on the way
+// out of a signal handler, so a shutdown that flushes one and not the other
+// loses every note written since the last turn.
+test("a signalled shutdown flushes the notes as well as the session", async () => {
+  const flushed: string[] = [];
+  await flushDurable(
+    { flush: async () => void flushed.push("session") },
+    { flush: async () => void flushed.push("notes") },
+  );
+  assert.deepEqual(flushed.sort(), ["notes", "session"]);
+});
+
+test("one failing store does not stop the other, or the exit", async () => {
+  const flushed: string[] = [];
+  await flushDurable(
+    {
+      flush: async () => {
+        throw new Error("S3 is down");
+      },
+    },
+    { flush: async () => void flushed.push("notes") },
+  );
+  assert.deepEqual(flushed, ["notes"]);
+});
+
+// SIGTERM from a draining task, then an impatient Ctrl-C. Re-entering the
+// shutdown puts two whole-file PUTs on the same key at once, which corrupts
+// the exit record by the act of writing it.
+test("a second signal does not re-enter the shutdown", () => {
+  const seen: string[] = [];
+  const shutdown = onceOnly((signal: string) => void seen.push(signal));
+
+  shutdown("SIGTERM");
+  shutdown("SIGINT");
+  shutdown("SIGTERM");
+
+  assert.deepEqual(seen, ["SIGTERM"], "only the first signal runs it");
 });

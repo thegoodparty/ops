@@ -10,7 +10,13 @@ import Database from "better-sqlite3";
 
 import { DEADLINE_GRACE_SECONDS } from "../agent/run";
 import type { DispatcherConfig, ToolApi } from "../types";
-import { createDispatcher, type DispatcherDb, type DispatcherDeps } from "./index";
+import {
+  RESUME_NOTICE_SECONDS,
+  createDispatcher,
+  resumeNotice,
+  type DispatcherDb,
+  type DispatcherDeps,
+} from "./index";
 import { createChildProcessSpawn, type AgentSpawnContext, type SpawnAgent } from "./spawn";
 
 const T0 = 1_700_000_000_000;
@@ -302,9 +308,13 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let launches = 0;
-    // Exits the instant it starts, which is what a crash loop looks like.
+    // Dies the instant it starts, and dies badly: run.ts exits non-zero and
+    // the spawn wrapper turns that into a rejection. Both halves matter now
+    // -- a short exit that succeeded is a deploy draining an agent, not a
+    // crash, and counting it walked a rolling deploy to this escalation.
     const spawn: SpawnAgent = async () => {
       launches += 1;
+      throw new Error("agent exited 1");
     };
 
     const d = createDispatcher(
@@ -330,6 +340,34 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  // The rolling-deploy case. Before SIGTERM exited zero and the counter
+  // required a failure, three bounces of a freshly-launched agent handed a
+  // human a crash-loop brief for a deploy that worked.
+  it("does not count a short clean exit as a crash", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, handOffs } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let launches = 0;
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+    };
+
+    const d = createDispatcher(
+      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
+    );
+
+    for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
+
+    assert.equal(launches, 5, "it keeps relaunching rather than giving up");
+    assert.deepEqual(handOffs, [], "and nobody is handed a crash-loop brief");
+    assert.equal(
+      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
+      "agent",
+    );
+    cleanup();
+  });
+
   it("falls back to relaunching when the crash-loop escalation fails", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, handOffs } = makeTools(sqlite);
@@ -338,6 +376,7 @@ describe("Dispatcher.tick", () => {
     let launches = 0;
     const spawn: SpawnAgent = async () => {
       launches += 1;
+      throw new Error("agent exited 1");
     };
 
     let handOffFails = true;
@@ -794,6 +833,116 @@ describe("Dispatcher.tick", () => {
       seconds: 420,
     });
     assert.deepEqual(handOffs, [], "a restart is not a crash loop");
+    cleanup();
+  });
+
+  // The three real runs that were killed were resumed automatically and
+  // silently, so the thread's last message -- still true -- read as patience
+  // while nothing was running. The resume was never the missing piece; saying
+  // it happened was.
+  it("says in the thread when it resumes an agent that has been gone a long time", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      attempts: 1,
+      sessionRef: "s-1",
+      lastStartedAt: T0 - (RESUME_NOTICE_SECONDS + 60) * 1000,
+    });
+
+    const notices: { incidentId: string; text: string }[] = [];
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        postNotice: async (incidentId, text) => {
+          notices.push({ incidentId, text });
+        },
+      }),
+    );
+    await d.tick();
+
+    assert.equal(notices.length, 1, "the thread is told exactly once");
+    assert.equal(notices[0].incidentId, "i1");
+    assert.equal(notices[0].text, resumeNotice(RESUME_NOTICE_SECONDS + 60));
+    assert.match(notices[0].text, /stopped without finishing/);
+
+    held.releaseAll();
+    await d.drain();
+    cleanup();
+  });
+
+  // A deploy puts every agent back within a tick or two. Saying so each time
+  // would teach people to skip the message that matters.
+  it("says nothing for a resume quick enough to be a deploy", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      attempts: 1,
+      sessionRef: "s-1",
+      lastStartedAt: T0 - 90_000,
+    });
+
+    const notices: string[] = [];
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          notices.push(text);
+        },
+      }),
+    );
+    await d.tick();
+
+    assert.deepEqual(notices, []);
+    // The agent is still told, because it is the one that has to re-check.
+    const directives = db.query<{ payload: string }>(
+      "SELECT payload FROM pending_directive",
+    );
+    assert.equal(directives.length, 1);
+
+    held.releaseAll();
+    await d.drain();
+    cleanup();
+  });
+
+  it("launches anyway when the thread cannot be reached", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      attempts: 1,
+      sessionRef: "s-1",
+      lastStartedAt: T0 - 3_600_000,
+    });
+
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        postNotice: async () => {
+          throw new Error("slack is down");
+        },
+      }),
+    );
+    const result = await d.tick();
+
+    assert.deepEqual(
+      result.started.map((a) => a.incidentId),
+      ["i1"],
+      "a notice nobody can deliver must not cost the resume",
+    );
+
+    held.releaseAll();
+    await d.drain();
     cleanup();
   });
 

@@ -363,3 +363,128 @@ export const sumSessionUsage = (contents: string): SessionUsage => {
 
   return total;
 };
+
+// ---------------------------------------------------------------------------
+// The exit record
+// ---------------------------------------------------------------------------
+
+/**
+ * How a run ended, written into the session as its last entry.
+ *
+ * Without this a killed run and a finished one are byte-for-byte the same
+ * *shape*: the writer appends per event and the file closes with the last
+ * one, so there is no exit record, no error entry and no signal marker, and
+ * S3 `LastModified` sits within a second of the last event either way. Three
+ * of seven real runs died mid-turn and read exactly like the four that did
+ * not. A 9.5-hour, $42.71 run was among them, and nobody knew to finish it.
+ *
+ * The record is a custom entry rather than a sidecar object because it has to
+ * travel with the whole-file sync that already exists, and because Pi persists
+ * custom entries synchronously -- so it is on disk before the flush that
+ * carries it, including from inside a signal handler.
+ */
+export const EXIT_ENTRY_TYPE = "bugboss_exit";
+
+export type ExitReason =
+  /** `session.prompt` returned and the last turn was clean. */
+  | "completed"
+  /** The wall-clock deadline fired. The agent had its grace to hand off. */
+  | "timed_out"
+  /** Pi reported an error on the last turn. */
+  | "turn_error"
+  /** SIGTERM or SIGINT reached the child before it was done. */
+  | "signal";
+
+export interface StoredExit {
+  reason: ExitReason;
+  /** Epoch ms, so a reader can tell the exit from the last event before it. */
+  at: number;
+  /** Which launch this was, matching the incident row's `attempts`. */
+  attempt: number | null;
+  /** Set when `reason` is `signal`. */
+  signal?: string;
+  /** Pi's message for the failing turn. Set when `reason` is `turn_error`. */
+  error?: string;
+}
+
+export const isStoredExit = (value: unknown): value is StoredExit => {
+  const candidate = value as StoredExit | undefined;
+  if (!candidate || typeof candidate !== "object") return false;
+  const reasons: ExitReason[] = ["completed", "timed_out", "turn_error", "signal"];
+  return (
+    reasons.includes(candidate.reason) &&
+    typeof candidate.at === "number" &&
+    (candidate.attempt === null || typeof candidate.attempt === "number")
+  );
+};
+
+/**
+ * What a session file says about how its last launch ended.
+ *
+ * `killed` is the answer that matters and it is reached two ways: no exit
+ * record at all, or an exit record with session events appended after it. The
+ * second is the resume case -- every launch writes its own record, so a file
+ * restored and continued carries an older one, and reading the last record
+ * without checking what follows would report a killed run as finished.
+ *
+ * `empty` is kept separate from `killed` because a child spawned and killed
+ * before its first turn synced has lost nothing, and calling that a killed
+ * run would put an alarm on every crash at boot.
+ */
+export type SessionOutcome =
+  | { kind: "ended"; exit: StoredExit }
+  | { kind: "killed"; turns: number }
+  | { kind: "empty" };
+
+/**
+ * Entry types Pi writes as part of running. A line of one of these after the
+ * last exit record is proof the run carried on past it.
+ */
+const isSessionEvent = (type: string | undefined): boolean =>
+  type !== undefined && type !== "custom";
+
+export const readSessionOutcome = (contents: string): SessionOutcome => {
+  let exit: StoredExit | null = null;
+  let eventsAfterExit = 0;
+  let turns = 0;
+
+  for (const line of contents.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: { type?: string; customType?: string; data?: unknown; message?: { role?: string } };
+    try {
+      entry = JSON.parse(trimmed) as typeof entry;
+    } catch {
+      // A torn last line is the normal signature of a kill mid-write. It is
+      // an event like any other for this purpose: something happened after
+      // whatever exit record came before it.
+      eventsAfterExit += 1;
+      continue;
+    }
+    if (entry.type === "message" && entry.message?.role === "assistant") turns += 1;
+    if (entry.type === "custom" && entry.customType === EXIT_ENTRY_TYPE) {
+      if (isStoredExit(entry.data)) {
+        exit = entry.data;
+        eventsAfterExit = 0;
+      }
+      continue;
+    }
+    if (isSessionEvent(entry.type)) eventsAfterExit += 1;
+  }
+
+  if (exit && eventsAfterExit === 0) return { kind: "ended", exit };
+  if (turns === 0 && eventsAfterExit === 0) return { kind: "empty" };
+  return { kind: "killed", turns };
+};
+
+/** One line for a log or a thread, so the wording is not written twice. */
+export const describeOutcome = (outcome: SessionOutcome): string => {
+  switch (outcome.kind) {
+    case "empty":
+      return "the session holds nothing; the run died before its first turn synced";
+    case "ended":
+      return `the run ended on purpose (${outcome.exit.reason}${outcome.exit.signal ? ` ${outcome.exit.signal}` : ""})`;
+    case "killed":
+      return `the run was killed after ${outcome.turns} turns, without writing an exit record`;
+  }
+};
