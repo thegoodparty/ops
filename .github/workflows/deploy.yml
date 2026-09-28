@@ -37,6 +37,22 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
+      # Install, test and build BEFORE assuming the role. Every one of these
+      # executes repository code -- `npm test` is `tsx --test` over
+      # `bugboss/**/*.test.ts` -- and the role carries `AdministratorAccess`
+      # (`deploy/components/ci-roles.ts`). Run them after the credentials step
+      # and any test file in the repo is an admin-credentialled shell.
+      #
+      # That was survivable while `CODEOWNERS` was `*` and every path on main
+      # had a human approval behind it. It is not now: `.github/CODEOWNERS`
+      # lists the trees that need a human, and `bugboss/` tests are not on it,
+      # so this ordering is what keeps a bot-approved merge from reaching the
+      # deploy role. Nothing below needs AWS except the ECR push and the
+      # deploy itself.
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
       # No AWS credentials on pull_request. The docker build uses the public
       # `node:22-alpine` base image, and both the ECR push and the deploy are
       # already skipped, so nothing before `main` needs the deploy role. This
@@ -59,10 +75,6 @@ jobs:
         uses: pulumi/actions@v6
         with:
           pulumi-version: "^3"
-
-      - run: npm ci
-      - run: npm test
-      - run: npm run build
 
       - name: Build Docker Image
         run: docker build -t "$IMAGE_URI" --platform linux/amd64 -f delegate/worker/Dockerfile .

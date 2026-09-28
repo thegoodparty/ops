@@ -159,10 +159,11 @@ records. One shared role means any `omni` pull request author can read `ops`,
 `org` and `workbench` state, and the reverse. Two roles keep that scoping
 meaningful.
 
-**The populations differ.** `ops` is a small infrastructure repository with
-`CODEOWNERS` over the whole tree. `omni` is the product monorepo. Sharing the
-identity raises the `ops` threat model to `omni`'s population and buys
-nothing.
+**The populations differ.** `ops` is a small infrastructure repository whose
+every permission-bearing tree -- `deploy/`, `deploy-org/`, `deploy-workbench/`
+and `.github/` -- is code-owned and needs a human approval. `omni` is the
+product monorepo. Sharing the identity raises the `ops` threat model to
+`omni`'s population and buys nothing.
 
 **A write grant would contaminate both.** The `ops` role is defensible
 precisely because it is read-only end to end. The moment one statement in a
