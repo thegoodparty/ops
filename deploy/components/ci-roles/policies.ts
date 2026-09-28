@@ -836,7 +836,9 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
  * resource-scoped; it exists so preview mode can resolve the currently
  * deployed delegate image rather than invent a URI. `secretsmanager` is
  * `DescribeSecret` metadata only: the value read was removed in step 3, which
- * is what lets this role exist without `GetSecretValue`.
+ * is what lets this role exist without `GetSecretValue`. `acm:ListCertificates`
+ * likewise cannot be resource-scoped; it backs the `getCertificate` data
+ * source in `components/bugboss.ts`.
  */
 export const githubActionsPulumiPreview: PolicyDocument = {
   Version: "2012-10-17",
@@ -867,6 +869,29 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       Effect: "Allow",
       Action: ["ecs:DescribeTaskDefinition"],
       Resource: "*",
+    },
+    {
+      Sid: "CertificateList",
+      Effect: "Allow",
+      // `components/bugboss.ts` resolves the wildcard certificate with the
+      // `getCertificate` data source, which lists certificates matching the
+      // domain and then describes the one it picked. `ListCertificates` takes
+      // no resource, so it cannot be scoped. Found by running a real preview:
+      // the role failed on `acm:ListCertificates`.
+      Action: ["acm:ListCertificates"],
+      Resource: "*",
+    },
+    {
+      Sid: "CertificateRead",
+      Effect: "Allow",
+      // The read half of the same lookup. The data source describes the
+      // certificate it chose and, because it filters to `ISSUED`, fetches that
+      // certificate's PEM and chain. Both accept the certificate ARN, so they
+      // share one scoped statement. `GetCertificate` returns the public
+      // certificate and chain, not the private key. Part of the same call, not
+      // a speculative widening.
+      Action: ["acm:DescribeCertificate", "acm:GetCertificate"],
+      Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
     },
   ],
 };
