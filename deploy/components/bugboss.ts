@@ -439,19 +439,6 @@ export const createBugBoss = (config: BugBossConfig) => {
               ],
               Resource: ["*"],
             },
-            // The only way into the container when the Boss itself is the
-            // broken thing. The `infra` tag keeps this to administrators.
-            {
-              Sid: "BreakGlassExec",
-              Effect: "Allow",
-              Action: [
-                "ssmmessages:OpenDataChannel",
-                "ssmmessages:OpenControlChannel",
-                "ssmmessages:CreateDataChannel",
-                "ssmmessages:CreateControlChannel",
-              ],
-              Resource: ["*"],
-            },
           ],
         }),
       },
@@ -614,7 +601,6 @@ export const createBugBoss = (config: BugBossConfig) => {
     // someone to notice.
     deploymentCircuitBreaker: { enable: true, rollback: true },
     healthCheckGracePeriodSeconds: 120,
-    enableExecuteCommand: true,
     // Default tags do not reach resources created at runtime — see
     // delegate/lambdas/dispatch.ts, which re-applies both by hand on RunTask.
     // This covers the tasks ECS launches; anything else BugBoss creates while
