@@ -261,11 +261,21 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Permission-change detection.** Independently of \`SELF_REVIEW\`, set
    \`PERMISSION_CHANGE=true\` if any path in the PR matches
-   \`^(delegate/agents/pr-reviewer|deploy/components/ci-roles|deploy/components/identity-center|deploy/deploy\\.sh|\\.github/CODEOWNERS)\`. These files
+   \`^(delegate/agents/pr-reviewer|deploy/components/ci-roles|deploy/components/identity-center|deploy/deploy\\.sh|deploy-org/|deploy-workbench/|utils/bedrock-models|\\.github/CODEOWNERS)\`. These files
    define who can do what in AWS and who must approve changes to that. A bot
    approval on them is never acceptable, no matter how clean the diff looks.
    This gate is deliberately separate from \`SELF_REVIEW\` so that narrowing the
    self-review paths later cannot silently un-protect them.
+
+   Three of those entries need saying out loud, because \`SELF_REVIEW\` does
+   not reach them and it is easy to assume it does. \`deploy-org/\` and
+   \`deploy-workbench/\` do NOT match \`^deploy/\` -- the prefix is
+   \`deploy-org\`, not \`deploy/\` -- and both mint IAM roles and org-level
+   account assignments. \`utils/bedrock-models\` looks like a constants file;
+   \`deploy/components/identity-center/policies.ts\` imports
+   \`bedrockInvokeResources\` from it, so that array *is* a permission set's
+   resource ARN list. All three are code-owned today, so this gate is their
+   second layer, not their only one.
 
    \`delegate/agents/pr-reviewer\` is in that list for exactly that reason. It
    is the file defining these gates, so it belongs here on the same grounds
