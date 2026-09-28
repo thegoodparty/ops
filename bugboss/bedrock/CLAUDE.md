@@ -126,3 +126,48 @@ wrong trade.
 A gap longer than an hour is beyond any ttl. Incident 1's last miss followed
 a 28,809s `contact_human` timeout that expired with no reply. That case wants
 a keep-alive or a shorter default timeout, not a longer cache.
+
+## Traps when changing this directory
+
+**The second argument to `registerApiProvider()` is not a registry key.**
+`registerApiProvider(provider, "bugboss-bedrock-invoke-model")` passes a
+*source label*, used only by `unregisterApiProviders(sourceId)` for bulk
+removal. The registry keys on `provider.api`. That mismatched string sitting
+next to the api id is the first thing anyone chases, and it means nothing.
+
+**Do not "simplify" `runtime.ts` onto Pi's documented extension hook.** We use
+`registerNativeProvider`, which installs our provider as the base. The
+obvious-looking alternative, `registerProvider(id, { api, streamSimple })`,
+registers an *extension* and routes through `composeModelProvider`. In
+`streamWith`, the extension branch calls `extension.streamSimple(...)` for
+both the simple and the full stream paths, so a full `stream()` call carrying
+real `StreamOptions` is silently downgraded to `SimpleStreamOptions`. It works
+today only because `createAgentSession` never calls `stream()`. It breaks
+quietly the day something does.
+
+**Adding any `models.json` entry for `amazon-bedrock` changes which path
+routes us.** It moves `recomposeProvider` off the base-untouched short-circuit
+and into `composeModelProvider`, where `supportsBaseApi` finds no builtin model
+declaring our api and falls through to `getApiProvider("bedrock-invoke-model")`
+-- which resolves only because `registerBedrockRouting` also does the
+api-registry registration. Both halves are load-bearing under different
+configs, and the file that switches between them is one nobody thinks of as
+routing.
+
+**`run.ts` builds `pi.ModelRuntime.create({})`.** That is identical to what
+`createAgentSession` does internally *only because nothing passes `agentDir`*.
+If someone adds `agentDir`, the session reads auth and models from one
+directory while streaming through a runtime built from another. Cheap to
+notice, silent if you do not.
+
+## Reproducing a misroute without AWS
+
+No credentials needed, about twenty lines. Register the api provider, resolve
+the model, build `ModelRuntime.create({ modelsPath: null, refreshOnCreate:
+false })`, call `runtime.streamSimple(model, ...)` with dummy
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, and print `message.api`.
+
+Correct routing reaches `InvokeModel`. Wrong routing returns
+`bedrock-converse-stream` and an `UnrecognizedClientException` from the real
+Converse endpoint -- which is also the proof that Converse actually *ran*
+rather than merely being selected. Fastest check for a regression here.
