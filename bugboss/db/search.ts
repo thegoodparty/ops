@@ -44,8 +44,13 @@ const STOPWORDS = new Set([
  * Raw text cannot be handed to MATCH: FTS5 reads `:` as a column filter, `*`
  * as a prefix and an unbalanced quote as a syntax error, so a model-written
  * sentence throws rather than searching. Every surviving term is quoted,
- * which makes it a literal string token and leaves no operator reachable
- * from the input at all.
+ * which leaves no operator reachable from the input at all.
+ *
+ * Quoting makes a term a phrase, not a literal: it is tokenized the same way
+ * the corpus was, so `"connection_pool"` is the phrase `connection pool` and
+ * matches either spelling. That is why the split below keeps underscores --
+ * an identifier stays one phrase, which asks for adjacency, where splitting
+ * on the underscore would widen it to every incident that said "pool".
  */
 export const toMatchQuery = (raw: string): string | null => {
   const terms = [

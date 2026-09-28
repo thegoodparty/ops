@@ -35,13 +35,25 @@ synchronous PUT. Reads that must see a write in progress belong inside the
 ## Schema changes
 
 `schema.sql` is executed as `CREATE TABLE IF NOT EXISTS` over the restored
-snapshot. **There is no migration runner.**
+snapshot. **There is no migration runner.** The consequence is easy to read
+the wrong way round: editing the body of a `CREATE TABLE` affects only a
+database that does not exist yet, so a change that looks applied everywhere
+is applied nowhere that matters.
 
-- **Columns** can be added freely.
-- **`CHECK` constraints cannot.** SQLite has no `ALTER TABLE ADD CHECK`, so
-  adding one needs a table rebuild that does not exist here. The cross-field
-  constraints landed while the database was empty; that window closed the
-  moment real data existed.
+- **Columns** need declaring twice. Once in `schema.sql`, which is what a
+  fresh database gets and where the column is documented, and once in
+  `LATE_COLUMNS` in `index.ts`, which `Db.open` applies as an `ALTER TABLE
+  ADD COLUMN` when the column is missing. SQLite has no `ADD COLUMN IF NOT
+  EXISTS`, which is why that check is in TypeScript rather than in the DDL.
+  The failure mode when the second edit is missed is the whole reason this is
+  written down: every test opens a new file and passes, and prod restores a
+  snapshot where the column never arrives, so the first statement naming it
+  rolls its transaction back.
+- **`CHECK` constraints cannot** be added at all. SQLite has no `ALTER TABLE
+  ADD CHECK`, so adding one needs a table rebuild that does not exist here.
+  The cross-field constraints landed while the database was empty; that
+  window closed the moment real data existed. A constraint you want now is
+  refused at the tool instead.
 
 The constraints are there because every invariant in this system was
 otherwise a comment plus a hand-written `if`, and three of them turned out
@@ -83,8 +95,16 @@ being created over a database that already has rows.
 Raw text cannot reach `MATCH`. FTS5 reads `:` as a column filter, `*` as a
 prefix and an unbalanced quote as a syntax error, so a model-written sentence
 throws rather than searching. `toMatchQuery` quotes every surviving term,
-which makes each a literal token and leaves no operator reachable from the
-input.
+which leaves no operator reachable from the input.
+
+A quoted term is a **phrase, not a literal**: the query runs through the same
+tokenizer as the corpus, so `"connection_pool"` becomes the two-token phrase
+`connection pool` and matches either spelling in the indexed text. That is
+why the term split keeps underscores — an identifier stays one phrase, which
+asks for adjacency, where splitting on the underscore would widen it to every
+incident that merely said "pool". Read as a literal instead, the expression
+looks like it should match nothing, and it has been reported as a bug on that
+reading more than once.
 
 ## `schema.sql` at runtime
 

@@ -63,8 +63,11 @@ recall at this corpus size.
 
 `toMatchQuery` is not decoration. FTS5 reads `:` as a column filter, `*` as a
 prefix and an unbalanced quote as a syntax error, so raw model text **throws**
-rather than searching. Every surviving term is quoted, which makes it a
-literal token and leaves no operator reachable from the input.
+rather than searching. Every surviving term is quoted, which leaves no
+operator reachable from the input. A quoted term is a phrase rather than a
+literal — it is tokenized like the corpus, so an identifier such as
+`connection_pool` matches that spelling and `connection pool` both. See
+`db/CLAUDE.md`.
 
 The result is a **new incident carrying `recurrenceOf`**, never a reopen.
 `resolvedAt` and `closedAt` are the numbers a recurrence falsifies, and two
