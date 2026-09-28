@@ -149,6 +149,35 @@ jobs:
             }
             core.setOutput("value", JSON.stringify(matrix));
 
+      # A project that fell out of the matrix will not run, so a comment from an
+      # earlier run would keep describing a plan this PR no longer contains.
+      # The preview job only deletes its own comment when it runs and finds no
+      # changes, which never happens for a dropped project.
+      - name: Handle dropped projects
+        if: steps.guard.outputs.value != 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          MATRIX: ${{ steps.matrix.outputs.value }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const projects = new Set(
+              JSON.parse(process.env.MATRIX).map((m) => m.project)
+            );
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            for (const c of comments) {
+              const match = c.body && c.body.match(/<!-- pulumi-preview:([a-z]+) -->/);
+              if (match && match[1] !== "conflict" && !projects.has(match[1])) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+              }
+            }
+
   preview:
     name: ${{ matrix.project }} preview
     needs: changes

@@ -234,6 +234,8 @@ bearing, since trust is by `sub` only, but keep it stable):
 - `actions/checkout` with `persist-credentials: false`.
 - One job per project with path filters, each posting its own
   marker-identified comment, so the parallel jobs never write the same comment.
+  A project that drops out of the matrix has its old comment deleted, since its
+  job no longer runs to clear it.
 - Skip when the PR is not mergeable. GitHub cannot build `refs/pull/N/merge`
   for a conflicted PR, so `actions/checkout` would silently fall back to the
   head and the plan would not be the proposed merge. A marker-identified
