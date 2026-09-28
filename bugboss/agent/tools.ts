@@ -1091,8 +1091,10 @@ export const runContactHuman = async (
 const MONITOR_DESCRIPTION = [
   "Block until a shell command exits 0, then return its output. Use this for",
   "every wait: a PR merging, a deploy finishing, a migration running, an alert",
-  "going quiet. It costs one turn no matter how long it waits, so never poll by",
-  "calling bash in a loop.",
+  "going quiet. It takes one turn no matter how long it waits, so never poll by",
+  "calling bash in a loop. The turn is not the whole cost: a block that outlives",
+  "the prompt cache pays for your context to be written again at the far end, so",
+  "leave the thread and your notes somewhere useful before you enter a long one.",
   "",
   "THE COMMAND MUST BE A READ-ONLY CHECK. On a container restart the session",
   "holds this tool call with no result and the command runs again, so anything",

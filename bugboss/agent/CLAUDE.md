@@ -65,6 +65,13 @@ returned; Loki bills bytes scanned.
 wait. That is what keeps a multi-day incident from saturating context on
 polling, and it is why the prompt forbids polling with bash in a loop.
 
+**One turn is not one bill, and the prompt used to say it was.** A block that
+outlives the prompt cache pays a full cache write on the turn after it, which
+on a nine-hour incident was 41% of what that incident cost. So the prompt
+prices the wait honestly and says what to do with it — refresh impact, post
+state, draft the post-mortem — because the cost lands whether or not the agent
+came out of the wait with anything.
+
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
