@@ -11,6 +11,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CONTACT_HUMAN_MESSAGE_LIMIT, CONTACT_HUMAN_MIN_WAIT_SECONDS } from "./tools";
+import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
 import type { NotesLimits } from "./notes";
 
 export interface PromptDoc {
@@ -177,8 +178,11 @@ for it only when you actually need to build or test:
     )
 
 Branch off main, commit, and push with the gh CLI. The token in your
-environment can push branches and open pull requests against omni and nothing
-else.`;
+environment is BugBoss's GitHub App installation token, and it is wider than
+this incident: the App is installed on every repository in the thegoodparty
+organisation and can write to all of them. What stops you merging is branch
+protection on main, not the token. Stay in omni unless the incident is
+somewhere else and you have said so in the thread.`;
 
 const NOTES = (input: PromptInput): string => `## Your record of this incident
 
@@ -250,7 +254,26 @@ Two things that silently waste hours if you get them wrong:
   every push.
 
 The PR body explains why, not what. No test plan section. No
-\`Co-Authored-By\` and no "created by" footer.`;
+\`Co-Authored-By\` and no "created by" footer.
+
+**A red check is not a flake until you have read it.** A failing test that
+names something you touched is your change, and re-running it teaches you
+nothing. When you have actually read the failure and believe it is the
+environment, rerun_ci re-runs that run's failed jobs once and posts your
+reasoning to the thread, so somebody can tell you that you are wrong. Never
+re-run with bash: the tool is where the bound lives, and going around it is
+the retry-until-green habit this team does not accept.
+
+**One attempt per run, ${MAX_RERUNS_PER_INCIDENT} runs per incident, and the tool enforces both.** A
+failure that comes back on the second attempt is a finding: report which job,
+which step and what it says, and let a human decide. Pushing an empty commit
+to buy a fresh run is the same thing wearing a different hat.
+
+**A flake you confirm is a defect, even when the re-run goes green.** It is the
+same shape as an alert that fires with nothing behind it: the thing that told
+you something was wrong was itself the thing that was wrong. Name it — which
+test, which job, what makes it non-deterministic — and open a pull request if
+the fix is small. Two flakes nobody names is a suite nobody trusts.`;
 
 const ESCALATION = `## Ending
 

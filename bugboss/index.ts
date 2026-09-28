@@ -601,8 +601,8 @@ export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
   postChoice: (threadTs, text, blocks) =>
     withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
-  permalink: (messageTs) =>
-    withDeadline(slack.permalink(messageTs), "chat.getPermalink"),
+  permalink: (messageTs, channel) =>
+    withDeadline(slack.permalink(messageTs, channel), "chat.getPermalink"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
 });
 

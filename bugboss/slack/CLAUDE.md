@@ -21,6 +21,31 @@ thread is only findable by its permalink. `chat.getPermalink` builds one from
 the workspace domain, which is why it is an API call rather than string
 concatenation; it needs no scope of its own.
 
+The same applies to anything that names an incident it is not standing in,
+which in practice means the Slack agent: it reads the whole database, so it
+routinely talks about incidents whose thread it is not in, and "incident 4"
+with no link is something the reader has to go and hunt for in the channel.
+So `get_incident` and `query_incidents` return `threadPermalink` on an
+incident row, and the prompt tells the model to link what the tools handed
+it. The link is withheld -- `threadPermalink` is null -- for the incident
+whose thread the answer is being written into, because a link to where the
+reader already is is noise, and withholding it is what makes that reliable
+rather than an instruction the model may forget.
+
+The alert that says a question went unanswered has the same problem from a
+harsher angle: it is read in another channel by somebody who was not in the
+thread and has the least context of anyone to reconstruct it, so it links the
+thread rather than naming a timestamp. That is the one permalink taking a
+channel of its own -- incidents all live in the incident channel, but the
+Slack agent answers wherever it is mentioned.
+
+`createCachingLinker` is why an answer naming five incidents is not five
+round trips. A permalink is a workspace, a channel and a timestamp, and only
+the workspace is unknowable from here, so the first real answer teaches it
+and every later link is string work. A permalink that fails alarms and leaves
+the bare reference; nothing waits on a second attempt, and a failure is never
+cached as an answer.
+
 ## A plain reply answers; a mention also interrupts
 
 Every message in an incident thread becomes a `human_message`

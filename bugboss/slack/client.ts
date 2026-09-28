@@ -1,6 +1,8 @@
 // Production implementations of the two interfaces relay.ts and agent.ts take
-// injected. Nothing here is imported by the tests, which is the point of the
-// split.
+// injected. The Slack and S3 clients are not reachable from the tests, which
+// is the point of the split. `createCachingLinker` is the exception: what it
+// decides -- how many API calls a message full of links costs -- is behaviour
+// rather than wiring, so it is tested on its own.
 
 import {
   GetObjectCommand,
@@ -10,8 +12,11 @@ import {
 } from "@aws-sdk/client-s3";
 import { retryPolicies, WebClient, type KnownBlock } from "@slack/web-api";
 
+import { makeLog } from "../logging";
 import type { ChoicePoster } from "./blocks";
 import type { ObjectStore, SlackClient } from "./agent";
+
+const log = makeLog("slack-client");
 
 /**
  * `conversations.replies` is throttled to roughly one request a minute for
@@ -24,10 +29,71 @@ const REPLIES_PAGE_LIMIT = 200;
  * A link to one message. Slack builds a permalink out of the workspace
  * domain, which nothing in here knows, so it is an API call rather than
  * string concatenation. `chat.getPermalink` needs no scope of its own.
+ *
+ * `channel` defaults to the incident channel, which is where every incident
+ * thread lives. It is passed only for a thread somewhere else -- the Slack
+ * agent answers wherever it is mentioned, and the alert saying it could not
+ * answer has to point back at that thread.
  */
 export interface SlackLinker {
-  permalink(messageTs: string): Promise<string>;
+  permalink(messageTs: string, channel?: string): Promise<string>;
 }
+
+/**
+ * The shape of an answer that can teach us the rest: a workspace, a channel
+ * and a timestamp. Only the first is unknowable from here.
+ */
+const ARCHIVE = /^(https:\/\/[^/?#]+)\/archives\/([^/?#]+)\/p\d+$/;
+
+/**
+ * The workspace domain is the only part of a permalink the API knows and we
+ * do not, and one real answer hands it over. After that every other link is
+ * string work, so an answer naming five incidents costs one round trip
+ * rather than five -- which matters because the Slack agent resolves these
+ * on the path to a reply somebody is waiting for.
+ */
+export const createCachingLinker = (
+  inner: SlackLinker,
+  defaultChannel: string,
+): SlackLinker => {
+  // Bounded by the messages linked before the workspace is known, which in
+  // practice is one. Cleared the moment it is.
+  const pending = new Map<string, Promise<string>>();
+  let origin: string | null = null;
+
+  return {
+    permalink: (messageTs, channel) => {
+      const where = channel ?? defaultChannel;
+      const digits = messageTs.replaceAll(".", "");
+      if (origin) return Promise.resolve(`${origin}/archives/${where}/p${digits}`);
+
+      const key = `${where}/${messageTs}`;
+      const held = pending.get(key);
+      if (held) return held;
+
+      const call = inner.permalink(messageTs, channel).then((url) => {
+        const parsed = ARCHIVE.exec(url);
+        // The channel has to come back as the one that was asked about. If
+        // it does not, this url is not the shape the rest are derived from,
+        // and deriving anyway would send readers to a link to nowhere.
+        if (parsed && parsed[2] === where) {
+          origin = parsed[1];
+          pending.clear();
+        } else {
+          // Still the right url for this message, so nothing is broken -- but
+          // every later link now costs an API call, and a silent tenfold rise
+          // in Slack calls is exactly the kind of thing nobody notices.
+          log("permalink_shape_unknown", { url });
+        }
+        return url;
+      });
+      pending.set(key, call);
+      // A rejection is not an answer, so it must not be cached as one.
+      call.catch(() => pending.delete(key));
+      return call;
+    },
+  };
+};
 
 export const createSlackClient = (
   token: string,
@@ -41,6 +107,21 @@ export const createSlackClient = (
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
   });
+  const linker = createCachingLinker(
+    {
+      permalink: async (messageTs, channel) => {
+        const res = await web.chat.getPermalink({
+          channel: channel ?? defaultChannel,
+          message_ts: messageTs,
+        });
+        if (!res.permalink) {
+          throw new Error("chat.getPermalink returned no permalink");
+        }
+        return res.permalink;
+      },
+    },
+    defaultChannel,
+  );
   return {
     post: async (threadTs, text, channel) => {
       const res = await web.chat.postMessage({
@@ -71,16 +152,7 @@ export const createSlackClient = (
       if (!res.ts) throw new Error("chat.postMessage returned no ts");
       return { ts: res.ts };
     },
-    permalink: async (messageTs) => {
-      const res = await web.chat.getPermalink({
-        channel: defaultChannel,
-        message_ts: messageTs,
-      });
-      if (!res.permalink) {
-        throw new Error("chat.getPermalink returned no permalink");
-      }
-      return res.permalink;
-    },
+    permalink: linker.permalink,
     replies: async ({ channel, threadTs, oldest }) => {
       const res = await web.conversations.replies({
         channel,
