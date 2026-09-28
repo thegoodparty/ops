@@ -105,9 +105,18 @@ export const timestamp = (at: number): string => {
   ].join(" ");
 };
 
-/** Two units at most: "1h 4m", "3d 2h", "47s". Past a day, minutes are noise. */
+/**
+ * Two units at most: "1h 4m", "3d 2h", "47s". Past a day, minutes are noise.
+ *
+ * This takes a length, not a difference. Deciding what a backwards interval
+ * means belongs to `interval` below, so nothing here turns a negative into a
+ * word: a sign that reaches this far is printed. A call site nobody thought
+ * about then shows a number that is visibly wrong, rather than no number at
+ * all.
+ */
 export const duration = (ms: number): string => {
-  if (!Number.isFinite(ms) || ms < 0) return "unknown";
+  if (!Number.isFinite(ms)) return "unknown";
+  if (ms < 0) return `-${duration(-ms)}`;
   const seconds = Math.round(ms / 1000);
   const units: [number, string][] = [
     [86400, "d"],
@@ -126,6 +135,39 @@ export const duration = (ms: number): string => {
     rest -= whole * size;
   }
   return parts.length > 0 ? parts.join(" ") : "0s";
+};
+
+/**
+ * One of the report's measured intervals, or a sentence saying why there is
+ * no number.
+ *
+ * Three answers, not two, because there are three states and they are not
+ * the same news. `null` means one of the two moments was never recorded.
+ * A negative means both were recorded and they disagree about which came
+ * first -- the incident's own timeline contradicts itself. Printing one word
+ * for both throws away the only clue that something upstream is wrong, and a
+ * number that cannot be right is exactly as worth saying out loud as an
+ * exception is.
+ */
+export const interval = (
+  ms: number | null,
+  say: {
+    /** When neither timestamp is there. A sentence, not a word. */
+    absent: string;
+    /** When they are both there and in the wrong order. `gap` is the size. */
+    backwards: (gap: string) => string;
+    /**
+     * When there is a number. Defaults to the number on its own, which is
+     * what a labelled table cell wants; a sentence in a thread wants "detected
+     * in 6h 15m" and passes that.
+     */
+    measured?: (length: string) => string;
+  },
+): string => {
+  if (ms === null) return say.absent;
+  if (ms < 0) return say.backwards(duration(-ms));
+  const length = duration(ms);
+  return say.measured ? say.measured(length) : length;
 };
 
 export const count = (value: number): string => value.toLocaleString("en-US");
@@ -193,7 +235,7 @@ export interface ReportMetrics {
   timeToDetectMs: number | null;
   /** resolvedAt - firstSignalAt: how long it took once we knew. */
   timeToResolveMs: number | null;
-  /** firstSignalAt - closedAt, the whole life of the incident. */
+  /** closedAt - firstSignalAt, the whole life of the incident. */
   lifetimeMs: number | null;
   totalTokens: number;
   prsMerged: number;
@@ -233,17 +275,27 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
     ],
     [
       "Time to detect",
-      metrics.timeToDetectMs === null
-        ? "not known — the agent could not pin down when impact began"
-        : duration(metrics.timeToDetectMs),
+      interval(metrics.timeToDetectMs, {
+        absent: "not known — when impact began was never recorded",
+        backwards: (gap) =>
+          `not usable — impact is recorded as beginning ${gap} after the first signal arrived, so one of the two times is wrong`,
+      }),
     ],
     [
       "Time to resolve",
-      metrics.timeToResolveMs === null ? "unknown" : duration(metrics.timeToResolveMs),
+      interval(metrics.timeToResolveMs, {
+        absent: "not known — no resolved time was recorded",
+        backwards: (gap) =>
+          `not usable — the incident is recorded as resolved ${gap} before its first signal arrived, so one of the two times is wrong`,
+      }),
     ],
     [
       "Open to closed",
-      metrics.lifetimeMs === null ? "unknown" : duration(metrics.lifetimeMs),
+      interval(metrics.lifetimeMs, {
+        absent: "not known — no close time was recorded",
+        backwards: (gap) =>
+          `not usable — the incident is recorded as closed ${gap} before its first signal arrived, so one of the two times is wrong`,
+      }),
     ],
     ["First signal", timestamp(incident.firstSignalAt)],
     ["Resolved", incident.resolvedAt === null ? "—" : timestamp(incident.resolvedAt)],
@@ -431,12 +483,17 @@ export const renderThreadSummary = (
     incident.usersImpacted === null
       ? "impact not measured"
       : `${count(incident.usersImpacted)} users impacted`,
-    metrics.timeToDetectMs === null
-      ? "time to detect unknown"
-      : `detected in ${duration(metrics.timeToDetectMs)}`,
-    metrics.timeToResolveMs === null
-      ? "time to resolve unknown"
-      : `resolved in ${duration(metrics.timeToResolveMs)}`,
+    interval(metrics.timeToDetectMs, {
+      measured: (length) => `detected in ${length}`,
+      absent: "time to detect not recorded",
+      backwards: () =>
+        "detection time inconsistent (impact recorded as starting after the signal)",
+    }),
+    interval(metrics.timeToResolveMs, {
+      measured: (length) => `resolved in ${length}`,
+      absent: "time to resolve not recorded",
+      backwards: () => "resolve time inconsistent (resolved before the signal)",
+    }),
   ].join(" · ");
 
   const work = [

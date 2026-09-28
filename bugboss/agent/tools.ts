@@ -11,6 +11,7 @@ import { execFile } from "node:child_process";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { makeAlarm, makeLog } from "../logging";
 import { choiceProblem, MAX_CHOICE_OPTIONS } from "../slack/blocks";
+import { overThreadBudget, THREAD_PROSE_CHARS } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
 
 const log = makeLog("agent-tools");
@@ -258,6 +259,21 @@ export const HEARTBEAT_MAX_PINGS = 3;
 export const HEARTBEAT_STATUS_CHARS = 400;
 
 /**
+ * How much of an echo a harness-written brief carries.
+ *
+ * Every post to a thread is refused past `THREAD_PROSE_CHARS`, and a brief
+ * the harness wrote has nobody to refuse it to -- the model is not in the
+ * loop, and a lost escalation is the worst outcome in this file. So the two
+ * variable parts of those briefs, both of which are echoes of text already
+ * sitting in the thread directly above, are clamped small enough that the
+ * composed brief provably fits: 350 for the echo, at most 375 of button
+ * labels, under 250 of template, against a budget of 1,200. `tools.test.ts`
+ * composes the worst case of each and checks it, so the arithmetic stays
+ * true rather than staying written down.
+ */
+export const HARNESS_BRIEF_ECHO_CHARS = 350;
+
+/**
  * Quiet seconds owed before the next nudge, given how many have gone already.
  * Measured from the last nudge rather than from the start, which is what
  * keeps a wait that spanned a night from firing its whole ladder in three
@@ -365,7 +381,10 @@ export const stalledWaitBrief = (args: {
     `Nobody ended this wait in ${formatWaited(args.waitedMs)}, across ${args.nudges} nudges in the thread, so this is yours.`,
     "",
     "*What I am waiting for*",
-    `${args.description} — ${args.awaitingHuman}`,
+    truncateOutput(
+      `${args.description} — ${args.awaitingHuman}`,
+      HARNESS_BRIEF_ECHO_CHARS,
+    ),
     "",
     "*Where it stands*",
     "```",
@@ -767,7 +786,7 @@ export const unansweredBrief = (
     `Nobody answered in ${waitedMinutes} minutes, so this is yours.`,
     "",
     "*What I asked*",
-    question,
+    truncateOutput(question, HARNESS_BRIEF_ECHO_CHARS),
     // The buttons are part of the question a reader saw, and the person
     // picking this up did not see the thread before now.
     ...(options.length
@@ -849,6 +868,24 @@ export const runContactHuman = async (
         "Keep the conclusion, what it means for users and the one thing you need in " +
         '"message"; move the queries, counts and rule ids into "details", which is ' +
         "posted as its own follow-up message under the ask.",
+      escalation: null,
+    };
+  }
+
+  // Checked here and not left to the route, even though the route checks it
+  // too. `details` is posted after the ask and after the marker is written,
+  // so a 400 there would throw with the question already in the thread and no
+  // wait started -- an ask nobody is waiting on, which is the one outcome
+  // this tool exists to prevent. Both refusals happen before anything is
+  // posted.
+  const longDetails = args.details ? overThreadBudget("details", args.details) : null;
+  if (longDetails) {
+    return {
+      reply: null,
+      timedOut: false,
+      directives: [],
+      terminate: false,
+      rejected: longDetails,
       escalation: null,
     };
   }
@@ -1120,7 +1157,7 @@ export const createContactHumanTool = async (
     details: Type.Optional(
       Type.String({
         description:
-          "The evidence, posted as a separate follow-up message under the ask. Queries, counts, rule ids, control tests. Unbounded.",
+          `The evidence, posted as a separate follow-up message under the ask. Queries, counts, rule ids, control tests. Its own post, so its own ${THREAD_PROSE_CHARS} characters; the uncapped place is the post-mortem.`,
       }),
     ),
     timeoutSeconds: Type.Number({

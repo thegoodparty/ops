@@ -86,6 +86,24 @@ On the degraded path the document is posted through `postProse`, which is the
 Markdown-to-mrkdwn conversion plus the length split — so the headings and
 tables that read correctly in the file still read correctly in the thread.
 
+## The thread is short; the document is complete
+
+Every other path into an incident thread is capped at `THREAD_PROSE_CHARS` and
+refuses a longer post (`slack/CLAUDE.md`). This document is the one thing
+exempt, and the exemption is structural rather than a bigger number: the report
+does not go out as thread text at all, it goes out as a file, so the thread
+stays short by the long version being somewhere else. `report_analysis`'s
+`postmortem` is therefore the one model field with no cap on it.
+
+The degraded path is the single case where the document does land in the thread
+as text, and it posts through `postDocument` — which does nothing `postProse`
+does not, and exists so that one exemption is a name at a call site rather than
+the absence of a check.
+
+The thread summary beside the file answers to the budget like any other post,
+which is what `SUMMARY_CAUSE_CHARS` is for: one line of cause, the numbers a
+person scanning the channel wants, and everything else in the file.
+
 ## Why a Markdown file
 
 Slack previews it inline, indexes the text for search, and leaves it

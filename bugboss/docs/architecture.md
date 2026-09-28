@@ -292,7 +292,13 @@ notification on a transition that already committed, so a failed upload
 degrades to thread text and alarms rather than touching the incident. It is
 claimed with an `incident_action` row before it posts, because two publishers
 race in normal operation and a container that dies mid-upload must stay quiet
-rather than post twice. `report/CLAUDE.md` has the rest, including why the
+rather than post twice.
+
+**The thread is short; the document is complete.** Every path into a thread is
+capped at about 200 words and refuses a longer post -- the ask, the evidence
+under it, the resolution evidence, the hand-off brief. The post-mortem is the
+one field with no cap, because it leaves as the file rather than as thread
+text. `slack/CLAUDE.md` has the table of which bound applies where. `report/CLAUDE.md` has the rest, including why the
 publish happens after usage roll-up and not inside the tool call.
 
 **Usage is read back off the session file**, after the child exits, by

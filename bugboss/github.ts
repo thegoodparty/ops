@@ -11,7 +11,11 @@
 
 import { createAppAuth } from "@octokit/auth-app";
 
+import { makeLog } from "./logging";
+
 import type { PrStateReader, ReportPr } from "./report";
+
+const log = makeLog("github");
 
 /**
  * Secrets Manager stores the PEM as one line, since JSON has no way to carry
@@ -114,7 +118,10 @@ export const createPrStateReader = (
               signal: AbortSignal.timeout(PR_STATE_TIMEOUT_MS),
             },
           );
-          if (!res.ok) return;
+          if (!res.ok) {
+            log("pr_state_unavailable", { url, status: res.status });
+            return;
+          }
           const body = (await res.json()) as PullRequestBody;
           found[url] = body.merged_at
             ? "merged"
@@ -123,8 +130,11 @@ export const createPrStateReader = (
               : body.state === "closed"
                 ? "closed"
                 : null;
-        } catch {
-          // Left absent, which renders as "state not known".
+        } catch (err) {
+          // Left absent, which renders as "state not known" -- but said out
+          // loud, because a report that quietly stops naming PR outcomes
+          // reads exactly like a report for an incident that opened none.
+          log("pr_state_unavailable", { url, error: String(err) });
         }
       }),
     );

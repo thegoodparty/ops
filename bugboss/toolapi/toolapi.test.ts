@@ -14,6 +14,7 @@ import { createToolApi, type CorrelationMerge } from "./index";
 import jwt from "jsonwebtoken";
 
 import { mintAgentToken, verifyAgentToken } from "./token";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 
 const SECRET = "test-secret-not-a-real-one";
 
@@ -779,24 +780,61 @@ describe("hand off", () => {
     assert.doesNotMatch(text, /\*\*/);
   });
 
-  it("splits a brief too long for one message rather than losing its tail", async () => {
+  it("splits a brief that escaping pushes past one message, keeping its tail", async () => {
     await seed("sig-long");
     const id = await openIncident(["sig-long"]);
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-long"] });
 
+    // Inside the thread budget as written; conversion multiplies it past what
+    // one message holds. A split for that reason is not the model writing too
+    // much, so it still goes out whole.
+    const brief = Array.from(
+      { length: 34 },
+      (_, i) => `- ruled out ${i} ${"&".repeat(18)}`,
+    ).join("\n");
+    assert.ok(brief.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
+
     const before = posts.length;
-    await tools.handOff({
+    await tools.handOff({ reason: "deadline", brief });
+
+    const sent = posts.slice(before);
+    assert.ok(sent.length > 1, `expected a split, got ${sent.length}`);
+    assert.ok(
+      sent.map((p) => p.text).join("").includes("ruled out 33"),
+      "the tail is not dropped",
+    );
+  });
+
+  it("refuses a brief past the thread budget instead of handing off anyway", async () => {
+    await seed("sig-budget");
+    const id = await openIncident(["sig-budget"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "auth change",
+      explainedSignalIds: ["sig-budget"],
+    });
+
+    const before = posts.length;
+    const res = await tools.handOff({
       reason: "deadline",
       brief: Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n"),
     });
 
-    const brief = posts.slice(before);
-    assert.ok(brief.length > 1, `expected a split, got ${brief.length}`);
-    assert.ok(
-      brief.map((p) => p.text).join("").includes("ruled out 399"),
-      "the tail is not dropped",
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /brief is \d+ characters/);
+    assert.match(res.error ?? "", /post-mortem/);
+    assert.equal(posts.length, before, "refused ahead of the post");
+    // The refusal has to leave the incident retryable: an escalation the
+    // model was told to rewrite is useless if the incident already stopped
+    // being its problem.
+    const row = db.get<{ owner: string; status: string }>(
+      "SELECT owner, status FROM incident WHERE id = ?",
+      [id],
     );
+    assert.ok(row);
+    assert.equal(row.owner, "agent");
+    assert.equal(row.status, "FIXING");
   });
 
   it("is terminal for the agent and leaves the incident open", async () => {

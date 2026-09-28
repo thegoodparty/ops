@@ -27,7 +27,7 @@ import {
   renderChoiceQuestion,
   type ChoicePoster,
 } from "../slack/blocks";
-import { postProse } from "../slack/format";
+import { overThreadBudget, postProse } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
 
 const log = makeLog("boss-http");
@@ -472,6 +472,15 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       const problem = choiceProblem(options);
       if (problem) return c.json({ error: problem }, 400);
     }
+    // Every post that reaches a thread comes through here -- the ask, the
+    // evidence under it, the rerun notice, the wait heartbeat -- so this is
+    // the only place a thread budget can be a budget rather than a rule one
+    // of four callers happens to follow. It refuses instead of splitting:
+    // two posts of 200 words are not shorter than one of 400, they are
+    // worse. The uncapped long form is the post-mortem, which leaves as a
+    // file rather than as thread text.
+    const tooLong = overThreadBudget("message", message);
+    if (tooLong) return c.json({ error: tooLong }, 400);
 
     const incident = deps.db.get<{ slackThreadTs: string | null }>(
       "SELECT slackThreadTs FROM incident WHERE id = ?",

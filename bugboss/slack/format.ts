@@ -273,6 +273,46 @@ export const toMrkdwn = (text: string): string =>
  */
 export const MAX_MESSAGE_CHARS = 3000;
 
+/**
+ * How much prose one thread post may carry before it is refused.
+ *
+ * Measured on a real incident thread rather than guessed: the messages this
+ * codebase composes ran 7 to 98 words, and the agent's own free text ran 370
+ * to 426 -- four times the longest thing anyone had written on purpose, in
+ * the place least able to carry it. Around 200 words is the ceiling that
+ * still leaves room to say something. Characters because every other bound
+ * here is in characters, and 1,200 is about 200 words of English prose.
+ *
+ * `MAX_MESSAGE_CHARS` is a different kind of number and they are not
+ * alternatives: 3,000 is what Slack will accept in one message, so past it
+ * text is *split*. This is what a reader will read, so past it text is
+ * *refused* -- splitting a 400-word post into two 200-word posts does not
+ * make it shorter.
+ *
+ * **This is the thread's budget and only the thread's.** The closing report
+ * is a file and is deliberately exempt: the thread is short, the document is
+ * complete. That exemption is `postDocument` below -- a different function
+ * rather than a bigger number -- so the one long thing is a call site you
+ * can grep for rather than a check somebody forgot.
+ */
+export const THREAD_PROSE_CHARS = 1200;
+
+/**
+ * Why this text is too long for a thread, or null.
+ *
+ * A sentence rather than a boolean, because every caller is about to hand it
+ * to whoever wrote the text, and "too long" on its own has never once been
+ * enough for anybody to fix anything. It names the field, both numbers, and
+ * where the long version is supposed to go.
+ */
+export const overThreadBudget = (what: string, text: string): string | null =>
+  text.length <= THREAD_PROSE_CHARS
+    ? null
+    : `${what} is ${text.length} characters and the limit for a thread post is ` +
+      `${THREAD_PROSE_CHARS}, about 200 words. Keep the conclusion and what it ` +
+      "means for users; the full write-up belongs in the post-mortem, which is " +
+      "not capped and which becomes the closing report.";
+
 /** Room for the `_(2/3)_` marker, which is added after chunking. */
 const CONTINUATION_RESERVE = 16;
 
@@ -386,6 +426,23 @@ export const splitForSlack = (
  * A split is not a failure, but it is a thing that happened to somebody's
  * post-mortem, so it is said out loud rather than inferred from the channel.
  */
+/**
+ * Post the one text that is exempt from `THREAD_PROSE_CHARS`: the closing
+ * report, when it could not be uploaded as a file and the thread is the only
+ * place left for it.
+ *
+ * It does nothing `postProse` does not. It exists so the exemption is a name
+ * at a call site instead of the absence of a check -- the thread is short and
+ * the document is complete, and this is the one place the document ends up in
+ * the thread anyway. A new caller of this is a decision somebody has to
+ * defend in review; a new caller of `postProse` is not.
+ */
+export const postDocument = (
+  post: (text: string) => Promise<{ ts: string }>,
+  text: string,
+  context: Record<string, unknown> = {},
+): Promise<{ ts: string }> => postProse(post, text, { ...context, document: true });
+
 export const postProse = async (
   post: (text: string) => Promise<{ ts: string }>,
   text: string,

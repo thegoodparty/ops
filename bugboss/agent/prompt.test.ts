@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 import {
   CONTACT_HUMAN_MESSAGE_LIMIT,
   CONTACT_HUMAN_MIN_WAIT_SECONDS,
@@ -232,4 +233,50 @@ test("the prompt does not understate how far the GitHub token reaches", () => {
   // wrong about. See bugboss/github-app.md.
   assert.doesNotMatch(prompt, /omni and nothing\s+else/);
   assert.match(prompt, /every repository in the thegoodparty/);
+});
+
+test("the thread cap is stated as a refusal, not a split", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /The thread is short; the document is complete/);
+  assert.match(prompt, new RegExp(`capped at ${THREAD_PROSE_CHARS} characters`));
+  // A model told the ceiling is a split writes long and lets the harness cut
+  // it. The refusal is the whole behaviour change, so the prompt says it.
+  assert.match(prompt, /refused: not truncated, not split across two\s+messages/);
+  assert.match(prompt, new RegExp(`tighter still, ${CONTACT_HUMAN_MESSAGE_LIMIT}\\s+characters`));
+  assert.doesNotMatch(prompt, /under about 3000 characters/);
+});
+
+test("the post-mortem is the one thing the prompt exempts from the cap", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /post-mortem is the single exception and it has no cap at all/);
+  assert.match(prompt, /becomes a file attached to the thread/);
+  assert.match(prompt, /Nothing here is asking you to write less/);
+  assert.match(prompt, /no cap is the post-mortem, which becomes the closing report/);
+  // `details` goes out through the thread route, so the old "no budget at
+  // all" reading of it is now a refused call the model did not expect.
+  assert.match(
+    prompt,
+    new RegExp(`its own\\s+${THREAD_PROSE_CHARS}-character budget rather than no budget at all`),
+  );
+});
+
+test("the prompt asks for behaviour over symbols, with a worked pair", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /\*\*Describe behaviour, not symbols\.\*\*/);
+  assert.match(prompt, /do not\s+carry this codebase in their heads/);
+  // Plain has to be spelled out as precise, or the rule reads as licence to
+  // drop the numbers that make a report actionable.
+  assert.match(prompt, /Plain is not vague, and it is not softer/);
+  assert.match(prompt, /1,000 at a time, 100\s+fetches, roughly 3\.5 minutes, against a 2-minute timeout/);
+  // An example changes behaviour where an adjective does not.
+  assert.match(prompt, /In symbols:/);
+  assert.match(prompt, /In behaviour:/);
+  assert.match(prompt, /sync\.worker\.ts:212/);
+  assert.match(prompt, /re-read the same 1,000 campaigns 47 times since 02:00/);
+  // Identifiers are not banned, they are routed. The opted-in reader gets them.
+  assert.match(prompt, /post-mortem and the closing report are the exception/);
+  assert.match(prompt, /naming `GET \/v1\/public-campaigns` is fine/);
 });

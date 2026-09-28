@@ -1,8 +1,12 @@
 // Production implementations of the two interfaces relay.ts and agent.ts take
 // injected. The Slack and S3 clients are not reachable from the tests, which
-// is the point of the split. `createCachingLinker` is the exception: what it
-// decides -- how many API calls a message full of links costs -- is behaviour
-// rather than wiring, so it is tested on its own.
+// is the point of the split. Two things in here are the exception, both
+// because what they decide is behaviour rather than wiring:
+// `createCachingLinker`, where the decision is how many API calls a message
+// full of links costs, and `createSlackFileUploader`, where it is the order of
+// the three upload steps and the bound on each. Both are tested on their own,
+// which for the uploader means stubbing axios as well as fetch -- the Slack
+// SDK does not use fetch.
 
 import {
   GetObjectCommand,
@@ -25,6 +29,18 @@ const log = makeLog("slack-client");
  * agents never call it at all, which is what keeps us under that.
  */
 const REPLIES_PAGE_LIMIT = 200;
+
+/**
+ * The signed upload URL is somebody else's host, and the POST to it is the
+ * one request here that carries a body. Unbounded it would hold the report
+ * sweep open for as long as that host cared to keep the socket, which is
+ * the worst outcome available: the inline fallback is strictly better than
+ * waiting. Fifteen seconds is above the 8s a Loki read gets -- this one
+ * uploads rather than reads -- and well inside the 30s dispatcher tick, so
+ * an upload endpoint that is simply gone degrades to thread text within the
+ * same tick that noticed the close.
+ */
+const UPLOAD_TIMEOUT_MS = 15_000;
 
 /**
  * A link to one message. Slack builds a permalink out of the workspace
@@ -177,7 +193,9 @@ export const createSlackClient = (
  * Three steps and no SDK shortcut: `files.upload` is deprecated, and
  * `filesUploadV2` wraps this same sequence while hiding which of the three
  * failed. The middle step is a plain POST to a signed URL -- not a Slack API
- * call, no token on it -- so it is `fetch` rather than the WebClient.
+ * call, no token on it -- so it is `fetch` rather than the WebClient, and
+ * the bound it would otherwise inherit from the SDK has to be passed by
+ * hand.
  *
  * `files:write` is the scope, and it does nothing until somebody reinstalls
  * the app. Until then `files.completeUploadExternal` answers `missing_scope`,
@@ -186,6 +204,7 @@ export const createSlackClient = (
 export const createSlackFileUploader = (token: string): FileUploader => {
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    timeout: UPLOAD_TIMEOUT_MS,
   });
   return {
     upload: async (file) => {
@@ -203,6 +222,7 @@ export const createSlackFileUploader = (token: string): FileUploader => {
       const uploaded = await fetch(ticket.upload_url, {
         method: "POST",
         body,
+        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
       });
       if (!uploaded.ok) {
         throw new Error(

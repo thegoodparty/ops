@@ -59,6 +59,11 @@ oauth_config:
       ## behind this one scope.) Without it the upload fails with
       ## missing_scope and the report is posted as thread text instead --
       ## nothing is lost, it is just longer to read.
+      ##
+      ## files:read is deliberately not requested. Nothing here reads a file
+      ## back: the Boss writes the report and the reader opens it in Slack.
+      ## Every scope in this file is one something calls, so that reinstalling
+      ## from the manifest is a decision rather than a diff nobody reads.
       - files:write
       ## usergroups.users.list, for the rotation snapshot recorded on each
       ## incident at open. A Slack user group keeps no history, so this is

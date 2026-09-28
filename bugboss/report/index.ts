@@ -24,7 +24,7 @@ import type Database from "better-sqlite3";
 import type { Db } from "../db";
 import { sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
-import { postProse, splitForSlack } from "../slack/format";
+import { postDocument, splitForSlack } from "../slack/format";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
 import {
   renderReportDocument,
@@ -295,7 +295,10 @@ export const publishIncidentReport = async (
       for (const part of splitForSlack(renderThreadSummary(data, note))) {
         await deps.post(threadTs, part);
       }
-      await postProse((text) => deps.post(threadTs, text), document, { incidentId });
+      // postDocument, not postProse: this is the one text exempt from the
+      // thread's length budget, and the exemption is supposed to be a name
+      // somebody can grep for.
+      await postDocument((text) => deps.post(threadTs, text), document, { incidentId });
       return "degraded";
     } catch (err) {
       alarm("publish_failed", { incidentId, error: String(err) });

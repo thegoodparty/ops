@@ -13,11 +13,13 @@ import {
   readReportData,
   renderReportDocument,
   renderThreadSummary,
+  reportMetrics,
   REPORT_PUBLISHED_ACTION,
   REPORT_SWEEP_GRACE_MS,
   type ReportDeps,
   type ReportUpload,
 } from "./index";
+import { duration } from "./render";
 
 const fakeS3 = () => {
   const objects = new Map<string, Buffer>();
@@ -115,6 +117,10 @@ interface SeedOptions {
   signalTitle?: string;
   rootCause?: string;
   sessionRef?: string | null;
+  /** Null for "never recorded"; later than `OPENED` for a backwards row. */
+  impactStartedAt?: number | null;
+  resolvedAt?: number | null;
+  prUrls?: string[];
 }
 
 const seed = async (id: string, opts: SeedOptions = {}) => {
@@ -125,6 +131,14 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
       ? "## Timeline\n\n10:00 impact began.\n\n## Five whys\n\n1. The pool saturated."
       : opts.postmortem;
   const sessionRef = opts.sessionRef === undefined ? `sessions/incident/${id}/session.jsonl` : opts.sessionRef;
+  const impactStartedAt =
+    opts.impactStartedAt === undefined ? OPENED - 600_000 : opts.impactStartedAt;
+  const resolvedAt =
+    opts.resolvedAt === undefined
+      ? status === "INVESTIGATING"
+        ? null
+        : OPENED + 3_600_000
+      : opts.resolvedAt;
 
   await db.withWrite((w) => {
     w.prepare(
@@ -139,12 +153,12 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
       id,
       status,
       opts.rootCause ?? "The connection pool saturated after the <prod> deploy.",
-      JSON.stringify(["https://github.com/thegoodparty/omni/pull/42"]),
+      JSON.stringify(opts.prUrls ?? ["https://github.com/thegoodparty/omni/pull/42"]),
       postmortem,
-      OPENED - 600_000,
+      impactStartedAt,
       OPENED,
       OPENED + 900_000,
-      status === "INVESTIGATING" ? null : OPENED + 3_600_000,
+      resolvedAt,
       closedAt,
       JSON.stringify(["U-ONCALL"]),
       sessionRef,
@@ -443,5 +457,192 @@ describe("the sweep catches a close whose container died", () => {
 
     assert.equal(await publishPendingReports(deps()), 0);
     assert.equal(uploads.length, 1);
+  });
+});
+
+/**
+ * Finds a row of the glance table by its label. A missing row is a failure
+ * worth naming here rather than an `undefined` that makes every assertion
+ * below it pass vacuously.
+ */
+const glanceRow = async (incidentId: string, label: string): Promise<string> => {
+  const data = await readReportData(deps(), incidentId);
+  assert.ok(data);
+  const row = renderReportDocument(data)
+    .split("\n")
+    .find((line) => line.startsWith(`| ${label} |`));
+  assert.ok(row, `the glance table always carries a "${label}" row`);
+  return row;
+};
+
+describe("an interval whose two times disagree is named, not erased", () => {
+  it("names the gap when impact is recorded as starting after the signal", async () => {
+    // Both timestamps exist and they contradict each other: impact is on
+    // record as beginning after we were already alerted. That is a fact about
+    // whatever wrote the row, and the only place it can surface is here.
+    await seed("inc-16", { impactStartedAt: OPENED + 12 * 60_000 });
+
+    const data = await readReportData(deps(), "inc-16");
+    assert.ok(data);
+    assert.equal(reportMetrics(data).timeToDetectMs, -12 * 60_000);
+
+    const row = await glanceRow("inc-16", "Time to detect");
+    assert.match(row, /not usable/);
+    assert.match(row, /beginning 12m after the first signal arrived/);
+    assert.match(row, /one of the two times is wrong/);
+    // The three states have to stay distinguishable in the output. Reading
+    // "unknown" or "not known" here sends someone hunting for a timestamp
+    // that was written, and never tells them it was written wrong.
+    assert.doesNotMatch(row, /\| unknown \|/);
+    assert.doesNotMatch(row, /not known/);
+    // A raw pipe would open a third column and shift every row under it.
+    assert.equal((row.match(/(?<!\\)\|/g) ?? []).length, 3);
+  });
+
+  it("carries the inconsistency into the thread summary too", async () => {
+    await seed("inc-17", { impactStartedAt: OPENED + 12 * 60_000 });
+
+    const data = await readReportData(deps(), "inc-17");
+    assert.ok(data);
+    const summary = renderThreadSummary(data);
+    assert.match(summary, /detection time inconsistent/);
+    // Most people only ever read the thread. Told the number was never
+    // captured, they go looking for a writer that is in fact working.
+    assert.doesNotMatch(summary, /time to detect not recorded/);
+  });
+
+  it("says something different for a time never recorded than for a backwards one", async () => {
+    await seed("inc-18", { impactStartedAt: null });
+    await seed("inc-19", { impactStartedAt: OPENED + 12 * 60_000 });
+
+    const absent = await glanceRow("inc-18", "Time to detect");
+    const backwards = await glanceRow("inc-19", "Time to detect");
+
+    assert.match(absent, /not known — when impact began was never recorded/);
+    // One sentence for both is the regression: nothing downstream, human or
+    // otherwise, can then tell a gap in the data from a contradiction in it.
+    assert.notEqual(absent, backwards);
+  });
+
+  it("names a resolve time that lands before the first signal", async () => {
+    await seed("inc-20", { resolvedAt: OPENED - 5 * 60_000 });
+
+    const row = await glanceRow("inc-20", "Time to resolve");
+    assert.equal(
+      row,
+      "| Time to resolve | not usable — the incident is recorded as resolved 5m before its first signal arrived, so one of the two times is wrong |",
+    );
+
+    const data = await readReportData(deps(), "inc-20");
+    assert.ok(data);
+    assert.match(renderThreadSummary(data), /resolve time inconsistent/);
+  });
+
+  it("names a close time that lands before the first signal", async () => {
+    await seed("inc-21", { closedAt: OPENED - 7 * 60_000 });
+
+    // Its own row, not the resolve wording: the reader has to know which of
+    // the two pairs of timestamps to go and look at.
+    const row = await glanceRow("inc-21", "Open to closed");
+    assert.equal(
+      row,
+      "| Open to closed | not usable — the incident is recorded as closed 7m before its first signal arrived, so one of the two times is wrong |",
+    );
+    assert.notEqual(row, await glanceRow("inc-21", "Time to resolve"));
+  });
+});
+
+describe("duration prints the length it was handed", () => {
+  it("keeps the sign on a negative rather than swallowing it", () => {
+    // Deciding what a backwards interval means is `interval`'s job, so in
+    // principle nothing reaches here with a negative. The point of printing
+    // the sign is the call site nobody has thought of yet: it shows a number
+    // that is visibly wrong instead of quietly showing none at all.
+    assert.equal(duration(-12 * 60_000), "-12m");
+    assert.equal(duration(-(3_600_000 + 4 * 60_000)), "-1h 4m");
+  });
+
+  it("keeps \"unknown\" for a number that is not one", () => {
+    assert.equal(duration(Number.NaN), "unknown");
+    assert.equal(duration(Number.POSITIVE_INFINITY), "unknown");
+    assert.equal(duration(Number.NEGATIVE_INFINITY), "unknown");
+  });
+});
+
+describe("the report survives GitHub being unreachable", () => {
+  it("publishes the whole report when the PR reader throws", async () => {
+    await seed("inc-22");
+
+    const outcome = await publishIncidentReport(
+      deps({
+        prStates: {
+          states: async () => {
+            throw new Error("github: 503");
+          },
+        },
+      }),
+      "inc-22",
+    );
+
+    // PR state is the one field in the report that depends on a service we
+    // do not run. Losing the report over it would trade every metric, the
+    // post-mortem and the spend for one column nobody was blocked on.
+    assert.equal(outcome, "published");
+    assert.equal(uploads.length, 1);
+    assert.match(uploads[0].content, /^# Incident inc-22/);
+    assert.match(uploads[0].content, /pull\/42 — state not known/);
+    assert.match(uploads[0].content, /\| Pull requests \| 1 \(0 merged\) \|/);
+  });
+
+  it("reflects a state the reader does answer with", async () => {
+    await seed("inc-23");
+    const wired = deps({
+      prStates: {
+        states: async () => ({
+          "https://github.com/thegoodparty/omni/pull/42": "merged",
+        }),
+      },
+    });
+
+    const data = await readReportData(wired, "inc-23");
+    assert.ok(data);
+    assert.equal(reportMetrics(data).prsMerged, 1);
+
+    const doc = renderReportDocument(data);
+    assert.match(doc, /pull\/42 — merged/);
+    assert.match(doc, /\| Pull requests \| 1 \(1 merged\) \|/);
+    // The merged count is in the thread too, because "did the fix land" is
+    // the question people scanning the channel are actually asking.
+    assert.match(renderThreadSummary(data), /1 PR \(1 merged\)/);
+  });
+
+  it("answers for the urls it was told about and says so for the rest", async () => {
+    await seed("inc-24", {
+      prUrls: [
+        "https://github.com/thegoodparty/omni/pull/42",
+        "https://github.com/thegoodparty/omni/pull/43",
+      ],
+    });
+    const wired = deps({
+      prStates: {
+        states: async () => ({
+          "https://github.com/thegoodparty/omni/pull/42": "open",
+        }),
+      },
+    });
+
+    const data = await readReportData(wired, "inc-24");
+    assert.ok(data);
+    // A partial answer must not smear across the urls it did not cover: a
+    // reader who sees a state at all is entitled to believe GitHub said it.
+    assert.deepEqual(data.prs, [
+      { url: "https://github.com/thegoodparty/omni/pull/42", state: "open" },
+      { url: "https://github.com/thegoodparty/omni/pull/43", state: null },
+    ]);
+
+    const doc = renderReportDocument(data);
+    assert.match(doc, /pull\/42 — open/);
+    assert.match(doc, /pull\/43 — state not known/);
+    assert.match(doc, /\| Pull requests \| 2 \(0 merged\) \|/);
   });
 });
