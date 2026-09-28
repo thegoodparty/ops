@@ -27,11 +27,50 @@ a capability: the App is installed org-wide with `contents: write`, so the
 token reaches every repository in the organisation and not only omni. The
 prompt used to say otherwise and was wrong.
 
+## The Grafana MCP surface is bounded twice, in code
+
+`mcp.ts` exposes mcp-grafana, which ships ~80 tools, and fifteen agents can
+hold it at once. On 2026-09-28 a third of all Loki read volume was ad-hoc MCP
+queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
+
+- **`GRAFANA_READ_TOOLS` is the surface.** Reads only: Loki, Prometheus,
+  Tempo, datasources, dashboards. Alert-*rule* reads are absent because
+  mcp-grafana v1.6.1 puts reading and creating a rule in one tool
+  (`alerting_manage_rules`); the firing alert already arrives through
+  `ingress/grafana.ts` and the rules are checked into omni.
+- **`GRAFANA_MCP_ARGS` tells the server the same thing**, and is the weaker
+  half: `--enabled-tools` is category-granular, so tool names in it disable
+  everything. `--disable-write` and `--disable-api` do the real work there,
+  and `--loki-guardrail-*` catches what our clamp cannot — a range-vector
+  duration inside the query, `count_over_time(…[30d])` in a 6h window.
+- **A dropped tool is `log`, a missing one is `alarm`.** The flag over-delivers
+  by design, so the filter dropping something is normal. An allowlisted tool
+  the server no longer lists is a capability that vanished — a rename, a
+  version bump — and nothing else in the run would mention it.
+- **The time range is clamped in `execute`, not asked for in the prompt.**
+  `DEFAULT_LOOKBACK_HOURS` 6, `MAX_LOOKBACK_HOURS` 24, and a widened request is
+  rewritten *and* announced in the tool result, because an agent that thinks it
+  read a month and read a day reports a negative on evidence it never had. The
+  argument names come from each tool's own `inputSchema`
+  (`startRfc3339`/`endRfc3339`, `startTime`/`endTime`, `start`/`end`); a shape
+  not in `TIME_RANGE_SHAPES` is not clamped, so adding a tool to the allowlist
+  means adding its shape in the same change.
+
+The 20,000-char output cap does not help with any of this. It bounds bytes
+returned; Loki bills bytes scanned.
+
 ## The two blocking tools
 
 `monitor` and `contact_human` each cost **one turn** no matter how long they
 wait. That is what keeps a multi-day incident from saturating context on
 polling, and it is why the prompt forbids polling with bash in a loop.
+
+**One turn is not one bill, and the prompt used to say it was.** A block that
+outlives the prompt cache pays a full cache write on the turn after it, which
+on a nine-hour incident was 41% of what that incident cost. So the prompt
+prices the wait honestly and says what to do with it — refresh impact, post
+state, draft the post-mortem — because the cost lands whether or not the agent
+came out of the wait with anything.
 
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
@@ -273,6 +312,28 @@ The session file is also the run's **cost ledger** -- `sumSessionUsage`
 reads it back after the child exits, so the key the agent writes and the key
 the Boss reads are one function. A drift between them costs no session and no
 error, only an incident that appears to have been free.
+
+## The exit record
+
+The last entry a launch writes is a `bugboss_exit` custom entry naming how
+the run ended: `completed`, `timed_out`, `turn_error` or `signal`. Without it
+a killed run and a finished one are the same shape on disk -- the writer
+appends per event and the file closes with the last one, and S3
+`LastModified` sits within a second of it either way. Three of seven real
+runs died mid-turn and read exactly like the four that did not; the longest
+was 9.5 hours and $42.71, with an approved PR and green checks waiting, and
+nobody knew to finish it.
+
+`readSessionOutcome` is the reader. **It is not last-record-wins**: every
+launch writes its own record, so a restored file carries an older one under
+the turns that followed it, and a record with session events after it means
+the run carried on past it and then died. `empty` is kept separate from
+`killed`, because a child killed before its first turn synced has lost
+nothing and alarming on it would alarm on every crash at boot.
+
+`SIGTERM` and `SIGINT` write one too. `SIGKILL` cannot, and the dispatcher's
+backstop uses it, so the absence of a record is still the common signature of
+a kill -- which is exactly what `killed` means.
 
 ## The notes directory
 

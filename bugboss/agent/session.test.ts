@@ -7,6 +7,7 @@ import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import {
+  EXIT_ENTRY_TYPE,
   PROMPT_ENTRY_TYPE,
   createSessionSync,
   readStoredPrefixFromFile,
@@ -15,7 +16,10 @@ import {
   sessionKeyFor,
   sessionSyncExtension,
   sumSessionUsage,
+  describeOutcome,
+  readSessionOutcome,
   type SessionStore,
+  type StoredExit,
 } from "./session";
 
 const fakeStore = () => {
@@ -339,4 +343,102 @@ test("a torn last line does not cost the lines before it", () => {
 
   assert.equal(usage.cacheRead, 5_000);
   assert.equal(usage.turns, 1);
+});
+
+// ---------------------------------------------------------------------------
+// The exit record
+// ---------------------------------------------------------------------------
+
+const exitTurn = (text: string) =>
+  JSON.stringify({ type: "message", message: { role: "assistant", content: text } });
+
+const exitToolResult = (text: string) =>
+  JSON.stringify({ type: "tool_result", content: text });
+
+const exitLine = (exit: Partial<StoredExit> = {}) =>
+  JSON.stringify({
+    type: "custom",
+    customType: EXIT_ENTRY_TYPE,
+    data: { reason: "completed", at: 1, attempt: 1, ...exit } satisfies StoredExit,
+  });
+
+test("a run that ended on purpose says so", () => {
+  const outcome = readSessionOutcome(
+    [exitTurn("working"), exitToolResult("done"), exitLine({ reason: "completed" })].join("\n"),
+  );
+  assert.equal(outcome.kind, "ended");
+  assert.equal(outcome.kind === "ended" && outcome.exit.reason, "completed");
+});
+
+// The whole point of the record. A killed run's file ends on an ordinary
+// event, exactly like a finished one's did before this existed, and three of
+// seven real runs died that way without anybody being able to tell.
+test("a run killed mid-turn is not mistaken for one that finished", () => {
+  const outcome = readSessionOutcome([exitTurn("working"), exitToolResult("done")].join("\n"));
+  assert.equal(outcome.kind, "killed");
+  assert.equal(outcome.kind === "killed" && outcome.turns, 1);
+});
+
+// The resume case, and the one a last-record-wins reader gets wrong: every
+// launch writes its own record, so a restored file carries an older one under
+// the turns that followed it.
+test("an exit record with a later turn after it is a killed run, not an ended one", () => {
+  const outcome = readSessionOutcome(
+    [
+      exitTurn("first launch"),
+      exitLine({ reason: "signal", signal: "SIGTERM" }),
+      exitTurn("second launch"),
+      exitToolResult("still going"),
+    ].join("\n"),
+  );
+  assert.equal(outcome.kind, "killed");
+  assert.equal(outcome.kind === "killed" && outcome.turns, 2);
+});
+
+test("a resumed run that then ended cleanly reports the newer record", () => {
+  const outcome = readSessionOutcome(
+    [
+      exitTurn("first launch"),
+      exitLine({ reason: "signal", signal: "SIGTERM", attempt: 1 }),
+      exitTurn("second launch"),
+      exitLine({ reason: "completed", attempt: 2 }),
+    ].join("\n"),
+  );
+  assert.equal(outcome.kind, "ended");
+  assert.equal(outcome.kind === "ended" && outcome.exit.attempt, 2);
+});
+
+// A child killed before its first turn synced has lost nothing, and calling
+// that a killed run would put an alarm on every crash at boot.
+test("a session with nothing in it is empty rather than killed", () => {
+  assert.equal(readSessionOutcome("").kind, "empty");
+  assert.equal(readSessionOutcome("\n  \n").kind, "empty");
+});
+
+// A kill mid-write leaves a torn last line. That is evidence of a kill, not
+// a parse problem to skip past.
+test("a torn last line counts as a run that carried on past its last record", () => {
+  const outcome = readSessionOutcome(
+    [exitTurn("working"), exitLine(), '{"type":"message","mess'].join("\n"),
+  );
+  assert.equal(outcome.kind, "killed");
+});
+
+test("a malformed exit record is not trusted as an ending", () => {
+  const outcome = readSessionOutcome(
+    [
+      exitTurn("working"),
+      JSON.stringify({ type: "custom", customType: EXIT_ENTRY_TYPE, data: { reason: "nope" } }),
+    ].join("\n"),
+  );
+  assert.equal(outcome.kind, "killed");
+});
+
+test("describeOutcome says which of the three it is", () => {
+  assert.match(describeOutcome({ kind: "killed", turns: 4 }), /killed after 4 turns/);
+  assert.match(
+    describeOutcome({ kind: "ended", exit: { reason: "timed_out", at: 1, attempt: 1 } }),
+    /ended on purpose \(timed_out\)/,
+  );
+  assert.match(describeOutcome({ kind: "empty" }), /before its first turn/);
 });

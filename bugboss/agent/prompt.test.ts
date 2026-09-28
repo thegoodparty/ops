@@ -214,6 +214,24 @@ test("the agent is told which waits carry a heartbeat", () => {
   assert.match(prompt, /Leave it unset for a deploy/);
 });
 
+test("the prompt does not tell the agent that a long wait is free", () => {
+  const prompt = composeSystemPrompt(input());
+
+  // It used to say monitor "costs one turn whether it returns in ten seconds
+  // or two days". That was turn accounting sold as cost: a block that outlives
+  // the prompt cache is paid for on the far side, where the whole context is
+  // written again -- 41% of the bill on the one nine-hour incident that was
+  // measured. A model told waiting is free has no reason to use a wait.
+  assert.doesNotMatch(prompt, /ten seconds or two days/);
+  assert.doesNotMatch(prompt, /costs\s+one turn/);
+  assert.match(prompt, /a turn is not what the wait costs/);
+  assert.match(prompt, /outlives the prompt cache/);
+  // And the correction has to leave the agent with something to do, or it
+  // reads as "wait less", which the measurements say is not a lever.
+  assert.match(prompt, /report_impact so the number in the thread is current/);
+  assert.match(prompt, /worse than waiting/);
+});
+
 test("the prompt makes a re-run a confirmation, never a way to get green", () => {
   const prompt = composeSystemPrompt(input());
 

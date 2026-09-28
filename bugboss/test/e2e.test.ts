@@ -1955,3 +1955,67 @@ test("a verified Slack delivery is acknowledged through the real wiring", async 
     [{ channel: "C0TEST", ts: "ack-e2e-1", name: "eyes" }],
   );
 });
+
+// A threadless incident is a real state: opening a thread can fail, and it
+// can fail for good. `slack.post(null, ...)` is a top-level channel message,
+// so announcing a resume anyway would put "the agent on this incident
+// stopped" in the channel with nothing saying which incident.
+test("a resume notice is not posted out of context when there is no thread", async () => {
+  const id = "orphan-resume";
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO incident (id, status, owner, firstSignalAt, attempts, sessionRef, lastStartedAt)
+       VALUES (?, 'FIXING', 'agent', ?, 1, ?, ?)`,
+    ).run(id, Date.now() - 7_200_000, `sessions/incident/${id}/session.jsonl`, Date.now() - 7_200_000);
+  });
+
+  const before = fakeSlack.posts.length;
+  // The alarm is half the contract and console.error is where it goes, so
+  // without capturing it this test could not tell "alarmed and returned"
+  // from "quietly did nothing" -- and a test that only checks the silence
+  // is the thing this PR keeps finding in production.
+  const alarms: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => {
+    alarms.push(args.map(String).join(" "));
+    realError(...(args as []));
+  };
+  try {
+    await boss.dispatchOnce();
+  } finally {
+    console.error = realError;
+  }
+
+  assert.ok(
+    alarms.some((line) => {
+      if (!line.includes("resume_notice_undeliverable")) return false;
+      const parsed = JSON.parse(line) as { event: string; incidentId?: string };
+      return parsed.event === "resume_notice_undeliverable" && parsed.incidentId === id;
+    }),
+    "the resume that could not be announced is alarmed, naming the incident",
+  );
+
+  // Only the resume notice. The fake agent runs this incident through to a
+  // close, and those posts are top-level for the same threadless reason --
+  // they are not what this test is about.
+  const orphaned = fakeSlack.posts
+    .slice(before)
+    .filter((p) => /stopped without finishing/.test(p.text));
+  assert.deepEqual(
+    orphaned,
+    [],
+    "a resume nobody can place is alarmed, not posted at channel root",
+  );
+
+  // And the resume itself still happened. A notice nobody can place must not
+  // cost the relaunch -- the directive is gone by now because the agent read
+  // it, so the launch is what is left to look at.
+  assert.equal(
+    boss.db.get<{ attempts: number }>(
+      "SELECT attempts FROM incident WHERE id = ?",
+      [id],
+    )?.attempts,
+    2,
+    "the agent was relaunched regardless",
+  );
+});

@@ -46,6 +46,19 @@ const log = makeLog("dispatcher");
 
 const alarm = makeAlarm("dispatcher");
 
+/**
+ * How long an agent has to have been gone before its resume is announced.
+ *
+ * A deploy or a container restart puts an agent back within a tick or two,
+ * and saying so every time would be noise on a routine event. A gap longer
+ * than this is not routine: the run was killed and nothing picked it up for
+ * minutes, which is the shape of the three real runs that died at the same
+ * lifecycle position and were never noticed. The resume was always automatic;
+ * what was missing is that it was silent, so a thread whose last message was
+ * true read as patience while nothing was happening.
+ */
+export const RESUME_NOTICE_SECONDS = 300;
+
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
   tickSeconds: 30,
@@ -72,6 +85,13 @@ export interface DispatcherDeps {
   mintToken: (incidentId: string) => string;
   /** Outbound tokens a child may hold. The composition root decides. */
   childCredentials?: Record<string, string | undefined>;
+  /**
+   * Says something in an incident's thread. Optional, because the E2E and
+   * the unit tests run a dispatcher with no Slack at all -- but absent in
+   * prod it would make the one event this exists to surface silent again,
+   * so the composition root passing nothing is worth noticing.
+   */
+  postNotice?: (incidentId: string, text: string) => Promise<void>;
   /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
   childBaseEnv?: Record<string, string | undefined>;
   /**
@@ -193,6 +213,17 @@ const crashLoopBrief = (
     `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
   ].join("\n");
 
+/** Minutes, because a gap worth announcing is never seconds. */
+export const resumeNotice = (deadSeconds: number): string => {
+  const minutes = Math.round(deadSeconds / 60);
+  const span = minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 6) / 10}h`;
+  return [
+    `The agent on this incident stopped without finishing and was gone for ${span}.`,
+    "Nothing was happening here in that time, whatever the last message says.",
+    "I have started it again; it will re-check anything time-sensitive before it continues.",
+  ].join(" ");
+};
+
 const stalledBrief = (row: EligibleRow, launches: number): string =>
   [
     "Escalated by the dispatcher. The agent did not hand off itself.",
@@ -214,6 +245,7 @@ export class Dispatcher {
   private readonly mintToken: (incidentId: string) => string;
   private readonly childCredentials: Record<string, string | undefined>;
   private readonly childBaseEnv: Record<string, string | undefined>;
+  private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
   private readonly fastFailureMs: number;
   private readonly maxLaunches: number;
   private readonly now: () => number;
@@ -250,6 +282,7 @@ export class Dispatcher {
     this.mintToken = deps.mintToken;
     this.childCredentials = deps.childCredentials ?? {};
     this.childBaseEnv = deps.childBaseEnv ?? {};
+    this.postNotice = deps.postNotice ?? null;
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
@@ -507,8 +540,15 @@ export class Dispatcher {
       run = Promise.reject(err);
     }
 
+    // Set by the catch below, and read by the then after it. A crash loop is
+    // made of crashes: an exit code of zero inside the window is a short run,
+    // not a failing one, and counting it was what let a rolling deploy walk
+    // a freshly-launched incident to a crash-loop escalation in three
+    // bounces. SIGTERM exits zero for exactly this reason.
+    let failed = false;
     entry.done = run
       .catch((err) => {
+        failed = true;
         // A child the dispatcher killed exits on a signal, which is a
         // rejection now. That is not an agent failure and it already alarmed
         // as agent_deadline_exceeded, so it would be the same event twice
@@ -525,10 +565,11 @@ export class Dispatcher {
         const exitedAt = this.now();
         this.lastExitAt.set(row.id, exitedAt);
 
-        // A crash loop dies quickly after starting; a deploy-killed agent was
-        // running fine for a while. Only the first should ever escalate.
+        // A crash loop dies quickly after starting *and* dies badly. A
+        // deploy-killed agent was either running fine for a while or shut
+        // down in good order; neither should escalate.
         const ranMs = exitedAt - entry.startedAt;
-        const fast = !entry.killed && ranMs < this.fastFailureMs;
+        const fast = !entry.killed && failed && ranMs < this.fastFailureMs;
         const failures = fast ? (this.fastFailures.get(row.id) ?? 0) + 1 : 0;
         if (fast) this.fastFailures.set(row.id, failures);
         else this.fastFailures.delete(row.id);
@@ -538,6 +579,7 @@ export class Dispatcher {
           attempt,
           pid: entry.pid,
           killed: entry.killed,
+          failed,
           ranSeconds: Math.round(ranMs / 1000),
           consecutiveFastFailures: failures,
         });
@@ -617,6 +659,30 @@ export class Dispatcher {
     const seconds = Math.max(0, Math.round((now - since) / 1000));
     if (seconds < this.config.tickSeconds) return;
     await this.emitDirective(row.id, { type: "resumed_after", seconds });
+    if (seconds < RESUME_NOTICE_SECONDS) return;
+
+    // Loud on both channels, because they answer different questions. The
+    // alarm is how an operator learns agents are dying; the thread is how the
+    // person watching this one incident learns that the quiet they were
+    // reading as progress was an agent that had not existed for an hour.
+    alarm("agent_resumed_after_gap", {
+      incidentId: row.id,
+      deadSeconds: seconds,
+      attempts: row.attempts,
+      status: row.status,
+      note: "the previous run stopped without finishing and nothing ran this incident in the meantime",
+    });
+    if (!this.postNotice) {
+      alarm("resume_notice_undeliverable", {
+        incidentId: row.id,
+        deadSeconds: seconds,
+        note: "no thread poster is wired in, so nobody watching this incident was told",
+      });
+      return;
+    }
+    await this.postNotice(row.id, resumeNotice(seconds)).catch((err: unknown) =>
+      alarm("resume_notice_failed", { incidentId: row.id, error: String(err) }),
+    );
   };
 
   private emitDirective = async (
