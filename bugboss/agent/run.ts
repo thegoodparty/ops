@@ -21,7 +21,12 @@ import type {
 } from "../types";
 import { resolveBedrockModel } from "../bedrock";
 import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
-import { connectMcpToolset, type McpToolset } from "./mcp";
+import {
+  connectMcpToolset,
+  GRAFANA_MCP_ARGS,
+  GRAFANA_READ_TOOLS,
+  type McpToolset,
+} from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import {
@@ -738,11 +743,12 @@ export const runIncidentAgent = async (
       await connectMcpToolset({
         name: "grafana",
         command: options.grafana.command ?? "uvx",
-        args: options.grafana.args ?? ["mcp-grafana"],
+        args: options.grafana.args ?? GRAFANA_MCP_ARGS,
         env: {
           GRAFANA_URL: options.grafana.url,
           GRAFANA_SERVICE_ACCOUNT_TOKEN: options.grafana.token,
         },
+        allowedTools: GRAFANA_READ_TOOLS,
       }),
     );
   }
