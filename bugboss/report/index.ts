@@ -181,10 +181,31 @@ export const readReportData = async (
   // A recurrence closes on an answer the first incident never had, and this
   // is the only place it is ever read back. Parsed defensively: a row whose
   // JSON will not load is a worse report, not a reason to withhold one.
+  //
+  // Every field is checked rather than cast, because the cast is the
+  // dangerous version: rendering runs *after* the publish is claimed, so a
+  // `why` that turned out to be missing would throw with the marker already
+  // durable -- the one shape of failure that loses a report for good. A row
+  // that is not an answer is treated exactly like one that will not parse.
   let recurrence: RecurrenceAnalysis | null = null;
   if (incident.recurrenceAnalysis) {
     try {
-      recurrence = JSON.parse(incident.recurrenceAnalysis) as RecurrenceAnalysis;
+      const parsed = JSON.parse(
+        incident.recurrenceAnalysis,
+      ) as Partial<RecurrenceAnalysis> | null;
+      if (
+        parsed &&
+        typeof parsed.category === "string" &&
+        typeof parsed.why === "string" &&
+        typeof parsed.remedy === "string"
+      ) {
+        recurrence = { category: parsed.category, why: parsed.why, remedy: parsed.remedy };
+      } else {
+        alarm("recurrence_unreadable", {
+          incidentId,
+          error: "parsed, but not a recurrence answer",
+        });
+      }
     } catch (err) {
       alarm("recurrence_unreadable", { incidentId, error: String(err) });
     }

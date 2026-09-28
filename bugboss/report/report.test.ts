@@ -722,6 +722,27 @@ describe("an incident that came back explains itself", () => {
     assert.equal(await publishIncidentReport(deps(), "inc-32"), "published");
   });
 
+  it("treats a row that parses but is not an answer the same as one that does not", async () => {
+    // Rendering runs after the publish is claimed, so a `why` that turned out
+    // to be missing would throw with the marker already durable -- and that
+    // is the one failure that loses a report for good rather than degrading.
+    for (const [id, stored] of [
+      ["inc-34", "null"],
+      ["inc-35", "42"],
+      ["inc-36", JSON.stringify({ category: "previous_fix_wrong" })],
+      ["inc-37", JSON.stringify({ category: 1, why: "x", remedy: "y" })],
+    ] as const) {
+      await seed(`${id}-prior`);
+      await seed(id, { recurrenceOf: `${id}-prior`, recurrenceAnalysis: stored });
+
+      const data = await readReportData(deps(), id);
+      assert.ok(data);
+      assert.equal(data.recurrence, null, stored);
+      assert.match(renderReportDocument(data), /could not be read back/);
+      assert.equal(await publishIncidentReport(deps(), id), "published", stored);
+    }
+  });
+
   it("says nothing at all for an incident that did not come back", async () => {
     await seed("inc-33");
 
