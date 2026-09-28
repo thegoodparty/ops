@@ -7,6 +7,7 @@
 import type {
   AssistantMessage,
   AssistantMessageEvent,
+  CacheRetention,
   JsonObject,
   StopReason,
   TextContent,
@@ -19,7 +20,10 @@ export interface AnthropicUsagePayload {
   output_tokens?: number | null;
   cache_read_input_tokens?: number | null;
   cache_creation_input_tokens?: number | null;
-  cache_creation?: { ephemeral_1h_input_tokens?: number | null } | null;
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number | null;
+    ephemeral_1h_input_tokens?: number | null;
+  } | null;
   output_tokens_details?: { thinking_tokens?: number | null } | null;
 }
 
@@ -104,7 +108,52 @@ export const mapStopReason = (reason: string): { stopReason: StopReason; errorMe
 
 type TrackedBlock = { contentIndex: number; partialJson: string };
 
-const applyUsage = (output: AssistantMessage, usage: AnthropicUsagePayload): void => {
+/** What a request asked the cache for, against what the service billed it as. */
+export interface CacheRetentionReport {
+  requested: CacheRetention;
+  /** Total tokens written to the cache on this turn. */
+  written: number;
+  /** The 1h share, or null when the response carried no `cache_creation` split. */
+  written1h: number | null;
+  /** The 5m share, or null when the response carried no `cache_creation` split. */
+  written5m: number | null;
+}
+
+/**
+ * Detects a cache write that did not get the retention it asked for.
+ *
+ * This exists because the failure mode is indistinguishable from the bug it
+ * fixes: a request that asks for 1h and is served 5m rebuilds its prefix on
+ * exactly the same schedule, at exactly the same price, and reports nothing.
+ * Bedrock returns both halves of the split on us.anthropic.claude-opus-5, so a
+ * downgrade is an observed number rather than an inference -- and an absent
+ * split is reported too, because `calculateCost` reads a missing 1h share as
+ * zero and would then bill a 1h write at the 5m rate.
+ *
+ * Any 5m share at all counts, not just a wholly downgraded write. A partial
+ * split is still tokens billed at a retention nobody asked for, and treating
+ * it as acceptable would be the same silence this whole check exists to break.
+ */
+const unhonouredRetention = (
+  retention: CacheRetention,
+  usage: AnthropicUsagePayload,
+  written: number,
+): CacheRetentionReport | undefined => {
+  if (retention !== "long" || written === 0) return undefined;
+  const split = usage.cache_creation;
+  if (!split) return { requested: retention, written, written1h: null, written5m: null };
+  const written1h = split.ephemeral_1h_input_tokens ?? 0;
+  const written5m = split.ephemeral_5m_input_tokens ?? 0;
+  if (written5m === 0 && written1h > 0) return undefined;
+  return { requested: retention, written, written1h, written5m };
+};
+
+const applyUsage = (
+  output: AssistantMessage,
+  usage: AnthropicUsagePayload,
+  retention?: CacheRetention,
+  onUnhonoured?: (report: CacheRetentionReport) => void,
+): void => {
   if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
   if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
   if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
@@ -117,6 +166,10 @@ const applyUsage = (output: AssistantMessage, usage: AnthropicUsagePayload): voi
   if (thinkingTokens != null) output.usage.reasoning = thinkingTokens;
   output.usage.totalTokens =
     output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+  if (retention && onUnhonoured && usage.cache_creation_input_tokens != null) {
+    const report = unhonouredRetention(retention, usage, usage.cache_creation_input_tokens);
+    if (report) onUnhonoured(report);
+  }
 };
 
 export interface ConsumeParams {
@@ -127,6 +180,10 @@ export interface ConsumeParams {
   applyCost: () => void;
   /** Pi's parseStreamingJson. */
   parseJson: (partial: string) => JsonObject;
+  /** The retention this request asked for, so the response can be held to it. */
+  cacheRetention?: CacheRetention;
+  /** Called when a cache write did not get the retention it asked for. */
+  onUnhonouredCacheRetention?: (report: CacheRetentionReport) => void;
   signal?: AbortSignal;
 }
 
@@ -140,6 +197,8 @@ export const consumeAnthropicStream = async ({
   push,
   applyCost,
   parseJson,
+  cacheRetention,
+  onUnhonouredCacheRetention,
   signal,
 }: ConsumeParams): Promise<void> => {
   const tracked = new Map<number, TrackedBlock>();
@@ -161,7 +220,9 @@ export const consumeAnthropicStream = async ({
       output.responseId = event.message?.id;
       const responseModel = event.message?.model;
       if (responseModel && responseModel !== output.model) output.responseModel = responseModel;
-      if (event.message?.usage) applyUsage(output, event.message.usage);
+      if (event.message?.usage) {
+        applyUsage(output, event.message.usage, cacheRetention, onUnhonouredCacheRetention);
+      }
       applyCost();
       if (!started) {
         started = true;
@@ -303,7 +364,9 @@ export const consumeAnthropicStream = async ({
         output.stopReason = mapped.stopReason;
         if (mapped.errorMessage) output.errorMessage = mapped.errorMessage;
       }
-      if (event.usage) applyUsage(output, event.usage);
+      if (event.usage) {
+        applyUsage(output, event.usage, cacheRetention, onUnhonouredCacheRetention);
+      }
       applyCost();
       continue;
     }
@@ -316,6 +379,10 @@ export const consumeAnthropicStream = async ({
       // splits cache reads from writes.
       const metrics = event["amazon-bedrock-invocationMetrics"];
       if (metrics && output.usage.totalTokens === 0) {
+        // No retention check here on purpose. These are Bedrock's own
+        // invocation metrics, which carry no `cache_creation` split at all, so
+        // holding them to the 1h tier would report a billing fault on every
+        // stream that fell back to them rather than on a real downgrade.
         applyUsage(output, {
           input_tokens: metrics.inputTokenCount,
           output_tokens: metrics.outputTokenCount,

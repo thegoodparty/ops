@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS incident (
   -- claim, so the evidence has to outlive the Slack message that carried it.
   resolvedEvidence  TEXT,
 
+  -- Why this incident happened again after an earlier one was closed on the
+  -- bar that no further alerts should occur, and what was done about that
+  -- rather than about the symptom. Required by reportAnalysis whenever
+  -- recurrenceOf is set, and refused at the tool rather than here: SQLite
+  -- cannot add a CHECK to an existing table, and this column arrives after
+  -- the table exists.
+  recurrenceAnalysis TEXT,
+
   -- Cross-field constraints, which are the difference between an invariant
   -- and a comment. Every one of these was reachable at some point today: a
   -- resurrected MERGED row, a RESOLVED incident whose evidence lived only in
@@ -118,6 +126,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS signal_open_source_idx
 CREATE INDEX IF NOT EXISTS incident_status_idx ON incident (status);
 CREATE INDEX IF NOT EXISTS signal_incident_idx ON signal (incidentId);
 
+-- Recurrence. Triage asks, on every delivery, whether an incident that
+-- already claimed this problem was over carried a signal like this one. Both
+-- reads join signal to incident, so both need the signal side indexed or the
+-- cost of the question grows with every alert the system has ever seen.
+--
+-- signal_open_source_idx cannot serve this: it is partial on closedAt IS
+-- NULL, and every signal a resolution closed has a closedAt. The exact key is
+-- the same (source, sourceId) though, which is the point -- the delivery that
+-- proves a resolution was premature is the one most certain to match the
+-- signal that resolution closed.
+CREATE INDEX IF NOT EXISTS signal_source_idx ON signal (source, sourceId);
+
+
+-- Text search over incidents that already claimed a problem was over.
+--
+-- The corpus is the post-mortems CLOSED has always required and nothing ever
+-- read back. FTS5 rather than embeddings on purpose: it is in-process, needs
+-- no service and no similarity threshold, and a wrong answer can be explained
+-- by reading the query.
+--
+-- Not an external-content table. External content keys on rowid and
+-- incident.id is TEXT, and a trigger-maintained index would have to survive
+-- being created over a restored snapshot that already has rows. This one is
+-- written by reportResolved and reportAnalysis inside their own transactions
+-- and reconciled at boot, which backfills the history for free.
+CREATE VIRTUAL TABLE IF NOT EXISTS incident_fts USING fts5(
+  incidentId UNINDEXED,
+  titles,
+  rootCause,
+  resolvedEvidence,
+  postmortem,
+  tokenize = 'porter unicode61'
+);
+
 -- A question asked by contact_human that has not been answered yet. Lets a
 -- resumed agent find the message it already posted rather than asking twice.
 CREATE TABLE IF NOT EXISTS pending_question (
@@ -127,6 +169,23 @@ CREATE TABLE IF NOT EXISTS pending_question (
   messageTs         TEXT NOT NULL,
   askedAt           INTEGER NOT NULL,
   message           TEXT NOT NULL DEFAULT ''
+);
+
+-- A wait on a person that monitor is sitting in. Keeps the elapsed clock and
+-- the nudge count across a container restart, so a resumed agent carries on
+-- waiting quietly instead of nudging the thread again -- every merge to ops
+-- main restarts this container, so that is the normal path.
+CREATE TABLE IF NOT EXISTS pending_wait (
+  incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  -- Matched on resume. clearWait does not run when the child is SIGKILLed
+  -- mid-wait, so a marker outlives the wait it was written for.
+  command           TEXT NOT NULL,
+  startedAt         INTEGER NOT NULL,
+  pings             INTEGER NOT NULL DEFAULT 0,
+  -- The backoff counts from the last nudge, not from the start. Without it a
+  -- wait that spanned a night would fire its whole ladder in the first three
+  -- minutes after the window opened.
+  lastPingAt        INTEGER
 );
 
 -- Slack replies the Boss has relayed, which agents poll for.

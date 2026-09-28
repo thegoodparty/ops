@@ -3,11 +3,14 @@ import { describe, test } from "node:test";
 
 import {
   MAX_MESSAGE_CHARS,
+  THREAD_PROSE_CHARS,
   bullets,
   channelLink,
   escape,
   link,
   mrkdwn,
+  overThreadBudget,
+  postDocument,
   postProse,
   raw,
   splitForSlack,
@@ -345,5 +348,96 @@ describe("postProse", () => {
     assert.ok(slack.sent.length > 1, `expected a split, got ${slack.sent.length}`);
     assert.deepEqual(result, { ts: "ts-1" });
     assert.ok(slack.sent.join("").includes("• finding 399"));
+  });
+});
+
+describe("the thread's budget", () => {
+  test("the limit itself is allowed, and one character past it is not", () => {
+    // An off-by-one here is the difference between a bound and a bound that
+    // rejects the longest post somebody carefully trimmed to fit.
+    assert.equal(overThreadBudget("the update", "x".repeat(THREAD_PROSE_CHARS)), null);
+    assert.equal(overThreadBudget("the update", ""), null);
+    assert.ok(overThreadBudget("the update", "x".repeat(THREAD_PROSE_CHARS + 1)));
+  });
+
+  test("the refusal tells the writer what to do about it", () => {
+    // A refusal a model cannot act on costs a turn and changes nothing: it
+    // retries, gets the same sentence, and the thread stays empty. So the
+    // sentence has to name the field, both numbers, and where the long
+    // version is supposed to go instead.
+    const text = "x".repeat(THREAD_PROSE_CHARS + 400);
+    const why = overThreadBudget("the incident summary", text);
+
+    assert.ok(why);
+    assert.match(why, /^the incident summary /, why);
+    assert.match(why, new RegExp(String(text.length)), why);
+    assert.match(why, new RegExp(String(THREAD_PROSE_CHARS)), why);
+    assert.match(why, /post-mortem/, why);
+  });
+
+  test("the thread budget sits under Slack's own per-message ceiling", () => {
+    // These are not two spellings of one limit and must not be merged into
+    // one. MAX_MESSAGE_CHARS is what Slack will accept in a message, so past
+    // it text is split; THREAD_PROSE_CHARS is what a reader will read, so
+    // past it text is refused. Raising the second to the first would turn
+    // every over-long post into two over-long posts.
+    assert.ok(
+      THREAD_PROSE_CHARS < MAX_MESSAGE_CHARS,
+      `${THREAD_PROSE_CHARS} vs ${MAX_MESSAGE_CHARS}`,
+    );
+  });
+});
+
+describe("postDocument", () => {
+  const recorder = () => {
+    const sent: string[] = [];
+    let n = 0;
+    return {
+      sent,
+      post: async (text: string) => {
+        sent.push(text);
+        n += 1;
+        return { ts: `ts-${n}` };
+      },
+    };
+  };
+
+  const document = Array.from(
+    { length: 400 },
+    (_, i) => `- finding ${i} ${"x".repeat(20)}`,
+  ).join("\n");
+
+  test("the exemption is a name, not a second way of posting", async () => {
+    // If these two ever render differently, the closing report in the thread
+    // stops being the same text as every other post and starts being a path
+    // nothing else exercises.
+    const viaDocument = recorder();
+    const viaProse = recorder();
+
+    const documentResult = await postDocument(viaDocument.post, document);
+    const proseResult = await postProse(viaProse.post, document);
+
+    assert.deepEqual(viaDocument.sent, viaProse.sent);
+    assert.deepEqual(documentResult, proseResult);
+  });
+
+  test("a document many times the thread budget arrives whole", async () => {
+    const slack = recorder();
+    assert.ok(
+      document.length > THREAD_PROSE_CHARS * 5,
+      `${document.length} chars is not a document`,
+    );
+
+    const result = await postDocument(slack.post, document);
+
+    assert.ok(slack.sent.length > 1, `expected a split, got ${slack.sent.length}`);
+    assert.deepEqual(result, { ts: "ts-1" });
+    // The tail is the part a truncating bound would take, and the part a
+    // reader of a post-mortem most needs.
+    assert.ok(slack.sent.join("").includes("• finding 399"));
+    assert.ok(slack.sent.join("").includes("• finding 0 "));
+    for (const part of slack.sent) {
+      assert.ok(part.length <= MAX_MESSAGE_CHARS, `${part.length} chars`);
+    }
   });
 });

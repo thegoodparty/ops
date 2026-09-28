@@ -370,3 +370,54 @@ test("registering claims the new id and leaves the builtin converse id alone", a
   assert.ok(compat.getApiProvider(BEDROCK_INVOKE_MODEL_API));
   assert.equal(compat.getApiProvider("bedrock-converse-stream"), builtinBefore);
 });
+
+// Asserted here rather than only on buildInvokeModelBody for the reason this
+// file's own CLAUDE.md records: a builder test passes happily while production
+// sends something else. This drives the real provider and reads the bytes that
+// reached the invoke, so the ttl is pinned on the wire and not just in a unit.
+test("the body the provider actually sends carries the 1h cache ttl", async () => {
+  const { model, sent, provider, pi } = await setup();
+
+  await provider
+    .stream(
+      model,
+      pi.normalizeContext({
+        systemPrompt: "You are the incident agent.",
+        messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
+        tools: [
+          {
+            name: "monitor",
+            description: "wait for something to change",
+            parameters: { type: "object", properties: {}, required: [] },
+          },
+        ],
+      }),
+      {},
+    )
+    .result();
+
+  const body = sent[0];
+  const expected = { type: "ephemeral", ttl: "1h" };
+  assert.deepEqual(body.system?.[0].cache_control, expected);
+  assert.deepEqual(body.tools?.[body.tools.length - 1].cache_control, expected);
+  const tail = body.messages[body.messages.length - 1];
+  const tailBlock = tail.content[tail.content.length - 1];
+  assert.deepEqual(tailBlock.type === "text" ? tailBlock.cache_control : undefined, expected);
+});
+
+test("a caller that asks for short retention overrides the default on the wire", async () => {
+  const { model, sent, provider, pi } = await setup();
+
+  await provider
+    .stream(
+      model,
+      pi.normalizeContext({
+        systemPrompt: "You are the incident agent.",
+        messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
+      }),
+      { cacheRetention: "short" },
+    )
+    .result();
+
+  assert.deepEqual(sent[0].system?.[0].cache_control, { type: "ephemeral" });
+});

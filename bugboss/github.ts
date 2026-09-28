@@ -11,6 +11,13 @@
 
 import { createAppAuth } from "@octokit/auth-app";
 
+import { makeAlarm, makeLog } from "./logging";
+
+import type { PrStateReader, ReportPr } from "./report";
+
+const alarm = makeAlarm("github");
+const log = makeLog("github");
+
 /**
  * Secrets Manager stores the PEM as one line, since JSON has no way to carry
  * the newlines. Rebuilding the armour is what makes it parse. Same shape as
@@ -61,3 +68,101 @@ export const createInstallationToken = (
   });
   return async () => (await auth({ type: "installation" })).token;
 };
+
+// ---------------------------------------------------------------------------
+// What became of a PR
+// ---------------------------------------------------------------------------
+
+/**
+ * Only the shape a BugBoss agent can produce. `prUrls` is whatever the model
+ * put there, so anything that is not a pull request url is left unanswered
+ * rather than guessed at.
+ */
+const PR_URL = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:[/?#].*)?$/;
+
+/** GitHub says `closed` for a merged PR too, so `merged_at` is the difference. */
+interface PullRequestBody {
+  state?: string;
+  merged_at?: string | null;
+}
+
+const PR_STATE_TIMEOUT_MS = 5_000;
+
+/**
+ * Reads whether each PR merged, for the closing report.
+ *
+ * Deliberately per-url and deliberately forgiving: a report is a notification
+ * on an already-committed transition, so a PR GitHub will not answer for is
+ * left out of the result and rendered as "state not known". Saying a PR
+ * merged when it did not is the one outcome worth avoiding here.
+ */
+export const createPrStateReader = (
+  installationToken: () => Promise<string>,
+): PrStateReader => ({
+  states: async (urls) => {
+    const token = await installationToken();
+    const found: Record<string, ReportPr["state"]> = {};
+    await Promise.all(
+      urls.map(async (url) => {
+        const parsed = PR_URL.exec(url.trim());
+        if (!parsed) return;
+        const [, owner, repo, number] = parsed;
+        try {
+          const res = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/pulls/${number}`,
+            {
+              headers: {
+                accept: "application/vnd.github+json",
+                authorization: `Bearer ${token}`,
+                "x-github-api-version": "2022-11-28",
+              },
+              signal: AbortSignal.timeout(PR_STATE_TIMEOUT_MS),
+            },
+          );
+          if (!res.ok) {
+            // 401, 403 and 404 are not this PR's bad luck. A rotated private
+            // key, a suspended installation, or an App that was never put on
+            // the repository will answer the same way for every PR on every
+            // incident until a human changes something -- and GitHub masks a
+            // repository an installation cannot see as 404 rather than 403,
+            // which is the same trap `agent/rerun.ts` has to explain to the
+            // agent. A 5xx is weather: the next report will be fine. Only the
+            // first kind is a failure nobody asked for.
+            const durable =
+              res.status === 401 || res.status === 403 || res.status === 404;
+            (durable ? alarm : log)("pr_state_unavailable", {
+              url,
+              status: res.status,
+            });
+            return;
+          }
+          const body = (await res.json()) as PullRequestBody;
+          found[url] = body.merged_at
+            ? "merged"
+            : body.state === "open"
+              ? "open"
+              : body.state === "closed"
+                ? "closed"
+                : null;
+        } catch (err) {
+          // Left absent, which renders as "state not known" -- but said out
+          // loud, because a report that quietly stops naming PR outcomes
+          // reads exactly like a report for an incident that opened none.
+          //
+          // The bound firing is the bound doing the job it was given, so it
+          // is news about this one request and nothing more. Anything else
+          // thrown here is a request that never got an answer for a reason
+          // nobody chose, and is worth waking someone for on the same
+          // grounds as a 401 above.
+          const name = (err as { name?: string }).name;
+          const transient = name === "TimeoutError" || name === "AbortError";
+          (transient ? log : alarm)("pr_state_unavailable", {
+            url,
+            error: String(err),
+          });
+        }
+      }),
+    );
+    return found;
+  },
+});

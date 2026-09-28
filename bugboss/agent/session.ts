@@ -12,10 +12,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { NotesStore } from "./notes";
 
 export interface SessionStore {
   get(key: string): Promise<Buffer | null>;
-  put(key: string, body: Buffer): Promise<void>;
+  /** `contentType` is for ./notes.ts; the session itself is always NDJSON. */
+  put(key: string, body: Buffer, contentType?: string): Promise<void>;
 }
 
 export interface SessionSync {
@@ -39,7 +41,7 @@ export const sessionFileFor = (sessionDir: string, incidentId: string): string =
 export const createS3SessionStore = (
   bucket: string,
   region?: string,
-): SessionStore => {
+): SessionStore & NotesStore => {
   let clientPromise: Promise<any> | null = null;
   const client = (): Promise<any> => {
     if (!clientPromise) {
@@ -68,7 +70,7 @@ export const createS3SessionStore = (
         throw err;
       }
     },
-    put: async (key, body) => {
+    put: async (key, body, contentType) => {
       const [{ PutObjectCommand }, s3] = await Promise.all([
         import("@aws-sdk/client-s3"),
         client(),
@@ -78,9 +80,37 @@ export const createS3SessionStore = (
           Bucket: bucket,
           Key: key,
           Body: body,
-          ContentType: "application/x-ndjson",
+          // The session is the only caller that does not name one, and it is
+          // the only NDJSON in the bucket.
+          ContentType: contentType ?? "application/x-ndjson",
         }),
       );
+    },
+    // list exists for the notes mirror in ./notes.ts, which is a directory
+    // rather than one object and has to know what S3 already holds. There is
+    // deliberately no delete: nothing in the agent's path removes an object
+    // from this bucket.
+    list: async (prefix) => {
+      const [{ ListObjectsV2Command }, s3] = await Promise.all([
+        import("@aws-sdk/client-s3"),
+        client(),
+      ]);
+      const keys: string[] = [];
+      let token: string | undefined;
+      do {
+        const res = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: prefix,
+            ContinuationToken: token,
+          }),
+        );
+        for (const object of res.Contents ?? []) {
+          if (object.Key) keys.push(object.Key);
+        }
+        token = res.IsTruncated ? res.NextContinuationToken : undefined;
+      } while (token);
+      return keys;
     },
   };
 };
@@ -230,4 +260,106 @@ export const readStoredPrefixFromFile = async (
     if ((err as { code?: string }).code === "ENOENT") return null;
     throw err;
   }
+};
+
+/**
+ * Token usage summed over one incident's whole session file.
+ *
+ * `turns` is not decoration. Tokens are never legitimately zero for a turn
+ * that reached the model, so a non-zero turn count next to a zero total is
+ * the signature of a reader that has drifted from Pi's entry shape -- which
+ * is exactly how this went unnoticed once already.
+ */
+export interface SessionUsage {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  modelId: string | null;
+  turns: number;
+  /**
+   * What Pi priced this file at as it ran, summed over the same entries.
+   *
+   * Not a substitute for the tokens, and not what the incident row stores:
+   * the record is tokens plus `modelId`, because those still multiply out
+   * correctly after a price change. This is the arithmetic done at the time,
+   * carried so a reader gets a figure without a price list -- and it is only
+   * ever presented as derived. Zero when the provider reported no prices.
+   */
+  costUsd: number;
+}
+
+interface UsageFields {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cost?: { total?: number };
+}
+
+/**
+ * Pi writes usage in two shapes, and both are spend:
+ *
+ * - `{ type: "message", message: { role: "assistant", usage } }` -- one per
+ *   model turn, and the overwhelming bulk of a run.
+ * - `{ type: "usage" | "compaction", usage }` -- out-of-band calls that are
+ *   billed but are not turns, such as the summarization compaction runs.
+ *
+ * A message entry never carries top-level `usage`, so reading the nested one
+ * first and falling back cannot double count.
+ */
+interface SessionUsageLine {
+  type?: string;
+  usage?: UsageFields;
+  model?: string;
+  modelId?: string;
+  message?: { role?: string; model?: string; usage?: UsageFields };
+}
+
+/**
+ * Sum a session file's usage. Totals are absolute over the whole file, which
+ * is what makes resume correct: a relaunched agent reopens the same restored
+ * file and appends to it, so re-reading it counts every launch once. Adding
+ * onto the stored row instead would double count every earlier launch.
+ */
+export const sumSessionUsage = (contents: string): SessionUsage => {
+  const total: SessionUsage = {
+    tokensIn: 0,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    modelId: null,
+    turns: 0,
+    costUsd: 0,
+  };
+
+  for (const line of contents.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: SessionUsageLine;
+    try {
+      entry = JSON.parse(trimmed) as SessionUsageLine;
+    } catch {
+      // A session file is appended a line at a time, so a torn last line is
+      // normal after a kill. Everything before it is still good.
+      continue;
+    }
+
+    if (entry.type === "message" && entry.message?.role === "assistant") {
+      total.turns += 1;
+    }
+
+    const usage = entry.message?.usage ?? entry.usage;
+    if (usage) {
+      total.tokensIn += usage.input ?? 0;
+      total.tokensOut += usage.output ?? 0;
+      total.cacheRead += usage.cacheRead ?? 0;
+      total.cacheWrite += usage.cacheWrite ?? 0;
+      total.costUsd += usage.cost?.total ?? 0;
+    }
+
+    total.modelId = entry.modelId ?? entry.message?.model ?? entry.model ?? total.modelId;
+  }
+
+  return total;
 };

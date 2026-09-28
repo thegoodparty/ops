@@ -1,5 +1,6 @@
-// The two loopback routes that are not ToolApi: the outstanding-question
-// marker and the non-draining directive read contact_human polls.
+// The loopback routes that are not ToolApi: the outstanding-question marker,
+// the wait marker monitor keeps while it is blocked on a person, and the
+// non-draining directive read contact_human polls.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -10,7 +11,14 @@ import { after, before, test } from "node:test";
 import { Db } from "../db";
 import { createMemoryS3 } from "../index";
 import { mintAgentToken } from "../toolapi";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
+import {
+  CHOICE_ACTION_PREFIX,
+  CHOICE_BLOCK_ID,
+  MAX_CHOICE_OPTIONS,
+  type SlackBlock,
+} from "../slack/blocks";
 import { createToolApiRoutes } from "./toolapi";
 
 const SECRET = "test-secret";
@@ -22,6 +30,7 @@ let app: ReturnType<typeof createToolApiRoutes>;
 let clock = 1_000_000;
 let reached = 0;
 const threadPosts: string[] = [];
+const choicePosts: { text: string; blocks: readonly SlackBlock[] }[] = [];
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-http-"));
@@ -50,6 +59,15 @@ before(async () => {
       post: async (_threadTs: string | null, text: string) => {
         threadPosts.push(text);
         return { ts: "ts-1" };
+      },
+      postChoice: async (
+        _threadTs: string | null,
+        text: string,
+        blocks: readonly SlackBlock[],
+      ) => {
+        threadPosts.push(text);
+        choicePosts.push({ text, blocks });
+        return { ts: `ts-choice-${choicePosts.length}` };
       },
     },
     now: () => clock,
@@ -205,17 +223,50 @@ test("what the agent writes is converted for Slack and never truncated", async (
   assert.ok(posted.includes("• *the cache*"), posted);
   assert.ok(posted.includes("`near &lt;Set-Cookie&gt;`"), posted);
 
+  // Inside the thread budget, but escaping multiplies it past what one
+  // message holds. Still a split and still the whole tail: the budget is
+  // about what a person will read, and conversion happening to need two
+  // messages is not the model writing too much.
+  const expands = Array.from(
+    { length: 34 },
+    (_, i) => `- ruled out ${i} ${"&".repeat(18)}`,
+  ).join("\n");
+  assert.ok(expands.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: expands }),
+  });
+  assert.equal(res.status, 200);
+  const parts = threadPosts.slice(before + 1);
+  assert.ok(parts.length > 1, `expected a split, got ${parts.length}`);
+  assert.ok(parts.join("").includes("ruled out 33"), "the tail is not dropped");
+
+  await authed("/pending-question", { method: "DELETE" });
+});
+
+test("a post past the thread budget is refused, not split into two long ones", async () => {
+  // Every post to a thread arrives through here -- the ask, the evidence
+  // under it, the rerun notice, the wait heartbeat -- so this is where the
+  // budget is a budget rather than a rule one of four callers follows.
+  const before = threadPosts.length;
   const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
   const res = await authed("/thread", {
     method: "POST",
     body: JSON.stringify({ message: long }),
   });
-  assert.equal(res.status, 200);
-  const parts = threadPosts.slice(before + 1);
-  assert.ok(parts.length > 1, `expected a split, got ${parts.length}`);
-  assert.ok(parts.join("").includes("ruled out 399"), "the tail is not dropped");
 
-  await authed("/pending-question", { method: "DELETE" });
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: string };
+  assert.match(body.error, /message is \d+ characters/);
+  assert.match(body.error, new RegExp(String(THREAD_PROSE_CHARS)));
+  // A refusal nobody can act on is a dead end, so it says where the long
+  // version goes instead of only that this one is too long.
+  assert.match(body.error, /post-mortem/);
+  assert.equal(
+    threadPosts.length,
+    before,
+    "refused before posting, so there is no half-delivered write-up",
+  );
 });
 
 test("the marker says whether the question was actually posted", async () => {
@@ -237,6 +288,75 @@ test("the marker says whether the question was actually posted", async () => {
   assert.equal(posted.messageTs, "ts-1");
 
   await authed("/pending-question", { method: "DELETE" });
+});
+
+test("a question with options posts buttons, and the marker points at them", async () => {
+  clock = 4_100_000;
+  await (await ask("Roll back, or wait for the next deploy?")).json();
+
+  const before = choicePosts.length;
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({
+      message: "Roll back, or wait for the next deploy?",
+      options: ["Roll back", "Wait for the next deploy"],
+    }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(choicePosts.length, before + 1, "one message, with blocks");
+
+  const posted = choicePosts.at(-1)!;
+  const actions = posted.blocks.find((block) => block.type === "actions");
+  assert.ok(actions && actions.type === "actions");
+  assert.deepEqual(
+    actions.elements.map((element) => element.value),
+    ["Roll back", "Wait for the next deploy"],
+  );
+  assert.ok(actions.elements.every((e) => e.action_id.startsWith(CHOICE_ACTION_PREFIX)));
+  assert.equal(actions.block_id, CHOICE_BLOCK_ID);
+  assert.ok(posted.text.includes("1. Roll back"), "the fallback is answerable as text");
+
+  // A press comes back quoting the message the buttons are on, and the marker
+  // is what the relay matches it against.
+  const marker = (await (await authed("/pending-question")).json()) as {
+    messageTs: string;
+  };
+  assert.equal(marker.messageTs, `ts-choice-${choicePosts.length}`);
+
+  await authed("/pending-question", { method: "DELETE" });
+});
+
+test("a question with no options still posts as plain prose", async () => {
+  const before = choicePosts.length;
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "What changed in the last hour?" }),
+  });
+  assert.equal(choicePosts.length, before, "no blocks where none were asked for");
+  assert.equal(threadPosts.at(-1), "What changed in the last hour?");
+});
+
+test("the boundary refuses options the tool would have caught, and posts nothing", async () => {
+  const before = threadPosts.length;
+  const tooMany = Array.from({ length: MAX_CHOICE_OPTIONS + 1 }, (_, i) => `o${i}`);
+
+  const many = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "Pick one", options: tooMany }),
+  });
+  assert.equal(many.status, 400);
+
+  const wrongType = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "Pick one", options: [1, 2] }),
+  });
+  assert.equal(wrongType.status, 400);
+  assert.match(
+    ((await wrongType.json()) as { error: string }).error,
+    /array of strings/,
+  );
+
+  assert.equal(threadPosts.length, before, "a refused question is never posted");
 });
 
 test("model arguments are validated before they reach a tool", async () => {
@@ -264,4 +384,115 @@ test("unknown keys are stripped rather than passed through", async () => {
   const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
   assert.equal(body.ok, true);
   assert.deepEqual(body.data, { cause: "bad column", explainedSignalIds: ["s1"] });
+});
+
+const startWait = (command: string) =>
+  authed("/pending-wait", { method: "POST", body: JSON.stringify({ command }) });
+
+type WaitRow = {
+  command: string;
+  startedAt: number;
+  pings: number;
+  lastPingAt: number | null;
+};
+
+test("a replayed wait keeps its clock and its nudge count", async () => {
+  clock = 1_000_000;
+  const first = (await (await startWait("gh pr view 2150")).json()) as WaitRow;
+  assert.deepEqual(first, {
+    command: "gh pr view 2150",
+    startedAt: 1_000_000,
+    pings: 0,
+    lastPingAt: null,
+  });
+
+  clock = 4_600_000;
+  const pinged = (await (
+    await authed("/pending-wait/ping", { method: "POST" })
+  ).json()) as WaitRow;
+  assert.equal(pinged.pings, 1);
+  assert.equal(pinged.lastPingAt, 4_600_000);
+
+  // The restart. Without this the elapsed clock would start over and the
+  // nudge count would be lost, so the resumed agent would nudge again.
+  clock = 5_000_000;
+  const replayed = (await (await startWait("gh pr view 2150")).json()) as WaitRow;
+  assert.equal(replayed.startedAt, 1_000_000);
+  assert.equal(replayed.pings, 1);
+  assert.equal(replayed.lastPingAt, 4_600_000);
+
+  // clearWait does not run when the child is SIGKILLed mid-wait, so a marker
+  // outlives its wait. A different command is a different wait and inherits
+  // neither the clock nor the count.
+  clock = 6_000_000;
+  const next = (await (await startWait("gh run list --commit abc")).json()) as WaitRow;
+  assert.deepEqual(next, {
+    command: "gh run list --commit abc",
+    startedAt: 6_000_000,
+    pings: 0,
+    lastPingAt: null,
+  });
+
+  await authed("/pending-wait", { method: "DELETE" });
+  assert.equal(
+    db.get<WaitRow>("SELECT command FROM pending_wait WHERE incidentId = ?", [
+      INCIDENT,
+    ]),
+    undefined,
+  );
+});
+
+test("counting a nudge against no wait is an error, not a new wait", async () => {
+  const res = await authed("/pending-wait/ping", { method: "POST" });
+  assert.equal(res.status, 404);
+  assert.equal(
+    db.get<WaitRow>("SELECT command FROM pending_wait WHERE incidentId = ?", [
+      INCIDENT,
+    ]),
+    undefined,
+    "a missing marker is not invented at the moment of the fault",
+  );
+});
+
+test("a harness notice does not seal a question whose post never landed", async () => {
+  clock = 7_000_000;
+  await ask("Can someone merge the PR?");
+  assert.equal(
+    db.get<{ messageTs: string }>(
+      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+      [INCIDENT],
+    )?.messageTs,
+    "",
+  );
+
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({
+      message: "Still waiting on someone: the PR to be merged",
+      sealsPendingQuestion: false,
+    }),
+  });
+  assert.equal(
+    db.get<{ messageTs: string }>(
+      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+      [INCIDENT],
+    )?.messageTs,
+    "",
+    "the nudge is not the question, so it does not make the question look sent",
+  );
+
+  // The ask itself still does.
+  await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: "Can someone merge the PR?" }),
+  });
+  assert.equal(
+    db.get<{ messageTs: string }>(
+      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+      [INCIDENT],
+    )?.messageTs,
+    "ts-1",
+  );
+
+  await authed("/pending-question", { method: "DELETE" });
 });

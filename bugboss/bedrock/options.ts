@@ -21,9 +21,42 @@
 // toInvokeModelModel() in ./model.ts is for. We have to pin the inference
 // profile id and cost rates per Layer 3 of the design anyway.
 
-import type { StreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { CacheRetention, StreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
 
 export const BEDROCK_INVOKE_MODEL_API = "bedrock-invoke-model";
+
+/**
+ * WHY THE 1h TIER IS THE DEFAULT HERE AND NOT PI'S "short":
+ *
+ * `monitor` and `contact_human` each cost one turn however long they block --
+ * that is the mechanism that stops a multi-day incident saturating context on
+ * polling. A tool that blocks for ten minutes and then resumes therefore lands
+ * the next request outside a 5-minute cache lifetime, and the agent rebuilds
+ * its whole ~190k prefix. Measured over seven production incidents: every one
+ * of 32 misses followed one of those two tools, no turn with a gap under 216s
+ * ever missed, no turn with a gap over 331s ever hit, and the rewrites were
+ * 27-41% of each run.
+ *
+ * A 1h write costs 2x base input against 1.25x for 5m, so the premium is 0.75x
+ * base on tokens written. Avoiding one 190k rewrite saves 1.15x base on 190k,
+ * which pays that premium on ~291k written tokens -- more than a whole run
+ * writes. Break-even is roughly one blocking wait per incident; the measured
+ * runs had between two and ten.
+ *
+ * Pi cannot carry this for us: `cacheRetention` has no path in through
+ * `createAgentSession`, and the `PI_CACHE_RETENTION` env fallback is read by
+ * Pi's own providers, not by `resolveCacheControl` in ./request.ts.
+ */
+export const DEFAULT_CACHE_RETENTION: CacheRetention = "long";
+
+/**
+ * The one place the default is applied. The body builder and the provider's
+ * response check both need the answer, and a check that resolved it separately
+ * could hold a request to a retention the body never asked for.
+ */
+export const resolveCacheRetention = (
+  options: Pick<BedrockInvokeModelOptions, "cacheRetention">,
+): CacheRetention => options.cacheRetention ?? DEFAULT_CACHE_RETENTION;
 
 export type BedrockInvokeModelApi = typeof BEDROCK_INVOKE_MODEL_API;
 
