@@ -5,6 +5,38 @@ reset. Updated as things land. Not product documentation.
 
 ## Blocked on a human
 
+- **Purge the 2026-09-28 alert-storm incidents from the database.** Between
+  **13:19:01 and 13:22:30 EDT** BugBoss opened **incidents 41-79** — 39 in
+  three and a half minutes — one per Grafana rule, each spawning an
+  investigating agent. None was a real fault. Grafana Cloud had begun
+  returning **429** on Loki queries; with `exec_err_state: Alerting` (which is
+  intended), every failed rule evaluation became a firing alert. Production
+  was healthy throughout: ~7 error lines in five minutes across gp-api prod.
+
+  These rows and their session transcripts are cruft and should be removed
+  from the SQLite database and the S3 mirror, along with the agent work
+  directories and notes.
+
+  Identifying them: title `[PROD] [<route>] Route errors detected`, and most
+  carry `[no value]` as the endpoint because the query returned nothing, so
+  there was no `request_endpoint` label to interpolate. That `[no value]` is
+  the cleanest marker of a storm incident.
+
+  **Two in the range are not cruft, so do not delete by range alone:**
+  - **#63 `[PROD] Alert notifications are failing to deliver`** — BugBoss
+    correctly detecting the real fault. The one true signal in the storm, and
+    worth reading before anything is dropped.
+  - **#79 `[PROD] High memory utilization`** — may be genuine, or may be
+    BugBoss's own memory under 30+ concurrent agents. Read it first.
+
+  The lower boundary needs checking: 41 is the earliest seen in `#dev-alerts`,
+  but incidents below it may also belong to the storm. Bound by timestamp
+  rather than by number.
+
+  Do this only after the load investigation lands and the underlying issue is
+  fixed, so the purge is not repeated.
+
+
 - **Merge #118** (`integration/bugboss-v1`). Needs a human codeowner. It is
   **not safely divisible** — cherry-picking pieces reintroduces the ordering
   hazard that broke deploys repeatedly, because the single-role change is
