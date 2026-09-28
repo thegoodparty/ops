@@ -79,6 +79,21 @@
 # `deploy/components/bugboss.ts`, owned above. Application code cannot widen
 # it.
 #
+# ## The reviewer's own criteria
+#
+# `CLAUDE.md`, at the root and in any directory. `delegate/agents/pr-reviewer.ts`
+# step 2 tells the reviewer to read "the repo's root `CLAUDE.md` -- authoritative
+# for conventions" and any `CLAUDE.md` in a directory the PR touches, and the
+# scout subagent is told the same. So these files are an input to the judgement
+# that this change is about making sufficient. A bot-approved edit here changes
+# what the reviewer will accept on every later PR, which is the one kind of
+# change that compounds.
+#
+# This is the only file-pattern entry that is not a named singleton, and it is
+# a pattern rather than a directory because the files it covers are scattered
+# by design. It costs a human on a bugboss documentation edit, which is the
+# right side to err on.
+#
 # ## Rules for editing this list
 #
 # Scope by directory. A file-scoped gate leaves the same hole one file over:
@@ -116,3 +131,8 @@
 /bugboss/github.ts               @thegoodparty/gp-contrib
 /bugboss/slack-app-manifest.yaml @thegoodparty/gp-contrib
 /bugboss/Dockerfile              @thegoodparty/gp-contrib
+
+# Last, so it wins over the tree rules above. Same owner either way, so the
+# ordering is for readers rather than for GitHub.
+/CLAUDE.md                       @thegoodparty/gp-contrib
+**/CLAUDE.md                     @thegoodparty/gp-contrib
