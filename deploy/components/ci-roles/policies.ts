@@ -1010,9 +1010,17 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       // that do not exist yet. Terraform plans read no other S3 object: there
       // is no `aws_s3_object` data source in either repo, and every
       // `terraform_remote_state` key is on the list.
+      //
+      // `GetObjectVersion` is a separate IAM action that returns object
+      // content for a given `versionId`, and `ReadOnlyAccess` grants it, so
+      // denying only `GetObject` leaves the same prod state readable one
+      // parameter away. This bucket has versioning `Enabled`, checked against
+      // AWS, so that was a live bypass rather than a theoretical one. Denying
+      // both is free: the S3 backend reads the current version and never
+      // passes a `versionId`.
       Sid: "DenyOtherS3Objects",
       Effect: "Deny",
-      Action: ["s3:GetObject"],
+      Action: ["s3:GetObject", "s3:GetObjectVersion"],
       NotResource: TF_STATE_READABLE,
     },
     {

@@ -140,6 +140,17 @@ describe("githubActionsPulumiPlan", () => {
     assert.deepEqual(asList(deny.NotResource), READABLE);
   });
 
+  // GetObjectVersion returns content for a versionId and is a separate IAM
+  // action that ReadOnlyAccess also grants. The bucket has versioning
+  // enabled, so denying only GetObject leaves the same object readable.
+  it("denies the versioned read as well as the current one", () => {
+    const deny = statement("DenyOtherS3Objects");
+    assert.deepEqual(asList(deny.Action), [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+    ]);
+  });
+
   // dataplatform plans with the lock held; gp-ai passes -lock=false. The only
   // write this role has is that one lock object.
   it("writes nothing but the dataplatform lock object", () => {

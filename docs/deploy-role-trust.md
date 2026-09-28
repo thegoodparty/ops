@@ -320,6 +320,14 @@ aws iam simulate-principal-policy \
 A unit test on the policy document cannot catch this class of gap, because the
 gap lives in the interaction between two policies. The simulator can.
 
+**Deny the action, then deny its siblings.** The first version of that deny
+covered `s3:GetObject` only. `ReadOnlyAccess` also grants
+`s3:GetObjectVersion`, a separate IAM action returning content for a given
+`versionId`, and this bucket has versioning `Enabled`, so the same prod state
+stayed readable one parameter away. When denying a read, check whether the
+service splits it across actions and simulate each one; a deny that names a
+single action is a guess until it has been.
+
 ## Design: `github-actions-preview-deploy`
 
 The hard one. Trusted by `repo:thegoodparty/omni:pull_request` alone, and by
