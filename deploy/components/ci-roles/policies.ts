@@ -923,6 +923,26 @@ export const githubActionsPulumiPreview: PolicyDocument = {
 
 const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 
+// Every secret value a plan on this role may read, allowed below and reused
+// as the NotResource of the deny, so the two cannot drift.
+//
+// All three are dev. Two of them are reached in a way that is easy to miss:
+// `broker-dev` and `broker-service-tokens-dev` are managed
+// `aws_secretsmanager_secret_version` **resources**, not data sources, and
+// Terraform refreshes a managed resource during plan, which calls
+// GetSecretValue. Searching for data sources alone finds only AI_SECRETS_DEV
+// and produces a role that fails on the first real plan.
+//
+// Adding a secret to a gp-ai dev root therefore needs a grant here first, in
+// its own merged-and-applied change, per the ordering rule in
+// docs/deploy-role-trust.md. The failure without one is a clean AccessDenied
+// on the plan, which is the intended fail-closed behaviour.
+const PLAN_READABLE_SECRETS = [
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-dev-??????",
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-service-tokens-dev-??????",
+];
+
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -1027,8 +1047,7 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Sid: "AiSecretsDevForPlan",
       Effect: "Allow",
       Action: ["secretsmanager:GetSecretValue"],
-      Resource:
-        "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+      Resource: PLAN_READABLE_SECRETS,
     },
     {
       // Everything except the one secret above. NotResource rather than a
@@ -1037,8 +1056,7 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Sid: "DenySecretValues",
       Effect: "Deny",
       Action: ["secretsmanager:GetSecretValue"],
-      NotResource:
-        "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+      NotResource: PLAN_READABLE_SECRETS,
     },
     {
       // Blanket, matching the shape above. `ReadOnlyAccess` grants
