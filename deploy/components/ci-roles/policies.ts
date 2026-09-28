@@ -847,17 +847,6 @@ export const githubActionsPulumiPreview: PolicyDocument = {
   Statement: [
     ...pulumiBackendReadStatements(["ops", "org", "workbench"]),
     {
-      Sid: "AssumeWorkbenchPreviewRole",
-      Effect: "Allow",
-      // The workbench stack reaches its account by assuming a role into
-      // 024901689212, and a preview must not use the admin apply role. This
-      // is the management-side half; the trust on the other side is in
-      // deploy-workbench/preview-role.ts. Not read-only like the rest, but
-      // it only reaches a role that holds no permissions.
-      Action: ["sts:AssumeRole"],
-      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-preview`,
-    },
-    {
       Sid: "RuntimeSecretMetadata",
       Effect: "Allow",
       // The two Secrets Manager secrets the ops program looks up by name:
@@ -913,6 +902,18 @@ export const githubActionsPulumiPreview: PolicyDocument = {
         "acm:ListTagsForCertificate",
       ],
       Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
+    },
+    {
+      Sid: "AssumeWorkbenchPreviewRole",
+      Effect: "Allow",
+      // The workbench stack reaches its account by assuming a role into
+      // 024901689212, and a preview must not use the admin apply role. This
+      // is the management-side half; the trust on the other side is in
+      // deploy-workbench/preview-role.ts. Not read-only like the rest, but
+      // it only reaches a role that holds no permissions. Last, so adding it
+      // does not renumber the statements above in every later diff.
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-preview`,
     },
   ],
 };
