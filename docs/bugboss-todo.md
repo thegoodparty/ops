@@ -6,9 +6,9 @@ reset. Updated as things land. Not product documentation.
 ## Blocked on a human
 
 - **Purge the 2026-09-28 alert-storm incidents from the database.** Between
-  **13:19:01 and 13:22:30 EDT** BugBoss opened **incidents 41-79** — 39 in
-  three and a half minutes — one per Grafana rule, each spawning an
-  investigating agent. None was a real fault. Grafana Cloud had begun
+  **13:17:09 and 13:22:30 EDT** BugBoss opened **incidents 13-79** — 67 in
+  five and a half minutes — one per Grafana rule, each spawning an
+  investigating agent. Almost none was a real fault. Grafana Cloud had begun
   returning **429** on Loki queries; with `exec_err_state: Alerting` (which is
   intended), every failed rule evaluation became a firing alert. Production
   was healthy throughout: ~7 error lines in five minutes across gp-api prod.
@@ -17,24 +17,30 @@ reset. Updated as things land. Not product documentation.
   from the SQLite database and the S3 mirror, along with the agent work
   directories and notes.
 
-  Identifying them: title `[PROD] [<route>] Route errors detected`, and most
-  carry `[no value]` as the endpoint because the query returned nothing, so
-  there was no `request_endpoint` label to interpolate. That `[no value]` is
-  the cleanest marker of a storm incident.
+  Identify them by **title and timestamp, not by id range** — the range has
+  real incidents inside it. Storm incidents are titled
+  `[PROD] [<route>] Route errors detected`, and most carry `[no value]` as the
+  endpoint because the query returned nothing, so there was no
+  `request_endpoint` label to interpolate. That `[no value]` is the cleanest
+  single marker.
 
-  **Two in the range are not cruft, so do not delete by range alone:**
+  **Inside the range but NOT cruft — read each before deleting anything:**
+  - **#27 `[PROD] [People] Person id repoint blocked, left for manual
+    resolution`** — not a route-errors alert at all. Almost certainly a real
+    signal that happened to land mid-storm, and it says it needs manual
+    resolution.
   - **#63 `[PROD] Alert notifications are failing to deliver`** — BugBoss
-    correctly detecting the real fault. The one true signal in the storm, and
-    worth reading before anything is dropped.
+    correctly detecting the real fault. The one true signal the storm
+    produced, and worth reading before anything is dropped.
   - **#79 `[PROD] High memory utilization`** — may be genuine, or may be
-    BugBoss's own memory under 30+ concurrent agents. Read it first.
+    BugBoss's own memory under 60+ concurrent agents. Read it first.
 
-  The lower boundary needs checking: 41 is the earliest seen in `#dev-alerts`,
-  but incidents below it may also belong to the storm. Bound by timestamp
-  rather than by number.
+  **Outside the range, leave alone:** #12 `[PROD] Health check probe failures`
+  at 13:07:32, ten minutes before the first storm incident and unrelated.
 
   Do this only after the load investigation lands and the underlying issue is
   fixed, so the purge is not repeated.
+
 
 
 - **Merge #118** (`integration/bugboss-v1`). Needs a human codeowner. It is
