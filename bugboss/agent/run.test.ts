@@ -22,6 +22,7 @@ import {
   reserveTokensFor,
   toolListDrift,
 } from "./run";
+import { notesPrefixFor } from "./notes";
 import { PROMPT_ENTRY_TYPE } from "./session";
 
 test("paths are derived from the incident, not the process", () => {
@@ -31,6 +32,20 @@ test("paths are derived from the incident, not the process", () => {
   assert.equal(paths.sessionFile, "/work/inc-7/session/inc-7.jsonl");
   assert.equal(paths.npmCiDone, "/work/inc-7/npm-ci.done");
   assert.deepEqual(computePaths("/work", "inc-7"), paths);
+});
+
+test("the notes directory is a sibling of the checkout, never inside it", () => {
+  const paths = computePaths("/work", "inc-7");
+
+  assert.equal(paths.notesDir, "/work/inc-7/notes");
+  // Inside the checkout a note is one `git add -A` away from being in the
+  // pull request the agent asks a human to merge.
+  assert.ok(!paths.notesDir.startsWith(`${paths.checkout}/`));
+  assert.equal(
+    notesPrefixFor("sessions/incident/inc-7/session.jsonl"),
+    "sessions/incident/inc-7/notes/",
+    "notes belong with that incident's material, not somewhere new",
+  );
 });
 
 test("compaction is configured at 95% of the window", () => {
@@ -115,9 +130,12 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
     reportAnalysis: async () => response,
     handOff: async () => response,
     getIncident: async () => response,
+    searchIncidents: async () => response,
   }) as unknown as ToolApi;
 
-test("the boss tools are the five transitions plus get_incident", async () => {
+// Two reads now, not one: search_incidents is how an agent reaches the
+// post-mortems of incidents nobody pointed it at.
+test("the boss tools are the five transitions plus the two reads", async () => {
   const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
 
   assert.deepEqual(
@@ -129,6 +147,7 @@ test("the boss tools are the five transitions plus get_incident", async () => {
       "report_impact",
       "report_resolved",
       "report_root_cause",
+      "search_incidents",
     ],
   );
   assert.ok(!tools.some((tool) => BUILTIN_TOOLS.includes(tool.name)));

@@ -15,6 +15,8 @@
 import type { Db } from "../db";
 import type { Directive, IncidentOwner, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
+import type { SlackChoiceClick } from "./blocks";
+import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 
 const log = makeLog("slack-relay");
 
@@ -118,47 +120,74 @@ const LINK_RETRY_MS = 100;
  */
 type LinkOutcome = "linked" | "lost" | "unwritable";
 
+/**
+ * A pull request, as `<url|owner/repo#7>`. The number is what a reader is
+ * looking for and a bare GitHub URL buries it, since `unfurl_links` is off.
+ */
+const prLink = (url: string): string => {
+  const parts = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/.exec(url);
+  return parts ? link(url, `${parts[1]}#${parts[2]}`) : link(url);
+};
+
+/**
+ * Every transition has the same three parts, which is the shape the PR
+ * reviewer already uses in this channel: a bold line saying what happened, the
+ * substance, then one italic line of what it means for the reader. No
+ * headings, because Slack has none; no tables, for the same reason.
+ *
+ * The literal text here is formatting and stays unescaped. Everything
+ * interpolated is escaped: a signal title comes out of an alert annotation,
+ * which is a thing an attacker can write, and one `<` in it would otherwise
+ * eat the rest of the message with a 200 back from Slack.
+ */
 export const renderEvent = (event: RelayEvent): string => {
   switch (event.type) {
     case "opened":
       return [
-        `*Incident ${event.incidentId} opened*`,
-        event.title,
-        `${event.signalCount} signal(s). An agent is investigating. Nobody is being paged.`,
+        mrkdwn`*Incident ${event.incidentId} opened*`,
+        mrkdwn`${event.title}`,
+        mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"} · an agent is investigating · nobody is being paged_`,
       ].join("\n");
     case "merged":
       return [
-        `*Incident ${event.incidentId} merged into ${event.into}*`,
-        event.reason,
-        `Follow ${event.into} from here.`,
+        mrkdwn`*Incident ${event.incidentId} merged into ${event.into}*`,
+        toMrkdwn(event.reason),
+        mrkdwn`_Follow ${event.into} from here._`,
       ].join("\n");
     case "escalated":
       return [
-        `*Escalation on incident ${event.incidentId}*`,
-        `Reason: ${event.reason}`,
+        mrkdwn`*Escalation on incident ${event.incidentId}* · ${event.reason}`,
         "",
-        event.brief,
+        toMrkdwn(event.brief),
         "",
-        "This incident now has a human owner and no agent is running on it.",
+        "_This incident now has a human owner and no agent is running on it._",
       ].join("\n");
     case "resolved":
       return [
-        `*Incident ${event.incidentId} resolved*`,
-        event.evidence,
-        ...event.prUrls.map((url) => `Shipped: ${url}`),
-        "Post-mortem to follow. Nothing auto-closes.",
+        mrkdwn`*Incident ${event.incidentId} resolved*`,
+        toMrkdwn(event.evidence),
+        ...(event.prUrls.length
+          ? [bullets(event.prUrls.map((url) => `Shipped: ${prLink(url)}`))]
+          : []),
+        "_Post-mortem to follow. Nothing auto-closes._",
       ].join("\n");
     case "prod_critical_signal":
       return [
-        `*Prod-critical signal on incident ${event.incidentId}*`,
-        `${event.signalTitle} (${event.slug})`,
-        "An agent is working it. This is a heads up, not a handover.",
+        mrkdwn`*Prod-critical signal on incident ${event.incidentId}*`,
+        mrkdwn`${event.signalTitle} (\`${event.slug}\`)`,
+        "_An agent is working it. This is a heads up, not a handover._",
       ].join("\n");
     case "pr_needs_merge":
       return [
-        `*A PR needs review and merge for incident ${event.incidentId}*`,
-        event.prUrl,
-        "Before merging: does the RCA explain the signals, does the diff match the stated cause, is the blast radius what the analysis implies, and is there a test that would have caught this?",
+        mrkdwn`*A PR needs review and merge for incident ${event.incidentId}*`,
+        prLink(event.prUrl),
+        "Before merging:",
+        bullets([
+          "Does the RCA explain the signals?",
+          "Does the diff match the stated cause?",
+          "Is the blast radius what the analysis implies?",
+          "Is there a test that would have caught this?",
+        ]),
       ].join("\n");
   }
 };
@@ -183,25 +212,31 @@ export interface SlackEvent {
   thread_ts?: string;
 }
 
-/** Which way ownership is being handed, per the Layer 4 actions table. */
-export type OwnershipClaim = "take_over" | "hand_back";
-
 export type InboundRoute =
   | { kind: "ignore"; reason: string }
-  /** Recorded against an incident. `interrupt` means a directive went with it. */
-  | { kind: "incident_reply"; incidentId: string; interrupt: boolean }
   /**
-   * A reply claiming the incident or handing it back. Recorded and relayed
-   * like any other reply; the kind is the part that says the incident is
-   * changing hands, and it carries what a write of `owner` would need. The
-   * relay does not write `owner` and cannot: the whole flip lives elsewhere.
+   * A message in an incident's thread, already recorded and already pushed to
+   * the agent as a directive. What it *means* -- an answer, a question, or the
+   * incident changing hands -- is a model call the caller makes off the Slack
+   * ack, so everything that read needs travels on the route.
+   *
+   * The relay does not write `owner` and cannot: the whole flip lives in the
+   * composition root, guarded in the statement.
    */
   | {
-      kind: "ownership_claim";
+      kind: "incident_reply";
       incidentId: string;
-      claim: OwnershipClaim;
-      slackUserId: string;
+      /** The message tagged the bot, so a directive interrupts as well. */
+      interrupt: boolean;
+      /** Who has the incident right now. Context for reading the message. */
+      owner: IncidentOwner;
+      /** False when no agent is on it, so a mention is a question for Job 6. */
+      agentRunning: boolean;
+      channel: string;
+      threadTs: string;
       ts: string;
+      user: string;
+      text: string;
     }
   | {
       kind: "slack_agent";
@@ -211,6 +246,23 @@ export type InboundRoute =
       user: string;
       text: string;
     };
+
+/**
+ * What a button press did. `answered` is the only one that moved anything;
+ * the other two are a press that arrived too late or second, and each still
+ * earns a line in the thread, because a button that does nothing and says
+ * nothing is indistinguishable from a broken one.
+ */
+export type ChoiceRoute =
+  | { kind: "ignore"; reason: string }
+  | {
+      kind: "answered";
+      incidentId: string;
+      choice: string;
+      slackUserId: string;
+    }
+  | { kind: "stale"; incidentId: string; slackUserId: string }
+  | { kind: "duplicate"; incidentId: string; slackUserId: string };
 
 /** The statuses during which the dispatcher keeps an agent on an incident. */
 const AGENT_RUNNING_STATUSES: readonly IncidentStatus[] = [
@@ -224,29 +276,6 @@ export const mentionsBot = (text: string, botUserId: string): boolean =>
 
 export const stripBotMention = (text: string, botUserId: string): string =>
   text.replaceAll(`<@${botUserId}>`, "").replace(/\s+/g, " ").trim();
-
-const CLAIM_WORDS: readonly (readonly [string, OwnershipClaim])[] = [
-  ["mine", "take_over"],
-  ["back to you", "hand_back"],
-];
-
-/**
- * The whole normalized message must be the claim word. Substring matching is
- * the wrong trade here: "not mine" and "that one is mine to fix" are ordinary
- * incident chatter, and a false claim is the expensive direction, because
- * owner = 'human' takes the incident out of the dispatcher's query and there
- * is nothing that hands it back.
- */
-export const ownershipClaim = (
-  text: string,
-  botUserId: string,
-): OwnershipClaim | null => {
-  const said = stripBotMention(text, botUserId)
-    .toLowerCase()
-    .replace(/[.!?]+$/, "")
-    .trim();
-  return CLAIM_WORDS.find(([word]) => word === said)?.[1] ?? null;
-};
 
 const ignore = (reason: string): InboundRoute => ({ kind: "ignore", reason });
 
@@ -280,7 +309,13 @@ export class SlackRelay {
         return open;
       }
 
-      const { ts } = await this.slack.post(null, body, this.cfg.channelId);
+      const parts = splitForSlack(body);
+      const { ts } = await this.slack.post(null, parts[0], this.cfg.channelId);
+      // The rest go into the thread this post just started, which is why they
+      // wait for it rather than being posted alongside.
+      for (const part of parts.slice(1)) {
+        await this.slack.post(ts, part, this.cfg.channelId);
+      }
       if ((await this.linkThread(event.incidentId, ts)) === "unwritable") {
         // The thread exists and nothing points at it, so the rest of this
         // incident will not land here. Said in the thread, which is where
@@ -288,8 +323,8 @@ export class SlackRelay {
         await this.slack.post(
           ts,
           [
-            `${ping}*Incident ${event.incidentId} is not linked to this thread*`,
-            "Recording this thread on the incident failed, so its later updates will not land here. The error is in the BugBoss logs.",
+            mrkdwn`${raw(ping)}*Incident ${event.incidentId} is not linked to this thread*`,
+            "_Recording this thread on the incident failed, so its later updates will not land here. The error is in the BugBoss logs._",
           ].join("\n"),
           this.cfg.channelId,
         );
@@ -308,16 +343,18 @@ export class SlackRelay {
         incidentId: event.incidentId,
         type: event.type,
       });
-      const { ts } = await this.slack.post(
-        null,
+      const orphan = splitForSlack(
         [
-          `${ping}*Incident ${event.incidentId} has no Slack thread*`,
-          "Its thread link is missing, so this is posting at the top level and the rest of the incident will follow it here.",
+          mrkdwn`${raw(ping)}*Incident ${event.incidentId} has no Slack thread*`,
+          "_Its thread link is missing, so this is posting at the top level and the rest of the incident will follow it here._",
           "",
           body,
         ].join("\n"),
-        this.cfg.channelId,
       );
+      const { ts } = await this.slack.post(null, orphan[0], this.cfg.channelId);
+      for (const part of orphan.slice(1)) {
+        await this.slack.post(ts, part, this.cfg.channelId);
+      }
       // Adopt this post as the thread. One recovered thread beats the loose
       // messages every later transition would otherwise add.
       const adopted = await this.linkThread(event.incidentId, ts);
@@ -329,11 +366,13 @@ export class SlackRelay {
       return ts;
     }
 
-    const { ts } = await this.slack.post(
-      threadTs,
-      (earnsMention(event) ? ping : "") + body,
-      this.cfg.channelId,
-    );
+    let first: string | null = null;
+    for (const part of splitForSlack((earnsMention(event) ? ping : "") + body)) {
+      const posted = await this.slack.post(threadTs, part, this.cfg.channelId);
+      first = first ?? posted.ts;
+    }
+    if (first === null) throw new Error("splitForSlack produced nothing to post");
+    const ts = first;
     log("posted", {
       incidentId: event.incidentId,
       type: event.type,
@@ -361,7 +400,12 @@ export class SlackRelay {
     const text = event.text ?? "";
     if (!channel || !ts || !user) return ignore("incomplete event");
 
-    const mentioned = mentionsBot(text, this.cfg.botUserId);
+    // Slack only delivers app_mention when the app was tagged, so the event
+    // type is a mention on its own. Resting this on the literal `<@id>` alone
+    // made the whole mention path depend on botUserId being configured, and
+    // an optional field nobody sets is a fix that only exists in the source.
+    const mentioned =
+      event.type === "app_mention" || mentionsBot(text, this.cfg.botUserId);
 
     // Slack delivers a threaded mention twice when the app subscribes to both
     // message.channels and app_mention. app_mention is the authoritative copy.
@@ -387,15 +431,11 @@ export class SlackRelay {
       incident.owner === "agent" &&
       AGENT_RUNNING_STATUSES.includes(incident.status);
 
-    // Checked before the Slack agent branch on purpose: that agent is
-    // read-only and its answer to a claim is to tell you to reply in the
-    // thread, which is what you just did.
-    const claim = ownershipClaim(text, this.cfg.botUserId);
-
-    if (mentioned && !agentRunning && !claim) {
-      return { kind: "slack_agent", channel, threadTs, ts, user, text };
-    }
-
+    // Recorded before anything decides what it meant, including a mention
+    // this incident has no agent for. Two reasons. The thread is the record,
+    // so a message in it belongs in thread_reply whoever ends up answering;
+    // and the insert is what collapses a Slack retry, so a delivery that used
+    // to skip it could run the Slack agent twice on one question.
     const inserted = await this.recordReply(incident.id, {
       channel,
       user,
@@ -404,27 +444,9 @@ export class SlackRelay {
     });
     if (!inserted) return ignore("duplicate delivery");
 
-    // `contact_human` waits on directives alone, and the contract is that a
-    // plain reply in the thread answers it; nothing else reads thread_reply on
-    // an agent's behalf. A mention answers too, and interrupts as well.
-    await this.pushDirective(incident.id, {
-      type: "human_message",
-      from: user,
-      text,
-      ts,
-    });
-
-    if (claim) {
-      log("ownership_claim", { incidentId: incident.id, claim, user, ts });
-      return {
-        kind: "ownership_claim",
-        incidentId: incident.id,
-        claim,
-        slackUserId: user,
-        ts,
-      };
-    }
-
+    // Handing it to the agent is the caller's, because whether it is an
+    // answer, a handover or two people talking to each other is a model call
+    // and this has to be back inside Slack's three seconds.
     log(mentioned ? "interrupt_recorded" : "reply_recorded", {
       incidentId: incident.id,
       ts,
@@ -433,6 +455,109 @@ export class SlackRelay {
       kind: "incident_reply",
       incidentId: incident.id,
       interrupt: mentioned,
+      owner: incident.owner,
+      agentRunning,
+      channel,
+      threadTs,
+      ts,
+      user,
+      text,
+    };
+  }
+
+  /**
+   * One press of a button on a question. It is recorded and delivered exactly
+   * as a typed reply is — a `thread_reply` row and a `human_message` directive
+   * carrying the label the agent wrote — so `contact_human` cannot tell the
+   * two apart and free text stays the answer of record.
+   *
+   * Anyone in the channel may press. Both guards that keeps honest are in the
+   * statement rather than around it, like every other transition here:
+   *
+   *   EXISTS — `pending_question` holds the one question the agent is waiting
+   *   on. A marker for a different message means this question has already
+   *   been answered or has timed out, and delivering a press against it would
+   *   file "Roll back" as the answer to whatever is being asked now.
+   *
+   *   The derived id — one question takes one answer, however many people
+   *   press, and however many times Slack redelivers.
+   */
+  async handleChoice(click: SlackChoiceClick): Promise<ChoiceRoute> {
+    const incident = this.incidentForThread(click.threadTs);
+    if (!incident) {
+      return { kind: "ignore", reason: "thread is not an incident thread" };
+    }
+
+    const recorded = await this.db.withWrite(
+      (d) =>
+        d
+          .prepare(
+            `INSERT OR IGNORE INTO thread_reply
+               (id, incidentId, slackUserId, text, ts, receivedAt)
+             SELECT ?, ?, ?, ?, ?, ?
+              WHERE EXISTS (
+                SELECT 1 FROM pending_question
+                 WHERE incidentId = ? AND messageTs = ?
+              )`,
+          )
+          .run(
+            `${click.channel}:${click.messageTs}:choice`,
+            incident.id,
+            click.user,
+            click.choice,
+            click.actionTs,
+            Date.now(),
+            incident.id,
+            click.messageTs,
+          ).changes > 0,
+    );
+
+    if (!recorded) {
+      const outstanding = this.db.get<{ messageTs: string }>(
+        "SELECT messageTs FROM pending_question WHERE incidentId = ?",
+        [incident.id],
+      );
+      const kind =
+        outstanding?.messageTs === click.messageTs ? "duplicate" : "stale";
+      log(`choice_${kind}`, {
+        incidentId: incident.id,
+        user: click.user,
+        messageTs: click.messageTs,
+      });
+      return { kind, incidentId: incident.id, slackUserId: click.user };
+    }
+
+    // Pressing an agent's own button is addressed to it by construction, so
+    // unlike a typed reply there is nothing here for a model to read and this
+    // stays inside the relay's write rather than moving to the composition
+    // root with the rest of the directive push.
+    await this.db.withWrite((d) => {
+      d.prepare(
+        `INSERT INTO pending_directive (incidentId, payload, createdAt)
+         VALUES (?, ?, ?)`,
+      ).run(
+        incident.id,
+        JSON.stringify({
+          type: "human_message",
+          from: click.user,
+          text: click.choice,
+          ts: click.actionTs,
+          addressed: "agent",
+        } satisfies Directive),
+        Date.now(),
+      );
+    });
+
+    log("choice_recorded", {
+      incidentId: incident.id,
+      user: click.user,
+      ts: click.actionTs,
+    });
+    return {
+      kind: "answered",
+      incidentId: incident.id,
+      choice: click.choice,
+      slackUserId: click.user,
     };
   }
 
@@ -526,15 +651,4 @@ export class SlackRelay {
     });
   }
 
-  private async pushDirective(
-    incidentId: string,
-    directive: Directive,
-  ): Promise<void> {
-    await this.db.withWrite((d) => {
-      d.prepare(
-        `INSERT INTO pending_directive (incidentId, payload, createdAt)
-         VALUES (?, ?, ?)`,
-      ).run(incidentId, JSON.stringify(directive), Date.now());
-    });
-  }
 }

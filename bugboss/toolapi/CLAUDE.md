@@ -66,6 +66,21 @@ names explicitly.
 
 ## Notify
 
+A merge and a split each leave two threads, and both are told. The absorbed
+incident's thread is the half that cannot be skipped: nothing is ever posted
+there again, and a thread that goes silent forever is indistinguishable from
+the Boss having died. Each message links to the other thread by permalink —
+`chat.getPermalink`, since Slack builds the URL out of a workspace domain
+nothing here knows — and a permalink that fails alarms and leaves the sentence
+naming the incident rather than losing it. Neither post can roll a merge back:
+the re-partition is committed and durable before anybody is told.
+
+The order is forced one way. A split's new incidents have no Slack thread
+until the relay opens one, and a thread that does not exist can be neither
+linked nor posted into, so the announcement opens threads first. That is why
+`ThreadPoster` carries `openThreads` rather than the tool API reaching for the
+relay.
+
 `notify()` returns whether it posted. `hand_off` posts **before** it commits
 `owner = 'human'` and returns `ok: false` if the post failed, leaving the
 incident owned by the agent. The failure modes are not symmetric: a write

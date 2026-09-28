@@ -14,6 +14,33 @@ import { GetObjectCommand } from "@aws-sdk/client-s3";
 
 const log = makeLog("db");
 
+/**
+ * Columns that arrived after their table shipped, and the reason they need
+ * naming twice. `schema.sql` runs as `CREATE TABLE IF NOT EXISTS` over a
+ * restored snapshot, so a column added to an existing table is a no-op there
+ * and the declaration only takes effect on a database created from scratch.
+ * Every test opens a fresh file and passes; prod restores a snapshot and
+ * every statement naming the column fails. SQLite has no
+ * `ADD COLUMN IF NOT EXISTS`, so the check is here rather than in the DDL.
+ *
+ * Keep the declaration in `schema.sql` too: that is what a fresh database
+ * gets, and it is where the column is documented.
+ */
+const LATE_COLUMNS: { table: string; column: string; type: string }[] = [
+  { table: "incident", column: "recurrenceAnalysis", type: "TEXT" },
+];
+
+const addLateColumns = (w: Database.Database): void => {
+  for (const { table, column, type } of LATE_COLUMNS) {
+    const present = (
+      w.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+    ).some((c) => c.name === column);
+    if (present) continue;
+    w.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    log("late_column_added", { table, column });
+  }
+};
+
 export interface DbConfig {
   path: string;
   bucket: string;
@@ -63,6 +90,7 @@ export class Db {
 
     const db = new Db(cfg, s3);
     db.write.exec(readFileSync(join(__dirname, "schema.sql"), "utf8"));
+    addLateColumns(db.write);
     return db;
   }
 

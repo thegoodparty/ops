@@ -6,7 +6,11 @@ FROM node:22-alpine
 # uv is not optional: the agent starts the Grafana MCP toolset with
 # `uvx mcp-grafana` before its session begins, so without it the spawn fails
 # and the run dies rather than starting without Grafana.
-RUN apk add --no-cache git curl github-cli bash aws-cli jq ripgrep uv
+# postgresql-client is how an agent answers "is the test database up" for
+# itself, with `pg_isready -d $OMNI_TEST_POSTGRES_URL`, rather than inferring
+# it from a vitest stack trace. omni's harness brings its own driver.
+RUN apk add --no-cache git curl github-cli bash aws-cli jq ripgrep uv \
+  postgresql-client
 
 WORKDIR /app
 

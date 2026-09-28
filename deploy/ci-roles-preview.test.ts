@@ -41,7 +41,7 @@ describe("githubActionsPulumiPreview", () => {
   // cannot slip in without failing here.
   it("grants read-only actions and nothing else", () => {
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe)/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List))/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
@@ -69,16 +69,47 @@ describe("githubActionsPulumiPreview", () => {
     );
   });
 
-  it("scopes secret metadata to the DELEGATES secret, not *", () => {
+  it("scopes secret metadata to the runtime secrets, not *", () => {
     const describe = githubActionsPulumiPreview.Statement.find((s) =>
       (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
         "secretsmanager:DescribeSecret"
       )
     );
     assert.ok(describe);
+    const resources = (Array.isArray(describe.Resource)
+      ? describe.Resource
+      : [describe.Resource]
+    ).sort();
+    assert.deepEqual(resources, [
+      "arn:aws:secretsmanager:us-west-2:333022194791:secret:BUGBOSS-??????",
+      "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
+    ]);
+  });
+
+  it("lists certificates on * but scopes the certificate reads to this account", () => {
+    const list = githubActionsPulumiPreview.Statement.find((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
+        "acm:ListCertificates"
+      )
+    );
+    assert.ok(list);
+    // ListCertificates does not accept a resource, so this one cannot narrow.
+    assert.equal(list.Resource, "*");
+
+    const read = githubActionsPulumiPreview.Statement.find((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
+        "acm:DescribeCertificate"
+      )
+    );
+    assert.ok(read);
+    assert.deepEqual(read.Action, [
+      "acm:DescribeCertificate",
+      "acm:GetCertificate",
+      "acm:ListTagsForCertificate",
+    ]);
     assert.equal(
-      describe.Resource,
-      "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????"
+      read.Resource,
+      "arn:aws:acm:us-west-2:333022194791:certificate/*"
     );
   });
 });

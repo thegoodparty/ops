@@ -14,6 +14,7 @@ import { createToolApi, type CorrelationMerge } from "./index";
 import jwt from "jsonwebtoken";
 
 import { mintAgentToken, verifyAgentToken } from "./token";
+import { THREAD_PROSE_CHARS } from "../slack/format";
 
 const SECRET = "test-secret-not-a-real-one";
 
@@ -46,7 +47,27 @@ let posts: { threadTs: string | null; text: string }[];
 let merges: CorrelationMerge[];
 let evidenceRows: Evidence[];
 
+/**
+ * The Slack surface a merge or a split needs beyond posting. `openThreads`
+ * stands in for the relay's sweep: every open incident without a thread gets
+ * one, which is what makes a freshly split incident linkable.
+ */
+const linking = {
+  permalink: async (messageTs: string) =>
+    `https://goodparty.slack.com/archives/C09/p${messageTs.replaceAll(".", "")}`,
+  openThreads: async () => {
+    await db.withWrite((w) => {
+      w.prepare(
+        `UPDATE incident SET slackThreadTs = 'thread-' || id
+          WHERE slackThreadTs IS NULL
+            AND status IN ('INVESTIGATING', 'FIXING', 'RESOLVED')`,
+      ).run();
+    });
+  },
+};
+
 const slack = {
+  ...linking,
   post: async (threadTs: string | null, text: string) => {
     posts.push({ threadTs, text });
     return { ts: `ts-${posts.length}` };
@@ -150,6 +171,18 @@ const incidentRow = (id: string) =>
     mergedInto: string | null;
     resolvedEvidence: string | null;
   }>("SELECT * FROM incident WHERE id = ?", [id]);
+
+/** What the relay does when it opens an incident's thread. */
+const withThread = (id: string) =>
+  db.withWrite((w) => {
+    w.prepare("UPDATE incident SET slackThreadTs = ? WHERE id = ?").run(
+      `thread-${id}`,
+      id,
+    );
+  });
+
+const postsIn = (incidentId: string): string[] =>
+  posts.filter((p) => p.threadTs === `thread-${incidentId}`).map((p) => p.text);
 
 const signalsOn = (incidentId: string): string[] =>
   db
@@ -492,6 +525,66 @@ describe("invariant 1: every attached signal must be explained", () => {
   });
 });
 
+describe("resolution evidence answers to the thread budget", () => {
+  // The refusal matters more than the cap does. This evidence is posted into
+  // the thread, so it is bounded like every other post -- but the check runs
+  // ahead of the write, and a threshold that drifted the wrong way would stop
+  // an agent resolving anything at all while every test about resolving
+  // still passed. So both sides of the boundary are pinned here.
+  it("refuses evidence past the budget, leaving the incident resolvable", async () => {
+    await seed("sig-long-ev");
+    const id = await openIncident(["sig-long-ev"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "bad deploy",
+      explainedSignalIds: ["sig-long-ev"],
+    });
+
+    const before = posts.length;
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "x".repeat(THREAD_PROSE_CHARS + 1),
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /evidence is \d+ characters/);
+    assert.match(res.error ?? "", /post-mortem/);
+    assert.equal(posts.length, before, "refused ahead of the post");
+    // The transition must not have happened, or the agent is stuck holding a
+    // FIXING incident it has already been told it cannot resolve.
+    const row = incidentRow(id);
+    assert.equal(row?.status, "FIXING");
+    assert.equal(row?.resolvedAt, null);
+
+    // And the refusal is recoverable: shortening it resolves.
+    const retry = await tools.reportResolved({
+      prUrls: [],
+      evidence: "the alert went quiet and stayed quiet for an hour",
+    });
+    assert.equal(retry.ok, true, retry.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+  });
+
+  it("accepts evidence exactly at the budget", async () => {
+    // The off-by-one that would refuse a resolution somebody trimmed to fit.
+    await seed("sig-edge-ev");
+    const id = await openIncident(["sig-edge-ev"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "bad deploy",
+      explainedSignalIds: ["sig-edge-ev"],
+    });
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "x".repeat(THREAD_PROSE_CHARS),
+    });
+
+    assert.equal(res.ok, true, res.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+  });
+});
+
 describe("invariant 2: resolution closes the signals it claims to have fixed", () => {
   // The tool API used to split any signal without a resolve notification out
   // into a recurrence. That asked whether we had heard the alert stop, not
@@ -722,6 +815,88 @@ describe("directives", () => {
 });
 
 describe("hand off", () => {
+  it("posts the brief as mrkdwn, with what it quotes made safe", async () => {
+    await seed("sig-fmt");
+    const id = await openIncident(["sig-fmt"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-fmt"] });
+
+    await tools.handOff({
+      reason: "deadline",
+      brief: [
+        "## What I believe now",
+        "- **the cookie** is dropped, see [the run](https://ci.test/7)",
+        "- the log says `parse failed near <Set-Cookie>`",
+      ].join("\n"),
+    });
+
+    const text = posts.at(-1)?.text ?? "";
+    assert.ok(text.includes("*What I believe now*"), text);
+    assert.ok(text.includes("• *the cookie* is dropped"), text);
+    assert.ok(text.includes("<https://ci.test/7|the run>"), text);
+    // The quoted log line is the attacker-writable part. Unescaped, its `<`
+    // swallows the rest of the brief and Slack still answers 200.
+    assert.ok(text.includes("`parse failed near &lt;Set-Cookie&gt;`"), text);
+    assert.doesNotMatch(text, /\*\*/);
+  });
+
+  it("splits a brief that escaping pushes past one message, keeping its tail", async () => {
+    await seed("sig-long");
+    const id = await openIncident(["sig-long"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-long"] });
+
+    // Inside the thread budget as written; conversion multiplies it past what
+    // one message holds. A split for that reason is not the model writing too
+    // much, so it still goes out whole.
+    const brief = Array.from(
+      { length: 34 },
+      (_, i) => `- ruled out ${i} ${"&".repeat(18)}`,
+    ).join("\n");
+    assert.ok(brief.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
+
+    const before = posts.length;
+    await tools.handOff({ reason: "deadline", brief });
+
+    const sent = posts.slice(before);
+    assert.ok(sent.length > 1, `expected a split, got ${sent.length}`);
+    assert.ok(
+      sent.map((p) => p.text).join("").includes("ruled out 33"),
+      "the tail is not dropped",
+    );
+  });
+
+  it("refuses a brief past the thread budget instead of handing off anyway", async () => {
+    await seed("sig-budget");
+    const id = await openIncident(["sig-budget"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "auth change",
+      explainedSignalIds: ["sig-budget"],
+    });
+
+    const before = posts.length;
+    const res = await tools.handOff({
+      reason: "deadline",
+      brief: Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n"),
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /brief is \d+ characters/);
+    assert.match(res.error ?? "", /post-mortem/);
+    assert.equal(posts.length, before, "refused ahead of the post");
+    // The refusal has to leave the incident retryable: an escalation the
+    // model was told to rewrite is useless if the incident already stopped
+    // being its problem.
+    const row = db.get<{ owner: string; status: string }>(
+      "SELECT owner, status FROM incident WHERE id = ?",
+      [id],
+    );
+    assert.ok(row);
+    assert.equal(row.owner, "agent");
+    assert.equal(row.status, "FIXING");
+  });
+
   it("is terminal for the agent and leaves the incident open", async () => {
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
@@ -768,6 +943,7 @@ describe("hand off", () => {
       tokenSecret: SECRET,
       correlator,
       slack: {
+        ...linking,
         post: async () => {
           throw new Error("slack is down");
         },
@@ -826,6 +1002,7 @@ describe("hand off", () => {
       tokenSecret: SECRET,
       correlator,
       slack: {
+        ...linking,
         // The TOCTOU window is exactly this await: the status read happens
         // before the post, the write after it.
         post: async (threadTs: string | null, text: string) => {
@@ -1092,5 +1269,563 @@ describe("agent tokens expire", () => {
   it("accepts a live one", () => {
     const live = mintAgentToken(SECRET, { incidentId: "42", attempt: 1 }, 3600);
     assert.equal(verifyAgentToken(SECRET, live).incidentId, "42");
+  });
+});
+
+describe("a merge is told to both threads", () => {
+  it("names the other incident in each thread, and links to it", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await withThread(a);
+    await withThread(b);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+
+    const res = await toolsFor(b).reportRootCause({
+      cause: "pool exhaustion",
+      explainedSignalIds: ["sig-b"],
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const absorbing = postsIn(a);
+    const absorbed = postsIn(b);
+    assert.equal(absorbing.length, 1, "the thread everyone keeps reading");
+    assert.equal(absorbed.length, 1, "and the one that is about to go quiet");
+
+    // Order, not just presence. The absorbed thread is never written to again,
+    // so if a crash between the two posts lands only one, it has to be that
+    // one -- the alternative is a surviving thread announcing that a thread is
+    // closing while that thread says nothing and simply stops.
+    assert.ok(
+      posts.findIndex((post) => post.threadTs === `thread-${b}`) <
+        posts.findIndex((post) => post.threadTs === `thread-${a}`),
+      "the absorbed thread is closed out before the surviving one is told",
+    );
+
+    assert.match(absorbing[0], new RegExp(`Incident ${b} is the same problem`));
+    assert.match(absorbing[0], /one pool, two alerts/, "and why we believe that");
+    assert.match(
+      absorbing[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${b}\\|incident ${b}'s thread>`,
+      ),
+      "a reader who has never used this has to be able to go and look",
+    );
+    assert.match(absorbing[0], /updates for both incidents arrive here/);
+
+    assert.match(absorbed[0], new RegExp(`same problem as incident ${a}`));
+    assert.match(
+      absorbed[0],
+      /last message in this thread/,
+      "a thread that simply stops is indistinguishable from the Boss having died",
+    );
+    assert.match(
+      absorbed[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${a}\\|incident ${a}'s thread>`,
+      ),
+    );
+  });
+
+  it("keeps the merge when the thread cannot be posted to", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await withThread(a);
+    await withThread(b);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+    const tools = createToolApi({
+      db,
+      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
+      tokenSecret: SECRET,
+      correlator,
+      slack: {
+        ...linking,
+        post: async () => {
+          throw new Error("slack is down");
+        },
+      },
+      evidence,
+    });
+
+    let res: Awaited<ReturnType<ToolApi["reportRootCause"]>> | undefined;
+    const alarms = await alarmsDuring(async () => {
+      res = await tools.reportRootCause({
+        cause: "pool exhaustion",
+        explainedSignalIds: ["sig-b"],
+      });
+    });
+
+    assert.equal(res?.ok, true, "the merge is the durable fact; the post is a notice");
+    assert.equal(incidentRow(b)?.status, "MERGED");
+    assert.equal(incidentRow(b)?.mergedInto, a);
+    assert.deepEqual(signalsOn(a), ["sig-a", "sig-b"]);
+    assert.ok(
+      alarms.some((line) => line.includes('"thread_post_failed"')),
+      "but nobody was told, and that is not something to swallow",
+    );
+  });
+
+  it("closes out the absorbed thread even when the surviving one refuses the post", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await withThread(a);
+    await withThread(b);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+    const tools = createToolApi({
+      db,
+      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
+      tokenSecret: SECRET,
+      correlator,
+      // Only the surviving thread is down. The absorbed one is the half that
+      // never gets another chance, so it cannot be the one that loses.
+      slack: {
+        ...slack,
+        post: async (threadTs: string | null, text: string) => {
+          if (threadTs === `thread-${a}`) throw new Error("slack is down");
+          return slack.post(threadTs, text);
+        },
+      },
+      evidence,
+    });
+
+    const alarms = await alarmsDuring(async () => {
+      const res = await tools.reportRootCause({
+        cause: "pool exhaustion",
+        explainedSignalIds: ["sig-b"],
+      });
+      assert.equal(res.ok, true, res.error);
+    });
+
+    assert.equal(postsIn(b).length, 1, "the thread about to go quiet was told");
+    assert.match(postsIn(b)[0], /last message in this thread/);
+    assert.ok(alarms.some((line) => line.includes('"thread_post_failed"')));
+  });
+
+  it("says so when the absorbed incident has no thread to close out", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await withThread(a);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+
+    const alarms = await alarmsDuring(async () => {
+      const res = await toolsFor(b).reportRootCause({
+        cause: "pool exhaustion",
+        explainedSignalIds: ["sig-b"],
+      });
+      assert.equal(res.ok, true, res.error);
+    });
+
+    assert.equal(postsIn(a).length, 1, "the surviving thread is still told");
+    assert.match(postsIn(a)[0], new RegExp(`incident ${b}'s thread`));
+    assert.ok(
+      alarms.some((line) => line.includes('"absorbed_thread_missing"')),
+      "an incident that reached a merge without a thread is a broken link",
+    );
+  });
+
+  it("still says what happened when the permalink call fails", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await withThread(a);
+    await withThread(b);
+    merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
+    const tools = createToolApi({
+      db,
+      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
+      tokenSecret: SECRET,
+      correlator,
+      slack: {
+        ...slack,
+        permalink: async () => {
+          throw new Error("chat.getPermalink: ratelimited");
+        },
+      },
+      evidence,
+    });
+
+    const alarms = await alarmsDuring(async () => {
+      const res = await tools.reportRootCause({
+        cause: "pool exhaustion",
+        explainedSignalIds: ["sig-b"],
+      });
+      assert.equal(res.ok, true, res.error);
+    });
+
+    assert.equal(postsIn(a).length, 1);
+    assert.equal(postsIn(b).length, 1);
+    assert.doesNotMatch(postsIn(b)[0], /<http/, "there is no link to give");
+    assert.match(
+      postsIn(b)[0],
+      new RegExp(`incident ${a}'s thread`),
+      "so the sentence names it instead of losing it",
+    );
+    assert.ok(alarms.some((line) => line.includes('"permalink_failed"')));
+  });
+});
+
+describe("a split is told to both threads", () => {
+  it("points the old thread at the new incident and the new one back", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a", "sig-b"]);
+    await withThread(id);
+
+    const res = await toolsFor(id).reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const born = (res.data as { splitInto: string[] }).splitInto;
+    assert.equal(born.length, 1);
+
+    const source = postsIn(id);
+    assert.equal(source.length, 1);
+    assert.match(source[0], /1 signal left this incident/);
+    assert.match(
+      source[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${born[0]}\\|incident ${born[0]}>`,
+      ),
+      "naming an incident nobody can find is the same gap as saying nothing",
+    );
+
+    const fresh = postsIn(born[0]);
+    assert.equal(fresh.length, 1, "a thread that opens with no origin reads as nowhere");
+    assert.match(fresh[0], new RegExp(`split out of incident ${id}`));
+    assert.match(
+      fresh[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${id}\\|its own thread>`,
+      ),
+    );
+  });
+
+  it("uses the thread openThreads had to open for the incident being split", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a", "sig-b"]);
+
+    const res = await toolsFor(id).reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const born = (res.data as { splitInto: string[] }).splitInto;
+    assert.equal(
+      postsIn(id).length,
+      1,
+      "the incident got its thread here, so the announcement belongs in it and not at the top level",
+    );
+    assert.match(
+      postsIn(born[0])[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${id}\\|its own thread>`,
+      ),
+      "and the back-link points at it rather than coming out blank",
+    );
+  });
+
+  it("tells both threads when a resolution sheds a signal its root cause never explained", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a"]);
+    await withThread(id);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+    // Triage attaches across FIXING, which is how an incident acquires a
+    // signal its root cause was never asked about.
+    await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: id, reason: "looked like the same thing" },
+      { kind: "boss" },
+    );
+    posts.length = 0;
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "quiet for an hour",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const born = (res.data as { splitInto: string[] }).splitInto;
+    assert.equal(born.length, 1);
+    assert.match(postsIn(id)[0], /1 signal left this incident/);
+    assert.match(
+      postsIn(id)[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${born[0]}\\|incident ${born[0]}>`,
+      ),
+    );
+    assert.equal(
+      postsIn(born[0]).length,
+      1,
+      "an incident that appears at the moment another one resolves needs its own origin",
+    );
+    assert.match(postsIn(born[0])[0], new RegExp(`split out of incident ${id}`));
+    assert.match(
+      postsIn(born[0])[0],
+      new RegExp(
+        `<https://goodparty\\.slack\\.com/archives/C09/pthread-${id}\\|its own thread>`,
+      ),
+    );
+  });
+
+  it("posts the resolution into the thread the split had to open", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({
+      cause: "the Pro webhook wrote to the wrong column",
+      explainedSignalIds: ["sig-a"],
+    });
+    await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: id, reason: "looked like the same thing" },
+      { kind: "boss" },
+    );
+    posts.length = 0;
+
+    const res = await tools.reportResolved({
+      prUrls: [],
+      evidence: "quiet for an hour",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    assert.equal(
+      posts.filter((p) => p.threadTs === null).length,
+      0,
+      "a message at the top of the channel is one nothing groups with the incident",
+    );
+    assert.equal(postsIn(id).length, 2, "the split notice and the resolution");
+    assert.match(postsIn(id)[1], new RegExp(`Incident ${id} resolved`));
+  });
+
+  it("says so when the split incident never got a thread", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const id = await openIncident(["sig-a", "sig-b"]);
+    await withThread(id);
+    const tools = createToolApi({
+      db,
+      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
+      tokenSecret: SECRET,
+      correlator,
+      slack: {
+        ...slack,
+        openThreads: async () => {
+          throw new Error("slack is down");
+        },
+      },
+      evidence,
+    });
+
+    const alarms = await alarmsDuring(async () => {
+      const res = await tools.reportRootCause({
+        cause: "the Pro webhook wrote to the wrong column",
+        explainedSignalIds: ["sig-a"],
+      });
+      assert.equal(res.ok, true, res.error);
+    });
+
+    assert.equal(postsIn(id).length, 1, "the thread that lost the signals is still told");
+    assert.ok(alarms.some((line) => line.includes('"split_threads_unopened"')));
+    assert.ok(alarms.some((line) => line.includes('"split_thread_missing"')));
+  });
+});
+
+describe("a recurrence closes on a second question", () => {
+  /** An incident already closed, and a live one that reopens its ground. */
+  const recurrencePair = async () => {
+    await seed("sig-old");
+    const first = await openIncident(["sig-old"]);
+    const firstTools = toolsFor(first);
+    await firstTools.reportRootCause({
+      cause: "the connection pool was sized for the old traffic shape",
+      explainedSignalIds: ["sig-old"],
+    });
+    await firstTools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
+      evidence: "zero matching lines for 90 minutes after the deploy",
+    });
+    await firstTools.reportAnalysis({
+      postmortem: "## Summary\nthe pool was too small",
+      usersImpacted: 3,
+      impactQuery: "q",
+    });
+
+    await seed("sig-new");
+    const second = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-new"], target: "NEW", reason: "it is back" },
+        { kind: "boss" },
+        { recurrenceOf: first },
+      )
+    ).target;
+    const secondTools = toolsFor(second);
+    await secondTools.reportRootCause({
+      cause: "the pool is still too small on the write path",
+      explainedSignalIds: ["sig-new"],
+    });
+    return { first, second, tools: secondTools };
+  };
+
+  it("refuses to close without an answer to why the last resolution failed", async () => {
+    const { first, second, tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nsized the pool again",
+      usersImpacted: 4,
+      impactQuery: "q",
+    });
+
+    assert.equal(closed.ok, false);
+    assert.match(String(closed.error), new RegExp(`recurrence of ${first}`));
+    assert.equal(
+      incidentRow(second)?.status,
+      "RESOLVED",
+      "an unexplained recurrence stays open; hand_off is the other exit",
+    );
+  });
+
+  it("refuses an answer too short to be one", async () => {
+    const { tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nagain",
+      usersImpacted: 4,
+      impactQuery: "q",
+      recurrence: {
+        category: "previous_fix_incomplete",
+        why: "too small",
+        remedy: "fixed it",
+      },
+    });
+
+    assert.equal(closed.ok, false);
+    assert.match(String(closed.error), /recurrence\.why is too short/);
+  });
+
+  it("closes with one, and stores it", async () => {
+    const { second, tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nsized the pool on both paths",
+      usersImpacted: 4,
+      impactQuery: "q",
+      recurrence: {
+        category: "previous_fix_incomplete",
+        why: "the earlier fix sized the read pool only, and the write path has its own",
+        remedy: "sized both pools and added an assertion that they are configured together",
+      },
+    });
+
+    assert.equal(closed.ok, true, closed.error);
+    const stored = db.get<{ recurrenceAnalysis: string | null }>(
+      "SELECT recurrenceAnalysis FROM incident WHERE id = ?",
+      [second],
+    );
+    assert.equal(
+      JSON.parse(String(stored?.recurrenceAnalysis)).category,
+      "previous_fix_incomplete",
+    );
+    assert.ok(
+      posts.some((p) => p.text.includes("Why it recurred")),
+      "the answer reaches the thread, not only a column",
+    );
+  });
+
+  it("says plainly when the fix belongs in BugBoss, which agents cannot open PRs against", async () => {
+    const { tools } = await recurrencePair();
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "the write path is quiet through two full refresh cycles",
+    });
+
+    await tools.reportAnalysis({
+      postmortem: "## Summary\nsized the pool",
+      usersImpacted: 4,
+      impactQuery: "q",
+      recurrence: {
+        category: "bugboss_defect",
+        why: "triage attached the second firing to the resolved incident, so nobody re-investigated",
+        remedy: "proposed tightening the attach guard in triage/triage.ts and raised it in the thread",
+      },
+    });
+
+    const post = posts.find((p) => p.text.includes("BugBoss let this recur"));
+    assert.ok(post, "a defect in the system itself must not end in a closed column");
+    assert.match(post!.text, /needs a person/);
+  });
+
+  it("refuses the resolution evidence the last one was closed on", async () => {
+    const { tools } = await recurrencePair();
+
+    const resolved = await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/2"],
+      evidence: "zero matching lines for 90 minutes after the deploy",
+    });
+
+    assert.equal(resolved.ok, false);
+    assert.match(String(resolved.error), /did not hold/);
+  });
+
+  it("leaves an ordinary incident alone", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "a cause", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
+      evidence: "quiet for an hour",
+    });
+
+    const closed = await tools.reportAnalysis({
+      postmortem: "## Summary\nfine",
+      usersImpacted: 1,
+      impactQuery: "q",
+    });
+
+    assert.equal(closed.ok, true, closed.error);
+  });
+
+  it("makes a closed incident searchable without waiting for a restart", async () => {
+    const { first, tools } = await recurrencePair();
+    const hits = await tools.searchIncidents({
+      text: "connection pool sized for old traffic",
+    });
+
+    assert.equal(hits.ok, true, hits.error);
+    assert.ok(
+      (hits.data ?? []).some((hit) => hit.incidentId === first),
+      "the index is written in the same transaction as the close",
+    );
   });
 });

@@ -63,20 +63,39 @@ describe("githubActionsPulumiDeployTrust", () => {
     );
   });
 
-  // Exact equality, not inclusion: these eight assume the role on
-  // pull_request and must stay, but a ninth added to this near-admin role's
-  // trust should fail the test rather than pass silently.
-  it("leaves exactly the other eight repositories wildcarded", () => {
+  // Exact equality, not inclusion: these three are the live repositories that
+  // still assume the role, and a fourth added to an administrator role's
+  // trust should fail the test rather than pass silently. The list only ever
+  // shrinks from here; docs/deploy-role-trust.md is the plan for emptying it.
+  it("leaves exactly the three live repositories wildcarded", () => {
     assert.deepEqual(wildcardSubjects(), [
-      "repo:thegoodparty/gp-api:*",
-      "repo:thegoodparty/people-api:*",
-      "repo:thegoodparty/election-api:*",
       "repo:thegoodparty/gp-terraform-dataplatform:*",
-      "repo:thegoodparty/campaign-plan-service:*",
       "repo:thegoodparty/gpvpn:*",
-      "repo:thegoodparty/runbooks:*",
       "repo:thegoodparty/omni:*",
     ]);
+  });
+
+  // The five removed in step 2 are archived, so they cannot run a workflow at
+  // all. Named individually so re-adding one is a deliberate act.
+  it("drops the archived repositories entirely", () => {
+    const archived = [
+      "gp-api",
+      "people-api",
+      "election-api",
+      "runbooks",
+      "campaign-plan-service",
+    ];
+    for (const repo of archived) {
+      assert.equal(
+        subjectConditions().some((c) =>
+          (Array.isArray(c.value) ? c.value : [c.value]).some((s) =>
+            s.startsWith(`repo:thegoodparty/${repo}:`)
+          )
+        ),
+        false,
+        `${repo} is archived and must not be trusted`
+      );
+    }
   });
 
   it("requires the sts audience on every statement", () => {

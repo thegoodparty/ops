@@ -22,10 +22,12 @@ const REVIEW_REPOS = new Set([
   "gp-terraform-dataplatform",
   "candidate-sites",
   "gp-marketing",
-  // ops: review scope only (not in WRITE_REPOS). Bot approvals here are a
-  // signal, not a merge gate: .github/CODEOWNERS covers the whole repo and
-  // the ruleset requires code-owner review, which the reviewer App cannot
-  // satisfy.
+  // ops: review scope only (not in WRITE_REPOS), but an approval here can
+  // merge. .github/CODEOWNERS no longer covers the whole repo -- it lists the
+  // permission-defining and reviewer-defining trees, and a PR touching none of
+  // them satisfies the code-owner requirement vacuously, so the bot's approval
+  // is the one approval the ruleset asks for. On a listed path the App still
+  // cannot satisfy code-owner review, and a human must approve.
   "ops",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);

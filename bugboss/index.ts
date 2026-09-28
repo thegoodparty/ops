@@ -22,12 +22,11 @@ import type Database from "better-sqlite3";
 import type { Hono } from "hono";
 
 import { Db } from "./db";
+import { reconcileSearchIndex } from "./db/search";
 import {
   createChildProcessSpawn,
-  createAssumeRoleCredentials,
   createDispatcher,
   pickBaseEnv,
-  type AgentCredentialProvider,
   type Dispatcher,
   type SpawnAgent,
   type TickResult,
@@ -35,9 +34,12 @@ import {
 import {
   createIngress,
   createLokiQuery,
+  humanSignal,
+  HUMAN_SOURCE,
   SLUG_LABEL,
   type GrafanaVerifier,
   type LokiQuery,
+  type HumanReport,
   type IngressRegistry,
   type SlackConfig,
   type SlackVerifier,
@@ -52,18 +54,39 @@ import {
   type BugBossServers,
   type HttpConfig,
 } from "./http";
-import { SlackAgent, type ObjectStore, type SlackAgentModel, type SlackClient } from "./slack/agent";
+import { parseWorkingHours } from "./agent/tools";
+import {
+  SLACK_AGENT_BUDGET_MS,
+  SlackAgent,
+  type ObjectStore,
+  type SlackAgentModel,
+  type SlackClient,
+} from "./slack/agent";
+import { createSlackAck } from "./slack/ack";
+import type { ChoicePoster, SlackChoiceClick } from "./slack/blocks";
+import { mrkdwn, raw, userMention } from "./slack/format";
 import {
   createRotationReader,
   createS3ObjectStore,
   createSlackClient,
+  createSlackFileUploader,
+  type SlackLinker,
 } from "./slack/client";
 import {
   SlackRelay,
+  mentionPrefix,
+  stripBotMention,
+  type ChoiceRoute,
   type InboundRoute,
-  type OwnershipClaim,
   type SlackEvent,
 } from "./slack/relay";
+import {
+  readMentionIntent,
+  readReplyIntent,
+  type Addressed,
+  type IntentDeps,
+  type OwnershipClaim,
+} from "./slack/intent";
 import {
   applyAssign,
   AssignError,
@@ -72,9 +95,25 @@ import {
   type AssignResult,
   type Correlator,
   type EvidenceStore,
+  type ThreadPoster,
 } from "./toolapi";
+import {
+  publishIncidentReport,
+  publishPendingReports,
+  type FileUploader,
+  type PrStateReader,
+  type ReportDeps,
+} from "./report";
+import {
+  TEST_DB_ENV_VAR,
+  TEST_DB_READY_DEADLINE_MS,
+  awaitTestDatabase,
+  resolveTestDatabase,
+} from "./testdb";
 import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
 import { attachedSignalIds } from "./triage/sql";
+import { sessionKeyFor, sumSessionUsage } from "./agent/session";
+import { createInstallationToken, createPrStateReader } from "./github";
 import { makeAlarm, makeLog } from "./logging";
 import type {
   BugBossConfig,
@@ -86,6 +125,7 @@ import type {
   RawSignal,
   Signal,
   SignalAdapter,
+  TestDatabase,
   ToolApi,
   TriageDecision,
 } from "./types";
@@ -124,9 +164,12 @@ const TRIAGE_CONCURRENCY = 5;
  * `sessions/<id>.jsonl`, but the Slack agent's read_agent_session tool and
  * the S3 lifecycle rule both read `sessions/incident/<id>/`, so the launch
  * below passes this explicitly.
+ *
+ * The agent's own copy, rather than a second literal: the Boss reads this
+ * key back to sum the run's tokens, so a drift between the two would show up
+ * as a free incident and nothing else.
  */
-export const incidentSessionKey = (incidentId: string): string =>
-  `sessions/incident/${incidentId}/session.jsonl`;
+export const incidentSessionKey = sessionKeyFor;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -154,9 +197,8 @@ export interface BugBossSecrets {
   githubAppId?: string;
   githubAppPrivateKey?: string;
   githubAppInstallationId?: string;
-  /** STS role the parent assumes for each child. Chunk 9 creates it. */
-  agentRoleArn?: string;
   triageModelId?: string;
+  intentModelId?: string;
   agentModelId?: string;
   awsRegion?: string;
 }
@@ -176,14 +218,32 @@ export interface CreateBugBossOptions {
   loki?: LokiQuery;
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
   model: ModelClient;
-  slack: SlackClient;
-  /** What a launch means. Defaults to a scrubbed child process. */
+  /**
+   * Reads what an inbound Slack message means. Defaults to `model`, because
+   * this is the same shape of bounded call triage makes and the prompt is a
+   * few hundred tokens; a smaller model belongs here the moment one is
+   * subscribed, which is what BUGBOSS_INTENT_MODEL_ID is for.
+   */
+  intentModel?: ModelClient;
+  slack: BossSlackClient;
+  /** What a launch means. Defaults to a child process. */
   spawnAgent?: SpawnAgent;
   /** Omitted means no S3: state stays in memory and dies with the process. */
   s3?: S3Client;
-  credentials?: AgentCredentialProvider;
   /** Overrides the default harness the Slack agent runs on. */
   slackAgentModel?: SlackAgentModel;
+  /**
+   * Uploads the closing report into an incident thread. Absent means the
+   * report is posted as text instead, which is the fallback and not a
+   * failure: a workspace where `files:write` was never granted still gets
+   * every word of it.
+   */
+  fileUploader?: FileUploader;
+  /**
+   * Looks up what became of the PRs an agent opened, for the closing report.
+   * Absent leaves every PR rendered as "state not known".
+   */
+  prStates?: PrStateReader;
   secrets?: BugBossSecrets;
   http?: HttpConfig;
   /**
@@ -234,6 +294,12 @@ export interface AcceptedSlackEvent {
   settled: Promise<void>;
 }
 
+/** A button press: recorded inside the ack, acknowledged in the thread after. */
+export interface AcceptedSlackInteraction {
+  routed: ChoiceRoute["kind"];
+  settled: Promise<void>;
+}
+
 export interface BugBoss {
   readonly db: Db;
   readonly dispatcher: Dispatcher;
@@ -254,6 +320,10 @@ export interface BugBoss {
   slackEvent(event: SlackEvent): Promise<void>;
   /** Relay now, answer after. What the webhook route calls. */
   slackEventAccepted(event: SlackEvent): Promise<AcceptedSlackEvent>;
+  /** Record a verified button press, then say so in the thread. */
+  slackInteractionAccepted(
+    click: SlackChoiceClick,
+  ): Promise<AcceptedSlackInteraction>;
   /** One dispatcher tick, waited out. Agents normally outlive a tick. */
   dispatchOnce(): Promise<TickResult>;
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
@@ -261,6 +331,8 @@ export interface BugBoss {
   sweepOrphans(): Promise<number>;
   /** Open a Slack thread for any incident still without one. */
   ensureIncidentThreads(): Promise<number>;
+  /** Post the closing report for any incident that closed without one. */
+  sweepReports(): Promise<number>;
   start(): void;
   stop(): void;
 }
@@ -458,7 +530,30 @@ export const createBedrockModelClient = (
   };
 };
 
-const SLACK_AGENT_BUDGET_MS = 120_000;
+/**
+ * Sent when the turn budget runs out with tool calls still outstanding.
+ * Everything the run read is still in the transcript, and throwing it away to
+ * post an apology is a silent failure wearing a message: the person waited,
+ * the work was paid for, and they learn nothing. So one more call, with no
+ * tools, turns what it already has into an answer that names its own gaps.
+ *
+ * It rides on the system prompt rather than as a final user turn, because the
+ * transcript at that point ends in tool results -- which are a user message --
+ * and a second one behind them is a shape nothing here needs to produce.
+ */
+const WRAP_UP_SYSTEM = [
+  "You have used your whole turn budget. This is your last message and you cannot call another tool.",
+  "Answer the question now from what you have already read. Say what you found, and say plainly which part of the question you did not reach.",
+  "Do not apologise and do not offer to keep looking.",
+].join(" ");
+
+/**
+ * Reached only when the wrap-up produced nothing either. It says what
+ * happened and what to do next, because somebody is waiting on this and
+ * "sorry" tells them neither.
+ */
+const NO_ANSWER_REPLY =
+  "I could not get to an answer for that one and I have nothing partial worth posting. What I did is in the BugBoss logs. Ask me again, or narrow the question.";
 
 /**
  * The Slack agent's harness, built on the same ModelClient everything else
@@ -495,6 +590,7 @@ export const createSlackAgentModel = (
     }));
 
     let answer = "";
+    let exhausted = false;
     for (let turn = 0; turn < req.maxTurns; turn++) {
       const reply = await model.complete({
         system: req.system,
@@ -522,12 +618,58 @@ export const createSlackAgentModel = (
             : `Unknown tool ${call.name}.`,
         });
       }
+      exhausted = turn === req.maxTurns - 1;
+    }
+
+    // Loud, because a question that needed more turns than it was given is
+    // how somebody gets a partial answer, and the budget is the thing to
+    // change. The tool results from the last turn are already on the
+    // transcript, so the wrap-up reads them before it writes.
+    if (exhausted) {
+      alarm("slack_agent_turns_exhausted", {
+        sessionKey: req.sessionKey,
+        turns: req.maxTurns,
+      });
+      try {
+        const wrapUp = await model.complete({
+          system: `${req.system}\n\n${WRAP_UP_SYSTEM}`,
+          messages: [...messages],
+          tools: [],
+          maxTokens: 4096,
+          signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
+        });
+        messages.push({
+          role: "assistant",
+          text: wrapUp.text,
+          toolCalls: wrapUp.toolCalls,
+        });
+        if (wrapUp.text) answer = wrapUp.text;
+      } catch (err) {
+        alarm("slack_agent_wrap_up_failed", {
+          sessionKey: req.sessionKey,
+          error: String(err),
+        });
+      }
+    }
+
+    const text = answer || NO_ANSWER_REPLY;
+    if (!answer) alarm("slack_agent_no_answer", { sessionKey: req.sessionKey });
+
+    // The transcript has to end on the assistant, because that is how the
+    // conversation ended: whatever is returned here is posted in the thread.
+    // A resume loads this and pushes the next question straight behind it, so
+    // a transcript left ending in tool results -- which a failed or skipped
+    // wrap-up does -- puts two user turns together and the next mention
+    // cannot load at all. That break surfaces hours later in another process
+    // with nothing pointing back at the run that caused it, so it is closed
+    // by construction rather than on the one branch that was noticed.
+    const last = messages[messages.length - 1];
+    if (last?.role !== "assistant") {
+      messages.push({ role: "assistant", text, toolCalls: [] });
     }
 
     await store.put(key, JSON.stringify(messages));
-    return {
-      text: answer || "I ran out of turns before I had an answer for that.",
-    };
+    return { text };
   },
 });
 
@@ -553,9 +695,21 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
   return Promise.race([work, expiry]).finally(() => clearTimeout(timer));
 };
 
-export const withSlackDeadline = (slack: SlackClient): SlackClient => ({
+/**
+ * Everything the Boss needs from Slack: posts, buttons, thread reads, and the
+ * permalink a merged or split incident links the other thread by.
+ */
+export type BossSlackClient = SlackClient & ChoicePoster & SlackLinker;
+
+export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
   post: (threadTs, text, channel) =>
     withDeadline(slack.post(threadTs, text, channel), "chat.postMessage"),
+  react: (channel, ts, name) =>
+    withDeadline(slack.react(channel, ts, name), "reactions.add"),
+  postChoice: (threadTs, text, blocks) =>
+    withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
+  permalink: (messageTs, channel) =>
+    withDeadline(slack.permalink(messageTs, channel), "chat.getPermalink"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
 });
 
@@ -595,6 +749,26 @@ export const createBugBoss = async (
   });
   const store = createS3ObjectStore(config.s3Bucket, s3);
 
+  // The search index is derived state, so it is rebuilt from the incidents
+  // rather than migrated. That is what makes a corpus older than the table
+  // searchable at all -- schema.sql runs over a restored snapshot, so the
+  // first boot after this ships finds an empty index and a full history --
+  // and it repairs anything a transition failed to write, which keeps the
+  // per-transition index a fast path rather than a single point of loss.
+  try {
+    const { indexed } = await reconcileSearchIndex(db);
+    if (indexed > 0) log("search_index_backfilled", { indexed });
+  } catch (err) {
+    // Not fatal: every other job still works, and the next boot tries again.
+    // Loud, though, because the visible symptom is a search that quietly
+    // finds nothing, which reads exactly like a problem that has never
+    // happened before.
+    alarm("search_index_backfill_failed", {
+      error: String(err),
+      note: "recurrence search may miss incidents closed before this boot",
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Ingress
   // -------------------------------------------------------------------------
@@ -615,7 +789,6 @@ export const createBugBoss = async (
       verifier: options.insecureTestVerifiers?.grafana,
       loki: options.loki,
     },
-    slack: slackIngress,
   });
 
   // -------------------------------------------------------------------------
@@ -670,9 +843,17 @@ export const createBugBoss = async (
     },
   });
 
-  const mention = secrets.slackRotationGroupId
-    ? `<!subteam^${secrets.slackRotationGroupId}>`
-    : "<!here>";
+  /**
+   * Reads what an inbound message means, for every interface a person talks
+   * to. One bounded call per message, off the Slack ack, on the same model
+   * seam triage uses -- a few hundred tokens in and a label out, so the bill
+   * is set by how much people type rather than by how many alerts fire.
+   */
+  const intent: IntentDeps = { model: options.intentModel ?? options.model };
+
+  // The relay's, so the two pings are spelled one way and carry the same
+  // trailing space.
+  const mention = mentionPrefix(secrets.slackRotationGroupId ?? null);
 
   /**
    * A thread belongs to an incident, not to the ingest that happened to open
@@ -804,26 +985,30 @@ export const createBugBoss = async (
   const mintToken = (incidentId: string) =>
     mintAgentToken(tokenSecret, { incidentId, attempt: 0 }, tokenTtlSeconds);
 
+  /**
+   * Slack as the tool API needs it. Opening a thread is the relay's job and
+   * the tool API cannot reach the relay, but a split creates incidents that
+   * have to be pointed at and posted into before anyone can follow them, so
+   * the capability is handed over rather than the relay.
+   */
+  const threads: ThreadPoster = {
+    post: (threadTs, text) => slack.post(threadTs, text),
+    permalink: (messageTs) => slack.permalink(messageTs),
+    openThreads: ensureIncidentThreads,
+  };
+
   const toolApiFor = (incidentId: string, token?: string): ToolApi => {
     const api = createToolApi({
       db,
       token: token ?? mintToken(incidentId),
       tokenSecret,
       correlator,
-      slack,
+      slack: threads,
       evidence,
     });
 
     return {
       ...api,
-      // Where a split happens. The incidents it creates are real incidents
-      // with agents of their own, so they need threads before those agents
-      // start posting into the channel.
-      reportRootCause: async (args) => {
-        const response = await api.reportRootCause(args);
-        await ensureIncidentThreads();
-        return response;
-      },
       // The only transition that has to reach the rotation. The tool API
       // posts the brief itself; this adds the ping, which is the one thing it
       // cannot know to do.
@@ -836,7 +1021,7 @@ export const createBugBoss = async (
                 "SELECT slackThreadTs FROM incident WHERE id = ?",
                 [incidentId],
               )?.slackThreadTs ?? null,
-              `${mention} Incident ${incidentId} needs a human: ${args.reason}`,
+              mrkdwn`${raw(mention)}*Incident ${incidentId} needs a human* · ${args.reason}`,
             )
             .catch((err: unknown) =>
               alarm("escalation_ping_failed", {
@@ -1034,6 +1219,9 @@ export const createBugBoss = async (
       action: decision.action,
       created: result.created,
       recurrenceOf: outcome.recurrenceOf,
+      // A null recurrenceOf with recurrenceChecked false is "we could not
+      // look", which is not the same fact as "nothing matched".
+      recurrenceChecked: outcome.recurrenceChecked,
       fellBack: outcome.fellBack,
     });
 
@@ -1045,22 +1233,10 @@ export const createBugBoss = async (
     };
   };
 
-  const ingestAccepted = async (
-    source: string,
-    req: IncomingRequest,
+  const acceptSignals = async (
+    signals: RawSignal[],
+    adapter: SignalAdapter,
   ): Promise<AcceptedIngest> => {
-    const adapter = ingress.get(source);
-
-    // Fails closed: nothing downstream ever sees an unverified body, and the
-    // HTTP layer answers 401 rather than 500 so a misconfigured contact point
-    // is distinguishable from a broken Boss.
-    let signals: RawSignal[];
-    try {
-      signals = await adapter.parse(req);
-    } catch (err) {
-      throw new IngestRejected((err as Error).message);
-    }
-
     // Durable before the caller answers 200, so a redelivery of the same
     // burst collapses onto these rows instead of triaging it a second time.
     // A row that cannot be written has to reach the source as a failure, or
@@ -1128,6 +1304,35 @@ export const createBugBoss = async (
 
     return { recorded: recorded.length, settled };
   };
+
+  const ingestAccepted = async (
+    source: string,
+    req: IncomingRequest,
+  ): Promise<AcceptedIngest> => {
+    const adapter = ingress.get(source);
+
+    // Fails closed: nothing downstream ever sees an unverified body, and the
+    // HTTP layer answers 401 rather than 500 so a misconfigured contact point
+    // is distinguishable from a broken Boss.
+    let signals: RawSignal[];
+    try {
+      signals = await adapter.parse(req);
+    } catch (err) {
+      throw new IngestRejected((err as Error).message);
+    }
+
+    return acceptSignals(signals, adapter);
+  };
+
+  /**
+   * A mention somebody meant as a report. It has no ingress channel of its
+   * own: what makes it a report is a model call rather than anything the
+   * webhook body says, so the signal is built here and placed through the
+   * human adapter, which is also what Signal.source already points the orphan
+   * sweep at.
+   */
+  const reportAccepted = (report: HumanReport): Promise<AcceptedIngest> =>
+    acceptSignals([humanSignal(report)], ingress.get(HUMAN_SOURCE));
 
   const ingest = async (
     source: string,
@@ -1210,27 +1415,6 @@ export const createBugBoss = async (
   // Dispatch
   // -------------------------------------------------------------------------
 
-  const credentials: AgentCredentialProvider =
-    options.credentials ??
-    (secrets.agentRoleArn
-      ? createAssumeRoleCredentials({
-          roleArn: secrets.agentRoleArn,
-          // No durationSeconds override: the default is the one hour that role
-          // chaining allows. A task role is itself an assumed role, so this
-          // AssumeRole is a chained one, and AWS caps those at an hour and
-          // REJECTS a longer request rather than clamping it. The role's
-          // maxSessionDuration is not the limit here and asking for it fails
-          // every launch. An incident still outlives the session because the
-          // child re-reads these from the loopback API before they expire.
-        })
-      : async (incidentId) => {
-          alarm("no_agent_role", {
-            incidentId,
-            note: "no agentRoleArn configured; the child gets no AWS access",
-          });
-          return { accessKeyId: "", secretAccessKey: "", sessionToken: "" };
-        });
-
   const childSpawn =
     options.spawnAgent ??
     createChildProcessSpawn({
@@ -1266,7 +1450,14 @@ export const createBugBoss = async (
       // file rather than from anything the agent reports: a killed agent
       // never gets to report, and the file is on disk either way. So the
       // numbers survive exactly the runs you most want them for.
-      void rollUpUsage(ctx.incidentId, sessionRef);
+      //
+      // The closing report follows the roll-up rather than running beside
+      // it, because the tokens it quotes are the ones roll-up just wrote.
+      // It is a no-op unless this launch was the one that closed the
+      // incident.
+      void rollUpUsage(ctx.incidentId, sessionRef).then(() =>
+        publishReport(ctx.incidentId),
+      );
     });
   };
 
@@ -1284,40 +1475,36 @@ export const createBugBoss = async (
   ): Promise<void> => {
     try {
       const raw = await store.get(sessionRef);
-      if (!raw) return;
-      let tokensIn = 0;
-      let tokensOut = 0;
-      let cacheRead = 0;
-      let cacheWrite = 0;
-      let modelId: string | null = null;
-      for (const line of raw.split("\n")) {
-        if (!line.trim()) continue;
-        let entry: {
-          usage?: {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-          };
-          model?: string;
-          modelId?: string;
-        };
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          // A session file is appended a line at a time, so a torn last line
-          // is normal after a kill. Everything before it is still good.
-          continue;
-        }
-        if (entry.usage) {
-          tokensIn += entry.usage.input ?? 0;
-          tokensOut += entry.usage.output ?? 0;
-          cacheRead += entry.usage.cacheRead ?? 0;
-          cacheWrite += entry.usage.cacheWrite ?? 0;
-        }
-        modelId = entry.modelId ?? entry.model ?? modelId;
+      if (!raw) {
+        // The child is spawned before its first turn syncs, so a crash at
+        // boot legitimately leaves no session. Say so rather than writing a
+        // zero that reads as a free run.
+        log("usage_roll_up_skipped", { incidentId, sessionRef, reason: "no session file" });
+        return;
       }
-      if (tokensIn + tokensOut + cacheRead + cacheWrite === 0 && !modelId) {
+      const usage = sumSessionUsage(raw);
+      const total = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+      if (total === 0) {
+        // A zero is never written, whatever produced it. The columns already
+        // default to zero, and on a resume the row may hold real tokens an
+        // earlier launch stored -- whose session object ages out under the
+        // lifecycle rule, so overwriting it loses the only copy.
+        if (usage.turns > 0) {
+          // A turn that reached the model always spends tokens, so this is not
+          // a cheap run: it is a reader that no longer matches what Pi writes.
+          alarm("usage_missing", {
+            incidentId,
+            sessionRef,
+            turns: usage.turns,
+            modelId: usage.modelId,
+          });
+        } else {
+          log("usage_roll_up_skipped", {
+            incidentId,
+            sessionRef,
+            reason: "session holds no turns",
+          });
+        }
         return;
       }
       await db.withWrite((w: Database.Database) => {
@@ -1326,15 +1513,23 @@ export const createBugBoss = async (
              SET tokensIn = ?, tokensOut = ?, cacheRead = ?, cacheWrite = ?,
                  modelId = COALESCE(?, modelId)
            WHERE id = ?`,
-        ).run(tokensIn, tokensOut, cacheRead, cacheWrite, modelId, incidentId);
+        ).run(
+          usage.tokensIn,
+          usage.tokensOut,
+          usage.cacheRead,
+          usage.cacheWrite,
+          usage.modelId,
+          incidentId,
+        );
       });
       log("usage_rolled_up", {
         incidentId,
-        tokensIn,
-        tokensOut,
-        cacheRead,
-        cacheWrite,
-        modelId,
+        tokensIn: usage.tokensIn,
+        tokensOut: usage.tokensOut,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite,
+        turns: usage.turns,
+        modelId: usage.modelId,
       });
     } catch (err: unknown) {
       // Never fatal. Losing a cost number is not worth failing a run over.
@@ -1342,13 +1537,38 @@ export const createBugBoss = async (
     }
   };
 
+  // -------------------------------------------------------------------------
+  // The closing report
+  // -------------------------------------------------------------------------
+
+  const reportDeps: ReportDeps = {
+    db,
+    sessions: store,
+    post: (threadTs, text) => slack.post(threadTs, text),
+    channel: config.slackChannelId,
+    uploader: options.fileUploader,
+    prStates: options.prStates,
+    now,
+  };
+
+  /**
+   * After the agent exits and after its usage is on the row, because the
+   * report quotes both. Never awaited by the dispatcher and never able to
+   * fail a launch: the transition it reports on committed long ago.
+   */
+  const publishReport = (incidentId: string): Promise<unknown> =>
+    publishIncidentReport(reportDeps, incidentId).catch((err: unknown) =>
+      alarm("report_publish_failed", { incidentId, error: String(err) }),
+    );
+
+  const sweepReports = (): Promise<number> => publishPendingReports(reportDeps);
+
   const dispatcher = createDispatcher({
     db,
     config: config.dispatcher,
     spawn,
     toolApiFor,
     mintToken,
-    credentials,
     childBaseEnv: {
       ...pickBaseEnv(process.env),
       AWS_REGION: secrets.awsRegion ?? process.env.AWS_REGION,
@@ -1357,7 +1577,17 @@ export const createBugBoss = async (
         options.http?.loopbackPort ?? DEFAULT_LOOPBACK_PORT
       }`,
       BUGBOSS_S3_BUCKET: config.s3Bucket,
+      // Only when it resolved. A refused URL is withheld deliberately: with
+      // this unset omni's harness goes back to starting its own container and
+      // says so, which is a better answer for fifteen agents than whatever a
+      // bad URL named.
+      ...(config.testDatabase.state === "configured"
+        ? { [TEST_DB_ENV_VAR]: config.testDatabase.url }
+        : {}),
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
+      ...(config.workingHours
+        ? { BUGBOSS_WORKING_HOURS: config.workingHours }
+        : {}),
       ...(secrets.grafanaUrl ? { GRAFANA_URL: secrets.grafanaUrl } : {}),
     },
     childCredentials: {
@@ -1466,8 +1696,8 @@ export const createBugBoss = async (
       // message, so silence is indistinguishable from the bot not reading it.
       await say(
         claim === "take_over"
-          ? `<@${slackUserId}> this one is already owned by a human.`
-          : `<@${slackUserId}> nothing to hand back: an agent already has this.`,
+          ? mrkdwn`${raw(userMention(slackUserId))} this one is already owned by a human.`
+          : mrkdwn`${raw(userMention(slackUserId))} nothing to hand back: an agent already has this.`,
       );
       return;
     }
@@ -1492,8 +1722,227 @@ export const createBugBoss = async (
     log("ownership_claimed", { incidentId, claim, slackUserId });
     await say(
       claim === "take_over"
-        ? `<@${slackUserId}> has this one. The agent is writing up what it found and will stop.`
-        : `Back to an agent, handed over by <@${slackUserId}>. It will pick this up within a tick.`,
+        ? mrkdwn`${raw(userMention(slackUserId))} has this one. The agent is writing up what it found and will stop.`
+        : mrkdwn`Back to an agent, handed over by ${raw(userMention(slackUserId))}. It will pick this up within a tick.`,
+    );
+  };
+
+  /**
+   * The one thing that reaches a running agent from Slack. `contact_human`
+   * waits on directives alone and nothing else reads `thread_reply` on an
+   * agent's behalf, so a message that never becomes one is a message the
+   * agent does not have -- which is why this happens whatever the read said,
+   * and only `addressed` varies.
+   *
+   * The relay recorded the reply inside the request and this runs after it,
+   * so a task replaced in that window leaves the message on the record with
+   * no directive: the agent waits out its timeout and escalates to a person,
+   * which is visible. The alternative is labelling a message before knowing
+   * what it is.
+   */
+  const pushHumanMessage = async (
+    route: Extract<InboundRoute, { kind: "incident_reply" }>,
+    addressed: "agent" | "others",
+  ): Promise<void> => {
+    await db.withWrite((w: Database.Database) => {
+      w.prepare(
+        `INSERT INTO pending_directive (incidentId, payload, createdAt)
+         VALUES (?, ?, ?)`,
+      ).run(
+        route.incidentId,
+        JSON.stringify({
+          type: "human_message",
+          from: route.user,
+          text: route.text,
+          ts: route.ts,
+          addressed,
+        } satisfies Directive),
+        now(),
+      );
+    });
+  };
+
+  const sayInThread = (
+    channel: string,
+    threadTs: string,
+    text: string,
+  ): Promise<void> =>
+    slack
+      .post(threadTs, text, channel)
+      .then(() => undefined)
+      .catch((err: unknown) =>
+        alarm("intent_reply_failed", { channel, threadTs, error: String(err) }),
+      );
+
+  /**
+   * Something a person said in an incident's thread. The relay has recorded
+   * it; this decides what it meant, off the Slack ack.
+   *
+   * Two questions, one model call. Does it hand the incident over, and was it
+   * for the agent at all -- because `contact_human` ends its wait on the
+   * first reply it sees, and two people talking to each other while an agent
+   * is blocked used to end that wait on whichever of them spoke first. The
+   * answer to that is not syntax: answering a direct question should not need
+   * ceremony, so the message is read rather than required to carry a tag.
+   *
+   * Three rules sit in code, on top of what the model says, for the same
+   * reason `applyRules` does in triage:
+   *
+   *   - An explicit @bugboss always means "this is for you". That is the
+   *     escape hatch for somebody who wants certainty, and because it is
+   *     decided here rather than by the model it keeps working while the
+   *     model is down.
+   *   - A handover is aimed at the system by definition, so it is delivered
+   *     as well as acted on.
+   *   - Nothing is ever dropped. A message that could not be read is still
+   *     delivered as context; what it loses is the right to end a wait.
+   *
+   * And the incident comes from the thread the message arrived in, never from
+   * the message, so no wording -- including wording pasted out of a log line
+   * -- reaches a different incident.
+   */
+  const answerIncidentMessage = async (
+    route: Extract<InboundRoute, { kind: "incident_reply" }>,
+  ): Promise<void> => {
+    const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
+    const outstanding =
+      db.get<{ message: string }>(
+        "SELECT message FROM pending_question WHERE incidentId = ?",
+        [route.incidentId],
+      )?.message ?? null;
+
+    const read = await readReplyIntent(intent, {
+      text: said,
+      owner: route.owner,
+      outstandingQuestion: outstanding,
+    });
+
+    const handingOver: OwnershipClaim | null =
+      read.handover === "take_over" || read.handover === "hand_back"
+        ? read.handover
+        : null;
+    const addressed: Addressed =
+      route.interrupt || handingOver ? "agent" : read.addressed;
+
+    // Delivered before anything else, so the agent has what was said whatever
+    // the rest of this decides. `others` and `unclear` ride through as
+    // context; only `agent` can end a wait.
+    await pushHumanMessage(route, addressed === "agent" ? "agent" : "others");
+
+    log("reply_read", {
+      incidentId: route.incidentId,
+      handover: read.handover,
+      addressed,
+      modelAddressed: read.addressed,
+      tagged: route.interrupt,
+      blocked: outstanding !== null,
+      fellBack: read.fellBack,
+    });
+
+    if (handingOver) {
+      await claimOwnership(route.incidentId, handingOver, route.user);
+      return;
+    }
+
+    // Everything the read could not settle, in one post. These used to be two
+    // branches with a return each, so a message that was ambiguous both ways
+    // -- which is the common shape of an unreadable message -- was told about
+    // the handover and never told its answer had not been delivered as one.
+    const unsureHandover = read.handover === "unclear";
+    // Only worth saying while something is blocked on it. With no outstanding
+    // question there is no wait to end, the directive is context either way,
+    // and narrating that is noise about nothing.
+    const unsureAddressee = addressed === "unclear" && outstanding !== null;
+
+    if (unsureHandover || unsureAddressee) {
+      await sayInThread(
+        route.channel,
+        route.threadTs,
+        [
+          read.fellBack
+            ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way.`
+            : mrkdwn`${raw(userMention(route.user))} I could not tell how to take that one. The agent has it as context either way.`,
+          ...(unsureHandover
+            ? [
+                "If you meant you are taking this incident over, or handing it back to an agent, say so plainly and I will move it.",
+              ]
+            : []),
+          ...(unsureAddressee
+            ? [
+                "And if it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
+              ]
+            : []),
+        ].join("\n"),
+      );
+    }
+
+    // Independent of the above, not an else. Somebody who tags @bugboss in a
+    // thread with no agent on it has asked a question, and an ambiguous
+    // handover is a footnote to that rather than a reason to leave them
+    // without an answer. A real handover returned above, so the read-only
+    // agent still never fields a claim -- its answer to one would be to tell
+    // you to reply in the thread, which is what you just did.
+    if (route.interrupt && !route.agentRunning) {
+      await slackAgent.handle({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        ts: route.ts,
+        user: route.user,
+        text: route.text,
+      });
+    }
+  };
+
+  /**
+   * An @bugboss mention outside any incident thread: somebody reporting
+   * something broken, or somebody asking a question. This used to turn on
+   * whether the first word was "report", "bug" or "broken", which is a magic
+   * phrase nobody can discover -- "@bugboss Pro upgrades are failing" was
+   * answered as a question and opened nothing.
+   */
+  const answerMention = async (
+    route: Extract<InboundRoute, { kind: "slack_agent" }>,
+  ): Promise<void> => {
+    const ask = () =>
+      slackAgent.handle({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        ts: route.ts,
+        user: route.user,
+        text: route.text,
+      });
+
+    const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
+    // A bare @bugboss is somebody about to type. There is no sentence to
+    // read, and a report built from it would open an incident with an empty
+    // body, so it goes to the agent that can ask what they want.
+    if (!said) return ask();
+
+    const read = await readMentionIntent(intent, { text: said });
+
+    if (read.intent === "bug_report") {
+      const accepted = await reportAccepted({
+        text: said,
+        // The verified Slack identity, never a field the body carried.
+        reportedBy: route.user,
+        channel: route.channel,
+        threadTs: route.threadTs === route.ts ? null : route.threadTs,
+        messageTs: route.ts,
+        reportedAt: now(),
+      });
+      await accepted.settled;
+      return;
+    }
+
+    if (read.intent === "question") return ask();
+
+    log("mention_unclear", { user: route.user, ts: route.ts, fellBack: read.fellBack });
+    await sayInThread(
+      route.channel,
+      route.threadTs,
+      read.fellBack
+        ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. Try me again.`
+        : mrkdwn`${raw(userMention(route.user))} I could not tell whether that is something broken you want me to put an agent on, or a question. Which is it?`,
     );
   };
 
@@ -1502,32 +1951,65 @@ export const createBugBoss = async (
   ): Promise<AcceptedSlackEvent> => {
     // The relay's writes are idempotent on (channel, ts) and bounded, so they
     // stay inside the request: recording the reply is what a Slack retry is
-    // supposed to collapse onto. The agent is a two-minute model run against
-    // a three-second ack, so it cannot.
+    // supposed to collapse onto. Reading what the message meant is a model
+    // call and answering it is a two-minute agent, against a three-second
+    // ack, so both run past the response.
     const route = await relay.handle(event);
-    if (route.kind === "ownership_claim") {
-      return {
-        routed: route.kind,
-        settled: claimOwnership(route.incidentId, route.claim, route.slackUserId),
-      };
+    if (route.kind === "incident_reply") {
+      return { routed: route.kind, settled: answerIncidentMessage(route) };
     }
     if (route.kind !== "slack_agent") {
       return { routed: route.kind, settled: Promise.resolve() };
     }
-    return {
-      routed: route.kind,
-      settled: slackAgent.handle({
-        channel: route.channel,
-        threadTs: route.threadTs,
-        ts: route.ts,
-        user: route.user,
-        text: route.text,
-      }),
-    };
+    return { routed: route.kind, settled: answerMention(route) };
   };
 
   const slackEvent = async (event: SlackEvent): Promise<void> => {
     await (await slackEventAccepted(event)).settled;
+  };
+
+  /**
+   * A button press, once the relay has decided what it was.
+   *
+   * The thread is the incident's record, so every press leaves a line in it —
+   * including the two that changed nothing. A button that silently does
+   * nothing is indistinguishable from a broken one, and the person who
+   * pressed it would reasonably go on waiting for an agent that never heard
+   * them. Each line ends by pointing at the thing that always works: typing.
+   */
+  const acknowledgeChoice = async (
+    route: ChoiceRoute,
+    click: SlackChoiceClick,
+  ): Promise<void> => {
+    if (route.kind === "ignore") {
+      log("choice_ignored", { reason: route.reason, user: click.user });
+      return;
+    }
+    const who = raw(userMention(route.slackUserId));
+    const text =
+      route.kind === "answered"
+        ? mrkdwn`${who} chose *${route.choice}*.`
+        : route.kind === "duplicate"
+          ? mrkdwn`${who} that question already has an answer. Reply in the thread to add anything else.`
+          : mrkdwn`${who} that question is closed and the agent has moved on. Reply in the thread and it will read you.`;
+    await slack
+      .post(click.threadTs, text, click.channel)
+      .then(() => undefined)
+      .catch((err: unknown) =>
+        alarm("choice_post_failed", {
+          incidentId: route.incidentId,
+          error: String(err),
+        }),
+      );
+  };
+
+  const slackInteractionAccepted = async (
+    click: SlackChoiceClick,
+  ): Promise<AcceptedSlackInteraction> => {
+    // The write is bounded and idempotent on the question's ts, so it stays
+    // inside the three seconds Slack gives an interaction. The post does not.
+    const route = await relay.handleChoice(click);
+    return { routed: route.kind, settled: acknowledgeChoice(route, click) };
   };
 
   // -------------------------------------------------------------------------
@@ -1537,6 +2019,11 @@ export const createBugBoss = async (
   const publicApp = createPublicApp({
     ingestAccepted,
     slackEventAccepted,
+    // Bound to the deadline-wrapped client, so a reactions.add that never
+    // answers alarms on the same ten-second budget every other Slack call
+    // has rather than sitting as a detached promise forever.
+    acknowledgeSlack: createSlackAck(slack),
+    slackInteractionAccepted,
     slackConfig: slackIngress,
   });
   const loopbackApp = createToolApiRoutes({
@@ -1544,10 +2031,6 @@ export const createBugBoss = async (
     tokenSecret,
     toolApiFor,
     slack,
-    // The child re-reads these on a timer. A role tops out at a twelve-hour
-    // session and an incident can run for a day, so credentials assumed once
-    // at launch expire mid-run.
-    credentials,
     now,
   });
 
@@ -1568,9 +2051,14 @@ export const createBugBoss = async (
     // signal and every threadless incident on disk is real rather than young.
     background("startup_sweep", sweepOrphans);
     background("startup_threads", ensureIncidentThreads);
+    background("startup_reports", sweepReports);
     resolutionTimer = setInterval(() => {
       background("orphan_sweep", sweepOrphans);
       background("thread_sweep", ensureIncidentThreads);
+      // Nothing relaunches an agent on a CLOSED incident, so a container
+      // replaced between the close and its report is the one case where the
+      // report has no other way out.
+      background("report_sweep", sweepReports);
     }, config.dispatcher.tickSeconds * 1000);
     resolutionTimer.unref();
     log("started", { env: config.env, bucket: config.s3Bucket });
@@ -1599,9 +2087,11 @@ export const createBugBoss = async (
     ingestAccepted,
     slackEvent,
     slackEventAccepted,
+    slackInteractionAccepted,
     dispatchOnce,
     sweepOrphans,
     ensureIncidentThreads,
+    sweepReports,
     start,
     stop,
   };
@@ -1646,8 +2136,8 @@ const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
   githubAppId: env.GITHUB_APP_ID,
   githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
   githubAppInstallationId: env.GITHUB_APP_INSTALLATION_ID,
-  agentRoleArn: env.BUGBOSS_AGENT_ROLE_ARN,
   triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
+  intentModelId: env.BUGBOSS_INTENT_MODEL_ID,
   agentModelId: env.BUGBOSS_MODEL_ID,
   awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
 });
@@ -1678,7 +2168,63 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       .split(",")
       .map((slug) => slug.trim())
       .filter(Boolean),
+    // Parsed and discarded: the child re-parses the string it is handed, and
+    // this is here so a typo stops the container at boot rather than killing
+    // every agent one launch at a time.
+    ...(env.BUGBOSS_WORKING_HOURS
+      ? {
+          workingHours: (() => {
+            parseWorkingHours(env.BUGBOSS_WORKING_HOURS);
+            return env.BUGBOSS_WORKING_HOURS;
+          })(),
+        }
+      : {}),
+    testDatabase: resolveTestDatabase(env),
   };
+};
+
+/**
+ * Say, once at boot, whether agents can run omni's database-backed tests.
+ *
+ * The prompt cannot carry this. A thinking block is bound to the system
+ * prompt, so a section that read "the database is up" on the first launch and
+ * something else after a restart would invalidate every block that followed
+ * it. The prompt therefore states the contract and this states the fact, and
+ * the failure an agent actually meets is the one omni's harness reports by
+ * name at the moment a suite runs.
+ *
+ * Never fatal, and there is no container dependency in the task definition
+ * either. An incident system that refuses to start because a test database is
+ * missing is worse than one that works alerts without a local test loop.
+ */
+export const reportTestDatabase = async (
+  testDatabase: TestDatabase,
+  deadlineMs = TEST_DB_READY_DEADLINE_MS,
+): Promise<void> => {
+  if (testDatabase.state === "absent") {
+    log("test_database_absent", { variable: TEST_DB_ENV_VAR });
+    return;
+  }
+  if (testDatabase.state === "refused") {
+    alarm("test_database_refused", { reason: testDatabase.reason });
+    return;
+  }
+
+  // Waits out initdb rather than reading a cold start as a failure. Both
+  // containers start together and Postgres binds TCP last, so a single probe
+  // here would alarm on every deploy.
+  const { host, port } = testDatabase;
+  const probe = await awaitTestDatabase({ host, port }, deadlineMs);
+  if (probe.reachable) {
+    log("test_database_ready", { host, port, waitedMs: probe.waitedMs });
+    return;
+  }
+  alarm("test_database_unreachable", {
+    host,
+    port,
+    waitedMs: probe.waitedMs,
+    error: probe.error,
+  });
 };
 
 /**
@@ -1692,6 +2238,12 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
   const secrets = readSecrets(env);
   const config = bossConfigFromEnv(env);
   if (!secrets.slackBotToken) throw new Error("SLACK_BOT_TOKEN is required");
+  // Started, not awaited. The wait above is up to ninety seconds and alert
+  // ingest is what this container exists for; a test database is never worth
+  // delaying it. Nothing downstream reads the result -- it is a log line.
+  void reportTestDatabase(config.testDatabase).catch((error: unknown) =>
+    alarm("test_database_report_failed", { error: String(error) }),
+  );
 
   return createBugBoss({
     config,
@@ -1699,7 +2251,36 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       modelId: secrets.triageModelId ?? DEFAULT_TRIAGE_MODEL_ID,
       region: secrets.awsRegion,
     }),
+    // Only when a different model is named for it. Every inbound Slack
+    // message costs one of these calls, so this is the knob that takes them
+    // off the triage model without a deploy.
+    intentModel: secrets.intentModelId
+      ? createBedrockModelClient({
+          modelId: secrets.intentModelId,
+          region: secrets.awsRegion,
+        })
+      : undefined,
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
+    // The closing report uploads as a file. Same token as every other post,
+    // but the `files:write` scope it needs is granted only when somebody
+    // reinstalls the app -- until then the upload throws and the report goes
+    // out inline, which is exactly what should happen.
+    fileUploader: createSlackFileUploader(secrets.slackBotToken),
+    // Only when the App is configured. The Boss otherwise never mints a
+    // GitHub token of its own; this is the one thing it asks GitHub for, and
+    // a report without PR states is still a report.
+    prStates:
+      secrets.githubAppId &&
+      secrets.githubAppPrivateKey &&
+      secrets.githubAppInstallationId
+        ? createPrStateReader(
+            createInstallationToken({
+              appId: secrets.githubAppId,
+              privateKey: secrets.githubAppPrivateKey,
+              installationId: secrets.githubAppInstallationId,
+            }),
+          )
+        : undefined,
     // The merged env, not process.env: Loki's credentials come from the
     // secret blob, and settingsEnv builds a new object rather than mutating
     // the process.

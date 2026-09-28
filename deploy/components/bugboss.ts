@@ -1,6 +1,8 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 
+import { TEST_DB_ENV_VAR } from "../../bugboss/testdb";
+
 const ACCOUNT_ID = "333022194791";
 const REGION = "us-west-2";
 const VPC_ID = "vpc-0763fa52c32ebcf6a";
@@ -9,13 +11,72 @@ const HOSTNAME = "bugboss.goodparty.org";
 const BUCKET_NAME = "bugboss-prod";
 const SECRET_NAME = "BUGBOSS";
 const CONTAINER_PORT = 3000;
-const AGENT_ROLE_NAME = "bugboss-agent";
 
-// Referenced, not constructed: naming the agent role here rather than reading
-// `agentRole.arn` is what keeps the two roles out of a dependency cycle, since
-// the agent role's trust policy has to name the task role and IAM rejects a
-// principal that does not exist yet. A Resource field takes no such check.
-const AGENT_ROLE_ARN = `arn:aws:iam::${ACCOUNT_ID}:role/${AGENT_ROLE_NAME}`;
+// Fargate takes container `memory` as a hard limit whose sum may not exceed
+// the task's, and container `cpu` as a relative share a container may burst
+// past while others are idle. So the CPU slice is free and the memory one is
+// not.
+//
+// The task grows by the sidecar's share rather than BugBoss giving it up.
+// Nobody has measured fifteen agents against 16 GB, and the failure if 14
+// turned out to be too little is an OOM-killed child mid-incident -- quiet,
+// and exactly the shape of failure this system exists to avoid.
+//
+// The sidecar gets 3 GB rather than 2 because of what the two limits do when
+// they are hit. Measured on this image at 203 concurrent backends: 905 MB
+// resident, so ~3.8 MB a backend above a 128 MB shared_buffers, which puts
+// the 400-connection ceiling near 1.65 GB. In 2 GB that is 20% of headroom.
+// Exhausting connections is loud and survivable -- Postgres says "too many
+// clients already" and the run fails. Exhausting memory is not: the sidecar
+// is OOM-killed, nothing restarts a non-essential container, and every agent
+// loses its test database at once. So size the memory so the connection
+// ceiling is always what gives first.
+export const TASK_CPU = 4096;
+export const TASK_MEMORY = 19456;
+export const POSTGRES_CPU = 512;
+export const POSTGRES_MEMORY = 3072;
+export const BUGBOSS_CPU = 3584;
+export const BUGBOSS_MEMORY = 16384;
+
+// Matches omni's own harness (packages/gp-api/src/test-postgres.ts) so an
+// agent gets the database that file expects. It cannot set these itself: they
+// are postmaster-context settings, fixed when the server starts, and the whole
+// point here is a server the harness did not start.
+//
+// Durability buys nothing and costs a lot: the per-test reset TRUNCATEs, whose
+// commit syncs a freshly created relation file per table, measured there at
+// ~350-400ms against ~10ms with these off. Nothing in this database outlives
+// the task.
+//
+// 300 is what omni asks for, sized for concurrent checkouts on one machine.
+// This task is fifteen of them: a run draws roughly 25 at the harness's pool
+// cap, so 400 covers the circuit breaker's worth of agents all testing at once.
+// Past it Postgres says "too many clients already", which is loud.
+const POSTGRES_SETTINGS = [
+  "-c",
+  "fsync=off",
+  "-c",
+  "synchronous_commit=off",
+  "-c",
+  "full_page_writes=off",
+  "-c",
+  "max_connections=400",
+];
+
+// Credentials the harness already expects, and the maintenance database it
+// derives every per-suite database from. All three are fixed by
+// packages/gp-api/src/test-postgres.ts; they are not secrets, because nothing
+// outside this task's network namespace can reach this port.
+const POSTGRES_USER = "test_user";
+const POSTGRES_PASSWORD = "test_password";
+const POSTGRES_DB = "postgres";
+const POSTGRES_PORT = 5432;
+
+/**
+ * Exported so the value this deploy writes is checked against the guard that
+ * reads it, rather than the two agreeing by inspection.
+ */
+export const TEST_DB_URL = `postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}`;
 
 // `Environment: infra` is a protection, not a label. The EngineerAccess SSO
 // permission set grants every engineer `Action: ["*"]` on anything tagged
@@ -316,81 +377,14 @@ export const createBugBoss = (config: BugBossConfig) => {
                 `arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/bugboss/*`,
               ],
             },
-            // Agents run as child processes in this container, so the
-            // parent assumes this one role and hands the temporary
-            // credentials down. The containment boundary is the role, not a
-            // list of environment variable names someone has to keep current.
-            {
-              Sid: "AssumeAgentRole",
-              Effect: "Allow",
-              Action: ["sts:AssumeRole"],
-              Resource: [AGENT_ROLE_ARN],
-            },
-            // The only way into the container when the Boss itself is the
-            // broken thing. The `infra` tag keeps this to administrators.
-            {
-              Sid: "BreakGlassExec",
-              Effect: "Allow",
-              Action: [
-                "ssmmessages:OpenDataChannel",
-                "ssmmessages:OpenControlChannel",
-                "ssmmessages:CreateDataChannel",
-                "ssmmessages:CreateControlChannel",
-              ],
-              Resource: ["*"],
-            },
-          ],
-        }),
-      },
-    ],
-    tags: TAGS,
-  });
-
-  // What a compromised agent gets, and the design assumes one is. Primary
-  // observability is Grafana — Loki, Tempo and Prometheus over MCP — so AWS
-  // is only for the layer beneath it: a task that never started, an OOM kill,
-  // a crash that happened before anything reached Loki. That is why there is
-  // no RDS or load balancer access here; neither is reachable that way and
-  // neither was ever needed.
-  //
-  // No S3, no Secrets Manager, no ECS or ECR write, no IAM, and no
-  // `sts:AssumeRole`, so it cannot pivot. Attribution comes free from the
-  // role session name the parent sets per incident, which CloudTrail records.
-  const agentRole = new aws.iam.Role("bugbossAgentRole", {
-    name: AGENT_ROLE_NAME,
-    description:
-      "Assumed by bugboss-task-role and handed to each incident agent child process.",
-    assumeRolePolicy: pulumi.jsonStringify({
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Effect: "Allow",
-          Action: "sts:AssumeRole",
-          Principal: { AWS: taskRole.arn },
-        },
-      ],
-    }),
-    // One hour, because that is all this role can ever issue: its only
-    // trusted principal is the task role, so every AssumeRole against it is
-    // chained, and chained sessions are capped at an hour whatever this says.
-    // A larger value here would only advertise a session nobody can get.
-    maxSessionDuration: 3600,
-    inlinePolicies: [
-      {
-        name: "inline",
-        policy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Sid: "OwnModelCalls",
-              Effect: "Allow",
-              Action: ["bedrock:InvokeModel*"],
-              Resource: [
-                "arn:aws:bedrock:*::foundation-model/*",
-                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/*`,
-                `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:application-inference-profile/*`,
-              ],
-            },
+            // Everything below this line is what an incident agent reads to
+            // investigate. Primary observability is Grafana (Loki, Tempo and
+            // Prometheus over MCP), so AWS is only for the layer beneath it:
+            // a task that never started, an OOM kill, a crash that happened
+            // before anything reached Loki. That is why there is no RDS or
+            // load balancer access here; neither is reachable that way and
+            // neither was ever needed.
+            //
             // Service events, which say why a task failed to start or was
             // replaced, come back in DescribeServices output.
             {
@@ -462,8 +456,8 @@ export const createBugBoss = (config: BugBossConfig) => {
     family: "bugboss",
     networkMode: "awsvpc",
     requiresCompatibilities: ["FARGATE"],
-    cpu: "4096",
-    memory: "16384",
+    cpu: String(TASK_CPU),
+    memory: String(TASK_MEMORY),
     executionRoleArn: executionRole.arn,
     taskRoleArn: taskRole.arn,
     runtimePlatform: {
@@ -476,21 +470,27 @@ export const createBugBoss = (config: BugBossConfig) => {
     // Investigating agents clone source only and cost a fraction of that, so
     // the ceiling is rarely approached. Everything above the free 20 GiB runs
     // about fifteen dollars a month, which is not worth trading against
-    // running out of disk halfway through an incident.
+    // running out of disk halfway through an incident. The sidecar's data
+    // directory shares this too: near-empty schemas cloned per suite, which
+    // is single-digit gigabytes even with every agent testing at once.
     ephemeralStorage: { sizeInGib: 200 },
     containerDefinitions: pulumi.jsonStringify([
       {
         name: "bugboss",
         image: config.imageUri,
-        cpu: 4096,
-        memory: 16384,
+        cpu: BUGBOSS_CPU,
+        memory: BUGBOSS_MEMORY,
         essential: true,
         portMappings: [{ containerPort: CONTAINER_PORT, protocol: "tcp" }],
         environment: [
           { name: "AWS_DEFAULT_REGION", value: REGION },
           { name: "PORT", value: String(CONTAINER_PORT) },
           { name: "BUGBOSS_BUCKET", value: bucket.bucket },
-          { name: "BUGBOSS_AGENT_ROLE_ARN", value: agentRole.arn },
+          // The sidecar below, on the task's shared network namespace. This
+          // is what an incident agent inherits so omni's test harness takes a
+          // Postgres instead of trying to start one; bugboss/testdb refuses
+          // anything but loopback here and alarms at boot if nothing answers.
+          { name: TEST_DB_ENV_VAR, value: TEST_DB_URL },
         ],
         // The whole secret as one JSON value rather than a key-per-env-var
         // map: the key list belongs to the application, and duplicating it
@@ -508,6 +508,71 @@ export const createBugBoss = (config: BugBossConfig) => {
         // Agents are child processes, so PID 1 has to reap them.
         linuxParameters: { initProcessEnabled: true },
       },
+      // Fargate has no Docker socket, so testcontainers -- which is how omni
+      // starts a database for 200 of gp-api's 576 test files -- has nothing to
+      // talk to. An agent could not run any of them, and pushed fixes whose
+      // only check was a CI round trip. Containers in one task share a network
+      // namespace, so this is reachable on loopback and needs no host, no
+      // daemon and no credential.
+      //
+      // Isolating the fifteen agents that share it is omni's job, not ours,
+      // and its harness already does it: the schema template is named for a
+      // digest of the migrations it holds, each suite clones that into its own
+      // database and drops it in afterAll, and a sweep collects clones a
+      // killed run left behind -- age-gated, so it cannot take one a live run
+      // is using. That was all built for "one container serves every checkout
+      // on the machine". This task is that machine.
+      //
+      // NOT essential. An essential container that exits stops the task, and
+      // a test database is not worth an incident system. Nothing depends on it
+      // either: BugBoss must boot and work alerts whether or not this is up.
+      // The cost of that choice is that its absence is quiet, which is why the
+      // Boss probes it at boot and alarms, and why omni's harness names
+      // OMNI_TEST_POSTGRES_URL in the failure an agent actually reads.
+      //
+      // Its data is the container's writable layer, on the task's 200 GiB of
+      // ephemeral storage, so it is gone when the task is -- and every merge
+      // to ops main replaces this task. Nothing accumulates across deploys.
+      {
+        name: "postgres",
+        image: "public.ecr.aws/docker/library/postgres:16-alpine",
+        cpu: POSTGRES_CPU,
+        memory: POSTGRES_MEMORY,
+        essential: false,
+        command: ["postgres", ...POSTGRES_SETTINGS],
+        environment: [
+          { name: "POSTGRES_USER", value: POSTGRES_USER },
+          { name: "POSTGRES_PASSWORD", value: POSTGRES_PASSWORD },
+          { name: "POSTGRES_DB", value: POSTGRES_DB },
+        ],
+        // No portMappings. The port is reachable inside the task by virtue of
+        // the shared namespace; publishing it would put a trust-nothing
+        // Postgres on the task ENI, which has a public IP.
+        //
+        // The health check changes nothing about the task, since nothing is
+        // essential here and nothing depends on it. It is here to be read:
+        // DescribeTasks reports it, and an agent already holds ecs:Describe*,
+        // so "is the test database up" has an answer that does not require
+        // inferring one from a failing suite.
+        healthCheck: {
+          command: [
+            "CMD-SHELL",
+            `pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1`,
+          ],
+          interval: 30,
+          timeout: 5,
+          retries: 3,
+          startPeriod: 60,
+        },
+        logConfiguration: {
+          logDriver: "awslogs",
+          options: {
+            "awslogs-group": logGroup.name,
+            "awslogs-region": REGION,
+            "awslogs-stream-prefix": "postgres",
+          },
+        },
+      },
     ]),
     tags: TAGS,
   });
@@ -516,7 +581,13 @@ export const createBugBoss = (config: BugBossConfig) => {
     name: "bugboss",
     cluster: cluster.arn,
     taskDefinition: taskDefinition.arn,
-    desiredCount: 1,
+    // Held at zero deliberately. BugBoss is stopped while the Loki query
+    // overage that its incident agents can contribute to is fixed, and while
+    // its own bounds on that are still in review. Scaling it down live was
+    // not enough: Pulumi holds the desired count, so every ops deploy put it
+    // back and it restarted twice before this landed. Set it to 1 when
+    // turning it back on, rather than scaling the service by hand.
+    desiredCount: 0,
     launchType: "FARGATE",
     // Stop-then-start, and this is the one invariant the whole design rests
     // on: two tasks would put two processes on the same SQLite file and the
@@ -536,7 +607,6 @@ export const createBugBoss = (config: BugBossConfig) => {
     // someone to notice.
     deploymentCircuitBreaker: { enable: true, rollback: true },
     healthCheckGracePeriodSeconds: 120,
-    enableExecuteCommand: true,
     // Default tags do not reach resources created at runtime — see
     // delegate/lambdas/dispatch.ts, which re-applies both by hand on RunTask.
     // This covers the tasks ECS launches; anything else BugBoss creates while
@@ -566,7 +636,6 @@ export const createBugBoss = (config: BugBossConfig) => {
     service,
     taskDefinition,
     taskRole,
-    agentRole,
     logGroup,
     loadBalancer,
     url: `https://${HOSTNAME}`,

@@ -25,6 +25,54 @@ pointer. It refuses only on `owner = 'human'`, not on "anything but agent" —
 a `null` owner means the row vanished mid-decision, which is a real race
 worth alarming on rather than swallowing.
 
+## Recurrence is the closed-incident half of the same question
+
+`correlate.ts` compares one incident against the **open** ones. Recurrence
+compares one signal against incidents that already claimed the problem was
+over. Same shape, opposite end of the lifecycle. It is two mechanisms, split
+on whether the answer is a fact or a judgement.
+
+**The fact.** `recurrence.ts` reads `(source, sourceId)` — the dedup key
+every adapter must produce, and the key `signal_open_source_idx` is scoped
+around, because the delivery proving a resolution was premature is the one
+most certain to collide with the signal that resolution closed. A match
+inside `RECURRENCE_WINDOW_MS` of that resolution is **conclusive** and is
+stamped in code, whether or not the model mentions it and whether or not the
+model answered at all. A fingerprint is stable for the life of the rule, so
+the window is what keeps January and June apart.
+
+**The judgement.** `search_incidents` (`db/search.ts`, exposed by `sql.ts`)
+is FTS5 over the post-mortems, root causes and resolution evidence of
+everything RESOLVED or CLOSED. It is a **tool, not a lookup done for the
+model**: a search needs a query, only something that has read the signal can
+write one, and the same reach has to be available to the incident agent,
+which is looking for a third incident nobody pointed it at.
+
+There is deliberately **no `alert_slug` key**. It looks like a cheap
+widening and is not one — it is an optional label, one rule covers many
+instances, and it is structurally blind to the case worth catching: the same
+cause returning through a *different* alert. Nothing keyed on the alert can
+see that. The search can.
+
+What the search misses that a person would not: different vocabulary for the
+same mechanism. "Connection pool exhausted" and "too many clients already"
+share no stem, and porter stemming does not bridge synonyms. That is the gap
+embeddings would close and the reason not to reach for them yet — a wrong
+answer here can be explained by reading the query, which is worth more than
+recall at this corpus size.
+
+`toMatchQuery` is not decoration. FTS5 reads `:` as a column filter, `*` as a
+prefix and an unbalanced quote as a syntax error, so raw model text **throws**
+rather than searching. Every surviving term is quoted, which leaves no
+operator reachable from the input. A quoted term is a phrase rather than a
+literal — it is tokenized like the corpus, so an identifier such as
+`connection_pool` matches that spelling and `connection pool` both. See
+`db/CLAUDE.md`.
+
+The result is a **new incident carrying `recurrenceOf`**, never a reopen.
+`resolvedAt` and `closedAt` are the numbers a recurrence falsifies, and two
+`CHECK` constraints mean a reopen can only clear them.
+
 ## A dead model must not look like a healthy one
 
 Both fallbacks (`triage.ts`, `correlate.ts`) alarm and carry a **rate**, not

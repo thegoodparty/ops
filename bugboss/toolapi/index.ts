@@ -20,12 +20,16 @@
 import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
+import { indexIncident, searchIncidents } from "../db/search";
 import type {
   Directive,
   Evidence,
   Incident,
   IncidentStatus,
+  IncidentMatch,
   IncidentView,
+  PriorIncident,
+  RecurrenceAnalysis,
   Signal,
   ToolApi,
   ToolResponse,
@@ -42,6 +46,16 @@ import {
   type SignalRow,
 } from "./assign";
 import { verifyAgentToken } from "./token";
+import {
+  bullets,
+  escape,
+  link,
+  mrkdwn,
+  overThreadBudget,
+  raw,
+  splitForSlack,
+  toMrkdwn,
+} from "../slack/format";
 import { makeAlarm, makeLog } from "../logging";
 
 export * from "./assign";
@@ -83,6 +97,22 @@ export interface Correlator {
 /** Job 5. The Boss posts status transitions; the agent posts its own work. */
 export interface ThreadPoster {
   post(threadTs: string | null, text: string): Promise<{ ts: string }>;
+  /**
+   * A link to one message, which is the only way a thread can point at
+   * another one. Slack builds it from the workspace domain, so it is an API
+   * call and not string concatenation.
+   */
+  permalink(messageTs: string): Promise<string>;
+  /**
+   * Open a Slack thread for every open incident that has none yet.
+   *
+   * A split creates incidents inside the same transaction as the transition,
+   * and their threads are opened afterwards by the relay. Without this the
+   * message telling the new incident where it came from would have nowhere
+   * to go and the one telling the old incident where its signals went would
+   * have nothing to link to.
+   */
+  openThreads(): Promise<unknown>;
 }
 
 /** Pre-fetched evidence, which lives in S3 rather than on the incident row. */
@@ -112,6 +142,42 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   const readIncident = (id: string): Incident | undefined => {
     const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [id]);
     return row ? rowToIncident(row) : undefined;
+  };
+
+  /**
+   * The post-mortem is the whole point of carrying this, and it is the one
+   * field with no bound on it. getIncident renders as JSON followed by the
+   * pending directives, and the agent's truncation keeps a head and a tail --
+   * so an unbounded post-mortem eats the middle of the incident rather than
+   * itself. Clipped here, where the size is known, instead.
+   */
+  const MAX_PRIOR_POSTMORTEM_CHARS = 6000;
+
+  const readPriorIncident = (id: string | null): PriorIncident | null => {
+    if (!id) return null;
+    const prior = readIncident(id);
+    // A dangling pointer is a real fault: recurrenceOf is a foreign key, so
+    // the row cannot simply be missing. Never a silent null.
+    if (!prior) {
+      alarm("prior_incident_missing", {
+        recurrenceOf: id,
+        note: "the incident this one recurs from cannot be read, so the agent starts without the post-mortem that explains it",
+      });
+      return null;
+    }
+    return {
+      id: prior.id,
+      status: prior.status,
+      rootCause: prior.rootCause,
+      prUrls: prior.prUrls,
+      resolvedEvidence: prior.resolvedEvidence,
+      postmortem:
+        prior.postmortem && prior.postmortem.length > MAX_PRIOR_POSTMORTEM_CHARS
+          ? `${prior.postmortem.slice(0, MAX_PRIOR_POSTMORTEM_CHARS)}...[truncated; the full text is in the incident database]`
+          : prior.postmortem,
+      resolvedAt: prior.resolvedAt,
+      closedAt: prior.closedAt,
+    };
   };
 
   const readSignals = (id: string): Signal[] =>
@@ -198,9 +264,28 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     }
   };
 
+  /**
+   * Everything the Boss says in an incident thread goes through here, so this
+   * is where mrkdwn and the length ceiling are enforced. A hand-off brief or a
+   * root cause is model prose that can run past what one message holds, and
+   * chat.postMessage truncates rather than refusing, so it is split into
+   * consecutive messages instead of being cut mid sentence.
+   */
   const notify = async (incident: Incident, text: string): Promise<boolean> => {
+    // The thread is looked up here rather than taken from the row the caller
+    // is holding. Every transition reads its incident before it writes, and a
+    // thread can be opened in between -- openThreads does exactly that during
+    // a split. A stale null posts at the top of the channel, where nothing
+    // groups it with the incident and Slack still answers ok.
+    const threadTs =
+      db.get<{ slackThreadTs: string | null }>(
+        "SELECT slackThreadTs FROM incident WHERE id = ?",
+        [incident.id],
+      )?.slackThreadTs ?? incident.slackThreadTs;
     try {
-      await slack.post(incident.slackThreadTs, text);
+      for (const part of splitForSlack(text)) {
+        await slack.post(threadTs, part);
+      }
       return true;
     } catch (err) {
       alarm("thread_post_failed", {
@@ -208,6 +293,162 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         error: String(err),
       });
       return false;
+    }
+  };
+
+  /**
+   * A reference to another incident's thread, as mrkdwn. Both branches are
+   * escaped already, so interpolate it with raw().
+   *
+   * Losing the link is not losing the message: a thread nobody can find is
+   * what this is here to fix, so a permalink that fails says so and the
+   * sentence still reads.
+   */
+  const threadRef = async (
+    incident: Incident | undefined,
+    label: string,
+  ): Promise<string> => {
+    if (!incident?.slackThreadTs) return escape(label);
+    try {
+      return link(await slack.permalink(incident.slackThreadTs), label);
+    } catch (err) {
+      alarm("permalink_failed", { incidentId: incident.id, error: String(err) });
+      return escape(label);
+    }
+  };
+
+  /**
+   * Both sides of a merge, written for somebody who has never used this
+   * system and is reading one of these threads at 2am.
+   *
+   * The absorbed incident's thread is the half that cannot be skipped. After
+   * this it is never written to again, and a thread that simply goes quiet
+   * forever is indistinguishable from the Boss having died -- which is what
+   * the reader is left to guess when the only message goes to the other
+   * thread.
+   *
+   * The merge is already committed and durable by the time this runs, so a
+   * post that fails alarms inside notify and the rest still goes out. A
+   * notification is not worth rolling a re-partition back for.
+   */
+  const announceMerge = async (result: AssignResult): Promise<void> => {
+    const into = readIncident(result.target);
+    if (!into) {
+      alarm("merge_target_gone", {
+        target: result.target,
+        merged: result.merged,
+      });
+      return;
+    }
+
+    for (const absorbedId of result.merged) {
+      const absorbed = readIncident(absorbedId);
+      const why = toMrkdwn(result.reason);
+      // Both links before either post. Each falls back on its own, and
+      // resolving them up front is what lets the order below be the only
+      // thing deciding which message survives a Slack failure.
+      const absorbedRef = await threadRef(
+        absorbed,
+        `incident ${absorbedId}'s thread`,
+      );
+      const intoRef = await threadRef(
+        into,
+        `incident ${result.target}'s thread`,
+      );
+
+      // The absorbed thread goes first. It is the one that is never written
+      // to again, so if only one of these two lands it has to be that one:
+      // the alternative is a surviving thread announcing that a thread is
+      // closing while that thread says nothing and simply stops.
+      if (absorbed?.slackThreadTs) {
+        await notify(
+          absorbed,
+          [
+            mrkdwn`*This incident is the same problem as incident ${result.target}, so the two have been merged*`,
+            why,
+            mrkdwn`_This is the last message in this thread · everything from here, including the fix and the post-mortem, is in ${raw(intoRef)}._`,
+          ].join("\n"),
+        );
+      } else {
+        // Nobody is left reading a thread that was never opened, so this is
+        // not a lost message so much as evidence of one that was: an
+        // incident reached a merge without the thread every incident gets.
+        alarm("absorbed_thread_missing", {
+          incidentId: absorbedId,
+          into: result.target,
+        });
+      }
+
+      await notify(
+        into,
+        [
+          mrkdwn`*Incident ${absorbedId} is the same problem as this one, so the two have been merged*`,
+          why,
+          mrkdwn`_Nothing further will be posted in ${raw(absorbedRef)} · updates for both incidents arrive here from now on._`,
+        ].join("\n"),
+      );
+    }
+  };
+
+  /**
+   * Both sides of a split, which asks the same two questions a merge does
+   * from the other end: where did these signals go, and where did this
+   * incident come from. A thread that opens with no answer to the second
+   * reads as an incident that appeared out of nowhere.
+   */
+  const announceSplit = async (
+    source: Incident,
+    splits: AssignResult[],
+  ): Promise<void> => {
+    // The incidents this call just created have no thread yet, and a thread
+    // that does not exist can be neither linked nor posted into.
+    try {
+      await slack.openThreads();
+    } catch (err) {
+      alarm("split_threads_unopened", {
+        incidentId: source.id,
+        error: String(err),
+      });
+    }
+
+    // Re-read after opening threads. The row this was called with was read
+    // before the transition, and the incident being split can be the one
+    // openThreads just gave a thread to -- in which case the stale copy sends
+    // its own announcement to the top level and leaves the back-link blank.
+    const from = readIncident(source.id) ?? source;
+
+    const one = splits.length === 1;
+    const refs = await Promise.all(
+      splits.map((split) =>
+        threadRef(readIncident(split.target), `incident ${split.target}`),
+      ),
+    );
+
+    await notify(
+      from,
+      [
+        mrkdwn`*${splits.length} signal${one ? "" : "s"} left this incident, because its root cause does not explain ${one ? "it" : "them"}*`,
+        mrkdwn`_Now worked separately as ${raw(refs.join(", "))}, with a new agent on ${one ? "it" : "each"} · this incident keeps the signals its root cause does explain._`,
+      ].join("\n"),
+    );
+
+    for (const split of splits) {
+      const born = readIncident(split.target);
+      if (!born?.slackThreadTs) {
+        alarm("split_thread_missing", {
+          incidentId: split.target,
+          from: from.id,
+        });
+        continue;
+      }
+      await notify(
+        born,
+        [
+          mrkdwn`*This incident was split out of incident ${from.id}*`,
+          mrkdwn`Incident ${from.id} found a root cause that does not account for what is here, so this is worked on its own from now on.`,
+          mrkdwn`_A separate agent is on this one · incident ${from.id} carries on in ${raw(await threadRef(from, "its own thread"))}._`,
+        ].join("\n"),
+      );
     }
   };
 
@@ -427,12 +668,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (splits === null) return raced(incidentId, "reportRootCause");
       splits.forEach(logAssign);
 
-      if (splits.length > 0) {
-        await notify(
-          incident,
-          `Root cause on ${incidentId} does not explain ${splits.length} attached signal(s). Split out as incident(s) ${splits.map((s) => s.target).join(", ")}.`,
-        );
-      }
+      if (splits.length > 0) await announceSplit(incident, splits);
 
       // Correlation runs after the transition is durable. It is the Boss's
       // job and a failure in it must not cost the agent its root cause.
@@ -466,12 +702,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         .map((o) => o.result);
       applied.forEach(logAssign);
 
-      for (const merge of applied) {
-        await notify(
-          incident,
-          `Merged incident(s) ${merge.merged.join(", ")} into ${merge.target}: ${merge.reason}`,
-        );
-      }
+      for (const merge of applied) await announceMerge(merge);
 
       return {
         ok: true,
@@ -513,7 +744,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (incident.usersImpacted !== args.usersImpacted) {
         await notify(
           incident,
-          `Impact on ${incidentId}: ${args.usersImpacted} users (was ${incident.usersImpacted ?? "unknown"}).`,
+          mrkdwn`*Impact on ${incidentId}: ${args.usersImpacted} users*\n_Previously ${incident.usersImpacted ?? "unknown"}._`,
         );
       }
 
@@ -527,6 +758,16 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       const stop = blocked(incident, ["FIXING"], "reportResolved");
       if (stop) return reject(stop);
+
+      // Ahead of the write, not after it: the evidence goes to the thread and
+      // this is the model's own prose, so it is the model that has to shorten
+      // it, and it cannot be asked to once the incident has already moved to
+      // RESOLVED.
+      const longEvidence = overThreadBudget("evidence", args.evidence);
+      if (longEvidence) return reject(longEvidence);
+
+      const repeated = repeatedEvidence(incident, args.evidence);
+      if (repeated) return reject(repeated);
 
       const splits = await db.withWrite((w) => {
         const at = Date.now();
@@ -560,21 +801,25 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           );
 
         closeOpenSignals(w, incidentId, at);
+        // RESOLVED is already searchable ground: it claims no further alerts
+        // should occur, which is the claim a later signal contradicts.
+        indexIncident(w, incidentId);
         return unexplained;
       });
       if (splits === null) return raced(incidentId, "reportResolved");
       splits.forEach(logAssign);
 
-      if (splits.length > 0) {
-        await notify(
-          incident,
-          `Resolving ${incidentId} left ${splits.length} signal(s) its root cause never explained. Split out as incident(s) ${splits.map((s) => s.target).join(", ")}.`,
-        );
-      }
+      if (splits.length > 0) await announceSplit(incident, splits);
 
       await notify(
         incident,
-        `Incident ${incidentId} resolved. ${args.evidence}${args.prUrls.length ? ` PRs: ${args.prUrls.join(", ")}` : ""}`,
+        [
+          mrkdwn`*Incident ${incidentId} resolved*`,
+          toMrkdwn(args.evidence),
+          ...(args.prUrls.length
+            ? [bullets(args.prUrls.map((url) => `Shipped: ${link(url)}`))]
+            : []),
+        ].join("\n"),
       );
       return {
         ok: true,
@@ -586,6 +831,57 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       };
     });
 
+  /** Long enough to be an answer rather than an acknowledgement. */
+  const MIN_RECURRENCE_ANSWER_CHARS = 40;
+
+  /**
+   * The one invariant a `CHECK` constraint would have carried if the schema
+   * could still take one. Refused at the tool, like the over-long
+   * `contact_human` message: an agent that cannot say why the last
+   * resolution failed has not finished, and its other exit is `hand_off`,
+   * which is the correct place for a recurrence nobody can explain.
+   */
+  const recurrenceGap = (
+    incident: Incident,
+    analysis: RecurrenceAnalysis | undefined,
+  ): string | null => {
+    if (!incident.recurrenceOf) return null;
+    if (!analysis) {
+      return `incident ${incident.id} is a recurrence of ${incident.recurrenceOf}, so reportAnalysis needs a recurrence argument: why that resolution did not hold, which kind of failure it was, and what you did about that rather than about the symptom. If you cannot answer it, hand off instead of closing.`;
+    }
+    if (analysis.why.trim().length < MIN_RECURRENCE_ANSWER_CHARS) {
+      return `recurrence.why is too short to be an answer; say specifically why the resolution of ${incident.recurrenceOf} did not hold`;
+    }
+    if (analysis.remedy.trim().length < MIN_RECURRENCE_ANSWER_CHARS) {
+      return `recurrence.remedy is too short; name what you changed so this does not recur again, or state plainly that you changed nothing and why`;
+    }
+    return null;
+  };
+
+  /**
+   * Byte-identical resolution evidence on a recurrence is the failure the
+   * previous incident already made: watching the same window for the same
+   * interval and reporting the same quiet is how a premature close happens
+   * twice. Narrow on purpose -- it catches the literal repeat, not a
+   * paraphrase, and the prompt carries the rest.
+   */
+  const repeatedEvidence = (incident: Incident, evidence: string): string | null => {
+    if (!incident.recurrenceOf) return null;
+    const prior = readIncident(incident.recurrenceOf);
+    const same =
+      prior?.resolvedEvidence &&
+      prior.resolvedEvidence.trim().replace(/\s+/g, " ") ===
+        evidence.trim().replace(/\s+/g, " ");
+    return same
+      ? `this is the resolution evidence incident ${incident.recurrenceOf} was closed on, and it did not hold. Watch something the last check would have missed, or for longer, before claiming this one is resolved.`
+      : null;
+  };
+
+  // No budget on `postmortem`, deliberately, and this is the one transition
+  // where that is true. It is not posted as thread text -- it becomes the
+  // closing report, a Markdown file in the thread -- so the thread stays
+  // short by the document being somewhere else rather than by the write-up
+  // being shorter. The thread post below is the Boss's own one-liner.
   const reportAnalysis: ToolApi["reportAnalysis"] = (args) =>
     call("reportAnalysis", async (incidentId) => {
       const incident = readIncident(incidentId);
@@ -593,6 +889,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       const stop = blocked(incident, ["RESOLVED"], "reportAnalysis");
       if (stop) return reject(stop);
+
+      const gap = recurrenceGap(incident, args.recurrence);
+      if (gap) return reject(gap);
 
       const applied = await db.withWrite((w) => {
         const at = Date.now();
@@ -604,7 +903,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             // instead of killing it. The status guard still holds the
             // transition, so a MERGED row cannot be resurrected through here.
             `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
-               usersImpacted = ?, impactQuery = ?
+               usersImpacted = ?, impactQuery = ?, recurrenceAnalysis = ?
              WHERE id = ? AND status = 'RESOLVED'`,
           )
           .run(
@@ -612,18 +911,39 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             args.postmortem,
             args.usersImpacted,
             args.impactQuery,
+            args.recurrence ? JSON.stringify(args.recurrence) : null,
             incidentId,
           ).changes;
         if (taken === 0) return false;
         closeOpenSignals(w, incidentId, at);
+        // Same transaction as the close, so an incident that is searchable
+        // and one that is closed are never two different facts.
+        indexIncident(w, incidentId);
         return true;
       });
       if (!applied) return raced(incidentId, "reportAnalysis");
 
       await notify(
         incident,
-        `Incident ${incidentId} closed. ${args.usersImpacted} users impacted. Post-mortem written.`,
+        mrkdwn`*Incident ${incidentId} closed*\n_${args.usersImpacted} users impacted · post-mortem written._`,
       );
+
+      // A recurrence closes on a second answer the first incident never had
+      // to give, and that answer is the only thing here that can change the
+      // system rather than the product. Posted rather than left in a column:
+      // "BugBoss let a premature close happen" reaching nobody is the same
+      // failure one level up.
+      if (args.recurrence) {
+        const defect = args.recurrence.category === "bugboss_defect";
+        await notify(
+          incident,
+          mrkdwn`*${defect ? "BugBoss let this recur" : "Why it recurred"}* · ${incidentId} was a recurrence of ${incident.recurrenceOf ?? "an earlier incident"}\n_${args.recurrence.category}_\n\n${raw(toMrkdwn(args.recurrence.why))}\n\n*What changed*\n${raw(toMrkdwn(args.recurrence.remedy))}${
+            defect
+              ? "\n\n_The fix is in ops, which agents do not open pull requests against. This needs a person._"
+              : ""
+          }`,
+        );
+      }
 
       return {
         ok: true,
@@ -642,13 +962,21 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         );
       }
 
+      // The brief is the first thing the person picking this up reads, on a
+      // phone, so it answers to the thread budget like every other post. The
+      // harness writes briefs too and cannot be asked to shorten one, which
+      // is why `unansweredBrief` clamps the question it echoes rather than
+      // relying on this staying generous.
+      const longBrief = overThreadBudget("brief", args.brief);
+      if (longBrief) return reject(longBrief);
+
       // The post comes first because it is the part that cannot be retried
       // from anywhere else. Once owner is 'human' the dispatcher stops
       // relaunching, so committing without the brief leaves an escalation
       // nobody was told about and nothing to pick it back up.
       const posted = await notify(
         incident,
-        `Incident ${incidentId} handed to a human: ${args.reason}\n\n${args.brief}`,
+        mrkdwn`*Incident ${incidentId} handed to a human* · ${args.reason}\n\n${raw(toMrkdwn(args.brief))}`,
       );
       if (!posted) {
         return reject(
@@ -666,7 +994,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const retract = (why: string) =>
         notify(
           incident,
-          `Correction on ${incidentId}: that hand-off could not be recorded, so ${why} Treat the brief above as a status update.`,
+          mrkdwn`*Correction on ${incidentId}*\nThat hand-off could not be recorded, so ${why} Treat the brief above as a status update.`,
         );
 
       try {
@@ -722,8 +1050,31 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           incident,
           signals: readSignals(incidentId),
           evidence: loaded,
+          priorIncident: readPriorIncident(incident.recurrenceOf),
         },
       };
+    });
+
+  /**
+   * Read-only and outside the transition set, so it drains no directives and
+   * changes nothing. The agent gets the same reach triage has: an exact
+   * signal key finds the same alert returning, and only the post-mortems
+   * find the same cause returning through a different one.
+   */
+  const searchIncidentsTool: ToolApi["searchIncidents"] = (args) =>
+    call<IncidentMatch[]>("searchIncidents", async (incidentId) => {
+      try {
+        return { ok: true, data: searchIncidents(db, args.text) };
+      } catch (err) {
+        // Rejected rather than answered with an empty array. "The search is
+        // broken" and "nothing matches" are the two results that must never
+        // be the same value, and this one is about to be read by an agent
+        // deciding whether a problem is new.
+        alarm("search_failed", { incidentId, error: String(err) });
+        return reject(
+          `the incident search failed (${String(err)}); this is not the same as finding nothing`,
+        );
+      }
     });
 
   return {
@@ -733,5 +1084,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     reportAnalysis,
     handOff,
     getIncident,
+    searchIncidents: searchIncidentsTool,
   };
 };
