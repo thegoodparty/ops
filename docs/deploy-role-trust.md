@@ -296,6 +296,48 @@ CLI grows a mode that skips `--create`, mirroring `PULUMI_MODE=preview` in
 this repo's `deploy.sh`, or the grant is added and the role stops being
 read-only. Prefer the first. It is an `omni` change and belongs in step 5.
 
+## What ReadOnlyAccess still allows
+
+Recorded because the plan role's shape makes this a standing property, not a
+one-off. `ReadOnlyAccess` grants reads of **data**, not just metadata, so
+scoping an Allow in the inline document scopes nothing on its own: the managed
+policy allows it anyway. Only a Deny narrows this role.
+
+That was not theoretical. Step 4 shipped with `s3:GetObject` allowed on
+`*/dev/terraform.tfstate` and denied only on the Pulumi bucket, and a
+`simulate-principal-policy` against the live role returned `allowed` for
+`broker/prod/terraform.tfstate`. Terraform state holds resource attributes in
+plaintext and gp-ai's prod roots put AI_SECRETS_PROD-derived values into
+theirs, so that was a production secret read by another name. Closed by a
+`NotResource` deny covering every S3 object outside the three state keys a
+plan actually reads.
+
+**Still open by the same mechanism, and accepted for now:** `ReadOnlyAccess`
+also permits DynamoDB item reads (`GetItem`, `Query`, `Scan`) and similar
+data-level reads in other services. No Terraform plan needs them. They are not
+denied yet because each deny should be verified against a real plan before it
+lands, and the S3 one was the reachable production secret. Worth a follow-up
+that enumerates data-level reads in `ReadOnlyAccess` and denies the set.
+
+**How to check this role, rather than reason about it:**
+
+```bash
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::333022194791:role/github-actions-pulumi-plan \
+  --action-names s3:GetObject \
+  --resource-arns arn:aws:s3:::goodparty-terraform-state-us-west-2/broker/prod/terraform.tfstate
+```
+
+A unit test on the policy document cannot catch this class of gap, because the
+gap lives in the interaction between two policies. The simulator can.
+
+**Deny the action, then deny its siblings.** The first version of that deny
+covered `s3:GetObject` only. `ReadOnlyAccess` also grants
+`s3:GetObjectVersion`, a separate IAM action returning content for a given
+`versionId`, and this bucket has versioning `Enabled`, so the same prod state
+stayed readable one parameter away. When denying a read, check whether the
+service splits it across actions and simulate each one; a deny that names a
+single action is a guess until it has been.
 ## What the preview audit found
 
 Read before designing step 6. Everything here is from the code on `main`, not
