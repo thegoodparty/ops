@@ -5,6 +5,7 @@ import type { AssistantMessage, AssistantMessageEvent, JsonObject } from "@earen
 
 import {
   type AnthropicStreamEvent,
+  type CacheRetentionReport,
   consumeAnthropicStream,
   INPUT_TRANSFORMATIONS_DIAGNOSTIC,
   mapStopReason,
@@ -358,4 +359,105 @@ test("start is emitted even when a provider skips message_start", async () => {
   ]);
 
   assert.equal(pushed[0].type, "start");
+});
+
+// The failure mode these cover is the one that makes the whole change worth
+// nothing if it happens: a request asks for the 1h tier, the service serves 5m,
+// and the run rebuilds its prefix on the same schedule at the same price with
+// nothing in the logs. Verified against us.anthropic.claude-opus-5, which
+// returns both halves of the `cache_creation` split, so a downgrade is an
+// observed number rather than a guess at a missing field.
+
+const startWith = (usage: Record<string, unknown>): AnthropicStreamEvent[] => [
+  {
+    type: "message_start",
+    message: { id: "msg_1", model: "us.anthropic.claude-opus-5", usage },
+  },
+  { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } },
+  { type: "message_stop" },
+];
+
+const retentionReports = async (
+  usage: Record<string, unknown>,
+  cacheRetention: "none" | "short" | "long" = "long",
+) => {
+  const output = newOutput();
+  const reports: CacheRetentionReport[] = [];
+  await consumeAnthropicStream({
+    events: (async function* () {
+      for (const event of startWith(usage)) yield event;
+    })(),
+    output,
+    push: () => {},
+    applyCost: () => {},
+    parseJson: () => ({}),
+    cacheRetention,
+    onUnhonouredCacheRetention: (report) => reports.push(report),
+  });
+  return { output, reports };
+};
+
+test("an honoured 1h write reports nothing", async () => {
+  const { output, reports } = await retentionReports({
+    input_tokens: 2,
+    cache_creation_input_tokens: 26618,
+    cache_read_input_tokens: 0,
+    cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 26618 },
+  });
+
+  assert.deepEqual(reports, []);
+  assert.equal(output.usage.cacheWrite, 26618);
+  assert.equal(output.usage.cacheWrite1h, 26618);
+});
+
+test("a write billed at the 5m rate after asking for 1h is reported", async () => {
+  const { reports } = await retentionReports({
+    input_tokens: 2,
+    cache_creation_input_tokens: 190000,
+    cache_read_input_tokens: 0,
+    cache_creation: { ephemeral_5m_input_tokens: 190000, ephemeral_1h_input_tokens: 0 },
+  });
+
+  assert.deepEqual(reports, [
+    { requested: "long", written: 190000, written1h: 0, written5m: 190000 },
+  ]);
+});
+
+test("a write with no cache_creation split is reported as unconfirmable", async () => {
+  // calculateCost reads a missing 1h share as zero, so this case silently
+  // bills a 1h write at the 5m rate -- it is under-reported cost, not just
+  // missing telemetry.
+  const { reports } = await retentionReports({
+    input_tokens: 2,
+    cache_creation_input_tokens: 190000,
+    cache_read_input_tokens: 0,
+  });
+
+  assert.deepEqual(reports, [
+    { requested: "long", written: 190000, written1h: null, written5m: null },
+  ]);
+});
+
+test("a cache read reports nothing, because no write happened", async () => {
+  const { reports } = await retentionReports({
+    input_tokens: 2,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 190000,
+    cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+  });
+
+  assert.deepEqual(reports, []);
+});
+
+test("a deliberate short retention is never held to the 1h tier", async () => {
+  const { reports } = await retentionReports(
+    {
+      input_tokens: 2,
+      cache_creation_input_tokens: 190000,
+      cache_creation: { ephemeral_5m_input_tokens: 190000, ephemeral_1h_input_tokens: 0 },
+    },
+    "short",
+  );
+
+  assert.deepEqual(reports, []);
 });
