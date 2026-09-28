@@ -98,6 +98,25 @@ export const SIGNAL_FLUSH_GRACE_MS = 5000;
  */
 export const signalExitCode = (signal: NodeJS.Signals): number =>
   signal === "SIGTERM" ? 0 : 1;
+
+/**
+ * Everything that has to reach S3 before the process goes.
+ *
+ * Both, in parallel. The session and the notes sync on the same `turn_end`
+ * -- one durability cadence, not two -- and neither that event nor
+ * `session_shutdown` fires on the way out of a signal handler. Flushing only
+ * the session loses every note written since the last turn, which is the
+ * half of the run a reader most wants after a kill.
+ *
+ * `allSettled`, because one failing store must not stop the other from
+ * trying, and because a rejection here would leave the process alive with
+ * nothing scheduled to end it.
+ */
+export const flushDurable = async (
+  ...syncs: readonly { flush: () => Promise<void> }[]
+): Promise<void> => {
+  await Promise.allSettled(syncs.map((sync) => sync.flush()));
+};
 export const COMPACTION_HEADROOM = 0.05;
 
 export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "write"];
@@ -906,6 +925,14 @@ const launch = async (args: {
     }
   };
 
+  const notesSync = createNotesSync({
+    store,
+    prefix: args.notesPrefix,
+    dir: paths.notesDir,
+    seen: args.notesSeen,
+    limits: NOTES_LIMITS,
+  });
+
   // SIGKILL cannot be caught and the dispatcher's backstop uses it, so this
   // upgrades only the kills that arrive politely: a container stopping, a
   // deploy draining, an operator scaling the service down. Those are the
@@ -928,21 +955,13 @@ const launch = async (args: {
     // exit itself -- and on a timer as well as on the flush, because a hung
     // PUT must not be what keeps a draining container alive.
     const quit = (): void => process.exit(signalExitCode(signal));
-    void sync.flush().then(quit, quit);
+    void flushDurable(sync, notesSync).then(quit, quit);
     setTimeout(quit, SIGNAL_FLUSH_GRACE_MS).unref();
   };
   for (const signal of signals) process.on(signal, onSignal);
   const releaseSignals = (): void => {
     for (const signal of signals) process.off(signal, onSignal);
   };
-
-  const notesSync = createNotesSync({
-    store,
-    prefix: args.notesPrefix,
-    dir: paths.notesDir,
-    seen: args.notesSeen,
-    limits: NOTES_LIMITS,
-  });
 
   // Assigned once the session exists; the first flush cannot precede it.
   let live: { steer: (message: string) => Promise<unknown> } | null = null;

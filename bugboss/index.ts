@@ -1645,6 +1645,19 @@ export const createBugBoss = async (
           "SELECT slackThreadTs FROM incident WHERE id = ?",
           [incidentId],
         )?.slackThreadTs ?? null;
+      // A threadless incident is a real state -- opening one can fail, and
+      // it can fail for good. `slack.post(null, ...)` is a top-level channel
+      // message, so posting anyway would put "the agent on this incident
+      // stopped" in the channel with nothing saying which incident. Alarming
+      // is the same answer the dispatcher gives when no poster is wired in
+      // at all: the event still reaches somebody, out of context does not.
+      if (!threadTs) {
+        alarm("resume_notice_undeliverable", {
+          incidentId,
+          note: "the incident has no Slack thread, so the resume was not announced where anyone is watching",
+        });
+        return;
+      }
       await slack.post(threadTs, text);
     },
     childBaseEnv: {

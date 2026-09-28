@@ -15,6 +15,7 @@ import {
   MODEL_BINDING_MISMATCH,
   exitCodeFor,
   exitRecordFor,
+  flushDurable,
   npmCiCommand,
   pinnedSessionModel,
   PREFIX_DRIFT_DIAGNOSTIC,
@@ -422,4 +423,30 @@ test("the attempt reaches the agent from the dispatcher's environment", () => {
 test("a drained agent exits clean and an interrupted one does not", () => {
   assert.equal(signalExitCode("SIGTERM"), 0);
   assert.equal(signalExitCode("SIGINT"), 1);
+});
+
+// The notes are the other half of what a killed run leaves behind, and they
+// ride the same turn_end the session does. Neither event fires on the way
+// out of a signal handler, so a shutdown that flushes one and not the other
+// loses every note written since the last turn.
+test("a signalled shutdown flushes the notes as well as the session", async () => {
+  const flushed: string[] = [];
+  await flushDurable(
+    { flush: async () => void flushed.push("session") },
+    { flush: async () => void flushed.push("notes") },
+  );
+  assert.deepEqual(flushed.sort(), ["notes", "session"]);
+});
+
+test("one failing store does not stop the other, or the exit", async () => {
+  const flushed: string[] = [];
+  await flushDurable(
+    {
+      flush: async () => {
+        throw new Error("S3 is down");
+      },
+    },
+    { flush: async () => void flushed.push("notes") },
+  );
+  assert.deepEqual(flushed, ["notes"]);
 });
