@@ -105,6 +105,7 @@ describe("githubActionsPulumiPreview", () => {
     assert.deepEqual(read.Action, [
       "acm:DescribeCertificate",
       "acm:GetCertificate",
+      "acm:ListTagsForCertificate",
     ]);
     assert.equal(
       read.Resource,
