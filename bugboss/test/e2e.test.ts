@@ -1970,7 +1970,30 @@ test("a resume notice is not posted out of context when there is no thread", asy
   });
 
   const before = fakeSlack.posts.length;
-  await boss.dispatchOnce();
+  // The alarm is half the contract and console.error is where it goes, so
+  // without capturing it this test could not tell "alarmed and returned"
+  // from "quietly did nothing" -- and a test that only checks the silence
+  // is the thing this PR keeps finding in production.
+  const alarms: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => {
+    alarms.push(args.map(String).join(" "));
+    realError(...(args as []));
+  };
+  try {
+    await boss.dispatchOnce();
+  } finally {
+    console.error = realError;
+  }
+
+  assert.ok(
+    alarms.some((line) => {
+      if (!line.includes("resume_notice_undeliverable")) return false;
+      const parsed = JSON.parse(line) as { event: string; incidentId?: string };
+      return parsed.event === "resume_notice_undeliverable" && parsed.incidentId === id;
+    }),
+    "the resume that could not be announced is alarmed, naming the incident",
+  );
 
   // Only the resume notice. The fake agent runs this incident through to a
   // close, and those posts are top-level for the same threadless reason --

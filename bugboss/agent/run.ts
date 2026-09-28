@@ -112,6 +112,25 @@ export const signalExitCode = (signal: NodeJS.Signals): number =>
  * trying, and because a rejection here would leave the process alive with
  * nothing scheduled to end it.
  */
+/**
+ * Wraps a shutdown so only the first signal runs it.
+ *
+ * A second signal before the exit lands -- SIGTERM from a draining task,
+ * then an impatient Ctrl-C -- re-enters the handler concurrently, and two
+ * whole-file PUTs on the same key at once is how the exit record this exists
+ * to write gets corrupted by the act of writing it.
+ */
+export const onceOnly = <T extends unknown[]>(
+  fn: (...args: T) => void,
+): ((...args: T) => void) => {
+  let ran = false;
+  return (...args: T) => {
+    if (ran) return;
+    ran = true;
+    fn(...args);
+  };
+};
+
 export const flushDurable = async (
   ...syncs: readonly { flush: () => Promise<void> }[]
 ): Promise<void> => {
@@ -939,7 +958,13 @@ const launch = async (args: {
   // common ones, and the record is the only thing that tells them apart from
   // a run that finished.
   const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
-  const onSignal = (signal: NodeJS.Signals): void => {
+  // One shot. A second signal before the exit lands -- SIGTERM from a
+  // draining task, then an impatient Ctrl-C -- would otherwise re-enter this
+  // concurrently and put two whole-file PUTs on the same key at once, which
+  // is how the exit record this exists to write gets corrupted by the act of
+  // writing it. Two quit timers racing to call process.exit is the milder
+  // half of the same bug.
+  const onSignal = onceOnly((signal: NodeJS.Signals): void => {
     console.error(
       JSON.stringify({
         component: "agent",
@@ -957,7 +982,7 @@ const launch = async (args: {
     const quit = (): void => process.exit(signalExitCode(signal));
     void flushDurable(sync, notesSync).then(quit, quit);
     setTimeout(quit, SIGNAL_FLUSH_GRACE_MS).unref();
-  };
+  });
   for (const signal of signals) process.on(signal, onSignal);
   const releaseSignals = (): void => {
     for (const signal of signals) process.off(signal, onSignal);

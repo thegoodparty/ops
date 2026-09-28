@@ -16,6 +16,7 @@ import {
   exitCodeFor,
   exitRecordFor,
   flushDurable,
+  onceOnly,
   npmCiCommand,
   pinnedSessionModel,
   PREFIX_DRIFT_DIAGNOSTIC,
@@ -449,4 +450,18 @@ test("one failing store does not stop the other, or the exit", async () => {
     { flush: async () => void flushed.push("notes") },
   );
   assert.deepEqual(flushed, ["notes"]);
+});
+
+// SIGTERM from a draining task, then an impatient Ctrl-C. Re-entering the
+// shutdown puts two whole-file PUTs on the same key at once, which corrupts
+// the exit record by the act of writing it.
+test("a second signal does not re-enter the shutdown", () => {
+  const seen: string[] = [];
+  const shutdown = onceOnly((signal: string) => void seen.push(signal));
+
+  shutdown("SIGTERM");
+  shutdown("SIGINT");
+  shutdown("SIGTERM");
+
+  assert.deepEqual(seen, ["SIGTERM"], "only the first signal runs it");
 });
