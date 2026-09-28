@@ -16,6 +16,7 @@ import type { Directive, IncidentView, ToolApi, ToolResponse } from "../types";
 import { resolveBedrockModel, registerBedrockInvokeModelProvider } from "../bedrock";
 import { connectMcpToolset, type McpToolset } from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
+import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import {
   createContactHumanTool,
   createMonitorTool,
@@ -651,6 +652,13 @@ const launch = async (args: {
       api,
       escalate: api,
       signal: deadlineAbort.signal,
+    }),
+    // Reads the token at each call rather than closing over it: the App
+    // credentials are refreshed in place every twenty minutes, and an incident
+    // outlives the one held here at launch.
+    await createRerunCiTool({
+      github: createGitHubRunsPort({ token: () => process.env.GITHUB_TOKEN }),
+      thread: api,
     }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(
