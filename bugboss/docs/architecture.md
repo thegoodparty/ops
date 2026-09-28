@@ -226,7 +226,9 @@ Five state-changing tools, each a transition, plus two reads:
 
 Plus two blocking tools that live in the harness, each costing one turn no
 matter how long it waits — which is what keeps a multi-day incident from
-saturating context on polling:
+saturating context on polling. The same property makes them the only thing
+that ever misses the prompt cache, which is why the prefix is written with a
+1h ttl; see `bugboss/bedrock/CLAUDE.md`.
 
 - `monitor(command, interval, timeout, awaitingHuman?)` — block until a
   read-only check passes. The general primitive: PR merged, deploy shipped,
