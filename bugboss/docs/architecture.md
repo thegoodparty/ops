@@ -204,6 +204,44 @@ There is no push channel and an agent is never addressable. Directives ride
 back on responses to calls the agent was already making — `stop`, `merged`,
 `handoff`, `new_signals`, `human_message`, `resumed_after`.
 
+## Running omni's tests
+
+An agent that writes a fix it cannot run is proposing a change on reasoning
+alone. Until it could run them, 200 of gp-api's 576 test files were out of
+reach and the only check on a fix was a CI round trip.
+
+omni starts its test Postgres with testcontainers, which needs a Docker
+socket. **Fargate has none** — no socket, no privileged mode, no
+Docker-in-Docker. That is the platform, not a missing package, so the answer
+had to come from somewhere other than a container runtime.
+
+**A Postgres sidecar in the task definition.** Containers in one task share a
+network namespace, so it is reachable on `127.0.0.1:5432`, and omni's harness
+takes it by URL instead of starting one. It needs no host, no daemon and no
+credential, and it costs nothing: the task already bills for 4 vCPU and 16 GB
+whether or not part of it runs a database.
+
+It is **not essential** and nothing depends on it. An essential container that
+exits stops the task, and a test database is not worth the incident system.
+The cost of that is that its absence is quiet, so it is said twice: the Boss
+probes it at boot and alarms, and the failure an agent actually reads is
+omni's, which names `OMNI_TEST_POSTGRES_URL` at the moment a suite runs. An
+agent must never read a connection error as a failing test and fix code that
+is fine.
+
+Isolating the fifteen agents that share it is **omni's job**, and its harness
+already does it — a template named for a digest of the migrations it holds, a
+per-suite clone the suite drops, an age-gated sweep for what a killed run left
+behind. That was built for "one container serves every checkout on the
+machine", and this task is that machine. Nothing here creates or drops a
+database.
+
+The data lives on the task's ephemeral storage and every merge to ops `main`
+replaces the task, so nothing accumulates across deploys.
+
+This does not replace CI, and the prompt says so. CI is still what has to be
+green at the approval SHA; what it cannot give an agent is the short loop.
+
 ## Durability
 
 **SQLite, mirrored to S3 synchronously.** Every write goes through
@@ -256,6 +294,7 @@ deleting is not the way back.
 | `slack/` | Outbound relay, inbound intent, and the read-only Slack agent |
 | `http/` | Public routes and the loopback tool API |
 | `db/` | SQLite, and the S3 mirror |
+| `testdb/` | The test Postgres URL, its guard and its boot probe |
 | `index.ts` | The composition root. The only place real services are named |
 
 `types.ts` is the contract every module is built against. `logging.ts` is

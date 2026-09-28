@@ -19,6 +19,7 @@ This file is what you need before editing anything here.
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
 | What the GitHub App may do, and why | [`github-app.md`](./github-app.md) |
+| The Postgres agents run omni's tests against | [`testdb/CLAUDE.md`](./testdb/CLAUDE.md) |
 
 `index.ts` is the composition root — the only place real services are
 named. `types.ts` is the contract everything else is built against.

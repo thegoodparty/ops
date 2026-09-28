@@ -324,6 +324,16 @@ export interface DispatcherConfig {
 // Config
 // ---------------------------------------------------------------------------
 
+/**
+ * The Postgres an incident agent runs omni's database-backed tests against,
+ * as the task definition named it. `refused` is a URL we will not hand an
+ * agent -- see bugboss/testdb/index.ts for what is refused and why.
+ */
+export type TestDatabase =
+  | { state: "absent" }
+  | { state: "refused"; reason: string }
+  | { state: "configured"; url: string; host: string; port: number };
+
 export interface BugBossConfig {
   env: "prod";
   s3Bucket: string;
@@ -340,4 +350,6 @@ export interface BugBossConfig {
    * fails the Boss at boot rather than every agent at launch.
    */
   workingHours?: string;
+  /** The Postgres agents run omni's database-backed tests against. */
+  testDatabase: TestDatabase;
 }

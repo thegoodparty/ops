@@ -12,6 +12,7 @@ import { join } from "node:path";
 
 import { CONTACT_HUMAN_MESSAGE_LIMIT, CONTACT_HUMAN_MIN_WAIT_SECONDS } from "./tools";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { TEST_DB_ENV_VAR } from "../testdb";
 import type { NotesLimits } from "./notes";
 
 export interface PromptDoc {
@@ -183,6 +184,34 @@ this incident: the App is installed on every repository in the thegoodparty
 organisation and can write to all of them. What stops you merging is branch
 protection on main, not the token. Stay in omni unless the incident is
 somewhere else and you have said so in the thread.`;
+
+const TESTS = (input: PromptInput): string => `## Running the tests
+
+omni's database-backed suites need a Postgres, and there is one in this
+container on loopback. The harness finds it through the environment, so once
+\`npm ci\` has finished you run a suite exactly the way the repository
+documents it and nothing else is needed:
+
+    cd ${input.checkoutPath}/packages/gp-api && npx vitest run src/path/to/file.test.ts
+
+Run the files your change touches, not the suite. The whole suite takes many
+minutes and CI runs it for you; what CI cannot give you is the short loop, and
+the short loop is the reason a fix you propose is one you have seen work.
+
+**There is no container runtime here.** \`docker\` will not run, and a test
+that tries to start its own container fails for that reason and not yours.
+The Postgres you have instead is shared with every other agent in this
+container, which omni's harness is built for: a suite clones a schema template
+into its own database and drops it when it finishes. Do not create databases
+by hand and do not drop one you did not create.
+
+**A failure naming ${TEST_DB_ENV_VAR} is infrastructure, not your change.**
+It means nothing in that run reached Postgres at all, so every database-backed
+failure in it is that one fact repeated. Do not edit code against it. Say so
+in the thread and let CI run the suite.
+
+A local pass is not a green build. CI is still what has to be green at the
+approval SHA, and it runs more than these suites.`;
 
 const NOTES = (input: PromptInput): string => `## Your record of this incident
 
@@ -383,6 +412,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     RULES,
     SLACK,
     CHECKOUT(input),
+    TESTS(input),
     NOTES(input),
     MONITOR_EXAMPLES(input),
     SHIP_PR,
