@@ -1828,4 +1828,24 @@ describe("a recurrence closes on a second question", () => {
       "the index is written in the same transaction as the close",
     );
   });
+
+  it("refuses a query with no searchable words rather than answering empty", async () => {
+    // This tool exists so an agent can find out whether a new alert is
+    // something already closed. `ok: true, data: []` is a confident "no
+    // prior incident", and on a stopword-only query the search never ran at
+    // all -- so the two have to be different answers.
+    const { tools } = await recurrencePair();
+
+    const unsearchable = await tools.searchIncidents({
+      text: "the error in production after the alert failed",
+    });
+    const matchedNothing = await tools.searchIncidents({
+      text: "certificate rotation expiry",
+    });
+
+    assert.equal(unsearchable.ok, false);
+    assert.match(String(unsearchable.error), /did not run/);
+    assert.equal(matchedNothing.ok, true, matchedNothing.error);
+    assert.deepEqual(matchedNothing.data, []);
+  });
 });
