@@ -1,5 +1,7 @@
 import * as aws from "@pulumi/aws";
 
+import { MANAGEMENT_ACCOUNT_ID } from "../utils/accounts";
+
 /**
  * The in-account deploy role. Step 10 of docs/workbench-account.md.
  *
@@ -45,9 +47,6 @@ import * as aws from "@pulumi/aws";
  * side is `AssumeWorkbenchDeployRole` in
  * deploy/components/ci-roles/policies.ts.
  */
-
-/** The management account. Matches `ACCOUNT_ID` in deploy/components/ci-roles.ts. */
-const MANAGEMENT_ACCOUNT_ID = "333022194791";
 
 /**
  * Named rather than inlined: the management-side grant in

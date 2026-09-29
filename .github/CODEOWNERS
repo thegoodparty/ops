@@ -41,9 +41,9 @@
 # ## The paths that reach a credential from outside their tree
 #
 # `/utils/` -- `deploy/components/identity-center/policies.ts` imports
-# `bedrockInvokeResources` from `utils/bedrock-models.ts`. That array *is* the
-# permission set's resource ARN list. It reads like a constants file and
-# edits like an IAM policy.
+# `bedrockInvokeResources` from `utils/bedrock-models.ts`, and the account ids
+# in `utils/accounts.ts` feed the same permission set's resource ARNs. Those
+# read like constants files and edit like IAM policy.
 #
 # `/scripts/`, `/run-script.ts` -- `.github/workflows/deploy-workbench.yml`
 # triggers on `scripts/enable-bedrock-models.ts` and runs `APPLY=1 npm run

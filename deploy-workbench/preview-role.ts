@@ -1,5 +1,7 @@
 import * as aws from "@pulumi/aws";
 
+import { MANAGEMENT_ACCOUNT_ID } from "../utils/accounts";
+
 /**
  * The read-only preview role. Step 8 of docs/pr-previews.md.
  *
@@ -27,9 +29,6 @@ import * as aws from "@pulumi/aws";
  *   and an `ArnLike` pins `aws:PrincipalArn` to that path and permission set
  *   rather than spelling an ARN that changes on every reprovision.
  */
-
-/** The management account. Matches `ACCOUNT_ID` in deploy/components/ci-roles.ts. */
-const MANAGEMENT_ACCOUNT_ID = "333022194791";
 
 /**
  * Named rather than inlined: the grant in

@@ -1,6 +1,10 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import {
+  MANAGEMENT_ACCOUNT_ID,
+  WORKBENCH_ACCOUNT_ID,
+} from "../../utils/accounts";
+import {
   adminReservedActions,
   engineerAccess,
   productManager,
@@ -186,7 +190,7 @@ type Account = {
 
 const accounts = {
   main: {
-    id: "333022194791",
+    id: MANAGEMENT_ACCOUNT_ID,
     namePrefix: "",
     adopted: true,
     assignments: {
@@ -214,7 +218,7 @@ const accounts = {
   // step's final act. Break-glass through Identity Center is the same
   // privilege with a named session attached to it.
   workbench: {
-    id: "024901689212",
+    id: WORKBENCH_ACCOUNT_ID,
     namePrefix: "workbench-",
     adopted: false,
     assignments: {
