@@ -458,12 +458,13 @@ git log --oneline -15 -- docs/workbench-account.md deploy/ deploy-org/ deploy-wo
 ```
 
 Read-only AWS calls are enough for all of that, so reconcile with the
-`gp-readonly` profile rather than reaching for `gp-admin`. An `ops` preview no
-longer needs `gp-admin` for the `DELEGATES` secret: `deploy/index.ts` reads only
-its metadata, and the key names are declared in `deploy/delegate-secret.ts`
-(see [`pr-previews.md`](./pr-previews.md), step 3). A `workbench` preview still
-assumes an admin role in 024901689212 when the provider is configured; steps 8
-and 10 of that plan give it a scoped path.
+`gp-readonly` profile rather than reaching for `gp-admin`. A local `pulumi
+preview` of any of the three stacks runs under `gp-readonly`: `ops` no longer
+needs `gp-admin` for the `DELEGATES` secret (`deploy/index.ts` reads only its
+metadata, and the key names are declared in `deploy/delegate-secret.ts`; see
+[`pr-previews.md`](./pr-previews.md), step 3), and `workbench` reaches its
+account by assuming the read-only `pulumi-preview` role (steps 8 and 10 of that
+plan). Only an apply needs `gp-admin`.
 
 If a step is marked `doing` with a date more than a day old, assume the session
 that claimed it is gone. Verify actual state with the commands above, then

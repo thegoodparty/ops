@@ -89,6 +89,13 @@ export const engineerAccess: PolicyDocument = {
   ],
 };
 
+/**
+ * The workbench account. Matches `WORKBENCH_ACCOUNT_ID` in
+ * deploy/components/ci-roles/policies.ts and the constant in
+ * deploy-workbench/index.ts.
+ */
+const WORKBENCH_ACCOUNT_ID = "024901689212";
+
 export const readOnlyAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -105,6 +112,18 @@ export const readOnlyAccess: PolicyDocument = {
           "aws:ResourceTag/Environment": "prod",
         },
       },
+    },
+    {
+      Sid: "AssumeWorkbenchPreviewRole",
+      Effect: "Allow",
+      // Local previews of the workbench stack. The managed `ReadOnlyAccess`
+      // policy has no `sts:AssumeRole`, and the workbench account assigns no
+      // permission sets, so the one cross-account hop is granted here on
+      // exactly the read-only role the PR workflow uses. The trust on the
+      // other side is deploy-workbench/preview-role.ts, and the role it
+      // reaches holds no permissions. See docs/pr-previews.md, step 10.
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-preview`,
     },
   ],
 };

@@ -45,7 +45,7 @@ type PermissionSet = {
  * every Allow regardless of position. Denies come first because they read as
  * the boundary the rest of the document sits inside.
  */
-const withAdminReserved = (policy?: PolicyDocument): PolicyDocument => ({
+export const withAdminReserved = (policy?: PolicyDocument): PolicyDocument => ({
   Version: "2012-10-17",
   Statement: [...adminReservedActions.Statement, ...(policy?.Statement ?? [])],
 });
@@ -81,6 +81,10 @@ const permissionSets = {
     id: "ps-790741c400f38152",
     name: "ReadOnlyAccess",
     sessionDuration: "PT8H",
+    // `AWSSecretsManagerClientReadOnlyAccess` reads as metadata-only, but its
+    // policy includes `secretsmanager:GetSecretValue`. This set can therefore
+    // read secret values. Verified against the AWS-managed policy reference at
+    // pr-previews step 10; narrowing it is its own follow-up.
     managedPolicies: [
       "arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess",
       "arn:aws:iam::aws:policy/ReadOnlyAccess",

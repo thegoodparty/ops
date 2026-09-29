@@ -85,8 +85,18 @@ the consumer by a different workflow, and nothing sequences the two.
       behind it replaced, which confirms step 8's cascade check. The preview
       role held: its only invoke is `getCallerIdentity`, so no action was
       needed.)
-- [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
-      todo. Depends on 8 being applied.
+- [x] 10. Extend the `ReadOnlyAccess` permission set for local previews: done
+      (2026-09-29, PR #167. `readOnlyAccess` allows `sts:AssumeRole` on exactly
+      `arn:aws:iam::024901689212:role/pulumi-preview`, the only allow in that
+      inline policy, with a test to keep it so. No new workbench assignment:
+      step 8's trust already admits the ReadOnlyAccess SSO role.
+      `workbench-account.md` "How to resume" now says previews run under
+      `gp-readonly`. Verified from the AWS-managed reference: the managed
+      `ReadOnlyAccess` covers the ops/org preview reads, and
+      `AWSSecretsManagerClientReadOnlyAccess` includes `GetSecretValue`
+      (recorded in `identity-center.ts` as a follow-up). The passphrase
+      `Environment=prod` tag was not checked — the sandbox has no
+      management-account session — so it stays the open question below.)
 - [x] 11. Revisit the workbench preview role at workbench step 10: done
       (2026-09-24, pi-step10; done as part of that step's design. The
       provider keeps the `assumeRoles` shape and only the ARN changes, so
@@ -380,4 +390,9 @@ decision: step 10 adds only the workbench hop.
   per-commit history of the plans and a clean run still leaves the diff up.
 - Is the passphrase parameter tagged `Environment=prod`? If so,
   `ReadOnlyAccess`'s inline deny blocks it and step 10 needs an exception.
-  (step 10)
+  Still open after step 10: the sandbox runs as `WorkbenchAccess` in the
+  workbench account and cannot read the management-account parameter's tags.
+  Check with `aws ssm list-tags-for-resource --resource-type Parameter
+  --resource-id pulumi-state-config-passphrase` from a `gp-readonly` or
+  `gp-admin` session; the fix if it is tagged is a `NotResource` exception on
+  the deny. (step 10)
