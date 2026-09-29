@@ -81,6 +81,49 @@ describe("linking", () => {
   });
 });
 
+describe("what a message full of references costs", () => {
+  /**
+   * `createCachingLinker` learns the workspace domain from its first real
+   * answer and derives every later link from it as string work. Asked in
+   * order, a board naming ten incidents is one API call; fired together it
+   * is ten, because none of them has taught it anything yet.
+   */
+  test("links are resolved in order, not all at once", async () => {
+    const inFlight: string[] = [];
+    let concurrent = 0;
+    const answer = await render("incident 4, incident 7 and incident 9", null, {
+      permalink: async (id) => {
+        inFlight.push(id);
+        concurrent = Math.max(concurrent, inFlight.length);
+        await Promise.resolve();
+        inFlight.pop();
+        return `${PERMALINK}${id}`;
+      },
+    });
+
+    assert.equal(concurrent, 1);
+    assert.match(answer, /Incident 4/);
+    assert.match(answer, /Incident 9/);
+  });
+
+  /**
+   * Ten incidents against a Slack that is refusing is ten consecutive
+   * ten-second deadlines, paid by whoever is waiting on the post.
+   */
+  test("one refusal stops the rest of the message asking", async () => {
+    let asked = 0;
+    const answer = await render("incident 4, incident 7 and incident 9", null, {
+      permalink: () => {
+        asked++;
+        return Promise.reject(new Error("ratelimited"));
+      },
+    });
+
+    assert.equal(asked, 1);
+    assert.equal(answer, "Incident 4, Incident 7 and Incident 9");
+  });
+});
+
 describe("what the pass must not touch", () => {
   test("a quoted log line inside code is left exactly as it was", async () => {
     const text = "here: `incident 7 not found` and incident 7";

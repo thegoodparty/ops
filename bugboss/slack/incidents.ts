@@ -117,19 +117,27 @@ export const renderIncidentRefs = async (
   // no link and still wants capitalising.
   if (!any) return text;
 
+  // Sequential, not `Promise.all`, for the reason the query tool used to
+  // give: `createCachingLinker` learns the workspace domain from its first
+  // real answer and derives every later link from it as string work, so a
+  // message naming ten incidents is one API call when they are asked in
+  // order and ten when they are fired together.
   const resolved = new Map<string, string>();
-  await Promise.all(
-    [...wanted].map(async (id) => {
-      try {
-        const url = await links.permalink(id);
-        if (url) resolved.set(id, url);
-      } catch (err) {
-        // A link is a convenience and this text is somebody's answer. Losing
-        // the link loses a convenience; failing the post loses the answer.
-        alarm("incident_link_failed", { incidentId: id, error: String(err) });
-      }
-    }),
-  );
+  for (const id of wanted) {
+    try {
+      const url = await links.permalink(id);
+      if (url) resolved.set(id, url);
+    } catch (err) {
+      // A link is a convenience and this text is somebody's answer. Losing
+      // the link loses a convenience; failing the post loses the answer.
+      //
+      // And the rest of this message stops asking: ten incidents against a
+      // Slack that is refusing is ten consecutive ten-second deadlines, paid
+      // by whoever is waiting on the post. The next message tries again.
+      alarm("incident_link_failed", { incidentId: id, error: String(err) });
+      break;
+    }
+  }
 
   const rendered = segments.map((segment, index) => {
     if (index % 2 === 1) {

@@ -283,6 +283,13 @@ Three things bound it:
 - **A link is never worth an answer.** A permalink that fails or an incident
   with no thread costs the link and nothing else.
 
+The lookups are **sequential**, for the reason the query tool used to give
+before it stopped handing out links: the linker learns the workspace from its
+first real answer and derives the rest, so a board naming ten incidents is
+one API call in order and ten fired together. One refusal stops the rest of
+that message asking, because ten against a Slack that is refusing is ten
+consecutive ten-second deadlines paid by whoever is waiting on the post.
+
 `permalink_shape_unknown` is the alarm to keep in mind if you touch this.
 `createCachingLinker` collapses every link to string work once it has parsed
 the workspace domain out of one real permalink; when it cannot, every link
