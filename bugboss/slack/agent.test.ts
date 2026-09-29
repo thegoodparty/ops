@@ -7,7 +7,7 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
-import { indexIncident } from "../db/search";
+import { indexIncident, toMatchQuery } from "../db/search";
 // The turn loop this agent runs on is named in the composition root, next to
 // the Bedrock client it drives. Its behaviour is the Slack agent's behaviour,
 // so it is tested here with the rest of that surface.
@@ -294,6 +294,21 @@ describe("search_incidents on the Slack agent", () => {
     });
   };
 
+  /**
+   * Text that reduces to no searchable terms, and does so by the length rule
+   * rather than by the stopword list.
+   *
+   * `toMatchQuery` drops a term that is under MIN_TERM_CHARS *or* is a
+   * stopword. A fixture leaning on the second is tautological: a sentence of
+   * common words is unsearchable only for as long as those exact words stay
+   * on the list, and if one leaves it the input becomes a real search
+   * returning zero hits -- so this test would quietly stop distinguishing
+   * "nothing like this" from "no search ran" and still pass. The premise is
+   * asserted below rather than assumed, so shrinking either rule fails here
+   * loudly instead.
+   */
+  const UNSEARCHABLE = "a b c";
+
   // The three answers the tool has to keep apart. Somebody asking "have we
   // seen this before" gets a wrong answer from two of them collapsing: a
   // search that never ran, reported as nothing found, reads as "this is new".
@@ -303,7 +318,13 @@ describe("search_incidents on the Slack agent", () => {
 
     const hit = await tool.run({ text: "connection pool exhausted" });
     const nothing = await tool.run({ text: "certificate rotation expiry" });
-    const never = await tool.run({ text: "the prod error" });
+    const never = await tool.run({ text: UNSEARCHABLE });
+
+    // The fixture's premise, checked: this text reaches FTS5 with no query
+    // at all, while the other two do produce one. Without this the test
+    // rests on a word list it does not own.
+    assert.equal(toMatchQuery(UNSEARCHABLE), null, "the unsearchable fixture became searchable");
+    assert.notEqual(toMatchQuery("certificate rotation expiry"), null, "the empty-corpus fixture stopped searching");
 
     assert.match(hit, /inc-old/);
     assert.match(hit, /connection pool was exhausted/);
