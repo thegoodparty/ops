@@ -589,6 +589,15 @@ read that was simply wrong: from inside, a hallucinated id and a real request
 look the same, and the cost of asking on a misread is one line while the cost
 of silence is the failure this file exists to remove.
 
+Everything it checks, it checks **inside the write**: both incidents still
+exist, both can still take signals, and which signals move. The write queue
+serializes behind a synchronous S3 PUT, so the gap between reading a list of
+ids and assigning them is hundreds of milliseconds of other people's writes
+— a correlation merge landing in it would move those signals to a third
+incident, and a list read beforehand would drag them back out. A human-actor
+assign has no containment to stop that. Same reason every transition in
+`toolapi/` puts its predicate in the statement.
+
 It does not choose a direction: the more established incident survives, which
 is `assign`'s rule, and a person who asks for the other direction gets this
 one and is told so. What follows is the same pair of messages correlation

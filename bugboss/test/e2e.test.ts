@@ -2024,6 +2024,53 @@ test("a mention naming only one incident is asked which two, not refused", async
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
+test("a combine naming an incident that does not exist says so", async () => {
+  const { newer } = await twoIncidents("nosuch");
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ addressed: "agent", combineIds: ["9999"] });
+  await boss.slackEvent(
+    replyIn(threadOf(newer)!, "this is the same bug as 9999, merge them"),
+  );
+
+  assert.equal(statusOf(newer).status, "INVESTIGATING");
+  assert.ok(
+    fakeSlack.posts
+      .slice(before)
+      .some((p) => /there is no .{0,40}9999/i.test(p.text)),
+    "a number that is in the message but not in the database is still an answer owed",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+test("a combine with nothing left to move says so rather than writing", async () => {
+  const { older, newer } = await twoIncidents("hollow");
+  // An open incident whose signals went elsewhere. `assign` would be handed
+  // an empty list and reject it, which reaches the person as a write that
+  // failed rather than as the plain fact that there is nothing there.
+  await boss.db.withWrite((w) => {
+    w.prepare("UPDATE signal SET incidentId = ? WHERE sourceId = ?").run(
+      older,
+      "fp-hollow-new",
+    );
+  });
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ addressed: "agent", combineIds: [older] });
+  await boss.slackEvent(
+    replyIn(threadOf(newer)!, `same thing as ${older}, merge them`),
+  );
+
+  assert.equal(statusOf(newer).status, "INVESTIGATING");
+  assert.ok(
+    fakeSlack.posts
+      .slice(before)
+      .some((p) => /has no signals left to move/.test(p.text)),
+    "and says which incident is empty, not that something went wrong",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
 // --- asking for a person, which is all it does -----------------------------
 
 /**

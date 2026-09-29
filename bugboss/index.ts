@@ -90,10 +90,14 @@ import {
 } from "./slack/intent";
 import {
   applyAssign,
+  assign,
   AssignError,
   createAnnouncer,
   createToolApi,
   establishedOf,
+  getIncidentRow,
+  getSignalsFor,
+  logAssign,
   mintAgentToken,
   type AssignResult,
   type Correlator,
@@ -2031,54 +2035,53 @@ export const createBugBoss = async (
       );
     }
 
-    const rows = pair.map((id) => ({
-      id,
-      status: db.get<{ status: IncidentStatus }>(
-        "SELECT status FROM incident WHERE id = ?",
-        [id],
-      )?.status,
-    }));
-    // Read now rather than trusted from the route. The route was built when
-    // the message arrived and this runs after a model call, so an incident
-    // can have been resolved, closed or merged away since.
-    for (const row of rows) {
-      if (!row.status) {
-        return decline(
-          `unknown incident ${row.id}`,
-          `there is no incident ${row.id}, so I have left these alone.`,
-        );
-      }
-      if (!COMBINABLE.includes(row.status)) {
-        return decline(
-          `incident ${row.id} is ${row.status}`,
-          `incident ${row.id} is ${row.status} and is not taking signals, so these cannot be combined. A signal arriving after a resolution is a recurrence rather than the same incident.`,
-        );
-      }
-    }
-
     // The rule, applied before anything moves, so what gets said matches
     // what gets written. Not negotiable from the message: a person asking
     // for the merge the other way round still gets this one, and is told.
+    // Both ids come from the message, so this needs no database.
     const into = establishedOf(pair[0], pair[1]);
     const absorb = into === pair[0] ? pair[1] : pair[0];
 
-    const signalIds = db
-      .query<{ id: string }>("SELECT id FROM signal WHERE incidentId = ?", [absorb])
-      .map((r) => r.id);
-    if (signalIds.length === 0) {
-      return decline(
-        "nothing to move",
-        `incident ${absorb} has no signals left to move, so there is nothing to combine.`,
-      );
-    }
-
-    let result: AssignResult;
+    // Which signals move is resolved inside the write, not before it. The
+    // same reason every transition here puts its predicate in the statement:
+    // the write queue serializes behind a synchronous S3 PUT, so the gap
+    // between reading a list of ids and assigning them is hundreds of
+    // milliseconds of other people's writes. A correlation merge landing in
+    // that gap moves those signals to a third incident, and a list read
+    // beforehand would then drag them out of it -- a human-actor assign has
+    // no containment to stop that, so it would be a silent cross-incident
+    // steal. `applyMerge` in the tool API reads its signals the same way.
+    //
+    // Both statuses are checked in here for the same reason, and only here.
+    // The route was built when the message arrived and this runs after a
+    // model call, so either incident can have resolved or merged away since
+    // -- and a second copy of the check outside the transaction would be a
+    // duplicate that no test can distinguish from this one.
+    let outcome:
+      | { kind: "unknown"; id: string }
+      | { kind: "shut"; id: string; status: IncidentStatus }
+      | { kind: "empty" }
+      | { kind: "assigned"; result: AssignResult };
     try {
-      result = await applyAssign(
-        db,
-        { signalIds, target: into, reason: args.said },
-        { kind: "human", slackUserId: args.user },
-      );
+      outcome = await db.withWrite((w: Database.Database) => {
+        for (const id of pair) {
+          const row = getIncidentRow(w, id);
+          if (!row) return { kind: "unknown" as const, id };
+          if (!COMBINABLE.includes(row.status)) {
+            return { kind: "shut" as const, id, status: row.status };
+          }
+        }
+        const signalIds = getSignalsFor(w, absorb).map((signal) => signal.id);
+        if (signalIds.length === 0) return { kind: "empty" as const };
+        return {
+          kind: "assigned" as const,
+          result: assign(
+            w,
+            { signalIds, target: into, reason: args.said },
+            { kind: "human", slackUserId: args.user },
+          ),
+        };
+      });
     } catch (err) {
       alarm("combine_failed", {
         here: args.here,
@@ -2090,6 +2093,27 @@ export const createBugBoss = async (
       );
       return;
     }
+
+    if (outcome.kind === "unknown") {
+      return decline(
+        `unknown incident ${outcome.id}`,
+        `there is no incident ${outcome.id}, so I have left these alone.`,
+      );
+    }
+    if (outcome.kind === "shut") {
+      return decline(
+        `incident ${outcome.id} is ${outcome.status}`,
+        `incident ${outcome.id} is ${outcome.status} and is not taking signals, so these cannot be combined. A signal arriving after a resolution is a recurrence rather than the same incident.`,
+      );
+    }
+    if (outcome.kind === "empty") {
+      return decline(
+        "nothing to move",
+        `incident ${absorb} has no signals left to move, so there is nothing to combine.`,
+      );
+    }
+    const result = outcome.result;
+    logAssign(result);
 
     // Their answer goes first, and announce's closing message last, because
     // one of the two threads announce writes into can be this one -- and
