@@ -46,7 +46,6 @@
 // `CLAUDE.md` in this directory before widening it.
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { truncateOutput, DEFAULT_MAX_TOOL_CHARS } from "./tools";
 
 export const RERUN_TOOL_NAME = "rerun_ci";
 
@@ -148,6 +147,10 @@ const githubHeaders = (token: string): Record<string, string> => ({
  * GitHub's error bodies are JSON with a `message`, except when they are an
  * HTML error page from a proxy. Both end up in a tool result a model reads, so
  * take the message when there is one and the raw text when there is not.
+ *
+ * The raw text goes whole. An HTML error page is the long case and the one
+ * worth reading: whatever names the proxy that refused us is in the middle of
+ * it, which is exactly what the old 500-character head-and-tail cut away.
  */
 export const githubMessage = (status: number, body: string): string => {
   try {
@@ -156,7 +159,7 @@ export const githubMessage = (status: number, body: string): string => {
   } catch {
     // Not JSON. Fall through to the raw body.
   }
-  return body.trim() ? truncateOutput(body.trim(), 500) : `HTTP ${status}`;
+  return body.trim() || `HTTP ${status}`;
 };
 
 export const createGitHubRunsPort = (deps: {
@@ -504,12 +507,10 @@ const RERUN_DESCRIPTION = [
 export const createRerunCiTool = async (deps: {
   github: GitHubRunsPort;
   thread: ThreadPort;
-  maxOutputChars?: number;
 }): Promise<ToolDefinition> => {
   const { Type } = await import("typebox");
   // One ledger for the life of the process, which is one incident.
   const attempted = new Set<string>();
-  const maxChars = deps.maxOutputChars ?? DEFAULT_MAX_TOOL_CHARS;
 
   const parameters = Type.Object({
     repo: Type.String({
@@ -558,7 +559,7 @@ export const createRerunCiTool = async (deps: {
                 "Wait for the new attempt with monitor.",
               ].join("\n");
       return {
-        content: [{ type: "text", text: truncateOutput(text, maxChars) }],
+        content: [{ type: "text", text }],
         details: { started: result.started, runId: args.runId },
       };
     },

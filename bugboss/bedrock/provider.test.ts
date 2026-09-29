@@ -87,10 +87,21 @@ test("an inference profile ARN resolves to the same catalog entry", async () => 
   assert.deepEqual(model.cost, { input: 5.5, output: 27.5, cacheRead: 0.55, cacheWrite: 6.875 });
 });
 
-test("an id the catalog does not know demands explicit cost rates", async () => {
+test("an id the catalog does not know is refused, cost rates or not", async () => {
+  // An application inference profile ARN is the id that reaches this and
+  // misses: its suffix is opaque rather than a model id. Explicit cost used
+  // to buy it a model definition with a made-up 200,000-token window, which
+  // is the wrong trade -- the rates were the only thing the caller could
+  // actually supply, and a wrong window is invisible in a way a wrong price
+  // is not.
+  const id = "arn:aws:bedrock:us-west-2:1:application-inference-profile/opaque";
+  await assert.rejects(resolveBedrockModel({ id }), /No Bedrock catalog entry/);
   await assert.rejects(
-    resolveBedrockModel({ id: "arn:aws:bedrock:us-west-2:1:application-inference-profile/opaque" }),
-    /pass explicit cost rates/,
+    resolveBedrockModel({
+      id,
+      cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 },
+    }),
+    /No Bedrock catalog entry/,
   );
 });
 

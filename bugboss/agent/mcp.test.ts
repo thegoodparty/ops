@@ -338,32 +338,37 @@ test("the allowlist is reads only, and the server is told the same thing", () =>
   assert.ok(GRAFANA_MCP_ARGS.some((arg) => arg.startsWith("--loki-guardrail-mode=")));
 });
 
-// The notice is an explanation of a bound, so it must not break a different
-// one. Adding it after the truncation is the same defect truncateOutput was
-// just fixed for, one layer up.
-test("the clamp notice comes out of the output budget, not on top of it", async () => {
-  const maxOutputChars = 900;
+// A log dump is the whole reason this agent has an MCP, and the middle of one
+// is where the line that explains the incident sits. It used to arrive with
+// that middle cut out; Pi compacts the conversation instead now, so what a
+// query returns reaches the model as the server sent it.
+test("a huge MCP result arrives whole, with the clamp notice still leading", async () => {
+  const echoed = 2_000_000;
   const set = await connectMcpToolset({
     name: "grafana",
     command: process.execPath,
     args: ["-e", FAKE_SERVER],
     env: { FAKE_TOOLS: JSON.stringify([LOKI_TOOL]) },
     allowedTools: [LOKI_TOOL.name],
-    maxOutputChars,
   });
   try {
     const [tool] = executable(set);
+    const needle = "NEEDLE_IN_THE_MIDDLE";
     const out = await tool.execute("c1", {
-      // Echoed back, so this is what makes the result long enough to truncate.
-      logql: "x".repeat(2_000_000),
+      // Echoed back, so this is what makes the result long.
+      logql: `${"x".repeat(echoed / 2)}${needle}${"x".repeat(echoed / 2)}`,
       startRfc3339: "now-30d",
       endRfc3339: "now",
     });
     const text = out.content[0].text;
     assert.match(text, /^\[bugboss\]/, "the notice still leads");
     assert.ok(
-      text.length <= maxOutputChars,
-      `capped at ${maxOutputChars} but came back as ${text.length}`,
+      text.includes(needle),
+      "the middle of the result is what a truncating cap used to drop",
+    );
+    assert.ok(
+      text.length > echoed,
+      `expected the whole ${echoed}-char echo back, got ${text.length}`,
     );
   } finally {
     set.close();

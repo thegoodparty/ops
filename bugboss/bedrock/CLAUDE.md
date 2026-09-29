@@ -19,6 +19,29 @@ restarted agent cannot continue its own session. Since every merge to ops
 So this module exists to keep the raw Anthropic message shape intact end to
 end.
 
+## The catalog is the only source of model facts, and a miss throws
+
+`resolveBedrockModel` reads context window, token limits and rates from Pi's
+Bedrock catalog (`getBuiltinModels("amazon-bedrock")`, shipped hydrated at
+`dist/providers/data/amazon-bedrock.json`), and throws when the id is not in
+it. `cost` is an override on a hit, never a licence to invent the rest.
+
+It used to substitute `contextWindow: 200000` and `maxTokens: 64000` for any
+id it did not know, which is five times too small for the model this agent
+runs: `us.anthropic.claude-opus-5` carries 1,000,000 and 128,000. That was
+the same class of error the function already threw on for a missing price,
+and worse in one way — a wrong rate at least shows up as a number somebody
+can disbelieve, where a wrong window is invisible. Too small and every
+session compacts away four fifths of a context it was entitled to; too large
+and the provider rejects a request nothing in the run predicted.
+
+`catalogIdFor` strips a *system-defined* inference profile ARN to its suffix,
+which is a catalog id. It deliberately does not match
+`:application-inference-profile/`: that suffix is an opaque generated id, so
+stripping it would turn one kind of catalog miss into another while looking
+like a fix. The throw is what protects that case, which is why the
+application profile ARN goes on the request field and never on `model.id`.
+
 ## Claiming an api id does not route anything
 
 `registerApiProvider()` puts this provider in pi-ai's registry, and
@@ -122,9 +145,9 @@ against Pi's hardcoded rates.
 applied at the `modelId` on the wire; `model.id` keeps the logical id. That
 is deliberate, and it is what the section below is about: the prefix records
 `model.id`, so putting the ARN there would pin the ARN in the session. Two
-things would then break. The costs come from Pi's catalog, which has no entry
-for an opaque profile suffix, so `resolveBedrockModel` would refuse to resolve
-a resumed session at all. And a session started before the profile existed
+things would then break. Everything about the model comes from Pi's catalog,
+which has no entry for an opaque profile suffix, so `resolveBedrockModel`
+would refuse to resolve a resumed session at all. And a session started before the profile existed
 would disagree with one started after it, for no reason a reader could see.
 Leaving `model.id` alone means a run started before the profile and resumed
 after it gets attribution from the resume onward and nothing else changes.

@@ -56,8 +56,10 @@ queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
   not in `TIME_RANGE_SHAPES` is not clamped, so adding a tool to the allowlist
   means adding its shape in the same change.
 
-The 20,000-char output cap does not help with any of this. It bounds bytes
-returned; Loki bills bytes scanned.
+There is no output cap to help with any of this, and there never was one that
+did: a cap bounds bytes returned, and Loki bills bytes scanned. Results now
+arrive whole and Pi compacts the conversation to make room — see "Nothing
+truncates a tool result" below.
 
 ## Two bounds, and the turn budget is the one that measures work
 
@@ -271,7 +273,9 @@ terminates the run. The details it rests on:
 
 `message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
 refused rather than truncated — truncating would cut off the question, which
-is the part at the bottom. The evidence goes in `details`, posted as its own
+is the part at the bottom. The limit is also what lets `unansweredBrief` quote
+the ask whole when nobody answers, which is the one thing the person picking
+the incident up cannot reconstruct. The evidence goes in `details`, posted as its own
 message under the ask — and posted *outside* the re-entrancy guard, because
 `messageTs` only records that the ask landed. A crash between the two posts
 leaves a marker that looks complete, so a resume re-posts the evidence rather
@@ -353,10 +357,52 @@ that met the bar did not hold. Three constraints carry the second:
 post-mortem often points at something that happened a third time under a
 different alert, and no key finds that.
 
-The post-mortem is clipped in `toolapi`, not here. `get_incident` renders as
-JSON followed by the pending directives, and the truncation that would
-otherwise apply keeps a head and a tail — so an unbounded post-mortem eats
-the middle of the incident rather than itself.
+A *prior* incident's post-mortem is clipped in `toolapi`, not here, at
+`MAX_PRIOR_POSTMORTEM_CHARS` — head only, and it names the incident database
+as where the rest is. That is background rather than evidence this run went
+and fetched, and a reader is told where to find the whole of it, which is the
+distinction the rule below turns on. `get_incident` itself renders as JSON
+followed by the pending directives, uncut.
+
+## Nothing truncates a tool result, and nothing truncates a message to a person
+
+Two rules that used to be one cap.
+
+**Tool results are never cut.** `DEFAULT_MAX_TOOL_CHARS` (20,000, about 5,000
+tokens) used to bound every one of them, and `truncateOutput` cut the middle
+out to do it. The outputs it actually fired on were stack traces, log dumps
+and test output, where the answer is usually in the middle — so it protected
+the session by destroying the evidence the run had just paid a tool call to
+fetch. Pi compacts just in time instead (`docs/architecture.md`), so a result
+lands whole and summarised history is what gives way. Do not add a cap back.
+
+**A message to a person is never cut by character count.** The nudge used to
+post `[... 549 characters elided ...]` in place of the middle of the sentence
+saying what was being waited for, to somebody reading it on a phone. A count
+of what they cannot see is not something anybody can act on. So:
+
+- Every prose field that a harness-composed Slack message echoes is **refused
+  at the tool boundary** — `MONITOR_FIELD_LIMIT` for `monitor`'s `description`
+  and `awaitingHuman`, `CONTACT_HUMAN_MESSAGE_LIMIT` for the ask,
+  `overThreadBudget` for everything the model posts itself. A refusal costs
+  one turn and says what to move where; a clamp costs the reader the sentence.
+- The composed worst case of each harness message has to fit
+  `THREAD_PROSE_CHARS`, because `escalate` refuses a longer one and a nudge
+  that fails to post is dropped by design. `tools.test.ts` composes those
+  worst cases at the field limits, which is what keeps the refusals
+  load-bearing rather than decorative.
+- `CONTACT_HUMAN_MESSAGE_LIMIT` is 550 rather than something rounder because
+  `unansweredBrief` quotes the ask **whole**, and that arithmetic is what buys
+  it. Changing one means redoing the other.
+- The one thing still excerpted is a probe's own output
+  (`statusExcerpt`/`STATUS_EXCERPT_CHARS`): nobody authored it, it is
+  unbounded at the source, and a reader who wants all of it runs the check.
+  Head only, ending in an ellipsis, and it says nothing about its own size.
+
+The Slack agent's `truncate` in `slack/agent.ts` is the exception, and
+deliberately: that agent has no compaction configured at all, so its caps are
+the only thing bounding its context. Its call sites are tool results it reads,
+not messages it posts.
 
 ## What it writes goes straight to Slack
 
