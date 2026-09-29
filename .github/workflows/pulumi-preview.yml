@@ -19,6 +19,9 @@ on:
       - "deploy-org/**"
       - "deploy-workbench/**"
       - "delegate/**"
+      # A shared input: all three projects import the account ids from it, so
+      # an edit here changes their plans and must start a preview.
+      - "utils/accounts.ts"
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
@@ -128,7 +131,7 @@ jobs:
             const any = (re) => paths.some((p) => re.test(p));
             // Shared inputs any project's preview depends on.
             const shared =
-              /^(package\.json|package-lock\.json|tsconfig\.json|\.nvmrc|\.github\/workflows\/pulumi-preview\.yml)$/;
+              /^(package\.json|package-lock\.json|tsconfig\.json|\.nvmrc|utils\/accounts\.ts|\.github\/workflows\/pulumi-preview\.yml)$/;
             const matrix = [];
             if (any(/^(deploy\/|delegate\/)/) || any(shared)) {
               matrix.push({ project: "ops", dir: "deploy", build: true });
