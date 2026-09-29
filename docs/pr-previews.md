@@ -77,8 +77,14 @@ the consumer by a different workflow, and nothing sequences the two.
       edit was an in-place provider update; the first live workbench preview
       after apply confirms it, and the fallback is CI role chaining. Tests
       cover the trust and the ops grant.)
-- [ ] 9. Workbench previews in the workflow: doing (pi-pr-previews,
-      2026-09-29). Depends on 8 being applied (it is).
+- [x] 9. Workbench previews in the workflow: done (2026-09-29, PR #165.
+      `deploy-workbench/**` joins the path filter and the matrix builder emits
+      `workbench` (`build: false`, no `dist/lambda` archive), alongside ops and
+      org. The first live workbench preview ran on this PR: 9 same, 1 update,
+      the provider's `assumeRoles` repointing at `pulumi-preview` with nothing
+      behind it replaced, which confirms step 8's cascade check. The preview
+      role held: its only invoke is `getCallerIdentity`, so no action was
+      needed.)
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
       todo. Depends on 8 being applied.
 - [x] 11. Revisit the workbench preview role at workbench step 10: done
