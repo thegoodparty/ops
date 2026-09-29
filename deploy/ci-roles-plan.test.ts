@@ -64,27 +64,33 @@ describe("githubActionsPulumiPlan", () => {
     ]);
   });
 
-  const AI_SECRETS_DEV =
-    "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????";
+  const PLAN_SECRETS = [
+    "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
+    "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-dev-??????",
+    "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-service-tokens-dev-??????",
+  ];
 
-  // The single documented exception, and the whole residual risk of the role.
-  // Pinned to DEV: gp-ai plans only its dev roots on a pull request, and the
-  // prod blob must stay unreachable.
-  it("allows exactly one secret value, the dev AI secrets", () => {
+  // The documented exceptions, and the whole residual risk of the role. All
+  // dev: gp-ai plans only its dev roots on a pull request, so no prod secret
+  // may appear here however the list grows.
+  it("allows only the listed dev secret values", () => {
     const allow = statement("AiSecretsDevForPlan");
     assert.equal(allow.Effect, "Allow");
-    assert.equal(allow.Resource, AI_SECRETS_DEV);
-    assert.ok(!String(allow.Resource).includes("PROD"));
+    assert.deepEqual(asList(allow.Resource), PLAN_SECRETS);
+    for (const one of asList(allow.Resource)) {
+      assert.equal(/PROD|prod/.test(one), false, `not dev: ${one}`);
+    }
   });
 
   // NotResource, not Resource: an explicit Deny beats the Allow above, so a
-  // blanket deny here would refuse the plan the role exists to run.
+  // blanket deny here would refuse the plan the role exists to run. The two
+  // lists must stay identical or one of them is a lie.
   it("denies every other secret value", () => {
     const deny = statement("DenySecretValues");
     assert.equal(deny.Effect, "Deny");
     assert.ok(asList(deny.Action).includes("secretsmanager:GetSecretValue"));
     assert.equal(deny.Resource, undefined);
-    assert.equal(deny.NotResource, AI_SECRETS_DEV);
+    assert.deepEqual(asList(deny.NotResource), PLAN_SECRETS);
   });
 
   // Blanket, and including GetParameterHistory: it returns prior versions
