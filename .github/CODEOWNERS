@@ -53,46 +53,12 @@
 # workflow trigger is not.
 #
 # `/package.json`, `/package-lock.json`, `/tsconfig.json` -- one
-# `package.json` builds every image, so a dependency added for bugboss also
-# installs into the delegate worker that holds the GitHub App token.
+# `package.json` builds every image, so a dependency added for any one
+# service also installs into the delegate worker that holds the GitHub App
+# token.
 # `tsconfig.json` governs the same `tsc` that compiles `delegate/`.
 #
 # `/.dockerignore` -- the build context for both images.
-#
-# ## BugBoss: open by default, with its boundaries owned
-#
-# Most of `bugboss/` is application code and merges on a bot approval. Four
-# parts are not application code:
-#
-# `bugboss/toolapi/` -- the agent's tool surface, and `token.ts` in it is "the
-# reason a fully compromised agent can still only corrupt one record". A new
-# file here is a new capability for a process that reads attacker-writable log
-# lines.
-# `bugboss/dispatcher/` -- mints the child agent's AWS credentials. Its own
-# comment names the agent role as "the containment boundary".
-# `bugboss/slack-app-manifest.yaml` -- the OAuth scopes, checked in expressly
-# so they stay reviewable.
-# `bugboss/Dockerfile` -- runs after the credentials step in `deploy.yml`.
-#
-# BugBoss holds GitHub App credentials and can open PRs, but those PRs face
-# the target repo's own review gates, and its AWS reach is fixed in
-# `deploy/components/bugboss.ts`, owned above. Application code cannot widen
-# it.
-#
-# ## The reviewer's own criteria
-#
-# `CLAUDE.md`, at the root and in any directory. `delegate/agents/pr-reviewer.ts`
-# step 2 tells the reviewer to read "the repo's root `CLAUDE.md` -- authoritative
-# for conventions" and any `CLAUDE.md` in a directory the PR touches, and the
-# scout subagent is told the same. So these files are an input to the judgement
-# that this change is about making sufficient. A bot-approved edit here changes
-# what the reviewer will accept on every later PR, which is the one kind of
-# change that compounds.
-#
-# This is the only file-pattern entry that is not a named singleton, and it is
-# a pattern rather than a directory because the files it covers are scattered
-# by design. It costs a human on a bugboss documentation edit, which is the
-# right side to err on.
 #
 # ## Rules for editing this list
 #
@@ -100,15 +66,14 @@
 # adding `deploy/components/evil.ts` touches no file-scoped path, so it would
 # need no human review. This repo has already been bitten by exactly that --
 # see the `job_workflow_ref` comment in
-# `deploy/components/ci-roles/policies.ts`. The four file-scoped entries below
+# `deploy/components/ci-roles/policies.ts`. The five file-scoped entries below
 # are singletons referenced by name from an owned path, where there is no
 # "one file over" to add.
 #
 # Before adding a path to the unowned side, check what executes it. The
 # ordering in `deploy.yml` -- install, test and build strictly before the
 # credentials step -- is load-bearing for every unowned path in this repo, and
-# is the only reason an unowned `bugboss/**/*.test.ts` is not an
-# admin-credentialled shell.
+# is the only reason an unowned test file is not an admin-credentialled shell.
 #
 # Narrowing this list is a security change. It is also, by construction, a
 # change to a path on the list, so it needs a human.
@@ -126,13 +91,3 @@
 /tsconfig.json                   @thegoodparty/gp-contrib
 /.dockerignore                   @thegoodparty/gp-contrib
 
-/bugboss/toolapi/                @thegoodparty/gp-contrib
-/bugboss/dispatcher/             @thegoodparty/gp-contrib
-/bugboss/github.ts               @thegoodparty/gp-contrib
-/bugboss/slack-app-manifest.yaml @thegoodparty/gp-contrib
-/bugboss/Dockerfile              @thegoodparty/gp-contrib
-
-# Last, so it wins over the tree rules above. Same owner either way, so the
-# ordering is for readers rather than for GitHub.
-/CLAUDE.md                       @thegoodparty/gp-contrib
-**/CLAUDE.md                     @thegoodparty/gp-contrib
