@@ -1424,6 +1424,29 @@ describe("the spawned environment", () => {
  * came back, one whose agent stopped for a reason nothing recorded -- are
  * exactly the shapes that went quiet for a day and a half in production.
  */
+describe("what the dispatcher's own briefs may claim", () => {
+  it("never says the agent stayed silent, in any of them", () => {
+    // Three briefs, one rule. Only the deadline one can be suppressed when
+    // the agent has already spoken: `entry.escalated` lives on the run, and
+    // the crash-loop and stalled paths fire after the run has left
+    // `this.running`, so neither of them can know. A sentence asserting
+    // something the code cannot check is the system contradicting itself in
+    // the thread, directly under the agent's own brief.
+    //
+    // Read off the source because that is where the claim would reappear: a
+    // fourth brief added later gets caught here rather than in production.
+    const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+    const offenders = (
+      src.match(/"[^"\n]*(did not say|said nothing|never said|stayed silent)[^"\n]*"/g) ?? []
+    ).filter((line) => !line.includes("//"));
+    assert.deepEqual(
+      offenders,
+      [],
+      "a dispatcher brief is claiming a silence it cannot verify",
+    );
+  });
+});
+
 describe("Dispatcher stale sweep", () => {
   const DAY = 86_400_000;
 

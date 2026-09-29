@@ -301,7 +301,12 @@ const crashLoopBrief = (
   fastFailureSeconds: number,
 ): string =>
   [
-    "Escalated by the dispatcher. The agent did not say anything itself.",
+    // Same rule as `deadlineBrief`, and this one cannot be suppressed at all:
+    // `entry.escalated` lives on the run, and the run is out of `running`
+    // before crash-loop detection looks. A fast-failing agent that escalates
+    // in its first seconds and then dies badly would get this posted under
+    // its own brief, so the sentence must not claim it said nothing.
+    "Escalated by the dispatcher after a crash loop.",
     "",
     `Its last ${failures} launches each died within ${fastFailureSeconds}s of starting, which is a crash loop rather than an interrupted investigation, so relaunching stopped. Total launches to date: ${row.attempts}.`,
     "",
@@ -345,7 +350,9 @@ export const staleNotice = (quietSeconds: number, unparked: boolean): string => 
 
 const stalledBrief = (row: EligibleRow, launches: number): string =>
   [
-    "Escalated by the dispatcher. The agent did not say anything itself.",
+    // As above: no live entry by the time this fires, so nothing here knows
+    // whether the run spoke before it stopped.
+    "Escalated by the dispatcher after too many launches without a finish.",
     "",
     `It has been launched ${launches} times on this incident since this container came up and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
     "",
