@@ -130,7 +130,7 @@ import {
   sessionKeyFor,
   sumSessionUsage,
 } from "./agent/session";
-import { DEFAULT_MAX_TURNS } from "./agent/run";
+import { INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
 import { createInstallationToken, createPrStateReader } from "./github";
 import { makeAlarm, makeLog } from "./logging";
@@ -2233,7 +2233,7 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       maxConcurrentAgents: Number(env.BUGBOSS_MAX_AGENTS ?? 15),
       tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
       agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 86_400),
-      maxTurns: Number(env.BUGBOSS_MAX_TURNS ?? DEFAULT_MAX_TURNS),
+      agentMaxTurns: Number(env.BUGBOSS_MAX_TURNS ?? INCIDENT_AGENT_MAX_TURNS),
       maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
       staleAfterSeconds: Number(env.BUGBOSS_STALE_HOURS ?? 24) * 3600,
     },

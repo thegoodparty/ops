@@ -476,7 +476,11 @@ export interface DispatcherConfig {
    */
   agentTimeoutSeconds: number;
   /**
-   * Turns one incident's agent may take, counted across every launch.
+   * Turns the incident agent may take on one incident, across every launch.
+   *
+   * Named beside `agentTimeoutSeconds` because it bounds the same child: the
+   * dispatcher launches incident agents and nothing else, and the Slack
+   * agent's own budget (`SLACK_AGENT_MAX_TURNS`) never passes through here.
    *
    * The bound that tracks work rather than time. A turn is a model call, so
    * this does not inflate while the agent waits on a person -- the nine-hour
@@ -484,7 +488,7 @@ export interface DispatcherConfig {
    * merge to ops `main` restarts this container, and a budget that refilled
    * on a restart would bound nothing.
    */
-  maxTurns: number;
+  agentMaxTurns: number;
   /** Stop relaunching after this many attempts and escalate. */
   maxAttempts: number;
   /**

@@ -14,7 +14,7 @@ import {
   createBossClient,
   createBossTools,
   createTurnBudget,
-  DEFAULT_MAX_TURNS,
+  INCIDENT_AGENT_MAX_TURNS,
   DEFAULT_TIMEOUT_SECONDS,
   MODEL_BINDING_MISMATCH,
   exitCodeFor,
@@ -723,7 +723,7 @@ test("the turn budget reaches the agent from the environment the dispatcher buil
         BUGBOSS_SESSION_REF: "sessions/incident/inc-1/session.jsonl",
         BUGBOSS_MAX_TURNS: value,
       }).maxTurns,
-      DEFAULT_MAX_TURNS,
+      INCIDENT_AGENT_MAX_TURNS,
       `BUGBOSS_MAX_TURNS=${JSON.stringify(value)} must fall back, not bind`,
     );
   }

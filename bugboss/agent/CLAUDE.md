@@ -67,8 +67,8 @@ they block, so the first nine-hour incident spent about eight of those hours
 inside a single turn waiting on a person. 92 turns, $18.51, against a
 24-hour deadline that fifteen agents could each have spent in full.
 
-So there is a second bound in turns — `BUGBOSS_MAX_TURNS`, 200 by default —
-and three things about it matter:
+So there is a second bound in turns — `INCIDENT_AGENT_MAX_TURNS`, 200,
+overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
 
 - **It is counted over the incident, not the process.** Every merge to ops
   `main` restarts this container, so a budget that started from zero on each
@@ -87,6 +87,12 @@ and three things about it matter:
   estimate, because shipping 200 before a dollar cap is only worth anything
   if somebody learns what 200 turns costs. It is called an estimate there
   too.
+
+**This is not the Slack agent's budget.** `SLACK_AGENT_MAX_TURNS` is 24 and
+ends by posting that the run is out of steps, which is right when a person is
+waiting in a thread for an answer. Nobody is watching an investigator, so its
+ending is a hand-off. Same mechanism, different number, different last act —
+the names say which is which so the next change picks the right one.
 
 `turn_end` cannot stop the loop. Pi reads a boundary result's `continue` as
 "force another turn" and never as "stop", so the stop is `session.abort()` —

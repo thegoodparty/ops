@@ -241,7 +241,7 @@ const config = (path: string): BugBossConfig => ({
     maxConcurrentAgents: 15,
     tickSeconds: 30,
     agentTimeoutSeconds: 1800,
-    maxTurns: 200,
+    agentMaxTurns: 200,
     maxAttempts: 3,
     staleAfterSeconds: 86_400,
   },

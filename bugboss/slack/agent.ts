@@ -519,6 +519,10 @@ export const SLACK_AGENT_SYSTEM = [
  * uses, nowhere near what an incident agent's run costs -- so what bounds
  * this is how long somebody will sit in a thread waiting, not the bill.
  */
+// Not the incident agent's budget. That one is INCIDENT_AGENT_MAX_TURNS in
+// agent/run.ts, an order of magnitude larger, and it ends in a hand-off
+// rather than in a reply -- because nobody is sitting in a thread waiting on
+// an investigator. Two budgets, two right answers on exhaustion.
 export const SLACK_AGENT_MAX_TURNS = 24;
 
 /** One model call's wall-clock bound, which every turn gets its own of. */

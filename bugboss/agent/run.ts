@@ -91,21 +91,32 @@ export const DEFAULT_TIMEOUT_SECONDS = 86_400;
 export const DEADLINE_GRACE_SECONDS = 180;
 
 /**
- * Turns one incident's agent may take, across every launch.
+ * Turns the **incident agent** may take on one incident, across every launch.
  *
- * The wall clock does not bound work. `monitor` and `contact_human` each
- * cost one turn however long they block, so the first nine-hour incident
- * spent about eight of those hours inside a single turn waiting on a person
- * -- 92 turns and $18.51 in total, against a 24-hour clock that would have
- * let fifteen agents do that at once. A turn is a model call, so it is the
- * unit that does not inflate while nobody is working.
+ * Named for its agent, not for turns, because this codebase now has two turn
+ * budgets and they are not the same number or the same behaviour.
+ * `SLACK_AGENT_MAX_TURNS` (24, `slack/agent.ts`) bounds the Slack agent, which
+ * answers a person waiting in a thread and whose right move on exhaustion is
+ * to say it ran out of steps. This bounds the investigator the dispatcher
+ * launches, which nobody is watching and whose right move is to hand off with
+ * a brief. Conflating them would give one of the two the wrong ending.
  *
- * 200 rather than 92: high enough that no incident like the ones we have
- * seen touches it, low enough that a runaway stops. It is a bound before a
- * dollar cap, not instead of one -- the escalation carries what the run
- * spent so the next number is measured rather than guessed.
+ * The wall clock does not bound work. `monitor` and `contact_human` each cost
+ * one turn however long they block, so the first nine-hour incident spent
+ * about eight of those hours inside a single turn waiting on a person -- 92
+ * turns and $18.51 in total, against a 24-hour clock that would have let
+ * fifteen agents do that at once. A turn is a model call, so it is the unit
+ * that does not inflate while nobody is working.
+ *
+ * 200 rather than 92: high enough that no incident like the ones we have seen
+ * touches it, low enough that a runaway stops. It is a bound before a dollar
+ * cap, not instead of one -- the escalation carries what the run spent so the
+ * next number is measured rather than guessed.
+ *
+ * Overridden by `BUGBOSS_MAX_TURNS`, which keeps the plain name because it is
+ * the only turn budget that is settable from the environment.
  */
-export const DEFAULT_MAX_TURNS = 200;
+export const INCIDENT_AGENT_MAX_TURNS = 200;
 
 /**
  * Turns held back from `maxTurns` for the hand-off, the way
@@ -650,7 +661,7 @@ export interface RunIncidentAgentOptions {
    */
   inferenceProfiles?: InferenceProfiles;
   timeoutSeconds?: number;
-  /** Turns this incident gets in total. Defaults to `DEFAULT_MAX_TURNS`. */
+  /** Turns this incident gets in total. Defaults to `INCIDENT_AGENT_MAX_TURNS`. */
   maxTurns?: number;
   awsRegion?: string;
   /**
@@ -761,7 +772,7 @@ export const agentOptionsFromEnv = (
     awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
     sessionKey,
     timeoutSeconds,
-    maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : DEFAULT_MAX_TURNS,
+    maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : INCIDENT_AGENT_MAX_TURNS,
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
     ...(grafanaToken
@@ -1373,7 +1384,7 @@ const launch = async (args: {
     void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
   };
 
-  const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxTurns = options.maxTurns ?? INCIDENT_AGENT_MAX_TURNS;
   const turnBudget = createTurnBudget({
     prior: args.priorUsage,
     maxTurns,
