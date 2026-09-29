@@ -86,7 +86,7 @@ the consumer by a different workflow, and nothing sequences the two.
       role held: its only invoke is `getCallerIdentity`, so no action was
       needed.)
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
-      todo. Depends on 8 being applied.
+      doing (pi-pr-previews, 2026-09-29). Depends on 8 being applied (it is).
 - [x] 11. Revisit the workbench preview role at workbench step 10: done
       (2026-09-24, pi-step10; done as part of that step's design. The
       provider keeps the `assumeRoles` shape and only the ARN changes, so
