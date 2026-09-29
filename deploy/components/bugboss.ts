@@ -488,8 +488,9 @@ export const createBugBoss = (config: BugBossConfig) => {
     "bugbossAgentInferenceProfile",
     {
       name: "bugboss-incident-agent",
+      // Bedrock validates this against ([0-9a-zA-Z:.][ _-]?)+ -- no commas.
       description:
-        "Incident agent invocations, so Bedrock spend is attributable to BugBoss",
+        "Incident agent invocations so Bedrock spend is attributable to BugBoss",
       modelSource: { copyFrom: AGENT_INFERENCE_PROFILE_SOURCE },
       tags: TAGS,
     },
