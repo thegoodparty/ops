@@ -135,3 +135,22 @@ The worker re-clones omni (sparse, just `packages/runbooks`) at every boot, so u
 ### Symptom: malformed header in Slack thread
 
 If a user replies with a continuation verb and gets `No prior workflow state found in this thread`, but a prior bot post is clearly a workflow post, look for a `workflow_malformed_header` warning in the Lambda log — the agent emitted a header that didn't pass validation. Check the agent prompt and `delegate/framework/thread-state.ts:parseHeader` for the contract.
+
+## Security pass (`security-scanner`)
+
+A **second, independent** reviewer that runs in parallel with `pr-reviewer` and never touches it. On a PR `opened`/`ready_for_review` (and on a `delegate security review` comment) it does an adversarial, diff-scoped security review and posts a **non-blocking, comment-only** review under its own `security-review` status context. It never approves, never requests changes, and its status is always `success` — it cannot gate merge. Trigger word for re-runs is `delegate security review` (distinct from `delegate review`).
+
+It posts under its **own GitHub App identity** (a third App, separate from the delegate and reviewer Apps). That separate login is what guarantees `pr-reviewer`'s login-scoped review/thread reconciliation never sees it.
+
+### Enable / onboard a repo
+
+The code is inert until the App is **fully** provisioned — `delegate/lambdas/github.ts` gates dispatch on all three values below being present in the secret, so a partial provision dispatches nothing (rather than failing tasks). To turn it on:
+
+1. **Register a "Delegate Security" GitHub App** in the org. Permissions: Contents `Read`, Pull requests `Read & write`, Commit statuses `Read & write`. Subscribe to no events (the existing webhook drives dispatch). Generate a private key.
+2. **Install** the App on the target repo(s).
+3. **Provision all three in the `DELEGATES` secret**: `SECURITY_APP_ID`, `SECURITY_INSTALLATION_ID`, `SECURITY_APP_PRIVATE_KEY`. The lambda reads them from the secret to gate dispatch; the worker reads the same three (injected as env from that secret) to mint the App token.
+4. **Add the repo** to `SECURITY_REVIEW_REPOS` in `delegate/lambdas/github.ts` (already seeded with `omni`). This is independent of `REVIEW_REPOS` — a repo can get the security pass without the main review.
+
+Onboarding another repo later = install the App there + add its name to `SECURITY_REVIEW_REPOS`. No other change.
+
+The analysis is ported from the `/security-scan` skill (source→sink taint taxonomy + adversarial disprove-it verifier) with first-class LLM/prompt-injection and infrastructure-as-code lenses, MITRE ATT&CK technique mapping, and multi-step chain analysis. Findings are diff-scoped (changed lines + reachable paths); Medium+ post inline with `suggestion` fixes, Low/info roll into a collapsed summary.
