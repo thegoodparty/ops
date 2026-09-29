@@ -166,10 +166,23 @@ const emptyUsage = (): AssistantMessage["usage"] => ({
 export interface CreateBedrockInvokeModelProviderOptions {
   /** Injected in tests so no AWS call is made. */
   invoke?: BedrockInvoke;
+  /**
+   * Maps the logical model id to the id put on the wire, which is how an
+   * application inference profile is reached: Bedrock has no request-level
+   * cost tag, so the only way to attribute a run is to invoke a tagged
+   * wrapper instead of the model.
+   *
+   * Only the request field changes. `model.id` stays the logical id, so the
+   * cost rates, the signed session prefix and the `modelId` recorded on the
+   * turn are all the same with a profile as without one -- which is what
+   * lets a session started before a profile existed resume after one does.
+   */
+  invokeModelIdFor?: (modelId: string) => string;
 }
 
 export const createBedrockInvokeModelProvider = async ({
   invoke = defaultInvoke,
+  invokeModelIdFor = (modelId) => modelId,
 }: CreateBedrockInvokeModelProviderOptions = {}): Promise<
   ApiProvider<BedrockInvokeModelApi, BedrockInvokeModelOptions>
 > => {
@@ -223,7 +236,7 @@ export const createBedrockInvokeModelProvider = async ({
 
         const response = await invoke(
           {
-            modelId: model.id,
+            modelId: invokeModelIdFor(model.id),
             contentType: "application/json",
             accept: "application/json",
             body: new TextEncoder().encode(JSON.stringify(body)),

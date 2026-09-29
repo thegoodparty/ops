@@ -8,7 +8,9 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Where the work is. Orthogonal to `owner`, which says who has it.
+ * Where the work is, and the only thing that says it. An open incident is
+ * always driven by an agent; a person is something it can be waiting on,
+ * never something it can be given to.
  *
  * RESOLVED means no users will be impacted any more and no further alerts
  * should occur, confirmed by evidence rather than asserted. That bar is what
@@ -21,8 +23,6 @@ export type IncidentStatus =
   | "RESOLVED"
   | "CLOSED"
   | "MERGED";
-
-export type IncidentOwner = "agent" | "human";
 
 /**
  * Anything telling us something is wrong. `source` is a free string, not a
@@ -44,6 +44,20 @@ export interface Signal {
   incidentId: string | null;
   /** Set when an agent's root cause accounts for this signal. */
   explained: boolean;
+  /**
+   * What triage spent placing this signal, summed over every request the
+   * decision took, including a request that failed. Accumulated rather than
+   * replaced: a re-delivery of a signal nothing ever placed is triaged again,
+   * and both attempts were paid for.
+   *
+   * Tokens and a modelId, never a dollar figure -- see `db/schema.sql`.
+   */
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  modelCalls: number;
+  modelId: string | null;
 }
 
 /** One hit from `searchIncidents`. Produced by `db/search.ts`. */
@@ -59,8 +73,16 @@ export interface IncidentMatch {
 export interface Incident {
   id: string;
   status: IncidentStatus;
-  owner: IncidentOwner;
   slackThreadTs: string | null;
+
+  /**
+   * What this incident is, in a few words, kept current by the agent.
+   *
+   * The only field that says what the incident *is* rather than what was
+   * concluded about it. Null until an agent writes one, which is what the
+   * first-signal title falls back to.
+   */
+  summary: string | null;
 
   rootCause: string | null;
   prUrls: string[];
@@ -93,11 +115,17 @@ export interface Incident {
   /** Total launches, informational. Escalation gates on fast failures. */
   attempts: number;
   modelId: string | null;
-  costUsd: number;
+  /**
+   * What the run spent, in tokens. Never in dollars: Bedrock returns tokens
+   * and a price is arithmetic against a table that goes stale silently, so a
+   * cost is derived wherever it is shown and labelled an estimate there.
+   */
   tokensIn: number;
   tokensOut: number;
   cacheRead: number;
   cacheWrite: number;
+  /** The 1h share of `cacheWrite`, which prices at 2x base input, not 1.25x. */
+  cacheWrite1h: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +135,18 @@ export interface Incident {
 /** A signal as a source hands it to us, before it has an id or an incident. */
 export type RawSignal = Omit<
   Signal,
-  "id" | "incidentId" | "explained" | "closedAt"
+  | "id"
+  | "incidentId"
+  | "explained"
+  | "closedAt"
+  // An adapter parses what a source sent. What placing it then cost is
+  // decided here and is not a thing any source could hand over.
+  | "tokensIn"
+  | "tokensOut"
+  | "cacheRead"
+  | "cacheWrite"
+  | "modelCalls"
+  | "modelId"
 >;
 
 export interface Evidence {
@@ -202,8 +241,23 @@ export interface ToolResponse<T = unknown> {
 export type Directive =
   | { type: "stop"; reason: string }
   | { type: "merged"; into: string }
-  | { type: "handoff"; reason: string }
-  | { type: "new_signals"; count: number; summary: string }
+  /**
+   * Signals landed on this incident that its agent did not put there.
+   * `summary` is the reason the move was made.
+   *
+   * `absorbed` names the incidents that were emptied into this one, when
+   * that is how the signals arrived. Without it a merge reaches the
+   * surviving agent as an unexplained pile of new signals, and the agent is
+   * then expected to write an honest title for an incident it never saw.
+   * The incidents it names arrive in full on the next `getIncident`, as
+   * `absorbed` on the view.
+   */
+  | {
+      type: "new_signals";
+      count: number;
+      summary: string;
+      absorbed?: string[];
+    }
   /**
    * Something a person said in the incident thread. `addressed` is whether it
    * was for the agent: `contact_human` ends its wait on a reply that was, and
@@ -240,6 +294,15 @@ export interface ToolApi {
     impactStartedAt?: number;
   }): Promise<ToolResponse>;
 
+  /**
+   * What this incident is, in a few words. Callable at any time and at any
+   * status, including before there is a root cause.
+   *
+   * Refused rather than truncated past `SUMMARY_CHARS`: a title cut at
+   * eighty characters reads as a complete thought that happens to be wrong.
+   */
+  setSummary(args: { summary: string }): Promise<ToolResponse>;
+
   /** Callable repeatedly. Impact grows during an incident. */
   reportImpact(args: {
     usersImpacted: number;
@@ -273,11 +336,90 @@ export interface ToolApi {
    */
   searchIncidents(args: { text: string }): Promise<ToolResponse<IncidentMatch[]>>;
 
-  /** Terminal. Sets owner: human and posts the brief. */
-  handOff(args: { reason: string; brief: string }): Promise<ToolResponse>;
+  /**
+   * Say that this incident needs a person, in its thread and at the rotation.
+   * Changes nothing: the agent still owns the work and carries on driving.
+   *
+   * This was `handOff`, and its real effect was the ownership write that took
+   * the incident out of the dispatcher's query. Announcing was always the
+   * useful half; stopping was the half that stranded eight incidents.
+   */
+  escalate(args: { reason: string; brief: string }): Promise<ToolResponse>;
 
-  /** Rehydration after resume, plus pending directives. */
-  getIncident(): Promise<ToolResponse<IncidentView>>;
+  /**
+   * Stop relaunching this incident until a person replies, the cooldown
+   * expires, or the stale sweep lifts it. The agent still has the incident;
+   * it simply has nothing it can do yet.
+   *
+   * This is the half of `owner = 'human'` that had to survive. Anything that
+   * makes an agent stop driving needs it, or the dispatcher relaunches on the
+   * next tick into whatever stopped it: a budget-exhausted run becomes a hot
+   * loop that pings the rotation every thirty seconds.
+   *
+   * It stops the relaunch. It does not free the dispatcher slot -- an agent
+   * parked inside `monitor` is alive and still holds one, deliberately.
+   */
+  park(args: {
+    waitingFor: string;
+    /** Runnable again after this long. Omitted means only a reply lifts it. */
+    wakeAfterSeconds?: number;
+    /**
+     * Whether a reply in the thread ends this wait. Defaults to true, which
+     * is the wait on a person: somebody replying is exactly the signal it is
+     * over. Pass false when a reply cannot change the thing being waited on
+     * -- a run out of turns is the case that forced this -- because waking
+     * on one relaunches an agent that stops again immediately and escalates
+     * again, and every comment on the thread becomes a page.
+     */
+    liftsOnReply?: boolean;
+  }): Promise<ToolResponse>;
+
+  /**
+   * Rehydration after resume, plus pending directives. With an id, any
+   * incident: reads are not contained.
+   *
+   * Containment is about writes. The argument for it -- a compromised agent
+   * re-partitions its own record and nothing else -- says nothing about
+   * reading, and withholding the read only made this system incoherent from
+   * the outside. An agent could already read a stranger's whole post-mortem
+   * through `searchIncidents`, which is scoped to RESOLVED and CLOSED, and
+   * could not see the open incident beside it: fluent about the past, blind
+   * to the present. The Slack question box has served any incident to anyone
+   * in the channel the whole time, and serves more of it than this does.
+   */
+  getIncident(args?: {
+    /** Defaults to the caller's own incident. */
+    incidentId?: string;
+  }): Promise<ToolResponse<IncidentView>>;
+
+  /**
+   * Ask for this incident and another to be combined. The agent proposes;
+   * it does not decide and it writes nothing across.
+   *
+   * An agent that works out its partition is wrong has to be able to say so.
+   * Before this its only legal move was to create a *third* incident, which
+   * is how a thread with days of history was abandoned for one opened
+   * minutes earlier -- the rule that keeps blast radius at one record was
+   * manufacturing the churn. The proposal goes to the Boss, which compares
+   * the two on the same judgement it uses after a root cause, and `assign`
+   * decides which record survives. So a captured agent can put one pair in
+   * front of that judgement and can still move nothing.
+   */
+  proposeMerge(args: {
+    /** The incident this one should be combined with. */
+    incidentId: string;
+    reason: string;
+  }): Promise<ToolResponse<MergeOutcomeView>>;
+}
+
+/** What became of a `proposeMerge`, in terms of incidents rather than steps. */
+export interface MergeOutcomeView {
+  /** True when the two were combined. */
+  combined: boolean;
+  /** The incident of record afterwards. The caller's own when nothing moved. */
+  incidentOfRecord: string;
+  /** Plain sentence for the agent, and for anything it repeats to a person. */
+  detail: string;
 }
 
 /**
@@ -292,6 +434,8 @@ export interface ToolApi {
 export interface PriorIncident {
   id: string;
   status: IncidentStatus;
+  /** Its few-word title, which is the fastest way to know what it was. */
+  summary: string | null;
   rootCause: string | null;
   prUrls: string[];
   /** What the earlier agent claimed it watched stop happening. */
@@ -337,12 +481,37 @@ export interface RecurrenceAnalysis {
   remedy: string;
 }
 
+/**
+ * What a signal looks like to the investigating agent.
+ *
+ * Triage's spend is left off deliberately. The agent is working out why
+ * something broke, and what placing the signal cost is of no use to that --
+ * it would be six numbers per signal re-serialized into the prompt on every
+ * `get_incident`, which is how a tool result grows without anyone deciding
+ * to grow it. The columns are on the row for a person or the Boss to query.
+ */
+export type SignalView = Omit<
+  Signal,
+  "tokensIn" | "tokensOut" | "cacheRead" | "cacheWrite" | "modelCalls" | "modelId"
+>;
+
 export interface IncidentView {
   incident: Incident;
-  signals: Signal[];
+  signals: SignalView[];
   evidence: Evidence[];
   /** Non-null only when this incident reopens ground that one claimed. */
   priorIncident: PriorIncident | null;
+  /**
+   * Incidents that were merged into this one, most recent first. Empty for
+   * almost every incident.
+   *
+   * The same shape and the same reason as `priorIncident`: somebody else
+   * already investigated part of what is now this incident's problem, and
+   * their conclusions are the most valuable thing this agent can start from.
+   * An agent asked to keep a title current for an incident that absorbed
+   * another one cannot do it honestly without having read the other one.
+   */
+  absorbed: PriorIncident[];
 }
 
 // ---------------------------------------------------------------------------
@@ -399,10 +568,39 @@ export interface DispatcherConfig {
   /** Circuit breaker, not a scheduler. Hitting it means something is wrong. */
   maxConcurrentAgents: number;
   tickSeconds: number;
-  /** Wall clock, the only bound on a run. Not a token or dollar cap. */
+  /**
+   * Wall clock, per launch. A poor proxy for work done and never the only
+   * bound: `monitor` and `contact_human` each cost one turn however long
+   * they block, so one real incident spent eight of its nine hours parked on
+   * a human and the clock counted all of it.
+   */
   agentTimeoutSeconds: number;
+  /**
+   * Turns the incident agent may take on one incident, across every launch.
+   *
+   * Named beside `agentTimeoutSeconds` because it bounds the same child: the
+   * dispatcher launches incident agents and nothing else, and the Slack
+   * agent's own budget (`SLACK_AGENT_MAX_TURNS`) never passes through here.
+   *
+   * The bound that tracks work rather than time. A turn is a model call, so
+   * this does not inflate while the agent waits on a person -- the nine-hour
+   * incident above was 92 turns. It is deliberately not per launch: every
+   * merge to ops `main` restarts this container, and a budget that refilled
+   * on a restart would bound nothing.
+   */
+  agentMaxTurns: number;
   /** Stop relaunching after this many attempts and escalate. */
   maxAttempts: number;
+  /**
+   * How long an incident may go with nothing happening to it at all before
+   * the stale sweep says so in its thread and lifts whatever it was waiting
+   * on. Zero or less turns the sweep off entirely.
+   *
+   * Omitting it is not the same as zero: an absent value takes
+   * `STALE_AFTER_SECONDS`, so a config written before the sweep existed still
+   * gets one. Turning the sweep off has to be said out loud.
+   */
+  staleAfterSeconds: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +633,14 @@ export interface BugBossConfig {
    * fails the Boss at boot rather than every agent at launch.
    */
   workingHours?: string;
+  /**
+   * Model id to application inference profile ARN, as JSON. Carried raw for
+   * the same reason `workingHours` is: the agent that uses it is a child
+   * process and the environment is the only channel to it. Parsed at both
+   * ends, but only this end throws -- an unattributable run is worth less
+   * than a dead agent.
+   */
+  inferenceProfiles?: string;
   /** The Postgres agents run omni's database-backed tests against. */
   testDatabase: TestDatabase;
 }

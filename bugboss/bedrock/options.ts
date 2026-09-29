@@ -26,6 +26,20 @@ import type { CacheRetention, StreamOptions, ThinkingLevel } from "@earendil-wor
 export const BEDROCK_INVOKE_MODEL_API = "bedrock-invoke-model";
 
 /**
+ * `thinking.block_binding` is gated behind this beta. Without it Bedrock
+ * rejects the whole request with
+ * `thinking.adaptive.block_binding: Extra inputs are not permitted`, which is
+ * how the InvokeModel provider died on its first turn in prod the night it
+ * first actually served a request.
+ *
+ * Verified against a live InvokeModel call on us.anthropic.claude-opus-5
+ * (us-west-2, 2026-09-28): the field is accepted with this beta and rejected
+ * without it, and Bedrock validates the beta list, so a stale name here would
+ * fail loudly rather than silently do nothing.
+ */
+export const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01";
+
+/**
  * WHY THE 1h TIER IS THE DEFAULT HERE AND NOT PI'S "short":
  *
  * `monitor` and `contact_human` each cost one turn however long they block --

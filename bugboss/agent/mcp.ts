@@ -22,7 +22,6 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { makeAlarm, makeLog } from "../logging";
-import { truncateOutput, DEFAULT_MAX_TOOL_CHARS } from "./tools";
 
 const log = makeLog("mcp");
 
@@ -34,7 +33,6 @@ export interface McpServerConfig {
   args: string[];
   env: Record<string, string>;
   requestTimeoutMs?: number;
-  maxOutputChars?: number;
   /** Tool names to expose. Unset exposes whatever the server lists. */
   allowedTools?: readonly string[];
 }
@@ -424,7 +422,6 @@ export const connectMcpToolset = async (
 ): Promise<McpToolset> => {
   const { Type } = await import("typebox");
   const timeoutMs = config.requestTimeoutMs ?? 120000;
-  const maxChars = config.maxOutputChars ?? DEFAULT_MAX_TOOL_CHARS;
   const client = new StdioClient(config, timeoutMs);
 
   await client.request("initialize", {
@@ -464,7 +461,7 @@ export const connectMcpToolset = async (
     return {
       name: sanitizeToolName(config.name, spec.name),
       label: spec.name,
-      description: `${spec.description ?? spec.name}\n\nOutput is capped at ${maxChars} characters; narrow the query rather than relying on truncation.${bound}`,
+      description: `${spec.description ?? spec.name}${bound}`,
       parameters,
       execute: async (_toolCallId: string, params: unknown) => {
         const given = (params ?? {}) as Record<string, unknown>;
@@ -475,18 +472,15 @@ export const connectMcpToolset = async (
           name: spec.name,
           arguments: clamped.arguments,
         });
-        // Prepended, because truncateOutput keeps the head: a notice at the
-        // end is the first thing a long result loses. Its room comes out of
-        // the budget rather than on top of it -- the description promises a
-        // cap, and a notice added after the truncation is the same defect
-        // truncateOutput itself was just fixed for.
+        // Still prepended rather than appended, though nothing is dropped
+        // any more: a clamped time range changes what the result *means*, so
+        // it belongs before the result rather than after however many
+        // thousand lines of it.
         const notice = clamped.notice ? `${clamped.notice}\n\n` : "";
-        const text = truncateOutput(
-          mcpResultToText(result),
-          Math.max(0, maxChars - notice.length),
-        );
         return {
-          content: [{ type: "text" as const, text: `${notice}${text}` }],
+          content: [
+            { type: "text" as const, text: `${notice}${mcpResultToText(result)}` },
+          ],
           details: undefined,
         };
       },

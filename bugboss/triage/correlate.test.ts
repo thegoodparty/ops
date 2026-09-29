@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { IncidentDigest } from "../types";
-import { runCorrelation, type CorrelationRequest } from "./correlate";
+import {
+  judgeMerge,
+  runCorrelation,
+  type CorrelationRequest,
+} from "./correlate";
 import { resetFallbackRates } from "./health";
+import { emptyModelUsage } from "./model";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
 import type { IncidentReader } from "./sql";
 
@@ -27,6 +32,7 @@ const request = (over: Partial<CorrelationRequest> = {}): CorrelationRequest => 
 const proposeCall = (merges: unknown[]): ModelReply => ({
   text: "",
   toolCalls: [{ id: "call-1", name: "propose", input: { merges } }],
+  usage: emptyModelUsage(),
 });
 
 const scripted = (replies: ModelReply[]) => {
@@ -222,4 +228,206 @@ test("a failed attached-signal read alarms instead of reporting an empty split",
   assert.ok(failed, "a database failure is a different fault from a model failure");
   assert.equal(failed.level, "error");
   assert.match(String(failed.error), /database is locked/);
+});
+
+// --- which incident survives ----------------------------------------------
+
+/**
+ * The line this replaces read `into: req.incidentId`, which made the survivor
+ * whichever agent happened to call report_root_cause first. Incident 79 lost
+ * a thread with four days of conversation to one opened minutes before; 81
+ * merged the right way round the same week, out of the same rule. The
+ * direction was a coin toss in both.
+ */
+test("the older incident survives, even when the newer one found the cause", async () => {
+  const db = fakeDb(["s1"]);
+  const { model } = scripted([
+    proposeCall([
+      { incidentId: "79", confident: true, reason: "same webhook, same column" },
+    ]),
+  ]);
+
+  const result = await runCorrelation(
+    { model, db, budgetMs: 2000 },
+    request({
+      incidentId: "82",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79" }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(result.merges, [
+    { incidentId: "82", into: "79", reason: "same webhook, same column" },
+  ]);
+});
+
+test("the whole group elects one survivor rather than flipping pair by pair", async () => {
+  const db = fakeDb(["s1"]);
+  const { model } = scripted([
+    proposeCall([
+      { incidentId: "40", confident: true, reason: "same cause as 40" },
+      { incidentId: "55", confident: true, reason: "same cause as 55" },
+    ]),
+  ]);
+
+  const result = await runCorrelation(
+    { model, db, budgetMs: 2000 },
+    request({
+      incidentId: "82",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "40" }),
+        digest({ id: "55" }),
+      ],
+    }),
+  );
+
+  // Flipped per pair this would send 82 into 40 and 55 into 82, and applyMerge
+  // declines the second because 82 is MERGED by then -- two thirds of one bug
+  // left open with an agent on each.
+  assert.deepEqual(
+    result.merges.map((m) => m.into),
+    ["40", "40"],
+    "everything lands on the most established incident in the group",
+  );
+  assert.deepEqual(
+    result.merges.map((m) => m.incidentId).sort(),
+    ["55", "82"],
+  );
+});
+
+test("a candidate the model was unsure about does not get a vote on the survivor", async () => {
+  const db = fakeDb(["s1"]);
+  const { model } = scripted([
+    proposeCall([
+      { incidentId: "40", confident: false, reason: "might be the same" },
+      { incidentId: "90", confident: true, reason: "definitely the same" },
+    ]),
+  ]);
+
+  const result = await runCorrelation(
+    { model, db, budgetMs: 2000 },
+    request({
+      incidentId: "82",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "40" }),
+        digest({ id: "90" }),
+      ],
+    }),
+  );
+
+  assert.deepEqual(result.merges, [
+    { incidentId: "90", into: "82", reason: "definitely the same" },
+  ]);
+});
+
+// --- an agent asking, rather than a root cause triggering ------------------
+
+/**
+ * The same judgement from the other direction. An agent that has read
+ * another incident and thinks it is the same bug gets to say so; what it
+ * does not get is the decision, or the direction.
+ */
+test("an agreed proposal comes back pointed at the established incident", async () => {
+  const { model } = scripted([
+    proposeCall([{ incidentId: "79", confident: true, reason: "same pool" }]),
+  ]);
+
+  const { merge, compared } = await judgeMerge(
+    { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+    {
+      incidentId: "82",
+      withIncidentId: "79",
+      reason: "both exhaust the same connection pool",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79" }),
+      ],
+    },
+  );
+
+  assert.equal(compared, true);
+  // The agent asked from 82 and 82 is the one absorbed. Which record
+  // survives is not the asker's to pick and not the model's either.
+  assert.deepEqual(merge, { incidentId: "82", into: "79", reason: "same pool" });
+});
+
+test("an unconfident answer is no merge, and is not a failure", async () => {
+  const { model } = scripted([
+    proposeCall([{ incidentId: "79", confident: false, reason: "maybe" }]),
+  ]);
+
+  const { merge, compared } = await judgeMerge(
+    { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+    {
+      incidentId: "82",
+      withIncidentId: "79",
+      reason: "both are 500s",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79" }),
+      ],
+    },
+  );
+
+  assert.equal(merge, null);
+  assert.equal(
+    compared,
+    true,
+    "a considered no is a comparison, and the agent should stop asking",
+  );
+});
+
+test("a dead model says so, rather than passing for a considered no", async () => {
+  const model: ModelClient = {
+    complete: () => Promise.reject(new Error("bedrock is down")),
+  };
+
+  const { result, alarms } = await capture(() =>
+    judgeMerge(
+      { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+      {
+        incidentId: "82",
+        withIncidentId: "79",
+        reason: "both exhaust the same connection pool",
+        openIncidents: [
+          digest({ id: "82", status: "FIXING" }),
+          digest({ id: "79" }),
+        ],
+      },
+    ),
+  );
+
+  assert.equal(result.merge, null);
+  // The agent is going to repeat one of two sentences into a Slack thread,
+  // and they point at different next moves: stop asking, or ask a person.
+  assert.equal(result.compared, false);
+  assert.ok(alarms.some((a) => a.event === "merge_request_unjudged"));
+});
+
+test("an incident that is not open is not put in front of the model at all", async () => {
+  const { model, requests } = scripted([]);
+
+  const { merge, compared } = await judgeMerge(
+    { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+    {
+      incidentId: "82",
+      withIncidentId: "79",
+      reason: "the same pool",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79", status: "CLOSED" }),
+      ],
+    },
+  );
+
+  assert.equal(merge, null);
+  // Nothing weighed them, so this is not a considered no either. The agent
+  // read the incident as open before it asked; it moved on in between, and
+  // standing the agent down over that is standing it down over nothing.
+  assert.equal(compared, false);
+  assert.equal(requests.length, 0, "and nothing was spent finding that out");
 });

@@ -27,10 +27,16 @@ import {
   renderRecurrence,
   type RecurrenceCandidate,
 } from "./recurrence";
-import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
+import {
+  emptyModelUsage,
+  runStructuredCall,
+  usageForLog,
+  type ModelClient,
+  type ModelToolSpec,
+  type ModelUsage,
+} from "./model";
 import { makeAlarm, makeLog } from "../logging";
 import {
-  incidentOwner,
   incidentStatus,
   queryTool,
   searchTool,
@@ -60,7 +66,22 @@ export interface TriageOutcome {
   recurrenceChecked: boolean;
   /** True when the model failed and the conservative default was taken. */
   fellBack: boolean;
+  /**
+   * What this decision spent, including on a fallback: the requests a dead
+   * call made before it gave up are the ones most worth costing, because a
+   * storm of them is invisible in every other record.
+   */
+  usage: ModelUsage;
 }
+
+/**
+ * What the rules produce. Identical to a `TriageOutcome` minus its cost,
+ * because `applyRules` is a pure function of the model's answer and has no
+ * business knowing what the answer cost -- `runTriage` owns the accumulator
+ * and stamps it on the way out, in one place rather than at twelve
+ * construction sites.
+ */
+type Decided = Omit<TriageOutcome, "usage">;
 
 const DEFAULT_BUDGET_MS = 55_000;
 const DEFAULT_MAX_ROUNDS = 6;
@@ -285,8 +306,16 @@ const recurrencePointer = (
   id: string | null | undefined,
 ): string | null => {
   if (!id) return null;
-  const digest = ctx.openIncidents.find((i) => i.id === id);
-  const status = digest?.status ?? incidentStatus(deps.db, id);
+  // The row, not the digest, and in that order. The digest was read before a
+  // model call that runs for tens of seconds, so a target that resolved while
+  // triage was thinking still reads as open in it -- and RESOLVED is exactly
+  // the state that makes this delivery a recurrence. Preferring the digest
+  // dropped the pointer in the one case it exists for: the signal proving a
+  // resolution was premature opened a fresh incident with nothing linking it
+  // to the one that had just claimed to be over.
+  const status =
+    incidentStatus(deps.db, id) ??
+    ctx.openIncidents.find((i) => i.id === id)?.status;
   return status && RECURRABLE.includes(status) ? id : null;
 };
 
@@ -302,7 +331,7 @@ const newIncident = (
   answer: Answer,
   recurrence: RecurrenceCandidate[] | null,
   note?: string,
-): TriageOutcome => {
+): Decided => {
   const conclusive = recurrence ? conclusiveRecurrence(recurrence) : null;
   const pointer =
     conclusive?.incidentId ?? recurrencePointer(deps, ctx, answer.recurrenceOf);
@@ -332,7 +361,7 @@ const applyRules = (
   ctx: TriageContext,
   answer: Answer,
   recurrence: RecurrenceCandidate[] | null,
-): TriageOutcome => {
+): Decided => {
   const conclusive = recurrence ? conclusiveRecurrence(recurrence) : null;
   const checked = recurrence !== null;
 
@@ -347,7 +376,13 @@ const applyRules = (
         `attach refused: ${answer.incidentId} is not an open incident`,
       );
     }
-    if (target.status === "RESOLVED") {
+    // Status read back from the database rather than taken from the digest,
+    // because the model can name any id the query tool turns up and these two
+    // refusals are what the invariant rests on. The digest is a snapshot from
+    // the start of the decision, and an incident can resolve, close or be
+    // merged away while the model is still thinking.
+    const status = incidentStatus(deps.db, target.id) ?? target.status;
+    if (status === "RESOLVED") {
       // Through newIncident like every other refusal, rather than stamping
       // target.id inline. The model names any RESOLVED incident it found; a
       // conclusive candidate is an exact (source, sourceId) match in the db
@@ -363,28 +398,13 @@ const applyRules = (
         `attach refused: ${target.id} is RESOLVED, so this signal is evidence the resolution was wrong`,
       );
     }
-    if (!ATTACHABLE.includes(target.status)) {
+    if (!ATTACHABLE.includes(status)) {
       return newIncident(
         deps,
         ctx,
         answer,
         recurrence,
-        `attach refused: ${target.id} is ${target.status}`,
-      );
-    }
-    // Status is where the work is and owner is who has it, so a handed-off
-    // incident still reads INVESTIGATING while no agent is coming back to it.
-    // Read rather than taken from the digest, because the model can name any
-    // id the query tool turns up and this guard is what the invariant rests
-    // on. Checked after the RESOLVED branch so a human-owned incident firing
-    // again is still a recurrence.
-    if (incidentOwner(deps.db, target.id) === "human") {
-      return newIncident(
-        deps,
-        ctx,
-        answer,
-        recurrence,
-        `attach refused: ${target.id} is owned by a human, so nothing attaches to it automatically`,
+        `attach refused: ${target.id} is ${status}`,
       );
     }
     if (conclusive) {
@@ -467,6 +487,7 @@ export const runTriage = async (
   ctx: TriageContext,
 ): Promise<TriageOutcome> => {
   const started = Date.now();
+  const usage = emptyModelUsage();
 
   // Its own guard, outside the try the model call sits in, for the reason
   // `runCorrelation` gives for reading its signals first: a failed read and a
@@ -496,6 +517,7 @@ export const runTriage = async (
       maxRounds: deps.maxRounds ?? DEFAULT_MAX_ROUNDS,
       maxInvalid: 2,
       maxTokens: deps.maxTokens ?? DEFAULT_MAX_TOKENS,
+      usage,
     });
 
     const outcome = applyRules(deps, ctx, answer, recurrence);
@@ -507,15 +529,20 @@ export const runTriage = async (
       recurrenceOf: outcome.recurrenceOf,
       recurrenceCandidates: recurrence?.length ?? null,
       ms: Date.now() - started,
+      ...usageForLog(usage),
     });
-    return outcome;
+    return { ...outcome, usage };
   } catch (err) {
     const health = recordCall(SITE, true);
+    // The tokens go on the alarm because this is the path that used to
+    // report nothing: a fallback storm spent real money and every incident it
+    // opened recorded a cost of zero.
     alarm("fell_back", {
       sourceId: ctx.signal.sourceId,
       error: String(err),
       ms: Date.now() - started,
       ...health,
+      ...usageForLog(usage),
     });
     if (health.sustained) {
       alarm("triage_model_unusable", {
@@ -536,6 +563,7 @@ export const runTriage = async (
       recurrenceOf: conclusive?.incidentId ?? null,
       recurrenceChecked: recurrence !== null,
       fellBack: true,
+      usage,
     };
   }
 };

@@ -69,6 +69,16 @@ const BODIES = {
     impactQuery: z.string().optional(),
     impactStartedAt: z.number().int().positive().optional(),
   }),
+  proposeMerge: z.object({
+    incidentId: z.string().min(1),
+    reason: z.string().min(1),
+  }),
+  // Length is not checked here. The tool API refuses an over-long summary
+  // with a sentence the model can act on; a zod max would come back as
+  // "String must contain at most 80 character(s)", which names no field and
+  // says nothing about what to do instead.
+  summary: z.object({
+    summary: z.string().min(1),  }),
   impact: z.object({
     usersImpacted: z.number(),
     query: z.string().min(1),
@@ -101,9 +111,14 @@ const BODIES = {
   search: z.object({
     text: z.string().min(1),
   }),
-  handoff: z.object({
+  escalate: z.object({
     reason: z.string().min(1),
     brief: z.string().min(1),
+  }),
+  park: z.object({
+    waitingFor: z.string().min(1),
+    wakeAfterSeconds: z.number().int().nonnegative().optional(),
+    liftsOnReply: z.boolean().optional(),
   }),
   none: z.object({}),
 };
@@ -167,7 +182,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
    */
   const tool = <S extends z.ZodType>(
     schema: S,
-    run: (api: ToolApi, body: z.infer<S>) => Promise<unknown>,
+    run: (api: ToolApi, body: z.infer<S>, c: Context) => Promise<unknown>,
   ) =>
     async (c: Context) => {
       const caller = authorize(c);
@@ -201,14 +216,35 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       }
 
       const api = deps.toolApiFor(caller.incidentId, caller.token);
-      return c.json(await run(api, parsed.data));
+      return c.json(await run(api, parsed.data, c));
     };
 
-  app.get("/incidents/:id", tool(BODIES.none, (api) => api.getIncident()));
+  // `?incident=` reads another incident. The path id still has to be the
+  // caller's own -- `authorize` rejects anything else, and the token is what
+  // scopes the writes -- so this asks for a read without widening the
+  // credential. Absent, it is the caller's own incident, which is every call
+  // that existed before reads opened up.
+  app.get(
+    "/incidents/:id",
+    tool(BODIES.none, (api, _body, c) => {
+      const other = c.req.query("incident");
+      return api.getIncident(other ? { incidentId: other } : undefined);
+    }),
+  );
+
+  app.post(
+    "/incidents/:id/propose-merge",
+    tool(BODIES.proposeMerge, (api, body) => api.proposeMerge(body)),
+  );
 
   app.post(
     "/incidents/:id/root-cause",
     tool(BODIES.rootCause, (api, body) => api.reportRootCause(body)),
+  );
+
+  app.post(
+    "/incidents/:id/summary",
+    tool(BODIES.summary, (api, body) => api.setSummary(body)),
   );
 
   app.post(
@@ -227,8 +263,13 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   );
 
   app.post(
-    "/incidents/:id/handoff",
-    tool(BODIES.handoff, (api, body) => api.handOff(body)),
+    "/incidents/:id/escalate",
+    tool(BODIES.escalate, (api, body) => api.escalate(body)),
+  );
+
+  app.post(
+    "/incidents/:id/park",
+    tool(BODIES.park, (api, body) => api.park(body)),
   );
 
   // POST rather than GET because the query is a body, not a path. It still

@@ -13,10 +13,6 @@
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
-import {
-  BedrockRuntimeClient,
-  InvokeModelCommand,
-} from "@aws-sdk/client-bedrock-runtime";
 import { S3Client } from "@aws-sdk/client-s3";
 import type Database from "better-sqlite3";
 import type { Hono } from "hono";
@@ -71,7 +67,13 @@ import {
   createSlackClient,
   createSlackFileUploader,
   type SlackLinker,
+  type SlackUpdater,
 } from "./slack/client";
+import {
+  createIncidentReferences,
+  withIncidentReferences,
+} from "./slack/incidents";
+import { boardOnRequest, sweepBoard } from "./board";
 import {
   SlackRelay,
   mentionPrefix,
@@ -85,12 +87,17 @@ import {
   readReplyIntent,
   type Addressed,
   type IntentDeps,
-  type OwnershipClaim,
 } from "./slack/intent";
 import {
   applyAssign,
+  assign,
   AssignError,
+  createAnnouncer,
   createToolApi,
+  establishedOf,
+  getIncidentRow,
+  getSignalsFor,
+  logAssign,
   mintAgentToken,
   type AssignResult,
   type Correlator,
@@ -110,13 +117,33 @@ import {
   awaitTestDatabase,
   resolveTestDatabase,
 } from "./testdb";
-import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
+import {
+  addModelUsage,
+  createTriage,
+  emptyModelUsage,
+  ModelRequestFailed,
+  usageForLog,
+  type ModelClient,
+  type ModelReply,
+  type ModelToolCall,
+  type ModelTurn,
+  type ModelUsage,
+} from "./triage";
+import { resolveBedrockModel } from "./bedrock";
+import { createPiModelClient } from "./bedrock/client";
+import {
+  assertBedrockInvokeModelRouting,
+  registerBedrockRouting,
+} from "./bedrock/runtime";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { attachedSignalIds } from "./triage/sql";
 import {
   readSessionOutcome,
   sessionKeyFor,
   sumSessionUsage,
 } from "./agent/session";
+import { INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
+import { parseInferenceProfiles } from "./bedrock/model";
 import { createInstallationToken, createPrStateReader } from "./github";
 import { makeAlarm, makeLog } from "./logging";
 import type {
@@ -145,7 +172,7 @@ export const DEFAULT_TRIAGE_MODEL_ID = "us.anthropic.claude-sonnet-5";
 
 /**
  * How long an agent token outlives the deadline that kills its agent. Wide
- * enough to cover the child's own handoff grace and the tick the parent waits
+ * enough to cover the child's own grace window and the tick the parent waits
  * before the backstop, so a token never expires under an agent still working.
  */
 const AGENT_TOKEN_GRACE_SECONDS = 600;
@@ -337,6 +364,8 @@ export interface BugBoss {
   ensureIncidentThreads(): Promise<number>;
   /** Post the closing report for any incident that closed without one. */
   sweepReports(): Promise<number>;
+  /** One pass of the status board: headers, the morning post, the all-clear. */
+  sweepBoard(): Promise<unknown>;
   start(): void;
   stop(): void;
 }
@@ -401,137 +430,58 @@ export const createMemoryS3 = (): S3Client => {
   return { send } as unknown as S3Client;
 };
 
-type AnthropicBlock =
-  | { type: "text"; text: string }
-  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-  | {
-      type: "tool_result";
-      tool_use_id: string;
-      content: { type: "text"; text: string }[];
-      is_error?: boolean;
-    };
-
-interface AnthropicMessage {
-  role: "user" | "assistant";
-  content: AnthropicBlock[];
-}
-
 /**
- * Anthropic requires every tool_result answering one assistant turn to arrive
- * in a single user message, and runStructuredCall emits one ModelTurn per
- * call, so consecutive results are coalesced here.
+ * The Boss's model seam, built on the runtime the incident agent streams
+ * through.
+ *
+ * It used to build its own InvokeModel body here, which made two request
+ * paths to the same model: a fix to one was a fix missing from the other, and
+ * that is how an absent beta header killed every incident agent while triage
+ * carried on working. One path now, so the Boss's own calls inherit the
+ * InvokeModel routing, the 1h cache retention and its downgrade check, and
+ * `calculateCost` -- which is what finally prices a triage decision.
+ *
+ * Async because pi-ai is ESM-only and this package is CommonJS, so the
+ * runtime is reached through a dynamic import.
  */
-const toAnthropicMessages = (turns: ModelTurn[]): AnthropicMessage[] => {
-  const out: AnthropicMessage[] = [];
-  for (const turn of turns) {
-    if (turn.role === "user") {
-      out.push({ role: "user", content: [{ type: "text", text: turn.text }] });
-      continue;
-    }
-    if (turn.role === "assistant") {
-      const content: AnthropicBlock[] = [];
-      if (turn.text) content.push({ type: "text", text: turn.text });
-      for (const call of turn.toolCalls) {
-        content.push({
-          type: "tool_use",
-          id: call.id,
-          name: call.name,
-          input: call.input,
-        });
-      }
-      if (content.length === 0) content.push({ type: "text", text: "(no reply)" });
-      out.push({ role: "assistant", content });
-      continue;
-    }
-    const block: AnthropicBlock = {
-      type: "tool_result",
-      tool_use_id: turn.toolCallId,
-      content: [{ type: "text", text: turn.text }],
-      ...(turn.isError ? { is_error: true } : {}),
-    };
-    const last = out[out.length - 1];
-    if (last && last.role === "user" && last.content.every((b) => b.type === "tool_result")) {
-      last.content.push(block);
-    } else {
-      out.push({ role: "user", content: [block] });
-    }
+/**
+ * One runtime for every Boss client.
+ *
+ * Memoized because `ModelRuntime.create` reads auth and the model catalog off
+ * disk and may refresh it over the network, and the Boss builds two clients
+ * at boot -- the triage model and, when one is named, a separate intent
+ * model. Two runtimes would do that work twice and wrap the same builtin
+ * provider twice for no gain. `registerBedrockRouting` is idempotent per
+ * runtime, so sharing one is also what keeps the router single-layered.
+ */
+let bossRuntime: Promise<ModelRuntime> | null = null;
+
+const sharedBossRuntime = (): Promise<ModelRuntime> => {
+  if (!bossRuntime) {
+    bossRuntime = (async () => {
+      const pi = await import("@earendil-works/pi-coding-agent");
+      const runtime = await pi.ModelRuntime.create({});
+      await registerBedrockRouting({ runtime });
+      return runtime;
+    })();
   }
-  return out;
+  return bossRuntime;
 };
 
-export interface BedrockModelClientConfig {
-  modelId: string;
-  region?: string;
-  client?: BedrockRuntimeClient;
-}
+export const createBossModelClient = async (
+  cfg: { modelId: string },
+): Promise<ModelClient> => {
+  const runtime = await sharedBossRuntime();
+  const model = await resolveBedrockModel({ id: cfg.modelId });
 
-/**
- * The Boss's own model seam, over InvokeModel with the native Anthropic body.
- * Separate from bugboss/bedrock, which is a Pi api provider for the incident
- * agent: these calls are one-shot, bounded and streamless, and carry no
- * thinking blocks to keep signed.
- */
-export const createBedrockModelClient = (
-  cfg: BedrockModelClientConfig,
-): ModelClient => {
-  const client =
-    cfg.client ??
-    new BedrockRuntimeClient(cfg.region ? { region: cfg.region } : {});
-  const decoder = new TextDecoder();
+  // Before the first request rather than after a bad one. Converse silently
+  // reshapes what it cannot carry, so a misroute here is not an error, it is
+  // a quietly different request -- and the agent's own launch asserts this
+  // for the same reason. Per model rather than per runtime, because the id
+  // is what carries the api.
+  assertBedrockInvokeModelRouting(runtime, model);
 
-  return {
-    complete: async (request) => {
-      const body = {
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: request.maxTokens,
-        system: request.system,
-        messages: toAnthropicMessages(request.messages),
-        ...(request.tools.length > 0
-          ? {
-              tools: request.tools.map((tool) => ({
-                name: tool.name,
-                description: tool.description,
-                input_schema: tool.inputSchema,
-              })),
-            }
-          : {}),
-      };
-
-      const response = await client.send(
-        new InvokeModelCommand({
-          modelId: cfg.modelId,
-          contentType: "application/json",
-          accept: "application/json",
-          body: JSON.stringify(body),
-        }),
-        { abortSignal: request.signal },
-      );
-
-      const payload = JSON.parse(decoder.decode(response.body)) as {
-        content?: {
-          type?: string;
-          text?: string;
-          id?: string;
-          name?: string;
-          input?: Record<string, unknown>;
-        }[];
-      };
-
-      let text = "";
-      const toolCalls: ModelToolCall[] = [];
-      for (const block of payload.content ?? []) {
-        if (block.type === "text" && block.text) text += block.text;
-        if (block.type === "tool_use" && block.id && block.name) {
-          toolCalls.push({
-            id: block.id,
-            name: block.name,
-            input: block.input ?? {},
-          });
-        }
-      }
-      return { text, toolCalls } satisfies ModelReply;
-    },
-  };
+  return createPiModelClient({ runtime, model });
 };
 
 /**
@@ -551,13 +501,37 @@ const WRAP_UP_SYSTEM = [
   "Do not apologise and do not offer to keep looking.",
 ].join(" ");
 
+/** "about 4 minutes", "under a minute" -- scale, not a measurement. */
+const roughly = (ms: number): string => {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return "under a minute";
+  return minutes === 1 ? "about a minute" : `about ${minutes} minutes`;
+};
+
 /**
- * Reached only when the wrap-up produced nothing either. It says what
- * happened and what to do next, because somebody is waiting on this and
- * "sorry" tells them neither.
+ * Reached only when the wrap-up produced nothing either, so the reader gets
+ * this instead of an answer they waited minutes for.
+ *
+ * Running out of steps and failing to compose anything are two different
+ * events and the reply has to say which, because the advice differs. Running
+ * out is deterministic in the question: the same question spends the budget
+ * the same way, so "ask me again" is advice that buys another four-minute
+ * wait for the same non-answer. What helps is a smaller question, and the
+ * reply says so and says how. The other case really can be a bad minute, and
+ * there asking again is the right thing to try.
+ *
+ * Neither sends anybody to the logs. The person reading this is on call in the
+ * middle of something else; a pointer to a log group is a second task, and
+ * whoever owns the budget already has the alarm.
  */
-const NO_ANSWER_REPLY =
-  "I could not get to an answer for that one and I have nothing partial worth posting. What I did is in the BugBoss logs. Ask me again, or narrow the question.";
+const noAnswerReply = (
+  exhausted: boolean,
+  turns: number,
+  elapsedMs: number,
+): string =>
+  exhausted
+    ? `I ran out of steps before I could answer that: ${turns} of them, taking ${roughly(elapsedMs)}, and I still could not put anything together worth posting. Asking the same question again spends the same budget the same way, so narrow it instead: one incident, or one specific thing you want to know about all of them.`
+    : "I could not put an answer together for that one, and I have nothing partial worth posting. Ask me again, or narrow it to one incident.";
 
 /**
  * The Slack agent's harness, built on the same ModelClient everything else
@@ -595,14 +569,28 @@ export const createSlackAgentModel = (
 
     let answer = "";
     let exhausted = false;
+    // Every request this run makes, banked as it returns. In place and
+    // outside the loop because a throw on turn nine has still spent the
+    // first eight turns, and the caller reads this beside the answer.
+    const usage = emptyModelUsage();
+    // What the reader is owed when nothing else survives the run: how long
+    // they waited, alongside how many steps bought it.
+    const startedAt = Date.now();
     for (let turn = 0; turn < req.maxTurns; turn++) {
-      const reply = await model.complete({
-        system: req.system,
-        messages: [...messages],
-        tools,
-        maxTokens: 4096,
-        signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
-      });
+      let reply: ModelReply;
+      try {
+        reply = await model.complete({
+          system: req.system,
+          messages: [...messages],
+          tools,
+          maxTokens: 4096,
+          signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
+        });
+      } catch (err) {
+        if (err instanceof ModelRequestFailed) addModelUsage(usage, err.usage);
+        throw err;
+      }
+      addModelUsage(usage, reply.usage);
       messages.push({
         role: "assistant",
         text: reply.text,
@@ -642,13 +630,26 @@ export const createSlackAgentModel = (
           maxTokens: 4096,
           signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
         });
+        addModelUsage(usage, wrapUp.usage);
         messages.push({
           role: "assistant",
           text: wrapUp.text,
           toolCalls: wrapUp.toolCalls,
         });
-        if (wrapUp.text) answer = wrapUp.text;
+        if (wrapUp.text) {
+          answer = wrapUp.text;
+        } else {
+          // An empty completion is not an exception, so `wrap_up_failed` does
+          // not see it -- and the outcome is the worse of the two: a whole
+          // run's reading sits on the transcript and the reader still gets
+          // the apology. Production reached this holding 24 turns of incident
+          // data. Nothing here can make the model speak, but a silent hole
+          // between a run that read everything and a reply that says nothing
+          // is the one shape this system does not allow.
+          alarm("slack_agent_wrap_up_empty", { sessionKey: req.sessionKey });
+        }
       } catch (err) {
+        if (err instanceof ModelRequestFailed) addModelUsage(usage, err.usage);
         alarm("slack_agent_wrap_up_failed", {
           sessionKey: req.sessionKey,
           error: String(err),
@@ -656,7 +657,8 @@ export const createSlackAgentModel = (
       }
     }
 
-    const text = answer || NO_ANSWER_REPLY;
+    const text =
+      answer || noAnswerReply(exhausted, req.maxTurns, Date.now() - startedAt);
     if (!answer) alarm("slack_agent_no_answer", { sessionKey: req.sessionKey });
 
     // The transcript has to end on the assistant, because that is how the
@@ -673,7 +675,7 @@ export const createSlackAgentModel = (
     }
 
     await store.put(key, JSON.stringify(messages));
-    return { text };
+    return { text, usage };
   },
 });
 
@@ -703,7 +705,10 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
  * Everything the Boss needs from Slack: posts, buttons, thread reads, and the
  * permalink a merged or split incident links the other thread by.
  */
-export type BossSlackClient = SlackClient & ChoicePoster & SlackLinker;
+export type BossSlackClient = SlackClient &
+  ChoicePoster &
+  SlackLinker &
+  SlackUpdater;
 
 export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
   post: (threadTs, text, channel) =>
@@ -712,6 +717,8 @@ export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
   postChoice: (threadTs, text, blocks) =>
     withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
+  update: (channel, ts, text) =>
+    withDeadline(slack.update(channel, ts, text), "chat.update"),
   permalink: (messageTs, channel) =>
     withDeadline(slack.permalink(messageTs, channel), "chat.getPermalink"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
@@ -742,7 +749,7 @@ export const createBugBoss = async (
 
   // Everything here talks to Slack through this, so no single stalled post
   // can hold the placement loop, the tool API or a resolution tick.
-  const slack = withSlackDeadline(options.slack);
+  const deadlined = withSlackDeadline(options.slack);
 
   const s3 = options.s3 ?? createMemoryS3();
   const db = await Db.open({
@@ -752,6 +759,62 @@ export const createBugBoss = async (
     s3,
   });
   const store = createS3ObjectStore(config.s3Bucket, s3);
+
+  /**
+   * Every outbound message, with its incident references capitalised and
+   * linked, on the way to Slack.
+   *
+   * Wrapped here rather than at each composer because there is no single
+   * place above this where BugBoss composes text: the relay, the Slack
+   * agent, the tool API, the merge announcements, the closing report and
+   * three call sites in this file each build their own. A pass on some of
+   * them would be the same inconsistency with a new cause.
+   *
+   * It goes outside the deadline wrapper, so a permalink lookup it makes is
+   * itself bounded and never eats the budget of the post it is preparing.
+   */
+  const slack = withIncidentReferences(
+    deadlined,
+    createIncidentReferences({
+      threads: {
+        incidentForThread: (threadTs) =>
+          db.get<{ id: string }>(
+            "SELECT id FROM incident WHERE slackThreadTs = ?",
+            [threadTs],
+          )?.id ?? null,
+        threadOf: (incidentId) =>
+          db.get<{ slackThreadTs: string | null }>(
+            "SELECT slackThreadTs FROM incident WHERE id = ?",
+            [incidentId],
+          )?.slackThreadTs ?? null,
+      },
+      permalink: (messageTs) => deadlined.permalink(messageTs),
+    }),
+  );
+
+  // Said once, at boot, rather than every thirty seconds by the sweep that
+  // skips them. `chat.update` replaces a message whole and the only way to
+  // read the original back is `conversations.replies`, throttled to roughly
+  // one request a minute -- so an incident whose opening was never recorded
+  // gets no status header, because writing one without knowing what is
+  // underneath it would delete the alert text somebody is scrolling back
+  // for. That is a known gap rather than an invisible one, which is the
+  // whole difference, and it empties itself: every incident opened from
+  // here on records its opening as it posts it.
+  const headerless = db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM incident i
+      WHERE i.slackThreadTs IS NOT NULL
+        AND i.status IN ('INVESTIGATING','FIXING','RESOLVED')
+        AND NOT EXISTS (
+          SELECT 1 FROM incident_thread t WHERE t.incidentId = i.id
+        )`,
+  )?.n ?? 0;
+  if (headerless > 0) {
+    log("threads_without_a_recorded_opening", {
+      incidents: headerless,
+      note: "these threads get no status header; their opening predates the record of it, and re-reading it off Slack is rate-limited",
+    });
+  }
 
   // The search index is derived state, so it is rebuilt from the incidents
   // rather than migrated. That is what makes a corpus older than the table
@@ -916,13 +979,8 @@ export const createBugBoss = async (
       rootCause: string | null;
       firstSignalAt: number;
     }>(
-      // Status is where the work is, owner is who has it, and they are
-      // orthogonal. assign refuses a boss-actor write into a human-owned
-      // incident, so offering one as an attach or merge candidate can only
-      // produce a refusal -- triage would propose it, the assign would throw,
-      // and the retry below would open the new incident anyway.
       `SELECT id, status, rootCause, firstSignalAt FROM incident
-       WHERE status IN ('INVESTIGATING','FIXING','RESOLVED') AND owner = 'agent'
+       WHERE status IN ('INVESTIGATING','FIXING','RESOLVED')
        ORDER BY firstSignalAt`,
     );
     if (rows.length === 0) return [];
@@ -975,6 +1033,20 @@ export const createBugBoss = async (
         reason: merge.reason,
       }));
     },
+    judgeMerge: async ({ incidentId, withIncidentId, reason }) => {
+      const { merge, compared } = await triage.judgeMerge({
+        incidentId,
+        withIncidentId,
+        reason,
+        openIncidents: openIncidents(),
+      });
+      return {
+        merge: merge
+          ? { absorb: merge.incidentId, into: merge.into, reason: merge.reason }
+          : null,
+        compared,
+      };
+    },
   };
 
   // Process-scoped, so a token cannot outlive the agents it was minted for:
@@ -1001,6 +1073,10 @@ export const createBugBoss = async (
     openThreads: ensureIncidentThreads,
   };
 
+  // The same two messages the tool API leaves behind when correlation merges.
+  // A person's merge is the same event and has to read as one.
+  const announce = createAnnouncer({ db, slack: threads });
+
   const toolApiFor = (incidentId: string, token?: string): ToolApi => {
     const api = createToolApi({
       db,
@@ -1013,12 +1089,17 @@ export const createBugBoss = async (
 
     return {
       ...api,
-      // The only transition that has to reach the rotation. The tool API
-      // posts the brief itself; this adds the ping, which is the one thing it
-      // cannot know to do.
-      handOff: async (args) => {
-        const response = await api.handOff(args);
+      // The only call that has to reach the rotation. The tool API posts the
+      // brief itself; this adds the ping, which is the one thing it cannot
+      // know to do.
+      escalate: async (args) => {
+        const response = await api.escalate(args);
         if (response.ok) {
+          // The dispatcher cannot see this call: a real child reaches the
+          // tool API over the loopback, with no dispatcher in the path. It
+          // has to know, or its deadline posts a placeholder brief on top of
+          // the one this agent just wrote.
+          dispatcher.noteEscalated(incidentId);
           await slack
             .post(
               db.get<{ slackThreadTs: string | null }>(
@@ -1138,6 +1219,78 @@ export const createBugBoss = async (
     }
   };
 
+  /**
+   * Accumulate rather than replace, which is the opposite of how the incident
+   * row is written. `rollUpUsage` re-reads a whole session file, so its total
+   * is already absolute and a SET is correct there. Here each triage decision
+   * knows only what it spent, and a signal can be triaged more than once: a
+   * re-delivery of a signal nothing ever placed falls through to be placed
+   * again, and both attempts were paid for.
+   *
+   * Every counter at zero with calls above zero is the drift signature the
+   * columns exist to expose, so it alarms rather than writing a free
+   * decision. Zero calls is not a fault at all -- triage and correlation both
+   * short-circuit before the model on some paths.
+   *
+   * It is its own `withWrite`, so it is its own S3 snapshot PUT on top of the
+   * one placement already costs. Worth naming rather than hiding: the write
+   * queue serializes on those, and this adds one per triaged signal. It is
+   * bought against a decision that just spent tens of seconds of model time,
+   * so a few hundred milliseconds behind the queue is not the expensive part
+   * of placing a signal -- and folding it into the two branches downstream
+   * would put triage's accounting inside `applyAssign`, which has no business
+   * knowing about it.
+   */
+  const recordTriageSpend = async (
+    signalId: string,
+    usage: ModelUsage,
+  ): Promise<void> => {
+    if (usage.calls === 0) return;
+
+    // Summed over all four counters, matching `rollUpUsage` below, and not a
+    // test on `tokensOut` alone. A request aborted after the provider
+    // reported its input but before it reported any output really does have
+    // output at zero, and those input tokens were really spent -- which is
+    // the timeout path this accounting exists to capture. Alarming on it
+    // would both cry wolf and refuse to write real spend. Every counter at
+    // zero is the shape that cannot happen for a request that reached the
+    // model, so that is the one worth alarming on.
+    const total =
+      usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+    if (total === 0) {
+      alarm("triage_usage_missing", {
+        signalId,
+        ...usageForLog(usage),
+        note: "a request reached the model and reported no tokens at all, which means this reader has drifted from what the provider returns",
+      });
+      return;
+    }
+    try {
+      await db.withWrite((w: Database.Database) => {
+        w.prepare(
+          `UPDATE signal
+             SET tokensIn = tokensIn + ?, tokensOut = tokensOut + ?,
+                 cacheRead = cacheRead + ?, cacheWrite = cacheWrite + ?,
+                 modelCalls = modelCalls + ?,
+                 modelId = COALESCE(?, modelId)
+           WHERE id = ?`,
+        ).run(
+          usage.tokensIn,
+          usage.tokensOut,
+          usage.cacheRead,
+          usage.cacheWrite,
+          usage.calls,
+          usage.modelId,
+          signalId,
+        );
+      });
+    } catch (err) {
+      // Never fatal. Losing the record of what a decision cost is worth
+      // strictly less than dropping the signal that decision was about.
+      alarm("triage_usage_write_failed", { signalId, error: String(err) });
+    }
+  };
+
   const placeRecorded = async (
     signalId: string,
     signal: RawSignal,
@@ -1161,6 +1314,12 @@ export const createBugBoss = async (
       openIncidents: openIncidents(),
     });
     const decision = outcome.decision;
+
+    // Before the branch, so a suppression is costed like a placement. A
+    // suppressed signal took a model call to suppress, and it is the cheap
+    // decision that arrives in bulk -- the one whose bill is only visible
+    // once it is written down.
+    await recordTriageSpend(signalId, outcome.usage);
 
     if (decision.action === "suppress") {
       // No incident and no agent. The signal stays in the table unattached,
@@ -1502,25 +1661,23 @@ export const createBugBoss = async (
       }
 
       // Whether the kill cost anything is a different question from whether
-      // it happened. An agent killed after handing off has already put the
-      // incident somewhere a person can see; one killed while it still owns
-      // an open incident has not, and that is the stranding case.
-      const row = db.get<{ status: IncidentStatus; owner: string }>(
-        "SELECT status, owner FROM incident WHERE id = ?",
+      // it happened. A killed run on an incident that has reached a terminal
+      // status cost nothing; one on an open incident is work that stopped,
+      // and the next tick relaunching it is the only thing that recovers it.
+      const row = db.get<{ status: IncidentStatus }>(
+        "SELECT status FROM incident WHERE id = ?",
         [incidentId],
       );
-      const stranded =
-        !!row && row.owner === "agent" && OPEN_STATUSES.includes(row.status);
+      const stranded = !!row && OPEN_STATUSES.includes(row.status);
       alarm("agent_run_killed", {
         incidentId,
         sessionRef,
         turns: outcome.turns,
         status: row?.status ?? null,
-        owner: row?.owner ?? null,
         stranded,
         note: stranded
-          ? "the incident is still the agent's and still open; the next dispatcher tick should relaunch it, and if none does it is stranded"
-          : "the work had already left the agent, so nothing is waiting on this",
+          ? "the incident is still open; the next dispatcher tick should relaunch it, and if none does it is stranded"
+          : "the incident had already reached a terminal status, so nothing is waiting on this",
       });
     } catch (err: unknown) {
       alarm("run_outcome_read_failed", { incidentId, sessionRef, error: String(err) });
@@ -1530,10 +1687,16 @@ export const createBugBoss = async (
   /**
    * Sum the run's token usage onto the incident.
    *
-   * Tokens rather than dollars. Pricing is per model and changes underneath
-   * us, so a stored dollar figure would be a guess frozen at write time,
-   * while tokens plus `modelId` stay true and multiply out whenever someone
-   * asks. `costUsd` is left unwritten for that reason.
+   * Tokens rather than dollars. Bedrock returns tokens; a price is
+   * arithmetic we do locally against Pi's per-model table, and the day AWS
+   * moves a rate that table goes stale with nothing in a stored dollar
+   * figure that could ever say so. Tokens plus `modelId` stay true and
+   * re-price whenever someone asks, so there is no cost column to write and
+   * every figure a human sees is derived at the point it is shown.
+   *
+   * The 1h cache-write share goes with them for the same reason: it prices
+   * at 2x base input where the rest of the write is 1.25x, so a re-pricing
+   * without it is wrong by most of that gap on every run here.
    */
   const rollUpUsage = async (
     incidentId: string,
@@ -1577,13 +1740,14 @@ export const createBugBoss = async (
         w.prepare(
           `UPDATE incident
              SET tokensIn = ?, tokensOut = ?, cacheRead = ?, cacheWrite = ?,
-                 modelId = COALESCE(?, modelId)
+                 cacheWrite1h = ?, modelId = COALESCE(?, modelId)
            WHERE id = ?`,
         ).run(
           usage.tokensIn,
           usage.tokensOut,
           usage.cacheRead,
           usage.cacheWrite,
+          usage.cacheWrite1h,
           usage.modelId,
           incidentId,
         );
@@ -1594,6 +1758,7 @@ export const createBugBoss = async (
         tokensOut: usage.tokensOut,
         cacheRead: usage.cacheRead,
         cacheWrite: usage.cacheWrite,
+        cacheWrite1h: usage.cacheWrite1h,
         turns: usage.turns,
         modelId: usage.modelId,
       });
@@ -1628,6 +1793,31 @@ export const createBugBoss = async (
     );
 
   const sweepReports = (): Promise<number> => publishPendingReports(reportDeps);
+
+  /**
+   * The status board: every thread's header, the morning post and the
+   * all-clear.
+   *
+   * Runs off the tick that already runs rather than a schedule of its own.
+   * Every merge to ops `main` restarts this container, so an in-memory
+   * "next fire at 07:00" either fires twice or is skipped depending on when
+   * a deploy lands. Everything this needs to remember is a row in SQLite --
+   * see `board/index.ts`.
+   *
+   * Not run at startup, unlike its three neighbours. Those exist to catch
+   * work a restart interrupted; this one only looks at the world, and at
+   * boot the world is still being put back together -- the orphan and thread
+   * sweeps are running, so a board read now is a board about to change. It
+   * waits one tick.
+   */
+  const sweepTheBoard = (): Promise<unknown> =>
+    sweepBoard({
+      db,
+      post: (text) => slack.post(null, text, config.slackChannelId),
+      update: (channel, ts, text) => slack.update(channel, ts, text),
+      channel: config.slackChannelId,
+      now,
+    });
 
   const dispatcher = createDispatcher({
     db,
@@ -1676,6 +1866,9 @@ export const createBugBoss = async (
         ? { [TEST_DB_ENV_VAR]: config.testDatabase.url }
         : {}),
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
+      ...(config.inferenceProfiles
+        ? { BUGBOSS_INFERENCE_PROFILES: config.inferenceProfiles }
+        : {}),
       ...(config.workingHours
         ? { BUGBOSS_WORKING_HOURS: config.workingHours }
         : {}),
@@ -1709,114 +1902,6 @@ export const createBugBoss = async (
   // -------------------------------------------------------------------------
   // Inbound Slack
   // -------------------------------------------------------------------------
-
-  /**
-   * A person claiming an incident, or handing it back.
-   *
-   * `owner` is the only axis that moves. Status says where the work is and
-   * owner says who has it, and a claim changes the second without touching
-   * the first: an incident a person takes over is still FIXING, it just is
-   * not an agent doing the fixing.
-   *
-   * A takeover does not kill the agent. It pushes `handoff`, so the agent
-   * finishes the turn it is in and writes its brief -- which is the artifact
-   * the person taking over actually wants, and the reason they are usually
-   * taking over at all. Killing it would throw that away to save a minute.
-   *
-   * Hand-back is what makes escalation a handoff rather than a hole. Without
-   * it `owner` only ever moves one way and no agent can reach the incident
-   * again, which is what the dispatcher's launch-ceiling reset already
-   * assumed was possible.
-   */
-  const claimOwnership = async (
-    incidentId: string,
-    claim: OwnershipClaim,
-    slackUserId: string,
-  ): Promise<void> => {
-    const readIncidentRow = () =>
-      db.get<{ owner: string; status: string; slackThreadTs: string | null }>(
-        "SELECT owner, status, slackThreadTs FROM incident WHERE id = ?",
-        [incidentId],
-      );
-
-    const say = (text: string) =>
-      slack
-        .post(readIncidentRow()?.slackThreadTs ?? null, text)
-        .then(() => undefined)
-        .catch((err: unknown) =>
-          alarm("ownership_post_failed", { incidentId, error: String(err) }),
-        );
-
-    const to = claim === "take_over" ? "human" : "agent";
-    const from = claim === "take_over" ? "agent" : "human";
-
-    const changed = await db.withWrite((w: Database.Database) => {
-      // Guarded in the statement, like every other transition: the read that
-      // decided this happened outside the transaction.
-      const res = w
-        .prepare(
-          `UPDATE incident SET owner = ?
-             WHERE id = ? AND owner = ?
-               AND status IN ('INVESTIGATING', 'FIXING', 'RESOLVED')`,
-        )
-        .run(to, incidentId, from);
-      if (res.changes === 0) return false;
-      w.prepare(
-        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
-         VALUES (?, 'human', ?, ?, ?, ?)`,
-      ).run(
-        incidentId,
-        slackUserId,
-        claim,
-        `owner ${from} -> ${to}`,
-        now(),
-      );
-      return true;
-    });
-
-    if (!changed) {
-      const row = readIncidentRow();
-      log("ownership_claim_ignored", {
-        incidentId,
-        claim,
-        slackUserId,
-        owner: row?.owner ?? null,
-        status: row?.status ?? null,
-      });
-      // Saying so matters more than it looks: the claim word is a normal
-      // message, so silence is indistinguishable from the bot not reading it.
-      await say(
-        claim === "take_over"
-          ? mrkdwn`${raw(userMention(slackUserId))} this one is already owned by a human.`
-          : mrkdwn`${raw(userMention(slackUserId))} nothing to hand back: an agent already has this.`,
-      );
-      return;
-    }
-
-    if (claim === "take_over") {
-      await db.withWrite((w: Database.Database) => {
-        w.prepare(
-          `INSERT INTO pending_directive (incidentId, payload, createdAt)
-           VALUES (?, ?, ?)`,
-        ).run(
-          incidentId,
-          JSON.stringify({
-            type: "handoff",
-            reason:
-              "a person took this over in Slack; write up what you have and stop",
-          } satisfies Directive),
-          now(),
-        );
-      });
-    }
-
-    log("ownership_claimed", { incidentId, claim, slackUserId });
-    await say(
-      claim === "take_over"
-        ? mrkdwn`${raw(userMention(slackUserId))} has this one. The agent is writing up what it found and will stop.`
-        : mrkdwn`Back to an agent, handed over by ${raw(userMention(slackUserId))}. It will pick this up within a tick.`,
-    );
-  };
 
   /**
    * The one thing that reaches a running agent from Slack. `contact_human`
@@ -1865,26 +1950,209 @@ export const createBugBoss = async (
         alarm("intent_reply_failed", { channel, threadTs, error: String(err) }),
       );
 
+  /** The statuses an incident can still take signals in. Mirrors assign. */
+  const COMBINABLE: readonly IncidentStatus[] = ["INVESTIGATING", "FIXING"];
+
+  /**
+   * Somebody has asked for two incidents to be made one. This is where that
+   * becomes a thing that happened, wherever they said it.
+   *
+   * One executor for every surface, and that is the point rather than tidy
+   * factoring. The same sentence typed as a thread reply and typed at a
+   * mention used to do two different things -- merge, and be handed to a
+   * read-only box that answered that it could not -- and a person cannot see
+   * the boundary that makes those differ. They asked the same question.
+   *
+   * It exists at all because the alternative was a refusal. An agent may
+   * only re-partition its own incident, so when a person asked one for a
+   * merge, its single legal move was to open a *third* incident. That is how
+   * a thread with four days of conversation was abandoned for one opened
+   * minutes earlier. Agent containment is untouched and should stay that
+   * way; an agent asks now, through proposeMerge, and a person asks here.
+   *
+   * Three things bound it, none of them a reading of the sentence:
+   *
+   *   - Every id must appear literally in what they typed. A model that
+   *     invents a plausible number is dropped here, not obeyed.
+   *   - Both must be incidents that can still take signals, re-read after
+   *     the model call rather than trusted from the route.
+   *   - Which of the two survives is not theirs to pick and is not read out
+   *     of the message. `assign` holds that rule.
+   */
+  const combineIncidents = async (args: {
+    channel: string;
+    threadTs: string;
+    user: string;
+    /** What they typed, with the bot mention stripped. */
+    said: string;
+    /** The ids the read came back with, unvalidated. */
+    named: string[];
+    /** The incident whose thread this was said in, if it was said in one. */
+    here: string | null;
+  }): Promise<void> => {
+    const say = (text: string) => sayInThread(args.channel, args.threadTs, text);
+    const decline = (why: string, note: string) => {
+      log("combine_declined", { here: args.here, named: args.named, why });
+      return say(mrkdwn`${raw(userMention(args.user))} ${raw(note)}`);
+    };
+
+    // Not the model's word for it. An id it read out of the message is in
+    // the message; an id it did not is a number it made up, and acting on
+    // one combines two incidents nobody asked about. Digits first, so the
+    // boundary match below cannot be handed a pattern.
+    const ids = [...new Set(args.named)].filter(
+      (id) =>
+        /^\d+$/.test(id) && new RegExp(`(^|\\D)${id}(\\D|$)`).test(args.said),
+    );
+    if (ids.length !== args.named.length) {
+      log("combine_ids_dropped", { named: args.named, kept: ids });
+    }
+
+    // The thread supplies the second side when they only named one, which is
+    // how people actually write it: "this is the same as 79". Out in the
+    // channel there is no thread to supply it, so two is the whole ask.
+    const pair =
+      ids.length >= 2
+        ? ids.slice(0, 2)
+        : ids.length === 1 && args.here && ids[0] !== args.here
+          ? [ids[0], args.here]
+          : null;
+
+    // Never silent. A message read as a combine is somebody asking for one,
+    // and the reasons a pair cannot be formed are all invisible to them: the
+    // model named an incident that is not in their sentence, or named the
+    // one they are already standing in, or named one thing out in the
+    // channel where nothing supplies the second. Saying nothing to any of
+    // those is the failure this whole change is about, and the cost of
+    // saying something on a misread is one line in a thread.
+    if (!pair) {
+      log("combine_incomplete", { here: args.here, named: args.named, kept: ids });
+      return decline(
+        "could not make a pair",
+        args.here
+          ? "I could not tell which other incident you meant. Name it and I will combine it with this one."
+          : "which two incidents? Name both and I will combine them.",
+      );
+    }
+
+    // The rule, applied before anything moves, so what gets said matches
+    // what gets written. Not negotiable from the message: a person asking
+    // for the merge the other way round still gets this one, and is told.
+    // Both ids come from the message, so this needs no database.
+    const into = establishedOf(pair[0], pair[1]);
+    const absorb = into === pair[0] ? pair[1] : pair[0];
+
+    // Which signals move is resolved inside the write, not before it. The
+    // same reason every transition here puts its predicate in the statement:
+    // the write queue serializes behind a synchronous S3 PUT, so the gap
+    // between reading a list of ids and assigning them is hundreds of
+    // milliseconds of other people's writes. A correlation merge landing in
+    // that gap moves those signals to a third incident, and a list read
+    // beforehand would then drag them out of it -- a human-actor assign has
+    // no containment to stop that, so it would be a silent cross-incident
+    // steal. `applyMerge` in the tool API reads its signals the same way.
+    //
+    // Both statuses are checked in here for the same reason, and only here.
+    // The route was built when the message arrived and this runs after a
+    // model call, so either incident can have resolved or merged away since
+    // -- and a second copy of the check outside the transaction would be a
+    // duplicate that no test can distinguish from this one.
+    let outcome:
+      | { kind: "unknown"; id: string }
+      | { kind: "shut"; id: string; status: IncidentStatus }
+      | { kind: "empty" }
+      | { kind: "assigned"; result: AssignResult };
+    try {
+      outcome = await db.withWrite((w: Database.Database) => {
+        for (const id of pair) {
+          const row = getIncidentRow(w, id);
+          if (!row) return { kind: "unknown" as const, id };
+          if (!COMBINABLE.includes(row.status)) {
+            return { kind: "shut" as const, id, status: row.status };
+          }
+        }
+        const signalIds = getSignalsFor(w, absorb).map((signal) => signal.id);
+        if (signalIds.length === 0) return { kind: "empty" as const };
+        return {
+          kind: "assigned" as const,
+          result: assign(
+            w,
+            { signalIds, target: into, reason: args.said },
+            { kind: "human", slackUserId: args.user },
+          ),
+        };
+      });
+    } catch (err) {
+      alarm("combine_failed", {
+        here: args.here,
+        pair,
+        error: String(err),
+      });
+      await say(
+        mrkdwn`${raw(userMention(args.user))} I could not combine these two -- ${err instanceof AssignError ? String((err as Error).message) : "the write failed and the error is in the BugBoss logs"}.`,
+      );
+      return;
+    }
+
+    if (outcome.kind === "unknown") {
+      return decline(
+        `unknown incident ${outcome.id}`,
+        `there is no incident ${outcome.id}, so I have left these alone.`,
+      );
+    }
+    if (outcome.kind === "shut") {
+      return decline(
+        `incident ${outcome.id} is ${outcome.status}`,
+        `incident ${outcome.id} is ${outcome.status} and is not taking signals, so these cannot be combined. A signal arriving after a resolution is a recurrence rather than the same incident.`,
+      );
+    }
+    if (outcome.kind === "empty") {
+      return decline(
+        "nothing to move",
+        `incident ${absorb} has no signals left to move, so there is nothing to combine.`,
+      );
+    }
+    const result = outcome.result;
+    logAssign(result);
+
+    // Their answer goes first, and announce's closing message last, because
+    // one of the two threads announce writes into can be this one -- and
+    // "this is the last message in this thread" has to be true when it is
+    // read.
+    //
+    // Which is also why this says nothing about a thread ending. Two
+    // messages both claiming to be the end is worse than one: the first is
+    // false by the time it is read, and the one that carries the link to
+    // where everything moved is the one that has to be believed.
+    await say(
+      [
+        mrkdwn`${raw(userMention(args.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
+        mrkdwn`_Incident ${into} is the older record, so it stays the incident of record and keeps its thread.${args.here === into ? " Everything carries on here." : ""}_`,
+      ].join("\n"),
+    );
+    await announce.announceMerge(result);
+  };
+
   /**
    * Something a person said in an incident's thread. The relay has recorded
-   * it; this decides what it meant, off the Slack ack.
+   * it; this decides who it was for, off the Slack ack.
    *
-   * Two questions, one model call. Does it hand the incident over, and was it
-   * for the agent at all -- because `contact_human` ends its wait on the
-   * first reply it sees, and two people talking to each other while an agent
-   * is blocked used to end that wait on whichever of them spoke first. The
-   * answer to that is not syntax: answering a direct question should not need
-   * ceremony, so the message is read rather than required to carry a tag.
+   * One question now, where there were two. The other asked whether the
+   * message handed the incident between a person and an agent, and no such
+   * move exists: an agent drives every open incident. What is left is the
+   * question that was always doing the work -- `contact_human` ends its wait
+   * on the first reply it sees, and two people talking to each other while an
+   * agent is blocked used to end that wait on whichever of them spoke first.
+   * The answer to that is not syntax: answering a direct question should not
+   * need ceremony, so the message is read rather than required to carry a tag.
    *
-   * Three rules sit in code, on top of what the model says, for the same
+   * Two rules sit in code, on top of what the model says, for the same
    * reason `applyRules` does in triage:
    *
    *   - An explicit @bugboss always means "this is for you". That is the
    *     escape hatch for somebody who wants certainty, and because it is
    *     decided here rather than by the model it keeps working while the
    *     model is down.
-   *   - A handover is aimed at the system by definition, so it is delivered
-   *     as well as acted on.
    *   - Nothing is ever dropped. A message that could not be read is still
    *     delivered as context; what it loses is the right to end a wait.
    *
@@ -1904,16 +2172,10 @@ export const createBugBoss = async (
 
     const read = await readReplyIntent(intent, {
       text: said,
-      owner: route.owner,
       outstandingQuestion: outstanding,
     });
 
-    const handingOver: OwnershipClaim | null =
-      read.handover === "take_over" || read.handover === "hand_back"
-        ? read.handover
-        : null;
-    const addressed: Addressed =
-      route.interrupt || handingOver ? "agent" : read.addressed;
+    const addressed: Addressed = route.interrupt ? "agent" : read.addressed;
 
     // Delivered before anything else, so the agent has what was said whatever
     // the rest of this decides. `others` and `unclear` ride through as
@@ -1922,57 +2184,50 @@ export const createBugBoss = async (
 
     log("reply_read", {
       incidentId: route.incidentId,
-      handover: read.handover,
       addressed,
       modelAddressed: read.addressed,
+      combineIds: read.combineIds,
       tagged: route.interrupt,
       blocked: outstanding !== null,
       fellBack: read.fellBack,
     });
 
-    if (handingOver) {
-      await claimOwnership(route.incidentId, handingOver, route.user);
-      return;
+    // Independent of `addressed`. Asking for two incidents to be combined is
+    // a thing people say to each other as much as to the agent, and the ask
+    // is no less real for being addressed sideways. The agent has the message
+    // either way; this is the half of it that needs doing rather than
+    // reading.
+    if (read.combineIds.length > 0) {
+      await combineIncidents({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        user: route.user,
+        said,
+        named: read.combineIds,
+        here: route.incidentId,
+      });
     }
 
-    // Everything the read could not settle, in one post. These used to be two
-    // branches with a return each, so a message that was ambiguous both ways
-    // -- which is the common shape of an unreadable message -- was told about
-    // the handover and never told its answer had not been delivered as one.
-    const unsureHandover = read.handover === "unclear";
     // Only worth saying while something is blocked on it. With no outstanding
     // question there is no wait to end, the directive is context either way,
     // and narrating that is noise about nothing.
-    const unsureAddressee = addressed === "unclear" && outstanding !== null;
-
-    if (unsureHandover || unsureAddressee) {
+    if (addressed === "unclear" && outstanding !== null) {
       await sayInThread(
         route.channel,
         route.threadTs,
         [
           read.fellBack
             ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way.`
-            : mrkdwn`${raw(userMention(route.user))} I could not tell how to take that one. The agent has it as context either way.`,
-          ...(unsureHandover
-            ? [
-                "If you meant you are taking this incident over, or handing it back to an agent, say so plainly and I will move it.",
-              ]
-            : []),
-          ...(unsureAddressee
-            ? [
-                "And if it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
-              ]
-            : []),
+            : mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent. It has it as context either way.`,
+          "If it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
         ].join("\n"),
       );
     }
 
     // Independent of the above, not an else. Somebody who tags @bugboss in a
-    // thread with no agent on it has asked a question, and an ambiguous
-    // handover is a footnote to that rather than a reason to leave them
-    // without an answer. A real handover returned above, so the read-only
-    // agent still never fields a claim -- its answer to one would be to tell
-    // you to reply in the thread, which is what you just did.
+    // thread with no agent running has asked a question, and an unreadable
+    // message is a footnote to that rather than a reason to leave them
+    // without an answer.
     if (route.interrupt && !route.agentRunning) {
       await slackAgent.handle({
         channel: route.channel,
@@ -2027,6 +2282,22 @@ export const createBugBoss = async (
 
     if (read.intent === "question") return ask();
 
+    // The surface that used to answer this with "I cannot". A mention is
+    // not in an incident thread, so nothing supplies a second id and both
+    // have to be named -- but the request is the same request, and it runs
+    // through the same executor rather than a second implementation that
+    // drifts from it.
+    if (read.intent === "combine") {
+      return combineIncidents({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        user: route.user,
+        said,
+        named: read.combineIds,
+        here: null,
+      });
+    }
+
     log("mention_unclear", { user: route.user, ts: route.ts, fellBack: read.fellBack });
     await sayInThread(
       route.channel,
@@ -2066,32 +2337,80 @@ export const createBugBoss = async (
    * including the two that changed nothing. A button that silently does
    * nothing is indistinguishable from a broken one, and the person who
    * pressed it would reasonably go on waiting for an agent that never heard
-   * them. Each line ends by pointing at the thing that always works: typing.
+   * them.
+   *
+   * What the line has to carry is what happens *next*. "Chose Merged" was
+   * only the first half: a press on an incident the dispatcher will not run
+   * writes a directive nothing is coming to consume, and it read exactly the
+   * same as a press an agent was about to act on. So every line here says
+   * whether an agent will read this, and when none will, the one move that
+   * changes that. A confident acknowledgement over an inert press is worse
+   * than silence, because silence at least does not claim.
    */
   const acknowledgeChoice = async (
     route: ChoiceRoute,
     click: SlackChoiceClick,
   ): Promise<void> => {
+    const say = (text: string, incidentId: string | null) =>
+      slack
+        .post(click.threadTs, text, click.channel)
+        .then(() => undefined)
+        .catch((err: unknown) =>
+          alarm("choice_post_failed", { incidentId, error: String(err) }),
+        );
+
     if (route.kind === "ignore") {
-      log("choice_ignored", { reason: route.reason, user: click.user });
+      // A button only exists on a question BugBoss posted into an incident
+      // thread, so a press whose thread matches no incident means the thread
+      // link is gone and the press is lost. That is an alarm, not a log, and
+      // the presser hears about it rather than watching a dead button.
+      alarm("choice_unmatched", {
+        reason: route.reason,
+        user: click.user,
+        threadTs: click.threadTs,
+      });
+      await say(
+        [
+          mrkdwn`${raw(userMention(click.user))} I cannot match this thread to an incident, so that press reached no agent.`,
+          "_Tag me here and say what you meant, and I will pick it up._",
+        ].join("\n"),
+        null,
+      );
       return;
     }
+
     const who = raw(userMention(route.slackUserId));
+    // The half "recorded" left out, and the only one the presser cannot see
+    // for themselves. `landed` separates the press that became the answer
+    // from the two that did not, because "the agent has that" is true of one
+    // of them and a claim about nothing for the others.
+    const next = (landed: boolean): string => {
+      switch (route.reader) {
+        case "agent":
+          return landed
+            ? "_The agent has that as its answer and carries on from here._"
+            : "_Reply in the thread and the agent will read you._";
+        case "closed":
+          return "_This incident is over and no agent will run on it again, so nothing here reaches one._";
+      }
+    };
+
     const text =
       route.kind === "answered"
-        ? mrkdwn`${who} chose *${route.choice}*.`
+        ? [mrkdwn`${who} chose *${route.choice}*.`, next(true)].join("\n")
         : route.kind === "duplicate"
-          ? mrkdwn`${who} that question already has an answer. Reply in the thread to add anything else.`
-          : mrkdwn`${who} that question is closed and the agent has moved on. Reply in the thread and it will read you.`;
-    await slack
-      .post(click.threadTs, text, click.channel)
-      .then(() => undefined)
-      .catch((err: unknown) =>
-        alarm("choice_post_failed", {
-          incidentId: route.incidentId,
-          error: String(err),
-        }),
-      );
+          ? [
+              route.recorded
+                ? mrkdwn`${who} that question already has an answer: *${route.recorded.choice}*, from ${raw(userMention(route.recorded.slackUserId))}.`
+                : mrkdwn`${who} that question already has an answer.`,
+              next(false),
+            ].join("\n")
+          : [
+              mrkdwn`${who} that question is closed — nothing is waiting on that answer any more.`,
+              next(false),
+            ].join("\n");
+
+    await say(text, route.incidentId);
   };
 
   const slackInteractionAccepted = async (
@@ -2146,6 +2465,9 @@ export const createBugBoss = async (
     resolutionTimer = setInterval(() => {
       background("orphan_sweep", sweepOrphans);
       background("thread_sweep", ensureIncidentThreads);
+      // After the thread sweep, so an incident whose thread was opened on
+      // this tick can carry a header on it rather than waiting for the next.
+      background("board_sweep", sweepTheBoard);
       // Nothing relaunches an agent on a CLOSED incident, so a container
       // replaced between the close and its report is the one case where the
       // report has no other way out.
@@ -2183,6 +2505,7 @@ export const createBugBoss = async (
     sweepOrphans,
     ensureIncidentThreads,
     sweepReports,
+    sweepBoard: sweepTheBoard,
     start,
     stop,
   };
@@ -2253,7 +2576,9 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       maxConcurrentAgents: Number(env.BUGBOSS_MAX_AGENTS ?? 15),
       tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
       agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 86_400),
+      agentMaxTurns: Number(env.BUGBOSS_MAX_TURNS ?? INCIDENT_AGENT_MAX_TURNS),
       maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
+      staleAfterSeconds: Number(env.BUGBOSS_STALE_HOURS ?? 24) * 3600,
     },
     prodCriticalSlugs: (env.BUGBOSS_PROD_CRITICAL_SLUGS ?? "")
       .split(",")
@@ -2267,6 +2592,18 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
           workingHours: (() => {
             parseWorkingHours(env.BUGBOSS_WORKING_HOURS);
             return env.BUGBOSS_WORKING_HOURS;
+          })(),
+        }
+      : {}),
+    // Same trick, same reason. The child re-parses the string it is handed
+    // and will not die on a bad one, so this is the only place a typo in the
+    // profile map can be loud -- and it is loud at boot, where somebody is
+    // looking, rather than as a silently missing line on next month's bill.
+    ...(env.BUGBOSS_INFERENCE_PROFILES
+      ? {
+          inferenceProfiles: (() => {
+            parseInferenceProfiles(env.BUGBOSS_INFERENCE_PROFILES);
+            return env.BUGBOSS_INFERENCE_PROFILES;
           })(),
         }
       : {}),
@@ -2338,18 +2675,17 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
 
   return createBugBoss({
     config,
-    model: createBedrockModelClient({
+    // Region is no longer passed: `resolveBedrockModel` takes it from an
+    // inference-profile ARN and otherwise the SDK's own chain reads the same
+    // AWS_REGION this used to forward by hand.
+    model: await createBossModelClient({
       modelId: secrets.triageModelId ?? DEFAULT_TRIAGE_MODEL_ID,
-      region: secrets.awsRegion,
     }),
     // Only when a different model is named for it. Every inbound Slack
     // message costs one of these calls, so this is the knob that takes them
     // off the triage model without a deploy.
     intentModel: secrets.intentModelId
-      ? createBedrockModelClient({
-          modelId: secrets.intentModelId,
-          region: secrets.awsRegion,
-        })
+      ? await createBossModelClient({ modelId: secrets.intentModelId })
       : undefined,
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
     // The closing report uploads as a file. Same token as every other post,

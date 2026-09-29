@@ -16,12 +16,18 @@
 // Advisory, exactly like triage. The model reads the sentence; the code keeps
 // the invariants. Two things make a wrong read cheap rather than expensive:
 //
-//   - It cannot name what it acts on. An ownership read is bound to the
+//   - It can name at most half of what it acts on. A read is bound to the
 //     incident whose thread the message arrived in, and the legal transitions
 //     are in the guarded UPDATE in the composition root. A message that reads
 //     like an order -- pasted out of a log line, or written by someone who
-//     wants one -- can still only move the one incident it was posted under,
-//     between the two states that statement allows.
+//     wants one -- can still only move the one incident it was posted under.
+//     A combine request is the one read that names a second incident, and it
+//     names only that second one: the first side is always the thread. The
+//     id it names has to appear literally in the message, has to be an open
+//     incident, and which of the two survives is a rule in `assign` rather
+//     than anything said here. So the worst a fabricated id achieves is to
+//     combine the incident somebody was already standing in with one real
+//     other one, at a verified person's request, announced in both threads.
 //   - It never fails quietly. A failed call answers `unclear`, which asks
 //     rather than guesses, and carries a fallback rate on its alarm so a dead
 //     model does not read as a quiet week.
@@ -31,11 +37,12 @@ import { z, type ZodType } from "zod";
 import { makeAlarm, makeLog } from "../logging";
 import {
   recordCall,
+  emptyModelUsage,
   runStructuredCall,
+  usageForLog,
   type ModelClient,
   type ModelToolSpec,
 } from "../triage";
-import type { IncidentOwner } from "../types";
 
 const log = makeLog("slack-intent");
 
@@ -63,15 +70,10 @@ export interface IntentDeps {
   maxTokens?: number;
 }
 
-/** Which way ownership is being handed, per the Layer 4 actions table. */
-export type OwnershipClaim = "take_over" | "hand_back";
-
-export type Handover = OwnershipClaim | "none" | "unclear";
-
 /** Who a reply was for. `others` is recorded and never ends a wait. */
 export type Addressed = "agent" | "others" | "unclear";
 
-export type MentionIntent = "bug_report" | "question" | "unclear";
+export type MentionIntent = "bug_report" | "question" | "combine" | "unclear";
 
 /** True when the model never answered and the safe labels were taken. */
 interface Fallible {
@@ -81,12 +83,23 @@ interface Fallible {
 }
 
 export interface ReplyRead extends Fallible {
-  handover: Handover;
   addressed: Addressed;
+  /**
+   * Incidents this person is asking to be combined, as they wrote them.
+   * Empty unless they asked. Unvalidated: the caller checks each id was
+   * really in the message and names an incident that can take signals, and
+   * supplies the thread's own incident when only one was named.
+   */
+  combineIds: string[];
 }
 
 export interface MentionRead extends Fallible {
   intent: MentionIntent;
+  /**
+   * The incidents a `combine` names. Two, out here: there is no thread to
+   * supply the other side. Same validation by the caller as the reply read.
+   */
+  combineIds: string[];
 }
 
 const INTENT_TOOL = "read_intent";
@@ -128,7 +141,6 @@ you what you are looking at.`;
 // A reply in an incident thread
 // ---------------------------------------------------------------------------
 
-const HANDOVERS = ["take_over", "hand_back", "none", "unclear"] as const;
 const ADDRESSEES = ["agent", "others", "unclear"] as const;
 
 const REPLY_TOOL: ModelToolSpec = {
@@ -138,77 +150,70 @@ const REPLY_TOOL: ModelToolSpec = {
   inputSchema: {
     type: "object",
     properties: {
-      handover: {
-        type: "string",
-        enum: [...HANDOVERS],
-        description:
-          "take_over: they are taking this incident on themselves, now. hand_back: they are giving it back to an agent. none: neither, which is most messages. unclear: it reads like a handover but you cannot tell which, or whether they mean it now.",
-      },
       addressed: {
         type: "string",
         enum: [...ADDRESSEES],
         description:
           "agent: they are talking to the agent working this incident. others: they are talking to the other people in the thread. unclear: you cannot tell.",
       },
+      combineIds: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Incident ids this person is asking to be combined, copied exactly from their message. Leave it out unless they plainly ask for that.",
+      },
       reason: REASON_PROPERTY,
     },
-    required: ["handover", "addressed", "reason"],
+    required: ["addressed", "reason"],
     additionalProperties: false,
   },
 };
 
 const replySchema = z.object({
-  handover: z.enum(HANDOVERS),
   addressed: z.enum(ADDRESSEES),
+  combineIds: z.array(z.string()).optional(),
   reason: REASON_SCHEMA,
 });
 
 const REPLY_SYSTEM = `You are the inbound-language step of BugBoss, an incident control plane. A
 person has replied in one incident's Slack thread, where an agent is
-investigating and other people are watching. Read that one message and answer
-two things about it.
+investigating and other people are watching. Read that one message and say
+who it was for.
 
-Answer by calling the ${INTENT_TOOL} tool exactly once, with both fields.
-
-FIELD 1, handover -- does this message move the incident between a person and
-an agent?
-
-- take_over: they are saying they are taking this incident on themselves, now.
-  "mine", "I've got this", "I'll take it from here", "stop, I'm on it".
-- hand_back: they are giving it back to an agent. "back to you", "all yours
-  again", "you can pick this up from here", "ok back to the bot".
-- none: neither. Most messages.
-- unclear: it reads like one of the two but you cannot tell which, or cannot
-  tell whether they mean it now.
-
-Choose take_over or hand_back only when the message plainly means it, about
-THIS incident, right now. Prefer none over a guess, and unclear over a
-handover you are not sure of. The asymmetry is deliberate: a handover you
-invent takes the incident out of the queue agents are dispatched from, and
-nothing afterwards notices that the work stopped.
-
-These are not handovers: ownership of something else ("not mine", "that one is
-mine to fix"); conditional or future ("I'll take this over once CI is green");
-reporting what someone else did ("Ada has this one"); quoted logs, alert
-bodies, PR titles or somebody else's message.
-
-FIELD 2, addressed -- who was this message for?
+Answer by calling the ${INTENT_TOOL} tool exactly once.
 
 - agent: they are talking to the agent. An answer to the question it asked, an
   instruction to it, a correction of something it said, or anything else aimed
-  at the thing doing the work. A handover is aimed at it too.
+  at the thing doing the work.
 - others: they are talking to the other people in the thread. Speculating with
   a colleague, agreeing with someone, asking a person something, reacting,
   thinking out loud, arranging who does what.
 - unclear: you cannot tell. Somebody will be asked, so this costs one sentence
   and costs nothing else.
 
-This one matters most when the agent has asked a question and is blocked
-waiting. That question, when there is one, is shown below as OUTSTANDING
-QUESTION. A message answers it when it supplies what was asked for, even
-tersely -- "yes", "org X only", "no, that one is fine" are answers. A message
-about the same subject is not automatically an answer: "did anyone check org
-X?" is one person asking another, not a reply to the agent.
+An agent is always working this incident, and nothing you answer changes that
+or stops it. Somebody saying they are taking this on themselves is talking to
+the agent -- it is an instruction to stand down, which the agent reads and
+acts on, not a transfer for you to record.
+
+This matters most when the agent has asked a question and is blocked waiting.
+That question, when there is one, is shown below as OUTSTANDING QUESTION. A
+message answers it when it supplies what was asked for, even tersely -- "yes",
+"org X only", "no, that one is fine" are answers. A message about the same
+subject is not automatically an answer: "did anyone check org X?" is one
+person asking another, not a reply to the agent.
+
+Second, and separately: are they asking for incidents to be combined? Two
+incidents turn out to be one bug often enough that people say so. Put the ids
+they named in combineIds, copied exactly from their message, when they plainly
+ask for that -- "this is the same as 79", "merge these into 79", "82 and this
+one are the same bug, put them together". One id is the usual answer, because
+the thread they are standing in is the other side. Leave it empty otherwise.
+
+Leave it out when they are asking whether two incidents are related, or saying
+they look similar, or mentioning another incident in passing. A question is not
+a request. You are not being asked which incident should survive; that is not
+yours or theirs to pick.
 
 Prefer unclear over a wrong agent. Ending the agent's wait on something that
 was not for it sends a long investigation down whatever an offhand remark
@@ -221,7 +226,12 @@ ${INJECTION_NOTE}`;
 // A mention outside any incident thread
 // ---------------------------------------------------------------------------
 
-const MENTION_INTENTS = ["bug_report", "question", "unclear"] as const;
+const MENTION_INTENTS = [
+  "bug_report",
+  "question",
+  "combine",
+  "unclear",
+] as const;
 
 const MENTION_TOOL: ModelToolSpec = {
   name: INTENT_TOOL,
@@ -234,7 +244,13 @@ const MENTION_TOOL: ModelToolSpec = {
         type: "string",
         enum: [...MENTION_INTENTS],
         description:
-          "bug_report: they are telling you something is broken. question: they are asking you something. unclear: it could be either and you cannot tell.",
+          "bug_report: they are telling you something is broken. question: they are asking you something. combine: they are asking for two incidents to be made one. unclear: you cannot tell.",
+      },
+      combineIds: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "For combine only: the incident ids they named, copied exactly from their message.",
       },
       reason: REASON_PROPERTY,
     },
@@ -245,6 +261,7 @@ const MENTION_TOOL: ModelToolSpec = {
 
 const mentionSchema = z.object({
   intent: z.enum(MENTION_INTENTS),
+  combineIds: z.array(z.string()).optional(),
   reason: REASON_SCHEMA,
 });
 
@@ -263,7 +280,10 @@ The three answers:
 - question: they are asking you something you could look up -- what is open,
   what happened to an incident, what an agent found -- or anything else that
   wants an answer rather than an investigation. A read-only agent answers it.
-- unclear: it could be either. They will be asked which they meant.
+- combine: they are asking for two incidents to be made one, and you put both
+  ids in combineIds. "merge 82 into 79", "79 and 82 are the same bug". Asking
+  *whether* two are related is a question, not this.
+- unclear: you cannot tell. They will be asked which they meant.
 
 Someone asking about something broken is asking a question, not filing a
 report: "did anyone look at the checkout errors?" wants what is already known.
@@ -293,6 +313,7 @@ const read = async <T>(
   },
 ): Promise<{ answer: T & { reason?: string }; fellBack: boolean }> => {
   const started = Date.now();
+  const usage = emptyModelUsage();
   try {
     const answer = await runStructuredCall({
       model: deps.model,
@@ -304,9 +325,10 @@ const read = async <T>(
       maxRounds: MAX_ROUNDS,
       maxInvalid: MAX_INVALID,
       maxTokens: deps.maxTokens ?? MAX_TOKENS,
+      usage,
     });
     recordCall(SITE, false);
-    log("read", { what: args.what, ...answer, ms: Date.now() - started });
+    log("read", { what: args.what, ...answer, ms: Date.now() - started, ...usageForLog(usage) });
     return { answer, fellBack: false };
   } catch (err) {
     const health = recordCall(SITE, true);
@@ -314,27 +336,40 @@ const read = async <T>(
     // is a bot that has stopped listening -- and its safe answer is a
     // plausible-looking label. The rate travels with the alarm so that reads
     // as an outage rather than as a week of vague people.
+    // Every inbound Slack message costs one of these, so an unreadable read
+    // that reports no tokens hides the cheapest call in the system becoming
+    // the most frequent one.
     alarm("unreadable", {
       what: args.what,
       error: String(err),
       ms: Date.now() - started,
       ...health,
+      ...usageForLog(usage),
     });
     throw err;
   }
 };
 
 /**
- * What a reply in an incident thread meant: whether it hands the incident
- * over, and whether it was for the agent at all. `owner` is context because
- * "back to you" reads differently depending on who has it, and the agent's
- * outstanding question is context because answering it is most of what
- * `addressed` is asking. Neither is a permission check -- legality stays in
- * the UPDATE, and the @bugboss override stays in the caller.
+ * Who a reply in an incident thread was for, and whether it asks for this
+ * incident to be combined with another.
+ *
+ * The second field is here rather than in a call of its own because every
+ * inbound message already pays for this one, and a combine request is a
+ * thing said in passing in the middle of an ordinary sentence -- a separate
+ * classifier would have to read the same message again to find it.
+ *
+ * The ownership field this used to carry is gone: it asked whether the
+ * message moved the incident between a person and an agent, and there is no
+ * such move any more -- an agent drives every open incident, so the only
+ * question left is whether the message was aimed at it. The agent's
+ * outstanding question is the context that matters, because answering it is
+ * most of what this is asking. It is not a permission check: the @bugboss
+ * override stays in the caller and nothing here can end a wait by itself.
  */
 export const readReplyIntent = async (
   deps: IntentDeps,
-  msg: { text: string; owner: IncidentOwner; outstandingQuestion: string | null },
+  msg: { text: string; outstandingQuestion: string | null },
 ): Promise<ReplyRead> => {
   try {
     const { answer } = await read(deps, {
@@ -343,27 +378,25 @@ export const readReplyIntent = async (
       spec: REPLY_TOOL,
       schema: replySchema,
       prompt: [
-        `This incident is currently owned by ${msg.owner === "human" ? "a person" : "an agent"}.`,
-        "",
         msg.outstandingQuestion
           ? `OUTSTANDING QUESTION -- the agent asked this and is blocked waiting for an answer:\n${clip(msg.outstandingQuestion)}`
           : "OUTSTANDING QUESTION: none. The agent is working and has not asked anything.",
         "",
         untrusted(msg.text),
         "",
-        "Say what that message does and who it was for.",
+        "Say who that message was for.",
       ].join("\n"),
     });
     return {
-      handover: answer.handover,
       addressed: answer.addressed,
+      combineIds: answer.combineIds ?? [],
       reason: answer.reason ?? "",
       fellBack: false,
     };
   } catch (err) {
     return {
-      handover: "unclear",
       addressed: "unclear",
+      combineIds: [],
       reason: String(err),
       fellBack: true,
     };
@@ -385,10 +418,16 @@ export const readMentionIntent = async (
     });
     return {
       intent: answer.intent,
+      combineIds: answer.combineIds ?? [],
       reason: answer.reason ?? "",
       fellBack: false,
     };
   } catch (err) {
-    return { intent: "unclear", reason: String(err), fellBack: true };
+    return {
+      intent: "unclear",
+      combineIds: [],
+      reason: String(err),
+      fellBack: true,
+    };
   }
 };

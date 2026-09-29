@@ -10,20 +10,19 @@ decide what is allowed. It cannot:
 
 - **Attach across `RESOLVED`.** That is a recurrence, and it gets a new
   incident with `recurrenceOf` pointing at the one whose ground it reopened.
-- **Attach to a human-owned incident.** No agent is coming back to that, so
-  signals would pile up unworked. Read from the database rather than the
-  digest, because the model has `query_incidents` and can name any id it
-  turns up — filtering the candidate list alone would leave the invariant
-  resting on what the model happened to be offered.
+- **Attach to an incident that is not open.** `CLOSED` and `MERGED` take
+  nothing.
 - **Suppress a cause the alert did not declare.** The alert's own
   `known_causes` annotation must carry a matching id whose action is
   `suppress`. A human report or a `bug_report` is never suppressible at all.
 
-The owner check sits **after** the `RESOLVED` branch deliberately: a
-human-owned incident that fires again must still produce a recurrence
-pointer. It refuses only on `owner = 'human'`, not on "anything but agent" —
-a `null` owner means the row vanished mid-decision, which is a real race
-worth alarming on rather than swallowing.
+Both of those read the status back **from the database**, not from the digest.
+The model has `query_incidents` and can name any id it turns up, so filtering
+the candidate list alone would leave the invariant resting on what the model
+happened to be offered — and the digest is a snapshot from the start of the
+decision, which an incident can resolve, close or be merged away inside. The
+`RESOLVED` branch is checked first, so an incident that already claimed the
+problem was over produces a recurrence pointer rather than a bare refusal.
 
 ## Recurrence is the closed-incident half of the same question
 
@@ -80,6 +79,32 @@ The result is a **new incident carrying `recurrenceOf`**, never a reopen.
 `resolvedAt` and `closedAt` are the numbers a recurrence falsifies, and two
 `CHECK` constraints mean a reopen can only clear them.
 
+## One guard, and it is the stronger one
+
+`prepareQuery` used to have a twin in `slack/agent.ts`, against the same
+database, with different answers. That one allowed `EXPLAIN`, blanked string
+literals and comments before checking anything, and scanned nineteen write
+keywords. This one allowed neither `EXPLAIN` nor any keyword scan, and
+checked the raw text.
+
+Neither caller ever saw the other, so what went unnoticed is that the weaker
+guard was the one running on every signal, and that checking raw text makes a
+semicolon inside a string literal a refusal of a correct query -- which a
+model cannot distinguish from a syntax error, so it rewrites a query that was
+right.
+
+The checks now read a stripped copy: no string literals, no bracketed
+identifiers, no comments. `WITH x AS (SELECT 1) DELETE FROM incident` opens
+with `WITH` and an opener check alone passes it, which is what the keyword
+scan is for.
+
+It returns an error rather than throwing, and that is the half worth keeping
+from this side. Both callers hand the answer straight back to the model as a
+tool result; a throw would have to be caught at every call site to become the
+same thing. Containment was never what either guard was for -- `Db`'s read
+connection is opened read-only, so a write fails at the driver regardless.
+This is about handing a model a sentence it can act on.
+
 ## A dead model must not look like a healthy one
 
 Both fallbacks (`triage.ts`, `correlate.ts`) alarm and carry a **rate**, not
@@ -95,6 +120,19 @@ count.
 `sustained` needs ≥10 calls and ≥50% fallbacks, so one transient failure
 never reads as total failure.
 
+## What a decision cost is part of the decision
+
+`TriageOutcome` carries a `ModelUsage`, and it is filled on the fallback path
+too. `applyRules` does not see it: it is a pure function of the model's answer
+and has no business knowing the price of one, so `runTriage` owns the
+accumulator and stamps it on the way out.
+
+The fallback is the case worth costing. A wrong model id or sustained
+throttling makes every signal its own incident, and the same failure that
+produces no decision still pays for every request it made trying -- so a
+storm reads as busy, productive and free unless the tokens are recorded where
+they were spent. They land on the `signal` row; see `db/CLAUDE.md`.
+
 ## Reads throw
 
 `sql.ts` helpers throw on a database error rather than returning `null` or
@@ -107,3 +145,41 @@ The one exception is `attachedSignalIds` inside `runCorrelation`, which sits
 outside the try block that two other modules rely on never throwing. It gets
 its own guard and a distinct event name — a failed read and a failed
 judgement are different faults.
+
+## Triage is unbounded in count, and where the bound belongs when it comes
+
+Not built, deliberately — recorded here so the reasoning outlives the
+conversation it came from, because the wrong bound here is expensive to
+undo.
+
+Triage is one model call per signal. The incident agent has a wall clock and
+a turn budget; this path has neither, because a turn cap does not apply to
+something that is not a loop. On 2026-09-28 a storm opened 67 incidents in
+five minutes, and that is the path it ran down.
+
+Three places the bound could go. Two are wrong:
+
+- **Not at admission.** Refusing a signal is an incident nobody opens, which
+  is the one rule this system does not bend.
+- **Not on dollars.** A price here is arithmetic over Pi's hardcoded table,
+  not a figure anyone was billed — the same reason nothing persists
+  `costUsd`. A dollar ceiling enforces a limit against our own drift.
+
+- **At the rate, and it is safe *because the signal is already durable*.**
+  `signal.incidentId IS NULL` is the untriaged marker, the orphan sweep
+  already retries, and `orphan_backlog` already exists as the series this is
+  judged on. So deferring triage loses nothing: a storm becomes a growing
+  backlog on instrumentation that already reports it, instead of 67
+  concurrent model calls. Nothing new has to be built to watch it. This is
+  the same property the incident agent's turn budget rests on — turns are
+  durable in the transcript, signals are durable in SQLite, and in both
+  cases a restart neither loses the work nor refills the allowance.
+
+**But a limit is the second-best answer.** A storm is correlated by
+construction: 67 alerts is usually a handful of causes, and triaging them
+one at a time pays 67 times to rediscover that. Batching the signals that
+arrive together into one call is cheaper *and* better, because a model
+looking at all of them at once sees the correlation that `correlate.ts`
+currently has to reconstruct afterwards. It is real work rather than a
+config change — the scope of a triage decision moves, so the prompt and the
+output schema move with it.

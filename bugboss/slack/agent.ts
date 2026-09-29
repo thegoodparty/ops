@@ -23,8 +23,10 @@ import {
   raw,
   userMention,
 } from "./format";
-import { describeOutcome, readSessionOutcome } from "../agent/session";
+import { boardOnRequest } from "../board";
+import { describeOutcome, readSessionOutcome, sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
+import { prepareQuery, searchTool, usageForLog, type ModelUsage } from "../triage";
 
 const log = makeLog("slack-agent");
 
@@ -73,9 +75,11 @@ export interface SlackReader {
  * whole client because it never reacts: the :eyes: goes on at the edge, before
  * anything here has been asked to run.
  *
- * The linker is here because this is the one surface that talks about
- * incidents it is not standing in. A bare "incident 4" in another thread is
- * something the reader has to go and hunt for in the channel.
+ * The linker is here for one message and it is not an answer: when a run
+ * dies where it was mentioned, the alert in the alert channel has to point
+ * back at the thread nobody got a reply in. Linking an incident *inside* an
+ * answer is not this surface's job -- `slack/incidents.ts` does that on the
+ * way out, for every surface.
  */
 export type SlackConversation = SlackPoster & SlackReader & SlackLinker;
 
@@ -112,7 +116,12 @@ export interface SlackAgentRun {
 
 /** The harness, behind an interface so tests can fake it. */
 export interface SlackAgentModel {
-  run(req: SlackAgentRun): Promise<{ text: string }>;
+  /**
+   * The usage is every request the run made, the wrap-up and the failed ones
+   * included. Returned rather than logged inside the harness because what a
+   * question cost belongs on the line that says the question was answered.
+   */
+  run(req: SlackAgentRun): Promise<{ text: string; usage: ModelUsage }>;
 }
 
 /**
@@ -153,83 +162,6 @@ const MAX_ROW_CHARS = 2000;
 const MAX_SESSION_CHARS = 24000;
 const DEFAULT_SESSION_TAIL_LINES = 80;
 const MAX_SESSION_TAIL_LINES = 400;
-
-/**
- * Blank out string literals, bracket identifiers and comments so keyword and
- * statement-separator checks cannot be defeated by quoting.
- */
-const stripSqlNoise = (sql: string): string => {
-  let out = "";
-  let i = 0;
-  while (i < sql.length) {
-    const c = sql[i];
-    if (c === "'" || c === '"' || c === "`") {
-      const quote = c;
-      i++;
-      while (i < sql.length) {
-        if (sql[i] === quote) {
-          if (sql[i + 1] === quote) {
-            i += 2;
-            continue;
-          }
-          i++;
-          break;
-        }
-        i++;
-      }
-      out += " ";
-      continue;
-    }
-    if (c === "[") {
-      while (i < sql.length && sql[i] !== "]") i++;
-      i++;
-      out += " ";
-      continue;
-    }
-    if (c === "-" && sql[i + 1] === "-") {
-      while (i < sql.length && sql[i] !== "\n") i++;
-      out += " ";
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      i += 2;
-      while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
-      i += 2;
-      out += " ";
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
-};
-
-const FORBIDDEN =
-  /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA|REINDEX|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RETURNING)\b/i;
-
-/**
- * Defence in depth. The real boundary is Db's read connection, which SQLite
- * opened read-only, so a write fails there even if this misses one. This runs
- * first because a clear refusal beats a SQLITE_READONLY stack trace, and
- * because it is what stops multi-statement input reaching the driver at all.
- */
-export const assertReadOnlySql = (sql: string): string => {
-  const body = stripSqlNoise(sql).trim().replace(/;\s*$/, "");
-  if (!body) throw new Error("empty statement");
-  if (body.includes(";")) {
-    throw new Error("one statement at a time; remove the extra ';'");
-  }
-  if (!/^(SELECT|WITH|EXPLAIN)\b/i.test(body)) {
-    throw new Error(
-      "read-only access: statements must start with SELECT, WITH or EXPLAIN",
-    );
-  }
-  const hit = body.match(FORBIDDEN);
-  if (hit) {
-    throw new Error(`read-only access: ${hit[1].toUpperCase()} is not allowed`);
-  }
-  return sql.trim();
-};
 
 const truncationSuffix = (total: number): string =>
   `... [truncated, ${total} chars]`;
@@ -279,60 +211,52 @@ export const tsAfter = (a: string, b: string): boolean => {
 export interface ToolDeps {
   db: Db;
   store: ObjectStore;
-  linker: SlackLinker;
-  /**
-   * The thread the answer is being written into, so an incident whose thread
-   * this already is can be denied a link to itself. Null outside a thread.
-   */
-  threadTs: string | null;
 }
 
 /**
- * Three tools, in a fixed order, built from literals. Nothing here may vary
+ * Five tools, in a fixed order, built from literals. Nothing here may vary
  * between two builds in two processes: the tools array is part of the prefix
- * every thinking block in the session is bound to. `threadTs` and `linker`
- * reach only the closures, never a name, a description or a schema.
+ * every thinking block in the session is bound to.
+ *
+ * None of them hands back a Slack url, deliberately. Linking an incident is
+ * not the model's job any more: it writes "incident 4" in prose and
+ * `slack/incidents.ts` renders it on the way out, from every surface. A
+ * `threadPermalink` field here would be a second mechanism for the same
+ * thing with the model holding one of them, which is the arrangement that
+ * produced the inconsistency to begin with.
  */
-export const buildTools = ({
-  db,
-  store,
-  linker,
-  threadTs,
-}: ToolDeps): SlackAgentTool[] => {
-  /**
-   * Slack was asked for a link and would not give one. The rest of this
-   * answer stops asking: fifty rows against a Slack outage is fifty
-   * consecutive ten-second deadlines, paid by somebody waiting on a reply.
-   * Scoped to one build, so the next mention tries again.
-   */
-  let linkable = true;
+/**
+ * What a run has spent, as one line above the transcript tail.
+ *
+ * The dollar figure calls itself an estimate here rather than leaving that to
+ * the prompt, because this is the text the Slack agent quotes back to whoever
+ * asked what an incident cost. Tokens are what Bedrock returned; the price is
+ * arithmetic over them against a table that goes stale the day a rate moves,
+ * and a number nobody hedged reads as a bill.
+ */
+export const sessionSpend = (body: string): string => {
+  const usage = sumSessionUsage(body);
+  const tokens = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+  const priced =
+    usage.costUsd > 0
+      ? `, estimated cost $${usage.costUsd.toFixed(2)} (derived from those tokens, not an invoiced figure)`
+      : "";
+  return `spend: ${usage.turns} turns, ${tokens} tokens on ${usage.modelId ?? "an unrecorded model"}${priced}`;
+};
 
+export const buildTools = ({ db, store }: ToolDeps): SlackAgentTool[] => {
   /**
-   * The link to an incident's thread, or null -- which the model is told how
-   * to read. Null is three different things: this is the thread we are
-   * standing in, where a self-link is noise; the incident has no thread; or
-   * the link could not be built. Only the last is a failure, and it alarms
-   * rather than costing the answer, because a link is a convenience.
+   * Triage's tool, adapted to this surface's shape rather than rebuilt, so
+   * one search answers the same three ways wherever it is called from: hits,
+   * an empty corpus answer, and a query that never reached the index at all.
    */
-  const threadPermalink = async (
-    row: Record<string, unknown>,
-  ): Promise<string | null> => {
-    const ts = row.slackThreadTs;
-    if (typeof ts !== "string" || !ts || ts === threadTs || !linkable) return null;
-    try {
-      return await linker.permalink(ts);
-    } catch (err) {
-      linkable = false;
-      alarm("permalink_failed", { threadTs: ts, error: String(err) });
-      return null;
-    }
-  };
+  const search = searchTool(db);
 
   return [
     {
       name: "get_incident",
       description:
-        "Read one incident in full: its row, its signals, and the human replies relayed into its Slack thread. The row carries threadPermalink, which is the link to that incident's Slack thread.",
+        "Read one incident in full: its row, its signals, and the human replies relayed into its Slack thread.",
       inputSchema: {
         type: "object",
         properties: {
@@ -359,10 +283,7 @@ export const buildTools = ({
         return truncate(
           JSON.stringify(
             {
-              incident: {
-                ...incident,
-                threadPermalink: await threadPermalink(incident),
-              },
+              incident,
               signals,
               replies,
             },
@@ -378,7 +299,6 @@ export const buildTools = ({
       description: [
         "Run one read-only SQL SELECT against the incident database and get back JSON rows.",
         "Tables: incident, signal, thread_reply, pending_question, pending_directive.",
-        "Select slackThreadTs on an incident and the row comes back with threadPermalink alongside it, which is how you link an incident you name.",
         "Run \"SELECT name, sql FROM sqlite_master WHERE type='table'\" for the live schema.",
         `At most ${MAX_SQL_ROWS} rows come back, so add your own LIMIT and ORDER BY.`,
       ].join(" "),
@@ -394,31 +314,17 @@ export const buildTools = ({
         additionalProperties: false,
       },
       run: async (input) => {
-        let sql: string;
-        try {
-          sql = assertReadOnlySql(String(input.sql ?? ""));
-        } catch (err) {
-          return `Rejected: ${(err as Error).message}`;
-        }
+        const prepared = prepareQuery(String(input.sql ?? ""));
+        if ("error" in prepared) return `Rejected: ${prepared.error}`;
         let rows: Record<string, unknown>[];
         try {
-          rows = db.query<Record<string, unknown>>(sql);
+          rows = db.query<Record<string, unknown>>(prepared.sql);
         } catch (err) {
           return `SQL error: ${(err as Error).message}`;
         }
         if (rows.length === 0) return "0 rows.";
-        // Sequential on purpose. The linker learns the workspace from its first
-        // real answer and derives the rest, so fifty rows are one API call --
-        // fired together they would be fifty.
-        const linkedRows: Record<string, unknown>[] = [];
-        for (const row of rows.slice(0, MAX_SQL_ROWS)) {
-          linkedRows.push(
-            "slackThreadTs" in row
-              ? { ...row, threadPermalink: await threadPermalink(row) }
-              : row,
-          );
-        }
-        const shown = linkedRows
+        const shown = rows
+          .slice(0, MAX_SQL_ROWS)
           .map((r) => truncate(JSON.stringify(r), MAX_ROW_CHARS))
           .join("\n");
         const note =
@@ -431,7 +337,7 @@ export const buildTools = ({
     {
       name: "read_agent_session",
       description:
-        "Read the tail of an incident agent's session transcript, live or archived, to see what it tried and what it ruled out.",
+        "Read the tail of an incident agent's session transcript, live or archived, to see what it tried and what it ruled out. Also reports what the run has spent, in turns and tokens, with a cost estimate derived from them.",
       inputSchema: {
         type: "object",
         properties: {
@@ -471,10 +377,31 @@ export const buildTools = ({
         // which was still true.
         const outcome = describeOutcome(readSessionOutcome(body));
         return truncate(
-          `${key}: ${lines.length} entries, last ${slice.length} -- ${outcome}\n${slice.join("\n")}`,
+          `${key}: ${lines.length} entries, last ${slice.length} -- ${outcome}\n${sessionSpend(body)}\n${slice.join("\n")}`,
           MAX_SESSION_CHARS,
         );
       },
+    },
+    {
+      name: search.spec.name,
+      description: search.spec.description,
+      inputSchema: search.spec.inputSchema,
+      run: (input) => Promise.resolve(search.run(input)),
+    },
+    {
+      name: "incident_board",
+      description:
+        "The status board: every open incident as one line -- where the work is, what it is, and what is needed from a person. Already written for Slack. Paste it into your answer exactly as it comes back; do not rewrite it, reorder it or leave rows out. Use it whenever somebody asks what is open, what is going on, or what needs them.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      // The same renderer the morning post and the thread headers use. A
+      // board the model composed from query_incidents would be a fourth
+      // rendering of the same three fields, disagreeing with the other
+      // three in whatever way that run happened to phrase it.
+      run: () => Promise.resolve(boardOnRequest(db)),
     },
   ];
 };
@@ -498,22 +425,24 @@ export const SLACK_AGENT_SYSTEM = [
   "You are read-only. You cannot merge, split, close, stop or restart anything, and you cannot take ownership. Do not claim otherwise and do not promise to do any of it. If someone wants to take an incident over, tell them to say so as a reply in that incident's thread, which is where ownership actually changes.",
   "",
   "Your tools:",
-  "- get_incident: one incident in full, with its signals and relayed human replies, and threadPermalink for its Slack thread.",
-  "- query_incidents: one read-only SQL SELECT against the incident database. Select slackThreadTs and each incident row comes back with a threadPermalink.",
-  "- read_agent_session: the tail of an incident agent's transcript, for what it tried and ruled out.",
+  "- get_incident: one incident in full, with its signals and relayed human replies.",
+  "- query_incidents: one read-only SQL SELECT against the incident database.",
+  "- read_agent_session: the tail of an incident agent's transcript, for what it tried and ruled out, plus what the run has spent.",
+  "- incident_board: every open incident as one line each, already formatted. Paste it in verbatim when somebody asks what is open.",
+  "- search_incidents: text search over the post-mortems and root causes of incidents that are already over. Plain words describing the failure -- the mechanism, the component, the error text -- not a question and not SQL. \"0 matches\" means nothing that ended reads like this, which is an answer; an error means the search did not run, which is not the same thing and is never reported as nothing found.",
   "",
-  "Which tool you reach for is what decides whether you answer at all. A question about more than one incident is a query_incidents question. A question about one incident in depth is a get_incident question. Reading incidents one at a time to answer a question about all of them spends the whole run on reading, and a run spent reading is a question nobody gets an answer to.",
+  "Which tool you reach for is what decides whether you answer at all. A question about more than one incident is a query_incidents question. A question about one incident in depth is a get_incident question. \"Has this happened before?\" is a search_incidents question: the same cause comes back through a different alert, so an id or an alert name finds nothing and the words for the failure find it. Reading incidents one at a time to answer a question about all of them spends the whole run on reading, and a run spent reading is a question nobody gets an answer to.",
   "",
   "\"What is the state of the incidents?\" is one call:",
   "```",
-  "SELECT i.id, i.status, i.owner, i.rootCause, i.slackThreadTs,",
+  "SELECT i.id, i.status, i.rootCause, i.slackThreadTs,",
   "       (SELECT title FROM signal WHERE incidentId = i.id ORDER BY openedAt LIMIT 1) AS title,",
   "       (SELECT askedAt FROM pending_question WHERE incidentId = i.id) AS waitingSince",
   "FROM incident i",
   "WHERE i.status IN ('INVESTIGATING','FIXING')",
   "ORDER BY i.firstSignalAt",
   "```",
-  "One row per open incident: what it is about, where the work is, who has it, whether an agent is stuck waiting on a person, and a link to each thread. Spend get_incident or read_agent_session afterwards, on the one or two that still need explaining.",
+  "One row per open incident: what it is about, where the work is, whether an agent is stuck waiting on a person, and a link to each thread. Spend get_incident or read_agent_session afterwards, on the one or two that still need explaining.",
   "",
   "Formatting. What you write is posted to Slack as you wrote it, and Slack renders mrkdwn, not Markdown:",
   "- *bold*, _italic_, ~strike~, `code`, ```block```. Never **bold**: the asterisks show.",
@@ -523,10 +452,7 @@ export const SLACK_AGENT_SYSTEM = [
   "- Do not escape &, < or > yourself. That is done for you, so typing &amp; posts a literal &amp;.",
   "- Never write <!here>, <!channel> or <!subteam^ID>. Who gets paged is the Boss's decision, and from you they post as literal text.",
   "",
-  "Linking incidents. Every incident you name that is not the one whose thread you are standing in gets a link to its thread, written <permalink|incident 4>. Somebody reading this somewhere else has no other way to reach it: the alternative is scrolling the channel hunting for it.",
-  "- The link is the threadPermalink the tools handed you. Never assemble a Slack URL yourself and never reuse one from memory.",
-  "- A null threadPermalink means no link. Most often that is because you are already in that incident's thread, where it is \"this incident\" and a link to where you already are is noise. It can also mean the incident has no thread, or that the link could not be built.",
-  "- A link is a convenience. A missing one is never a reason to leave an incident out of your answer or to hedge about it; write the bare reference and carry on.",
+  "Naming incidents. Write \"incident 4\" in plain prose. It is capitalised and linked to its thread for you, on the way out, every time -- including inside a board you pasted. Do not build a link yourself, do not paste a Slack URL, and do not skip naming an incident because you are unsure whether it can be linked.",
   "",
   "Somebody on the rotation asking what needs them is the commonest question here, and it has a shape. Lead with how many incidents are open, so they know the size of it, then three parts in this order:",
   "- What is blocked on a person, and what that person has to do. This is the whole reason they asked. An incident owned by a human is on this list, and so is one whose agent is waiting on an unanswered question.",
@@ -561,6 +487,10 @@ export const SLACK_AGENT_SYSTEM = [
  * uses, nowhere near what an incident agent's run costs -- so what bounds
  * this is how long somebody will sit in a thread waiting, not the bill.
  */
+// Not the incident agent's budget. That one is INCIDENT_AGENT_MAX_TURNS in
+// agent/run.ts, an order of magnitude larger, and it ends in a hand-off
+// rather than in a reply -- because nobody is sitting in a thread waiting on
+// an investigator. Two budgets, two right answers on exhaustion.
 export const SLACK_AGENT_MAX_TURNS = 24;
 
 /** One model call's wall-clock bound, which every turn gets its own of. */
@@ -668,18 +598,9 @@ export class SlackAgent {
       const missed =
         fresh || !prior ? [] : await this.missedMessages(mention, prior.lastSeenTs);
 
-      // Rebuilt per mention because whether an incident earns a link depends
-      // on which thread this answer is being written into. Only the closures
-      // move: name, description and schema are literals, so the bytes the
-      // session prefix is bound to are the same on every build.
-      const tools = buildTools({
-        db: this.db,
-        store: this.store,
-        linker: this.slack,
-        threadTs: mention.threadTs,
-      });
+      const tools = buildTools({ db: this.db, store: this.store });
 
-      const { text } = await this.model.run({
+      const { text, usage } = await this.model.run({
         system: SLACK_AGENT_SYSTEM,
         tools,
         sessionKey,
@@ -704,7 +625,12 @@ export class SlackAgent {
       } catch (err) {
         log("state_write_failed", { thread: lockKey, error: String(err) });
       }
-      log("answered", { thread: lockKey, fresh, missed: missed.length });
+      log("answered", {
+        thread: lockKey,
+        fresh,
+        missed: missed.length,
+        ...usageForLog(usage),
+      });
     } catch (err) {
       log("run_failed", { thread: lockKey, error: String(err) });
       await this.reportFailure(mention, err);

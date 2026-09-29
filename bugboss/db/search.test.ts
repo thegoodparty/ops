@@ -56,9 +56,9 @@ const seed = async (args: {
     const status = args.status ?? "CLOSED";
     w.prepare(
       `INSERT INTO incident
-         (id, status, owner, prUrls, firstSignalAt, resolvedAt, closedAt, postmortem,
-          rootCause, resolvedEvidence, attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
-       VALUES (?, ?, 'agent', '[]', 1000, ?, ?, ?, ?, 'the alert went quiet for 90 minutes', 0, 0, 0, 0, 0, 0)`,
+         (id, status, prUrls, firstSignalAt, resolvedAt, closedAt, postmortem,
+          rootCause, resolvedEvidence, attempts, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
+       VALUES (?, ?, '[]', 1000, ?, ?, ?, ?, 'the alert went quiet for 90 minutes', 0, 0, 0, 0, 0, 0)`,
     ).run(
       args.id,
       status,

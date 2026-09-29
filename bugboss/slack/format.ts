@@ -147,6 +147,11 @@ export const bullets = (items: readonly string[]): string =>
 /**
  * The spans of model prose that survive untouched.
  *
+ * Exported because a second pass runs over finished mrkdwn on the way out --
+ * `slack/incidents.ts` -- and it has to protect exactly what this protects.
+ * Two copies of this list would drift, and the way that shows up is one pass
+ * rewriting the inside of a code block the other one left alone.
+ *
  * Code first, so a `**` inside a fenced block stays what the agent typed. Then
  * the two entity forms an agent may legitimately write: a user or channel
  * reference, and a link.
@@ -157,7 +162,7 @@ export const bullets = (items: readonly string[]): string =>
  * rotation for itself is how the rotation gets muted. They fall through to
  * escaping, so they render as literal text rather than disappearing.
  */
-const SEGMENT = new RegExp(
+export const PROTECTED = new RegExp(
   [
     "(",
     "```[\\s\\S]*?```", // fenced block
@@ -248,7 +253,7 @@ const convertProse = (text: string): string => {
  */
 export const toMrkdwn = (text: string): string =>
   text
-    .split(SEGMENT)
+    .split(PROTECTED)
     .map((segment, index) =>
       index % 2 === 0
         ? convertProse(segment)
@@ -312,6 +317,34 @@ export const overThreadBudget = (what: string, text: string): string | null =>
       `${THREAD_PROSE_CHARS}, about 200 words. Keep the conclusion and what it ` +
       "means for users; the full write-up belongs in the post-mortem, which is " +
       "not capped and which becomes the closing report.";
+
+/**
+ * How long an incident's summary may be before it is refused.
+ *
+ * A title, not a paragraph. Eighty characters is about a dozen words, which
+ * is what fits on one line of a status board next to an id and a status and
+ * still leaves room for what is needed from a person -- and a board whose
+ * rows wrap is a board nobody scans.
+ *
+ * The same shape as `overThreadBudget` rather than a second idea: past the
+ * limit the value is refused with a sentence naming the field, both numbers
+ * and where the long version belongs. Nothing here truncates. A title cut at
+ * eighty characters reads as a complete thought that happens to be wrong,
+ * which is worse than no title at all, and the thing that wrote it is a model
+ * that can be asked again.
+ */
+export const SUMMARY_CHARS = 80;
+
+/**
+ * Why this summary is too long, or null. Sibling of `overThreadBudget`.
+ */
+export const overSummaryBudget = (text: string): string | null =>
+  text.length <= SUMMARY_CHARS
+    ? null
+    : `The summary is ${text.length} characters and the limit is ` +
+      `${SUMMARY_CHARS}, about a dozen words. It is a title, not a ` +
+      "description: name what is broken and who it is broken for. The " +
+      "mechanism belongs in the root cause and the detail in the post-mortem.";
 
 /** Room for the `_(2/3)_` marker, which is added after chunking. */
 const CONTINUATION_RESERVE = 16;

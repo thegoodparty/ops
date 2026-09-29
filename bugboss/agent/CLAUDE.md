@@ -56,8 +56,91 @@ queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
   not in `TIME_RANGE_SHAPES` is not clamped, so adding a tool to the allowlist
   means adding its shape in the same change.
 
-The 20,000-char output cap does not help with any of this. It bounds bytes
-returned; Loki bills bytes scanned.
+There is no output cap to help with any of this, and there never was one that
+did: a cap bounds bytes returned, and Loki bills bytes scanned. Results now
+arrive whole and Pi compacts the conversation to make room — see "Nothing
+truncates a tool result" below.
+
+## Two bounds, and the turn budget is the one that measures work
+
+The wall clock bounds how long a launch may run. It does not bound what the
+run does: `monitor` and `contact_human` each cost **one turn** however long
+they block, so the first nine-hour incident spent about eight of those hours
+inside a single turn waiting on a person. 92 turns, $18.51, against a
+24-hour deadline that fifteen agents could each have spent in full.
+
+So there is a second bound in turns — `INCIDENT_AGENT_MAX_TURNS`, 200,
+overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
+
+- **It is counted over the incident, not the process.** Every merge to ops
+  `main` restarts this container, so a budget that started from zero on each
+  launch would bound nothing. `createTurnBudget` is seeded from
+  `sumSessionUsage` over the restored transcript, which counts assistant
+  messages — the same unit `turn_end` fires on.
+- **It announces and parks; it does not just stop.** Same two layers as the
+  deadline: at `maxTurns - TURN_BUDGET_GRACE_TURNS` the blocking-tool abort
+  fires and the model is steered to write a brief, and at `maxTurns` the
+  harness does it on the agent's behalf. Two calls, and only one of them is
+  optional. `escalate` is the announcement and is skipped when the agent
+  already escalated inside its grace. **`park` is not skippable.** Nothing
+  else stops the dispatcher relaunching, and a relaunched agent is instantly
+  over budget again, so without it the run escalates, stops, relaunches and
+  escalates every tick — the hot loop `park` exists for, named in its own
+  doc comment in `types.ts`. Announcing is what a person sees; parking is
+  what makes it stop.
+- **The agent escalating itself wins the announcement.** The steer asks for
+  exactly that and the model can answer on its very last grace turn, which
+  ends the same `turn_end` the cap fires on. The budget watches
+  `toolResults` for a successful `escalate`, because both posting puts "it
+  never wrote a brief" directly under the brief it just wrote. A *refused*
+  escalation does not count — nobody was told, which is the case the
+  harness exists for.
+- **The grace is clamped to half the budget.** `TURN_BUDGET_GRACE_TURNS` is
+  a constant and `maxTurns` is settable, so the two configure into nonsense
+  at small budgets: unclamped, `BUGBOSS_MAX_TURNS=10` puts the soft edge at
+  turn 0 and the agent is told to wrap up before it has done anything, with
+  nine turns left unused. The clamp is on the grace rather than a floor
+  under `maxTurns`, because a small budget is a legitimate ask and the
+  honest reading of it is "wrap up sooner". `TurnBudgetState.graceTurns`
+  carries what was actually given, so the brief cannot quote a window nobody
+  had.
+- **The park is the stop, and it opts out of lifting on a reply.**
+  `ToolApi.park` defaults `liftsOnReply` to true, which is right for a wait
+  on a person and wrong for this one: a reply is not news about having run
+  out of turns. Without `liftsOnReply: false` every comment on the thread
+  woke an agent that was over budget before it started, stopped again, and
+  paged the rotation. The argument is in `turnBudgetPark` rather than at the
+  call site so a test fails if it is dropped.
+- **The announcement is suppressed only when the agent already made it.**
+  `shouldAnnounceExhaustion` is `!state.escalated` and nothing more. There
+  was a second arm for a launch that began over budget, and it was treating
+  the wake rather than preventing it; once a budget wait survives a reply
+  the wake does not happen. Nothing lifts a budget wait now: the stale sweep
+  reads `liftsOnReply` too, so it announces one and leaves it standing
+  rather than relaunching an agent that would exhaust before its first turn.
+  Suppressing here as well would only take away the saying-so, and an
+  incident a day quiet and still out of turns is exactly what should be said
+  out loud.
+  The brief says plainly that replying will not restart it, because it will
+  not — raising `BUGBOSS_MAX_TURNS` or taking the work over is what
+  continues it.
+- **The brief carries what the run spent.** Turns, tokens and a cost
+  estimate, because shipping 200 before a dollar cap is only worth anything
+  if somebody learns what 200 turns costs. It is called an estimate there
+  too.
+
+**This is not the Slack agent's budget.** `SLACK_AGENT_MAX_TURNS` is 24 and
+ends by posting that the run is out of steps, which is right when a person is
+waiting in a thread for an answer. Nobody is watching an investigator, so its
+ending is an escalation and a park. Same mechanism, different number,
+different last act — the names say which is which so the next change picks
+the right one.
+
+`turn_end` cannot stop the loop. Pi reads a boundary result's `continue` as
+"force another turn" and never as "stop", so the stop is `session.abort()` —
+which leaves an error message behind exactly as a failing turn does. That is
+why `exitCodeFor` exempts `turnsExhausted`: without it a bound working as
+designed reaches the dispatcher as `agent_failed` and alarms every time.
 
 ## The two blocking tools
 
@@ -82,6 +165,13 @@ came out of the wait with anything.
   argument decides it rather than the command string, because a harness that
   pattern-matched `gh pr` would stop nudging the day somebody wrote the same
   check differently.
+
+  The `command` has to **observe the thing itself** — `gh pr view --json
+  state,mergedAt`, a flag read, a health check — not park until somebody says
+  in Slack that they did it. Being told is the fallback. That is instruction
+  (`prompt.ts`, the tool description) rather than a validator: what a command
+  observes is not readable from its text, and this codebase does not
+  pattern-match human-facing behaviour.
 - `contact_human(message, …)` — re-entrant. The marker is written *before*
   the post, so a resumed agent resumes waiting rather than asking twice. It
   re-posts when the stored message differs from the new one, and when
@@ -147,45 +237,46 @@ forbids it; that is advice, not a control. If a reviewer wants this closed,
 the only real answer is a second, narrower token for the agent's shell, which
 is a bigger change than this one.
 
-## contact_human is not an escalation, and the harness enforces that
+## contact_human is a question, and an unanswered one gets loud
 
-The two tools that reach a person differ only in who owns the incident
-afterwards: `contact_human` leaves `owner: agent`, `hand_off` sets
-`owner: human`. An agent blocked on a question nobody answers is therefore
-invisible as work needing a person — the dispatcher will not relaunch an
-incident a live agent still holds, and nothing lists one owned by an agent
-as unclaimed. The first real run ended exactly there: it could not reconcile
-the alert, and asked instead of escalating.
+Both tools that reach a person leave the incident exactly where it was.
+`contact_human` asks for one fact or one action; `escalate` says the incident
+needs a person and reaches the rotation. Neither moves the work and neither is
+an exit — the agent keeps the incident and keeps driving it, because it is the
+only thing that can finish it.
 
-So an unanswered wait converts. `runContactHuman` calls `hand_off` itself,
-returns `terminate`, and the agent stops. Three details it rests on:
+So an unanswered wait escalates rather than ending. `runContactHuman` calls
+`escalate` itself and carries on; only a `stop` or a `merged` directive
+terminates the run. The details it rests on:
 
 - **The floor.** A requested wait below `CONTACT_HUMAN_MIN_WAIT_SECONDS` is
   raised to it, not answered early. Without that, the escalation is opt-out:
   ask for two minutes and no timeout ever means anything.
 - **Not on the deadline abort.** The soft deadline has its own path — the run
   steers the model to write a real brief inside the grace window — and
-  handing off here would spend the turn that brief needs.
-- **A failed hand-off is loud.** Ownership did not move and nobody was told,
-  so the result says so and tells the model to call `hand_off` itself. The
-  prompt is where the model is asked to hand off first; this is the floor
-  under it, and the brief the harness writes is deliberately thinner.
+  escalating here would spend the turn that brief needs.
+- **A failed escalation is loud.** Nobody was told, so the result says so and
+  tells the model to say it in the thread itself. The prompt is where the model
+  is asked to escalate first; this is the floor under it, and the brief the
+  harness writes is deliberately thinner.
 - **The clock runs from `askedAt`, not from process start.** A restart is not
   an answer. A deadline of `now() + wait` hands a crash-looping agent a fresh
   wait every time and defers the escalation for as long as the crashes last.
-- **The marker is cleared after the hand-off, and only if it landed.** Clearing
-  first and dying in between replays as a brand-new question: re-posted, with a
-  fresh `askedAt` that makes a reply already in the thread look too old to be
-  one.
+- **The marker is cleared after the escalation, and only if it landed.**
+  Clearing first and dying in between replays as a brand-new question:
+  re-posted, with a fresh `askedAt` that makes a reply already in the thread
+  look too old to be one.
 - **Buttons do not opt out of any of it.** A button nobody presses is
   silence, so a question with `options` hits the same floor, the same
-  deadline and the same hand-off. The labels go into the harness's brief,
-  because they were part of the question and whoever picks this up was not
+  deadline and the same escalation. The labels go into the harness's brief,
+  because they were part of the question and whoever reads it was not
   watching the thread.
 
 `message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
 refused rather than truncated — truncating would cut off the question, which
-is the part at the bottom. The evidence goes in `details`, posted as its own
+is the part at the bottom. The limit is also what lets `unansweredBrief` quote
+the ask whole when nobody answers, which is the one thing the person picking
+the incident up cannot reconstruct. The evidence goes in `details`, posted as its own
 message under the ask — and posted *outside* the re-entrancy guard, because
 `messageTs` only records that the ask landed. A crash between the two posts
 leaves a marker that looks complete, so a resume re-posts the evidence rather
@@ -200,11 +291,15 @@ An agent that posts "please merge this" and then blocks is indistinguishable
 from one that has died, and a merge nobody notices is the stall that matters
 most — the human's only job in this system is the merge. So a wait with
 `awaitingHuman` set nudges the thread on its own: due an hour in, then two,
-then four, and once the nudges run out `hand_off` sets `owner: human` and the
-agent stops. That last step is the point of the ladder — an incident blocked
-with `owner: agent` is invisible, since the dispatcher will not relaunch one
-an agent still holds and nothing lists it as unclaimed work. `hand_off` is
-also the only post in the sequence that reaches the rotation group.
+then four. Past `HEARTBEAT_LOUD_AFTER_PINGS` the nudge becomes an `escalate` —
+the same facts, posted where the rotation sees them — and the wait continues.
+
+**The ladder does not terminate**, because the agent is the only thing that
+can finish the work: volume is the only thing left that can change.
+`HEARTBEAT_MAX_GAP_SECONDS` clamps the doubling at a day, so it runs 1h, 2h,
+4h, 8h, 16h and then daily for as long as the wait lasts. Nothing open goes
+quiet for more than a day. Left doubling, the eighth nudge would land a
+fortnight after the seventh, which is indistinguishable from having given up.
 
 It lives in the wait loop rather than in the prompt for the same two reasons
 `runContactHuman`'s escalation does. It must cost **no turns** — a model asked
@@ -251,8 +346,9 @@ that met the bar did not hold. Three constraints carry the second:
   literal repeat — watching the same window for the same interval and
   reporting the same quiet — not a paraphrase. The prompt carries the rest.
 - **`report_analysis` requires a `recurrence` argument** and refuses without
-  one: which of six kinds of failure, why, and what changed. `hand_off` is
-  the other exit, and an unexplained recurrence belongs there.
+  one: which of six kinds of failure, why, and what changed. An agent that
+  cannot answer escalates instead and keeps the incident: a recurrence nobody
+  can explain stays open with somebody told it needs them.
 - **`bugboss_defect` is one of the six.** The fix is in `ops`, and agents do
   not open pull requests against it, so the answer leaves as a proposal
   posted to the channel. The prompt says so; see the note in the PR that
@@ -262,14 +358,56 @@ that met the bar did not hold. Three constraints carry the second:
 post-mortem often points at something that happened a third time under a
 different alert, and no key finds that.
 
-The post-mortem is clipped in `toolapi`, not here. `get_incident` renders as
-JSON followed by the pending directives, and the truncation that would
-otherwise apply keeps a head and a tail — so an unbounded post-mortem eats
-the middle of the incident rather than itself.
+A *prior* incident's post-mortem is clipped in `toolapi`, not here, at
+`MAX_PRIOR_POSTMORTEM_CHARS` — head only, and it names the incident database
+as where the rest is. That is background rather than evidence this run went
+and fetched, and a reader is told where to find the whole of it, which is the
+distinction the rule below turns on. `get_incident` itself renders as JSON
+followed by the pending directives, uncut.
+
+## Nothing truncates a tool result, and nothing truncates a message to a person
+
+Two rules that used to be one cap.
+
+**Tool results are never cut.** `DEFAULT_MAX_TOOL_CHARS` (20,000, about 5,000
+tokens) used to bound every one of them, and `truncateOutput` cut the middle
+out to do it. The outputs it actually fired on were stack traces, log dumps
+and test output, where the answer is usually in the middle — so it protected
+the session by destroying the evidence the run had just paid a tool call to
+fetch. Pi compacts just in time instead (`docs/architecture.md`), so a result
+lands whole and summarised history is what gives way. Do not add a cap back.
+
+**A message to a person is never cut by character count.** The nudge used to
+post `[... 549 characters elided ...]` in place of the middle of the sentence
+saying what was being waited for, to somebody reading it on a phone. A count
+of what they cannot see is not something anybody can act on. So:
+
+- Every prose field that a harness-composed Slack message echoes is **refused
+  at the tool boundary** — `MONITOR_FIELD_LIMIT` for `monitor`'s `description`
+  and `awaitingHuman`, `CONTACT_HUMAN_MESSAGE_LIMIT` for the ask,
+  `overThreadBudget` for everything the model posts itself. A refusal costs
+  one turn and says what to move where; a clamp costs the reader the sentence.
+- The composed worst case of each harness message has to fit
+  `THREAD_PROSE_CHARS`, because `escalate` refuses a longer one and a nudge
+  that fails to post is dropped by design. `tools.test.ts` composes those
+  worst cases at the field limits, which is what keeps the refusals
+  load-bearing rather than decorative.
+- `CONTACT_HUMAN_MESSAGE_LIMIT` is 550 rather than something rounder because
+  `unansweredBrief` quotes the ask **whole**, and that arithmetic is what buys
+  it. Changing one means redoing the other.
+- The one thing still excerpted is a probe's own output
+  (`statusExcerpt`/`STATUS_EXCERPT_CHARS`): nobody authored it, it is
+  unbounded at the source, and a reader who wants all of it runs the check.
+  Head only, ending in an ellipsis, and it says nothing about its own size.
+
+The Slack agent's `truncate` in `slack/agent.ts` is the exception, and
+deliberately: that agent has no compaction configured at all, so its caps are
+the only thing bounding its context. Its call sites are tool results it reads,
+not messages it posts.
 
 ## What it writes goes straight to Slack
 
-`contact_human`, the hand-off brief, the root cause, the resolution evidence
+`contact_human`, the escalation brief, the root cause, the resolution evidence
 and the post-mortem are all posted as the agent wrote them, so the prompt
 carries the mrkdwn contract ("Writing to Slack" in `prompt.ts`). The model is
 told **not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at
@@ -283,7 +421,7 @@ root cause and post-mortem stay as the agent wrote them.
 
 The poll in `contact_human` uses a **non-draining** read
 (`GET /incidents/:id/directives`). Draining there destroyed `stop`,
-`merged`, `handoff`, `new_signals` and `resumed_after` — including the
+`merged`, `new_signals` and `resumed_after` — including the
 `resumed_after` the dispatcher inserts at launch, which the agent's first
 replayed call would eat before it ever ran `get_incident`.
 
@@ -306,7 +444,7 @@ nothing.
 Every flush checks `lastError()`. A silently failing S3 write means the next
 restart starts from scratch with the whole investigation lost, and combined
 with relaunch that is an unbounded loop of agents each beginning again. N
-consecutive failures steers the agent to hand off.
+consecutive failures steers the agent to escalate.
 
 The session file is also the run's **cost ledger** -- `sumSessionUsage`
 reads it back after the child exits, so the key the agent writes and the key

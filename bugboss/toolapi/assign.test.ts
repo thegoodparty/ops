@@ -8,7 +8,13 @@ import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
 import type { Directive } from "../types";
-import { applyAssign, assign, AssignError, logAssign } from "./assign";
+import {
+  applyAssign,
+  assign,
+  AssignError,
+  establishedOf,
+  logAssign,
+} from "./assign";
 
 const fakeS3 = () => {
   const objects = new Map<string, Buffer>();
@@ -56,8 +62,8 @@ const directivesFor = (incidentId: string): Directive[] =>
     .map((r) => JSON.parse(r.payload) as Directive);
 
 const incident = (id: string) =>
-  db.get<{ id: string; status: string; mergedInto: string | null; recurrenceOf: string | null; owner: string; firstSignalAt: number }>(
-    "SELECT id, status, mergedInto, recurrenceOf, owner, firstSignalAt FROM incident WHERE id = ?",
+  db.get<{ id: string; status: string; mergedInto: string | null; recurrenceOf: string | null; firstSignalAt: number }>(
+    "SELECT id, status, mergedInto, recurrenceOf, firstSignalAt FROM incident WHERE id = ?",
     [id],
   );
 
@@ -104,7 +110,6 @@ describe("assign: one primitive, four operations", () => {
     assert.deepEqual(result.merged, []);
     const row = incident(result.target);
     assert.equal(row?.status, "INVESTIGATING");
-    assert.equal(row?.owner, "agent");
     assert.equal(row?.firstSignalAt, 1000, "firstSignalAt comes from the signal");
     assert.deepEqual(signalsOn(result.target), ["sig-a"]);
   });
@@ -311,7 +316,22 @@ describe("assign: containment", () => {
         { signalIds: ["sig-a"], target: b, reason: "steal" },
         { kind: "agent", incidentId: a },
       ),
-      /cannot assign into incident/,
+      (err: Error) => {
+        // It still refuses -- writes stay contained however reads opened up.
+        assert.match(err.message, /not something this call does/);
+        // And it says what to call instead. An agent repeats a tool error
+        // into a Slack thread, and "an agent may only re-partition its own
+        // incident" is a boundary the person reading it cannot see, did not
+        // ask about, and can do nothing with.
+        assert.match(err.message, /propose_merge/);
+        assert.doesNotMatch(err.message, /\bagent\b|\bboss\b|\bhuman\b/i);
+        return true;
+      },
+    );
+    assert.deepEqual(
+      signalsOn(b),
+      ["sig-b"],
+      "and nothing moved, which is the half that matters",
     );
   });
 
@@ -352,5 +372,158 @@ describe("assign: containment", () => {
 
     assert.deepEqual(result.merged, [b]);
     assert.doesNotThrow(() => logAssign(result));
+  });
+  it("refuses a merge that would absorb the more established incident", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = (
+      await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "a" }, { kind: "boss" })
+    ).target;
+    const newer = (
+      await applyAssign(db, { signalIds: ["sig-b"], target: "NEW", reason: "b" }, { kind: "boss" })
+    ).target;
+
+    await assert.rejects(
+      applyAssign(
+        db,
+        { signalIds: ["sig-a"], target: newer, reason: "one bug" },
+        { kind: "human", slackUserId: "U123" },
+      ),
+      new RegExp(
+        `incident ${older} is more established than ${newer}.*merge ${newer} into ${older} instead`,
+      ),
+      "the refusal names the direction that would have worked",
+    );
+
+    assert.deepEqual(
+      signalsOn(older),
+      ["sig-a"],
+      "a refused merge moves nothing, including the signals it was given",
+    );
+    assert.equal(incident(older)?.status, "INVESTIGATING");
+    assert.deepEqual(directivesFor(older), [], "and tells nobody it happened");
+  });
+
+  it("leaves a partial re-partition alone, however old the source", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    await seed("sig-c");
+    const older = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-a", "sig-b"], target: "NEW", reason: "a" },
+        { kind: "boss" },
+      )
+    ).target;
+    const newer = (
+      await applyAssign(db, { signalIds: ["sig-c"], target: "NEW", reason: "c" }, { kind: "boss" })
+    ).target;
+
+    // The establishment rule is about two incidents becoming one. Moving some
+    // of the older incident's signals into the newer one leaves both open, so
+    // nothing has to win and nothing is refused.
+    const result = await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: newer, reason: "this one belongs there" },
+      { kind: "human", slackUserId: "U123" },
+    );
+
+    assert.deepEqual(result.merged, [], "neither incident was absorbed");
+    assert.deepEqual(signalsOn(older), ["sig-a"]);
+    assert.deepEqual(signalsOn(newer), ["sig-b", "sig-c"]);
+  });
+
+  it("merges into the more established incident when that is the direction asked for", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = (
+      await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "a" }, { kind: "boss" })
+    ).target;
+    const newer = (
+      await applyAssign(db, { signalIds: ["sig-b"], target: "NEW", reason: "b" }, { kind: "boss" })
+    ).target;
+
+    const result = await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: older, reason: "one bug" },
+      { kind: "human", slackUserId: "U123" },
+    );
+
+    assert.deepEqual(result.merged, [newer]);
+    assert.equal(incident(newer)?.mergedInto, older);
+  });
+});
+
+describe("firstSignalAt follows the signals", () => {
+  it("falls to the earliest signal the incident now holds", async () => {
+    await seed("sig-late");
+    await seed("sig-early");
+    // seed() stamps openedAt in call order, so the second is the later one.
+    // Swap them, because the case is an incident absorbing signals that
+    // started before it did -- which is exactly how incident 79 came to
+    // report the 28th while holding a signal from the 27th.
+    await db.withWrite((w) => {
+      w.prepare("UPDATE signal SET openedAt = ? WHERE id = ?").run(500, "sig-early");
+    });
+
+    const holder = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-late"], target: "NEW", reason: "late" },
+        { kind: "boss" },
+      )
+    ).target;
+    assert.equal(incident(holder)?.firstSignalAt, 1000);
+
+    await applyAssign(
+      db,
+      { signalIds: ["sig-early"], target: holder, reason: "older than this" },
+      { kind: "boss" },
+    );
+
+    // Not cosmetic: this is the input to time to detect, and an incident
+    // that absorbed an older signal really did start earlier than its own
+    // column said.
+    assert.equal(incident(holder)?.firstSignalAt, 500);
+  });
+
+  it("is left alone when nothing moved in", async () => {
+    await seed("sig-a");
+    const incidentId = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-a"], target: "NEW", reason: "a" },
+        { kind: "boss" },
+      )
+    ).target;
+
+    await applyAssign(
+      db,
+      { signalIds: ["sig-a"], target: incidentId, reason: "already home" },
+      { kind: "boss" },
+    );
+
+    assert.equal(incident(incidentId)?.firstSignalAt, 1000);
+  });
+});
+
+describe("establishedOf: which record stays", () => {
+  it("reads ids as numbers, which is where string order goes wrong", () => {
+    // "10" sorts before "9" as text, and the tenth incident opened is the
+    // younger of the two. This is the whole reason the comparison is numeric.
+    assert.equal(establishedOf("9", "10"), "9");
+    assert.equal(establishedOf("10", "9"), "9");
+  });
+
+  it("answers the same whichever way round it is asked", () => {
+    // A rule whose answer depends on argument order is not an order, and the
+    // way it fails is by reversing a merge depending on who called it.
+    for (const [a, b] of [
+      ["1", "2"],
+      ["82", "79"],
+      ["7", "7"],
+    ]) {
+      assert.equal(establishedOf(a, b), establishedOf(b, a), `${a} vs ${b}`);
+    }
   });
 });

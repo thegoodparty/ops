@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { resetFallbackRates } from "./health";
 import type { IncidentDigest, RawSignal, TriageContext } from "../types";
+import { emptyModelUsage, ModelRequestFailed } from "./model";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
 import {
   attachedSignalIds,
@@ -58,6 +59,7 @@ const context = (over: Partial<TriageContext> = {}): TriageContext => ({
 const decideCall = (input: Record<string, unknown>): ModelReply => ({
   text: "",
   toolCalls: [{ id: "call-1", name: "decide", input }],
+  usage: emptyModelUsage(),
 });
 
 const scripted = (replies: ModelReply[]) => {
@@ -91,7 +93,6 @@ const fakeDb = (
   opts: {
     signalIds?: string[];
     statuses?: Record<string, string>;
-    owners?: Record<string, string>;
     recurrence?: RecurrenceRow[];
   } = {},
 ) => {
@@ -107,10 +108,6 @@ const fakeDb = (
       }
       if (/from\s+signal/i.test(sql)) {
         return (opts.signalIds ?? []).map((id) => ({ id })) as unknown as T[];
-      }
-      if (/select\s+owner/i.test(sql)) {
-        const owner = opts.owners?.[String(params[0])];
-        return (owner ? [{ owner }] : []) as unknown as T[];
       }
       const status = opts.statuses?.[String(params[0])];
       return (status ? [{ status }] : []) as unknown as T[];
@@ -413,6 +410,7 @@ test("can reach the incident database before deciding", async () => {
           },
         },
       ],
+      usage: emptyModelUsage(),
     },
     decideCall({
       action: "new_incident",
@@ -529,10 +527,15 @@ test("a failed status read falls back loudly instead of dropping the recurrence"
   assert.equal(alarms.filter((a) => a.event === "fell_back").length, 1);
 });
 
-// --- owner is a separate axis from status --------------------------------
+// --- the attach decision re-reads the row, it does not trust the digest ---
+//
+// `openIncidents` is a snapshot taken before the model call, and the call can
+// take tens of seconds. Every one of these gives the digest one status and
+// the database another, which is the only way to tell which of the two the
+// refusals are reading.
 
-test("refuses to attach to an incident a human has taken over", async () => {
-  const { db } = fakeDb({ owners: { "inc-7": "human" } });
+test("refuses to attach to an incident that was merged away mid-decision", async () => {
+  const { db } = fakeDb({ statuses: { "inc-7": "MERGED" } });
   const { model } = scripted([
     decideCall({
       action: "attach",
@@ -549,14 +552,14 @@ test("refuses to attach to an incident a human has taken over", async () => {
   assert.equal(
     outcome.decision.action,
     "new_incident",
-    "an open status does not mean an agent is coming back to it",
+    "the digest still says INVESTIGATING, so an attach here would park a signal on a dead row",
   );
-  assert.match(outcome.decision.reason, /owned by a human/);
+  assert.match(outcome.decision.reason, /inc-7 is MERGED/);
   assert.equal(outcome.fellBack, false);
 });
 
-test("still attaches when an agent owns the incident", async () => {
-  const { db } = fakeDb({ owners: { "inc-7": "agent" } });
+test("still attaches when the row says what the digest said", async () => {
+  const { db } = fakeDb({ statuses: { "inc-7": "FIXING" } });
   const { model } = scripted([
     decideCall({ action: "attach", incidentId: "inc-7", reason: "same problem" }),
   ]);
@@ -573,23 +576,36 @@ test("still attaches when an agent owns the incident", async () => {
   });
 });
 
-test("a human-owned RESOLVED incident is still a recurrence, not an owner refusal", async () => {
-  const { db } = fakeDb({ owners: { "inc-9": "human" } });
+test("an incident that resolves mid-decision takes the RESOLVED branch", async () => {
+  const { db } = fakeDb({ statuses: { "inc-9": "RESOLVED" } });
   const { model } = scripted([
     decideCall({ action: "attach", incidentId: "inc-9", reason: "identical to the one we closed" }),
   ]);
 
   const outcome = await runTriage(
     { model, db, budgetMs: 2000 },
-    context({ openIncidents: [digest({ id: "inc-9", status: "RESOLVED" })] }),
+    context({ openIncidents: [digest({ id: "inc-9", status: "INVESTIGATING" })] }),
   );
 
-  assert.equal(
-    outcome.recurrenceOf,
-    "inc-9",
-    "who owns it must not cost us the evidence that the resolution was wrong",
-  );
-  assert.match(outcome.decision.reason, /RESOLVED/);
+  // Two separate things have to hold for this to work, and they used to be
+  // protected by two different mechanisms that both went when `owner` did.
+  //
+  // First, the refusal. This branch used to sit above a guard refusing any
+  // attach to a human-owned incident, and the order was load-bearing: put the
+  // owner check first and an incident firing again after resolution stopped
+  // being a recurrence at all. The guard is gone, so nothing can pre-empt
+  // this branch any more and the ordering it depended on cannot be broken by
+  // a future reorder. What replaced the guard is the status re-read above --
+  // the digest is a snapshot from before a model call that runs for tens of
+  // seconds, so on exactly this path it is the stale copy.
+  assert.equal(outcome.decision.action, "new_incident");
+  assert.match(outcome.decision.reason, /inc-9 is RESOLVED/);
+  // Second, the pointer. `recurrencePointer` preferred that same stale digest,
+  // so it answered null precisely when a delivery is a recurrence. Both
+  // failures had one symptom -- the signal proving a resolution premature
+  // opening a fresh incident with nothing linking it back -- so both are
+  // asserted here rather than in two tests that could each pass alone.
+  assert.equal(outcome.recurrenceOf, "inc-9");
 });
 
 // --- recurrence -----------------------------------------------------------
@@ -784,4 +800,204 @@ test("suppressing a recurrence is allowed but never quiet", async () => {
     1,
     "dropping the one delivery that contradicts a resolution is the failure this exists to catch",
   );
+});
+
+// ---------------------------------------------------------------------------
+// What the decision cost
+// ---------------------------------------------------------------------------
+
+/** A reply with real numbers on it, so a zero total cannot pass by default. */
+const priced = (
+  reply: Omit<ModelReply, "usage">,
+  over: Partial<ModelReply["usage"]> = {},
+): ModelReply => ({
+  ...reply,
+  usage: {
+    ...emptyModelUsage(),
+    tokensIn: 900,
+    tokensOut: 120,
+    costUsd: 0.004,
+    modelId: "us.anthropic.claude-sonnet-5",
+    calls: 1,
+    ...over,
+  },
+});
+
+test("a decision carries what it spent", async () => {
+  resetFallbackRates();
+  const { model } = scripted([
+    priced(decideCall({ action: "new_incident", reason: "nothing matches" })),
+  ]);
+
+  const outcome = await runTriage({ model, db: fakeDb().db }, context());
+
+  assert.equal(outcome.decision.action, "new_incident");
+  assert.equal(outcome.usage.tokensIn, 900);
+  assert.equal(outcome.usage.tokensOut, 120);
+  assert.equal(outcome.usage.calls, 1);
+  assert.equal(outcome.usage.modelId, "us.anthropic.claude-sonnet-5");
+});
+
+test("a decision that took several rounds carries all of them", async () => {
+  resetFallbackRates();
+  const { model } = scripted([
+    priced({ text: "", toolCalls: [{ id: "q", name: "query_incidents", input: { sql: "select 1" } }] }),
+    priced(decideCall({ action: "new_incident", reason: "nothing matches" })),
+  ]);
+
+  const outcome = await runTriage({ model, db: fakeDb().db }, context());
+
+  // Summed, not last-write-wins: a decision that looked things up cost more
+  // than one request and the record has to say so.
+  assert.equal(outcome.usage.calls, 2);
+  assert.equal(outcome.usage.tokensIn, 1800);
+});
+
+test("a fallback carries what the dead call spent before it gave up", async () => {
+  resetFallbackRates();
+  // Prose every round, so the loop exhausts its rounds and triage falls back.
+  const { model } = scripted([
+    priced({ text: "probably fine", toolCalls: [] }),
+    priced({ text: "still probably fine", toolCalls: [] }),
+  ]);
+
+  const outcome = await runTriage({ model, db: fakeDb().db, maxRounds: 2 }, context());
+
+  assert.equal(outcome.fellBack, true);
+  assert.equal(outcome.decision.action, "new_incident");
+  // The whole point. Today's storm ran 67 of these in five minutes and every
+  // incident it opened recorded a cost of zero -- not free, uncounted.
+  assert.equal(outcome.usage.calls, 2);
+  assert.ok(outcome.usage.tokensIn > 0, "a fallback reported no tokens");
+  assert.ok(outcome.usage.costUsd > 0, "a fallback reported no cost");
+});
+
+test("a decision carries the tokens of a request that died in transport", async () => {
+  resetFallbackRates();
+  // The shape the rounds-exhausted test does not reach: the first request
+  // answers, the second fails at the provider. Its tokens arrive on the
+  // throw rather than in a reply, and that is the only path that can bank
+  // them -- a throttled storm is exactly when the bill matters most.
+  const replies = [
+    priced({ text: "", toolCalls: [{ id: "q", name: "query_incidents", input: { sql: "select 1" } }] }),
+  ];
+  const model: ModelClient = {
+    complete: () => {
+      const reply = replies.shift();
+      if (reply) return Promise.resolve(reply);
+      return Promise.reject(
+        new ModelRequestFailed("ThrottlingException", {
+          ...emptyModelUsage(),
+          tokensIn: 700,
+          costUsd: 0.003,
+          calls: 1,
+        }),
+      );
+    },
+  };
+
+  const outcome = await runTriage({ model, db: fakeDb().db }, context());
+
+  assert.equal(outcome.fellBack, true);
+  assert.equal(outcome.usage.calls, 2, "the failed request was not counted");
+  assert.equal(outcome.usage.tokensIn, 1600);
+  assert.ok(outcome.usage.costUsd > 0.006, "the failed request's cost was dropped");
+});
+
+// ---------------------------------------------------------------------------
+// One SQL guard, the stronger of the two that used to exist
+// ---------------------------------------------------------------------------
+
+const refused = (sql: string): string => {
+  const result = prepareQuery(sql);
+  assert.ok("error" in result, `expected a refusal for: ${sql}`);
+  return "error" in result ? result.error : "";
+};
+
+const allowed = (sql: string): string => {
+  const result = prepareQuery(sql);
+  assert.ok("sql" in result, `expected this to be allowed: ${sql}`);
+  return "sql" in result ? result.sql : "";
+};
+
+test("the guard reads code, not the raw text", () => {
+  // The reason the checks run over a stripped copy. Both of these are single
+  // legitimate SELECTs, and the old triage guard refused the first outright
+  // because it looked for ";" in the raw string. A false refusal on a
+  // correct query is worse than it sounds: the model cannot tell it from a
+  // real syntax error, so it rewrites a query that was right.
+  allowed("SELECT * FROM signal WHERE body LIKE '%;%'");
+  allowed("SELECT * FROM signal WHERE title = 'DROP TABLE incident'");
+  allowed("SELECT 1 -- ; DROP TABLE incident");
+  allowed("SELECT 1 /* DELETE FROM incident */");
+});
+
+test("the guard refuses a write however it is spelled", () => {
+  // The keyword scan the triage guard did not have at all. Every one of these
+  // opens with SELECT or WITH, so an opener check alone passes them.
+  for (const sql of [
+    "WITH x AS (SELECT 1) DELETE FROM incident",
+    "SELECT 1; DROP TABLE incident",
+    "WITH x AS (SELECT 1) SELECT * FROM x; PRAGMA journal_mode = delete",
+    "SELECT * FROM incident RETURNING id",
+    "WITH t AS (UPDATE incident SET status = 'CLOSED' RETURNING id) SELECT * FROM t",
+  ]) {
+    assert.match(refused(sql), /read-only access|one statement/i);
+  }
+});
+
+test("EXPLAIN is allowed, because reading a plan is reading", () => {
+  // The Slack agent's guard allowed it and triage's did not, for no reason
+  // anybody recorded. Unifying on the stricter guard would have taken this
+  // away from the surface that had it.
+  allowed("EXPLAIN QUERY PLAN SELECT * FROM signal WHERE sourceId = 'fp-1'");
+});
+
+test("the guard still answers the cases it always answered", () => {
+  assert.deepEqual(prepareQuery("SELECT 1;"), { sql: "SELECT 1" });
+  assert.match(refused("DELETE FROM incident"), /read-only access/);
+  assert.match(refused("   "), /empty query/);
+  // Refusals are returned, never thrown. Both callers hand the string back to
+  // the model as a tool result, and a throw would have to be caught at each
+  // one to become the same thing.
+  assert.doesNotThrow(() => prepareQuery("DROP TABLE incident"));
+});
+
+// Moved here with the guard itself, from the copy that used to live in
+// slack/agent.ts. Every shape that copy asserted is asserted against the one
+// that replaced it: a case dropped during the merge is exactly how the
+// weaker of the two guards ended up on the hot path unnoticed.
+test("every read the Slack agent's guard accepted is still accepted", () => {
+  for (const sql of [
+    "SELECT * FROM incident",
+    "  select id from signal where explained = 0  ",
+    "WITH open AS (SELECT * FROM incident WHERE status='INVESTIGATING') SELECT count(*) FROM open",
+    "SELECT name, sql FROM sqlite_master WHERE type='table'",
+    "SELECT * FROM incident WHERE rootCause LIKE '%delete the row%'",
+    "SELECT 1 -- DROP TABLE incident",
+    "SELECT id FROM incident;",
+    "EXPLAIN QUERY PLAN SELECT * FROM signal WHERE incidentId = 'x'",
+  ]) {
+    allowed(sql);
+  }
+});
+
+test("every write the Slack agent's guard rejected is still rejected", () => {
+  for (const sql of [
+    "DELETE FROM incident",
+    "UPDATE incident SET status='CLOSED'",
+    "INSERT INTO incident (id) VALUES ('x')",
+    "DROP TABLE incident",
+    "SELECT 1; DROP TABLE incident",
+    "SELECT 1;DELETE FROM signal",
+    "PRAGMA journal_mode = DELETE",
+    "ATTACH DATABASE '/tmp/evil.db' AS evil",
+    "VACUUM INTO '/tmp/copy.db'",
+    "DELETE FROM incident RETURNING id",
+    "WITH x AS (DELETE FROM signal RETURNING id) SELECT * FROM x",
+    "",
+    "   ",
+  ]) {
+    refused(sql);
+  }
 });

@@ -61,9 +61,9 @@ export interface ReportAction {
 /**
  * What the agent spent. Tokens and `modelId` are the record and come off the
  * incident row, which `rollUpUsage` writes from the session file after the
- * child exits. `turns` and `costUsd` come from that same file read once more
- * at publish time, so they are null when it has aged out from under the
- * lifecycle rule while the row's tokens survive.
+ * child exits. `turns` and `estimatedCostUsd` come from that same file read
+ * once more at publish time, so they are null when it has aged out from
+ * under the lifecycle rule while the row's tokens survive.
  */
 export interface ReportRun {
   modelId: string | null;
@@ -71,9 +71,17 @@ export interface ReportRun {
   tokensOut: number;
   cacheRead: number;
   cacheWrite: number;
+  /** The 1h share of `cacheWrite`, billed at 2x base input rather than 1.25x. */
+  cacheWrite1h: number;
   attempts: number;
   turns: number | null;
-  costUsd: number | null;
+  /**
+   * Pi's own arithmetic over those tokens at the prices it held while the run
+   * was happening. An estimate, and named one: nothing here ever sees an
+   * invoice, and Pi's price table is a hardcoded per-model list that goes
+   * stale the day AWS moves a rate.
+   */
+  estimatedCostUsd: number | null;
 }
 
 export interface ReportData {
@@ -330,7 +338,6 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
   const sources = [...new Set(data.signals.map((signal) => signal.source))];
   const rows: [string, string][] = [
     ["Status", incident.status],
-    ["Owner at close", incident.owner],
     [
       "Users impacted",
       incident.usersImpacted === null ? "not measured" : count(incident.usersImpacted),
@@ -454,6 +461,7 @@ const runTable = (data: ReportData, metrics: ReportMetrics): string[] => {
     ["Output tokens", count(run.tokensOut)],
     ["Cache read", count(run.cacheRead)],
     ["Cache write", count(run.cacheWrite)],
+    ["Cache write (1h)", count(run.cacheWrite1h)],
     ["Total tokens", `${count(metrics.totalTokens)} (${compact(metrics.totalTokens)})`],
   ];
   return [
@@ -463,9 +471,9 @@ const runTable = (data: ReportData, metrics: ReportMetrics): string[] => {
     "| --- | --- |",
     ...rows.map(([label, value]) => `| ${cell(label)} | ${cell(value)} |`),
     "",
-    run.costUsd === null || run.costUsd === 0
-      ? "Tokens and the model id are the record here. Pricing moves, so a stored dollar figure would be a guess frozen at write time, while these two multiply out correctly whenever someone asks."
-      : `Priced at the time this ran, that came to **${dollars(run.costUsd)}**. That figure is derived and is not the record: tokens and the model id are, because pricing moves and they multiply out correctly whenever someone asks.`,
+    run.estimatedCostUsd === null || run.estimatedCostUsd === 0
+      ? "Tokens and the model id are the record here. Prices move, so a stored dollar figure would be a guess frozen at write time, while these two re-price correctly whenever someone asks."
+      : `**Estimated cost: ${dollars(run.estimatedCostUsd)}.** An estimate, not a bill — it is arithmetic over the tokens above at the prices we held while this ran, and nothing here ever sees an invoice. Tokens and the model id are the record, because they re-price correctly after a rate change and a stored dollar figure would not.`,
     "",
   ];
 };
@@ -614,9 +622,9 @@ export const renderThreadSummary = (
   ].join(" · ");
 
   const priced =
-    run.costUsd === null || run.costUsd === 0
+    run.estimatedCostUsd === null || run.estimatedCostUsd === 0
       ? ""
-      : ` (~${dollars(run.costUsd)} as priced at run time)`;
+      : ` (est. ${dollars(run.estimatedCostUsd)})`;
   const spend = [
     `${compact(metrics.totalTokens)} tokens`,
     ...(run.turns === null ? [] : [`${count(run.turns)} turns`]),

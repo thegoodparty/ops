@@ -8,9 +8,18 @@ import type Database from "better-sqlite3";
 import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
-import type { Evidence, IncidentView, ToolApi } from "../types";
+import type {
+  Evidence,
+  IncidentView,
+  MergeOutcomeView,
+  ToolApi,
+} from "../types";
 import { applyAssign } from "./assign";
-import { createToolApi, type CorrelationMerge } from "./index";
+import {
+  createToolApi,
+  type CorrelationMerge,
+  type MergeVerdict,
+} from "./index";
 import jwt from "jsonwebtoken";
 
 import { mintAgentToken, verifyAgentToken } from "./token";
@@ -74,8 +83,13 @@ const slack = {
   },
 };
 
+/** Queued verdicts for `proposeMerge`. Empty means "not the same problem". */
+const verdicts: MergeVerdict[] = [];
+
 const correlator = {
   correlate: async () => merges.splice(0, merges.length),
+  judgeMerge: async () =>
+    verdicts.shift() ?? { merge: null, compared: true },
 };
 
 const evidence = { load: async () => evidenceRows };
@@ -139,11 +153,18 @@ const writesDieAfter = (n: number): Db =>
     })(),
   }) as unknown as Db;
 
-/** A human claiming the incident in Slack. Returned unawaited by the races. */
-const humanClaims = (id: string) =>
-  db.withWrite((w) => {
-    w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(id);
-  });
+/**
+ * A merge landing on an incident, which is how its status moves out from
+ * under a call already in flight. Returned unawaited by the races below: both
+ * writes queue in the same tick, which is what a few hundred milliseconds of
+ * snapshot latency looks like from inside a handler.
+ */
+const mergedAway = (signalId: string, into: string) =>
+  applyAssign(
+    db,
+    { signalIds: [signalId], target: into, reason: "one pool, two alerts" },
+    { kind: "boss" },
+  );
 
 const openIncident = async (signalIds: string[]) =>
   (
@@ -157,7 +178,7 @@ const openIncident = async (signalIds: string[]) =>
 const incidentRow = (id: string) =>
   db.get<{
     status: string;
-    owner: string;
+    summary: string | null;
     rootCause: string | null;
     prUrls: string;
     postmortem: string | null;
@@ -366,77 +387,48 @@ describe("a status check the write does not repeat", () => {
     );
   });
 
-  it("refuses a resolution a human takeover landed in front of", async () => {
+  it("refuses a resolution a merge landed in front of", async () => {
     await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = toolsFor(id);
-    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    const tools = toolsFor(b);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-b"] });
 
-    const claim = humanClaims(id);
+    const merge = mergedAway("sig-b", a);
     const resolved = tools.reportResolved({
       prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
       evidence: "quiet for an hour",
     });
-    await claim;
+    await merge;
     const res = await resolved;
 
     assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.status, "FIXING", "the human's record did not move");
-    assert.equal(incidentRow(id)?.resolvedEvidence, null);
-    assert.deepEqual(JSON.parse(incidentRow(id)!.prUrls), []);
+    assert.equal(incidentRow(b)?.status, "MERGED", "the merged record did not move");
+    assert.equal(incidentRow(b)?.resolvedEvidence, null);
+    assert.deepEqual(JSON.parse(incidentRow(b)!.prUrls), []);
     assert.equal(
-      db.query("SELECT id FROM signal WHERE incidentId = ? AND closedAt IS NULL", [id])
+      db.query("SELECT id FROM signal WHERE incidentId = ? AND closedAt IS NULL", [a])
         .length,
-      1,
-      "and the signals a resolution would have closed are still open",
+      2,
+      "and both signals a resolution would have closed are still open on the survivor",
     );
   });
 
-  // Rewritten: this asserted that a human takeover refuses the post-mortem.
-  // That was the old contract and it threw away the one artifact a takeover
-  // is usually for. A takeover now pushes `handoff` and lets the agent finish
-  // its write-up, so reportAnalysis is the single tool an owner change does
-  // not block. Every other transition still loses the race, which the three
-  // sibling tests here cover.
-  it("lets the agent's write-up land even after a human takes over", async () => {
+  it("refuses an impact number a merge landed in front of", async () => {
     await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = toolsFor(id);
-    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
-    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
 
-    const claim = humanClaims(id);
-    const analysis = tools.reportAnalysis({
-      postmortem: "p",
-      usersImpacted: 4,
-      impactQuery: "q",
-    });
-    await claim;
-    const res = await analysis;
-
-    assert.equal(res.ok, true, res.error);
-    assert.equal(incidentRow(id)?.status, "CLOSED");
-    assert.equal(incidentRow(id)?.postmortem, "p");
-    assert.equal(
-      incidentRow(id)?.owner,
-      "human",
-      "the write-up lands without taking the incident back",
-    );
-  });
-
-  it("refuses an impact number a human takeover landed in front of", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = toolsFor(id);
-
-    const claim = humanClaims(id);
-    const impact = tools.reportImpact({ usersImpacted: 99, query: "q" });
-    await claim;
+    const merge = mergedAway("sig-b", a);
+    const impact = toolsFor(b).reportImpact({ usersImpacted: 99, query: "q" });
+    await merge;
     const res = await impact;
 
     assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.usersImpacted, null);
-    assert.equal(incidentRow(id)?.impactQuery, null);
+    assert.equal(incidentRow(b)?.usersImpacted, null);
+    assert.equal(incidentRow(b)?.impactQuery, null);
   });
 });
 
@@ -651,6 +643,111 @@ describe("invariant 2: resolution closes the signals it claims to have fixed", (
   });
 });
 
+describe("park", () => {
+  const waitRow = (id: string) =>
+    db.get<{
+      waitingFor: string;
+      wakeAt: number | null;
+      liftsOnReply: number;
+      startedAt: number;
+    }>("SELECT * FROM incident_wait WHERE incidentId = ?", [id]);
+
+  it("defaults to a wait a reply ends, which is the wait on a person", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(id).park({ waitingFor: "somebody to merge it" });
+
+    assert.equal(res.ok, true);
+    assert.equal(waitRow(id)?.liftsOnReply, 1);
+    assert.equal(waitRow(id)?.waitingFor, "somebody to merge it");
+  });
+
+  // The row `turnBudgetPark` writes, and the only one in the system that a
+  // reply must not end. A reply adds no turns, so waking on one relaunches an
+  // agent that is over budget before its first turn: it stops again, escalates
+  // again, and every comment on the thread becomes a page. The flag is the
+  // whole mechanism, so the 0 actually reaching the column is the thing worth
+  // asserting rather than the argument reaching the handler.
+  it("writes a wait no reply can end when the caller says so", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(id).park({
+      waitingFor: "a person, after the 200-turn budget ran out",
+      liftsOnReply: false,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(waitRow(id)?.liftsOnReply, 0);
+    assert.deepEqual(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1", [
+        id,
+      ]),
+      [],
+      "the delete in recordReply is keyed on this, so a 1 here would defeat it",
+    );
+  });
+
+  it("leaves wakeAt null when no wake time is given, and sets one when it is", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const open = await openIncident(["sig-a"]);
+    const timed = await openIncident(["sig-b"]);
+
+    // Null is the shape that can wait forever: only a reply or the stale
+    // sweep lifts it, which is why both of those exist.
+    await toolsFor(open).park({ waitingFor: "a person" });
+    assert.equal(waitRow(open)?.wakeAt, null);
+
+    const before = Date.now();
+    await toolsFor(timed).park({ waitingFor: "a deploy", wakeAfterSeconds: 600 });
+    const wakeAt = waitRow(timed)?.wakeAt;
+    assert.ok(wakeAt !== null && wakeAt !== undefined);
+    assert.ok(wakeAt >= before + 600_000, `${wakeAt} < ${before + 600_000}`);
+  });
+
+  // One row per incident, so a second park is an update rather than a second
+  // wait -- and the update has to carry the flag. An agent that parked on a
+  // person and then ran out of turns would otherwise keep the old 1 and be
+  // woken by the next comment, which is the exact loop this flag prevents.
+  it("replaces an existing wait, including flipping it to one a reply cannot end", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    await tools.park({ waitingFor: "somebody to merge it", wakeAfterSeconds: 60 });
+    assert.equal(waitRow(id)?.liftsOnReply, 1);
+
+    await tools.park({
+      waitingFor: "a person, after the 200-turn budget ran out",
+      liftsOnReply: false,
+    });
+
+    assert.equal(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id]).length,
+      1,
+      "one wait per incident",
+    );
+    assert.equal(waitRow(id)?.liftsOnReply, 0);
+    assert.equal(waitRow(id)?.wakeAt, null, "and the new wake time replaces the old one");
+  });
+
+  it("refuses to park an incident that is already closed", async () => {
+    await seed("sig-a", { closedAt: 2000 });
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+
+    const res = await tools.park({ waitingFor: "somebody" });
+
+    assert.equal(res.ok, false);
+    assert.equal(waitRow(id), undefined, "nothing waits on a closed incident");
+  });
+});
+
 describe("the scoped token", () => {
   it("refuses a token for another incident reaching this one's signals", async () => {
     await seed("sig-a");
@@ -728,6 +825,183 @@ describe("the scoped token", () => {
   });
 });
 
+describe("reads are not contained", () => {
+  it("reads an incident that is not the caller's", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const mine = await openIncident(["sig-a"]);
+    const theirs = await openIncident(["sig-b"]);
+
+    const res = await toolsFor(mine).getIncident({ incidentId: theirs });
+
+    assert.equal(res.ok, true, res.error);
+    const view = res.data as IncidentView;
+    assert.equal(view.incident.id, theirs);
+    assert.deepEqual(
+      view.signals.map((s) => s.id),
+      ["sig-b"],
+      "the signals come with it, or the read cannot answer what it is for",
+    );
+  });
+
+  it("reads the caller's own incident when no id is given", async () => {
+    await seed("sig-a");
+    const mine = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(mine).getIncident();
+
+    assert.equal((res.data as IncidentView).incident.id, mine);
+  });
+
+  it("reading another incident moves nothing and drains only the caller's own", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const mine = await openIncident(["sig-a"]);
+    const theirs = await openIncident(["sig-b"]);
+    await db.withWrite((w) => {
+      w.prepare(
+        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
+      ).run(theirs, JSON.stringify({ type: "stop", reason: "not yours" }), 1);
+    });
+
+    const res = await toolsFor(mine).getIncident({ incidentId: theirs });
+
+    assert.equal(res.ok, true, res.error);
+    assert.deepEqual(
+      res.directives,
+      [],
+      "a read of somebody else's incident does not collect their directives",
+    );
+    assert.equal(
+      db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [theirs])
+        .length,
+      1,
+      "and leaves them where the agent that owns them will find them",
+    );
+    assert.deepEqual(signalsOn(theirs), ["sig-b"], "reading is not moving");
+  });
+});
+
+describe("proposeMerge: the agent asks", () => {
+  it("combines the two when the proposal is agreed, and tells both threads", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    await withThread(older);
+    await withThread(newer);
+    verdicts.push({
+      merge: { absorb: newer, into: older, reason: "one pool, two alerts" },
+      compared: true,
+    });
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "the same connection pool",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const data = res.data as MergeOutcomeView;
+    assert.equal(data.combined, true);
+    assert.equal(data.incidentOfRecord, older);
+    assert.equal(incidentRow(newer)?.status, "MERGED");
+    assert.deepEqual(signalsOn(older), ["sig-a", "sig-b"]);
+
+    // The other suite covers these two messages thoroughly and reaches them
+    // only through reportRootCause. A merge an agent asked for is the same
+    // event for everybody reading either thread, and nothing else here would
+    // notice if this route stopped telling them.
+    assert.equal(postsIn(newer).length, 1, "the thread that goes quiet is told");
+    assert.match(postsIn(newer)[0], /last message in this thread/);
+    assert.equal(postsIn(older).length, 1, "and so is the one that carries on");
+    assert.match(postsIn(older)[0], /is the same problem as this one/);
+    assert.ok(
+      posts.findIndex((post) => post.threadTs === `thread-${newer}`) <
+        posts.findIndex((post) => post.threadTs === `thread-${older}`),
+      "absorbed thread first, so a crash between the two loses the survivor's copy",
+    );
+  });
+
+  it("writes nothing when the two are judged different problems", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "both are 500s",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const data = res.data as MergeOutcomeView;
+    assert.equal(data.combined, false);
+    assert.equal(data.incidentOfRecord, newer);
+    assert.match(data.detail, /not the same problem/);
+    assert.equal(incidentRow(older)?.status, "INVESTIGATING");
+    assert.deepEqual(signalsOn(older), ["sig-a"], "asking moved nothing");
+  });
+
+  it("tells a considered no apart from nothing having compared them", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    verdicts.push({ merge: null, compared: false });
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "the same connection pool",
+    });
+
+    // One means stop asking; the other means ask a person. An agent handed
+    // the same sentence for both would take a dead judgement for a verdict.
+    const data = res.data as MergeOutcomeView;
+    assert.match(data.detail, /could not be compared/);
+    assert.doesNotMatch(data.detail, /not the same problem/);
+  });
+
+  it("says nothing about kinds of caller in anything it hands back", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    await db.withWrite((w) => {
+      w.prepare(
+        `UPDATE incident SET status = 'CLOSED', resolvedAt = 1, closedAt = 2,
+           postmortem = 'closed by the test' WHERE id = ?`,
+      ).run(older);
+    });
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "the same connection pool",
+    });
+
+    // The agent repeats these into a Slack thread. A person reading "an
+    // agent may not do that" is being shown a boundary they cannot see, did
+    // not ask about and can do nothing with. Every sentence here is about
+    // incidents and signals.
+    const data = res.data as MergeOutcomeView;
+    assert.equal(data.combined, false);
+    assert.match(data.detail, /is CLOSED and is not taking signals/);
+    assert.doesNotMatch(data.detail, /\bagent\b|\bboss\b|\bhuman\b|\bpermission\b/i);
+  });
+
+  it("refuses to weigh an incident against itself", async () => {
+    await seed("sig-a");
+    const mine = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(mine).proposeMerge({
+      incidentId: mine,
+      reason: "the same as me",
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is this incident/);
+  });
+});
+
 describe("directives", () => {
   it("returns a merge the agent never asked about", async () => {
     await seed("sig-a");
@@ -746,6 +1020,54 @@ describe("directives", () => {
     assert.equal(incidentRow(b)?.status, "MERGED");
     assert.equal(incidentRow(b)?.mergedInto, a);
     assert.deepEqual(signalsOn(a), ["sig-a", "sig-b"]);
+    // Read back rather than asserted. This call wrote FIXING and correlation
+    // then absorbed the incident out from under it, so a response repeating
+    // what it wrote would contradict the directive travelling beside it --
+    // and the direction rule makes an absorbed reporting incident the
+    // ordinary case rather than a corner of one.
+    assert.equal(
+      (res.data as { status: string }).status,
+      "MERGED",
+      "the status reports where the incident ended up, not what this call set",
+    );
+  });
+
+  it("carries an absorbed incident's root cause to the agent that now owns the signals", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    merges.push({ absorb: newer, into: older, reason: "one pool, two alerts" });
+
+    const res = await toolsFor(newer).reportRootCause({
+      cause: "the upgrade webhook holds a connection per request",
+      explainedSignalIds: ["sig-b"],
+    });
+    assert.equal(res.ok, true, res.error);
+
+    // The cause cannot be written onto the survivor: that would be a
+    // transition no agent made, past the gate that makes every attached
+    // signal explained. So it reaches the surviving agent as something to
+    // check, and the agent that found it is the one that closes.
+    assert.equal(incidentRow(older)?.rootCause, null);
+    const handed = db
+      .query<{ payload: string }>(
+        "SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
+        [older],
+      )
+      .map((r) => JSON.parse(r.payload) as { type: string; summary?: string });
+    const news = handed.find((d) => d.type === "new_signals");
+    assert.ok(news, "the surviving agent is told signals arrived");
+    assert.match(
+      news.summary ?? "",
+      /upgrade webhook holds a connection per request/,
+      "and told the cause the incident that just closed had found for them",
+    );
+    assert.match(
+      news.summary ?? "",
+      /nothing has checked it against the signals/,
+      "as a claim to verify, which is the only honest form for an unverified cause",
+    );
   });
 
   it("says so when it declines a merge the correlator proposed", async () => {
@@ -753,7 +1075,12 @@ describe("directives", () => {
     await seed("sig-b");
     const a = await openIncident(["sig-a"]);
     const b = await openIncident(["sig-b"]);
-    await toolsFor(a).handOff({ reason: "mine now", brief: "taking this one" });
+    // Status is the whole of what makes a merge target eligible now, so
+    // resolving the target is how the correlator's proposal goes stale: a
+    // signal moved onto a RESOLVED incident is one nothing will re-explain.
+    const aTools = toolsFor(a);
+    await aTools.reportRootCause({ cause: "pool exhaustion", explainedSignalIds: ["sig-a"] });
+    await aTools.reportResolved({ prUrls: [], evidence: "quiet for an hour" });
     merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
 
     const lines = await logsDuring(async () => {
@@ -768,8 +1095,7 @@ describe("directives", () => {
     assert.deepEqual(signalsOn(a), ["sig-a"], "and the merge did not");
     const declined = lines.find((line) => line.includes('"merge_declined"'));
     assert.ok(declined, "two incidents left on one cause is not something to pass over");
-    assert.match(declined!, /"intoStatus":"INVESTIGATING"/);
-    assert.match(declined!, /"intoOwner":"human"/);
+    assert.match(declined!, /"intoStatus":"RESOLVED"/);
   });
 
   it("drains on a rejected call as well as a successful one", async () => {
@@ -814,14 +1140,23 @@ describe("directives", () => {
   });
 });
 
-describe("hand off", () => {
+describe("escalate", () => {
+  /**
+   * Everything about the row, so "nothing moved" is the whole row and not a
+   * list of columns somebody remembered to check. `escalate` replaced a tool
+   * whose real effect was a write, and the reason it replaced it is that the
+   * write took the incident out of the dispatcher's query and stranded it.
+   */
+  const rowOf = (id: string) =>
+    db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [id]);
+
   it("posts the brief as mrkdwn, with what it quotes made safe", async () => {
     await seed("sig-fmt");
     const id = await openIncident(["sig-fmt"]);
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-fmt"] });
 
-    await tools.handOff({
+    await tools.escalate({
       reason: "deadline",
       brief: [
         "## What I believe now",
@@ -856,7 +1191,7 @@ describe("hand off", () => {
     assert.ok(brief.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
 
     const before = posts.length;
-    await tools.handOff({ reason: "deadline", brief });
+    await tools.escalate({ reason: "deadline", brief });
 
     const sent = posts.slice(before);
     assert.ok(sent.length > 1, `expected a split, got ${sent.length}`);
@@ -866,7 +1201,7 @@ describe("hand off", () => {
     );
   });
 
-  it("refuses a brief past the thread budget instead of handing off anyway", async () => {
+  it("refuses a brief past the thread budget instead of posting it anyway", async () => {
     await seed("sig-budget");
     const id = await openIncident(["sig-budget"]);
     const tools = toolsFor(id);
@@ -876,7 +1211,7 @@ describe("hand off", () => {
     });
 
     const before = posts.length;
-    const res = await tools.handOff({
+    const res = await tools.escalate({
       reason: "deadline",
       brief: Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n"),
     });
@@ -885,56 +1220,100 @@ describe("hand off", () => {
     assert.match(res.error ?? "", /brief is \d+ characters/);
     assert.match(res.error ?? "", /post-mortem/);
     assert.equal(posts.length, before, "refused ahead of the post");
-    // The refusal has to leave the incident retryable: an escalation the
-    // model was told to rewrite is useless if the incident already stopped
-    // being its problem.
-    const row = db.get<{ owner: string; status: string }>(
-      "SELECT owner, status FROM incident WHERE id = ?",
-      [id],
-    );
-    assert.ok(row);
-    assert.equal(row.owner, "agent");
-    assert.equal(row.status, "FIXING");
+    // The refusal has to leave the incident exactly where it was, or the
+    // model is told to rewrite a brief for an incident that has moved on.
+    assert.equal(incidentRow(id)?.status, "FIXING");
   });
 
-  it("is terminal for the agent and leaves the incident open", async () => {
+  it("changes nothing about the incident it escalates", async () => {
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-a"] });
+    const before = rowOf(id);
 
-    const res = await tools.handOff({
+    const res = await tools.escalate({
       reason: "the fix touches auth",
       brief: "What I believe now: the session cookie is dropped on refresh.",
     });
 
     assert.equal(res.ok, true, res.error);
-    assert.equal(incidentRow(id)?.owner, "human");
-    assert.equal(incidentRow(id)?.status, "FIXING", "handing off is not closing");
+    assert.deepEqual(res.data, { incidentId: id }, "there is no transition to report");
+    assert.deepEqual(rowOf(id), before, "the row is untouched, which is the whole change");
     assert.match(posts.at(-1)?.text ?? "", /What I believe now/);
-
-    const after = await tools.reportResolved({ prUrls: [], evidence: "x" });
-    assert.equal(after.ok, false);
-    assert.match(after.error ?? "", /owned by a human/);
-
-    const view = await tools.getIncident();
-    assert.equal(view.ok, true, "reading is still allowed after a hand off");
+    assert.match(
+      posts.at(-1)?.text ?? "",
+      /An agent is still working this incident/,
+      "a reader who is told an incident needs them assumes nothing else is on it",
+    );
   });
 
-  it("still writes the brief when a human claimed the incident first", async () => {
+  it("leaves every other tool working afterwards", async () => {
+    // The gate this replaced revoked an agent's tools the moment an incident
+    // changed hands, so an escalation was the end of the run. Escalating is
+    // now an announcement, and the agent carries straight on.
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
-    await db.withWrite((w) => {
-      w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(id);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-a"] });
+    await tools.escalate({ reason: "the fix touches auth", brief: "ruled out DNS" });
+
+    const resolved = await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
+      evidence: "quiet for an hour after the revert",
     });
 
-    const res = await toolsFor(id).handOff({ reason: "you took it", brief: "ruled out DNS" });
-
-    assert.equal(res.ok, true, res.error);
-    assert.match(posts.at(-1)?.text ?? "", /ruled out DNS/);
+    assert.equal(resolved.ok, true, resolved.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+    const analysis = await tools.reportAnalysis({
+      postmortem: "p",
+      usersImpacted: 1,
+      impactQuery: "q",
+    });
+    assert.equal(analysis.ok, true, analysis.error);
+    assert.equal(incidentRow(id)?.status, "CLOSED");
   });
 
-  it("does not hand off an incident it could not announce", async () => {
+  it("refuses to escalate an incident nothing can be done about", async () => {
+    await seed("sig-a", { closedAt: 2000 });
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    const before = posts.length;
+
+    const res = await tools.escalate({ reason: "have a look", brief: "b" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is CLOSED; there is nothing left/);
+    assert.equal(posts.length, before, "and nobody is called to a closed incident");
+  });
+
+  it("refuses to escalate an incident a merge took away", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await mergedAway("sig-b", a);
+    const before = posts.length;
+
+    const res = await toolsFor(b).escalate({ reason: "have a look", brief: "b" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is MERGED; there is nothing left/);
+    assert.equal(
+      posts.length,
+      before,
+      "the thread everyone reads is the survivor's, so a brief here reaches nobody",
+    );
+  });
+
+  it("reports a failed post as a failed escalation", async () => {
+    // The only tool here that fails on a failed notification. Everywhere else
+    // the state is already committed and the message is commentary; the whole
+    // effect of this one is the message, so an escalation nobody was told
+    // about has not happened.
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
@@ -950,124 +1329,32 @@ describe("hand off", () => {
       },
       evidence,
     });
+    const before = rowOf(id);
 
-    const res = await tools.handOff({
+    const res = await tools.escalate({
       reason: "the fix touches auth",
       brief: "What I believe now: the session cookie is dropped on refresh.",
     });
 
     assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /could not post/);
-    assert.equal(
-      incidentRow(id)?.owner,
-      "agent",
-      "the dispatcher skips human-owned incidents, so this would be an escalation nobody has",
-    );
-    assert.equal(incidentRow(id)?.status, "INVESTIGATING", "and it stays relaunchable");
+    assert.match(res.error ?? "", /nobody has been told/);
+    assert.match(res.error ?? "", /worth calling again/);
+    assert.deepEqual(rowOf(id), before, "and there is nothing to retract");
   });
 
-  it("retracts the brief in the thread when the hand-off cannot be recorded", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = createToolApi({
-      db: writesDieAfter(0),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
-      correlator,
-      slack,
-      evidence,
-    });
-
-    const res = await tools.handOff({
-      reason: "the fix touches auth",
-      brief: "What I believe now: the session cookie is dropped on refresh.",
-    });
-
-    assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.owner, "agent", "nobody owns it but the agent");
-    assert.match(posts.at(-2)?.text ?? "", /session cookie/, "the brief went out");
-    assert.match(
-      posts.at(-1)?.text ?? "",
-      /could not be recorded/,
-      "so the same thread has to say it did not stick, rather than leaving a person to infer it",
-    );
-  });
-
-  it("refuses to hand off an incident that closed while the brief was posting", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = createToolApi({
-      db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
-      correlator,
-      slack: {
-        ...linking,
-        // The TOCTOU window is exactly this await: the status read happens
-        // before the post, the write after it.
-        post: async (threadTs: string | null, text: string) => {
-          await db.withWrite((w) => {
-            w.prepare(
-              `UPDATE incident
-                  SET status = 'CLOSED', resolvedAt = 1, closedAt = 1, postmortem = 'x'
-                WHERE id = ?`,
-            ).run(id);
-          });
-          return slack.post(threadTs, text);
-        },
-      },
-      evidence,
-    });
-
-    const res = await tools.handOff({ reason: "the fix touches auth", brief: "b" });
-
-    assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /lost a race/);
-    assert.equal(
-      incidentRow(id)?.owner,
-      "agent",
-      "a closed incident is not something to put on a person's plate",
-    );
-    assert.match(
-      posts.at(-1)?.text ?? "",
-      /could not be recorded/,
-      "the brief already said it was theirs, so the thread has to take that back",
-    );
-  });
-
-  it("stops triage attaching new signals to what a human took", async () => {
+  it("still lets triage attach new signals to an escalated incident", async () => {
+    // Asking for a person is not the incident going quiet. An agent is still
+    // driving it, so a related signal belongs on it rather than on a second
+    // incident nobody has connected to the first.
     await seed("sig-a");
     await seed("sig-b");
     const id = await openIncident(["sig-a"]);
-    await toolsFor(id).handOff({ reason: "the fix touches auth", brief: "b" });
-
-    await assert.rejects(
-      applyAssign(
-        db,
-        { signalIds: ["sig-b"], target: id, reason: "looks related" },
-        { kind: "boss" },
-      ),
-      /owned by a human/,
-    );
-    assert.equal(
-      db.get<{ incidentId: string | null }>(
-        "SELECT incidentId FROM signal WHERE id = 'sig-b'",
-      )?.incidentId,
-      null,
-      "no agent is coming back to that incident, so nothing may pile up on it",
-    );
-  });
-
-  it("still lets a person move signals into the incident they hold", async () => {
-    await seed("sig-a");
-    await seed("sig-b");
-    const id = await openIncident(["sig-a"]);
-    await toolsFor(id).handOff({ reason: "the fix touches auth", brief: "b" });
+    await toolsFor(id).escalate({ reason: "the fix touches auth", brief: "b" });
 
     const res = await applyAssign(
       db,
-      { signalIds: ["sig-b"], target: id, reason: "I am working both of these" },
-      { kind: "human", slackUserId: "U1" },
+      { signalIds: ["sig-b"], target: id, reason: "looks related" },
+      { kind: "boss" },
     );
 
     assert.equal(res.target, id);
@@ -1703,7 +1990,7 @@ describe("a recurrence closes on a second question", () => {
     assert.equal(
       incidentRow(second)?.status,
       "RESOLVED",
-      "an unexplained recurrence stays open; hand_off is the other exit",
+      "an unexplained recurrence stays open rather than closing on a blank",
     );
   });
 
@@ -1847,5 +2134,197 @@ describe("a recurrence closes on a second question", () => {
     assert.match(String(unsearchable.error), /did not run/);
     assert.equal(matchedNothing.ok, true, matchedNothing.error);
     assert.deepEqual(matchedNothing.data, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("set_summary: what the incident is", () => {
+  it("is callable before there is any conclusion at all", async () => {
+    await seed("sig-sum-1");
+    const incidentId = await openIncident(["sig-sum-1"]);
+    const tools = toolsFor(incidentId);
+
+    const response = await tools.setSummary({ summary: "Checkout is failing" });
+
+    assert.equal(response.ok, true, response.error);
+    assert.equal(incidentRow(incidentId)?.summary, "Checkout is failing");
+  });
+
+  /**
+   * Incident 79 opened on a memory alert and became the Loki 429 explosion.
+   * The whole field exists so that is a thing the system can say.
+   */
+  it("replaces what was there, because the incident changed", async () => {
+    await seed("sig-sum-2");
+    const incidentId = await openIncident(["sig-sum-2"]);
+    const tools = toolsFor(incidentId);
+
+    await tools.setSummary({ summary: "Memory alert on bugboss-prod" });
+    await tools.setSummary({ summary: "Loki reads are being rejected" });
+
+    assert.equal(
+      incidentRow(incidentId)?.summary,
+      "Loki reads are being rejected",
+    );
+  });
+
+  /**
+   * Nothing is announced. A title changing is not news; the thread's header
+   * picks it up on the next sweep, and a message every time an agent
+   * sharpens four words is how a channel gets muted.
+   */
+  it("says nothing in the thread", async () => {
+    await seed("sig-sum-3");
+    const incidentId = await openIncident(["sig-sum-3"]);
+    const before = posts.length;
+
+    await toolsFor(incidentId).setSummary({ summary: "Checkout is failing" });
+
+    assert.equal(posts.length, before);
+  });
+
+  /**
+   * Refused, never truncated. A title cut at eighty characters reads as a
+   * complete thought that happens to be wrong, and the thing that wrote it
+   * is a model that can be asked again. Same shape as overThreadBudget.
+   */
+  it("refuses one that is too long, naming both numbers and where it belongs", async () => {
+    await seed("sig-sum-4");
+    const incidentId = await openIncident(["sig-sum-4"]);
+    const long = "Loki is rejecting reads ".repeat(10);
+
+    const response = await toolsFor(incidentId).setSummary({ summary: long });
+
+    assert.equal(response.ok, false);
+    assert.match(
+      String(response.error),
+      new RegExp(String(long.trim().length)),
+      "the number it quotes is the length of what it would have stored",
+    );
+    assert.match(String(response.error), /80/);
+    assert.match(String(response.error), /root cause/);
+    assert.equal(
+      incidentRow(incidentId)?.summary,
+      null,
+      "and writes nothing, so the row keeps no half of it",
+    );
+  });
+
+  it("collapses a title somebody wrote across two lines", async () => {
+    await seed("sig-sum-5");
+    const incidentId = await openIncident(["sig-sum-5"]);
+
+    await toolsFor(incidentId).setSummary({ summary: "Checkout\n  is failing" });
+
+    assert.equal(incidentRow(incidentId)?.summary, "Checkout is failing");
+  });
+
+  it("refuses whitespace, which is not a title", async () => {
+    await seed("sig-sum-6");
+    const incidentId = await openIncident(["sig-sum-6"]);
+
+    const response = await toolsFor(incidentId).setSummary({ summary: "   " });
+
+    assert.equal(response.ok, false);
+    assert.equal(incidentRow(incidentId)?.summary, null);
+  });
+
+  it("is refused on an incident that has been merged away", async () => {
+    await seed("sig-sum-7");
+    await seed("sig-sum-8");
+    // Survivor first, because a merge only goes into the more established
+    // incident now. What this test is about is the status, not the order.
+    const survivor = await openIncident(["sig-sum-8"]);
+    const absorbed = await openIncident(["sig-sum-7"]);
+    await mergedAway("sig-sum-7", survivor);
+
+    const response = await toolsFor(absorbed).setSummary({ summary: "anything" });
+
+    assert.equal(response.ok, false);
+  });
+});
+
+describe("an incident that absorbed another one", () => {
+  const merged = async (tag: string) => {
+    await seed(`sig-${tag}-a`);
+    await seed(`sig-${tag}-b`);
+    const survivor = await openIncident([`sig-${tag}-a`]);
+    const absorbed = await openIncident([`sig-${tag}-b`]);
+    await toolsFor(absorbed).setSummary({ summary: `what ${tag} was` });
+    await applyAssign(
+      db,
+      {
+        signalIds: [`sig-${tag}-b`],
+        target: survivor,
+        reason: "one bug, two alerts",
+      },
+      { kind: "human", slackUserId: "U1" },
+    );
+    return { survivor, absorbed };
+  };
+
+  /**
+   * Without this the merge reaches the surviving agent as an unexplained
+   * pile of new signals, and the agent is then expected to keep an honest
+   * title for an incident it was never told about.
+   */
+  it("is told so, by name, on the directive that carries the signals", async () => {
+    const { survivor, absorbed } = await merged("abs1");
+
+    const view = await toolsFor(survivor).getIncident();
+
+    const news = view.directives.find((d) => d.type === "new_signals");
+    assert.ok(news, JSON.stringify(view.directives));
+    assert.deepEqual(
+      news.type === "new_signals" ? news.absorbed : null,
+      [absorbed],
+    );
+  });
+
+  /**
+   * Same shape and the same reason as `priorIncident`: somebody already
+   * investigated part of what is now this incident's problem, and an agent
+   * cannot write an honest title for something it never saw.
+   */
+  it("can read what that incident had found, on the first get_incident", async () => {
+    const { survivor, absorbed } = await merged("abs2");
+
+    const view = await toolsFor(survivor).getIncident();
+
+    const read = (view.data as IncidentView).absorbed;
+    assert.deepEqual(
+      read.map((r) => r.id),
+      [absorbed],
+    );
+    assert.equal(read[0].summary, "what abs2 was");
+    assert.equal(read[0].status, "MERGED");
+  });
+
+  it("an incident that absorbed nothing carries an empty list, not a null", async () => {
+    await seed("sig-abs3");
+    const incidentId = await openIncident(["sig-abs3"]);
+
+    const view = await toolsFor(incidentId).getIncident();
+
+    assert.deepEqual((view.data as IncidentView).absorbed, []);
+  });
+
+  /**
+   * Read off `mergedInto` rather than remembered, so it is the same answer
+   * after a restart and after a merge this process never saw.
+   */
+  it("is still readable by a process that did not see the merge happen", async () => {
+    const { survivor, absorbed } = await merged("abs4");
+    await db.withWrite((w) => {
+      w.prepare("DELETE FROM pending_directive WHERE incidentId = ?").run(survivor);
+    });
+
+    const view = await toolsFor(survivor).getIncident();
+
+    assert.deepEqual(
+      (view.data as IncidentView).absorbed.map((r) => r.id),
+      [absorbed],
+    );
   });
 });

@@ -21,28 +21,117 @@ const MAX_CHARS = 4000;
 
 export const SCHEMA_SUMMARY = `incident(
   id TEXT, status TEXT in (INVESTIGATING,FIXING,RESOLVED,CLOSED,MERGED),
-  owner TEXT in (agent,human), rootCause TEXT, prUrls TEXT json, postmortem TEXT,
+  rootCause TEXT, prUrls TEXT json, postmortem TEXT,
   usersImpacted INT, impactQuery TEXT,
   impactStartedAt INT, firstSignalAt INT, fixingAt INT, resolvedAt INT, closedAt INT,
-  mergedInto TEXT, recurrenceOf TEXT, attempts INT, costUsd REAL)
+  mergedInto TEXT, recurrenceOf TEXT, attempts INT, modelId TEXT,
+  tokensIn INT, tokensOut INT, cacheRead INT, cacheWrite INT, cacheWrite1h INT)
 signal(
   id TEXT, source TEXT, sourceId TEXT, kind TEXT, title TEXT, body TEXT,
   labels TEXT json, reportedBy TEXT, openedAt INT, closedAt INT,
-  incidentId TEXT, explained INT)
+  incidentId TEXT, explained INT,
+  tokensIn INT, tokensOut INT, cacheRead INT, cacheWrite INT,
+  modelCalls INT, modelId TEXT)
+The token columns on signal are what triage spent placing it. There is no
+cost column on signal: price the tokens against modelId if somebody asks for
+dollars, and say it is an estimate.
 Timestamps are epoch milliseconds. Labels and prUrls are JSON text; use
-json_extract(labels, '$.alert_slug') to read one.`;
+json_extract(labels, '$.alert_slug') to read one.
+There is no cost column. Spend is recorded in tokens because prices move and
+tokens do not; a dollar figure is arithmetic over these and modelId, and is an
+estimate whenever you quote one.`;
+
+// The guard below used to exist twice, against the same database, with
+// different answers: this one allowed SELECT and WITH and checked the raw
+// text, while the Slack agent's allowed EXPLAIN too, stripped comments and
+// string literals before checking anything, and scanned for nineteen write
+// keywords. Neither caller ever saw the other, so nobody noticed that the
+// path running on every single signal was the weaker one -- and that checking
+// raw text means a semicolon inside a string literal is a false refusal.
+//
+// One guard now, the stronger of the two.
+
+const FORBIDDEN =
+  /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA|REINDEX|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RETURNING)\b/i;
 
 /**
- * The read connection is already opened read-only, so this guard is about
- * giving the model a correctable error rather than about containment.
+ * Blank out string literals, bracketed identifiers and comments, so the
+ * checks below read only code. Checking raw text is how a `;` or a `DROP`
+ * inside a quoted string becomes a refusal of a legitimate query.
+ */
+const stripSqlNoise = (sql: string): string => {
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'" || c === '"' || c === "`") {
+      const quote = c;
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      out += " ";
+      continue;
+    }
+    if (c === "[") {
+      while (i < sql.length && sql[i] !== "]") i++;
+      i++;
+      out += " ";
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      while (i < sql.length && sql[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      i += 2;
+      while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+};
+
+/**
+ * The read connection is already opened read-only, so containment is not what
+ * this is for: a write fails at the driver even if this misses one. It runs
+ * first because a correctable sentence beats a SQLITE_READONLY stack trace to
+ * a model that can try again, and because it is what keeps multi-statement
+ * input away from the driver at all.
+ *
+ * Returns an error rather than throwing, which is the shape both callers
+ * want: the answer goes back to the model as a tool result either way, and a
+ * throw would have to be caught at every call site to become one.
  */
 export const prepareQuery = (raw: string): { sql: string } | { error: string } => {
   const sql = raw.trim().replace(/;+\s*$/, "").trim();
-  if (sql.length === 0) return { error: "empty query" };
-  if (!/^(select|with)\b/i.test(sql)) {
-    return { error: "only SELECT and WITH statements are allowed" };
+  const body = stripSqlNoise(sql).trim().replace(/;\s*$/, "");
+  if (body.length === 0) return { error: "empty query" };
+  if (body.includes(";")) {
+    return { error: "one statement at a time; remove the extra ';'" };
   }
-  if (sql.includes(";")) return { error: "one statement per call" };
+  if (!/^(select|with|explain)\b/i.test(body)) {
+    return {
+      error: "read-only access: statements must start with SELECT, WITH or EXPLAIN",
+    };
+  }
+  const hit = body.match(FORBIDDEN);
+  if (hit) {
+    return { error: `read-only access: ${hit[1].toUpperCase()} is not allowed` };
+  }
   return { sql };
 };
 
@@ -93,19 +182,6 @@ export const incidentStatus = (db: IncidentReader, id: string): string | null =>
     [id],
   );
   return rows[0]?.status ?? null;
-};
-
-/**
- * Who has an incident, which types.ts keeps deliberately orthogonal to its
- * status: a handed-off incident still reads INVESTIGATING. Throws on a failed
- * read, for the same reason as above.
- */
-export const incidentOwner = (db: IncidentReader, id: string): string | null => {
-  const rows = db.query<{ owner: string }>(
-    "SELECT owner FROM incident WHERE id = ?",
-    [id],
-  );
-  return rows[0]?.owner ?? null;
 };
 
 /** Throws on a failed read, for the same reason: [] means "nothing attached". */

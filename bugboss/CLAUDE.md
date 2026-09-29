@@ -14,8 +14,9 @@ This file is what you need before editing anything here.
 | Transitions, merge, split, correlation | [`toolapi/CLAUDE.md`](./toolapi/CLAUDE.md) |
 | Launch, deadlines, escalation | [`dispatcher/CLAUDE.md`](./dispatcher/CLAUDE.md) |
 | The incident agent, its tools, resume | [`agent/CLAUDE.md`](./agent/CLAUDE.md) |
-| The Bedrock provider | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
+| The Bedrock request path every model call takes | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
 | Threads, relay, the Slack agent | [`slack/CLAUDE.md`](./slack/CLAUDE.md) |
+| The status board, the morning post, the all-clear | [`board/CLAUDE.md`](./board/CLAUDE.md) |
 | The closing report an incident ends with | [`report/CLAUDE.md`](./report/CLAUDE.md) |
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
@@ -24,7 +25,50 @@ This file is what you need before editing anything here.
 
 `index.ts` is the composition root — the only place real services are
 named. `types.ts` is the contract everything else is built against.
+`model.ts` is the seam the Boss's own bounded calls are written against, and
+`bedrock/client.ts` is its only implementation that reaches a model.
 `logging.ts` is the one home for `alarm` and `log`.
+
+## There are two agents here, not four
+
+**The incident agent** (`agent/`) is the only thing in this system that
+writes state. It runs Pi in a child process, investigates, opens a pull
+request, waits, and writes a post-mortem.
+
+**The Boss** is everything else that talks to a model: triage, root-cause
+correlation, the inbound-language read (`slack/intent.ts`) and the Slack
+question box (`slack/agent.ts`). All four are read-only against the incident
+corpus, all four share one request path (`bedrock/client.ts`) and one
+read-only toolset (`triage/sql.ts`), and none of them can change an incident.
+
+The intent read is not a third agent. It has no tools and answers one label,
+so it is a capability of the Boss rather than a peer, and it is written
+against the same seam for the same reason.
+
+**Every Boss capability is an answer-tool schema plus read-only lookup tools,
+and code decides what happens to the answer.** That is the shape, and it is
+not a style preference. `decide` goes to `applyRules`. `read_intent` goes to
+the guarded `UPDATE` in the composition root. A merge proposal goes to
+`toolapi`. Nothing the Boss can call writes anything, so "the model proposes;
+the rules decide" is structural here rather than a discipline somebody
+remembers -- see [`triage/CLAUDE.md`](./triage/CLAUDE.md). A free-form tool on
+a Boss path would end that, quietly, and is the one change to this area worth
+refusing.
+
+The Slack question box is the deliberate exception, and only about its
+*output*: its answer is prose, not a schema, because there is nothing to
+validate in "here is what I found". Code still decides what happens to it --
+it is capped at about 200 words and posted. It reads; it does not act.
+
+**Two loops, on purpose.** `runStructuredCall` bounds a whole call with one
+wall-clock budget and a round count, and throws so every caller takes its
+conservative default. The Slack box bounds each turn separately, because what
+limits it is how long a person will sit in a thread, and it ends an exhausted
+run with a tool-less wrap-up rather than a throw -- somebody is waiting, and
+the reading is already paid for. Those are different bound shapes, not one
+shape with options, and folding them would cost triage its readability to
+serve the question box. They share the request path, the toolset and the
+usage accounting, which is where the duplication actually was.
 
 ## The rules that are not negotiable
 
@@ -35,14 +79,13 @@ thing that happened, including a transition a module refused on purpose. An
 alarm that fires during normal operation teaches people to ignore alarms.
 
 **Every interface a person talks to is natural language.** Nothing here
-decides what somebody wants by matching their words against a list. Two
-things did — the ownership claim and the bug-report verb — and both were a
-magic phrase nobody could discover and everybody mistyped, failing silently
-when they did. Intent is a model call (`slack/intent.ts`), advisory the way
-triage is: the model reads the sentence, the code keeps the invariants, and
-an ambiguous read asks in the thread rather than guessing. Who a message was
-for is read the same way, because requiring a tag to answer a direct question
-is the same mistake in the other direction.
+decides what somebody wants by matching their words against a list. One thing
+did — the bug-report verb — and it was a magic phrase nobody could discover
+and everybody mistyped, failing silently when they did. Intent is a model call
+(`slack/intent.ts`), advisory the way triage is: the model reads the sentence,
+the code keeps the invariants, and an ambiguous read asks in the thread rather
+than guessing. Who a message was for is read the same way, because requiring a
+tag to answer a direct question is the same mistake in the other direction.
 
 An entity check — "does this text contain `<@U…>`", "is this string empty" —
 is not a language interface. One of those is load-bearing: an explicit
@@ -50,14 +93,38 @@ is not a language interface. One of those is load-bearing: an explicit
 rather than the model, it is the escape hatch that still works when the model
 does not.
 
+**Anything a reader sees the same way twice is rendered once, in code.** An
+incident reference, a status-board row and a thread's header are all
+formatting, and formatting asked for in a prompt is followed
+probabilistically -- which is how the same answer came to link some incidents
+and not others, and to spell the same word two ways in one message. The
+renderers are `slack/incidents.ts` and `slack/board.ts`; the model writes
+"incident 4" in prose and code decides what that looks like. This is the
+opposite of the language rule above, not an exception to it: that one is
+about reading what a person meant, this one is about our own output.
+
+**There is no scheduler, and adding one is the wrong fix.** Every merge to
+ops `main` restarts this container, so an in-memory "next fire at 07:00"
+either fires twice or is skipped depending on when a deploy lands. Recurring
+work rides the dispatcher tick or the composition root's sweep interval, and
+remembers what it has done in SQLite -- as a **date** where a day is the
+unit, never a timestamp, or the clocks going back produce a double post.
+
 **Nothing auto-closes.** The Boss may decide an alert needs no incident, but
 every incident ends in an outcome a person can see. A quiet signal is
 evidence an agent reads, never a transition the Boss makes.
 
-**Status is where the work is. Owner is who has it.** Orthogonal, by design
-(`types.ts`). An incident can be `FIXING` and owned by a human. Of the
+**An open incident is always driven by an agent.** A person is something an
+incident can be *waiting on*, never something it can be *given to*
+(`types.ts`). `status` is the only axis, and it says where the work is. Of the
 places that ask "is this available", the dispatcher, `openIncidents()` and
 triage's guard must all agree — they have disagreed before.
+
+Waiting on a person is a row in `incident_wait`, not a field on the incident.
+It says the dispatcher must not relaunch this incident yet, and nothing more:
+the agent still has the work, and it still holds its dispatcher slot. Any
+reply in the thread deletes the row, before anything reads what the reply
+meant. `dispatcher/CLAUDE.md` has the mechanism.
 
 **Evidence, not assertion.** `RESOLVED` means no users are affected any more
 and no further alerts should occur, confirmed. Every number the agent
@@ -100,9 +167,37 @@ changes only a database that does not exist yet.
   transaction: a `schema_drift` alarm lists every column `schema.sql`
   declares that the live database does not have. It does not fix it, so the
   second edit is still yours.
+- **The `LATE_COLUMNS` type must be the whole declaration**, constraints and
+  default included -- `"INTEGER NOT NULL DEFAULT 0"`, never a bare
+  `"INTEGER"`. `ALTER TABLE ADD COLUMN x INTEGER` produces a *nullable*
+  column and leaves every row already in the snapshot at NULL, while
+  `schema.sql` says `NOT NULL` and the TypeScript type says `number`. So
+  prod reads null out of a field nothing declares nullable, and only for the
+  rows that predate the column.
+
+  `schema_drift` cannot catch this, which is why it is written down here
+  instead: `PRAGMA table_info` reports the declared type as `INTEGER` for
+  both spellings, so the check compares equal. It verifies presence, not
+  nullability. The default is also what backfills the existing rows, and
+  SQLite refuses `NOT NULL` with no default outright.
 - A `LATE_COLUMNS` entry naming a table that does not exist **refuses the
   boot**. That is a defect in the list, identical on every boot, so it never
   reaches prod.
+- Removing a **column** is normally one edit, not two: delete it from
+  `schema.sql` and stop naming it in SQL. Nothing catches the existing
+  database up, so it keeps the column forever, and that is fine *because the
+  column has a `DEFAULT`* -- a restored snapshot still accepts an insert that
+  no longer names it.
+  
+  Which is the same fact the addition trap above turns on, seen from the
+  other side: a `NOT NULL` column with no default is the one thing SQLite
+  gives you no way to retrofit. It cannot be added that way, and it cannot be
+  retired that way either, because the first insert that stops naming it
+  fails against every database that already exists and none that a test
+  opens. There is no `ALTER COLUMN` to add the default afterwards. So such a
+  column is **kept, declared and written, and read by nothing**.
+  `incident.owner` is the one; `db/CLAUDE.md` says why that is a better trade
+  than dropping it for real.
 - Adding a **`CHECK` constraint** is not possible at all. SQLite cannot add
   one to an existing table, so it needs a table rebuild that does not exist
   here. The cross-field constraints landed while the database was empty; that

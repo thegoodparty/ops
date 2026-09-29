@@ -11,6 +11,10 @@
 //   merge   all of B's signals      -> A
 //   split   a subset of A's signals -> NEW
 //
+// Merge is the one of the four with a direction, and the direction is not the
+// caller's to pick: the more established of the two incidents stays as the
+// record, and a request to merge the other way is refused. See establishedOf.
+//
 // Every function here is synchronous and takes a raw handle, because it runs
 // inside Db.withWrite's transaction. A merge touches two incidents and the
 // whole point of SQL here is that it either lands on both or on neither.
@@ -156,6 +160,39 @@ export const drainDirectives = (
 // The primitive
 // ---------------------------------------------------------------------------
 
+/**
+ * Which of two incidents stays the incident of record when they combine.
+ *
+ * The lower id, because ids are handed out MAX(id)+1 and are therefore the
+ * only monotonic record of when the incident itself was opened -- and the one
+ * fact about an incident a re-partition cannot move.
+ *
+ * `firstSignalAt` is the obvious answer and it is wrong twice over. It is a
+ * property of the signals, so the challenger inherits the incumbent's age by
+ * taking its oldest one: incident 82 was minutes old and read a day older
+ * than the incident it absorbed. And it is never recomputed on absorb, so 79
+ * held a signal from the 27th while its own column said the 28th. Movable and
+ * stale, and a merge is exactly the moment both bite.
+ *
+ * What this protects is the thread people have been reading, but the number
+ * of replies in it is not the test either: most incidents carry none, so it
+ * ties constantly and falls back to age anyway, and it backs the newcomer the
+ * moment somebody says "on it" in a fresh thread. Age of the record dominates
+ * it and never ties.
+ */
+export const establishedOf = (a: string, b: string): string => {
+  const na = Number(a);
+  const nb = Number(b);
+  // The string branch is for an id this system did not allocate, which is a
+  // fixture rather than a state production can reach. It is here because the
+  // numeric comparison answers NaN <= NaN with false, so without it the
+  // "winner" of two unparseable ids would be whichever was passed second --
+  // an answer that changes when the arguments swap is not an order at all,
+  // and it fails in the direction of silently reversing a merge.
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na <= nb ? a : b;
+  return a <= b ? a : b;
+};
+
 const nextIncidentId = (db: Database.Database): string => {
   const row = db
     .prepare("SELECT MAX(CAST(id AS INTEGER)) AS n FROM incident")
@@ -190,9 +227,14 @@ export const assign = (
         `signal ${foreign.id} is not attached to incident ${actor.incidentId}`,
       );
     }
+    // Off the normal path now: proposeMerge is how signals reach another
+    // incident, and it goes through a judgement and lands here as the Boss.
+    // So this is a guard rather than an answer, and it says what to call
+    // instead -- not which kinds of caller exist, which is a shape of this
+    // system nobody outside it should have to learn from an error.
     if (req.target !== "NEW" && req.target !== actor.incidentId) {
       throw new AssignError(
-        `incident ${actor.incidentId} cannot assign into incident ${req.target}`,
+        `moving signals into incident ${req.target} is not something this call does; propose_merge asks for the two incidents to be combined`,
       );
     }
   }
@@ -204,9 +246,12 @@ export const assign = (
     target = opts.newId ? opts.newId() : nextIncidentId(db);
     created = true;
     db.prepare(
+      // `owner` is write-only and always 'agent'. It is named here rather than
+      // left to its default because the restored snapshot's copy of the column
+      // has no default -- see the comment on it in schema.sql.
       `INSERT INTO incident
          (id, status, owner, prUrls, firstSignalAt, recurrenceOf, rotationAtOpen,
-          attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+          attempts, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
        VALUES (?, 'INVESTIGATING', 'agent', '[]', ?, ?, ?, 0, 0, 0, 0, 0, 0)`,
     ).run(
       target,
@@ -229,16 +274,6 @@ export const assign = (
         `incident ${req.target} is ${existing.status} and cannot take signals`,
       );
     }
-    // A hand-off does not move the work, so status still reads INVESTIGATING
-    // or FIXING and the incident still looks open. Nothing is coming back to
-    // it on its own, though -- the dispatcher skips human-owned incidents --
-    // so an automatic attach here is a signal parked where no one is looking.
-    // A person moving signals around their own incident is the exception.
-    if (existing.owner === "human" && actor.kind !== "human") {
-      throw new AssignError(
-        `incident ${req.target} is owned by a human and cannot take signals automatically`,
-      );
-    }
     target = req.target;
   }
 
@@ -251,12 +286,56 @@ export const assign = (
     ),
   ];
 
+  // Establishment. A move that empties one incident into another is the two
+  // becoming one, and something has to stay the incident of record. Left to
+  // the caller it was an accident of which agent happened to be acting:
+  // correlation absorbed whichever incident had not just reported a root
+  // cause, which sent a thread with four days of conversation into one opened
+  // minutes earlier. Held here because this is the single writer, so no
+  // caller can arrive at a backwards merge by another route.
+  //
+  // A partial move is not this. Re-partitioning stays free; only the last
+  // signal leaving is a merge.
+  if (!created) {
+    for (const source of sources) {
+      const staying = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM signal
+            WHERE incidentId = ? AND id NOT IN (${placeholders(ids.length)})`,
+        )
+        .get(source, ...ids) as { n: number };
+      if (staying.n > 0) continue;
+      if (establishedOf(source, target) !== source) continue;
+      throw new AssignError(
+        `incident ${source} is more established than ${target}, so it stays the incident of record; merge ${target} into ${source} instead`,
+      );
+    }
+  }
+
   if (moved.length > 0) {
     // explained resets: it means "accounted for by this incident's root
     // cause", which a signal arriving in a new home has not been.
     db.prepare(
       `UPDATE signal SET incidentId = ?, explained = 0 WHERE id IN (${placeholders(moved.length)})`,
     ).run(target, ...moved);
+  }
+
+  // firstSignalAt follows the signals, because it is the input to time to
+  // detect and an incident that has absorbed older signals really did start
+  // earlier than its own column said. Left alone, incident 79 held a signal
+  // from the 27th and reported the 28th.
+  //
+  // It cannot go up here: only a move *in* runs this, so the minimum over
+  // what the target holds can only fall. The EXISTS guard is for the column
+  // being NOT NULL -- an empty target would write a null and throw, which a
+  // move into it cannot produce, but the guard costs nothing and the throw
+  // would roll back a legitimate re-partition.
+  if (!created && moved.length > 0) {
+    db.prepare(
+      `UPDATE incident
+          SET firstSignalAt = (SELECT MIN(openedAt) FROM signal WHERE incidentId = ?)
+        WHERE id = ? AND EXISTS (SELECT 1 FROM signal WHERE incidentId = ?)`,
+    ).run(target, target, target);
   }
 
   // An emptied source is a merge only when the signals landed somewhere that
@@ -288,11 +367,18 @@ export const assign = (
     !(actor.kind === "agent" && actor.incidentId === target);
   if (movedIntoRunningAgent) {
     const row = getIncidentRow(db, target);
-    if (row && row.owner === "agent" && ATTACHABLE_STATUSES.includes(row.status)) {
+    if (row && ATTACHABLE_STATUSES.includes(row.status)) {
       pushDirective(db, target, {
         type: "new_signals",
         count: moved.length,
         summary: req.reason,
+        // Named, not implied. Signals arriving because another incident was
+        // emptied into this one is a different event from signals arriving
+        // because a new alert fired, and the surviving agent is the one that
+        // has to write a title covering both -- which it cannot do honestly
+        // for an incident it was never told about. The details follow on its
+        // next get_incident, as `absorbed`.
+        ...(merged.length > 0 ? { absorbed: merged } : {}),
       });
     }
   }

@@ -13,7 +13,7 @@
 // broadcasting them, so one agent's answer could arrive on another's socket.
 
 import type { Db } from "../db";
-import type { Directive, IncidentOwner, IncidentStatus } from "../types";
+import type { Directive, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
 import type { SlackChoiceClick } from "./blocks";
 import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
@@ -71,7 +71,6 @@ export interface RelayDeps {
 export type RelayEvent =
   | { type: "opened"; incidentId: string; title: string; signalCount: number }
   | { type: "merged"; incidentId: string; into: string; reason: string }
-  | { type: "escalated"; incidentId: string; reason: string; brief: string }
   | {
       type: "resolved";
       incidentId: string;
@@ -88,13 +87,16 @@ export type RelayEvent =
 
 /**
  * At roughly 20 incidents a week, pinging the rotation for things that resolve
- * themselves is how a rotation gets muted. Exactly three things earn a
- * mention: an escalation, a signal on the prod-critical allowlist, and a PR
- * that needs merging. Everything else lands in the thread unannounced, where
- * anyone curious can watch.
+ * themselves is how a rotation gets muted. Two things earn a mention here: a
+ * signal on the prod-critical allowlist, and a PR that needs merging.
+ * Everything else lands in the thread unannounced, where anyone curious can
+ * watch.
+ *
+ * An escalation earns one too and does not come through here. `escalate`
+ * posts its own brief and the composition root adds the ping, because the
+ * rotation snapshot it mentions is per-incident.
  */
 const MENTION_EVENTS: readonly string[] = [
-  "escalated",
   "prod_critical_signal",
   "pr_needs_merge",
 ];
@@ -149,18 +151,12 @@ export const renderEvent = (event: RelayEvent): string => {
         mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"} · an agent is investigating · nobody is being paged_`,
       ].join("\n");
     case "merged":
+      // Both references name the word "incident", which is what the outbound
+      // pass keys off to render them as links. A bare id is a number.
       return [
-        mrkdwn`*Incident ${event.incidentId} merged into ${event.into}*`,
+        mrkdwn`*Incident ${event.incidentId} merged into incident ${event.into}*`,
         toMrkdwn(event.reason),
-        mrkdwn`_Follow ${event.into} from here._`,
-      ].join("\n");
-    case "escalated":
-      return [
-        mrkdwn`*Escalation on incident ${event.incidentId}* · ${event.reason}`,
-        "",
-        toMrkdwn(event.brief),
-        "",
-        "_This incident now has a human owner and no agent is running on it._",
+        mrkdwn`_Follow incident ${event.into} from here._`,
       ].join("\n");
     case "resolved":
       return [
@@ -220,16 +216,12 @@ export type InboundRoute =
    * incident changing hands -- is a model call the caller makes off the Slack
    * ack, so everything that read needs travels on the route.
    *
-   * The relay does not write `owner` and cannot: the whole flip lives in the
-   * composition root, guarded in the statement.
    */
   | {
       kind: "incident_reply";
       incidentId: string;
       /** The message tagged the bot, so a directive interrupts as well. */
       interrupt: boolean;
-      /** Who has the incident right now. Context for reading the message. */
-      owner: IncidentOwner;
       /** False when no agent is on it, so a mention is a question for Job 6. */
       agentRunning: boolean;
       channel: string;
@@ -252,6 +244,10 @@ export type InboundRoute =
  * the other two are a press that arrived too late or second, and each still
  * earns a line in the thread, because a button that does nothing and says
  * nothing is indistinguishable from a broken one.
+ *
+ * Each carries `reader`, because "recorded" reads identically whether an
+ * agent is about to act on the press or whether the directive it wrote will
+ * never be consumed by anyone.
  */
 export type ChoiceRoute =
   | { kind: "ignore"; reason: string }
@@ -260,9 +256,39 @@ export type ChoiceRoute =
       incidentId: string;
       choice: string;
       slackUserId: string;
+      /** Who will read the directive this press just wrote, if anyone. */
+      reader: ChoiceReader;
     }
-  | { kind: "stale"; incidentId: string; slackUserId: string }
-  | { kind: "duplicate"; incidentId: string; slackUserId: string };
+  | {
+      kind: "stale";
+      incidentId: string;
+      slackUserId: string;
+      reader: ChoiceReader;
+    }
+  | {
+      kind: "duplicate";
+      incidentId: string;
+      slackUserId: string;
+      reader: ChoiceReader;
+      /**
+       * The answer that won, so a second presser is told what was filed
+       * rather than only that their own press was not. Null if the row it
+       * names has since gone.
+       */
+      recorded: { choice: string; slackUserId: string } | null;
+    };
+
+/**
+ * Who will read what a press wrote. Derived from the dispatcher's own
+ * eligibility, so the places that ask "is this available" keep agreeing:
+ *
+ *   agent   one is on it, or the dispatcher resumes one within a tick.
+ *   closed  past those statuses, so nothing will ever read this.
+ *
+ * There used to be a third answer for an incident in a running status that no
+ * agent could reach. Nothing can be in that state now.
+ */
+export type ChoiceReader = "agent" | "closed";
 
 /** The statuses during which the dispatcher keeps an agent on an incident. */
 const AGENT_RUNNING_STATUSES: readonly IncidentStatus[] = [
@@ -316,7 +342,13 @@ export class SlackRelay {
       for (const part of parts.slice(1)) {
         await this.slack.post(ts, part, this.cfg.channelId);
       }
-      if ((await this.linkThread(event.incidentId, ts)) === "unwritable") {
+      const linked = await this.linkThread(event.incidentId, ts);
+      // Only once this post is the thread. A `lost` link means somebody else
+      // won the race and this is a loose message, so recording its text as
+      // the opening would later have the header sweep write it over the
+      // winner's -- chat.update replaces a message whole.
+      if (linked === "linked") await this.recordOpening(event.incidentId, parts[0]);
+      if (linked === "unwritable") {
         // The thread exists and nothing points at it, so the rest of this
         // incident will not land here. Said in the thread, which is where
         // anyone following this incident is looking.
@@ -358,6 +390,9 @@ export class SlackRelay {
       // Adopt this post as the thread. One recovered thread beats the loose
       // messages every later transition would otherwise add.
       const adopted = await this.linkThread(event.incidentId, ts);
+      // Recorded on the same terms as a normal open: whatever ends up being
+      // the thread's parent message is what a header has to sit above.
+      if (adopted === "linked") await this.recordOpening(event.incidentId, orphan[0]);
       log("posted_top_level", {
         incidentId: event.incidentId,
         type: event.type,
@@ -427,9 +462,7 @@ export class SlackRelay {
         : ignore("thread is not an incident thread");
     }
 
-    const agentRunning =
-      incident.owner === "agent" &&
-      AGENT_RUNNING_STATUSES.includes(incident.status);
+    const agentRunning = AGENT_RUNNING_STATUSES.includes(incident.status);
 
     // Recorded before anything decides what it meant, including a mention
     // this incident has no agent for. Two reasons. The thread is the record,
@@ -455,7 +488,6 @@ export class SlackRelay {
       kind: "incident_reply",
       incidentId: incident.id,
       interrupt: mentioned,
-      owner: incident.owner,
       agentRunning,
       channel,
       threadTs,
@@ -487,6 +519,15 @@ export class SlackRelay {
     if (!incident) {
       return { kind: "ignore", reason: "thread is not an incident thread" };
     }
+
+    // The dispatcher's own eligibility, read off the same list it uses. A
+    // press writes a directive; whether anything is coming to consume it is
+    // this, and the thread has to say which.
+    const reader: ChoiceReader = AGENT_RUNNING_STATUSES.includes(
+      incident.status,
+    )
+      ? "agent"
+      : "closed";
 
     // Both writes are one transaction because they are one act. The reply row
     // is what the thread shows and the directive is the only thing the agent
@@ -550,20 +591,45 @@ export class SlackRelay {
         incidentId: incident.id,
         user: click.user,
         messageTs: click.messageTs,
+        reader,
       });
-      return { kind, incidentId: incident.id, slackUserId: click.user };
+      if (kind === "stale") {
+        return {
+          kind,
+          incidentId: incident.id,
+          slackUserId: click.user,
+          reader,
+        };
+      }
+      // The derived id is what made the first press the only one, so it is
+      // also how the answer that won is found again.
+      const won = this.db.get<{ text: string; slackUserId: string }>(
+        "SELECT text, slackUserId FROM thread_reply WHERE id = ?",
+        [`${click.channel}:${click.messageTs}:choice`],
+      );
+      return {
+        kind,
+        incidentId: incident.id,
+        slackUserId: click.user,
+        reader,
+        recorded: won
+          ? { choice: won.text, slackUserId: won.slackUserId }
+          : null,
+      };
     }
 
     log("choice_recorded", {
       incidentId: incident.id,
       user: click.user,
       ts: click.actionTs,
+      reader,
     });
     return {
       kind: "answered",
       incidentId: incident.id,
       choice: click.choice,
       slackUserId: click.user,
+      reader,
     };
   }
 
@@ -573,6 +639,34 @@ export class SlackRelay {
       [incidentId],
     );
     return row?.slackThreadTs ?? null;
+  }
+
+  /**
+   * Keep the text of the message that started this thread, so a header can
+   * later be put above it without reading it back off Slack.
+   *
+   * `INSERT OR IGNORE`: a re-emit that finds the thread already open never
+   * gets here, but a retry that raced one must not replace the opening with
+   * a later message. First write wins, like the thread link itself.
+   *
+   * Never fatal. The thread exists and the incident is running; what is lost
+   * is a header, and losing it loudly is better than losing the transition
+   * that was being announced.
+   */
+  private async recordOpening(incidentId: string, text: string): Promise<void> {
+    try {
+      await this.db.withWrite((d) => {
+        d.prepare(
+          "INSERT OR IGNORE INTO incident_thread (incidentId, opening) VALUES (?, ?)",
+        ).run(incidentId, text);
+      });
+    } catch (err) {
+      alarm("thread_opening_unrecorded", {
+        incidentId,
+        error: String(err),
+        note: "this incident's thread will carry no status header",
+      });
+    }
   }
 
   private async linkThread(
@@ -619,14 +713,11 @@ export class SlackRelay {
 
   private incidentForThread(
     threadTs: string,
-  ): { id: string; status: IncidentStatus; owner: IncidentOwner } | undefined {
+  ): { id: string; status: IncidentStatus } | undefined {
     return this.db.get<{
       id: string;
       status: IncidentStatus;
-      owner: IncidentOwner;
-    }>("SELECT id, status, owner FROM incident WHERE slackThreadTs = ?", [
-      threadTs,
-    ]);
+    }>("SELECT id, status FROM incident WHERE slackThreadTs = ?", [threadTs]);
   }
 
   /**
@@ -639,6 +730,22 @@ export class SlackRelay {
     msg: { channel: string; user: string; text: string; ts: string },
   ): Promise<boolean> {
     return this.db.withWrite((d) => {
+      // Talking to an incident wakes it. No judgement, and deliberately
+      // upstream of anything that reads what the message meant: the whole
+      // failure this system had was a reply landing on an incident nothing
+      // would ever run again, and every version of the fix that asked a
+      // model to recognise the right words is a version that goes quiet the
+      // first time somebody phrases it their own way. A reply that turns out
+      // to be two people talking to each other costs one relaunch.
+      //
+      // The one exception is a kind, not a reading. A wait that a reply
+      // cannot end -- a run out of turns is the case -- stays put, because
+      // waking it relaunches an agent that stops again on its first turn and
+      // escalates again, so every comment on the thread pages the rotation.
+      // Still no message read: the parker said which kind it was.
+      d.prepare(
+        "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1",
+      ).run(incidentId);
       const res = d
         .prepare(
           `INSERT OR IGNORE INTO thread_reply

@@ -131,13 +131,19 @@ reset. Updated as things land. Not product documentation.
   agreed; not yet built.
 - **Agents cannot propose a fix in `ops` when the cause is BugBoss itself.**
   Unconfirmed whether this works end to end.
-- **`bugboss/bedrock/` has never executed against live Bedrock.** The routing
-  fix is asserted at boot and refuses to launch on Converse, so a misroute is
-  now loud. But signature replay itself is exercised for the first time in
-  production. If it is subtly wrong, `prefixMismatchBehavior` defaults to
-  `drop_block` and the result is the current behaviour — no thinking carried
-  across a restart — plus an `anthropic_input_transformations` diagnostic.
-  Bounded by the status quo, but worth watching on the first long incident.
+- **Signature replay is still exercised for the first time in production.**
+  `bugboss/bedrock/` has now executed against live Bedrock: the routing fix is
+  asserted at boot and refuses to launch on Converse, and the request body is
+  verified field by field against a real `InvokeModel` call. What that first
+  real request found was that the body itself was invalid — `block_binding`
+  needs the `thinking-binding-controls-2026-08-01` beta, and every incident
+  agent died on turn one until it was sent. Replay across a restart is the part
+  still unproven, and it is worth watching on the first long incident.
+
+  This bullet used to reason that a subtly wrong `prefixMismatchBehavior` was
+  "bounded by the status quo". It was not: a bad thinking config fails the whole
+  turn rather than degrading to no-thinking-on-resume. Do not assume a body
+  field fails soft.
 
 ## Cost
 

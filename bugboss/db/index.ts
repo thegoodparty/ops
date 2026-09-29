@@ -36,6 +36,34 @@ export interface LateColumn {
  */
 export const LATE_COLUMNS: LateColumn[] = [
   { table: "incident", column: "recurrenceAnalysis", type: "TEXT" },
+  // Whole declaration, default included, for the reason spelled out below.
+  {
+    table: "incident_wait",
+    column: "liftsOnReply",
+    type: "INTEGER NOT NULL DEFAULT 1",
+  },
+  // The 1h cache-write share, which prices at 2x base input where the
+  // rest of the write is 1.25x. Same full declaration as the signal
+  // columns below, for the reason given there.
+  { table: "incident", column: "cacheWrite1h", type: "INTEGER NOT NULL DEFAULT 0" },
+  // The few-word title the agent keeps current, which is the board's middle
+  // column and the thread header's. Nullable: an incident that has not been
+  // given one falls back to its first signal's title.
+  { table: "incident", column: "summary", type: "TEXT" },
+  // Triage's own spend, per signal. The full declaration including
+  // `NOT NULL DEFAULT 0`, not a bare `INTEGER`, and the difference is not
+  // cosmetic: `ALTER TABLE ADD COLUMN x INTEGER` leaves the column nullable
+  // and every existing row NULL, while `schema.sql` declares it NOT NULL and
+  // the TypeScript type says `number`. `schemaDrift` below cannot catch that
+  // -- `PRAGMA table_info` reports the type as "INTEGER" either way, so the
+  // check compares equal and the divergence is invisible. The default is also
+  // what backfills the rows already in the snapshot.
+  { table: "signal", column: "tokensIn", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "tokensOut", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "cacheRead", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "cacheWrite", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "modelCalls", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "modelId", type: "TEXT" },
 ];
 
 const columnsOf = (db: Database.Database, table: string) =>
@@ -43,6 +71,26 @@ const columnsOf = (db: Database.Database, table: string) =>
     name: string;
     type: string;
   }[];
+
+/**
+ * Every incident is agent-driven, said once in the data as well as the code.
+ *
+ * Nothing reads `owner`, so this changes no behaviour in this image. It is
+ * here for the one reader that still exists: the previous image, if a deploy
+ * is rolled back. That build filters the dispatcher on `owner = 'agent'`, so
+ * rows left saying `'human'` would come back stranded exactly as they are
+ * now. Writing the value the new model implies makes a rollback correct
+ * rather than merely survivable.
+ *
+ * Idempotent, and cheap enough to run every boot: after the first one it
+ * matches nothing.
+ */
+export const settleOwnerToAgent = (w: Database.Database): void => {
+  const moved = w
+    .prepare("UPDATE incident SET owner = 'agent' WHERE owner <> 'agent'")
+    .run().changes;
+  if (moved > 0) log("owner_settled", { rows: moved });
+};
 
 export const addLateColumns = (
   w: Database.Database,
@@ -177,6 +225,7 @@ export class Db {
     const ddl = readFileSync(join(__dirname, "schema.sql"), "utf8");
     db.write.exec(ddl);
     addLateColumns(db.write, cfg.lateColumns);
+    settleOwnerToAgent(db.write);
 
     // Alarm rather than throw, unlike a bad LATE_COLUMNS entry above. This
     // one is reachable only in prod -- every test opens a fresh file, where

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
+
 import {
   BUGBOSS_CPU,
   BUGBOSS_MEMORY,
@@ -59,5 +62,43 @@ describe("the test database URL this deploy writes", () => {
     if (resolved.state !== "configured") return;
     assert.equal(resolved.host, "127.0.0.1");
     assert.equal(resolved.port, 5432);
+  });
+});
+
+/**
+ * The Pulumi program is compiled by ts-node from `deploy/`, which has no
+ * tsconfig of its own -- so it runs on ts-node's default
+ * `moduleResolution: node`, not the `NodeNext` the root tsconfig sets. Under
+ * that setting a package export-map subpath does not resolve, and
+ * `bugboss/bedrock/model.ts` has one. Importing it from here therefore fails
+ * `pulumi preview` with a TS2307 that `npm run build` and `tsc --noEmit`
+ * both pass clean, so the first sign of it is a red PR.
+ *
+ * `bugboss/bedrock/defaults.ts` exists to be the import that is safe. This
+ * compiles the program the way Pulumi will rather than asserting anything
+ * about which files it names, because the next one to reach into `bugboss/`
+ * will not be this one.
+ */
+describe("the Pulumi program under the resolution Pulumi actually uses", () => {
+  it("compiles, so a reachable export-map subpath cannot pass tsc and fail preview", () => {
+    const repoRoot = join(__dirname, "..");
+    execFileSync(
+      join(repoRoot, "node_modules", ".bin", "tsc"),
+      [
+        "--noEmit",
+        "--moduleResolution",
+        "node",
+        "--module",
+        "commonjs",
+        "--target",
+        "es2022",
+        "--esModuleInterop",
+        "--skipLibCheck",
+        "--strict",
+        "--resolveJsonModule",
+        join("deploy", "index.ts"),
+      ],
+      { cwd: repoRoot, stdio: "pipe" },
+    );
   });
 });

@@ -109,6 +109,7 @@ export interface RegisterBedrockRoutingOptions extends CreateBedrockInvokeModelP
 export const registerBedrockRouting = async ({
   runtime,
   invoke,
+  invokeModelIdFor,
 }: RegisterBedrockRoutingOptions): Promise<Provider> => {
   const builtin = runtime.getProvider(BEDROCK_PROVIDER_ID);
   if (!builtin) {
@@ -122,7 +123,10 @@ export const registerBedrockRouting = async ({
   // what routes us today -- see the header -- but it is what getApiProvider()
   // would find if a models.json entry for "amazon-bedrock" ever pushed this
   // provider id down composeModelProvider()'s path instead.
-  const invokeModel = await registerBedrockInvokeModelProvider({ invoke });
+  const invokeModel = await registerBedrockInvokeModelProvider({
+    invoke,
+    invokeModelIdFor,
+  });
   const provider = routeBedrockProvider(builtin, invokeModel);
   runtime.registerNativeProvider(provider);
 

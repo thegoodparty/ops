@@ -14,6 +14,7 @@ import {
   BEDROCK_INVOKE_MODEL_API,
   type BedrockInvoke,
   createBedrockInvokeModelProvider,
+  invokeModelIdFor,
   resolveBedrockModel,
 } from "./index";
 import {
@@ -188,5 +189,43 @@ test("registering twice keeps one router rather than wrapping it in another", as
 
     assert.equal(first, second);
     assert.equal(runtime.getProvider(BEDROCK_PROVIDER_ID), first);
+  });
+});
+
+// The same seam this file exists for, one layer up. `registerBedrockRouting`
+// builds the provider, so a profile resolver it accepts and forgets to pass
+// on fails exactly the way Converse did: nothing throws, every request looks
+// right, and the only symptom is a Cost Explorer line that never appears.
+test("the profile resolver survives the trip through registerBedrockRouting", async () => {
+  await withAwsEnv(async () => {
+    const runtime = await createRuntime();
+    const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+    const arn =
+      "arn:aws:bedrock:us-west-2:333022194791:application-inference-profile/abcd1234efgh";
+
+    const ids: (string | undefined)[] = [];
+    const invoke: BedrockInvoke = async (input) => {
+      ids.push(input.modelId);
+      return {
+        $metadata: { httpStatusCode: 200 },
+        body: (async function* () {
+          for (const event of turn) {
+            yield { chunk: { bytes: encoder.encode(JSON.stringify(event)) } };
+          }
+        })(),
+      };
+    };
+
+    await registerBedrockRouting({
+      runtime,
+      invoke,
+      invokeModelIdFor: invokeModelIdFor({ "us.anthropic.claude-opus-5": arn }),
+    });
+
+    await runtime
+      .streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] })
+      .result();
+
+    assert.deepEqual(ids, [arn]);
   });
 });

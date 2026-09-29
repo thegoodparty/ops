@@ -1,6 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 
+import { DEFAULT_MODEL_ID } from "../../bugboss/bedrock/defaults";
 import { TEST_DB_ENV_VAR } from "../../bugboss/testdb";
 
 const ACCOUNT_ID = "333022194791";
@@ -84,6 +85,38 @@ export const TEST_DB_URL = `postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@1
 // control of the incident system. `ops` has no `prod` tag value; prod-only
 // means `infra`. `Project` overrides the stack default of `ops`.
 const TAGS = { Environment: "infra", Project: "bugboss" };
+
+/**
+ * The model the agent is invoked through, so the spend is attributable.
+ *
+ * Bedrock puts no cost tag on an InvokeModel request. An application
+ * inference profile is the only mechanism AWS offers: a tagged wrapper you
+ * pass as `modelId`, whose usage then lands under those tags in Cost
+ * Explorer. Without it every dollar BugBoss spends is indistinguishable from
+ * every other Bedrock call in the account.
+ *
+ * It is not a control. Cost Explorer lags about a day, so nothing can be
+ * enforced on this. What it buys is the one number the local price table can
+ * be checked against -- which matters because that table is Pi's hardcoded
+ * per-model list, and the day AWS moves a rate it goes stale with nothing in
+ * an estimate that could say so. Every cost BugBoss reports is an estimate
+ * for that reason; this is how anyone ever finds out the estimate drifted.
+ *
+ * Opus only, deliberately. The agent's model is runtime-configurable through
+ * BUGBOSS_MODEL_ID and retunes from SSM without a deploy, so the mapping
+ * below is a map rather than a switch: a model nobody wrapped falls back to
+ * the bare id and loses its attribution, which is the right way round.
+ */
+// Account-qualified and regional, which is what a *system-defined inference
+// profile* ARN actually looks like -- verified against
+// `aws bedrock list-inference-profiles --type-equals SYSTEM_DEFINED`, which
+// returns exactly this string for us.anthropic.claude-opus-5. Two reviewers
+// read it as the empty-account form, so: that one
+// (`arn:aws:bedrock:us-west-2::foundation-model/...`) is a *foundation model*,
+// AWS-owned and therefore accountless, and it is the form in this resource's
+// own docstring example. A profile is an account resource. The task role's
+// `bedrock:InvokeModel*` statement below already assumes the same shape.
+const AGENT_INFERENCE_PROFILE_SOURCE = `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/${DEFAULT_MODEL_ID}`;
 
 export interface BugBossConfig {
   imageUri: pulumi.Input<string>;
@@ -446,6 +479,22 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
+  // `copyFrom` a system-defined inference profile is what makes this an
+  // application inference profile rather than a second cross-region one.
+  // The tags are the whole point of the resource: they are what Cost
+  // Explorer groups by, and they are the same TAGS everything else here
+  // carries so the spend lines up with the rest of BugBoss.
+  const agentInferenceProfile = new aws.bedrock.InferenceProfile(
+    "bugbossAgentInferenceProfile",
+    {
+      name: "bugboss-incident-agent",
+      description:
+        "Incident agent invocations, so Bedrock spend is attributable to BugBoss",
+      modelSource: { copyFrom: AGENT_INFERENCE_PROFILE_SOURCE },
+      tags: TAGS,
+    },
+  );
+
   const cluster = new aws.ecs.Cluster("bugbossCluster", {
     name: "bugboss",
     settings: [{ name: "containerInsights", value: "enabled" }],
@@ -491,6 +540,16 @@ export const createBugBoss = (config: BugBossConfig) => {
           // Postgres instead of trying to start one; bugboss/testdb refuses
           // anything but loopback here and alarms at boot if nothing answers.
           { name: TEST_DB_ENV_VAR, value: TEST_DB_URL },
+          // A map, keyed by the logical model id the agent is configured
+          // with. An entry that matches nothing costs a run its line in Cost
+          // Explorer and nothing else, which is what a retune to a model
+          // nobody wrapped has to do.
+          {
+            name: "BUGBOSS_INFERENCE_PROFILES",
+            value: pulumi.jsonStringify({
+              [DEFAULT_MODEL_ID]: agentInferenceProfile.arn,
+            }),
+          },
         ],
         // The whole secret as one JSON value rather than a key-per-env-var
         // map: the key list belongs to the application, and duplicating it
@@ -581,13 +640,11 @@ export const createBugBoss = (config: BugBossConfig) => {
     name: "bugboss",
     cluster: cluster.arn,
     taskDefinition: taskDefinition.arn,
-    // Held at zero deliberately. BugBoss is stopped while the Loki query
-    // overage that its incident agents can contribute to is fixed, and while
-    // its own bounds on that are still in review. Scaling it down live was
-    // not enough: Pulumi holds the desired count, so every ops deploy put it
-    // back and it restarted twice before this landed. Set it to 1 when
-    // turning it back on, rather than scaling the service by hand.
-    desiredCount: 0,
+    // Turning BugBoss off is a change to this line, not a manual scale.
+    // Pulumi owns the count, so scaling the service by hand is drift the
+    // next ops deploy silently undoes — which is how it came back twice on
+    // 2026-09-28 while it was meant to be stopped.
+    desiredCount: 1,
     launchType: "FARGATE",
     // Stop-then-start, and this is the one invariant the whole design rests
     // on: two tasks would put two processes on the same SQLite file and the

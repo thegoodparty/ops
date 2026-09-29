@@ -11,8 +11,40 @@ CREATE TABLE IF NOT EXISTS incident (
   id                TEXT PRIMARY KEY,
   status            TEXT NOT NULL CHECK (status IN
                       ('INVESTIGATING','FIXING','RESOLVED','CLOSED','MERGED')),
-  owner             TEXT NOT NULL CHECK (owner IN ('agent','human')),
+
+  -- Write-only, and permanently so. Nothing reads this: an open incident is
+  -- always driven by an agent, so there is no second thing for a column to
+  -- say. It is still declared and still written as the literal 'agent'
+  -- because it cannot safely be removed either way round.
+  --
+  -- Dropping it from this file is what the retirement rule asks for, and it
+  -- does not work here. That rule rests on the retired column having a
+  -- DEFAULT -- `costUsd` is REAL NOT NULL DEFAULT 0, so a database that keeps
+  -- it accepts an INSERT that stops naming it. This one is NOT NULL with no
+  -- default, so the same treatment makes every INSERT fail against the
+  -- restored snapshot, which is every write in production. SQLite has no
+  -- ALTER COLUMN, so the default cannot be added afterwards, and dropping the
+  -- column for real is a door that only opens one way: the previous image
+  -- reads it, so a rollback would meet a database it cannot boot against.
+  --
+  -- Writing a constant costs one word in one INSERT and keeps a fresh
+  -- database and a restored snapshot identical. A rollback is not merely
+  -- survivable but correct, since every row already says 'agent'.
+  owner             TEXT NOT NULL DEFAULT 'agent'
+                      CHECK (owner IN ('agent','human')),
   slackThreadTs     TEXT,
+  -- What this incident is, in a few words, kept current by the agent.
+  --
+  -- The row had rootCause, postmortem and usersImpacted and nothing that
+  -- said what the incident *was*, so a thread's top-level message stayed
+  -- whatever the first alert happened to say, forever. Incident 79 opened on
+  -- a memory alert and became the Loki 429 explosion, and there was nowhere
+  -- to write that down.
+  --
+  -- Length is bounded at the tool rather than here: past the limit the value
+  -- is refused with a sentence saying why, never truncated. See
+  -- SUMMARY_CHARS in slack/format.ts.
+  summary           TEXT,
 
   rootCause         TEXT,
   prUrls            TEXT NOT NULL DEFAULT '[]',   -- JSON array
@@ -54,11 +86,19 @@ CREATE TABLE IF NOT EXISTS incident (
   -- one: every merge to main restarts this container.
   attempts          INTEGER NOT NULL DEFAULT 0,
   modelId           TEXT,
-  costUsd           REAL NOT NULL DEFAULT 0,
+  -- Tokens, never dollars. Bedrock returns these; a price is arithmetic we do
+  -- against a table that goes stale the day AWS changes a rate, and a stored
+  -- dollar figure has nothing in it that could ever say so. These re-price
+  -- correctly forever, which is why a cost is derived at render time and
+  -- always labelled an estimate.
   tokensIn          INTEGER NOT NULL DEFAULT 0,
   tokensOut         INTEGER NOT NULL DEFAULT 0,
   cacheRead         INTEGER NOT NULL DEFAULT 0,
   cacheWrite        INTEGER NOT NULL DEFAULT 0,
+  -- The 1h share of cacheWrite. Re-pricing needs it: a 1h write costs 2x base
+  -- input against 1.25x for 5m, so a total with no split prices a long-cache
+  -- run as if it were a short-cache one and understates it by most of the gap.
+  cacheWrite1h      INTEGER NOT NULL DEFAULT 0,
   -- What the agent observed stop happening. RESOLVED is an evidence-based
   -- claim, so the evidence has to outlive the Slack message that carried it.
   resolvedEvidence  TEXT,
@@ -104,6 +144,26 @@ CREATE TABLE IF NOT EXISTS signal (
   closedAt          INTEGER,
   incidentId        TEXT REFERENCES incident(id),
   explained         INTEGER NOT NULL DEFAULT 0,
+
+  -- What triage spent deciding where this signal belongs. The work that
+  -- created this row, so it is costed on this row; an agent's spend lands on
+  -- incident instead.
+  --
+  -- Tokens and a modelId rather than dollars, for the reason the incident
+  -- row gives: a price table goes stale silently while tokens multiply out
+  -- correctly whenever they are asked. There is deliberately no costUsd
+  -- column here.
+  --
+  -- modelCalls is the guard, not decoration: a request that reached the model
+  -- always spends something, so calls above zero beside zero tokens means the
+  -- reader has drifted from what the provider reports rather than that triage
+  -- was free.
+  tokensIn          INTEGER NOT NULL DEFAULT 0,
+  tokensOut         INTEGER NOT NULL DEFAULT 0,
+  cacheRead         INTEGER NOT NULL DEFAULT 0,
+  cacheWrite        INTEGER NOT NULL DEFAULT 0,
+  modelCalls        INTEGER NOT NULL DEFAULT 0,
+  modelId           TEXT,
 
   CHECK (kind IN ('alert', 'error', 'bug_report', 'regression')),
   -- explained is relative to a root cause, so it is meaningless detached.
@@ -188,6 +248,48 @@ CREATE TABLE IF NOT EXISTS pending_wait (
   lastPingAt        INTEGER
 );
 
+-- An incident that is blocked on a person and must not be relaunched until
+-- something changes. Not ownership and not a hand-off: the agent still drives
+-- this incident, it simply has nothing to do until the wait ends.
+--
+-- This is the half of `owner = 'human'` that was load-bearing. That column did
+-- two jobs at once -- it stopped the relaunch and it said who had the work --
+-- and deleting it without replacing the first turns an agent that stops
+-- driving into a hot loop: the dispatcher relaunches on the next tick, the
+-- agent is immediately back in the state that stopped it, and it exits again,
+-- pinging the rotation every thirty seconds forever. A budget-exhausted agent
+-- is the case that makes this unavoidable.
+--
+-- It stops the relaunch. It does NOT free the dispatcher slot, and those are
+-- easy to conflate: an agent parked inside `monitor` is alive and still holds
+-- its slot, and that is deliberate. Suspend-and-resume was considered and
+-- ruled out, so a run that is merely waiting stays running.
+CREATE TABLE IF NOT EXISTS incident_wait (
+  incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  -- What is being waited on, in one line, for the thread and the digest.
+  waitingFor        TEXT NOT NULL,
+  -- Runnable again from this moment. NULL means nothing but a reply or the
+  -- stale sweep will lift it, which is the right shape for a wait on a person
+  -- with no deadline of its own.
+  wakeAt            INTEGER,
+  -- Whether a reply in the thread ends this wait.
+  --
+  -- Named for the rule rather than for who parked, because that is the
+  -- question a new caller has to answer: would somebody replying mean this
+  -- is over? Waiting on a person is yes, and it is the reason the delete in
+  -- `recordReply` reads no message and asks no model -- talking to an
+  -- incident wakes it, full stop. Waiting because the run is out of budget
+  -- is no: a reply adds no turns, so waking on one relaunches an agent that
+  -- exhausts again immediately and escalates again, which turned every
+  -- comment on the thread into a page for the rotation.
+  --
+  -- Defaults to lifting, which is both the older behaviour and the safer
+  -- side: a wait that lifts when it should not costs one relaunch, where one
+  -- that persists when it should not is a stall nobody is watching for.
+  liftsOnReply      INTEGER NOT NULL DEFAULT 1,
+  startedAt         INTEGER NOT NULL
+);
+
 -- Slack replies the Boss has relayed, which agents poll for.
 CREATE TABLE IF NOT EXISTS thread_reply (
   id                TEXT PRIMARY KEY,
@@ -227,3 +329,54 @@ CREATE TABLE IF NOT EXISTS incident_action (
 
 CREATE INDEX IF NOT EXISTS incident_action_incident_idx
   ON incident_action (incidentId, at);
+
+-- What the thread's top-level message is made of, so a header can be put
+-- above it without guessing at what is already there.
+--
+-- A table of its own rather than two columns on `incident`, because
+-- `getIncidentRow` is `SELECT *` and spreads the row, so anything added
+-- there arrives in the agent's `get_incident` result -- and the opening is
+-- the whole alert body, re-serialized into the prompt on every read. This is
+-- how the message is rendered, not what the incident is.
+--
+-- chat.update replaces a message wholesale and the only way to read the
+-- original back is conversations.replies, which is throttled to roughly one
+-- request a minute. So the opening is recorded when it is posted. An
+-- incident opened before this table existed has no row, and gets no header:
+-- the one answer that cannot destroy somebody's alert text.
+CREATE TABLE IF NOT EXISTS incident_thread (
+  incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  opening           TEXT NOT NULL,
+  -- The header last written above it, so the sweep can tell whether anything
+  -- changed rather than rewriting the message every thirty seconds. Compared
+  -- before the outbound link pass runs, so the value is stable.
+  header            TEXT
+);
+
+-- When the board last said something, so that saying it again is a decision
+-- rather than an accident of when this container restarted.
+--
+-- One row, and everything in it is persisted for the same reason: every
+-- merge to ops main restarts this process, so an in-memory schedule either
+-- fires twice or is skipped depending on the timing of a deploy. There is no
+-- cron here and there must not be one -- the sweep runs off the tick that
+-- already runs, and this table is the whole of its memory.
+CREATE TABLE IF NOT EXISTS board_state (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  -- The date of the last daily post, as YYYY-MM-DD in the board's own
+  -- timezone. A date and not a timestamp, deliberately: "has it been 24
+  -- hours" is the question that produces a double post on the day the clocks
+  -- go back and a skipped day when they go forward, and "is it still the
+  -- same day there" is the question that does not.
+  dailyOn           TEXT,
+  -- When the board was first seen empty in the current unbroken run of
+  -- empties, or NULL while something is open. The all-clear waits on this
+  -- rather than firing on a close, because a board that empties and refills
+  -- ninety seconds later would otherwise announce itself clear each time.
+  emptySince        INTEGER,
+  -- Whether the all-clear for the current run of empties has been posted.
+  -- Set on the first observation too, when that observation is already of an
+  -- empty board: a board this process never watched become empty is not an
+  -- event it can honestly announce.
+  clearAnnounced    INTEGER NOT NULL DEFAULT 0
+);

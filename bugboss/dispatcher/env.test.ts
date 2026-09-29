@@ -14,6 +14,7 @@ const input = (over: Partial<Parameters<typeof buildChildEnv>[0]> = {}) => ({
   token: "tok-1",
   sessionRef: null,
   deadlineAt: 1_699_000_000_000,
+  maxTurns: 200,
   attempt: 1,
   ...over,
 });
@@ -44,10 +45,21 @@ describe("buildChildEnv", () => {
       "BUGBOSS_ATTEMPT",
       "BUGBOSS_DEADLINE_AT",
       "BUGBOSS_INCIDENT_ID",
+      "BUGBOSS_MAX_TURNS",
       "BUGBOSS_TOKEN",
       "PATH",
     ]);
     assert.equal(hasAwsCredentialPath(env), false);
+  });
+
+  // The child builds its environment from nothing, so a bound the parent
+  // holds and does not hand down is a bound that does not exist: the agent
+  // falls back to its own default and BUGBOSS_MAX_TURNS in the task
+  // definition becomes a setting nobody can change and nothing reports.
+  it("hands the turn budget down, or it is a setting that does nothing", () => {
+    const env = buildChildEnv(input({ maxTurns: 40 }));
+
+    assert.equal(env.BUGBOSS_MAX_TURNS, "40");
   });
 
   it("passes the injected outbound credentials through", () => {

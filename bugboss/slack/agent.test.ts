@@ -7,18 +7,19 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
+import { indexIncident, toMatchQuery } from "../db/search";
 // The turn loop this agent runs on is named in the composition root, next to
 // the Bedrock client it drives. Its behaviour is the Slack agent's behaviour,
 // so it is tested here with the rest of that surface.
 import { createSlackAgentModel } from "../index";
-import type { ModelClient, ModelReply, ModelRequest } from "../triage";
+import { emptyModelUsage, ModelRequestFailed } from "../model";
+import type { ModelClient, ModelReply, ModelRequest, ModelUsage } from "../triage";
 import {
   MAX_SQL_ROWS,
   SLACK_AGENT_BUDGET_MS,
   SLACK_AGENT_MAX_TURNS,
   SLACK_AGENT_SYSTEM,
   SlackAgent,
-  assertReadOnlySql,
   buildTools,
   createMemoryThreadLock,
   incidentSessionPrefix,
@@ -97,7 +98,7 @@ const fakeModel = () => {
             state.gates.push(resolve);
           });
         }
-        return { text: state.reply };
+        return { text: state.reply, usage: emptyModelUsage() };
       },
     },
   };
@@ -169,9 +170,10 @@ beforeEach(async () => {
   await db.withWrite((d) => {
     d.prepare("DELETE FROM thread_reply").run();
     d.prepare("DELETE FROM signal").run();
+    d.prepare("DELETE FROM incident_thread").run();
     d.prepare("DELETE FROM incident").run();
     d.prepare(
-      "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES ('inc-1','INVESTIGATING','agent',1)",
+      "INSERT INTO incident (id, status, firstSignalAt) VALUES ('inc-1','INVESTIGATING',1)",
     ).run();
   });
 });
@@ -179,41 +181,6 @@ beforeEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("SQL access is read-only", () => {
-  test("the guard accepts reads", () => {
-    for (const sql of [
-      "SELECT * FROM incident",
-      "  select id from signal where explained = 0  ",
-      "WITH open AS (SELECT * FROM incident WHERE status='INVESTIGATING') SELECT count(*) FROM open",
-      "SELECT name, sql FROM sqlite_master WHERE type='table'",
-      "SELECT * FROM incident WHERE rootCause LIKE '%delete the row%'",
-      "SELECT 1 -- DROP TABLE incident",
-      "SELECT id FROM incident;",
-      "EXPLAIN QUERY PLAN SELECT * FROM signal WHERE incidentId = 'x'",
-    ]) {
-      assert.doesNotThrow(() => assertReadOnlySql(sql), sql);
-    }
-  });
-
-  test("the guard rejects every write shape", () => {
-    for (const sql of [
-      "DELETE FROM incident",
-      "UPDATE incident SET status='CLOSED'",
-      "INSERT INTO incident (id) VALUES ('x')",
-      "DROP TABLE incident",
-      "SELECT 1; DROP TABLE incident",
-      "SELECT 1;DELETE FROM signal",
-      "PRAGMA journal_mode = DELETE",
-      "ATTACH DATABASE '/tmp/evil.db' AS evil",
-      "VACUUM INTO '/tmp/copy.db'",
-      "DELETE FROM incident RETURNING id",
-      "WITH x AS (DELETE FROM signal RETURNING id) SELECT * FROM x",
-      "",
-      "   ",
-    ]) {
-      assert.throws(() => assertReadOnlySql(sql), `must reject: ${sql}`);
-    }
-  });
-
   test("the connection underneath is read-only, not just the guard", () => {
     // A guard is a message; this is the boundary. RETURNING makes it a
     // statement better-sqlite3 will happily run as a reader, so what stops it
@@ -231,11 +198,48 @@ describe("SQL access is read-only", () => {
 
   test("the tool refuses a write and leaves the row alone", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, query] = buildTools({ db, store });
     const out = await query.run({ sql: "DELETE FROM incident" });
 
     assert.match(out, /^Rejected: /);
     assert.equal(db.query("SELECT id FROM incident").length, 1);
+  });
+
+  // The Slack agent runs the same guard triage does now, so what it accepts
+  // and what it refuses is settled in triage/triage.test.ts. What is left to
+  // check here is the wiring: that a refusal still reaches the model as
+  // "Rejected: <reason>" carrying that guard's words, and that a query the
+  // shared guard accepts actually runs.
+  test("a refusal carries the shared guard's reason in this surface's shape", async () => {
+    const { store } = memoryStore();
+    const [, query] = buildTools({ db, store });
+
+    assert.equal(
+      await query.run({ sql: "SELECT 1; DROP TABLE incident" }),
+      "Rejected: one statement at a time; remove the extra ';'",
+    );
+    assert.equal(await query.run({ sql: "   " }), "Rejected: empty query");
+    assert.equal(
+      await query.run({ sql: "UPDATE incident SET status='CLOSED'" }),
+      "Rejected: read-only access: statements must start with SELECT, WITH or EXPLAIN",
+    );
+    assert.equal(
+      await query.run({ sql: "WITH t AS (SELECT 1) UPDATE incident SET status='CLOSED'" }),
+      "Rejected: read-only access: UPDATE is not allowed",
+    );
+  });
+
+  test("a read the guard accepts runs, semicolon and quoted keywords included", async () => {
+    const { store } = memoryStore();
+    const [, query] = buildTools({ db, store });
+
+    assert.match(await query.run({ sql: "SELECT id FROM incident;" }), /inc-1/);
+    assert.equal(
+      await query.run({
+        sql: "SELECT id FROM incident WHERE rootCause LIKE '%DROP TABLE%'",
+      }),
+      "0 rows.",
+    );
   });
 
   test("results are bounded", async () => {
@@ -249,7 +253,7 @@ describe("SQL access is read-only", () => {
     });
 
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, query] = buildTools({ db, store });
     const out = await query.run({ sql: "SELECT * FROM signal" });
 
     assert.equal(out.split("\n").length, MAX_SQL_ROWS + 1, "rows are capped");
@@ -265,11 +269,89 @@ describe("SQL access is read-only", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("search_incidents on the Slack agent", () => {
+  const searchTool = () => {
+    const { store } = memoryStore();
+    const tool = buildTools({ db, store }).find(
+      (t) => t.name === "search_incidents",
+    );
+    assert.ok(tool, "the Slack agent can reach the search triage has");
+    return tool;
+  };
+
+  const seedClosed = async () => {
+    await db.withWrite((w) => {
+      w.prepare("DELETE FROM incident_fts").run();
+      w.prepare(
+        `INSERT INTO incident
+           (id, status, owner, prUrls, firstSignalAt, resolvedAt, closedAt,
+            postmortem, rootCause, resolvedEvidence)
+         VALUES ('inc-old','CLOSED','agent','[]',1000,2000,3000,?,?,'the alert went quiet')`,
+      ).run(
+        "## Summary\nthe connection pool ran out under the morning spike",
+        "the connection pool was exhausted",
+      );
+      indexIncident(w, "inc-old");
+    });
+  };
+
+  /**
+   * Text that reduces to no searchable terms, and does so by the length rule
+   * rather than by the stopword list.
+   *
+   * `toMatchQuery` drops a term that is under MIN_TERM_CHARS *or* is a
+   * stopword. A fixture leaning on the second is tautological: a sentence of
+   * common words is unsearchable only for as long as those exact words stay
+   * on the list, and if one leaves it the input becomes a real search
+   * returning zero hits -- so this test would quietly stop distinguishing
+   * "nothing like this" from "no search ran" and still pass. The premise is
+   * asserted below rather than assumed, so shrinking either rule fails here
+   * loudly instead.
+   */
+  const UNSEARCHABLE = "a b c";
+
+  // The three answers the tool has to keep apart. Somebody asking "have we
+  // seen this before" gets a wrong answer from two of them collapsing: a
+  // search that never ran, reported as nothing found, reads as "this is new".
+  test("a hit, nothing in the corpus, and a search that never ran stay three answers", async () => {
+    await seedClosed();
+    const tool = searchTool();
+
+    const hit = await tool.run({ text: "connection pool exhausted" });
+    const nothing = await tool.run({ text: "certificate rotation expiry" });
+    const never = await tool.run({ text: UNSEARCHABLE });
+
+    // The fixture's premise, checked: this text reaches FTS5 with no query
+    // at all, while the other two do produce one. Without this the test
+    // rests on a word list it does not own.
+    assert.equal(toMatchQuery(UNSEARCHABLE), null, "the unsearchable fixture became searchable");
+    assert.notEqual(toMatchQuery("certificate rotation expiry"), null, "the empty-corpus fixture stopped searching");
+
+    assert.match(hit, /inc-old/);
+    assert.match(hit, /connection pool was exhausted/);
+    assert.match(nothing, /^0 matches/);
+    assert.match(never, /^error:/);
+    assert.match(never, /did not run/);
+    assert.notEqual(
+      nothing,
+      never,
+      "one answer for both is the bug: the agent cannot tell it failed to search",
+    );
+  });
+
+  test("the prompt tells the model the tool exists and how to read it", () => {
+    assert.match(SLACK_AGENT_SYSTEM, /- search_incidents:/);
+    assert.match(SLACK_AGENT_SYSTEM, /the search did not run/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
 describe("prefix binding", () => {
   test("the tool specs are byte-identical across builds and database states", async () => {
     const specs = () =>
       JSON.stringify(
-        buildTools({ db, store: memoryStore().store, linker: fakeLinker, threadTs: null }).map(
+        buildTools({ db, store: memoryStore().store }).map(
           ({ name, description, inputSchema }) => ({ name, description, inputSchema }),
         ),
       );
@@ -277,14 +359,20 @@ describe("prefix binding", () => {
     const before = specs();
     await db.withWrite((d) => {
       d.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES ('inc-2','FIXING','human',2)",
+        "INSERT INTO incident (id, status, firstSignalAt) VALUES ('inc-2','FIXING',2)",
       ).run();
     });
 
     assert.equal(specs(), before);
     assert.deepEqual(
-      buildTools({ db, store: memoryStore().store, linker: fakeLinker, threadTs: null }).map((t) => t.name),
-      ["get_incident", "query_incidents", "read_agent_session"],
+      buildTools({ db, store: memoryStore().store }).map((t) => t.name),
+      [
+        "get_incident",
+        "query_incidents",
+        "read_agent_session",
+        "search_incidents",
+        "incident_board",
+      ],
       "order is part of the prefix",
     );
   });
@@ -378,7 +466,7 @@ describe("the per-thread lock", () => {
         run: async () => {
           calls++;
           if (calls === 1) throw new Error("bedrock said no");
-          return { text: "second time lucky" };
+          return { text: "second time lucky", usage: emptyModelUsage() };
         },
       },
       config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
@@ -639,7 +727,7 @@ describe("reading another agent's session", () => {
       "sessions/incident/inc-1/session.jsonl",
       ["{\"role\":\"user\"}", "{\"role\":\"assistant\"}", "{\"role\":\"tool\"}"].join("\n"),
     );
-    const [, , read] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, , read] = buildTools({ db, store });
 
     const out = await read.run({ incidentId: "inc-1", tailLines: 2 });
     assert.match(out, /3 entries, last 2/);
@@ -648,7 +736,7 @@ describe("reading another agent's session", () => {
 
   test("a missing session says so rather than inventing one", async () => {
     const { store } = memoryStore();
-    const [, , read] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, , read] = buildTools({ db, store });
     const out = await read.run({ incidentId: "inc-404" });
     assert.match(out, /No session under sessions\/incident\/inc-404\//);
   });
@@ -656,7 +744,19 @@ describe("reading another agent's session", () => {
 
 // ---------------------------------------------------------------------------
 
-describe("an incident named outside its own thread is linkable", () => {
+/**
+ * Linking used to live here: the tools handed back a `threadPermalink` and
+ * the system prompt asked the model to write `<permalink|incident 4>` with
+ * it. A prompt instruction is followed probabilistically, so some answers
+ * linked and some did not and the casing wandered inside one message.
+ *
+ * Rendering is code now (`slack/incidents.ts`), running over every outbound
+ * message from every surface, and it is tested there and end to end. What is
+ * left here is the guard that the second mechanism does not come back: a
+ * model holding one way to link and the client holding another is the
+ * arrangement that produced the inconsistency.
+ */
+describe("the Slack agent hands back no links of its own", () => {
   const withThread = (id: string, threadTs: string) =>
     db.withWrite((d) => {
       d.prepare("UPDATE incident SET slackThreadTs = ? WHERE id = ?").run(
@@ -665,206 +765,40 @@ describe("an incident named outside its own thread is linkable", () => {
       );
     });
 
-  test("the model is handed the link when it is standing somewhere else", async () => {
+  test("get_incident reports the thread ts, never a url", async () => {
     await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "100.0",
-    });
+    const [get] = buildTools({ db, store: memoryStore().store });
 
     const out = await get.run({ incidentId: "inc-1" });
 
-    assert.match(
-      out,
-      new RegExp(`"threadPermalink": "${permalinkFor("400.0")}"`),
-      "a reader in another thread has no other way to reach it",
-    );
-  });
-
-  test("and denied it inside that incident's own thread", async () => {
-    await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "400.0",
-    });
-
-    const out = await get.run({ incidentId: "inc-1" });
-
-    // Withheld rather than merely discouraged: an instruction the model can
-    // forget is not what stops it linking to where the reader already is.
-    assert.match(out, /"threadPermalink": null/);
+    assert.match(out, /"slackThreadTs": "400.0"/, "the row is still whole");
+    assert.doesNotMatch(out, /threadPermalink/);
     assert.doesNotMatch(out, /goodparty\.slack\.com/);
   });
 
-  test("an incident with no thread yet has nothing to point at", async () => {
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "100.0",
-    });
-
-    const out = await get.run({ incidentId: "inc-1" });
-
-    assert.match(out, /"threadPermalink": null/);
-  });
-
-  test("a link Slack refuses costs the link, not the answer", async () => {
+  test("query_incidents does not decorate a row that names a thread", async () => {
     await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: { permalink: () => Promise.reject(new Error("ratelimited")) },
-      threadTs: "100.0",
-    });
-
-    let out = "";
-    const lines = await captureLogs(async () => {
-      out = await get.run({ incidentId: "inc-1" });
-    });
-
-    assert.match(out, /"id": "inc-1"/, "the incident is still reported");
-    assert.match(out, /"threadPermalink": null/, "and the model writes it bare");
-    assert.ok(
-      lines.some((line) => line.includes('"permalink_failed"')),
-      "degrading is not swallowing",
-    );
-  });
-
-  test("a whole query's worth of incidents is one round trip", async () => {
-    await db.withWrite((d) => {
-      const stmt = d.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 'agent', 1, ?)",
-      );
-      for (let i = 2; i <= 6; i++) stmt.run(`inc-${i}`, `${i}00.0`);
-    });
-    const asked: string[] = [];
-    const { store } = memoryStore();
-    const [, query] = buildTools({
-      db,
-      store,
-      linker: {
-        permalink: (ts) => {
-          asked.push(ts);
-          return Promise.resolve(permalinkFor(ts));
-        },
-      },
-      threadTs: "100.0",
-    });
+    const [, query] = buildTools({ db, store: memoryStore().store });
 
     const out = await query.run({
-      sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL ORDER BY id",
+      sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL",
     });
 
-    for (let i = 2; i <= 6; i++) {
-      assert.match(out, new RegExp(`"threadPermalink":"${permalinkFor(`${i}00.0`)}"`));
-    }
-    assert.deepEqual(asked.length, 5, "the fake learns nothing; the real one asks once");
-  });
-
-  test("Slack going down partway does not turn fifty rows into fifty waits", async () => {
-    await db.withWrite((d) => {
-      const stmt = d.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 'agent', 1, ?)",
-      );
-      for (let i = 2; i <= 6; i++) stmt.run(`inc-${i}`, `${i}00.0`);
-    });
-    let asked = 0;
-    const { store } = memoryStore();
-    const [, query] = buildTools({
-      db,
-      store,
-      linker: {
-        permalink: () => {
-          asked++;
-          return Promise.reject(new Error("ratelimited"));
-        },
-      },
-      threadTs: "100.0",
-    });
-
-    let out = "";
-    await captureLogs(async () => {
-      out = await query.run({
-        sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL ORDER BY id",
-      });
-    });
-
-    assert.equal(asked, 1, "it stops asking a Slack that just said no");
-    assert.equal(
-      out.split("\n").filter((l) => l.includes('"threadPermalink":null')).length,
-      5,
-      "and every row still comes back",
-    );
-  });
-
-  test("rows that are not incidents are left alone", async () => {
-    await db.withWrite((d) => {
-      d.prepare(
-        "INSERT INTO signal (id, source, sourceId, kind, title, body, openedAt) VALUES ('s-1','grafana','fp-1','alert','pool','b',1)",
-      ).run();
-    });
-    const { store } = memoryStore();
-    const [, query] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "100.0",
-    });
-
-    const out = await query.run({ sql: "SELECT id, title FROM signal" });
-
+    assert.match(out, /"inc-1"/);
     assert.doesNotMatch(out, /threadPermalink/);
   });
 
-  test("the thread the answer is written into is the one the tools are built for", async () => {
-    await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const posts: string[] = [];
-    const agent = new SlackAgent({
-      db,
-      store,
-      slack: {
-        ...fakeLinker,
-        post: (_threadTs, text) => {
-          posts.push(text);
-          return Promise.resolve({ ts: "x" });
-        },
-        replies: () => Promise.resolve([]),
-      },
-      // Standing in for the model doing what it is told: look the incident up
-      // and say what came back.
-      model: {
-        run: async (req) => ({ text: await req.tools[0].run({ incidentId: "inc-1" }) }),
-      },
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
-    });
-
-    await agent.handle(mention({ threadTs: "999.0", ts: "999.1" }));
-    assert.ok(
-      posts.join("").includes(permalinkFor("400.0")),
-      "asked about incident 1 from another thread, it has the link",
-    );
-
-    posts.length = 0;
-    await agent.handle(mention({ threadTs: "400.0", ts: "400.1" }));
-    assert.ok(
-      !posts.join("").includes(permalinkFor("400.0")),
-      "asked in incident 1's own thread, it has nothing to self-link with",
-    );
-  });
-
-  test("the prompt still tells the model to link", () => {
-    assert.match(SLACK_AGENT_SYSTEM, /threadPermalink/);
-    assert.match(SLACK_AGENT_SYSTEM, /<permalink\|incident 4>/);
+  /**
+   * The instruction that used to live here is what this change removed. It
+   * asked the model to write `<permalink|incident 4>` itself, and putting it
+   * back would not merely be redundant: an assembled link and a rendered one
+   * would nest.
+   */
+  test("the prompt no longer asks the model to build links itself", () => {
+    assert.doesNotMatch(SLACK_AGENT_SYSTEM, /<permalink\|/);
+    assert.doesNotMatch(SLACK_AGENT_SYSTEM, /assemble a Slack URL/);
+    assert.doesNotMatch(SLACK_AGENT_SYSTEM, /threadPermalink/);
+    assert.match(SLACK_AGENT_SYSTEM, /capitalised and linked to its thread for you/);
   });
 });
 
@@ -877,7 +811,7 @@ const countingTool = (results: string[]) => ({
   inputSchema: { type: "object" } as Record<string, unknown>,
   run: (input: Record<string, unknown>) => {
     results.push(String(input.incidentId));
-    return Promise.resolve(`${String(input.incidentId)} is FIXING, owner agent`);
+    return Promise.resolve(`${String(input.incidentId)} is FIXING, an agent is on it`);
   },
 });
 
@@ -905,6 +839,7 @@ describe("a run that uses its whole budget", () => {
           return Promise.resolve({
             text: "Two of the three are open and I read inc-1; I did not reach inc-2.",
             toolCalls: [],
+            usage: emptyModelUsage(),
           } satisfies ModelReply);
         }
         return Promise.resolve({
@@ -916,6 +851,7 @@ describe("a run that uses its whole budget", () => {
               input: { incidentId: "inc-1" },
             },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -963,6 +899,7 @@ describe("a run that uses its whole budget", () => {
           toolCalls: [
             { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -989,7 +926,11 @@ describe("a run that uses its whole budget", () => {
         if (request.tools.length === 0) {
           return wrapUpFails
             ? Promise.reject(new Error("bedrock throttled"))
-            : Promise.resolve({ text: "", toolCalls: [] } satisfies ModelReply);
+            : Promise.resolve({
+                text: "",
+                toolCalls: [],
+                usage: emptyModelUsage(),
+              } satisfies ModelReply);
         }
         // The second mention answers straight away, so what it is asked with
         // is the transcript the failed run left behind.
@@ -997,6 +938,7 @@ describe("a run that uses its whole budget", () => {
           return Promise.resolve({
             text: "inc-1 is still being worked.",
             toolCalls: [],
+            usage: emptyModelUsage(),
           } satisfies ModelReply);
         }
         return Promise.resolve({
@@ -1004,6 +946,7 @@ describe("a run that uses its whole budget", () => {
           toolCalls: [
             { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -1030,7 +973,7 @@ describe("a run that uses its whole budget", () => {
     );
   });
 
-  test("says what happened when the wrap-up has nothing to say either", async () => {
+  test("says it ran out of steps, and how many, when the wrap-up has nothing either", async () => {
     const { store } = memoryStore();
     // Burns every turn on tool calls, so the budget really does run out, and
     // then answers the wrap-up with nothing.
@@ -1038,12 +981,17 @@ describe("a run that uses its whole budget", () => {
       complete: (request) =>
         Promise.resolve(
           request.tools.length === 0
-            ? ({ text: "", toolCalls: [] } satisfies ModelReply)
+            ? ({
+                text: "",
+                toolCalls: [],
+                usage: emptyModelUsage(),
+              } satisfies ModelReply)
             : ({
                 text: "",
                 toolCalls: [
                   { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
                 ],
+                usage: emptyModelUsage(),
               } satisfies ModelReply),
         ),
     };
@@ -1056,8 +1004,59 @@ describe("a run that uses its whole budget", () => {
       answer = result.text;
     });
 
-    assert.match(answer, /narrow the question/);
+    // The four minutes of silence are the only thing the reader experienced,
+    // so the reply has to name what caused them and how much it bought.
+    assert.match(answer, /ran out of steps/);
+    assert.match(answer, /\b4\b/, "and how many, so the wait has a size");
+    assert.match(
+      answer,
+      /under a minute|about a minute|about \d+ minutes/,
+      "and how long, which is what they actually waited",
+    );
+    assert.match(answer, /narrow it instead/);
+    // Asking again spends the same budget the same way, so advice to do that
+    // costs the reader another wait for the same non-answer.
+    assert.doesNotMatch(answer, /[Aa]sk me again/);
+    // A pointer to a log group is a second task for somebody already in the
+    // middle of one, and whoever owns the budget has the alarm already.
+    assert.doesNotMatch(answer, /logs/);
     assert.ok(lines.some((l) => l.includes("slack_agent_turns_exhausted")));
+    assert.ok(lines.some((l) => l.includes("slack_agent_no_answer")));
+    // The wrap-up answered, it just answered with nothing, so it never threw
+    // and `wrap_up_failed` never fired. That is how a run holding everything
+    // it read posted an apology with nobody told.
+    assert.ok(lines.some((l) => l.includes("slack_agent_wrap_up_empty")));
+    assert.ok(!lines.some((l) => l.includes("slack_agent_wrap_up_failed")));
+  });
+
+  test("does not claim it ran out of steps when it did not", async () => {
+    // One turn, no tool calls, no text. The budget was never touched, so
+    // blaming it would be a fabrication and "ask me again" is the right
+    // advice rather than the wrong one.
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: () =>
+        Promise.resolve({
+          text: "",
+          toolCalls: [],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply),
+    };
+
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run(
+        runRequest([countingTool([])], 4),
+      );
+      answer = result.text;
+    });
+
+    assert.doesNotMatch(answer, /ran out of steps/);
+    assert.match(answer, /Ask me again/);
+    assert.ok(
+      !lines.some((l) => l.includes("slack_agent_turns_exhausted")),
+      "nothing was exhausted",
+    );
     assert.ok(lines.some((l) => l.includes("slack_agent_no_answer")));
   });
 });
@@ -1083,6 +1082,7 @@ describe("the turn budget", () => {
             toolCalls: turn === 1
               ? [{ id: "q", name: "get_incident", input: { incidentId: "inc-0" } }]
               : [],
+            usage: emptyModelUsage(),
           } satisfies ModelReply);
         }
         return Promise.resolve({
@@ -1094,6 +1094,7 @@ describe("the turn budget", () => {
               input: { incidentId: `inc-${turn}` },
             },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -1180,6 +1181,101 @@ describe("asking the right tool", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("what a question cost", () => {
+  const spent = (tokens: number): ModelUsage => ({
+    tokensIn: tokens,
+    tokensOut: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    costUsd: tokens / 1000,
+    modelId: "anthropic.test",
+    calls: 1,
+  });
+
+  test("every turn is banked, the wrap-up included", async () => {
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: (request) =>
+        Promise.resolve(
+          request.tools.length === 0
+            ? ({
+                text: "inc-1 is being worked, and that is as far as I got.",
+                toolCalls: [],
+                usage: spent(5),
+              } satisfies ModelReply)
+            : ({
+                text: "",
+                toolCalls: [
+                  { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+                ],
+                usage: spent(100),
+              } satisfies ModelReply),
+        ),
+    };
+
+    let usage = emptyModelUsage();
+    await captureLogs(async () => {
+      usage = (
+        await createSlackAgentModel(model, store).run(runRequest([countingTool([])], 2))
+      ).usage;
+    });
+
+    assert.equal(usage.calls, 3, "two turns and the wrap-up");
+    assert.equal(usage.tokensIn, 205);
+    assert.equal(usage.modelId, "anthropic.test");
+  });
+
+  // A wrap-up that failed still spent what it spent, and this is the run that
+  // most needs costing: it is the one that cost the most and answered least.
+  test("a wrap-up that throws still reports what it spent", async () => {
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: (request) =>
+        request.tools.length === 0
+          ? Promise.reject(new ModelRequestFailed("bedrock throttled", spent(7)))
+          : Promise.resolve({
+              text: "inc-1 is being worked.",
+              toolCalls: [
+                { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+              ],
+              usage: spent(100),
+            } satisfies ModelReply),
+    };
+
+    let usage = emptyModelUsage();
+    await captureLogs(async () => {
+      usage = (
+        await createSlackAgentModel(model, store).run(runRequest([countingTool([])], 1))
+      ).usage;
+    });
+
+    assert.equal(usage.calls, 2, "the failed wrap-up is a call that happened");
+    assert.equal(usage.tokensIn, 107);
+  });
+
+  test("the answered line carries the tokens", async () => {
+    const { store } = memoryStore();
+    const slack = fakeSlack();
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: slack.client,
+      model: { run: () => Promise.resolve({ text: "two are open.", usage: spent(120) }) },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+    });
+
+    const lines = await captureLogs(() => agent.handle(mention()));
+    const answered = lines.find((l) => l.includes('"event":"answered"'));
+    assert.ok(answered, "the run was answered");
+    const parsed = JSON.parse(answered) as Record<string, unknown>;
+    assert.equal(parsed.tokensIn, 120);
+    assert.equal(parsed.modelCalls, 1);
+    assert.equal(parsed.modelId, "anthropic.test");
+  });
+});
+
+// ---------------------------------------------------------------------------
+
 describe("read_agent_session", () => {
   const sessionKeyFor = (id: string) => `sessions/incident/${id}/session.jsonl`;
 
@@ -1189,7 +1285,7 @@ describe("read_agent_session", () => {
   const readSession = async (lines: string[]) => {
     const { store, objects } = memoryStore();
     objects.set(sessionKeyFor("inc-1"), lines.join("\n"));
-    const tools = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const tools = buildTools({ db, store });
     const tool = tools.find((t) => t.name === "read_agent_session");
     assert.ok(tool);
     return tool.run({ incidentId: "inc-1" });
@@ -1217,6 +1313,24 @@ describe("read_agent_session", () => {
     );
     // And it survives the cut, because it is in the head the cap keeps.
     assert.match(out, /was killed after 20000 turns/);
+  });
+
+  // The Slack agent is what a human asks "what did incident 7 cost", and it
+  // answers out of this tool result. A dollar figure that does not say it is
+  // an estimate gets quoted back as though somebody had seen a bill.
+  test("reports spend, and never states the dollar figure as a fact", async () => {
+    const priced = JSON.stringify({
+      type: "message",
+      message: {
+        role: "assistant",
+        model: "us.anthropic.claude-opus-5",
+        usage: { input: 10, output: 20, cacheRead: 300, cacheWrite: 40, cost: { total: 18.51 } },
+      },
+    });
+    const out = await readSession([priced, priced]);
+    assert.match(out, /spend: 2 turns, 740 tokens on us\.anthropic\.claude-opus-5/);
+    assert.match(out, /estimated cost \$37\.02/);
+    assert.match(out, /not an invoiced figure/);
   });
 
   test("says a run ended on purpose when it did", async () => {

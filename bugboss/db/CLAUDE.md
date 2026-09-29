@@ -63,6 +63,50 @@ is applied nowhere that matters.
   a throwaway in-memory database built from the same DDL, so SQLite parses
   the schema and no comment, table-level `CHECK` or virtual-table directive
   can be mistaken for a column.
+- **Removing a column is one edit, not two**, and the asymmetry from adding
+  one is real rather than an oversight. Delete it from `schema.sql` and stop
+  naming it in SQL. A database that already exists keeps the column and
+  nothing catches it up: a column nothing reads and nothing writes costs a few
+  bytes a row, and an `ALTER TABLE DROP COLUMN` that never runs can never
+  fail.
+
+  What makes that safe is the **default**. `costUsd` is `REAL NOT NULL DEFAULT
+  0`, so a restored snapshot still accepts an `INSERT` that has stopped naming
+  it. That is the whole discriminator, and the next bullet is the case where
+  it does not hold.
+- **A `NOT NULL` column with no default cannot be retired that way.** The same
+  treatment makes every `INSERT` fail against the restored snapshot, which is
+  every write in production and none in the suite, because a test opens a
+  fresh file and a fresh file is built from the current `schema.sql`. SQLite
+  has no `ALTER COLUMN`, so the default cannot be added to the existing column
+  afterwards; that is verified, not assumed. Dropping the column for real
+  works mechanically and is a door that only opens one way: the previous image
+  reads it, so a rollback meets a database it cannot boot against.
+
+  So the column is **kept, declared and written, and read by nothing**.
+  `incident.owner` is the one. `schema.sql` declares it `NOT NULL DEFAULT
+  'agent'`, and the single `INSERT INTO incident` in `toolapi/assign.ts`
+  writes the literal `'agent'`. One word in one statement keeps a fresh
+  database and a restored snapshot identical.
+
+  `settleOwnerToAgent` runs at boot and sets the column to `'agent'` on every
+  row that is not already. It changes nothing in this image, because nothing
+  reads the column here. It is there for the one reader that still exists:
+  the **previous** image, if a deploy is rolled back. That build filters the
+  dispatcher on `owner = 'agent'`, so a row left saying `'human'` would come
+  back stranded exactly as it is now. Between the settle and the constant,
+  a rollback is not merely survivable but correct. It is idempotent and
+  matches nothing after the first boot, which is why it is cheap to run on
+  every one.
+
+  `describe("the write-only owner column")` in `index.test.ts` is what holds
+  all of that, because none of it is visible from a fresh file. It builds a
+  fixture snapshot whose copy of the column has *no* default, which is
+  production's shape, and asserts that a write goes through, that booting over
+  it reports no `schema_drift` (only the declared type is compared, which is
+  what makes the differing default survivable), that a seeded `'human'` row
+  comes back `'agent'`, that the `INSERT` still names the column and still
+  writes `'agent'`, and that no query in the package reads it back.
 - **`CHECK` constraints cannot** be added at all. SQLite has no `ALTER TABLE
   ADD CHECK`, so adding one needs a table rebuild that does not exist here.
   The cross-field constraints landed while the database was empty; that
@@ -72,6 +116,28 @@ is applied nowhere that matters.
 The constraints are there because every invariant in this system was
 otherwise a comment plus a hand-written `if`, and three of them turned out
 to be reachable.
+
+## Triage's spend is on the signal row
+
+Six columns on `signal` -- `tokensIn`, `tokensOut`, `cacheRead`, `cacheWrite`,
+`modelCalls`, `modelId` -- and no `costUsd`, matching `incident`. Tokens plus a
+model id multiply out correctly after a price change; a stored dollar figure is
+a guess frozen at write time. Anything showing a person a dollar figure derives
+it and says it is an estimate.
+
+They are written accumulating, not replacing. `rollUpUsage` re-reads the whole
+session file so its total is absolute and a `SET` is right there; a triage
+decision knows only what it just spent, and a signal nothing ever placed is
+triaged again on its next delivery.
+
+`modelCalls` is the guard rather than a statistic. A request that reached the
+model always spends something, so calls above zero beside zero tokens means a
+reader has drifted from what the provider returns -- and that alarms instead of
+recording a decision that cost nothing.
+
+The columns are deliberately absent from `SignalView`, which is what the
+investigating agent gets from `get_incident`. Six numbers per signal, on every
+read, about a decision it is not working on.
 
 ## Uniqueness on signals
 
@@ -85,6 +151,25 @@ That index cannot serve the recurrence lookup itself, though: it is partial
 on `closedAt IS NULL`, and every signal a resolution closed has a `closedAt`.
 `signal_source_idx` is the same key without the partial clause, read once per
 inbound delivery by `triage/recurrence.ts`.
+
+## Two tables that are not incident state
+
+**`incident_thread`** holds how a thread's top-level message is rendered: the
+text it was opened with, and the header last written above it. It is a table
+rather than two columns on `incident` because `getIncidentRow` is `SELECT *`
+and spreads the row, so anything added there arrives in the agent's
+`get_incident` result — and the opening is the whole alert body, re-serialized
+into the prompt on every read.
+
+The opening is recorded when the relay posts it. `chat.update` replaces a
+message wholesale and the only way to read the original back is
+`conversations.replies`, throttled to roughly one request a minute. An
+incident with no row gets no header, which is the one answer that cannot
+delete somebody's alert text.
+
+**`board_state`** is one row, and it is the whole memory of everything
+recurring the board does. See `board/CLAUDE.md` for why every field in it is
+persisted and why `dailyOn` is a date rather than a timestamp.
 
 ## `incident_fts` is derived, not migrated
 

@@ -81,18 +81,29 @@ runner: a column added to a live table would exist in the file and never in
 production. `incident_action` already is the ledger of what happened to an
 incident.
 
-## Tokens and the model are the record; dollars are derived
+## Tokens are the record; the dollar line is an estimate and says so
 
-Pricing moves, so a stored dollar figure is a guess frozen at write time while
-tokens plus `modelId` multiply out correctly whenever anyone asks
-(`docs/architecture.md`). The report prints both and says which is which: the
-token table is the record, and the dollar line is what **Pi** priced the run
-at as it ran, read back out of the same session file. Nothing here holds a
-price list, and `costUsd` on the incident row stays unwritten.
+Bedrock returns tokens. A price is arithmetic we do locally against a table
+that goes stale silently when a rate moves, so there is no cost column and
+nothing here holds a price list (`docs/architecture.md`). The report prints
+both and names which is which: the token table is the record, and the dollar
+line is what **Pi** priced the run at as it ran, read back out of the same
+session file and labelled `Estimated cost`.
 
-`turns` comes from that file too, so both are simply missing once it ages out
-under the S3 lifecycle rule while the row's tokens survive. Missing renders as
-"not recorded" — never as zero, which reads as a free run.
+The label is load-bearing, not manners. The figure reaches a Slack summary
+and a document a person reads months later, and an unhedged number is quoted
+back as though somebody had seen a bill. `estimatedCostUsd` is named that on
+`ReportRun` for the same reason.
+
+`Cache write (1h)` is its own row because it does not price like the rest of
+the write: 2x base input against 1.25x for 5m, and every run here asks for
+the long cache (`bedrock/CLAUDE.md`). A re-pricing that only had the total
+would understate a run by most of that gap.
+
+`turns` and the estimate come from the session file, so both are simply
+missing once it ages out under the S3 lifecycle rule while the row's tokens
+survive. Missing renders as "not recorded" — never as zero, which reads as a
+free run.
 
 ## It is the only reader of the recurrence answer
 

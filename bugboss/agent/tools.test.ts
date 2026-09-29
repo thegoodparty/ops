@@ -9,10 +9,13 @@ import {
   CONTACT_HUMAN_MESSAGE_LIMIT,
   createContactHumanTool,
   createMonitorTool,
-  HEARTBEAT_ECHO_CHARS,
-  HEARTBEAT_MAX_PINGS,
+  MONITOR_FIELD_LIMIT,
+  HEARTBEAT_LOUD_AFTER_PINGS,
+  HEARTBEAT_MAX_GAP_SECONDS,
   directiveTimestampMillis,
+  escalationText,
   firstReplyAfter,
+  heartbeatGapSeconds,
   insideWorkingHours,
   parseWorkingHours,
   runContactHuman,
@@ -20,7 +23,8 @@ import {
   heartbeatMessage,
   shellProbe,
   stalledWaitBrief,
-  truncateOutput,
+  statusExcerpt,
+  STATUS_EXCERPT_CHARS,
   unansweredBrief,
   type HeartbeatDeps,
   type HumanContactPort,
@@ -59,6 +63,7 @@ test("monitor returns as soon as the command exits 0", async () => {
     output: "MERGED\n",
     timedOut: false,
     escalation: null,
+    rejected: null,
     directives: [],
   });
   assert.equal(calls.length, 1);
@@ -113,17 +118,56 @@ test("monitor stops when the turn is aborted", async () => {
   assert.equal(result.timedOut, true);
 });
 
-test("monitor output is capped", async () => {
+test("monitor's description does not tell the agent to pre-summarise", async () => {
+  // A cap removed from the code and left standing in the tool description is
+  // the same bug one layer up: the agent reads "output is capped" and narrows
+  // the probe command itself, throwing the evidence away voluntarily. So the
+  // instruction and the behaviour are asserted as one thing -- the tool says
+  // output comes back whole, and it does.
+  const tool = await createMonitorTool({
+    probe: async () => ({ code: 0, output: "x".repeat(50_000) }),
+  });
+
+  assert.doesNotMatch(
+    tool.description,
+    /output is capped/i,
+    "the description promises a cap that no longer exists",
+  );
+  assert.match(tool.description, /whole/i);
+
+  const out = await tool.execute(
+    "c1",
+    {
+      command: "cat huge",
+      intervalSeconds: 1,
+      timeoutSeconds: 1,
+      description: "a big log",
+    } as never,
+    new AbortController().signal,
+    undefined,
+    {} as never,
+  );
+  const text = out.content[0].type === "text" ? out.content[0].text : "";
+  assert.ok(
+    text.includes("x".repeat(50_000)),
+    "the description says whole and the tool must deliver whole",
+  );
+});
+
+test("monitor hands back everything the probe printed", async () => {
+  // What the cap used to take was the middle, and a monitor is most often
+  // waiting on something whose interesting line is in the middle: the failing
+  // job in a CI summary, the one pod that will not come up. Pi compacts the
+  // conversation to make room now, so the evidence is not what gives way.
+  const needle = "NEEDLE_IN_THE_MIDDLE";
+  const output = `${"x".repeat(25_000)}${needle}${"x".repeat(25_000)}`;
   const result = await runMonitor(
     { command: "cat huge", intervalSeconds: 1, timeoutSeconds: 1, description: "a big log" },
-    { probe: async () => ({ code: 0, output: "x".repeat(50000) }), maxOutputChars: 1000 },
+    { probe: async () => ({ code: 0, output }) },
   );
 
-  // Against the cap itself, not a loose multiple of it: `truncateOutput`
-  // holds its cap exactly, and a caller that checks a looser number is a
-  // caller that would not notice it slipping again.
-  assert.ok(result.output.length <= 1000, `capped output was ${result.output.length}`);
-  assert.match(result.output, /characters elided/);
+  assert.equal(result.output, output);
+  assert.ok(result.output.includes(needle));
 });
 
 test("the real probe reports exit codes from the shell", async () => {
@@ -132,72 +176,26 @@ test("the real probe reports exit codes from the shell", async () => {
   assert.equal(failure.code, 3);
 });
 
-test("truncateOutput leaves small output alone", () => {
-  assert.equal(truncateOutput("short", 1000), "short");
+test("statusExcerpt leaves output that fits completely alone", () => {
+  assert.equal(statusExcerpt("  short  "), "short");
+  assert.equal(statusExcerpt("   "), "(no output)");
+  const exact = "z".repeat(STATUS_EXCERPT_CHARS);
+  assert.equal(statusExcerpt(exact), exact);
 });
 
-test("truncateOutput holds its cap at every size and budget", () => {
-  // The contract, asserted directly rather than at whichever input somebody
-  // happened to have in hand. The old cap overshot by the length of the
-  // marker naming what it dropped, and that marker grows with the number it
-  // prints -- so every caller's margin shrank as its inputs grew, which is
-  // the opposite of what a margin is for.
-  const sizes = [0, 1, 39, 199, 1000, 100_000, 10_000_000];
-  const budgets = [0, 1, 10, 30, 39, 40, 200, 400, 1000, 20_000];
-
-  for (const size of sizes) {
-    const text = "z".repeat(size);
-    for (const maxChars of budgets) {
-      const capped = truncateOutput(text, maxChars);
-      assert.ok(
-        capped.length <= maxChars,
-        `${size} characters capped at ${maxChars} came back as ${capped.length}`,
-      );
-      // At or under the cap nothing is a truncation, so nothing may change:
-      // an elision marker on an output that fits sends a reader looking for
-      // text that never existed.
-      if (size <= maxChars) assert.equal(capped, text);
-    }
-  }
-});
-
-test("truncateOutput still marks the cut when the marker outgrows the budget", () => {
-  // Nothing here passes a budget this small -- the tightest clamp in this
-  // file is 200 -- so it is a caller bug rather than an input, and the
-  // answer to one is to be loud about it, not to quietly hand back more
-  // than was asked for or a cut nobody can see.
-  for (const maxChars of [40, 30, 10, 1]) {
-    const capped = truncateOutput("y".repeat(5000), maxChars);
-    assert.equal(capped.length, maxChars, `cap ${maxChars} was not honoured`);
-    assert.ok(
-      /characters elided/.test(capped) || capped.endsWith("…"),
-      `cap ${maxChars} truncated without saying so: ${JSON.stringify(capped)}`,
-    );
-  }
-  assert.equal(truncateOutput("y".repeat(5000), 0), "");
-});
-
-test("truncateOutput's marker names the count it actually dropped", () => {
-  // Sized at the heartbeat echo clamp, which is where the old overshoot
-  // actually bit: the marker is a fixed ~39 characters and the old slices
-  // left it a tenth of the budget, so a small cap overshot every time.
-  // The marker has to survive the fix -- truncation a reader cannot see is
-  // the silent failure this file is built against -- and it has to keep
-  // telling the truth once the slices are sized around it.
+test("statusExcerpt keeps the head, shows the cut, and counts nothing", () => {
+  // The shape is the change. The old helper cut the middle out and said
+  // `[... 549 characters elided ...]`, which went into a Slack message
+  // somebody read on a phone: a count of what they are missing is not
+  // something anybody can act on, and the middle is where the answer
+  // usually is. A reader who wants all of it runs the check.
   const text = "q".repeat(5000);
-  const capped = truncateOutput(text, HEARTBEAT_ECHO_CHARS);
-  const split = /\n\n\[\.\.\. (\d+) characters elided \.\.\.\]\n\n/.exec(capped);
+  const excerpt = statusExcerpt(text);
 
-  assert.ok(split, `no elision marker in ${JSON.stringify(capped)}`);
-  assert.ok(capped.length <= HEARTBEAT_ECHO_CHARS);
-
-  const head = capped.slice(0, split.index);
-  const tail = capped.slice(split.index + split[0].length);
-  assert.ok(text.startsWith(head), "the head is the start of the input");
-  assert.ok(text.endsWith(tail), "the tail is the end of the input");
-  assert.equal(Number(split[1]), text.length - head.length - tail.length);
-  // Roughly twice as much head as tail, which is the shape callers read.
-  assert.ok(head.length > tail.length);
+  assert.ok(excerpt.length <= STATUS_EXCERPT_CHARS + 1, `came back as ${excerpt.length}`);
+  assert.ok(text.startsWith(excerpt.slice(0, -1)), "what is kept is the head");
+  assert.ok(excerpt.endsWith("\u2026"), "the cut is visible");
+  assert.doesNotMatch(excerpt, /\d+ characters/);
 });
 
 const fakeContact = (pending: PendingQuestion | null = null) => {
@@ -233,8 +231,10 @@ const fakeContact = (pending: PendingQuestion | null = null) => {
 };
 
 /**
- * The hand-off port the harness reaches for when nobody answers. Recording,
- * because the assertion that matters is that ownership actually moved.
+ * The escalation port the harness reaches for when nobody answers.
+ * Recording, because the assertion that matters is that the rotation was
+ * actually told: the call writes nothing, so the only evidence it happened
+ * is that it was made and what it said.
  */
 const recordingEscalate = (
   response: { ok: boolean; error?: string; directives?: Directive[] } = { ok: true },
@@ -243,7 +243,7 @@ const recordingEscalate = (
   return {
     calls,
     port: {
-      handOff: async (args: { reason: string; brief: string }) => {
+      escalate: async (args: { reason: string; brief: string }) => {
         calls.push(args);
         return {
           ok: response.ok,
@@ -335,7 +335,7 @@ test("a resumed agent resumes waiting instead of asking twice", async () => {
   assert.equal(state.recorded, 0);
 });
 
-test("a question nobody answers becomes a hand-off, not a longer wait", async () => {
+test("a question nobody answers gets loud, and the agent keeps the incident", async () => {
   const clock = fakeClock();
   const { state, port } = fakeContact();
   const escalate = recordingEscalate();
@@ -358,13 +358,18 @@ test("a question nobody answers becomes a hand-off, not a longer wait", async ()
     reply: null,
     timedOut: true,
     directives: [],
-    terminate: true,
+    // The escalation moved nothing, so silence is not a reason to stop: the
+    // agent is still the only thing that can finish this incident, and a run
+    // that exited here would leave it with nobody driving it at all.
+    terminate: false,
     rejected: null,
-    escalation: { handedOff: true, reason: "no reply in 10 minutes" },
+    escalation: { told: true, reason: "no reply in 10 minutes" },
   });
-  assert.equal(escalate.calls.length, 1, "owner has to actually move to a human");
+  assert.equal(escalate.calls.length, 1, "the rotation has to actually be told");
   assert.match(escalate.calls[0].brief, /What I asked/);
   assert.match(escalate.calls[0].brief, /anyone\?/);
+  // The question is no longer outstanding: it was asked, it went unanswered,
+  // and that has now been said out loud. A later ask starts its own wait.
   assert.equal(state.cleared, 1);
   assert.equal(state.pending, null);
 });
@@ -394,12 +399,12 @@ test("a wait shorter than the floor is raised to it, not answered early", async 
   assert.equal(escalate.calls[0].reason, "no reply in 10 minutes");
 });
 
-test("a failed automatic hand-off leaves the incident with the agent, loudly", async () => {
+test("a failed escalation says nobody was told, so the agent says it itself", async () => {
   const clock = fakeClock();
   const { port } = fakeContact();
   const escalate = recordingEscalate({
     ok: false,
-    error: "could not post the hand-off brief",
+    error: "could not post the brief",
   });
   const api = directiveFeed([]);
 
@@ -419,13 +424,18 @@ test("a failed automatic hand-off leaves the incident with the agent, loudly", a
     {} as never,
   );
 
-  assert.equal(result.terminate, false, "nobody was told, so the agent still has it");
+  // An unanswered question never terminates now, told or untold. The
+  // difference the failure makes is what the model is asked to do next: a
+  // landed escalation is already in the thread, an unsent one is not, and
+  // only the model can put it there.
+  assert.equal(result.terminate, false);
   const text = String(result.content[0].type === "text" && result.content[0].text);
-  assert.match(text, /could not post the hand-off brief/);
-  assert.match(text, /Call hand_off yourself now/);
+  assert.match(text, /could not post the brief/);
+  assert.match(text, /Nobody has been told/);
+  assert.match(text, /say it in the thread yourself/);
 });
 
-test("directives collected by the escalating hand-off are handed back", async () => {
+test("directives the escalation drained are handed back", async () => {
   const clock = fakeClock();
   const { port } = fakeContact();
   const escalate = recordingEscalate({
@@ -550,7 +560,7 @@ test("the escalation clock runs from the question, not from this process", async
   const clock = fakeClock();
   // A marker 700 seconds old: the agent asked, the container died, and the
   // replacement replays the call. A fresh wait here would let a crash loop
-  // defer the hand-off for as long as the crashes last.
+  // defer the escalation for as long as the crashes last.
   const { port } = fakeContact({
     message: "anyone?",
     messageTs: "ts-1",
@@ -575,7 +585,7 @@ test("the escalation clock runs from the question, not from this process", async
   assert.equal(result.escalation?.reason, "no reply in 12 minutes");
 });
 
-test("a failed hand-off keeps the marker, so the next attempt does not restart the wait", async () => {
+test("a failed escalation keeps the marker, so the next attempt does not restart the wait", async () => {
   const clock = fakeClock();
   const { state, port } = fakeContact();
   const escalate = recordingEscalate({ ok: false, error: "Slack is down" });
@@ -597,7 +607,7 @@ test("a failed hand-off keeps the marker, so the next attempt does not restart t
   assert.equal(state.pending?.message, "anyone?");
 });
 
-test("a stop the failed hand-off drained still stops the agent", async () => {
+test("a stop the failed escalation drained still stops the agent", async () => {
   const clock = fakeClock();
   const { port } = fakeContact();
   const escalate = recordingEscalate({
@@ -619,7 +629,10 @@ test("a stop the failed hand-off drained still stops the agent", async () => {
     },
   );
 
-  assert.equal(result.terminate, true, "the incident is no longer the agent's either way");
+  // A `stop` is the one thing that does end the run, and it arrived on the
+  // escalation's response rather than on a poll. The escalation failing does
+  // not make it any less a stop.
+  assert.equal(result.terminate, true, "a stop ends the run however it arrived");
 });
 
 test("the evidence is posted under the ask, as its own message", async () => {
@@ -1021,11 +1034,11 @@ test("a button nobody presses is silence, and silence still escalates", async ()
     },
   );
 
-  // The floor, the deadline and the hand-off all apply unchanged. Options
+  // The floor, the deadline and the escalation all apply unchanged. Options
   // that skipped any of them would be a way to ask without being escalatable.
   assert.equal(api.reads.length, 11, "the floor is not opted out of by offering buttons");
-  assert.deepEqual(result.escalation, { handedOff: true, reason: "no reply in 10 minutes" });
-  assert.equal(result.terminate, true);
+  assert.deepEqual(result.escalation, { told: true, reason: "no reply in 10 minutes" });
+  assert.equal(result.terminate, false, "the incident is still the agent's");
   assert.equal(state.cleared, 1);
 });
 
@@ -1134,7 +1147,7 @@ const clockAt = (iso: string) => {
 const heartbeatHarness = (args: {
   now: () => number;
   existing?: PendingWait;
-  handOff?: ToolResponse;
+  escalation?: ToolResponse;
   postFails?: boolean;
   pingFails?: boolean;
   clearFails?: boolean;
@@ -1142,7 +1155,7 @@ const heartbeatHarness = (args: {
   let marker: PendingWait | null = args.existing ?? null;
   const posts: string[] = [];
   const postTimes: string[] = [];
-  const handOffs: { reason: string; brief: string }[] = [];
+  const escalations: { reason: string; brief: string }[] = [];
   let recordWaitCalls = 0;
   let clears = 0;
 
@@ -1173,9 +1186,9 @@ const heartbeatHarness = (args: {
       postTimes.push(new Date(args.now()).toISOString());
     },
     escalate: {
-      handOff: async (payload) => {
-        handOffs.push(payload);
-        return args.handOff ?? { ok: true, directives: [] };
+      escalate: async (payload) => {
+        escalations.push(payload);
+        return args.escalation ?? { ok: true, directives: [] };
       },
     },
   };
@@ -1184,7 +1197,7 @@ const heartbeatHarness = (args: {
     deps,
     posts,
     postTimes,
-    handOffs,
+    escalations,
     clears: () => clears,
     recordWaitCalls: () => recordWaitCalls,
   };
@@ -1286,15 +1299,30 @@ test("a wait with nobody to nudge posts nothing and records no marker", async ()
   assert.equal(harness.recordWaitCalls(), 0);
 });
 
-test("the nudges run out and the incident is handed to a human", async () => {
+/**
+ * Round the clock, for the tests that care about the ladder's shape rather
+ * than about when a nudge is allowed to land. The window is what makes the
+ * real timings readable, and it would otherwise push every rung in these
+ * tests to the next morning.
+ */
+const ALWAYS = {
+  timeZone: "UTC",
+  startHour: 0,
+  endHour: 24,
+  days: [0, 1, 2, 3, 4, 5, 6],
+};
+
+test("the third nudge becomes an escalation, and the wait carries on", async () => {
   const clock = clockAt("2026-09-28T16:00:00Z");
   const started = clock.now();
+  // Two nudges gone and the third one due: the rung that used to end the
+  // ladder by handing the incident to a person and stopping the agent.
   const harness = heartbeatHarness({
     now: clock.now,
     existing: {
       ...PR_WAIT,
       startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_MAX_PINGS,
+      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
       lastPingAt: started - 8 * 3_600_000,
     },
   });
@@ -1304,42 +1332,135 @@ test("the nudges run out and the incident is handed to a human", async () => {
     { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
   );
 
-  assert.deepEqual(result.escalation, {
-    handedOff: true,
-    reason: "nobody ended a 15h wait after 3 nudges",
-  });
-  assert.equal(harness.handOffs.length, 1);
-  assert.match(harness.handOffs[0].brief, /so this is yours/);
-  assert.match(harness.handOffs[0].brief, /the PR to be merged/);
-  // A fourth nudge in the thread is not what a stalled wait needs; hand_off
-  // is the post that reaches the rotation.
+  // The wait ran to its own deadline. Getting loud is not an exit: the agent
+  // is still the only thing that can finish this incident, so the ladder has
+  // nowhere to hand it and nothing to hand it to.
+  assert.equal(result.timedOut, true);
+  assert.equal(
+    result.escalation,
+    null,
+    "the monitor never reports an escalation as an outcome, because it is not one",
+  );
+
+  assert.equal(harness.escalations.length, 1);
+  assert.match(harness.escalations[0].reason, /a 15h wait after 3 nudges/);
+  assert.match(harness.escalations[0].brief, /the PR to be merged/);
+  assert.match(harness.escalations[0].brief, /still on this/);
+  assert.match(harness.escalations[0].brief, /Nothing here needs taking over/);
+  // The loud rung replaces the nudge rather than arriving beside it: the
+  // same facts, posted where the rotation sees them.
   assert.equal(harness.posts.length, 0);
+});
+
+test("the ladder gets louder rather than ending, for as long as the wait lasts", async () => {
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    existing: {
+      ...PR_WAIT,
+      startedAt: started - 15 * 3_600_000,
+      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
+      lastPingAt: started - 8 * 3_600_000,
+    },
+  });
+
+  // Three days of wall clock on a wait that nobody ever ends. Terminating
+  // here is what stranded incidents: the wait ended, the incident moved to a
+  // person, and nothing in the system could reach it again -- so the only
+  // thing left that can change is the volume.
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 3 * 86_400 },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: { ...harness.deps, workingHours: ALWAYS },
+    },
+  );
+
+  assert.equal(result.timedOut, true);
+  // 8h, then 16h, then a day and a day: the gap doubles and then stops, and
+  // the elapsed figure keeps climbing from the wait's original start, which
+  // is the marker surviving each escalation rather than being dropped by it.
+  assert.deepEqual(
+    harness.escalations.map((call) => call.reason),
+    [
+      "nobody has ended a 15h wait after 3 nudges",
+      "nobody has ended a 23h wait after 4 nudges",
+      "nobody has ended a 39h wait after 5 nudges",
+      "nobody has ended a 63h wait after 6 nudges",
+    ],
+  );
+  assert.equal(harness.posts.length, 0, "past the third rung every nudge is loud");
+  assert.equal(harness.clears(), 1, "dropped once, by the timeout that ended the wait");
+});
+
+test("the gap doubles to a day and then stops doubling", () => {
+  // A wait can legitimately run for days, and left doubling the eighth rung
+  // would be a fortnight after the seventh -- which reads as having given up.
+  assert.deepEqual(
+    [0, 1, 2, 3, 4, 5, 6].map((pings) => heartbeatGapSeconds(pings)),
+    [3_600, 7_200, 14_400, 28_800, 57_600, 86_400, 86_400],
+  );
+  assert.equal(
+    heartbeatGapSeconds(50),
+    HEARTBEAT_MAX_GAP_SECONDS,
+    "2**50 hours is still a day; nothing open goes quiet for longer than that",
+  );
+});
+
+test("a failed escalation costs the escalation, not the wait", async () => {
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    escalation: { ok: false, error: "slack said no", directives: [] },
+    existing: {
+      ...PR_WAIT,
+      startedAt: started - 15 * 3_600_000,
+      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
+      lastPingAt: started - 8 * 3_600_000,
+    },
+  });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 90_000 },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: { ...harness.deps, workingHours: ALWAYS },
+    },
+  );
+
+  // Nothing is retried in place. Retried every interval, with no backoff to
+  // advance, the escalation would be the spam the ladder exists to avoid; the
+  // next rung is hours away, still arrives, and carries the wait that accrued
+  // in between.
+  assert.deepEqual(
+    harness.escalations.map((call) => call.reason),
+    [
+      "nobody has ended a 15h wait after 3 nudges",
+      "nobody has ended a 23h wait after 4 nudges",
+    ],
+  );
+  assert.equal(result.timedOut, true, "an unsent Slack message ends no wait");
   assert.equal(harness.clears(), 1);
 });
 
-test("a hand-off that fails leaves the incident with the agent and says so", async () => {
+test("an escalation that lands does not stop the agent", async () => {
   const clock = clockAt("2026-09-28T16:00:00Z");
   const started = clock.now();
   const harness = heartbeatHarness({
     now: clock.now,
-    handOff: { ok: false, error: "already owned by a human", directives: [] },
     existing: {
       ...PR_WAIT,
       startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_MAX_PINGS,
+      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
       lastPingAt: started - 8 * 3_600_000,
     },
   });
-
-  const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
-
-  assert.equal(result.escalation?.handedOff, false);
-  // The marker keeps its startedAt, so the next attempt escalates at once
-  // rather than starting the wait over.
-  assert.equal(harness.clears(), 0);
 
   const tool = await createMonitorTool({
     probe: stalled,
@@ -1355,40 +1476,24 @@ test("a hand-off that fails leaves the incident with the agent and says so", asy
     {} as never,
   );
   const text = String(out.content[0].type === "text" && out.content[0].text);
-  assert.match(text, /Call hand_off yourself now/);
+
+  // The rotation was told and the wait then ran out on its own deadline, so
+  // what the model gets back is an ordinary timeout on an incident it still
+  // holds. `terminate` is reserved for a `stop` or a `merged`.
+  assert.equal(harness.escalations.length, 1);
+  assert.match(text, /TIMED OUT/);
   assert.equal(out.terminate, false);
 });
 
-test("a hand-off that lands stops the agent", async () => {
-  const clock = clockAt("2026-09-28T16:00:00Z");
-  const started = clock.now();
-  const harness = heartbeatHarness({
-    now: clock.now,
-    existing: {
-      ...PR_WAIT,
-      startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_MAX_PINGS,
-      lastPingAt: started - 8 * 3_600_000,
-    },
-  });
-
-  const tool = await createMonitorTool({
-    probe: stalled,
-    sleep: clock.sleep,
-    now: clock.now,
-    heartbeat: harness.deps,
-  });
-  const out = await tool.execute(
-    "call-1",
-    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 } as never,
-    undefined,
-    undefined,
-    {} as never,
+test("an escalation tells the model the incident is still its own", () => {
+  assert.match(
+    escalationText({ told: true, reason: "no reply in 10 minutes" }),
+    /This incident is still yours/,
   );
-  const text = String(out.content[0].type === "text" && out.content[0].text);
-
-  assert.match(text, /HANDED OFF/);
-  assert.equal(out.terminate, true);
+  assert.match(
+    escalationText({ told: false, reason: "no reply in 10 minutes", error: "503" }),
+    /Nobody has been told/,
+  );
 });
 
 test("a Slack failure costs the nudge, not the wait", async () => {
@@ -1487,26 +1592,28 @@ test("recording the wait is the one marker call that is allowed to fail loudly",
   );
 });
 
-test("the hand-off brief counts the nudges that were actually sent", async () => {
+test("the escalation's brief counts the nudges that were actually sent", async () => {
   const clock = clockAt("2026-09-28T15:00:00Z");
   const harness = heartbeatHarness({ now: clock.now });
 
+  // Loud from the second rung, so the first one is a quiet nudge and the
+  // count in the brief has something to be wrong about.
   await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 86_400 },
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 14_400 },
     {
       probe: stalled,
       sleep: clock.sleep,
       now: clock.now,
-      heartbeat: { ...harness.deps, maxPings: 1 },
+      heartbeat: { ...harness.deps, loudAfterPings: 2 },
     },
   );
 
   assert.equal(harness.posts.length, 1);
-  assert.match(harness.handOffs[0].brief, /across 1 nudges/);
+  assert.match(harness.escalations[0].brief, /across 2 nudges/);
 });
 
 // A brief the harness writes has nobody to refuse it to: the model is not in
-// the loop by the time either of these is composed, and `hand_off` now
+// the loop by the time either of these is composed, and `escalate` now
 // rejects a brief past the thread budget. So the worst case each of them can
 // produce has to fit, and these are the tests that keep that true instead of
 // merely written down in a comment.
@@ -1518,47 +1625,84 @@ test("the harness's nudge fits the thread budget at its worst", () => {
   // purpose -- losing a day-long wait to a 503 is the worse trade -- which
   // means an over-long one produces an incident that waits all day, nudges
   // nobody, and then hands off claiming it nudged three times.
-  // Absurd inputs on purpose. The margin here is not a constant: the elision
-  // marker `truncateOutput` adds names how much it dropped, so it grows with
-  // the input, and `formatWaited` grows with the wait. A bound checked only
-  // at plausible sizes is a bound that holds until somebody waits longer.
+  //
+  // The two prose fields are at their real maximum rather than an absurd one,
+  // because what bounds them now is a refusal at the tool boundary rather
+  // than a clamp here. The test below is the one that keeps that refusal
+  // honest; without it this bound is arithmetic about nothing.
   const nudge = heartbeatMessage({
-    description: "d".repeat(100_000_000),
-    awaitingHuman: "a".repeat(100_000_000),
-    waitedMs: Number.MAX_SAFE_INTEGER,
+    description: "d".repeat(MONITOR_FIELD_LIMIT),
+    awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
+    // Still unbounded at the source -- it is whatever the check printed --
+    // so it stays absurd.
     status: "s".repeat(100_000_000),
-    // The hand-off sentence is the longer of the two tails.
-    nextSeconds: null,
+    waitedMs: Number.MAX_SAFE_INTEGER,
+    // There is always a next nudge, and the sentence naming it grows with how
+    // far away it is, so the worst case is a gap no clock would ever produce.
+    nextSeconds: Number.MAX_SAFE_INTEGER,
   });
 
   assert.ok(
     nudge.length <= THREAD_PROSE_CHARS,
     `a maximal nudge is ${nudge.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
   );
-  assert.match(nudge, /characters elided/);
+  // Both fields whole, and nothing anywhere telling the reader how much of
+  // something they cannot see they are missing.
+  assert.ok(nudge.includes("d".repeat(MONITOR_FIELD_LIMIT)));
+  assert.ok(nudge.includes("a".repeat(MONITOR_FIELD_LIMIT)));
+  assert.doesNotMatch(nudge, /characters elided/);
 });
 
-test("an ordinary nudge is left exactly as written", () => {
-  // The clamp must be invisible on every real nudge: an elision marker on a
-  // one-line wait would send a reader looking for text that never existed.
-  const nudge = heartbeatMessage({
-    description: "the preview deploy for PR 42",
-    awaitingHuman: "someone needs to merge it",
-    waitedMs: 3_600_000,
-    status: "pending",
-    nextSeconds: 1_800,
-  });
+test("monitor refuses a field too long to survive a nudge, before waiting", async () => {
+  // The bound above only holds because of this. Both fields are echoed
+  // verbatim into messages the harness composes with the model no longer in
+  // the loop, so this call is the last moment at which being too long is
+  // something anybody can fix -- and it has to refuse *before* the marker,
+  // or a refused call leaves a wait nobody is serving.
+  let recorded = 0;
+  const marker = {
+    recordWait: async () => {
+      recorded += 1;
+      return { command: "check", startedAt: 0, pings: 0, lastPingAt: null };
+    },
+    recordPing: async () => ({ command: "check", startedAt: 0, pings: 1, lastPingAt: 0 }),
+    clearWait: async () => {},
+  };
+  let probed = 0;
 
-  assert.ok(nudge.includes("the preview deploy for PR 42"));
-  assert.ok(nudge.includes("someone needs to merge it"));
-  assert.doesNotMatch(nudge, /elided/);
+  const result = await runMonitor(
+    {
+      command: "gh pr view 42 --json mergedAt",
+      intervalSeconds: 5,
+      timeoutSeconds: 86_400,
+      description: "d".repeat(MONITOR_FIELD_LIMIT + 1),
+      awaitingHuman: "somebody has to merge it",
+    },
+    {
+      probe: async () => {
+        probed += 1;
+        return { code: 0, output: "" };
+      },
+      heartbeat: {
+        marker,
+        post: async () => {},
+        escalate: { escalate: async () => ({ ok: true, directives: [] }) },
+      },
+    },
+  );
+
+  assert.ok(result.rejected, "an over-long description was accepted");
+  assert.match(result.rejected, /description is 201 characters/);
+  assert.equal(recorded, 0, "a refused call must not leave a wait marker behind");
+  assert.equal(probed, 0, "a refused call must not start waiting");
 });
 
 test("the harness's unanswered brief fits the thread budget at its worst", () => {
-  // The question is already capped by the tool, so this is its true maximum;
-  // the minute count is not capped anywhere, so it gets an absurd one.
+  // The question is bounded by the tool, so this is its true maximum; the
+  // minute count is not bounded anywhere, so it gets an absurd one.
+  const question = "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT);
   const brief = unansweredBrief(
-    "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT),
+    question,
     999_999_999,
     Array.from({ length: MAX_CHOICE_OPTIONS }, (_, i) => `${i}`.padEnd(75, "o")),
   );
@@ -1567,22 +1711,20 @@ test("the harness's unanswered brief fits the thread budget at its worst", () =>
     brief.length <= THREAD_PROSE_CHARS,
     `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
   );
-  // The question is echoed, not reproduced: it is already in the thread
-  // directly above, verbatim, so the elision costs the reader nothing and is
-  // marked where it happens.
-  assert.match(brief, /characters elided/);
+  // The question goes in whole, which is what `CONTACT_HUMAN_MESSAGE_LIMIT`
+  // is sized for. It used to be clamped here, so the person picking up the
+  // incident got the start of the question and a count of the rest.
+  assert.ok(brief.includes(question), "the question a reader must answer is cut");
+  assert.doesNotMatch(brief, /characters elided/);
   assert.ok(brief.includes("What I offered"), "the buttons a reader saw survive");
 });
 
 test("the harness's stalled-wait brief fits the thread budget at its worst", () => {
-  // Absurd inputs, for the same reason as the nudge above: the elision marker
-  // grows with what it elided and `formatWaited` grows with the wait, so a
-  // bound checked at plausible sizes is a bound that holds until it does not.
   const brief = stalledWaitBrief({
-    description: "d".repeat(100_000_000),
-    awaitingHuman: "a".repeat(100_000_000),
-    waitedMs: Number.MAX_SAFE_INTEGER,
+    description: "d".repeat(MONITOR_FIELD_LIMIT),
+    awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
     status: "s".repeat(100_000_000),
+    waitedMs: Number.MAX_SAFE_INTEGER,
     nudges: 999_999,
   });
 
@@ -1590,7 +1732,9 @@ test("the harness's stalled-wait brief fits the thread budget at its worst", () 
     brief.length <= THREAD_PROSE_CHARS,
     `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
   );
-  assert.match(brief, /characters elided/);
+  assert.ok(brief.includes("d".repeat(MONITOR_FIELD_LIMIT)));
+  assert.ok(brief.includes("a".repeat(MONITOR_FIELD_LIMIT)));
+  assert.doesNotMatch(brief, /characters elided/);
 });
 
 test("a short harness brief is left exactly as written", () => {
