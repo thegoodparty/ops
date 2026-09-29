@@ -712,6 +712,69 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  // `park` is an upsert, and the conflict branch is the reachable half: an
+  // agent parks itself on a deploy with a wake time, the wake passes, the
+  // incident is eligible again, and a crash loop then drives it to the
+  // ceiling while the agent's own row is still sitting there. The dispatcher
+  // has to replace that row rather than fail quietly against it -- a stale
+  // wake in the past is not a stop, so DO NOTHING here would mean the park
+  // does not park and the incident is relaunched instead of cooling down.
+  it("parks over a wait whose wake time has already passed", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait
+           (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES ('i1', 'a deploy to go out', ?, 1, ?)`,
+      )
+      .run(T0 - 1000, T0 - 2000);
+
+    let launches = 0;
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+      throw new Error("agent exited 1");
+    };
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+        maxLaunches: 99,
+        parkCooldownSeconds: 3600,
+        now: () => T0,
+      }),
+    );
+
+    // The expired wake is what makes it eligible at all, so these launches
+    // are the proof the conflict branch is reachable rather than theoretical.
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    assert.equal(launches, 3);
+    assert.deepEqual((await d.tick()).escalated, ["i1"]);
+    assert.equal(escalations.length, 1);
+
+    const wait = db.get<{ waitingFor: string; wakeAt: number | null }>(
+      "SELECT waitingFor, wakeAt FROM incident_wait WHERE incidentId = 'i1'",
+    );
+    assert.match(wait?.waitingFor ?? "", /died within/, "the agent's wait was replaced");
+    assert.equal(
+      wait?.wakeAt,
+      T0 + 3_600_000,
+      "and it carries the dispatcher's cooldown, not the wake that had already passed",
+    );
+
+    assert.deepEqual(
+      (await d.tick()).started,
+      [],
+      "which is what makes the park a stop rather than a row nobody replaced",
+    );
+    assert.equal(launches, 3);
+    cleanup();
+  });
+
   it("leaves a wait a reply cannot end alone, however much the thread talks", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
