@@ -19,7 +19,13 @@ import type {
   ToolApi,
   ToolResponse,
 } from "../types";
-import { resolveBedrockModel } from "../bedrock";
+import {
+  DEFAULT_MODEL_ID,
+  invokeModelIdFor,
+  parseInferenceProfiles,
+  resolveBedrockModel,
+  type InferenceProfiles,
+} from "../bedrock";
 import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
 import {
   connectMcpToolset,
@@ -61,6 +67,8 @@ import {
   EXIT_ENTRY_TYPE,
   createSessionSync,
   createS3SessionStore,
+  emptySessionUsage,
+  readSessionUsageFromFile,
   readStoredPrefixFromFile,
   restoreSessionFile,
   sessionFileFor,
@@ -68,15 +76,48 @@ import {
   PROMPT_ENTRY_TYPE,
   SESSION_SYNC_FAILURE_LIMIT,
   type SessionStore,
+  type SessionUsage,
   type StoredExit,
   type StoredPrefix,
 } from "./session";
 
 export const DEFAULT_WORK_ROOT = "/work";
 export const DEFAULT_OMNI_REPO = "https://github.com/thegoodparty/omni.git";
-export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
+// Declared in bedrock/model.ts so the Pulumi program can read it without
+// loading this module's graph, and re-exported here because this is where
+// everything else looks for it.
+export { DEFAULT_MODEL_ID };
 export const DEFAULT_TIMEOUT_SECONDS = 86_400;
 export const DEADLINE_GRACE_SECONDS = 180;
+
+/**
+ * Turns one incident's agent may take, across every launch.
+ *
+ * The wall clock does not bound work. `monitor` and `contact_human` each
+ * cost one turn however long they block, so the first nine-hour incident
+ * spent about eight of those hours inside a single turn waiting on a person
+ * -- 92 turns and $18.51 in total, against a 24-hour clock that would have
+ * let fifteen agents do that at once. A turn is a model call, so it is the
+ * unit that does not inflate while nobody is working.
+ *
+ * 200 rather than 92: high enough that no incident like the ones we have
+ * seen touches it, low enough that a runaway stops. It is a bound before a
+ * dollar cap, not instead of one -- the escalation carries what the run
+ * spent so the next number is measured rather than guessed.
+ */
+export const DEFAULT_MAX_TURNS = 200;
+
+/**
+ * Turns held back from `maxTurns` for the hand-off, the way
+ * `DEADLINE_GRACE_SECONDS` is held back from the wall clock.
+ *
+ * A run that dies on its budget having written nothing is the silent failure
+ * this whole system is built against: the thread's last message stays true,
+ * so the silence reads as patience. So the budget has the same two layers
+ * the deadline does -- steer, then stop -- and the brief is written inside
+ * the gap between them.
+ */
+export const TURN_BUDGET_GRACE_TURNS = 10;
 
 /**
  * How long a signalled exit waits for its last session flush to reach S3.
@@ -603,7 +644,14 @@ export interface RunIncidentAgentOptions {
   workRoot?: string;
   omniRepoUrl?: string;
   modelId?: string;
+  /**
+   * Model id to application inference profile ARN. Empty is normal: it costs
+   * the run its line in Cost Explorer and nothing else.
+   */
+  inferenceProfiles?: InferenceProfiles;
   timeoutSeconds?: number;
+  /** Turns this incident gets in total. Defaults to `DEFAULT_MAX_TURNS`. */
+  maxTurns?: number;
   awsRegion?: string;
   /**
    * The S3 key for the session, from the dispatcher's sessionRef. Required
@@ -628,6 +676,37 @@ export interface RunIncidentAgentOptions {
   api?: BossClient;
   skipClone?: boolean;
 }
+
+/**
+ * The profile map, or none, but never a throw.
+ *
+ * The composition root parses the same string at boot and refuses to start
+ * on a bad one, so this is the second line rather than the first. It is
+ * deliberately softer than `parseWorkingHours` next to it: a bad working
+ * window delivers nudges at the wrong hour for as long as nobody doubts it,
+ * where a bad profile map costs a line in Cost Explorer. Killing an agent
+ * that is working a production incident over a billing tag is the wrong
+ * trade, and it is the same call `stream.ts` makes about an unhonoured
+ * cache retention.
+ */
+const readInferenceProfiles = (
+  env: Record<string, string | undefined>,
+): InferenceProfiles => {
+  try {
+    return parseInferenceProfiles(env.BUGBOSS_INFERENCE_PROFILES);
+  } catch (error: unknown) {
+    console.error(
+      JSON.stringify({
+        component: "agent",
+        level: "error",
+        event: "inference_profiles_unreadable",
+        error: String(error),
+        note: "this run is not attributable in Cost Explorer; it is otherwise unaffected",
+      }),
+    );
+    return {};
+  }
+};
 
 /**
  * The dispatcher builds the child's environment from nothing and launches
@@ -665,6 +744,10 @@ export const agentOptionsFromEnv = (
     : undefined;
 
   const attempt = Number(env.BUGBOSS_ATTEMPT);
+  // Same shape as `attempt`: a missing or malformed value falls back to the
+  // default rather than to zero, which `Number("")` would otherwise make
+  // finite and hand every agent a budget of nothing.
+  const maxTurns = Number(env.BUGBOSS_MAX_TURNS);
 
   return {
     incidentId,
@@ -674,9 +757,11 @@ export const agentOptionsFromEnv = (
     workRoot: env.BUGBOSS_WORK_ROOT ?? DEFAULT_WORK_ROOT,
     omniRepoUrl: env.BUGBOSS_OMNI_REPO ?? DEFAULT_OMNI_REPO,
     modelId: env.BUGBOSS_MODEL_ID ?? DEFAULT_MODEL_ID,
+    inferenceProfiles: readInferenceProfiles(env),
     awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
     sessionKey,
     timeoutSeconds,
+    maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : DEFAULT_MAX_TURNS,
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
     ...(grafanaToken
@@ -694,6 +779,8 @@ export interface RunIncidentAgentResult {
   sessionFile: string | undefined;
   restored: boolean;
   timedOut: boolean;
+  /** The incident's turn budget ran out and the run was stopped on it. */
+  turnsExhausted: boolean;
   /** Pi's message for the last failed or aborted turn. Null on a clean end. */
   error: string | null;
 }
@@ -702,9 +789,16 @@ export interface RunIncidentAgentResult {
  * A force-aborted 30-minute investigation used to exit 0, exactly like a
  * resolution, so the parent had nothing to act on. A timeout the agent handed
  * off inside its grace window is still a clean end; an aborted turn is not.
+ *
+ * A run stopped on its turn budget is a clean end too, and the exception is
+ * load-bearing rather than cosmetic. The budget stops the run with
+ * `session.abort()`, which leaves an error message behind exactly as a
+ * failing turn does -- so without this, a bound working as designed would
+ * reach the dispatcher as `agent_failed` and alarm every time. The incident
+ * is already with a human by then; nothing is waiting on the exit code.
  */
 export const exitCodeFor = (result: RunIncidentAgentResult): number =>
-  result.error ? 1 : 0;
+  result.turnsExhausted ? 0 : result.error ? 1 : 0;
 
 export const sessionSyncFailedMessage = (streak: number): string =>
   `Your session has failed to save ${streak} times in a row. Nothing you have done since is durable: if this container restarts you will start over from nothing. Stop investigating and call escalate now, with a brief covering what you believe, what you ruled out and what you were about to do.`;
@@ -725,15 +819,172 @@ export const kickoffMessage = (incidentId: string): string =>
  */
 export const exitRecordFor = (args: {
   timedOut: boolean;
+  turnsExhausted: boolean;
   error: string | null;
   attempt: number | null;
   at: number;
 }): StoredExit => ({
-  reason: args.timedOut ? "timed_out" : args.error ? "turn_error" : "completed",
+  // A timeout stays first. The dispatcher is acting on the same wall clock
+  // and escalating under that name, and two halves of one ending that
+  // disagree about what it was is worse than either name alone. Turn
+  // exhaustion comes before `turn_error` because the abort that stops it
+  // leaves an error behind that describes the harness, not the turn.
+  reason: args.timedOut
+    ? "timed_out"
+    : args.turnsExhausted
+      ? "turns_exhausted"
+      : args.error
+        ? "turn_error"
+        : "completed",
   at: args.at,
   attempt: args.attempt,
   ...(args.error ? { error: args.error } : {}),
 });
+
+// ---------------------------------------------------------------------------
+// The turn budget
+// ---------------------------------------------------------------------------
+
+/** Running spend, prior launches plus this one. */
+export interface TurnBudgetState {
+  used: number;
+  max: number;
+  usage: SessionUsage;
+}
+
+const compactTokens = (n: number): string =>
+  n >= 1_000_000
+    ? `${(n / 1_000_000).toFixed(1)}M`
+    : n >= 1_000
+      ? `${Math.round(n / 1_000)}k`
+      : String(n);
+
+/**
+ * What the model is told when the budget is nearly gone. Deliberately the
+ * same shape as `deadlineMessage`: one bound, two layers, one instruction.
+ */
+export const turnBudgetMessage = (state: TurnBudgetState): string =>
+  `You have used ${state.used} of the ${state.max} turns this incident gets, counted across every launch. Stop investigating. Spend what is left calling hand_off with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing. A restart does not give the turns back, so there is no later.`;
+
+/**
+ * The brief the harness writes when the model did not write one.
+ *
+ * It carries the tokens and a cost estimate because that is the point of
+ * shipping a turn cap before a dollar cap: 200 turns has no known price yet,
+ * and the only way anyone learns one is for the number to reach a person who
+ * is already reading about this incident. Called an estimate here for the
+ * same reason it is called one everywhere else -- it is arithmetic over
+ * tokens against a price table that goes stale silently, not an invoice.
+ */
+export const turnBudgetBrief = (state: TurnBudgetState, graceTurns: number): string => {
+  const { usage } = state;
+  const tokens = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+  return [
+    "This is yours because the agent ran out of turns, not because it finished.",
+    "",
+    `It used all ${state.max} turns this incident gets, across every launch, and did not hand off in the ${graceTurns} it was asked to. Everything it found is in this thread.`,
+    "",
+    "*What it spent*",
+    `${state.used} turns on ${usage.modelId ?? "an unrecorded model"} · ${compactTokens(tokens)} tokens (${usage.tokensIn} in, ${usage.tokensOut} out, ${usage.cacheRead} cache read, ${usage.cacheWrite} cache write)`,
+    usage.costUsd > 0
+      ? `Estimated cost $${usage.costUsd.toFixed(2)}, derived from those tokens at the prices we held while it ran. An estimate, not an invoiced figure.`
+      : "No cost estimate: the provider reported no prices for this run.",
+    "",
+    "*Where it stands*",
+    "What I believe now: whatever the agent last posted in this thread.",
+    "What I ruled out: not recorded; it never got to write a brief.",
+    "What I was about to do: unknown. It was still working when the budget ran out.",
+    "Side effects: check the incident for PRs it opened.",
+  ].join("\n");
+};
+
+/**
+ * Per-turn usage as Pi hangs it off the assistant message. The same shape
+ * `sumSessionUsage` reads back off disk, spelt out again rather than shared
+ * because the two read it from different places and one changing is not a
+ * reason for the other to.
+ */
+interface TurnUsage {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cacheWrite1h?: number;
+  cost?: { total?: number };
+}
+
+export interface TurnBudget {
+  extension: (pi: ExtensionAPI) => void;
+  state: () => TurnBudgetState;
+  exhausted: () => boolean;
+}
+
+/**
+ * Counts turns over the incident and fires the two layers.
+ *
+ * Seeded from the restored session rather than from zero, because every
+ * merge to ops `main` restarts this container and a budget that refilled on
+ * a restart would bound nothing. `sumSessionUsage` counts assistant messages
+ * over the whole file, which is the same unit `turn_end` fires on, so the
+ * two halves of the count agree.
+ *
+ * `turn_end` cannot stop the loop: Pi reads a boundary result's `continue`
+ * as "force another turn" and never as "stop", so a handler returning false
+ * only declines to extend a run that was ending anyway. The stop is
+ * `session.abort()`, which is what the wall-clock deadline already uses.
+ *
+ * Both handlers are awaited by Pi's boundary dispatch, so the hand-off
+ * completes before the next turn could start. They fire once each: a steer
+ * repeated every turn is a sentence the model cannot act on twice, and a
+ * second hand-off would post a second brief over the first.
+ */
+export const createTurnBudget = (args: {
+  prior: SessionUsage;
+  maxTurns: number;
+  graceTurns: number;
+  onGrace: (state: TurnBudgetState) => void | Promise<void>;
+  onExhausted: (state: TurnBudgetState) => void | Promise<void>;
+}): TurnBudget => {
+  const usage: SessionUsage = { ...args.prior };
+  let steered = false;
+  let stopped = false;
+
+  const state = (): TurnBudgetState => ({
+    used: usage.turns,
+    max: args.maxTurns,
+    usage: { ...usage },
+  });
+
+  return {
+    state,
+    exhausted: () => stopped,
+    extension: (pi: ExtensionAPI): void => {
+      pi.on("turn_end", async (event) => {
+        usage.turns += 1;
+        const turn = (event.message as { usage?: TurnUsage }).usage;
+        if (turn) {
+          usage.tokensIn += turn.input ?? 0;
+          usage.tokensOut += turn.output ?? 0;
+          usage.cacheRead += turn.cacheRead ?? 0;
+          usage.cacheWrite += turn.cacheWrite ?? 0;
+          usage.cacheWrite1h += turn.cacheWrite1h ?? 0;
+          usage.costUsd += turn.cost?.total ?? 0;
+        }
+
+        if (usage.turns >= args.maxTurns) {
+          if (stopped) return;
+          stopped = true;
+          await args.onExhausted(state());
+          return;
+        }
+        if (usage.turns >= args.maxTurns - args.graceTurns && !steered) {
+          steered = true;
+          await args.onGrace(state());
+        }
+      });
+    },
+  };
+};
 
 export const deadlineMessage = (graceSeconds: number): string =>
   `Your wall-clock deadline has expired. Stop investigating. Within the next ${graceSeconds} seconds, call escalate with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing.`;
@@ -783,6 +1034,14 @@ export const runIncidentAgent = async (
       }),
     );
   }
+  // The turn budget is over the incident, not over this process, so a launch
+  // starts from what the restored transcript already spent. Read here rather
+  // than inside `launch` for the same reason the pinned model is: both are
+  // properties of the file on disk before a session is opened over it.
+  const priorUsage = restored
+    ? await readSessionUsageFromFile(paths.sessionFile)
+    : emptySessionUsage();
+
   const pinned = await pinnedSessionModel({
     restored,
     sessionFile: paths.sessionFile,
@@ -798,14 +1057,22 @@ export const runIncidentAgent = async (
   // Built here rather than left to createAgentSession, because the router has
   // to be installed on the runtime the session will actually stream through.
   const modelRuntime = await pi.ModelRuntime.create({});
-  await registerBedrockRouting({ runtime: modelRuntime });
+  const profiles = options.inferenceProfiles ?? {};
+  await registerBedrockRouting({
+    runtime: modelRuntime,
+    invokeModelIdFor: invokeModelIdFor(profiles),
+  });
   assertBedrockInvokeModelRouting(modelRuntime, model);
+  // `invokedAs` is the only place the two ids are visible together. They
+  // differ whenever cost attribution is on, and a reader who sees them the
+  // same knows this run will not appear under the bugboss tags.
   console.log(
     JSON.stringify({
       component: "agent",
       event: "model_provider_selected",
       incidentId: options.incidentId,
       modelId: model.id,
+      invokedAs: invokeModelIdFor(profiles)(model.id),
       api: model.api,
     }),
   );
@@ -841,6 +1108,7 @@ export const runIncidentAgent = async (
       notesPrefix,
       notesSeen: notes.seen,
       storedPrefix: pinned.storedPrefix,
+      priorUsage,
     });
   } finally {
     for (const set of mcp) set.close();
@@ -861,20 +1129,22 @@ const launch = async (args: {
   notesPrefix: string;
   notesSeen: Map<string, NoteRecord>;
   storedPrefix: StoredPrefix | null;
+  priorUsage: SessionUsage;
 }): Promise<RunIncidentAgentResult> => {
   const { options, paths, store, key, api, pi, model, modelRuntime, mcp, restored, storedPrefix } =
     args;
 
-  // Aborted when the soft deadline fires, so a tool parked in a 24h wait
-  // returns and the turn can end. `steer` only delivers between turns, so
-  // without this the graceful hand-off request never reaches an agent in the
-  // state it spends most of a long incident in.
-  const deadlineAbort = new AbortController();
+  // Aborted when either soft bound fires -- the wall-clock deadline or the
+  // turn budget -- so a tool parked in a 24h wait returns and the turn can
+  // end. `steer` only delivers between turns, so without this the graceful
+  // hand-off request never reaches an agent in the state it spends most of a
+  // long incident in.
+  const wrapUpAbort = new AbortController();
 
   const bossTools = await createBossTools({ api, onRootCause: () => startNpmCi(paths) });
   const localTools = [
     await createMonitorTool({
-      signal: deadlineAbort.signal,
+      signal: wrapUpAbort.signal,
       heartbeat: {
         marker: api,
         post: (message: string) => api.postNotice(message),
@@ -886,7 +1156,7 @@ const launch = async (args: {
       contact: api,
       api,
       escalate: api,
-      signal: deadlineAbort.signal,
+      signal: wrapUpAbort.signal,
     }),
     // Reads the token at each call rather than closing over it: the App
     // credentials are refreshed in place every twenty minutes, and an incident
@@ -1013,7 +1283,10 @@ const launch = async (args: {
   };
 
   // Assigned once the session exists; the first flush cannot precede it.
-  let live: { steer: (message: string) => Promise<unknown> } | null = null;
+  let live: {
+    steer: (message: string) => Promise<unknown>;
+    abort: () => Promise<unknown>;
+  } | null = null;
   const onSyncFailure = (error: Error, streak: number): void => {
     console.error(
       JSON.stringify({
@@ -1100,6 +1373,95 @@ const launch = async (args: {
     void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
   };
 
+  const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
+  const turnBudget = createTurnBudget({
+    prior: args.priorUsage,
+    maxTurns,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: (state) => {
+      console.log(
+        JSON.stringify({
+          component: "agent",
+          event: "turn_budget_grace",
+          incidentId: options.incidentId,
+          used: state.used,
+          max: state.max,
+          graceTurns: TURN_BUDGET_GRACE_TURNS,
+        }),
+      );
+      // Same pair as the deadline: free a blocking tool so the steer lands,
+      // then ask for the brief. An agent inside a 24h `monitor` would
+      // otherwise spend its whole grace parked in one turn.
+      wrapUpAbort.abort();
+      void live?.steer(turnBudgetMessage(state)).catch(() => {});
+    },
+    onExhausted: async (state) => {
+      const tokens =
+        state.usage.tokensIn +
+        state.usage.tokensOut +
+        state.usage.cacheRead +
+        state.usage.cacheWrite;
+      // Error level. This is a bound working, not a fault, but it is the one
+      // event that says what 200 turns actually costs -- and the reason the
+      // cap shipped before a dollar cap was to find that out.
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "turn_budget_exhausted",
+          incidentId: options.incidentId,
+          used: state.used,
+          max: state.max,
+          modelId: state.usage.modelId,
+          tokensIn: state.usage.tokensIn,
+          tokensOut: state.usage.tokensOut,
+          cacheRead: state.usage.cacheRead,
+          cacheWrite: state.usage.cacheWrite,
+          cacheWrite1h: state.usage.cacheWrite1h,
+          tokens,
+          estimatedCostUsd: state.usage.costUsd,
+        }),
+      );
+      // The harness hands off on the agent's behalf, the way an unanswered
+      // `contact_human` does. Without it an incident stopped on its budget
+      // keeps `owner: agent`, which nothing lists as unclaimed and the
+      // dispatcher will not relaunch -- invisible work, which is the shape
+      // this whole subsystem exists to avoid.
+      try {
+        const response = await api.handOff({
+          reason: `turn budget of ${state.max} turns exhausted`,
+          brief: turnBudgetBrief(state, TURN_BUDGET_GRACE_TURNS),
+        });
+        if (!response.ok) {
+          console.error(
+            JSON.stringify({
+              component: "agent",
+              level: "error",
+              event: "turn_budget_handoff_refused",
+              incidentId: options.incidentId,
+              error: response.error ?? "the hand off was refused without a reason",
+              note: "the incident is still the agent's and nobody was told; the next launch re-attempts this on its first turn",
+            }),
+          );
+        }
+      } catch (err: unknown) {
+        console.error(
+          JSON.stringify({
+            component: "agent",
+            level: "error",
+            event: "turn_budget_handoff_failed",
+            incidentId: options.incidentId,
+            error: String(err),
+            note: "the incident is still the agent's and nobody was told; the next launch re-attempts this on its first turn",
+          }),
+        );
+      }
+      // Stopped either way. A budget that keeps running when its hand-off
+      // fails is not a budget, and the failure is loud above.
+      await live?.abort().catch(() => {});
+    },
+  });
+
   const settings = pi.SettingsManager.inMemory({
     compaction: { enabled: true, reserveTokens: reserveTokensFor(model.contextWindow) },
   });
@@ -1116,6 +1478,7 @@ const launch = async (args: {
     extensionFactories: [
       sessionSyncExtension(sync, onSyncFailure),
       notesSyncExtension(notesSync, onNotesFlush),
+      turnBudget.extension,
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
       // every thinking block is signed against.
@@ -1153,7 +1516,7 @@ const launch = async (args: {
   // process as the real backstop.
   const deadline = setTimeout(() => {
     timedOut = true;
-    deadlineAbort.abort();
+    wrapUpAbort.abort();
     session.steer(deadlineMessage(DEADLINE_GRACE_SECONDS)).catch(() => {});
   }, timeoutSeconds * 1000);
   const hardStop = setTimeout(
@@ -1175,7 +1538,15 @@ const launch = async (args: {
     // written afterwards stays on a disk that is about to go away. A timeout
     // the agent handed off inside its grace is still a timeout -- that is the
     // more specific cause, and `error` carries the rest.
-    recordExit(exitRecordFor({ timedOut, error, attempt, at: Date.now() }));
+    recordExit(
+      exitRecordFor({
+        timedOut,
+        turnsExhausted: turnBudget.exhausted(),
+        error,
+        attempt,
+        at: Date.now(),
+      }),
+    );
     await sync.flush();
     const lost = sync.lastError();
     if (lost) onSyncFailure(lost, sync.failureStreak());
@@ -1188,6 +1559,7 @@ const launch = async (args: {
     sessionFile: sessionManager.getSessionFile(),
     restored,
     timedOut,
+    turnsExhausted: turnBudget.exhausted(),
     error,
   };
 };

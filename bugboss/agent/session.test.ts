@@ -218,6 +218,7 @@ const assistantTurn = (usage: {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  cacheWrite1h?: number;
 }) =>
   JSON.stringify({
     type: "message",
@@ -246,6 +247,26 @@ const modelChange = JSON.stringify({
 const toolResult = JSON.stringify({
   type: "message",
   message: { role: "toolResult", toolName: "get_incident", content: "{}", isError: false },
+});
+
+test("the 1h share of a cache write is summed, because it does not price like the rest", () => {
+  // Every run here asks for the 1h ttl, and a 1h write costs 2x base input
+  // against 1.25x for 5m. A row that stored only the total would re-price a
+  // long-cache run as a short-cache one and understate it by most of the gap,
+  // which is the whole reason dollars are not stored in the first place.
+  const contents = [
+    modelChange,
+    assistantTurn({ input: 2, output: 39, cacheRead: 0, cacheWrite: 78_492, cacheWrite1h: 78_492 }),
+    assistantTurn({ input: 4, output: 12, cacheRead: 78_492, cacheWrite: 1_200, cacheWrite1h: 900 }),
+    // A turn Bedrock returned no split for. Absent is not zero-and-fine, but
+    // summing it as zero is the only honest thing a reader can do with it.
+    assistantTurn({ input: 1, output: 3, cacheRead: 79_692, cacheWrite: 500 }),
+  ].join("\n");
+
+  const usage = sumSessionUsage(contents);
+
+  assert.equal(usage.cacheWrite, 80_192);
+  assert.equal(usage.cacheWrite1h, 79_392);
 });
 
 test("a real transcript's turns are counted, nested where Pi actually writes them", () => {

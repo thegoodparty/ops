@@ -13,6 +13,17 @@ import { BEDROCK_INVOKE_MODEL_API, type BedrockInvokeModelApi } from "./options"
 
 export type BedrockInvokeModelModel = Model<BedrockInvokeModelApi>;
 
+/**
+ * The cross-region inference profile the incident agent runs on by default.
+ *
+ * It lives in this leaf rather than next to the rest of the agent's defaults
+ * because `deploy/components/bugboss.ts` needs it to build the application
+ * inference profile that wraps it, and a Pulumi program should not have to
+ * load the agent's whole module graph -- an S3 client, the GitHub App, the
+ * MCP toolset -- to read one string.
+ */
+export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
+
 /** `arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude-opus-5` */
 const INFERENCE_PROFILE_ARN = /^arn:aws(?:-[a-z0-9-]+)?:bedrock:[a-z0-9-]+:\d+:inference-profile\/(.+)$/;
 
@@ -26,6 +37,68 @@ export const regionFromModelId = (modelId: string): string | undefined => {
   const match = modelId.match(/^arn:aws(?:-[a-z0-9-]+)?:bedrock:([a-z0-9-]+):/);
   return match ? match[1] : undefined;
 };
+
+// ---------------------------------------------------------------------------
+// Application inference profiles
+// ---------------------------------------------------------------------------
+
+/**
+ * Model id to application inference profile ARN, as the task definition
+ * carries it.
+ *
+ * Bedrock puts no request-level cost tag on InvokeModel. The one mechanism
+ * AWS offers is an application inference profile: a tagged wrapper you pass
+ * as `modelId`, whose usage then shows up under those tags in Cost Explorer.
+ * That is the only way to check the local price table against a real
+ * invoice, which is the whole reason cost is an estimate everywhere else.
+ *
+ * A map rather than a single ARN because the model is runtime-configurable
+ * through `BUGBOSS_MODEL_ID` and retunes from SSM without a deploy. A model
+ * nobody wrapped has to keep working; it just loses the attribution.
+ */
+export type InferenceProfiles = Readonly<Record<string, string>>;
+
+/**
+ * Parse the map, or throw.
+ *
+ * Throwing is for the composition root, which parses at boot so a typo stops
+ * the container where somebody is watching. The agent path never throws --
+ * see `invokeModelIdFor`.
+ */
+export const parseInferenceProfiles = (raw: string | undefined): InferenceProfiles => {
+  if (!raw || raw.trim() === "") return {};
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      "BUGBOSS_INFERENCE_PROFILES must be a JSON object of model id to profile ARN",
+    );
+  }
+  const out: Record<string, string> = {};
+  for (const [modelId, arn] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof arn !== "string" || arn === "") {
+      throw new Error(
+        `BUGBOSS_INFERENCE_PROFILES["${modelId}"] must be a non-empty profile ARN`,
+      );
+    }
+    out[modelId] = arn;
+  }
+  return out;
+};
+
+/**
+ * The id to put on the wire for `modelId`.
+ *
+ * Falls back to the bare model id, never throws, and never warns twice: an
+ * unrecognised model must lose cost attribution, not lose the agent. It is
+ * the request field only -- `model.id` stays the logical id, so the session
+ * prefix, the pinned-model check and the stored `modelId` are all untouched
+ * and a run that predates a profile resumes on the same value it was signed
+ * against.
+ */
+export const invokeModelIdFor =
+  (profiles: InferenceProfiles) =>
+  (modelId: string): string =>
+    profiles[modelId] ?? modelId;
 
 export const toInvokeModelModel = (
   model: Model<string>,

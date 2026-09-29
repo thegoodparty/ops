@@ -1465,6 +1465,24 @@ describe("read_agent_session", () => {
     assert.match(out, /was killed after 20000 turns/);
   });
 
+  // The Slack agent is what a human asks "what did incident 7 cost", and it
+  // answers out of this tool result. A dollar figure that does not say it is
+  // an estimate gets quoted back as though somebody had seen a bill.
+  test("reports spend, and never states the dollar figure as a fact", async () => {
+    const priced = JSON.stringify({
+      type: "message",
+      message: {
+        role: "assistant",
+        model: "us.anthropic.claude-opus-5",
+        usage: { input: 10, output: 20, cacheRead: 300, cacheWrite: 40, cost: { total: 18.51 } },
+      },
+    });
+    const out = await readSession([priced, priced]);
+    assert.match(out, /spend: 2 turns, 740 tokens on us\.anthropic\.claude-opus-5/);
+    assert.match(out, /estimated cost \$37\.02/);
+    assert.match(out, /not an invoiced figure/);
+  });
+
   test("says a run ended on purpose when it did", async () => {
     const out = await readSession([
       turn("closing this out"),

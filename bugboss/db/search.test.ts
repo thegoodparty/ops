@@ -57,7 +57,7 @@ const seed = async (args: {
     w.prepare(
       `INSERT INTO incident
          (id, status, prUrls, firstSignalAt, resolvedAt, closedAt, postmortem,
-          rootCause, resolvedEvidence, attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+          rootCause, resolvedEvidence, attempts, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
        VALUES (?, ?, '[]', 1000, ?, ?, ?, ?, 'the alert went quiet for 90 minutes', 0, 0, 0, 0, 0, 0)`,
     ).run(
       args.id,

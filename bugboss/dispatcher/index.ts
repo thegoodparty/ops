@@ -22,7 +22,7 @@ import type {
 } from "../types";
 // The child's own grace, read rather than copied: the parent's backstop is
 // defined relative to it, so a change there must move this too.
-import { DEADLINE_GRACE_SECONDS } from "../agent/run";
+import { DEADLINE_GRACE_SECONDS, DEFAULT_MAX_TURNS } from "../agent/run";
 import { buildChildEnv, hasAwsCredentialPath } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
 import { makeAlarm, makeLog } from "../logging";
@@ -90,6 +90,9 @@ export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   // A day. An incident waits on a review, a merge and a deploy, and those
   // are measured in hours, so a half-hour ceiling killed agents mid-wait.
   agentTimeoutSeconds: 86_400,
+  // The bound that counts work rather than time, and the one a restart does
+  // not refill. See DEFAULT_MAX_TURNS in agent/run.ts for the number.
+  maxTurns: DEFAULT_MAX_TURNS,
   maxAttempts: 3,
   staleAfterSeconds: STALE_AFTER_SECONDS,
 };
@@ -683,6 +686,7 @@ export class Dispatcher {
       token,
       sessionRef: row.sessionRef,
       deadlineAt,
+      maxTurns: this.config.maxTurns,
       attempt,
     });
     // The child resolves AWS through the container credential provider, so

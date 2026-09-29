@@ -26,6 +26,7 @@ const config = (over: Partial<DispatcherConfig> = {}): DispatcherConfig => ({
   maxConcurrentAgents: 15,
   tickSeconds: 30,
   agentTimeoutSeconds: 1800,
+  maxTurns: 200,
   maxAttempts: 3,
   staleAfterSeconds: 86_400,
   ...over,

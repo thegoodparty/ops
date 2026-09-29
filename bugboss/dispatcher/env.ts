@@ -33,6 +33,12 @@ export interface ChildEnvInput {
   sessionRef: string | null;
   /** Epoch ms. The agent's own in-container deadline. */
   deadlineAt: number;
+  /**
+   * Turns this incident's agent may take in total, across every launch.
+   * Absolute rather than remaining: the child counts what the restored
+   * session already holds, which is the only copy either side has.
+   */
+  maxTurns: number;
   attempt: number;
 }
 
@@ -87,6 +93,7 @@ export const buildChildEnv = (
   env.BUGBOSS_TOKEN = input.token;
   env.BUGBOSS_ATTEMPT = String(input.attempt);
   env.BUGBOSS_DEADLINE_AT = String(input.deadlineAt);
+  env.BUGBOSS_MAX_TURNS = String(input.maxTurns);
   if (input.sessionRef) env.BUGBOSS_SESSION_REF = input.sessionRef;
 
   return env;

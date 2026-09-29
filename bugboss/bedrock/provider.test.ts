@@ -11,7 +11,9 @@ import {
   BEDROCK_INVOKE_MODEL_API,
   type BedrockInvoke,
   createBedrockInvokeModelProvider,
+  invokeModelIdFor,
   type InvokeModelBody,
+  parseInferenceProfiles,
   registerBedrockInvokeModelProvider,
   resolveBedrockModel,
 } from "./index";
@@ -420,4 +422,91 @@ test("a caller that asks for short retention overrides the default on the wire",
     .result();
 
   assert.deepEqual(sent[0].system?.[0].cache_control, { type: "ephemeral" });
+});
+
+// ---------------------------------------------------------------------------
+// Application inference profiles
+// ---------------------------------------------------------------------------
+
+const PROFILE_ARN =
+  "arn:aws:bedrock:us-west-2:333022194791:application-inference-profile/abcd1234efgh";
+
+test("the profile ARN goes on the wire and nowhere else", async () => {
+  // This is the whole design. Bedrock has no request-level cost tag, so the
+  // only way to attribute a run is to invoke a tagged wrapper -- but the
+  // model id is pinned in the session and a thinking block is signed against
+  // that prefix, so swapping `model.id` would make every session started
+  // before the profile unresumable after it. The swap is the request field.
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  const ids: (string | undefined)[] = [];
+  const provider = await createBedrockInvokeModelProvider({
+    invoke: async (input) => {
+      ids.push(input.modelId);
+      return chunks(silentThinkingTurn);
+    },
+    invokeModelIdFor: invokeModelIdFor({ "us.anthropic.claude-opus-5": PROFILE_ARN }),
+  });
+  const pi = await import("@earendil-works/pi-ai");
+
+  const message = await provider
+    .stream(model, pi.normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] }))
+    .result();
+
+  assert.deepEqual(ids, [PROFILE_ARN]);
+  assert.equal(model.id, "us.anthropic.claude-opus-5", "the model object is untouched");
+  assert.equal(
+    message.model,
+    "us.anthropic.claude-opus-5",
+    "the session records the logical id, so a resume replays against the same prefix",
+  );
+  // The profile's own ARN maps to no catalog entry, so costing off it would
+  // report every run at zero dollars. Costing off the logical id does not.
+  assert.ok(message.usage.cost.total > 0);
+});
+
+test("a model nobody wrapped loses its attribution, not its agent", async () => {
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-sonnet-5" });
+  const ids: (string | undefined)[] = [];
+  const provider = await createBedrockInvokeModelProvider({
+    invoke: async (input) => {
+      ids.push(input.modelId);
+      return chunks(silentThinkingTurn);
+    },
+    // The retune case: BUGBOSS_MODEL_ID moves from SSM without a deploy, so
+    // the map is routinely out of step with the model actually configured.
+    invokeModelIdFor: invokeModelIdFor({ "us.anthropic.claude-opus-5": PROFILE_ARN }),
+  });
+  const pi = await import("@earendil-works/pi-ai");
+
+  const message = await provider
+    .stream(model, pi.normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] }))
+    .result();
+
+  assert.deepEqual(ids, ["us.anthropic.claude-sonnet-5"]);
+  assert.equal(message.stopReason, "stop");
+});
+
+test("no profile map at all is the ordinary case and changes nothing", async () => {
+  const { model, provider, pi } = await setup();
+  assert.equal(invokeModelIdFor({})(model.id), model.id);
+
+  const message = await provider
+    .stream(model, pi.normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] }))
+    .result();
+  assert.equal(message.stopReason, "stop");
+});
+
+test("the profile map is refused at parse time rather than dropped at request time", () => {
+  assert.deepEqual(parseInferenceProfiles(undefined), {});
+  assert.deepEqual(parseInferenceProfiles(""), {});
+  assert.deepEqual(parseInferenceProfiles("  "), {});
+  assert.deepEqual(parseInferenceProfiles(`{"us.anthropic.claude-opus-5":"${PROFILE_ARN}"}`), {
+    "us.anthropic.claude-opus-5": PROFILE_ARN,
+  });
+
+  assert.throws(() => parseInferenceProfiles("[]"), /JSON object of model id to profile ARN/);
+  assert.throws(() => parseInferenceProfiles('"arn"'), /JSON object of model id to profile ARN/);
+  assert.throws(() => parseInferenceProfiles('{"m":123}'), /non-empty profile ARN/);
+  assert.throws(() => parseInferenceProfiles('{"m":""}'), /non-empty profile ARN/);
+  assert.throws(() => parseInferenceProfiles("{nope"), SyntaxError);
 });

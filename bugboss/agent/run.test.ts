@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
 import type { ToolApi, ToolResponse } from "../types";
 import {
   agentOptionsFromEnv,
@@ -11,6 +13,8 @@ import {
   computePaths,
   createBossClient,
   createBossTools,
+  createTurnBudget,
+  DEFAULT_MAX_TURNS,
   DEFAULT_TIMEOUT_SECONDS,
   MODEL_BINDING_MISMATCH,
   exitCodeFor,
@@ -25,9 +29,12 @@ import {
   reserveTokensFor,
   signalExitCode,
   toolListDrift,
+  turnBudgetBrief,
+  turnBudgetMessage,
+  type TurnBudgetState,
 } from "./run";
 import { notesPrefixFor } from "./notes";
-import { PROMPT_ENTRY_TYPE } from "./session";
+import { emptySessionUsage, PROMPT_ENTRY_TYPE } from "./session";
 
 test("paths are derived from the incident, not the process", () => {
   const paths = computePaths("/work", "inc-7");
@@ -403,37 +410,65 @@ test("an agreeing model id is not an alarm, and a fresh run uses the configured 
   assert.equal(fresh.mismatch, null);
 });
 
+const ended = (over: Partial<Parameters<typeof exitCodeFor>[0]> = {}) => ({
+  sessionFile: "f",
+  restored: true,
+  timedOut: false,
+  turnsExhausted: false,
+  error: null,
+  ...over,
+});
+
 test("a force-aborted run does not exit like a finished one", () => {
-  assert.equal(exitCodeFor({ sessionFile: "f", restored: true, timedOut: false, error: null }), 0);
+  assert.equal(exitCodeFor(ended()), 0);
   // The deadline nudge worked and the agent escalated inside the grace window.
-  assert.equal(exitCodeFor({ sessionFile: "f", restored: true, timedOut: true, error: null }), 0);
+  assert.equal(exitCodeFor(ended({ timedOut: true })), 0);
+  assert.equal(exitCodeFor(ended({ timedOut: true, error: "aborted by user" })), 1);
+  // The turn budget stops the run with the same abort a failing turn leaves
+  // an error behind for, so without the exception a bound doing its job
+  // reaches the dispatcher as agent_failed and alarms every time.
   assert.equal(
-    exitCodeFor({
-      sessionFile: "f",
-      restored: true,
-      timedOut: true,
-      error: "aborted by user",
-    }),
-    1,
+    exitCodeFor(ended({ turnsExhausted: true, error: "aborted by user" })),
+    0,
   );
 });
 
 test("the exit record names a timeout even when the aborted turn also errored", () => {
   assert.deepEqual(
-    exitRecordFor({ timedOut: true, error: "aborted", attempt: 3, at: 5 }),
+    exitRecordFor({ timedOut: true, turnsExhausted: false, error: "aborted", attempt: 3, at: 5 }),
     { reason: "timed_out", at: 5, attempt: 3, error: "aborted" },
   );
-  assert.deepEqual(exitRecordFor({ timedOut: false, error: "boom", attempt: 1, at: 5 }), {
-    reason: "turn_error",
-    at: 5,
-    attempt: 1,
-    error: "boom",
-  });
-  assert.deepEqual(exitRecordFor({ timedOut: false, error: null, attempt: 1, at: 5 }), {
-    reason: "completed",
-    at: 5,
-    attempt: 1,
-  });
+  assert.deepEqual(
+    exitRecordFor({ timedOut: false, turnsExhausted: false, error: "boom", attempt: 1, at: 5 }),
+    { reason: "turn_error", at: 5, attempt: 1, error: "boom" },
+  );
+  assert.deepEqual(
+    exitRecordFor({ timedOut: false, turnsExhausted: false, error: null, attempt: 1, at: 5 }),
+    { reason: "completed", at: 5, attempt: 1 },
+  );
+});
+
+// A killed run and a finished one are the same shape on disk, which is why
+// the exit record exists at all. A run stopped on its budget is a third
+// ending, and it is the one a reader most needs to tell from a crash: the
+// answer is "it ran out of room", not "something broke".
+test("a run stopped on its budget is named, not filed under the abort it used", () => {
+  assert.deepEqual(
+    exitRecordFor({
+      timedOut: false,
+      turnsExhausted: true,
+      error: "aborted by user",
+      attempt: 2,
+      at: 5,
+    }),
+    { reason: "turns_exhausted", at: 5, attempt: 2, error: "aborted by user" },
+  );
+  // The dispatcher is escalating the wall clock under its own name at the
+  // same moment, so a timeout stays a timeout and the two halves agree.
+  assert.deepEqual(
+    exitRecordFor({ timedOut: true, turnsExhausted: true, error: null, attempt: 2, at: 5 }),
+    { reason: "timed_out", at: 5, attempt: 2 },
+  );
 });
 
 // Carried purely so the exit record can name the launch. Reading a session
@@ -496,4 +531,200 @@ test("a second signal does not re-enter the shutdown", () => {
   shutdown("SIGTERM");
 
   assert.deepEqual(seen, ["SIGTERM"], "only the first signal runs it");
+});
+
+// ---------------------------------------------------------------------------
+// The turn budget
+// ---------------------------------------------------------------------------
+
+const turnEndHandlerFor = (budget: { extension: (pi: ExtensionAPI) => void }) => {
+  const handlers: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+  budget.extension({
+    on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => {
+      handlers[event] = handler;
+      return () => {};
+    },
+  } as unknown as ExtensionAPI);
+  assert.ok(handlers.turn_end, "the budget counts on turn_end or it counts nothing");
+  return handlers.turn_end;
+};
+
+const turn = (
+  usage: Partial<{
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cacheWrite1h: number;
+    cost: { total: number };
+  }> = {},
+) => [{ type: "turn_end", message: { usage } }, {}] as const;
+
+test("the turn budget counts the whole incident, not this container's share of it", async () => {
+  // Every merge to ops main restarts this container, so a budget that
+  // started from zero on each launch would bound nothing at all: a runaway
+  // incident gets a fresh 200 turns every deploy.
+  const prior = { ...emptySessionUsage(), turns: 8 };
+  const grace: TurnBudgetState[] = [];
+  const exhausted: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior,
+    maxTurns: 10,
+    graceTurns: 1,
+    onGrace: (state) => void grace.push(state),
+    onExhausted: (state) => void exhausted.push(state),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  await turnEnd(...turn());
+  assert.deepEqual(
+    grace.map((s) => s.used),
+    [9],
+    "turn 9 of 10 is the grace edge, counting the 8 an earlier launch used",
+  );
+  assert.equal(exhausted.length, 0);
+  assert.equal(budget.exhausted(), false);
+
+  await turnEnd(...turn());
+  assert.deepEqual(
+    exhausted.map((s) => s.used),
+    [10],
+  );
+  assert.equal(budget.exhausted(), true);
+});
+
+test("a budget already spent stops on its first turn back rather than starting over", async () => {
+  const exhausted: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 200 },
+    maxTurns: 200,
+    graceTurns: 10,
+    onGrace: () => assert.fail("there is no grace left to give"),
+    onExhausted: (state) => void exhausted.push(state),
+  });
+
+  await turnEndHandlerFor(budget)(...turn());
+
+  assert.equal(exhausted.length, 1);
+  assert.equal(exhausted[0].used, 201);
+});
+
+test("each layer fires once, because a model cannot act on the same sentence twice", async () => {
+  const grace: TurnBudgetState[] = [];
+  const exhausted: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 4,
+    graceTurns: 2,
+    onGrace: (state) => void grace.push(state),
+    onExhausted: (state) => void exhausted.push(state),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  for (let i = 0; i < 6; i++) await turnEnd(...turn());
+
+  assert.equal(grace.length, 1, "a steer repeated every turn is noise the agent cannot use");
+  assert.equal(exhausted.length, 1, "a second hand-off posts a second brief over the first");
+});
+
+test("the budget carries what the run spent, so the escalation can say it", async () => {
+  // The point of shipping a turn cap before a dollar cap is to find out what
+  // 200 turns costs. That only happens if the number reaches a person.
+  const exhausted: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 1, tokensIn: 100, costUsd: 0.5 },
+    maxTurns: 3,
+    graceTurns: 1,
+    onGrace: () => {},
+    onExhausted: (state) => void exhausted.push(state),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  await turnEnd(
+    ...turn({ input: 10, output: 20, cacheRead: 300, cacheWrite: 40, cacheWrite1h: 40, cost: { total: 1.25 } }),
+  );
+  await turnEnd(...turn({ input: 5, output: 7, cost: { total: 0.75 } }));
+
+  assert.equal(exhausted.length, 1);
+  const { usage } = exhausted[0];
+  assert.equal(usage.tokensIn, 115, "prior launches plus this one");
+  assert.equal(usage.tokensOut, 27);
+  assert.equal(usage.cacheRead, 300);
+  assert.equal(usage.cacheWrite1h, 40);
+  assert.equal(usage.costUsd, 2.5);
+});
+
+test("the escalation brief names the spend and never states the price as a fact", () => {
+  const brief = turnBudgetBrief(
+    {
+      used: 200,
+      max: 200,
+      usage: {
+        ...emptySessionUsage(),
+        turns: 200,
+        tokensIn: 3_000,
+        tokensOut: 1_200,
+        cacheRead: 1_200_000,
+        cacheWrite: 90_000,
+        modelId: "us.anthropic.claude-opus-5",
+        costUsd: 41.2345,
+      },
+    },
+    10,
+  );
+
+  assert.match(brief, /ran out of turns, not because it finished/);
+  assert.match(brief, /200 turns on us\.anthropic\.claude-opus-5/);
+  assert.match(brief, /1\.3M tokens \(3000 in, 1200 out, 1200000 cache read, 90000 cache write\)/);
+  assert.match(brief, /Estimated cost \$41\.23/);
+  assert.match(brief, /An estimate, not an invoiced figure/);
+});
+
+test("a run the provider priced at nothing says so rather than reporting it free", () => {
+  const brief = turnBudgetBrief(
+    { used: 5, max: 5, usage: { ...emptySessionUsage(), turns: 5 } },
+    1,
+  );
+
+  assert.match(brief, /No cost estimate: the provider reported no prices/);
+  assert.doesNotMatch(brief, /\$0\.00/);
+});
+
+test("the steer says the budget does not come back, because a restart looks like one that would", () => {
+  const message = turnBudgetMessage({
+    used: 190,
+    max: 200,
+    usage: emptySessionUsage(),
+  });
+
+  assert.match(message, /190 of the 200 turns/);
+  assert.match(message, /across every launch/);
+  assert.match(message, /calling hand_off/);
+  assert.match(message, /A restart does not give the turns back/);
+});
+
+test("the turn budget reaches the agent from the environment the dispatcher builds", () => {
+  const options = agentOptionsFromEnv({
+    BUGBOSS_INCIDENT_ID: "inc-1",
+    BUGBOSS_S3_BUCKET: "b",
+    BUGBOSS_SESSION_REF: "sessions/incident/inc-1/session.jsonl",
+    BUGBOSS_MAX_TURNS: "40",
+  });
+  assert.equal(options.maxTurns, 40);
+
+  // Number("") is 0 and 0 is finite, so an unset-but-present variable would
+  // otherwise hand every agent a budget of nothing and stop it on its first
+  // turn -- the same trap BUGBOSS_DEADLINE_AT already carries a guard for.
+  for (const value of ["", "0", "-5", "nonsense"]) {
+    assert.equal(
+      agentOptionsFromEnv({
+        BUGBOSS_INCIDENT_ID: "inc-1",
+        BUGBOSS_S3_BUCKET: "b",
+        BUGBOSS_SESSION_REF: "sessions/incident/inc-1/session.jsonl",
+        BUGBOSS_MAX_TURNS: value,
+      }).maxTurns,
+      DEFAULT_MAX_TURNS,
+      `BUGBOSS_MAX_TURNS=${JSON.stringify(value)} must fall back, not bind`,
+    );
+  }
 });

@@ -59,6 +59,41 @@ queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
 The 20,000-char output cap does not help with any of this. It bounds bytes
 returned; Loki bills bytes scanned.
 
+## Two bounds, and the turn budget is the one that measures work
+
+The wall clock bounds how long a launch may run. It does not bound what the
+run does: `monitor` and `contact_human` each cost **one turn** however long
+they block, so the first nine-hour incident spent about eight of those hours
+inside a single turn waiting on a person. 92 turns, $18.51, against a
+24-hour deadline that fifteen agents could each have spent in full.
+
+So there is a second bound in turns — `BUGBOSS_MAX_TURNS`, 200 by default —
+and three things about it matter:
+
+- **It is counted over the incident, not the process.** Every merge to ops
+  `main` restarts this container, so a budget that started from zero on each
+  launch would bound nothing. `createTurnBudget` is seeded from
+  `sumSessionUsage` over the restored transcript, which counts assistant
+  messages — the same unit `turn_end` fires on.
+- **It hands off, it does not just stop.** Same two layers as the deadline:
+  at `maxTurns - TURN_BUDGET_GRACE_TURNS` the blocking-tool abort fires and
+  the model is steered to write a brief, and at `maxTurns` the harness calls
+  `hand_off` itself and aborts the session. The harness hand-off is the
+  floor under the steer, exactly as it is for an unanswered `contact_human`:
+  an incident stopped on its budget with `owner: agent` is invisible — the
+  dispatcher will not relaunch one an agent still holds and nothing lists it
+  as unclaimed.
+- **The brief carries what the run spent.** Turns, tokens and a cost
+  estimate, because shipping 200 before a dollar cap is only worth anything
+  if somebody learns what 200 turns costs. It is called an estimate there
+  too.
+
+`turn_end` cannot stop the loop. Pi reads a boundary result's `continue` as
+"force another turn" and never as "stop", so the stop is `session.abort()` —
+which leaves an error message behind exactly as a failing turn does. That is
+why `exitCodeFor` exempts `turnsExhausted`: without it a bound working as
+designed reaches the dispatcher as `agent_failed` and alarms every time.
+
 ## The two blocking tools
 
 `monitor` and `contact_human` each cost **one turn** no matter how long they

@@ -262,6 +262,36 @@ export const readStoredPrefixFromFile = async (
   }
 };
 
+export const emptySessionUsage = (): SessionUsage => ({
+  tokensIn: 0,
+  tokensOut: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  cacheWrite1h: 0,
+  modelId: null,
+  turns: 0,
+  costUsd: 0,
+});
+
+/**
+ * What the restored session already spent, read off local disk at launch.
+ *
+ * The turn budget is measured over the incident rather than over the
+ * process, so a launch has to start from what earlier launches used. A file
+ * that is not there is a first launch, which is zero and not an error --
+ * `restoreSessionFile` has already said whether one was restored.
+ */
+export const readSessionUsageFromFile = async (
+  sessionFile: string,
+): Promise<SessionUsage> => {
+  try {
+    return sumSessionUsage(await readFile(sessionFile, "utf8"));
+  } catch (err) {
+    if ((err as { code?: string }).code === "ENOENT") return emptySessionUsage();
+    throw err;
+  }
+};
+
 /**
  * Token usage summed over one incident's whole session file.
  *
@@ -275,6 +305,14 @@ export interface SessionUsage {
   tokensOut: number;
   cacheRead: number;
   cacheWrite: number;
+  /**
+   * The 1h share of `cacheWrite`. Carried separately because it does not
+   * price like the rest of it: Pi bills a 1h write at 2x base input against
+   * 1.25x for 5m, so a re-pricing that only has the total understates a run
+   * that used the long cache -- which is every run here, since
+   * `DEFAULT_CACHE_RETENTION` is `"long"`.
+   */
+  cacheWrite1h: number;
   modelId: string | null;
   turns: number;
   /**
@@ -284,7 +322,7 @@ export interface SessionUsage {
    * the record is tokens plus `modelId`, because those still multiply out
    * correctly after a price change. This is the arithmetic done at the time,
    * carried so a reader gets a figure without a price list -- and it is only
-   * ever presented as derived. Zero when the provider reported no prices.
+   * ever presented as an estimate. Zero when the provider reported no prices.
    */
   costUsd: number;
 }
@@ -294,6 +332,7 @@ interface UsageFields {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
+  cacheWrite1h?: number;
   cost?: { total?: number };
 }
 
@@ -328,6 +367,7 @@ export const sumSessionUsage = (contents: string): SessionUsage => {
     tokensOut: 0,
     cacheRead: 0,
     cacheWrite: 0,
+    cacheWrite1h: 0,
     modelId: null,
     turns: 0,
     costUsd: 0,
@@ -355,6 +395,7 @@ export const sumSessionUsage = (contents: string): SessionUsage => {
       total.tokensOut += usage.output ?? 0;
       total.cacheRead += usage.cacheRead ?? 0;
       total.cacheWrite += usage.cacheWrite ?? 0;
+      total.cacheWrite1h += usage.cacheWrite1h ?? 0;
       total.costUsd += usage.cost?.total ?? 0;
     }
 
@@ -390,6 +431,13 @@ export type ExitReason =
   | "completed"
   /** The wall-clock deadline fired. The agent had its grace to write a brief. */
   | "timed_out"
+  /**
+   * The incident's turn budget ran out. Counted across every launch, not per
+   * container, so this is the bound a restart does not refill -- which is
+   * what makes it the only one that tracks work done rather than time
+   * passed.
+   */
+  | "turns_exhausted"
   /** Pi reported an error on the last turn. */
   | "turn_error"
   /** SIGTERM or SIGINT reached the child before it was done. */
@@ -410,7 +458,13 @@ export interface StoredExit {
 export const isStoredExit = (value: unknown): value is StoredExit => {
   const candidate = value as StoredExit | undefined;
   if (!candidate || typeof candidate !== "object") return false;
-  const reasons: ExitReason[] = ["completed", "timed_out", "turn_error", "signal"];
+  const reasons: ExitReason[] = [
+    "completed",
+    "timed_out",
+    "turns_exhausted",
+    "turn_error",
+    "signal",
+  ];
   return (
     reasons.includes(candidate.reason) &&
     typeof candidate.at === "number" &&

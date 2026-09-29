@@ -23,18 +23,22 @@ import { Db, type LateColumn } from ".";
 const SCHEMA = join(__dirname, "schema.sql");
 
 /**
- * A snapshot from before `recurrenceAnalysis` existed, built by stripping the
- * column out of the live schema rather than pinning a copy of the old one, so
- * this keeps describing the real upgrade as the schema moves on.
+ * A snapshot from before the late columns existed, built by stripping them
+ * out of the live schema rather than pinning a copy of the old one, so this
+ * keeps describing the real upgrade as the schema moves on.
  */
 const preColumnSnapshot = (dir: string): Buffer => {
   const ddl = readFileSync(SCHEMA, "utf8")
     .split("\n")
-    .filter((line) => !/^\s*recurrenceAnalysis\s+TEXT,\s*$/.test(line))
+    .filter(
+      (line) =>
+        !/^\s*recurrenceAnalysis\s+TEXT,\s*$/.test(line) &&
+        !/^\s*cacheWrite1h\s+INTEGER/.test(line),
+    )
     .join("\n");
   assert.ok(
-    !/recurrenceAnalysis/.test(ddl),
-    "the column has been renamed or moved; this fixture no longer builds an old snapshot",
+    !/recurrenceAnalysis/.test(ddl) && !/cacheWrite1h/.test(ddl),
+    "a column has been renamed or moved; this fixture no longer builds an old snapshot",
   );
   const path = join(dir, "old.db");
   const old = new Database(path);
@@ -94,6 +98,10 @@ describe("a column added after its table shipped", () => {
         columns.includes("recurrenceAnalysis"),
         "without this every reportResolved and reportAnalysis rolls back on prod",
       );
+      assert.ok(
+        columns.includes("cacheWrite1h"),
+        "without this every usage roll-up rolls back on prod and a run reads as free",
+      );
     } finally {
       db.close();
     }
@@ -106,7 +114,7 @@ describe("a column added after its table shipped", () => {
         w.prepare(
           `INSERT INTO incident
              (id, status, owner, prUrls, firstSignalAt, resolvedAt, attempts,
-              costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+              tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
            VALUES ('inc-1', 'RESOLVED', 'agent', '[]', 1000, 2000, 0, 0, 0, 0, 0, 0)`,
         ).run();
         // The two statements the missing column broke: the close writes it and
@@ -186,6 +194,81 @@ const alarmsDuring = async (fn: () => Promise<Db>) => {
     console.error = original;
   }
 };
+
+/**
+ * `costUsd` was dropped from `schema.sql` when the system stopped pretending
+ * a locally computed dollar figure was a fact. There is no migration runner,
+ * so prod's `incident` table still has the column and always will: the DDL
+ * runs as CREATE TABLE IF NOT EXISTS over a restored snapshot, and
+ * `LATE_COLUMNS` only adds.
+ *
+ * That divergence is deliberate and it is only safe while nothing writes the
+ * column. It is `NOT NULL DEFAULT 0`, so an INSERT that omits it takes the
+ * default; an INSERT that names it would fail on every fresh database, which
+ * is every test, while passing in prod -- the inverse of the usual trap and
+ * just as quiet. This pins the safe half.
+ */
+describe("a live database that still carries the retired costUsd column", () => {
+  let dir: string;
+  let snapshot: Buffer;
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "bugboss-db-cost-"));
+    snapshot = snapshotWith(dir, "withcost.db", (ddl) =>
+      ddl.replace(
+        "  modelId           TEXT,\n",
+        "  modelId           TEXT,\n  costUsd           REAL NOT NULL DEFAULT 0,\n",
+      ),
+    );
+  });
+
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("takes the insert assign.ts writes, which no longer names it", async () => {
+    const { db, alarms } = await alarmsDuring(() =>
+      Db.open({
+        path: join(dir, "live.db"),
+        bucket: "b",
+        key: "k",
+        s3: s3Holding(snapshot) as unknown as S3Client,
+      }),
+    );
+    try {
+      assert.ok(
+        db
+          .query<{ name: string }>("PRAGMA table_info(incident)")
+          .some((c) => c.name === "costUsd"),
+        "the fixture is meant to reproduce prod, where the column outlives its declaration",
+      );
+      // A column the live database has and schema.sql does not is not drift
+      // this can act on: there is no DROP COLUMN pass, and alarming on it
+      // every boot would be an alarm nobody can clear.
+      assert.deepEqual(
+        alarms.filter((a) => a.event === "schema_drift"),
+        [],
+      );
+
+      await db.withWrite((w) => {
+        w.prepare(
+          `INSERT INTO incident
+             (id, status, owner, prUrls, firstSignalAt, recurrenceOf, rotationAtOpen,
+              attempts, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
+           VALUES (?, 'INVESTIGATING', 'agent', '[]', ?, NULL, NULL, 0, 0, 0, 0, 0, 0)`,
+        ).run("inc-1", 1000);
+      });
+
+      assert.equal(
+        db.get<{ costUsd: number }>("SELECT costUsd FROM incident WHERE id = ?", [
+          "inc-1",
+        ])?.costUsd,
+        0,
+        "the leftover column takes its default; nothing writes it and nothing reads it",
+      );
+    } finally {
+      db.close();
+    }
+  });
+});
 
 describe("a LATE_COLUMNS entry that cannot be applied", () => {
   let dir: string;

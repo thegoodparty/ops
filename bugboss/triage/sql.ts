@@ -24,7 +24,8 @@ export const SCHEMA_SUMMARY = `incident(
   rootCause TEXT, prUrls TEXT json, postmortem TEXT,
   usersImpacted INT, impactQuery TEXT,
   impactStartedAt INT, firstSignalAt INT, fixingAt INT, resolvedAt INT, closedAt INT,
-  mergedInto TEXT, recurrenceOf TEXT, attempts INT, costUsd REAL)
+  mergedInto TEXT, recurrenceOf TEXT, attempts INT, modelId TEXT,
+  tokensIn INT, tokensOut INT, cacheRead INT, cacheWrite INT, cacheWrite1h INT)
 signal(
   id TEXT, source TEXT, sourceId TEXT, kind TEXT, title TEXT, body TEXT,
   labels TEXT json, reportedBy TEXT, openedAt INT, closedAt INT,
@@ -35,7 +36,10 @@ The token columns on signal are what triage spent placing it. There is no
 cost column on signal: price the tokens against modelId if somebody asks for
 dollars, and say it is an estimate.
 Timestamps are epoch milliseconds. Labels and prUrls are JSON text; use
-json_extract(labels, '$.alert_slug') to read one.`;
+json_extract(labels, '$.alert_slug') to read one.
+There is no cost column. Spend is recorded in tokens because prices move and
+tokens do not; a dollar figure is arithmetic over these and modelId, and is an
+estimate whenever you quote one.`;
 
 // The guard below used to exist twice, against the same database, with
 // different answers: this one allowed SELECT and WITH and checked the raw

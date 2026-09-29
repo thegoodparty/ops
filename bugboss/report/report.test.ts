@@ -151,8 +151,8 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
          usersImpacted, impactQuery, impactStartedAt, firstSignalAt, fixingAt,
          resolvedAt, closedAt, rotationAtOpen, sessionRef, lastStartedAt,
          attempts, modelId, tokensIn, tokensOut, cacheRead, cacheWrite,
-         resolvedEvidence)
-       VALUES (?, ?, 'thread-1', ?, ?, ?, 1240, 'sum(rate(errors))', ?, ?, ?, ?, ?, ?, ?, ?, 2, 'us.anthropic.claude-opus-5', 3000, 1200, 100000, 2000, ?)`,
+         cacheWrite1h, resolvedEvidence)
+       VALUES (?, ?, 'thread-1', ?, ?, ?, 1240, 'sum(rate(errors))', ?, ?, ?, ?, ?, ?, ?, ?, 2, 'us.anthropic.claude-opus-5', 3000, 1200, 100000, 2000, 1500, ?)`,
     ).run(
       id,
       status,
@@ -230,7 +230,8 @@ describe("the report assembles from a real incident row", () => {
     assert.ok(data);
     assert.equal(data.run.modelId, "us.anthropic.claude-opus-5");
     assert.equal(data.run.turns, 2, "turns come from the session file, not the row");
-    assert.equal(data.run.costUsd, 3.76);
+    assert.equal(data.run.estimatedCostUsd, 3.76);
+    assert.equal(data.run.cacheWrite1h, 1500, "the 1h split is the record, not the price");
     assert.equal(data.prs.length, 1);
     assert.equal(data.prs[0].state, null, "no PR reader wired, so state is not known");
 
@@ -248,8 +249,16 @@ describe("the report assembles from a real incident row", () => {
     assert.match(doc, /\| Turns \| 2 \|/);
     assert.match(doc, /\| Total tokens \| 106,200 \(106\.2k\) \|/);
     assert.match(doc, /\| Cache read \| 100,000 \|/);
-    assert.match(doc, /\$3\.76/);
-    assert.match(doc, /derived and is not the record/);
+    // The 1h share prices at 2x base input where the rest is 1.25x, so a
+    // re-pricing that cannot see it is wrong by most of that gap.
+    assert.match(doc, /\| Cache write \(1h\) \| 1,500 \|/);
+    assert.match(doc, /Estimated cost: \$3\.76\./);
+    assert.match(doc, /An estimate, not a bill/);
+    assert.doesNotMatch(
+      doc,
+      /Priced at the time this ran/,
+      "a dollar figure is never stated as the record",
+    );
     assert.match(doc, /https:\/\/github\.com\/thegoodparty\/omni\/pull\/42 — state not known/);
     assert.match(doc, /## What people did/);
     assert.match(doc, /U-SWAIN \| merge \| same connection pool as inc-9/);
@@ -266,7 +275,7 @@ describe("the report assembles from a real incident row", () => {
     const data = await readReportData(deps(), "inc-2");
     assert.ok(data);
     assert.equal(data.run.turns, null);
-    assert.equal(data.run.costUsd, null);
+    assert.equal(data.run.estimatedCostUsd, null);
 
     const doc = renderReportDocument(data);
     assert.match(doc, /\| Time to detect \| not known/);

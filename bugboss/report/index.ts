@@ -173,18 +173,18 @@ export const readReportData = async (
   );
 
   // Tokens and modelId are the record and come off the row. Turns and the
-  // run-time price are read back out of the same session file rollUpUsage
+  // estimated price are read back out of the same session file rollUpUsage
   // summed, so they are simply missing once it ages out -- which is the
   // honest shape, rather than a zero that reads as a free run.
   let turns: number | null = null;
-  let costUsd: number | null = null;
+  let estimatedCostUsd: number | null = null;
   if (incident.sessionRef) {
     try {
       const contents = await deps.sessions.get(incident.sessionRef);
       if (contents) {
         const usage = sumSessionUsage(contents);
         turns = usage.turns;
-        costUsd = usage.costUsd > 0 ? usage.costUsd : null;
+        estimatedCostUsd = usage.costUsd > 0 ? usage.costUsd : null;
       }
     } catch (err) {
       // A missing turn count is a worse report, not a worse incident.
@@ -247,9 +247,10 @@ export const readReportData = async (
       tokensOut: incident.tokensOut,
       cacheRead: incident.cacheRead,
       cacheWrite: incident.cacheWrite,
+      cacheWrite1h: incident.cacheWrite1h,
       attempts: incident.attempts,
       turns,
-      costUsd,
+      estimatedCostUsd,
     },
   };
 };

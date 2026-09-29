@@ -36,6 +36,10 @@ export interface LateColumn {
  */
 export const LATE_COLUMNS: LateColumn[] = [
   { table: "incident", column: "recurrenceAnalysis", type: "TEXT" },
+  // The 1h cache-write share, which prices at 2x base input where the
+  // rest of the write is 1.25x. Same full declaration as the signal
+  // columns below, for the reason given there.
+  { table: "incident", column: "cacheWrite1h", type: "INTEGER NOT NULL DEFAULT 0" },
   // Triage's own spend, per signal. The full declaration including
   // `NOT NULL DEFAULT 0`, not a bare `INTEGER`, and the difference is not
   // cosmetic: `ALTER TABLE ADD COLUMN x INTEGER` leaves the column nullable

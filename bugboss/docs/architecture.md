@@ -415,20 +415,45 @@ same routing before the first one. One path deliberately, so a fix to the
 request lands once -- two paths is how a beta header present on one and absent
 from the other killed every incident agent while triage carried on working.
 
-**Wall-clock timeout, not budget caps.** A deadline is external, so it costs
-nothing in harness capability. Two layers: the child steers itself to write
-a brief at the soft deadline, and the parent SIGKILLs strictly later.
+**Two bounds on a run, and the wall clock is the weaker one.** A deadline is
+external, so it costs nothing in harness capability, but it does not measure
+work: `monitor` and `contact_human` each cost one turn however long they
+block, and the first nine-hour incident spent about eight of those hours
+inside a single turn waiting on a person. So the run is also bounded in
+**turns**, counted across every launch of one incident -- 92 turns for that
+nine-hour run against a ceiling of 200. Both bounds have the same two
+layers: the child steers itself to write a brief at the soft edge, then it
+is stopped. The wall clock's stop is the parent's SIGKILL, strictly later;
+the turn budget's is `session.abort()` in the child, with the harness
+handing off first so nothing is left owned by a dead agent.
+
+Turns rather than dollars because dollars here are an estimate (below) and a
+cap on an estimate is a cap on arithmetic. 200 is a bound before a price
+cap, not instead of one: the escalation carries what the run spent so the
+next number is measured rather than guessed.
 
 **Compaction at 95% of the context window**, made safe by bounded tool
 results.
 
-**Tokens, not dollars.** Pricing moves; a stored dollar figure would be a
-guess frozen at write time, while tokens plus `modelId` multiply out
-correctly whenever asked. The closing report prints both and says which is
-which: the token table is the record, and the dollar line beside it is what
-Pi priced that run at while it ran, read back out of the session file rather
-than off a price list kept here. `costUsd` on the incident row stays
-unwritten.
+**Tokens are facts; dollars are arithmetic.** Bedrock returns token counts.
+A price is something we compute locally against Pi's hardcoded per-model
+table, and the day AWS moves a rate that table goes stale with nothing in a
+stored dollar figure that could ever say so. So the incident row records
+`tokensIn`, `tokensOut`, `cacheRead`, `cacheWrite` and the 1h share of that
+write -- which is carried separately because it prices at 2x base input
+where the rest is 1.25x, and every run here asks for the long cache. There
+is no cost column. A dollar figure is derived where it is shown and called
+an **estimate** in the closing report, in Slack and in
+`read_agent_session`, because that is what it is.
+
+The one way to check the estimate is an **application inference profile**: a
+tagged wrapper the agent is invoked through, since Bedrock puts no
+cost tag on an InvokeModel request. Its usage lands under `Project: bugboss`
+in Cost Explorer, about a day late -- too late to enforce anything, and the
+only mechanism that would ever reveal the local price table had drifted. The
+profile ARN is the request field only; `model.id` stays the logical id, so
+the signed session prefix is untouched and a model nobody wrapped loses its
+attribution rather than its agent.
 
 The Boss's own bounded calls are costed the same way. `runStructuredCall`
 adds each request's usage onto a `ModelUsage` in place, including the request

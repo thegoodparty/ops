@@ -74,11 +74,19 @@ CREATE TABLE IF NOT EXISTS incident (
   -- one: every merge to main restarts this container.
   attempts          INTEGER NOT NULL DEFAULT 0,
   modelId           TEXT,
-  costUsd           REAL NOT NULL DEFAULT 0,
+  -- Tokens, never dollars. Bedrock returns these; a price is arithmetic we do
+  -- against a table that goes stale the day AWS changes a rate, and a stored
+  -- dollar figure has nothing in it that could ever say so. These re-price
+  -- correctly forever, which is why a cost is derived at render time and
+  -- always labelled an estimate.
   tokensIn          INTEGER NOT NULL DEFAULT 0,
   tokensOut         INTEGER NOT NULL DEFAULT 0,
   cacheRead         INTEGER NOT NULL DEFAULT 0,
   cacheWrite        INTEGER NOT NULL DEFAULT 0,
+  -- The 1h share of cacheWrite. Re-pricing needs it: a 1h write costs 2x base
+  -- input against 1.25x for 5m, so a total with no split prices a long-cache
+  -- run as if it were a short-cache one and understates it by most of the gap.
+  cacheWrite1h      INTEGER NOT NULL DEFAULT 0,
   -- What the agent observed stop happening. RESOLVED is an evidence-based
   -- claim, so the evidence has to outlive the Slack message that carried it.
   resolvedEvidence  TEXT,

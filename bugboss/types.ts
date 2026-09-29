@@ -106,11 +106,17 @@ export interface Incident {
   /** Total launches, informational. Escalation gates on fast failures. */
   attempts: number;
   modelId: string | null;
-  costUsd: number;
+  /**
+   * What the run spent, in tokens. Never in dollars: Bedrock returns tokens
+   * and a price is arithmetic against a table that goes stale silently, so a
+   * cost is derived wherever it is shown and labelled an estimate there.
+   */
   tokensIn: number;
   tokensOut: number;
   cacheRead: number;
   cacheWrite: number;
+  /** The 1h share of `cacheWrite`, which prices at 2x base input, not 1.25x. */
+  cacheWrite1h: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -462,8 +468,23 @@ export interface DispatcherConfig {
   /** Circuit breaker, not a scheduler. Hitting it means something is wrong. */
   maxConcurrentAgents: number;
   tickSeconds: number;
-  /** Wall clock, the only bound on a run. Not a token or dollar cap. */
+  /**
+   * Wall clock, per launch. A poor proxy for work done and never the only
+   * bound: `monitor` and `contact_human` each cost one turn however long
+   * they block, so one real incident spent eight of its nine hours parked on
+   * a human and the clock counted all of it.
+   */
   agentTimeoutSeconds: number;
+  /**
+   * Turns one incident's agent may take, counted across every launch.
+   *
+   * The bound that tracks work rather than time. A turn is a model call, so
+   * this does not inflate while the agent waits on a person -- the nine-hour
+   * incident above was 92 turns. It is deliberately not per launch: every
+   * merge to ops `main` restarts this container, and a budget that refilled
+   * on a restart would bound nothing.
+   */
+  maxTurns: number;
   /** Stop relaunching after this many attempts and escalate. */
   maxAttempts: number;
   /**
@@ -508,6 +529,14 @@ export interface BugBossConfig {
    * fails the Boss at boot rather than every agent at launch.
    */
   workingHours?: string;
+  /**
+   * Model id to application inference profile ARN, as JSON. Carried raw for
+   * the same reason `workingHours` is: the agent that uses it is a child
+   * process and the environment is the only channel to it. Parsed at both
+   * ends, but only this end throws -- an unattributable run is worth less
+   * than a dead agent.
+   */
+  inferenceProfiles?: string;
   /** The Postgres agents run omni's database-backed tests against. */
   testDatabase: TestDatabase;
 }

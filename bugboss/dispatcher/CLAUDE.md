@@ -50,6 +50,26 @@ arrives as `undefined`, `killAt` becomes `NaN`, and `now < NaN` is false —
 so the backstop would collapse to *zero* and kill every agent on its first
 tick. The grace test pins its clocks to literals for the same reason.
 
+## The turn budget is the child's, and this is only the courier
+
+`BUGBOSS_MAX_TURNS` goes down in `buildChildEnv` beside the deadline and
+nothing here acts on it. That is deliberate: the count lives in the restored
+session file, which the dispatcher never reads, and the escalation has to
+carry what the run spent — which the incident row does not have yet, because
+`rollUpUsage` runs after the child exits and after this has already
+escalated. So the child owns both halves. It counts, it hands off with live
+numbers, and the work leaves it as `owner: human` before this ever sees the
+exit. See `agent/CLAUDE.md`.
+
+The one thing to know here: the child hands off and then aborts, which
+leaves an error message behind. `exitCodeFor` exempts that case, so a budget
+doing its job arrives as a clean exit rather than as `agent_failed`.
+
+Unlike the deadline, the budget is **not** per launch. The deadline is
+`now + agentTimeoutSeconds` on every launch and a restart gives a full clock
+back; the budget does not, because turns are work done and a restart did not
+undo any of it.
+
 ## Relaunch bounds
 
 Two counters, both **in memory on purpose**:

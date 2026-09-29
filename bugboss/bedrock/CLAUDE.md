@@ -86,15 +86,58 @@ reachable: `runStructuredCall` records the assistant turn before nudging a
 prose reply back towards the answer tool, and a reply can be empty. Hence the
 `"(no reply)"` placeholder.
 
-## Usage is the cost record
+## Usage is the cost record, and it is tokens
 
 Per-turn usage is what the Boss sums out of the session file after a child
 exits. Nothing else records what a run cost, and it is read from the file
 rather than reported by the agent because a killed agent never gets to
 report — and the file is on disk either way.
 
+**Tokens, never dollars.** Bedrock returns tokens; `pi.calculateCost` prices
+them from a hardcoded per-model table in `node_modules/@earendil-works/pi-ai`.
+The day AWS moves a rate that table is wrong and nothing in a stored dollar
+figure could say so, where tokens re-price correctly forever. So the incident
+row holds tokens and `modelId`, a cost is derived wherever it is shown and
+called an estimate there, and `usage.cacheWrite1h` is carried alongside the
+total because a 1h write bills at 2x base input against 1.25x for 5m.
+
 `emptyUsage()` exists so a turn that fails still has a shape to record
 rather than a hole.
+
+## Application inference profiles are the only cost attribution there is
+
+Bedrock puts no cost tag on an `InvokeModel` request. The one mechanism AWS
+offers is an **application inference profile**: a profile created with tags,
+invoked by passing its ARN as `modelId`, whose usage then appears under those
+tags in Cost Explorer. `deploy/components/bugboss.ts` creates one wrapping
+Opus and hands the map down as `BUGBOSS_INFERENCE_PROFILES`, keyed by logical
+model id.
+
+It enforces nothing -- Cost Explorer lags about a day. What it buys is the
+one real number the local price table can be checked against, which matters
+because every dollar figure this system reports is arithmetic over tokens
+against Pi's hardcoded rates.
+
+**The swap is the request field and nothing else.** `invokeModelIdFor` is
+applied at the `modelId` on the wire; `model.id` keeps the logical id. That
+is deliberate, and it is what the section below is about: the prefix records
+`model.id`, so putting the ARN there would pin the ARN in the session. Two
+things would then break. The costs come from Pi's catalog, which has no entry
+for an opaque profile suffix, so `resolveBedrockModel` would refuse to resolve
+a resumed session at all. And a session started before the profile existed
+would disagree with one started after it, for no reason a reader could see.
+Leaving `model.id` alone means a run started before the profile and resumed
+after it gets attribution from the resume onward and nothing else changes.
+
+**An unrecognised model loses attribution, not the agent.** The model is
+runtime-configurable (`BUGBOSS_MODEL_ID`) and retunes from SSM without a
+deploy, so the map is routinely out of step with what is configured.
+`invokeModelIdFor` falls back to the bare id and never throws.
+`parseInferenceProfiles` does throw, and only the composition root calls it
+that way: a typo stops the container at boot where somebody is watching,
+while the child logs `inference_profiles_unreadable` and carries on. Killing
+an agent working a production incident over a billing tag is the same trade
+`stream.ts` refuses to make over an unhonoured cache retention.
 
 ## No explicit credentials
 

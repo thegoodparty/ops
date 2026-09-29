@@ -130,6 +130,8 @@ import {
   sessionKeyFor,
   sumSessionUsage,
 } from "./agent/session";
+import { DEFAULT_MAX_TURNS } from "./agent/run";
+import { parseInferenceProfiles } from "./bedrock/model";
 import { createInstallationToken, createPrStateReader } from "./github";
 import { makeAlarm, makeLog } from "./logging";
 import type {
@@ -1587,10 +1589,16 @@ export const createBugBoss = async (
   /**
    * Sum the run's token usage onto the incident.
    *
-   * Tokens rather than dollars. Pricing is per model and changes underneath
-   * us, so a stored dollar figure would be a guess frozen at write time,
-   * while tokens plus `modelId` stay true and multiply out whenever someone
-   * asks. `costUsd` is left unwritten for that reason.
+   * Tokens rather than dollars. Bedrock returns tokens; a price is
+   * arithmetic we do locally against Pi's per-model table, and the day AWS
+   * moves a rate that table goes stale with nothing in a stored dollar
+   * figure that could ever say so. Tokens plus `modelId` stay true and
+   * re-price whenever someone asks, so there is no cost column to write and
+   * every figure a human sees is derived at the point it is shown.
+   *
+   * The 1h cache-write share goes with them for the same reason: it prices
+   * at 2x base input where the rest of the write is 1.25x, so a re-pricing
+   * without it is wrong by most of that gap on every run here.
    */
   const rollUpUsage = async (
     incidentId: string,
@@ -1634,13 +1642,14 @@ export const createBugBoss = async (
         w.prepare(
           `UPDATE incident
              SET tokensIn = ?, tokensOut = ?, cacheRead = ?, cacheWrite = ?,
-                 modelId = COALESCE(?, modelId)
+                 cacheWrite1h = ?, modelId = COALESCE(?, modelId)
            WHERE id = ?`,
         ).run(
           usage.tokensIn,
           usage.tokensOut,
           usage.cacheRead,
           usage.cacheWrite,
+          usage.cacheWrite1h,
           usage.modelId,
           incidentId,
         );
@@ -1651,6 +1660,7 @@ export const createBugBoss = async (
         tokensOut: usage.tokensOut,
         cacheRead: usage.cacheRead,
         cacheWrite: usage.cacheWrite,
+        cacheWrite1h: usage.cacheWrite1h,
         turns: usage.turns,
         modelId: usage.modelId,
       });
@@ -1733,6 +1743,9 @@ export const createBugBoss = async (
         ? { [TEST_DB_ENV_VAR]: config.testDatabase.url }
         : {}),
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
+      ...(config.inferenceProfiles
+        ? { BUGBOSS_INFERENCE_PROFILES: config.inferenceProfiles }
+        : {}),
       ...(config.workingHours
         ? { BUGBOSS_WORKING_HOURS: config.workingHours }
         : {}),
@@ -2220,6 +2233,7 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       maxConcurrentAgents: Number(env.BUGBOSS_MAX_AGENTS ?? 15),
       tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
       agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 86_400),
+      maxTurns: Number(env.BUGBOSS_MAX_TURNS ?? DEFAULT_MAX_TURNS),
       maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
       staleAfterSeconds: Number(env.BUGBOSS_STALE_HOURS ?? 24) * 3600,
     },
@@ -2235,6 +2249,18 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
           workingHours: (() => {
             parseWorkingHours(env.BUGBOSS_WORKING_HOURS);
             return env.BUGBOSS_WORKING_HOURS;
+          })(),
+        }
+      : {}),
+    // Same trick, same reason. The child re-parses the string it is handed
+    // and will not die on a bad one, so this is the only place a typo in the
+    // profile map can be loud -- and it is loud at boot, where somebody is
+    // looking, rather than as a silently missing line on next month's bill.
+    ...(env.BUGBOSS_INFERENCE_PROFILES
+      ? {
+          inferenceProfiles: (() => {
+            parseInferenceProfiles(env.BUGBOSS_INFERENCE_PROFILES);
+            return env.BUGBOSS_INFERENCE_PROFILES;
           })(),
         }
       : {}),

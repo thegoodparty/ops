@@ -209,7 +209,7 @@ export const assign = (
       // has no default -- see the comment on it in schema.sql.
       `INSERT INTO incident
          (id, status, owner, prUrls, firstSignalAt, recurrenceOf, rotationAtOpen,
-          attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+          attempts, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
        VALUES (?, 'INVESTIGATING', 'agent', '[]', ?, ?, ?, 0, 0, 0, 0, 0, 0)`,
     ).run(
       target,

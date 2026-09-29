@@ -73,7 +73,7 @@ const seedClosed = async (args: {
     w.prepare(
       `INSERT INTO incident
          (id, status, prUrls, firstSignalAt, resolvedAt, closedAt, postmortem,
-          rootCause, resolvedEvidence, attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+          rootCause, resolvedEvidence, attempts, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
        VALUES (?, ?, '[]', ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0)`,
     ).run(
       args.id,
@@ -156,7 +156,7 @@ describe("recurrence: the closed-incident analogue of the open list", () => {
     await db.withWrite((w) => {
       w.prepare(
         `INSERT INTO incident (id, status, prUrls, firstSignalAt, attempts,
-           costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+           tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
          VALUES ('9', 'FIXING', '[]', ?, 0, 0, 0, 0, 0, 0)`,
       ).run(NOW - DAY);
       w.prepare(
