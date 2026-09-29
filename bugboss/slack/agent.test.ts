@@ -1102,7 +1102,12 @@ describe("a run that uses its whole budget", () => {
     // advice rather than the wrong one.
     const { store } = memoryStore();
     const model: ModelClient = {
-      complete: () => Promise.resolve({ text: "", toolCalls: [] } satisfies ModelReply),
+      complete: () =>
+        Promise.resolve({
+          text: "",
+          toolCalls: [],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply),
     };
 
     let answer = "";

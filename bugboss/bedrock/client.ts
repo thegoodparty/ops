@@ -144,13 +144,23 @@ export const createPiModelClient = ({ runtime, model }: PiModelClientDeps): Mode
     const message = await runtime.complete(model, context, {
       maxTokens: request.maxTokens,
       signal: request.signal,
-      // Off, and not by omission. The shared body builder turns adaptive
-      // thinking on for any model whose catalog entry says it reasons, and
-      // these calls cannot afford it: triage caps output at 2048 tokens and
-      // the inbound-language read at 512, so a thinking block can spend the
-      // whole budget before the answer tool is reached and the call falls
-      // back having produced nothing. The agent wants thinking and asks for
-      // it; a bounded call that answers with a label does not.
+      // Off, and not by omission.
+      //
+      // DO NOT "fix" this to match the agent. The shared body builder turns
+      // adaptive thinking on for any model whose catalog entry says it
+      // reasons, and these calls cannot afford it: triage caps output at 2048
+      // tokens and the inbound-language read at 512, so a thinking block can
+      // spend the whole budget before the answer tool is reached. The call
+      // then falls back, which is silent by design -- so the symptom is
+      // triage quality quietly degrading and looking like a bad model rather
+      // than like a harness bug. That is the failure nobody diagnoses.
+      //
+      // The asymmetry with the agent is the point, not an inconsistency. An
+      // incident agent reasons for a living across ~90 turns and asks for
+      // thinking explicitly; a bounded call that answers with one label does
+      // not. It also keeps this path off `thinking.block_binding`, and so off
+      // the beta that gates it -- see `request.ts`, where the field and its
+      // beta are deliberately one decision.
       thinkingEnabled: false,
     });
 

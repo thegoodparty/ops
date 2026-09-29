@@ -408,3 +408,22 @@ test("a request that outlives its deadline still reports what it spent", async (
     assert.equal(usage.tokensIn, 500);
   });
 });
+
+test("a Boss call sends neither thinking nor the beta that gates it", async () => {
+  await withAwsEnv(async () => {
+    const { client, bodies } = await harness([{ text: "ok" }]);
+    await client.complete(request({ maxTokens: 512 }));
+
+    // The body builder adds `thinking-binding-controls-2026-08-01` beside the
+    // only branch that emits `thinking.block_binding`, because sending either
+    // half alone is a 400. With thinking off the Boss needs neither, and
+    // asserting both together is what stops someone restoring thinking here
+    // and reasoning that the beta is now unnecessary, or the reverse.
+    const body = bodies[0] as { thinking?: unknown; anthropic_beta?: string[] };
+    assert.equal(body.thinking, undefined);
+    assert.ok(
+      !(body.anthropic_beta ?? []).includes("thinking-binding-controls-2026-08-01"),
+      "the Boss sent a beta for a field it does not send",
+    );
+  });
+});
