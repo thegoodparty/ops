@@ -107,6 +107,15 @@ const TAGS = { Environment: "infra", Project: "bugboss" };
  * below is a map rather than a switch: a model nobody wrapped falls back to
  * the bare id and loses its attribution, which is the right way round.
  */
+// Account-qualified and regional, which is what a *system-defined inference
+// profile* ARN actually looks like -- verified against
+// `aws bedrock list-inference-profiles --type-equals SYSTEM_DEFINED`, which
+// returns exactly this string for us.anthropic.claude-opus-5. Two reviewers
+// read it as the empty-account form, so: that one
+// (`arn:aws:bedrock:us-west-2::foundation-model/...`) is a *foundation model*,
+// AWS-owned and therefore accountless, and it is the form in this resource's
+// own docstring example. A profile is an account resource. The task role's
+// `bedrock:InvokeModel*` statement below already assumes the same shape.
 const AGENT_INFERENCE_PROFILE_SOURCE = `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/${DEFAULT_MODEL_ID}`;
 
 export interface BugBossConfig {
