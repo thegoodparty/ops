@@ -587,16 +587,25 @@ test("an incident that resolves mid-decision takes the RESOLVED branch", async (
     context({ openIncidents: [digest({ id: "inc-9", status: "INVESTIGATING" })] }),
   );
 
-  // The owner guard that used to sit below this branch is gone, so nothing
-  // can pre-empt it. What replaced it is the status re-read above: the digest
-  // is a snapshot from before a model call that runs for tens of seconds.
+  // Two separate things have to hold for this to work, and they used to be
+  // protected by two different mechanisms that both went when `owner` did.
+  //
+  // First, the refusal. This branch used to sit above a guard refusing any
+  // attach to a human-owned incident, and the order was load-bearing: put the
+  // owner check first and an incident firing again after resolution stopped
+  // being a recurrence at all. The guard is gone, so nothing can pre-empt
+  // this branch any more and the ordering it depended on cannot be broken by
+  // a future reorder. What replaced the guard is the status re-read above --
+  // the digest is a snapshot from before a model call that runs for tens of
+  // seconds, so on exactly this path it is the stale copy.
   assert.equal(outcome.decision.action, "new_incident");
   assert.match(outcome.decision.reason, /inc-9 is RESOLVED/);
-  assert.equal(
-    outcome.recurrenceOf,
-    null,
-    "the pointer is still decided off the digest, which on this path has not caught up",
-  );
+  // Second, the pointer. `recurrencePointer` preferred that same stale digest,
+  // so it answered null precisely when a delivery is a recurrence. Both
+  // failures had one symptom -- the signal proving a resolution premature
+  // opening a fresh incident with nothing linking it back -- so both are
+  // asserted here rather than in two tests that could each pass alone.
+  assert.equal(outcome.recurrenceOf, "inc-9");
 });
 
 // --- recurrence -----------------------------------------------------------

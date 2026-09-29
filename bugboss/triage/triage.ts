@@ -306,8 +306,16 @@ const recurrencePointer = (
   id: string | null | undefined,
 ): string | null => {
   if (!id) return null;
-  const digest = ctx.openIncidents.find((i) => i.id === id);
-  const status = digest?.status ?? incidentStatus(deps.db, id);
+  // The row, not the digest, and in that order. The digest was read before a
+  // model call that runs for tens of seconds, so a target that resolved while
+  // triage was thinking still reads as open in it -- and RESOLVED is exactly
+  // the state that makes this delivery a recurrence. Preferring the digest
+  // dropped the pointer in the one case it exists for: the signal proving a
+  // resolution was premature opened a fresh incident with nothing linking it
+  // to the one that had just claimed to be over.
+  const status =
+    incidentStatus(deps.db, id) ??
+    ctx.openIncidents.find((i) => i.id === id)?.status;
   return status && RECURRABLE.includes(status) ? id : null;
 };
 
