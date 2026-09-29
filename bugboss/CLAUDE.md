@@ -102,6 +102,19 @@ changes only a database that does not exist yet.
   transaction: a `schema_drift` alarm lists every column `schema.sql`
   declares that the live database does not have. It does not fix it, so the
   second edit is still yours.
+- **The `LATE_COLUMNS` type must be the whole declaration**, constraints and
+  default included -- `"INTEGER NOT NULL DEFAULT 0"`, never a bare
+  `"INTEGER"`. `ALTER TABLE ADD COLUMN x INTEGER` produces a *nullable*
+  column and leaves every row already in the snapshot at NULL, while
+  `schema.sql` says `NOT NULL` and the TypeScript type says `number`. So
+  prod reads null out of a field nothing declares nullable, and only for the
+  rows that predate the column.
+
+  `schema_drift` cannot catch this, which is why it is written down here
+  instead: `PRAGMA table_info` reports the declared type as `INTEGER` for
+  both spellings, so the check compares equal. It verifies presence, not
+  nullability. The default is also what backfills the existing rows, and
+  SQLite refuses `NOT NULL` with no default outright.
 - A `LATE_COLUMNS` entry naming a table that does not exist **refuses the
   boot**. That is a defect in the list, identical on every boot, so it never
   reaches prod.

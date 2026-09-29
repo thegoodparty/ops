@@ -73,6 +73,28 @@ The constraints are there because every invariant in this system was
 otherwise a comment plus a hand-written `if`, and three of them turned out
 to be reachable.
 
+## Triage's spend is on the signal row
+
+Six columns on `signal` -- `tokensIn`, `tokensOut`, `cacheRead`, `cacheWrite`,
+`modelCalls`, `modelId` -- and no `costUsd`, matching `incident`. Tokens plus a
+model id multiply out correctly after a price change; a stored dollar figure is
+a guess frozen at write time. Anything showing a person a dollar figure derives
+it and says it is an estimate.
+
+They are written accumulating, not replacing. `rollUpUsage` re-reads the whole
+session file so its total is absolute and a `SET` is right there; a triage
+decision knows only what it just spent, and a signal nothing ever placed is
+triaged again on its next delivery.
+
+`modelCalls` is the guard rather than a statistic. A request that reached the
+model always spends something, so calls above zero beside zero tokens means a
+reader has drifted from what the provider returns -- and that alarms instead of
+recording a decision that cost nothing.
+
+The columns are deliberately absent from `SignalView`, which is what the
+investigating agent gets from `get_incident`. Six numbers per signal, on every
+read, about a decision it is not working on.
+
 ## Uniqueness on signals
 
 One **open** signal per `(source, sourceId)`, not one for all time. A

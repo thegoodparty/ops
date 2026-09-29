@@ -36,6 +36,20 @@ export interface LateColumn {
  */
 export const LATE_COLUMNS: LateColumn[] = [
   { table: "incident", column: "recurrenceAnalysis", type: "TEXT" },
+  // Triage's own spend, per signal. The full declaration including
+  // `NOT NULL DEFAULT 0`, not a bare `INTEGER`, and the difference is not
+  // cosmetic: `ALTER TABLE ADD COLUMN x INTEGER` leaves the column nullable
+  // and every existing row NULL, while `schema.sql` declares it NOT NULL and
+  // the TypeScript type says `number`. `schemaDrift` below cannot catch that
+  // -- `PRAGMA table_info` reports the type as "INTEGER" either way, so the
+  // check compares equal and the divergence is invisible. The default is also
+  // what backfills the rows already in the snapshot.
+  { table: "signal", column: "tokensIn", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "tokensOut", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "cacheRead", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "cacheWrite", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "modelCalls", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "signal", column: "modelId", type: "TEXT" },
 ];
 
 const columnsOf = (db: Database.Database, table: string) =>

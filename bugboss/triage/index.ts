@@ -78,6 +78,7 @@ export type {
   ModelRequest,
   ModelToolCall,
   ModelToolSpec,
+  ModelUsage,
   ModelTurn,
   StructuredCall,
 } from "./model";

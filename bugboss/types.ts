@@ -44,6 +44,20 @@ export interface Signal {
   incidentId: string | null;
   /** Set when an agent's root cause accounts for this signal. */
   explained: boolean;
+  /**
+   * What triage spent placing this signal, summed over every request the
+   * decision took, including a request that failed. Accumulated rather than
+   * replaced: a re-delivery of a signal nothing ever placed is triaged again,
+   * and both attempts were paid for.
+   *
+   * Tokens and a modelId, never a dollar figure -- see `db/schema.sql`.
+   */
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  modelCalls: number;
+  modelId: string | null;
 }
 
 /** One hit from `searchIncidents`. Produced by `db/search.ts`. */
@@ -107,7 +121,18 @@ export interface Incident {
 /** A signal as a source hands it to us, before it has an id or an incident. */
 export type RawSignal = Omit<
   Signal,
-  "id" | "incidentId" | "explained" | "closedAt"
+  | "id"
+  | "incidentId"
+  | "explained"
+  | "closedAt"
+  // An adapter parses what a source sent. What placing it then cost is
+  // decided here and is not a thing any source could hand over.
+  | "tokensIn"
+  | "tokensOut"
+  | "cacheRead"
+  | "cacheWrite"
+  | "modelCalls"
+  | "modelId"
 >;
 
 export interface Evidence {
@@ -337,9 +362,23 @@ export interface RecurrenceAnalysis {
   remedy: string;
 }
 
+/**
+ * What a signal looks like to the investigating agent.
+ *
+ * Triage's spend is left off deliberately. The agent is working out why
+ * something broke, and what placing the signal cost is of no use to that --
+ * it would be six numbers per signal re-serialized into the prompt on every
+ * `get_incident`, which is how a tool result grows without anyone deciding
+ * to grow it. The columns are on the row for a person or the Boss to query.
+ */
+export type SignalView = Omit<
+  Signal,
+  "tokensIn" | "tokensOut" | "cacheRead" | "cacheWrite" | "modelCalls" | "modelId"
+>;
+
 export interface IncidentView {
   incident: Incident;
-  signals: Signal[];
+  signals: SignalView[];
   evidence: Evidence[];
   /** Non-null only when this incident reopens ground that one claimed. */
   priorIncident: PriorIncident | null;

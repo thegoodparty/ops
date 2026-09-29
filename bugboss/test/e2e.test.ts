@@ -35,7 +35,7 @@ import { firstReplyAfter } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { SlackEvent } from "../slack/relay";
 import { emptyModelUsage } from "../model";
-import type { ModelReply, ModelRequest } from "../triage";
+import type { ModelReply, ModelRequest, ModelUsage } from "../triage";
 import type { ReportUpload } from "../report";
 import type { BugBossConfig, Directive, TriageDecision } from "../types";
 
@@ -71,16 +71,26 @@ const fakeModel = {
   searchBefore: null as string | null,
   /** What the real search tool answered, so a test can assert it worked. */
   lastSearchResult: "",
+  /**
+   * What each triage request reports spending. Zero unless a test sets it,
+   * so every test that does not care about cost runs through
+   * recordTriageSpend's `calls === 0` return and writes nothing.
+   */
+  usage: emptyModelUsage(),
   next(): QueuedDecision {
     const d = this.triageDecisions.shift();
     if (!d) throw new Error("fakeModel: no triage decision queued");
     return d;
   },
   async complete(request: ModelRequest): Promise<ModelReply> {
-    const call = (name: string, input: Record<string, unknown>) => ({
+    const call = (
+      name: string,
+      input: Record<string, unknown>,
+      usage: ModelUsage = emptyModelUsage(),
+    ) => ({
       text: "",
       toolCalls: [{ id: `call-${name}`, name, input }],
-      usage: emptyModelUsage(),
+      usage,
     });
     // Correlation asks a different question and must not eat a queued triage
     // decision. Nothing in these tests expects a merge.
@@ -107,12 +117,12 @@ const fakeModel = {
       if (this.searchBefore && !request.messages.some((m) => m.role === "toolResult")) {
         const text = this.searchBefore;
         this.searchBefore = null;
-        return call("search_incidents", { text });
+        return call("search_incidents", { text }, { ...this.usage });
       }
       const last = request.messages.at(-1);
       if (last?.role === "toolResult") this.lastSearchResult = last.text;
       if (this.gate) await this.gate;
-      return call("decide", { ...this.next() });
+      return call("decide", { ...this.next() }, { ...this.usage });
     } finally {
       this.inFlight--;
     }
@@ -198,7 +208,11 @@ const fakeSlackAgent = {
 };
 
 /** Slack's user group, which changes under us and keeps no history. */
-const rotation = { members: ["U-ada", "U-grace"] as string[] | null };
+const rotation = {
+  members: ["U-ada", "U-grace"] as string[] | null,
+  /** Reading it is a Slack call, so it can fail. Off unless a test says so. */
+  fail: false,
+};
 
 /** The closing report's file upload. Captured, so the thread can be read. */
 const fakeUploader = {
@@ -240,7 +254,10 @@ before(async () => {
     spawnAgent: fakeAgent,
     s3: undefined,
     // Who is on call is an external fact, and a mutable one.
-    rotationMembers: async () => rotation.members,
+    rotationMembers: async () => {
+      if (rotation.fail) throw new Error("slack: usergroups.users.list failed");
+      return rotation.members;
+    },
     // Without this the relay cannot strip its own mention out of a message
     // before the model reads it, and an @bugboss report opens an incident
     // titled with the raw mention markup.
@@ -2098,4 +2115,384 @@ test("a resume notice is not posted out of context when there is no thread", asy
     2,
     "the agent was relaunched regardless",
   );
+});
+
+// --- what triage spent placing a signal ------------------------------------
+
+/**
+ * The six columns, read back off the row. Spelled out rather than `SELECT *`
+ * so a column that silently stopped being written shows up as a missing key
+ * in a deepEqual rather than as an undefined nobody compares.
+ */
+interface SpendRow {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  modelCalls: number;
+  modelId: string | null;
+}
+
+const spendOf = (sourceId: string): SpendRow | undefined =>
+  boss.db.get<SpendRow>(
+    `SELECT tokensIn, tokensOut, cacheRead, cacheWrite, modelCalls, modelId
+       FROM signal WHERE sourceId = ? AND closedAt IS NULL
+       ORDER BY id DESC LIMIT 1`,
+    [sourceId],
+  );
+
+/**
+ * What one triage request reports spending. `calls: 1` because a figure that
+ * reached the model is the only kind worth writing, and `costUsd` rides along
+ * deliberately unwritten -- there is no dollar column on signal.
+ */
+const modelSpent = (
+  usage: Omit<ModelUsage, "costUsd" | "calls">,
+): ModelUsage => ({ ...usage, costUsd: 0.0041, calls: 1 });
+
+const SONNET = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+const HAIKU = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+
+/** The keys a signal handed to an agent must not carry. See SignalView. */
+const SPEND_KEYS = [
+  "tokensIn",
+  "tokensOut",
+  "cacheRead",
+  "cacheWrite",
+  "modelCalls",
+  "modelId",
+];
+
+test("a placed signal carries what triage spent placing it", async () => {
+  fakeModel.usage = modelSpent({
+    tokensIn: 1811,
+    tokensOut: 204,
+    cacheRead: 9422,
+    cacheWrite: 1337,
+    modelId: SONNET,
+  });
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "500s on /spend, nothing open matches",
+  });
+  try {
+    await boss.ingest("grafana", grafanaBody("fp-spend-1", "spend-route-errors"));
+  } finally {
+    fakeModel.usage = emptyModelUsage();
+  }
+
+  assert.ok(
+    incidentOf("fp-spend-1"),
+    "the signal has to have been placed for this to be about a placement",
+  );
+  assert.deepEqual(spendOf("fp-spend-1"), {
+    tokensIn: 1811,
+    tokensOut: 204,
+    cacheRead: 9422,
+    cacheWrite: 1337,
+    modelCalls: 1,
+    modelId: SONNET,
+  });
+});
+
+test("a suppressed signal is costed too", async () => {
+  // Deciding not to act still took a model call, and a suppression is the
+  // cheap decision that arrives in bulk -- so it is the one whose bill is
+  // invisible unless it is written down. This is why the write sits before
+  // the suppress branch rather than inside the placement arm.
+  const knownCauses = JSON.stringify([
+    {
+      id: "spend-known-flake",
+      summary: "the canary restarts nightly and trips this for a minute",
+      confirmedBy: "the restart shows in the deploy log",
+      action: "suppress",
+    },
+  ]);
+
+  fakeModel.usage = modelSpent({
+    tokensIn: 903,
+    tokensOut: 77,
+    cacheRead: 4100,
+    cacheWrite: 0,
+    modelId: HAIKU,
+  });
+  fakeModel.triageDecisions.push({
+    action: "suppress",
+    knownCauseId: "spend-known-flake",
+    reason: "the canary restarts nightly; this is that",
+  });
+  try {
+    await boss.ingest("grafana", {
+      headers: { "x-grafana-alerting-signature": "valid-in-test" },
+      rawBody: JSON.stringify({
+        status: "firing",
+        alerts: [
+          {
+            status: "firing",
+            fingerprint: "fp-spend-supp",
+            labels: { alert_slug: "spend-canary-restart", environment: "prod" },
+            annotations: {
+              summary: "[PROD] spend-canary-restart",
+              known_causes: knownCauses,
+            },
+            startsAt: new Date().toISOString(),
+          },
+        ],
+      }),
+    });
+  } finally {
+    fakeModel.usage = emptyModelUsage();
+  }
+
+  const row = boss.db.get<{ incidentId: string | null; closedAt: number | null }>(
+    "SELECT incidentId, closedAt FROM signal WHERE sourceId = 'fp-spend-supp'",
+  );
+  assert.equal(row!.incidentId, null, "this has to be a suppression, not a placement");
+  assert.ok(row!.closedAt, "and a finished one, which is what the branch does");
+
+  // spendOf skips closed rows, so read this one directly.
+  assert.deepEqual(
+    boss.db.get<SpendRow>(
+      `SELECT tokensIn, tokensOut, cacheRead, cacheWrite, modelCalls, modelId
+         FROM signal WHERE sourceId = 'fp-spend-supp'`,
+    ),
+    {
+      tokensIn: 903,
+      tokensOut: 77,
+      cacheRead: 4100,
+      cacheWrite: 0,
+      modelCalls: 1,
+      modelId: HAIKU,
+    },
+  );
+});
+
+test("spend accumulates across two triage passes on one signal", async () => {
+  // The rotation read is a Slack call that sits after the decision and before
+  // the assign, so a failure there is exactly the shape this column set has
+  // to survive: triage was paid for and the signal reached no incident. The
+  // next delivery of it is triaged again (recordSignal's needsPlacement), and
+  // both attempts were real money.
+  rotation.fail = true;
+  fakeModel.usage = modelSpent({
+    tokensIn: 1000,
+    tokensOut: 100,
+    cacheRead: 200,
+    cacheWrite: 30,
+    modelId: SONNET,
+  });
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "first attempt",
+  });
+  let first: { action: string }[];
+  try {
+    first = await boss.ingest(
+      "grafana",
+      grafanaBody("fp-spend-sum", "spend-sum-errors"),
+    );
+  } finally {
+    rotation.fail = false;
+  }
+
+  assert.equal(
+    first[0].action,
+    "failed",
+    "pass one has to die after triage, or there is only ever one pass",
+  );
+  assert.equal(
+    incidentOf("fp-spend-sum"),
+    null,
+    "and leave the signal unplaced, which is what makes it triageable again",
+  );
+  assert.deepEqual(spendOf("fp-spend-sum"), {
+    tokensIn: 1000,
+    tokensOut: 100,
+    cacheRead: 200,
+    cacheWrite: 30,
+    modelCalls: 1,
+    modelId: SONNET,
+  });
+
+  // The second pass reports no modelId, which a provider reply can omit
+  // while still charging for the tokens. COALESCE is what keeps the first
+  // pass's answer rather than blanking the column.
+  fakeModel.usage = modelSpent({
+    tokensIn: 7,
+    tokensOut: 3,
+    cacheRead: 11,
+    cacheWrite: 5,
+    modelId: null,
+  });
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "second attempt, and this one lands",
+  });
+  try {
+    await boss.ingest("grafana", grafanaBody("fp-spend-sum", "spend-sum-errors"));
+  } finally {
+    fakeModel.usage = emptyModelUsage();
+  }
+
+  assert.ok(
+    incidentOf("fp-spend-sum"),
+    "the re-delivery is the last chance anything has to place it",
+  );
+  assert.deepEqual(
+    spendOf("fp-spend-sum"),
+    {
+      tokensIn: 1007,
+      tokensOut: 103,
+      cacheRead: 211,
+      cacheWrite: 35,
+      modelCalls: 2,
+      modelId: SONNET,
+    },
+    "a SET here would report the cheap second pass as the whole bill",
+  );
+});
+
+test("a triage call that reports no tokens alarms and writes nothing", async () => {
+  // Calls above zero beside a zero total is not a free decision. It is this
+  // reader having drifted from what the provider returns, and writing it
+  // would record the drift as a fact about the cost of triage.
+  fakeModel.usage = { ...emptyModelUsage(), calls: 1, modelId: SONNET };
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "real, and it still has to be placed",
+  });
+
+  const alarms: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => {
+    alarms.push(args.map(String).join(" "));
+    realError(...(args as []));
+  };
+  try {
+    await boss.ingest("grafana", grafanaBody("fp-spend-blind", "spend-blind-errors"));
+  } finally {
+    console.error = realError;
+    fakeModel.usage = emptyModelUsage();
+  }
+
+  const signalId = boss.db.get<{ id: string }>(
+    "SELECT id FROM signal WHERE sourceId = 'fp-spend-blind'",
+  )!.id;
+  assert.ok(
+    alarms.some((line) => {
+      if (!line.includes("triage_usage_missing")) return false;
+      const parsed = JSON.parse(line) as {
+        event: string;
+        signalId?: string;
+        modelCalls?: number;
+      };
+      return (
+        parsed.event === "triage_usage_missing" &&
+        parsed.signalId === signalId &&
+        parsed.modelCalls === 1
+      );
+    }),
+    `a reader that has drifted has to say so, naming the signal: ${alarms.join("\n")}`,
+  );
+
+  // Nothing written, including the modelId the call did report. Half a row
+  // is worse than no row: it reads as a decision that cost nothing.
+  assert.deepEqual(spendOf("fp-spend-blind"), {
+    tokensIn: 0,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    modelCalls: 0,
+    modelId: null,
+  });
+
+  assert.ok(
+    incidentOf("fp-spend-blind"),
+    "and the signal is still placed: losing the cost record is not worth the alert",
+  );
+});
+
+test("get_incident does not hand the agent triage's spend", async () => {
+  fakeModel.usage = modelSpent({
+    tokensIn: 2222,
+    tokensOut: 111,
+    cacheRead: 30,
+    cacheWrite: 4,
+    modelId: SONNET,
+  });
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "real, and the agent is about to read it",
+  });
+  try {
+    await boss.ingest("grafana", grafanaBody("fp-spend-view", "spend-view-errors"));
+  } finally {
+    fakeModel.usage = emptyModelUsage();
+  }
+
+  const incidentId = incidentOf("fp-spend-view");
+  assert.ok(incidentId);
+  // The row really does carry the spend, so what follows is about the view
+  // withholding it rather than about there being nothing there to withhold.
+  assert.equal(spendOf("fp-spend-view")?.tokensIn, 2222);
+
+  const view = await bossClientFor(
+    incidentId,
+    boss.mintToken(incidentId),
+  ).getIncident();
+  assert.ok(view.ok, view.error);
+
+  const signals = view.data!.signals;
+  assert.ok(signals.length > 0, "there has to be a signal for one to be stripped");
+  for (const signal of signals) {
+    // Absent, not zeroed. Six numbers per signal re-serialized into the
+    // prompt on every get_incident is how a tool result grows without
+    // anyone deciding to grow it.
+    assert.deepEqual(
+      Object.keys(signal).filter((key) => SPEND_KEYS.includes(key)),
+      [],
+      `a signal handed to an agent carried triage's spend: ${Object.keys(signal).join(", ")}`,
+    );
+    // And the rest of it survived, so this is a strip rather than a blanket
+    // that would have passed while hiding the whole signal.
+    assert.ok(signal.id.length > 0 && typeof signal.title === "string");
+  }
+});
+
+test("a decision that never reached the model is not alarmed as missing", async () => {
+  // Zero tokens with zero calls is the ordinary case, not drift: triage
+  // short-circuits before the model on some paths, and so does correlation.
+  // Alarming on it would fire on normal operation, which is how people learn
+  // to ignore an alarm.
+  fakeModel.usage = emptyModelUsage();
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "real, and the fake model reports nothing",
+  });
+
+  const alarms: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => {
+    alarms.push(args.map(String).join(" "));
+    realError(...(args as []));
+  };
+  try {
+    await boss.ingest("grafana", grafanaBody("fp-spend-free", "spend-free-errors"));
+  } finally {
+    console.error = realError;
+  }
+
+  assert.deepEqual(
+    alarms.filter((line) => line.includes("triage_usage_missing")),
+    [],
+  );
+  assert.ok(incidentOf("fp-spend-free"), "and the placement happened anyway");
+  assert.deepEqual(spendOf("fp-spend-free"), {
+    tokensIn: 0,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    modelCalls: 0,
+    modelId: null,
+  });
 });

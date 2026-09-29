@@ -95,6 +95,19 @@ count.
 `sustained` needs ≥10 calls and ≥50% fallbacks, so one transient failure
 never reads as total failure.
 
+## What a decision cost is part of the decision
+
+`TriageOutcome` carries a `ModelUsage`, and it is filled on the fallback path
+too. `applyRules` does not see it: it is a pure function of the model's answer
+and has no business knowing the price of one, so `runTriage` owns the
+accumulator and stamps it on the way out.
+
+The fallback is the case worth costing. A wrong model id or sustained
+throttling makes every signal its own incident, and the same failure that
+produces no decision still pays for every request it made trying -- so a
+storm reads as busy, productive and free unless the tokens are recorded where
+they were spent. They land on the `signal` row; see `db/CLAUDE.md`.
+
 ## Reads throw
 
 `sql.ts` helpers throw on a database error rather than returning `null` or

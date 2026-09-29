@@ -106,7 +106,14 @@ import {
   awaitTestDatabase,
   resolveTestDatabase,
 } from "./testdb";
-import { createTriage, type ModelClient, type ModelToolCall, type ModelTurn } from "./triage";
+import {
+  createTriage,
+  usageForLog,
+  type ModelClient,
+  type ModelToolCall,
+  type ModelTurn,
+  type ModelUsage,
+} from "./triage";
 import { resolveBedrockModel } from "./bedrock";
 import { createPiModelClient } from "./bedrock/client";
 import {
@@ -1101,6 +1108,67 @@ export const createBugBoss = async (
     }
   };
 
+  /**
+   * Accumulate rather than replace, which is the opposite of how the incident
+   * row is written. `rollUpUsage` re-reads a whole session file, so its total
+   * is already absolute and a SET is correct there. Here each triage decision
+   * knows only what it spent, and a signal can be triaged more than once: a
+   * re-delivery of a signal nothing ever placed falls through to be placed
+   * again, and both attempts were paid for.
+   *
+   * A zero total with calls above zero is the drift signature the columns
+   * exist to expose, so it alarms rather than writing a free decision. A zero
+   * total with zero calls is not a fault -- correlation short-circuits before
+   * the model on some paths and so does triage.
+   *
+   * It is its own `withWrite`, so it is its own S3 snapshot PUT on top of the
+   * one placement already costs. Worth naming rather than hiding: the write
+   * queue serializes on those, and this adds one per triaged signal. It is
+   * bought against a decision that just spent tens of seconds of model time,
+   * so a few hundred milliseconds behind the queue is not the expensive part
+   * of placing a signal -- and folding it into the two branches downstream
+   * would put triage's accounting inside `applyAssign`, which has no business
+   * knowing about it.
+   */
+  const recordTriageSpend = async (
+    signalId: string,
+    usage: ModelUsage,
+  ): Promise<void> => {
+    if (usage.calls === 0) return;
+    if (usage.tokensIn === 0 && usage.tokensOut === 0) {
+      alarm("triage_usage_missing", {
+        signalId,
+        ...usageForLog(usage),
+        note: "a request reached the model and reported no tokens, which means this reader has drifted from what the provider returns",
+      });
+      return;
+    }
+    try {
+      await db.withWrite((w: Database.Database) => {
+        w.prepare(
+          `UPDATE signal
+             SET tokensIn = tokensIn + ?, tokensOut = tokensOut + ?,
+                 cacheRead = cacheRead + ?, cacheWrite = cacheWrite + ?,
+                 modelCalls = modelCalls + ?,
+                 modelId = COALESCE(?, modelId)
+           WHERE id = ?`,
+        ).run(
+          usage.tokensIn,
+          usage.tokensOut,
+          usage.cacheRead,
+          usage.cacheWrite,
+          usage.calls,
+          usage.modelId,
+          signalId,
+        );
+      });
+    } catch (err) {
+      // Never fatal. Losing the record of what a decision cost is worth
+      // strictly less than dropping the signal that decision was about.
+      alarm("triage_usage_write_failed", { signalId, error: String(err) });
+    }
+  };
+
   const placeRecorded = async (
     signalId: string,
     signal: RawSignal,
@@ -1124,6 +1192,12 @@ export const createBugBoss = async (
       openIncidents: openIncidents(),
     });
     const decision = outcome.decision;
+
+    // Before the branch, so a suppression is costed like a placement. A
+    // suppressed signal took a model call to suppress, and it is the cheap
+    // decision that arrives in bulk -- the one whose bill is only visible
+    // once it is written down.
+    await recordTriageSpend(signalId, outcome.usage);
 
     if (decision.action === "suppress") {
       // No incident and no agent. The signal stays in the table unattached,

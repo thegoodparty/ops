@@ -326,3 +326,92 @@ describe("a column schema.sql declares that the live database lacks", () => {
     }
   });
 });
+
+describe("triage's spend columns reach a database that already exists", () => {
+  let dir: string;
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "bugboss-db-signal-usage-"));
+  });
+
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  /** A snapshot from before the spend columns, with a signal already in it. */
+  const olderSnapshot = (name: string): Buffer => {
+    const ddl = readFileSync(SCHEMA, "utf8").replace(
+      /^\s*tokensIn\s+INTEGER NOT NULL DEFAULT 0,\s*$\n\s*tokensOut\s+INTEGER NOT NULL DEFAULT 0,\s*$\n\s*cacheRead\s+INTEGER NOT NULL DEFAULT 0,\s*$\n\s*cacheWrite\s+INTEGER NOT NULL DEFAULT 0,\s*$\n\s*modelCalls\s+INTEGER NOT NULL DEFAULT 0,\s*$\n\s*modelId\s+TEXT,\s*$\n/m,
+      "",
+    );
+    assert.notEqual(
+      ddl,
+      readFileSync(SCHEMA, "utf8"),
+      "the signal spend declarations have moved; this fixture no longer builds an older snapshot",
+    );
+    const path = join(dir, name);
+    const old = new Database(path);
+    old.exec(ddl);
+    // Production restores a snapshot with real rows in it. A defaulted
+    // backfill is only correct if it reaches them.
+    old
+      .prepare(
+        `INSERT INTO signal
+           (id, source, sourceId, kind, title, body, labels, reportedBy, openedAt)
+         VALUES ('sig-1', 'grafana', 'fp-1', 'alert', 't', 'b', '{}', NULL, 1)`,
+      )
+      .run();
+    old.close();
+    return readFileSync(path);
+  };
+
+  it("is added to the live database, and backfilled on the rows already there", async () => {
+    // The two-edits-not-one hazard, on the columns this change adds. Every
+    // test opens a fresh file where schema.sql is enough; prod restores a
+    // snapshot where only LATE_COLUMNS is.
+    const { db, alarms } = await alarmsDuring(() =>
+      Db.open({
+        path: join(dir, "live.db"),
+        bucket: "b",
+        key: "k",
+        s3: s3Holding(olderSnapshot("old.db")) as unknown as S3Client,
+      }),
+    );
+    try {
+      assert.deepEqual(
+        alarms.filter((a) => a.event === "schema_drift"),
+        [],
+        "the late-column pass did not repair every spend column",
+      );
+
+      const row = db
+        .query<{
+          tokensIn: number;
+          tokensOut: number;
+          cacheRead: number;
+          cacheWrite: number;
+          modelCalls: number;
+          modelId: string | null;
+        }>("SELECT tokensIn, tokensOut, cacheRead, cacheWrite, modelCalls, modelId FROM signal WHERE id = 'sig-1'")[0];
+
+      // Zero rather than null is the whole reason the entries carry
+      // `NOT NULL DEFAULT 0` instead of a bare `INTEGER`: a bare add leaves
+      // these null on every pre-existing row while the type says `number`,
+      // and `schemaDrift` cannot see the difference because PRAGMA reports
+      // the declared type as INTEGER either way.
+      assert.deepEqual(row, {
+        tokensIn: 0,
+        tokensOut: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        modelCalls: 0,
+        modelId: null,
+      });
+
+      const columns = db
+        .query<{ name: string; notnull: number }>("PRAGMA table_info(signal)")
+        .filter((c) => c.name === "tokensIn");
+      assert.equal(columns[0].notnull, 1, "the live column is nullable where schema.sql says it is not");
+    } finally {
+      db.close();
+    }
+  });
+});

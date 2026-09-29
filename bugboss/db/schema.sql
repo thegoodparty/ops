@@ -105,6 +105,26 @@ CREATE TABLE IF NOT EXISTS signal (
   incidentId        TEXT REFERENCES incident(id),
   explained         INTEGER NOT NULL DEFAULT 0,
 
+  -- What triage spent deciding where this signal belongs. The work that
+  -- created this row, so it is costed on this row; an agent's spend lands on
+  -- incident instead.
+  --
+  -- Tokens and a modelId rather than dollars, for the reason the incident
+  -- row gives: a price table goes stale silently while tokens multiply out
+  -- correctly whenever they are asked. There is deliberately no costUsd
+  -- column here.
+  --
+  -- modelCalls is the guard, not decoration: a request that reached the model
+  -- always spends something, so calls above zero beside zero tokens means the
+  -- reader has drifted from what the provider reports rather than that triage
+  -- was free.
+  tokensIn          INTEGER NOT NULL DEFAULT 0,
+  tokensOut         INTEGER NOT NULL DEFAULT 0,
+  cacheRead         INTEGER NOT NULL DEFAULT 0,
+  cacheWrite        INTEGER NOT NULL DEFAULT 0,
+  modelCalls        INTEGER NOT NULL DEFAULT 0,
+  modelId           TEXT,
+
   CHECK (kind IN ('alert', 'error', 'bug_report', 'regression')),
   -- explained is relative to a root cause, so it is meaningless detached.
   CHECK (explained = 0 OR incidentId IS NOT NULL)

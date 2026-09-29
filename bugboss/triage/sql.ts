@@ -28,7 +28,12 @@ export const SCHEMA_SUMMARY = `incident(
 signal(
   id TEXT, source TEXT, sourceId TEXT, kind TEXT, title TEXT, body TEXT,
   labels TEXT json, reportedBy TEXT, openedAt INT, closedAt INT,
-  incidentId TEXT, explained INT)
+  incidentId TEXT, explained INT,
+  tokensIn INT, tokensOut INT, cacheRead INT, cacheWrite INT,
+  modelCalls INT, modelId TEXT)
+The token columns on signal are what triage spent placing it. There is no
+cost column on signal: price the tokens against modelId if somebody asks for
+dollars, and say it is an estimate.
 Timestamps are epoch milliseconds. Labels and prUrls are JSON text; use
 json_extract(labels, '$.alert_slug') to read one.`;
 

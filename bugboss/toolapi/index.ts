@@ -31,6 +31,7 @@ import type {
   PriorIncident,
   RecurrenceAnalysis,
   Signal,
+  SignalView,
   ToolApi,
   ToolResponse,
 } from "../types";
@@ -179,6 +180,17 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       closedAt: prior.closedAt,
     };
   };
+
+  /** Strips triage's spend, which the agent has no use for. See SignalView. */
+  const toSignalView = ({
+    tokensIn: _tokensIn,
+    tokensOut: _tokensOut,
+    cacheRead: _cacheRead,
+    cacheWrite: _cacheWrite,
+    modelCalls: _modelCalls,
+    modelId: _modelId,
+    ...rest
+  }: Signal): SignalView => rest;
 
   const readSignals = (id: string): Signal[] =>
     db
@@ -1048,7 +1060,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         ok: true,
         data: {
           incident,
-          signals: readSignals(incidentId),
+          signals: readSignals(incidentId).map(toSignalView),
           evidence: loaded,
           priorIncident: readPriorIncident(incident.recurrenceOf),
         },

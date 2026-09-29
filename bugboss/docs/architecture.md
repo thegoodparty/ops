@@ -393,6 +393,20 @@ bounded call is an exception, so a total returned beside the answer would
 count only the requests that worked -- and a storm of fallbacks is exactly the
 spend no other record shows.
 
+**Spend is recorded where the work happened.** An agent's tokens land on
+`incident`; what triage spent placing a signal lands on that `signal` row,
+because placing it is the work that created the row. The suppressed signal is
+the case that makes it worth a column rather than a log line: it never becomes
+an incident, so an incident-shaped record cannot hold it, and it is the
+decision that arrives in bulk.
+
+The signal write accumulates rather than replaces, which is the opposite of
+`rollUpUsage`. That one re-reads a whole session file, so its total is already
+absolute. A triage decision only ever knows what it just spent, and a signal
+can be triaged twice -- a re-delivery of a signal nothing ever placed falls
+through to be placed again, and both attempts were paid for. There is no
+`costUsd` column on either row.
+
 **An incident ends with a document, at `CLOSED`.** Not at `RESOLVED`: the
 post-mortem does not exist until `report_analysis` writes it, and the schema
 has a `CHECK` saying so. The report is a Markdown file uploaded into the
