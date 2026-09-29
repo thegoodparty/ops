@@ -291,7 +291,7 @@ Starting grant, widened only by observed failures, the discipline
 | --- | --- | --- |
 | Pulumi state | `pulumiBackendReadStatements` | `omni`'s project prefixes |
 | Terraform state | `s3:GetObject`, `s3:ListBucket` | `goodparty-terraform-state-us-west-2/dataplatform/*` |
-| Terraform lock | `s3:PutObject`, `s3:DeleteObject` | the `.tflock` object under that same prefix |
+| Terraform lock | `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` | the `.tflock` object under that same prefix |
 | Current image | `ecs:DescribeServices`, `ecs:DescribeTaskDefinition` | `*`, which these do not scope |
 | Planned services | describe and list only | per observed plan failures |
 

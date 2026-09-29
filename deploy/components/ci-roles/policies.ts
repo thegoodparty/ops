@@ -943,9 +943,18 @@ const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 // `shared/slack-notifier` is not a `*/dev/*` key and is easy to miss: gp-ai's
 // dev roots reach it through `data "terraform_remote_state"`. It read fine
 // before the deny existed, because ReadOnlyAccess covered it.
+//
+// The `.tflock` object is on this list because releasing a lock reads it
+// before deleting it, to check the ID it is about to remove is the one it
+// took. `DataplatformStateLock` below allows the Put and the Delete, but the
+// deny's NotResource is what decides the Get, and an explicit deny beats the
+// ReadOnlyAccess that would otherwise cover it. Leaving it off let a plan
+// take the lock and then fail to release it, stranding the lockfile and
+// blocking every later plan until someone removed it by hand.
 const TF_STATE_READABLE = [
   `${TF_BUCKET}/*/dev/terraform.tfstate`,
   `${TF_BUCKET}/dataplatform/terraform.tfstate`,
+  `${TF_BUCKET}/dataplatform/terraform.tfstate.tflock`,
   `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
 ];
 

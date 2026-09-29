@@ -122,6 +122,7 @@ describe("githubActionsPulumiPlan", () => {
   const READABLE = [
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/*/dev/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate",
+    "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate.tflock",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/shared/slack-notifier/terraform.tfstate",
   ];
 
@@ -170,5 +171,18 @@ describe("githubActionsPulumiPlan", () => {
       writes[0].Resource,
       "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate.tflock"
     );
+  });
+
+  // Taking the lock is a Put, but releasing it is a Get and then a Delete:
+  // Terraform reads the lockfile back to confirm the ID before removing it.
+  // The Put and Delete were allowed and the Get was not, so a plan acquired
+  // the lock and stranded it. Asserted separately from the READABLE list
+  // above because the two failures look nothing alike: this one leaves the
+  // state locked for everyone, not just this role.
+  it("can read the lock object back, so it can release it", () => {
+    const lock =
+      "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate.tflock";
+    assert.ok(asList(statement("TerraformStateObjects").Resource).includes(lock));
+    assert.ok(asList(statement("DenyOtherS3Objects").NotResource).includes(lock));
   });
 });
