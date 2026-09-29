@@ -81,6 +81,10 @@ const permissionSets = {
     id: "ps-790741c400f38152",
     name: "ReadOnlyAccess",
     sessionDuration: "PT8H",
+    // `AWSSecretsManagerClientReadOnlyAccess` reads as metadata-only, but its
+    // policy includes `secretsmanager:GetSecretValue`. This set can therefore
+    // read secret values. Verified against the AWS-managed policy reference at
+    // pr-previews step 10; narrowing it is its own follow-up.
     managedPolicies: [
       "arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess",
       "arn:aws:iam::aws:policy/ReadOnlyAccess",
