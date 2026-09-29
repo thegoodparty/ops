@@ -268,24 +268,42 @@ jobs:
 
           echo "has_errors=$has_errors" >> "$GITHUB_OUTPUT"
 
-      # Each run posts a new comment, so a project's plan history stays on the
-      # PR. Nothing is edited or deleted; the commit in the header says which
-      # run a plan belongs to.
+      # One comment per project, edited in place. The marker in the body is
+      # how a run finds its predecessor; each project owns its own marker, so
+      # the two parallel jobs never touch the same comment and cannot race.
+      # The commit in the header says which run the current plan belongs to.
       - name: Post comment
         if: steps.preview.outcome == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           COMMENT_FILE: /tmp/${{ matrix.project }}.comment.md
+          MARKER: "<!-- pulumi-preview:${{ matrix.project }} -->"
         with:
           script: |
             const fs = require("fs");
             const { owner, repo } = context.repo;
-            await github.rest.issues.createComment({
+            const issue_number = context.payload.pull_request.number;
+            const body = fs.readFileSync(process.env.COMMENT_FILE, "utf8");
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
-              issue_number: context.payload.pull_request.number,
-              body: fs.readFileSync(process.env.COMMENT_FILE, "utf8"),
+              issue_number,
+              per_page: 100,
             });
+            const existing = comments.find(
+              (c) => c.body && c.body.includes(process.env.MARKER),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
 
       - name: Fail if the preview reported errors
         if: steps.preview.outputs.has_errors == 'true'
