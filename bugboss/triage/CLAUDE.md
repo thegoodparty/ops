@@ -145,3 +145,41 @@ The one exception is `attachedSignalIds` inside `runCorrelation`, which sits
 outside the try block that two other modules rely on never throwing. It gets
 its own guard and a distinct event name — a failed read and a failed
 judgement are different faults.
+
+## Triage is unbounded in count, and where the bound belongs when it comes
+
+Not built, deliberately — recorded here so the reasoning outlives the
+conversation it came from, because the wrong bound here is expensive to
+undo.
+
+Triage is one model call per signal. The incident agent has a wall clock and
+a turn budget; this path has neither, because a turn cap does not apply to
+something that is not a loop. On 2026-09-28 a storm opened 67 incidents in
+five minutes, and that is the path it ran down.
+
+Three places the bound could go. Two are wrong:
+
+- **Not at admission.** Refusing a signal is an incident nobody opens, which
+  is the one rule this system does not bend.
+- **Not on dollars.** A price here is arithmetic over Pi's hardcoded table,
+  not a figure anyone was billed — the same reason nothing persists
+  `costUsd`. A dollar ceiling enforces a limit against our own drift.
+
+- **At the rate, and it is safe *because the signal is already durable*.**
+  `signal.incidentId IS NULL` is the untriaged marker, the orphan sweep
+  already retries, and `orphan_backlog` already exists as the series this is
+  judged on. So deferring triage loses nothing: a storm becomes a growing
+  backlog on instrumentation that already reports it, instead of 67
+  concurrent model calls. Nothing new has to be built to watch it. This is
+  the same property the incident agent's turn budget rests on — turns are
+  durable in the transcript, signals are durable in SQLite, and in both
+  cases a restart neither loses the work nor refills the allowance.
+
+**But a limit is the second-best answer.** A storm is correlated by
+construction: 67 alerts is usually a handful of causes, and triaging them
+one at a time pays 67 times to rediscover that. Batching the signals that
+arrive together into one call is cheaper *and* better, because a model
+looking at all of them at once sees the correlation that `correlate.ts`
+currently has to reconstruct afterwards. It is real work rather than a
+config change — the scope of a triage decision moves, so the prompt and the
+output schema move with it.

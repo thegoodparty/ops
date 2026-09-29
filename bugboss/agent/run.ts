@@ -934,13 +934,13 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
       : "What I was about to do: unknown. It was still working when the budget ran out.",
     "Side effects: check the incident for PRs it opened.",
     "",
-    // Deliberately not "reply and it will carry on". A reply deletes the
-    // park and the incident relaunches, but the budget is counted over the
-    // incident, so the new agent is over it before it starts and stops
-    // again. Saying otherwise sends a person to type into a thread that
-    // cannot act on it. Raising the budget or taking the work is what moves
-    // this; both are things a person does outside the thread.
-    `Replying here wakes it, but the ${state.max}-turn budget is spent for the whole incident, so it will stop again immediately. To actually continue it, raise BUGBOSS_MAX_TURNS or pick the work up yourself.`,
+    // Deliberately not "reply and it will carry on". A budget wait is not
+    // lifted by a reply -- a reply says a person has answered, which is
+    // nothing to do with having run out of turns. So the two things named
+    // here are the two that actually move it, and both happen outside the
+    // thread. Telling somebody to reply would send them to type into a
+    // thread that cannot act on them.
+    `The ${state.max}-turn budget for this incident is spent, so replying here will not restart it. To continue the work, raise BUGBOSS_MAX_TURNS or pick it up yourself.`,
   ].join("\n");
 };
 
@@ -962,21 +962,26 @@ interface TurnUsage {
 /**
  * Whether the harness should announce this exhaustion, or only park.
  *
- * Two ways the announcement is already made or already useless:
+ * One reason to stay quiet: the agent escalated itself inside the grace.
+ * The steer asks for exactly that, and it can land on the same `turn_end`
+ * the cap fires on, so both posting puts "it never wrote a brief" directly
+ * under the brief it just wrote.
  *
- * - The agent escalated itself inside the grace. The steer asks for exactly
- *   that, and it can land on the same `turn_end` the cap fires on, so both
- *   posting puts "it never wrote a brief" under the brief it just wrote.
- * - The launch started already over budget. A reply deletes the park and
- *   the dispatcher relaunches, so without this every comment on the thread
- *   pages the rotation again with the same fact. The first escalation
- *   stands; repeating it adds nothing and trains people to ignore it.
+ * There was a second arm here, suppressing a launch that began already over
+ * budget. That case was a symptom, not a rule: `incident_wait` conflated
+ * "waiting on a person", which a reply rightly ends, with "out of budget",
+ * which a reply has nothing to do with -- so any comment woke the incident
+ * and paged the rotation again. `incident_wait.liftsOnReply` now separates
+ * the two and `recordReply` only deletes a wait that says yes, so the wake
+ * does not happen and there is nothing left to suppress. Suppressing it
+ * here as well would be a second mechanism for one invariant, and the one
+ * that reads like a live rule while guarding nothing.
  *
  * Parking is not conditional on any of this. Announcing is what a person
  * sees; parking is what makes the relaunch stop.
  */
 export const shouldAnnounceExhaustion = (state: TurnBudgetState): boolean =>
-  !state.escalated && state.used <= state.max;
+  !state.escalated;
 
 export interface TurnBudget {
   extension: (pi: ExtensionAPI) => void;
@@ -1539,14 +1544,6 @@ const launch = async (args: {
       // calls are asymmetric for that reason: a duplicate announcement is a
       // contradiction a person reads, a duplicate park is a no-op.
       // Announcing is what a person sees; parking is what makes it stop.
-      //
-      // A launch that started already over budget is the third case, and it
-      // is the one that used to page people. A reply deletes the park, the
-      // dispatcher relaunches, this fires on turn one -- so every comment on
-      // the thread produced a fresh escalation to the rotation. The first
-      // escalation already said everything true about this incident; the
-      // repeats say it again and add nothing. So it re-parks silently.
-      const alreadySpent = state.used > state.max;
       if (!shouldAnnounceExhaustion(state)) {
         console.log(
           JSON.stringify({
@@ -1555,9 +1552,7 @@ const launch = async (args: {
             incidentId: options.incidentId,
             used: state.used,
             max: state.max,
-            reason: alreadySpent
-              ? "the budget was already spent before this launch; the first escalation stands"
-              : "the agent escalated on its own inside the grace window",
+            reason: "the agent escalated on its own inside the grace window",
           }),
         );
       } else {

@@ -794,26 +794,24 @@ test("the model comes off the turn, so a first launch can still be re-priced", a
   assert.doesNotMatch(brief, /an unrecorded model/);
 });
 
-test("the announcement is made once per incident, not once per reply", () => {
-  // `park` is deleted by any thread reply, so the dispatcher relaunches and
-  // this fires again on turn one. Announcing every time pages the rotation
-  // on every comment with a fact it already has.
+test("the announcement is suppressed only when the agent already made it", () => {
   const base = { graceTurns: 10, usage: emptySessionUsage() };
 
   assert.equal(
     shouldAnnounceExhaustion({ ...base, used: 200, max: 200, escalated: false }),
     true,
-    "the first exhaustion is the one worth saying",
-  );
-  assert.equal(
-    shouldAnnounceExhaustion({ ...base, used: 201, max: 200, escalated: false }),
-    false,
-    "a relaunch into a spent budget repeats it",
   );
   assert.equal(
     shouldAnnounceExhaustion({ ...base, used: 200, max: 200, escalated: true }),
     false,
-    "the agent already said it",
+    "the agent already said it, on the same turn_end this fires on",
+  );
+  // Deliberately still announced. A launch that begins over budget is a
+  // wake that should not have happened, and that is fixed where the wait
+  // is classified rather than muffled here -- one invariant, one mechanism.
+  assert.equal(
+    shouldAnnounceExhaustion({ ...base, used: 201, max: 200, escalated: false }),
+    true,
   );
 });
 
@@ -829,12 +827,17 @@ test("the brief does not promise that replying will continue the work", () => {
     usage: { ...emptySessionUsage(), turns: 200 },
   });
 
-  assert.match(brief, /raise BUGBOSS_MAX_TURNS or pick the work up yourself/);
-  assert.match(brief, /it will stop again immediately/);
+  assert.match(brief, /raise BUGBOSS_MAX_TURNS or pick it up yourself/);
+  assert.match(brief, /replying here will not restart it/);
   assert.doesNotMatch(
     brief,
     /nothing will relaunch into the same exhausted budget/,
-    "a reply does relaunch it; saying otherwise is the part that misled",
+    "the original wording promised a reply was harmless, which it was not",
+  );
+  assert.doesNotMatch(
+    brief,
+    /Replying here wakes it/,
+    "a budget wait is not lifted by a reply, so this would send a person nowhere",
   );
 });
 
