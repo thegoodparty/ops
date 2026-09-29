@@ -872,6 +872,67 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  it("does not add its own brief to a wedged agent that already wrote one", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    // The sequence, not the outcome. The test above has the child exit after
+    // escalating, so the deadline never fires on it and it passes whether or
+    // not anything suppresses the second brief. The case that matters is the
+    // one the deadline kill exists for: an agent wedged badly enough that it
+    // uses its grace to say what it knows and then still cannot exit.
+    let kills = 0;
+    let released = () => {};
+    const spawn: SpawnAgent = async (ctx) => {
+      ctx.register({ pid: 55, kill: () => { kills += 1; } });
+      await ctx.escalate({ reason: "out of time", brief: "the real brief" });
+      await new Promise<void>((resolve) => {
+        released = resolve;
+      });
+    };
+
+    let clock = T0;
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        config: config({ agentTimeoutSeconds: 60 }),
+        now: () => clock,
+      }),
+    );
+
+    await d.tick();
+    // Past the soft deadline, the grace, and the tick the backstop adds.
+    clock = T0 + 300_000;
+    const after = await d.tick();
+
+    assert.equal(kills, 1, "it was too wedged to exit, so it is killed");
+    assert.deepEqual(after.killed, ["i1"]);
+    assert.deepEqual(
+      after.escalated,
+      [],
+      "it already spoke for itself, so the dispatcher does not speak over it",
+    );
+    assert.deepEqual(
+      escalations.map((h) => h.brief),
+      ["the real brief"],
+      "one brief, the agent's",
+    );
+    // And nothing claims it stayed silent, which is the half that would be
+    // worse than redundant: a placeholder posted under the agent's own brief
+    // is the system contradicting itself in front of whoever reads the thread.
+    assert.equal(
+      escalations.some((h) => /did not say anything/.test(h.brief)),
+      false,
+    );
+
+    released();
+    await d.drain();
+    cleanup();
+  });
+
   it("resumes an existing session and reports how long the agent was gone", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();

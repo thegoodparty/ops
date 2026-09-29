@@ -253,6 +253,20 @@ interface Entry {
   attempt: number;
   proc: AgentProcess | null;
   killed: boolean;
+  /**
+   * This run has already escalated, so the deadline must not escalate over
+   * the top of it.
+   *
+   * `owner` used to carry this without anyone naming it: the agent's own
+   * `hand_off` set it to human and the dispatcher's escalate re-read it and
+   * became a no-op. Deleting the column took the suppression with it, and
+   * the result was two briefs on a wedged agent -- its own, then a
+   * dispatcher placeholder claiming it had said nothing.
+   *
+   * Per-run and in memory by nature: the question is whether *this child*
+   * spoke, and a restart is a new child that will write its own brief.
+   */
+  escalated: boolean;
   done: Promise<void>;
 }
 
@@ -265,9 +279,14 @@ const toRunningAgent = (e: Entry): RunningAgent => ({
 
 const deadlineBrief = (e: Entry, ranSeconds: number): string =>
   [
-    "Escalated by the dispatcher. The agent did not say anything itself.",
+    // Never claims the agent said nothing. The suppression below means this
+    // brief should not be reachable at all once it has, but a sentence that
+    // asserts something the code can check is one wrong suppression away from
+    // the system contradicting itself in the thread, directly under the
+    // agent's own brief.
+    "Escalated by the dispatcher, which killed the agent at its deadline.",
     "",
-    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not escalate in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed, so it never wrote a brief.`,
+    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not finish in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
@@ -424,6 +443,25 @@ export class Dispatcher {
   };
 
   list = (): RunningAgent[] => [...this.running.values()].map(toRunningAgent);
+
+  /**
+   * Record that the agent on this incident escalated, so the deadline does
+   * not post a placeholder brief over the top of the one it just wrote.
+   *
+   * Needed because the spawn context is not the path a real child takes. In
+   * process -- the E2E, the unit tests -- the child calls the context's
+   * `escalate` and the dispatcher sees it directly. A real child is a
+   * separate process calling the loopback API, which reaches `toolApiFor`
+   * without the dispatcher in the call at all. So the composition root, which
+   * already wraps that call to add the rotation ping, tells us.
+   *
+   * A no-op for an incident with no live run, which is the honest answer:
+   * there is no placeholder pending for one, and nothing to suppress.
+   */
+  noteEscalated = (incidentId: string): void => {
+    const entry = this.running.get(incidentId);
+    if (entry) entry.escalated = true;
+  };
 
   /** Waits for everything currently running. For tests and shutdown. */
   drain = async (): Promise<void> => {
@@ -713,6 +751,7 @@ export class Dispatcher {
       attempt,
       proc: null,
       killed: false,
+      escalated: false,
       done: Promise.resolve(),
     };
     this.running.set(row.id, entry);
@@ -723,7 +762,11 @@ export class Dispatcher {
       reportImpact: (args) => tools.reportImpact(args),
       reportResolved: (args) => tools.reportResolved(args),
       reportAnalysis: (args) => tools.reportAnalysis(args),
-      escalate: (args) => tools.escalate(args),
+      escalate: async (args) => {
+        const response = await tools.escalate(args);
+        if (response.ok) entry.escalated = true;
+        return response;
+      },
       park: (args) => tools.park(args),
       getIncident: () => tools.getIncident(),
       searchIncidents: (args) => tools.searchIncidents(args),
@@ -821,9 +864,21 @@ export class Dispatcher {
         deadlineAt: entry.deadlineAt,
         graceSeconds: DEADLINE_GRACE_SECONDS,
       });
-      // Kill first, then escalate, so the brief the agent wrote in its grace
-      // window is already in the thread when the escalation lands beside it.
       entry.proc?.kill();
+
+      // An agent that used its grace to escalate has already put a better
+      // brief in the thread and already reached the rotation. Posting the
+      // placeholder on top of it is the system saying the same thing twice,
+      // the second time worse.
+      if (entry.escalated) {
+        log("deadline_brief_suppressed", {
+          incidentId: entry.incidentId,
+          ranSeconds,
+          note: "the agent escalated during its grace window, so its own brief stands",
+        });
+        continue;
+      }
+
       const ok = await this.escalate(
         entry.incidentId,
         `wall-clock deadline of ${this.config.agentTimeoutSeconds}s expired`,

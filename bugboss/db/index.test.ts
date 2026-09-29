@@ -702,6 +702,17 @@ describe("the write-only owner column", () => {
     // half of `owner/repo`, and the comments explaining why this column is
     // still here obviously name it too. So comments come out first, and what
     // is left has to look like a statement before it counts.
+    //
+    // Every string form, and that is not a detail. The first version of this
+    // matched template literals alone, which made it pass while
+    // `settleOwnerToAgent` named the column in a double-quoted `UPDATE` a few
+    // lines away -- green for the wrong reason, on the one statement it most
+    // needed to see. The same mistake was made independently elsewhere the
+    // same night, so treat it as the default failure of a guard like this
+    // rather than an oversight: a scanner that reads one quoting style
+    // reports clean on the code written in the other, and says nothing at
+    // all about what it skipped. Prove a guard fails before trusting that it
+    // passes.
     const root = join(__dirname, "..");
     const offenders: string[] = [];
     const walk = (at: string) => {

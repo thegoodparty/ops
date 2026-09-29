@@ -1002,6 +1002,11 @@ export const createBugBoss = async (
       escalate: async (args) => {
         const response = await api.escalate(args);
         if (response.ok) {
+          // The dispatcher cannot see this call: a real child reaches the
+          // tool API over the loopback, with no dispatcher in the path. It
+          // has to know, or its deadline posts a placeholder brief on top of
+          // the one this agent just wrote.
+          dispatcher.noteEscalated(incidentId);
           await slack
             .post(
               db.get<{ slackThreadTs: string | null }>(
