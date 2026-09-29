@@ -933,6 +933,13 @@ const TF_STATE_READABLE = [
   `${TF_BUCKET}/*/dev/terraform.tfstate`,
   `${TF_BUCKET}/dataplatform/terraform.tfstate`,
   `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
+  // The lock object is read, not only written. S3-native locking does a
+  // conditional GET to see whether a lock is already held, so a plan that
+  // takes the lock needs GetObject here as well as the Put/Delete below.
+  // Missed first time round because the deny was checked against the three
+  // state keys and not against everything a plan touches; the dataplatform
+  // plan then failed with "Error acquiring the state lock ... explicit deny".
+  `${TF_BUCKET}/dataplatform/terraform.tfstate.tflock`,
 ];
 
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {

@@ -335,6 +335,15 @@ denied yet because each deny should be verified against a real plan before it
 lands, and the S3 one was the reachable production secret. Worth a follow-up
 that enumerates data-level reads in `ReadOnlyAccess` and denies the set.
 
+**Check the deny against what the consumer touches, not against the allow
+list.** After the S3 deny landed, I simulated the three state keys, saw
+`allowed`, and called it verified. The dataplatform plan then failed on
+`Error acquiring the state lock`: S3-native locking does a conditional GET on
+the `.tflock` object, and the role could write that object but no longer read
+it. Testing the allow list only ever confirms the allow list. The useful test
+enumerates what the job actually reads, and in particular checks that every
+object the role may write, it may also read.
+
 **How to check this role, rather than reason about it:**
 
 ```bash

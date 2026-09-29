@@ -119,11 +119,34 @@ describe("githubActionsPulumiPlan", () => {
     );
   });
 
+  const LOCK =
+    "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate.tflock";
+
   const READABLE = [
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/*/dev/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/shared/slack-notifier/terraform.tfstate",
+    LOCK,
   ];
+
+  // Regression: the lock was writable but not readable, so every dataplatform
+  // plan failed on "Error acquiring the state lock". Whatever the role may
+  // write, it must also be able to read.
+  it("can read every object it can write", () => {
+    const writes = githubActionsPulumiPlan.Statement.filter(
+      (s) =>
+        s.Effect === "Allow" &&
+        asList(s.Action).some((a) => /^s3:(Put|Delete)Object/.test(a))
+    );
+    for (const w of writes) {
+      for (const one of asList(w.Resource)) {
+        assert.ok(
+          READABLE.includes(one),
+          `${one} is writable but not in the readable list`
+        );
+      }
+    }
+  });
 
   it("reads only the listed Terraform states", () => {
     const allow = statement("TerraformStateObjects");
