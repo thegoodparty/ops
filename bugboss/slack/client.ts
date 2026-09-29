@@ -16,12 +16,18 @@ import {
 } from "@aws-sdk/client-s3";
 import { retryPolicies, WebClient, type KnownBlock } from "@slack/web-api";
 
-import { makeLog } from "../logging";
+import { makeAlarm } from "../logging";
 import type { ChoicePoster } from "./blocks";
 import type { ObjectStore, SlackClient } from "./agent";
 import type { FileUploader } from "../report";
 
-const log = makeLog("slack-client");
+/**
+ * Error level, because the thing it reports is a tenfold rise in Slack calls
+ * that changes nothing a reader can see. An answer naming fifty incidents
+ * still comes back correct and still carries every link -- it just pays fifty
+ * round trips for them. There is no symptom to notice, so it has to be said.
+ */
+const alarm = makeAlarm("slack-client");
 
 /**
  * `conversations.replies` is throttled to roughly one request a minute for
@@ -62,8 +68,19 @@ export interface SlackLinker {
 /**
  * The shape of an answer that can teach us the rest: a workspace, a channel
  * and a timestamp. Only the first is unknowable from here.
+ *
+ * The trailing query string is optional and is deliberately not captured.
+ * `chat.getPermalink` appends `?thread_ts=…&cid=…` to a link to a message
+ * inside a thread -- which is what Slack's own "Copy link" produces -- and
+ * anchoring this to the end of `p\d+` rejected every one of them. Nothing
+ * here wants those parameters: the only two fields read are the workspace and
+ * the channel, and every caller asks about a thread's parent message, whose
+ * bare `/archives/<channel>/p<ts>` form is the whole link. So a reply-shaped
+ * answer whose `thread_ts` names a different message than its own `p<ts>`
+ * teaches the workspace and nothing else, and the links derived afterwards are
+ * built from the timestamp the caller passed rather than from anything in here.
  */
-const ARCHIVE = /^(https:\/\/[^/?#]+)\/archives\/([^/?#]+)\/p\d+$/;
+const ARCHIVE = /^(https:\/\/[^/?#]+)\/archives\/([^/?#]+)\/p\d+(?:[?#].*)?$/;
 
 /**
  * The workspace domain is the only part of a permalink the API knows and we
@@ -80,6 +97,10 @@ export const createCachingLinker = (
   // practice is one. Cleared the moment it is.
   const pending = new Map<string, Promise<string>>();
   let origin: string | null = null;
+  // One build that cannot read its answers will fail on every one of them, and
+  // fifty identical alarms about the same defect is how an alarm stops meaning
+  // anything. The condition is per-linker, so say it once per linker.
+  let shapeReported = false;
 
   return {
     permalink: (messageTs, channel) => {
@@ -99,11 +120,12 @@ export const createCachingLinker = (
         if (parsed && parsed[2] === where) {
           origin = parsed[1];
           pending.clear();
-        } else {
+        } else if (!shapeReported) {
+          shapeReported = true;
           // Still the right url for this message, so nothing is broken -- but
           // every later link now costs an API call, and a silent tenfold rise
           // in Slack calls is exactly the kind of thing nobody notices.
-          log("permalink_shape_unknown", { url });
+          alarm("permalink_shape_unknown", { url });
         }
         return url;
       });

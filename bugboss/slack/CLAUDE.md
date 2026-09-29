@@ -46,6 +46,23 @@ and every later link is string work. A permalink that fails alarms and leaves
 the bare reference; nothing waits on a second attempt, and a failure is never
 cached as an answer.
 
+It only teaches anything if it can read the answer, and **Slack's own links
+carry a query string** — `?thread_ts=…&cid=…` on a link to a message inside a
+thread, which is also what "Copy link" hands a person. `ARCHIVE` anchored past
+the timestamp for a while and so matched none of them, which cost nothing a
+reader could see and turned every answer into one Slack call per incident.
+That is the reason it **alarms** rather than logs: correct links, a tenfold
+rise in API calls, and no symptom at all. It alarms **once per linker**,
+because one build that cannot read its answers cannot read any of them and
+fifty identical alarms is how an alarm stops meaning anything.
+
+Only two fields are read out of an answer, the workspace and the channel, and
+the query parameters are deliberately not among them. `thread_ts` names the
+**parent** of the message that was linked, which is a different timestamp from
+its own `p<ts>`; every caller here asks about a thread's parent, and the links
+derived afterwards are built from the timestamp the caller passed. Reading one
+back out of the url would point later links at the wrong message.
+
 ## A plain reply answers; a mention also interrupts
 
 Every message in an incident thread becomes a `human_message`
@@ -463,8 +480,18 @@ cannot answer any way but from what it already has. It is told to name the
 part of the question it did not reach, so the gaps are in the answer rather
 than implied by its shortness. Running out is still a real event and still
 **alarms** — visible to whoever owns the budget, not to whoever asked the
-question. The bare apology is gone; what is left when even the wrap-up
-produces nothing says what happened and what to do instead.
+question.
+
+What is left when even the wrap-up produces nothing is **two** replies, not
+one, because running out of turns and failing to compose anything need
+different advice. Running out says so, and says how many turns over how long,
+because the minutes of silence are the only thing the reader experienced and
+they are owed the size of them. It does **not** say "ask me again": the budget
+is spent the same way by the same question, so a retry buys another wait for
+the same non-answer. It asks for a smaller question instead. The other case
+really can be a bad minute, and there asking again is the right thing to try.
+Neither sends anybody to the logs — the person reading this is on call in the
+middle of something else, and whoever owns the budget has the alarm already.
 
 **The transcript always ends on the assistant**, whatever happened. Whatever
 the harness returns is what gets posted, so it is recorded as the turn it

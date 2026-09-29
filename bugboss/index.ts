@@ -551,13 +551,37 @@ const WRAP_UP_SYSTEM = [
   "Do not apologise and do not offer to keep looking.",
 ].join(" ");
 
+/** "about 4 minutes", "under a minute" -- scale, not a measurement. */
+const roughly = (ms: number): string => {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return "under a minute";
+  return minutes === 1 ? "about a minute" : `about ${minutes} minutes`;
+};
+
 /**
- * Reached only when the wrap-up produced nothing either. It says what
- * happened and what to do next, because somebody is waiting on this and
- * "sorry" tells them neither.
+ * Reached only when the wrap-up produced nothing either, so the reader gets
+ * this instead of an answer they waited minutes for.
+ *
+ * Running out of steps and failing to compose anything are two different
+ * events and the reply has to say which, because the advice differs. Running
+ * out is deterministic in the question: the same question spends the budget
+ * the same way, so "ask me again" is advice that buys another four-minute
+ * wait for the same non-answer. What helps is a smaller question, and the
+ * reply says so and says how. The other case really can be a bad minute, and
+ * there asking again is the right thing to try.
+ *
+ * Neither sends anybody to the logs. The person reading this is on call in the
+ * middle of something else; a pointer to a log group is a second task, and
+ * whoever owns the budget already has the alarm.
  */
-const NO_ANSWER_REPLY =
-  "I could not get to an answer for that one and I have nothing partial worth posting. What I did is in the BugBoss logs. Ask me again, or narrow the question.";
+const noAnswerReply = (
+  exhausted: boolean,
+  turns: number,
+  elapsedMs: number,
+): string =>
+  exhausted
+    ? `I ran out of steps before I could answer that: ${turns} of them, taking ${roughly(elapsedMs)}, and I still could not put anything together worth posting. Asking the same question again spends the same budget the same way, so narrow it instead: one incident, or one specific thing you want to know about all of them.`
+    : "I could not put an answer together for that one, and I have nothing partial worth posting. Ask me again, or narrow it to one incident.";
 
 /**
  * The Slack agent's harness, built on the same ModelClient everything else
@@ -595,6 +619,9 @@ export const createSlackAgentModel = (
 
     let answer = "";
     let exhausted = false;
+    // What the reader is owed when nothing else survives the run: how long
+    // they waited, alongside how many steps bought it.
+    const startedAt = Date.now();
     for (let turn = 0; turn < req.maxTurns; turn++) {
       const reply = await model.complete({
         system: req.system,
@@ -656,7 +683,8 @@ export const createSlackAgentModel = (
       }
     }
 
-    const text = answer || NO_ANSWER_REPLY;
+    const text =
+      answer || noAnswerReply(exhausted, req.maxTurns, Date.now() - startedAt);
     if (!answer) alarm("slack_agent_no_answer", { sessionKey: req.sessionKey });
 
     // The transcript has to end on the assistant, because that is how the

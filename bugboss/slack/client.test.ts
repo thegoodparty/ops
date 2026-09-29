@@ -165,6 +165,98 @@ describe("a permalink is paid for once", () => {
     assert.equal(asked.length, 2);
     assert.ok(lines.some((line) => line.includes('"permalink_shape_unknown"')));
   });
+
+  test("the query parameters Slack puts on its own links teach the workspace too", async () => {
+    // Verbatim out of production: ten of these in a second and a half, every
+    // one of them unreadable, so the workspace was never learned and every
+    // incident in the answer cost its own round trip. It is also what Slack's
+    // "Copy link" hands a person, so nothing about it is exotic.
+    const asked: string[] = [];
+    const linker = createCachingLinker(
+      {
+        permalink: (ts) => {
+          asked.push(ts);
+          return Promise.resolve(
+            `${answer(ts)}?thread_ts=${ts}&cid=${INCIDENTS}`,
+          );
+        },
+      },
+      INCIDENTS,
+    );
+
+    let first = "";
+    const lines = await captureLogs(async () => {
+      first = await linker.permalink("1790357486.538869");
+      await linker.permalink("300.000400");
+      await linker.permalink("500.000600");
+    });
+
+    assert.equal(
+      first,
+      `${answer("1790357486.538869")}?thread_ts=1790357486.538869&cid=${INCIDENTS}`,
+      "the answer Slack gave is still what the first caller gets",
+    );
+    assert.deepEqual(
+      asked,
+      ["1790357486.538869"],
+      "one round trip for three links, not three",
+    );
+    assert.ok(
+      !lines.some((line) => line.includes("permalink_shape_unknown")),
+      "this is Slack's own shape and nothing is wrong with it",
+    );
+  });
+
+  test("a link to a message inside a thread teaches the workspace and nothing else", async () => {
+    // The parameters carry the parent thread's timestamp, which is not the
+    // linked message's own. Reading either of them back out would point every
+    // later link at the wrong message, so neither is read: what is taken is
+    // the workspace, and the timestamp is the one the caller asked with.
+    const asked: string[] = [];
+    const linker = createCachingLinker(
+      {
+        permalink: (ts) => {
+          asked.push(ts);
+          return Promise.resolve(
+            `${answer(ts)}?thread_ts=1790000000.000001&cid=${INCIDENTS}`,
+          );
+        },
+      },
+      INCIDENTS,
+    );
+
+    await linker.permalink("1790357486.538869");
+
+    assert.equal(
+      await linker.permalink("300.000400"),
+      answer("300.000400"),
+      "derived from the timestamp asked for, never from the parent in the query",
+    );
+    assert.deepEqual(asked, ["1790357486.538869"]);
+  });
+
+  test("an unreadable answer is said once, not once per row", async () => {
+    // Fifty rows against one defect is fifty identical alarms, which is how
+    // an alarm stops meaning anything.
+    const linker = createCachingLinker(
+      {
+        permalink: (ts) =>
+          Promise.resolve(`https://goodparty.slack.com/something-else/${ts}`),
+      },
+      INCIDENTS,
+    );
+
+    const lines = await captureLogs(async () => {
+      await linker.permalink("100.000200");
+      await linker.permalink("300.000400");
+      await linker.permalink("500.000600");
+    });
+
+    assert.equal(
+      lines.filter((line) => line.includes('"permalink_shape_unknown"')).length,
+      1,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
