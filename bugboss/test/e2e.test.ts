@@ -1919,6 +1919,8 @@ test("a combine is refused when the thread's own incident closed while it was be
 test("the same ask typed at the bot outside a thread does the same thing", async () => {
   const { older, newer } = await twoIncidents("mention");
 
+  const before = fakeSlack.posts.length;
+
   fakeModel.intents.push({ intent: "combine", combineIds: [newer, older] });
   await boss.slackEvent({
     type: "app_mention",
@@ -1931,6 +1933,44 @@ test("the same ask typed at the bot outside a thread does the same thing", async
   assert.equal(statusOf(newer).status, "MERGED");
   assert.equal(statusOf(newer).mergedInto, older);
   assert.deepEqual(signalsOn(older), ["fp-mention-new", "fp-mention-old"]);
+
+  // The database is only half of "does the same thing". A merge that lands
+  // and says nothing back is the failure this change is about, moved one
+  // surface over: the person typed at the bot and is watching their own
+  // message, not either incident thread.
+  const said = fakeSlack.posts.slice(before);
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === "2100.1" &&
+        /Done -- incident .* is now part of incident/.test(p.text),
+    ),
+    "they are answered under the message they typed, which is where they are looking",
+  );
+  assert.ok(
+    said.some(
+      (p) => p.threadTs === "2100.1" && /is the older record/.test(p.text),
+    ),
+    "and told which record survived, since they named both and picked neither",
+  );
+  // Both incident threads still get the pair of messages a merge leaves,
+  // because the people following those threads did not see this exchange.
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === threadOf(newer) &&
+        /last message in this thread/.test(p.text),
+    ),
+    "the absorbed thread is closed out",
+  );
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === threadOf(older) &&
+        /is the same problem as this one/.test(p.text),
+    ),
+    "and the surviving thread says where the signals came from",
+  );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
