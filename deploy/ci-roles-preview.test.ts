@@ -40,11 +40,26 @@ describe("githubActionsPulumiPreview", () => {
   // on. Reasserted as an allowlist rather than a denylist so a new write action
   // cannot slip in without failing here.
   it("grants read-only actions and nothing else", () => {
+    // `sts:AssumeRole` is the one non-read action; it only reaches the
+    // workbench preview role, asserted separately below.
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List))/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List)|sts:AssumeRole)/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
+  });
+
+  it("reaches the workbench preview role by assume, and nothing else there", () => {
+    const assume = githubActionsPulumiPreview.Statement.find((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
+        "sts:AssumeRole"
+      )
+    );
+    assert.ok(assume);
+    assert.equal(
+      assume.Resource,
+      "arn:aws:iam::024901689212:role/pulumi-preview"
+    );
   });
 
   it("never grants GetSecretValue", () => {

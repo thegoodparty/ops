@@ -64,8 +64,19 @@ the consumer by a different workflow, and nothing sequences the two.
       and in `ci-roles/policies.ts` about why the other eight stay wildcarded
       is wrong on the facts; `docs/deploy-role-trust.md` records what they
       actually use and plans their narrowing).
-- [ ] 8. Workbench-side preview role, and a configurable provider role: todo.
-      Depends on 4 being applied.
+- [x] 8. Workbench-side preview role, and a configurable provider role: done
+      (2026-09-28, PR #144. `deploy-workbench/preview-role.ts` creates
+      `pulumi-preview`, trusted by `github-actions-pulumi-preview` and, for
+      step 10, by the management account's `ReadOnlyAccess` SSO role through
+      an `ArnLike` on `aws:PrincipalArn`; `AssumeWorkbenchPreviewRole` in the
+      ops preview policy grants the management-side assume; the role holds no
+      permissions. The provider's `assumeRoles[0].roleArn` now comes from
+      `providerRoleName`, set to `pulumi-deploy` on apply and `pulumi-preview`
+      on preview by `deploy.sh`, which also gained the step 5 preview block.
+      The cascade check rests on step 10's cutover, where the same `roleArn`
+      edit was an in-place provider update; the first live workbench preview
+      after apply confirms it, and the fallback is CI role chaining. Tests
+      cover the trust and the ops grant.)
 - [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
       applied.
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:

@@ -830,7 +830,9 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
 
 /**
  * The whole grant for the PR preview role. Read-only, and only the three
- * projects a PR can preview.
+ * projects a PR can preview. The one exception is `sts:AssumeRole` on the
+ * workbench preview role, which is how a preview reaches that account without
+ * the admin apply role; the role it reaches holds no permissions.
  *
  * Widened only by observed failures. `ecs:DescribeTaskDefinition` cannot be
  * resource-scoped; it exists so preview mode can resolve the currently
@@ -900,6 +902,18 @@ export const githubActionsPulumiPreview: PolicyDocument = {
         "acm:ListTagsForCertificate",
       ],
       Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
+    },
+    {
+      Sid: "AssumeWorkbenchPreviewRole",
+      Effect: "Allow",
+      // The workbench stack reaches its account by assuming a role into
+      // 024901689212, and a preview must not use the admin apply role. This
+      // is the management-side half; the trust on the other side is in
+      // deploy-workbench/preview-role.ts. Not read-only like the rest, but
+      // it only reaches a role that holds no permissions. Last, so adding it
+      // does not renumber the statements above in every later diff.
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-preview`,
     },
   ],
 };
