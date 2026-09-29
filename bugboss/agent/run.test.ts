@@ -28,6 +28,7 @@ import {
   renderDirectives,
   reserveTokensFor,
   signalExitCode,
+  shouldAnnounceExhaustion,
   toolListDrift,
   TURN_BUDGET_GRACE_TURNS,
   turnBudgetBrief,
@@ -560,6 +561,9 @@ const turnWithEscalate = (isError = false) =>
     {},
   ] as const;
 
+const turnOn = (model: string) =>
+  [{ type: "turn_end", message: { model, usage: {} } }, {}] as const;
+
 const turn = (
   usage: Partial<{
     input: number;
@@ -765,6 +769,73 @@ test("the budget carries what the run spent, so the escalation can say it", asyn
   assert.equal(usage.cacheRead, 300);
   assert.equal(usage.cacheWrite1h, 40);
   assert.equal(usage.costUsd, 2.5);
+});
+
+test("the model comes off the turn, so a first launch can still be re-priced", async () => {
+  // A first launch seeds from emptySessionUsage(), so nothing else ever
+  // sets modelId. Without reading it off the turn the exhaustion brief
+  // names "an unrecorded model" on the common path — 200 turns in one
+  // process — and the one figure this cap exists to produce cannot be
+  // re-priced against anything.
+  let brief = "";
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 2,
+    graceTurns: 1,
+    onGrace: () => {},
+    onExhausted: (state) => void (brief = turnBudgetBrief(state)),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  await turnEnd(...turnOn("us.anthropic.claude-opus-5"));
+  await turnEnd(...turnOn("us.anthropic.claude-opus-5"));
+
+  assert.match(brief, /turns on us\.anthropic\.claude-opus-5/);
+  assert.doesNotMatch(brief, /an unrecorded model/);
+});
+
+test("the announcement is made once per incident, not once per reply", () => {
+  // `park` is deleted by any thread reply, so the dispatcher relaunches and
+  // this fires again on turn one. Announcing every time pages the rotation
+  // on every comment with a fact it already has.
+  const base = { graceTurns: 10, usage: emptySessionUsage() };
+
+  assert.equal(
+    shouldAnnounceExhaustion({ ...base, used: 200, max: 200, escalated: false }),
+    true,
+    "the first exhaustion is the one worth saying",
+  );
+  assert.equal(
+    shouldAnnounceExhaustion({ ...base, used: 201, max: 200, escalated: false }),
+    false,
+    "a relaunch into a spent budget repeats it",
+  );
+  assert.equal(
+    shouldAnnounceExhaustion({ ...base, used: 200, max: 200, escalated: true }),
+    false,
+    "the agent already said it",
+  );
+});
+
+test("the brief does not promise that replying will continue the work", () => {
+  // It used to. A reply wakes the incident and the new agent is over budget
+  // before it starts, so the person types into a thread that cannot act on
+  // it and gets another page for their trouble.
+  const brief = turnBudgetBrief({
+    used: 200,
+    max: 200,
+    graceTurns: 10,
+    escalated: false,
+    usage: { ...emptySessionUsage(), turns: 200 },
+  });
+
+  assert.match(brief, /raise BUGBOSS_MAX_TURNS or pick the work up yourself/);
+  assert.match(brief, /it will stop again immediately/);
+  assert.doesNotMatch(
+    brief,
+    /nothing will relaunch into the same exhausted budget/,
+    "a reply does relaunch it; saying otherwise is the part that misled",
+  );
 });
 
 test("the escalation brief names the spend and never states the price as a fact", () => {

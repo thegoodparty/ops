@@ -102,6 +102,14 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   honest reading of it is "wrap up sooner". `TurnBudgetState.graceTurns`
   carries what was actually given, so the brief cannot quote a window nobody
   had.
+- **The announcement happens once per incident, the park every time.** A
+  reply deletes the park and the dispatcher relaunches, so this fires again
+  on turn one of a launch that is already over budget. Announcing each time
+  pages the rotation on every comment with a fact it already has, so
+  `shouldAnnounceExhaustion` suppresses it; parking is never suppressed.
+  The brief says plainly that a reply wakes the incident but does not buy
+  more turns, because it does not — raising `BUGBOSS_MAX_TURNS` or taking
+  the work over is what continues it.
 - **The brief carries what the run spent.** Turns, tokens and a cost
   estimate, because shipping 200 before a dollar cap is only worth anything
   if somebody learns what 200 turns costs. It is called an estimate there
