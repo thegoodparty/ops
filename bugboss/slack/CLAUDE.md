@@ -462,9 +462,14 @@ they are taking an incident over, nothing happens, and nothing says so.
 
 ## The Slack agent is read-only, deliberately
 
-`assertReadOnlySql` enforces it. It answers questions about incidents; it
-cannot merge, close, stop, restart or take ownership. Ownership changes by
-replying in the thread.
+`prepareQuery` in `triage/sql.ts` enforces it — one guard for both surfaces,
+rather than the two that used to disagree about what a read was. It answers
+questions about incidents; it cannot merge, close, stop, restart or take
+ownership. Ownership changes by replying in the thread.
+
+What a run spent comes back from the harness beside the answer and lands on
+the `answered` log line. The wrap-up call and a call that failed are both in
+it: the run that cost the most is the one that answered least.
 
 Its failures must not die in the channel that failed: the in-thread apology
 is tried first, and if that throws it is logged distinctly and re-posted to

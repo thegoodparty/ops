@@ -25,6 +25,7 @@ import {
 } from "./format";
 import { describeOutcome, readSessionOutcome } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
+import { prepareQuery, usageForLog, type ModelUsage } from "../triage";
 
 const log = makeLog("slack-agent");
 
@@ -112,7 +113,12 @@ export interface SlackAgentRun {
 
 /** The harness, behind an interface so tests can fake it. */
 export interface SlackAgentModel {
-  run(req: SlackAgentRun): Promise<{ text: string }>;
+  /**
+   * The usage is every request the run made, the wrap-up and the failed ones
+   * included. Returned rather than logged inside the harness because what a
+   * question cost belongs on the line that says the question was answered.
+   */
+  run(req: SlackAgentRun): Promise<{ text: string; usage: ModelUsage }>;
 }
 
 /**
@@ -153,83 +159,6 @@ const MAX_ROW_CHARS = 2000;
 const MAX_SESSION_CHARS = 24000;
 const DEFAULT_SESSION_TAIL_LINES = 80;
 const MAX_SESSION_TAIL_LINES = 400;
-
-/**
- * Blank out string literals, bracket identifiers and comments so keyword and
- * statement-separator checks cannot be defeated by quoting.
- */
-const stripSqlNoise = (sql: string): string => {
-  let out = "";
-  let i = 0;
-  while (i < sql.length) {
-    const c = sql[i];
-    if (c === "'" || c === '"' || c === "`") {
-      const quote = c;
-      i++;
-      while (i < sql.length) {
-        if (sql[i] === quote) {
-          if (sql[i + 1] === quote) {
-            i += 2;
-            continue;
-          }
-          i++;
-          break;
-        }
-        i++;
-      }
-      out += " ";
-      continue;
-    }
-    if (c === "[") {
-      while (i < sql.length && sql[i] !== "]") i++;
-      i++;
-      out += " ";
-      continue;
-    }
-    if (c === "-" && sql[i + 1] === "-") {
-      while (i < sql.length && sql[i] !== "\n") i++;
-      out += " ";
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      i += 2;
-      while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
-      i += 2;
-      out += " ";
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
-};
-
-const FORBIDDEN =
-  /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA|REINDEX|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RETURNING)\b/i;
-
-/**
- * Defence in depth. The real boundary is Db's read connection, which SQLite
- * opened read-only, so a write fails there even if this misses one. This runs
- * first because a clear refusal beats a SQLITE_READONLY stack trace, and
- * because it is what stops multi-statement input reaching the driver at all.
- */
-export const assertReadOnlySql = (sql: string): string => {
-  const body = stripSqlNoise(sql).trim().replace(/;\s*$/, "");
-  if (!body) throw new Error("empty statement");
-  if (body.includes(";")) {
-    throw new Error("one statement at a time; remove the extra ';'");
-  }
-  if (!/^(SELECT|WITH|EXPLAIN)\b/i.test(body)) {
-    throw new Error(
-      "read-only access: statements must start with SELECT, WITH or EXPLAIN",
-    );
-  }
-  const hit = body.match(FORBIDDEN);
-  if (hit) {
-    throw new Error(`read-only access: ${hit[1].toUpperCase()} is not allowed`);
-  }
-  return sql.trim();
-};
 
 const truncationSuffix = (total: number): string =>
   `... [truncated, ${total} chars]`;
@@ -288,7 +217,7 @@ export interface ToolDeps {
 }
 
 /**
- * Three tools, in a fixed order, built from literals. Nothing here may vary
+ * Four tools, in a fixed order, built from literals. Nothing here may vary
  * between two builds in two processes: the tools array is part of the prefix
  * every thinking block in the session is bound to. `threadTs` and `linker`
  * reach only the closures, never a name, a description or a schema.
@@ -394,15 +323,11 @@ export const buildTools = ({
         additionalProperties: false,
       },
       run: async (input) => {
-        let sql: string;
-        try {
-          sql = assertReadOnlySql(String(input.sql ?? ""));
-        } catch (err) {
-          return `Rejected: ${(err as Error).message}`;
-        }
+        const prepared = prepareQuery(String(input.sql ?? ""));
+        if ("error" in prepared) return `Rejected: ${prepared.error}`;
         let rows: Record<string, unknown>[];
         try {
-          rows = db.query<Record<string, unknown>>(sql);
+          rows = db.query<Record<string, unknown>>(prepared.sql);
         } catch (err) {
           return `SQL error: ${(err as Error).message}`;
         }
@@ -679,7 +604,7 @@ export class SlackAgent {
         threadTs: mention.threadTs,
       });
 
-      const { text } = await this.model.run({
+      const { text, usage } = await this.model.run({
         system: SLACK_AGENT_SYSTEM,
         tools,
         sessionKey,
@@ -704,7 +629,12 @@ export class SlackAgent {
       } catch (err) {
         log("state_write_failed", { thread: lockKey, error: String(err) });
       }
-      log("answered", { thread: lockKey, fresh, missed: missed.length });
+      log("answered", {
+        thread: lockKey,
+        fresh,
+        missed: missed.length,
+        ...usageForLog(usage),
+      });
     } catch (err) {
       log("run_failed", { thread: lockKey, error: String(err) });
       await this.reportFailure(mention, err);

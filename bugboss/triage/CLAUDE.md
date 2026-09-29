@@ -80,6 +80,32 @@ The result is a **new incident carrying `recurrenceOf`**, never a reopen.
 `resolvedAt` and `closedAt` are the numbers a recurrence falsifies, and two
 `CHECK` constraints mean a reopen can only clear them.
 
+## One guard, and it is the stronger one
+
+`prepareQuery` used to have a twin in `slack/agent.ts`, against the same
+database, with different answers. That one allowed `EXPLAIN`, blanked string
+literals and comments before checking anything, and scanned nineteen write
+keywords. This one allowed neither `EXPLAIN` nor any keyword scan, and
+checked the raw text.
+
+Neither caller ever saw the other, so what went unnoticed is that the weaker
+guard was the one running on every signal, and that checking raw text makes a
+semicolon inside a string literal a refusal of a correct query -- which a
+model cannot distinguish from a syntax error, so it rewrites a query that was
+right.
+
+The checks now read a stripped copy: no string literals, no bracketed
+identifiers, no comments. `WITH x AS (SELECT 1) DELETE FROM incident` opens
+with `WITH` and an opener check alone passes it, which is what the keyword
+scan is for.
+
+It returns an error rather than throwing, and that is the half worth keeping
+from this side. Both callers hand the answer straight back to the model as a
+tool result; a throw would have to be caught at every call site to become the
+same thing. Containment was never what either guard was for -- `Db`'s read
+connection is opened read-only, so a write fails at the driver regardless.
+This is about handing a model a sentence it can act on.
+
 ## A dead model must not look like a healthy one
 
 Both fallbacks (`triage.ts`, `correlate.ts`) alarm and carry a **rate**, not

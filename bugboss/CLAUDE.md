@@ -28,6 +28,47 @@ named. `types.ts` is the contract everything else is built against.
 `bedrock/client.ts` is its only implementation that reaches a model.
 `logging.ts` is the one home for `alarm` and `log`.
 
+## There are two agents here, not four
+
+**The incident agent** (`agent/`) is the only thing in this system that
+writes state. It runs Pi in a child process, investigates, opens a pull
+request, waits, and writes a post-mortem.
+
+**The Boss** is everything else that talks to a model: triage, root-cause
+correlation, the inbound-language read (`slack/intent.ts`) and the Slack
+question box (`slack/agent.ts`). All four are read-only against the incident
+corpus, all four share one request path (`bedrock/client.ts`) and one
+read-only toolset (`triage/sql.ts`), and none of them can change an incident.
+
+The intent read is not a third agent. It has no tools and answers one label,
+so it is a capability of the Boss rather than a peer, and it is written
+against the same seam for the same reason.
+
+**Every Boss capability is an answer-tool schema plus read-only lookup tools,
+and code decides what happens to the answer.** That is the shape, and it is
+not a style preference. `decide` goes to `applyRules`. `read_intent` goes to
+the guarded `UPDATE` in the composition root. A merge proposal goes to
+`toolapi`. Nothing the Boss can call writes anything, so "the model proposes;
+the rules decide" is structural here rather than a discipline somebody
+remembers -- see [`triage/CLAUDE.md`](./triage/CLAUDE.md). A free-form tool on
+a Boss path would end that, quietly, and is the one change to this area worth
+refusing.
+
+The Slack question box is the deliberate exception, and only about its
+*output*: its answer is prose, not a schema, because there is nothing to
+validate in "here is what I found". Code still decides what happens to it --
+it is capped at about 200 words and posted. It reads; it does not act.
+
+**Two loops, on purpose.** `runStructuredCall` bounds a whole call with one
+wall-clock budget and a round count, and throws so every caller takes its
+conservative default. The Slack box bounds each turn separately, because what
+limits it is how long a person will sit in a thread, and it ends an exhausted
+run with a tool-less wrap-up rather than a throw -- somebody is waiting, and
+the reading is already paid for. Those are different bound shapes, not one
+shape with options, and folding them would cost triage its readability to
+serve the question box. They share the request path, the toolset and the
+usage accounting, which is where the duplication actually was.
+
 ## The rules that are not negotiable
 
 **Nothing fails silently.** This system's success state is quiet and its

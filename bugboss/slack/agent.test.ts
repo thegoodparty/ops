@@ -11,15 +11,14 @@ import { Db } from "../db";
 // the Bedrock client it drives. Its behaviour is the Slack agent's behaviour,
 // so it is tested here with the rest of that surface.
 import { createSlackAgentModel } from "../index";
-import { emptyModelUsage } from "../model";
-import type { ModelClient, ModelReply, ModelRequest } from "../triage";
+import { emptyModelUsage, ModelRequestFailed } from "../model";
+import type { ModelClient, ModelReply, ModelRequest, ModelUsage } from "../triage";
 import {
   MAX_SQL_ROWS,
   SLACK_AGENT_BUDGET_MS,
   SLACK_AGENT_MAX_TURNS,
   SLACK_AGENT_SYSTEM,
   SlackAgent,
-  assertReadOnlySql,
   buildTools,
   createMemoryThreadLock,
   incidentSessionPrefix,
@@ -98,7 +97,7 @@ const fakeModel = () => {
             state.gates.push(resolve);
           });
         }
-        return { text: state.reply };
+        return { text: state.reply, usage: emptyModelUsage() };
       },
     },
   };
@@ -180,41 +179,6 @@ beforeEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("SQL access is read-only", () => {
-  test("the guard accepts reads", () => {
-    for (const sql of [
-      "SELECT * FROM incident",
-      "  select id from signal where explained = 0  ",
-      "WITH open AS (SELECT * FROM incident WHERE status='INVESTIGATING') SELECT count(*) FROM open",
-      "SELECT name, sql FROM sqlite_master WHERE type='table'",
-      "SELECT * FROM incident WHERE rootCause LIKE '%delete the row%'",
-      "SELECT 1 -- DROP TABLE incident",
-      "SELECT id FROM incident;",
-      "EXPLAIN QUERY PLAN SELECT * FROM signal WHERE incidentId = 'x'",
-    ]) {
-      assert.doesNotThrow(() => assertReadOnlySql(sql), sql);
-    }
-  });
-
-  test("the guard rejects every write shape", () => {
-    for (const sql of [
-      "DELETE FROM incident",
-      "UPDATE incident SET status='CLOSED'",
-      "INSERT INTO incident (id) VALUES ('x')",
-      "DROP TABLE incident",
-      "SELECT 1; DROP TABLE incident",
-      "SELECT 1;DELETE FROM signal",
-      "PRAGMA journal_mode = DELETE",
-      "ATTACH DATABASE '/tmp/evil.db' AS evil",
-      "VACUUM INTO '/tmp/copy.db'",
-      "DELETE FROM incident RETURNING id",
-      "WITH x AS (DELETE FROM signal RETURNING id) SELECT * FROM x",
-      "",
-      "   ",
-    ]) {
-      assert.throws(() => assertReadOnlySql(sql), `must reject: ${sql}`);
-    }
-  });
-
   test("the connection underneath is read-only, not just the guard", () => {
     // A guard is a message; this is the boundary. RETURNING makes it a
     // statement better-sqlite3 will happily run as a reader, so what stops it
@@ -237,6 +201,43 @@ describe("SQL access is read-only", () => {
 
     assert.match(out, /^Rejected: /);
     assert.equal(db.query("SELECT id FROM incident").length, 1);
+  });
+
+  // The Slack agent runs the same guard triage does now, so what it accepts
+  // and what it refuses is settled in triage/triage.test.ts. What is left to
+  // check here is the wiring: that a refusal still reaches the model as
+  // "Rejected: <reason>" carrying that guard's words, and that a query the
+  // shared guard accepts actually runs.
+  test("a refusal carries the shared guard's reason in this surface's shape", async () => {
+    const { store } = memoryStore();
+    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+
+    assert.equal(
+      await query.run({ sql: "SELECT 1; DROP TABLE incident" }),
+      "Rejected: one statement at a time; remove the extra ';'",
+    );
+    assert.equal(await query.run({ sql: "   " }), "Rejected: empty query");
+    assert.equal(
+      await query.run({ sql: "UPDATE incident SET status='CLOSED'" }),
+      "Rejected: read-only access: statements must start with SELECT, WITH or EXPLAIN",
+    );
+    assert.equal(
+      await query.run({ sql: "WITH t AS (SELECT 1) UPDATE incident SET status='CLOSED'" }),
+      "Rejected: read-only access: UPDATE is not allowed",
+    );
+  });
+
+  test("a read the guard accepts runs, semicolon and quoted keywords included", async () => {
+    const { store } = memoryStore();
+    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+
+    assert.match(await query.run({ sql: "SELECT id FROM incident;" }), /inc-1/);
+    assert.equal(
+      await query.run({
+        sql: "SELECT id FROM incident WHERE rootCause LIKE '%DROP TABLE%'",
+      }),
+      "0 rows.",
+    );
   });
 
   test("results are bounded", async () => {
@@ -263,6 +264,8 @@ describe("SQL access is read-only", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 
@@ -379,7 +382,7 @@ describe("the per-thread lock", () => {
         run: async () => {
           calls++;
           if (calls === 1) throw new Error("bedrock said no");
-          return { text: "second time lucky" };
+          return { text: "second time lucky", usage: emptyModelUsage() };
         },
       },
       config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
@@ -844,7 +847,10 @@ describe("an incident named outside its own thread is linkable", () => {
       // Standing in for the model doing what it is told: look the incident up
       // and say what came back.
       model: {
-        run: async (req) => ({ text: await req.tools[0].run({ incidentId: "inc-1" }) }),
+        run: async (req) => ({
+          text: await req.tools[0].run({ incidentId: "inc-1" }),
+          usage: emptyModelUsage(),
+        }),
       },
       config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
     });
@@ -1243,6 +1249,101 @@ describe("asking the right tool", () => {
     assert.match(SLACK_AGENT_SYSTEM, /needs nothing from them/i);
     assert.match(SLACK_AGENT_SYSTEM, /About 200 words/);
     assert.match(SLACK_AGENT_SYSTEM, /Plain terms/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("what a question cost", () => {
+  const spent = (tokens: number): ModelUsage => ({
+    tokensIn: tokens,
+    tokensOut: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    costUsd: tokens / 1000,
+    modelId: "anthropic.test",
+    calls: 1,
+  });
+
+  test("every turn is banked, the wrap-up included", async () => {
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: (request) =>
+        Promise.resolve(
+          request.tools.length === 0
+            ? ({
+                text: "inc-1 is being worked, and that is as far as I got.",
+                toolCalls: [],
+                usage: spent(5),
+              } satisfies ModelReply)
+            : ({
+                text: "",
+                toolCalls: [
+                  { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+                ],
+                usage: spent(100),
+              } satisfies ModelReply),
+        ),
+    };
+
+    let usage = emptyModelUsage();
+    await captureLogs(async () => {
+      usage = (
+        await createSlackAgentModel(model, store).run(runRequest([countingTool([])], 2))
+      ).usage;
+    });
+
+    assert.equal(usage.calls, 3, "two turns and the wrap-up");
+    assert.equal(usage.tokensIn, 205);
+    assert.equal(usage.modelId, "anthropic.test");
+  });
+
+  // A wrap-up that failed still spent what it spent, and this is the run that
+  // most needs costing: it is the one that cost the most and answered least.
+  test("a wrap-up that throws still reports what it spent", async () => {
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: (request) =>
+        request.tools.length === 0
+          ? Promise.reject(new ModelRequestFailed("bedrock throttled", spent(7)))
+          : Promise.resolve({
+              text: "inc-1 is being worked.",
+              toolCalls: [
+                { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+              ],
+              usage: spent(100),
+            } satisfies ModelReply),
+    };
+
+    let usage = emptyModelUsage();
+    await captureLogs(async () => {
+      usage = (
+        await createSlackAgentModel(model, store).run(runRequest([countingTool([])], 1))
+      ).usage;
+    });
+
+    assert.equal(usage.calls, 2, "the failed wrap-up is a call that happened");
+    assert.equal(usage.tokensIn, 107);
+  });
+
+  test("the answered line carries the tokens", async () => {
+    const { store } = memoryStore();
+    const slack = fakeSlack();
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: slack.client,
+      model: { run: () => Promise.resolve({ text: "two are open.", usage: spent(120) }) },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+    });
+
+    const lines = await captureLogs(() => agent.handle(mention()));
+    const answered = lines.find((l) => l.includes('"event":"answered"'));
+    assert.ok(answered, "the run was answered");
+    const parsed = JSON.parse(answered) as Record<string, unknown>;
+    assert.equal(parsed.tokensIn, 120);
+    assert.equal(parsed.modelCalls, 1);
+    assert.equal(parsed.modelId, "anthropic.test");
   });
 });
 

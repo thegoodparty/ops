@@ -203,7 +203,10 @@ const fakeSlackAgent = {
   asked: [] as string[],
   run(req: { input: string }) {
     fakeSlackAgent.asked.push(req.input);
-    return Promise.resolve({ text: "two incidents are open right now." });
+    return Promise.resolve({
+      text: "two incidents are open right now.",
+      usage: emptyModelUsage(),
+    });
   },
 };
 

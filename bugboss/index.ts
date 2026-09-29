@@ -107,9 +107,13 @@ import {
   resolveTestDatabase,
 } from "./testdb";
 import {
+  addModelUsage,
   createTriage,
+  emptyModelUsage,
+  ModelRequestFailed,
   usageForLog,
   type ModelClient,
+  type ModelReply,
   type ModelToolCall,
   type ModelTurn,
   type ModelUsage,
@@ -550,17 +554,28 @@ export const createSlackAgentModel = (
 
     let answer = "";
     let exhausted = false;
+    // Every request this run makes, banked as it returns. In place and
+    // outside the loop because a throw on turn nine has still spent the
+    // first eight turns, and the caller reads this beside the answer.
+    const usage = emptyModelUsage();
     // What the reader is owed when nothing else survives the run: how long
     // they waited, alongside how many steps bought it.
     const startedAt = Date.now();
     for (let turn = 0; turn < req.maxTurns; turn++) {
-      const reply = await model.complete({
-        system: req.system,
-        messages: [...messages],
-        tools,
-        maxTokens: 4096,
-        signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
-      });
+      let reply: ModelReply;
+      try {
+        reply = await model.complete({
+          system: req.system,
+          messages: [...messages],
+          tools,
+          maxTokens: 4096,
+          signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
+        });
+      } catch (err) {
+        if (err instanceof ModelRequestFailed) addModelUsage(usage, err.usage);
+        throw err;
+      }
+      addModelUsage(usage, reply.usage);
       messages.push({
         role: "assistant",
         text: reply.text,
@@ -600,6 +615,7 @@ export const createSlackAgentModel = (
           maxTokens: 4096,
           signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
         });
+        addModelUsage(usage, wrapUp.usage);
         messages.push({
           role: "assistant",
           text: wrapUp.text,
@@ -618,6 +634,7 @@ export const createSlackAgentModel = (
           alarm("slack_agent_wrap_up_empty", { sessionKey: req.sessionKey });
         }
       } catch (err) {
+        if (err instanceof ModelRequestFailed) addModelUsage(usage, err.usage);
         alarm("slack_agent_wrap_up_failed", {
           sessionKey: req.sessionKey,
           error: String(err),
@@ -643,7 +660,7 @@ export const createSlackAgentModel = (
     }
 
     await store.put(key, JSON.stringify(messages));
-    return { text };
+    return { text, usage };
   },
 });
 

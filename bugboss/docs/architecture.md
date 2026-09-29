@@ -72,6 +72,22 @@ signals across incidents.
 attach across `RESOLVED`, never to a `CLOSED` or `MERGED` target, never to
 one a human owns.
 
+## Two agents
+
+One thing here writes state: the incident agent (`agent/`), a Pi session in a
+child process. Everything else that reaches a model is the Boss -- triage,
+root-cause correlation, the inbound-language read and the Slack question box
+-- and all of it is read-only against the incident corpus. They share one
+request path (`bedrock/client.ts`), one read-only toolset (`triage/sql.ts`)
+and one usage accumulator.
+
+Every Boss capability is an answer-tool schema plus read-only lookup tools,
+with code deciding what happens to the answer, which is what makes "the model
+proposes; the rules decide" structural rather than remembered. The numbered
+steps below are stages of one pipeline, not separate agents; the only place
+the count matters is that a free-form tool on a Boss path would collapse the
+distinction.
+
 ## The path an alert takes
 
 **1. Ingress** (`ingress/`) verifies and parses. Grafana's HMAC is over

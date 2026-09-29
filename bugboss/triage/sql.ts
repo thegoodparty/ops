@@ -37,17 +37,97 @@ dollars, and say it is an estimate.
 Timestamps are epoch milliseconds. Labels and prUrls are JSON text; use
 json_extract(labels, '$.alert_slug') to read one.`;
 
+// The guard below used to exist twice, against the same database, with
+// different answers: this one allowed SELECT and WITH and checked the raw
+// text, while the Slack agent's allowed EXPLAIN too, stripped comments and
+// string literals before checking anything, and scanned for nineteen write
+// keywords. Neither caller ever saw the other, so nobody noticed that the
+// path running on every single signal was the weaker one -- and that checking
+// raw text means a semicolon inside a string literal is a false refusal.
+//
+// One guard now, the stronger of the two.
+
+const FORBIDDEN =
+  /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|VACUUM|PRAGMA|REINDEX|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RETURNING)\b/i;
+
 /**
- * The read connection is already opened read-only, so this guard is about
- * giving the model a correctable error rather than about containment.
+ * Blank out string literals, bracketed identifiers and comments, so the
+ * checks below read only code. Checking raw text is how a `;` or a `DROP`
+ * inside a quoted string becomes a refusal of a legitimate query.
+ */
+const stripSqlNoise = (sql: string): string => {
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'" || c === '"' || c === "`") {
+      const quote = c;
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      out += " ";
+      continue;
+    }
+    if (c === "[") {
+      while (i < sql.length && sql[i] !== "]") i++;
+      i++;
+      out += " ";
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      while (i < sql.length && sql[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      i += 2;
+      while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+};
+
+/**
+ * The read connection is already opened read-only, so containment is not what
+ * this is for: a write fails at the driver even if this misses one. It runs
+ * first because a correctable sentence beats a SQLITE_READONLY stack trace to
+ * a model that can try again, and because it is what keeps multi-statement
+ * input away from the driver at all.
+ *
+ * Returns an error rather than throwing, which is the shape both callers
+ * want: the answer goes back to the model as a tool result either way, and a
+ * throw would have to be caught at every call site to become one.
  */
 export const prepareQuery = (raw: string): { sql: string } | { error: string } => {
   const sql = raw.trim().replace(/;+\s*$/, "").trim();
-  if (sql.length === 0) return { error: "empty query" };
-  if (!/^(select|with)\b/i.test(sql)) {
-    return { error: "only SELECT and WITH statements are allowed" };
+  const body = stripSqlNoise(sql).trim().replace(/;\s*$/, "");
+  if (body.length === 0) return { error: "empty query" };
+  if (body.includes(";")) {
+    return { error: "one statement at a time; remove the extra ';'" };
   }
-  if (sql.includes(";")) return { error: "one statement per call" };
+  if (!/^(select|with|explain)\b/i.test(body)) {
+    return {
+      error: "read-only access: statements must start with SELECT, WITH or EXPLAIN",
+    };
+  }
+  const hit = body.match(FORBIDDEN);
+  if (hit) {
+    return { error: `read-only access: ${hit[1].toUpperCase()} is not allowed` };
+  }
   return { sql };
 };
 

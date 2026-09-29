@@ -890,3 +890,101 @@ test("a decision carries the tokens of a request that died in transport", async 
   assert.equal(outcome.usage.tokensIn, 1600);
   assert.ok(outcome.usage.costUsd > 0.006, "the failed request's cost was dropped");
 });
+
+// ---------------------------------------------------------------------------
+// One SQL guard, the stronger of the two that used to exist
+// ---------------------------------------------------------------------------
+
+const refused = (sql: string): string => {
+  const result = prepareQuery(sql);
+  assert.ok("error" in result, `expected a refusal for: ${sql}`);
+  return "error" in result ? result.error : "";
+};
+
+const allowed = (sql: string): string => {
+  const result = prepareQuery(sql);
+  assert.ok("sql" in result, `expected this to be allowed: ${sql}`);
+  return "sql" in result ? result.sql : "";
+};
+
+test("the guard reads code, not the raw text", () => {
+  // The reason the checks run over a stripped copy. Both of these are single
+  // legitimate SELECTs, and the old triage guard refused the first outright
+  // because it looked for ";" in the raw string. A false refusal on a
+  // correct query is worse than it sounds: the model cannot tell it from a
+  // real syntax error, so it rewrites a query that was right.
+  allowed("SELECT * FROM signal WHERE body LIKE '%;%'");
+  allowed("SELECT * FROM signal WHERE title = 'DROP TABLE incident'");
+  allowed("SELECT 1 -- ; DROP TABLE incident");
+  allowed("SELECT 1 /* DELETE FROM incident */");
+});
+
+test("the guard refuses a write however it is spelled", () => {
+  // The keyword scan the triage guard did not have at all. Every one of these
+  // opens with SELECT or WITH, so an opener check alone passes them.
+  for (const sql of [
+    "WITH x AS (SELECT 1) DELETE FROM incident",
+    "SELECT 1; DROP TABLE incident",
+    "WITH x AS (SELECT 1) SELECT * FROM x; PRAGMA journal_mode = delete",
+    "SELECT * FROM incident RETURNING id",
+    "WITH t AS (UPDATE incident SET status = 'CLOSED' RETURNING id) SELECT * FROM t",
+  ]) {
+    assert.match(refused(sql), /read-only access|one statement/i);
+  }
+});
+
+test("EXPLAIN is allowed, because reading a plan is reading", () => {
+  // The Slack agent's guard allowed it and triage's did not, for no reason
+  // anybody recorded. Unifying on the stricter guard would have taken this
+  // away from the surface that had it.
+  allowed("EXPLAIN QUERY PLAN SELECT * FROM signal WHERE sourceId = 'fp-1'");
+});
+
+test("the guard still answers the cases it always answered", () => {
+  assert.deepEqual(prepareQuery("SELECT 1;"), { sql: "SELECT 1" });
+  assert.match(refused("DELETE FROM incident"), /read-only access/);
+  assert.match(refused("   "), /empty query/);
+  // Refusals are returned, never thrown. Both callers hand the string back to
+  // the model as a tool result, and a throw would have to be caught at each
+  // one to become the same thing.
+  assert.doesNotThrow(() => prepareQuery("DROP TABLE incident"));
+});
+
+// Moved here with the guard itself, from the copy that used to live in
+// slack/agent.ts. Every shape that copy asserted is asserted against the one
+// that replaced it: a case dropped during the merge is exactly how the
+// weaker of the two guards ended up on the hot path unnoticed.
+test("every read the Slack agent's guard accepted is still accepted", () => {
+  for (const sql of [
+    "SELECT * FROM incident",
+    "  select id from signal where explained = 0  ",
+    "WITH open AS (SELECT * FROM incident WHERE status='INVESTIGATING') SELECT count(*) FROM open",
+    "SELECT name, sql FROM sqlite_master WHERE type='table'",
+    "SELECT * FROM incident WHERE rootCause LIKE '%delete the row%'",
+    "SELECT 1 -- DROP TABLE incident",
+    "SELECT id FROM incident;",
+    "EXPLAIN QUERY PLAN SELECT * FROM signal WHERE incidentId = 'x'",
+  ]) {
+    allowed(sql);
+  }
+});
+
+test("every write the Slack agent's guard rejected is still rejected", () => {
+  for (const sql of [
+    "DELETE FROM incident",
+    "UPDATE incident SET status='CLOSED'",
+    "INSERT INTO incident (id) VALUES ('x')",
+    "DROP TABLE incident",
+    "SELECT 1; DROP TABLE incident",
+    "SELECT 1;DELETE FROM signal",
+    "PRAGMA journal_mode = DELETE",
+    "ATTACH DATABASE '/tmp/evil.db' AS evil",
+    "VACUUM INTO '/tmp/copy.db'",
+    "DELETE FROM incident RETURNING id",
+    "WITH x AS (DELETE FROM signal RETURNING id) SELECT * FROM x",
+    "",
+    "   ",
+  ]) {
+    refused(sql);
+  }
+});
