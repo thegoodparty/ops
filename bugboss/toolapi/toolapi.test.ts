@@ -643,6 +643,111 @@ describe("invariant 2: resolution closes the signals it claims to have fixed", (
   });
 });
 
+describe("park", () => {
+  const waitRow = (id: string) =>
+    db.get<{
+      waitingFor: string;
+      wakeAt: number | null;
+      liftsOnReply: number;
+      startedAt: number;
+    }>("SELECT * FROM incident_wait WHERE incidentId = ?", [id]);
+
+  it("defaults to a wait a reply ends, which is the wait on a person", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(id).park({ waitingFor: "somebody to merge it" });
+
+    assert.equal(res.ok, true);
+    assert.equal(waitRow(id)?.liftsOnReply, 1);
+    assert.equal(waitRow(id)?.waitingFor, "somebody to merge it");
+  });
+
+  // The row `turnBudgetPark` writes, and the only one in the system that a
+  // reply must not end. A reply adds no turns, so waking on one relaunches an
+  // agent that is over budget before its first turn: it stops again, escalates
+  // again, and every comment on the thread becomes a page. The flag is the
+  // whole mechanism, so the 0 actually reaching the column is the thing worth
+  // asserting rather than the argument reaching the handler.
+  it("writes a wait no reply can end when the caller says so", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(id).park({
+      waitingFor: "a person, after the 200-turn budget ran out",
+      liftsOnReply: false,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(waitRow(id)?.liftsOnReply, 0);
+    assert.deepEqual(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1", [
+        id,
+      ]),
+      [],
+      "the delete in recordReply is keyed on this, so a 1 here would defeat it",
+    );
+  });
+
+  it("leaves wakeAt null when no wake time is given, and sets one when it is", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const open = await openIncident(["sig-a"]);
+    const timed = await openIncident(["sig-b"]);
+
+    // Null is the shape that can wait forever: only a reply or the stale
+    // sweep lifts it, which is why both of those exist.
+    await toolsFor(open).park({ waitingFor: "a person" });
+    assert.equal(waitRow(open)?.wakeAt, null);
+
+    const before = Date.now();
+    await toolsFor(timed).park({ waitingFor: "a deploy", wakeAfterSeconds: 600 });
+    const wakeAt = waitRow(timed)?.wakeAt;
+    assert.ok(wakeAt !== null && wakeAt !== undefined);
+    assert.ok(wakeAt >= before + 600_000, `${wakeAt} < ${before + 600_000}`);
+  });
+
+  // One row per incident, so a second park is an update rather than a second
+  // wait -- and the update has to carry the flag. An agent that parked on a
+  // person and then ran out of turns would otherwise keep the old 1 and be
+  // woken by the next comment, which is the exact loop this flag prevents.
+  it("replaces an existing wait, including flipping it to one a reply cannot end", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    await tools.park({ waitingFor: "somebody to merge it", wakeAfterSeconds: 60 });
+    assert.equal(waitRow(id)?.liftsOnReply, 1);
+
+    await tools.park({
+      waitingFor: "a person, after the 200-turn budget ran out",
+      liftsOnReply: false,
+    });
+
+    assert.equal(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id]).length,
+      1,
+      "one wait per incident",
+    );
+    assert.equal(waitRow(id)?.liftsOnReply, 0);
+    assert.equal(waitRow(id)?.wakeAt, null, "and the new wake time replaces the old one");
+  });
+
+  it("refuses to park an incident that is already closed", async () => {
+    await seed("sig-a", { closedAt: 2000 });
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+
+    const res = await tools.park({ waitingFor: "somebody" });
+
+    assert.equal(res.ok, false);
+    assert.equal(waitRow(id), undefined, "nothing waits on a closed incident");
+  });
+});
+
 describe("the scoped token", () => {
   it("refuses a token for another incident reaching this one's signals", async () => {
     await seed("sig-a");
