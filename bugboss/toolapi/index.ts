@@ -46,6 +46,7 @@ import {
   type IncidentRow,
   type SignalRow,
 } from "./assign";
+import { createAnnouncer } from "./announce";
 import { verifyAgentToken } from "./token";
 import {
   bullets,
@@ -59,6 +60,7 @@ import {
 } from "../slack/format";
 import { makeAlarm, makeLog } from "../logging";
 
+export * from "./announce";
 export * from "./assign";
 export * from "./token";
 
@@ -276,131 +278,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     }
   };
 
-  /**
-   * Everything the Boss says in an incident thread goes through here, so this
-   * is where mrkdwn and the length ceiling are enforced. An escalation brief or a
-   * root cause is model prose that can run past what one message holds, and
-   * chat.postMessage truncates rather than refusing, so it is split into
-   * consecutive messages instead of being cut mid sentence.
-   */
-  const notify = async (incident: Incident, text: string): Promise<boolean> => {
-    // The thread is looked up here rather than taken from the row the caller
-    // is holding. Every transition reads its incident before it writes, and a
-    // thread can be opened in between -- openThreads does exactly that during
-    // a split. A stale null posts at the top of the channel, where nothing
-    // groups it with the incident and Slack still answers ok.
-    const threadTs =
-      db.get<{ slackThreadTs: string | null }>(
-        "SELECT slackThreadTs FROM incident WHERE id = ?",
-        [incident.id],
-      )?.slackThreadTs ?? incident.slackThreadTs;
-    try {
-      for (const part of splitForSlack(text)) {
-        await slack.post(threadTs, part);
-      }
-      return true;
-    } catch (err) {
-      alarm("thread_post_failed", {
-        incidentId: incident.id,
-        error: String(err),
-      });
-      return false;
-    }
-  };
-
-  /**
-   * A reference to another incident's thread, as mrkdwn. Both branches are
-   * escaped already, so interpolate it with raw().
-   *
-   * Losing the link is not losing the message: a thread nobody can find is
-   * what this is here to fix, so a permalink that fails says so and the
-   * sentence still reads.
-   */
-  const threadRef = async (
-    incident: Incident | undefined,
-    label: string,
-  ): Promise<string> => {
-    if (!incident?.slackThreadTs) return escape(label);
-    try {
-      return link(await slack.permalink(incident.slackThreadTs), label);
-    } catch (err) {
-      alarm("permalink_failed", { incidentId: incident.id, error: String(err) });
-      return escape(label);
-    }
-  };
-
-  /**
-   * Both sides of a merge, written for somebody who has never used this
-   * system and is reading one of these threads at 2am.
-   *
-   * The absorbed incident's thread is the half that cannot be skipped. After
-   * this it is never written to again, and a thread that simply goes quiet
-   * forever is indistinguishable from the Boss having died -- which is what
-   * the reader is left to guess when the only message goes to the other
-   * thread.
-   *
-   * The merge is already committed and durable by the time this runs, so a
-   * post that fails alarms inside notify and the rest still goes out. A
-   * notification is not worth rolling a re-partition back for.
-   */
-  const announceMerge = async (result: AssignResult): Promise<void> => {
-    const into = readIncident(result.target);
-    if (!into) {
-      alarm("merge_target_gone", {
-        target: result.target,
-        merged: result.merged,
-      });
-      return;
-    }
-
-    for (const absorbedId of result.merged) {
-      const absorbed = readIncident(absorbedId);
-      const why = toMrkdwn(result.reason);
-      // Both links before either post. Each falls back on its own, and
-      // resolving them up front is what lets the order below be the only
-      // thing deciding which message survives a Slack failure.
-      const absorbedRef = await threadRef(
-        absorbed,
-        `incident ${absorbedId}'s thread`,
-      );
-      const intoRef = await threadRef(
-        into,
-        `incident ${result.target}'s thread`,
-      );
-
-      // The absorbed thread goes first. It is the one that is never written
-      // to again, so if only one of these two lands it has to be that one:
-      // the alternative is a surviving thread announcing that a thread is
-      // closing while that thread says nothing and simply stops.
-      if (absorbed?.slackThreadTs) {
-        await notify(
-          absorbed,
-          [
-            mrkdwn`*This incident is the same problem as incident ${result.target}, so the two have been merged*`,
-            why,
-            mrkdwn`_This is the last message in this thread · everything from here, including the fix and the post-mortem, is in ${raw(intoRef)}._`,
-          ].join("\n"),
-        );
-      } else {
-        // Nobody is left reading a thread that was never opened, so this is
-        // not a lost message so much as evidence of one that was: an
-        // incident reached a merge without the thread every incident gets.
-        alarm("absorbed_thread_missing", {
-          incidentId: absorbedId,
-          into: result.target,
-        });
-      }
-
-      await notify(
-        into,
-        [
-          mrkdwn`*Incident ${absorbedId} is the same problem as this one, so the two have been merged*`,
-          why,
-          mrkdwn`_Nothing further will be posted in ${raw(absorbedRef)} · updates for both incidents arrive here from now on._`,
-        ].join("\n"),
-      );
-    }
-  };
+  const { notify, threadRef, announceMerge } = createAnnouncer({ db, slack });
 
   /**
    * Both sides of a split, which asks the same two questions a merge does
@@ -705,11 +583,18 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       for (const merge of applied) await announceMerge(merge);
 
+      // Read back rather than asserted. Correlation can now absorb the
+      // reporting incident itself -- when an older incident turns out to be
+      // the same bug, the cause travels to it and this record is the one
+      // that closes -- so the FIXING this call just wrote is no longer
+      // something it can claim afterwards. The `merged` directive riding
+      // out with this response is what stands the agent down; a status
+      // saying FIXING underneath it would contradict it.
       return {
         ok: true,
         data: {
           incidentId,
-          status: "FIXING" as IncidentStatus,
+          status: readIncident(incidentId)?.status ?? ("FIXING" as IncidentStatus),
           splitInto: splits.map((s) => s.target),
           merged: applied.flatMap((m) => m.merged),
         },

@@ -16,12 +16,18 @@
 // Advisory, exactly like triage. The model reads the sentence; the code keeps
 // the invariants. Two things make a wrong read cheap rather than expensive:
 //
-//   - It cannot name what it acts on. An ownership read is bound to the
+//   - It can name at most half of what it acts on. A read is bound to the
 //     incident whose thread the message arrived in, and the legal transitions
 //     are in the guarded UPDATE in the composition root. A message that reads
 //     like an order -- pasted out of a log line, or written by someone who
-//     wants one -- can still only move the one incident it was posted under,
-//     between the two states that statement allows.
+//     wants one -- can still only move the one incident it was posted under.
+//     A combine request is the one read that names a second incident, and it
+//     names only that second one: the first side is always the thread. The
+//     id it names has to appear literally in the message, has to be an open
+//     incident, and which of the two survives is a rule in `assign` rather
+//     than anything said here. So the worst a fabricated id achieves is to
+//     combine the incident somebody was already standing in with one real
+//     other one, at a verified person's request, announced in both threads.
 //   - It never fails quietly. A failed call answers `unclear`, which asks
 //     rather than guesses, and carries a fallback rate on its alarm so a dead
 //     model does not read as a quiet week.
@@ -78,6 +84,12 @@ interface Fallible {
 
 export interface ReplyRead extends Fallible {
   addressed: Addressed;
+  /**
+   * An incident this person is asking the thread's incident to be combined
+   * with, or null. Unvalidated: the caller checks that it was really in the
+   * message and that it names an incident that can take signals.
+   */
+  combineWith: string | null;
 }
 
 export interface MentionRead extends Fallible {
@@ -138,6 +150,11 @@ const REPLY_TOOL: ModelToolSpec = {
         description:
           "agent: they are talking to the agent working this incident. others: they are talking to the other people in the thread. unclear: you cannot tell.",
       },
+      combineWith: {
+        type: "string",
+        description:
+          "The id of another incident this person is asking to combine this one with, copied exactly from their message. Leave this out unless they plainly ask for that.",
+      },
       reason: REASON_PROPERTY,
     },
     required: ["addressed", "reason"],
@@ -147,6 +164,7 @@ const REPLY_TOOL: ModelToolSpec = {
 
 const replySchema = z.object({
   addressed: z.enum(ADDRESSEES),
+  combineWith: z.string().optional(),
   reason: REASON_SCHEMA,
 });
 
@@ -177,6 +195,18 @@ message answers it when it supplies what was asked for, even tersely -- "yes",
 "org X only", "no, that one is fine" are answers. A message about the same
 subject is not automatically an answer: "did anyone check org X?" is one
 person asking another, not a reply to the agent.
+
+Second, and separately: are they asking for this incident and another one to
+be combined? Two incidents turn out to be one bug often enough that people say
+so, and until now nothing could act on it. Set combineWith to the other
+incident's id, copied exactly from their message, when they plainly ask for
+that -- "this is the same as 79", "merge these into 79", "82 and this one are
+the same bug, put them together". Leave it out otherwise.
+
+Leave it out when they are asking whether two incidents are related, or saying
+they look similar, or mentioning another incident in passing. A question is not
+a request. You are not being asked which incident should survive; that is not
+yours or theirs to pick.
 
 Prefer unclear over a wrong agent. Ending the agent's wait on something that
 was not for it sends a long investigation down whatever an offhand remark
@@ -299,9 +329,15 @@ const read = async <T>(
 };
 
 /**
- * Who a reply in an incident thread was for.
+ * Who a reply in an incident thread was for, and whether it asks for this
+ * incident to be combined with another.
  *
- * One field, where this used to answer two. The other asked whether the
+ * The second field is here rather than in a call of its own because every
+ * inbound message already pays for this one, and a combine request is a
+ * thing said in passing in the middle of an ordinary sentence -- a separate
+ * classifier would have to read the same message again to find it.
+ *
+ * The ownership field this used to carry is gone: it asked whether the
  * message moved the incident between a person and an agent, and there is no
  * such move any more -- an agent drives every open incident, so the only
  * question left is whether the message was aimed at it. The agent's
@@ -331,12 +367,14 @@ export const readReplyIntent = async (
     });
     return {
       addressed: answer.addressed,
+      combineWith: answer.combineWith ?? null,
       reason: answer.reason ?? "",
       fellBack: false,
     };
   } catch (err) {
     return {
       addressed: "unclear",
+      combineWith: null,
       reason: String(err),
       fellBack: true,
     };

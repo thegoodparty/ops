@@ -723,6 +723,16 @@ describe("directives", () => {
     assert.equal(incidentRow(b)?.status, "MERGED");
     assert.equal(incidentRow(b)?.mergedInto, a);
     assert.deepEqual(signalsOn(a), ["sig-a", "sig-b"]);
+    // Read back rather than asserted. This call wrote FIXING and correlation
+    // then absorbed the incident out from under it, so a response repeating
+    // what it wrote would contradict the directive travelling beside it --
+    // and the direction rule makes an absorbed reporting incident the
+    // ordinary case rather than a corner of one.
+    assert.equal(
+      (res.data as { status: string }).status,
+      "MERGED",
+      "the status reports where the incident ended up, not what this call set",
+    );
   });
 
   it("says so when it declines a merge the correlator proposed", async () => {

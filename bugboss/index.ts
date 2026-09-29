@@ -85,7 +85,9 @@ import {
 import {
   applyAssign,
   AssignError,
+  createAnnouncer,
   createToolApi,
+  establishedOf,
   mintAgentToken,
   type AssignResult,
   type Correlator,
@@ -984,6 +986,10 @@ export const createBugBoss = async (
     openThreads: ensureIncidentThreads,
   };
 
+  // The same two messages the tool API leaves behind when correlation merges.
+  // A person's merge is the same event and has to read as one.
+  const announce = createAnnouncer({ db, slack: threads });
+
   const toolApiFor = (incidentId: string, token?: string): ToolApi => {
     const api = createToolApi({
       db,
@@ -1832,6 +1838,133 @@ export const createBugBoss = async (
         alarm("intent_reply_failed", { channel, threadTs, error: String(err) }),
       );
 
+  /** The statuses an incident can still take signals in. Mirrors assign. */
+  const COMBINABLE: readonly IncidentStatus[] = ["INVESTIGATING", "FIXING"];
+
+  /**
+   * Somebody in a thread has asked for this incident and another one to be
+   * combined. This is where that becomes a thing that happened.
+   *
+   * It exists because the alternative was a refusal. An agent may only
+   * re-partition its own incident -- rightly, that is what keeps a
+   * compromised one to a single record -- so when a person asked for a merge
+   * the agent in the thread had exactly one legal move, which was to create
+   * a *third* incident. It said it could not instead, and the ask went
+   * nowhere. The authority to do this already existed as the `human` actor;
+   * nothing had ever routed anything to it. Nothing here weakens the agent's
+   * containment. The request simply stops being executed under it.
+   *
+   * Three things bound it, none of them a reading of the sentence:
+   *
+   *   - The thread supplies one side. A message can name the other incident
+   *     and nothing else, so no wording reaches a pair of incidents the
+   *     person was not standing in front of.
+   *   - The named id must appear literally in what they typed. A model that
+   *     invents a plausible number gets dropped here rather than obeyed, and
+   *     the drop is logged with what it said.
+   *   - Which of the two survives is not theirs to pick, and is not read out
+   *     of the message. `assign` holds that rule.
+   */
+  const combineIncidents = async (
+    route: Extract<InboundRoute, { kind: "incident_reply" }>,
+    named: string,
+    said: string,
+  ): Promise<void> => {
+    const say = (text: string) => sayInThread(route.channel, route.threadTs, text);
+    const decline = (why: string, note: string) => {
+      log("combine_declined", { incidentId: route.incidentId, named, why });
+      return say(mrkdwn`${raw(userMention(route.user))} ${raw(note)}`);
+    };
+
+    // Digits first, so the boundary match below cannot be fed a pattern.
+    if (!/^\d+$/.test(named)) {
+      log("combine_dropped", { incidentId: route.incidentId, named, why: "not an incident id" });
+      return;
+    }
+    // Not the model's word for it. An id it read out of the message is in the
+    // message; an id it did not is a number it made up, and acting on one is
+    // a merge nobody asked for.
+    if (!new RegExp(`(^|\\D)${named}(\\D|$)`).test(said)) {
+      log("combine_dropped", { incidentId: route.incidentId, named, why: "not in the message" });
+      return;
+    }
+    if (named === route.incidentId) {
+      log("combine_dropped", { incidentId: route.incidentId, named, why: "already this incident" });
+      return;
+    }
+
+    const other = db.get<{ id: string; status: IncidentStatus }>(
+      "SELECT id, status FROM incident WHERE id = ?",
+      [named],
+    );
+    if (!other) {
+      return decline("unknown incident", `there is no incident ${named}, so I have left this one alone.`);
+    }
+    if (!COMBINABLE.includes(other.status)) {
+      return decline(
+        `incident ${named} is ${other.status}`,
+        `incident ${named} is ${other.status}, so these two cannot be combined. A signal arriving after a resolution is a recurrence, not the same incident.`,
+      );
+    }
+
+    // Read now rather than trusted from the route. The route was built when
+    // the message arrived and this runs after a model call, so the incident
+    // the person is standing in can have been resolved or merged away since.
+    const here = db.get<{ status: IncidentStatus }>(
+      "SELECT status FROM incident WHERE id = ?",
+      [route.incidentId],
+    );
+    if (!here || !COMBINABLE.includes(here.status)) {
+      return decline(
+        `incident ${route.incidentId} is ${here?.status ?? "gone"}`,
+        `this incident is ${here?.status ?? "gone"} now, so these two cannot be combined.`,
+      );
+    }
+
+    // The rule, applied before anything moves, so what gets said matches what
+    // gets written. Not negotiable from the message: a person asking for the
+    // merge the other way round still gets this one, and is told so.
+    const into = establishedOf(route.incidentId, named);
+    const absorb = into === named ? route.incidentId : named;
+
+    const signalIds = db
+      .query<{ id: string }>("SELECT id FROM signal WHERE incidentId = ?", [absorb])
+      .map((r) => r.id);
+    if (signalIds.length === 0) {
+      return decline("nothing to move", `incident ${absorb} has no signals left to move, so there is nothing to combine.`);
+    }
+
+    let result: AssignResult;
+    try {
+      result = await applyAssign(
+        db,
+        { signalIds, target: into, reason: said },
+        { kind: "human", slackUserId: route.user },
+      );
+    } catch (err) {
+      alarm("combine_failed", {
+        incidentId: route.incidentId,
+        named,
+        error: String(err),
+      });
+      await say(
+        mrkdwn`${raw(userMention(route.user))} I could not combine these two -- ${err instanceof AssignError ? String((err as Error).message) : "the write failed and the error is in the BugBoss logs"}.`,
+      );
+      return;
+    }
+
+    // Their answer goes first, and announce's closing message last, because
+    // one of the two threads announce writes into is this one -- and "this is
+    // the last message in this thread" has to be true when it is read.
+    await say(
+      [
+        mrkdwn`${raw(userMention(route.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
+        mrkdwn`_Incident ${into} is the older record, so it stays the one of account and keeps its thread. ${absorb === route.incidentId ? "This thread stops here." : "Everything carries on here."}_`,
+      ].join("\n"),
+    );
+    await announce.announceMerge(result);
+  };
+
   /**
    * Something a person said in an incident's thread. The relay has recorded
    * it; this decides who it was for, off the Slack ack.
@@ -1885,10 +2018,18 @@ export const createBugBoss = async (
       incidentId: route.incidentId,
       addressed,
       modelAddressed: read.addressed,
+      combineWith: read.combineWith,
       tagged: route.interrupt,
       blocked: outstanding !== null,
       fellBack: read.fellBack,
     });
+
+    // Independent of `addressed`. Asking for two incidents to be combined is
+    // a thing people say to each other as much as to the agent, and the ask
+    // is no less real for being addressed sideways. The agent has the message
+    // either way; this is the half of it that needs doing rather than
+    // reading.
+    if (read.combineWith) await combineIncidents(route, read.combineWith, said);
 
     // Only worth saying while something is blocked on it. With no outstanding
     // question there is no wait to end, the directive is context either way,

@@ -79,6 +79,28 @@ signals across incidents.
 `toolapi/assign.ts` is the single writer that holds the invariants: never
 attach across `RESOLVED`, and never to a `CLOSED` or `MERGED` target.
 
+Merge is the one of the four with a direction, and it is not the caller's to
+pick. The more established of the two incidents stays as the record — the
+lower id, which is the only monotonic record of when an incident was opened
+and the one thing a re-partition cannot move — and a merge the other way
+round is refused with an error naming the direction that would have worked.
+Left to callers the survivor was an accident of which agent happened to be
+acting, and a thread with days of conversation could be absorbed into one
+opened minutes earlier.
+
+Who may call it:
+
+| Actor | May |
+| --- | --- |
+| `agent` | re-partition its own incident only: create, split, and nothing that reaches a second record |
+| `human` | combine the incident whose thread they are in with one other, at a verified Slack identity |
+| `boss` | triage placement and root-cause correlation |
+
+An agent that concludes its partition is wrong cannot consolidate — that is
+what keeps a compromised one to a single record. Its refusal names the path
+that exists: say so in the thread, and a person there can. That request is
+read by `slack/intent.ts` and applied by the composition root as `human`.
+
 ## Two agents
 
 One thing here writes state: the incident agent (`agent/`), a Pi session in a

@@ -369,10 +369,13 @@ the presser a Slack error; the numbered options and free text still answer.
 is a model call. There is no keyword, no verb and no phrase to know — for
 either interface:
 
-- **In an incident thread**, whether the message was for the agent at all.
-  One field, one call. Somebody saying they are taking the incident on is a
-  message *to* the agent — an instruction to stand down, which it reads and
-  acts on — not a transfer for the Boss to record.
+- **In an incident thread**, whether the message was for the agent at all,
+  and whether it asks for this incident to be combined with another one. Two
+  fields, one call — a combine request is a thing said in the middle of an
+  ordinary sentence, so a separate classifier would read the same message
+  twice. Somebody saying they are taking the incident on is a message *to*
+  the agent — an instruction to stand down, which it reads and acts on — not
+  a transfer for the Boss to record.
 - **On a mention anywhere else**, whether somebody is reporting something
   broken or asking a question.
 
@@ -400,15 +403,21 @@ Same split as `triage/`: the model reads the sentence, the code keeps the
 invariants. Two things bound a wrong or captured read, and neither of them is
 the model behaving:
 
-- **It cannot name what it acts on.** The incident comes from
-  `slackThreadTs`, never from the message, and the answer is one enum label
-  with no field that could carry an id. A message that names a different
-  incident still only reaches the one whose thread it was posted in.
-- **Nothing it answers is a transition.** The read decides which directive the
-  agent is handed and whether that directive may end a wait. It writes nothing
-  to the incident, so the worst a captured read can do is answer a question
-  wrongly — which the agent can see and argue with, because it is still the
-  thing driving.
+- **It can name at most half of what it acts on.** One side of a combine is
+  always the thread the message arrived in, never the message, so the answer
+  can carry one other incident id and nothing else. Three code-side checks
+  bound that id: it must appear literally in what the person typed, it must
+  name an incident that can still take signals, and which of the two survives
+  is `assign`'s rule rather than anything said in the message. So a fully
+  captured read reaches a pair of open incidents somebody was already
+  standing in front of, at a verified person's request, announced in both
+  threads.
+- **Nothing it answers is a transition except that one, and that one is a
+  person's.** For `addressed`, the read decides which directive the agent is
+  handed and whether it may end a wait; it writes nothing. A combine does
+  write, and it writes under the `human` actor because that is whose request
+  it is — the Slack user id comes off the verified event, never out of the
+  text.
 
 The message is fenced in a `<MESSAGE untrusted="true">` block with the rule
 stated in the system prompt, the same framing triage puts around an alert
@@ -451,6 +460,29 @@ model is down, every reply in an incident thread gets a line saying it could
 not be read. That is bounded by how many people are typing, and the
 alternative is the failure this whole file exists to remove — somebody answers
 the agent, nothing happens, and nothing says so.
+
+### Combining two incidents, when a person asks
+
+Somebody in a thread says "this is the same bug as 79, merge them" and it
+happens. It did not used to: an agent may only re-partition its own incident,
+so the one legal move left to the agent being asked was to open a *third*
+incident — which is exactly what happened the day this was found, leaving the
+thread with the history abandoned and its signals in a record minutes old.
+The agent's containment rule is right and is untouched. What was missing was
+anything routing the request to the `human` actor that had been sitting in
+`AssignActor`, unconstructed, since it was written.
+
+`combineIncidents` in the composition root runs it. It does not choose a
+direction: the more established incident survives, which is `assign`'s rule,
+and a person who asks for the other direction gets this one and is told so in
+the thread. What follows is the same pair of messages correlation leaves —
+the absorbed thread is closed out with a permalink to the survivor, and the
+survivor is told where the signals came from.
+
+A button press does **not** reach this: `handleChoice` treats a press as
+addressed to the agent by construction and never reads it, on purpose. So an
+agent that wants a merge asks in prose rather than posting a choice, and its
+containment error says so.
 
 ## The Slack agent is read-only, deliberately
 

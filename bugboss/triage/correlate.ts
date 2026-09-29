@@ -21,6 +21,7 @@ import {
   type ModelClient,
   type ModelToolSpec,
 } from "./model";
+import { establishedOf } from "../toolapi/assign";
 import { makeAlarm, makeLog } from "../logging";
 import {
   attachedSignalIds,
@@ -42,7 +43,7 @@ export interface CorrelationRequest {
 export interface MergeProposal {
   /** The incident absorbed. Its agent gets a `merged` directive and exits. */
   incidentId: string;
-  /** The reporting incident, which is the one that knows the cause. */
+  /** The most established incident in the group, which may be this one. */
   into: string;
   reason: string;
 }
@@ -177,6 +178,20 @@ Which of these does the reported root cause explain?`;
  * Enforced here rather than in the prompt: the model is advisory about the
  * match, and a merge is the one direction that cannot be walked back by the
  * system on its own.
+ *
+ * The model says which incidents are one bug. It does not say which of them
+ * is the record, and it is not asked: that used to be `into: req.incidentId`,
+ * which made the survivor whichever agent happened to call report_root_cause
+ * first. Incident 79 lost four days of thread to an incident opened minutes
+ * before, and incident 81 merged the right way round out of the same rule --
+ * the direction was a coin toss either way.
+ *
+ * So the group elects its survivor: the most established of the reporting
+ * incident and every candidate the model was confident about. Per pair would
+ * not do. Three incidents that are one bug, flipped pairwise, would send the
+ * reporting incident into the oldest and then the rest into an incident that
+ * is already MERGED, which `applyMerge` declines -- leaving two thirds of one
+ * bug open.
  */
 const applyRules = (
   req: CorrelationRequest,
@@ -184,7 +199,7 @@ const applyRules = (
   merges: z.infer<typeof answerSchema>["merges"],
 ): MergeProposal[] => {
   const seen = new Set<string>();
-  const kept: MergeProposal[] = [];
+  const confident: { id: string; reason: string }[] = [];
 
   for (const merge of merges) {
     const candidate = candidates.find((c) => c.id === merge.incidentId);
@@ -198,10 +213,36 @@ const applyRules = (
     }
     if (seen.has(candidate.id)) continue;
     seen.add(candidate.id);
-    kept.push({ incidentId: candidate.id, into: req.incidentId, reason: merge.reason });
+    confident.push({ id: candidate.id, reason: merge.reason });
   }
 
-  return kept;
+  if (confident.length === 0) return [];
+
+  const into = confident.reduce(
+    (best, c) => establishedOf(best, c.id),
+    req.incidentId,
+  );
+  if (into !== req.incidentId) {
+    log("merge_direction_flipped", {
+      reporting: req.incidentId,
+      into,
+      note: "the reporting incident is the newer record, so it is the one absorbed",
+    });
+  }
+
+  // The reporting incident absorbs nothing when it is not the survivor -- it
+  // joins the others going the other way, carrying the cause it just found.
+  // Its reason is the one the model gave for matching it against the survivor,
+  // because that is the only sentence written about those two specifically.
+  const absorbed = confident.filter((c) => c.id !== into);
+  const ownReason = confident.find((c) => c.id === into)?.reason ?? "";
+
+  return [
+    ...absorbed.map((c) => ({ incidentId: c.id, into, reason: c.reason })),
+    ...(into === req.incidentId
+      ? []
+      : [{ incidentId: req.incidentId, into, reason: ownReason }]),
+  ];
 };
 
 /**

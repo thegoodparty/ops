@@ -8,7 +8,13 @@ import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
 import type { Directive } from "../types";
-import { applyAssign, assign, AssignError, logAssign } from "./assign";
+import {
+  applyAssign,
+  assign,
+  AssignError,
+  establishedOf,
+  logAssign,
+} from "./assign";
 
 const fakeS3 = () => {
   const objects = new Map<string, Buffer>();
@@ -351,5 +357,105 @@ describe("assign: containment", () => {
 
     assert.deepEqual(result.merged, [b]);
     assert.doesNotThrow(() => logAssign(result));
+  });
+  it("refuses a merge that would absorb the more established incident", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = (
+      await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "a" }, { kind: "boss" })
+    ).target;
+    const newer = (
+      await applyAssign(db, { signalIds: ["sig-b"], target: "NEW", reason: "b" }, { kind: "boss" })
+    ).target;
+
+    await assert.rejects(
+      applyAssign(
+        db,
+        { signalIds: ["sig-a"], target: newer, reason: "one bug" },
+        { kind: "human", slackUserId: "U123" },
+      ),
+      new RegExp(
+        `incident ${older} is more established than ${newer}.*merge ${newer} into ${older} instead`,
+      ),
+      "the refusal names the direction that would have worked",
+    );
+
+    assert.deepEqual(
+      signalsOn(older),
+      ["sig-a"],
+      "a refused merge moves nothing, including the signals it was given",
+    );
+    assert.equal(incident(older)?.status, "INVESTIGATING");
+    assert.deepEqual(directivesFor(older), [], "and tells nobody it happened");
+  });
+
+  it("leaves a partial re-partition alone, however old the source", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    await seed("sig-c");
+    const older = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-a", "sig-b"], target: "NEW", reason: "a" },
+        { kind: "boss" },
+      )
+    ).target;
+    const newer = (
+      await applyAssign(db, { signalIds: ["sig-c"], target: "NEW", reason: "c" }, { kind: "boss" })
+    ).target;
+
+    // The establishment rule is about two incidents becoming one. Moving some
+    // of the older incident's signals into the newer one leaves both open, so
+    // nothing has to win and nothing is refused.
+    const result = await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: newer, reason: "this one belongs there" },
+      { kind: "human", slackUserId: "U123" },
+    );
+
+    assert.deepEqual(result.merged, [], "neither incident was absorbed");
+    assert.deepEqual(signalsOn(older), ["sig-a"]);
+    assert.deepEqual(signalsOn(newer), ["sig-b", "sig-c"]);
+  });
+
+  it("merges into the more established incident when that is the direction asked for", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = (
+      await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "a" }, { kind: "boss" })
+    ).target;
+    const newer = (
+      await applyAssign(db, { signalIds: ["sig-b"], target: "NEW", reason: "b" }, { kind: "boss" })
+    ).target;
+
+    const result = await applyAssign(
+      db,
+      { signalIds: ["sig-b"], target: older, reason: "one bug" },
+      { kind: "human", slackUserId: "U123" },
+    );
+
+    assert.deepEqual(result.merged, [newer]);
+    assert.equal(incident(newer)?.mergedInto, older);
+  });
+});
+
+describe("establishedOf: which record stays", () => {
+  it("reads ids as numbers, which is where string order goes wrong", () => {
+    // "10" sorts before "9" as text, and the tenth incident opened is the
+    // younger of the two. This is the whole reason the comparison is numeric.
+    assert.equal(establishedOf("9", "10"), "9");
+    assert.equal(establishedOf("10", "9"), "9");
+  });
+
+  it("answers the same whichever way round it is asked", () => {
+    // A rule whose answer depends on argument order is not an order, and the
+    // way it fails is by reversing a merge depending on who called it.
+    for (const [a, b] of [
+      ["1", "2"],
+      ["82", "79"],
+      ["7", "7"],
+    ]) {
+      assert.equal(establishedOf(a, b), establishedOf(b, a), `${a} vs ${b}`);
+    }
   });
 });

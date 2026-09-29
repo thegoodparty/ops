@@ -1644,6 +1644,197 @@ test("a person saying they have it reaches the agent and keeps the incident", as
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
+// --- a person combining two incidents --------------------------------------
+
+/**
+ * What Swain asked for in incident 79's thread, and what the agent answered:
+ * that it could not. An agent may only re-partition its own incident, so the
+ * merge it was asked for had no legal form and the one move left to it was
+ * to open a *third* incident -- which is what it did, minutes later, as
+ * incident 82. The containment rule was right and is untouched. What was
+ * missing was anything routing a person's request to the `human` actor that
+ * had been sitting in `AssignActor` unconstructed since it was written.
+ */
+const twoIncidents = async (tag: string) => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first" });
+  await boss.ingest("grafana", grafanaBody(`fp-${tag}-old`, `${tag}-old-errors`));
+  const older = incidentOf(`fp-${tag}-old`)!;
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "second" });
+  await boss.ingest("grafana", grafanaBody(`fp-${tag}-new`, `${tag}-new-errors`));
+  const newer = incidentOf(`fp-${tag}-new`)!;
+
+  assert.ok(Number(older) < Number(newer), "the fixture opened them in order");
+  return { older, newer };
+};
+
+const statusOf = (incidentId: string) =>
+  boss.db.get<{ status: string; mergedInto: string | null }>(
+    "SELECT status, mergedInto FROM incident WHERE id = ?",
+    [incidentId],
+  )!;
+
+const signalsOn = (incidentId: string) =>
+  boss.db
+    .query<{ sourceId: string }>(
+      "SELECT sourceId FROM signal WHERE incidentId = ? ORDER BY sourceId",
+      [incidentId],
+    )
+    .map((r) => r.sourceId);
+
+test("a person asking for a merge in a thread gets the merge, not a refusal", async () => {
+  const { older, newer } = await twoIncidents("comb");
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ addressed: "others", combineWith: older });
+  await boss.slackEvent(
+    replyIn(threadOf(newer)!, `this is the same bug as ${older}, merge them`),
+  );
+
+  assert.equal(statusOf(newer).status, "MERGED");
+  assert.equal(statusOf(newer).mergedInto, older);
+  assert.equal(statusOf(older).status, "INVESTIGATING");
+  assert.deepEqual(signalsOn(older), ["fp-comb-new", "fp-comb-old"]);
+  assert.deepEqual(signalsOn(newer), []);
+
+  const said = fakeSlack.posts.slice(before);
+  assert.ok(
+    said.some(
+      (p) => p.threadTs === threadOf(newer) && /Done -- incident/.test(p.text),
+    ),
+    "the person who asked is answered in the thread they asked in",
+  );
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === threadOf(newer) &&
+        /last message in this thread/.test(p.text),
+    ),
+    "the absorbed thread is closed out rather than just going quiet",
+  );
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === threadOf(older) &&
+        /is the same problem as this one/.test(p.text),
+    ),
+    "and the surviving thread says where the signals came from",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+/**
+ * The direction is not the asker's to pick. Somebody standing in the older
+ * thread saying "fold this into the new one" is describing the merge they
+ * want, not choosing which record survives, and obeying them is how a thread
+ * with history gets abandoned for one with none.
+ */
+test("the established incident survives even when the person asks the other way", async () => {
+  const { older, newer } = await twoIncidents("rev");
+
+  fakeModel.intents.push({ addressed: "agent", combineWith: newer });
+  await boss.slackEvent(
+    replyIn(threadOf(older)!, `merge this one into ${newer}, same root cause`),
+  );
+
+  assert.equal(
+    statusOf(newer).status,
+    "MERGED",
+    "the newer record is the one absorbed, whichever way it was asked",
+  );
+  assert.equal(statusOf(newer).mergedInto, older);
+  assert.equal(statusOf(older).status, "INVESTIGATING");
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+/**
+ * The model reads a message written by whoever is in the channel, and an
+ * incident id is four characters. An id it produces that is not in what they
+ * typed is a number it made up, and acting on one merges two incidents at
+ * nobody's request.
+ */
+test("an incident id the person never typed is dropped, not merged", async () => {
+  const { older, newer } = await twoIncidents("ghost");
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ addressed: "others", combineWith: older });
+  await boss.slackEvent(
+    replyIn(threadOf(newer)!, "still seeing this on the checkout path"),
+  );
+
+  assert.equal(statusOf(newer).status, "INVESTIGATING");
+  assert.equal(statusOf(older).status, "INVESTIGATING");
+  assert.deepEqual(signalsOn(older), ["fp-ghost-old"]);
+  assert.deepEqual(
+    fakeSlack.posts.slice(before),
+    [],
+    "and nothing is said about it either, because nothing was asked",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+test("a combine naming an incident that cannot take signals is declined out loud", async () => {
+  const { older, newer } = await twoIncidents("closed");
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `UPDATE incident SET status = 'CLOSED', resolvedAt = 1, closedAt = 2,
+         postmortem = 'closed by the test' WHERE id = ?`,
+    ).run(older);
+  });
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ addressed: "agent", combineWith: older });
+  await boss.slackEvent(
+    replyIn(threadOf(newer)!, `isn't this the same as ${older}? merge them`),
+  );
+
+  assert.equal(statusOf(newer).status, "INVESTIGATING");
+  const said = fakeSlack.posts.slice(before);
+  assert.ok(
+    said.some((p) => /is CLOSED, so these two cannot be combined/.test(p.text)),
+    "a person who asked for something impossible is told, not ignored",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+/**
+ * The thread the message arrived in was open when it arrived. Reading what
+ * the message meant is a model call, and an incident can be resolved and
+ * closed while that call is in flight -- which is the one window where the
+ * route in hand is stale. Without the re-read the signals leave a closed
+ * incident, quietly: `assign` guards the target's status and not the
+ * source's, so the move lands and the record it emptied stays CLOSED.
+ */
+test("a combine is refused when the thread's own incident closed while it was being read", async () => {
+  const { older, newer } = await twoIncidents("stale");
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `UPDATE incident SET status = 'CLOSED', resolvedAt = 1, closedAt = 2,
+         postmortem = 'closed by the test' WHERE id = ?`,
+    ).run(newer);
+  });
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ addressed: "agent", combineWith: older });
+  await boss.slackEvent(
+    replyIn(threadOf(newer)!, `this is the same bug as ${older}`),
+  );
+
+  assert.deepEqual(
+    signalsOn(newer),
+    ["fp-stale-new"],
+    "nothing leaves a closed incident",
+  );
+  assert.deepEqual(signalsOn(older), ["fp-stale-old"]);
+  assert.ok(
+    fakeSlack.posts
+      .slice(before)
+      .some((p) => /this incident is CLOSED now/.test(p.text)),
+    "and the person is told why, rather than watching nothing happen",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
 // --- asking for a person, which is all it does -----------------------------
 
 /**

@@ -11,6 +11,10 @@
 //   merge   all of B's signals      -> A
 //   split   a subset of A's signals -> NEW
 //
+// Merge is the one of the four with a direction, and the direction is not the
+// caller's to pick: the more established of the two incidents stays as the
+// record, and a request to merge the other way is refused. See establishedOf.
+//
 // Every function here is synchronous and takes a raw handle, because it runs
 // inside Db.withWrite's transaction. A merge touches two incidents and the
 // whole point of SQL here is that it either lands on both or on neither.
@@ -156,6 +160,39 @@ export const drainDirectives = (
 // The primitive
 // ---------------------------------------------------------------------------
 
+/**
+ * Which of two incidents stays the incident of record when they combine.
+ *
+ * The lower id, because ids are handed out MAX(id)+1 and are therefore the
+ * only monotonic record of when the incident itself was opened -- and the one
+ * fact about an incident a re-partition cannot move.
+ *
+ * `firstSignalAt` is the obvious answer and it is wrong twice over. It is a
+ * property of the signals, so the challenger inherits the incumbent's age by
+ * taking its oldest one: incident 82 was minutes old and read a day older
+ * than the incident it absorbed. And it is never recomputed on absorb, so 79
+ * held a signal from the 27th while its own column said the 28th. Movable and
+ * stale, and a merge is exactly the moment both bite.
+ *
+ * What this protects is the thread people have been reading, but the number
+ * of replies in it is not the test either: most incidents carry none, so it
+ * ties constantly and falls back to age anyway, and it backs the newcomer the
+ * moment somebody says "on it" in a fresh thread. Age of the record dominates
+ * it and never ties.
+ */
+export const establishedOf = (a: string, b: string): string => {
+  const na = Number(a);
+  const nb = Number(b);
+  // The string branch is for an id this system did not allocate, which is a
+  // fixture rather than a state production can reach. It is here because the
+  // numeric comparison answers NaN <= NaN with false, so without it the
+  // "winner" of two unparseable ids would be whichever was passed second --
+  // an answer that changes when the arguments swap is not an order at all,
+  // and it fails in the direction of silently reversing a merge.
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na <= nb ? a : b;
+  return a <= b ? a : b;
+};
+
 const nextIncidentId = (db: Database.Database): string => {
   const row = db
     .prepare("SELECT MAX(CAST(id AS INTEGER)) AS n FROM incident")
@@ -190,9 +227,15 @@ export const assign = (
         `signal ${foreign.id} is not attached to incident ${actor.incidentId}`,
       );
     }
+    // The refusal names the move that is open to it. An agent that has
+    // worked out its partition is wrong used to be told only that it may not
+    // fix it, and its one legal move was to create a new incident -- so the
+    // rule that keeps the blast radius at one record is also what manufactured
+    // a churn of fresh incidents nobody could follow. It still may not reach
+    // another record itself. It can ask the people in its thread, who can.
     if (req.target !== "NEW" && req.target !== actor.incidentId) {
       throw new AssignError(
-        `incident ${actor.incidentId} cannot assign into incident ${req.target}`,
+        `incident ${actor.incidentId} cannot assign into incident ${req.target}: an agent may only re-partition its own incident. Say in your Slack thread that these two are the same problem and name incident ${req.target}, and a person there can combine them.`,
       );
     }
   }
@@ -243,6 +286,32 @@ export const assign = (
         .filter((id): id is string => id !== null && id !== target),
     ),
   ];
+
+  // Establishment. A move that empties one incident into another is the two
+  // becoming one, and something has to stay the incident of record. Left to
+  // the caller it was an accident of which agent happened to be acting:
+  // correlation absorbed whichever incident had not just reported a root
+  // cause, which sent a thread with four days of conversation into one opened
+  // minutes earlier. Held here because this is the single writer, so no
+  // caller can arrive at a backwards merge by another route.
+  //
+  // A partial move is not this. Re-partitioning stays free; only the last
+  // signal leaving is a merge.
+  if (!created) {
+    for (const source of sources) {
+      const staying = db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM signal
+            WHERE incidentId = ? AND id NOT IN (${placeholders(ids.length)})`,
+        )
+        .get(source, ...ids) as { n: number };
+      if (staying.n > 0) continue;
+      if (establishedOf(source, target) !== source) continue;
+      throw new AssignError(
+        `incident ${source} is more established than ${target}, so it stays the incident of record; merge ${target} into ${source} instead`,
+      );
+    }
+  }
 
   if (moved.length > 0) {
     // explained resets: it means "accounted for by this incident's root

@@ -12,9 +12,37 @@ one place:
 - Never attach across `RESOLVED`. A signal arriving after a resolution is
   evidence the resolution was wrong, so it belongs to a recurrence.
 - Never to a `CLOSED` or `MERGED` target.
+- **The more established incident survives a merge.** When a move would empty
+  one incident into another, the lower id — the record opened first — has to
+  be the target, and the other direction is refused with an error naming the
+  one that would have worked. See `establishedOf`.
 
 `logAssign` is emitted **after** the transaction, never inside it, so a
 rolled-back assign leaves no record claiming it happened.
+
+## Which incident survives
+
+Left to the caller, the survivor was an accident of who was acting:
+correlation absorbed whichever incident had not just reported a root cause,
+which sent a thread with four days of conversation into one opened minutes
+earlier. So the rule lives in `assign`, where no caller can route around it,
+and `triage/correlate.ts` elects one survivor for the whole group rather than
+flipping pairs — three incidents flipped pairwise send the reporting one into
+the oldest and then the rest into an incident that is already `MERGED`.
+
+The test is the **lower incident id**, not the earliest `firstSignalAt`.
+`firstSignalAt` is a property of the signals, and the act being adjudicated is
+moving signals, so the challenger inherits the incumbent's age by taking its
+oldest one; it is also never recomputed on absorb. Ids come from `MAX(id)+1`,
+so they are the only monotonic record of when the incident itself was opened,
+and the one thing a merge cannot move.
+
+An agent is still confined to its own incident and cannot merge at all. Its
+one move was to create a *new* incident, which is what manufactured the churn
+of fresh records the rule exists to stop, so the refusal now names the path
+that does exist: say so in the thread, and a person there can combine them.
+That request is executed by the composition root as the `human` actor — see
+`slack/CLAUDE.md`.
 
 ## Guard in the statement
 
@@ -79,6 +107,13 @@ agent chases two causes and the other has nobody on it" miss the design
 names explicitly.
 
 ## Notify
+
+The merge half lives in `announce.ts` rather than here, because there are two
+ways a merge happens and only one of them runs inside an agent's call:
+correlation merges on a root cause, and a person merges by saying so in a
+thread, which the composition root applies with no agent in the path. A merge
+that reads one way when the Boss did it and another way when a person did is
+a thread nobody can follow back.
 
 A merge and a split each leave two threads, and both are told. The absorbed
 incident's thread is the half that cannot be skipped: nothing is ever posted
