@@ -141,3 +141,19 @@ export interface ModelReply {
 export interface ModelClient {
   complete(request: ModelRequest): Promise<ModelReply>;
 }
+
+/**
+ * A model client that also says how much it can hold.
+ *
+ * Only a caller that owns its own loop needs this, which is one of them: the
+ * Slack agent keeps a persisted transcript across mentions and has to decide
+ * what to drop before each request. Read off the resolved catalog entry
+ * rather than chosen, for the reason `resolveBedrockModel` throws on a miss
+ * instead of substituting a window -- a number that is wrong in either
+ * direction is invisible, and the agent would either compact away four
+ * fifths of a context it was entitled to or discover the ceiling as a
+ * provider error.
+ */
+export interface SizedModelClient extends ModelClient {
+  readonly contextWindow: number;
+}

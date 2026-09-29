@@ -68,7 +68,6 @@ export const META_PREFIX = "grafana_";
 // decompresses, so an under-narrowed query is an invoice rather than an error.
 export const MAX_QUERIES_PER_ALERT = 6;
 export const MAX_LINES = 50;
-export const MAX_LINE_BYTES = 2_000;
 
 // Wider than any rule's own evaluation window, because by the time a
 // notification has been grouped, routed and delivered the lines that caused it
@@ -240,16 +239,6 @@ export const readKnownCauses = (raw: string | undefined): ParsedKnownCauses => {
 export const parseKnownCauses = (raw: string | undefined): KnownCause[] =>
   readKnownCauses(raw).causes;
 
-const truncate = (line: string): string => {
-  const encoded = Buffer.from(line, "utf8");
-  if (encoded.length <= MAX_LINE_BYTES) return line;
-  // Cut on a byte boundary and repair the edge. The limit is about prompt
-  // bytes, so slicing by characters would let a line of multi-byte content
-  // pass the check and blow the budget.
-  const cut = encoded.subarray(0, MAX_LINE_BYTES).toString("utf8");
-  return `${cut.replace(/�+$/, "")} …[truncated]`;
-};
-
 export const linesFrom = (payload: unknown): string[] => {
   const body = payload as { data?: { resultType?: unknown; result?: unknown } };
   const data = body?.data;
@@ -267,7 +256,12 @@ export const linesFrom = (payload: unknown): string[] => {
     const values = (stream as { values?: unknown }).values;
     for (const entry of Array.isArray(values) ? values : []) {
       if (Array.isArray(entry) && entry.length >= 2) {
-        lines.push(truncate(String(entry[1])));
+        // Whole. A log line is the one thing in an alert nobody wrote for
+        // a reader, and the bound on this block is `MAX_LINES` -- fifty
+        // entries, a count of lines rather than a count of bytes inside
+        // one. A stack trace cut at two kilobytes loses the frame the
+        // alert is about as readily as it loses noise.
+        lines.push(String(entry[1]));
       }
       if (lines.length >= MAX_LINES) return lines;
     }

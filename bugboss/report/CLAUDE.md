@@ -150,9 +150,12 @@ as text, and it posts through `postDocument` — which does nothing `postProse`
 does not, and exists so that one exemption is a name at a call site rather than
 the absence of a check.
 
-The thread summary beside the file answers to the budget like any other post,
-which is what `SUMMARY_CAUSE_CHARS` is for: one line of cause, the numbers a
-person scanning the channel wants, and everything else in the file.
+The thread summary beside the file is the numbers a person scanning the
+channel wants and one line of cause. The line is the cause's first line,
+whole — it used to be cut at 300 characters on top of that, and a cause that
+reads as a finished sentence and stops before the clause naming what broke is
+worse than no cause at all. Length was never the problem it solved: the
+summary already goes out through `splitForSlack`.
 
 ## Why a Markdown file
 

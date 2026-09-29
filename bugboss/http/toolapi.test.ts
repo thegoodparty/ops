@@ -269,6 +269,50 @@ test("a post past the thread budget is refused, not split into two long ones", a
   );
 });
 
+test("a harness-composed post is split, because there is nobody to refuse it to", async () => {
+  // The other half of the same rule. The budget is a refusal, and a refusal
+  // only means anything where somebody can rewrite the text -- a wait nudge
+  // and a re-run notice are composed after the model has stopped, so
+  // refusing one drops it. That is what used to force a 400-character cut
+  // through the middle of the check's output.
+  const before = threadPosts.length;
+  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
+
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({
+      message: long,
+      sealsPendingQuestion: false,
+      harnessComposed: true,
+    }),
+  });
+
+  assert.equal(res.status, 200);
+  const posted = threadPosts.slice(before).join("\n");
+  assert.ok(threadPosts.length > before + 1, "it went out as more than one post");
+  // Whole, across the parts. Nothing is missing and nothing says it is.
+  assert.ok(posted.includes("ruled out 0"));
+  assert.ok(posted.includes("ruled out 399"));
+  assert.doesNotMatch(posted, /truncat|elided/);
+});
+
+test("a model post cannot buy the harness exemption by asking for it", async () => {
+  // This side of the socket does not trust the child. The flag is set by
+  // `postNotice`, which is the harness's own client method; nothing the
+  // model calls reaches it. This is the check that would notice if that
+  // ever stopped being true from the wire's point of view.
+  const before = threadPosts.length;
+  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
+
+  const res = await authed("/thread", {
+    method: "POST",
+    body: JSON.stringify({ message: long, harnessComposed: "yes" }),
+  });
+
+  assert.equal(res.status, 400, "anything but a literal true is not the exemption");
+  assert.equal(threadPosts.length, before);
+});
+
 test("the marker says whether the question was actually posted", async () => {
   clock = 4_000_000;
   await (await ask("Is the rollback safe?")).json();

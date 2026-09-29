@@ -9,6 +9,7 @@ import {
   attachedSignalIds,
   incidentStatus,
   prepareQuery,
+  queryTool,
   type IncidentReader,
 } from "./sql";
 import { runTriage } from "./triage";
@@ -428,6 +429,24 @@ test("can reach the incident database before deciding", async () => {
   assert.equal(requests[1].messages.at(-1)?.role, "toolResult");
 });
 
+test("the query tool caps rows and returns each one whole", async () => {
+  // Two bounds used to compose here and only one of them was a bound worth
+  // having. The row cap is a count and stays; the 4,000-character cut on
+  // the JSON payload went, because a query whose answer is in a long column
+  // came back looking complete and was not, and the model has no way to
+  // tell a short answer from a cut one.
+  const wide = "w".repeat(20_000);
+  const rows = Array.from({ length: 60 }, (_, i) => ({ id: `s-${i}`, body: wide }));
+  const out = await queryTool({
+    query: <T>() => rows as T[],
+    get: () => undefined,
+  } as never).run({ sql: "SELECT * FROM signal" });
+
+  assert.match(String(out), /60 row\(s\), showing 50/);
+  assert.ok(String(out).includes(wide), "a row comes back whole");
+  assert.doesNotMatch(String(out), /\[truncated\]/);
+});
+
 test("the database tool takes one read and nothing else", () => {
   assert.deepEqual(prepareQuery("SELECT 1;"), { sql: "SELECT 1" });
   assert.ok("error" in prepareQuery("DELETE FROM incident"));
@@ -640,6 +659,42 @@ test("an exact-key match inside the window is a recurrence without the model", a
   assert.match(outcome.decision.reason, /recurrence of 41/);
 });
 
+test("a long report and its evidence reach triage whole", async () => {
+  // Five fields used to be cut here: the signal body at 4,000 characters,
+  // an evidence summary at 2,000, the query at 500, the title at 500 and
+  // the labels JSON at 2,000. What triage is deciding is whether this
+  // signal is the one that already has an incident, and the sentence that
+  // says so is as likely to be in the half that went as the half that
+  // stayed. What bounds this prompt is `MAX_LINES` and `MAX_EVIDENCE`, and
+  // both count things rather than characters.
+  const tail = "and it only happens on the voter-density route";
+  const body = `${"b".repeat(20_000)}\n${tail}`;
+  const summary = `${"e".repeat(20_000)}\nCode: 57014`;
+  const { db } = fakeDb();
+  const { model, requests } = scripted([
+    decideCall({ action: "new_incident", reason: "opening one" }),
+  ]);
+
+  await runTriage(
+    { model, db, budgetMs: 2000 },
+    context({
+      signal: signal({ body, title: "t".repeat(2000) }),
+      evidence: [{ query: "q".repeat(2000), summary, artifactKey: null }],
+    }),
+  );
+
+  const prompt = (() => {
+    const first = requests[0]?.messages[0];
+    return first && first.role === "user" ? first.text : "";
+  })();
+
+  assert.ok(prompt.includes(tail), "the end of the report is there");
+  assert.ok(prompt.includes("Code: 57014"), "and the line the evidence turned on");
+  assert.ok(prompt.includes("t".repeat(2000)), "and the whole title");
+  assert.ok(prompt.includes("q".repeat(2000)), "and the query that produced it");
+  assert.doesNotMatch(prompt, /\[truncated\]/);
+});
+
 test("the candidates reach the prompt, with their root causes", async () => {
   const { db } = fakeDb({ recurrence: [priorRow()] });
   const { model, requests } = scripted([
@@ -656,6 +711,41 @@ test("the candidates reach the prompt, with their root causes", async () => {
   assert.match(prompt, /41 \| CLOSED/);
   assert.match(prompt, /statement timeout/);
   assert.match(prompt, /CONCLUSIVE/);
+});
+
+test("a prior incident's cause and evidence reach the prompt whole", async () => {
+  // They used to be cut at 400 and 300 characters. This block is what
+  // triage reads to decide whether the signal in front of it is the same
+  // problem coming back, and the sentence that settles that is routinely
+  // the last one -- what the earlier fix actually did. `MAX_CANDIDATES`
+  // bounds this block, and it counts incidents.
+  const causeTail = "and the write path has a pool of its own";
+  const evidenceTail = "through two full refresh cycles on both paths";
+  const titleTail = "on the voter-density export route";
+  const { db } = fakeDb({
+    recurrence: [
+      priorRow({
+        rootCause: `${"c".repeat(2000)} ${causeTail}`,
+        resolvedEvidence: `${"e".repeat(2000)} ${evidenceTail}`,
+        signalTitle: `${"t".repeat(2000)} ${titleTail}`,
+      }),
+    ],
+  });
+  const { model, requests } = scripted([
+    decideCall({ action: "new_incident", reason: "opening one" }),
+  ]);
+
+  await runTriage({ model, db, budgetMs: 2000 }, context());
+
+  const prompt = (() => {
+    const first = requests[0]?.messages[0];
+    return first && first.role === "user" ? first.text : "";
+  })();
+
+  assert.ok(prompt.includes(causeTail), "the end of the recorded cause is there");
+  assert.ok(prompt.includes(evidenceTail), "and why it was called resolved");
+  assert.ok(prompt.includes(titleTail), "and the whole title of the signal it closed");
+  assert.doesNotMatch(prompt, /\[truncated\]/);
 });
 
 test("an exact match older than the window is offered, not asserted", async () => {

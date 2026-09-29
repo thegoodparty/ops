@@ -415,10 +415,18 @@ export const createBossClient = (args: {
     // Same thread, but it does not seal an outstanding question's marker. A
     // harness nudge landing on a blank one would make a question whose Slack
     // post had failed look sent.
+    //
+    // `harnessComposed` is the second difference and is the reason this is a
+    // separate method rather than a flag on `post`. Nothing the model writes
+    // reaches here: the nudge, the stalled-wait output and the re-run notice
+    // are composed after the model has stopped, so the thread budget splits
+    // them instead of refusing them to nobody.
     postNotice: (message) =>
-      call<void>("POST", "/thread", { message, sealsPendingQuestion: false }).then(
-        () => undefined,
-      ),
+      call<void>("POST", "/thread", {
+        message,
+        sealsPendingQuestion: false,
+        harnessComposed: true,
+      }).then(() => undefined),
   };
 };
 

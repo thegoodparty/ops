@@ -157,6 +157,34 @@ test("merges only a confident match on a mergeable incident", async () => {
   );
 });
 
+test("the reporting incident's root cause is compared whole", async () => {
+  // It used to be cut at 6,000 characters, which was never a bound so much
+  // as the appearance of one: the candidates' causes sit in the same prompt
+  // uncut, so the cap removed text from exactly one of the two things being
+  // compared -- the one the comparison is about. A merge is the direction
+  // that cannot be walked back, so a comparison made against half a cause
+  // is the wrong thing to be cheap about.
+  const tail = "and only on the write path, which the read pool never touches";
+  const db = fakeDb(["s1"]);
+  const { model, requests } = scripted([proposeCall([])]);
+
+  await runCorrelation(
+    { model, db, budgetMs: 2000 },
+    request({
+      rootCause: `${"c".repeat(20_000)} ${tail}`,
+      openIncidents: [
+        digest({ id: "inc-1", status: "FIXING" }),
+        digest({ id: "inc-2", status: "INVESTIGATING" }),
+      ],
+    }),
+  );
+
+  const prompt = requests[0].messages[0];
+  assert.equal(prompt.role, "user");
+  assert.ok(prompt.role === "user" && prompt.text.includes(tail));
+  assert.ok(prompt.role === "user" && !prompt.text.includes("[truncated]"));
+});
+
 test("does not call the model when there is nothing to merge into", async () => {
   const db = fakeDb(["s1"]);
   const { model, requests } = scripted([]);

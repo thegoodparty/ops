@@ -15,6 +15,28 @@ Three functions (`types.ts`):
 There is deliberately no `isResolved`. Nothing decides an alert is over
 except an agent, on evidence.
 
+## `sourceId` is a dedup key, not an address
+
+`link.ts` turns a signal into something a reader can open, and it is a
+function rather than a column because the two sources answer from different
+places and neither answer is `sourceId`:
+
+| Source | Where the link is | Why not `sourceId` |
+| --- | --- | --- |
+| `grafana` | the `grafana_generator_url` label | `sourceId` is the Alertmanager fingerprint, which addresses nothing |
+| `human` | `chat.getPermalink` on `slack_channel` + `slack_message_ts` | the id names the message; a permalink needs the workspace domain, which nothing here knows |
+
+Nothing is assembled out of an instance host and a rule uid. A URL built from
+parts is a guess that looks like a fact, and it breaks silently the day
+either moves — so a Grafana alert that arrived without a `generatorURL` gets
+no link and says so by having none.
+
+`signalOrigin` always names the source (`a Grafana alert`, `a Slack report`)
+and may or may not have a url. "1 signal" on its own told a reader nothing
+about what they were looking at, the label costs nothing, and a permalink
+Slack refuses then loses the link rather than the sentence. The relay's
+`opened` message is the caller.
+
 ## Ingress does not read what a message says
 
 Slack is **not** an adapter. A person reports something by mentioning

@@ -91,5 +91,6 @@ export type {
   ModelToolSpec,
   ModelUsage,
   ModelTurn,
+  SizedModelClient,
   StructuredCall,
 } from "./model";

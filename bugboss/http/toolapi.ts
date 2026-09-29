@@ -27,7 +27,7 @@ import {
   renderChoiceQuestion,
   type ChoicePoster,
 } from "../slack/blocks";
-import { overThreadBudget, postProse } from "../slack/format";
+import { overThreadBudget, postDocument, postProse } from "../slack/format";
 import type { Directive, ToolApi } from "../types";
 
 const log = makeLog("boss-http");
@@ -510,15 +510,21 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     // sent, so the next attempt would skip the post and wait out its timeout
     // on an answer to something nobody was ever asked.
     let seals = true;
+    // Whether the harness composed this post rather than the model. It
+    // decides whether the thread budget is a refusal or a split -- see the
+    // budget check below.
+    let harnessComposed = false;
     let options: string[] = [];
     try {
       const body = (await c.req.json()) as {
         message?: unknown;
         options?: unknown;
         sealsPendingQuestion?: unknown;
+        harnessComposed?: unknown;
       };
       message = String(body.message ?? "");
       seals = body.sealsPendingQuestion !== false;
+      harnessComposed = body.harnessComposed === true;
       if (body.options !== undefined) {
         if (
           !Array.isArray(body.options) ||
@@ -542,15 +548,39 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     // Every post the *agent* causes comes through here -- the ask, the
     // evidence under it, the rerun notice, the wait heartbeat -- which is
     // what makes this the place the budget can be one thing rather than a
-    // rule four callers each keep separately. The Boss's own posts do not
-    // come through here; they go out via `notify` and the relay, and they
-    // split rather than refuse, because there is nobody to refuse them to.
+    // rule four callers each keep separately.
     //
-    // It refuses instead of splitting: two posts of 200 words are not
-    // shorter than one of 400, they are worse. The uncapped long form is the
-    // post-mortem, which leaves as a file rather than as thread text.
-    const tooLong = overThreadBudget("message", message);
-    if (tooLong) return c.json({ error: tooLong }, 400);
+    // For text the model wrote it refuses instead of splitting: two posts of
+    // 200 words are not shorter than one of 400, they are worse. The
+    // uncapped long form is the post-mortem, which leaves as a file rather
+    // than as thread text.
+    //
+    // `harnessComposed` is not an exemption from that rule. It is the rest
+    // of the rule, and the rule is already written two paragraphs up: the
+    // Boss's own posts go out via `notify` and the relay, and they *split
+    // rather than refuse, because there is nobody to refuse them to*. This
+    // extends that to the posts that follow the same logic and happen to
+    // need the agent's token to reach the thread.
+    //
+    // A wait nudge and a re-run notice are composed after the model has
+    // stopped. Refusing one does not shorten it, because the author it
+    // would be refused to is gone -- it deletes it. And a nudge that fails
+    // to post is dropped by design (losing a day-long wait to a 503 is the
+    // worse trade), so this route refusing one produced an incident that
+    // waited all day, nudged nobody, and then escalated saying it had
+    // nudged three times. That is what the 400-character cut through the
+    // middle of the check's output was buying.
+    //
+    // **This is not a hole in the budget, and it is not a way round it.**
+    // Nothing the model can call sets the flag. `postNotice` is the
+    // harness's own client method; every model-facing path goes through
+    // `post`, and `contact_human` and `escalate` check the budget in
+    // process before they ever reach this route. The literal `=== true`
+    // above is deliberate: a truthy value is not the exemption.
+    if (!harnessComposed) {
+      const tooLong = overThreadBudget("message", message);
+      if (tooLong) return c.json({ error: tooLong }, 400);
+    }
 
     const incident = deps.db.get<{ slackThreadTs: string | null }>(
       "SELECT slackThreadTs FROM incident WHERE id = ?",
@@ -569,7 +599,8 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     // not markup.
     let ts: string;
     if (options.length === 0) {
-      ({ ts } = await postProse(
+      const send = harnessComposed ? postDocument : postProse;
+      ({ ts } = await send(
         (part) => deps.slack.post(incident.slackThreadTs, part),
         message,
         { incidentId: caller.incidentId },

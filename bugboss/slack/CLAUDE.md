@@ -233,11 +233,24 @@ longer in the loop, so there is nobody to refuse them to — and the wait nudge
 is *dropped* on a failed post by design, because losing a day-long wait to a
 503 is the worse trade. An over-long one would therefore mean an incident that
 waits all day, nudges nobody, and then escalates claiming it nudged three
-times. So they clamp the text they echo — which is already in the thread
-directly above — small enough that the composed post provably fits, and
-`tools.test.ts` composes the worst case of each to keep that true. The nudge
-gets a smaller clamp than the briefs because it carries two echoes plus the
-whole status block where they carry one.
+times.
+
+They used to buy the fit by clamping the one field with nobody behind it: the
+check's own output, cut to 400 characters. **They do not clamp anything now.**
+
+- The nudge and the re-run notice go out through `postNotice`, which marks
+  them `harnessComposed` on the wire. The `/thread` route skips the budget
+  for those and sends them through `postDocument`, so a long one splits.
+  Splitting a post nobody can rewrite is the whole point: it costs a second
+  message, where a refusal costs the message.
+- The stalled-wait brief cannot take that route, because it goes through
+  `escalate` and a brief is a brief. So it carries no output at all and says
+  the output is in the message below it — `stalledWaitStatus` posts that,
+  whole, on the harness path, right after the escalation lands.
+
+What still has to fit `THREAD_PROSE_CHARS` is the part the harness *wrote*,
+with the model's own fields at their refused maximum. `tools.test.ts`
+composes the worst case of each to keep that true.
 
 ## Incident references are rendered by code, on the way out
 
@@ -326,6 +339,12 @@ The surfaces:
 - **The thread header.** Two lines above the message that opened the thread,
   rewritten in place with `chat.update`. Nothing is removed: the alert text
   that started the thread is what somebody scrolling back is looking for.
+  This division is why the opening message carries the signal **whole** and
+  the header carries the short form. Incident 83 opened on "*...I heard
+  about 502s Can you op…*" because the opening message tried to be the short
+  form too, on a title cut at 120 characters. The header has `summary`, the
+  few-word title the agent keeps current and that `setSummary` refuses
+  rather than truncates; the message under it has the report.
   An edit is **silent** — Slack marks it "(edited)" and notifies nobody — so
   it is right for a header people re-read and wrong as a way to tell anyone
   anything. A change worth knowing about still posts in the thread as well.
@@ -335,6 +354,10 @@ The surfaces:
   three fields, disagreeing in whatever way that run happened to phrase it.
 - **The morning board** and **the all-clear**, both driven by the sweep in
   `board/index.ts`.
+
+The opening message's trailer links the signal that opened the incident —
+`<url|a Grafana alert>` or `<url|a Slack report>`, from `ingress/link.ts`.
+It used to say "1 signal" and give no way to reach it.
 
 `chat.update` replaces a message wholesale and the only way to read the
 original back is `conversations.replies`, which is throttled to roughly one
@@ -637,6 +660,41 @@ identically.
 `alertChannel` and `rotationGroupId` are **required**, not optional. An
 optional field nobody sets is a fix that exists in the source and not in
 production, which had already happened three times here.
+
+## The Slack agent compacts; it does not narrow its results
+
+Its loop is hand-rolled (`createSlackAgentModel`, in the composition root)
+and its transcript is persisted per thread, so it grows across a run *and*
+across mentions. That used to be bounded the only way it could be with no
+compaction: every tool result was cut — each SQL row at 2,000 characters,
+the session tail at 24,000, `get_incident` at 100,000. A row cut in half is
+a row the model reads as complete and answers off, which is the failure
+those caps were buying protection from a different failure with.
+
+`compactTranscript` replaced them, on the shape Pi uses for the incident
+agent: measure after a result lands, before the next request, and drop the
+oldest **whole round** rather than narrowing anything.
+
+- Rounds, not turns. Anthropic rejects a tool result that is not immediately
+  behind the assistant message that called for it, so a cut between the two
+  is a 400 and not a smaller request. A round starts at a `user` *or* an
+  `assistant` turn — assistant matters, because one mention is one user turn
+  and then however many tool rounds it takes, so user turns alone give one
+  boundary per mention and nothing to drop inside the run that is growing.
+- The question survives. If the cut reaches past it, it goes back on the
+  front: a transcript has to open on a user turn, and that is the turn worth
+  spending.
+- The model is **told** what is gone, on that turn. A round that vanishes
+  silently is a round it will go and read again.
+- The window is read off the model (`SizedModelClient.contextWindow`), never
+  chosen. `resolveBedrockModel` throws rather than substitute one for the
+  same reason: a wrong window is invisible in both directions.
+- One round larger than the window is kept whole. It fails loudly at the
+  provider and the reader is told the question was too big, which beats
+  being answered off half a row.
+
+What is left bounding this surface counts **things**: `MAX_SQL_ROWS`,
+`MAX_SESSION_TAIL_LINES`, the reply `LIMIT`. Never a width.
 
 ## A budget spent reading is a question left unanswered
 

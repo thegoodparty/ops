@@ -270,11 +270,19 @@ test("a read that fell back asks for no combine", async () => {
   );
 });
 
-test("a very long paste is clipped rather than becoming the prompt", async () => {
+test("a very long paste reaches the model whole", async () => {
+  // It used to be cut at 4,000 characters. On this path the end of a long
+  // report is the half saying what somebody actually wants, so it is the
+  // half the label depends on -- and the bound was never missing anyway:
+  // this is one Slack post, which Slack will not accept past 40,000
+  // characters, against a call with no tools that asks for 512 back.
   const { model, prompts } = fakeModel([reads("others")]);
-  await asked(model, "x".repeat(50_000));
-  assert.ok(userText(prompts[0]).length < 6000);
-  assert.match(userText(prompts[0]), /\.\.\.\[truncated\]/);
+  const paste = `${"x".repeat(50_000)}\nso can somebody look at it`;
+
+  await asked(model, paste);
+
+  assert.ok(userText(prompts[0]).includes(paste));
+  assert.doesNotMatch(userText(prompts[0]), /truncated/);
 });
 
 // --- invalid answers -------------------------------------------------------

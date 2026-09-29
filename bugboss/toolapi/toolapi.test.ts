@@ -1972,6 +1972,29 @@ describe("a recurrence closes on a second question", () => {
     return { first, second, tools: secondTools };
   };
 
+  it("hands the agent the prior incident's post-mortem whole", async () => {
+    // It used to be cut at 6,000 characters, and the reason given was that
+    // the agent's own tool-output truncation kept a head and a tail, so an
+    // unbounded post-mortem would eat the middle of the incident rather
+    // than itself. That truncation is gone -- Pi compacts just in time, so
+    // a tool result lands whole and what gives way is summarised history.
+    // This is the document the agent has to read to say why the last fix
+    // did not hold, so the half that used to go is the half it needs.
+    const { first, tools } = await recurrencePair();
+    const remedy = "and the remedy nobody applied was to size the write pool";
+    const long = `## Summary\n${"p".repeat(20_000)}\n${remedy}`;
+    await db.withWrite((w) =>
+      w.prepare("UPDATE incident SET postmortem = ? WHERE id = ?").run(long, first),
+    );
+
+    const res = await tools.getIncident();
+
+    assert.equal(res.ok, true, res.error);
+    const carried = JSON.stringify(res.data);
+    assert.ok(carried.includes(remedy), "the end of the post-mortem is there");
+    assert.ok(!carried.includes("[truncated"));
+  });
+
   it("refuses to close without an answer to why the last resolution failed", async () => {
     const { first, second, tools } = await recurrencePair();
     await tools.reportResolved({

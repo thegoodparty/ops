@@ -24,6 +24,7 @@ export type {
   ModelToolSpec,
   ModelTurn,
   ModelUsage,
+  SizedModelClient,
 } from "../model";
 export { addModelUsage, emptyModelUsage, ModelRequestFailed, usageForLog } from "../model";
 

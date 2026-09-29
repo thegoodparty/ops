@@ -331,6 +331,43 @@ describe("the report assembles from a real incident row", () => {
     );
   });
 
+  it("puts the whole cause in the thread summary, every line of it", async () => {
+    // Two cuts used to sit here: 300 characters, and before that only the
+    // first line. Both leave a reader with a sentence that reads as
+    // finished, and no way to know there was more -- and "the rest is in
+    // the file" is not an answer, because the summary is what somebody
+    // scanning the channel actually reads. It splits past one message.
+    const line =
+      `The pool was sized for the old traffic shape, ${"x".repeat(600)}, ` +
+      "and the write path saturated it first.";
+    const rest = "The read path had its own pool and never saturated.";
+    await seed("inc-16", { rootCause: `${line}\n\n${rest}` });
+
+    const data = await readReportData(deps(), "inc-16");
+    assert.ok(data);
+    const summary = renderThreadSummary(data);
+
+    assert.ok(summary.includes("the write path saturated it first."));
+    assert.ok(summary.includes(rest), "the lines after the first are there too");
+    assert.doesNotMatch(summary, /\u2026/);
+  });
+
+  it("puts the whole signal headline at the top of the report", async () => {
+    const rest = "and the write path saturated first";
+    await seed("inc-17", { signalTitle: `Route errors detected\n${rest}` });
+
+    const data = await readReportData(deps(), "inc-17");
+    assert.ok(data);
+    const doc = renderReportDocument(data);
+
+    // Anchored to the headline's own position. The signals table further
+    // down carries the title too, so `doc.includes(...)` would pass on a
+    // headline that had been reduced to its first line.
+    const headline = doc.split("\n").slice(0, 4).join("\n");
+    assert.ok(headline.includes("Route errors detected"));
+    assert.ok(headline.includes(rest), "a headline with a second line keeps it");
+  });
+
   it("escapes the thread summary but not the document", async () => {
     await seed("inc-4", {
       rootCause: "A `<script>` tag & an ampersand reached the log line.",
