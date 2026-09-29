@@ -482,6 +482,14 @@ than implied by its shortness. Running out is still a real event and still
 **alarms** — visible to whoever owns the budget, not to whoever asked the
 question.
 
+A wrap-up that produces nothing is **not** the same as one that fails, and
+until recently only the second was visible: an empty completion raises no
+exception, so `slack_agent_wrap_up_failed` never saw it. That is the shape
+production hit — a run holding everything it had read, a model that answered
+with nothing, and an apology posted with nobody told. It alarms on its own now
+(`slack_agent_wrap_up_empty`). The alarm cannot make the model speak; what it
+closes is the silence around it.
+
 What is left when even the wrap-up produces nothing is **two** replies, not
 one, because running out of turns and failing to compose anything need
 different advice. Running out says so, and says how many turns over how long,
