@@ -1,6 +1,8 @@
 # bedrock
 
-A Pi API provider over Bedrock's `InvokeModel`, used by the incident agent.
+A Pi API provider over Bedrock's `InvokeModel`. Every model call BugBoss
+makes arrives here: the incident agent streams through it, and the Boss's own
+bounded calls do one request at a time through `client.ts`.
 
 ## Why not `Converse`
 
@@ -39,6 +41,50 @@ Mistral and DeepSeek while our models reach `InvokeModel`.
 `assertBedrockInvokeModelRouting()` proves it before the session starts, and
 `runtime.test.ts` proves it against a real `ModelRuntime` -- which the tests
 next to it do not, since they drive the provider directly.
+
+## One request path, not two
+
+`client.ts` is a `ModelClient` (`../model.ts`) over `ModelRuntime.complete()`,
+and it is what triage, root-cause correlation, the inbound-language read and
+the Slack agent make their bounded calls through.
+
+They do not build their own Anthropic body, and nothing here should grow one.
+Two request paths to a single model means a fix landed on one is a fix missing
+from the other, which is how an absent beta header killed every incident agent
+while triage carried on working, and opened two incidents no agent could
+investigate.
+
+Going through the runtime inherits rather than reimplements: the routing the
+section above exists to assert, the 1h retention and its downgrade check, the
+lone-surrogate sanitizer, the coalescing Anthropic requires of tool results
+answering one turn, and `calculateCost` -- which is what finally puts a number
+on a triage decision.
+
+What it deliberately does not inherit is Pi's agent session.
+`runStructuredCall` (`../triage/model.ts`) still owns the loop, because the
+bound that matters there is an answer a Zod schema accepts inside a wall-clock
+budget, and `createAgentSession` owns a JSONL file, resume and compaction
+instead. `complete()` is one request.
+
+### A failed request resolves rather than rejecting
+
+Pi turns a setup failure, a transport error, a missing credential and an abort
+alike into a terminal message with `stopReason: "error"` and zeroed usage.
+Unchecked that is an empty reply with no tool calls, which is indistinguishable
+from a model that answered in prose and is a shape every caller retries
+against -- a dead model wearing a healthy one's clothes, the one thing
+`triage/CLAUDE.md` says must not happen. So the stop reason is checked and
+thrown as `ModelRequestFailed`, carrying the usage, because a call that died
+still spent what it spent.
+
+### An empty assistant turn still has to say something
+
+Pi's body builder skips an assistant message whose content blocks all came out
+empty, and the round after one is a user turn -- so the transcript hands
+Anthropic two consecutive user messages and is rejected. That shape is
+reachable: `runStructuredCall` records the assistant turn before nudging a
+prose reply back towards the answer tool, and a reply can be empty. Hence the
+`"(no reply)"` placeholder.
 
 ## Usage is the cost record
 

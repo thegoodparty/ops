@@ -11,6 +11,7 @@ import { Db } from "../db";
 // the Bedrock client it drives. Its behaviour is the Slack agent's behaviour,
 // so it is tested here with the rest of that surface.
 import { createSlackAgentModel } from "../index";
+import { emptyModelUsage } from "../model";
 import type { ModelClient, ModelReply, ModelRequest } from "../triage";
 import {
   MAX_SQL_ROWS,
@@ -905,6 +906,7 @@ describe("a run that uses its whole budget", () => {
           return Promise.resolve({
             text: "Two of the three are open and I read inc-1; I did not reach inc-2.",
             toolCalls: [],
+            usage: emptyModelUsage(),
           } satisfies ModelReply);
         }
         return Promise.resolve({
@@ -916,6 +918,7 @@ describe("a run that uses its whole budget", () => {
               input: { incidentId: "inc-1" },
             },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -963,6 +966,7 @@ describe("a run that uses its whole budget", () => {
           toolCalls: [
             { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -989,7 +993,11 @@ describe("a run that uses its whole budget", () => {
         if (request.tools.length === 0) {
           return wrapUpFails
             ? Promise.reject(new Error("bedrock throttled"))
-            : Promise.resolve({ text: "", toolCalls: [] } satisfies ModelReply);
+            : Promise.resolve({
+                text: "",
+                toolCalls: [],
+                usage: emptyModelUsage(),
+              } satisfies ModelReply);
         }
         // The second mention answers straight away, so what it is asked with
         // is the transcript the failed run left behind.
@@ -997,6 +1005,7 @@ describe("a run that uses its whole budget", () => {
           return Promise.resolve({
             text: "inc-1 is still being worked.",
             toolCalls: [],
+            usage: emptyModelUsage(),
           } satisfies ModelReply);
         }
         return Promise.resolve({
@@ -1004,6 +1013,7 @@ describe("a run that uses its whole budget", () => {
           toolCalls: [
             { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };
@@ -1038,12 +1048,17 @@ describe("a run that uses its whole budget", () => {
       complete: (request) =>
         Promise.resolve(
           request.tools.length === 0
-            ? ({ text: "", toolCalls: [] } satisfies ModelReply)
+            ? ({
+                text: "",
+                toolCalls: [],
+                usage: emptyModelUsage(),
+              } satisfies ModelReply)
             : ({
                 text: "",
                 toolCalls: [
                   { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
                 ],
+                usage: emptyModelUsage(),
               } satisfies ModelReply),
         ),
     };
@@ -1129,6 +1144,7 @@ describe("the turn budget", () => {
             toolCalls: turn === 1
               ? [{ id: "q", name: "get_incident", input: { incidentId: "inc-0" } }]
               : [],
+            usage: emptyModelUsage(),
           } satisfies ModelReply);
         }
         return Promise.resolve({
@@ -1140,6 +1156,7 @@ describe("the turn budget", () => {
               input: { incidentId: `inc-${turn}` },
             },
           ],
+          usage: emptyModelUsage(),
         } satisfies ModelReply);
       },
     };

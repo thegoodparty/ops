@@ -34,6 +34,7 @@ import { classifySlackEvent, type SlackConfig } from "../ingress";
 import { firstReplyAfter } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { SlackEvent } from "../slack/relay";
+import { emptyModelUsage } from "../model";
 import type { ModelReply, ModelRequest } from "../triage";
 import type { ReportUpload } from "../report";
 import type { BugBossConfig, Directive, TriageDecision } from "../types";
@@ -79,6 +80,7 @@ const fakeModel = {
     const call = (name: string, input: Record<string, unknown>) => ({
       text: "",
       toolCalls: [{ id: `call-${name}`, name, input }],
+      usage: emptyModelUsage(),
     });
     // Correlation asks a different question and must not eat a queued triage
     // decision. Nothing in these tests expects a merge.

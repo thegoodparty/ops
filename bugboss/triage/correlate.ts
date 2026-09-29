@@ -14,7 +14,13 @@ import { z } from "zod";
 
 import type { AssignRequest, IncidentDigest } from "../types";
 import { recordCall } from "./health";
-import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
+import {
+  emptyModelUsage,
+  runStructuredCall,
+  usageForLog,
+  type ModelClient,
+  type ModelToolSpec,
+} from "./model";
 import { makeAlarm, makeLog } from "../logging";
 import {
   attachedSignalIds,
@@ -210,6 +216,7 @@ export const runCorrelation = async (
   req: CorrelationRequest,
 ): Promise<CorrelationResult> => {
   const started = Date.now();
+  const usage = emptyModelUsage();
 
   const explained = new Set(req.explainedSignalIds);
   // Read before the try that guards the model call, because a failed read and
@@ -268,6 +275,7 @@ export const runCorrelation = async (
       maxRounds: deps.maxRounds ?? DEFAULT_MAX_ROUNDS,
       maxInvalid: 2,
       maxTokens: deps.maxTokens ?? DEFAULT_MAX_TOKENS,
+      usage,
     });
 
     const merges = applyRules(req, candidates, answer.merges);
@@ -279,6 +287,7 @@ export const runCorrelation = async (
       merges: merges.length,
       splits: splits.length,
       ms: Date.now() - started,
+      ...usageForLog(usage),
     });
     return { merges, splits, fellBack: false };
   } catch (err) {
@@ -290,6 +299,7 @@ export const runCorrelation = async (
       splits: splits.length,
       ms: Date.now() - started,
       ...health,
+      ...usageForLog(usage),
       note: "no merge was proposed because nothing was compared, which is indistinguishable downstream from comparing every candidate and finding nothing",
     });
     if (health.sustained) {

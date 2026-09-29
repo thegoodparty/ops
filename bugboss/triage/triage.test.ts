@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { resetFallbackRates } from "./health";
 import type { IncidentDigest, RawSignal, TriageContext } from "../types";
+import { emptyModelUsage, ModelRequestFailed } from "./model";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
 import {
   attachedSignalIds,
@@ -58,6 +59,7 @@ const context = (over: Partial<TriageContext> = {}): TriageContext => ({
 const decideCall = (input: Record<string, unknown>): ModelReply => ({
   text: "",
   toolCalls: [{ id: "call-1", name: "decide", input }],
+  usage: emptyModelUsage(),
 });
 
 const scripted = (replies: ModelReply[]) => {
@@ -413,6 +415,7 @@ test("can reach the incident database before deciding", async () => {
           },
         },
       ],
+      usage: emptyModelUsage(),
     },
     decideCall({
       action: "new_incident",
@@ -784,4 +787,106 @@ test("suppressing a recurrence is allowed but never quiet", async () => {
     1,
     "dropping the one delivery that contradicts a resolution is the failure this exists to catch",
   );
+});
+
+// ---------------------------------------------------------------------------
+// What the decision cost
+// ---------------------------------------------------------------------------
+
+/** A reply with real numbers on it, so a zero total cannot pass by default. */
+const priced = (
+  reply: Omit<ModelReply, "usage">,
+  over: Partial<ModelReply["usage"]> = {},
+): ModelReply => ({
+  ...reply,
+  usage: {
+    ...emptyModelUsage(),
+    tokensIn: 900,
+    tokensOut: 120,
+    costUsd: 0.004,
+    modelId: "us.anthropic.claude-sonnet-5",
+    calls: 1,
+    ...over,
+  },
+});
+
+test("a decision carries what it spent", async () => {
+  resetFallbackRates();
+  const { model } = scripted([
+    priced(decideCall({ action: "new_incident", reason: "nothing matches" })),
+  ]);
+
+  const outcome = await runTriage({ model, db: fakeDb().db }, context());
+
+  assert.equal(outcome.decision.action, "new_incident");
+  assert.equal(outcome.usage.tokensIn, 900);
+  assert.equal(outcome.usage.tokensOut, 120);
+  assert.equal(outcome.usage.calls, 1);
+  assert.equal(outcome.usage.modelId, "us.anthropic.claude-sonnet-5");
+});
+
+test("a decision that took several rounds carries all of them", async () => {
+  resetFallbackRates();
+  const { model } = scripted([
+    priced({ text: "", toolCalls: [{ id: "q", name: "query_incidents", input: { sql: "select 1" } }] }),
+    priced(decideCall({ action: "new_incident", reason: "nothing matches" })),
+  ]);
+
+  const outcome = await runTriage({ model, db: fakeDb().db }, context());
+
+  // Summed, not last-write-wins: a decision that looked things up cost more
+  // than one request and the record has to say so.
+  assert.equal(outcome.usage.calls, 2);
+  assert.equal(outcome.usage.tokensIn, 1800);
+});
+
+test("a fallback carries what the dead call spent before it gave up", async () => {
+  resetFallbackRates();
+  // Prose every round, so the loop exhausts its rounds and triage falls back.
+  const { model } = scripted([
+    priced({ text: "probably fine", toolCalls: [] }),
+    priced({ text: "still probably fine", toolCalls: [] }),
+  ]);
+
+  const outcome = await runTriage({ model, db: fakeDb().db, maxRounds: 2 }, context());
+
+  assert.equal(outcome.fellBack, true);
+  assert.equal(outcome.decision.action, "new_incident");
+  // The whole point. Today's storm ran 67 of these in five minutes and every
+  // incident it opened recorded a cost of zero -- not free, uncounted.
+  assert.equal(outcome.usage.calls, 2);
+  assert.ok(outcome.usage.tokensIn > 0, "a fallback reported no tokens");
+  assert.ok(outcome.usage.costUsd > 0, "a fallback reported no cost");
+});
+
+test("a decision carries the tokens of a request that died in transport", async () => {
+  resetFallbackRates();
+  // The shape the rounds-exhausted test does not reach: the first request
+  // answers, the second fails at the provider. Its tokens arrive on the
+  // throw rather than in a reply, and that is the only path that can bank
+  // them -- a throttled storm is exactly when the bill matters most.
+  const replies = [
+    priced({ text: "", toolCalls: [{ id: "q", name: "query_incidents", input: { sql: "select 1" } }] }),
+  ];
+  const model: ModelClient = {
+    complete: () => {
+      const reply = replies.shift();
+      if (reply) return Promise.resolve(reply);
+      return Promise.reject(
+        new ModelRequestFailed("ThrottlingException", {
+          ...emptyModelUsage(),
+          tokensIn: 700,
+          costUsd: 0.003,
+          calls: 1,
+        }),
+      );
+    },
+  };
+
+  const outcome = await runTriage({ model, db: fakeDb().db }, context());
+
+  assert.equal(outcome.fellBack, true);
+  assert.equal(outcome.usage.calls, 2, "the failed request was not counted");
+  assert.equal(outcome.usage.tokensIn, 1600);
+  assert.ok(outcome.usage.costUsd > 0.006, "the failed request's cost was dropped");
 });

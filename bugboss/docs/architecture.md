@@ -338,7 +338,7 @@ deleting is not the way back.
 | `toolapi/` | `assign`, the transitions, correlation |
 | `dispatcher/` | Launch, deadlines, escalation, the circuit breaker |
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
-| `bedrock/` | A Pi provider over Bedrock `InvokeModel` |
+| `bedrock/` | The Pi provider over Bedrock `InvokeModel`, and the Boss's client on it |
 | `slack/` | Outbound relay, inbound intent, and the read-only Slack agent |
 | `report/` | The closing report: assemble, render, publish once |
 | `http/` | Public routes and the loopback tool API |
@@ -346,8 +346,9 @@ deleting is not the way back.
 | `testdb/` | The test Postgres URL, its guard and its boot probe |
 | `index.ts` | The composition root. The only place real services are named |
 
-`types.ts` is the contract every module is built against. `logging.ts` is
-the one place `alarm` and `log` are defined.
+`types.ts` is the contract every module is built against. `model.ts` is the
+seam the Boss's own bounded calls are written against. `logging.ts` is the one
+place `alarm` and `log` are defined.
 
 ## Choices worth knowing
 
@@ -363,6 +364,12 @@ the builtin serves Converse to every model it owns. `bedrock/runtime.ts`
 registers a native provider that dispatches on `model.api` instead, and
 `agent/run.ts` asserts the routing before the session starts.
 
+Both callers reach the model through it: the agent streams, and the Boss's own
+bounded calls do one request each through `bedrock/client.ts`, asserting the
+same routing before the first one. One path deliberately, so a fix to the
+request lands once -- two paths is how a beta header present on one and absent
+from the other killed every incident agent while triage carried on working.
+
 **Wall-clock timeout, not budget caps.** A deadline is external, so it costs
 nothing in harness capability. Two layers: the child steers itself to write
 a brief at the soft deadline, and the parent SIGKILLs strictly later.
@@ -377,6 +384,14 @@ which: the token table is the record, and the dollar line beside it is what
 Pi priced that run at while it ran, read back out of the session file rather
 than off a price list kept here. `costUsd` on the incident row stays
 unwritten.
+
+The Boss's own bounded calls are costed the same way. `runStructuredCall`
+adds each request's usage onto a `ModelUsage` in place, including the request
+that throws, so a triage decision, a correlation, an inbound read and a
+fallback all log what they spent. In place because every failure path out of a
+bounded call is an exception, so a total returned beside the answer would
+count only the requests that worked -- and a storm of fallbacks is exactly the
+spend no other record shows.
 
 **An incident ends with a document, at `CLOSED`.** Not at `RESOLVED`: the
 post-mortem does not exist until `report_analysis` writes it, and the schema

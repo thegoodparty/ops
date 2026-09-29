@@ -13,10 +13,6 @@
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
-import {
-  BedrockRuntimeClient,
-  InvokeModelCommand,
-} from "@aws-sdk/client-bedrock-runtime";
 import { S3Client } from "@aws-sdk/client-s3";
 import type Database from "better-sqlite3";
 import type { Hono } from "hono";
@@ -110,7 +106,14 @@ import {
   awaitTestDatabase,
   resolveTestDatabase,
 } from "./testdb";
-import { createTriage, type ModelClient, type ModelReply, type ModelToolCall, type ModelTurn } from "./triage";
+import { createTriage, type ModelClient, type ModelToolCall, type ModelTurn } from "./triage";
+import { resolveBedrockModel } from "./bedrock";
+import { createPiModelClient } from "./bedrock/client";
+import {
+  assertBedrockInvokeModelRouting,
+  registerBedrockRouting,
+} from "./bedrock/runtime";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { attachedSignalIds } from "./triage/sql";
 import {
   readSessionOutcome,
@@ -401,137 +404,58 @@ export const createMemoryS3 = (): S3Client => {
   return { send } as unknown as S3Client;
 };
 
-type AnthropicBlock =
-  | { type: "text"; text: string }
-  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-  | {
-      type: "tool_result";
-      tool_use_id: string;
-      content: { type: "text"; text: string }[];
-      is_error?: boolean;
-    };
-
-interface AnthropicMessage {
-  role: "user" | "assistant";
-  content: AnthropicBlock[];
-}
-
 /**
- * Anthropic requires every tool_result answering one assistant turn to arrive
- * in a single user message, and runStructuredCall emits one ModelTurn per
- * call, so consecutive results are coalesced here.
+ * The Boss's model seam, built on the runtime the incident agent streams
+ * through.
+ *
+ * It used to build its own InvokeModel body here, which made two request
+ * paths to the same model: a fix to one was a fix missing from the other, and
+ * that is how an absent beta header killed every incident agent while triage
+ * carried on working. One path now, so the Boss's own calls inherit the
+ * InvokeModel routing, the 1h cache retention and its downgrade check, and
+ * `calculateCost` -- which is what finally prices a triage decision.
+ *
+ * Async because pi-ai is ESM-only and this package is CommonJS, so the
+ * runtime is reached through a dynamic import.
  */
-const toAnthropicMessages = (turns: ModelTurn[]): AnthropicMessage[] => {
-  const out: AnthropicMessage[] = [];
-  for (const turn of turns) {
-    if (turn.role === "user") {
-      out.push({ role: "user", content: [{ type: "text", text: turn.text }] });
-      continue;
-    }
-    if (turn.role === "assistant") {
-      const content: AnthropicBlock[] = [];
-      if (turn.text) content.push({ type: "text", text: turn.text });
-      for (const call of turn.toolCalls) {
-        content.push({
-          type: "tool_use",
-          id: call.id,
-          name: call.name,
-          input: call.input,
-        });
-      }
-      if (content.length === 0) content.push({ type: "text", text: "(no reply)" });
-      out.push({ role: "assistant", content });
-      continue;
-    }
-    const block: AnthropicBlock = {
-      type: "tool_result",
-      tool_use_id: turn.toolCallId,
-      content: [{ type: "text", text: turn.text }],
-      ...(turn.isError ? { is_error: true } : {}),
-    };
-    const last = out[out.length - 1];
-    if (last && last.role === "user" && last.content.every((b) => b.type === "tool_result")) {
-      last.content.push(block);
-    } else {
-      out.push({ role: "user", content: [block] });
-    }
+/**
+ * One runtime for every Boss client.
+ *
+ * Memoized because `ModelRuntime.create` reads auth and the model catalog off
+ * disk and may refresh it over the network, and the Boss builds two clients
+ * at boot -- the triage model and, when one is named, a separate intent
+ * model. Two runtimes would do that work twice and wrap the same builtin
+ * provider twice for no gain. `registerBedrockRouting` is idempotent per
+ * runtime, so sharing one is also what keeps the router single-layered.
+ */
+let bossRuntime: Promise<ModelRuntime> | null = null;
+
+const sharedBossRuntime = (): Promise<ModelRuntime> => {
+  if (!bossRuntime) {
+    bossRuntime = (async () => {
+      const pi = await import("@earendil-works/pi-coding-agent");
+      const runtime = await pi.ModelRuntime.create({});
+      await registerBedrockRouting({ runtime });
+      return runtime;
+    })();
   }
-  return out;
+  return bossRuntime;
 };
 
-export interface BedrockModelClientConfig {
-  modelId: string;
-  region?: string;
-  client?: BedrockRuntimeClient;
-}
+export const createBossModelClient = async (
+  cfg: { modelId: string },
+): Promise<ModelClient> => {
+  const runtime = await sharedBossRuntime();
+  const model = await resolveBedrockModel({ id: cfg.modelId });
 
-/**
- * The Boss's own model seam, over InvokeModel with the native Anthropic body.
- * Separate from bugboss/bedrock, which is a Pi api provider for the incident
- * agent: these calls are one-shot, bounded and streamless, and carry no
- * thinking blocks to keep signed.
- */
-export const createBedrockModelClient = (
-  cfg: BedrockModelClientConfig,
-): ModelClient => {
-  const client =
-    cfg.client ??
-    new BedrockRuntimeClient(cfg.region ? { region: cfg.region } : {});
-  const decoder = new TextDecoder();
+  // Before the first request rather than after a bad one. Converse silently
+  // reshapes what it cannot carry, so a misroute here is not an error, it is
+  // a quietly different request -- and the agent's own launch asserts this
+  // for the same reason. Per model rather than per runtime, because the id
+  // is what carries the api.
+  assertBedrockInvokeModelRouting(runtime, model);
 
-  return {
-    complete: async (request) => {
-      const body = {
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: request.maxTokens,
-        system: request.system,
-        messages: toAnthropicMessages(request.messages),
-        ...(request.tools.length > 0
-          ? {
-              tools: request.tools.map((tool) => ({
-                name: tool.name,
-                description: tool.description,
-                input_schema: tool.inputSchema,
-              })),
-            }
-          : {}),
-      };
-
-      const response = await client.send(
-        new InvokeModelCommand({
-          modelId: cfg.modelId,
-          contentType: "application/json",
-          accept: "application/json",
-          body: JSON.stringify(body),
-        }),
-        { abortSignal: request.signal },
-      );
-
-      const payload = JSON.parse(decoder.decode(response.body)) as {
-        content?: {
-          type?: string;
-          text?: string;
-          id?: string;
-          name?: string;
-          input?: Record<string, unknown>;
-        }[];
-      };
-
-      let text = "";
-      const toolCalls: ModelToolCall[] = [];
-      for (const block of payload.content ?? []) {
-        if (block.type === "text" && block.text) text += block.text;
-        if (block.type === "tool_use" && block.id && block.name) {
-          toolCalls.push({
-            id: block.id,
-            name: block.name,
-            input: block.input ?? {},
-          });
-        }
-      }
-      return { text, toolCalls } satisfies ModelReply;
-    },
-  };
+  return createPiModelClient({ runtime, model });
 };
 
 /**
@@ -2429,18 +2353,17 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
 
   return createBugBoss({
     config,
-    model: createBedrockModelClient({
+    // Region is no longer passed: `resolveBedrockModel` takes it from an
+    // inference-profile ARN and otherwise the SDK's own chain reads the same
+    // AWS_REGION this used to forward by hand.
+    model: await createBossModelClient({
       modelId: secrets.triageModelId ?? DEFAULT_TRIAGE_MODEL_ID,
-      region: secrets.awsRegion,
     }),
     // Only when a different model is named for it. Every inbound Slack
     // message costs one of these calls, so this is the knob that takes them
     // off the triage model without a deploy.
     intentModel: secrets.intentModelId
-      ? createBedrockModelClient({
-          modelId: secrets.intentModelId,
-          region: secrets.awsRegion,
-        })
+      ? await createBossModelClient({ modelId: secrets.intentModelId })
       : undefined,
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
     // The closing report uploads as a file. Same token as every other post,

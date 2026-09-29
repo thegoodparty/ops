@@ -27,7 +27,14 @@ import {
   renderRecurrence,
   type RecurrenceCandidate,
 } from "./recurrence";
-import { runStructuredCall, type ModelClient, type ModelToolSpec } from "./model";
+import {
+  emptyModelUsage,
+  runStructuredCall,
+  usageForLog,
+  type ModelClient,
+  type ModelToolSpec,
+  type ModelUsage,
+} from "./model";
 import { makeAlarm, makeLog } from "../logging";
 import {
   incidentOwner,
@@ -60,7 +67,22 @@ export interface TriageOutcome {
   recurrenceChecked: boolean;
   /** True when the model failed and the conservative default was taken. */
   fellBack: boolean;
+  /**
+   * What this decision spent, including on a fallback: the requests a dead
+   * call made before it gave up are the ones most worth costing, because a
+   * storm of them is invisible in every other record.
+   */
+  usage: ModelUsage;
 }
+
+/**
+ * What the rules produce. Identical to a `TriageOutcome` minus its cost,
+ * because `applyRules` is a pure function of the model's answer and has no
+ * business knowing what the answer cost -- `runTriage` owns the accumulator
+ * and stamps it on the way out, in one place rather than at twelve
+ * construction sites.
+ */
+type Decided = Omit<TriageOutcome, "usage">;
 
 const DEFAULT_BUDGET_MS = 55_000;
 const DEFAULT_MAX_ROUNDS = 6;
@@ -302,7 +324,7 @@ const newIncident = (
   answer: Answer,
   recurrence: RecurrenceCandidate[] | null,
   note?: string,
-): TriageOutcome => {
+): Decided => {
   const conclusive = recurrence ? conclusiveRecurrence(recurrence) : null;
   const pointer =
     conclusive?.incidentId ?? recurrencePointer(deps, ctx, answer.recurrenceOf);
@@ -332,7 +354,7 @@ const applyRules = (
   ctx: TriageContext,
   answer: Answer,
   recurrence: RecurrenceCandidate[] | null,
-): TriageOutcome => {
+): Decided => {
   const conclusive = recurrence ? conclusiveRecurrence(recurrence) : null;
   const checked = recurrence !== null;
 
@@ -467,6 +489,7 @@ export const runTriage = async (
   ctx: TriageContext,
 ): Promise<TriageOutcome> => {
   const started = Date.now();
+  const usage = emptyModelUsage();
 
   // Its own guard, outside the try the model call sits in, for the reason
   // `runCorrelation` gives for reading its signals first: a failed read and a
@@ -496,6 +519,7 @@ export const runTriage = async (
       maxRounds: deps.maxRounds ?? DEFAULT_MAX_ROUNDS,
       maxInvalid: 2,
       maxTokens: deps.maxTokens ?? DEFAULT_MAX_TOKENS,
+      usage,
     });
 
     const outcome = applyRules(deps, ctx, answer, recurrence);
@@ -507,15 +531,20 @@ export const runTriage = async (
       recurrenceOf: outcome.recurrenceOf,
       recurrenceCandidates: recurrence?.length ?? null,
       ms: Date.now() - started,
+      ...usageForLog(usage),
     });
-    return outcome;
+    return { ...outcome, usage };
   } catch (err) {
     const health = recordCall(SITE, true);
+    // The tokens go on the alarm because this is the path that used to
+    // report nothing: a fallback storm spent real money and every incident it
+    // opened recorded a cost of zero.
     alarm("fell_back", {
       sourceId: ctx.signal.sourceId,
       error: String(err),
       ms: Date.now() - started,
       ...health,
+      ...usageForLog(usage),
     });
     if (health.sustained) {
       alarm("triage_model_unusable", {
@@ -536,6 +565,7 @@ export const runTriage = async (
       recurrenceOf: conclusive?.incidentId ?? null,
       recurrenceChecked: recurrence !== null,
       fellBack: true,
+      usage,
     };
   }
 };

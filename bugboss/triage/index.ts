@@ -52,6 +52,11 @@ export {
   RECURRENCE_WINDOW_MS,
 } from "./recurrence";
 export { runStructuredCall } from "./model";
+// The seam itself lives in ../model.ts. Re-exported here because slack/ has
+// always reached the Boss's model surface through this barrel, and a caller
+// that gets the types from one module and the helpers from another is how the
+// two drift.
+export { addModelUsage, emptyModelUsage, ModelRequestFailed, usageForLog } from "../model";
 // Not triage's alone: it tracks the fallback rate of every bounded model
 // call the Boss makes, including the inbound-language read in slack/.
 export { recordCall, resetFallbackRates, SUSTAINED_FALLBACK_RATE } from "./health";

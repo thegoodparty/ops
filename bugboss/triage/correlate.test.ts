@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { IncidentDigest } from "../types";
 import { runCorrelation, type CorrelationRequest } from "./correlate";
 import { resetFallbackRates } from "./health";
+import { emptyModelUsage } from "./model";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
 import type { IncidentReader } from "./sql";
 
@@ -27,6 +28,7 @@ const request = (over: Partial<CorrelationRequest> = {}): CorrelationRequest => 
 const proposeCall = (merges: unknown[]): ModelReply => ({
   text: "",
   toolCalls: [{ id: "call-1", name: "propose", input: { merges } }],
+  usage: emptyModelUsage(),
 });
 
 const scripted = (replies: ModelReply[]) => {

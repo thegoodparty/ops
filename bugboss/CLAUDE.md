@@ -14,7 +14,7 @@ This file is what you need before editing anything here.
 | Transitions, merge, split, correlation | [`toolapi/CLAUDE.md`](./toolapi/CLAUDE.md) |
 | Launch, deadlines, escalation | [`dispatcher/CLAUDE.md`](./dispatcher/CLAUDE.md) |
 | The incident agent, its tools, resume | [`agent/CLAUDE.md`](./agent/CLAUDE.md) |
-| The Bedrock provider | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
+| The Bedrock request path every model call takes | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
 | Threads, relay, the Slack agent | [`slack/CLAUDE.md`](./slack/CLAUDE.md) |
 | The closing report an incident ends with | [`report/CLAUDE.md`](./report/CLAUDE.md) |
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
@@ -24,6 +24,8 @@ This file is what you need before editing anything here.
 
 `index.ts` is the composition root — the only place real services are
 named. `types.ts` is the contract everything else is built against.
+`model.ts` is the seam the Boss's own bounded calls are written against, and
+`bedrock/client.ts` is its only implementation that reaches a model.
 `logging.ts` is the one home for `alarm` and `log`.
 
 ## The rules that are not negotiable

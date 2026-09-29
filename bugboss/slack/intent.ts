@@ -31,7 +31,9 @@ import { z, type ZodType } from "zod";
 import { makeAlarm, makeLog } from "../logging";
 import {
   recordCall,
+  emptyModelUsage,
   runStructuredCall,
+  usageForLog,
   type ModelClient,
   type ModelToolSpec,
 } from "../triage";
@@ -293,6 +295,7 @@ const read = async <T>(
   },
 ): Promise<{ answer: T & { reason?: string }; fellBack: boolean }> => {
   const started = Date.now();
+  const usage = emptyModelUsage();
   try {
     const answer = await runStructuredCall({
       model: deps.model,
@@ -304,9 +307,10 @@ const read = async <T>(
       maxRounds: MAX_ROUNDS,
       maxInvalid: MAX_INVALID,
       maxTokens: deps.maxTokens ?? MAX_TOKENS,
+      usage,
     });
     recordCall(SITE, false);
-    log("read", { what: args.what, ...answer, ms: Date.now() - started });
+    log("read", { what: args.what, ...answer, ms: Date.now() - started, ...usageForLog(usage) });
     return { answer, fellBack: false };
   } catch (err) {
     const health = recordCall(SITE, true);
@@ -314,11 +318,15 @@ const read = async <T>(
     // is a bot that has stopped listening -- and its safe answer is a
     // plausible-looking label. The rate travels with the alarm so that reads
     // as an outage rather than as a week of vague people.
+    // Every inbound Slack message costs one of these, so an unreadable read
+    // that reports no tokens hides the cheapest call in the system becoming
+    // the most frequent one.
     alarm("unreadable", {
       what: args.what,
       error: String(err),
       ms: Date.now() - started,
       ...health,
+      ...usageForLog(usage),
     });
     throw err;
   }

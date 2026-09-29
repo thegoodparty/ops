@@ -1,50 +1,31 @@
-// The model seam for the Boss's own bounded calls: triage (Job 2) and
-// root-cause correlation (Job 2b). Design spec: bugboss/docs/architecture.md.
+// The bounded agentic loop the Boss's own calls run in.
 //
-// The interface is deliberately smaller than any SDK's -- one call, tools in,
-// text and tool calls out. Two reasons. These calls run inside the Boss
-// process on a wall-clock budget, so they must not inherit a harness's
-// session, resume and streaming machinery; and the end-to-end test has to
-// substitute a fake without standing up Bedrock.
+// The model seam itself lives in ../model.ts, beside types.ts, because four
+// modules in three directories build against it. What is here is the loop:
+// the answer-tool-plus-schema contract, its retry, and its bounds.
 
 import { makeLog } from "../logging";
 import type { ZodType } from "zod";
+import {
+  addModelUsage,
+  ModelRequestFailed,
+  type ModelClient,
+  type ModelReply,
+  type ModelToolSpec,
+  type ModelTurn,
+  type ModelUsage,
+} from "../model";
 
-export interface ModelToolSpec {
-  name: string;
-  description: string;
-  /** JSON Schema for the tool input. */
-  inputSchema: Record<string, unknown>;
-}
-
-export interface ModelToolCall {
-  id: string;
-  name: string;
-  input: Record<string, unknown>;
-}
-
-export type ModelTurn =
-  | { role: "user"; text: string }
-  | { role: "assistant"; text: string; toolCalls: ModelToolCall[] }
-  | { role: "toolResult"; toolCallId: string; text: string; isError?: boolean };
-
-export interface ModelRequest {
-  system: string;
-  messages: ModelTurn[];
-  tools: ModelToolSpec[];
-  maxTokens: number;
-  /** Aborted when the call's wall-clock budget runs out. */
-  signal: AbortSignal;
-}
-
-export interface ModelReply {
-  text: string;
-  toolCalls: ModelToolCall[];
-}
-
-export interface ModelClient {
-  complete(request: ModelRequest): Promise<ModelReply>;
-}
+export type {
+  ModelClient,
+  ModelReply,
+  ModelRequest,
+  ModelToolCall,
+  ModelToolSpec,
+  ModelTurn,
+  ModelUsage,
+} from "../model";
+export { addModelUsage, emptyModelUsage, ModelRequestFailed, usageForLog } from "../model";
 
 /** A tool the loop executes itself, rather than handing back to the caller. */
 export interface LoopTool {
@@ -64,6 +45,12 @@ export interface StructuredCall<T> {
   /** Invalid answers tolerated before the call gives up. */
   maxInvalid: number;
   maxTokens: number;
+  /**
+   * Added to in place as each request returns, including the request that
+   * throws. Optional so a caller that does not record spend need not carry
+   * one; every caller in the Boss does.
+   */
+  usage?: ModelUsage;
 }
 
 const log = makeLog("triage");
@@ -134,17 +121,30 @@ export const runStructuredCall = async <T>(call: StructuredCall<T>): Promise<T> 
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw new Error("budget exhausted before an answer");
 
-      const reply = await withDeadline(
-        call.model.complete({
-          system: call.system,
-          messages: [...messages],
-          tools,
-          maxTokens: call.maxTokens,
-          signal: controller.signal,
-        }),
-        remaining,
-        "model call",
-      );
+      let reply: ModelReply;
+      try {
+        reply = await withDeadline(
+          call.model.complete({
+            system: call.system,
+            messages: [...messages],
+            tools,
+            maxTokens: call.maxTokens,
+            signal: controller.signal,
+          }),
+          remaining,
+          "model call",
+        );
+      } catch (err) {
+        // A request that failed after reaching the model still spent what it
+        // spent. Banking it here is the only place that can: every failure
+        // path out of this loop is an exception, and the caller reads the
+        // total afterwards precisely because it cannot read a return value.
+        if (call.usage && err instanceof ModelRequestFailed) {
+          addModelUsage(call.usage, err.usage);
+        }
+        throw err;
+      }
+      if (call.usage) addModelUsage(call.usage, reply.usage);
 
       messages.push({
         role: "assistant",

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
 import { readMentionIntent, readReplyIntent, untrusted } from "./intent";
+import { emptyModelUsage } from "../model";
 import {
   resetFallbackRates,
   type ModelClient,
@@ -29,6 +30,7 @@ const answers = (input: Record<string, unknown>): ModelReply => ({
   toolCalls: [
     { id: "c1", name: "read_intent", input: { reason: "because", ...input } },
   ],
+  usage: emptyModelUsage(),
 });
 
 /** One reply read answers both questions, so a fake has to answer both. */
