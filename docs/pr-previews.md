@@ -366,8 +366,13 @@ decision: step 10 adds only the workbench hop.
 
 ## Open questions
 
-- Does a DIY-backend preview lock? (step 4)
-- Does a change to the workbench provider's role ARN cascade? (step 8)
+- ~~Does a DIY-backend preview lock?~~ Settled by use: ops, org and
+  workbench previews run without lock objects and superseded runs cancel
+  cleanly, so preview does not lock.
+- ~~Does a change to the workbench provider's role ARN cascade?~~ Settled at
+  step 9: no. The first live workbench preview showed the provider updated in
+  place (`assumeRoles` repointed at `pulumi-preview`) with every resource
+  `same`.
 - ~~One comment per project or one combined comment?~~ Decided at step 5:
   one comment per project. Two parallel jobs editing one shared comment would
   race; a per-project comment needs no coordination. Revisited after use: each
