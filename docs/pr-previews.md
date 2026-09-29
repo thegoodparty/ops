@@ -77,8 +77,14 @@ the consumer by a different workflow, and nothing sequences the two.
       edit was an in-place provider update; the first live workbench preview
       after apply confirms it, and the fallback is CI role chaining. Tests
       cover the trust and the ops grant.)
-- [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
-      applied.
+- [x] 9. Workbench previews in the workflow: done (2026-09-29, PR #165.
+      `deploy-workbench/**` joins the path filter and the matrix builder emits
+      `workbench` (`build: false`, no `dist/lambda` archive), alongside ops and
+      org. The first live workbench preview ran on this PR: 9 same, 1 update,
+      the provider's `assumeRoles` repointing at `pulumi-preview` with nothing
+      behind it replaced, which confirms step 8's cascade check. The preview
+      role held: its only invoke is `getCallerIdentity`, so no action was
+      needed.)
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
       todo. Depends on 8 being applied.
 - [x] 11. Revisit the workbench preview role at workbench step 10: done
@@ -360,8 +366,13 @@ decision: step 10 adds only the workbench hop.
 
 ## Open questions
 
-- Does a DIY-backend preview lock? (step 4)
-- Does a change to the workbench provider's role ARN cascade? (step 8)
+- ~~Does a DIY-backend preview lock?~~ Settled by use: ops, org and
+  workbench previews run without lock objects and superseded runs cancel
+  cleanly, so preview does not lock.
+- ~~Does a change to the workbench provider's role ARN cascade?~~ Settled at
+  step 9: no. The first live workbench preview showed the provider updated in
+  place (`assumeRoles` repointed at `pulumi-preview`) with every resource
+  `same`.
 - ~~One comment per project or one combined comment?~~ Decided at step 5:
   one comment per project. Two parallel jobs editing one shared comment would
   race; a per-project comment needs no coordination. Revisited after use: each
