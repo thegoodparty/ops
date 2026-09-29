@@ -94,7 +94,8 @@ the consumer by a different workflow, and nothing sequences the two.
       `gp-readonly`. Verified from the AWS-managed reference: the managed
       `ReadOnlyAccess` covers the ops/org preview reads, and
       `AWSSecretsManagerClientReadOnlyAccess` includes `GetSecretValue`
-      (recorded in `identity-center.ts` as a follow-up). The passphrase
+      (removed in two applies: PR #171 clears its `protect` flag, a follow-up
+      deletes the attachment). The passphrase
       `Environment=prod` tag was not checked — the sandbox has no
       management-account session — so it stays the open question below.)
 - [x] 11. Revisit the workbench preview role at workbench step 10: done
@@ -371,8 +372,11 @@ Verify then, and record the finding: whether
 `secretsmanager:GetSecretValue`. If it does, `gp-readonly` can run an `ops`
 preview even before step 3, the "How to resume" claim that preview needs
 `gp-admin` is already stale, and the set is broader than its name suggests.
-That last point is worth its own follow-up, but it does not change this
-decision: step 10 adds only the workbench hop.
+That last point is its own follow-up: `protect: true` means destroying the
+attachment needs its own pull request, so PR #171 clears the flag and a
+follow-up drops the entry from `permissionSets`. `ReadOnlyAccess` already
+carries the metadata reads, so nothing is lost. It did not change this
+decision: step 10 added only the workbench hop.
 
 ## Open questions
 
