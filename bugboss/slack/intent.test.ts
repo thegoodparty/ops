@@ -383,3 +383,49 @@ test("a failed mention read does not silently become a question", async () => {
   assert.equal(value.fellBack, true);
   assert.ok(lines.some((line) => line.includes('"what":"mention"')));
 });
+
+// --- a combine asked for out in the channel --------------------------------
+
+/**
+ * The mention read has to be able to answer this, or the same sentence does
+ * two different things depending on whether the person happened to be
+ * standing in an incident thread when they typed it. Out here there is no
+ * thread to supply a second id, so both come from the message.
+ */
+test("a mention asking for a combine carries both ids", async () => {
+  const { model } = fakeModel([
+    answers({ intent: "combine", combineIds: ["82", "79"] }),
+  ]);
+
+  const read = await readMentionIntent(
+    { model },
+    { text: "82 and 79 are the same bug, merge them" },
+  );
+
+  assert.equal(read.intent, "combine");
+  assert.deepEqual(read.combineIds, ["82", "79"]);
+});
+
+test("a mention that is not a combine carries no ids to act on", async () => {
+  for (const intent of ["bug_report", "question", "unclear"] as const) {
+    const { model } = fakeModel([answers({ intent })]);
+    const read = await readMentionIntent({ model }, { text: "the site is down" });
+    assert.deepEqual(read.combineIds, [], intent);
+  }
+});
+
+test("a dead model out in the channel asks nothing to be combined", async () => {
+  const { value } = await capturingErrors(() =>
+    readMentionIntent(
+      { model: fakeModel([new Error("bedrock is down")]).model },
+      { text: "82 and 79 are the same bug" },
+    ),
+  );
+
+  assert.equal(value.intent, "unclear");
+  assert.deepEqual(
+    value.combineIds,
+    [],
+    "an unreadable message must not fall back into moving incidents around",
+  );
+});
