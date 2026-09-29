@@ -45,7 +45,7 @@ type PermissionSet = {
  * every Allow regardless of position. Denies come first because they read as
  * the boundary the rest of the document sits inside.
  */
-const withAdminReserved = (policy?: PolicyDocument): PolicyDocument => ({
+export const withAdminReserved = (policy?: PolicyDocument): PolicyDocument => ({
   Version: "2012-10-17",
   Statement: [...adminReservedActions.Statement, ...(policy?.Statement ?? [])],
 });
