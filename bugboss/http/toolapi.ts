@@ -101,9 +101,13 @@ const BODIES = {
   search: z.object({
     text: z.string().min(1),
   }),
-  handoff: z.object({
+  escalate: z.object({
     reason: z.string().min(1),
     brief: z.string().min(1),
+  }),
+  park: z.object({
+    waitingFor: z.string().min(1),
+    wakeAfterSeconds: z.number().int().nonnegative().optional(),
   }),
   none: z.object({}),
 };
@@ -227,8 +231,13 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   );
 
   app.post(
-    "/incidents/:id/handoff",
-    tool(BODIES.handoff, (api, body) => api.handOff(body)),
+    "/incidents/:id/escalate",
+    tool(BODIES.escalate, (api, body) => api.escalate(body)),
+  );
+
+  app.post(
+    "/incidents/:id/park",
+    tool(BODIES.park, (api, body) => api.park(body)),
   );
 
   // POST rather than GET because the query is a body, not a path. It still

@@ -14,6 +14,7 @@ import {
   RESUME_NOTICE_SECONDS,
   createDispatcher,
   resumeNotice,
+  staleNotice,
   type DispatcherDb,
   type DispatcherDeps,
 } from "./index";
@@ -26,6 +27,7 @@ const config = (over: Partial<DispatcherConfig> = {}): DispatcherConfig => ({
   tickSeconds: 30,
   agentTimeoutSeconds: 1800,
   maxAttempts: 3,
+  staleAfterSeconds: 86_400,
   ...over,
 });
 
@@ -57,7 +59,6 @@ const makeDb = () => {
 interface IncidentOverrides {
   status?: string;
   mergedInto?: string;
-  owner?: string;
   attempts?: number;
   sessionRef?: string | null;
   firstSignalAt?: number;
@@ -72,14 +73,13 @@ const insertIncident = (
   sqlite
     .prepare(
       `INSERT INTO incident
-         (id, status, owner, firstSignalAt, attempts, sessionRef, lastStartedAt,
+         (id, status, firstSignalAt, attempts, sessionRef, lastStartedAt,
           resolvedAt, closedAt, postmortem, mergedInto)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
       over.status ?? "INVESTIGATING",
-      over.owner ?? "agent",
       over.firstSignalAt ?? T0,
       over.attempts ?? 0,
       over.sessionRef ?? null,
@@ -114,8 +114,14 @@ const captureAlarms = async (fn: () => Promise<void>): Promise<string[]> => {
   return events;
 };
 
-const makeTools = (sqlite: Database.Database) => {
-  const handOffs: { incidentId: string; reason: string; brief: string }[] = [];
+/**
+ * The escalation path, recording only. `escalate` writes nothing: it posts a
+ * brief and mentions the rotation, and the incident carries on being driven
+ * by an agent. So the fake's whole job is to say that the call was made and
+ * what it said -- there is no state change left to simulate.
+ */
+const makeTools = () => {
+  const escalations: { incidentId: string; reason: string; brief: string }[] = [];
   const toolApiFor = (incidentId: string): ToolApi => ({
     reportRootCause: ok,
     reportImpact: ok,
@@ -123,15 +129,13 @@ const makeTools = (sqlite: Database.Database) => {
     reportAnalysis: ok,
     getIncident: ok,
     searchIncidents: ok,
-    handOff: async ({ reason, brief }) => {
-      handOffs.push({ incidentId, reason, brief });
-      sqlite
-        .prepare("UPDATE incident SET owner = 'human' WHERE id = ?")
-        .run(incidentId);
+    escalate: async ({ reason, brief }) => {
+      escalations.push({ incidentId, reason, brief });
       return { ok: true, directives: [] };
     },
+    park: ok,
   });
-  return { toolApiFor, handOffs };
+  return { toolApiFor, escalations };
 };
 
 /** Spawns that never finish until released, so "live" means something. */
@@ -158,17 +162,22 @@ const deps = (
 });
 
 describe("Dispatcher.tick", () => {
-  it("starts exactly one agent per eligible incident", async () => {
+  // Status is the whole of eligibility now. Nothing marks an open incident as
+  // somebody else's: an agent drives every one of them, and the only rows
+  // that get no agent are the two that are over.
+  it("starts exactly one agent per open incident, and none for a terminal one", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", { status: "INVESTIGATING" });
     insertIncident(sqlite, "i2", { status: "FIXING" });
-    insertIncident(sqlite, "i3", { status: "INVESTIGATING", owner: "human" });
     // RESOLVED is an agent status: report_analysis is the only exit from it
     // and it is the agent's to call, so a RESOLVED incident still needs one.
-    insertIncident(sqlite, "i4", { status: "RESOLVED" });
-    insertIncident(sqlite, "i5", { status: "CLOSED" });
-    insertIncident(sqlite, "i6", { status: "MERGED", mergedInto: "i1" });
+    insertIncident(sqlite, "i3", { status: "RESOLVED" });
+    // CLOSED has a post-mortem and MERGED has an incident that absorbed it.
+    // Both are finished, and finished is the only reason to leave a row
+    // without an agent.
+    insertIncident(sqlite, "i4", { status: "CLOSED" });
+    insertIncident(sqlite, "i5", { status: "MERGED", mergedInto: "i1" });
 
     const spawned: string[] = [];
     const spawn: SpawnAgent = async (ctx) => {
@@ -179,10 +188,10 @@ describe("Dispatcher.tick", () => {
     const result = await d.tick();
     await result.settled;
 
-    assert.deepEqual(spawned.sort(), ["i1", "i2", "i4"]);
+    assert.deepEqual(spawned.sort(), ["i1", "i2", "i3"]);
     assert.deepEqual(
       result.started.map((a) => a.incidentId).sort(),
-      ["i1", "i2", "i4"],
+      ["i1", "i2", "i3"],
     );
     assert.equal(result.circuitOpen, false);
 
@@ -191,13 +200,13 @@ describe("Dispatcher.tick", () => {
         .query<{ id: string; attempts: number }>("SELECT id, attempts FROM incident")
         .map((r) => [r.id, r.attempts]),
     );
-    assert.deepEqual(attempts, { i1: 1, i2: 1, i3: 0, i4: 1, i5: 0, i6: 0 });
+    assert.deepEqual(attempts, { i1: 1, i2: 1, i3: 1, i4: 0, i5: 0 });
     cleanup();
   });
 
   it("resumes and escalates a RESOLVED incident, because the post-mortem is the agent's", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     // The container restarted while the agent was drafting the post-mortem.
     insertIncident(sqlite, "i1", {
       status: "RESOLVED",
@@ -225,18 +234,15 @@ describe("Dispatcher.tick", () => {
     assert.equal(contexts[0].sessionRef, "s-1", "resume the post-mortem, not restart it");
     assert.deepEqual(d.list().map((a) => a.phase), ["RESOLVED"]);
 
-    // And if it wedges there, RESOLVED must still reach a human rather than
-    // sitting owner='agent' forever, invisible to the unclaimed digest.
+    // And if it wedges there, RESOLVED must still be said out loud rather
+    // than going quiet: the post-mortem is the last thing anyone is waiting
+    // for, and nothing else in the system would ever mention it again.
     clock = T0 + 60_000 + 211_000;
     const second = await d.tick();
     assert.equal(kills, 1);
     assert.deepEqual(second.killed, ["i1"]);
     assert.deepEqual(second.escalated, ["i1"]);
-    assert.equal(handOffs.length, 1);
-    assert.equal(
-      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
-      "human",
-    );
+    assert.equal(escalations.length, 1);
 
     releases.forEach((r) => r());
     await d.drain();
@@ -245,7 +251,7 @@ describe("Dispatcher.tick", () => {
 
   it("does not start a second agent for an incident that already has one", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     const held = heldSpawn();
@@ -270,7 +276,7 @@ describe("Dispatcher.tick", () => {
 
   it("stops dispatching at the concurrency ceiling and says so", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     for (const id of ["i1", "i2", "i3", "i4", "i5"]) insertIncident(sqlite, id);
 
     const held = heldSpawn();
@@ -304,7 +310,7 @@ describe("Dispatcher.tick", () => {
 
   it("escalates a crash loop instead of relaunching forever", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let launches = 0;
@@ -323,20 +329,58 @@ describe("Dispatcher.tick", () => {
 
     for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
     assert.equal(launches, 3);
-    assert.equal(handOffs.length, 0, "the limit is a ceiling, not a trigger");
+    assert.equal(escalations.length, 0, "the limit is a ceiling, not a trigger");
 
     const fourth = await d.tick();
     assert.equal(launches, 3, "no relaunch past three consecutive fast deaths");
     assert.deepEqual(fourth.escalated, ["i1"]);
-    assert.match(handOffs[0].reason, /consecutive launches died/);
-    assert.match(handOffs[0].brief, /crash loop/);
-    assert.equal(
-      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
-      "human",
+    assert.match(escalations[0].reason, /consecutive launches died/);
+    assert.match(escalations[0].brief, /crash loop/);
+
+    // Said once, then left alone. The dispatcher records the incident as one
+    // it has given up relaunching, which is what stops both the relaunch and
+    // a second copy of the same brief every thirty seconds.
+    const fifth = await d.tick();
+    assert.deepEqual(fifth.escalated, [], "given up on, so the loop is over");
+    cleanup();
+  });
+
+  // The half `owner = 'human'` used to do for free. That write took the row
+  // out of the eligibility query, which stopped the relaunch, and made the
+  // second escalation a no-op. Nothing writes ownership any more -- an open
+  // incident is always an agent's -- so the dispatcher has to remember, and
+  // this is the test that says it does.
+  it("gives up on a crash loop once, and then says nothing further", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let launches = 0;
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+      throw new Error("agent exited 1");
+    };
+
+    const d = createDispatcher(
+      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
     );
 
-    const fifth = await d.tick();
-    assert.deepEqual(fifth.escalated, [], "human-owned, so the loop is over");
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    assert.deepEqual((await d.tick()).escalated, ["i1"]);
+
+    // Twenty more ticks is ten minutes of the incident sitting open, which is
+    // the shape of the bug: a condition re-decided every tick posts the same
+    // brief until somebody closes the incident.
+    for (let i = 0; i < 20; i += 1) await (await d.tick()).settled;
+
+    assert.equal(launches, 3, "no relaunch after the dispatcher gave up");
+    assert.equal(escalations.length, 1, "and no second copy of the brief");
+    // The incident is untouched and still open: giving up on relaunching it
+    // is not a transition, and the status is the only thing eligibility reads.
+    assert.equal(
+      db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'i1'")?.status,
+      "INVESTIGATING",
+    );
     cleanup();
   });
 
@@ -345,7 +389,7 @@ describe("Dispatcher.tick", () => {
   // human a crash-loop brief for a deploy that worked.
   it("does not count a short clean exit as a crash", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let launches = 0;
@@ -360,17 +404,13 @@ describe("Dispatcher.tick", () => {
     for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
 
     assert.equal(launches, 5, "it keeps relaunching rather than giving up");
-    assert.deepEqual(handOffs, [], "and nobody is handed a crash-loop brief");
-    assert.equal(
-      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
-      "agent",
-    );
+    assert.deepEqual(escalations, [], "and nobody is handed a crash-loop brief");
     cleanup();
   });
 
   it("falls back to relaunching when the crash-loop escalation fails", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let launches = 0;
@@ -379,12 +419,12 @@ describe("Dispatcher.tick", () => {
       throw new Error("agent exited 1");
     };
 
-    let handOffFails = true;
+    let escalationFails = true;
     const failingToolApiFor = (incidentId: string): ToolApi => ({
       ...toolApiFor(incidentId),
-      handOff: async (args) => {
-        if (handOffFails) throw new Error("Slack is down");
-        return toolApiFor(incidentId).handOff(args);
+      escalate: async (args) => {
+        if (escalationFails) throw new Error("Slack is down");
+        return toolApiFor(incidentId).escalate(args);
       },
     });
 
@@ -401,25 +441,32 @@ describe("Dispatcher.tick", () => {
     assert.equal(launches, 3);
 
     const failed = await d.tick();
-    assert.deepEqual(failed.escalated, [], "the handoff threw, so nobody was told");
+    assert.deepEqual(failed.escalated, [], "the escalation threw, so nobody was told");
     assert.equal(launches, 3, "this tick spends itself on the escalation");
 
-    // Before: the counter stayed at the ceiling, so every later tick retried
-    // the same failing escalation and the incident never moved again.
+    // An untold escalation must not stop the relaunching, because nothing
+    // else is coming: the counter stayed at the ceiling before, so every
+    // later tick retried the same failing call and the incident never moved.
     await (await d.tick()).settled;
     assert.equal(launches, 4, "a failed escalation falls back to relaunching");
 
-    handOffFails = false;
+    escalationFails = false;
     for (let i = 0; i < 2; i += 1) await (await d.tick()).settled;
     const recovered = await d.tick();
     assert.deepEqual(recovered.escalated, ["i1"], "and it can still escalate later");
-    assert.equal(handOffs.length, 1);
+    assert.equal(escalations.length, 1);
+
+    // Only the escalation that landed ends the relaunching. Up to here every
+    // failure fell back, which is why the fallback cannot be permanent.
+    for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
+    assert.equal(launches, 6);
+    assert.equal(escalations.length, 1);
     cleanup();
   });
 
   it("escalates an agent that dies just past the fast-failure window", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let clock = T0;
@@ -455,26 +502,23 @@ describe("Dispatcher.tick", () => {
 
     for (let i = 0; i < 3; i += 1) await die();
     assert.equal(launches, 3);
-    assert.equal(handOffs.length, 0, "the limit is a ceiling, not a trigger");
+    assert.equal(escalations.length, 0, "the limit is a ceiling, not a trigger");
 
     const fourth = await d.tick();
     assert.equal(launches, 3, "no relaunch past the launch ceiling");
     assert.deepEqual(fourth.escalated, ["i1"]);
-    assert.match(handOffs[0].reason, /launches/);
-    assert.match(handOffs[0].brief, /has finished none of them/);
-    assert.equal(
-      db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")?.owner,
-      "human",
-    );
+    assert.match(escalations[0].reason, /launches/);
+    assert.match(escalations[0].brief, /has finished none of them/);
     cleanup();
   });
 
-  it("gives a handed-back incident a fresh launch budget", async () => {
+  // Why the give-up set is in memory rather than a column. Every merge to
+  // ops `main` restarts this container, and a persisted quarantine is one a
+  // deploy could not clear -- an incident open, nobody looking at it, and no
+  // agent allowed near it, which is the hole this whole change removes.
+  it("keeps an incident it gave up on parked across a restart, and wakes it on the cooldown", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
-    // design.md: a human hands back by replying in the thread, which flips
-    // owner to agent. A ceiling that outlived the escalation would bounce it
-    // straight back on the next tick.
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     let clock = T0;
@@ -484,19 +528,21 @@ describe("Dispatcher.tick", () => {
       launches += 1;
       return new Promise<void>((resolve) => releases.push(resolve));
     };
+    const build = () =>
+      createDispatcher(
+        deps({
+          db,
+          spawn,
+          toolApiFor,
+          config: config({ maxAttempts: 3 }),
+          fastFailureSeconds: 60,
+          maxLaunches: 2,
+          parkCooldownSeconds: 3600,
+          now: () => clock,
+        }),
+      );
 
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn,
-        toolApiFor,
-        config: config({ maxAttempts: 3 }),
-        fastFailureSeconds: 60,
-        maxLaunches: 2,
-        now: () => clock,
-      }),
-    );
-
+    const d = build();
     for (let i = 0; i < 2; i += 1) {
       await d.tick();
       clock += 61_000;
@@ -505,26 +551,79 @@ describe("Dispatcher.tick", () => {
     }
     assert.deepEqual((await d.tick()).escalated, ["i1"]);
     assert.equal(launches, 2);
+    assert.deepEqual((await d.tick()).started, [], "this container is done with it");
+    assert.equal(escalations.length, 1, "said once, not once a tick");
 
-    sqlite.prepare("UPDATE incident SET owner = 'agent' WHERE id = 'i1'").run();
-    const handedBack = await d.tick();
-
+    // A new container, same database. The stop is a row now rather than a
+    // Set, so a restart does not undo it -- which is the point. A crash loop
+    // that a deploy could clear is a crash loop that a deploy would relaunch
+    // straight into.
+    const restarted = build();
     assert.deepEqual(
-      handedBack.started.map((a) => a.incidentId),
+      (await restarted.tick()).started,
+      [],
+      "the park outlives the process that decided it",
+    );
+    assert.equal(launches, 2);
+
+    // The cooldown is what lifts it, because none of the reasons it parked
+    // are permanent.
+    clock += 3_600_000;
+    const woken = await restarted.tick();
+    assert.deepEqual(
+      woken.started.map((a) => a.incidentId),
       ["i1"],
-      "the human asked for an agent, so it gets one",
+      "not now is not the same as not ever",
     );
     assert.equal(launches, 3);
-    assert.equal(handOffs.length, 1, "and it is not escalated straight back");
+    assert.equal(escalations.length, 1, "and it is not escalated straight back");
 
     releases.forEach((r) => r());
     await d.drain();
+    await restarted.drain();
+    cleanup();
+  });
+
+  it("wakes a parked incident the moment somebody replies in its thread", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+    // Parked with a cooldown a long way off, so a wake here can only have
+    // come from the reply.
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt)
+         VALUES ('i1', 'somebody to look', ?, ?)`,
+      )
+      .run(T0 + 86_400_000, T0);
+
+    const spawned: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async (ctx) => {
+          spawned.push(ctx.incidentId);
+        },
+        toolApiFor,
+        now: () => T0,
+      }),
+    );
+
+    await (await d.tick()).settled;
+    assert.deepEqual(spawned, [], "parked, so nothing runs it");
+
+    // What the relay does when a reply lands, which is the whole fix: talking
+    // to an incident wakes it, with no model in the path.
+    sqlite.prepare("DELETE FROM incident_wait WHERE incidentId = 'i1'").run();
+
+    await (await d.tick()).settled;
+    assert.deepEqual(spawned, ["i1"]);
     cleanup();
   });
 
   it("does not count container restarts toward the launch ceiling", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     // Every merge to ops main restarts this container. That is routine, so it
     // must never read as an agent that cannot stay up.
     insertIncident(sqlite, "i1", { attempts: 40, sessionRef: "s-1" });
@@ -552,13 +651,13 @@ describe("Dispatcher.tick", () => {
       clock += 900_000;
     }
 
-    assert.deepEqual(handOffs, [], "46 launches, none of them the agent's fault");
+    assert.deepEqual(escalations, [], "46 launches, none of them the agent's fault");
     cleanup();
   });
 
   it("treats an interrupted agent as interrupted, not as crashing", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     // A high total: every merge to ops main restarts this container, and a
     // long incident collects launches that way.
     insertIncident(sqlite, "i1", { attempts: 12, sessionRef: "s-1" });
@@ -584,7 +683,7 @@ describe("Dispatcher.tick", () => {
     }
 
     assert.equal(held.contexts.length, 4, "a healthy agent is always relaunched");
-    assert.deepEqual(handOffs, [], "attempts alone must never escalate");
+    assert.deepEqual(escalations, [], "attempts alone must never escalate");
     assert.equal(
       db.get<{ attempts: number }>("SELECT attempts FROM incident WHERE id = 'i1'")
         ?.attempts,
@@ -596,7 +695,7 @@ describe("Dispatcher.tick", () => {
 
   it("keeps ticking when one incident fails to launch", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1");
     insertIncident(sqlite, "i2");
 
@@ -625,7 +724,7 @@ describe("Dispatcher.tick", () => {
     await d.tick();
     const third = await d.tick();
     assert.deepEqual(third.escalated, ["i1"], "a launch that never starts escalates");
-    assert.match(handOffs[0].reason, /consecutive launches died/);
+    assert.match(escalations[0].reason, /consecutive launches died/);
     assert.deepEqual(d.list().map((a) => a.incidentId), ["i2"], "i2 ran throughout");
 
     held.releaseAll();
@@ -633,9 +732,9 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
-  it("leaves the child its whole handoff grace before the kill", async () => {
+  it("leaves the child its whole brief-writing grace before the kill", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1");
 
     let kills = 0;
@@ -680,14 +779,14 @@ describe("Dispatcher.tick", () => {
     );
 
     // The soft deadline is the child's to act on: it steers itself to write a
-    // handoff brief and hard-stops 180s later. A parent SIGKILL here is what
+    // brief and hard-stops 180s later. A parent SIGKILL here is what
     // left every timeout escalation with an empty brief.
     clock = T0 + 61_000;
     const duringGrace = await d.tick();
     assert.equal(kills, 0, "killing at the soft deadline eats the grace window");
     assert.deepEqual(duringGrace.killed, []);
     assert.deepEqual(duringGrace.escalated, []);
-    assert.equal(handOffs.length, 0);
+    assert.equal(escalations.length, 0);
 
     // 1s before the child's own hard stop at 60s + 180s.
     clock = T0 + 239_000;
@@ -710,8 +809,8 @@ describe("Dispatcher.tick", () => {
     assert.equal(kills, 1, "the parent is the backstop for a wedged agent");
     assert.deepEqual(afterGrace.killed, ["i1"]);
     assert.deepEqual(afterGrace.escalated, ["i1"]);
-    assert.equal(handOffs.length, 1);
-    assert.match(handOffs[0].reason, /deadline/);
+    assert.equal(escalations.length, 1);
+    assert.match(escalations[0].reason, /deadline/);
 
     // Killed once, not once per tick.
     clock += 60_000;
@@ -723,16 +822,18 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
-  it("never escalates a child that used its grace to hand off itself", async () => {
+  it("never adds its own brief on top of one the agent wrote in its grace", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1");
 
     let kills = 0;
     const spawn: SpawnAgent = async (ctx) => {
       ctx.register({ pid: 55, kill: () => { kills += 1; } });
-      // What the child does with the grace the soft deadline buys it.
-      await ctx.handOff({ reason: "out of time", brief: "the real brief" });
+      // What the child does with the grace the soft deadline buys it. It says
+      // what it knows and exits; the incident is still open afterwards,
+      // because saying so was never a transition.
+      await ctx.escalate({ reason: "out of time", brief: "the real brief" });
     };
 
     let clock = T0;
@@ -753,18 +854,26 @@ describe("Dispatcher.tick", () => {
 
     assert.equal(kills, 0, "it exited on its own; there is nothing to kill");
     assert.deepEqual(after.killed, []);
-    assert.deepEqual(after.escalated, []);
     assert.deepEqual(
-      handOffs.map((h) => h.brief),
+      after.escalated,
+      [],
+      "the deadline brief is for an agent too wedged to write its own",
+    );
+    // An open incident always has an agent, so the exit is staffed again
+    // rather than left: the escalation said the incident needs a person, and
+    // that is not the same thing as it no longer needing an agent.
+    assert.deepEqual(after.started.map((a) => a.incidentId), ["i1"]);
+    assert.deepEqual(
+      [...new Set(escalations.map((h) => h.brief))],
       ["the real brief"],
-      "the agent's brief, not the dispatcher's placeholder",
+      "the agent's brief, never the dispatcher's placeholder",
     );
     cleanup();
   });
 
   it("resumes an existing session and reports how long the agent was gone", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
@@ -806,7 +915,7 @@ describe("Dispatcher.tick", () => {
 
   it("measures the gap from lastStartedAt after a container restart", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor, handOffs } = makeTools(sqlite);
+    const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1", { sessionRef: "s-1" });
 
     // The container dies mid-run: no exit is observed and no memory survives.
@@ -832,7 +941,7 @@ describe("Dispatcher.tick", () => {
       type: "resumed_after",
       seconds: 420,
     });
-    assert.deepEqual(handOffs, [], "a restart is not a crash loop");
+    assert.deepEqual(escalations, [], "a restart is not a crash loop");
     cleanup();
   });
 
@@ -842,7 +951,7 @@ describe("Dispatcher.tick", () => {
   // it happened was.
   it("says in the thread when it resumes an agent that has been gone a long time", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
@@ -878,7 +987,7 @@ describe("Dispatcher.tick", () => {
   // would teach people to skip the message that matters.
   it("says nothing for a resume quick enough to be a deploy", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
@@ -914,7 +1023,7 @@ describe("Dispatcher.tick", () => {
 
   it("launches anyway when the thread cannot be reached", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
@@ -948,7 +1057,7 @@ describe("Dispatcher.tick", () => {
 
   it("skips resumed_after when the gap is shorter than a tick", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       attempts: 1,
       sessionRef: "s-1",
@@ -969,7 +1078,7 @@ describe("Dispatcher.tick", () => {
 describe("the spawned environment", () => {
   it("carries the container credential path, and only what it was handed", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     process.env.SLACK_BOT_TOKEN = "xoxb-parent-only";
@@ -1012,7 +1121,7 @@ describe("the spawned environment", () => {
 
   it("is what child_process actually gets, with nothing inherited", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     process.env.BUGBOSS_PARENT_ONLY = "slack-token-shaped-thing";
@@ -1055,11 +1164,11 @@ describe("the spawned environment", () => {
 
   it("reports a child that exits non-zero instead of calling it a clean run", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     // agent/run.ts exits 1 from its failure handler. Resolving on any exit
-    // made that byte-identical to a clean hand_off.
+    // made that byte-identical to an agent that finished in good order.
     const crashingSpawn = ((_cmd: string, _args: string[]) => {
       const child = new EventEmitter() as ChildProcess;
       Object.assign(child, { pid: 778, kill: () => true });
@@ -1089,7 +1198,7 @@ describe("the spawned environment", () => {
 
   it("does not call a signalled child a clean run either", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     const signalledSpawn = ((_cmd: string, _args: string[]) => {
@@ -1121,7 +1230,7 @@ describe("the spawned environment", () => {
 
   it("alarms on a SIGKILL it did not send", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     // The kernel's OOM killer and the dispatcher's backstop send the same
@@ -1163,7 +1272,7 @@ describe("the spawned environment", () => {
 
   it("stays quiet about a clean exit", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     const cleanSpawn = ((_cmd: string, _args: string[]) => {
@@ -1195,7 +1304,7 @@ describe("the spawned environment", () => {
 
   it("does not call its own deadline kill an agent failure", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools(sqlite);
+    const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
     let clock = T0;
@@ -1226,7 +1335,6 @@ describe("the spawned environment", () => {
 
     const events = await captureAlarms(async () => {
       await d.tick();
-      await d.drain();
     });
 
     assert.ok(events.includes("agent_deadline_exceeded"), `${events}`);
@@ -1235,6 +1343,411 @@ describe("the spawned environment", () => {
       false,
       "the dispatcher killed it on purpose and already said why",
     );
+    // The same tick staffs the incident again, and that is the point of the
+    // kill: an incident too wedged to finish still needs an agent on it, and
+    // the escalation beside this one is what tells a person to look. Nothing
+    // here takes the incident away from the agents.
+    assert.deepEqual(d.list().map((a) => a.incidentId), ["i1"]);
+    assert.equal(d.list()[0].startedAt, clock, "a fresh run, not the killed one");
+
+    exits.forEach((e) => e());
+    await d.drain();
     cleanup();
+  });
+});
+
+/**
+ * The backstop. Every other watch in this process is reached by an incident
+ * being runnable; the two that are not -- one parked on a person who never
+ * came back, one whose agent stopped for a reason nothing recorded -- are
+ * exactly the shapes that went quiet for a day and a half in production.
+ */
+describe("Dispatcher stale sweep", () => {
+  const DAY = 86_400_000;
+
+  const park = (sqlite: Database.Database, id: string, at: number) =>
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt)
+         VALUES (?, 'a person', NULL, ?)`,
+      )
+      .run(id, at);
+
+  const reply = (sqlite: Database.Database, id: string, at: number) =>
+    sqlite
+      .prepare(
+        `INSERT INTO thread_reply (id, incidentId, slackUserId, text, ts, receivedAt)
+         VALUES (?, ?, 'U-swain', 'any update?', ?, ?)`,
+      )
+      .run(`c:${id}:${at}`, id, String(at), at);
+
+  const sweeps = (db: DispatcherDb, id: string) =>
+    db.query(
+      "SELECT id FROM incident_action WHERE incidentId = ? AND action = 'stale_swept'",
+      [id],
+    ).length;
+
+  it("sweeps a quiet incident once, and not again on the next tick", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    // Parked, because the sweep only ever reaches an incident the dispatcher
+    // cannot run: anything runnable was launched moments earlier in this same
+    // tick and is therefore being addressed, not going unaddressed.
+    park(sqlite, "i1", T0 - 2 * DAY);
+
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    const first = await d.tick();
+    await first.settled;
+    assert.deepEqual(first.swept, ["i1"]);
+    assert.equal(posts.length, 1);
+    assert.match(posts[0], /Nothing has happened on this incident for 48h/);
+
+    // The marker it just wrote is itself activity, so the clock it reads has
+    // moved. Nothing else suppresses this.
+    const second = await d.tick();
+    await second.settled;
+    assert.deepEqual(second.swept, []);
+    assert.equal(posts.length, 1);
+    assert.equal(sweeps(db, "i1"), 1);
+    cleanup();
+  });
+
+  it("un-parks the incident it sweeps, so the next tick runs it", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    // Parked with no wake time: only a reply or this sweep can lift it, which
+    // is the shape that could otherwise wait forever.
+    park(sqlite, "i1", T0 - 2 * DAY);
+
+    const spawned: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async (ctx) => {
+          spawned.push(ctx.incidentId);
+        },
+        toolApiFor,
+        postNotice: async () => {},
+      }),
+    );
+
+    const first = await d.tick();
+    await first.settled;
+    assert.deepEqual(first.started, [], "parked, so this tick leaves it alone");
+    assert.deepEqual(first.swept, ["i1"]);
+    assert.equal(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = 'i1'")
+        .length,
+      0,
+      "a wait nobody answered for a day stops being a reason to wait",
+    );
+
+    const second = await d.tick();
+    await second.settled;
+    assert.deepEqual(spawned, ["i1"]);
+    cleanup();
+  });
+
+  it("counts a fresh park as activity, so the sweep cannot undo it immediately", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    // Quiet for two days and only just parked. Without the park in the
+    // activity clock the two mechanisms fight: this is swept on the very next
+    // tick, the wait is deleted, and the incident is relaunched straight back
+    // into whatever the ceiling parked it for.
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    park(sqlite, "i1", T0);
+
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, [], "deciding to wait is something happening");
+    assert.equal(posts.length, 0);
+    assert.equal(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = 'i1'")
+        .length,
+      1,
+      "the wait survives the tick that would otherwise have lifted it",
+    );
+    cleanup();
+  });
+
+  it("counts a reply as activity, so a live conversation is never stale", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 4 * DAY,
+      lastStartedAt: T0 - 3 * DAY,
+    });
+    park(sqlite, "i1", T0 - 3 * DAY);
+    reply(sqlite, "i1", T0 - 3600_000);
+
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, []);
+    assert.equal(posts.length, 0);
+    cleanup();
+  });
+
+  it("never sweeps an incident whose agent is still running", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    const { spawn, releaseAll } = heldSpawn();
+    // A run may last a day, so a healthy agent's own launch timestamp ages
+    // past the threshold under it. Only the running map can say otherwise.
+    insertIncident(sqlite, "i1", {
+      status: "INVESTIGATING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+      sessionRef: "s-1",
+      attempts: 1,
+    });
+
+    let clock = T0;
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        config: config({ agentTimeoutSeconds: 3 * 86_400 }),
+        now: () => clock,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    await d.tick();
+    clock = T0 + 60_000;
+    const result = await d.tick();
+    assert.deepEqual(result.swept, []);
+    assert.deepEqual(
+      posts.filter((t) => t.includes("Nothing has happened")),
+      [],
+    );
+
+    releaseAll();
+    await d.drain();
+    cleanup();
+  });
+
+  it("does not re-post after a container restart", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    park(sqlite, "i1", T0 - 2 * DAY);
+
+    let clock = T0;
+    const posts: string[] = [];
+    const build = () =>
+      createDispatcher(
+        deps({
+          db,
+          spawn: async () => {},
+          toolApiFor,
+          now: () => clock,
+          postNotice: async (_id, text) => {
+            posts.push(text);
+          },
+        }),
+      );
+
+    await (await build().tick()).settled;
+    assert.equal(posts.length, 1);
+
+    // Every merge to ops main restarts this container. A sweep counted from
+    // process start would make each deploy a notification.
+    clock = T0 + 60_000;
+    const after = await build().tick();
+    await after.settled;
+    assert.deepEqual(after.swept, []);
+    assert.equal(posts.length, 1);
+    cleanup();
+  });
+
+  it("does not sweep again an hour after something parks it back", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    park(sqlite, "i1", T0 - 2 * DAY);
+
+    let clock = T0;
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        now: () => clock,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    await (await d.tick()).settled;
+    assert.equal(posts.length, 1);
+
+    // The agent it woke parks straight back. Nothing about that earns a
+    // second notification inside the threshold.
+    park(sqlite, "i1", clock);
+    clock = T0 + 3600_000;
+    const after = await d.tick();
+    await after.settled;
+    assert.deepEqual(after.swept, []);
+    assert.equal(posts.length, 1);
+    cleanup();
+  });
+
+  it("is off at a threshold of zero rather than sweeping everything", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", { status: "FIXING", firstSignalAt: T0 - 5 * DAY });
+    insertIncident(sqlite, "i2", {
+      status: "INVESTIGATING",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        config: config({ staleAfterSeconds: 0 }),
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, []);
+    assert.equal(posts.length, 0);
+    cleanup();
+  });
+
+  it("never touches a closed or merged incident", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", { status: "FIXING", firstSignalAt: T0 - 5 * DAY });
+    park(sqlite, "i1", T0 - 5 * DAY);
+    insertIncident(sqlite, "i2", {
+      status: "CLOSED",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+    insertIncident(sqlite, "i3", {
+      status: "MERGED",
+      mergedInto: "i1",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+
+    const d = createDispatcher(
+      deps({ db, spawn: async () => {}, toolApiFor, postNotice: async () => {} }),
+    );
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, ["i1"]);
+    cleanup();
+  });
+
+  it("un-parks and says nobody was told when no poster is wired in", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    park(sqlite, "i1", T0 - 2 * DAY);
+
+    const d = createDispatcher(deps({ db, spawn: async () => {}, toolApiFor }));
+    const events = await captureAlarms(async () => {
+      const result = await d.tick();
+      await result.settled;
+      // The un-park still happens. It is the half that recovers the incident
+      // and it does not depend on anyone reading a thread.
+      assert.deepEqual(result.swept, ["i1"]);
+    });
+
+    assert.ok(events.includes("incident_stale"), `${events}`);
+    assert.ok(events.includes("stale_notice_undeliverable"), `${events}`);
+    assert.equal(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = 'i1'")
+        .length,
+      0,
+    );
+    cleanup();
+  });
+});
+
+describe("staleNotice", () => {
+  it("leads with how long it has been quiet", () => {
+    assert.match(staleNotice(26 * 3600, false), /for 26h\./);
+    assert.match(staleNotice(45 * 60, false), /for 45m\./);
+  });
+
+  it("only claims to have un-parked when it did", () => {
+    assert.match(staleNotice(86_400, true), /no longer waiting/);
+    assert.equal(staleNotice(86_400, false).includes("no longer waiting"), false);
   });
 });

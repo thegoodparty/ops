@@ -58,6 +58,26 @@ const columnsOf = (db: Database.Database, table: string) =>
     type: string;
   }[];
 
+/**
+ * Every incident is agent-driven, said once in the data as well as the code.
+ *
+ * Nothing reads `owner`, so this changes no behaviour in this image. It is
+ * here for the one reader that still exists: the previous image, if a deploy
+ * is rolled back. That build filters the dispatcher on `owner = 'agent'`, so
+ * rows left saying `'human'` would come back stranded exactly as they are
+ * now. Writing the value the new model implies makes a rollback correct
+ * rather than merely survivable.
+ *
+ * Idempotent, and cheap enough to run every boot: after the first one it
+ * matches nothing.
+ */
+export const settleOwnerToAgent = (w: Database.Database): void => {
+  const moved = w
+    .prepare("UPDATE incident SET owner = 'agent' WHERE owner <> 'agent'")
+    .run().changes;
+  if (moved > 0) log("owner_settled", { rows: moved });
+};
+
 export const addLateColumns = (
   w: Database.Database,
   late: LateColumn[] = LATE_COLUMNS,
@@ -191,6 +211,7 @@ export class Db {
     const ddl = readFileSync(join(__dirname, "schema.sql"), "utf8");
     db.write.exec(ddl);
     addLateColumns(db.write, cfg.lateColumns);
+    settleOwnerToAgent(db.write);
 
     // Alarm rather than throw, unlike a bad LATE_COLUMNS entry above. This
     // one is reachable only in prod -- every test opens a fresh file, where

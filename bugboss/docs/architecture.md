@@ -43,9 +43,17 @@ INVESTIGATING ──► FIXING ──► RESOLVED ──► CLOSED
        └──► MERGED ◄─┘        (absorbed into another incident)
 ```
 
-`status` is **where the work is**. `owner` (`agent` | `human`) is **who has
-it**, and the two are orthogonal. A PR is not a phase: resolving may take
-zero pull requests or four.
+`status` is **where the work is**, and it is the only axis. An open incident
+is always driven by an agent: a person is something it can be waiting on,
+never something it can be given to. A PR is not a phase either — resolving may
+take zero pull requests or four.
+
+Waiting on a person is a row in **`incident_wait`**, not a field on the
+incident. It says one thing: do not relaunch this incident yet. The agent
+still has the work and still holds its dispatcher slot. Any reply in the
+thread deletes the row, and that delete is deliberately upstream of anything
+that reads what the reply meant, so talking to an incident wakes it with no
+model in the path.
 
 `RESOLVED` means no users are affected any more and no further alerts should
 occur, confirmed by evidence rather than asserted. That bar is what makes a
@@ -69,8 +77,7 @@ signals across incidents.
 | Split | a subset of A's signals → `NEW` |
 
 `toolapi/assign.ts` is the single writer that holds the invariants: never
-attach across `RESOLVED`, never to a `CLOSED` or `MERGED` target, never to
-one a human owns.
+attach across `RESOLVED`, and never to a `CLOSED` or `MERGED` target.
 
 ## Two agents
 
@@ -146,6 +153,16 @@ is wrong. Ticks are serialized against each other: a tick awaits an S3 put
 and an STS call before recording a launch, so overlapping ticks would start
 two children on one incident, and both would write the same session file.
 
+The dispatcher is also the only thing that notices an incident nobody is
+working. Every other guard watches a run, so an incident with no run at all
+is invisible to all of them, and `park` makes that state reachable: a wait
+with no wake is lifted by a reply that may never come. `sweepStale` reads one
+clock over the incident's own timestamps, its thread replies and its recorded
+actions, and an incident quiet for `BUGBOSS_STALE_HOURS` is un-parked, said
+out loud in the thread and alarmed. The marker it writes is itself activity,
+which is what makes it fire once, survive a restart and not ping-pong,
+without a second flag to keep in step.
+
 When an incident carries `recurrenceOf`, `get_incident` returns the earlier
 incident with it: root cause, resolution evidence, PR urls and post-mortem.
 Somebody already investigated this and wrote down what they concluded, and the
@@ -163,9 +180,9 @@ reaching nobody is the same failure one level up. Agents do not open pull
 requests against `ops`, so a defect leaves here as a proposal for a person.
 
 That constraint is the one `CLOSED` would carry if the schema could still
-take a `CHECK`. It cannot, so it is refused at the tool instead — and an
-agent that cannot answer has `hand_off`, which is the right end for a
-recurrence nobody can explain.
+take a `CHECK`. It cannot, so it is refused at the tool instead — and an agent
+that cannot answer escalates, which leaves a recurrence nobody can explain
+open with somebody told it needs them.
 
 **5. The agent** (`agent/`) runs Pi against Bedrock in the same container.
 It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP
@@ -179,14 +196,13 @@ slash command, no button and no phrase to learn: inbound Slack text is read
 by a bounded model call (`slack/intent.ts`) which answers one label, and
 that is the only thing in this system that reads what a person wrote.
 
-Two interfaces use it. In an incident thread it answers two things about one
-message: whether it hands the incident between a person and an agent, and
-whether it was for the agent at all. On a mention anywhere else it answers
-whether somebody is reporting something broken or asking a question — the two
-things a mention can be, and previously the difference between a first word of
-`report` and any other first word.
+Two interfaces use it. In an incident thread it answers one thing about one
+message: whether it was for the agent at all. On a mention anywhere else it
+answers whether somebody is reporting something broken or asking a question —
+the two things a mention can be, and previously the difference between a first
+word of `report` and any other first word.
 
-The second question exists because `contact_human` ends its wait on the first
+The first question exists because `contact_human` ends its wait on the first
 reply after its question, so two people talking to each other while an agent
 was blocked ended it on whichever of them spoke first. A message somebody sent
 to the thread rather than to the agent is still recorded and still delivered;
@@ -197,10 +213,11 @@ down.
 It is advisory, on the same split as triage. The model reads the sentence;
 the code holds the invariants. A wrong read is bounded structurally rather
 than by the model behaving: the incident comes from the thread the message
-arrived in and never from the message, the answer is a bare enum with no
-field that could name one, and the ownership move is still the guarded
-`UPDATE` in the composition root. An ambiguous read asks in the thread, and a
-failed call says the read failed. Nothing goes quiet, which is what the old
+arrived in and never from the message, the answer is a bare enum with no field
+that could name one, and nothing it answers writes to the incident at all —
+the only effect is which directive the agent sees and whether it may end a
+wait. An ambiguous read asks in the thread, and a failed call says the read
+failed. Nothing goes quiet, which is what the old
 string matchers did whenever somebody phrased it their own way.
 
 The read runs off the Slack ack, beside the Slack agent, for the reason the
@@ -229,7 +246,8 @@ minted per launch; the incident is derived from the token and then checked
 against the path, so a valid token for incident A cannot be aimed at B. That
 check is what keeps fifteen concurrent agents out of each other's incidents.
 
-Five state-changing tools, each a transition, plus two reads:
+Four tools that move the incident through its lifecycle, two that move it
+through nothing, and two reads:
 
 | Tool | Transition |
 | --- | --- |
@@ -238,7 +256,18 @@ Five state-changing tools, each a transition, plus two reads:
 | `report_impact` | Repeatable; impact grows during an incident |
 | `report_resolved` | `FIXING → RESOLVED`, with evidence |
 | `report_analysis` | `RESOLVED → CLOSED`, terminal |
-| `hand_off` | Sets `owner: human`, posts the brief |
+| `escalate` | None. Posts the brief and reaches the rotation; the agent keeps the incident and keeps working |
+| `park` | None. Stops the relaunch until a reply, the cooldown or the stale sweep; the agent keeps the incident |
+
+`escalate` and `park` answer different questions, and neither is a hand-off,
+because there is nothing to hand to. Escalating says a person is needed;
+parking says stop relaunching until something changes. Parking is the one
+correctness rests on: without it an agent that stops driving is relaunched on
+the next tick, lands back in whatever stopped it, exits again, and pings the
+rotation every thirty seconds. It stops the relaunch and it does **not** free
+the dispatcher slot, which is the easiest thing here to read the wrong way
+round: an agent parked inside `monitor` is alive and still holds one,
+deliberately.
 
 Plus two blocking tools that live in the harness, each costing one turn no
 matter how long it waits — which is what keeps a multi-day incident from
@@ -249,9 +278,9 @@ that ever misses the prompt cache, which is why the prefix is written with a
 - `monitor(command, interval, timeout, awaitingHuman?)` — block until a
   read-only check passes. The general primitive: PR merged, deploy shipped,
   alert quiet. With `awaitingHuman` set it nudges the thread inside working
-  hours when the person does not turn up, backing off 1h/2h/4h and then
-  handing the incident over; without it the wait is silent, because nobody is
-  being asked for anything
+  hours when the person does not turn up, backing off 1h/2h/4h/8h/16h and then
+  once a day, getting loud enough to reach the rotation and never stopping;
+  without it the wait is silent, because nobody is being asked for anything
 - `contact_human(message, details, timeout, options?)` — post to the thread
   and block for a reply that was **for the agent**; see "The human boundary".
   Re-entrant: the marker is written before the post, so a resumed agent
@@ -260,13 +289,13 @@ that ever misses the prompt cache, which is why the prefix is written with a
   thing read. `options` render as buttons on the ask; pressing one is recorded
   and delivered as an ordinary reply, typing something else always works, and
   a button nobody presses is an unanswered question like any other. A wait
-  nobody answers becomes a `hand_off`
+  nobody answers escalates, and the agent goes on waiting
 
 ### How an agent learns things changed
 
 There is no push channel and an agent is never addressable. Directives ride
 back on responses to calls the agent was already making — `stop`, `merged`,
-`handoff`, `new_signals`, `human_message`, `resumed_after`.
+`new_signals`, `human_message`, `resumed_after`.
 
 ## Running omni's tests
 
@@ -352,7 +381,7 @@ deleting is not the way back.
 | `ingress/` | Verify and parse per source. Adding a source is one adapter |
 | `triage/` | The decision, and the rules that bound it |
 | `toolapi/` | `assign`, the transitions, correlation |
-| `dispatcher/` | Launch, deadlines, escalation, the circuit breaker |
+| `dispatcher/` | Launch, deadlines, escalation, parking, the stale sweep, the circuit breaker |
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
 | `bedrock/` | The Pi provider over Bedrock `InvokeModel`, and the Boss's client on it |
 | `slack/` | Outbound relay, inbound intent, and the read-only Slack agent |
@@ -436,7 +465,7 @@ rather than post twice.
 
 **The thread is short; the document is complete.** Every path into a thread is
 capped at about 200 words and refuses a longer post -- the ask, the evidence
-under it, the resolution evidence, the hand-off brief. The post-mortem is the
+under it, the resolution evidence, the escalation brief. The post-mortem is the
 one field with no cap, because it leaves as the file rather than as thread
 text. `slack/CLAUDE.md` has the table of which bound applies where. `report/CLAUDE.md` has the rest, including why the
 publish happens after usage roll-up and not inside the tool call.

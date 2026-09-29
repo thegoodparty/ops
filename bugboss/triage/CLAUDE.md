@@ -10,20 +10,19 @@ decide what is allowed. It cannot:
 
 - **Attach across `RESOLVED`.** That is a recurrence, and it gets a new
   incident with `recurrenceOf` pointing at the one whose ground it reopened.
-- **Attach to a human-owned incident.** No agent is coming back to that, so
-  signals would pile up unworked. Read from the database rather than the
-  digest, because the model has `query_incidents` and can name any id it
-  turns up — filtering the candidate list alone would leave the invariant
-  resting on what the model happened to be offered.
+- **Attach to an incident that is not open.** `CLOSED` and `MERGED` take
+  nothing.
 - **Suppress a cause the alert did not declare.** The alert's own
   `known_causes` annotation must carry a matching id whose action is
   `suppress`. A human report or a `bug_report` is never suppressible at all.
 
-The owner check sits **after** the `RESOLVED` branch deliberately: a
-human-owned incident that fires again must still produce a recurrence
-pointer. It refuses only on `owner = 'human'`, not on "anything but agent" —
-a `null` owner means the row vanished mid-decision, which is a real race
-worth alarming on rather than swallowing.
+Both of those read the status back **from the database**, not from the digest.
+The model has `query_incidents` and can name any id it turns up, so filtering
+the candidate list alone would leave the invariant resting on what the model
+happened to be offered — and the digest is a snapshot from the start of the
+decision, which an incident can resolve, close or be merged away inside. The
+`RESOLVED` branch is checked first, so an incident that already claimed the
+problem was over produces a recurrence pointer rather than a bare refusal.
 
 ## Recurrence is the closed-incident half of the same question
 

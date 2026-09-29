@@ -132,21 +132,25 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
     reportImpact: async () => response,
     reportResolved: async () => response,
     reportAnalysis: async () => response,
-    handOff: async () => response,
+    escalate: async () => response,
     getIncident: async () => response,
     searchIncidents: async () => response,
   }) as unknown as ToolApi;
 
 // Two reads now, not one: search_incidents is how an agent reaches the
 // post-mortems of incidents nobody pointed it at.
-test("the boss tools are the five transitions plus the two reads", async () => {
+//
+// Four transitions, not five: `escalate` sits in this list but writes no
+// state. It says the incident needs a person and leaves the agent driving,
+// which is why it is named for what it does rather than for what it moves.
+test("the boss tools are the four transitions, the escalation and the two reads", async () => {
   const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
 
   assert.deepEqual(
     tools.map((tool) => tool.name).sort(),
     [
+      "escalate",
       "get_incident",
-      "hand_off",
       "report_analysis",
       "report_impact",
       "report_resolved",
@@ -183,7 +187,7 @@ test("reporting a root cause starts the install, and directives reach the model"
 
 test("a failed boss call is reported rather than swallowed", async () => {
   const tools = await createBossTools({
-    api: stubApi({ ok: false, error: "incident is human-owned", directives: [] }),
+    api: stubApi({ ok: false, error: "incident is already CLOSED", directives: [] }),
   });
   const impact = tools.find((tool) => tool.name === "report_impact");
   assert.ok(impact);
@@ -198,7 +202,7 @@ test("a failed boss call is reported rather than swallowed", async () => {
 
   assert.match(
     String(result.content[0].type === "text" && result.content[0].text),
-    /error: incident is human-owned/,
+    /error: incident is already CLOSED/,
   );
 });
 
@@ -256,7 +260,7 @@ test("the dispatcher's environment is the whole launch contract", () => {
   });
 });
 
-test("an expired deadline still leaves room to hand off", () => {
+test("an expired deadline still leaves room to escalate", () => {
   const options = agentOptionsFromEnv(
     {
       BUGBOSS_INCIDENT_ID: "inc-7",
@@ -373,7 +377,7 @@ test("an agreeing model id is not an alarm, and a fresh run uses the configured 
 
 test("a force-aborted run does not exit like a finished one", () => {
   assert.equal(exitCodeFor({ sessionFile: "f", restored: true, timedOut: false, error: null }), 0);
-  // The deadline nudge worked and the agent handed off inside the grace window.
+  // The deadline nudge worked and the agent escalated inside the grace window.
   assert.equal(exitCodeFor({ sessionFile: "f", restored: true, timedOut: true, error: null }), 0);
   assert.equal(
     exitCodeFor({

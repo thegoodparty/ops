@@ -16,7 +16,6 @@ import type Database from "better-sqlite3";
 import type {
   Directive,
   DispatcherConfig,
-  IncidentOwner,
   IncidentStatus,
   RunningAgent,
   ToolApi,
@@ -59,6 +58,32 @@ const alarm = makeAlarm("dispatcher");
  */
 export const RESUME_NOTICE_SECONDS = 300;
 
+/**
+ * How long an incident the dispatcher gave up on stays unrunnable.
+ *
+ * Long enough that a crash loop is not a busy loop, short enough that a
+ * container which has come back healthy picks the work up again without
+ * waiting for a person. Nothing here is a permanent verdict: the reasons the
+ * dispatcher parks an incident are all "not now".
+ */
+export const PARK_COOLDOWN_SECONDS = 3600;
+
+/**
+ * How long an incident may go with nothing at all happening to it.
+ *
+ * A day, because what is being measured is a conversation between an agent, a
+ * reviewer and a deploy, and a quiet morning in the middle of one is normal.
+ * A whole quiet day is not: every open incident is either being worked or
+ * waiting on somebody, and both of those produce something inside a day.
+ */
+export const STALE_AFTER_SECONDS = 86_400;
+
+/**
+ * The `incident_action` the sweep writes, which is also the only thing that
+ * stops it firing again. See `sweepStale` for why those are the same row.
+ */
+export const STALE_SWEPT_ACTION = "stale_swept";
+
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
   tickSeconds: 30,
@@ -66,6 +91,7 @@ export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   // are measured in hours, so a half-hour ceiling killed agents mid-wait.
   agentTimeoutSeconds: 86_400,
   maxAttempts: 3,
+  staleAfterSeconds: STALE_AFTER_SECONDS,
 };
 
 /** The slice of the database layer the dispatcher uses. `Db` satisfies it. */
@@ -106,18 +132,22 @@ export interface DispatcherDeps {
    * some work and deserves more rope than a crash loop.
    */
   maxLaunches?: number;
+  /** How long a parked incident stays unrunnable before it is tried again. */
+  parkCooldownSeconds?: number;
   now?: () => number;
 }
 
 export interface TickResult {
   started: RunningAgent[];
-  /** Incidents handed to a human this tick, by either escalation path. */
+  /** Incidents escalated this tick, by either escalation path. */
   escalated: string[];
   /** Incidents whose child was killed for passing its deadline. */
   killed: string[];
   running: number;
   /** The ceiling stopped a launch. Something is wrong; a human should look. */
   circuitOpen: boolean;
+  /** Incidents that had gone quiet long enough for the sweep to say so. */
+  swept: string[];
   /** Resolves when everything this tick started has exited. */
   settled: Promise<void>;
 }
@@ -132,12 +162,11 @@ interface EligibleRow {
 }
 
 /**
- * The statuses the agent still owns, so the statuses that must have a live
- * one. RESOLVED belongs here: `report_analysis` is the only exit from it and
- * it is the agent's to call, so an incident whose post-mortem was interrupted
- * by a restart needs relaunching like any other. Leaving it out stranded it at
- * `owner: 'agent'` with nothing to relaunch it and no path to a human, and it
- * is invisible to the escalated-and-unclaimed digest while owner stays agent.
+ * The statuses an open incident is driven through, so the statuses that must
+ * have a live agent. RESOLVED belongs here: `report_analysis` is the only
+ * exit from it and it is the agent's to call, so an incident whose
+ * post-mortem was interrupted by a restart needs relaunching like any other.
+ * Leaving it out stranded it with nothing to relaunch it.
  * `slack/relay.ts` holds the same list as AGENT_RUNNING_STATUSES.
  */
 const AGENT_STATUSES: readonly IncidentStatus[] = [
@@ -148,10 +177,58 @@ const AGENT_STATUSES: readonly IncidentStatus[] = [
 
 // No ORDER BY: a priority order is a scheduler, and this is not one.
 const ELIGIBLE_SQL = `
-  SELECT id, status, sessionRef, attempts, lastStartedAt, firstSignalAt
-  FROM incident
-  WHERE status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
-    AND owner = 'agent'
+  SELECT i.id AS id, i.status AS status, i.sessionRef AS sessionRef,
+         i.attempts AS attempts, i.lastStartedAt AS lastStartedAt,
+         i.firstSignalAt AS firstSignalAt
+  FROM incident i
+  LEFT JOIN incident_wait w ON w.incidentId = i.id
+  WHERE i.status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+    AND (w.incidentId IS NULL OR (w.wakeAt IS NOT NULL AND w.wakeAt <= ?))
+`;
+
+interface StaleRow {
+  id: string;
+  status: IncidentStatus;
+  /** The most recent moment anything at all touched this incident. */
+  lastActivityAt: number;
+  /** Sweeps already recorded, so the alarm can say this is not the first. */
+  sweeps: number;
+  /** SQLite has no boolean: 1 when an `incident_wait` row exists. */
+  parked: number;
+}
+
+// Deliberately wider than `lastStartedAt`. A reply and an escalation each
+// move an incident without launching an agent, so a clock watching launches
+// alone reads a live conversation as silence -- and, the other way round,
+// would call an incident stale while its agent was mid-run, since a run may
+// last a day. `firstSignalAt` is the floor and is NOT NULL, so a freshly
+// opened incident has a real age rather than reading as quiet since 1970.
+//
+// Parking counts, and has to. Deciding to wait is something happening, and
+// without it the two mechanisms fight: an incident quiet for a day that then
+// crash-loops is parked by the ceiling and swept on the very next tick,
+// which deletes the wait and relaunches it straight back into the crash. The
+// clock has to start when the wait started, so what the sweep answers is
+// "has this wait itself gone unanswered too long" rather than "was this
+// incident quiet before anyone decided to wait".
+const STALE_SQL = `
+  SELECT i.id AS id, i.status AS status,
+         MAX(
+           i.firstSignalAt,
+           COALESCE(i.lastStartedAt, 0),
+           COALESCE((SELECT MAX(receivedAt) FROM thread_reply
+                      WHERE incidentId = i.id), 0),
+           COALESCE((SELECT MAX(at) FROM incident_action
+                      WHERE incidentId = i.id), 0),
+           COALESCE(w.startedAt, 0)
+         ) AS lastActivityAt,
+         (SELECT COUNT(*) FROM incident_action
+           WHERE incidentId = i.id AND action = '${STALE_SWEPT_ACTION}')
+           AS sweeps,
+         (w.incidentId IS NOT NULL) AS parked
+  FROM incident i
+  LEFT JOIN incident_wait w ON w.incidentId = i.id
+  WHERE i.status NOT IN ('CLOSED', 'MERGED')
 `;
 
 interface Entry {
@@ -163,7 +240,7 @@ interface Entry {
   deadlineAt: number;
   /**
    * The parent's backstop, a tick later than the child's hard stop. The child
-   * treats deadlineAt as soft, steers itself to write a handoff brief, and
+   * treats deadlineAt as soft, steers itself to write a brief, and
    * aborts DEADLINE_GRACE_SECONDS later; killing at deadlineAt gave it one
    * tick of that window, so every timeout escalation handed a human the
    * placeholder brief instead of the agent's.
@@ -185,9 +262,9 @@ const toRunningAgent = (e: Entry): RunningAgent => ({
 
 const deadlineBrief = (e: Entry, ranSeconds: number): string =>
   [
-    "Escalated by the dispatcher. The agent did not hand off itself.",
+    "Escalated by the dispatcher. The agent did not say anything itself.",
     "",
-    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not hand off in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed, so it never wrote a brief.`,
+    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not escalate in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed, so it never wrote a brief.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
@@ -202,13 +279,13 @@ const crashLoopBrief = (
   fastFailureSeconds: number,
 ): string =>
   [
-    "Escalated by the dispatcher. The agent did not hand off itself.",
+    "Escalated by the dispatcher. The agent did not say anything itself.",
     "",
     `Its last ${failures} launches each died within ${fastFailureSeconds}s of starting, which is a crash loop rather than an interrupted investigation, so relaunching stopped. Total launches to date: ${row.attempts}.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
-    "What I was about to do: unknown; each launch died before handing off.",
+    "What I was about to do: unknown; each launch died before saying.",
     "Side effects: check the incident for PRs an earlier launch opened.",
     `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
   ].join("\n");
@@ -224,15 +301,35 @@ export const resumeNotice = (deadSeconds: number): string => {
   ].join(" ");
 };
 
+/**
+ * What the thread is told. Leads with the silence, because that is the part
+ * nobody in the thread can see: the last message there is still true, and
+ * reads as patience.
+ *
+ * It promises no hand-off and no change of owner, because neither exists --
+ * an open incident is always an agent's, and all the sweep does is make it
+ * runnable again and say that it went quiet.
+ */
+export const staleNotice = (quietSeconds: number, unparked: boolean): string => {
+  const minutes = Math.round(quietSeconds / 60);
+  const span = minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 6) / 10}h`;
+  return [
+    `Nothing has happened on this incident for ${span}.`,
+    unparked
+      ? "It was waiting on somebody and nobody came back, so it is no longer waiting: an agent will pick it up again and carry on from where it stopped."
+      : "An agent still has it and will pick it up again; quiet this long usually means something is stuck rather than in progress.",
+  ].join(" ");
+};
+
 const stalledBrief = (row: EligibleRow, launches: number): string =>
   [
-    "Escalated by the dispatcher. The agent did not hand off itself.",
+    "Escalated by the dispatcher. The agent did not say anything itself.",
     "",
     `It has been launched ${launches} times on this incident since this container came up and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
-    "What I was about to do: unknown; no launch got far enough to hand off.",
+    "What I was about to do: unknown; no launch got far enough to say.",
     "Side effects: check the incident for PRs an earlier launch opened.",
     `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
   ].join("\n");
@@ -248,6 +345,8 @@ export class Dispatcher {
   private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
   private readonly fastFailureMs: number;
   private readonly maxLaunches: number;
+  private readonly parkCooldownMs: number;
+  private readonly staleAfterSeconds: number;
   private readonly now: () => number;
 
   /** The live side of the comparison. In-process, so it is simply true. */
@@ -272,6 +371,7 @@ export class Dispatcher {
    * this job: it counts container restarts too, and those are routine.
    */
   private readonly launches = new Map<string, number>();
+
   private timer: NodeJS.Timeout | null = null;
 
   constructor(deps: DispatcherDeps) {
@@ -286,6 +386,9 @@ export class Dispatcher {
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
+    this.parkCooldownMs = (deps.parkCooldownSeconds ?? PARK_COOLDOWN_SECONDS) * 1000;
+    this.staleAfterSeconds =
+      deps.config.staleAfterSeconds ?? STALE_AFTER_SECONDS;
     this.now = deps.now ?? Date.now;
   }
 
@@ -348,7 +451,7 @@ export class Dispatcher {
     const now = this.now();
     const expired = await this.enforceDeadlines(now);
 
-    const eligible = this.db.query<EligibleRow>(ELIGIBLE_SQL);
+    const eligible = this.db.query<EligibleRow>(ELIGIBLE_SQL, [now]);
     const started: RunningAgent[] = [];
     const escalated = [...expired.escalated];
     const settling: Promise<void>[] = [];
@@ -368,20 +471,25 @@ export class Dispatcher {
           `${failures} consecutive launches died within ${this.fastFailureMs / 1000}s`,
           crashLoopBrief(row, failures, this.fastFailureMs / 1000),
         );
-        // Cleared either way. A successful escalation flipped the incident to
-        // a human, and if they hand it back the agent earns a fresh three
-        // launches rather than being re-escalated on the first tick. A failed
-        // one must fall back to relaunching: keeping the counter at the
-        // ceiling retried the same failing escalation every tick for as long
+        // A told escalation stops the relaunching; an untold one must fall
+        // back to it. Keeping the counter at the ceiling with nothing else
+        // changed retried the same failing escalation every tick for as long
         // as the incident stayed open, which never resolved and never said so.
-        this.fastFailures.delete(row.id);
-        if (ok) escalated.push(row.id);
-        else
+        if (ok) {
+          await this.park(
+            row.id,
+            `${failures} launches in a row died within ${this.fastFailureMs / 1000}s`,
+            now,
+          );
+          escalated.push(row.id);
+        } else {
+          this.fastFailures.delete(row.id);
           alarm("crash_loop_escalation_failed", {
             incidentId: row.id,
             failures,
             note: "nobody was told; relaunching instead of retrying the escalation",
           });
+        }
         continue;
       }
 
@@ -392,18 +500,22 @@ export class Dispatcher {
           `${launches} launches on this incident without finishing one`,
           stalledBrief(row, launches),
         );
-        // Cleared on the same rule as fastFailures, and here it is what keeps
-        // hand-back working: a human replying in the thread flips owner back
-        // to agent, and a ceiling that outlived the escalation would bounce
-        // the incident straight back at them on the next tick.
-        this.launches.delete(row.id);
-        if (ok) escalated.push(row.id);
-        else
+        // Same rule as fastFailures above.
+        if (ok) {
+          await this.park(
+            row.id,
+            `${launches} launches on this incident without finishing one`,
+            now,
+          );
+          escalated.push(row.id);
+        } else {
+          this.launches.delete(row.id);
           alarm("stalled_escalation_failed", {
             incidentId: row.id,
             launches,
             note: "nobody was told; relaunching instead of retrying the escalation",
           });
+        }
         continue;
       }
 
@@ -441,14 +553,113 @@ export class Dispatcher {
       });
     }
 
+    // After the launch loop on purpose: an incident this tick relaunched is
+    // in `this.running` by the time the sweep looks, so it is skipped rather
+    // than reported quiet on the strength of the row it left behind.
+    const swept = await this.sweepStale(now);
+
     return {
       started,
       escalated,
       killed: expired.killed,
       running: this.running.size,
       circuitOpen,
+      swept,
       settled: Promise.all(settling).then(() => undefined),
     };
+  };
+
+  /**
+   * Notice that an incident has gone unaddressed, say so once, and make it
+   * runnable again.
+   *
+   * Nothing else here asks whether anything is still happening. Every other
+   * guard watches a run -- a deadline, a crash loop, a launch ceiling -- and
+   * an incident with no run at all is invisible to all of them. `park` makes
+   * that state reachable on purpose: a wait with a NULL `wakeAt` is lifted by
+   * a reply that may never come, so an incident can sit blocked on a person
+   * indefinitely with nobody noticing. This is the thing that notices.
+   */
+  private sweepStale = async (now: number): Promise<string[]> => {
+    // Off rather than everything. A threshold that is not a positive number
+    // has to disable the sweep explicitly: a typo in BUGBOSS_STALE_HOURS
+    // makes it NaN, every comparison against NaN is false, and the cost of
+    // reading that as "everything is stale" is a post in every open thread
+    // at once.
+    if (!Number.isFinite(this.staleAfterSeconds) || this.staleAfterSeconds <= 0) {
+      return [];
+    }
+
+    const swept: string[] = [];
+    for (const row of this.db.query<StaleRow>(STALE_SQL)) {
+      // Which means, in practice, that this only ever reaches an incident the
+      // dispatcher cannot run: a parked one, or one the ceiling keeps
+      // skipping. Anything runnable was launched moments ago by the loop
+      // above and is in this map, so it is being addressed rather than going
+      // unaddressed. That is the right scope -- "nothing is happening here"
+      // is only true when nothing can.
+      //
+      // A run may last a day, so a live agent's own launch timestamp ages
+      // past the threshold underneath it, and no row anywhere says the
+      // process is still alive. This map is the only thing that can.
+      if (this.running.has(row.id)) continue;
+
+      const quietSeconds = Math.round((now - row.lastActivityAt) / 1000);
+      if (quietSeconds < this.staleAfterSeconds) continue;
+
+      const parked = row.parked === 1;
+      // The marker is also activity, and that is the whole trick. The clock
+      // above reads `incident_action`, so writing this row resets the clock
+      // the sweep itself reads. One mechanism buys all three things this
+      // needs: it fires once rather than every tick, it survives a container
+      // restart -- every merge to ops main restarts this container, and a
+      // sweep counted from process start would re-post on every deploy --
+      // and it cannot ping-pong if something parks the incident straight
+      // back. A separate suppression flag would be a second thing to keep in
+      // step with the first, for nothing.
+      //
+      // Marker first and committed, then the post, on the precedent
+      // `report/index.ts` sets: a container that dies between the two stays
+      // quiet rather than saying it twice, and the un-park is the half that
+      // actually recovers the incident, so it must not be lost to a Slack
+      // call that fails.
+      await this.db.withWrite((db) => {
+        db.prepare(
+          `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+           VALUES (?, 'boss', NULL, ?, ?, ?)`,
+        ).run(
+          row.id,
+          STALE_SWEPT_ACTION,
+          `nothing happened on this incident for ${quietSeconds}s`,
+          now,
+        );
+        db.prepare("DELETE FROM incident_wait WHERE incidentId = ?").run(row.id);
+      });
+      swept.push(row.id);
+
+      alarm("incident_stale", {
+        incidentId: row.id,
+        status: row.status,
+        quietSeconds,
+        parked,
+        sweeps: row.sweeps + 1,
+        note: "nothing has touched this incident in a long time; it is runnable again",
+      });
+
+      if (!this.postNotice) {
+        alarm("stale_notice_undeliverable", {
+          incidentId: row.id,
+          quietSeconds,
+          note: "no thread poster is wired in, so nobody watching this incident was told",
+        });
+        continue;
+      }
+      await this.postNotice(row.id, staleNotice(quietSeconds, parked)).catch(
+        (err: unknown) =>
+          alarm("stale_notice_failed", { incidentId: row.id, error: String(err) }),
+      );
+    }
+    return swept;
   };
 
   private launch = async (row: EligibleRow, now: number): Promise<Entry> => {
@@ -508,7 +719,8 @@ export class Dispatcher {
       reportImpact: (args) => tools.reportImpact(args),
       reportResolved: (args) => tools.reportResolved(args),
       reportAnalysis: (args) => tools.reportAnalysis(args),
-      handOff: (args) => tools.handOff(args),
+      escalate: (args) => tools.escalate(args),
+      park: (args) => tools.park(args),
       getIncident: () => tools.getIncident(),
       searchIncidents: (args) => tools.searchIncidents(args),
       incidentId: row.id,
@@ -605,9 +817,8 @@ export class Dispatcher {
         deadlineAt: entry.deadlineAt,
         graceSeconds: DEADLINE_GRACE_SECONDS,
       });
-      // Kill first, then escalate: an agent that used its grace already called
-      // hand_off, and escalate re-reads owner, so the placeholder brief is
-      // suppressed rather than racing the real one.
+      // Kill first, then escalate, so the brief the agent wrote in its grace
+      // window is already in the thread when the escalation lands beside it.
       entry.proc?.kill();
       const ok = await this.escalate(
         entry.incidentId,
@@ -620,30 +831,75 @@ export class Dispatcher {
   };
 
   /**
-   * Escalation and takeover are the same operation, so this is `hand_off`
-   * called on the agent's behalf rather than a second path into the state
-   * machine. A no-op if the agent already handed off, closed, or was merged.
+   * Say, loudly, that this incident needs a person to look -- and change
+   * nothing about who is driving it, because an agent always is.
+   *
+   * Still `escalate` called on the agent's behalf rather than a second path
+   * into the state machine, exactly as it was when the call was named
+   * `hand_off`. What changed is underneath: that tool's real effect was the
+   * ownership write, which took the incident out of the query above and left
+   * no agent able to reach it. All that is left is the half that was always
+   * the point, the post that reaches the rotation.
+   *
+   * A no-op on an incident that closed or was merged while this was being
+   * decided. The `owner` check that used to sit here also made it idempotent;
+   * nothing replaces that, and nothing needs to -- each caller fires once per
+   * condition, and a duplicate is now a second Slack post rather than a
+   * second transition.
    */
   private escalate = async (
     incidentId: string,
     reason: string,
     brief: string,
   ): Promise<boolean> => {
-    const row = this.db.get<{ status: IncidentStatus; owner: IncidentOwner }>(
-      "SELECT status, owner FROM incident WHERE id = ?",
+    const row = this.db.get<{ status: IncidentStatus }>(
+      "SELECT status FROM incident WHERE id = ?",
       [incidentId],
     );
-    if (!row || row.owner !== "agent") return false;
+    if (!row) return false;
     if (!AGENT_STATUSES.includes(row.status)) return false;
 
     try {
-      await this.toolApiFor(incidentId).handOff({ reason, brief });
+      await this.toolApiFor(incidentId).escalate({ reason, brief });
       log("escalated", { incidentId, reason });
       return true;
     } catch (err) {
       alarm("escalation_failed", { incidentId, reason, error: String(err) });
       return false;
     }
+  };
+
+  /**
+   * Stop relaunching this incident until something changes.
+   *
+   * The half of `owner = 'human'` that was doing real work. Without it an
+   * agent that stops driving is relaunched on the next tick, lands straight
+   * back in whatever stopped it, and exits again -- a hot loop posting an
+   * escalation every thirty seconds. It is not ownership and not a hand-off:
+   * the agent still has this incident, it simply has nothing it can do yet.
+   *
+   * The wake is a cooldown rather than never, because none of the reasons
+   * this fires are permanent -- a crash loop and a launch ceiling both say
+   * "not now" rather than "not ever", and a container that comes back healthy
+   * should get another go without needing a person. A reply in the thread
+   * lifts it sooner, and the stale sweep lifts one nobody answered at all.
+   */
+  private park = async (
+    incidentId: string,
+    waitingFor: string,
+    now: number,
+  ): Promise<void> => {
+    await this.db.withWrite((db) => {
+      db.prepare(
+        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(incidentId) DO UPDATE SET
+           waitingFor = excluded.waitingFor,
+           wakeAt = excluded.wakeAt,
+           startedAt = excluded.startedAt`,
+      ).run(incidentId, waitingFor, now + this.parkCooldownMs, now);
+    });
+    log("parked", { incidentId, waitingFor, wakeAt: now + this.parkCooldownMs });
   };
 
   private emitResumedAfter = async (

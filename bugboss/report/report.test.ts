@@ -147,12 +147,12 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
   await db.withWrite((w) => {
     w.prepare(
       `INSERT INTO incident (
-         id, status, owner, slackThreadTs, rootCause, prUrls, postmortem,
+         id, status, slackThreadTs, rootCause, prUrls, postmortem,
          usersImpacted, impactQuery, impactStartedAt, firstSignalAt, fixingAt,
          resolvedAt, closedAt, rotationAtOpen, sessionRef, lastStartedAt,
          attempts, modelId, tokensIn, tokensOut, cacheRead, cacheWrite,
          resolvedEvidence)
-       VALUES (?, ?, 'agent', 'thread-1', ?, ?, ?, 1240, 'sum(rate(errors))', ?, ?, ?, ?, ?, ?, ?, ?, 2, 'us.anthropic.claude-opus-5', 3000, 1200, 100000, 2000, ?)`,
+       VALUES (?, ?, 'thread-1', ?, ?, ?, 1240, 'sum(rate(errors))', ?, ?, ?, ?, ?, ?, ?, ?, 2, 'us.anthropic.claude-opus-5', 3000, 1200, 100000, 2000, ?)`,
     ).run(
       id,
       status,
@@ -187,7 +187,7 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
     );
     w.prepare(
       `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
-       VALUES (?, 'human', 'U-SWAIN', 'take_over', 'owner agent -> human', ?)`,
+       VALUES (?, 'human', 'U-SWAIN', 'merge', 'same connection pool as inc-9', ?)`,
     ).run(id, OPENED + 120_000);
   });
   if (sessionRef) s3.objects.set(sessionRef, Buffer.from(SESSION, "utf8"));
@@ -252,7 +252,7 @@ describe("the report assembles from a real incident row", () => {
     assert.match(doc, /derived and is not the record/);
     assert.match(doc, /https:\/\/github\.com\/thegoodparty\/omni\/pull\/42 — state not known/);
     assert.match(doc, /## What people did/);
-    assert.match(doc, /take_over/);
+    assert.match(doc, /U-SWAIN \| merge \| same connection pool as inc-9/);
   });
 
   it("says so rather than inventing a number it does not have", async () => {

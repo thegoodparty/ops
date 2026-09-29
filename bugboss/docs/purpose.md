@@ -49,7 +49,7 @@ The measurements, in the order they matter:
 | **Time to detect** | `firstSignalAt − impactStartedAt`. Measures the alert rules, not the agents — the one number BugBoss cannot improve by being better at its job |
 | **Time to resolve** | `resolvedAt − firstSignalAt`. Heavily right-skewed and uncorrelated with severity, so report percentiles and never a mean |
 | **Human minutes per incident** | The actual target. Not yet instrumented |
-| **Outcome** | auto-resolved, human-assisted, human-owned, unresolved. Auto-resolved must mean no human input beyond the merge, or the metric flatters itself |
+| **Outcome** | auto-resolved, human-assisted, unresolved. Auto-resolved must mean no human input beyond the merge, or the metric flatters itself |
 
 ## What it deliberately is not
 
@@ -73,9 +73,10 @@ Alerts get triaged; incidents get worked. One incident can hold many
 signals, and the same alert firing twice is two signals. Keeping them
 separate is what makes merge and split expressible at all.
 
-**Status is where the work is. Owner is who has it.** They are orthogonal.
-An incident can be `FIXING` and owned by a human: the work is at the fixing
-stage, and a person is doing it. Collapsing them would force every reader to
-decode ownership out of a status field.
+**An open incident is always driven by an agent.** A person is something an
+incident can be waiting on, never something it can be given to. `status` says
+where the work is and nothing says who has it, because an agent always does.
+An agent that could give its incident away left nothing that could finish the
+work and nothing that would notice nothing had.
 
 The detail is in [`architecture.md`](./architecture.md).

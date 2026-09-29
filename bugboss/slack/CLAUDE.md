@@ -11,7 +11,7 @@ thread is already the whole story.
 
 `slackThreadTs` is written when `opened` posts. If that write is lost, every
 later `emit` takes the no-thread path and posts a **new top-level message**
-— so merged, escalated and resolved become scattered orphans that do not
+— so merged, resolved and closed become scattered orphans that do not
 even group, and Slack returns success each time. The fallback therefore
 alarms and adopts its own post as the thread, rather than logging quietly
 and fragmenting forever.
@@ -128,42 +128,37 @@ a reaction that lies. The :eyes: means "received", and that stays true.
 
 `contact_human` ends its wait on the **first** reply after the question. Two
 people talking to each other while an agent is blocked therefore ended it on
-whichever of them spoke first, and unlike a wrong ownership move there is no
-field anywhere that records it — the investigation just turns on an offhand
-remark and nothing downstream can tell.
+whichever of them spoke first, and no field anywhere records that — the
+investigation just turns on an offhand remark and nothing downstream can tell.
 
 The fix is not syntax. Requiring an `@bugboss` tag to answer would make the
 common case ceremony, and answering a direct question should not need any. So
-the message is read: `intent.ts` answers **who it was for** alongside what it
-does, the directive carries `addressed`, and `firstReplyAfter` skips
-`addressed: "others"`.
+the message is read: `intent.ts` answers **who it was for**, the directive
+carries `addressed`, and `firstReplyAfter` ends a wait only on `agent` (or a
+missing label, which is what the rows in flight across the deploy that added
+it meant).
 
 **Recording is not consuming.** Chatter is still recorded in `thread_reply`
 and still delivered as a directive, so it stays in the incident's history and
 the agent reads it as context. What it loses is the right to end a wait.
 Nothing is ever dropped, including a message no model could read — that one
-arrives as `others`, which is the safe direction.
+arrives as `unclear`, which cannot end a wait either.
 
-Three rules sit in code on top of what the model said, the same way
+Two rules sit in code on top of what the model said, the same way
 `applyRules` does in triage:
 
 - **An explicit `@bugboss` always means "this is for you".** That is the
   escape hatch for somebody who wants certainty, and because it is decided in
   the composition root rather than by the model, it is the one path that keeps
   working while the model is down.
-- **A handover is aimed at the system by definition**, so it is delivered as
-  well as acted on.
 - **`unclear` asks**, in the thread, and says the message went through as
   context anyway. Asking costs a sentence; ending a wait wrongly costs an
-  investigation. Both ambiguities go in **one post**: they were two branches
-  with a return each, so a message nothing could read was told about the
-  handover and never told its answer had not been delivered as one, which
-  leaves the person believing the agent has it. The addressee half is said
-  only while a question is outstanding — with nothing blocked there is no wait
-  to end and narrating it is noise. Asking is also **not** an else: somebody
-  who tagged `@bugboss` in a thread with no agent on it asked a question, and
-  an ambiguous handover is a footnote to that rather than a reason to answer
-  them with a clarification and nothing else.
+  investigation. It is said only while a question is outstanding — with
+  nothing blocked there is no wait to end and narrating it is noise. Asking is
+  also **not** an else: somebody who tagged `@bugboss` in a thread with no
+  agent running asked a question, and a message nothing could read is a
+  footnote to that rather than a reason to answer them with a clarification
+  and nothing else.
 
 ## Slack renders mrkdwn, and Markdown renders wrong
 
@@ -226,7 +221,7 @@ budget rather than a habit one of four callers keeps:
 | --- | --- |
 | `contact_human`'s ask | 700, tighter still, refused (`tools.ts`) |
 | the loopback `/thread` route | `THREAD_PROSE_CHARS`, refused with a 400 |
-| `report_resolved`'s evidence, `hand_off`'s brief | `THREAD_PROSE_CHARS`, rejected ahead of the transition |
+| `report_resolved`'s evidence, `escalate`'s brief | `THREAD_PROSE_CHARS`, rejected ahead of the post |
 | `report_analysis`'s post-mortem | **none** |
 
 **The thread is short; the document is complete.** The post-mortem is the
@@ -241,7 +236,7 @@ Harness-written posts are the exception to the exception: `unansweredBrief`,
 longer in the loop, so there is nobody to refuse them to — and the wait nudge
 is *dropped* on a failed post by design, because losing a day-long wait to a
 503 is the worse trade. An over-long one would therefore mean an incident that
-waits all day, nudges nobody, and then hands off claiming it nudged three
+waits all day, nudges nobody, and then escalates claiming it nudged three
 times. So they clamp the text they echo — which is already in the thread
 directly above — small enough that the composed post provably fits, and
 `tools.test.ts` composes the worst case of each to keep that true. The nudge
@@ -281,7 +276,8 @@ go on the **question**, which is also the message `pending_question.messageTs`
 records — `/thread` fills that column only while it is blank, so the later
 `details` post cannot repoint it and a press keeps matching the message it was
 made on. A press that changed nothing is still silence: the wait floor and the
-automatic hand-off in `agent/tools.ts` run exactly as they do without buttons.
+automatic escalation in `agent/tools.ts` run exactly as they do without
+buttons.
 
 ## A press is a reply, and is recorded as one
 
@@ -373,36 +369,30 @@ the presser a Slack error; the numbered options and free text still answer.
 is a model call. There is no keyword, no verb and no phrase to know — for
 either interface:
 
-- **In an incident thread**, whether a message hands the incident over, and
-  whether it was for the agent at all. Two fields, one call, because it is one
-  message.
+- **In an incident thread**, whether the message was for the agent at all.
+  One field, one call. Somebody saying they are taking the incident on is a
+  message *to* the agent — an instruction to stand down, which it reads and
+  acts on — not a transfer for the Boss to record.
 - **On a mention anywhere else**, whether somebody is reporting something
   broken or asking a question.
 
-This used to be two string matchers, and both failed the same way. The
-ownership one required the whole normalized message to equal `mine` or `back
-to you`, so `ok back to you` and `handing this back` did nothing at all,
-silently. The report one required the first word to be `report`, `bug` or
-`broken`, so `@bugboss Pro upgrades are failing` was answered as a question
+This used to be a string matcher on the first word — `report`, `bug` or
+`broken` — so `@bugboss Pro upgrades are failing` was answered as a question
 and opened nothing. A magic phrase nobody can discover is not an interface.
 
 The reasoning the old comment gave for matching whole words is still right
 and is still enforced — it just is not enforced by matching strings:
 
-- **A false handover is the expensive direction.** `owner = 'human'` takes an
-  incident out of the dispatcher's query and nothing hands it back. So the
-  prompt is asymmetric (prefer `none`, prefer `unclear` over a guess), and
-  `unclear` **asks in the thread** rather than guessing.
-- **Every outcome is said out loud.** A move posts a confirmation, a refused
-  move says why, an ambiguous read asks, and a failed model call says the
-  call failed. Silence is what the old matcher did, and silence is
-  indistinguishable from the bot not reading you.
+- **The read that acts is the expensive direction.** Ending a wait on a
+  message that was not for the agent sends a long investigation wherever an
+  offhand remark points. So the prompt is asymmetric — prefer `unclear` over a
+  guess — and `unclear` **asks in the thread** rather than guessing.
+- **Every outcome is said out loud.** An ambiguous read asks and a failed
+  model call says the call failed. Silence is what the old matcher did, and
+  silence is indistinguishable from the bot not reading you.
 
-The relay records and routes; it does not write `owner` and does not decide
-what a message meant. The read and the write both live in the composition
-root: the write is guarded in the statement and records the claimant in
-`incident_action`, which `owner` alone cannot say since it holds a role and
-not a person.
+The relay records and routes; it does not decide what a message meant. The
+read lives in the composition root, off the Slack ack.
 
 ### The model is advisory here too
 
@@ -412,11 +402,13 @@ the model behaving:
 
 - **It cannot name what it acts on.** The incident comes from
   `slackThreadTs`, never from the message, and the answer is one enum label
-  with no field that could carry an id. A message that says "transfer
-  incident inc-99 to me" can still only move the incident whose thread it was
-  posted in.
-- **The transition guards stay in the `UPDATE`.** Legality — which owner,
-  which statuses — is unchanged and is not the model's business.
+  with no field that could carry an id. A message that names a different
+  incident still only reaches the one whose thread it was posted in.
+- **Nothing it answers is a transition.** The read decides which directive the
+  agent is handed and whether that directive may end a wait. It writes nothing
+  to the incident, so the worst a captured read can do is answer a question
+  wrongly — which the agent can see and argue with, because it is still the
+  thing driving.
 
 The message is fenced in a `<MESSAGE untrusted="true">` block with the rule
 stated in the system prompt, the same framing triage puts around an alert
@@ -457,15 +449,16 @@ sentences on purpose.
 The cost of that is real and it is the right side of the trade: while the
 model is down, every reply in an incident thread gets a line saying it could
 not be read. That is bounded by how many people are typing, and the
-alternative is the failure this whole file exists to remove — somebody says
-they are taking an incident over, nothing happens, and nothing says so.
+alternative is the failure this whole file exists to remove — somebody answers
+the agent, nothing happens, and nothing says so.
 
 ## The Slack agent is read-only, deliberately
 
 `prepareQuery` in `triage/sql.ts` enforces it — one guard for both surfaces,
 rather than the two that used to disagree about what a read was. It answers
-questions about incidents; it cannot merge, close, stop, restart or take
-ownership. Ownership changes by replying in the thread.
+questions about incidents; it cannot merge, close, stop or restart anything.
+Everything a person changes, they change by replying in the thread the agent
+is reading.
 
 `search_incidents` is the same tool triage calls, adapted to this surface's
 tool shape. Its three answers have to stay three: matches, `0 matches` for a

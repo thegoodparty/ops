@@ -21,7 +21,7 @@ const MAX_CHARS = 4000;
 
 export const SCHEMA_SUMMARY = `incident(
   id TEXT, status TEXT in (INVESTIGATING,FIXING,RESOLVED,CLOSED,MERGED),
-  owner TEXT in (agent,human), rootCause TEXT, prUrls TEXT json, postmortem TEXT,
+  rootCause TEXT, prUrls TEXT json, postmortem TEXT,
   usersImpacted INT, impactQuery TEXT,
   impactStartedAt INT, firstSignalAt INT, fixingAt INT, resolvedAt INT, closedAt INT,
   mergedInto TEXT, recurrenceOf TEXT, attempts INT, costUsd REAL)
@@ -178,19 +178,6 @@ export const incidentStatus = (db: IncidentReader, id: string): string | null =>
     [id],
   );
   return rows[0]?.status ?? null;
-};
-
-/**
- * Who has an incident, which types.ts keeps deliberately orthogonal to its
- * status: a handed-off incident still reads INVESTIGATING. Throws on a failed
- * read, for the same reason as above.
- */
-export const incidentOwner = (db: IncidentReader, id: string): string | null => {
-  const rows = db.query<{ owner: string }>(
-    "SELECT owner FROM incident WHERE id = ?",
-    [id],
-  );
-  return rows[0]?.owner ?? null;
 };
 
 /** Throws on a failed read, for the same reason: [] means "nothing attached". */

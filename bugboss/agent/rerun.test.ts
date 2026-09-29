@@ -575,7 +575,7 @@ test("the re-run notice does not seal a question whose Slack post never landed",
   try {
     await db.withWrite((w) => {
       w.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES (?, 'INVESTIGATING', 'agent', ?)",
+        "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
       ).run(incidentId, 1_000_000);
       w.prepare(
         `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)

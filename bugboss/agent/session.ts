@@ -388,7 +388,7 @@ export const EXIT_ENTRY_TYPE = "bugboss_exit";
 export type ExitReason =
   /** `session.prompt` returned and the last turn was clean. */
   | "completed"
-  /** The wall-clock deadline fired. The agent had its grace to hand off. */
+  /** The wall-clock deadline fired. The agent had its grace to write a brief. */
   | "timed_out"
   /** Pi reported an error on the last turn. */
   | "turn_error"

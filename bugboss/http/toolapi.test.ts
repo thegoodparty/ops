@@ -42,7 +42,7 @@ before(async () => {
   });
   await db.withWrite((w) => {
     w.prepare(
-      "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES (?, 'INVESTIGATING', 'agent', ?)",
+      "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
     ).run(INCIDENT, clock);
   });
 

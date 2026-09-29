@@ -101,8 +101,6 @@ export const renderDirectives = (directives: Directive[]): string => {
         return `STOP: ${directive.reason}`;
       case "merged":
         return `MERGED: this incident is now part of ${directive.into}. Stop work and exit.`;
-      case "handoff":
-        return `HANDOFF: ${directive.reason}`;
       case "new_signals":
         return `NEW SIGNALS (${directive.count}): ${directive.summary}`;
       case "human_message":
@@ -162,17 +160,22 @@ const eitherSignal = (
 // ---------------------------------------------------------------------------
 
 /**
- * Why the harness holds a transition at all: a wait nobody ever ends is the
- * one outcome the agent can neither act on nor report. Both waits on a person
- * reach it -- `runMonitor` when the nudges run out, `runContactHuman` when a
+ * Why the harness speaks up at all: a wait nobody ever ends is the one
+ * outcome the agent can neither act on nor report. Both waits on a person
+ * reach it -- `runMonitor` when the nudges get loud, `runContactHuman` when a
  * question goes unanswered -- so the port and its outcome are shared.
+ *
+ * This used to be `handOff`, and the difference is the whole of this change.
+ * That call moved the incident to a person and stopped the agent, which took
+ * it out of the dispatcher's query with nothing able to bring it back.
+ * `escalate` says the same thing to the same people and moves nothing.
  */
-export type HandOffPort = Pick<ToolApi, "handOff">;
+export type EscalatePort = Pick<ToolApi, "escalate">;
 
-/** What the harness did with a wait nobody ended. */
+/** Whether the harness got the escalation out. */
 export type Escalation =
-  | { handedOff: true; reason: string }
-  | { handedOff: false; reason: string; error: string };
+  | { told: true; reason: string }
+  | { told: false; reason: string; error: string };
 
 /**
  * When a nudge is allowed to land. One zone rather than each person's local
@@ -286,12 +289,27 @@ export const parseWorkingHours = (spec: string): WorkingHours => {
 export const HEARTBEAT_FIRST_SECONDS = 3600;
 
 /**
- * Nudges before the thread stops being the right place to put this. The gap
- * doubles each time, so inside one working window they land an hour, three
- * hours and seven hours in: a fourth carries nothing the third did not, only
- * volume, and volume is what teaches people to skim the thread.
+ * Nudges before the thread stops being the only place to put this. After
+ * this many the same facts go out as an escalation, which mentions the
+ * rotation; the gap doubles each time, so inside one working window the
+ * quiet ones land an hour, three hours and seven hours in.
+ *
+ * The ladder does not end here, and that is the point. It used to hand the
+ * incident to a person and stop the agent, which is what stranded eight
+ * incidents: nothing else could finish the work and nothing was coming back
+ * for it. Getting louder is the only thing left that can change, so that is
+ * what happens.
  */
-export const HEARTBEAT_MAX_PINGS = 3;
+export const HEARTBEAT_LOUD_AFTER_PINGS = 3;
+
+/**
+ * The gap stops doubling here. A wait can legitimately run for days -- a
+ * merge over a weekend, a vendor -- and left doubling, the eighth nudge would
+ * be a fortnight after the seventh, which is indistinguishable from having
+ * given up. A day is the floor the whole system is held to: nothing open goes
+ * quiet for longer than this.
+ */
+export const HEARTBEAT_MAX_GAP_SECONDS = 86_400;
 
 /** How much of the check's own output a nudge carries. */
 export const HEARTBEAT_STATUS_CHARS = 400;
@@ -340,13 +358,14 @@ export const HEARTBEAT_ECHO_CHARS = 200;
  * Quiet seconds owed before the next nudge, given how many have gone already.
  * Measured from the last nudge rather than from the start, which is what
  * keeps a wait that spanned a night from firing its whole ladder in three
- * consecutive minutes once the window opens: 1h, then 2h, then 4h, then the
- * hand-off 8h after that.
+ * consecutive minutes once the window opens: 1h, 2h, 4h, 8h, 16h, then once
+ * a day for as long as the wait lasts.
  */
 export const heartbeatGapSeconds = (
   pings: number,
   first = HEARTBEAT_FIRST_SECONDS,
-): number => first * 2 ** pings;
+  maxGap = HEARTBEAT_MAX_GAP_SECONDS,
+): number => Math.min(first * 2 ** pings, maxGap);
 
 export interface PendingWait {
   /** The command this marker was written for. */
@@ -385,10 +404,13 @@ export interface HeartbeatDeps {
    * wrong for a nudge the model did not write.
    */
   post(message: string): Promise<void>;
-  escalate: HandOffPort;
+  escalate: EscalatePort;
   workingHours?: WorkingHours;
   firstSeconds?: number;
-  maxPings?: number;
+  /** Nudges before they start mentioning the rotation. */
+  loudAfterPings?: number;
+  /** The ceiling the doubling gap stops at. */
+  maxGapSeconds?: number;
 }
 
 export const formatWaited = (ms: number): string => {
@@ -411,8 +433,8 @@ export const heartbeatMessage = (args: {
   awaitingHuman: string;
   waitedMs: number;
   status: string;
-  /** Seconds until the next nudge, or null when the next step is the hand-off. */
-  nextSeconds: number | null;
+  /** Seconds until the next one. There is always a next one. */
+  nextSeconds: number;
 }): string =>
   [
     `*Still waiting on someone: ${truncateOutput(args.description, HEARTBEAT_ECHO_CHARS)}*`,
@@ -422,16 +444,14 @@ export const heartbeatMessage = (args: {
     "```",
     truncateOutput(args.status.trim(), HEARTBEAT_STATUS_CHARS) || "(no output)",
     "```",
-    args.nextSeconds === null
-      ? "If nobody picks this up, I hand the incident to a human next."
-      : `Next nudge in ${formatWaited(args.nextSeconds * 1000)}.`,
+    `Next nudge in ${formatWaited(args.nextSeconds * 1000)}.`,
   ].join("\n");
 
 /**
- * The brief the harness writes when the nudges run out. Thinner than the one
- * `hand_off` asks for -- the harness knows the wait and nothing else -- which
- * is why the prompt tells the model to hand off itself if it can see this
- * coming.
+ * The brief the harness writes once the nudges get loud. Thinner than one the
+ * model would write -- the harness knows the wait and nothing else -- which
+ * is why the prompt tells the model to escalate itself if it can see this
+ * coming and say something more useful.
  */
 export const stalledWaitBrief = (args: {
   description: string;
@@ -441,7 +461,7 @@ export const stalledWaitBrief = (args: {
   nudges: number;
 }): string =>
   [
-    `Nobody ended this wait in ${formatWaited(args.waitedMs)}, across ${args.nudges} nudges in the thread, so this is yours.`,
+    `Nobody has ended this wait in ${formatWaited(args.waitedMs)}, across ${args.nudges} nudges in the thread.`,
     "",
     "*What I am waiting for*",
     truncateOutput(
@@ -453,7 +473,9 @@ export const stalledWaitBrief = (args: {
     "```",
     truncateOutput(args.status.trim(), HEARTBEAT_STATUS_CHARS) || "(no output)",
     "```",
-    "Everything I found is in this thread. The work is done; this one step is not.",
+    "Everything I found is in this thread. The work is done; this one step is not, and it is not something I can do.",
+    "",
+    "I am still on this and still checking. Nothing here needs taking over.",
   ].join("\n");
 
 /**
@@ -475,9 +497,9 @@ const release = async (
 };
 
 /**
- * A failure here is never swallowed: the incident stays the agent's and the
- * tool result says so, so the next turn calls `hand_off` itself rather than
- * believing it was relieved.
+ * A failure here costs the escalation and not the wait. The next rung is
+ * hours away and still arrives, and the wait was always going to continue --
+ * nothing about an unsent Slack message changes who can finish this.
  */
 const escalateStalledWait = async (
   heartbeat: HeartbeatDeps,
@@ -485,20 +507,20 @@ const escalateStalledWait = async (
   brief: string,
 ): Promise<{ outcome: Escalation; directives: Directive[] }> => {
   try {
-    const response = await heartbeat.escalate.handOff({ reason, brief });
+    const response = await heartbeat.escalate.escalate({ reason, brief });
     return {
       outcome: response.ok
-        ? { handedOff: true, reason }
+        ? { told: true, reason }
         : {
-            handedOff: false,
+            told: false,
             reason,
-            error: response.error ?? "the hand off was refused without a reason",
+            error: response.error ?? "the escalation was refused without a reason",
           },
       directives: response.directives ?? [],
     };
   } catch (error: unknown) {
     return {
-      outcome: { handedOff: false, reason, error: String(error) },
+      outcome: { told: false, reason, error: String(error) },
       directives: [],
     };
   }
@@ -532,7 +554,7 @@ export interface MonitorResult {
   timedOut: boolean;
   /** Set when the nudges ran out and the harness handed the incident over. */
   escalation: Escalation | null;
-  /** Anything the hand-off drained. The caller renders these. */
+  /** Anything the escalation drained. The caller renders these. */
   directives: Directive[];
 }
 
@@ -570,7 +592,8 @@ export const runMonitor = async (
   const ask = args.awaitingHuman?.trim() ?? "";
   const heartbeat = ask ? deps.heartbeat : undefined;
   const firstSeconds = heartbeat?.firstSeconds ?? HEARTBEAT_FIRST_SECONDS;
-  const maxPings = heartbeat?.maxPings ?? HEARTBEAT_MAX_PINGS;
+  const loudAfter = heartbeat?.loudAfterPings ?? HEARTBEAT_LOUD_AFTER_PINGS;
+  const maxGapSeconds = heartbeat?.maxGapSeconds ?? HEARTBEAT_MAX_GAP_SECONDS;
   // Not caught, unlike the two calls inside the loop, and the difference is
   // what each failure costs. Nothing has been waited on yet, so a throw here
   // costs one turn and the model reissues the call; swallowing it would start
@@ -612,7 +635,8 @@ export const runMonitor = async (
     if (heartbeat && marker) {
       const waitedMs = now() - startedAt;
       const quietMs = now() - Math.min(marker.lastPingAt ?? startedAt, now());
-      const gapMs = heartbeatGapSeconds(marker.pings, firstSeconds) * 1000;
+      const gapMs =
+        heartbeatGapSeconds(marker.pings, firstSeconds, maxGapSeconds) * 1000;
       // The window gates the nudge, not the clock. A wait that spans a night
       // keeps accruing and stays silent, and the first poll after the window
       // opens is the one that speaks -- so "silence until morning, then a
@@ -621,41 +645,6 @@ export const runMonitor = async (
         quietMs >= gapMs &&
         insideWorkingHours(now(), heartbeat.workingHours)
       ) {
-        if (marker.pings >= maxPings) {
-          // Handing off rather than nudging a fourth time, because the two
-          // differ in who owns the incident and that is the part that has
-          // gone wrong. An agent blocked with `owner: agent` is invisible:
-          // the dispatcher will not relaunch an incident an agent still
-          // holds, and nothing lists one as unclaimed work. `hand_off` is
-          // also the only post here that reaches the rotation group.
-          const reason = `nobody ended a ${formatWaited(waitedMs)} wait after ${maxPings} nudges`;
-          const escalated = await escalateStalledWait(
-            heartbeat,
-            reason,
-            stalledWaitBrief({
-              description: args.description,
-              awaitingHuman: ask,
-              waitedMs,
-              status: last,
-              nudges: marker.pings,
-            }),
-          );
-          // Cleared only when the hand-off landed. Left standing after a
-          // failure the marker keeps its `startedAt`, so the next attempt
-          // escalates at once instead of restarting the wait.
-          if (escalated.outcome.handedOff) await release(heartbeat, args.command);
-          log("wait_escalated", {
-            command: args.command,
-            waitedMs,
-            handedOff: escalated.outcome.handedOff,
-          });
-          return {
-            output: truncateOutput(last, maxChars),
-            timedOut: true,
-            escalation: escalated.outcome,
-            directives: escalated.directives,
-          };
-        }
         // Counted before it is posted, which is the opposite order from the
         // question marker and deliberate. A crash in between costs one nudge
         // and the next threshold still comes; the other order re-nudges on
@@ -676,15 +665,61 @@ export const runMonitor = async (
           await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
           continue;
         }
+
+        // Past `loudAfter` the nudge becomes an escalation: the same facts,
+        // posted where the rotation sees them. It never becomes a hand-off.
+        // That is the change -- a hand-off moved the incident to a person and
+        // stopped the agent, and since nothing else could finish the work and
+        // nothing was coming back for it, the incident simply stopped. So the
+        // ladder gets louder and the wait carries on.
+        if (marker.pings >= loudAfter) {
+          const escalated = await escalateStalledWait(
+            heartbeat,
+            `nobody has ended a ${formatWaited(waitedMs)} wait after ${marker.pings} nudges`,
+            stalledWaitBrief({
+              description: args.description,
+              awaitingHuman: ask,
+              waitedMs,
+              status: last,
+              nudges: marker.pings,
+            }),
+          );
+          // Deliberately not released, and the wait deliberately not ended.
+          // The marker is what carries `startedAt` and the ping count across
+          // the restarts that every merge to ops `main` causes, and this wait
+          // is still the thing the agent is blocked on.
+          log("wait_escalated", {
+            command: args.command,
+            waitedMs,
+            pings: marker.pings,
+            told: escalated.outcome.told,
+          });
+          // The wait carries on either way, so the model is never handed a
+          // turn on which it could notice this. That makes the alarm the only
+          // reporter: an escalation nobody received looks, from the thread,
+          // exactly like a wait that has not got loud yet.
+          if (!escalated.outcome.told) {
+            alarm("wait_escalation_undelivered", {
+              command: args.command,
+              waitedMs,
+              pings: marker.pings,
+              error: escalated.outcome.error,
+            });
+          }
+          await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
+          continue;
+        }
+
         const message = heartbeatMessage({
           description: args.description,
           awaitingHuman: ask,
           waitedMs,
           status: last,
-          nextSeconds:
-            marker.pings >= maxPings
-              ? null
-              : heartbeatGapSeconds(marker.pings, firstSeconds),
+          nextSeconds: heartbeatGapSeconds(
+            marker.pings,
+            firstSeconds,
+            maxGapSeconds,
+          ),
         });
         try {
           await heartbeat.post(message);
@@ -761,7 +796,7 @@ export interface DirectivePeek {
 export interface ContactHumanDeps {
   contact: HumanContactPort;
   api: DirectivePeek;
-  escalate: HandOffPort;
+  escalate: EscalatePort;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   pollSeconds?: number;
@@ -779,7 +814,7 @@ export interface ContactHumanArgs {
   /**
    * Answers to render as buttons beside the ask. They change what the
    * question looks like and nothing else: the wait floor, the deadline and
-   * the hand-off below all run exactly as they do without them, because a
+   * the escalation below all run exactly as they do without them, because a
    * button nobody presses *is* an unanswered question.
    */
   options?: readonly string[];
@@ -849,9 +884,9 @@ export interface ContactHumanResult {
 
 /**
  * The brief the harness writes when the model did not. It is deliberately
- * thinner than the one `hand_off` asks for — the harness knows the question
- * and nothing else — which is the reason the prompt tells the model to hand
- * off itself before it gets here.
+ * thinner than one the model would write — the harness knows the question
+ * and nothing else — which is the reason the prompt tells the model to
+ * escalate itself before it gets here.
  */
 export const unansweredBrief = (
   question: string,
@@ -859,7 +894,7 @@ export const unansweredBrief = (
   options: readonly string[] = [],
 ): string =>
   [
-    `Nobody answered in ${waitedMinutes} minutes, so this is yours.`,
+    `Nobody answered in ${waitedMinutes} minutes.`,
     "",
     "*What I asked*",
     truncateOutput(question, HARNESS_BRIEF_ECHO_CHARS),
@@ -870,14 +905,13 @@ export const unansweredBrief = (
       : []),
     "",
     "*Where it stands*",
-    "Everything I found is in this thread. I stopped at the question rather than guessing past it.",
+    "Everything I found is in this thread. I stopped at the question rather than guessing past it, and I am still on this.",
   ].join("\n");
 
 /**
- * The hand-off the harness makes on its own behalf. A failure here is never
- * swallowed: the incident stays the agent's and the tool result says so, so
- * the next turn can call `hand_off` itself rather than believing it was
- * relieved.
+ * The escalation the harness makes on its own behalf. A failure here is never
+ * swallowed: the tool result says nobody was told, so the next turn can say
+ * it itself rather than believing the thread has been warned.
  */
 const escalateUnanswered = async (
   deps: ContactHumanDeps,
@@ -887,40 +921,40 @@ const escalateUnanswered = async (
 ): Promise<{ outcome: Escalation; directives: Directive[] }> => {
   const reason = `no reply in ${waitedMinutes} minutes`;
   try {
-    const response = await deps.escalate.handOff({
+    const response = await deps.escalate.escalate({
       reason,
       brief: unansweredBrief(question, waitedMinutes, options),
     });
     return {
       outcome: response.ok
-        ? { handedOff: true, reason }
+        ? { told: true, reason }
         : {
-            handedOff: false,
+            told: false,
             reason,
-            error: response.error ?? "the hand off was refused without a reason",
+            error: response.error ?? "the escalation was refused without a reason",
           },
       directives: response.directives ?? [],
     };
   } catch (err) {
     return {
-      outcome: { handedOff: false, reason, error: String(err) },
+      outcome: { told: false, reason, error: String(err) },
       directives: [],
     };
   }
 };
 
 /**
- * Ask a human, and hand the incident over if nobody answers.
+ * Ask a human, and say so loudly if nobody answers.
  *
- * The second half is the part that is in code rather than in the prompt. The
- * two tools that reach a person differ only in who owns the incident
- * afterwards: `contact_human` leaves `owner: agent` and `hand_off` sets
- * `owner: human`. An agent blocked on a question nobody answers is therefore
- * invisible — the dispatcher will not relaunch an incident an agent still
- * holds, and no digest of unclaimed work lists one owned by an agent. The
- * prompt has always said to hand off when a question goes unanswered inside
- * the wait budget; the model is advisory about when that is, and is not
- * trusted with the invariant.
+ * The second half is the part that is in code rather than in the prompt,
+ * because the failure is one the agent cannot see: a question nobody replies
+ * to looks, from inside the wait, exactly like a question nobody has replied
+ * to *yet*. So the escalation is the harness's to make on a clock, and the
+ * model is advisory about when rather than trusted with it.
+ *
+ * What it does not do is end anything. The incident is still the agent's --
+ * it always is -- so an unanswered question buys a louder thread and a turn
+ * back, not a stop.
  */
 export const runContactHuman = async (
   args: ContactHumanArgs,
@@ -1060,26 +1094,25 @@ export const runContactHuman = async (
         waitedMinutes,
         args.options,
       );
-      // Cleared after the hand-off, and only if it landed. Clearing first and
-      // dying in between replays as a brand-new question: re-posted, with a
-      // fresh askedAt that makes a reply already sitting in the thread look
-      // too old to be one. Left standing after a failed hand-off, the marker
-      // keeps the original askedAt, so the next attempt escalates at once
-      // instead of restarting the wait.
-      if (escalation.outcome.handedOff) await deps.contact.clearPending();
+      // Cleared after the escalation, and only if it landed. Clearing first
+      // and dying in between replays as a brand-new question: re-posted, with
+      // a fresh askedAt that makes a reply already sitting in the thread look
+      // too old to be one. Left standing after a failed escalation, the
+      // marker keeps the original askedAt, so the next attempt escalates at
+      // once instead of restarting the wait.
+      if (escalation.outcome.told) await deps.contact.clearPending();
       return {
         reply: null,
         timedOut: true,
         directives: [...rest, ...escalation.directives],
-        // Ownership moved, so there is nothing left for this agent to do —
-        // and a stop or merged the hand-off drained says the same thing even
-        // when the hand-off itself failed.
-        terminate:
-          escalation.outcome.handedOff ||
-          escalation.directives.some(
-            (directive) =>
-              directive.type === "stop" || directive.type === "merged",
-          ),
+        // The escalation moved nothing, so the question going unanswered is
+        // not a reason to stop -- the agent is still the only thing that can
+        // finish this. Only a `stop` or a `merged` ends the run, and those
+        // say so whatever the escalation did.
+        terminate: escalation.directives.some(
+          (directive) =>
+            directive.type === "stop" || directive.type === "merged",
+        ),
         rejected: null,
         escalation: escalation.outcome,
       };
@@ -1107,9 +1140,20 @@ const MONITOR_DESCRIPTION = [
   "SET `awaitingHuman` WHEN A PERSON IS THE THING YOU ARE WAITING FOR: merge",
   "this PR, flip this flag, restart that worker. Say what they have to do and",
   "include the link. It turns on the heartbeat -- the thread is nudged once the",
-  "wait passes an hour inside working hours, the gap doubles, and if the nudges",
-  "run out the incident is handed to a human and you stop. Hand off yourself",
-  "first if you can see it coming: your brief is better than the harness's.",
+  "wait passes an hour inside working hours, the gap doubles to a day and then",
+  "keeps going, and past the third nudge each one also mentions the rotation.",
+  "It never hands the incident away and it never stops you: this incident is",
+  "yours until it closes. Escalate yourself first if you can see the loud",
+  "rungs coming, because your brief is better than the harness's.",
+  "",
+  "THE COMMAND MUST STILL DETECT THE THING THE PERSON WAS ASKED TO DO. This is",
+  "the part that gets skipped. `awaitingHuman` controls who gets nudged; the",
+  "command is what ends the wait, and if it does not actually observe the",
+  "outcome then the wait can only end by somebody telling you, which is the",
+  "slowest path there is and often never happens at all. A merge is",
+  "`gh pr view <url> --json state,mergedAt` and a grep for merged. A flag flip",
+  "is a read of the flag. A restart is the health check. Being told in the",
+  "thread is the fallback, not the plan.",
   "",
   "Leave it unset for a deploy, a migration, npm ci or an alert going quiet.",
   "Nobody is being asked for anything, so nothing is posted.",
@@ -1122,8 +1166,8 @@ const CONTACT_HUMAN_DESCRIPTION = [
   "",
   "THIS IS NOT AN ESCALATION. The incident stays yours and no human has been",
   "told it is theirs. If you have concluded you cannot take the incident",
-  "further, that is hand_off, not a question. A question you do not intend to",
-  "act on yourself is a hand-off wearing a question mark.",
+  "further, that is escalate, not a question. A question you do not intend to",
+  "act on yourself is an escalation wearing a question mark.",
   "",
   `The message is capped at ${CONTACT_HUMAN_MESSAGE_LIMIT} characters and a longer one is refused.`,
   "It carries the conclusion, what it means for users, and the one thing you",
@@ -1136,11 +1180,11 @@ const CONTACT_HUMAN_DESCRIPTION = [
   "anyone can ignore them and type something else, including an answer you did",
   "not list, so never ask a question that only works if a button is pressed.",
   "",
-  "If nobody answers, this hands the incident to a human for you: owner becomes",
-  "human, a brief you did not write is posted, and you stop. Hand off yourself",
-  "first if you can see it coming — your brief is better than the one the",
-  "harness writes. Buttons change nothing here: one nobody presses is silence,",
-  "and silence escalates.",
+  "If nobody answers, this escalates for you: the rotation is told and a brief",
+  "you did not write is posted. The incident stays yours and you get the turn",
+  "back. Escalate yourself first if you can see it coming — your brief is",
+  "better than the one the harness writes. Buttons change nothing here: one",
+  "nobody presses is silence, and silence escalates.",
   "",
   "Safe to call again after a restart: the outstanding question is recorded",
   "before it is posted, so a repeated call resumes waiting rather than asking",
@@ -1167,7 +1211,7 @@ export const createMonitorTool = async (
     awaitingHuman: Type.Optional(
       Type.String({
         description:
-          "Only when a person has to act for this wait to end: what they must do, with the link. Unset for a deploy, a migration or an alert going quiet.",
+          "Only when a person has to act for this wait to end: what they must do, with the link. The command must still be a check that detects them having done it -- `gh pr view --json state,mergedAt` for a merge, a flag read for a flag flip -- not a placeholder that waits to be told. Unset for a deploy, a migration or an alert going quiet.",
       }),
     ),
   });
@@ -1183,11 +1227,12 @@ export const createMonitorTool = async (
         ...deps,
         signal: eitherSignal(signal, deps.signal),
       });
-      const header = result.escalation
-        ? monitorEscalationText(result.escalation, args.description)
-        : result.timedOut
-          ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
-          : `Condition met: ${args.description}`;
+      // No escalation branch. A wait that gets loud keeps waiting, so the
+      // model is not given a turn to be told about it; it learns from the
+      // thread, like everyone else.
+      const header = result.timedOut
+        ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
+        : `Condition met: ${args.description}`;
       return {
         content: [
           {
@@ -1196,31 +1241,20 @@ export const createMonitorTool = async (
           },
         ],
         details: { timedOut: result.timedOut, command: args.command },
-        terminate:
-          (result.escalation?.handedOff ?? false) ||
-          result.directives.some(
-            (directive) =>
-              directive.type === "stop" || directive.type === "merged",
-          ),
+        terminate: result.directives.some(
+          (directive) =>
+            directive.type === "stop" || directive.type === "merged",
+        ),
       };
     },
   } as ToolDefinition;
 };
 
-/** What the model is told about a `monitor` wait the harness handed off. */
-export const monitorEscalationText = (
-  escalation: Escalation,
-  description: string,
-): string =>
-  escalation.handedOff
-    ? `HANDED OFF: ${escalation.reason} waiting for ${description}. Owner is now human and a brief has been posted for you. Stop work and exit.`
-    : `error: ${escalation.reason} waiting for ${description}, and the automatic hand off failed (${escalation.error}). The incident is still yours and nobody has been told. Call hand_off yourself now.`;
-
-/** The same, for a `contact_human` question nobody answered. */
+/** What the model is told about a `contact_human` question nobody answered. */
 export const escalationText = (escalation: Escalation): string =>
-  escalation.handedOff
-    ? `${escalation.reason}, so this incident has been handed to a human: owner is now human and a brief has been posted for you. Stop work and exit.`
-    : `error: ${escalation.reason}, and the automatic hand off failed (${escalation.error}). The incident is still yours and nobody has been told. Call hand_off yourself now.`;
+  escalation.told
+    ? `${escalation.reason}, so the rotation has been told and a brief posted. This incident is still yours; carry on, or ask again if you still need the answer.`
+    : `error: ${escalation.reason}, and the automatic escalation failed (${escalation.error}). Nobody has been told, so say it in the thread yourself.`;
 
 export const createContactHumanTool = async (
   deps: ContactHumanDeps,
@@ -1281,7 +1315,7 @@ export const createContactHumanTool = async (
         : result.escalation
           ? escalationText(result.escalation)
           : result.timedOut
-            ? "Your deadline ended this wait. Hand off now, with a brief."
+            ? "Your deadline ended this wait. Escalate now, with a brief."
             : result.reply === null
               ? "The wait ended on a directive rather than a reply."
               : `Reply: ${result.reply}`;

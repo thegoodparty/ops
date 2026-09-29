@@ -37,7 +37,6 @@ import {
 } from "./model";
 import { makeAlarm, makeLog } from "../logging";
 import {
-  incidentOwner,
   incidentStatus,
   queryTool,
   searchTool,
@@ -369,7 +368,13 @@ const applyRules = (
         `attach refused: ${answer.incidentId} is not an open incident`,
       );
     }
-    if (target.status === "RESOLVED") {
+    // Status read back from the database rather than taken from the digest,
+    // because the model can name any id the query tool turns up and these two
+    // refusals are what the invariant rests on. The digest is a snapshot from
+    // the start of the decision, and an incident can resolve, close or be
+    // merged away while the model is still thinking.
+    const status = incidentStatus(deps.db, target.id) ?? target.status;
+    if (status === "RESOLVED") {
       // Through newIncident like every other refusal, rather than stamping
       // target.id inline. The model names any RESOLVED incident it found; a
       // conclusive candidate is an exact (source, sourceId) match in the db
@@ -385,28 +390,13 @@ const applyRules = (
         `attach refused: ${target.id} is RESOLVED, so this signal is evidence the resolution was wrong`,
       );
     }
-    if (!ATTACHABLE.includes(target.status)) {
+    if (!ATTACHABLE.includes(status)) {
       return newIncident(
         deps,
         ctx,
         answer,
         recurrence,
-        `attach refused: ${target.id} is ${target.status}`,
-      );
-    }
-    // Status is where the work is and owner is who has it, so a handed-off
-    // incident still reads INVESTIGATING while no agent is coming back to it.
-    // Read rather than taken from the digest, because the model can name any
-    // id the query tool turns up and this guard is what the invariant rests
-    // on. Checked after the RESOLVED branch so a human-owned incident firing
-    // again is still a recurrence.
-    if (incidentOwner(deps.db, target.id) === "human") {
-      return newIncident(
-        deps,
-        ctx,
-        answer,
-        recurrence,
-        `attach refused: ${target.id} is owned by a human, so nothing attaches to it automatically`,
+        `attach refused: ${target.id} is ${status}`,
       );
     }
     if (conclusive) {

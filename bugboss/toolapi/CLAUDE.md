@@ -12,7 +12,6 @@ one place:
 - Never attach across `RESOLVED`. A signal arriving after a resolution is
   evidence the resolution was wrong, so it belongs to a recurrence.
 - Never to a `CLOSED` or `MERGED` target.
-- Never to one a human owns — that incident has no agent coming back to it.
 
 `logAssign` is emitted **after** the transaction, never inside it, so a
 rolled-back assign leaves no record claiming it happened.
@@ -30,15 +29,11 @@ So: **the predicate goes in the `UPDATE`**, and `changes === 0` rejects.
 
 ```sql
 UPDATE incident SET status = 'FIXING', ...
- WHERE id = ? AND status = 'INVESTIGATING' AND owner = 'agent'
+ WHERE id = ? AND status = 'INVESTIGATING'
 ```
 
 `blocked()` stays as the cheap early reject, so the model gets a readable
 error, but it cannot hold a transition.
-
-**One exception:** `reportAnalysis` has no owner predicate. A person who
-takes an incident over still gets the agent's write-up, which is the whole
-reason a takeover winds the agent down rather than killing it.
 
 ## The explained-signal gate
 
@@ -52,6 +47,25 @@ The split runs **after** the guarded `UPDATE`. If it ran first and the guard
 then matched nothing, the transaction would still commit the splits, tearing
 signals off an incident the call never touched.
 
+## `park` moves no state
+
+`park` writes one row in `incident_wait` and nothing else. The status does not
+change, the agent keeps the incident, and the only difference afterwards is
+that the dispatcher will not relaunch it until the wait is lifted. It is
+refused on `CLOSED` and `MERGED`, where nothing is waiting on anything.
+
+Anything that makes an agent stop driving needs this call, or the dispatcher
+relaunches it on the next tick into whatever stopped it and it exits again,
+pinging the rotation every thirty seconds. The part that catches people out is
+that parking stops the *relaunch* and does **not** free the dispatcher slot:
+an agent parked inside `monitor` is alive and still holds one, on purpose.
+`dispatcher/CLAUDE.md` has the rest.
+
+`escalate` stays separate and is not a substitute. It commits no transition
+either, but it changes nothing about runnability: it posts the brief, reaches
+the rotation, and leaves the incident with its agent still working. An agent
+that is both blocked and needs somebody calls both.
+
 ## Correlation
 
 Triggered by `report_root_cause`, because that is the first moment an
@@ -60,7 +74,7 @@ incident and splits the signals the cause does not account for.
 
 A correlation failure must never cost the agent its root cause: the
 transition commits, the merge is skipped, and the decline is logged with the
-target's actual status and owner. A silently declined merge is the "one
+target's actual status. A silently declined merge is the "one
 agent chases two causes and the other has nobody on it" miss the design
 names explicitly.
 
@@ -81,8 +95,10 @@ linked nor posted into, so the announcement opens threads first. That is why
 `ThreadPoster` carries `openThreads` rather than the tool API reaching for the
 relay.
 
-`notify()` returns whether it posted. `hand_off` posts **before** it commits
-`owner = 'human'` and returns `ok: false` if the post failed, leaving the
-incident owned by the agent. The failure modes are not symmetric: a write
-that lands with no post means `ELIGIBLE_SQL` skips the incident forever and
-nobody was told, which is invisible.
+`notify()` returns whether it posted, and one caller acts on it. `escalate`
+is nothing *but* its post — it commits no transition, checks the brief against
+the thread budget, posts, and leaves the incident with the agent — so a failed
+post means the escalation did not happen. It returns `ok: false`, and the
+agent is told to say it in the thread itself. Everywhere else the state is
+already durable and the message is commentary, so a failed post alarms and the
+transition stands.

@@ -81,7 +81,6 @@ import {
   readReplyIntent,
   type Addressed,
   type IntentDeps,
-  type OwnershipClaim,
 } from "./slack/intent";
 import {
   applyAssign,
@@ -159,7 +158,7 @@ export const DEFAULT_TRIAGE_MODEL_ID = "us.anthropic.claude-sonnet-5";
 
 /**
  * How long an agent token outlives the deadline that kills its agent. Wide
- * enough to cover the child's own handoff grace and the tick the parent waits
+ * enough to cover the child's own grace window and the tick the parent waits
  * before the backstop, so a token never expires under an agent still working.
  */
 const AGENT_TOKEN_GRACE_SECONDS = 600;
@@ -903,13 +902,8 @@ export const createBugBoss = async (
       rootCause: string | null;
       firstSignalAt: number;
     }>(
-      // Status is where the work is, owner is who has it, and they are
-      // orthogonal. assign refuses a boss-actor write into a human-owned
-      // incident, so offering one as an attach or merge candidate can only
-      // produce a refusal -- triage would propose it, the assign would throw,
-      // and the retry below would open the new incident anyway.
       `SELECT id, status, rootCause, firstSignalAt FROM incident
-       WHERE status IN ('INVESTIGATING','FIXING','RESOLVED') AND owner = 'agent'
+       WHERE status IN ('INVESTIGATING','FIXING','RESOLVED')
        ORDER BY firstSignalAt`,
     );
     if (rows.length === 0) return [];
@@ -1000,11 +994,11 @@ export const createBugBoss = async (
 
     return {
       ...api,
-      // The only transition that has to reach the rotation. The tool API
-      // posts the brief itself; this adds the ping, which is the one thing it
-      // cannot know to do.
-      handOff: async (args) => {
-        const response = await api.handOff(args);
+      // The only call that has to reach the rotation. The tool API posts the
+      // brief itself; this adds the ping, which is the one thing it cannot
+      // know to do.
+      escalate: async (args) => {
+        const response = await api.escalate(args);
         if (response.ok) {
           await slack
             .post(
@@ -1567,25 +1561,23 @@ export const createBugBoss = async (
       }
 
       // Whether the kill cost anything is a different question from whether
-      // it happened. An agent killed after handing off has already put the
-      // incident somewhere a person can see; one killed while it still owns
-      // an open incident has not, and that is the stranding case.
-      const row = db.get<{ status: IncidentStatus; owner: string }>(
-        "SELECT status, owner FROM incident WHERE id = ?",
+      // it happened. A killed run on an incident that has reached a terminal
+      // status cost nothing; one on an open incident is work that stopped,
+      // and the next tick relaunching it is the only thing that recovers it.
+      const row = db.get<{ status: IncidentStatus }>(
+        "SELECT status FROM incident WHERE id = ?",
         [incidentId],
       );
-      const stranded =
-        !!row && row.owner === "agent" && OPEN_STATUSES.includes(row.status);
+      const stranded = !!row && OPEN_STATUSES.includes(row.status);
       alarm("agent_run_killed", {
         incidentId,
         sessionRef,
         turns: outcome.turns,
         status: row?.status ?? null,
-        owner: row?.owner ?? null,
         stranded,
         note: stranded
-          ? "the incident is still the agent's and still open; the next dispatcher tick should relaunch it, and if none does it is stranded"
-          : "the work had already left the agent, so nothing is waiting on this",
+          ? "the incident is still open; the next dispatcher tick should relaunch it, and if none does it is stranded"
+          : "the incident had already reached a terminal status, so nothing is waiting on this",
       });
     } catch (err: unknown) {
       alarm("run_outcome_read_failed", { incidentId, sessionRef, error: String(err) });
@@ -1776,114 +1768,6 @@ export const createBugBoss = async (
   // -------------------------------------------------------------------------
 
   /**
-   * A person claiming an incident, or handing it back.
-   *
-   * `owner` is the only axis that moves. Status says where the work is and
-   * owner says who has it, and a claim changes the second without touching
-   * the first: an incident a person takes over is still FIXING, it just is
-   * not an agent doing the fixing.
-   *
-   * A takeover does not kill the agent. It pushes `handoff`, so the agent
-   * finishes the turn it is in and writes its brief -- which is the artifact
-   * the person taking over actually wants, and the reason they are usually
-   * taking over at all. Killing it would throw that away to save a minute.
-   *
-   * Hand-back is what makes escalation a handoff rather than a hole. Without
-   * it `owner` only ever moves one way and no agent can reach the incident
-   * again, which is what the dispatcher's launch-ceiling reset already
-   * assumed was possible.
-   */
-  const claimOwnership = async (
-    incidentId: string,
-    claim: OwnershipClaim,
-    slackUserId: string,
-  ): Promise<void> => {
-    const readIncidentRow = () =>
-      db.get<{ owner: string; status: string; slackThreadTs: string | null }>(
-        "SELECT owner, status, slackThreadTs FROM incident WHERE id = ?",
-        [incidentId],
-      );
-
-    const say = (text: string) =>
-      slack
-        .post(readIncidentRow()?.slackThreadTs ?? null, text)
-        .then(() => undefined)
-        .catch((err: unknown) =>
-          alarm("ownership_post_failed", { incidentId, error: String(err) }),
-        );
-
-    const to = claim === "take_over" ? "human" : "agent";
-    const from = claim === "take_over" ? "agent" : "human";
-
-    const changed = await db.withWrite((w: Database.Database) => {
-      // Guarded in the statement, like every other transition: the read that
-      // decided this happened outside the transaction.
-      const res = w
-        .prepare(
-          `UPDATE incident SET owner = ?
-             WHERE id = ? AND owner = ?
-               AND status IN ('INVESTIGATING', 'FIXING', 'RESOLVED')`,
-        )
-        .run(to, incidentId, from);
-      if (res.changes === 0) return false;
-      w.prepare(
-        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
-         VALUES (?, 'human', ?, ?, ?, ?)`,
-      ).run(
-        incidentId,
-        slackUserId,
-        claim,
-        `owner ${from} -> ${to}`,
-        now(),
-      );
-      return true;
-    });
-
-    if (!changed) {
-      const row = readIncidentRow();
-      log("ownership_claim_ignored", {
-        incidentId,
-        claim,
-        slackUserId,
-        owner: row?.owner ?? null,
-        status: row?.status ?? null,
-      });
-      // Saying so matters more than it looks: the claim word is a normal
-      // message, so silence is indistinguishable from the bot not reading it.
-      await say(
-        claim === "take_over"
-          ? mrkdwn`${raw(userMention(slackUserId))} this one is already owned by a human.`
-          : mrkdwn`${raw(userMention(slackUserId))} nothing to hand back: an agent already has this.`,
-      );
-      return;
-    }
-
-    if (claim === "take_over") {
-      await db.withWrite((w: Database.Database) => {
-        w.prepare(
-          `INSERT INTO pending_directive (incidentId, payload, createdAt)
-           VALUES (?, ?, ?)`,
-        ).run(
-          incidentId,
-          JSON.stringify({
-            type: "handoff",
-            reason:
-              "a person took this over in Slack; write up what you have and stop",
-          } satisfies Directive),
-          now(),
-        );
-      });
-    }
-
-    log("ownership_claimed", { incidentId, claim, slackUserId });
-    await say(
-      claim === "take_over"
-        ? mrkdwn`${raw(userMention(slackUserId))} has this one. The agent is writing up what it found and will stop.`
-        : mrkdwn`Back to an agent, handed over by ${raw(userMention(slackUserId))}. It will pick this up within a tick.`,
-    );
-  };
-
-  /**
    * The one thing that reaches a running agent from Slack. `contact_human`
    * waits on directives alone and nothing else reads `thread_reply` on an
    * agent's behalf, so a message that never becomes one is a message the
@@ -1932,24 +1816,24 @@ export const createBugBoss = async (
 
   /**
    * Something a person said in an incident's thread. The relay has recorded
-   * it; this decides what it meant, off the Slack ack.
+   * it; this decides who it was for, off the Slack ack.
    *
-   * Two questions, one model call. Does it hand the incident over, and was it
-   * for the agent at all -- because `contact_human` ends its wait on the
-   * first reply it sees, and two people talking to each other while an agent
-   * is blocked used to end that wait on whichever of them spoke first. The
-   * answer to that is not syntax: answering a direct question should not need
-   * ceremony, so the message is read rather than required to carry a tag.
+   * One question now, where there were two. The other asked whether the
+   * message handed the incident between a person and an agent, and no such
+   * move exists: an agent drives every open incident. What is left is the
+   * question that was always doing the work -- `contact_human` ends its wait
+   * on the first reply it sees, and two people talking to each other while an
+   * agent is blocked used to end that wait on whichever of them spoke first.
+   * The answer to that is not syntax: answering a direct question should not
+   * need ceremony, so the message is read rather than required to carry a tag.
    *
-   * Three rules sit in code, on top of what the model says, for the same
+   * Two rules sit in code, on top of what the model says, for the same
    * reason `applyRules` does in triage:
    *
    *   - An explicit @bugboss always means "this is for you". That is the
    *     escape hatch for somebody who wants certainty, and because it is
    *     decided here rather than by the model it keeps working while the
    *     model is down.
-   *   - A handover is aimed at the system by definition, so it is delivered
-   *     as well as acted on.
    *   - Nothing is ever dropped. A message that could not be read is still
    *     delivered as context; what it loses is the right to end a wait.
    *
@@ -1969,16 +1853,10 @@ export const createBugBoss = async (
 
     const read = await readReplyIntent(intent, {
       text: said,
-      owner: route.owner,
       outstandingQuestion: outstanding,
     });
 
-    const handingOver: OwnershipClaim | null =
-      read.handover === "take_over" || read.handover === "hand_back"
-        ? read.handover
-        : null;
-    const addressed: Addressed =
-      route.interrupt || handingOver ? "agent" : read.addressed;
+    const addressed: Addressed = route.interrupt ? "agent" : read.addressed;
 
     // Delivered before anything else, so the agent has what was said whatever
     // the rest of this decides. `others` and `unclear` ride through as
@@ -1987,7 +1865,6 @@ export const createBugBoss = async (
 
     log("reply_read", {
       incidentId: route.incidentId,
-      handover: read.handover,
       addressed,
       modelAddressed: read.addressed,
       tagged: route.interrupt,
@@ -1995,49 +1872,26 @@ export const createBugBoss = async (
       fellBack: read.fellBack,
     });
 
-    if (handingOver) {
-      await claimOwnership(route.incidentId, handingOver, route.user);
-      return;
-    }
-
-    // Everything the read could not settle, in one post. These used to be two
-    // branches with a return each, so a message that was ambiguous both ways
-    // -- which is the common shape of an unreadable message -- was told about
-    // the handover and never told its answer had not been delivered as one.
-    const unsureHandover = read.handover === "unclear";
     // Only worth saying while something is blocked on it. With no outstanding
     // question there is no wait to end, the directive is context either way,
     // and narrating that is noise about nothing.
-    const unsureAddressee = addressed === "unclear" && outstanding !== null;
-
-    if (unsureHandover || unsureAddressee) {
+    if (addressed === "unclear" && outstanding !== null) {
       await sayInThread(
         route.channel,
         route.threadTs,
         [
           read.fellBack
             ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way.`
-            : mrkdwn`${raw(userMention(route.user))} I could not tell how to take that one. The agent has it as context either way.`,
-          ...(unsureHandover
-            ? [
-                "If you meant you are taking this incident over, or handing it back to an agent, say so plainly and I will move it.",
-              ]
-            : []),
-          ...(unsureAddressee
-            ? [
-                "And if it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
-              ]
-            : []),
+            : mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent. It has it as context either way.`,
+          "If it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
         ].join("\n"),
       );
     }
 
     // Independent of the above, not an else. Somebody who tags @bugboss in a
-    // thread with no agent on it has asked a question, and an ambiguous
-    // handover is a footnote to that rather than a reason to leave them
-    // without an answer. A real handover returned above, so the read-only
-    // agent still never fields a claim -- its answer to one would be to tell
-    // you to reply in the thread, which is what you just did.
+    // thread with no agent running has asked a question, and an unreadable
+    // message is a footnote to that rather than a reason to leave them
+    // without an answer.
     if (route.interrupt && !route.agentRunning) {
       await slackAgent.handle({
         channel: route.channel,
@@ -2184,10 +2038,6 @@ export const createBugBoss = async (
           return landed
             ? "_The agent has that as its answer and carries on from here._"
             : "_Reply in the thread and the agent will read you._";
-        case "nobody":
-          return landed
-            ? "_It is recorded and waiting, but a person owns this incident, so no agent has read it. Say in the thread that you are handing it back and one picks it up, this answer included._"
-            : "_A person owns this incident, so no agent is reading the thread. Say in the thread that you are handing it back and one will._";
         case "closed":
           return "_This incident is over and no agent will run on it again, so nothing here reaches one._";
       }
@@ -2371,6 +2221,7 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
       agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 86_400),
       maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
+      staleAfterSeconds: Number(env.BUGBOSS_STALE_HOURS ?? 24) * 3600,
     },
     prodCriticalSlugs: (env.BUGBOSS_PROD_CRITICAL_SLUGS ?? "")
       .split(",")

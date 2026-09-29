@@ -37,7 +37,6 @@ import {
   type ModelClient,
   type ModelToolSpec,
 } from "../triage";
-import type { IncidentOwner } from "../types";
 
 const log = makeLog("slack-intent");
 
@@ -65,11 +64,6 @@ export interface IntentDeps {
   maxTokens?: number;
 }
 
-/** Which way ownership is being handed, per the Layer 4 actions table. */
-export type OwnershipClaim = "take_over" | "hand_back";
-
-export type Handover = OwnershipClaim | "none" | "unclear";
-
 /** Who a reply was for. `others` is recorded and never ends a wait. */
 export type Addressed = "agent" | "others" | "unclear";
 
@@ -83,7 +77,6 @@ interface Fallible {
 }
 
 export interface ReplyRead extends Fallible {
-  handover: Handover;
   addressed: Addressed;
 }
 
@@ -130,7 +123,6 @@ you what you are looking at.`;
 // A reply in an incident thread
 // ---------------------------------------------------------------------------
 
-const HANDOVERS = ["take_over", "hand_back", "none", "unclear"] as const;
 const ADDRESSEES = ["agent", "others", "unclear"] as const;
 
 const REPLY_TOOL: ModelToolSpec = {
@@ -140,12 +132,6 @@ const REPLY_TOOL: ModelToolSpec = {
   inputSchema: {
     type: "object",
     properties: {
-      handover: {
-        type: "string",
-        enum: [...HANDOVERS],
-        description:
-          "take_over: they are taking this incident on themselves, now. hand_back: they are giving it back to an agent. none: neither, which is most messages. unclear: it reads like a handover but you cannot tell which, or whether they mean it now.",
-      },
       addressed: {
         type: "string",
         enum: [...ADDRESSEES],
@@ -154,63 +140,43 @@ const REPLY_TOOL: ModelToolSpec = {
       },
       reason: REASON_PROPERTY,
     },
-    required: ["handover", "addressed", "reason"],
+    required: ["addressed", "reason"],
     additionalProperties: false,
   },
 };
 
 const replySchema = z.object({
-  handover: z.enum(HANDOVERS),
   addressed: z.enum(ADDRESSEES),
   reason: REASON_SCHEMA,
 });
 
 const REPLY_SYSTEM = `You are the inbound-language step of BugBoss, an incident control plane. A
 person has replied in one incident's Slack thread, where an agent is
-investigating and other people are watching. Read that one message and answer
-two things about it.
+investigating and other people are watching. Read that one message and say
+who it was for.
 
-Answer by calling the ${INTENT_TOOL} tool exactly once, with both fields.
-
-FIELD 1, handover -- does this message move the incident between a person and
-an agent?
-
-- take_over: they are saying they are taking this incident on themselves, now.
-  "mine", "I've got this", "I'll take it from here", "stop, I'm on it".
-- hand_back: they are giving it back to an agent. "back to you", "all yours
-  again", "you can pick this up from here", "ok back to the bot".
-- none: neither. Most messages.
-- unclear: it reads like one of the two but you cannot tell which, or cannot
-  tell whether they mean it now.
-
-Choose take_over or hand_back only when the message plainly means it, about
-THIS incident, right now. Prefer none over a guess, and unclear over a
-handover you are not sure of. The asymmetry is deliberate: a handover you
-invent takes the incident out of the queue agents are dispatched from, and
-nothing afterwards notices that the work stopped.
-
-These are not handovers: ownership of something else ("not mine", "that one is
-mine to fix"); conditional or future ("I'll take this over once CI is green");
-reporting what someone else did ("Ada has this one"); quoted logs, alert
-bodies, PR titles or somebody else's message.
-
-FIELD 2, addressed -- who was this message for?
+Answer by calling the ${INTENT_TOOL} tool exactly once.
 
 - agent: they are talking to the agent. An answer to the question it asked, an
   instruction to it, a correction of something it said, or anything else aimed
-  at the thing doing the work. A handover is aimed at it too.
+  at the thing doing the work.
 - others: they are talking to the other people in the thread. Speculating with
   a colleague, agreeing with someone, asking a person something, reacting,
   thinking out loud, arranging who does what.
 - unclear: you cannot tell. Somebody will be asked, so this costs one sentence
   and costs nothing else.
 
-This one matters most when the agent has asked a question and is blocked
-waiting. That question, when there is one, is shown below as OUTSTANDING
-QUESTION. A message answers it when it supplies what was asked for, even
-tersely -- "yes", "org X only", "no, that one is fine" are answers. A message
-about the same subject is not automatically an answer: "did anyone check org
-X?" is one person asking another, not a reply to the agent.
+An agent is always working this incident, and nothing you answer changes that
+or stops it. Somebody saying they are taking this on themselves is talking to
+the agent -- it is an instruction to stand down, which the agent reads and
+acts on, not a transfer for you to record.
+
+This matters most when the agent has asked a question and is blocked waiting.
+That question, when there is one, is shown below as OUTSTANDING QUESTION. A
+message answers it when it supplies what was asked for, even tersely -- "yes",
+"org X only", "no, that one is fine" are answers. A message about the same
+subject is not automatically an answer: "did anyone check org X?" is one
+person asking another, not a reply to the agent.
 
 Prefer unclear over a wrong agent. Ending the agent's wait on something that
 was not for it sends a long investigation down whatever an offhand remark
@@ -333,16 +299,19 @@ const read = async <T>(
 };
 
 /**
- * What a reply in an incident thread meant: whether it hands the incident
- * over, and whether it was for the agent at all. `owner` is context because
- * "back to you" reads differently depending on who has it, and the agent's
- * outstanding question is context because answering it is most of what
- * `addressed` is asking. Neither is a permission check -- legality stays in
- * the UPDATE, and the @bugboss override stays in the caller.
+ * Who a reply in an incident thread was for.
+ *
+ * One field, where this used to answer two. The other asked whether the
+ * message moved the incident between a person and an agent, and there is no
+ * such move any more -- an agent drives every open incident, so the only
+ * question left is whether the message was aimed at it. The agent's
+ * outstanding question is the context that matters, because answering it is
+ * most of what this is asking. It is not a permission check: the @bugboss
+ * override stays in the caller and nothing here can end a wait by itself.
  */
 export const readReplyIntent = async (
   deps: IntentDeps,
-  msg: { text: string; owner: IncidentOwner; outstandingQuestion: string | null },
+  msg: { text: string; outstandingQuestion: string | null },
 ): Promise<ReplyRead> => {
   try {
     const { answer } = await read(deps, {
@@ -351,26 +320,22 @@ export const readReplyIntent = async (
       spec: REPLY_TOOL,
       schema: replySchema,
       prompt: [
-        `This incident is currently owned by ${msg.owner === "human" ? "a person" : "an agent"}.`,
-        "",
         msg.outstandingQuestion
           ? `OUTSTANDING QUESTION -- the agent asked this and is blocked waiting for an answer:\n${clip(msg.outstandingQuestion)}`
           : "OUTSTANDING QUESTION: none. The agent is working and has not asked anything.",
         "",
         untrusted(msg.text),
         "",
-        "Say what that message does and who it was for.",
+        "Say who that message was for.",
       ].join("\n"),
     });
     return {
-      handover: answer.handover,
       addressed: answer.addressed,
       reason: answer.reason ?? "",
       fellBack: false,
     };
   } catch (err) {
     return {
-      handover: "unclear",
       addressed: "unclear",
       reason: String(err),
       fellBack: true,

@@ -204,6 +204,9 @@ export const assign = (
     target = opts.newId ? opts.newId() : nextIncidentId(db);
     created = true;
     db.prepare(
+      // `owner` is write-only and always 'agent'. It is named here rather than
+      // left to its default because the restored snapshot's copy of the column
+      // has no default -- see the comment on it in schema.sql.
       `INSERT INTO incident
          (id, status, owner, prUrls, firstSignalAt, recurrenceOf, rotationAtOpen,
           attempts, costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
@@ -227,16 +230,6 @@ export const assign = (
     if (!ATTACHABLE_STATUSES.includes(existing.status)) {
       throw new AssignError(
         `incident ${req.target} is ${existing.status} and cannot take signals`,
-      );
-    }
-    // A hand-off does not move the work, so status still reads INVESTIGATING
-    // or FIXING and the incident still looks open. Nothing is coming back to
-    // it on its own, though -- the dispatcher skips human-owned incidents --
-    // so an automatic attach here is a signal parked where no one is looking.
-    // A person moving signals around their own incident is the exception.
-    if (existing.owner === "human" && actor.kind !== "human") {
-      throw new AssignError(
-        `incident ${req.target} is owned by a human and cannot take signals automatically`,
       );
     }
     target = req.target;
@@ -288,7 +281,7 @@ export const assign = (
     !(actor.kind === "agent" && actor.incidentId === target);
   if (movedIntoRunningAgent) {
     const row = getIncidentRow(db, target);
-    if (row && row.owner === "agent" && ATTACHABLE_STATUSES.includes(row.status)) {
+    if (row && ATTACHABLE_STATUSES.includes(row.status)) {
       pushDirective(db, target, {
         type: "new_signals",
         count: moved.length,

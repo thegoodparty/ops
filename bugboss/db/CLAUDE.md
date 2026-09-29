@@ -63,6 +63,50 @@ is applied nowhere that matters.
   a throwaway in-memory database built from the same DDL, so SQLite parses
   the schema and no comment, table-level `CHECK` or virtual-table directive
   can be mistaken for a column.
+- **Removing a column is one edit, not two**, and the asymmetry from adding
+  one is real rather than an oversight. Delete it from `schema.sql` and stop
+  naming it in SQL. A database that already exists keeps the column and
+  nothing catches it up: a column nothing reads and nothing writes costs a few
+  bytes a row, and an `ALTER TABLE DROP COLUMN` that never runs can never
+  fail.
+
+  What makes that safe is the **default**. `costUsd` is `REAL NOT NULL DEFAULT
+  0`, so a restored snapshot still accepts an `INSERT` that has stopped naming
+  it. That is the whole discriminator, and the next bullet is the case where
+  it does not hold.
+- **A `NOT NULL` column with no default cannot be retired that way.** The same
+  treatment makes every `INSERT` fail against the restored snapshot, which is
+  every write in production and none in the suite, because a test opens a
+  fresh file and a fresh file is built from the current `schema.sql`. SQLite
+  has no `ALTER COLUMN`, so the default cannot be added to the existing column
+  afterwards; that is verified, not assumed. Dropping the column for real
+  works mechanically and is a door that only opens one way: the previous image
+  reads it, so a rollback meets a database it cannot boot against.
+
+  So the column is **kept, declared and written, and read by nothing**.
+  `incident.owner` is the one. `schema.sql` declares it `NOT NULL DEFAULT
+  'agent'`, and the single `INSERT INTO incident` in `toolapi/assign.ts`
+  writes the literal `'agent'`. One word in one statement keeps a fresh
+  database and a restored snapshot identical.
+
+  `settleOwnerToAgent` runs at boot and sets the column to `'agent'` on every
+  row that is not already. It changes nothing in this image, because nothing
+  reads the column here. It is there for the one reader that still exists:
+  the **previous** image, if a deploy is rolled back. That build filters the
+  dispatcher on `owner = 'agent'`, so a row left saying `'human'` would come
+  back stranded exactly as it is now. Between the settle and the constant,
+  a rollback is not merely survivable but correct. It is idempotent and
+  matches nothing after the first boot, which is why it is cheap to run on
+  every one.
+
+  `describe("the write-only owner column")` in `index.test.ts` is what holds
+  all of that, because none of it is visible from a fresh file. It builds a
+  fixture snapshot whose copy of the column has *no* default, which is
+  production's shape, and asserts that a write goes through, that booting over
+  it reports no `schema_drift` (only the declared type is compared, which is
+  what makes the differing default survivable), that a seeded `'human'` row
+  comes back `'agent'`, that the `INSERT` still names the column and still
+  writes `'agent'`, and that no query in the package reads it back.
 - **`CHECK` constraints cannot** be added at all. SQLite has no `ALTER TABLE
   ADD CHECK`, so adding one needs a table rebuild that does not exist here.
   The cross-field constraints landed while the database was empty; that

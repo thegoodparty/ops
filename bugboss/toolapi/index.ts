@@ -1,6 +1,6 @@
 // Job 4: serve the agent tool API. Design spec: bugboss/docs/architecture.md.
 //
-// The agent's only path to state. Six methods, four of which are state
+// The agent's only path to state. Six methods, three of which are state
 // transitions, and every response carries the directives the agent has not
 // picked up yet. That array is the whole coordination mechanism: there is no
 // push channel and an agent never has to be addressable, so it learns that a
@@ -278,7 +278,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
   /**
    * Everything the Boss says in an incident thread goes through here, so this
-   * is where mrkdwn and the length ceiling are enforced. A hand-off brief or a
+   * is where mrkdwn and the length ceiling are enforced. An escalation brief or a
    * root cause is model prose that can run past what one message holds, and
    * chat.postMessage truncates rather than refusing, so it is split into
    * consecutive messages instead of being cut mid sentence.
@@ -477,13 +477,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     allowed: IncidentStatus[],
     tool: string,
   ): string | null => {
-    // reportAnalysis is allowed through, because the write-up is the reason a
-    // takeover asks the agent to wind down rather than killing it. Blocking
-    // it would mean the moment a person claims an incident, everything the
-    // agent found is lost -- which is exactly what the person wanted.
-    if (incident.owner === "human" && tool !== "reportAnalysis") {
-      return `incident ${incident.id} is owned by a human; only reportAnalysis, handOff and getIncident remain`;
-    }
     if (!allowed.includes(incident.status)) {
       return `${tool} requires ${allowed.join(" or ")}; incident ${incident.id} is ${incident.status}`;
     }
@@ -495,7 +488,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     const now = readIncident(incidentId);
     return reject(
       now
-        ? `${tool} lost a race on incident ${incidentId}: it is ${now.status}, owned by ${now.owner === "human" ? "a human" : "an agent"}, and the transition did not apply`
+        ? `${tool} lost a race on incident ${incidentId}: it is ${now.status}, and the transition did not apply`
         : `${tool} lost a race on incident ${incidentId}, which is gone`,
     );
   };
@@ -535,12 +528,10 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
   /** Correlation moves records nobody else has claimed, in either direction. */
   const mergeable = (row: Incident | undefined): boolean =>
-    !!row &&
-    row.owner === "agent" &&
-    (row.status === "INVESTIGATING" || row.status === "FIXING");
+    !!row && (row.status === "INVESTIGATING" || row.status === "FIXING");
 
   const where = (row: Incident | undefined) =>
-    row ? { status: row.status, owner: row.owner } : { status: "gone" };
+    row ? { status: row.status } : { status: "gone" };
 
   /**
    * Declining is a decision, not a non-event: the Boss believed two
@@ -572,7 +563,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       return declined({
         reason: "the incident to absorb is no longer an agent's open work",
         absorbStatus: at.status,
-        absorbOwner: at.owner,
       });
     }
 
@@ -584,7 +574,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       return declined({
         reason: "the target is no longer an agent's open work",
         intoStatus: at.status,
-        intoOwner: at.owner,
       });
     }
 
@@ -641,7 +630,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
                usersImpacted = COALESCE(?, usersImpacted),
                impactQuery = COALESCE(?, impactQuery),
                impactStartedAt = COALESCE(?, impactStartedAt)
-             WHERE id = ? AND status = 'INVESTIGATING' AND owner = 'agent'`,
+             WHERE id = ? AND status = 'INVESTIGATING'`,
           )
           .run(
             args.cause,
@@ -744,8 +733,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           w
             .prepare(
               `UPDATE incident SET usersImpacted = ?, impactQuery = ?
-               WHERE id = ? AND status IN ('INVESTIGATING','FIXING','RESOLVED')
-                 AND owner = 'agent'`,
+               WHERE id = ? AND status IN ('INVESTIGATING','FIXING','RESOLVED')`,
             )
             .run(args.usersImpacted, args.query, incidentId).changes,
       );
@@ -787,7 +775,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           .prepare(
             `UPDATE incident SET status = 'RESOLVED', resolvedAt = ?, prUrls = ?,
                resolvedEvidence = ?
-             WHERE id = ? AND status = 'FIXING' AND owner = 'agent'`,
+             WHERE id = ? AND status = 'FIXING'`,
           )
           .run(at, JSON.stringify(args.prUrls), args.evidence, incidentId).changes;
         if (taken === 0) return null;
@@ -849,9 +837,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   /**
    * The one invariant a `CHECK` constraint would have carried if the schema
    * could still take one. Refused at the tool, like the over-long
-   * `contact_human` message: an agent that cannot say why the last
-   * resolution failed has not finished, and its other exit is `hand_off`,
-   * which is the correct place for a recurrence nobody can explain.
+   * `contact_human` message: an agent that cannot say why the last resolution
+   * failed has not finished, and leaving the incident open and escalated is
+   * the correct place for a recurrence nobody can explain.
    */
   const recurrenceGap = (
     incident: Incident,
@@ -859,7 +847,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   ): string | null => {
     if (!incident.recurrenceOf) return null;
     if (!analysis) {
-      return `incident ${incident.id} is a recurrence of ${incident.recurrenceOf}, so reportAnalysis needs a recurrence argument: why that resolution did not hold, which kind of failure it was, and what you did about that rather than about the symptom. If you cannot answer it, hand off instead of closing.`;
+      return `incident ${incident.id} is a recurrence of ${incident.recurrenceOf}, so reportAnalysis needs a recurrence argument: why that resolution did not hold, which kind of failure it was, and what you did about that rather than about the symptom. If you cannot answer it, escalate and leave this open instead of closing it.`;
     }
     if (analysis.why.trim().length < MIN_RECURRENCE_ANSWER_CHARS) {
       return `recurrence.why is too short to be an answer; say specifically why the resolution of ${incident.recurrenceOf} did not hold`;
@@ -909,11 +897,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         const at = Date.now();
         const taken = w
           .prepare(
-            // No owner predicate, unlike its siblings. A person who takes an
-            // incident over gets the agent's write-up rather than losing it,
-            // which is the whole reason a takeover winds the agent down
-            // instead of killing it. The status guard still holds the
-            // transition, so a MERGED row cannot be resurrected through here.
+            // The status guard is what holds this transition, so a MERGED
+            // row cannot be resurrected through here.
             `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
                usersImpacted = ?, impactQuery = ?, recurrenceAnalysis = ?
              WHERE id = ? AND status = 'RESOLVED'`,
@@ -963,18 +948,29 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       };
     });
 
-  const handOff: ToolApi["handOff"] = (args) =>
-    call("handOff", async (incidentId) => {
+  /**
+   * The half of the old `handOff` that was always the point. It says in the
+   * thread that this incident needs a person and then changes nothing: the
+   * agent is still driving, so there is no transition to lose a race on and
+   * nothing to retract when the post fails.
+   *
+   * Rejected on a failed post, unlike every notification elsewhere in this
+   * module. Everywhere else the state is already committed and the message is
+   * commentary; here the message is the entire effect, so an escalation
+   * nobody was told about has not happened and the agent has to know that.
+   */
+  const escalate: ToolApi["escalate"] = (args) =>
+    call("escalate", async (incidentId) => {
       const incident = readIncident(incidentId);
       if (!incident) return reject(`unknown incident: ${incidentId}`);
 
       if (incident.status === "CLOSED" || incident.status === "MERGED") {
         return reject(
-          `incident ${incidentId} is ${incident.status}; there is nothing to hand off`,
+          `incident ${incidentId} is ${incident.status}; there is nothing left for a person to pick up`,
         );
       }
 
-      // The brief is the first thing the person picking this up reads, on a
+      // The brief is the first thing the person reading this sees, on a
       // phone, so it answers to the thread budget like every other post. The
       // harness writes briefs too and cannot be asked to shorten one, which
       // is why `unansweredBrief` clamps the question it echoes rather than
@@ -982,66 +978,49 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const longBrief = overThreadBudget("brief", args.brief);
       if (longBrief) return reject(longBrief);
 
-      // The post comes first because it is the part that cannot be retried
-      // from anywhere else. Once owner is 'human' the dispatcher stops
-      // relaunching, so committing without the brief leaves an escalation
-      // nobody was told about and nothing to pick it back up.
       const posted = await notify(
         incident,
-        mrkdwn`*Incident ${incidentId} handed to a human* · ${args.reason}\n\n${raw(toMrkdwn(args.brief))}`,
+        mrkdwn`*Incident ${incidentId} needs a person to look* · ${args.reason}\n\n${raw(toMrkdwn(args.brief))}\n\n_An agent is still working this incident._`,
       );
       if (!posted) {
         return reject(
-          `could not post the hand-off brief for incident ${incidentId}; it stays owned by the agent so the hand off can be retried`,
+          `could not post the escalation for incident ${incidentId}, so nobody has been told; it is worth calling again`,
         );
       }
 
-      // Past this point the brief is out, so a person is reading that this
-      // is theirs. Every way of not committing the hand-off has to say so in
-      // the same thread the brief went to: leaving it standing is how
-      // somebody ends up believing they own an incident that nothing
-      // assigned to them. Shared by both failure paths below so they cannot
-      // drift apart — one of them silently not retracting is exactly the
-      // bug this guards.
-      const retract = (why: string) =>
-        notify(
-          incident,
-          mrkdwn`*Correction on ${incidentId}*\nThat hand-off could not be recorded, so ${why} Treat the brief above as a status update.`,
-        );
+      return { ok: true, data: { incidentId } };
+    });
 
-      try {
-        const taken = await db.withWrite((w) =>
-          w
-            .prepare(
-              // Guarded on status, deliberately not on owner: a human who
-              // claimed the incident in Slack already flipped owner, and the
-              // agent's last act is still to write the brief.
-              //
-              // The status guard is the TOCTOU fix. Between the check above
-              // and this write, reportAnalysis or a merge can move the
-              // incident to a terminal state, and no CHECK constraint
-              // involves owner — so without it the write succeeds and hands
-              // a person an incident that is already closed.
-              `UPDATE incident SET owner = 'human'
-                 WHERE id = ? AND status NOT IN ('CLOSED', 'MERGED')`,
-            )
-            .run(incidentId).changes,
+  const park: ToolApi["park"] = (args) =>
+    call("park", async (incidentId) => {
+      const incident = readIncident(incidentId);
+      if (!incident) return reject(`unknown incident: ${incidentId}`);
+      if (incident.status === "CLOSED" || incident.status === "MERGED") {
+        return reject(
+          `incident ${incidentId} is ${incident.status}; nothing is waiting on anything`,
         );
-        if (taken === 0) {
-          await retract(
-            "the incident reached a terminal state while the brief was posting and nobody has been assigned.",
-          );
-          return raced(incidentId, "handOff");
-        }
-      } catch (err) {
-        // The write itself failed, so the row still says agent and the
-        // dispatcher will put another agent on it. Two agents posting into
-        // the thread somebody was handed reads as being ignored.
-        await retract("it is still owned by the agent and nobody has been assigned.");
-        throw err;
       }
 
-      return { ok: true, data: { incidentId, owner: "human" as const } };
+      const at = Date.now();
+      const wakeAt =
+        args.wakeAfterSeconds === undefined
+          ? null
+          : at + Math.max(0, args.wakeAfterSeconds) * 1000;
+
+      await db.withWrite((w) =>
+        w
+          .prepare(
+            `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(incidentId) DO UPDATE SET
+               waitingFor = excluded.waitingFor,
+               wakeAt = excluded.wakeAt,
+               startedAt = excluded.startedAt`,
+          )
+          .run(incidentId, args.waitingFor, wakeAt, at),
+      );
+
+      return { ok: true, data: { incidentId, wakeAt } };
     });
 
   const getIncident: ToolApi["getIncident"] = () =>
@@ -1103,7 +1082,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     reportImpact,
     reportResolved,
     reportAnalysis,
-    handOff,
+    escalate,
+    park,
     getIncident,
     searchIncidents: searchIncidentsTool,
   };

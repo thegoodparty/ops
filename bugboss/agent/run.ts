@@ -285,7 +285,8 @@ export const createBossClient = (args: {
     reportImpact: (payload) => call<ToolResponse>("POST", "/impact", payload),
     reportResolved: (payload) => call<ToolResponse>("POST", "/resolved", payload),
     reportAnalysis: (payload) => call<ToolResponse>("POST", "/analysis", payload),
-    handOff: (payload) => call<ToolResponse>("POST", "/handoff", payload),
+    escalate: (payload) => call<ToolResponse>("POST", "/escalate", payload),
+    park: (payload) => call<ToolResponse>("POST", "/park", payload),
     getIncident: () => call<ToolResponse<IncidentView>>("GET", ""),
     searchIncidents: (payload) =>
       call<ToolResponse<IncidentMatch[]>>("POST", "/search", payload),
@@ -477,10 +478,10 @@ export const createBossTools = async (args: {
         ),
     },
     {
-      name: "hand_off",
-      label: "Hand off",
+      name: "escalate",
+      label: "Escalate",
       description:
-        "Terminal. Gives the incident to a human and posts your brief. Before calling it without a root cause, you must propose either a change to the alert rule as a PR or a named piece of missing instrumentation.",
+        "Says this incident needs a person, in the thread and at the rotation, and posts your brief. It changes nothing and does not end your run: this incident is yours either way, and you keep working it. Use it when you are blocked on something only a person can do, or when you are out of ideas. Before calling it without a root cause, you must propose either a change to the alert rule as a PR or a named piece of missing instrumentation.",
       parameters: Type.Object({
         reason: Type.String(),
         brief: Type.String({
@@ -490,7 +491,7 @@ export const createBossTools = async (args: {
       }),
       execute: async (_id: string, params: unknown) =>
         bossToolResult(
-          await args.api.handOff(params as unknown as Parameters<ToolApi["handOff"]>[0]),
+          await args.api.escalate(params as unknown as Parameters<ToolApi["escalate"]>[0]),
           maxChars,
         ),
     },
@@ -683,7 +684,7 @@ export const exitCodeFor = (result: RunIncidentAgentResult): number =>
   result.error ? 1 : 0;
 
 export const sessionSyncFailedMessage = (streak: number): string =>
-  `Your session has failed to save ${streak} times in a row. Nothing you have done since is durable: if this container restarts you will start over from nothing. Stop investigating and call hand_off now, with a brief covering what you believe, what you ruled out and what you were about to do.`;
+  `Your session has failed to save ${streak} times in a row. Nothing you have done since is durable: if this container restarts you will start over from nothing. Stop investigating and call escalate now, with a brief covering what you believe, what you ruled out and what you were about to do.`;
 
 export const resumeMessage = (): string =>
   "You were restarted. Time passed while you were down, and pull requests merge, deploys ship, alerts stop and people fix things by hand in that time. Call get_incident first: its resumed_after directive says how long. Re-run only the checks that matter for what you were in the middle of, then continue.";
@@ -712,7 +713,7 @@ export const exitRecordFor = (args: {
 });
 
 export const deadlineMessage = (graceSeconds: number): string =>
-  `Your wall-clock deadline has expired. Stop investigating. Within the next ${graceSeconds} seconds, call hand_off with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing.`;
+  `Your wall-clock deadline has expired. Stop investigating. Within the next ${graceSeconds} seconds, call escalate with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing.`;
 
 export const runIncidentAgent = async (
   options: RunIncidentAgentOptions,
@@ -1125,8 +1126,8 @@ const launch = async (args: {
   const timeoutSeconds = options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
   let timedOut = false;
   // Two layers, because an in-process deadline cannot fire inside a wedged
-  // agent: ask it to hand off, then stop it. The dispatcher kills the process
-  // as the real backstop.
+  // agent: ask it to write its brief, then stop it. The dispatcher kills the
+  // process as the real backstop.
   const deadline = setTimeout(() => {
     timedOut = true;
     deadlineAbort.abort();

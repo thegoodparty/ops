@@ -56,8 +56,8 @@ const directivesFor = (incidentId: string): Directive[] =>
     .map((r) => JSON.parse(r.payload) as Directive);
 
 const incident = (id: string) =>
-  db.get<{ id: string; status: string; mergedInto: string | null; recurrenceOf: string | null; owner: string; firstSignalAt: number }>(
-    "SELECT id, status, mergedInto, recurrenceOf, owner, firstSignalAt FROM incident WHERE id = ?",
+  db.get<{ id: string; status: string; mergedInto: string | null; recurrenceOf: string | null; firstSignalAt: number }>(
+    "SELECT id, status, mergedInto, recurrenceOf, firstSignalAt FROM incident WHERE id = ?",
     [id],
   );
 
@@ -104,7 +104,6 @@ describe("assign: one primitive, four operations", () => {
     assert.deepEqual(result.merged, []);
     const row = incident(result.target);
     assert.equal(row?.status, "INVESTIGATING");
-    assert.equal(row?.owner, "agent");
     assert.equal(row?.firstSignalAt, 1000, "firstSignalAt comes from the signal");
     assert.deepEqual(signalsOn(result.target), ["sig-a"]);
   });

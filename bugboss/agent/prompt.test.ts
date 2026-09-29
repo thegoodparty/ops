@@ -85,7 +85,7 @@ test("the load-bearing rules are all in there", () => {
   assert.match(prompt, /npm-ci\.done/);
   assert.match(prompt, /95% of the context window/);
   assert.match(prompt, /report_root_cause/);
-  assert.match(prompt, /hand_off/);
+  assert.match(prompt, /escalate/);
   assert.match(prompt, /resumed_after/);
   assert.match(prompt, /Loki uid grafanacloud-logs/);
   assert.match(prompt, /drive delegate to Approved/);
@@ -95,10 +95,14 @@ test("the prompt names the difference between asking and escalating", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.match(prompt, /I am still working, and I need one fact from you/);
-  assert.match(prompt, /I cannot take this further, it is yours/);
+  assert.match(prompt, /somebody needs to look at this/);
+  // The prompt has to say that escalating changes nothing, or a model that
+  // reads only the prompt believes it can put an incident down.
+  assert.match(prompt, /this one is yours until it closes/);
+  assert.match(prompt, /No incident is ever taken off you/);
   // The harness enforces this one; the prompt has to say so, or a model that
   // reads only the prompt believes an unanswered question is survivable.
-  assert.match(prompt, /converted into a hand_off by the harness/);
+  assert.match(prompt, /is escalated by the harness/);
   assert.match(prompt, new RegExp(`${CONTACT_HUMAN_MIN_WAIT_SECONDS} seconds is raised to it`));
 });
 

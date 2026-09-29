@@ -82,6 +82,13 @@ came out of the wait with anything.
   argument decides it rather than the command string, because a harness that
   pattern-matched `gh pr` would stop nudging the day somebody wrote the same
   check differently.
+
+  The `command` has to **observe the thing itself** — `gh pr view --json
+  state,mergedAt`, a flag read, a health check — not park until somebody says
+  in Slack that they did it. Being told is the fallback. That is instruction
+  (`prompt.ts`, the tool description) rather than a validator: what a command
+  observes is not readable from its text, and this codebase does not
+  pattern-match human-facing behaviour.
 - `contact_human(message, …)` — re-entrant. The marker is written *before*
   the post, so a resumed agent resumes waiting rather than asking twice. It
   re-posts when the stored message differs from the new one, and when
@@ -147,40 +154,39 @@ forbids it; that is advice, not a control. If a reviewer wants this closed,
 the only real answer is a second, narrower token for the agent's shell, which
 is a bigger change than this one.
 
-## contact_human is not an escalation, and the harness enforces that
+## contact_human is a question, and an unanswered one gets loud
 
-The two tools that reach a person differ only in who owns the incident
-afterwards: `contact_human` leaves `owner: agent`, `hand_off` sets
-`owner: human`. An agent blocked on a question nobody answers is therefore
-invisible as work needing a person — the dispatcher will not relaunch an
-incident a live agent still holds, and nothing lists one owned by an agent
-as unclaimed. The first real run ended exactly there: it could not reconcile
-the alert, and asked instead of escalating.
+Both tools that reach a person leave the incident exactly where it was.
+`contact_human` asks for one fact or one action; `escalate` says the incident
+needs a person and reaches the rotation. Neither moves the work and neither is
+an exit — the agent keeps the incident and keeps driving it, because it is the
+only thing that can finish it.
 
-So an unanswered wait converts. `runContactHuman` calls `hand_off` itself,
-returns `terminate`, and the agent stops. Three details it rests on:
+So an unanswered wait escalates rather than ending. `runContactHuman` calls
+`escalate` itself and carries on; only a `stop` or a `merged` directive
+terminates the run. The details it rests on:
 
 - **The floor.** A requested wait below `CONTACT_HUMAN_MIN_WAIT_SECONDS` is
   raised to it, not answered early. Without that, the escalation is opt-out:
   ask for two minutes and no timeout ever means anything.
 - **Not on the deadline abort.** The soft deadline has its own path — the run
   steers the model to write a real brief inside the grace window — and
-  handing off here would spend the turn that brief needs.
-- **A failed hand-off is loud.** Ownership did not move and nobody was told,
-  so the result says so and tells the model to call `hand_off` itself. The
-  prompt is where the model is asked to hand off first; this is the floor
-  under it, and the brief the harness writes is deliberately thinner.
+  escalating here would spend the turn that brief needs.
+- **A failed escalation is loud.** Nobody was told, so the result says so and
+  tells the model to say it in the thread itself. The prompt is where the model
+  is asked to escalate first; this is the floor under it, and the brief the
+  harness writes is deliberately thinner.
 - **The clock runs from `askedAt`, not from process start.** A restart is not
   an answer. A deadline of `now() + wait` hands a crash-looping agent a fresh
   wait every time and defers the escalation for as long as the crashes last.
-- **The marker is cleared after the hand-off, and only if it landed.** Clearing
-  first and dying in between replays as a brand-new question: re-posted, with a
-  fresh `askedAt` that makes a reply already in the thread look too old to be
-  one.
+- **The marker is cleared after the escalation, and only if it landed.**
+  Clearing first and dying in between replays as a brand-new question:
+  re-posted, with a fresh `askedAt` that makes a reply already in the thread
+  look too old to be one.
 - **Buttons do not opt out of any of it.** A button nobody presses is
   silence, so a question with `options` hits the same floor, the same
-  deadline and the same hand-off. The labels go into the harness's brief,
-  because they were part of the question and whoever picks this up was not
+  deadline and the same escalation. The labels go into the harness's brief,
+  because they were part of the question and whoever reads it was not
   watching the thread.
 
 `message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
@@ -200,11 +206,15 @@ An agent that posts "please merge this" and then blocks is indistinguishable
 from one that has died, and a merge nobody notices is the stall that matters
 most — the human's only job in this system is the merge. So a wait with
 `awaitingHuman` set nudges the thread on its own: due an hour in, then two,
-then four, and once the nudges run out `hand_off` sets `owner: human` and the
-agent stops. That last step is the point of the ladder — an incident blocked
-with `owner: agent` is invisible, since the dispatcher will not relaunch one
-an agent still holds and nothing lists it as unclaimed work. `hand_off` is
-also the only post in the sequence that reaches the rotation group.
+then four. Past `HEARTBEAT_LOUD_AFTER_PINGS` the nudge becomes an `escalate` —
+the same facts, posted where the rotation sees them — and the wait continues.
+
+**The ladder does not terminate**, because the agent is the only thing that
+can finish the work: volume is the only thing left that can change.
+`HEARTBEAT_MAX_GAP_SECONDS` clamps the doubling at a day, so it runs 1h, 2h,
+4h, 8h, 16h and then daily for as long as the wait lasts. Nothing open goes
+quiet for more than a day. Left doubling, the eighth nudge would land a
+fortnight after the seventh, which is indistinguishable from having given up.
 
 It lives in the wait loop rather than in the prompt for the same two reasons
 `runContactHuman`'s escalation does. It must cost **no turns** — a model asked
@@ -251,8 +261,9 @@ that met the bar did not hold. Three constraints carry the second:
   literal repeat — watching the same window for the same interval and
   reporting the same quiet — not a paraphrase. The prompt carries the rest.
 - **`report_analysis` requires a `recurrence` argument** and refuses without
-  one: which of six kinds of failure, why, and what changed. `hand_off` is
-  the other exit, and an unexplained recurrence belongs there.
+  one: which of six kinds of failure, why, and what changed. An agent that
+  cannot answer escalates instead and keeps the incident: a recurrence nobody
+  can explain stays open with somebody told it needs them.
 - **`bugboss_defect` is one of the six.** The fix is in `ops`, and agents do
   not open pull requests against it, so the answer leaves as a proposal
   posted to the channel. The prompt says so; see the note in the PR that
@@ -269,7 +280,7 @@ the middle of the incident rather than itself.
 
 ## What it writes goes straight to Slack
 
-`contact_human`, the hand-off brief, the root cause, the resolution evidence
+`contact_human`, the escalation brief, the root cause, the resolution evidence
 and the post-mortem are all posted as the agent wrote them, so the prompt
 carries the mrkdwn contract ("Writing to Slack" in `prompt.ts`). The model is
 told **not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at
@@ -283,7 +294,7 @@ root cause and post-mortem stay as the agent wrote them.
 
 The poll in `contact_human` uses a **non-draining** read
 (`GET /incidents/:id/directives`). Draining there destroyed `stop`,
-`merged`, `handoff`, `new_signals` and `resumed_after` — including the
+`merged`, `new_signals` and `resumed_after` — including the
 `resumed_after` the dispatcher inserts at launch, which the agent's first
 replayed call would eat before it ever ran `get_incident`.
 
@@ -306,7 +317,7 @@ nothing.
 Every flush checks `lastError()`. A silently failing S3 write means the next
 restart starts from scratch with the whole investigation lost, and combined
 with relaunch that is an unbounded loop of agents each beginning again. N
-consecutive failures steers the agent to hand off.
+consecutive failures steers the agent to escalate.
 
 The session file is also the run's **cost ledger** -- `sumSessionUsage`
 reads it back after the child exits, so the key the agent writes and the key

@@ -172,7 +172,7 @@ beforeEach(async () => {
     d.prepare("DELETE FROM signal").run();
     d.prepare("DELETE FROM incident").run();
     d.prepare(
-      "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES ('inc-1','INVESTIGATING','agent',1)",
+      "INSERT INTO incident (id, status, firstSignalAt) VALUES ('inc-1','INVESTIGATING',1)",
     ).run();
   });
 });
@@ -358,7 +358,7 @@ describe("prefix binding", () => {
     const before = specs();
     await db.withWrite((d) => {
       d.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt) VALUES ('inc-2','FIXING','human',2)",
+        "INSERT INTO incident (id, status, firstSignalAt) VALUES ('inc-2','FIXING',2)",
       ).run();
     });
 
@@ -823,7 +823,7 @@ describe("an incident named outside its own thread is linkable", () => {
   test("a whole query's worth of incidents is one round trip", async () => {
     await db.withWrite((d) => {
       const stmt = d.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 'agent', 1, ?)",
+        "INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 1, ?)",
       );
       for (let i = 2; i <= 6; i++) stmt.run(`inc-${i}`, `${i}00.0`);
     });
@@ -854,7 +854,7 @@ describe("an incident named outside its own thread is linkable", () => {
   test("Slack going down partway does not turn fifty rows into fifty waits", async () => {
     await db.withWrite((d) => {
       const stmt = d.prepare(
-        "INSERT INTO incident (id, status, owner, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 'agent', 1, ?)",
+        "INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 1, ?)",
       );
       for (let i = 2; i <= 6; i++) stmt.run(`inc-${i}`, `${i}00.0`);
     });
@@ -961,7 +961,7 @@ const countingTool = (results: string[]) => ({
   inputSchema: { type: "object" } as Record<string, unknown>,
   run: (input: Record<string, unknown>) => {
     results.push(String(input.incidentId));
-    return Promise.resolve(`${String(input.incidentId)} is FIXING, owner agent`);
+    return Promise.resolve(`${String(input.incidentId)} is FIXING, an agent is on it`);
   },
 });
 

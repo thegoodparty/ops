@@ -78,14 +78,13 @@ thing that happened, including a transition a module refused on purpose. An
 alarm that fires during normal operation teaches people to ignore alarms.
 
 **Every interface a person talks to is natural language.** Nothing here
-decides what somebody wants by matching their words against a list. Two
-things did — the ownership claim and the bug-report verb — and both were a
-magic phrase nobody could discover and everybody mistyped, failing silently
-when they did. Intent is a model call (`slack/intent.ts`), advisory the way
-triage is: the model reads the sentence, the code keeps the invariants, and
-an ambiguous read asks in the thread rather than guessing. Who a message was
-for is read the same way, because requiring a tag to answer a direct question
-is the same mistake in the other direction.
+decides what somebody wants by matching their words against a list. One thing
+did — the bug-report verb — and it was a magic phrase nobody could discover
+and everybody mistyped, failing silently when they did. Intent is a model call
+(`slack/intent.ts`), advisory the way triage is: the model reads the sentence,
+the code keeps the invariants, and an ambiguous read asks in the thread rather
+than guessing. Who a message was for is read the same way, because requiring a
+tag to answer a direct question is the same mistake in the other direction.
 
 An entity check — "does this text contain `<@U…>`", "is this string empty" —
 is not a language interface. One of those is load-bearing: an explicit
@@ -97,10 +96,17 @@ does not.
 every incident ends in an outcome a person can see. A quiet signal is
 evidence an agent reads, never a transition the Boss makes.
 
-**Status is where the work is. Owner is who has it.** Orthogonal, by design
-(`types.ts`). An incident can be `FIXING` and owned by a human. Of the
+**An open incident is always driven by an agent.** A person is something an
+incident can be *waiting on*, never something it can be *given to*
+(`types.ts`). `status` is the only axis, and it says where the work is. Of the
 places that ask "is this available", the dispatcher, `openIncidents()` and
 triage's guard must all agree — they have disagreed before.
+
+Waiting on a person is a row in `incident_wait`, not a field on the incident.
+It says the dispatcher must not relaunch this incident yet, and nothing more:
+the agent still has the work, and it still holds its dispatcher slot. Any
+reply in the thread deletes the row, before anything reads what the reply
+meant. `dispatcher/CLAUDE.md` has the mechanism.
 
 **Evidence, not assertion.** `RESOLVED` means no users are affected any more
 and no further alerts should occur, confirmed. Every number the agent
@@ -159,6 +165,21 @@ changes only a database that does not exist yet.
 - A `LATE_COLUMNS` entry naming a table that does not exist **refuses the
   boot**. That is a defect in the list, identical on every boot, so it never
   reaches prod.
+- Removing a **column** is normally one edit, not two: delete it from
+  `schema.sql` and stop naming it in SQL. Nothing catches the existing
+  database up, so it keeps the column forever, and that is fine *because the
+  column has a `DEFAULT`* -- a restored snapshot still accepts an insert that
+  no longer names it.
+  
+  Which is the same fact the addition trap above turns on, seen from the
+  other side: a `NOT NULL` column with no default is the one thing SQLite
+  gives you no way to retrofit. It cannot be added that way, and it cannot be
+  retired that way either, because the first insert that stops naming it
+  fails against every database that already exists and none that a test
+  opens. There is no `ALTER COLUMN` to add the default afterwards. So such a
+  column is **kept, declared and written, and read by nothing**.
+  `incident.owner` is the one; `db/CLAUDE.md` says why that is a better trade
+  than dropping it for real.
 - Adding a **`CHECK` constraint** is not possible at all. SQLite cannot add
   one to an existing table, so it needs a table rebuild that does not exist
   here. The cross-field constraints landed while the database was empty; that

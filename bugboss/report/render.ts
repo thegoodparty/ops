@@ -330,7 +330,6 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
   const sources = [...new Set(data.signals.map((signal) => signal.source))];
   const rows: [string, string][] = [
     ["Status", incident.status],
-    ["Owner at close", incident.owner],
     [
       "Users impacted",
       incident.usersImpacted === null ? "not measured" : count(incident.usersImpacted),

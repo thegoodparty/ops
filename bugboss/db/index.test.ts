@@ -4,7 +4,13 @@
 // database created from scratch -- which is every test, and not prod.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -437,5 +443,221 @@ describe("triage's spend columns reach a database that already exists", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+/**
+ * `incident.owner` is write-only, and this is the suite that keeps it that
+ * way. Nothing reads it -- an open incident is always driven by an agent --
+ * but it is still declared and still written, because neither way of removing
+ * it is safe.
+ *
+ * The retirement rule says to drop a column from `schema.sql` and stop naming
+ * it anywhere. That works for `costUsd`, which is `REAL NOT NULL DEFAULT 0`:
+ * a database that keeps the column accepts an `INSERT` that has stopped
+ * naming it. `owner` is `NOT NULL` with **no default**, so the same treatment
+ * makes every write fail against the restored snapshot, which is every write
+ * in production and none in the suite. SQLite has no `ALTER COLUMN`, so the
+ * default cannot be added after the fact either.
+ *
+ * So it stays named. These tests are what stop somebody applying the other
+ * rule to it, and the first one is the one that would have caught it.
+ */
+describe("the write-only owner column", () => {
+  let dir: string;
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "bugboss-db-owner-"));
+  });
+
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  /**
+   * Production's copy of the column, which is the shape that matters: no
+   * default, so an `INSERT` that omits it is rejected. A fresh database built
+   * from the current `schema.sql` has a default and would accept one, which
+   * is exactly why a test on a fresh file cannot see this.
+   */
+  const snapshotWithoutDefault = (name: string) => {
+    const path = join(dir, name);
+    const ddl = readFileSync(
+      join(__dirname, "..", "db", "schema.sql"),
+      "utf8",
+    ).replace(
+      /owner\s+TEXT NOT NULL DEFAULT 'agent'/,
+      "owner             TEXT NOT NULL",
+    );
+    const seed = new Database(path);
+    seed.exec(ddl);
+    const declared = (
+      seed.prepare("PRAGMA table_info(incident)").all() as {
+        name: string
+        dflt_value: string | null
+      }[]
+    ).find((c) => c.name === "owner");
+    assert.ok(declared, "the fixture lost the column it exists to model");
+    assert.equal(
+      declared?.dflt_value,
+      null,
+      "the fixture is meant to have no default; if schema.sql moved, this suite is testing nothing",
+    );
+    seed.close();
+    const bytes = readFileSync(path);
+    rmSync(path);
+    return bytes;
+  };
+
+  const openOver = async (name: string, bytes: Buffer) =>
+    Db.open({
+      path: join(dir, name),
+      bucket: "b",
+      key: "k",
+      s3: s3Holding(bytes) as unknown as S3Client,
+    });
+
+  it("takes a write against a snapshot whose column has no default", async () => {
+    const db = await openOver("prod-shape.db", snapshotWithoutDefault("seed1.db"));
+    try {
+      // The whole point. Drop `owner` from the INSERT and this is the line
+      // that fails in production and nowhere else.
+      await db.withWrite((w) => {
+        w.prepare(
+          `INSERT INTO incident
+             (id, status, owner, prUrls, firstSignalAt, attempts, costUsd,
+              tokensIn, tokensOut, cacheRead, cacheWrite)
+           VALUES ('i1', 'INVESTIGATING', 'agent', '[]', 1, 0, 0, 0, 0, 0, 0)`,
+        ).run();
+      });
+      assert.equal(
+        db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = 'i1'")
+          ?.owner,
+        "agent",
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("boots over that snapshot without reporting drift", async () => {
+    // `schemaDrift` reports columns the DDL declares and the database lacks.
+    // Both have this one, so a differing default must not read as drift --
+    // only the declared type is compared, and that is what makes keeping the
+    // column survivable at all.
+    const events: string[] = [];
+    const original = console.error;
+    console.error = (line: unknown) => {
+      try {
+        events.push(JSON.parse(String(line)).event);
+      } catch {
+        original(line);
+      }
+    };
+    try {
+      const db = await openOver("nodrift.db", snapshotWithoutDefault("seed2.db"));
+      db.close();
+    } finally {
+      console.error = original;
+    }
+    assert.equal(events.includes("schema_drift"), false, `${events}`);
+  });
+
+  it("is written as 'agent' by the only statement that creates an incident", () => {
+    // Read off the source rather than through assign(), because what this
+    // guards is the literal: a future edit that drops `owner` from the column
+    // list passes every test in this repo and fails every write in prod.
+    const assignSrc = readFileSync(
+      join(__dirname, "..", "toolapi", "assign.ts"),
+      "utf8",
+    );
+    const inserts = assignSrc.match(/INSERT INTO incident[\s\S]*?VALUES[^`]*/g) ?? [];
+    assert.equal(inserts.length, 1, "a second incident INSERT needs the same treatment");
+    assert.match(inserts[0], /\bowner\b/, "the INSERT must still name owner");
+    assert.match(inserts[0], /'agent'/, "and must write it as agent");
+  });
+
+  it("settles every row to agent, so a rollback is correct and not just safe", async () => {
+    const bytes = snapshotWithoutDefault("seed3.db");
+    // Seed the shape production actually had: rows a previous build would
+    // read as human-owned and therefore never dispatch.
+    const path = join(dir, "stranded.db");
+    writeFileSync(path, bytes);
+    const seeded = new Database(path);
+    seeded
+      .prepare(
+        `INSERT INTO incident (id, status, owner, prUrls, firstSignalAt, attempts,
+            costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+         VALUES ('stranded', 'FIXING', 'human', '[]', 1, 4, 0, 0, 0, 0, 0)`,
+      )
+      .run();
+    // Closed before it is read: schema.sql sets WAL, so an open handle leaves
+    // the tables in the -wal file and the bytes come back empty.
+    seeded.close();
+    const withRow = readFileSync(path);
+    rmSync(path);
+
+    const db = await openOver("settled.db", withRow);
+    try {
+      assert.equal(
+        db.get<{ owner: string }>(
+          "SELECT owner FROM incident WHERE id = 'stranded'",
+        )?.owner,
+        "agent",
+        "the previous image filters on this column; a rolled-back deploy must not find the old answer",
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("is read by no SQL in the package", () => {
+    // The claim the whole design rests on. A SELECT, a WHERE or an UPDATE
+    // naming this column is a behaviour change, not a refactor, so it fails
+    // here rather than in review.
+    //
+    // Scanned as SQL rather than as text: `owner` is also how GitHub spells
+    // half of `owner/repo`, and the comments explaining why this column is
+    // still here obviously name it too. So comments come out first, and what
+    // is left has to look like a statement before it counts.
+    const root = join(__dirname, "..");
+    const offenders: string[] = [];
+    const walk = (at: string) => {
+      for (const entry of readdirSync(at, { withFileTypes: true })) {
+        if (entry.name === "node_modules" || entry.name === "docs") continue;
+        const full = join(at, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
+        const src = readFileSync(full, "utf8")
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/^\s*\/\/.*$/gm, "");
+        // Every string form, not just backticks. The first version of this
+        // scanned template literals only, which made it green for the wrong
+        // reason: `settleOwnerToAgent` names the column in a double-quoted
+        // UPDATE and went straight past.
+        const strings = src.match(/`[^`]*`|"[^"\n]*"|'[^'\n]*'/g) ?? [];
+        for (const sql of strings) {
+          if (!/\b(SELECT|UPDATE|INSERT|DELETE)\b/i.test(sql)) continue;
+          if (!/\bowner\b/.test(sql)) continue;
+          // The two statements that legitimately name it, both writes.
+          if (
+            full.endsWith(join("toolapi", "assign.ts")) &&
+            /INSERT INTO incident/.test(sql)
+          ) {
+            continue;
+          }
+          if (
+            full.endsWith(join("db", "index.ts")) &&
+            /UPDATE incident SET owner/.test(sql)
+          ) {
+            continue;
+          }
+          offenders.push(`${full.slice(root.length + 1)}: ${sql.slice(0, 60)}`);
+        }
+      }
+    };
+    walk(root);
+    assert.deepEqual(offenders, [], "owner is write-only; this SQL reads it");
   });
 });

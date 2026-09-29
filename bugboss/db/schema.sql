@@ -11,7 +11,27 @@ CREATE TABLE IF NOT EXISTS incident (
   id                TEXT PRIMARY KEY,
   status            TEXT NOT NULL CHECK (status IN
                       ('INVESTIGATING','FIXING','RESOLVED','CLOSED','MERGED')),
-  owner             TEXT NOT NULL CHECK (owner IN ('agent','human')),
+
+  -- Write-only, and permanently so. Nothing reads this: an open incident is
+  -- always driven by an agent, so there is no second thing for a column to
+  -- say. It is still declared and still written as the literal 'agent'
+  -- because it cannot safely be removed either way round.
+  --
+  -- Dropping it from this file is what the retirement rule asks for, and it
+  -- does not work here. That rule rests on the retired column having a
+  -- DEFAULT -- `costUsd` is REAL NOT NULL DEFAULT 0, so a database that keeps
+  -- it accepts an INSERT that stops naming it. This one is NOT NULL with no
+  -- default, so the same treatment makes every INSERT fail against the
+  -- restored snapshot, which is every write in production. SQLite has no
+  -- ALTER COLUMN, so the default cannot be added afterwards, and dropping the
+  -- column for real is a door that only opens one way: the previous image
+  -- reads it, so a rollback would meet a database it cannot boot against.
+  --
+  -- Writing a constant costs one word in one INSERT and keeps a fresh
+  -- database and a restored snapshot identical. A rollback is not merely
+  -- survivable but correct, since every row already says 'agent'.
+  owner             TEXT NOT NULL DEFAULT 'agent'
+                      CHECK (owner IN ('agent','human')),
   slackThreadTs     TEXT,
 
   rootCause         TEXT,
@@ -206,6 +226,33 @@ CREATE TABLE IF NOT EXISTS pending_wait (
   -- wait that spanned a night would fire its whole ladder in the first three
   -- minutes after the window opened.
   lastPingAt        INTEGER
+);
+
+-- An incident that is blocked on a person and must not be relaunched until
+-- something changes. Not ownership and not a hand-off: the agent still drives
+-- this incident, it simply has nothing to do until the wait ends.
+--
+-- This is the half of `owner = 'human'` that was load-bearing. That column did
+-- two jobs at once -- it stopped the relaunch and it said who had the work --
+-- and deleting it without replacing the first turns an agent that stops
+-- driving into a hot loop: the dispatcher relaunches on the next tick, the
+-- agent is immediately back in the state that stopped it, and it exits again,
+-- pinging the rotation every thirty seconds forever. A budget-exhausted agent
+-- is the case that makes this unavoidable.
+--
+-- It stops the relaunch. It does NOT free the dispatcher slot, and those are
+-- easy to conflate: an agent parked inside `monitor` is alive and still holds
+-- its slot, and that is deliberate. Suspend-and-resume was considered and
+-- ruled out, so a run that is merely waiting stays running.
+CREATE TABLE IF NOT EXISTS incident_wait (
+  incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  -- What is being waited on, in one line, for the thread and the digest.
+  waitingFor        TEXT NOT NULL,
+  -- Runnable again from this moment. NULL means nothing but a reply or the
+  -- stale sweep will lift it, which is the right shape for a wait on a person
+  -- with no deadline of its own.
+  wakeAt            INTEGER,
+  startedAt         INTEGER NOT NULL
 );
 
 -- Slack replies the Boss has relayed, which agents poll for.

@@ -93,7 +93,6 @@ const fakeDb = (
   opts: {
     signalIds?: string[];
     statuses?: Record<string, string>;
-    owners?: Record<string, string>;
     recurrence?: RecurrenceRow[];
   } = {},
 ) => {
@@ -109,10 +108,6 @@ const fakeDb = (
       }
       if (/from\s+signal/i.test(sql)) {
         return (opts.signalIds ?? []).map((id) => ({ id })) as unknown as T[];
-      }
-      if (/select\s+owner/i.test(sql)) {
-        const owner = opts.owners?.[String(params[0])];
-        return (owner ? [{ owner }] : []) as unknown as T[];
       }
       const status = opts.statuses?.[String(params[0])];
       return (status ? [{ status }] : []) as unknown as T[];
@@ -532,10 +527,15 @@ test("a failed status read falls back loudly instead of dropping the recurrence"
   assert.equal(alarms.filter((a) => a.event === "fell_back").length, 1);
 });
 
-// --- owner is a separate axis from status --------------------------------
+// --- the attach decision re-reads the row, it does not trust the digest ---
+//
+// `openIncidents` is a snapshot taken before the model call, and the call can
+// take tens of seconds. Every one of these gives the digest one status and
+// the database another, which is the only way to tell which of the two the
+// refusals are reading.
 
-test("refuses to attach to an incident a human has taken over", async () => {
-  const { db } = fakeDb({ owners: { "inc-7": "human" } });
+test("refuses to attach to an incident that was merged away mid-decision", async () => {
+  const { db } = fakeDb({ statuses: { "inc-7": "MERGED" } });
   const { model } = scripted([
     decideCall({
       action: "attach",
@@ -552,14 +552,14 @@ test("refuses to attach to an incident a human has taken over", async () => {
   assert.equal(
     outcome.decision.action,
     "new_incident",
-    "an open status does not mean an agent is coming back to it",
+    "the digest still says INVESTIGATING, so an attach here would park a signal on a dead row",
   );
-  assert.match(outcome.decision.reason, /owned by a human/);
+  assert.match(outcome.decision.reason, /inc-7 is MERGED/);
   assert.equal(outcome.fellBack, false);
 });
 
-test("still attaches when an agent owns the incident", async () => {
-  const { db } = fakeDb({ owners: { "inc-7": "agent" } });
+test("still attaches when the row says what the digest said", async () => {
+  const { db } = fakeDb({ statuses: { "inc-7": "FIXING" } });
   const { model } = scripted([
     decideCall({ action: "attach", incidentId: "inc-7", reason: "same problem" }),
   ]);
@@ -576,23 +576,27 @@ test("still attaches when an agent owns the incident", async () => {
   });
 });
 
-test("a human-owned RESOLVED incident is still a recurrence, not an owner refusal", async () => {
-  const { db } = fakeDb({ owners: { "inc-9": "human" } });
+test("an incident that resolves mid-decision takes the RESOLVED branch", async () => {
+  const { db } = fakeDb({ statuses: { "inc-9": "RESOLVED" } });
   const { model } = scripted([
     decideCall({ action: "attach", incidentId: "inc-9", reason: "identical to the one we closed" }),
   ]);
 
   const outcome = await runTriage(
     { model, db, budgetMs: 2000 },
-    context({ openIncidents: [digest({ id: "inc-9", status: "RESOLVED" })] }),
+    context({ openIncidents: [digest({ id: "inc-9", status: "INVESTIGATING" })] }),
   );
 
+  // The owner guard that used to sit below this branch is gone, so nothing
+  // can pre-empt it. What replaced it is the status re-read above: the digest
+  // is a snapshot from before a model call that runs for tens of seconds.
+  assert.equal(outcome.decision.action, "new_incident");
+  assert.match(outcome.decision.reason, /inc-9 is RESOLVED/);
   assert.equal(
     outcome.recurrenceOf,
-    "inc-9",
-    "who owns it must not cost us the evidence that the resolution was wrong",
+    null,
+    "the pointer is still decided off the digest, which on this path has not caught up",
   );
-  assert.match(outcome.decision.reason, /RESOLVED/);
 });
 
 // --- recurrence -----------------------------------------------------------

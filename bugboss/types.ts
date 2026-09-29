@@ -8,7 +8,9 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Where the work is. Orthogonal to `owner`, which says who has it.
+ * Where the work is, and the only thing that says it. An open incident is
+ * always driven by an agent; a person is something it can be waiting on,
+ * never something it can be given to.
  *
  * RESOLVED means no users will be impacted any more and no further alerts
  * should occur, confirmed by evidence rather than asserted. That bar is what
@@ -21,8 +23,6 @@ export type IncidentStatus =
   | "RESOLVED"
   | "CLOSED"
   | "MERGED";
-
-export type IncidentOwner = "agent" | "human";
 
 /**
  * Anything telling us something is wrong. `source` is a free string, not a
@@ -73,7 +73,6 @@ export interface IncidentMatch {
 export interface Incident {
   id: string;
   status: IncidentStatus;
-  owner: IncidentOwner;
   slackThreadTs: string | null;
 
   rootCause: string | null;
@@ -227,7 +226,6 @@ export interface ToolResponse<T = unknown> {
 export type Directive =
   | { type: "stop"; reason: string }
   | { type: "merged"; into: string }
-  | { type: "handoff"; reason: string }
   | { type: "new_signals"; count: number; summary: string }
   /**
    * Something a person said in the incident thread. `addressed` is whether it
@@ -298,8 +296,34 @@ export interface ToolApi {
    */
   searchIncidents(args: { text: string }): Promise<ToolResponse<IncidentMatch[]>>;
 
-  /** Terminal. Sets owner: human and posts the brief. */
-  handOff(args: { reason: string; brief: string }): Promise<ToolResponse>;
+  /**
+   * Say that this incident needs a person, in its thread and at the rotation.
+   * Changes nothing: the agent still owns the work and carries on driving.
+   *
+   * This was `handOff`, and its real effect was the ownership write that took
+   * the incident out of the dispatcher's query. Announcing was always the
+   * useful half; stopping was the half that stranded eight incidents.
+   */
+  escalate(args: { reason: string; brief: string }): Promise<ToolResponse>;
+
+  /**
+   * Stop relaunching this incident until a person replies, the cooldown
+   * expires, or the stale sweep lifts it. The agent still has the incident;
+   * it simply has nothing it can do yet.
+   *
+   * This is the half of `owner = 'human'` that had to survive. Anything that
+   * makes an agent stop driving needs it, or the dispatcher relaunches on the
+   * next tick into whatever stopped it: a budget-exhausted run becomes a hot
+   * loop that pings the rotation every thirty seconds.
+   *
+   * It stops the relaunch. It does not free the dispatcher slot -- an agent
+   * parked inside `monitor` is alive and still holds one, deliberately.
+   */
+  park(args: {
+    waitingFor: string;
+    /** Runnable again after this long. Omitted means only a reply lifts it. */
+    wakeAfterSeconds?: number;
+  }): Promise<ToolResponse>;
 
   /** Rehydration after resume, plus pending directives. */
   getIncident(): Promise<ToolResponse<IncidentView>>;
@@ -442,6 +466,16 @@ export interface DispatcherConfig {
   agentTimeoutSeconds: number;
   /** Stop relaunching after this many attempts and escalate. */
   maxAttempts: number;
+  /**
+   * How long an incident may go with nothing happening to it at all before
+   * the stale sweep says so in its thread and lifts whatever it was waiting
+   * on. Zero or less turns the sweep off entirely.
+   *
+   * Omitting it is not the same as zero: an absent value takes
+   * `STALE_AFTER_SECONDS`, so a config written before the sweep existed still
+   * gets one. Turning the sweep off has to be said out loud.
+   */
+  staleAfterSeconds: number;
 }
 
 // ---------------------------------------------------------------------------

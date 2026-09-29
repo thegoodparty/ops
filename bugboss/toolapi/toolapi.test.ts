@@ -139,11 +139,18 @@ const writesDieAfter = (n: number): Db =>
     })(),
   }) as unknown as Db;
 
-/** A human claiming the incident in Slack. Returned unawaited by the races. */
-const humanClaims = (id: string) =>
-  db.withWrite((w) => {
-    w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(id);
-  });
+/**
+ * A merge landing on an incident, which is how its status moves out from
+ * under a call already in flight. Returned unawaited by the races below: both
+ * writes queue in the same tick, which is what a few hundred milliseconds of
+ * snapshot latency looks like from inside a handler.
+ */
+const mergedAway = (signalId: string, into: string) =>
+  applyAssign(
+    db,
+    { signalIds: [signalId], target: into, reason: "one pool, two alerts" },
+    { kind: "boss" },
+  );
 
 const openIncident = async (signalIds: string[]) =>
   (
@@ -157,7 +164,6 @@ const openIncident = async (signalIds: string[]) =>
 const incidentRow = (id: string) =>
   db.get<{
     status: string;
-    owner: string;
     rootCause: string | null;
     prUrls: string;
     postmortem: string | null;
@@ -366,77 +372,48 @@ describe("a status check the write does not repeat", () => {
     );
   });
 
-  it("refuses a resolution a human takeover landed in front of", async () => {
+  it("refuses a resolution a merge landed in front of", async () => {
     await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = toolsFor(id);
-    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    const tools = toolsFor(b);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-b"] });
 
-    const claim = humanClaims(id);
+    const merge = mergedAway("sig-b", a);
     const resolved = tools.reportResolved({
       prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
       evidence: "quiet for an hour",
     });
-    await claim;
+    await merge;
     const res = await resolved;
 
     assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.status, "FIXING", "the human's record did not move");
-    assert.equal(incidentRow(id)?.resolvedEvidence, null);
-    assert.deepEqual(JSON.parse(incidentRow(id)!.prUrls), []);
+    assert.equal(incidentRow(b)?.status, "MERGED", "the merged record did not move");
+    assert.equal(incidentRow(b)?.resolvedEvidence, null);
+    assert.deepEqual(JSON.parse(incidentRow(b)!.prUrls), []);
     assert.equal(
-      db.query("SELECT id FROM signal WHERE incidentId = ? AND closedAt IS NULL", [id])
+      db.query("SELECT id FROM signal WHERE incidentId = ? AND closedAt IS NULL", [a])
         .length,
-      1,
-      "and the signals a resolution would have closed are still open",
+      2,
+      "and both signals a resolution would have closed are still open on the survivor",
     );
   });
 
-  // Rewritten: this asserted that a human takeover refuses the post-mortem.
-  // That was the old contract and it threw away the one artifact a takeover
-  // is usually for. A takeover now pushes `handoff` and lets the agent finish
-  // its write-up, so reportAnalysis is the single tool an owner change does
-  // not block. Every other transition still loses the race, which the three
-  // sibling tests here cover.
-  it("lets the agent's write-up land even after a human takes over", async () => {
+  it("refuses an impact number a merge landed in front of", async () => {
     await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = toolsFor(id);
-    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
-    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
 
-    const claim = humanClaims(id);
-    const analysis = tools.reportAnalysis({
-      postmortem: "p",
-      usersImpacted: 4,
-      impactQuery: "q",
-    });
-    await claim;
-    const res = await analysis;
-
-    assert.equal(res.ok, true, res.error);
-    assert.equal(incidentRow(id)?.status, "CLOSED");
-    assert.equal(incidentRow(id)?.postmortem, "p");
-    assert.equal(
-      incidentRow(id)?.owner,
-      "human",
-      "the write-up lands without taking the incident back",
-    );
-  });
-
-  it("refuses an impact number a human takeover landed in front of", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = toolsFor(id);
-
-    const claim = humanClaims(id);
-    const impact = tools.reportImpact({ usersImpacted: 99, query: "q" });
-    await claim;
+    const merge = mergedAway("sig-b", a);
+    const impact = toolsFor(b).reportImpact({ usersImpacted: 99, query: "q" });
+    await merge;
     const res = await impact;
 
     assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.usersImpacted, null);
-    assert.equal(incidentRow(id)?.impactQuery, null);
+    assert.equal(incidentRow(b)?.usersImpacted, null);
+    assert.equal(incidentRow(b)?.impactQuery, null);
   });
 });
 
@@ -753,7 +730,12 @@ describe("directives", () => {
     await seed("sig-b");
     const a = await openIncident(["sig-a"]);
     const b = await openIncident(["sig-b"]);
-    await toolsFor(a).handOff({ reason: "mine now", brief: "taking this one" });
+    // Status is the whole of what makes a merge target eligible now, so
+    // resolving the target is how the correlator's proposal goes stale: a
+    // signal moved onto a RESOLVED incident is one nothing will re-explain.
+    const aTools = toolsFor(a);
+    await aTools.reportRootCause({ cause: "pool exhaustion", explainedSignalIds: ["sig-a"] });
+    await aTools.reportResolved({ prUrls: [], evidence: "quiet for an hour" });
     merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
 
     const lines = await logsDuring(async () => {
@@ -768,8 +750,7 @@ describe("directives", () => {
     assert.deepEqual(signalsOn(a), ["sig-a"], "and the merge did not");
     const declined = lines.find((line) => line.includes('"merge_declined"'));
     assert.ok(declined, "two incidents left on one cause is not something to pass over");
-    assert.match(declined!, /"intoStatus":"INVESTIGATING"/);
-    assert.match(declined!, /"intoOwner":"human"/);
+    assert.match(declined!, /"intoStatus":"RESOLVED"/);
   });
 
   it("drains on a rejected call as well as a successful one", async () => {
@@ -814,14 +795,23 @@ describe("directives", () => {
   });
 });
 
-describe("hand off", () => {
+describe("escalate", () => {
+  /**
+   * Everything about the row, so "nothing moved" is the whole row and not a
+   * list of columns somebody remembered to check. `escalate` replaced a tool
+   * whose real effect was a write, and the reason it replaced it is that the
+   * write took the incident out of the dispatcher's query and stranded it.
+   */
+  const rowOf = (id: string) =>
+    db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [id]);
+
   it("posts the brief as mrkdwn, with what it quotes made safe", async () => {
     await seed("sig-fmt");
     const id = await openIncident(["sig-fmt"]);
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-fmt"] });
 
-    await tools.handOff({
+    await tools.escalate({
       reason: "deadline",
       brief: [
         "## What I believe now",
@@ -856,7 +846,7 @@ describe("hand off", () => {
     assert.ok(brief.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
 
     const before = posts.length;
-    await tools.handOff({ reason: "deadline", brief });
+    await tools.escalate({ reason: "deadline", brief });
 
     const sent = posts.slice(before);
     assert.ok(sent.length > 1, `expected a split, got ${sent.length}`);
@@ -866,7 +856,7 @@ describe("hand off", () => {
     );
   });
 
-  it("refuses a brief past the thread budget instead of handing off anyway", async () => {
+  it("refuses a brief past the thread budget instead of posting it anyway", async () => {
     await seed("sig-budget");
     const id = await openIncident(["sig-budget"]);
     const tools = toolsFor(id);
@@ -876,7 +866,7 @@ describe("hand off", () => {
     });
 
     const before = posts.length;
-    const res = await tools.handOff({
+    const res = await tools.escalate({
       reason: "deadline",
       brief: Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n"),
     });
@@ -885,56 +875,100 @@ describe("hand off", () => {
     assert.match(res.error ?? "", /brief is \d+ characters/);
     assert.match(res.error ?? "", /post-mortem/);
     assert.equal(posts.length, before, "refused ahead of the post");
-    // The refusal has to leave the incident retryable: an escalation the
-    // model was told to rewrite is useless if the incident already stopped
-    // being its problem.
-    const row = db.get<{ owner: string; status: string }>(
-      "SELECT owner, status FROM incident WHERE id = ?",
-      [id],
-    );
-    assert.ok(row);
-    assert.equal(row.owner, "agent");
-    assert.equal(row.status, "FIXING");
+    // The refusal has to leave the incident exactly where it was, or the
+    // model is told to rewrite a brief for an incident that has moved on.
+    assert.equal(incidentRow(id)?.status, "FIXING");
   });
 
-  it("is terminal for the agent and leaves the incident open", async () => {
+  it("changes nothing about the incident it escalates", async () => {
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-a"] });
+    const before = rowOf(id);
 
-    const res = await tools.handOff({
+    const res = await tools.escalate({
       reason: "the fix touches auth",
       brief: "What I believe now: the session cookie is dropped on refresh.",
     });
 
     assert.equal(res.ok, true, res.error);
-    assert.equal(incidentRow(id)?.owner, "human");
-    assert.equal(incidentRow(id)?.status, "FIXING", "handing off is not closing");
+    assert.deepEqual(res.data, { incidentId: id }, "there is no transition to report");
+    assert.deepEqual(rowOf(id), before, "the row is untouched, which is the whole change");
     assert.match(posts.at(-1)?.text ?? "", /What I believe now/);
-
-    const after = await tools.reportResolved({ prUrls: [], evidence: "x" });
-    assert.equal(after.ok, false);
-    assert.match(after.error ?? "", /owned by a human/);
-
-    const view = await tools.getIncident();
-    assert.equal(view.ok, true, "reading is still allowed after a hand off");
+    assert.match(
+      posts.at(-1)?.text ?? "",
+      /An agent is still working this incident/,
+      "a reader who is told an incident needs them assumes nothing else is on it",
+    );
   });
 
-  it("still writes the brief when a human claimed the incident first", async () => {
+  it("leaves every other tool working afterwards", async () => {
+    // The gate this replaced revoked an agent's tools the moment an incident
+    // changed hands, so an escalation was the end of the run. Escalating is
+    // now an announcement, and the agent carries straight on.
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
-    await db.withWrite((w) => {
-      w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(id);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "auth change", explainedSignalIds: ["sig-a"] });
+    await tools.escalate({ reason: "the fix touches auth", brief: "ruled out DNS" });
+
+    const resolved = await tools.reportResolved({
+      prUrls: ["https://github.com/thegoodparty/omni/pull/1"],
+      evidence: "quiet for an hour after the revert",
     });
 
-    const res = await toolsFor(id).handOff({ reason: "you took it", brief: "ruled out DNS" });
-
-    assert.equal(res.ok, true, res.error);
-    assert.match(posts.at(-1)?.text ?? "", /ruled out DNS/);
+    assert.equal(resolved.ok, true, resolved.error);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+    const analysis = await tools.reportAnalysis({
+      postmortem: "p",
+      usersImpacted: 1,
+      impactQuery: "q",
+    });
+    assert.equal(analysis.ok, true, analysis.error);
+    assert.equal(incidentRow(id)?.status, "CLOSED");
   });
 
-  it("does not hand off an incident it could not announce", async () => {
+  it("refuses to escalate an incident nothing can be done about", async () => {
+    await seed("sig-a", { closedAt: 2000 });
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    const before = posts.length;
+
+    const res = await tools.escalate({ reason: "have a look", brief: "b" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is CLOSED; there is nothing left/);
+    assert.equal(posts.length, before, "and nobody is called to a closed incident");
+  });
+
+  it("refuses to escalate an incident a merge took away", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    await mergedAway("sig-b", a);
+    const before = posts.length;
+
+    const res = await toolsFor(b).escalate({ reason: "have a look", brief: "b" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is MERGED; there is nothing left/);
+    assert.equal(
+      posts.length,
+      before,
+      "the thread everyone reads is the survivor's, so a brief here reaches nobody",
+    );
+  });
+
+  it("reports a failed post as a failed escalation", async () => {
+    // The only tool here that fails on a failed notification. Everywhere else
+    // the state is already committed and the message is commentary; the whole
+    // effect of this one is the message, so an escalation nobody was told
+    // about has not happened.
     await seed("sig-a");
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
@@ -950,124 +984,32 @@ describe("hand off", () => {
       },
       evidence,
     });
+    const before = rowOf(id);
 
-    const res = await tools.handOff({
+    const res = await tools.escalate({
       reason: "the fix touches auth",
       brief: "What I believe now: the session cookie is dropped on refresh.",
     });
 
     assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /could not post/);
-    assert.equal(
-      incidentRow(id)?.owner,
-      "agent",
-      "the dispatcher skips human-owned incidents, so this would be an escalation nobody has",
-    );
-    assert.equal(incidentRow(id)?.status, "INVESTIGATING", "and it stays relaunchable");
+    assert.match(res.error ?? "", /nobody has been told/);
+    assert.match(res.error ?? "", /worth calling again/);
+    assert.deepEqual(rowOf(id), before, "and there is nothing to retract");
   });
 
-  it("retracts the brief in the thread when the hand-off cannot be recorded", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = createToolApi({
-      db: writesDieAfter(0),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
-      correlator,
-      slack,
-      evidence,
-    });
-
-    const res = await tools.handOff({
-      reason: "the fix touches auth",
-      brief: "What I believe now: the session cookie is dropped on refresh.",
-    });
-
-    assert.equal(res.ok, false);
-    assert.equal(incidentRow(id)?.owner, "agent", "nobody owns it but the agent");
-    assert.match(posts.at(-2)?.text ?? "", /session cookie/, "the brief went out");
-    assert.match(
-      posts.at(-1)?.text ?? "",
-      /could not be recorded/,
-      "so the same thread has to say it did not stick, rather than leaving a person to infer it",
-    );
-  });
-
-  it("refuses to hand off an incident that closed while the brief was posting", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const tools = createToolApi({
-      db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
-      correlator,
-      slack: {
-        ...linking,
-        // The TOCTOU window is exactly this await: the status read happens
-        // before the post, the write after it.
-        post: async (threadTs: string | null, text: string) => {
-          await db.withWrite((w) => {
-            w.prepare(
-              `UPDATE incident
-                  SET status = 'CLOSED', resolvedAt = 1, closedAt = 1, postmortem = 'x'
-                WHERE id = ?`,
-            ).run(id);
-          });
-          return slack.post(threadTs, text);
-        },
-      },
-      evidence,
-    });
-
-    const res = await tools.handOff({ reason: "the fix touches auth", brief: "b" });
-
-    assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /lost a race/);
-    assert.equal(
-      incidentRow(id)?.owner,
-      "agent",
-      "a closed incident is not something to put on a person's plate",
-    );
-    assert.match(
-      posts.at(-1)?.text ?? "",
-      /could not be recorded/,
-      "the brief already said it was theirs, so the thread has to take that back",
-    );
-  });
-
-  it("stops triage attaching new signals to what a human took", async () => {
+  it("still lets triage attach new signals to an escalated incident", async () => {
+    // Asking for a person is not the incident going quiet. An agent is still
+    // driving it, so a related signal belongs on it rather than on a second
+    // incident nobody has connected to the first.
     await seed("sig-a");
     await seed("sig-b");
     const id = await openIncident(["sig-a"]);
-    await toolsFor(id).handOff({ reason: "the fix touches auth", brief: "b" });
-
-    await assert.rejects(
-      applyAssign(
-        db,
-        { signalIds: ["sig-b"], target: id, reason: "looks related" },
-        { kind: "boss" },
-      ),
-      /owned by a human/,
-    );
-    assert.equal(
-      db.get<{ incidentId: string | null }>(
-        "SELECT incidentId FROM signal WHERE id = 'sig-b'",
-      )?.incidentId,
-      null,
-      "no agent is coming back to that incident, so nothing may pile up on it",
-    );
-  });
-
-  it("still lets a person move signals into the incident they hold", async () => {
-    await seed("sig-a");
-    await seed("sig-b");
-    const id = await openIncident(["sig-a"]);
-    await toolsFor(id).handOff({ reason: "the fix touches auth", brief: "b" });
+    await toolsFor(id).escalate({ reason: "the fix touches auth", brief: "b" });
 
     const res = await applyAssign(
       db,
-      { signalIds: ["sig-b"], target: id, reason: "I am working both of these" },
-      { kind: "human", slackUserId: "U1" },
+      { signalIds: ["sig-b"], target: id, reason: "looks related" },
+      { kind: "boss" },
     );
 
     assert.equal(res.target, id);
@@ -1703,7 +1645,7 @@ describe("a recurrence closes on a second question", () => {
     assert.equal(
       incidentRow(second)?.status,
       "RESOLVED",
-      "an unexplained recurrence stays open; hand_off is the other exit",
+      "an unexplained recurrence stays open rather than closing on a blank",
     );
   });
 
