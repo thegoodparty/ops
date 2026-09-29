@@ -1771,6 +1771,8 @@ export const createBugBoss = async (
     incidentId: string,
     claim: OwnershipClaim,
     slackUserId: string,
+    /** Nobody asked for this hand-back; addressing the agent implied it. */
+    implied = false,
   ): Promise<void> => {
     const readIncidentRow = () =>
       db.get<{ owner: string; status: string; slackThreadTs: string | null }>(
@@ -1807,7 +1809,9 @@ export const createBugBoss = async (
         incidentId,
         slackUserId,
         claim,
-        `owner ${from} -> ${to}`,
+        implied
+          ? `owner ${from} -> ${to} (addressed the agent)`
+          : `owner ${from} -> ${to}`,
         now(),
       );
       return true;
@@ -1822,6 +1826,11 @@ export const createBugBoss = async (
         owner: row?.owner ?? null,
         status: row?.status ?? null,
       });
+      // An implied claim nobody made gets no correction. "Nothing to hand
+      // back" is an answer to a sentence somebody typed, and there was no
+      // such sentence here -- the incident had simply already moved between
+      // the read and the write.
+      if (implied) return;
       // Saying so matters more than it looks: the claim word is a normal
       // message, so silence is indistinguishable from the bot not reading it.
       await say(
@@ -1853,7 +1862,13 @@ export const createBugBoss = async (
     await say(
       claim === "take_over"
         ? mrkdwn`${raw(userMention(slackUserId))} has this one. The agent is writing up what it found and will stop.`
-        : mrkdwn`Back to an agent, handed over by ${raw(userMention(slackUserId))}. It will pick this up within a tick.`,
+        : implied
+          ? // Never silent, because a flip nobody asked for is the one that
+            // most needs seeing: somebody who took this incident on purpose
+            // has just had it moved, and the sentence has to carry how to
+            // undo that as well as what happened.
+            mrkdwn`${raw(userMention(slackUserId))} that was for the agent and a person owned this incident, so I have handed it back to one. It will pick this up within a tick. If you meant to keep it, say it is yours and I will stop it.`
+          : mrkdwn`Back to an agent, handed over by ${raw(userMention(slackUserId))}. It will pick this up within a tick.`,
     );
   };
 
@@ -1947,10 +1962,33 @@ export const createBugBoss = async (
       outstandingQuestion: outstanding,
     });
 
-    const handingOver: OwnershipClaim | null =
+    const claimed: OwnershipClaim | null =
       read.handover === "take_over" || read.handover === "hand_back"
         ? read.handover
         : null;
+
+    // Talking to the agent on an incident a person owns IS handing it back.
+    //
+    // The prompt's conservatism was built against a false `take_over`, and
+    // that asymmetry is real: a wrong take_over strands an incident with
+    // nothing to recover it. hand_back is the cheap direction -- a wrong one
+    // starts an agent somebody did not want, they say "mine", and it stops.
+    // One conservatism setting was being applied to both, so an ordinary
+    // "please resolve this" on a human-owned incident read as handover:
+    // none, addressed: agent, was recorded, was queued for an agent, and no
+    // agent was ever going to run. The risks are not symmetric, so the
+    // setting is not either.
+    //
+    // Only `none`. An `unclear` read asks in the thread below, and acting on
+    // it as well would move the incident while asking whether to.
+    const impliedHandBack =
+      claimed === null &&
+      read.handover === "none" &&
+      route.owner === "human" &&
+      (route.interrupt || read.addressed === "agent");
+
+    const handingOver: OwnershipClaim | null =
+      claimed ?? (impliedHandBack ? "hand_back" : null);
     const addressed: Addressed =
       route.interrupt || handingOver ? "agent" : read.addressed;
 
@@ -1967,10 +2005,16 @@ export const createBugBoss = async (
       tagged: route.interrupt,
       blocked: outstanding !== null,
       fellBack: read.fellBack,
+      impliedHandBack,
     });
 
     if (handingOver) {
-      await claimOwnership(route.incidentId, handingOver, route.user);
+      await claimOwnership(
+        route.incidentId,
+        handingOver,
+        route.user,
+        impliedHandBack,
+      );
       return;
     }
 
@@ -2293,6 +2337,9 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
       tickSeconds: Number(env.BUGBOSS_TICK_SECONDS ?? 30),
       agentTimeoutSeconds: Number(env.BUGBOSS_AGENT_TIMEOUT ?? 86_400),
       maxAttempts: Number(env.BUGBOSS_MAX_ATTEMPTS ?? 3),
+      // Hours rather than seconds, because this is the one dispatcher bound
+      // a person sets by thinking about their own working day.
+      staleAfterSeconds: Number(env.BUGBOSS_STALE_HOURS ?? 24) * 3600,
     },
     prodCriticalSlugs: (env.BUGBOSS_PROD_CRITICAL_SLUGS ?? "")
       .split(",")

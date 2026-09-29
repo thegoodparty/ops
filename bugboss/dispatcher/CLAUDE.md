@@ -96,6 +96,53 @@ without Slack, but a prod composition root that passes nothing makes the one
 event this exists to surface silent again, so its absence alarms rather than
 passing.
 
+## Nothing open stays silent for a day
+
+Every watch above is reached through `owner = 'agent'`. `ELIGIBLE_SQL` asks
+whether every incident that *should* have an agent has a live one and defines
+"should" as that column, so an incident a person owns is not late — it is not
+in the question. `agent_resumed_after_gap` fires on a relaunch, which needs
+the same column. `pending_wait`'s nudge needs a live agent parked on
+`monitor(awaitingHuman)`. An incident somebody took, or was escalated to and
+never answered, falls outside all three, and seven open incidents reached 8
+to 32 hours of complete silence there.
+
+`sweepStale` asks the question none of those do: has anything happened here
+lately. Over every incident that is not `CLOSED` or `MERGED`, whatever the
+owner, `staleAfterSeconds` (`BUGBOSS_STALE_HOURS`, default 24) past the last
+activity it posts in the thread — plainly, how long it has been quiet and
+what happens next — and flips `owner` back to `'agent'` so the incident
+actually moves.
+
+**Activity is wider than `lastStartedAt`.** A reply and a hand-off each move
+an incident without launching an agent, so the clock is the max of
+`firstSignalAt`, `lastStartedAt`, the newest `thread_reply.receivedAt` and
+the newest `incident_action.at`. Watching launches alone would read a running
+conversation as silence and, the other way round, call an incident stale
+while its agent was mid-run — a run may last a day. The live-agent case is
+answered by the `running` map instead, because no row can show it. `handOff`
+writes an `incident_action` row for this reason: without it, an incident
+escalated at the 24-hour deadline would be handed straight back to an agent
+by the sweep on the same tick, undoing the escalation.
+
+**The marker is also activity, which is the whole trick.** A `stale_swept`
+`incident_action` row goes in before the post, in one transaction with the
+flip. Because the clock already reads `incident_action`, writing it resets
+the clock — so the sweep cannot fire twice, and a swept incident an agent
+parks straight back on a person cannot bounce back here an hour later. The
+next sweep is a full threshold away by construction, with no separate
+suppression to keep in step with it. It is persisted rather than counted from
+process start for the reason `pending_wait` is: every merge to ops `main`
+restarts this container, and a sweep that re-posted on resume would make each
+deploy a notification storm.
+
+It runs **after** the launch loop, so an incident this tick already
+relaunched is in `running` and is not also reported quiet by the row it left
+behind. A hand-back is therefore picked up by the next tick, which is what
+the post says. `staleAfterSeconds` at zero or less turns it off rather than
+sweeping everything — `Number()` on an unset variable is `NaN`, and the cost
+of reading that wrong is a post in every open thread at once.
+
 ## Exit codes
 
 A child that exits non-zero or dies to a signal **rejects**. The dispatcher

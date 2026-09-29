@@ -998,8 +998,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         );
 
       try {
-        const taken = await db.withWrite((w) =>
-          w
+        const taken = await db.withWrite((w) => {
+          const changes = w
             .prepare(
               // Guarded on status, deliberately not on owner: a human who
               // claimed the incident in Slack already flipped owner, and the
@@ -1013,8 +1013,23 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
               `UPDATE incident SET owner = 'human'
                  WHERE id = ? AND status NOT IN ('CLOSED', 'MERGED')`,
             )
-            .run(incidentId).changes,
-        );
+            .run(incidentId).changes;
+          // A hand-off is the last thing that happened on this incident, and
+          // until now it left no timestamp anywhere except `owner`. The
+          // dispatcher's stale sweep reads `incident_action` as part of its
+          // clock, so without this row an agent that hands off at hour 23 of
+          // its own run looks quiet since hour 0 -- and an incident escalated
+          // at the 24-hour deadline would be handed straight back to an
+          // agent by the sweep on the same tick, undoing the escalation.
+          if (changes > 0) {
+            w.prepare(
+              `INSERT INTO incident_action
+                 (incidentId, actorKind, actorId, action, reason, at)
+               VALUES (?, 'agent', NULL, 'hand_off', ?, ?)`,
+            ).run(incidentId, args.reason, Date.now());
+          }
+          return changes;
+        });
         if (taken === 0) {
           await retract(
             "the incident reached a terminal state while the brief was posting and nobody has been assigned.",

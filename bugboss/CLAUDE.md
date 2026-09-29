@@ -59,6 +59,12 @@ evidence an agent reads, never a transition the Boss makes.
 places that ask "is this available", the dispatcher, `openIncidents()` and
 triage's guard must all agree — they have disagreed before.
 
+**Nothing open goes quiet for a day.** Every other watch here is reached
+through `owner = 'agent'`, which is how seven open incidents sat 8 to 32
+hours with people replying into threads no agent could see. The dispatcher's
+`sweepStale` is the one question that does not ask who owns an incident, only
+whether anything has happened on it — `dispatcher/CLAUDE.md`.
+
 **Evidence, not assertion.** `RESOLVED` means no users are affected any more
 and no further alerts should occur, confirmed. Every number the agent
 reports carries the query that produced it, so it can be checked.

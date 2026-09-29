@@ -190,6 +190,16 @@ string matchers did whenever somebody phrased it their own way.
 The read runs off the Slack ack, beside the Slack agent, for the reason the
 webhook acknowledges before it works.
 
+Ownership is the one place the read is deliberately lopsided. `owner =
+'human'` takes an incident out of the query the dispatcher launches from, so
+a takeover nobody meant strands it; a hand-back nobody meant starts an agent
+somebody then tells to stop. Reading an ordinary message for the agent on a
+human-owned incident as a hand-back therefore costs little and is what keeps
+a reply from being filed where no agent can see it. Under all of it,
+`sweepStale` in the dispatcher posts and hands back anything open that has
+gone `BUGBOSS_STALE_HOURS` (default 24) with no agent run, no reply and no
+status change, so no incident can sit silent for a day whoever owns it.
+
 ## The agent boundary
 
 An agent is a child process of the Boss, running as the same user. It

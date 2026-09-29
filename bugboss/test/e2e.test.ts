@@ -223,6 +223,7 @@ const config = (path: string): BugBossConfig => ({
     tickSeconds: 30,
     agentTimeoutSeconds: 1800,
     maxAttempts: 3,
+    staleAfterSeconds: 86_400,
   },
   prodCriticalSlugs: [],
 });
@@ -1512,6 +1513,97 @@ test("a person can take an incident over, and hand it back", async () => {
     ])?.owner,
     "agent",
   );
+});
+
+/**
+ * Talking to the agent on an incident a person owns IS handing it back.
+ *
+ * This is the whole of tonight's stall, end to end. Seven open incidents sat
+ * at `owner = 'human'` while somebody replied into each thread; every reply
+ * classified as `handover: none, addressed: agent`, was recorded, was queued
+ * as a directive, and no agent was ever going to read it.
+ *
+ * The prompt's conservatism was built against a false `take_over`, and that
+ * asymmetry is real -- a wrong take_over strands an incident with nothing to
+ * recover it. A wrong hand_back starts an agent somebody did not want, they
+ * say "mine", and it stops. One setting was being applied to both.
+ */
+test("addressing the agent on a human-owned incident hands it back", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own-imp", "webhook-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-imp'`,
+  )!;
+
+  fakeModel.intents.push({ handover: "take_over", addressed: "agent" });
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "I've got this one", "U-ada"));
+
+  const before = fakeSlack.posts.length;
+  // The production read, verbatim from the logs on incident 1.
+  fakeModel.intents.push({ handover: "none", addressed: "agent" });
+  await boss.slackEvent(
+    replyIn(row.slackThreadTs!, "please resolve this incident", "U-swain"),
+  );
+
+  assert.equal(
+    boss.db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [
+      row.id,
+    ])?.owner,
+    "agent",
+    "a message for the agent puts the incident back where an agent can reach it",
+  );
+
+  // Never silent. Somebody who took this on purpose has just had it moved,
+  // so the flip has to be visible and has to carry how to undo it.
+  const said = fakeSlack.posts.slice(before);
+  assert.equal(said.length, 1);
+  assert.equal(said[0].threadTs, row.slackThreadTs);
+  assert.match(said[0].text, /handed it back to one/);
+  assert.match(said[0].text, /say it is yours/);
+
+  assert.match(
+    boss.db.get<{ reason: string }>(
+      `SELECT reason FROM incident_action
+         WHERE incidentId = ? AND action = 'hand_back'`,
+      [row.id],
+    )!.reason,
+    /addressed the agent/,
+    "the trail distinguishes a flip nobody asked for from one somebody did",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+/**
+ * And two people talking to each other over an incident one of them owns is
+ * not a hand-back. `addressed: others` is the field that separates them, and
+ * it is the same field that already keeps a side conversation from ending an
+ * agent's wait.
+ */
+test("people talking to each other do not hand a human-owned incident back", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-own-imp2", "queue-errors"));
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-imp2'`,
+  )!;
+
+  fakeModel.intents.push({ handover: "take_over", addressed: "agent" });
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "taking this", "U-ada"));
+
+  fakeModel.intents.push({ handover: "none", addressed: "others" });
+  await boss.slackEvent(
+    replyIn(row.slackThreadTs!, "did the deploy go out yet?", "U-grace"),
+  );
+
+  assert.equal(
+    boss.db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [
+      row.id,
+    ])?.owner,
+    "human",
+    "the person who took it still has it",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
 /**

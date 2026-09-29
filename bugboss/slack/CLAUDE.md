@@ -354,10 +354,27 @@ and opened nothing. A magic phrase nobody can discover is not an interface.
 The reasoning the old comment gave for matching whole words is still right
 and is still enforced — it just is not enforced by matching strings:
 
-- **A false handover is the expensive direction.** `owner = 'human'` takes an
-  incident out of the dispatcher's query and nothing hands it back. So the
-  prompt is asymmetric (prefer `none`, prefer `unclear` over a guess), and
-  `unclear` **asks in the thread** rather than guessing.
+- **A false `take_over` is the expensive direction — and only that one.**
+  `owner = 'human'` takes an incident out of the dispatcher's query, so a
+  takeover nobody meant strands it with nothing to recover it. The prompt is
+  asymmetric for that reason (prefer `none`, prefer `unclear` over a guess),
+  and `unclear` **asks in the thread** rather than guessing.
+
+  `hand_back` does not carry that cost, and for a long time the one prompt
+  setting was applied to both. A wrong hand-back starts an agent somebody
+  did not want, they say "mine", and it stops. So the composition root reads
+  a `none` on a **human-owned** incident that was `addressed: agent` as a
+  hand-back anyway, and says so in the thread with how to undo it. Without
+  it an ordinary "please resolve this" was recorded, queued as a directive,
+  and read by nobody: seven open incidents sat 8 to 32 hours that way, each
+  with somebody replying into a thread no agent could see. `others` is what
+  separates that from two people talking over an incident one of them owns,
+  which is the same field that already keeps a side conversation from ending
+  an agent's wait.
+
+  The backstop under both directions is the dispatcher's stale sweep —
+  nothing open stays silent for a day, whoever owns it. See
+  `dispatcher/CLAUDE.md`.
 - **Every outcome is said out loud.** A move posts a confirmation, a refused
   move says why, an ambiguous read asks, and a failed model call says the
   call failed. Silence is what the old matcher did, and silence is

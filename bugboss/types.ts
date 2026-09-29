@@ -403,6 +403,12 @@ export interface DispatcherConfig {
   agentTimeoutSeconds: number;
   /** Stop relaunching after this many attempts and escalate. */
   maxAttempts: number;
+  /**
+   * How long an open incident may go with nothing happening on it at all
+   * before the sweep says so in its thread and hands it back to an agent.
+   * Zero or less turns the sweep off.
+   */
+  staleAfterSeconds: number;
 }
 
 // ---------------------------------------------------------------------------

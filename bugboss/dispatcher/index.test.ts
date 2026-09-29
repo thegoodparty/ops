@@ -14,6 +14,7 @@ import {
   RESUME_NOTICE_SECONDS,
   createDispatcher,
   resumeNotice,
+  staleNotice,
   type DispatcherDb,
   type DispatcherDeps,
 } from "./index";
@@ -26,6 +27,7 @@ const config = (over: Partial<DispatcherConfig> = {}): DispatcherConfig => ({
   tickSeconds: 30,
   agentTimeoutSeconds: 1800,
   maxAttempts: 3,
+  staleAfterSeconds: 86_400,
   ...over,
 });
 
@@ -1236,5 +1238,366 @@ describe("the spawned environment", () => {
       "the dispatcher killed it on purpose and already said why",
     );
     cleanup();
+  });
+});
+
+/**
+ * The sweep. Everything else here watches incidents with `owner = 'agent'`,
+ * which is why seven open incidents could reach 8 to 32 hours of complete
+ * silence: a person owned each one, so no query in this process could see
+ * them and nothing ever asked whether anything had happened lately.
+ */
+describe("Dispatcher stale sweep", () => {
+  const DAY = 86_400_000;
+
+  const reply = (sqlite: Database.Database, id: string, at: number) =>
+    sqlite
+      .prepare(
+        `INSERT INTO thread_reply
+           (id, incidentId, slackUserId, text, ts, receivedAt)
+         VALUES (?, ?, 'U-swain', 'please resolve this incident', ?, ?)`,
+      )
+      .run(`c:${at}`, id, String(at), at);
+
+  const ownerOf = (db: DispatcherDb, id: string) =>
+    db.get<{ owner: string }>("SELECT owner FROM incident WHERE id = ?", [id])
+      ?.owner;
+
+  it("hands a quiet human-owned incident back and says so, once", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    // Incident 1 as it actually stood: FIXING, owned by a person, four
+    // launches, last one 32 hours ago, replies in the thread that no agent
+    // was ever going to read.
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      owner: "human",
+      attempts: 4,
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 32 * 3600_000,
+    });
+    reply(sqlite, "i1", T0 - 30 * 3600_000);
+
+    const posts: { incidentId: string; text: string }[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async (incidentId, text) => {
+          posts.push({ incidentId, text });
+        },
+      }),
+    );
+
+    const first = await captureAlarms(async () => {
+      const result = await d.tick();
+      await result.settled;
+      assert.deepEqual(result.swept, ["i1"]);
+    });
+
+    assert.ok(first.includes("incident_stale"), `${first}`);
+    assert.equal(ownerOf(db, "i1"), "agent");
+    assert.equal(posts.length, 1);
+    assert.match(posts[0].text, /Nothing has happened on this incident for 30h/);
+    assert.match(posts[0].text, /handed it back to an agent/);
+
+    // The clock the sweep reads includes the marker it just wrote, so a
+    // second tick thirty seconds later has nothing stale to find. There is
+    // no separate suppression to keep in step with it.
+    const second = await d.tick();
+    await second.settled;
+    assert.deepEqual(second.swept, []);
+    assert.equal(posts.length, 1);
+    cleanup();
+  });
+
+  it("launches an agent on the incident it swept", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "INVESTIGATING",
+      owner: "human",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+
+    const spawned: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async (ctx) => {
+          spawned.push(ctx.incidentId);
+        },
+        toolApiFor,
+        postNotice: async () => {},
+      }),
+    );
+
+    // The sweep runs after the launch loop, so the hand-back is picked up by
+    // the next tick rather than the one that made it. Handing back and never
+    // launching would be the same stall wearing a notification.
+    const first = await d.tick();
+    await first.settled;
+    assert.deepEqual(spawned, []);
+
+    const second = await d.tick();
+    await second.settled;
+    assert.deepEqual(spawned, ["i1"]);
+    cleanup();
+  });
+
+  it("counts a reply as activity, so a live conversation is not stale", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      owner: "human",
+      firstSignalAt: T0 - 4 * DAY,
+      lastStartedAt: T0 - 3 * DAY,
+    });
+    reply(sqlite, "i1", T0 - 3600_000);
+
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, []);
+    assert.equal(posts.length, 0);
+    assert.equal(ownerOf(db, "i1"), "human", "nobody's incident was taken");
+    cleanup();
+  });
+
+  it("leaves an incident alone while its agent is still running", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    const { spawn, releaseAll } = heldSpawn();
+    // A run may last a day, so the launch timestamp of a perfectly healthy
+    // agent ages past the threshold underneath it. Reading the row alone
+    // would call this stale mid-investigation.
+    insertIncident(sqlite, "i1", {
+      status: "INVESTIGATING",
+      sessionRef: "s-1",
+      attempts: 1,
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+
+    let clock = T0;
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        // A day and a half of agent, so the deadline backstop stays out of it.
+        config: config({ agentTimeoutSeconds: 129_600 }),
+        now: () => clock,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    await d.tick();
+    clock = T0 + 60_000;
+    const result = await d.tick();
+    assert.deepEqual(result.swept, []);
+    // The resume notice is its own event and fires here on merit, since the
+    // previous run had been gone two days.
+    assert.deepEqual(posts.filter((t) => t.includes("Nothing has happened")), []);
+
+    releaseAll();
+    await d.drain();
+    cleanup();
+  });
+
+  it("does not re-post after a restart", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      owner: "human",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+
+    let clock = T0;
+    const posts: string[] = [];
+    const build = () =>
+      createDispatcher(
+        deps({
+          db,
+          spawn: async () => {},
+          toolApiFor,
+          now: () => clock,
+          postNotice: async (_id, text) => {
+            posts.push(text);
+          },
+        }),
+      );
+
+    await (await build().tick()).settled;
+    assert.equal(posts.length, 1);
+
+    // Every merge to ops main replaces this container. A sweep that counted
+    // from process start would make each deploy a notification, which is the
+    // exact mistake pending_wait was written to avoid.
+    clock = T0 + 60_000;
+    const after = await build().tick();
+    await after.settled;
+    assert.deepEqual(after.swept, []);
+    assert.equal(posts.length, 1);
+    cleanup();
+  });
+
+  it("does not sweep an incident again an hour after handing it back", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      owner: "human",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+
+    let clock = T0;
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        now: () => clock,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    await (await d.tick()).settled;
+    assert.equal(posts.length, 1);
+
+    // The agent it was handed to parks it straight back on a person. Nothing
+    // about that earns a second notification within the threshold, and a
+    // sweep that fired on it would ping-pong the incident all day.
+    sqlite.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run("i1");
+    clock = T0 + 3600_000;
+    const after = await d.tick();
+    await after.settled;
+    assert.deepEqual(after.swept, []);
+    assert.equal(posts.length, 1);
+    cleanup();
+  });
+
+  it("is off at a threshold of zero rather than sweeping everything", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      owner: "human",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+    insertIncident(sqlite, "i2", {
+      status: "INVESTIGATING",
+      owner: "human",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {},
+        toolApiFor,
+        config: config({ staleAfterSeconds: 0 }),
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+      }),
+    );
+
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, []);
+    assert.equal(posts.length, 0);
+    cleanup();
+  });
+
+  it("never touches a closed or merged incident", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", { status: "FIXING", owner: "human" });
+    insertIncident(sqlite, "i2", {
+      status: "CLOSED",
+      owner: "human",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+    insertIncident(sqlite, "i3", {
+      status: "MERGED",
+      owner: "human",
+      mergedInto: "i1",
+      firstSignalAt: T0 - 5 * DAY,
+    });
+
+    const d = createDispatcher(
+      deps({ db, spawn: async () => {}, toolApiFor, postNotice: async () => {} }),
+    );
+    const result = await d.tick();
+    await result.settled;
+    assert.deepEqual(result.swept, []);
+    cleanup();
+  });
+
+  it("says nobody was told when no thread poster is wired in", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools(sqlite);
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      owner: "human",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+
+    const d = createDispatcher(deps({ db, spawn: async () => {}, toolApiFor }));
+    const events = await captureAlarms(async () => {
+      const result = await d.tick();
+      await result.settled;
+      // The hand-back still happens. It is the half that recovers the
+      // incident, and it does not depend on anyone reading a thread.
+      assert.deepEqual(result.swept, ["i1"]);
+    });
+
+    assert.ok(events.includes("stale_notice_undeliverable"), `${events}`);
+    assert.equal(ownerOf(db, "i1"), "agent");
+    cleanup();
+  });
+});
+
+describe("staleNotice", () => {
+  it("leads with the silence, in hours up to two days and then in days", () => {
+    assert.match(staleNotice(26 * 3600, true, 1), /for 26h:/);
+    assert.match(staleNotice(72 * 3600, true, 1), /for 3d:/);
+  });
+
+  it("says how to stop it, and counts the repeats", () => {
+    assert.match(staleNotice(86_400, true, 1), /say it is yours/);
+    assert.match(staleNotice(86_400, true, 3), /That is 3 times now/);
+  });
+
+  it("does not claim a hand-back that did not happen", () => {
+    const held = staleNotice(86_400, false, 1);
+    assert.equal(held.includes("handed it back"), false);
+    assert.match(held, /An agent owns it/);
   });
 });

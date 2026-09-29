@@ -66,7 +66,23 @@ export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   // are measured in hours, so a half-hour ceiling killed agents mid-wait.
   agentTimeoutSeconds: 86_400,
   maxAttempts: 3,
+  staleAfterSeconds: 86_400,
 };
+
+/**
+ * The marker the stale sweep leaves, and the reason it is an `incident_action`
+ * row rather than a column or a counter.
+ *
+ * It has to be persisted, because every merge to ops `main` restarts this
+ * container and a sweep counted from process start would re-post on every
+ * deploy. And it has to be *activity*, because the clock the sweep reads
+ * already includes `incident_action`: writing the marker is what resets that
+ * clock, so one sweep cannot fire twice and a swept incident cannot bounce
+ * back here an hour later however quickly an agent parks it on a person
+ * again. The next sweep is a full threshold away by construction, with no
+ * separate suppression to keep in step with it.
+ */
+export const STALE_SWEPT_ACTION = "stale_swept";
 
 /** The slice of the database layer the dispatcher uses. `Db` satisfies it. */
 export interface DispatcherDb {
@@ -115,6 +131,8 @@ export interface TickResult {
   escalated: string[];
   /** Incidents whose child was killed for passing its deadline. */
   killed: string[];
+  /** Incidents that had gone quiet too long and were handed back this tick. */
+  swept: string[];
   running: number;
   /** The ceiling stopped a launch. Something is wrong; a human should look. */
   circuitOpen: boolean;
@@ -129,6 +147,14 @@ interface EligibleRow {
   attempts: number;
   lastStartedAt: number | null;
   firstSignalAt: number;
+}
+
+interface StaleRow {
+  id: string;
+  owner: IncidentOwner;
+  lastActivityAt: number;
+  /** Times this incident has been swept before. Read out of the markers. */
+  sweeps: number;
 }
 
 /**
@@ -152,6 +178,41 @@ const ELIGIBLE_SQL = `
   FROM incident
   WHERE status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
     AND owner = 'agent'
+`;
+
+/**
+ * Every open incident, with the last moment anything at all happened on it.
+ *
+ * Not scoped to an owner, unlike `ELIGIBLE_SQL`, and that is the whole point:
+ * `owner = 'human'` is precisely the state nothing was watching.
+ *
+ * "Anything" is deliberately wider than `lastStartedAt`. A reply and a
+ * hand-off each move an incident without launching an agent, so a clock that
+ * watched launches alone would read a running conversation as silence — and,
+ * the other way round, would call an incident stale while its agent was
+ * mid-run, since a run may last a day. The live-agent case is handled by the
+ * `running` map rather than here, because a row cannot show it.
+ *
+ * `firstSignalAt` is the floor. It is NOT NULL, so a freshly opened incident
+ * that nothing has touched yet still has a real age rather than reading as
+ * quiet since the epoch.
+ */
+const STALE_SQL = `
+  SELECT i.id AS id,
+         i.owner AS owner,
+         MAX(
+           i.firstSignalAt,
+           COALESCE(i.lastStartedAt, 0),
+           COALESCE((SELECT MAX(r.receivedAt) FROM thread_reply r
+                      WHERE r.incidentId = i.id), 0),
+           COALESCE((SELECT MAX(a.at) FROM incident_action a
+                      WHERE a.incidentId = i.id), 0)
+         ) AS lastActivityAt,
+         (SELECT COUNT(*) FROM incident_action a
+           WHERE a.incidentId = i.id
+             AND a.action = '${STALE_SWEPT_ACTION}') AS sweeps
+    FROM incident i
+   WHERE i.status NOT IN ('CLOSED', 'MERGED')
 `;
 
 interface Entry {
@@ -221,6 +282,31 @@ export const resumeNotice = (deadSeconds: number): string => {
     `The agent on this incident stopped without finishing and was gone for ${span}.`,
     "Nothing was happening here in that time, whatever the last message says.",
     "I have started it again; it will re-check anything time-sensitive before it continues.",
+  ].join(" ");
+};
+
+/**
+ * What the sweep says. Two things, plainly: how long this has been silent,
+ * and what is about to happen about it. The silence is the finding, so it
+ * leads — a person reading their own thread has no way to tell a day of
+ * quiet deliberation from a day of nothing running at all, which is the
+ * whole reason these incidents went unnoticed.
+ */
+export const staleNotice = (
+  quietSeconds: number,
+  handedBack: boolean,
+  sweep: number,
+): string => {
+  const hours = Math.round(quietSeconds / 3600);
+  const span = hours < 48 ? `${hours}h` : `${Math.round(hours / 2.4) / 10}d`;
+  return [
+    `Nothing has happened on this incident for ${span}: no agent ran, nobody replied, and its status did not move.`,
+    handedBack
+      ? "It was owned by a person, which takes it out of the list agents are dispatched from, so I have handed it back to an agent. One will pick it up within a tick."
+      : "An agent owns it and one will be started on it within a tick.",
+    sweep > 1
+      ? `That is ${sweep} times now. If this is genuinely waiting on something, say it is yours and I will stop moving it.`
+      : "If you are on this and do not want an agent touching it, say it is yours and I will stop it.",
   ].join(" ");
 };
 
@@ -432,6 +518,8 @@ export class Dispatcher {
       settling.push(entry.done);
     }
 
+    const swept = await this.sweepStale(this.now());
+
     if (circuitOpen) {
       alarm("circuit_breaker_open", {
         running: this.running.size,
@@ -445,10 +533,118 @@ export class Dispatcher {
       started,
       escalated,
       killed: expired.killed,
+      swept,
       running: this.running.size,
       circuitOpen,
       settled: Promise.all(settling).then(() => undefined),
     };
+  };
+
+  /**
+   * Nothing sits silent for a day.
+   *
+   * Every other watch this process keeps is reached through `owner = 'agent'`.
+   * `ELIGIBLE_SQL` asks whether every incident that should have an agent has
+   * a live one and defines "should" as that column, so an incident a person
+   * owns is not late — it is not in the question. `agent_resumed_after_gap`
+   * fires on a relaunch, which needs the same column. The `pending_wait`
+   * nudge needs a live agent parked on `monitor(awaitingHuman)`. An incident
+   * a person took, or was escalated to and never answered, is outside all
+   * three, and seven open incidents reached 8 to 32 hours of total silence
+   * there — each with somebody replying into a thread no agent was reading.
+   *
+   * So this asks the one question none of those do: has anything happened
+   * here lately. It runs after the launch loop rather than before it, so an
+   * incident this tick already relaunched is in `running` and is not also
+   * reported quiet by the row it left behind.
+   */
+  private sweepStale = async (now: number): Promise<string[]> => {
+    const staleMs = this.config.staleAfterSeconds * 1000;
+    // Off, rather than everything-is-stale. `Number(undefined)` is NaN and a
+    // misread env var could be either, and the failure mode of getting this
+    // wrong is a post in every open thread at once.
+    if (!Number.isFinite(staleMs) || staleMs <= 0) return [];
+
+    const swept: string[] = [];
+    for (const row of this.db.query<StaleRow>(STALE_SQL)) {
+      // Work in progress the row cannot show: a run may last a day, so a
+      // live agent's own launch timestamp ages past the threshold under it.
+      if (this.running.has(row.id)) continue;
+      const quietMs = now - row.lastActivityAt;
+      if (quietMs < staleMs) continue;
+      const quietSeconds = Math.round(quietMs / 1000);
+
+      let handedBack: boolean;
+      try {
+        handedBack = await this.db.withWrite((db) => {
+          // The marker goes in whatever the flip does. It is what stops this
+          // firing again next tick, and an incident already at
+          // `owner: 'agent'` still went quiet and still earns being told.
+          db.prepare(
+            `INSERT INTO incident_action
+               (incidentId, actorKind, actorId, action, reason, at)
+             VALUES (?, 'boss', NULL, ?, ?, ?)`,
+          ).run(
+            row.id,
+            STALE_SWEPT_ACTION,
+            `nothing happened for ${Math.round(quietSeconds / 3600)}h`,
+            now,
+          );
+          return (
+            db
+              .prepare(
+                `UPDATE incident SET owner = 'agent'
+                   WHERE id = ? AND owner = 'human'
+                     AND status NOT IN ('CLOSED', 'MERGED')`,
+              )
+              .run(row.id).changes > 0
+          );
+        });
+      } catch (err) {
+        alarm("stale_sweep_failed", {
+          incidentId: row.id,
+          quietSeconds,
+          error: String(err),
+          note: "the incident is still stuck and nobody was told; the next tick tries again",
+        });
+        continue;
+      }
+
+      swept.push(row.id);
+      // Before the post, and committed before it, on the same rule the
+      // closing report and `contact_human` follow: a container that dies
+      // between the two stays quiet rather than saying it twice. The
+      // hand-back is the part that actually recovers the incident, so it
+      // must not be lost to a Slack call that failed.
+      alarm("incident_stale", {
+        incidentId: row.id,
+        quietSeconds,
+        owner: row.owner,
+        handedBack,
+        sweep: row.sweeps + 1,
+        note: "no agent ran, no reply arrived and the status did not move for longer than the threshold",
+      });
+
+      if (!this.postNotice) {
+        alarm("stale_notice_undeliverable", {
+          incidentId: row.id,
+          quietSeconds,
+          note: "no thread poster is wired in, so nobody watching this incident was told it had stopped",
+        });
+        continue;
+      }
+      await this.postNotice(
+        row.id,
+        staleNotice(quietSeconds, handedBack, row.sweeps + 1),
+      ).catch((err: unknown) =>
+        alarm("stale_notice_failed", {
+          incidentId: row.id,
+          error: String(err),
+        }),
+      );
+    }
+
+    return swept;
   };
 
   private launch = async (row: EligibleRow, now: number): Promise<Entry> => {
