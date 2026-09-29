@@ -77,8 +77,8 @@ the consumer by a different workflow, and nothing sequences the two.
       edit was an in-place provider update; the first live workbench preview
       after apply confirms it, and the fallback is CI role chaining. Tests
       cover the trust and the ops grant.)
-- [ ] 9. Workbench previews in the workflow: todo. Depends on 8 being
-      applied.
+- [ ] 9. Workbench previews in the workflow: doing (pi-pr-previews,
+      2026-09-29). Depends on 8 being applied (it is).
 - [ ] 10. Extend the `ReadOnlyAccess` permission set for local previews:
       todo. Depends on 8 being applied.
 - [x] 11. Revisit the workbench preview role at workbench step 10: done
