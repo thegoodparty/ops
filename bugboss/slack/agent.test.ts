@@ -7,6 +7,7 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
+import { indexIncident } from "../db/search";
 // The turn loop this agent runs on is named in the composition root, next to
 // the Bedrock client it drives. Its behaviour is the Slack agent's behaviour,
 // so it is tested here with the rest of that surface.
@@ -267,6 +268,61 @@ describe("SQL access is read-only", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("search_incidents on the Slack agent", () => {
+  const searchTool = () => {
+    const { store } = memoryStore();
+    const tool = buildTools({ db, store, linker: fakeLinker, threadTs: null }).find(
+      (t) => t.name === "search_incidents",
+    );
+    assert.ok(tool, "the Slack agent can reach the search triage has");
+    return tool;
+  };
+
+  const seedClosed = async () => {
+    await db.withWrite((w) => {
+      w.prepare("DELETE FROM incident_fts").run();
+      w.prepare(
+        `INSERT INTO incident
+           (id, status, owner, prUrls, firstSignalAt, resolvedAt, closedAt,
+            postmortem, rootCause, resolvedEvidence)
+         VALUES ('inc-old','CLOSED','agent','[]',1000,2000,3000,?,?,'the alert went quiet')`,
+      ).run(
+        "## Summary\nthe connection pool ran out under the morning spike",
+        "the connection pool was exhausted",
+      );
+      indexIncident(w, "inc-old");
+    });
+  };
+
+  // The three answers the tool has to keep apart. Somebody asking "have we
+  // seen this before" gets a wrong answer from two of them collapsing: a
+  // search that never ran, reported as nothing found, reads as "this is new".
+  test("a hit, nothing in the corpus, and a search that never ran stay three answers", async () => {
+    await seedClosed();
+    const tool = searchTool();
+
+    const hit = await tool.run({ text: "connection pool exhausted" });
+    const nothing = await tool.run({ text: "certificate rotation expiry" });
+    const never = await tool.run({ text: "the prod error" });
+
+    assert.match(hit, /inc-old/);
+    assert.match(hit, /connection pool was exhausted/);
+    assert.match(nothing, /^0 matches/);
+    assert.match(never, /^error:/);
+    assert.match(never, /did not run/);
+    assert.notEqual(
+      nothing,
+      never,
+      "one answer for both is the bug: the agent cannot tell it failed to search",
+    );
+  });
+
+  test("the prompt tells the model the tool exists and how to read it", () => {
+    assert.match(SLACK_AGENT_SYSTEM, /- search_incidents:/);
+    assert.match(SLACK_AGENT_SYSTEM, /the search did not run/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 
 describe("prefix binding", () => {
@@ -288,7 +344,7 @@ describe("prefix binding", () => {
     assert.equal(specs(), before);
     assert.deepEqual(
       buildTools({ db, store: memoryStore().store, linker: fakeLinker, threadTs: null }).map((t) => t.name),
-      ["get_incident", "query_incidents", "read_agent_session"],
+      ["get_incident", "query_incidents", "read_agent_session", "search_incidents"],
       "order is part of the prefix",
     );
   });

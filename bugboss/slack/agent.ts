@@ -25,7 +25,7 @@ import {
 } from "./format";
 import { describeOutcome, readSessionOutcome } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
-import { prepareQuery, usageForLog, type ModelUsage } from "../triage";
+import { prepareQuery, searchTool, usageForLog, type ModelUsage } from "../triage";
 
 const log = makeLog("slack-agent");
 
@@ -257,6 +257,13 @@ export const buildTools = ({
     }
   };
 
+  /**
+   * Triage's tool, adapted to this surface's shape rather than rebuilt, so
+   * one search answers the same three ways wherever it is called from: hits,
+   * an empty corpus answer, and a query that never reached the index at all.
+   */
+  const search = searchTool(db);
+
   return [
     {
       name: "get_incident",
@@ -401,6 +408,12 @@ export const buildTools = ({
         );
       },
     },
+    {
+      name: search.spec.name,
+      description: search.spec.description,
+      inputSchema: search.spec.inputSchema,
+      run: (input) => Promise.resolve(search.run(input)),
+    },
   ];
 };
 
@@ -426,8 +439,9 @@ export const SLACK_AGENT_SYSTEM = [
   "- get_incident: one incident in full, with its signals and relayed human replies, and threadPermalink for its Slack thread.",
   "- query_incidents: one read-only SQL SELECT against the incident database. Select slackThreadTs and each incident row comes back with a threadPermalink.",
   "- read_agent_session: the tail of an incident agent's transcript, for what it tried and ruled out.",
+  "- search_incidents: text search over the post-mortems and root causes of incidents that are already over. Plain words describing the failure -- the mechanism, the component, the error text -- not a question and not SQL. \"0 matches\" means nothing that ended reads like this, which is an answer; an error means the search did not run, which is not the same thing and is never reported as nothing found.",
   "",
-  "Which tool you reach for is what decides whether you answer at all. A question about more than one incident is a query_incidents question. A question about one incident in depth is a get_incident question. Reading incidents one at a time to answer a question about all of them spends the whole run on reading, and a run spent reading is a question nobody gets an answer to.",
+  "Which tool you reach for is what decides whether you answer at all. A question about more than one incident is a query_incidents question. A question about one incident in depth is a get_incident question. \"Has this happened before?\" is a search_incidents question: the same cause comes back through a different alert, so an id or an alert name finds nothing and the words for the failure find it. Reading incidents one at a time to answer a question about all of them spends the whole run on reading, and a run spent reading is a question nobody gets an answer to.",
   "",
   "\"What is the state of the incidents?\" is one call:",
   "```",

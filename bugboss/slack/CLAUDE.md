@@ -467,6 +467,12 @@ rather than the two that used to disagree about what a read was. It answers
 questions about incidents; it cannot merge, close, stop, restart or take
 ownership. Ownership changes by replying in the thread.
 
+`search_incidents` is the same tool triage calls, adapted to this surface's
+tool shape. Its three answers have to stay three: matches, `0 matches` for a
+corpus that has nothing like this, and an `error:` for a query that never
+reached the index. A search that never ran, reported as nothing found, tells
+somebody asking "have we seen this before" that the problem is new.
+
 What a run spent comes back from the harness beside the answer and lands on
 the `answered` log line. The wrap-up call and a call that failed are both in
 it: the run that cost the most is the one that answered least.
