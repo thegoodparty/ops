@@ -1116,10 +1116,10 @@ export const createBugBoss = async (
    * re-delivery of a signal nothing ever placed falls through to be placed
    * again, and both attempts were paid for.
    *
-   * A zero total with calls above zero is the drift signature the columns
-   * exist to expose, so it alarms rather than writing a free decision. A zero
-   * total with zero calls is not a fault -- correlation short-circuits before
-   * the model on some paths and so does triage.
+   * Every counter at zero with calls above zero is the drift signature the
+   * columns exist to expose, so it alarms rather than writing a free
+   * decision. Zero calls is not a fault at all -- triage and correlation both
+   * short-circuit before the model on some paths.
    *
    * It is its own `withWrite`, so it is its own S3 snapshot PUT on top of the
    * one placement already costs. Worth naming rather than hiding: the write
@@ -1135,11 +1135,22 @@ export const createBugBoss = async (
     usage: ModelUsage,
   ): Promise<void> => {
     if (usage.calls === 0) return;
-    if (usage.tokensIn === 0 && usage.tokensOut === 0) {
+
+    // Summed over all four counters, matching `rollUpUsage` below, and not a
+    // test on `tokensOut` alone. A request aborted after the provider
+    // reported its input but before it reported any output really does have
+    // output at zero, and those input tokens were really spent -- which is
+    // the timeout path this accounting exists to capture. Alarming on it
+    // would both cry wolf and refuse to write real spend. Every counter at
+    // zero is the shape that cannot happen for a request that reached the
+    // model, so that is the one worth alarming on.
+    const total =
+      usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+    if (total === 0) {
       alarm("triage_usage_missing", {
         signalId,
         ...usageForLog(usage),
-        note: "a request reached the model and reported no tokens, which means this reader has drifted from what the provider returns",
+        note: "a request reached the model and reported no tokens at all, which means this reader has drifted from what the provider returns",
       });
       return;
     }

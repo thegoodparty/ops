@@ -2496,3 +2496,51 @@ test("a decision that never reached the model is not alarmed as missing", async 
     modelId: null,
   });
 });
+
+test("a request that spent input and produced no output is still costed", async () => {
+  // The shape a review flagged as a gap and it is the opposite: a request
+  // aborted after the provider reported its input but before any output
+  // really does carry tokensOut at zero, and those input tokens were really
+  // spent. That is the timeout path the accumulator exists to capture, so
+  // alarming here would cry wolf and refuse to write real spend at once.
+  // Only every counter at zero is a shape that cannot happen.
+  fakeModel.usage = {
+    ...emptyModelUsage(),
+    tokensIn: 1400,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    modelId: SONNET,
+    calls: 1,
+  };
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "input was read, nothing came back",
+  });
+
+  const alarms: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => {
+    alarms.push(args.map(String).join(" "));
+    realError(...(args as []));
+  };
+  try {
+    await boss.ingest("grafana", grafanaBody("fp-spend-partial", "spend-partial-errors"));
+  } finally {
+    console.error = realError;
+  }
+
+  assert.deepEqual(
+    alarms.filter((line) => line.includes("triage_usage_missing")),
+    [],
+    "a partially reported request was called drift",
+  );
+  assert.deepEqual(spendOf("fp-spend-partial"), {
+    tokensIn: 1400,
+    tokensOut: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    modelCalls: 1,
+    modelId: SONNET,
+  });
+});
