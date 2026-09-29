@@ -311,6 +311,46 @@ A press that changes nothing still gets a line in the thread. A button that
 silently does nothing is indistinguishable from a broken one, and the person
 who pressed it would go on waiting for an agent that never heard them.
 
+### The line has to say what happens next
+
+Saying the press landed is only half of it, and the wrong half. The two
+guards above ask whether the press is *the* answer to the question an agent
+posed; neither asks whether an agent is still there. `pending_question`
+outlives the run that wrote it — `clearPending` does not run when a child is
+killed mid-wait — and the dispatcher launches only for `owner = 'agent'` in
+an agent status. So a press on an incident a person has taken over passes
+`EXISTS`, writes its `thread_reply` row and its `pending_directive`, and
+nothing is coming to consume either. That press was acknowledged in exactly
+the words a live agent's press got: "chose Merged", full stop. Somebody
+pressed, read that, and waited on an agent that did not exist.
+
+So `ChoiceRoute` carries `agentRunning`, read off the same
+`AGENT_RUNNING_STATUSES` an inbound reply uses and the same predicate
+`ELIGIBLE_SQL` runs on — a press is a reply, so it answers to the same field.
+The acknowledgement's second line is that field: the agent has it and carries
+on, or nothing is running to read it and here is the one move that changes
+that, which is saying in the thread that you are handing it back. Both are
+true sentences; the old one was true only half the time and unfalsifiable the
+rest.
+
+**Nothing here hands the incident back on its own.** A false handover is the
+expensive direction in the other places that read one, and a press is a
+weaker signal of intent than a sentence — it is one tap, often on a question
+whose agent has been gone for hours. The thread says what to type instead.
+
+The same field fixes the other two. A second press is told *which* answer
+won and who pressed it, since the first press is the only one and the loser
+otherwise learns only that theirs was not it. A press on a closed question
+is told nothing is waiting on that answer — and, when no agent is running,
+not told to "reply in the thread and it will read you", which was the same
+false promise in the other branch.
+
+A press whose thread matches no incident is the remaining silence, and it is
+an `alarm` now rather than a log: a button only exists on a question BugBoss
+posted into an incident thread, so no match means the thread link is gone and
+the press is lost. The presser is told, in the thread, rather than watching a
+button that did nothing.
+
 ## Interactivity arrives down `/slack`, as a form
 
 Slack posts a press to the Interactivity Request URL as

@@ -2105,32 +2105,79 @@ export const createBugBoss = async (
    * including the two that changed nothing. A button that silently does
    * nothing is indistinguishable from a broken one, and the person who
    * pressed it would reasonably go on waiting for an agent that never heard
-   * them. Each line ends by pointing at the thing that always works: typing.
+   * them.
+   *
+   * What the line has to carry is what happens *next*. "Chose Merged" was
+   * only the first half: a press on an incident the dispatcher will not run
+   * writes a directive nothing is coming to consume, and it read exactly the
+   * same as a press an agent was about to act on. So every line here says
+   * whether an agent will read this, and when none will, the one move that
+   * changes that. A confident acknowledgement over an inert press is worse
+   * than silence, because silence at least does not claim.
    */
   const acknowledgeChoice = async (
     route: ChoiceRoute,
     click: SlackChoiceClick,
   ): Promise<void> => {
+    const say = (text: string, incidentId: string | null) =>
+      slack
+        .post(click.threadTs, text, click.channel)
+        .then(() => undefined)
+        .catch((err: unknown) =>
+          alarm("choice_post_failed", { incidentId, error: String(err) }),
+        );
+
     if (route.kind === "ignore") {
-      log("choice_ignored", { reason: route.reason, user: click.user });
+      // A button only exists on a question BugBoss posted into an incident
+      // thread, so a press whose thread matches no incident means the thread
+      // link is gone and the press is lost. That is an alarm, not a log, and
+      // the presser hears about it rather than watching a dead button.
+      alarm("choice_unmatched", {
+        reason: route.reason,
+        user: click.user,
+        threadTs: click.threadTs,
+      });
+      await say(
+        [
+          mrkdwn`${raw(userMention(click.user))} I cannot match this thread to an incident, so that press reached no agent.`,
+          "_Tag me here and say what you meant, and I will pick it up._",
+        ].join("\n"),
+        null,
+      );
       return;
     }
+
     const who = raw(userMention(route.slackUserId));
+    // Stated once, because the honest half of all three lines is the same
+    // question: is anything running that will read this thread.
+    const handBack =
+      "_No agent is running on this incident. Say in the thread that you are handing it back and one will start within a tick._";
+
     const text =
       route.kind === "answered"
-        ? mrkdwn`${who} chose *${route.choice}*.`
+        ? [
+            mrkdwn`${who} chose *${route.choice}*.`,
+            route.agentRunning
+              ? "_The agent has that as its answer and carries on from here._"
+              : `_It is recorded and waiting, but nothing is running to read it._\n${handBack}`,
+          ].join("\n")
         : route.kind === "duplicate"
-          ? mrkdwn`${who} that question already has an answer. Reply in the thread to add anything else.`
-          : mrkdwn`${who} that question is closed and the agent has moved on. Reply in the thread and it will read you.`;
-    await slack
-      .post(click.threadTs, text, click.channel)
-      .then(() => undefined)
-      .catch((err: unknown) =>
-        alarm("choice_post_failed", {
-          incidentId: route.incidentId,
-          error: String(err),
-        }),
-      );
+          ? [
+              route.recorded
+                ? mrkdwn`${who} that question already has an answer: *${route.recorded.choice}*, from ${raw(userMention(route.recorded.slackUserId))}.`
+                : mrkdwn`${who} that question already has an answer.`,
+              route.agentRunning
+                ? "_Reply in the thread if you meant something else; the agent reads it._"
+                : handBack,
+            ].join("\n")
+          : [
+              mrkdwn`${who} that question is closed — nothing is waiting on that answer any more.`,
+              route.agentRunning
+                ? "_Reply in the thread and the agent will read you._"
+                : handBack,
+            ].join("\n");
+
+    await say(text, route.incidentId);
   };
 
   const slackInteractionAccepted = async (

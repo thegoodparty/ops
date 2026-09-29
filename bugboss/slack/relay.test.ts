@@ -773,8 +773,12 @@ describe("mention text helpers", () => {
 describe("a button press", () => {
   const QUESTION_TS = "1800.5";
 
-  const askWithButtons = async (incidentId: string) => {
-    await seedIncident(incidentId);
+  const askWithButtons = async (
+    incidentId: string,
+    status = "INVESTIGATING",
+    owner = "agent",
+  ) => {
+    await seedIncident(incidentId, status, owner);
     const thread = await relay.emit({
       type: "opened",
       incidentId,
@@ -809,6 +813,7 @@ describe("a button press", () => {
       incidentId: "inc-1",
       choice: "Roll back",
       slackUserId: "U0HUMAN",
+      agentRunning: true,
     });
 
     const replies = db.query<{ text: string; slackUserId: string }>(
@@ -845,6 +850,10 @@ describe("a button press", () => {
       kind: "duplicate",
       incidentId: "inc-1",
       slackUserId: "U0OTHER",
+      agentRunning: true,
+      // The answer that won, so the thread can name it rather than only tell
+      // the second presser that theirs was not it.
+      recorded: { choice: "Roll back", slackUserId: "U0HUMAN" },
     });
     assert.equal(
       db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-1'").length,
@@ -866,6 +875,7 @@ describe("a button press", () => {
       kind: "stale",
       incidentId: "inc-1",
       slackUserId: "U0HUMAN",
+      agentRunning: true,
     });
     assert.equal(
       db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-1'").length,
@@ -882,6 +892,48 @@ describe("a button press", () => {
     const thread = await askWithButtons("inc-1");
     const route = await press(thread, { messageTs: "1700.1" });
     assert.equal(route.kind, "stale");
+  });
+
+  /**
+   * The press that started this: recorded, acknowledged, and read by nobody.
+   * `pending_question` outlives the agent that wrote it -- clearPending does
+   * not run when a child is killed mid-wait -- so the EXISTS guard says yes
+   * on an incident the dispatcher will never launch, and the directive sits
+   * there. The route has to carry that, or the thread cannot tell the two
+   * apart.
+   */
+  test("a press on a human-owned incident is answered, and says nothing will read it", async () => {
+    const thread = await askWithButtons("inc-2", "FIXING", "human");
+    const route = await press(thread);
+
+    assert.deepEqual(route, {
+      kind: "answered",
+      incidentId: "inc-2",
+      choice: "Roll back",
+      slackUserId: "U0HUMAN",
+      agentRunning: false,
+    });
+    // Still recorded, and still the same row a typed reply writes. Nothing
+    // about the equivalence changes; what changes is what the thread says.
+    assert.equal(
+      db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-2'")
+        .length,
+      1,
+    );
+  });
+
+  test("a stale press on a human-owned incident carries that too", async () => {
+    const thread = await askWithButtons("inc-4", "FIXING", "human");
+    await db.withWrite((d) => {
+      d.prepare("DELETE FROM pending_question WHERE incidentId = ?").run("inc-4");
+    });
+    const route = await press(thread);
+    assert.deepEqual(route, {
+      kind: "stale",
+      incidentId: "inc-4",
+      slackUserId: "U0HUMAN",
+      agentRunning: false,
+    });
   });
 
   test("a press in a thread that is not an incident is ignored", async () => {
