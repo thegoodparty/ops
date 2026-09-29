@@ -406,10 +406,34 @@ describe("triage's spend columns reach a database that already exists", () => {
         modelId: null,
       });
 
-      const columns = db
-        .query<{ name: string; notnull: number }>("PRAGMA table_info(signal)")
-        .filter((c) => c.name === "tokensIn");
-      assert.equal(columns[0].notnull, 1, "the live column is nullable where schema.sql says it is not");
+      // Every NOT NULL column, not just the first. The zero check above
+      // catches a bare `INTEGER` -- it leaves existing rows null -- but it
+      // does not catch `INTEGER DEFAULT 0`, which backfills the rows and
+      // still leaves the column nullable, diverging from `schema.sql` and
+      // from the TypeScript type in a way `schema_drift` cannot see. That
+      // is the trap, so it is asserted per column rather than sampled.
+      const live = new Map(
+        db
+          .query<{ name: string; notnull: number }>("PRAGMA table_info(signal)")
+          .map((c) => [c.name, c.notnull]),
+      );
+      for (const column of [
+        "tokensIn",
+        "tokensOut",
+        "cacheRead",
+        "cacheWrite",
+        "modelCalls",
+      ]) {
+        assert.equal(
+          live.get(column),
+          1,
+          `signal.${column} is nullable in the live database where schema.sql says NOT NULL`,
+        );
+      }
+      // modelId is the one that is meant to be nullable: there is no
+      // sensible default model id, and null is what "nothing reached a
+      // model" looks like.
+      assert.equal(live.get("modelId"), 0);
     } finally {
       db.close();
     }
