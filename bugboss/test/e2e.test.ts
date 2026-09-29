@@ -1704,13 +1704,14 @@ test("a person asking for a merge in a thread gets the merge, not a refusal", as
     ),
     "the person who asked is answered in the thread they asked in",
   );
-  assert.ok(
-    said.some(
+  assert.equal(
+    said.filter(
       (p) =>
         p.threadTs === threadOf(newer) &&
-        /last message in this thread/.test(p.text),
-    ),
-    "the absorbed thread is closed out rather than just going quiet",
+        /last message in this thread|thread stops here/.test(p.text),
+    ).length,
+    1,
+    "exactly one message says this thread is ending, and it is the one carrying the link",
   );
   assert.ok(
     said.some(
@@ -1731,6 +1732,7 @@ test("a person asking for a merge in a thread gets the merge, not a refusal", as
  */
 test("the established incident survives even when the person asks the other way", async () => {
   const { older, newer } = await twoIncidents("rev");
+  const before = fakeSlack.posts.length;
 
   fakeModel.intents.push({ addressed: "agent", combineWith: newer });
   await boss.slackEvent(
@@ -1744,6 +1746,35 @@ test("the established incident survives even when the person asks the other way"
   );
   assert.equal(statusOf(newer).mergedInto, older);
   assert.equal(statusOf(older).status, "INVESTIGATING");
+
+  // Getting the opposite of what you asked for and being told nothing is the
+  // failure this whole change is about, one layer down: the merge happened,
+  // the other way round, and the person is still watching their own thread.
+  const said = fakeSlack.posts.slice(before);
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === threadOf(older) &&
+        /Done -- incident .* is now part of incident/.test(p.text),
+    ),
+    "the person who asked is answered in the thread they asked in",
+  );
+  assert.ok(
+    said.some(
+      (p) =>
+        p.threadTs === threadOf(older) && /is the older record/.test(p.text),
+    ),
+    "and told why it went the way it did, since they asked for the other one",
+  );
+  assert.equal(
+    said.filter(
+      (p) =>
+        p.threadTs === threadOf(older) &&
+        /last message in this thread|carries on here/.test(p.text),
+    ).length,
+    1,
+    "the surviving thread is told it continues, once, and never that it ends",
+  );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 

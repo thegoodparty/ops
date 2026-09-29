@@ -231,7 +231,10 @@ const applyRules = (
   }
 
   // The reporting incident absorbs nothing when it is not the survivor -- it
-  // joins the others going the other way, carrying the cause it just found.
+  // joins the others going the other way. The cause it just found travels
+  // with it as the merge's reason rather than as a column, because writing a
+  // cause onto the survivor would forge a transition no agent made; see
+  // applyMerge in toolapi/index.ts.
   // Its reason is the one the model gave for matching it against the survivor,
   // because that is the only sentence written about those two specifically.
   const absorbed = confident.filter((c) => c.id !== into);

@@ -100,6 +100,16 @@ Triggered by `report_root_cause`, because that is the first moment an
 incident has a claim worth comparing. It compares against every open
 incident and splits the signals the cause does not account for.
 
+Since the survivor is the more established incident rather than the reporting
+one, the incident carrying the root cause is routinely the one that closes.
+The cause travels with the signals as the merge's **reason** — which is what
+the surviving agent reads in its `new_signals` directive and what both threads
+are told — and never as a column on the survivor. Writing it there would forge
+a transition no agent made, past the gate that makes every attached signal
+explained. It arrives as a claim to check, which is the only honest form for a
+cause nothing has run against the signals that just landed, and the surviving
+agent is the thing that can call `report_root_cause` on it.
+
 A correlation failure must never cost the agent its root cause: the
 transition commits, the merge is skipped, and the decline is logged with the
 target's actual status. A silently declined merge is the "one

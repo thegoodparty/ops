@@ -405,7 +405,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   };
 
   /** Correlation moves records nobody else has claimed, in either direction. */
-  const mergeable = (row: Incident | undefined): boolean =>
+  const mergeable = (row: Incident | undefined): row is Incident =>
     !!row && (row.status === "INVESTIGATING" || row.status === "FIXING");
 
   const where = (row: Incident | undefined) =>
@@ -460,6 +460,22 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       return declined({ reason: "the incident to absorb has no signals left" });
     }
 
+    // The cause has to travel with the signals, and it cannot travel as a
+    // column. Correlation now absorbs the reporting incident whenever an
+    // older record turns out to be the same bug, so the incident carrying
+    // the root cause is routinely the one that closes -- and writing that
+    // cause onto the survivor would forge a transition no agent made, past
+    // the gate that makes every attached signal explained. So it travels as
+    // the merge's reason, which is what the surviving agent reads in its
+    // `new_signals` directive and what both threads are told. It arrives as
+    // a claim to check, which is the only form an unverified cause can
+    // honestly take: the survivor's own agent is the thing that can run it
+    // against the signals and call reportRootCause.
+    const cause =
+      absorb.rootCause && !into.rootCause
+        ? `\n\nIncident ${merge.absorb} reported this root cause before it was absorbed, and nothing has checked it against the signals that just arrived: ${absorb.rootCause}`
+        : "";
+
     return {
       kind: "applied",
       result: assign(
@@ -467,7 +483,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         {
           signalIds: signals.map((s) => s.id),
           target: merge.into,
-          reason: merge.reason,
+          reason: `${merge.reason}${cause}`,
         },
         { kind: "boss" },
       ),

@@ -735,6 +735,44 @@ describe("directives", () => {
     );
   });
 
+  it("carries an absorbed incident's root cause to the agent that now owns the signals", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    merges.push({ absorb: newer, into: older, reason: "one pool, two alerts" });
+
+    const res = await toolsFor(newer).reportRootCause({
+      cause: "the upgrade webhook holds a connection per request",
+      explainedSignalIds: ["sig-b"],
+    });
+    assert.equal(res.ok, true, res.error);
+
+    // The cause cannot be written onto the survivor: that would be a
+    // transition no agent made, past the gate that makes every attached
+    // signal explained. So it reaches the surviving agent as something to
+    // check, and the agent that found it is the one that closes.
+    assert.equal(incidentRow(older)?.rootCause, null);
+    const handed = db
+      .query<{ payload: string }>(
+        "SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
+        [older],
+      )
+      .map((r) => JSON.parse(r.payload) as { type: string; summary?: string });
+    const news = handed.find((d) => d.type === "new_signals");
+    assert.ok(news, "the surviving agent is told signals arrived");
+    assert.match(
+      news.summary ?? "",
+      /upgrade webhook holds a connection per request/,
+      "and told the cause the incident that just closed had found for them",
+    );
+    assert.match(
+      news.summary ?? "",
+      /nothing has checked it against the signals/,
+      "as a claim to verify, which is the only honest form for an unverified cause",
+    );
+  });
+
   it("says so when it declines a merge the correlator proposed", async () => {
     await seed("sig-a");
     await seed("sig-b");

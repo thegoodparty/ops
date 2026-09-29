@@ -1956,10 +1956,16 @@ export const createBugBoss = async (
     // Their answer goes first, and announce's closing message last, because
     // one of the two threads announce writes into is this one -- and "this is
     // the last message in this thread" has to be true when it is read.
+    //
+    // Which is also why this says nothing about the thread ending when they
+    // are standing in the one being absorbed. Two messages both claiming to
+    // be the end is worse than one: the first is false by the time it is
+    // read, and the one that carries the link to where everything moved is
+    // the one that has to be believed.
     await say(
       [
         mrkdwn`${raw(userMention(route.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
-        mrkdwn`_Incident ${into} is the older record, so it stays the one of account and keeps its thread. ${absorb === route.incidentId ? "This thread stops here." : "Everything carries on here."}_`,
+        mrkdwn`_Incident ${into} is the older record, so it stays the one of account and keeps its thread.${absorb === route.incidentId ? "" : " Everything carries on here."}_`,
       ].join("\n"),
     );
     await announce.announceMerge(result);
