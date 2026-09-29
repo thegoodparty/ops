@@ -1869,6 +1869,73 @@ test("a person saying they have it reaches the agent and keeps the incident", as
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
+/**
+ * The failure this exists for. Swain answered an agent's outstanding question
+ * in incident 10's thread; the intent call timed out at its ceiling, and
+ * BugBoss replied asking him to say it again. He had already been given the
+ * answer he was asking for earlier in the same thread.
+ *
+ * A model that never ran is not a model that read the message and could not
+ * tell. `unclear` is a verdict; a fallback is the absence of one, and
+ * defaulting the absence to "ask the human to repeat themselves" puts the
+ * one interface into this system behind a call that routinely spends most of
+ * its budget. The wait's own rule says which way to err: lifting one that
+ * should not have lifted costs a relaunch, and leaving one up is a stall.
+ */
+test("an intent call that fails wakes the agent instead of asking again", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-unread", "zip-validation"));
+
+  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
+    `SELECT i.id, i.slackThreadTs FROM incident i
+       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-unread'`,
+  )!;
+  assert.ok(row.slackThreadTs, "a reply can only arrive in a thread");
+
+  // Load-bearing. The "say it again" post is only reachable with a question
+  // outstanding, so without one this test would pass on a bug it never ran.
+  const client = bossClientFor(row.id, boss.mintToken(row.id));
+  await client.recordPending("What are the bad zip values?");
+  assert.ok(
+    boss.db.get("SELECT 1 FROM pending_question WHERE incidentId = ?", [row.id]),
+    "the branch under test needs a question outstanding to be reachable",
+  );
+
+  const postsBefore = fakeSlack.posts.length;
+  fakeModel.intents.push(new Error("ModelRequestFailed: Request was aborted"));
+  await boss.slackEvent(
+    replyIn(row.slackThreadTs!, "give me a query to run against the db"),
+  );
+
+  const directives = boss.db
+    .query<{ payload: string }>(
+      "SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
+      [row.id],
+    )
+    .map((d) => JSON.parse(d.payload) as Directive & { addressed?: string });
+  assert.deepEqual(
+    directives.map((d) => d.type),
+    ["human_message"],
+    "what was said still reaches the agent",
+  );
+  assert.equal(
+    directives[0].addressed,
+    "agent",
+    "and counts as an answer, so the wait it was blocking on ends",
+  );
+
+  assert.deepEqual(
+    fakeSlack.posts
+      .slice(postsBefore)
+      .filter((post) => /say it again/.test(post.text)),
+    [],
+    "nobody is asked to repeat a message the agent has already been given",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+
+  await client.clearPending();
+});
+
 // --- a person combining two incidents --------------------------------------
 
 /**

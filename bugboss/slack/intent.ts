@@ -55,8 +55,13 @@ const SITE = "slack-intent";
  * Small by design: one message in, one label out, no tools and no lookups.
  * This runs off the Slack ack, so the budget is about not stranding a reply
  * behind a hung model rather than about a three-second deadline.
+ *
+ * It is generous because a healthy read already spends most of a ten-second
+ * ceiling, which made an abort an ordinary outcome rather than a sign of a
+ * hung model -- and the thing this budget exists to catch is the hung model.
+ * Nobody waits on this: the Slack ack has already gone out.
  */
-const BUDGET_MS = 10_000;
+const BUDGET_MS = 30_000;
 const MAX_ROUNDS = 2;
 const MAX_INVALID = 1;
 const MAX_TOKENS = 512;

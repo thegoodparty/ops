@@ -2222,7 +2222,22 @@ export const createBugBoss = async (
       outstandingQuestion: outstanding,
     });
 
-    const addressed: Addressed = route.interrupt ? "agent" : read.addressed;
+    // A failed read is not an unclear one. `unclear` is a model that looked
+    // at the message and could not tell; `fellBack` is a model that never
+    // ran, so there is no verdict to defer to.
+    //
+    // Only while a question is outstanding. With nothing blocked, an
+    // unreadable message is context and there is no wait for it to end
+    // wrongly, so the conservative label stays. With something blocked the
+    // cost is not symmetric, and the wait's own rule already says which way
+    // to err: one that lifts when it should not costs a relaunch, one that
+    // persists when it should not is a stall nobody is watching. Treating
+    // no-information as uncertainty is what answered a person who had
+    // answered the agent's question by asking them to say it again.
+    const addressed: Addressed =
+      route.interrupt || (read.fellBack && outstanding !== null)
+        ? "agent"
+        : read.addressed;
 
     // Delivered before anything else, so the agent has what was said whatever
     // the rest of this decides. `others` and `unclear` ride through as
@@ -2263,11 +2278,21 @@ export const createBugBoss = async (
         route.channel,
         route.threadTs,
         [
-          read.fellBack
-            ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way.`
-            : mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent. It has it as context either way.`,
+          mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent. It has it as context either way.`,
           "If it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
         ].join("\n"),
+      );
+    }
+
+    // A failed read is still narrated, because a silent one looks exactly
+    // like a working one and this call is every interface into the system.
+    // It says what happened and what was done about it, and asks for
+    // nothing: the message has already gone to the agent as the answer.
+    if (read.fellBack && outstanding !== null) {
+      await sayInThread(
+        route.channel,
+        route.threadTs,
+        mrkdwn`${raw(userMention(route.user))} The call that works out what a message means failed, so I could not tell who that was for -- the error is in the BugBoss logs. I have given it to the agent as the answer it was waiting on, so there is nothing you need to do.`,
       );
     }
 
