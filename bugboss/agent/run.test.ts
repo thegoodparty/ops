@@ -143,7 +143,7 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
 // Four transitions, not five: `escalate` sits in this list but writes no
 // state. It says the incident needs a person and leaves the agent driving,
 // which is why it is named for what it does rather than for what it moves.
-test("the boss tools are the four transitions, the escalation and the two reads", async () => {
+test("the boss tools are the four transitions, escalate, park and the two reads", async () => {
   const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
 
   assert.deepEqual(
@@ -151,6 +151,7 @@ test("the boss tools are the four transitions, the escalation and the two reads"
     [
       "escalate",
       "get_incident",
+      "park",
       "report_analysis",
       "report_impact",
       "report_resolved",
@@ -159,6 +160,33 @@ test("the boss tools are the four transitions, the escalation and the two reads"
     ],
   );
   assert.ok(!tools.some((tool) => BUILTIN_TOOLS.includes(tool.name)));
+});
+
+test("park reaches the boss, because a wait nothing can write is a hot loop", async () => {
+  // The gap this closes: `park` existed on the tool API and the loopback
+  // route and was reachable by nothing the model could call, so an agent that
+  // was genuinely blocked had no way to stop being relaunched into the same
+  // dead end.
+  const calls: unknown[] = [];
+  const api = {
+    ...stubApi({ ok: true, directives: [] }),
+    park: async (args: unknown) => {
+      calls.push(args);
+      return { ok: true as const, directives: [] };
+    },
+  };
+  const tools = await createBossTools({ api });
+  const park = tools.find((tool) => tool.name === "park");
+  assert.ok(park, "the model can see it");
+
+  await park.execute(
+    "call-1",
+    { waitingFor: "the credential rotation" } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+  assert.deepEqual(calls, [{ waitingFor: "the credential rotation" }]);
 });
 
 test("reporting a root cause starts the install, and directives reach the model", async () => {

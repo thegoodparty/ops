@@ -100,6 +100,9 @@ test("the prompt names the difference between asking and escalating", () => {
   // reads only the prompt believes it can put an incident down.
   assert.match(prompt, /this one is yours until it closes/);
   assert.match(prompt, /No incident is ever taken off you/);
+  // A tool the model is never told to reach for is a tool it does not have.
+  assert.match(prompt, /Park before you stop/);
+  assert.match(prompt, /relaunches you into the same dead end/);
   // The harness enforces this one; the prompt has to say so, or a model that
   // reads only the prompt believes an unanswered question is survivable.
   assert.match(prompt, /is escalated by the harness/);

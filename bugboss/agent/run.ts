@@ -495,6 +495,29 @@ export const createBossTools = async (args: {
           maxChars,
         ),
     },
+    {
+      name: "park",
+      label: "Park",
+      description:
+        "Say this incident has nothing you can do yet, so nothing relaunches you into the same dead end. Use it when the only thing left is a person acting and you are about to stop: you have escalated, there is no check you could monitor, and continuing would just burn turns. It is not a hand-off and it does not end the incident -- it is still yours, and any reply in the thread brings you straight back. Prefer monitor with awaitingHuman when you can write a command that detects the thing being waited for, because that keeps you here and wakes you the moment it happens. Park is for when you cannot.",
+      parameters: Type.Object({
+        waitingFor: Type.String({
+          description:
+            "What has to happen before this is worth picking up again, in one line.",
+        }),
+        wakeAfterSeconds: Type.Optional(
+          Type.Number({
+            description:
+              "Come back anyway after this long. Leave it out when only a person can end the wait.",
+          }),
+        ),
+      }),
+      execute: async (_id: string, params: unknown) =>
+        bossToolResult(
+          await args.api.park(params as unknown as Parameters<ToolApi["park"]>[0]),
+          maxChars,
+        ),
+    },
   ] as unknown as ToolDefinition[];
 
   return tools;
