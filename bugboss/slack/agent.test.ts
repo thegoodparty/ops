@@ -1030,7 +1030,7 @@ describe("a run that uses its whole budget", () => {
     );
   });
 
-  test("says what happened when the wrap-up has nothing to say either", async () => {
+  test("says it ran out of steps, and how many, when the wrap-up has nothing either", async () => {
     const { store } = memoryStore();
     // Burns every turn on tool calls, so the budget really does run out, and
     // then answers the wrap-up with nothing.
@@ -1056,8 +1056,49 @@ describe("a run that uses its whole budget", () => {
       answer = result.text;
     });
 
-    assert.match(answer, /narrow the question/);
+    // The four minutes of silence are the only thing the reader experienced,
+    // so the reply has to name what caused them and how much it bought.
+    assert.match(answer, /ran out of steps/);
+    assert.match(answer, /\b4\b/, "and how many, so the wait has a size");
+    assert.match(
+      answer,
+      /under a minute|about a minute|about \d+ minutes/,
+      "and how long, which is what they actually waited",
+    );
+    assert.match(answer, /narrow it instead/);
+    // Asking again spends the same budget the same way, so advice to do that
+    // costs the reader another wait for the same non-answer.
+    assert.doesNotMatch(answer, /[Aa]sk me again/);
+    // A pointer to a log group is a second task for somebody already in the
+    // middle of one, and whoever owns the budget has the alarm already.
+    assert.doesNotMatch(answer, /logs/);
     assert.ok(lines.some((l) => l.includes("slack_agent_turns_exhausted")));
+    assert.ok(lines.some((l) => l.includes("slack_agent_no_answer")));
+  });
+
+  test("does not claim it ran out of steps when it did not", async () => {
+    // One turn, no tool calls, no text. The budget was never touched, so
+    // blaming it would be a fabrication and "ask me again" is the right
+    // advice rather than the wrong one.
+    const { store } = memoryStore();
+    const model: ModelClient = {
+      complete: () => Promise.resolve({ text: "", toolCalls: [] } satisfies ModelReply),
+    };
+
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run(
+        runRequest([countingTool([])], 4),
+      );
+      answer = result.text;
+    });
+
+    assert.doesNotMatch(answer, /ran out of steps/);
+    assert.match(answer, /Ask me again/);
+    assert.ok(
+      !lines.some((l) => l.includes("slack_agent_turns_exhausted")),
+      "nothing was exhausted",
+    );
     assert.ok(lines.some((l) => l.includes("slack_agent_no_answer")));
   });
 });
