@@ -22,6 +22,7 @@ import {
   type BedrockInvokeModelApi,
   type BedrockInvokeModelOptions,
   resolveCacheRetention,
+  THINKING_BINDING_CONTROLS_BETA,
 } from "./options";
 
 export const ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31";
@@ -327,6 +328,8 @@ export const buildInvokeModelBody = ({
         : { type: "tool", name: options.toolChoice.name };
   }
 
+  const betas = new Set(options.betas ?? []);
+
   if (model.reasoning && options.thinkingEnabled !== false) {
     // Adaptive only. budget_tokens is deprecated on 4.6 and 400s on 4.7+, and
     // every model this provider targets is 5-series.
@@ -340,6 +343,10 @@ export const buildInvokeModelBody = ({
         ? {}
         : { block_binding: { prefix_mismatch_behavior: "drop_block" } }),
     };
+    // The beta is added here, beside the only branch that emits the field it
+    // gates, because the two are one decision: sending either half alone is a
+    // 400 the caller cannot see coming.
+    if (body.thinking.block_binding) betas.add(THINKING_BINDING_CONTROLS_BETA);
     if (options.effort) body.output_config = { effort: options.effort };
   }
 
@@ -348,7 +355,7 @@ export const buildInvokeModelBody = ({
     body.temperature = options.temperature;
   }
 
-  if (options.betas && options.betas.length > 0) body.anthropic_beta = options.betas;
+  if (betas.size > 0) body.anthropic_beta = [...betas];
 
   const userId = options.metadata?.user_id;
   if (typeof userId === "string") body.metadata = { user_id: userId };

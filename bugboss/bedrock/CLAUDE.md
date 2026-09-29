@@ -136,6 +136,36 @@ a keep-alive or a shorter default timeout, not a longer cache.
 
 ## Traps when changing this directory
 
+**A body field can be beta-gated, and Bedrock names the field, not the beta.**
+`thinking.block_binding` is accepted only with `thinking-binding-controls-2026-08-01`
+in `anthropic_beta`. Without it the entire request is a `ValidationException`
+reading `thinking.adaptive.block_binding: Extra inputs are not permitted`, which
+reads like a field we invented rather than a header we failed to send.
+
+That is how the provider died on its first turn the night #124 finally routed a
+request through it. The field had been in the body since this module was
+written; Converse builds its own thinking config and never sent it, so months of
+silent Converse fallback hid a field Bedrock would always have rejected.
+`buildInvokeModelBody()` therefore adds the beta beside the one branch that
+emits the field -- sending either half alone is a 400 the caller cannot see
+coming, so they are one decision, not two.
+
+Verified against live `InvokeModel` calls on `us.anthropic.claude-opus-5`
+(us-west-2, 2026-09-28): accepted with the beta, rejected without it, and a
+bogus beta name is itself rejected -- so a name that stops being real fails
+loudly rather than quietly doing nothing. `display`, `output_config.effort`,
+`anthropic_beta` as a body field and `metadata.user_id` are all accepted, and
+the full production body still returns `cache_creation.ephemeral_1h_input_tokens`,
+so the 1h write and `stream.ts`'s downgrade check are untouched.
+
+**Do not "fix" a rejected `block_binding` by deleting it.** It looks like the
+clean fix and every test would pass, because the prefix-binding check is not
+currently enforced for this account on this model: a real signed thinking block
+replayed under a deliberately changed system prompt was accepted even with
+`prefix_mismatch_behavior: "error"`. So deleting the field costs nothing today
+and wedges the relaunch loop on the day enforcement arrives -- a quiet failure
+of exactly the kind this module exists to prevent. Keep the field, send the beta.
+
 **The second argument to `registerApiProvider()` is not a registry key.**
 `registerApiProvider(provider, "bugboss-bedrock-invoke-model")` passes a
 *source label*, used only by `unregisterApiProviders(sourceId)` for bulk
@@ -178,3 +208,17 @@ Correct routing reaches `InvokeModel`. Wrong routing returns
 `bedrock-converse-stream` and an `UnrecognizedClientException` from the real
 Converse endpoint -- which is also the proof that Converse actually *ran*
 rather than merely being selected. Fastest check for a regression here.
+
+## Settling a body-shape question
+
+Routing is provable without credentials; whether Bedrock *accepts* a field is
+not. It validates server-side against its own copy of the Anthropic schema, so
+the only answer that counts is a live call. `aws bedrock-runtime invoke-model`
+with a two-message body answers one field per call in about a second, and a
+deliberately bogus value is the control that proves the check is real rather
+than ignored.
+
+Reaching it through this provider instead of by hand is worth the extra step,
+because `streamSimple()` sends `thinkingEnabled: false` unless
+`options.reasoning` is set -- so a probe that omits it builds a body with no
+thinking config at all and passes against every version of this file.

@@ -127,6 +127,60 @@ test("prefixMismatchBehavior: error drops the block_binding", () => {
   assert.equal(body.thinking?.block_binding, undefined);
 });
 
+// Every field here is rejected outright by Bedrock InvokeModel unless the beta
+// beside it is in `anthropic_beta`. Verified against a live call on
+// us.anthropic.claude-opus-5 (us-west-2, 2026-09-28): with the beta the request
+// is accepted, without it the whole request is a ValidationException reading
+// `thinking.adaptive.block_binding: Extra inputs are not permitted`. Bedrock
+// also validates the beta list, so a name that stops being real fails loudly.
+const GATED_THINKING_FIELDS: Record<string, string> = {
+  block_binding: "thinking-binding-controls-2026-08-01",
+};
+
+test("a gated thinking field is never sent without the beta that makes it legal", () => {
+  // The suite was green while prod died on every launch, because one test
+  // asserted block_binding IS in the body and nothing asserted the half that
+  // makes Bedrock accept it. This walks the option matrix and holds the pairing.
+  const cases = [
+    {},
+    { effort: "high" },
+    { thinkingDisplay: "omitted" },
+    { prefixMismatchBehavior: "drop_block" },
+    { prefixMismatchBehavior: "error" },
+    { betas: ["context-management-2025-06-27"] },
+    { thinkingEnabled: false },
+  ];
+
+  for (const options of cases) {
+    const body = build([], options);
+    const sent = body.anthropic_beta ?? [];
+    for (const [field, beta] of Object.entries(GATED_THINKING_FIELDS)) {
+      if (body.thinking && field in body.thinking) {
+        assert.ok(
+          sent.includes(beta),
+          `options ${JSON.stringify(options)} sent thinking.${field} without ${beta}`,
+        );
+      }
+    }
+  }
+});
+
+test("a caller's own betas survive alongside the binding beta, exactly once", () => {
+  const body = build([], {
+    betas: ["context-management-2025-06-27", "thinking-binding-controls-2026-08-01"],
+  });
+
+  assert.deepEqual(body.anthropic_beta, [
+    "context-management-2025-06-27",
+    "thinking-binding-controls-2026-08-01",
+  ]);
+});
+
+test("no thinking config means no binding beta", () => {
+  const body = build([], { thinkingEnabled: false });
+  assert.equal(body.anthropic_beta, undefined);
+});
+
 test("thinkingEnabled: false sends no thinking config and allows temperature", () => {
   const body = build([], { thinkingEnabled: false, temperature: 0.4 });
 
