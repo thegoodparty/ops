@@ -20,7 +20,6 @@ const alarm = makeAlarm("agent-tools");
 export const MONITOR_TOOL_NAME = "monitor";
 export const CONTACT_HUMAN_TOOL_NAME = "contact_human";
 
-export const DEFAULT_MAX_TOOL_CHARS = 20000;
 export const DEFAULT_PROBE_TIMEOUT_SECONDS = 60;
 export const CONTACT_HUMAN_POLL_SECONDS = 30;
 
@@ -29,8 +28,21 @@ export const CONTACT_HUMAN_POLL_SECONDS = 30;
  * the question at the bottom, to a reader holding a phone. Truncating would be
  * silent and would cut the question off; refusing costs one turn and says
  * exactly what to move where. `details` is the unbounded half.
+ *
+ * 550 rather than a rounder number because `unansweredBrief` quotes this
+ * whole, and that brief goes through `escalate`, which refuses a post over
+ * `THREAD_PROSE_CHARS` like any other. Worst case that brief is this, plus
+ * `MAX_CHOICE_OPTIONS` button labels at 75 each, plus its own template, and
+ * it lands at 1,149 against 1,200. At the old 700 it did not fit, which is
+ * why the brief used to clamp the question instead -- and a clamped question
+ * is the one thing the person picking up the incident most needs intact.
+ * Making the ask's own limit close the arithmetic is what removes the clamp.
+ *
+ * That leaves about 50 characters of slack, so the wording of that brief and
+ * this number are one decision. `tools.test.ts` composes the worst case,
+ * which is what turns "and it still fits" from a claim into a failure.
  */
-export const CONTACT_HUMAN_MESSAGE_LIMIT = 700;
+export const CONTACT_HUMAN_MESSAGE_LIMIT = 550;
 
 /**
  * The shortest silence that means anything. Below it nobody has had a chance
@@ -40,53 +52,37 @@ export const CONTACT_HUMAN_MESSAGE_LIMIT = 700;
  */
 export const CONTACT_HUMAN_MIN_WAIT_SECONDS = 1800;
 
-const elisionMarker = (dropped: number): string =>
-  `\n\n[... ${dropped} characters elided ...]\n\n`;
+/**
+ * How much of a probe's own output a nudge or a brief carries.
+ *
+ * The status block is the one thing in either that nobody authored: it is
+ * whatever the model's check printed last, and it exists so a reader can see
+ * whether the thing they are being nudged about has moved. So it is the one
+ * thing here that is still excerpted, and what changed is the shape.
+ *
+ * Head only, and the cut says nothing about its own size. What used to sit
+ * in these messages was `[... 549 characters elided ...]` from the middle of
+ * the text -- a count of what the reader is missing, which tells them
+ * nothing they can act on, and a cut through the middle, which is where the
+ * answer usually is. A reader who wants the whole output runs the check; a
+ * reader being nudged wants the top of it.
+ */
+export const STATUS_EXCERPT_CHARS = 400;
 
 /**
- * A cap that is one: `truncateOutput(text, n).length <= n` for every text
- * and every n. It used to overshoot, and by an amount that *grew* with the
- * input rather than a constant one, because the marker naming what went is
- * part of the output and the slices were sized as if it were not. So every
- * caller's margin shrank as its inputs grew, which is the opposite of what
- * a margin is for, and `HEARTBEAT_ECHO_CHARS` below was set low to absorb
- * it.
+ * A probe's last output, ready for a fenced block.
  *
- * The marker never goes. Truncation a reader cannot see is the silent
- * failure this whole file is built against, so the head and the tail shrink
- * to make room for it rather than the other way round -- and they stay
- * roughly two to one, which is the shape callers read.
- *
- * Sizing it is circular: the marker names how much was dropped, and how much
- * is dropped depends on how much room the marker takes. Reserving against
- * `text.length` -- the largest number the marker could ever print -- settles
- * it in a single pass, because dropping fewer characters can only ever mean
- * the same digits or fewer, so the marker finally written is never longer
- * than the space held for it.
+ * The ellipsis is the whole of what the reader is told about the cut, and it
+ * is deliberate rather than terse: a cut nobody can see is the silent
+ * failure this file is built against, and a cut measured in characters is
+ * noise dressed as precision.
  */
-export const truncateOutput = (
-  text: string,
-  maxChars = DEFAULT_MAX_TOOL_CHARS,
-): string => {
-  if (text.length <= maxChars) return text;
-
-  const reserved = elisionMarker(text.length).length;
-  if (maxChars < reserved) {
-    // A budget too small to hold the bare marker is a caller bug, not an
-    // input: the tightest clamp here is 200 against a marker of about 40.
-    // Honour the cap anyway, keep an ellipsis so the cut is still visible to
-    // the reader, and alarm so the mis-sized budget is visible to us --
-    // returning a count nobody has room for would only move the overshoot.
-    alarm("truncate_budget_below_marker", { maxChars, reserved });
-    return maxChars > 0 ? `${text.slice(0, maxChars - 1)}\u2026` : "";
-  }
-
-  const room = maxChars - reserved;
-  const head = text.slice(0, Math.floor((room * 2) / 3));
-  const tailChars = room - head.length;
-  const tail = tailChars ? text.slice(-tailChars) : "";
-  const dropped = text.length - head.length - tail.length;
-  return `${head}${elisionMarker(dropped)}${tail}`;
+export const statusExcerpt = (output: string): string => {
+  const text = output.trim();
+  if (!text) return "(no output)";
+  return text.length <= STATUS_EXCERPT_CHARS
+    ? text
+    : `${text.slice(0, STATUS_EXCERPT_CHARS).trimEnd()}\u2026`;
 };
 
 /**
@@ -311,48 +307,34 @@ export const HEARTBEAT_LOUD_AFTER_PINGS = 3;
  */
 export const HEARTBEAT_MAX_GAP_SECONDS = 86_400;
 
-/** How much of the check's own output a nudge carries. */
-export const HEARTBEAT_STATUS_CHARS = 400;
-
 /**
- * How much of an echo a harness-written brief carries.
+ * The limit on `monitor`'s two prose fields, and a refusal rather than a
+ * clamp.
  *
- * Every post to a thread is refused past `THREAD_PROSE_CHARS`, and a brief
- * the harness wrote has nobody to refuse it to -- the model is not in the
- * loop, and a lost escalation is the worst outcome in this file. So the two
- * variable parts of those briefs, both of which are echoes of text already
- * sitting in the thread directly above, are clamped small enough that the
- * composed brief provably fits: 350 for the echo, at most 375 of button
- * labels, under 250 of template, against a budget of 1,200. `tools.test.ts`
- * composes the worst case of each and checks it, so the arithmetic stays
- * true rather than staying written down.
+ * Both are echoed into every nudge and into the brief the harness writes
+ * when the nudges run out, and neither of those has anybody to refuse it
+ * to: the model is not in the loop by then, and a nudge that fails to post
+ * is dropped by design, so an over-long one means an incident that waits
+ * all day, nudges nobody, and then reports that it nudged three times. The
+ * old fix was to cut the fields at compose time. That put
+ * `[... N characters elided ...]` into a Slack message somebody was reading
+ * on a phone, in place of the middle of the sentence explaining what was
+ * being waited for.
+ *
+ * Refusing moves the same arithmetic to the only place it can be fixed. The
+ * schema asks for one line; a call that sends four gets a tool result saying
+ * so and costs one turn, which is what every other over-long field in this
+ * file already costs (`CONTACT_HUMAN_MESSAGE_LIMIT`, `overThreadBudget`).
+ *
+ * 200 is the number the composition needs, unchanged from when it was a
+ * clamp: two of these, plus a `STATUS_EXCERPT_CHARS` block, plus a
+ * `formatWaited` bounded at fifteen characters, plus template. The nudge
+ * lands at 962 and the stalled-wait brief at 1,124, against the 1,200 a
+ * thread post gets -- so the brief is the tight one and its wording has
+ * about 75 characters of room. `tools.test.ts` composes both worst cases, so
+ * the arithmetic stays true rather than staying written down.
  */
-export const HARNESS_BRIEF_ECHO_CHARS = 350;
-
-/**
- * The same clamp for a nudge, and much smaller, because a nudge spends its
- * budget differently: it echoes *two* of the model's fields and then carries
- * the whole status block underneath, where a brief echoes one.
- *
- * Being refused is the whole reason this exists. A nudge nobody can shorten
- * is dropped on a failed post by design, so an over-long one would mean an
- * incident that waits all day, nudges nobody, and then hands off saying it
- * nudged three times.
- *
- * The number is low for headroom now, not for arithmetic. It was set here
- * when `truncateOutput` returned *more* than the cap it was given by an
- * amount that grew with the input, so no composed bound stayed true as
- * inputs grew. That is fixed -- the cap is exact -- and `formatWaited` is
- * the only part left that varies, bounded at fifteen characters by the
- * largest wait a clock can express. So the composed worst case is a
- * constant: under 1,000 against a budget of 1,200 at 200 each, and 300 each
- * is the most that still fits at all. 200 stays because it leaves the next
- * wording change somewhere to go, and because 200 characters is still a
- * whole sentence for a field the schema asks for in one line.
- * `tools.test.ts` asserts it at inputs no model could produce, not at
- * plausible ones.
- */
-export const HEARTBEAT_ECHO_CHARS = 200;
+export const MONITOR_FIELD_LIMIT = 200;
 
 /**
  * Quiet seconds owed before the next nudge, given how many have gone already.
@@ -437,12 +419,12 @@ export const heartbeatMessage = (args: {
   nextSeconds: number;
 }): string =>
   [
-    `*Still waiting on someone: ${truncateOutput(args.description, HEARTBEAT_ECHO_CHARS)}*`,
-    `${formatWaited(args.waitedMs)} so far, and it is the only thing outstanding. ${truncateOutput(args.awaitingHuman, HEARTBEAT_ECHO_CHARS)}`,
+    `*Still waiting on someone: ${args.description}*`,
+    `${formatWaited(args.waitedMs)} so far, and it is the only thing outstanding. ${args.awaitingHuman}`,
     "",
     "*What the check says now*",
     "```",
-    truncateOutput(args.status.trim(), HEARTBEAT_STATUS_CHARS) || "(no output)",
+    statusExcerpt(args.status),
     "```",
     `Next nudge in ${formatWaited(args.nextSeconds * 1000)}.`,
   ].join("\n");
@@ -464,14 +446,11 @@ export const stalledWaitBrief = (args: {
     `Nobody has ended this wait in ${formatWaited(args.waitedMs)}, across ${args.nudges} nudges in the thread.`,
     "",
     "*What I am waiting for*",
-    truncateOutput(
-      `${args.description} — ${args.awaitingHuman}`,
-      HARNESS_BRIEF_ECHO_CHARS,
-    ),
+    `${args.description} — ${args.awaitingHuman}`,
     "",
     "*Where it stands*",
     "```",
-    truncateOutput(args.status.trim(), HEARTBEAT_STATUS_CHARS) || "(no output)",
+    statusExcerpt(args.status),
     "```",
     "Everything I found is in this thread. The work is done; this one step is not, and it is not something I can do.",
     "",
@@ -530,8 +509,9 @@ export interface MonitorDeps {
   probe?: Probe;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
-  maxOutputChars?: number;
   probeTimeoutSeconds?: number;
+  /** Overridable so a test can compose the worst case without a 200-char literal. */
+  fieldLimit?: number;
   signal?: AbortSignal;
   /** Absent means no wait can nudge, whatever the model asks for. */
   heartbeat?: HeartbeatDeps;
@@ -556,6 +536,8 @@ export interface MonitorResult {
   escalation: Escalation | null;
   /** Anything the escalation drained. The caller renders these. */
   directives: Directive[];
+  /** Set when the call was refused before any wait was started. */
+  rejected: string | null;
 }
 
 /**
@@ -577,10 +559,36 @@ export const runMonitor = async (
   const probe = deps.probe ?? shellProbe;
   const sleep = deps.sleep ?? wait;
   const now = deps.now ?? Date.now;
-  const maxChars = deps.maxOutputChars ?? DEFAULT_MAX_TOOL_CHARS;
   const probeTimeoutMs =
     (deps.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000;
   const intervalMs = Math.max(1, args.intervalSeconds) * 1000;
+  const fieldLimit = deps.fieldLimit ?? MONITOR_FIELD_LIMIT;
+
+  // Before the marker, before the first probe, and before anything can be
+  // posted. Both fields end up in Slack messages the harness composes with
+  // the model no longer in the loop, so this is the last point at which
+  // being too long is something anybody can fix. It costs one turn.
+  const overLong = (
+    [
+      ["description", args.description],
+      ["awaitingHuman", args.awaitingHuman ?? ""],
+    ] as const
+  ).find(([, text]) => text.length > fieldLimit);
+  if (overLong) {
+    const [field, text] = overLong;
+    return {
+      output: "",
+      timedOut: false,
+      escalation: null,
+      directives: [],
+      rejected:
+        `${field} is ${text.length} characters and the limit is ${fieldLimit}. ` +
+        "It is echoed verbatim into every nudge and into the brief posted if " +
+        "nobody turns up, so it has to be the one line the schema asks for. " +
+        "Say what you are waiting for and who has to do what; the reasoning " +
+        "belongs in the thread.",
+    };
+  }
 
   // Only a wait on a person gets a heartbeat. `monitor` is the general
   // primitive, and most of what it waits for -- a deploy shipping, an alert
@@ -616,19 +624,21 @@ export const runMonitor = async (
     if (result.code === 0) {
       if (heartbeat) await release(heartbeat, args.command);
       return {
-        output: truncateOutput(last, maxChars),
+        output: last,
         timedOut: false,
         escalation: null,
         directives: [],
+        rejected: null,
       };
     }
     if (deps.signal?.aborted || now() >= deadline) {
       if (heartbeat) await release(heartbeat, args.command);
       return {
-        output: truncateOutput(last, maxChars),
+        output: last,
         timedOut: true,
         escalation: null,
         directives: [],
+        rejected: null,
       };
     }
 
@@ -802,7 +812,6 @@ export interface ContactHumanDeps {
   pollSeconds?: number;
   minWaitSeconds?: number;
   messageLimit?: number;
-  maxOutputChars?: number;
   signal?: AbortSignal;
 }
 
@@ -887,6 +896,11 @@ export interface ContactHumanResult {
  * thinner than one the model would write — the harness knows the question
  * and nothing else — which is the reason the prompt tells the model to
  * escalate itself before it gets here.
+ *
+ * The question goes in whole. It is the only thing in here the reader
+ * genuinely needs and the only thing they cannot reconstruct, so
+ * `CONTACT_HUMAN_MESSAGE_LIMIT` is sized to let it -- see there for the
+ * arithmetic against the 1,200 `escalate` will accept.
  */
 export const unansweredBrief = (
   question: string,
@@ -897,7 +911,7 @@ export const unansweredBrief = (
     `Nobody answered in ${waitedMinutes} minutes.`,
     "",
     "*What I asked*",
-    truncateOutput(question, HARNESS_BRIEF_ECHO_CHARS),
+    question,
     // The buttons are part of the question a reader saw, and the person
     // picking this up did not see the thread before now.
     ...(options.length
@@ -963,7 +977,6 @@ export const runContactHuman = async (
   const sleep = deps.sleep ?? wait;
   const now = deps.now ?? Date.now;
   const pollMs = (deps.pollSeconds ?? CONTACT_HUMAN_POLL_SECONDS) * 1000;
-  const maxChars = deps.maxOutputChars ?? DEFAULT_MAX_TOOL_CHARS;
   const limit = deps.messageLimit ?? CONTACT_HUMAN_MESSAGE_LIMIT;
   const minWaitSeconds = deps.minWaitSeconds ?? CONTACT_HUMAN_MIN_WAIT_SECONDS;
 
@@ -1062,7 +1075,7 @@ export const runContactHuman = async (
       // a duplicate post, a failure before it is a silent 24-hour wait.
       if (reply) await deps.api.consumeDirective(reply.id);
       return {
-        reply: reply ? truncateOutput(reply.directive.text, maxChars) : null,
+        reply: reply ? reply.directive.text : null,
         timedOut: false,
         directives: rest,
         terminate,
@@ -1134,8 +1147,9 @@ const MONITOR_DESCRIPTION = [
   "with a side effect happens twice. `monitor` with `gh pr merge` is a bug.",
   "",
   "Each invocation of the command is a short exec with its own timeout; the",
-  "waiting happens inside the tool. Output is capped, so have the command print",
-  "a summary rather than a whole log.",
+  "waiting happens inside the tool. Output comes back whole, so the command can",
+  "print a whole log -- do not pre-summarise it. The answer is usually in the",
+  "middle, and the context is compacted to make room rather than the log cut.",
   "",
   "SET `awaitingHuman` WHEN A PERSON IS THE THING YOU ARE WAITING FOR: merge",
   "this PR, flip this flag, restart that worker. Say what they have to do and",
@@ -1195,6 +1209,7 @@ export const createMonitorTool = async (
   deps: MonitorDeps = {},
 ): Promise<ToolDefinition> => {
   const { Type } = await import("typebox");
+  const fieldLimit = deps.fieldLimit ?? MONITOR_FIELD_LIMIT;
   const parameters = Type.Object({
     command: Type.String({
       description: "Read-only shell command. Exit 0 means the wait is over.",
@@ -1206,12 +1221,12 @@ export const createMonitorTool = async (
       description: "Give up after this long and return the last output.",
     }),
     description: Type.String({
-      description: "What you are waiting for, in one line.",
+      description: `What you are waiting for, in one line. Posted verbatim in every nudge, so at most ${fieldLimit} characters.`,
     }),
     awaitingHuman: Type.Optional(
       Type.String({
         description:
-          "Only when a person has to act for this wait to end: what they must do, with the link. The command must still be a check that detects them having done it -- `gh pr view --json state,mergedAt` for a merge, a flag read for a flag flip -- not a placeholder that waits to be told. Unset for a deploy, a migration or an alert going quiet.",
+          `Only when a person has to act for this wait to end: what they must do, with the link. One line, at most ${fieldLimit} characters, posted verbatim in every nudge. The command must still be a check that detects them having done it -- \`gh pr view --json state,mergedAt\` for a merge, a flag read for a flag flip -- not a placeholder that waits to be told. Unset for a deploy, a migration or an alert going quiet.`,
       }),
     ),
   });
@@ -1230,6 +1245,14 @@ export const createMonitorTool = async (
       // No escalation branch. A wait that gets loud keeps waiting, so the
       // model is not given a turn to be told about it; it learns from the
       // thread, like everyone else.
+      if (result.rejected) {
+        return {
+          content: [
+            { type: "text", text: `Nothing is being waited on: ${result.rejected}` },
+          ],
+          details: { refused: true, command: args.command },
+        };
+      }
       const header = result.timedOut
         ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
         : `Condition met: ${args.description}`;

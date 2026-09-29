@@ -10,6 +10,7 @@ import type { ToolApi, ToolResponse } from "../types";
 import {
   agentOptionsFromEnv,
   BUILTIN_TOOLS,
+  COMPACTION_KEEP_RECENT_TOKENS,
   computePaths,
   createBossClient,
   createBossTools,
@@ -36,6 +37,7 @@ import {
   turnBudgetMessage,
   type TurnBudgetState,
 } from "./run";
+import { resolveBedrockModel } from "../bedrock";
 import { notesPrefixFor } from "./notes";
 import { emptySessionUsage, PROMPT_ENTRY_TYPE } from "./session";
 
@@ -62,9 +64,26 @@ test("the notes directory is a sibling of the checkout, never inside it", () => 
   );
 });
 
-test("compaction is configured at 95% of the window", () => {
-  assert.equal(reserveTokensFor(200000), 10000);
-  assert.equal(reserveTokensFor(1000000), 50000);
+// The old assertions restated the formula -- `reserveTokensFor(1000000)` is
+// `50000` said twice -- so they could not notice the formula being wrong, and
+// it was: the reserve was smaller than one maximum response. These assert the
+// two properties the number exists for instead, against the real catalog
+// entry for the model this agent runs.
+test("the compaction reserve leaves room for a maximum response", async () => {
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+
+  assert.ok(
+    reserveTokensFor(model) >= model.maxTokens,
+    `reserve ${reserveTokensFor(model)} is under maxTokens ${model.maxTokens}, so Pi ` +
+      "would ask for output that cannot fit",
+  );
+  assert.ok(
+    reserveTokensFor(model) > COMPACTION_KEEP_RECENT_TOKENS,
+    "a reserve under the kept tail cannot be reached by compacting",
+  );
+  // And it is still headroom rather than the window: a reserve this side of
+  // half would compact every session from its first turn.
+  assert.ok(reserveTokensFor(model) < model.contextWindow / 2);
 });
 
 test("npm ci records both outcomes so monitor can see either", () => {

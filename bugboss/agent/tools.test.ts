@@ -9,7 +9,7 @@ import {
   CONTACT_HUMAN_MESSAGE_LIMIT,
   createContactHumanTool,
   createMonitorTool,
-  HEARTBEAT_ECHO_CHARS,
+  MONITOR_FIELD_LIMIT,
   HEARTBEAT_LOUD_AFTER_PINGS,
   HEARTBEAT_MAX_GAP_SECONDS,
   directiveTimestampMillis,
@@ -23,7 +23,8 @@ import {
   heartbeatMessage,
   shellProbe,
   stalledWaitBrief,
-  truncateOutput,
+  statusExcerpt,
+  STATUS_EXCERPT_CHARS,
   unansweredBrief,
   type HeartbeatDeps,
   type HumanContactPort,
@@ -62,6 +63,7 @@ test("monitor returns as soon as the command exits 0", async () => {
     output: "MERGED\n",
     timedOut: false,
     escalation: null,
+    rejected: null,
     directives: [],
   });
   assert.equal(calls.length, 1);
@@ -116,17 +118,56 @@ test("monitor stops when the turn is aborted", async () => {
   assert.equal(result.timedOut, true);
 });
 
-test("monitor output is capped", async () => {
+test("monitor's description does not tell the agent to pre-summarise", async () => {
+  // A cap removed from the code and left standing in the tool description is
+  // the same bug one layer up: the agent reads "output is capped" and narrows
+  // the probe command itself, throwing the evidence away voluntarily. So the
+  // instruction and the behaviour are asserted as one thing -- the tool says
+  // output comes back whole, and it does.
+  const tool = await createMonitorTool({
+    probe: async () => ({ code: 0, output: "x".repeat(50_000) }),
+  });
+
+  assert.doesNotMatch(
+    tool.description,
+    /output is capped/i,
+    "the description promises a cap that no longer exists",
+  );
+  assert.match(tool.description, /whole/i);
+
+  const out = await tool.execute(
+    "c1",
+    {
+      command: "cat huge",
+      intervalSeconds: 1,
+      timeoutSeconds: 1,
+      description: "a big log",
+    } as never,
+    new AbortController().signal,
+    undefined,
+    {} as never,
+  );
+  const text = out.content[0].type === "text" ? out.content[0].text : "";
+  assert.ok(
+    text.includes("x".repeat(50_000)),
+    "the description says whole and the tool must deliver whole",
+  );
+});
+
+test("monitor hands back everything the probe printed", async () => {
+  // What the cap used to take was the middle, and a monitor is most often
+  // waiting on something whose interesting line is in the middle: the failing
+  // job in a CI summary, the one pod that will not come up. Pi compacts the
+  // conversation to make room now, so the evidence is not what gives way.
+  const needle = "NEEDLE_IN_THE_MIDDLE";
+  const output = `${"x".repeat(25_000)}${needle}${"x".repeat(25_000)}`;
   const result = await runMonitor(
     { command: "cat huge", intervalSeconds: 1, timeoutSeconds: 1, description: "a big log" },
-    { probe: async () => ({ code: 0, output: "x".repeat(50000) }), maxOutputChars: 1000 },
+    { probe: async () => ({ code: 0, output }) },
   );
 
-  // Against the cap itself, not a loose multiple of it: `truncateOutput`
-  // holds its cap exactly, and a caller that checks a looser number is a
-  // caller that would not notice it slipping again.
-  assert.ok(result.output.length <= 1000, `capped output was ${result.output.length}`);
-  assert.match(result.output, /characters elided/);
+  assert.equal(result.output, output);
+  assert.ok(result.output.includes(needle));
 });
 
 test("the real probe reports exit codes from the shell", async () => {
@@ -135,72 +176,26 @@ test("the real probe reports exit codes from the shell", async () => {
   assert.equal(failure.code, 3);
 });
 
-test("truncateOutput leaves small output alone", () => {
-  assert.equal(truncateOutput("short", 1000), "short");
+test("statusExcerpt leaves output that fits completely alone", () => {
+  assert.equal(statusExcerpt("  short  "), "short");
+  assert.equal(statusExcerpt("   "), "(no output)");
+  const exact = "z".repeat(STATUS_EXCERPT_CHARS);
+  assert.equal(statusExcerpt(exact), exact);
 });
 
-test("truncateOutput holds its cap at every size and budget", () => {
-  // The contract, asserted directly rather than at whichever input somebody
-  // happened to have in hand. The old cap overshot by the length of the
-  // marker naming what it dropped, and that marker grows with the number it
-  // prints -- so every caller's margin shrank as its inputs grew, which is
-  // the opposite of what a margin is for.
-  const sizes = [0, 1, 39, 199, 1000, 100_000, 10_000_000];
-  const budgets = [0, 1, 10, 30, 39, 40, 200, 400, 1000, 20_000];
-
-  for (const size of sizes) {
-    const text = "z".repeat(size);
-    for (const maxChars of budgets) {
-      const capped = truncateOutput(text, maxChars);
-      assert.ok(
-        capped.length <= maxChars,
-        `${size} characters capped at ${maxChars} came back as ${capped.length}`,
-      );
-      // At or under the cap nothing is a truncation, so nothing may change:
-      // an elision marker on an output that fits sends a reader looking for
-      // text that never existed.
-      if (size <= maxChars) assert.equal(capped, text);
-    }
-  }
-});
-
-test("truncateOutput still marks the cut when the marker outgrows the budget", () => {
-  // Nothing here passes a budget this small -- the tightest clamp in this
-  // file is 200 -- so it is a caller bug rather than an input, and the
-  // answer to one is to be loud about it, not to quietly hand back more
-  // than was asked for or a cut nobody can see.
-  for (const maxChars of [40, 30, 10, 1]) {
-    const capped = truncateOutput("y".repeat(5000), maxChars);
-    assert.equal(capped.length, maxChars, `cap ${maxChars} was not honoured`);
-    assert.ok(
-      /characters elided/.test(capped) || capped.endsWith("…"),
-      `cap ${maxChars} truncated without saying so: ${JSON.stringify(capped)}`,
-    );
-  }
-  assert.equal(truncateOutput("y".repeat(5000), 0), "");
-});
-
-test("truncateOutput's marker names the count it actually dropped", () => {
-  // Sized at the heartbeat echo clamp, which is where the old overshoot
-  // actually bit: the marker is a fixed ~39 characters and the old slices
-  // left it a tenth of the budget, so a small cap overshot every time.
-  // The marker has to survive the fix -- truncation a reader cannot see is
-  // the silent failure this file is built against -- and it has to keep
-  // telling the truth once the slices are sized around it.
+test("statusExcerpt keeps the head, shows the cut, and counts nothing", () => {
+  // The shape is the change. The old helper cut the middle out and said
+  // `[... 549 characters elided ...]`, which went into a Slack message
+  // somebody read on a phone: a count of what they are missing is not
+  // something anybody can act on, and the middle is where the answer
+  // usually is. A reader who wants all of it runs the check.
   const text = "q".repeat(5000);
-  const capped = truncateOutput(text, HEARTBEAT_ECHO_CHARS);
-  const split = /\n\n\[\.\.\. (\d+) characters elided \.\.\.\]\n\n/.exec(capped);
+  const excerpt = statusExcerpt(text);
 
-  assert.ok(split, `no elision marker in ${JSON.stringify(capped)}`);
-  assert.ok(capped.length <= HEARTBEAT_ECHO_CHARS);
-
-  const head = capped.slice(0, split.index);
-  const tail = capped.slice(split.index + split[0].length);
-  assert.ok(text.startsWith(head), "the head is the start of the input");
-  assert.ok(text.endsWith(tail), "the tail is the end of the input");
-  assert.equal(Number(split[1]), text.length - head.length - tail.length);
-  // Roughly twice as much head as tail, which is the shape callers read.
-  assert.ok(head.length > tail.length);
+  assert.ok(excerpt.length <= STATUS_EXCERPT_CHARS + 1, `came back as ${excerpt.length}`);
+  assert.ok(text.startsWith(excerpt.slice(0, -1)), "what is kept is the head");
+  assert.ok(excerpt.endsWith("\u2026"), "the cut is visible");
+  assert.doesNotMatch(excerpt, /\d+ characters/);
 });
 
 const fakeContact = (pending: PendingQuestion | null = null) => {
@@ -1630,15 +1625,18 @@ test("the harness's nudge fits the thread budget at its worst", () => {
   // purpose -- losing a day-long wait to a 503 is the worse trade -- which
   // means an over-long one produces an incident that waits all day, nudges
   // nobody, and then hands off claiming it nudged three times.
-  // Absurd inputs on purpose. The margin here is not a constant: the elision
-  // marker `truncateOutput` adds names how much it dropped, so it grows with
-  // the input, and `formatWaited` grows with the wait. A bound checked only
-  // at plausible sizes is a bound that holds until somebody waits longer.
+  //
+  // The two prose fields are at their real maximum rather than an absurd one,
+  // because what bounds them now is a refusal at the tool boundary rather
+  // than a clamp here. The test below is the one that keeps that refusal
+  // honest; without it this bound is arithmetic about nothing.
   const nudge = heartbeatMessage({
-    description: "d".repeat(100_000_000),
-    awaitingHuman: "a".repeat(100_000_000),
-    waitedMs: Number.MAX_SAFE_INTEGER,
+    description: "d".repeat(MONITOR_FIELD_LIMIT),
+    awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
+    // Still unbounded at the source -- it is whatever the check printed --
+    // so it stays absurd.
     status: "s".repeat(100_000_000),
+    waitedMs: Number.MAX_SAFE_INTEGER,
     // There is always a next nudge, and the sentence naming it grows with how
     // far away it is, so the worst case is a gap no clock would ever produce.
     nextSeconds: Number.MAX_SAFE_INTEGER,
@@ -1648,30 +1646,63 @@ test("the harness's nudge fits the thread budget at its worst", () => {
     nudge.length <= THREAD_PROSE_CHARS,
     `a maximal nudge is ${nudge.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
   );
-  assert.match(nudge, /characters elided/);
+  // Both fields whole, and nothing anywhere telling the reader how much of
+  // something they cannot see they are missing.
+  assert.ok(nudge.includes("d".repeat(MONITOR_FIELD_LIMIT)));
+  assert.ok(nudge.includes("a".repeat(MONITOR_FIELD_LIMIT)));
+  assert.doesNotMatch(nudge, /characters elided/);
 });
 
-test("an ordinary nudge is left exactly as written", () => {
-  // The clamp must be invisible on every real nudge: an elision marker on a
-  // one-line wait would send a reader looking for text that never existed.
-  const nudge = heartbeatMessage({
-    description: "the preview deploy for PR 42",
-    awaitingHuman: "someone needs to merge it",
-    waitedMs: 3_600_000,
-    status: "pending",
-    nextSeconds: 1_800,
-  });
+test("monitor refuses a field too long to survive a nudge, before waiting", async () => {
+  // The bound above only holds because of this. Both fields are echoed
+  // verbatim into messages the harness composes with the model no longer in
+  // the loop, so this call is the last moment at which being too long is
+  // something anybody can fix -- and it has to refuse *before* the marker,
+  // or a refused call leaves a wait nobody is serving.
+  let recorded = 0;
+  const marker = {
+    recordWait: async () => {
+      recorded += 1;
+      return { command: "check", startedAt: 0, pings: 0, lastPingAt: null };
+    },
+    recordPing: async () => ({ command: "check", startedAt: 0, pings: 1, lastPingAt: 0 }),
+    clearWait: async () => {},
+  };
+  let probed = 0;
 
-  assert.ok(nudge.includes("the preview deploy for PR 42"));
-  assert.ok(nudge.includes("someone needs to merge it"));
-  assert.doesNotMatch(nudge, /elided/);
+  const result = await runMonitor(
+    {
+      command: "gh pr view 42 --json mergedAt",
+      intervalSeconds: 5,
+      timeoutSeconds: 86_400,
+      description: "d".repeat(MONITOR_FIELD_LIMIT + 1),
+      awaitingHuman: "somebody has to merge it",
+    },
+    {
+      probe: async () => {
+        probed += 1;
+        return { code: 0, output: "" };
+      },
+      heartbeat: {
+        marker,
+        post: async () => {},
+        escalate: { escalate: async () => ({ ok: true, directives: [] }) },
+      },
+    },
+  );
+
+  assert.ok(result.rejected, "an over-long description was accepted");
+  assert.match(result.rejected, /description is 201 characters/);
+  assert.equal(recorded, 0, "a refused call must not leave a wait marker behind");
+  assert.equal(probed, 0, "a refused call must not start waiting");
 });
 
 test("the harness's unanswered brief fits the thread budget at its worst", () => {
-  // The question is already capped by the tool, so this is its true maximum;
-  // the minute count is not capped anywhere, so it gets an absurd one.
+  // The question is bounded by the tool, so this is its true maximum; the
+  // minute count is not bounded anywhere, so it gets an absurd one.
+  const question = "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT);
   const brief = unansweredBrief(
-    "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT),
+    question,
     999_999_999,
     Array.from({ length: MAX_CHOICE_OPTIONS }, (_, i) => `${i}`.padEnd(75, "o")),
   );
@@ -1680,22 +1711,20 @@ test("the harness's unanswered brief fits the thread budget at its worst", () =>
     brief.length <= THREAD_PROSE_CHARS,
     `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
   );
-  // The question is echoed, not reproduced: it is already in the thread
-  // directly above, verbatim, so the elision costs the reader nothing and is
-  // marked where it happens.
-  assert.match(brief, /characters elided/);
+  // The question goes in whole, which is what `CONTACT_HUMAN_MESSAGE_LIMIT`
+  // is sized for. It used to be clamped here, so the person picking up the
+  // incident got the start of the question and a count of the rest.
+  assert.ok(brief.includes(question), "the question a reader must answer is cut");
+  assert.doesNotMatch(brief, /characters elided/);
   assert.ok(brief.includes("What I offered"), "the buttons a reader saw survive");
 });
 
 test("the harness's stalled-wait brief fits the thread budget at its worst", () => {
-  // Absurd inputs, for the same reason as the nudge above: the elision marker
-  // grows with what it elided and `formatWaited` grows with the wait, so a
-  // bound checked at plausible sizes is a bound that holds until it does not.
   const brief = stalledWaitBrief({
-    description: "d".repeat(100_000_000),
-    awaitingHuman: "a".repeat(100_000_000),
-    waitedMs: Number.MAX_SAFE_INTEGER,
+    description: "d".repeat(MONITOR_FIELD_LIMIT),
+    awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
     status: "s".repeat(100_000_000),
+    waitedMs: Number.MAX_SAFE_INTEGER,
     nudges: 999_999,
   });
 
@@ -1703,7 +1732,9 @@ test("the harness's stalled-wait brief fits the thread budget at its worst", () 
     brief.length <= THREAD_PROSE_CHARS,
     `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
   );
-  assert.match(brief, /characters elided/);
+  assert.ok(brief.includes("d".repeat(MONITOR_FIELD_LIMIT)));
+  assert.ok(brief.includes("a".repeat(MONITOR_FIELD_LIMIT)));
+  assert.doesNotMatch(brief, /characters elided/);
 });
 
 test("a short harness brief is left exactly as written", () => {

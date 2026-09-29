@@ -40,7 +40,6 @@ import {
   createContactHumanTool,
   createMonitorTool,
   renderDirectives,
-  truncateOutput,
   type DirectivePeek,
   parseWorkingHours,
   type HumanContactPort,
@@ -197,7 +196,13 @@ export const flushDurable = async (
 ): Promise<void> => {
   await Promise.allSettled(syncs.map((sync) => sync.flush()));
 };
-export const COMPACTION_HEADROOM = 0.05;
+/**
+ * The tail compaction will not summarise, and ours rather than Pi's default
+ * because `reserveTokensFor` is derived from it. Left implicit, a Pi release
+ * that retuned its own default would move our reserve without touching a
+ * line of this repo.
+ */
+export const COMPACTION_KEEP_RECENT_TOKENS = 20_000;
 
 export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "write"];
 
@@ -234,9 +239,46 @@ export const computePaths = (workRoot: string, incidentId: string): AgentPaths =
   };
 };
 
-/** Compaction fires at 95% of the window; bounded tool results make that safe. */
-export const reserveTokensFor = (contextWindow: number): number =>
-  Math.max(1, Math.round(contextWindow * COMPACTION_HEADROOM));
+/**
+ * The band between where compaction fires and the end of the window.
+ *
+ * Pi compacts just in time already: `prepareNextTurnWithContext` re-projects
+ * the session *after* a tool result has been appended and *before* the next
+ * provider request, and compacts there if the projection is over
+ * `contextWindow - reserveTokens`. So a tool result never has to be cut to
+ * fit -- it lands whole, gets measured, and what gives way is summarised
+ * history, which the session transcript still holds. That is why there is no
+ * longer a cap on tool output anywhere in this agent.
+ *
+ * What made that unsafe was this number. It was 5% of the window, and the
+ * comment here said bounded tool results were what made 95% safe -- which
+ * was true of the cut-down results and is the reason the two changes are one
+ * change. But 5% was also wrong on its own terms, before any of that: at
+ * 1,000,000 it left 50,000 tokens of headroom for a model whose single
+ * response can be 128,000. Compaction fired at 950k and Pi then asked for up
+ * to 128k of output into a 50k gap.
+ *
+ * Both terms are read rather than chosen:
+ *
+ * - `maxTokens` is the most this model can emit in one response. A reserve
+ *   below it asks for output that cannot fit, whatever else is going on.
+ * - `keepRecentTokens` is the tail compaction keeps. A reserve below it
+ *   cannot be reached by compacting, because what compaction keeps already
+ *   exceeds the room it is trying to free.
+ *
+ * On Opus 5 that is 148,000 of 1,000,000, so compaction fires around 85%,
+ * and any single tool result up to ~148k tokens lands whole and triggers a
+ * compaction before the next request rather than an overflow. A result
+ * larger than that is out of scope on purpose.
+ *
+ * One coupling worth knowing, because it is not local: Pi sizes the
+ * summarisation request's own output budget as
+ * `min(0.8 * reserveTokens, maxTokens)`. Raising the reserve raises what a
+ * summary is *allowed* to be, not what it is asked for -- the summarisation
+ * prompt is what keeps it short.
+ */
+export const reserveTokensFor = (model: { maxTokens: number }): number =>
+  model.maxTokens + COMPACTION_KEEP_RECENT_TOKENS;
 
 const exec = (command: string, args: string[], cwd?: string): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -383,16 +425,13 @@ export const createBossClient = (args: {
 // cannot import from here.
 export { renderDirectives };
 
-const bossToolResult = (response: ToolResponse<unknown>, maxChars: number) => ({
+const bossToolResult = (response: ToolResponse<unknown>) => ({
   content: [
     {
       type: "text" as const,
-      text: truncateOutput(
-        `${response.ok ? "ok" : `error: ${response.error ?? "unknown"}`}${
-          response.data === undefined ? "" : `\n\n${JSON.stringify(response.data, null, 2)}`
-        }${renderDirectives(response.directives ?? [])}`,
-        maxChars,
-      ),
+      text: `${response.ok ? "ok" : `error: ${response.error ?? "unknown"}`}${
+        response.data === undefined ? "" : `\n\n${JSON.stringify(response.data, null, 2)}`
+      }${renderDirectives(response.directives ?? [])}`,
     },
   ],
   details: undefined,
@@ -404,10 +443,8 @@ const bossToolResult = (response: ToolResponse<unknown>, maxChars: number) => ({
 export const createBossTools = async (args: {
   api: ToolApi;
   onRootCause?: () => void;
-  maxOutputChars?: number;
 }): Promise<ToolDefinition[]> => {
   const { Type } = await import("typebox");
-  const maxChars = args.maxOutputChars ?? 20000;
 
   const tools: ToolDefinition[] = [
     {
@@ -428,7 +465,6 @@ export const createBossTools = async (args: {
           await args.api.getIncident(
             params as unknown as Parameters<ToolApi["getIncident"]>[0],
           ),
-          maxChars,
         ),
     },
     {
@@ -450,7 +486,6 @@ export const createBossTools = async (args: {
           await args.api.proposeMerge(
             params as unknown as Parameters<ToolApi["proposeMerge"]>[0],
           ),
-          maxChars,
         ),
     },
     {
@@ -479,7 +514,7 @@ export const createBossTools = async (args: {
           params as unknown as Parameters<ToolApi["reportRootCause"]>[0],
         );
         if (response.ok) args.onRootCause?.();
-        return bossToolResult(response, maxChars);
+        return bossToolResult(response);
       },
     },
     {
@@ -496,8 +531,7 @@ export const createBossTools = async (args: {
         bossToolResult(
           await args.api.searchIncidents(
             params as unknown as Parameters<ToolApi["searchIncidents"]>[0],
-          ),
-          maxChars,
+          )
         ),
     },
     {
@@ -511,8 +545,7 @@ export const createBossTools = async (args: {
       }),
       execute: async (_id: string, params: unknown) =>
         bossToolResult(
-          await args.api.reportImpact(params as unknown as Parameters<ToolApi["reportImpact"]>[0]),
-          maxChars,
+          await args.api.reportImpact(params as unknown as Parameters<ToolApi["reportImpact"]>[0])
         ),
     },
     {
@@ -528,8 +561,7 @@ export const createBossTools = async (args: {
         bossToolResult(
           await args.api.reportResolved(
             params as unknown as Parameters<ToolApi["reportResolved"]>[0],
-          ),
-          maxChars,
+          )
         ),
     },
     {
@@ -575,8 +607,7 @@ export const createBossTools = async (args: {
         bossToolResult(
           await args.api.reportAnalysis(
             params as unknown as Parameters<ToolApi["reportAnalysis"]>[0],
-          ),
-          maxChars,
+          )
         ),
     },
     {
@@ -593,8 +624,7 @@ export const createBossTools = async (args: {
       }),
       execute: async (_id: string, params: unknown) =>
         bossToolResult(
-          await args.api.escalate(params as unknown as Parameters<ToolApi["escalate"]>[0]),
-          maxChars,
+          await args.api.escalate(params as unknown as Parameters<ToolApi["escalate"]>[0])
         ),
     },
     {
@@ -616,8 +646,7 @@ export const createBossTools = async (args: {
       }),
       execute: async (_id: string, params: unknown) =>
         bossToolResult(
-          await args.api.park(params as unknown as Parameters<ToolApi["park"]>[0]),
-          maxChars,
+          await args.api.park(params as unknown as Parameters<ToolApi["park"]>[0])
         ),
     },
   ] as unknown as ToolDefinition[];
@@ -1684,7 +1713,11 @@ const launch = async (args: {
   });
 
   const settings = pi.SettingsManager.inMemory({
-    compaction: { enabled: true, reserveTokens: reserveTokensFor(model.contextWindow) },
+    compaction: {
+      enabled: true,
+      reserveTokens: reserveTokensFor(model),
+      keepRecentTokens: COMPACTION_KEEP_RECENT_TOKENS,
+    },
   });
 
   const resourceLoader = new pi.DefaultResourceLoader({

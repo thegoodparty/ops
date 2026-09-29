@@ -11,7 +11,11 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { THREAD_PROSE_CHARS } from "../slack/format";
-import { CONTACT_HUMAN_MESSAGE_LIMIT, CONTACT_HUMAN_MIN_WAIT_SECONDS } from "./tools";
+import {
+  CONTACT_HUMAN_MESSAGE_LIMIT,
+  CONTACT_HUMAN_MIN_WAIT_SECONDS,
+  MONITOR_FIELD_LIMIT,
+} from "./tools";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
 import { TEST_DB_ENV_VAR } from "../testdb";
 import type { NotesLimits } from "./notes";
@@ -131,7 +135,9 @@ because a container restart replays the call and runs it again.
 
 **When a person is what you are waiting for, say so in awaitingHuman.** A
 merge, a flag, a restart someone else has to do. Write what they have to do and
-include the link. The thread is then nudged for you once the wait passes an
+include the link, in one line: both it and description go verbatim into every
+nudge somebody reads on a phone, so each is capped at ${MONITOR_FIELD_LIMIT}
+characters and a longer one is refused rather than shortened for you. The thread is then nudged for you once the wait passes an
 hour inside working hours, with the gap doubling to a day and then holding
 there, and past the third nudge each one also reaches the rotation. It costs
 you no turns. Leave it unset for a deploy, a migration, npm ci or an alert

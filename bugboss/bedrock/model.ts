@@ -102,18 +102,35 @@ export const toInvokeModelModel = (
 export interface ResolveBedrockModelInput {
   /** Inference profile id, base model id, or an inference profile ARN. */
   id: string;
-  /** Required only when the id resolves to no catalog entry. */
+  /** Overrides the catalog's rates. Never a substitute for a catalog entry. */
   cost?: ModelCost;
   overrides?: Partial<BedrockInvokeModelModel>;
 }
 
 /**
  * Build a model definition for `id`, taking context window, limits and cost
- * from Pi's Bedrock catalog when it knows the id.
+ * from Pi's Bedrock catalog.
  *
- * An application inference profile ARN has an opaque suffix that maps to no
- * catalog entry, so `cost` has to be supplied for one. Failing loudly beats
- * reporting a run that cost zero dollars: the Boss derives spend from usage.
+ * A miss throws, and `cost` does not rescue one. It used to: an id the
+ * catalog did not know got the caller's rates and a made-up 200,000-token
+ * window, on the reasoning that cost was the only thing worth failing over.
+ * That reasoning was half right. Failing loudly beats reporting a run that
+ * cost zero dollars, and it beats a wrong window for the same reason and
+ * more: the Boss derives spend from usage, so a bad rate at least shows up
+ * as a number somebody can disbelieve, whereas a window that is wrong in
+ * either direction is invisible. Too small and every session compacts away
+ * four fifths of a context it was entitled to keep. Too large and the
+ * provider rejects a request nothing in the run predicted. The model we
+ * actually run, `us.anthropic.claude-opus-5`, carries 1,000,000 -- five
+ * times what was substituted here.
+ *
+ * An application inference profile ARN is the one id that reaches this and
+ * misses: its suffix is an opaque generated id rather than a model id, so
+ * `catalogIdFor` deliberately does not strip it. Teaching that regex
+ * `:application-inference-profile/` would only turn one kind of miss into
+ * another while looking fixed -- the stripped suffix still matches nothing.
+ * The throw is what protects that case, which is why the ARN goes on the
+ * request field and never on `model.id` (see `invokeModelIdFor`).
  */
 export const resolveBedrockModel = async ({
   id,
@@ -125,24 +142,12 @@ export const resolveBedrockModel = async ({
   const entry = getBuiltinModels("amazon-bedrock").find((model) => model.id === catalogId);
 
   if (!entry) {
-    if (!cost) {
-      throw new Error(
-        `No Bedrock catalog entry for "${catalogId}"; pass explicit cost rates for "${id}"`,
-      );
-    }
-    return {
-      id,
-      name: id,
-      api: BEDROCK_INVOKE_MODEL_API,
-      provider: "amazon-bedrock",
-      baseUrl: "",
-      reasoning: true,
-      input: ["text", "image"],
-      cost,
-      contextWindow: 200000,
-      maxTokens: 64000,
-      ...overrides,
-    };
+    throw new Error(
+      `No Bedrock catalog entry for "${catalogId}", so the context window, ` +
+        `token limits and rates for "${id}" are all unknown. Point ` +
+        "BUGBOSS_MODEL_ID at a catalog id, or an inference profile ARN whose " +
+        "suffix is one.",
+    );
   }
 
   return toInvokeModelModel(entry, { id, ...(cost ? { cost } : {}), ...overrides });

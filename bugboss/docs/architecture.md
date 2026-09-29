@@ -469,8 +469,18 @@ cap on an estimate is a cap on arithmetic. 200 is a bound before a price
 cap, not instead of one: the escalation carries what the run spent so the
 next number is measured rather than guessed.
 
-**Compaction at 95% of the context window**, made safe by bounded tool
-results.
+**Compaction just in time, and no cap on tool output.** Pi re-projects the
+session after a tool result is appended and before the next provider request,
+and compacts there if the projection is over `contextWindow - reserveTokens`.
+So a result never has to be cut to fit: it lands whole, gets measured, and
+what gives way is summarised history, which the session transcript still
+holds. Cutting the result instead meant losing the middle of a stack trace or
+a log dump the run had just paid a tool call to fetch.
+
+`reserveTokensFor` is `maxTokens + keepRecentTokens` — the most the model can
+emit in one response, plus the tail compaction will not summarise. It was 5%
+of the window, which on Opus 5's 1,000,000 left 50,000 tokens of headroom in
+front of a response that can be 128,000.
 
 **Tokens are facts; dollars are arithmetic.** Bedrock returns token counts.
 A price is something we compute locally against Pi's hardcoded per-model
