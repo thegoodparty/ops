@@ -674,7 +674,18 @@ export const createSlackAgentModel = (
           text: wrapUp.text,
           toolCalls: wrapUp.toolCalls,
         });
-        if (wrapUp.text) answer = wrapUp.text;
+        if (wrapUp.text) {
+          answer = wrapUp.text;
+        } else {
+          // An empty completion is not an exception, so `wrap_up_failed` does
+          // not see it -- and the outcome is the worse of the two: a whole
+          // run's reading sits on the transcript and the reader still gets
+          // the apology. Production reached this holding 24 turns of incident
+          // data. Nothing here can make the model speak, but a silent hole
+          // between a run that read everything and a reply that says nothing
+          // is the one shape this system does not allow.
+          alarm("slack_agent_wrap_up_empty", { sessionKey: req.sessionKey });
+        }
       } catch (err) {
         alarm("slack_agent_wrap_up_failed", {
           sessionKey: req.sessionKey,

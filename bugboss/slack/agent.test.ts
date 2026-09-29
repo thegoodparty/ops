@@ -1074,6 +1074,11 @@ describe("a run that uses its whole budget", () => {
     assert.doesNotMatch(answer, /logs/);
     assert.ok(lines.some((l) => l.includes("slack_agent_turns_exhausted")));
     assert.ok(lines.some((l) => l.includes("slack_agent_no_answer")));
+    // The wrap-up answered, it just answered with nothing, so it never threw
+    // and `wrap_up_failed` never fired. That is how a run holding everything
+    // it read posted an apology with nobody told.
+    assert.ok(lines.some((l) => l.includes("slack_agent_wrap_up_empty")));
+    assert.ok(!lines.some((l) => l.includes("slack_agent_wrap_up_failed")));
   });
 
   test("does not claim it ran out of steps when it did not", async () => {
