@@ -168,12 +168,22 @@ const sweepHeaders = async (
   deps: BoardDeps,
   rows: readonly BoardRow[],
 ): Promise<number> => {
+  // Scoped to the open incidents rather than every thread ever opened. The
+  // opening is a whole alert body, so an unscoped read pulls the entire
+  // corpus of them off disk twice a minute forever to find the handful that
+  // could have changed.
   const threads = new Map(
     deps.db
-      .query<{ incidentId: string; slackThreadTs: string | null; opening: string; header: string | null }>(
+      .query<{
+        incidentId: string;
+        slackThreadTs: string | null;
+        opening: string;
+        header: string | null;
+      }>(
         `SELECT t.incidentId AS incidentId, i.slackThreadTs AS slackThreadTs,
                 t.opening AS opening, t.header AS header
-           FROM incident_thread t JOIN incident i ON i.id = t.incidentId`,
+           FROM incident_thread t JOIN incident i ON i.id = t.incidentId
+          WHERE i.status IN (${OPEN_LIST})`,
       )
       .map((row) => [row.incidentId, row]),
   );
