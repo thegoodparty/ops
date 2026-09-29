@@ -405,10 +405,11 @@ of what they cannot see is not something anybody can act on. So:
   `unansweredBrief` quotes the ask **whole**, and that arithmetic is what buys
   it. Changing one means redoing the other.
 
-The Slack agent is the one place a cap still stands. That agent has no
-compaction configured at all, so its per-result caps are the only thing
-bounding a transcript that grows across a run *and* across mentions. Removing
-them needs compaction built first, which is its own change.
+The Slack agent used to be the exception. It had no compaction, so its
+per-result caps were the only thing bounding its context. It has compaction
+now — `compactTranscript` in `slack/agent.ts`, wired into the loop in the
+composition root — and the caps are gone with it. What is left on that surface
+bounds *rows and entries*, never widths.
 
 ## What it writes goes straight to Slack
 

@@ -250,6 +250,31 @@ describe("SQL access is read-only", () => {
     );
   });
 
+  test("get_incident carries the incident and its signals whole", async () => {
+    // It used to be cut at 100,000 characters. Unreachable on most
+    // incidents and not on all of them -- an incident that ran for days
+    // with a wide alert body is exactly the one somebody asks about -- and
+    // the cut landed on JSON, so what came back would not even parse.
+    const tail = "and the write path saturated first";
+    await db.withWrite((d) => {
+      d.prepare(
+        `INSERT INTO incident (id, status, owner, prUrls, firstSignalAt, postmortem)
+         VALUES ('inc-wide','INVESTIGATING','agent','[]',1,?)`,
+      ).run(`${"y".repeat(150_000)} ${tail}`);
+      d.prepare(
+        "INSERT INTO signal (id, source, sourceId, kind, title, body, openedAt, incidentId) VALUES (?, 'grafana', ?, 'alert', ?, 'b', 1, 'inc-wide')",
+      ).run("s-wide", "fp-wide", `${"t".repeat(20_000)} ${tail}`);
+    });
+
+    const { store } = memoryStore();
+    const tool = buildTools({ db, store }).find((t) => t.name === "get_incident");
+    assert.ok(tool);
+    const out = await tool.run({ incidentId: "inc-wide" });
+
+    assert.ok(out.includes(tail), "the end of the signal body is there");
+    assert.doesNotThrow(() => JSON.parse(out), "and it is still JSON");
+  });
+
   test("results are bounded", async () => {
     await db.withWrite((d) => {
       const stmt = d.prepare(
@@ -266,11 +291,13 @@ describe("SQL access is read-only", () => {
 
     assert.equal(out.split("\n").length, MAX_SQL_ROWS + 1, "rows are capped");
     assert.match(out, /first 50 shown/);
+    // Rows, and only rows. Each one comes back whole: a row cut at 2,000
+    // characters is a row the model reads as complete and answers off, and
+    // what got cut was whichever column happened to be last. The bound on
+    // the context is `compactTranscript`, which drops whole rounds.
     for (const line of out.split("\n").slice(0, MAX_SQL_ROWS)) {
-      // 2000 exactly, not "under 2200". The old slack-agent truncate sliced
-      // to the cap and then appended its marker on top, so the slack the
-      // number carried was the overshoot, and it grew with the row.
-      assert.ok(line.length <= 2000, `each row is capped: ${line.length}`);
+      assert.ok(line.includes("y".repeat(5000)), "the row is whole");
+      assert.ok(!line.includes("truncated"));
     }
   });
 });
@@ -345,6 +372,33 @@ describe("search_incidents on the Slack agent", () => {
       never,
       "one answer for both is the bug: the agent cannot tell it failed to search",
     );
+  });
+
+  test("a hit carries the recorded cause whole", async () => {
+    // It used to be cut at 300 characters. The search is how an agent finds
+    // the same cause coming back through a different alert, and what makes
+    // that judgement is the cause -- the excerpt beside it is only where the
+    // words matched.
+    const tail = "and only on the write path, which has a pool of its own";
+    await db.withWrite((w) => {
+      w.prepare("DELETE FROM incident_fts").run();
+      w.prepare(
+        `INSERT INTO incident
+           (id, status, owner, prUrls, firstSignalAt, resolvedAt, closedAt,
+            postmortem, rootCause, resolvedEvidence)
+         VALUES ('inc-long','CLOSED','agent','[]',1000,2000,3000,?,?,'quiet')`,
+      ).run(
+        "## Summary\nthe connection pool ran out under the morning spike",
+        `${"c".repeat(2000)} ${tail}`,
+      );
+      indexIncident(w, "inc-long");
+    });
+
+    const hit = await searchTool().run({ text: "connection pool exhausted" });
+
+    assert.match(hit, /inc-long/);
+    assert.ok(hit.includes(tail), "the end of the cause is there");
+    assert.doesNotMatch(hit, /truncated/);
   });
 
   test("the prompt tells the model the tool exists and how to read it", () => {
@@ -567,6 +621,31 @@ describe("session persistence", () => {
     assert.doesNotMatch(second.input, /already seen/, "nothing before the watermark");
     assert.match(second.input, /and now\?$/, "the question comes last");
     assert.ok(objects.get(`sessions/slack/${CHANNEL}/100.0/state.json`));
+  });
+
+  test("a long message somebody typed is replayed whole", async () => {
+    // Each missed reply used to be cut at 2,000 characters on its way into
+    // the prompt. It is a person catching the agent up on what they know,
+    // and the pasted log or the sentence at the end is the part they went
+    // to the trouble for.
+    const { model, slack, agent } = build();
+    await agent.handle(mention({ ts: "100.0" }));
+
+    const tail = "and it only started after the Tuesday deploy";
+    slack.state.replies = [
+      {
+        user: "U0OTHER",
+        botId: null,
+        text: `${"l".repeat(20_000)}\n${tail}`,
+        ts: "150.0",
+      },
+    ];
+    await agent.handle(mention({ ts: "200.0", text: `<@${BOT}> and now?` }));
+
+    const second = model.runs[1];
+    assert.ok(second.input.includes(tail), "the end of what they wrote is there");
+    assert.ok(second.input.includes("l".repeat(20_000)), "and so is the rest");
+    assert.doesNotMatch(second.input, /truncated/);
   });
 
   test("a thread idle for more than seven days starts clean", async () => {
@@ -1322,20 +1401,18 @@ describe("read_agent_session", () => {
     assert.match(out, /was killed after 1 turns/);
   });
 
-  // Two bounds compose here: the exit-record line this PR prepends to the
-  // header, and the session reader's own cap. Asserted at a size nobody
-  // would choose, because a bound checked at a plausible input is a bound
-  // that holds until somebody waits longer.
-  test("the outcome line comes out of the session budget, not on top of it", async () => {
+  // The reader used to cut its own answer at 24,000 characters, which meant
+  // the entries a reader asked for by number were the entries most likely
+  // to be missing. `tailLines` is the bound now, and it counts entries.
+  test("the tail comes back whole, however wide the entries are", async () => {
     const out = await readSession(
       Array.from({ length: 20_000 }, (_, i) => turn(`${i} ${"x".repeat(500)}`)),
     );
-    assert.ok(
-      out.length <= 24_000,
-      `MAX_SESSION_CHARS is 24000 but the reader returned ${out.length}`,
-    );
-    // And it survives the cut, because it is in the head the cap keeps.
+
     assert.match(out, /was killed after 20000 turns/);
+    assert.ok(out.includes("19999 "), "the last entry is there");
+    assert.ok(out.includes("19920 "), "and so are the eighty asked for");
+    assert.ok(!out.includes("truncated"));
   });
 
   // The Slack agent is what a human asks "what did incident 7 cost", and it
@@ -1371,6 +1448,12 @@ describe("read_agent_session", () => {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * What replaced the per-result character caps. The difference is the whole
+ * point and is what each of these asserts: a tool result lands whole, and
+ * what gives way when the transcript will not fit is the oldest complete
+ * round rather than the middle of a row.
+ */
 describe("compacting the transcript instead of cutting results", () => {
   const round = (n: number, width: number): ModelTurn[] => [
     { role: "user", text: `question ${n}` },

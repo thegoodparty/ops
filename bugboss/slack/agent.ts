@@ -157,38 +157,20 @@ export const createMemoryThreadLock = (): ThreadLock => {
 // Read-only SQL
 // ---------------------------------------------------------------------------
 
-/** Bounded tool results. Compaction at 95% is only safe if nothing is wide. */
+/**
+ * Rows, not characters. Every bound left on this surface is a count of
+ * things -- rows, entries -- rather than a width, because a row cut in half
+ * is a row the model reads as complete and wrong, and the width was never
+ * the thing anybody wanted to limit anyway.
+ *
+ * What made the widths necessary was this loop having no compaction at all:
+ * results accumulated on a transcript that is also persisted per thread, so
+ * the only bound on the context was how narrow each result had been made.
+ * `compactTranscript` below is what replaced them.
+ */
 export const MAX_SQL_ROWS = 50;
-const MAX_ROW_CHARS = 2000;
-const MAX_SESSION_CHARS = 24000;
 const DEFAULT_SESSION_TAIL_LINES = 80;
 const MAX_SESSION_TAIL_LINES = 400;
-
-const truncationSuffix = (total: number): string =>
-  `... [truncated, ${total} chars]`;
-
-/**
- * A cap that is one: `truncate(s, n).length <= n` for every s and every n.
- *
- * It used to slice to the full width and then append the suffix on top, so
- * it returned `max` plus a marker that grew with the input -- the same defect
- * `truncateOutput` carried, in a second function nobody thought to look at
- * when that one was fixed. The suffix names `s.length` rather than how much
- * went, so unlike there its width is known before the slice is taken and
- * simply comes out of the budget.
- */
-const truncate = (s: string, max: number): string => {
-  if (s.length <= max) return s;
-  const suffix = truncationSuffix(s.length);
-  if (max < suffix.length) {
-    // Unreachable from the callers here -- the tightest is 2000 against a
-    // suffix of about 30 -- but a cap honoured only for budgets somebody
-    // happened to choose is not a cap.
-    alarm("truncate_budget_below_suffix", { max, suffix: suffix.length });
-    return max > 0 ? `${s.slice(0, max - 1)}\u2026` : "";
-  }
-  return `${s.slice(0, max - suffix.length)}${suffix}`;
-};
 
 /**
  * A Slack ts is "<seconds>.<microseconds>". Comparing the whole thing as a
@@ -281,18 +263,7 @@ export const buildTools = ({ db, store }: ToolDeps): SlackAgentTool[] => {
           "SELECT slackUserId, text, ts FROM thread_reply WHERE incidentId = ? ORDER BY ts DESC LIMIT 20",
           [incidentId],
         );
-        return truncate(
-          JSON.stringify(
-            {
-              incident,
-              signals,
-              replies,
-            },
-            null,
-            2,
-          ),
-          MAX_SQL_ROWS * MAX_ROW_CHARS,
-        );
+        return JSON.stringify({ incident, signals, replies }, null, 2);
       },
     },
     {
@@ -326,7 +297,7 @@ export const buildTools = ({ db, store }: ToolDeps): SlackAgentTool[] => {
         if (rows.length === 0) return "0 rows.";
         const shown = rows
           .slice(0, MAX_SQL_ROWS)
-          .map((r) => truncate(JSON.stringify(r), MAX_ROW_CHARS))
+          .map((r) => JSON.stringify(r))
           .join("\n");
         const note =
           rows.length > MAX_SQL_ROWS
@@ -377,10 +348,7 @@ export const buildTools = ({ db, store }: ToolDeps): SlackAgentTool[] => {
         // inference that let a 9.5-hour run sit dead behind a last message
         // which was still true.
         const outcome = describeOutcome(readSessionOutcome(body));
-        return truncate(
-          `${key}: ${lines.length} entries, last ${slice.length} -- ${outcome}\n${sessionSpend(body)}\n${slice.join("\n")}`,
-          MAX_SESSION_CHARS,
-        );
+        return `${key}: ${lines.length} entries, last ${slice.length} -- ${outcome}\n${sessionSpend(body)}\n${slice.join("\n")}`;
       },
     },
     {
@@ -910,7 +878,7 @@ export class SlackAgent {
     const question = stripBotMention(mention.text, this.cfg.botUserId);
     if (missed.length === 0) return `<@${mention.user}> asks: ${question}`;
     const transcript = missed
-      .map((m) => `<@${m.user ?? "unknown"}>: ${truncate(m.text, MAX_ROW_CHARS)}`)
+      .map((m) => `<@${m.user ?? "unknown"}>: ${m.text}`)
       .join("\n");
     return [
       `Said in this thread since you last answered (${missed.length} message(s)):`,
