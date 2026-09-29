@@ -934,7 +934,13 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
       : "What I was about to do: unknown. It was still working when the budget ran out.",
     "Side effects: check the incident for PRs it opened.",
     "",
-    "It is parked until somebody replies here, so nothing will relaunch into the same exhausted budget in the meantime.",
+    // Deliberately not "reply and it will carry on". A reply deletes the
+    // park and the incident relaunches, but the budget is counted over the
+    // incident, so the new agent is over it before it starts and stops
+    // again. Saying otherwise sends a person to type into a thread that
+    // cannot act on it. Raising the budget or taking the work is what moves
+    // this; both are things a person does outside the thread.
+    `Replying here wakes it, but the ${state.max}-turn budget is spent for the whole incident, so it will stop again immediately. To actually continue it, raise BUGBOSS_MAX_TURNS or pick the work up yourself.`,
   ].join("\n");
 };
 
@@ -952,6 +958,25 @@ interface TurnUsage {
   cacheWrite1h?: number;
   cost?: { total?: number };
 }
+
+/**
+ * Whether the harness should announce this exhaustion, or only park.
+ *
+ * Two ways the announcement is already made or already useless:
+ *
+ * - The agent escalated itself inside the grace. The steer asks for exactly
+ *   that, and it can land on the same `turn_end` the cap fires on, so both
+ *   posting puts "it never wrote a brief" under the brief it just wrote.
+ * - The launch started already over budget. A reply deletes the park and
+ *   the dispatcher relaunches, so without this every comment on the thread
+ *   pages the rotation again with the same fact. The first escalation
+ *   stands; repeating it adds nothing and trains people to ignore it.
+ *
+ * Parking is not conditional on any of this. Announcing is what a person
+ * sees; parking is what makes the relaunch stop.
+ */
+export const shouldAnnounceExhaustion = (state: TurnBudgetState): boolean =>
+  !state.escalated && state.used <= state.max;
 
 export interface TurnBudget {
   extension: (pi: ExtensionAPI) => void;
@@ -1027,7 +1052,15 @@ export const createTurnBudget = (args: {
           escalated = true;
         }
 
-        const turn = (event.message as { usage?: TurnUsage }).usage;
+        // The model comes off the turn, not off the seed. A first launch
+        // starts from `emptySessionUsage()`, so without this `modelId` is
+        // null for all 200 turns and the one report whose whole job is to
+        // say what 200 turns cost names no model to re-price it against.
+        // Same field `sumSessionUsage` reads back off disk.
+        const message = event.message as { model?: string; usage?: TurnUsage };
+        if (message.model) usage.modelId = message.model;
+
+        const turn = message.usage;
         if (turn) {
           usage.tokensIn += turn.input ?? 0;
           usage.tokensOut += turn.output ?? 0;
@@ -1506,14 +1539,25 @@ const launch = async (args: {
       // calls are asymmetric for that reason: a duplicate announcement is a
       // contradiction a person reads, a duplicate park is a no-op.
       // Announcing is what a person sees; parking is what makes it stop.
-      if (state.escalated) {
+      //
+      // A launch that started already over budget is the third case, and it
+      // is the one that used to page people. A reply deletes the park, the
+      // dispatcher relaunches, this fires on turn one -- so every comment on
+      // the thread produced a fresh escalation to the rotation. The first
+      // escalation already said everything true about this incident; the
+      // repeats say it again and add nothing. So it re-parks silently.
+      const alreadySpent = state.used > state.max;
+      if (!shouldAnnounceExhaustion(state)) {
         console.log(
           JSON.stringify({
             component: "agent",
             event: "turn_budget_escalation_skipped",
             incidentId: options.incidentId,
             used: state.used,
-            note: "the agent escalated on its own inside the grace window",
+            max: state.max,
+            reason: alreadySpent
+              ? "the budget was already spent before this launch; the first escalation stands"
+              : "the agent escalated on its own inside the grace window",
           }),
         );
       } else {
