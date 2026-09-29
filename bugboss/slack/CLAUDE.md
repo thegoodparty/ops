@@ -480,8 +480,15 @@ the read-only box, which answered that it could not. A person cannot see the
 boundary that makes those differ and did not ask about it.
 
 In a thread the person usually names one incident and the thread supplies the
-other. Outside one there is nothing to supply it, so both have to be named,
-and a mention with only one is **asked which two** rather than told no.
+other. Outside one there is nothing to supply it, so both have to be named.
+
+**It is never silent.** Every way a pair fails to form — the model named an
+incident that is not in the sentence, or named the one they are standing in,
+or named one thing out in the channel — is invisible to the person, so each
+one asks which incident rather than dropping the message. That includes a
+read that was simply wrong: from inside, a hallucinated id and a real request
+look the same, and the cost of asking on a misread is one line while the cost
+of silence is the failure this file exists to remove.
 
 It does not choose a direction: the more established incident survives, which
 is `assign`'s rule, and a person who asks for the other direction gets this

@@ -961,7 +961,7 @@ export const createBugBoss = async (
       }));
     },
     judgeMerge: async ({ incidentId, withIncidentId, reason }) => {
-      const { merge, fellBack } = await triage.judgeMerge({
+      const { merge, compared } = await triage.judgeMerge({
         incidentId,
         withIncidentId,
         reason,
@@ -971,9 +971,7 @@ export const createBugBoss = async (
         merge: merge
           ? { absorb: merge.incidentId, into: merge.into, reason: merge.reason }
           : null,
-        // A judgement that fell back compared nothing, which the agent has to
-        // be able to tell from a considered no.
-        compared: !fellBack,
+        compared,
       };
     },
   };
@@ -1922,15 +1920,21 @@ export const createBugBoss = async (
           ? [ids[0], args.here]
           : null;
 
+    // Never silent. A message read as a combine is somebody asking for one,
+    // and the reasons a pair cannot be formed are all invisible to them: the
+    // model named an incident that is not in their sentence, or named the
+    // one they are already standing in, or named one thing out in the
+    // channel where nothing supplies the second. Saying nothing to any of
+    // those is the failure this whole change is about, and the cost of
+    // saying something on a misread is one line in a thread.
     if (!pair) {
-      if (!args.here && ids.length < 2) {
-        return decline(
-          "one id outside a thread",
-          "which two incidents? Name both and I will combine them.",
-        );
-      }
-      log("combine_dropped", { here: args.here, named: args.named, kept: ids });
-      return;
+      log("combine_incomplete", { here: args.here, named: args.named, kept: ids });
+      return decline(
+        "could not make a pair",
+        args.here
+          ? "I could not tell which other incident you meant. Name it and I will combine it with this one."
+          : "which two incidents? Name both and I will combine them.",
+      );
     }
 
     const rows = pair.map((id) => ({
@@ -2005,7 +2009,7 @@ export const createBugBoss = async (
     await say(
       [
         mrkdwn`${raw(userMention(args.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
-        mrkdwn`_Incident ${into} is the older record, so it stays the one of account and keeps its thread.${args.here === into ? " Everything carries on here." : ""}_`,
+        mrkdwn`_Incident ${into} is the older record, so it stays the incident of record and keeps its thread.${args.here === into ? " Everything carries on here." : ""}_`,
       ].join("\n"),
     );
     await announce.announceMerge(result);

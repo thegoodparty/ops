@@ -1798,9 +1798,13 @@ test("the established incident survives even when the person asks the other way"
   assert.ok(
     said.some(
       (p) =>
-        p.threadTs === threadOf(older) && /is the older record/.test(p.text),
+        p.threadTs === threadOf(older) &&
+        /is the older record, so it stays the incident of record/.test(p.text),
     ),
-    "and told why it went the way it did, since they asked for the other one",
+    // "incident of record" is the term assign.ts, types.ts and the docs all
+    // use for this. Somebody reading the thread and somebody reading the
+    // design should not have to work out that two phrases mean one thing.
+    "and told why it went the way it did, in the words the rest of this uses",
   );
   assert.equal(
     said.filter(
@@ -1816,11 +1820,17 @@ test("the established incident survives even when the person asks the other way"
 
 /**
  * The model reads a message written by whoever is in the channel, and an
- * incident id is four characters. An id it produces that is not in what they
+ * incident id is two digits. An id it produces that is not in what they
  * typed is a number it made up, and acting on one merges two incidents at
  * nobody's request.
+ *
+ * It is not silent about it, though. From in here the two cases are
+ * indistinguishable -- a model that hallucinated an id, and a person whose
+ * sentence this read as a combine -- and the second of those asked. Saying
+ * nothing to somebody who asked is the failure this change exists to
+ * remove; the cost of the mistake in the other direction is one line.
  */
-test("an incident id the person never typed is dropped, not merged", async () => {
+test("an incident id the person never typed is not merged, and is not ignored", async () => {
   const { older, newer } = await twoIncidents("ghost");
   const before = fakeSlack.posts.length;
 
@@ -1832,10 +1842,15 @@ test("an incident id the person never typed is dropped, not merged", async () =>
   assert.equal(statusOf(newer).status, "INVESTIGATING");
   assert.equal(statusOf(older).status, "INVESTIGATING");
   assert.deepEqual(signalsOn(older), ["fp-ghost-old"]);
-  assert.deepEqual(
-    fakeSlack.posts.slice(before),
-    [],
-    "and nothing is said about it either, because nothing was asked",
+
+  const said = fakeSlack.posts.slice(before);
+  assert.ok(
+    said.some((p) => /which other incident you meant/.test(p.text)),
+    "it asks which incident rather than going quiet on a request",
+  );
+  assert.ok(
+    said.every((p) => !/cannot|can't|unable/i.test(p.text)),
+    "and never tells them it cannot",
   );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });

@@ -39,7 +39,8 @@ export interface Triage {
   /** The same judgement, asked by an agent about one named incident. */
   judgeMerge(req: MergeRequest): Promise<{
     merge: MergeProposal | null;
-    fellBack: boolean;
+    /** False when nothing weighed the two, which is not a considered no. */
+    compared: boolean;
   }>;
 }
 

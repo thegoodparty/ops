@@ -336,7 +336,7 @@ test("an agreed proposal comes back pointed at the established incident", async 
     proposeCall([{ incidentId: "79", confident: true, reason: "same pool" }]),
   ]);
 
-  const { merge, fellBack } = await judgeMerge(
+  const { merge, compared } = await judgeMerge(
     { model, db: fakeDb(["s1"]), budgetMs: 2000 },
     {
       incidentId: "82",
@@ -349,7 +349,7 @@ test("an agreed proposal comes back pointed at the established incident", async 
     },
   );
 
-  assert.equal(fellBack, false);
+  assert.equal(compared, true);
   // The agent asked from 82 and 82 is the one absorbed. Which record
   // survives is not the asker's to pick and not the model's either.
   assert.deepEqual(merge, { incidentId: "82", into: "79", reason: "same pool" });
@@ -360,7 +360,7 @@ test("an unconfident answer is no merge, and is not a failure", async () => {
     proposeCall([{ incidentId: "79", confident: false, reason: "maybe" }]),
   ]);
 
-  const { merge, fellBack } = await judgeMerge(
+  const { merge, compared } = await judgeMerge(
     { model, db: fakeDb(["s1"]), budgetMs: 2000 },
     {
       incidentId: "82",
@@ -375,9 +375,9 @@ test("an unconfident answer is no merge, and is not a failure", async () => {
 
   assert.equal(merge, null);
   assert.equal(
-    fellBack,
-    false,
-    "a considered no is not the same answer as nothing having compared them",
+    compared,
+    true,
+    "a considered no is a comparison, and the agent should stop asking",
   );
 });
 
@@ -404,14 +404,14 @@ test("a dead model says so, rather than passing for a considered no", async () =
   assert.equal(result.merge, null);
   // The agent is going to repeat one of two sentences into a Slack thread,
   // and they point at different next moves: stop asking, or ask a person.
-  assert.equal(result.fellBack, true);
+  assert.equal(result.compared, false);
   assert.ok(alarms.some((a) => a.event === "merge_request_unjudged"));
 });
 
 test("an incident that is not open is not put in front of the model at all", async () => {
   const { model, requests } = scripted([]);
 
-  const { merge, fellBack } = await judgeMerge(
+  const { merge, compared } = await judgeMerge(
     { model, db: fakeDb(["s1"]), budgetMs: 2000 },
     {
       incidentId: "82",
@@ -425,6 +425,9 @@ test("an incident that is not open is not put in front of the model at all", asy
   );
 
   assert.equal(merge, null);
-  assert.equal(fellBack, false);
+  // Nothing weighed them, so this is not a considered no either. The agent
+  // read the incident as open before it asked; it moved on in between, and
+  // standing the agent down over that is standing it down over nothing.
+  assert.equal(compared, false);
   assert.equal(requests.length, 0, "and nothing was spent finding that out");
 });

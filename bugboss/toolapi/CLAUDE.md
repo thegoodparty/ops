@@ -50,8 +50,11 @@ of every open incident, and `assign` picks which record survives. A captured
 agent can put one pair in front of that judgement and still move nothing.
 
 `MergeVerdict.compared` separates a considered no from nothing having weighed
-them. They point at different next moves — stop asking, or ask a person — and
-an agent handed one sentence for both takes a dead model for a verdict.
+them. They point at different next moves — stop asking, or read it again —
+and an agent handed one sentence for both takes a dead model for a verdict.
+It is not derived from whether the model threw: nothing is compared when the
+model dies **and** when the named incident resolved or merged away between the
+agent reading it and the judgement running.
 
 **Nothing this returns names a kind of caller.** The agent repeats these
 sentences into a Slack thread, and "an agent may only re-partition its own

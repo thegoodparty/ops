@@ -382,6 +382,12 @@ export interface MergeRequest {
  * quietly stay apart, and this falling back means an agent that asked a
  * question got no answer, which it has to be told.
  *
+ * Which is what `compared` carries, and why it is not derived from whether
+ * the model threw. Nothing is compared when the model dies *and* when the
+ * named incident moved on between the agent reading it and this running --
+ * and both of those have to reach the agent as "read it again", never as
+ * "these are different problems".
+ *
  * The agent's reason stands in for a root cause in the prompt. That is what
  * it is: a claim about what these two share, written by the thing that has
  * read both. It is untrusted for the same reason a root cause is, and the
@@ -390,10 +396,15 @@ export interface MergeRequest {
 export const judgeMerge = async (
   deps: CorrelateDeps,
   req: MergeRequest,
-): Promise<{ merge: MergeProposal | null; fellBack: boolean }> => {
+): Promise<{ merge: MergeProposal | null; compared: boolean }> => {
   const started = Date.now();
   const usage = emptyModelUsage();
 
+  // `compared: false`, not a considered no. The agent checked this incident
+  // was open before it asked and the answer is built from a second read, so
+  // the case here is one that resolved or merged away in between -- and
+  // telling the agent the two are different problems would stand it down
+  // over something nothing looked at.
   const candidate = req.openIncidents.find((i) => i.id === req.withIncidentId);
   if (!candidate || !MERGEABLE.includes(candidate.status)) {
     log("merge_request_no_candidate", {
@@ -401,7 +412,7 @@ export const judgeMerge = async (
       withIncidentId: req.withIncidentId,
       status: candidate?.status ?? "gone",
     });
-    return { merge: null, fellBack: false };
+    return { merge: null, compared: false };
   }
 
   const asCorrelation: CorrelationRequest = {
@@ -434,7 +445,7 @@ export const judgeMerge = async (
       ms: Date.now() - started,
       ...usageForLog(usage),
     });
-    return { merge: merge ?? null, fellBack: false };
+    return { merge: merge ?? null, compared: true };
   } catch (err) {
     const health = recordCall(SITE, true);
     // Told apart from a considered no on purpose. An agent that asked and
@@ -449,6 +460,6 @@ export const judgeMerge = async (
       ...health,
       ...usageForLog(usage),
     });
-    return { merge: null, fellBack: true };
+    return { merge: null, compared: false };
   }
 };

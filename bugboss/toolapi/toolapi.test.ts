@@ -777,11 +777,13 @@ describe("reads are not contained", () => {
 });
 
 describe("proposeMerge: the agent asks", () => {
-  it("combines the two when the proposal is agreed", async () => {
+  it("combines the two when the proposal is agreed, and tells both threads", async () => {
     await seed("sig-a");
     await seed("sig-b");
     const older = await openIncident(["sig-a"]);
     const newer = await openIncident(["sig-b"]);
+    await withThread(older);
+    await withThread(newer);
     verdicts.push({
       merge: { absorb: newer, into: older, reason: "one pool, two alerts" },
       compared: true,
@@ -798,6 +800,20 @@ describe("proposeMerge: the agent asks", () => {
     assert.equal(data.incidentOfRecord, older);
     assert.equal(incidentRow(newer)?.status, "MERGED");
     assert.deepEqual(signalsOn(older), ["sig-a", "sig-b"]);
+
+    // The other suite covers these two messages thoroughly and reaches them
+    // only through reportRootCause. A merge an agent asked for is the same
+    // event for everybody reading either thread, and nothing else here would
+    // notice if this route stopped telling them.
+    assert.equal(postsIn(newer).length, 1, "the thread that goes quiet is told");
+    assert.match(postsIn(newer)[0], /last message in this thread/);
+    assert.equal(postsIn(older).length, 1, "and so is the one that carries on");
+    assert.match(postsIn(older)[0], /is the same problem as this one/);
+    assert.ok(
+      posts.findIndex((post) => post.threadTs === `thread-${newer}`) <
+        posts.findIndex((post) => post.threadTs === `thread-${older}`),
+      "absorbed thread first, so a crash between the two loses the survivor's copy",
+    );
   });
 
   it("writes nothing when the two are judged different problems", async () => {
