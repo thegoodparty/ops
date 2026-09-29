@@ -650,6 +650,68 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  // The `maxLaunches` twin of the test above. Both ceilings clear their
+  // counter at the park and each needs its own test: covering one and
+  // trusting the other is how the uncovered one comes back, and the property
+  // here is invisible unless one dispatcher instance crosses the cooldown.
+  it("gives a stalled incident another go at the cooldown instead of paging again", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let clock = T0;
+    let launches = 0;
+    const releases: (() => void)[] = [];
+    const spawn: SpawnAgent = () => {
+      launches += 1;
+      return new Promise<void>((resolve) => releases.push(resolve));
+    };
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+        fastFailureSeconds: 60,
+        maxLaunches: 2,
+        parkCooldownSeconds: 3600,
+        now: () => clock,
+      }),
+    );
+
+    // Dies at 61s every time: slow enough to clear the fast-failure counter
+    // on each exit, so this is the launch ceiling and only it.
+    for (let i = 0; i < 2; i += 1) {
+      await d.tick();
+      clock += 61_000;
+      releases.forEach((r) => r());
+      await d.drain();
+    }
+    assert.deepEqual((await d.tick()).escalated, ["i1"]);
+    assert.equal(escalations.length, 1);
+    assert.equal(launches, 2, "no relaunch past the ceiling");
+
+    assert.deepEqual((await d.tick()).started, [], "parked for the cooldown");
+    assert.equal(escalations.length, 1, "said once, not once a tick");
+
+    // Same instance across the boundary. A count left at the ceiling meets
+    // the incident here and pages a second time for the same two launches,
+    // then parks and does it again every hour for the container's life.
+    clock += 3_600_000;
+    const woken = await d.tick();
+    assert.deepEqual(
+      woken.started.map((a) => a.incidentId),
+      ["i1"],
+      "the cooldown owes it another go",
+    );
+    assert.equal(escalations.length, 1, "and nobody was paged twice for it");
+
+    releases.forEach((r) => r());
+    await d.drain();
+    cleanup();
+  });
+
   it("leaves a wait a reply cannot end alone, however much the thread talks", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
