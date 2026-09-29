@@ -11,18 +11,9 @@ import type { Model, ModelCost } from "@earendil-works/pi-ai";
 
 import { BEDROCK_INVOKE_MODEL_API, type BedrockInvokeModelApi } from "./options";
 
-export type BedrockInvokeModelModel = Model<BedrockInvokeModelApi>;
+export { DEFAULT_MODEL_ID } from "./defaults";
 
-/**
- * The cross-region inference profile the incident agent runs on by default.
- *
- * It lives in this leaf rather than next to the rest of the agent's defaults
- * because `deploy/components/bugboss.ts` needs it to build the application
- * inference profile that wraps it, and a Pulumi program should not have to
- * load the agent's whole module graph -- an S3 client, the GitHub App, the
- * MCP toolset -- to read one string.
- */
-export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
+export type BedrockInvokeModelModel = Model<BedrockInvokeModelApi>;
 
 /** `arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude-opus-5` */
 const INFERENCE_PROFILE_ARN = /^arn:aws(?:-[a-z0-9-]+)?:bedrock:[a-z0-9-]+:\d+:inference-profile\/(.+)$/;

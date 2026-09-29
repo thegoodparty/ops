@@ -1,7 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 
-import { DEFAULT_MODEL_ID } from "../../bugboss/bedrock/model";
+import { DEFAULT_MODEL_ID } from "../../bugboss/bedrock/defaults";
 import { TEST_DB_ENV_VAR } from "../../bugboss/testdb";
 
 const ACCOUNT_ID = "333022194791";

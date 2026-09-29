@@ -83,8 +83,8 @@ import {
 
 export const DEFAULT_WORK_ROOT = "/work";
 export const DEFAULT_OMNI_REPO = "https://github.com/thegoodparty/omni.git";
-// Declared in bedrock/model.ts so the Pulumi program can read it without
-// loading this module's graph, and re-exported here because this is where
+// Declared in bedrock/defaults.ts, which has no imports so the Pulumi
+// program can read it, and re-exported here because this is where
 // everything else looks for it.
 export { DEFAULT_MODEL_ID };
 export const DEFAULT_TIMEOUT_SECONDS = 86_400;
