@@ -99,13 +99,21 @@ export const renderDirectives = (directives: Directive[]): string => {
         return `MERGED: this incident is now part of ${directive.into}. Stop work and exit.`;
       case "new_signals": {
         const head = `NEW SIGNALS (${directive.count})`;
-        if (!directive.absorbed?.length) return `${head}: ${directive.summary}`;
-        const from = directive.absorbed.join(" and incident ");
+        const absorbed = directive.absorbed ?? [];
+        if (absorbed.length === 0) return `${head}: ${directive.summary}`;
+        // Agreement matters here beyond tidiness: this is the sentence that
+        // tells an agent how many other investigations it has inherited, and
+        // "incident 82 and 83 has been merged" reads as one of them.
+        const one = absorbed.length === 1;
+        const which = one
+          ? `incident ${absorbed[0]}`
+          : `incidents ${absorbed.slice(0, -1).join(", ")} and ${absorbed.at(-1)}`;
         return (
-          `${head}: incident ${from} has been merged into yours and its ` +
-          `signals are now yours. Why: ${directive.summary}. Call ` +
-          "get_incident: what that incident had already found comes back " +
-          "as `absorbed`, and your summary now has to describe both halves."
+          `${head}: ${which} ${one ? "has" : "have"} been merged into yours ` +
+          `and ${one ? "its" : "their"} signals are now yours. Why: ` +
+          `${directive.summary}. Call get_incident: what ${one ? "that incident" : "those incidents"} ` +
+          `had already found comes back as \`absorbed\`, and your summary now ` +
+          "has to describe every part of it."
         );
       }
       case "human_message":
