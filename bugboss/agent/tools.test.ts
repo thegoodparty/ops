@@ -118,6 +118,42 @@ test("monitor stops when the turn is aborted", async () => {
   assert.equal(result.timedOut, true);
 });
 
+test("monitor's description does not tell the agent to pre-summarise", async () => {
+  // A cap removed from the code and left standing in the tool description is
+  // the same bug one layer up: the agent reads "output is capped" and narrows
+  // the probe command itself, throwing the evidence away voluntarily. So the
+  // instruction and the behaviour are asserted as one thing -- the tool says
+  // output comes back whole, and it does.
+  const tool = await createMonitorTool({
+    probe: async () => ({ code: 0, output: "x".repeat(50_000) }),
+  });
+
+  assert.doesNotMatch(
+    tool.description,
+    /output is capped/i,
+    "the description promises a cap that no longer exists",
+  );
+  assert.match(tool.description, /whole/i);
+
+  const out = await tool.execute(
+    "c1",
+    {
+      command: "cat huge",
+      intervalSeconds: 1,
+      timeoutSeconds: 1,
+      description: "a big log",
+    } as never,
+    new AbortController().signal,
+    undefined,
+    {} as never,
+  );
+  const text = out.content[0].type === "text" ? out.content[0].text : "";
+  assert.ok(
+    text.includes("x".repeat(50_000)),
+    "the description says whole and the tool must deliver whole",
+  );
+});
+
 test("monitor hands back everything the probe printed", async () => {
   // What the cap used to take was the middle, and a monitor is most often
   // waiting on something whose interesting line is in the middle: the failing
