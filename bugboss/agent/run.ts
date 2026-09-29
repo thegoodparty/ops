@@ -895,7 +895,16 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
   return [
     "This is yours because the agent ran out of turns, not because it finished.",
     "",
-    `It used all ${state.max} turns this incident gets, across every launch, and did not hand off in the ${state.graceTurns} it was asked to. Everything it found is in this thread.`,
+    // Two cases, because one sentence cannot honestly cover both. A launch
+    // that spent the budget got its grace and ignored it. A launch that
+    // started already over -- the previous one died before its hand-off
+    // landed -- never had a grace window at all, and `used` is past `max`.
+    // One sentence quoting `max` produced "used all 200 turns" directly
+    // above "201 turns on ...", which is the sort of thing that makes a
+    // reader distrust the rest of the brief.
+    state.used > state.max
+      ? `Its ${state.max}-turn budget for this incident was already spent when this launch started, so it stopped on its first turn back rather than investigating on borrowed time. ${state.used} turns have gone into it across every launch. Everything it found is in this thread.`
+      : `It used all ${state.max} turns this incident gets, across every launch, and did not hand off in the ${state.graceTurns} it was asked to. Everything it found is in this thread.`,
     "",
     "*What it spent*",
     `${state.used} turns on ${usage.modelId ?? "an unrecorded model"} · ${compactTokens(tokens)} tokens (${usage.tokensIn} in, ${usage.tokensOut} out, ${usage.cacheRead} cache read, ${usage.cacheWrite} cache write)`,
@@ -906,7 +915,9 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     "*Where it stands*",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded; it never got to write a brief.",
-    "What I was about to do: unknown. It was still working when the budget ran out.",
+    state.used > state.max
+      ? "What I was about to do: nothing yet on this launch; the budget was gone before it started."
+      : "What I was about to do: unknown. It was still working when the budget ran out.",
     "Side effects: check the incident for PRs it opened.",
   ].join("\n");
 };

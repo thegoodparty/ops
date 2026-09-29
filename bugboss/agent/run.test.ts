@@ -738,6 +738,32 @@ test("the escalation brief names the spend and never states the price as a fact"
   assert.match(brief, /An estimate, not an invoiced figure/);
 });
 
+test("a brief for an already-spent budget does not contradict its own numbers", async () => {
+  // The relaunch case: the previous launch died before its hand-off landed,
+  // so this one starts over budget and stops on turn 1. Quoting `max` in the
+  // opening line put "used all 200 turns" directly above "201 turns on ...",
+  // and a brief that disagrees with itself is one a reader stops trusting.
+  let brief = "";
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 200, modelId: "us.anthropic.claude-opus-5" },
+    maxTurns: 200,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: () => assert.fail("there is no grace left to give"),
+    onExhausted: (state) => void (brief = turnBudgetBrief(state)),
+  });
+
+  await turnEndHandlerFor(budget)(...turn());
+
+  assert.match(brief, /201 turns on us\.anthropic\.claude-opus-5/);
+  assert.match(brief, /already spent when this launch started/);
+  assert.doesNotMatch(brief, /used all 200 turns/);
+  assert.doesNotMatch(
+    brief,
+    /still working when the budget ran out/,
+    "it did no work on this launch, so saying it was interrupted mid-investigation is a lie",
+  );
+});
+
 test("a run the provider priced at nothing says so rather than reporting it free", () => {
   const brief = turnBudgetBrief({
     used: 5,
