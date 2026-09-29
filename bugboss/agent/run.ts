@@ -983,6 +983,24 @@ interface TurnUsage {
 export const shouldAnnounceExhaustion = (state: TurnBudgetState): boolean =>
   !state.escalated;
 
+/**
+ * How an exhausted run parks, as a value so the one argument that matters
+ * cannot be dropped without a test noticing.
+ *
+ * `liftsOnReply: false` is the whole point and it is not the default. A
+ * reply is not news about having run out of turns, so waking on one
+ * relaunches an agent that is over budget before it starts: it stops again
+ * immediately, announces again, and every comment on the thread becomes a
+ * page. It is also what makes the closing brief's "replying here will not
+ * restart it" true rather than a wish.
+ */
+export const turnBudgetPark = (
+  state: TurnBudgetState,
+): { waitingFor: string; liftsOnReply: boolean } => ({
+  waitingFor: `a person, after the ${state.max}-turn budget for this incident ran out`,
+  liftsOnReply: false,
+});
+
 export interface TurnBudget {
   extension: (pi: ExtensionAPI) => void;
   state: () => TurnBudgetState;
@@ -1588,9 +1606,7 @@ const launch = async (args: {
       }
 
       try {
-        const parked = await api.park({
-          waitingFor: `a person, after the ${state.max}-turn budget for this incident ran out`,
-        });
+        const parked = await api.park(turnBudgetPark(state));
         if (!parked.ok) {
           // The loud one. A failed park is the hot loop: the dispatcher
           // relaunches, the new agent is over budget on its first turn, and

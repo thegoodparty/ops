@@ -30,6 +30,7 @@ import {
   signalExitCode,
   shouldAnnounceExhaustion,
   toolListDrift,
+  turnBudgetPark,
   TURN_BUDGET_GRACE_TURNS,
   turnBudgetBrief,
   turnBudgetMessage,
@@ -813,6 +814,24 @@ test("the announcement is suppressed only when the agent already made it", () =>
     shouldAnnounceExhaustion({ ...base, used: 201, max: 200, escalated: false }),
     true,
   );
+});
+
+test("an exhausted run parks on a wait a reply cannot lift", () => {
+  // `liftsOnReply` defaults to true, which is right for a wait on a person
+  // and wrong for this one. Without the argument a reply wakes the incident,
+  // the relaunched agent is over budget before it starts, and every comment
+  // on the thread becomes a page — which is the whole failure this bound was
+  // added to stop, reintroduced by an omitted default.
+  const park = turnBudgetPark({
+    used: 200,
+    max: 200,
+    graceTurns: 10,
+    escalated: false,
+    usage: emptySessionUsage(),
+  });
+
+  assert.equal(park.liftsOnReply, false);
+  assert.match(park.waitingFor, /200-turn budget for this incident ran out/);
 });
 
 test("the brief does not promise that replying will continue the work", () => {
