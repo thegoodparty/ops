@@ -97,8 +97,17 @@ export const renderDirectives = (directives: Directive[]): string => {
         return `STOP: ${directive.reason}`;
       case "merged":
         return `MERGED: this incident is now part of ${directive.into}. Stop work and exit.`;
-      case "new_signals":
-        return `NEW SIGNALS (${directive.count}): ${directive.summary}`;
+      case "new_signals": {
+        const head = `NEW SIGNALS (${directive.count})`;
+        if (!directive.absorbed?.length) return `${head}: ${directive.summary}`;
+        const from = directive.absorbed.join(" and incident ");
+        return (
+          `${head}: incident ${from} has been merged into yours and its ` +
+          `signals are now yours. Why: ${directive.summary}. Call ` +
+          "get_incident: what that incident had already found comes back " +
+          "as `absorbed`, and your summary now has to describe both halves."
+        );
+      }
       case "human_message":
         return `MESSAGE from ${directive.from} at ${directive.ts}: ${directive.text}`;
       case "resumed_after":

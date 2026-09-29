@@ -22,15 +22,11 @@ the workspace domain, which is why it is an API call rather than string
 concatenation; it needs no scope of its own.
 
 The same applies to anything that names an incident it is not standing in,
-which in practice means the Slack agent: it reads the whole database, so it
-routinely talks about incidents whose thread it is not in, and "incident 4"
-with no link is something the reader has to go and hunt for in the channel.
-So `get_incident` and `query_incidents` return `threadPermalink` on an
-incident row, and the prompt tells the model to link what the tools handed
-it. The link is withheld -- `threadPermalink` is null -- for the incident
-whose thread the answer is being written into, because a link to where the
-reader already is is noise, and withholding it is what makes that reliable
-rather than an instruction the model may forget.
+and "Incident 4" with no link is something the reader has to go and hunt for
+in the channel. Nothing that composes a message has to think about that:
+every outbound message passes through the pass in `slack/incidents.ts`, which
+links a named incident unless the reader is already in its thread. See
+"Incident references are rendered by code" below.
 
 The alert that says a question went unanswered has the same problem from a
 harsher angle: it is read in another channel by somebody who was not in the
@@ -242,6 +238,102 @@ directly above — small enough that the composed post provably fits, and
 `tools.test.ts` composes the worst case of each to keep that true. The nudge
 gets a smaller clamp than the briefs because it carries two echoes plus the
 whole status block where they carry one.
+
+## Incident references are rendered by code, on the way out
+
+Every incident BugBoss names reads "Incident 4", capitalised, and carries a
+link to its thread unless the reader is already standing in it.
+
+That used to be a line in the Slack agent's system prompt — *"every incident
+you name that is not the one whose thread you are standing in gets a link to
+its thread, written `<permalink|incident 4>`"* — so it was followed
+probabilistically. Some answers linked and some did not, and the casing
+wandered between "incident 4" and "Incident 4" inside one message. It is
+`slack/incidents.ts` now: a pass over finished mrkdwn that normalises always
+and links conditionally.
+
+**This is not the deterministic matching this codebase refuses.** That rule
+is about reading what a person meant, where a fixed phrase is a magic word
+nobody can guess and everybody mistypes. This is our own output, on the way
+out, put into one shape. Determinism is the point of it.
+
+**The seam is the client, and it has to be.** There is no single place above
+it where outbound text is composed: `relay.ts` splits and posts for itself,
+`agent.ts` goes through `postProse`, `toolapi/index.ts` and
+`toolapi/announce.ts` each run their own `splitForSlack` loop, `report/` uses
+`postDocument`, `http/toolapi.ts` does two of those, and the composition root
+posts directly in three more places. A pass on some of them would be the same
+inconsistency with a new cause, which is worse than the old one because it
+looks fixed. So `withIncidentReferences` wraps the `SlackClient` itself,
+outside the deadline wrapper, and a surface added later gets it by default.
+
+Three things bound it:
+
+- **It skips what it must not touch.** Code spans, fenced blocks and Slack
+  entities are protected by the same `PROTECTED` regex `toMrkdwn` splits on,
+  exported rather than copied so the two cannot drift. A reference inside a
+  link label is still capitalised — the label is text a reader sees — but
+  never re-linked.
+- **It matches one shape only:** the word, then one number. Not "incidents 4
+  and 5", where the 5 would have to be recognised as an id purely from
+  sitting after a conjunction. A bare number is a count, a duration and an
+  hour of the day far more often than it is an incident, and a link to the
+  wrong thread looks exactly as authoritative as a right one. A miss is
+  readable prose; an invention is a lie with a link on it.
+- **A link is never worth an answer.** A permalink that fails or an incident
+  with no thread costs the link and nothing else.
+
+`permalink_shape_unknown` is the alarm to keep in mind if you touch this.
+`createCachingLinker` collapses every link to string work once it has parsed
+the workspace domain out of one real permalink; when it cannot, every link
+costs an API call. This pass asks for a link every time an answer names an
+incident, so it memoises per incident for the life of the process — an
+incident's thread is written once, under `WHERE slackThreadTs IS NULL`, so it
+never moves. Only answers are held. A *missing* one is re-asked, because the
+relay posts the rest of a split opening message into the thread before it
+records that thread on the incident: "this thread belongs to no incident" is
+true for a moment and false forever after.
+
+## One renderer, three surfaces
+
+A status-board row and an incident thread's top-level message are the same
+three fields at different scales, so they are one renderer (`slack/board.ts`):
+
+| Field | Where it comes from |
+| --- | --- |
+| status | the incident row |
+| the few-word title | `incident.summary`, falling back to the first signal's title |
+| what is needed | `incident_wait.waitingFor`, or "nothing needed from anyone" |
+
+None of the three is new state. The third in particular is derived rather
+than invented: `waitingFor` is already *"what is being waited on, in one line,
+for the thread and the digest"*, and an incident with no wait needs nothing.
+Saying that out loud is what makes the ones that do worth trusting.
+
+Nothing in the renderer resolves a link. Every line names its incident in
+prose and the pass above links it — which is also what stops a thread's own
+header linking to itself, with no special case anywhere.
+
+The surfaces:
+
+- **The thread header.** Two lines above the message that opened the thread,
+  rewritten in place with `chat.update`. Nothing is removed: the alert text
+  that started the thread is what somebody scrolling back is looking for.
+  An edit is **silent** — Slack marks it "(edited)" and notifies nobody — so
+  it is right for a header people re-read and wrong as a way to tell anyone
+  anything. A change worth knowing about still posts in the thread as well.
+- **The board on request.** `incident_board`, a tool on the Slack agent that
+  hands back the rendered text for it to paste verbatim. A board the model
+  composed from `query_incidents` would be a fourth rendering of the same
+  three fields, disagreeing in whatever way that run happened to phrase it.
+- **The morning board** and **the all-clear**, both driven by the sweep in
+  `board/index.ts`.
+
+`chat.update` replaces a message wholesale and the only way to read the
+original back is `conversations.replies`, which is throttled to roughly one
+request a minute. So the relay records the opening text in `incident_thread`
+when it posts it. An incident opened before that table existed has no row and
+gets **no header** — the one answer that cannot delete somebody's alert text.
 
 ## Block Kit for one message: a question with its answers
 
@@ -566,3 +658,12 @@ parks the caller inside the SDK with nothing thrown and nothing logged.
 
 The client pins a five-minute policy, and posts are off the ingest request.
 Both matter: an agent blocked in `contact_human` still waits on one.
+
+`chat.update` shares that budget, which is the bound worth remembering if you
+change what the board sweep does. It edits only threads whose rendered header
+has actually changed, so a steady state costs nothing and the worst tick is
+one edit per incident that moved -- and each one goes through the same
+ten-second deadline, so a Slack that is refusing edits costs the sweep a tick
+rather than the process. Widening it to "rewrite every open thread each tick"
+would be fifteen edits every thirty seconds forever, for no change anybody
+can see.

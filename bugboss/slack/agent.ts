@@ -23,6 +23,7 @@ import {
   raw,
   userMention,
 } from "./format";
+import { boardOnRequest } from "../board";
 import { describeOutcome, readSessionOutcome, sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
 import { prepareQuery, searchTool, usageForLog, type ModelUsage } from "../triage";
@@ -74,9 +75,11 @@ export interface SlackReader {
  * whole client because it never reacts: the :eyes: goes on at the edge, before
  * anything here has been asked to run.
  *
- * The linker is here because this is the one surface that talks about
- * incidents it is not standing in. A bare "incident 4" in another thread is
- * something the reader has to go and hunt for in the channel.
+ * The linker is here for one message and it is not an answer: when a run
+ * dies where it was mentioned, the alert in the alert channel has to point
+ * back at the thread nobody got a reply in. Linking an incident *inside* an
+ * answer is not this surface's job -- `slack/incidents.ts` does that on the
+ * way out, for every surface.
  */
 export type SlackConversation = SlackPoster & SlackReader & SlackLinker;
 
@@ -208,19 +211,19 @@ export const tsAfter = (a: string, b: string): boolean => {
 export interface ToolDeps {
   db: Db;
   store: ObjectStore;
-  linker: SlackLinker;
-  /**
-   * The thread the answer is being written into, so an incident whose thread
-   * this already is can be denied a link to itself. Null outside a thread.
-   */
-  threadTs: string | null;
 }
 
 /**
- * Four tools, in a fixed order, built from literals. Nothing here may vary
+ * Five tools, in a fixed order, built from literals. Nothing here may vary
  * between two builds in two processes: the tools array is part of the prefix
- * every thinking block in the session is bound to. `threadTs` and `linker`
- * reach only the closures, never a name, a description or a schema.
+ * every thinking block in the session is bound to.
+ *
+ * None of them hands back a Slack url, deliberately. Linking an incident is
+ * not the model's job any more: it writes "incident 4" in prose and
+ * `slack/incidents.ts` renders it on the way out, from every surface. A
+ * `threadPermalink` field here would be a second mechanism for the same
+ * thing with the model holding one of them, which is the arrangement that
+ * produced the inconsistency to begin with.
  */
 /**
  * What a run has spent, as one line above the transcript tail.
@@ -241,41 +244,7 @@ export const sessionSpend = (body: string): string => {
   return `spend: ${usage.turns} turns, ${tokens} tokens on ${usage.modelId ?? "an unrecorded model"}${priced}`;
 };
 
-export const buildTools = ({
-  db,
-  store,
-  linker,
-  threadTs,
-}: ToolDeps): SlackAgentTool[] => {
-  /**
-   * Slack was asked for a link and would not give one. The rest of this
-   * answer stops asking: fifty rows against a Slack outage is fifty
-   * consecutive ten-second deadlines, paid by somebody waiting on a reply.
-   * Scoped to one build, so the next mention tries again.
-   */
-  let linkable = true;
-
-  /**
-   * The link to an incident's thread, or null -- which the model is told how
-   * to read. Null is three different things: this is the thread we are
-   * standing in, where a self-link is noise; the incident has no thread; or
-   * the link could not be built. Only the last is a failure, and it alarms
-   * rather than costing the answer, because a link is a convenience.
-   */
-  const threadPermalink = async (
-    row: Record<string, unknown>,
-  ): Promise<string | null> => {
-    const ts = row.slackThreadTs;
-    if (typeof ts !== "string" || !ts || ts === threadTs || !linkable) return null;
-    try {
-      return await linker.permalink(ts);
-    } catch (err) {
-      linkable = false;
-      alarm("permalink_failed", { threadTs: ts, error: String(err) });
-      return null;
-    }
-  };
-
+export const buildTools = ({ db, store }: ToolDeps): SlackAgentTool[] => {
   /**
    * Triage's tool, adapted to this surface's shape rather than rebuilt, so
    * one search answers the same three ways wherever it is called from: hits,
@@ -287,7 +256,7 @@ export const buildTools = ({
     {
       name: "get_incident",
       description:
-        "Read one incident in full: its row, its signals, and the human replies relayed into its Slack thread. The row carries threadPermalink, which is the link to that incident's Slack thread.",
+        "Read one incident in full: its row, its signals, and the human replies relayed into its Slack thread.",
       inputSchema: {
         type: "object",
         properties: {
@@ -314,10 +283,7 @@ export const buildTools = ({
         return truncate(
           JSON.stringify(
             {
-              incident: {
-                ...incident,
-                threadPermalink: await threadPermalink(incident),
-              },
+              incident,
               signals,
               replies,
             },
@@ -333,7 +299,6 @@ export const buildTools = ({
       description: [
         "Run one read-only SQL SELECT against the incident database and get back JSON rows.",
         "Tables: incident, signal, thread_reply, pending_question, pending_directive.",
-        "Select slackThreadTs on an incident and the row comes back with threadPermalink alongside it, which is how you link an incident you name.",
         "Run \"SELECT name, sql FROM sqlite_master WHERE type='table'\" for the live schema.",
         `At most ${MAX_SQL_ROWS} rows come back, so add your own LIMIT and ORDER BY.`,
       ].join(" "),
@@ -358,18 +323,8 @@ export const buildTools = ({
           return `SQL error: ${(err as Error).message}`;
         }
         if (rows.length === 0) return "0 rows.";
-        // Sequential on purpose. The linker learns the workspace from its first
-        // real answer and derives the rest, so fifty rows are one API call --
-        // fired together they would be fifty.
-        const linkedRows: Record<string, unknown>[] = [];
-        for (const row of rows.slice(0, MAX_SQL_ROWS)) {
-          linkedRows.push(
-            "slackThreadTs" in row
-              ? { ...row, threadPermalink: await threadPermalink(row) }
-              : row,
-          );
-        }
-        const shown = linkedRows
+        const shown = rows
+          .slice(0, MAX_SQL_ROWS)
           .map((r) => truncate(JSON.stringify(r), MAX_ROW_CHARS))
           .join("\n");
         const note =
@@ -433,6 +388,21 @@ export const buildTools = ({
       inputSchema: search.spec.inputSchema,
       run: (input) => Promise.resolve(search.run(input)),
     },
+    {
+      name: "incident_board",
+      description:
+        "The status board: every open incident as one line -- where the work is, what it is, and what is needed from a person. Already written for Slack. Paste it into your answer exactly as it comes back; do not rewrite it, reorder it or leave rows out. Use it whenever somebody asks what is open, what is going on, or what needs them.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+      // The same renderer the morning post and the thread headers use. A
+      // board the model composed from query_incidents would be a fourth
+      // rendering of the same three fields, disagreeing with the other
+      // three in whatever way that run happened to phrase it.
+      run: () => Promise.resolve(boardOnRequest(db)),
+    },
   ];
 };
 
@@ -455,9 +425,10 @@ export const SLACK_AGENT_SYSTEM = [
   "You are read-only. You cannot merge, split, close, stop or restart anything, and you cannot take ownership. Do not claim otherwise and do not promise to do any of it. If someone wants to take an incident over, tell them to say so as a reply in that incident's thread, which is where ownership actually changes.",
   "",
   "Your tools:",
-  "- get_incident: one incident in full, with its signals and relayed human replies, and threadPermalink for its Slack thread.",
-  "- query_incidents: one read-only SQL SELECT against the incident database. Select slackThreadTs and each incident row comes back with a threadPermalink.",
+  "- get_incident: one incident in full, with its signals and relayed human replies.",
+  "- query_incidents: one read-only SQL SELECT against the incident database.",
   "- read_agent_session: the tail of an incident agent's transcript, for what it tried and ruled out, plus what the run has spent.",
+  "- incident_board: every open incident as one line each, already formatted. Paste it in verbatim when somebody asks what is open.",
   "- search_incidents: text search over the post-mortems and root causes of incidents that are already over. Plain words describing the failure -- the mechanism, the component, the error text -- not a question and not SQL. \"0 matches\" means nothing that ended reads like this, which is an answer; an error means the search did not run, which is not the same thing and is never reported as nothing found.",
   "",
   "Which tool you reach for is what decides whether you answer at all. A question about more than one incident is a query_incidents question. A question about one incident in depth is a get_incident question. \"Has this happened before?\" is a search_incidents question: the same cause comes back through a different alert, so an id or an alert name finds nothing and the words for the failure find it. Reading incidents one at a time to answer a question about all of them spends the whole run on reading, and a run spent reading is a question nobody gets an answer to.",
@@ -481,10 +452,7 @@ export const SLACK_AGENT_SYSTEM = [
   "- Do not escape &, < or > yourself. That is done for you, so typing &amp; posts a literal &amp;.",
   "- Never write <!here>, <!channel> or <!subteam^ID>. Who gets paged is the Boss's decision, and from you they post as literal text.",
   "",
-  "Linking incidents. Every incident you name that is not the one whose thread you are standing in gets a link to its thread, written <permalink|incident 4>. Somebody reading this somewhere else has no other way to reach it: the alternative is scrolling the channel hunting for it.",
-  "- The link is the threadPermalink the tools handed you. Never assemble a Slack URL yourself and never reuse one from memory.",
-  "- A null threadPermalink means no link. Most often that is because you are already in that incident's thread, where it is \"this incident\" and a link to where you already are is noise. It can also mean the incident has no thread, or that the link could not be built.",
-  "- A link is a convenience. A missing one is never a reason to leave an incident out of your answer or to hedge about it; write the bare reference and carry on.",
+  "Naming incidents. Write \"incident 4\" in plain prose. It is capitalised and linked to its thread for you, on the way out, every time -- including inside a board you pasted. Do not build a link yourself, do not paste a Slack URL, and do not skip naming an incident because you are unsure whether it can be linked.",
   "",
   "Somebody on the rotation asking what needs them is the commonest question here, and it has a shape. Lead with how many incidents are open, so they know the size of it, then three parts in this order:",
   "- What is blocked on a person, and what that person has to do. This is the whole reason they asked. An incident owned by a human is on this list, and so is one whose agent is waiting on an unanswered question.",
@@ -630,16 +598,7 @@ export class SlackAgent {
       const missed =
         fresh || !prior ? [] : await this.missedMessages(mention, prior.lastSeenTs);
 
-      // Rebuilt per mention because whether an incident earns a link depends
-      // on which thread this answer is being written into. Only the closures
-      // move: name, description and schema are literals, so the bytes the
-      // session prefix is bound to are the same on every build.
-      const tools = buildTools({
-        db: this.db,
-        store: this.store,
-        linker: this.slack,
-        threadTs: mention.threadTs,
-      });
+      const tools = buildTools({ db: this.db, store: this.store });
 
       const { text, usage } = await this.model.run({
         system: SLACK_AGENT_SYSTEM,

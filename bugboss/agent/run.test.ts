@@ -172,7 +172,7 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
 // Four transitions, not five: `escalate` sits in this list but writes no
 // state. It says the incident needs a person and leaves the agent driving,
 // which is why it is named for what it does rather than for what it moves.
-test("the boss tools are the four transitions, escalate, park and the two reads", async () => {
+test("the boss tools are the four transitions, the title, escalate, park and the two reads", async () => {
   const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
 
   assert.deepEqual(
@@ -186,6 +186,7 @@ test("the boss tools are the four transitions, escalate, park and the two reads"
       "report_resolved",
       "report_root_cause",
       "search_incidents",
+      "set_summary",
     ],
   );
   assert.ok(!tools.some((tool) => BUILTIN_TOOLS.includes(tool.name)));

@@ -52,6 +52,7 @@ import {
   escape,
   link,
   mrkdwn,
+  overSummaryBudget,
   overThreadBudget,
   raw,
   splitForSlack,
@@ -154,6 +155,21 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    */
   const MAX_PRIOR_POSTMORTEM_CHARS = 6000;
 
+  const toPriorIncident = (prior: Incident): PriorIncident => ({
+    id: prior.id,
+    status: prior.status,
+    summary: prior.summary,
+    rootCause: prior.rootCause,
+    prUrls: prior.prUrls,
+    resolvedEvidence: prior.resolvedEvidence,
+    postmortem:
+      prior.postmortem && prior.postmortem.length > MAX_PRIOR_POSTMORTEM_CHARS
+        ? `${prior.postmortem.slice(0, MAX_PRIOR_POSTMORTEM_CHARS)}...[truncated; the full text is in the incident database]`
+        : prior.postmortem,
+    resolvedAt: prior.resolvedAt,
+    closedAt: prior.closedAt,
+  });
+
   const readPriorIncident = (id: string | null): PriorIncident | null => {
     if (!id) return null;
     const prior = readIncident(id);
@@ -166,20 +182,24 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       });
       return null;
     }
-    return {
-      id: prior.id,
-      status: prior.status,
-      rootCause: prior.rootCause,
-      prUrls: prior.prUrls,
-      resolvedEvidence: prior.resolvedEvidence,
-      postmortem:
-        prior.postmortem && prior.postmortem.length > MAX_PRIOR_POSTMORTEM_CHARS
-          ? `${prior.postmortem.slice(0, MAX_PRIOR_POSTMORTEM_CHARS)}...[truncated; the full text is in the incident database]`
-          : prior.postmortem,
-      resolvedAt: prior.resolvedAt,
-      closedAt: prior.closedAt,
-    };
+    return toPriorIncident(prior);
   };
+
+  /**
+   * The incidents merged into this one, newest first.
+   *
+   * Read off `mergedInto` rather than remembered from the merge, so it is
+   * the same answer after a restart and after a merge this process never
+   * saw. No alarm on an empty result: almost every incident has absorbed
+   * nothing, which is not a fault.
+   */
+  const readAbsorbed = (incidentId: string): PriorIncident[] =>
+    db
+      .query<IncidentRow>(
+        "SELECT * FROM incident WHERE mergedInto = ? ORDER BY CAST(id AS INTEGER) DESC",
+        [incidentId],
+      )
+      .map((row) => toPriorIncident(rowToIncident(row)));
 
   /** Strips triage's spend, which the agent has no use for. See SignalView. */
   const toSignalView = ({
@@ -716,6 +736,57 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       };
     });
 
+  /**
+   * The few-word title, rewritten.
+   *
+   * Callable at any status an agent is still on, including INVESTIGATING
+   * before there is any conclusion at all -- an incident with no title is
+   * the state this exists to remove, so the first call must not have to wait
+   * for a root cause.
+   *
+   * Nothing is announced. A title changing is not news: the thread's header
+   * picks it up on the next sweep, which is where somebody reads it, and a
+   * message every time an agent sharpens four words would be the noise that
+   * gets the channel muted. The transitions that *are* news already post.
+   */
+  const setSummary: ToolApi["setSummary"] = (args) =>
+    call("setSummary", async (incidentId) => {
+      const incident = readIncident(incidentId);
+      if (!incident) return reject(`unknown incident: ${incidentId}`);
+
+      const stop = blocked(
+        incident,
+        ["INVESTIGATING", "FIXING", "RESOLVED"],
+        "setSummary",
+      );
+      if (stop) return reject(stop);
+
+      // Collapsed before it is measured, because a title is one line by
+      // definition and a newline inside one breaks every row of the board
+      // it is about to appear in.
+      const summary = args.summary.replace(/\s+/g, " ").trim();
+      if (!summary) {
+        return reject(
+          "The summary is empty. Say what is broken and who it is broken for, in a few words.",
+        );
+      }
+      const tooLong = overSummaryBudget(summary);
+      if (tooLong) return reject(tooLong);
+
+      const applied = await db.withWrite(
+        (w) =>
+          w
+            .prepare(
+              `UPDATE incident SET summary = ?
+               WHERE id = ? AND status IN ('INVESTIGATING','FIXING','RESOLVED')`,
+            )
+            .run(summary, incidentId).changes,
+      );
+      if (applied === 0) return raced(incidentId, "setSummary");
+
+      return { ok: true, data: { incidentId, summary } };
+    });
+
   const reportImpact: ToolApi["reportImpact"] = (args) =>
     call("reportImpact", async (incidentId) => {
       const incident = readIncident(incidentId);
@@ -1046,6 +1117,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           signals: readSignals(incidentId).map(toSignalView),
           evidence: loaded,
           priorIncident: readPriorIncident(incident.recurrenceOf),
+          absorbed: readAbsorbed(incidentId),
         },
       };
     });
@@ -1083,6 +1155,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
   return {
     reportRootCause,
+    setSummary,
     reportImpact,
     reportResolved,
     reportAnalysis,

@@ -67,7 +67,13 @@ import {
   createSlackClient,
   createSlackFileUploader,
   type SlackLinker,
+  type SlackUpdater,
 } from "./slack/client";
+import {
+  createIncidentReferences,
+  withIncidentReferences,
+} from "./slack/incidents";
+import { boardOnRequest, sweepBoard } from "./board";
 import {
   SlackRelay,
   mentionPrefix,
@@ -352,6 +358,8 @@ export interface BugBoss {
   ensureIncidentThreads(): Promise<number>;
   /** Post the closing report for any incident that closed without one. */
   sweepReports(): Promise<number>;
+  /** One pass of the status board: headers, the morning post, the all-clear. */
+  sweepBoard(): Promise<unknown>;
   start(): void;
   stop(): void;
 }
@@ -691,7 +699,10 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
  * Everything the Boss needs from Slack: posts, buttons, thread reads, and the
  * permalink a merged or split incident links the other thread by.
  */
-export type BossSlackClient = SlackClient & ChoicePoster & SlackLinker;
+export type BossSlackClient = SlackClient &
+  ChoicePoster &
+  SlackLinker &
+  SlackUpdater;
 
 export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
   post: (threadTs, text, channel) =>
@@ -700,6 +711,8 @@ export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
   postChoice: (threadTs, text, blocks) =>
     withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
+  update: (channel, ts, text) =>
+    withDeadline(slack.update(channel, ts, text), "chat.update"),
   permalink: (messageTs, channel) =>
     withDeadline(slack.permalink(messageTs, channel), "chat.getPermalink"),
   replies: (args) => withDeadline(slack.replies(args), "conversations.replies"),
@@ -730,7 +743,7 @@ export const createBugBoss = async (
 
   // Everything here talks to Slack through this, so no single stalled post
   // can hold the placement loop, the tool API or a resolution tick.
-  const slack = withSlackDeadline(options.slack);
+  const deadlined = withSlackDeadline(options.slack);
 
   const s3 = options.s3 ?? createMemoryS3();
   const db = await Db.open({
@@ -740,6 +753,38 @@ export const createBugBoss = async (
     s3,
   });
   const store = createS3ObjectStore(config.s3Bucket, s3);
+
+  /**
+   * Every outbound message, with its incident references capitalised and
+   * linked, on the way to Slack.
+   *
+   * Wrapped here rather than at each composer because there is no single
+   * place above this where BugBoss composes text: the relay, the Slack
+   * agent, the tool API, the merge announcements, the closing report and
+   * three call sites in this file each build their own. A pass on some of
+   * them would be the same inconsistency with a new cause.
+   *
+   * It goes outside the deadline wrapper, so a permalink lookup it makes is
+   * itself bounded and never eats the budget of the post it is preparing.
+   */
+  const slack = withIncidentReferences(
+    deadlined,
+    createIncidentReferences({
+      threads: {
+        incidentForThread: (threadTs) =>
+          db.get<{ id: string }>(
+            "SELECT id FROM incident WHERE slackThreadTs = ?",
+            [threadTs],
+          )?.id ?? null,
+        threadOf: (incidentId) =>
+          db.get<{ slackThreadTs: string | null }>(
+            "SELECT slackThreadTs FROM incident WHERE id = ?",
+            [incidentId],
+          )?.slackThreadTs ?? null,
+      },
+      permalink: (messageTs) => deadlined.permalink(messageTs),
+    }),
+  );
 
   // The search index is derived state, so it is rebuilt from the incidents
   // rather than migrated. That is what makes a corpus older than the table
@@ -1701,6 +1746,31 @@ export const createBugBoss = async (
 
   const sweepReports = (): Promise<number> => publishPendingReports(reportDeps);
 
+  /**
+   * The status board: every thread's header, the morning post and the
+   * all-clear.
+   *
+   * Runs off the tick that already runs rather than a schedule of its own.
+   * Every merge to ops `main` restarts this container, so an in-memory
+   * "next fire at 07:00" either fires twice or is skipped depending on when
+   * a deploy lands. Everything this needs to remember is a row in SQLite --
+   * see `board/index.ts`.
+   *
+   * Not run at startup, unlike its three neighbours. Those exist to catch
+   * work a restart interrupted; this one only looks at the world, and at
+   * boot the world is still being put back together -- the orphan and thread
+   * sweeps are running, so a board read now is a board about to change. It
+   * waits one tick.
+   */
+  const sweepTheBoard = (): Promise<unknown> =>
+    sweepBoard({
+      db,
+      post: (text) => slack.post(null, text, config.slackChannelId),
+      update: (channel, ts, text) => slack.update(channel, ts, text),
+      channel: config.slackChannelId,
+      now,
+    });
+
   const dispatcher = createDispatcher({
     db,
     config: config.dispatcher,
@@ -2131,6 +2201,9 @@ export const createBugBoss = async (
     resolutionTimer = setInterval(() => {
       background("orphan_sweep", sweepOrphans);
       background("thread_sweep", ensureIncidentThreads);
+      // After the thread sweep, so an incident whose thread was opened on
+      // this tick can carry a header on it rather than waiting for the next.
+      background("board_sweep", sweepTheBoard);
       // Nothing relaunches an agent on a CLOSED incident, so a container
       // replaced between the close and its report is the one case where the
       // report has no other way out.
@@ -2168,6 +2241,7 @@ export const createBugBoss = async (
     sweepOrphans,
     ensureIncidentThreads,
     sweepReports,
+    sweepBoard: sweepTheBoard,
     start,
     stop,
   };

@@ -75,6 +75,15 @@ export interface Incident {
   status: IncidentStatus;
   slackThreadTs: string | null;
 
+  /**
+   * What this incident is, in a few words, kept current by the agent.
+   *
+   * The only field that says what the incident *is* rather than what was
+   * concluded about it. Null until an agent writes one, which is what the
+   * first-signal title falls back to.
+   */
+  summary: string | null;
+
   rootCause: string | null;
   prUrls: string[];
   postmortem: string | null;
@@ -232,7 +241,23 @@ export interface ToolResponse<T = unknown> {
 export type Directive =
   | { type: "stop"; reason: string }
   | { type: "merged"; into: string }
-  | { type: "new_signals"; count: number; summary: string }
+  /**
+   * Signals landed on this incident that its agent did not put there.
+   * `summary` is the reason the move was made.
+   *
+   * `absorbed` names the incidents that were emptied into this one, when
+   * that is how the signals arrived. Without it a merge reaches the
+   * surviving agent as an unexplained pile of new signals, and the agent is
+   * then expected to write an honest title for an incident it never saw.
+   * The incidents it names arrive in full on the next `getIncident`, as
+   * `absorbed` on the view.
+   */
+  | {
+      type: "new_signals";
+      count: number;
+      summary: string;
+      absorbed?: string[];
+    }
   /**
    * Something a person said in the incident thread. `addressed` is whether it
    * was for the agent: `contact_human` ends its wait on a reply that was, and
@@ -268,6 +293,15 @@ export interface ToolApi {
      */
     impactStartedAt?: number;
   }): Promise<ToolResponse>;
+
+  /**
+   * What this incident is, in a few words. Callable at any time and at any
+   * status, including before there is a root cause.
+   *
+   * Refused rather than truncated past `SUMMARY_CHARS`: a title cut at
+   * eighty characters reads as a complete thought that happens to be wrong.
+   */
+  setSummary(args: { summary: string }): Promise<ToolResponse>;
 
   /** Callable repeatedly. Impact grows during an incident. */
   reportImpact(args: {
@@ -356,6 +390,8 @@ export interface ToolApi {
 export interface PriorIncident {
   id: string;
   status: IncidentStatus;
+  /** Its few-word title, which is the fastest way to know what it was. */
+  summary: string | null;
   rootCause: string | null;
   prUrls: string[];
   /** What the earlier agent claimed it watched stop happening. */
@@ -421,6 +457,17 @@ export interface IncidentView {
   evidence: Evidence[];
   /** Non-null only when this incident reopens ground that one claimed. */
   priorIncident: PriorIncident | null;
+  /**
+   * Incidents that were merged into this one, most recent first. Empty for
+   * almost every incident.
+   *
+   * The same shape and the same reason as `priorIncident`: somebody else
+   * already investigated part of what is now this incident's problem, and
+   * their conclusions are the most valuable thing this agent can start from.
+   * An agent asked to keep a title current for an incident that absorbed
+   * another one cannot do it honestly without having read the other one.
+   */
+  absorbed: PriorIncident[];
 }
 
 // ---------------------------------------------------------------------------

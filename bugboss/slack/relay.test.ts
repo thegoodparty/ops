@@ -117,6 +117,7 @@ beforeEach(async () => {
     d.prepare("DELETE FROM thread_reply").run();
     d.prepare("DELETE FROM incident_wait").run();
     d.prepare("DELETE FROM signal").run();
+    d.prepare("DELETE FROM incident_thread").run();
     d.prepare("DELETE FROM incident").run();
   });
   slack = fakeSlack();

@@ -69,6 +69,13 @@ const BODIES = {
     impactQuery: z.string().optional(),
     impactStartedAt: z.number().int().positive().optional(),
   }),
+  // Length is not checked here. The tool API refuses an over-long summary
+  // with a sentence the model can act on; a zod max would come back as
+  // "String must contain at most 80 character(s)", which names no field and
+  // says nothing about what to do instead.
+  summary: z.object({
+    summary: z.string().min(1),
+  }),
   impact: z.object({
     usersImpacted: z.number(),
     query: z.string().min(1),
@@ -214,6 +221,11 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   app.post(
     "/incidents/:id/root-cause",
     tool(BODIES.rootCause, (api, body) => api.reportRootCause(body)),
+  );
+
+  app.post(
+    "/incidents/:id/summary",
+    tool(BODIES.summary, (api, body) => api.setSummary(body)),
   );
 
   app.post(

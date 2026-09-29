@@ -66,6 +66,21 @@ export interface SlackLinker {
 }
 
 /**
+ * Rewrite a message already posted. The only thing BugBoss edits is an
+ * incident thread's top-level message, which carries the header saying where
+ * that incident is and what it is.
+ *
+ * An edit is silent: Slack marks the message "(edited)" and notifies nobody,
+ * including the people already in the thread. That is exactly right for a
+ * header somebody re-reads and exactly wrong as a way to tell anyone
+ * anything, so a change worth knowing about still posts in the thread as
+ * well. Nothing here is the announcement.
+ */
+export interface SlackUpdater {
+  update(channel: string, ts: string, text: string): Promise<void>;
+}
+
+/**
  * The shape of an answer that can teach us the rest: a workspace, a channel
  * and a timestamp. Only the first is unknowable from here.
  *
@@ -140,7 +155,7 @@ export const createCachingLinker = (
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
-): SlackClient & ChoicePoster & SlackLinker => {
+): SlackClient & ChoicePoster & SlackLinker & SlackUpdater => {
   // The SDK defaults to ten retries over about thirty minutes and does not
   // reject a rate-limited call, so a 429 parks the caller inside the SDK with
   // nothing thrown and nothing logged. Posts are off the ingest request now,
@@ -193,6 +208,15 @@ export const createSlackClient = (
       });
       if (!res.ts) throw new Error("chat.postMessage returned no ts");
       return { ts: res.ts };
+    },
+    // `text` replaces the whole message, so the caller passes the header and
+    // the original body together. There is no partial edit and no append.
+    update: async (channel, ts, text) => {
+      await web.chat.update({
+        channel,
+        ts,
+        text,
+      });
     },
     permalink: linker.permalink,
     replies: async ({ channel, threadTs, oldest }) => {
