@@ -17,6 +17,7 @@ on:
     paths:
       - "deploy/**"
       - "deploy-org/**"
+      - "deploy-workbench/**"
       - "delegate/**"
       - "package.json"
       - "package-lock.json"
@@ -134,6 +135,16 @@ jobs:
             }
             if (any(/^deploy-org\//) || any(shared)) {
               matrix.push({ project: "org", dir: "deploy-org", build: false });
+            }
+            // No `dist/lambda` archive here, so no `npm run build`; the
+            // preview compiles the program through ts-node with the deps
+            // `npm ci` installed.
+            if (any(/^deploy-workbench\//) || any(shared)) {
+              matrix.push({
+                project: "workbench",
+                dir: "deploy-workbench",
+                build: false,
+              });
             }
             core.setOutput("value", JSON.stringify(matrix));
 
