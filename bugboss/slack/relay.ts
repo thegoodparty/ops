@@ -151,10 +151,12 @@ export const renderEvent = (event: RelayEvent): string => {
         mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"} · an agent is investigating · nobody is being paged_`,
       ].join("\n");
     case "merged":
+      // Both references name the word "incident", which is what the outbound
+      // pass keys off to render them as links. A bare id is a number.
       return [
-        mrkdwn`*Incident ${event.incidentId} merged into ${event.into}*`,
+        mrkdwn`*Incident ${event.incidentId} merged into incident ${event.into}*`,
         toMrkdwn(event.reason),
-        mrkdwn`_Follow ${event.into} from here._`,
+        mrkdwn`_Follow incident ${event.into} from here._`,
       ].join("\n");
     case "resolved":
       return [
@@ -340,7 +342,13 @@ export class SlackRelay {
       for (const part of parts.slice(1)) {
         await this.slack.post(ts, part, this.cfg.channelId);
       }
-      if ((await this.linkThread(event.incidentId, ts)) === "unwritable") {
+      const linked = await this.linkThread(event.incidentId, ts);
+      // Only once this post is the thread. A `lost` link means somebody else
+      // won the race and this is a loose message, so recording its text as
+      // the opening would later have the header sweep write it over the
+      // winner's -- chat.update replaces a message whole.
+      if (linked === "linked") await this.recordOpening(event.incidentId, parts[0]);
+      if (linked === "unwritable") {
         // The thread exists and nothing points at it, so the rest of this
         // incident will not land here. Said in the thread, which is where
         // anyone following this incident is looking.
@@ -382,6 +390,9 @@ export class SlackRelay {
       // Adopt this post as the thread. One recovered thread beats the loose
       // messages every later transition would otherwise add.
       const adopted = await this.linkThread(event.incidentId, ts);
+      // Recorded on the same terms as a normal open: whatever ends up being
+      // the thread's parent message is what a header has to sit above.
+      if (adopted === "linked") await this.recordOpening(event.incidentId, orphan[0]);
       log("posted_top_level", {
         incidentId: event.incidentId,
         type: event.type,
@@ -628,6 +639,34 @@ export class SlackRelay {
       [incidentId],
     );
     return row?.slackThreadTs ?? null;
+  }
+
+  /**
+   * Keep the text of the message that started this thread, so a header can
+   * later be put above it without reading it back off Slack.
+   *
+   * `INSERT OR IGNORE`: a re-emit that finds the thread already open never
+   * gets here, but a retry that raced one must not replace the opening with
+   * a later message. First write wins, like the thread link itself.
+   *
+   * Never fatal. The thread exists and the incident is running; what is lost
+   * is a header, and losing it loudly is better than losing the transition
+   * that was being announced.
+   */
+  private async recordOpening(incidentId: string, text: string): Promise<void> {
+    try {
+      await this.db.withWrite((d) => {
+        d.prepare(
+          "INSERT OR IGNORE INTO incident_thread (incidentId, opening) VALUES (?, ?)",
+        ).run(incidentId, text);
+      });
+    } catch (err) {
+      alarm("thread_opening_unrecorded", {
+        incidentId,
+        error: String(err),
+        note: "this incident's thread will carry no status header",
+      });
+    }
   }
 
   private async linkThread(

@@ -89,6 +89,36 @@ detect and it was never recomputed on absorb: incident 79 held a signal from
 the 27th and reported the 28th. Only a move *in* runs the recompute, so the
 value can only fall.
 
+## `set_summary` writes, and announces nothing
+
+The one transition-shaped call that is not a transition. It is callable at
+any status an agent is still on, including `INVESTIGATING` before there is
+any conclusion — an incident with no title is the state the field exists to
+remove, so the first call must not have to wait for a root cause.
+
+It says nothing in the thread. A title changing is not news: the thread's
+header picks it up on the next board sweep, which is where somebody reads it,
+and a message every time an agent sharpens four words is how a channel gets
+muted. The transitions that *are* news already post.
+
+Over `SUMMARY_CHARS` it is **refused**, with a sentence naming the field,
+both numbers and where the long version belongs — the same shape as
+`overThreadBudget`, and for the same reason. A title cut at eighty characters
+reads as a complete thought that happens to be wrong, and the thing that
+wrote it is a model that can be asked again.
+
+## An absorbed incident is readable
+
+`getIncident` carries `absorbed`: every incident with `mergedInto` pointing
+here, projected the same way `priorIncident` is. Read off the column rather
+than remembered from the merge, so it is the same answer after a restart and
+after a merge this process never saw.
+
+It exists because the surviving agent is asked to keep a title that is true
+of both halves, and for the half it never investigated the only honest source
+is what that agent concluded. The `new_signals` directive names the incidents
+by id; this is where the detail arrives.
+
 ## Guard in the statement
 
 Every transition here had a TOCTOU: read the incident, check it, then write

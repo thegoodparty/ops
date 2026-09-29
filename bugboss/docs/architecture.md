@@ -55,6 +55,14 @@ thread deletes the row, and that delete is deliberately upstream of anything
 that reads what the reply meant, so talking to an incident wakes it with no
 model in the path.
 
+`incident.summary` is the one field that says what the incident **is**,
+rather than what was concluded about it. The row carried `rootCause`,
+`postmortem` and `usersImpacted` and nothing else, so a thread's top-level
+message stayed whatever the first alert happened to say, forever: incident 79
+opened on a memory alert and became the Loki 429 explosion, and there was
+nowhere to write that down. The agent keeps it current as a goal, not on a
+trigger list, and it is refused past a few words rather than truncated.
+
 `RESOLVED` means no users are affected any more and no further alerts should
 occur, confirmed by evidence rather than asserted. That bar is what makes a
 post-resolution signal unambiguous evidence of a premature close.
@@ -333,6 +341,13 @@ There is no push channel and an agent is never addressable. Directives ride
 back on responses to calls the agent was already making — `stop`, `merged`,
 `new_signals`, `human_message`, `resumed_after`.
 
+`new_signals` names the incidents that were emptied into this one, when that
+is how the signals arrived. Without it a merge reaches the surviving agent as
+an unexplained pile of new signals, and that agent is then expected to keep an
+honest title for an incident it was never told about. What the absorbed
+incident had already found arrives on the next `get_incident`, as `absorbed`
+— the same shape and the same reasoning as `priorIncident` for a recurrence.
+
 ## Running omni's tests
 
 An agent that writes a fix it cannot run is proposing a change on reasoning
@@ -420,7 +435,8 @@ deleting is not the way back.
 | `dispatcher/` | Launch, deadlines, escalation, parking, the stale sweep, the circuit breaker |
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
 | `bedrock/` | The Pi provider over Bedrock `InvokeModel`, and the Boss's client on it |
-| `slack/` | Outbound relay, inbound intent, and the read-only Slack agent |
+| `slack/` | Outbound relay, inbound intent, the read-only Slack agent, and how outbound text is rendered |
+| `board/` | When the status board says anything: headers, the morning post, the all-clear |
 | `report/` | The closing report: assemble, render, publish once |
 | `http/` | Public routes and the loopback tool API |
 | `db/` | SQLite, and the S3 mirror |
@@ -430,6 +446,35 @@ deleting is not the way back.
 `types.ts` is the contract every module is built against. `model.ts` is the
 seam the Boss's own bounded calls are written against. `logging.ts` is the one
 place `alarm` and `log` are defined.
+
+## The status board
+
+Three fields — where the work is, what the incident is, and what is needed
+from a person — rendered once and shown at three scales: a header on each
+incident thread, a board somebody can ask for, and a board posted at 07:00
+Eastern on a morning when something is open. A fourth message, one-off, says
+the board is clear when the last open incident closes and stays closed.
+
+The fields are derived, not invented. "What is needed" is
+`incident_wait.waitingFor`, which already existed as *"what is being waited
+on, in one line, for the thread and the digest"*; an incident with no wait
+needs nothing, and saying that out loud is what makes the ones that do worth
+trusting. "Clear" is zero open incidents, full stop: an incident parked on a
+person for a week keeps the board non-empty, which is the point of a board.
+
+**None of it is scheduled.** There is no cron in this container and there
+must not be one — every merge to ops `main` restarts it, so an in-memory
+schedule fires twice or is skipped depending on deploy timing. The sweep
+rides the interval that already runs and remembers what it has done in
+`board_state`, as a date where a day is the unit. `board/CLAUDE.md` has the
+whole of it.
+
+Incident references in outbound text are rendered by the same principle:
+"Incident 4", capitalised, linked to its thread unless the reader is already
+in it. That was a prompt instruction and was therefore followed
+probabilistically; it is a pass wrapped around the Slack client now, so it
+reaches every surface rather than the ones somebody remembered.
+`slack/CLAUDE.md` has the seam and why it is where it is.
 
 ## Choices worth knowing
 

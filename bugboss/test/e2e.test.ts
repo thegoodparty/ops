@@ -159,6 +159,12 @@ const fakeSlack = {
     this.posts.push({ threadTs, text });
     return Promise.resolve({ ts: `ts-${this.posts.length}` });
   },
+  /** Edits, keyed by the message they rewrote. The board's headers land here. */
+  edits: [] as { channel: string; ts: string; text: string }[],
+  update(channel: string, ts: string, text: string) {
+    this.edits.push({ channel, ts, text });
+    return Promise.resolve();
+  },
   /** The Slack agent reads a thread on resume. Nothing here ever mentions it. */
   replies() {
     return Promise.resolve([]);
@@ -1058,6 +1064,7 @@ test("a Slack call that never answers is bounded, not silently queued", async ()
       post: () => new Promise(() => {}),
       react: () => new Promise(() => {}),
       postChoice: () => new Promise(() => {}),
+      update: () => new Promise(() => {}),
       permalink: () => new Promise(() => {}),
       replies: () => new Promise(() => {}),
     });
@@ -1736,7 +1743,7 @@ test("a person asking for a merge in a thread gets the merge, not a refusal", as
   const said = fakeSlack.posts.slice(before);
   assert.ok(
     said.some(
-      (p) => p.threadTs === threadOf(newer) && /Done -- incident/.test(p.text),
+      (p) => p.threadTs === threadOf(newer) && /Done -- .*is now part of/.test(p.text),
     ),
     "the person who asked is answered in the thread they asked in",
   );
@@ -1791,7 +1798,7 @@ test("the established incident survives even when the person asks the other way"
     said.some(
       (p) =>
         p.threadTs === threadOf(older) &&
-        /Done -- incident .* is now part of incident/.test(p.text),
+        /Done -- .*is now part of/.test(p.text),
     ),
     "the person who asked is answered in the thread they asked in",
   );
@@ -1912,7 +1919,7 @@ test("a combine is refused when the thread's own incident closed while it was be
     fakeSlack.posts
       .slice(before)
       .some((p) =>
-        new RegExp(`incident ${newer} is CLOSED and is not taking signals`).test(
+        new RegExp(`${newer}.{0,40}is CLOSED and is not taking signals`).test(
           p.text,
         ),
       ),
@@ -1957,8 +1964,7 @@ test("the same ask typed at the bot outside a thread does the same thing", async
   assert.ok(
     said.some(
       (p) =>
-        p.threadTs === "2100.1" &&
-        /Done -- incident .* is now part of incident/.test(p.text),
+        p.threadTs === "2100.1" && /Done -- .*is now part of/.test(p.text),
     ),
     "they are answered under the message they typed, which is where they are looking",
   );
@@ -3180,4 +3186,159 @@ test("a request that spent input and produced no output is still costed", async 
     modelCalls: 1,
     modelId: SONNET,
   });
+});
+
+// --- the status board ------------------------------------------------------
+
+/**
+ * The complaint this answers: BugBoss linked incidents inconsistently,
+ * because linking was a line in a system prompt and a prompt instruction is
+ * followed probabilistically. It is a pass over outbound text now, wrapped
+ * around the Slack client itself, so it reaches every surface -- including
+ * the ones that never went near `postProse`.
+ */
+test("an incident named in another incident's thread is capitalised and linked", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "one" });
+  await boss.ingest("grafana", grafanaBody("fp-brd-1", "board-one-errors"));
+  const one = incidentOf("fp-brd-1")!;
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "two" });
+  await boss.ingest("grafana", grafanaBody("fp-brd-2", "board-two-errors"));
+  const two = incidentOf("fp-brd-2")!;
+
+  const before = fakeSlack.posts.length;
+  // The relay is one of the composers that never goes through postProse: it
+  // splits and posts for itself. So this is the seam being proved, not the
+  // renderer.
+  await boss.relay.emit({
+    type: "merged",
+    incidentId: two,
+    into: one,
+    reason: "same cause",
+  });
+
+  const said = fakeSlack.posts.slice(before).map((p) => p.text).join("\n");
+  assert.match(
+    said,
+    new RegExp(`<https://[^|]+\\\\|Incident ${one}>`),
+    "the incident that is not this thread's is a link",
+  );
+  assert.ok(
+    !new RegExp(`<https://[^|]+\\\\|Incident ${two}>`).test(said),
+    `the thread's own incident is never linked to itself: ${said}`,
+  );
+  assert.ok(!/\bincident \d/.test(said), `never lower case: ${said}`);
+});
+
+/**
+ * Sweep until the headers stop changing. One sweep rewrites at most
+ * `MAX_HEADER_UPDATES_PER_TICK` of them, deliberately -- `chat.update` is
+ * Tier 3 and a burst of stale headers has to spread across ticks -- and this
+ * file has accumulated a channel's worth of incidents by now.
+ */
+const drainBoard = async () => {
+  for (let i = 0; i < 20; i++) {
+    const before = fakeSlack.edits.length;
+    await boss.sweepBoard();
+    if (fakeSlack.edits.length === before) return;
+  }
+  assert.fail("headers never settled");
+};
+
+test("a thread carries a header above the message that opened it", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "header" });
+  const before = fakeSlack.posts.length;
+  await boss.ingest("grafana", grafanaBody("fp-brd-3", "board-header-errors"));
+  const incidentId = incidentOf("fp-brd-3")!;
+  const threadTs = threadOf(incidentId)!;
+  const opening = fakeSlack.posts
+    .slice(before)
+    .find((p) => p.threadTs === null)!;
+
+  // Settle whatever this file has accumulated, then make one change and
+  // watch exactly that reach the thread.
+  await drainBoard();
+  fakeSlack.edits.length = 0;
+  await boss.toolApiFor(incidentId).setSummary({
+    summary: "Board header errors on the briefings route",
+  });
+  await drainBoard();
+
+  const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
+  assert.ok(edit, JSON.stringify(fakeSlack.edits));
+  assert.match(edit.text, /Board header errors on the briefings route/);
+  assert.match(edit.text, /Investigating/);
+  // Swain's constraint: nothing is removed from the original message except
+  // the status and the title, both of which are added above it.
+  assert.ok(edit.text.endsWith(opening.text), edit.text);
+  assert.match(opening.text, /board-header-errors/, "which is the alert text");
+});
+
+test("the header follows the incident and is not rewritten when it has not moved", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "moves" });
+  await boss.ingest("grafana", grafanaBody("fp-brd-4", "board-moves-errors"));
+  const incidentId = incidentOf("fp-brd-4")!;
+  const threadTs = threadOf(incidentId)!;
+  await drainBoard();
+
+  fakeSlack.edits.length = 0;
+  await boss.sweepBoard();
+  assert.deepEqual(
+    fakeSlack.edits.filter((e) => e.ts === threadTs),
+    [],
+    "an unchanged header is not an edit",
+  );
+
+  const signal = boss.db.get<{ id: string }>(
+    "SELECT id FROM signal WHERE sourceId = 'fp-brd-4'",
+  )!;
+  await boss.toolApiFor(incidentId).reportRootCause({
+    cause: "the pool is saturated",
+    explainedSignalIds: [signal.id],
+  });
+  await drainBoard();
+
+  const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
+  assert.ok(edit, "a status change reaches the header");
+  assert.match(edit.text, /Fixing/);
+});
+
+/**
+ * There is no scheduler in BugBoss and there must not be one: every merge to
+ * ops `main` restarts this container, so an in-memory schedule fires twice
+ * or is skipped depending on when a deploy lands. The board therefore rides
+ * the loop that already runs -- and a feature that rides a loop it was never
+ * actually attached to is a feature that never runs at all, silently.
+ */
+test("the board runs off the tick, not off a schedule of its own", async () => {
+  const own = mkdtempSync(join(tmpdir(), "bugboss-tick-"));
+  const ticking = await createBugBoss({
+    config: { ...config(join(own, "tick.db")), s3Bucket: "bugboss-tick-test" },
+    model: fakeModel,
+    slack: fakeSlack,
+    spawnAgent: fakeAgent,
+    slackAgentModel: fakeSlackAgent,
+    fileUploader: fakeUploader,
+    // Ephemeral ports: this boss is started for real, which is the point.
+    http: { publicPort: 0, loopbackPort: 0 },
+    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
+  });
+  const state = () =>
+    ticking.db.get<{ id: number }>("SELECT id FROM board_state WHERE id = 1");
+
+  mock.timers.enable({ apis: ["setInterval"] });
+  try {
+    ticking.start();
+    assert.equal(state(), undefined, "nothing has swept yet");
+
+    mock.timers.tick(30_000);
+    // The sweeps are launched, not awaited, by the interval body.
+    for (let i = 0; i < 50 && !state(); i++) await Promise.resolve();
+
+    assert.ok(state(), "one tick of the existing loop is what runs the board");
+  } finally {
+    mock.timers.reset();
+    ticking.stop();
+    rmSync(own, { recursive: true, force: true });
+  }
 });

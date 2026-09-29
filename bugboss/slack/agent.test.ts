@@ -170,6 +170,7 @@ beforeEach(async () => {
   await db.withWrite((d) => {
     d.prepare("DELETE FROM thread_reply").run();
     d.prepare("DELETE FROM signal").run();
+    d.prepare("DELETE FROM incident_thread").run();
     d.prepare("DELETE FROM incident").run();
     d.prepare(
       "INSERT INTO incident (id, status, firstSignalAt) VALUES ('inc-1','INVESTIGATING',1)",
@@ -197,7 +198,7 @@ describe("SQL access is read-only", () => {
 
   test("the tool refuses a write and leaves the row alone", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, query] = buildTools({ db, store });
     const out = await query.run({ sql: "DELETE FROM incident" });
 
     assert.match(out, /^Rejected: /);
@@ -211,7 +212,7 @@ describe("SQL access is read-only", () => {
   // shared guard accepts actually runs.
   test("a refusal carries the shared guard's reason in this surface's shape", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, query] = buildTools({ db, store });
 
     assert.equal(
       await query.run({ sql: "SELECT 1; DROP TABLE incident" }),
@@ -230,7 +231,7 @@ describe("SQL access is read-only", () => {
 
   test("a read the guard accepts runs, semicolon and quoted keywords included", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, query] = buildTools({ db, store });
 
     assert.match(await query.run({ sql: "SELECT id FROM incident;" }), /inc-1/);
     assert.equal(
@@ -252,7 +253,7 @@ describe("SQL access is read-only", () => {
     });
 
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, query] = buildTools({ db, store });
     const out = await query.run({ sql: "SELECT * FROM signal" });
 
     assert.equal(out.split("\n").length, MAX_SQL_ROWS + 1, "rows are capped");
@@ -271,7 +272,7 @@ describe("SQL access is read-only", () => {
 describe("search_incidents on the Slack agent", () => {
   const searchTool = () => {
     const { store } = memoryStore();
-    const tool = buildTools({ db, store, linker: fakeLinker, threadTs: null }).find(
+    const tool = buildTools({ db, store }).find(
       (t) => t.name === "search_incidents",
     );
     assert.ok(tool, "the Slack agent can reach the search triage has");
@@ -350,7 +351,7 @@ describe("prefix binding", () => {
   test("the tool specs are byte-identical across builds and database states", async () => {
     const specs = () =>
       JSON.stringify(
-        buildTools({ db, store: memoryStore().store, linker: fakeLinker, threadTs: null }).map(
+        buildTools({ db, store: memoryStore().store }).map(
           ({ name, description, inputSchema }) => ({ name, description, inputSchema }),
         ),
       );
@@ -364,8 +365,14 @@ describe("prefix binding", () => {
 
     assert.equal(specs(), before);
     assert.deepEqual(
-      buildTools({ db, store: memoryStore().store, linker: fakeLinker, threadTs: null }).map((t) => t.name),
-      ["get_incident", "query_incidents", "read_agent_session", "search_incidents"],
+      buildTools({ db, store: memoryStore().store }).map((t) => t.name),
+      [
+        "get_incident",
+        "query_incidents",
+        "read_agent_session",
+        "search_incidents",
+        "incident_board",
+      ],
       "order is part of the prefix",
     );
   });
@@ -720,7 +727,7 @@ describe("reading another agent's session", () => {
       "sessions/incident/inc-1/session.jsonl",
       ["{\"role\":\"user\"}", "{\"role\":\"assistant\"}", "{\"role\":\"tool\"}"].join("\n"),
     );
-    const [, , read] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, , read] = buildTools({ db, store });
 
     const out = await read.run({ incidentId: "inc-1", tailLines: 2 });
     assert.match(out, /3 entries, last 2/);
@@ -729,7 +736,7 @@ describe("reading another agent's session", () => {
 
   test("a missing session says so rather than inventing one", async () => {
     const { store } = memoryStore();
-    const [, , read] = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const [, , read] = buildTools({ db, store });
     const out = await read.run({ incidentId: "inc-404" });
     assert.match(out, /No session under sessions\/incident\/inc-404\//);
   });
@@ -737,7 +744,19 @@ describe("reading another agent's session", () => {
 
 // ---------------------------------------------------------------------------
 
-describe("an incident named outside its own thread is linkable", () => {
+/**
+ * Linking used to live here: the tools handed back a `threadPermalink` and
+ * the system prompt asked the model to write `<permalink|incident 4>` with
+ * it. A prompt instruction is followed probabilistically, so some answers
+ * linked and some did not and the casing wandered inside one message.
+ *
+ * Rendering is code now (`slack/incidents.ts`), running over every outbound
+ * message from every surface, and it is tested there and end to end. What is
+ * left here is the guard that the second mechanism does not come back: a
+ * model holding one way to link and the client holding another is the
+ * arrangement that produced the inconsistency.
+ */
+describe("the Slack agent hands back no links of its own", () => {
   const withThread = (id: string, threadTs: string) =>
     db.withWrite((d) => {
       d.prepare("UPDATE incident SET slackThreadTs = ? WHERE id = ?").run(
@@ -746,209 +765,40 @@ describe("an incident named outside its own thread is linkable", () => {
       );
     });
 
-  test("the model is handed the link when it is standing somewhere else", async () => {
+  test("get_incident reports the thread ts, never a url", async () => {
     await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "100.0",
-    });
+    const [get] = buildTools({ db, store: memoryStore().store });
 
     const out = await get.run({ incidentId: "inc-1" });
 
-    assert.match(
-      out,
-      new RegExp(`"threadPermalink": "${permalinkFor("400.0")}"`),
-      "a reader in another thread has no other way to reach it",
-    );
-  });
-
-  test("and denied it inside that incident's own thread", async () => {
-    await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "400.0",
-    });
-
-    const out = await get.run({ incidentId: "inc-1" });
-
-    // Withheld rather than merely discouraged: an instruction the model can
-    // forget is not what stops it linking to where the reader already is.
-    assert.match(out, /"threadPermalink": null/);
+    assert.match(out, /"slackThreadTs": "400.0"/, "the row is still whole");
+    assert.doesNotMatch(out, /threadPermalink/);
     assert.doesNotMatch(out, /goodparty\.slack\.com/);
   });
 
-  test("an incident with no thread yet has nothing to point at", async () => {
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "100.0",
-    });
-
-    const out = await get.run({ incidentId: "inc-1" });
-
-    assert.match(out, /"threadPermalink": null/);
-  });
-
-  test("a link Slack refuses costs the link, not the answer", async () => {
+  test("query_incidents does not decorate a row that names a thread", async () => {
     await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const [get] = buildTools({
-      db,
-      store,
-      linker: { permalink: () => Promise.reject(new Error("ratelimited")) },
-      threadTs: "100.0",
-    });
-
-    let out = "";
-    const lines = await captureLogs(async () => {
-      out = await get.run({ incidentId: "inc-1" });
-    });
-
-    assert.match(out, /"id": "inc-1"/, "the incident is still reported");
-    assert.match(out, /"threadPermalink": null/, "and the model writes it bare");
-    assert.ok(
-      lines.some((line) => line.includes('"permalink_failed"')),
-      "degrading is not swallowing",
-    );
-  });
-
-  test("a whole query's worth of incidents is one round trip", async () => {
-    await db.withWrite((d) => {
-      const stmt = d.prepare(
-        "INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 1, ?)",
-      );
-      for (let i = 2; i <= 6; i++) stmt.run(`inc-${i}`, `${i}00.0`);
-    });
-    const asked: string[] = [];
-    const { store } = memoryStore();
-    const [, query] = buildTools({
-      db,
-      store,
-      linker: {
-        permalink: (ts) => {
-          asked.push(ts);
-          return Promise.resolve(permalinkFor(ts));
-        },
-      },
-      threadTs: "100.0",
-    });
+    const [, query] = buildTools({ db, store: memoryStore().store });
 
     const out = await query.run({
-      sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL ORDER BY id",
+      sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL",
     });
 
-    for (let i = 2; i <= 6; i++) {
-      assert.match(out, new RegExp(`"threadPermalink":"${permalinkFor(`${i}00.0`)}"`));
-    }
-    assert.deepEqual(asked.length, 5, "the fake learns nothing; the real one asks once");
-  });
-
-  test("Slack going down partway does not turn fifty rows into fifty waits", async () => {
-    await db.withWrite((d) => {
-      const stmt = d.prepare(
-        "INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', 1, ?)",
-      );
-      for (let i = 2; i <= 6; i++) stmt.run(`inc-${i}`, `${i}00.0`);
-    });
-    let asked = 0;
-    const { store } = memoryStore();
-    const [, query] = buildTools({
-      db,
-      store,
-      linker: {
-        permalink: () => {
-          asked++;
-          return Promise.reject(new Error("ratelimited"));
-        },
-      },
-      threadTs: "100.0",
-    });
-
-    let out = "";
-    await captureLogs(async () => {
-      out = await query.run({
-        sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL ORDER BY id",
-      });
-    });
-
-    assert.equal(asked, 1, "it stops asking a Slack that just said no");
-    assert.equal(
-      out.split("\n").filter((l) => l.includes('"threadPermalink":null')).length,
-      5,
-      "and every row still comes back",
-    );
-  });
-
-  test("rows that are not incidents are left alone", async () => {
-    await db.withWrite((d) => {
-      d.prepare(
-        "INSERT INTO signal (id, source, sourceId, kind, title, body, openedAt) VALUES ('s-1','grafana','fp-1','alert','pool','b',1)",
-      ).run();
-    });
-    const { store } = memoryStore();
-    const [, query] = buildTools({
-      db,
-      store,
-      linker: fakeLinker,
-      threadTs: "100.0",
-    });
-
-    const out = await query.run({ sql: "SELECT id, title FROM signal" });
-
+    assert.match(out, /"inc-1"/);
     assert.doesNotMatch(out, /threadPermalink/);
   });
 
-  test("the thread the answer is written into is the one the tools are built for", async () => {
-    await withThread("inc-1", "400.0");
-    const { store } = memoryStore();
-    const posts: string[] = [];
-    const agent = new SlackAgent({
-      db,
-      store,
-      slack: {
-        ...fakeLinker,
-        post: (_threadTs, text) => {
-          posts.push(text);
-          return Promise.resolve({ ts: "x" });
-        },
-        replies: () => Promise.resolve([]),
-      },
-      // Standing in for the model doing what it is told: look the incident up
-      // and say what came back.
-      model: {
-        run: async (req) => ({
-          text: await req.tools[0].run({ incidentId: "inc-1" }),
-          usage: emptyModelUsage(),
-        }),
-      },
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
-    });
-
-    await agent.handle(mention({ threadTs: "999.0", ts: "999.1" }));
-    assert.ok(
-      posts.join("").includes(permalinkFor("400.0")),
-      "asked about incident 1 from another thread, it has the link",
-    );
-
-    posts.length = 0;
-    await agent.handle(mention({ threadTs: "400.0", ts: "400.1" }));
-    assert.ok(
-      !posts.join("").includes(permalinkFor("400.0")),
-      "asked in incident 1's own thread, it has nothing to self-link with",
-    );
-  });
-
-  test("the prompt still tells the model to link", () => {
-    assert.match(SLACK_AGENT_SYSTEM, /threadPermalink/);
-    assert.match(SLACK_AGENT_SYSTEM, /<permalink\|incident 4>/);
+  /**
+   * The instruction that used to live here is what this change removed. It
+   * asked the model to write `<permalink|incident 4>` itself, and putting it
+   * back would not merely be redundant: an assembled link and a rendered one
+   * would nest.
+   */
+  test("the prompt no longer asks the model to build links itself", () => {
+    assert.doesNotMatch(SLACK_AGENT_SYSTEM, /<permalink\|/);
+    assert.doesNotMatch(SLACK_AGENT_SYSTEM, /assemble a Slack URL/);
+    assert.doesNotMatch(SLACK_AGENT_SYSTEM, /threadPermalink/);
+    assert.match(SLACK_AGENT_SYSTEM, /capitalised and linked to its thread for you/);
   });
 });
 
@@ -1435,7 +1285,7 @@ describe("read_agent_session", () => {
   const readSession = async (lines: string[]) => {
     const { store, objects } = memoryStore();
     objects.set(sessionKeyFor("inc-1"), lines.join("\n"));
-    const tools = buildTools({ db, store, linker: fakeLinker, threadTs: null });
+    const tools = buildTools({ db, store });
     const tool = tools.find((t) => t.name === "read_agent_session");
     assert.ok(tool);
     return tool.run({ incidentId: "inc-1" });

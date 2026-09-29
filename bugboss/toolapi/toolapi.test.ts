@@ -178,6 +178,7 @@ const openIncident = async (signalIds: string[]) =>
 const incidentRow = (id: string) =>
   db.get<{
     status: string;
+    summary: string | null;
     rootCause: string | null;
     prUrls: string;
     postmortem: string | null;
@@ -2028,5 +2029,197 @@ describe("a recurrence closes on a second question", () => {
     assert.match(String(unsearchable.error), /did not run/);
     assert.equal(matchedNothing.ok, true, matchedNothing.error);
     assert.deepEqual(matchedNothing.data, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("set_summary: what the incident is", () => {
+  it("is callable before there is any conclusion at all", async () => {
+    await seed("sig-sum-1");
+    const incidentId = await openIncident(["sig-sum-1"]);
+    const tools = toolsFor(incidentId);
+
+    const response = await tools.setSummary({ summary: "Checkout is failing" });
+
+    assert.equal(response.ok, true, response.error);
+    assert.equal(incidentRow(incidentId)?.summary, "Checkout is failing");
+  });
+
+  /**
+   * Incident 79 opened on a memory alert and became the Loki 429 explosion.
+   * The whole field exists so that is a thing the system can say.
+   */
+  it("replaces what was there, because the incident changed", async () => {
+    await seed("sig-sum-2");
+    const incidentId = await openIncident(["sig-sum-2"]);
+    const tools = toolsFor(incidentId);
+
+    await tools.setSummary({ summary: "Memory alert on bugboss-prod" });
+    await tools.setSummary({ summary: "Loki reads are being rejected" });
+
+    assert.equal(
+      incidentRow(incidentId)?.summary,
+      "Loki reads are being rejected",
+    );
+  });
+
+  /**
+   * Nothing is announced. A title changing is not news; the thread's header
+   * picks it up on the next sweep, and a message every time an agent
+   * sharpens four words is how a channel gets muted.
+   */
+  it("says nothing in the thread", async () => {
+    await seed("sig-sum-3");
+    const incidentId = await openIncident(["sig-sum-3"]);
+    const before = posts.length;
+
+    await toolsFor(incidentId).setSummary({ summary: "Checkout is failing" });
+
+    assert.equal(posts.length, before);
+  });
+
+  /**
+   * Refused, never truncated. A title cut at eighty characters reads as a
+   * complete thought that happens to be wrong, and the thing that wrote it
+   * is a model that can be asked again. Same shape as overThreadBudget.
+   */
+  it("refuses one that is too long, naming both numbers and where it belongs", async () => {
+    await seed("sig-sum-4");
+    const incidentId = await openIncident(["sig-sum-4"]);
+    const long = "Loki is rejecting reads ".repeat(10);
+
+    const response = await toolsFor(incidentId).setSummary({ summary: long });
+
+    assert.equal(response.ok, false);
+    assert.match(
+      String(response.error),
+      new RegExp(String(long.trim().length)),
+      "the number it quotes is the length of what it would have stored",
+    );
+    assert.match(String(response.error), /80/);
+    assert.match(String(response.error), /root cause/);
+    assert.equal(
+      incidentRow(incidentId)?.summary,
+      null,
+      "and writes nothing, so the row keeps no half of it",
+    );
+  });
+
+  it("collapses a title somebody wrote across two lines", async () => {
+    await seed("sig-sum-5");
+    const incidentId = await openIncident(["sig-sum-5"]);
+
+    await toolsFor(incidentId).setSummary({ summary: "Checkout\n  is failing" });
+
+    assert.equal(incidentRow(incidentId)?.summary, "Checkout is failing");
+  });
+
+  it("refuses whitespace, which is not a title", async () => {
+    await seed("sig-sum-6");
+    const incidentId = await openIncident(["sig-sum-6"]);
+
+    const response = await toolsFor(incidentId).setSummary({ summary: "   " });
+
+    assert.equal(response.ok, false);
+    assert.equal(incidentRow(incidentId)?.summary, null);
+  });
+
+  it("is refused on an incident that has been merged away", async () => {
+    await seed("sig-sum-7");
+    await seed("sig-sum-8");
+    // Survivor first, because a merge only goes into the more established
+    // incident now. What this test is about is the status, not the order.
+    const survivor = await openIncident(["sig-sum-8"]);
+    const absorbed = await openIncident(["sig-sum-7"]);
+    await mergedAway("sig-sum-7", survivor);
+
+    const response = await toolsFor(absorbed).setSummary({ summary: "anything" });
+
+    assert.equal(response.ok, false);
+  });
+});
+
+describe("an incident that absorbed another one", () => {
+  const merged = async (tag: string) => {
+    await seed(`sig-${tag}-a`);
+    await seed(`sig-${tag}-b`);
+    const survivor = await openIncident([`sig-${tag}-a`]);
+    const absorbed = await openIncident([`sig-${tag}-b`]);
+    await toolsFor(absorbed).setSummary({ summary: `what ${tag} was` });
+    await applyAssign(
+      db,
+      {
+        signalIds: [`sig-${tag}-b`],
+        target: survivor,
+        reason: "one bug, two alerts",
+      },
+      { kind: "human", slackUserId: "U1" },
+    );
+    return { survivor, absorbed };
+  };
+
+  /**
+   * Without this the merge reaches the surviving agent as an unexplained
+   * pile of new signals, and the agent is then expected to keep an honest
+   * title for an incident it was never told about.
+   */
+  it("is told so, by name, on the directive that carries the signals", async () => {
+    const { survivor, absorbed } = await merged("abs1");
+
+    const view = await toolsFor(survivor).getIncident();
+
+    const news = view.directives.find((d) => d.type === "new_signals");
+    assert.ok(news, JSON.stringify(view.directives));
+    assert.deepEqual(
+      news.type === "new_signals" ? news.absorbed : null,
+      [absorbed],
+    );
+  });
+
+  /**
+   * Same shape and the same reason as `priorIncident`: somebody already
+   * investigated part of what is now this incident's problem, and an agent
+   * cannot write an honest title for something it never saw.
+   */
+  it("can read what that incident had found, on the first get_incident", async () => {
+    const { survivor, absorbed } = await merged("abs2");
+
+    const view = await toolsFor(survivor).getIncident();
+
+    const read = (view.data as IncidentView).absorbed;
+    assert.deepEqual(
+      read.map((r) => r.id),
+      [absorbed],
+    );
+    assert.equal(read[0].summary, "what abs2 was");
+    assert.equal(read[0].status, "MERGED");
+  });
+
+  it("an incident that absorbed nothing carries an empty list, not a null", async () => {
+    await seed("sig-abs3");
+    const incidentId = await openIncident(["sig-abs3"]);
+
+    const view = await toolsFor(incidentId).getIncident();
+
+    assert.deepEqual((view.data as IncidentView).absorbed, []);
+  });
+
+  /**
+   * Read off `mergedInto` rather than remembered, so it is the same answer
+   * after a restart and after a merge this process never saw.
+   */
+  it("is still readable by a process that did not see the merge happen", async () => {
+    const { survivor, absorbed } = await merged("abs4");
+    await db.withWrite((w) => {
+      w.prepare("DELETE FROM pending_directive WHERE incidentId = ?").run(survivor);
+    });
+
+    const view = await toolsFor(survivor).getIncident();
+
+    assert.deepEqual(
+      (view.data as IncidentView).absorbed.map((r) => r.id),
+      [absorbed],
+    );
   });
 });

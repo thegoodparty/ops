@@ -16,6 +16,7 @@ This file is what you need before editing anything here.
 | The incident agent, its tools, resume | [`agent/CLAUDE.md`](./agent/CLAUDE.md) |
 | The Bedrock request path every model call takes | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
 | Threads, relay, the Slack agent | [`slack/CLAUDE.md`](./slack/CLAUDE.md) |
+| The status board, the morning post, the all-clear | [`board/CLAUDE.md`](./board/CLAUDE.md) |
 | The closing report an incident ends with | [`report/CLAUDE.md`](./report/CLAUDE.md) |
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
@@ -91,6 +92,23 @@ is not a language interface. One of those is load-bearing: an explicit
 `@bugboss` always means "this is for you", and because code decides that
 rather than the model, it is the escape hatch that still works when the model
 does not.
+
+**Anything a reader sees the same way twice is rendered once, in code.** An
+incident reference, a status-board row and a thread's header are all
+formatting, and formatting asked for in a prompt is followed
+probabilistically -- which is how the same answer came to link some incidents
+and not others, and to spell the same word two ways in one message. The
+renderers are `slack/incidents.ts` and `slack/board.ts`; the model writes
+"incident 4" in prose and code decides what that looks like. This is the
+opposite of the language rule above, not an exception to it: that one is
+about reading what a person meant, this one is about our own output.
+
+**There is no scheduler, and adding one is the wrong fix.** Every merge to
+ops `main` restarts this container, so an in-memory "next fire at 07:00"
+either fires twice or is skipped depending on when a deploy lands. Recurring
+work rides the dispatcher tick or the composition root's sweep interval, and
+remembers what it has done in SQLite -- as a **date** where a day is the
+unit, never a timestamp, or the clocks going back produce a double post.
 
 **Nothing auto-closes.** The Boss may decide an alert needs no incident, but
 every incident ends in an outcome a person can see. A quiet signal is

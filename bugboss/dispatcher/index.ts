@@ -766,6 +766,7 @@ export class Dispatcher {
     const tools = this.toolApiFor(row.id);
     const ctx: AgentSpawnContext = {
       reportRootCause: (args) => tools.reportRootCause(args),
+      setSummary: (args) => tools.setSummary(args),
       reportImpact: (args) => tools.reportImpact(args),
       reportResolved: (args) => tools.reportResolved(args),
       reportAnalysis: (args) => tools.reportAnalysis(args),

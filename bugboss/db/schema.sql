@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS incident (
   owner             TEXT NOT NULL DEFAULT 'agent'
                       CHECK (owner IN ('agent','human')),
   slackThreadTs     TEXT,
+  -- What this incident is, in a few words, kept current by the agent.
+  --
+  -- The row had rootCause, postmortem and usersImpacted and nothing that
+  -- said what the incident *was*, so a thread's top-level message stayed
+  -- whatever the first alert happened to say, forever. Incident 79 opened on
+  -- a memory alert and became the Loki 429 explosion, and there was nowhere
+  -- to write that down.
+  --
+  -- Length is bounded at the tool rather than here: past the limit the value
+  -- is refused with a sentence saying why, never truncated. See
+  -- SUMMARY_CHARS in slack/format.ts.
+  summary           TEXT,
 
   rootCause         TEXT,
   prUrls            TEXT NOT NULL DEFAULT '[]',   -- JSON array
@@ -317,3 +329,54 @@ CREATE TABLE IF NOT EXISTS incident_action (
 
 CREATE INDEX IF NOT EXISTS incident_action_incident_idx
   ON incident_action (incidentId, at);
+
+-- What the thread's top-level message is made of, so a header can be put
+-- above it without guessing at what is already there.
+--
+-- A table of its own rather than two columns on `incident`, because
+-- `getIncidentRow` is `SELECT *` and spreads the row, so anything added
+-- there arrives in the agent's `get_incident` result -- and the opening is
+-- the whole alert body, re-serialized into the prompt on every read. This is
+-- how the message is rendered, not what the incident is.
+--
+-- chat.update replaces a message wholesale and the only way to read the
+-- original back is conversations.replies, which is throttled to roughly one
+-- request a minute. So the opening is recorded when it is posted. An
+-- incident opened before this table existed has no row, and gets no header:
+-- the one answer that cannot destroy somebody's alert text.
+CREATE TABLE IF NOT EXISTS incident_thread (
+  incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  opening           TEXT NOT NULL,
+  -- The header last written above it, so the sweep can tell whether anything
+  -- changed rather than rewriting the message every thirty seconds. Compared
+  -- before the outbound link pass runs, so the value is stable.
+  header            TEXT
+);
+
+-- When the board last said something, so that saying it again is a decision
+-- rather than an accident of when this container restarted.
+--
+-- One row, and everything in it is persisted for the same reason: every
+-- merge to ops main restarts this process, so an in-memory schedule either
+-- fires twice or is skipped depending on the timing of a deploy. There is no
+-- cron here and there must not be one -- the sweep runs off the tick that
+-- already runs, and this table is the whole of its memory.
+CREATE TABLE IF NOT EXISTS board_state (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  -- The date of the last daily post, as YYYY-MM-DD in the board's own
+  -- timezone. A date and not a timestamp, deliberately: "has it been 24
+  -- hours" is the question that produces a double post on the day the clocks
+  -- go back and a skipped day when they go forward, and "is it still the
+  -- same day there" is the question that does not.
+  dailyOn           TEXT,
+  -- When the board was first seen empty in the current unbroken run of
+  -- empties, or NULL while something is open. The all-clear waits on this
+  -- rather than firing on a close, because a board that empties and refills
+  -- ninety seconds later would otherwise announce itself clear each time.
+  emptySince        INTEGER,
+  -- Whether the all-clear for the current run of empties has been posted.
+  -- Set on the first observation too, when that observation is already of an
+  -- empty board: a board this process never watched become empty is not an
+  -- event it can honestly announce.
+  clearAnnounced    INTEGER NOT NULL DEFAULT 0
+);

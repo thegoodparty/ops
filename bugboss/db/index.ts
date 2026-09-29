@@ -46,6 +46,10 @@ export const LATE_COLUMNS: LateColumn[] = [
   // rest of the write is 1.25x. Same full declaration as the signal
   // columns below, for the reason given there.
   { table: "incident", column: "cacheWrite1h", type: "INTEGER NOT NULL DEFAULT 0" },
+  // The few-word title the agent keeps current, which is the board's middle
+  // column and the thread header's. Nullable: an incident that has not been
+  // given one falls back to its first signal's title.
+  { table: "incident", column: "summary", type: "TEXT" },
   // Triage's own spend, per signal. The full declaration including
   // `NOT NULL DEFAULT 0`, not a bare `INTEGER`, and the difference is not
   // cosmetic: `ALTER TABLE ADD COLUMN x INTEGER` leaves the column nullable

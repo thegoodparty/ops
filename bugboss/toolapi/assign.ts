@@ -372,6 +372,13 @@ export const assign = (
         type: "new_signals",
         count: moved.length,
         summary: req.reason,
+        // Named, not implied. Signals arriving because another incident was
+        // emptied into this one is a different event from signals arriving
+        // because a new alert fired, and the surviving agent is the one that
+        // has to write a title covering both -- which it cannot do honestly
+        // for an incident it was never told about. The details follow on its
+        // next get_incident, as `absorbed`.
+        ...(merged.length > 0 ? { absorbed: merged } : {}),
       });
     }
   }

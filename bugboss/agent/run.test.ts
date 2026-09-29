@@ -105,6 +105,62 @@ test("directives are rendered for the model", () => {
   assert.match(rendered, /RESUMED after 420s/);
 });
 
+/**
+ * The rendered text is what the agent actually reads; the payload it is
+ * rendered from is not. Covering only the payload is how a sentence nobody
+ * proofread reaches a model that is about to act on it.
+ */
+test("a merge tells the agent what it has inherited, in the singular", () => {
+  const rendered = renderDirectives([
+    { type: "new_signals", count: 2, summary: "one bug, two alerts", absorbed: ["82"] },
+  ]);
+
+  assert.match(rendered, /incident 82 has been merged into yours/);
+  assert.match(rendered, /its signals are now yours/);
+  assert.match(rendered, /one bug, two alerts/);
+  assert.match(rendered, /what that incident had already found/);
+  assert.match(rendered, /`absorbed`/);
+});
+
+test("and in the plural, which is a different sentence", () => {
+  const rendered = renderDirectives([
+    {
+      type: "new_signals",
+      count: 5,
+      summary: "one saturated pool",
+      absorbed: ["82", "83", "91"],
+    },
+  ]);
+
+  // "incident 82, 83 and 91 has been merged" reads as one incident, which is
+  // the opposite of what the agent needs to know.
+  assert.match(rendered, /incidents 82, 83 and 91 have been merged into yours/);
+  assert.match(rendered, /their signals are now yours/);
+  assert.match(rendered, /what those incidents had already found/);
+  assert.doesNotMatch(rendered, / has been merged/);
+});
+
+/**
+ * Signals arriving because a new alert fired is a different event from
+ * signals arriving because another incident was emptied into this one, and
+ * the ordinary case must not start talking about merges.
+ */
+test("signals that arrived on their own say nothing about a merge", () => {
+  const rendered = renderDirectives([
+    { type: "new_signals", count: 1, summary: "same fingerprint" },
+  ]);
+
+  assert.equal(rendered.trim().split("\n").at(-1), "NEW SIGNALS (1): same fingerprint");
+});
+
+test("an empty absorbed list is the ordinary case, not a merge with no names", () => {
+  const rendered = renderDirectives([
+    { type: "new_signals", count: 1, summary: "same fingerprint", absorbed: [] },
+  ]);
+
+  assert.doesNotMatch(rendered, /merged/);
+});
+
 test("the boss client talks to the incident's endpoints", async () => {
   const seen: Array<{ url: string; method: string; body: unknown }> = [];
   const fetchImpl = (async (url: string, init: RequestInit) => {
@@ -177,11 +233,10 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
 // state. It says the incident needs a person and leaves the agent driving,
 // which is why it is named for what it does rather than for what it moves.
 //
-// `propose_merge` is a ninth thing and is neither. It writes nothing on the
-// agent's word: it asks, the two incidents are compared, and the rules pick
-// which record survives.
-test("the boss tools are the four transitions, the ask, escalate, park and the two reads", async () => {
-  const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
+// `propose_merge` is neither a transition nor a read. It writes nothing on
+// the agent's word: it asks, the two incidents are compared, and the rules
+// pick which record survives.
+test("the boss tools are the four transitions, the title, the ask, escalate, park and the two reads", async () => {  const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
 
   assert.deepEqual(
     tools.map((tool) => tool.name).sort(),
@@ -195,6 +250,7 @@ test("the boss tools are the four transitions, the ask, escalate, park and the t
       "report_resolved",
       "report_root_cause",
       "search_incidents",
+      "set_summary",
     ],
   );
   assert.ok(!tools.some((tool) => BUILTIN_TOOLS.includes(tool.name)));

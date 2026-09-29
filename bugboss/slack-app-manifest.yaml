@@ -41,6 +41,10 @@ oauth_config:
   scopes:
     bot:
       ## chat.postMessage: every incident thread, transition and question.
+      ## chat.update: the status header above an incident thread's top-level
+      ## message. Editing a message the bot itself posted needs no scope
+      ## beyond this one, so the board added nothing here and needs no
+      ## reinstall.
       - chat:write
       ## conversations.replies, so the Slack agent can read a thread before
       ## answering in it. Also required to receive message.channels.

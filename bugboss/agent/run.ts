@@ -385,6 +385,7 @@ export const createBossClient = (args: {
 
   return {
     reportRootCause: (payload) => call<ToolResponse>("POST", "/root-cause", payload),
+    setSummary: (payload) => call<ToolResponse>("POST", "/summary", payload),
     reportImpact: (payload) => call<ToolResponse>("POST", "/impact", payload),
     reportResolved: (payload) => call<ToolResponse>("POST", "/resolved", payload),
     reportAnalysis: (payload) => call<ToolResponse>("POST", "/analysis", payload),
@@ -532,6 +533,22 @@ export const createBossTools = async (args: {
           await args.api.searchIncidents(
             params as unknown as Parameters<ToolApi["searchIncidents"]>[0],
           )
+        ),
+    },
+    {
+      name: "set_summary",
+      label: "Set summary",
+      description:
+        "Set or rewrite this incident's summary: a few words naming what is broken and who it is broken for. It is the title people read on the status board and at the top of this thread, and it should always be true of the incident as you currently understand it. Call it as soon as you know more than the first alert said, and again whenever that stops being accurate.",
+      parameters: Type.Object({
+        summary: Type.String({
+          description:
+            "A few words. What is broken and who it is broken for, not why and not what you are doing about it.",
+        }),
+      }),
+      execute: async (_id: string, params: unknown) =>
+        bossToolResult(
+          await args.api.setSummary(params as unknown as Parameters<ToolApi["setSummary"]>[0])
         ),
     },
     {
