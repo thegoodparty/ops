@@ -17,7 +17,6 @@ export const QUERY_TOOL = "query_incidents";
 export const SEARCH_TOOL = "search_incidents";
 
 const MAX_ROWS = 50;
-const MAX_CHARS = 4000;
 
 export const SCHEMA_SUMMARY = `incident(
   id TEXT, status TEXT in (INVESTIGATING,FIXING,RESOLVED,CLOSED,MERGED),
@@ -157,10 +156,11 @@ export const queryTool = (db: IncidentReader): LoopTool => ({
     try {
       const rows = db.query(prepared.sql);
       const head = rows.slice(0, MAX_ROWS);
-      const body = JSON.stringify(head);
-      const clipped =
-        body.length > MAX_CHARS ? `${body.slice(0, MAX_CHARS)}...[truncated]` : body;
-      return `${rows.length} row(s), showing ${head.length}: ${clipped}`;
+      // Rows, and only rows. The result used to be cut at 4,000 characters
+      // on top of the row cap, which meant a query whose answer was in a
+      // long column came back looking complete and was not -- and the model
+      // has no way to tell a short answer from a cut one.
+      return `${rows.length} row(s), showing ${head.length}: ${JSON.stringify(head)}`;
     } catch (err) {
       return `error: ${String(err)}`;
     }
@@ -191,7 +191,6 @@ export const attachedSignalIds = (db: IncidentReader, incidentId: string): strin
     .map((row) => row.id);
 
 const MAX_SEARCH_RESULTS = 5;
-const MAX_SEARCH_CAUSE_CHARS = 300;
 
 /**
  * Text search over the post-mortems of incidents that already claimed a
@@ -234,11 +233,7 @@ export const searchTool = (db: SearchReader & IncidentReader): LoopTool => ({
           (hit) =>
             `- ${hit.incidentId} | ${hit.status} | resolved ${
               hit.resolvedAt ? new Date(hit.resolvedAt).toISOString().slice(0, 10) : "?"
-            }\n  rootCause: ${
-              hit.rootCause
-                ? hit.rootCause.slice(0, MAX_SEARCH_CAUSE_CHARS)
-                : "never established"
-            }\n  matched: ${hit.excerpt}`,
+            }\n  rootCause: ${hit.rootCause ?? "never established"}\n  matched: ${hit.excerpt}`,
         )
         .join("\n");
     } catch (err) {

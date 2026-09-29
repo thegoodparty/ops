@@ -169,14 +169,15 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   };
 
   /**
-   * The post-mortem is the whole point of carrying this, and it is the one
-   * field with no bound on it. getIncident renders as JSON followed by the
-   * pending directives, and the agent's truncation keeps a head and a tail --
-   * so an unbounded post-mortem eats the middle of the incident rather than
-   * itself. Clipped here, where the size is known, instead.
+   * The post-mortem goes whole, which is the whole point of carrying it.
+   *
+   * It used to be cut at 6,000 characters, and the reason given was that the
+   * agent's own tool-output truncation kept a head and a tail, so an
+   * unbounded post-mortem would eat the middle of the incident rather than
+   * itself. That truncation is gone: Pi compacts just in time, so a tool
+   * result lands whole and what gives way is summarised history. The cap
+   * outlived the thing it was protecting against.
    */
-  const MAX_PRIOR_POSTMORTEM_CHARS = 6000;
-
   const toPriorIncident = (prior: Incident): PriorIncident => ({
     id: prior.id,
     status: prior.status,
@@ -184,10 +185,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     rootCause: prior.rootCause,
     prUrls: prior.prUrls,
     resolvedEvidence: prior.resolvedEvidence,
-    postmortem:
-      prior.postmortem && prior.postmortem.length > MAX_PRIOR_POSTMORTEM_CHARS
-        ? `${prior.postmortem.slice(0, MAX_PRIOR_POSTMORTEM_CHARS)}...[truncated; the full text is in the incident database]`
-        : prior.postmortem,
+    postmortem: prior.postmortem,
     resolvedAt: prior.resolvedAt,
     closedAt: prior.closedAt,
   });

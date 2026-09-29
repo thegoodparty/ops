@@ -50,29 +50,58 @@ test("there is a stakeholder to notify", () => {
 
 // --- shape -----------------------------------------------------------------
 
-test("the title is the first line and the body is the whole report", () => {
+test("the report is trimmed and otherwise left exactly as written", () => {
+  // The title used to be the first line here. Nothing reduces it now: the
+  // one caller has already collapsed the whitespace, so the field is one
+  // line without anything having to make it one.
   const signal = humanSignal({
     text: "\n  Pro upgrades look broken  \n\nSteps: click upgrade, get a 500.\n",
     reportedBy: "U0HUMAN",
     reportedAt: NOW,
   });
-  assert.equal(signal.title, "Pro upgrades look broken");
+  assert.equal(
+    signal.title,
+    "Pro upgrades look broken  \n\nSteps: click upgrade, get a 500.",
+  );
+  assert.equal(signal.title, signal.body);
   assert.match(signal.body, /Steps: click upgrade/);
   assert.equal(signal.source, "human");
   assert.equal(signal.kind, "bug_report");
   assert.equal(signal.openedAt, NOW);
 });
 
-test("a very long first line is truncated for the title only", () => {
-  const long = "x".repeat(300);
+test("a long first line is the title whole, never cut", () => {
+  // Incident 83 opened on "...I heard about 502s Can you op\u2026" -- the
+  // report's first line cut at 120 characters, mid-word, in the message
+  // announcing the incident. A title is a line the reporter wrote.
+  const long = `${"x".repeat(300)} and here is the part that used to go`;
   const signal = humanSignal({
     text: long,
     reportedBy: "U0HUMAN",
     reportedAt: NOW,
   });
-  assert.equal(signal.title.length, 120);
-  assert.ok(signal.title.endsWith("…"));
-  assert.equal(signal.body.length, 300);
+
+  assert.equal(signal.title, long);
+  assert.equal(signal.body, long);
+  assert.doesNotMatch(signal.title, /\u2026/);
+});
+
+test("nothing reduces the report, not even to its first line", () => {
+  // Taking the first line looked like a safe way to keep a one-line field
+  // one line, and it was unreachable rather than safe: the only caller
+  // passes text that has already been through `stripBotMention`, which
+  // collapses every run of whitespace. `e2e.test.ts` holds that end to end.
+  const signal = humanSignal({
+    text: "  voter density queries are failing  \n\nand the 502s started Tuesday",
+    reportedBy: "U0HUMAN",
+    reportedAt: NOW,
+  });
+
+  assert.equal(
+    signal.title,
+    "voter density queries are failing  \n\nand the 502s started Tuesday",
+  );
+  assert.equal(signal.title, signal.body);
 });
 
 test("an empty report or an unattributed one is refused", () => {

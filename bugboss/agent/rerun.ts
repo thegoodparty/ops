@@ -303,22 +303,16 @@ export const githubRefusalText = (
  * exactly the failure this system is built not to have.
  */
 /**
- * How much of a workflow name a link label carries.
- *
- * The notice is a thread post and the thread refuses one past
- * `THREAD_PROSE_CHARS`. The suspicion already has its own limit, so the only
- * other thing in here that can run long is a name GitHub gave us -- and a
- * link label nobody can read to the end is not worth the budget it spends.
- * `rerun.test.ts` composes the worst case so this stays true.
+ * The name goes in whole. It used to be cut at 80 characters, to keep the
+ * notice under `THREAD_PROSE_CHARS` alongside a suspicion already limited
+ * to 700 -- an arithmetic in which a name GitHub gave us was the term that
+ * gave way, because it was the only one with nobody to refuse to. The
+ * notice goes out on the harness path now (`postNotice`), so a long one
+ * splits rather than being refused, and the arithmetic is gone with it.
  */
-const LINK_LABEL_CHARS = 80;
-
 const linkLabel = (name: string): string => {
   const clean = name.replace(/[<>|]/g, " ").replace(/\s+/g, " ").trim();
-  if (!clean) return "the workflow run";
-  return clean.length <= LINK_LABEL_CHARS
-    ? clean
-    : `${clean.slice(0, LINK_LABEL_CHARS - 1).trimEnd()}…`;
+  return clean || "the workflow run";
 };
 
 export const rerunNotice = (

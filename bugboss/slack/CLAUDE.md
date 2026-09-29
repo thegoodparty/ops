@@ -233,11 +233,24 @@ longer in the loop, so there is nobody to refuse them to — and the wait nudge
 is *dropped* on a failed post by design, because losing a day-long wait to a
 503 is the worse trade. An over-long one would therefore mean an incident that
 waits all day, nudges nobody, and then escalates claiming it nudged three
-times. So they clamp the text they echo — which is already in the thread
-directly above — small enough that the composed post provably fits, and
-`tools.test.ts` composes the worst case of each to keep that true. The nudge
-gets a smaller clamp than the briefs because it carries two echoes plus the
-whole status block where they carry one.
+times.
+
+They used to buy the fit by clamping the one field with nobody behind it: the
+check's own output, cut to 400 characters. **They do not clamp anything now.**
+
+- The nudge and the re-run notice go out through `postNotice`, which marks
+  them `harnessComposed` on the wire. The `/thread` route skips the budget
+  for those and sends them through `postDocument`, so a long one splits.
+  Splitting a post nobody can rewrite is the whole point: it costs a second
+  message, where a refusal costs the message.
+- The stalled-wait brief cannot take that route, because it goes through
+  `escalate` and a brief is a brief. So it carries no output at all and says
+  the output is in the message below it — `stalledWaitStatus` posts that,
+  whole, on the harness path, right after the escalation lands.
+
+What still has to fit `THREAD_PROSE_CHARS` is the part the harness *wrote*,
+with the model's own fields at their refused maximum. `tools.test.ts`
+composes the worst case of each to keep that true.
 
 ## Incident references are rendered by code, on the way out
 
@@ -326,6 +339,12 @@ The surfaces:
 - **The thread header.** Two lines above the message that opened the thread,
   rewritten in place with `chat.update`. Nothing is removed: the alert text
   that started the thread is what somebody scrolling back is looking for.
+  This division is why the opening message carries the signal **whole** and
+  the header carries the short form. Incident 83 opened on "*...I heard
+  about 502s Can you op…*" because the opening message tried to be the short
+  form too, on a title cut at 120 characters. The header has `summary`, the
+  few-word title the agent keeps current and that `setSummary` refuses
+  rather than truncates; the message under it has the report.
   An edit is **silent** — Slack marks it "(edited)" and notifies nobody — so
   it is right for a header people re-read and wrong as a way to tell anyone
   anything. A change worth knowing about still posts in the thread as well.
@@ -335,6 +354,10 @@ The surfaces:
   three fields, disagreeing in whatever way that run happened to phrase it.
 - **The morning board** and **the all-clear**, both driven by the sweep in
   `board/index.ts`.
+
+The opening message's trailer links the signal that opened the incident —
+`<url|a Grafana alert>` or `<url|a Slack report>`, from `ingress/link.ts`.
+It used to say "1 signal" and give no way to reach it.
 
 `chat.update` replaces a message wholesale and the only way to read the
 original back is `conversations.replies`, which is throttled to roughly one

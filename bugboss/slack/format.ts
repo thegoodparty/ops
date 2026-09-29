@@ -122,6 +122,17 @@ export const channelLink = (channelId: string): string => {
 const LINKABLE = /^(?:https?:\/\/|mailto:)/;
 
 /**
+ * Whether `link()` will take this, without finding out by being thrown at.
+ *
+ * Exported because a caller holding a url out of telemetry has to decide
+ * what to do *instead* of linking, and it cannot make that decision from a
+ * throw: by then it is inside whatever composed the message. A Grafana
+ * alert's `generatorURL` arrives on a label, labels are attacker-writable,
+ * and the announcement that renders it is the one an incident opens with.
+ */
+export const isLinkable = (url: string): boolean => LINKABLE.test(url.trim());
+
+/**
  * A link, as `<url|label>`. The label cannot contain a pipe — Slack splits on
  * the first one and there is no escape for it — so pipes in a label become
  * slashes rather than silently truncating the label at the first pipe.
@@ -294,11 +305,14 @@ export const MAX_MESSAGE_CHARS = 3000;
  * *refused* -- splitting a 400-word post into two 200-word posts does not
  * make it shorter.
  *
- * **This is the thread's budget and only the thread's.** The closing report
- * is a file and is deliberately exempt: the thread is short, the document is
- * complete. That exemption is `postDocument` below -- a different function
- * rather than a bigger number -- so the one long thing is a call site you
- * can grep for rather than a check somebody forgot.
+ * **This is the thread's budget and only the thread's**, and it is a budget
+ * on text somebody is in a position to rewrite. The closing report is a file
+ * and is deliberately exempt: the thread is short, the document is complete.
+ * So is anything the harness composed after the model has stopped, because
+ * refusing a post to an author who is gone does not shorten it, it deletes
+ * it. Both exemptions are `postDocument` below -- a different function
+ * rather than a bigger number -- so the long things are call sites you can
+ * grep for rather than a check somebody forgot.
  */
 export const THREAD_PROSE_CHARS = 1200;
 
@@ -460,15 +474,25 @@ export const splitForSlack = (
  * post-mortem, so it is said out loud rather than inferred from the channel.
  */
 /**
- * Post the one text that is exempt from `THREAD_PROSE_CHARS`: the closing
- * report, when it could not be uploaded as a file and the thread is the only
- * place left for it.
+ * Post text that is exempt from `THREAD_PROSE_CHARS`, and say so by name.
  *
  * It does nothing `postProse` does not. It exists so the exemption is a name
- * at a call site instead of the absence of a check -- the thread is short and
- * the document is complete, and this is the one place the document ends up in
- * the thread anyway. A new caller of this is a decision somebody has to
- * defend in review; a new caller of `postProse` is not.
+ * at a call site instead of the absence of a check: a new caller of this is
+ * a decision somebody has to defend in review, and a new caller of
+ * `postProse` is not.
+ *
+ * Two callers, and they are the same exemption seen twice. The budget is a
+ * refusal, and a refusal only means anything where there is an author to
+ * refuse to:
+ *
+ *   - The closing report, when it could not be uploaded as a file and the
+ *     thread is the only place left for it. The thread is short and the
+ *     document is complete.
+ *   - A harness-composed post -- the wait nudge, the re-run notice -- which
+ *     the model is not in the loop for by the time it is written. Refusing
+ *     one drops it, and a nudge that nudges nobody is the failure the tool
+ *     that sends it exists to prevent. See the `harnessComposed` branch in
+ *     `http/toolapi.ts`.
  */
 export const postDocument = (
   post: (text: string) => Promise<{ ts: string }>,

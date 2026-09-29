@@ -742,6 +742,183 @@ test("a human bug report resolves without spawning a recurrence", async () => {
   );
 });
 
+/**
+ * The test that makes `ingress/human.ts` taking a first line safe.
+ *
+ * That title is a *label*, not a reduction, and the only reason that is true
+ * is this: the opening message renders the signal's `body`, so the whole
+ * report is in front of the reader with the one-line header above it. It
+ * used to render the `title`, and that is exactly how incident 83 opened on
+ * "...I heard about 502s Can you op\u2026".
+ *
+ * So the two facts hold each other up, and this is the one that carries the
+ * weight. A later change rendering `title` again would turn the first line
+ * back into a real cut, silently, and nothing else here would fail.
+ */
+test("the opening message carries the whole report, not its first line", async () => {
+  const tail = "and it only started after the Tuesday deploy, around 14:00";
+  const report = [
+    "Voter density queries are failing in prod and have been for a while.",
+    "",
+    "I heard about 502s from two people on the growth team,",
+    tail,
+  ].join("\n");
+
+  fakeModel.intents.push({ intent: "bug_report" });
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open looks like this",
+  });
+
+  const before = fakeSlack.posts.length;
+  await boss.slackEvent({
+    type: "app_mention",
+    user: "U-reporter",
+    channel: "C0BUGS",
+    ts: "1764000000.001900",
+    text: `<@B0BOSS> ${report}`,
+  });
+  await boss.ensureIncidentThreads();
+
+  const opening = fakeSlack.posts
+    .slice(before)
+    .map((post) => post.text)
+    .join("\n");
+
+  assert.match(opening, /opened\*/, "the opening message went out");
+  assert.ok(opening.includes(tail), "the end of the report reached the channel");
+  assert.ok(
+    opening.includes("I heard about 502s from two people on the growth team,"),
+    "and the middle of it",
+  );
+  assert.doesNotMatch(opening, /\u2026/);
+
+  // And nothing reduced it on the way in either. `stripBotMention` has
+  // already collapsed the newlines by this point, which is what makes the
+  // title a one-line field without anything having to cut it -- so title
+  // and body are the same whole report.
+  const stored = boss.db.get<{ title: string; body: string }>(
+    "SELECT title, body FROM signal WHERE sourceId = ?",
+    ["slack:C0BUGS:1764000000.001900"],
+  );
+  assert.ok(stored?.title.includes(tail), "the title is not a first line");
+  assert.equal(stored?.title, stored?.body);
+  assert.doesNotMatch(stored?.title ?? "", /\n/, "and it is still one line");
+});
+
+/**
+ * The same property for the other source, where it is a different claim.
+ *
+ * For a report the title and the body are now the same text, so a test on
+ * the report path cannot tell "the message carries the body" from "the
+ * message carries the title". An alert can: its title is the summary
+ * annotation and its body is the description, the values and the links.
+ */
+test("the opening message carries an alert's body, not just its summary", async () => {
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open looks like this",
+  });
+
+  const before = fakeSlack.posts.length;
+  await boss.ingest("grafana", {
+    headers: { "x-grafana-alerting-signature": "valid-in-test" },
+    rawBody: JSON.stringify({
+      status: "firing",
+      alerts: [
+        {
+          status: "firing",
+          fingerprint: "fp-body",
+          labels: { alert_slug: "voter-density-5xx", environment: "prod" },
+          annotations: {
+            summary: "[PROD] voter-density-5xx",
+            description: "p99 on the density route is 24 of 25 connections in use",
+          },
+          generatorURL: "https://goodparty.grafana.net/alerting/grafana/abc/view",
+          startsAt: new Date().toISOString(),
+        },
+      ],
+    }),
+  });
+  await boss.ensureIncidentThreads();
+
+  const opening = fakeSlack.posts
+    .slice(before)
+    .map((post) => post.text)
+    .join("\n");
+
+  assert.match(opening, /opened\*/);
+  assert.ok(
+    opening.includes("p99 on the density route is 24 of 25 connections in use"),
+    "the description is in the message, so it is the body being rendered",
+  );
+  // And the trailer links the alert that opened it rather than only counting
+  // it. This is Grafana's own deeplink, carried on the webhook -- nothing is
+  // rebuilt out of an instance host and a rule uid.
+  assert.ok(
+    opening.includes(
+      "<https://goodparty.grafana.net/alerting/grafana/abc/view|a Grafana alert>",
+    ),
+    opening,
+  );
+});
+
+/**
+ * The consequence, rather than the unit. A url the Slack client will not
+ * accept must cost the link and nothing else -- and the thing it would
+ * otherwise cost is the entire incident-open announcement, because
+ * `renderEvent` runs inside the try/catch that turns any throw into
+ * `open_post_failed`. The thread would never open, on every tick, and the
+ * only trace would be an alarm.
+ */
+test("an alert whose generator url is unusable still opens its thread", async () => {
+  fakeModel.triageDecisions.push({
+    action: "new_incident",
+    reason: "nothing open looks like this",
+  });
+
+  const before = fakeSlack.posts.length;
+  await boss.ingest("grafana", {
+    headers: { "x-grafana-alerting-signature": "valid-in-test" },
+    rawBody: JSON.stringify({
+      status: "firing",
+      alerts: [
+        {
+          status: "firing",
+          fingerprint: "fp-hostile-url",
+          // A label, which is attacker-writable, standing in for the
+          // `generatorURL` the alert declines to send.
+          labels: {
+            alert_slug: "hostile-url",
+            environment: "prod",
+            grafana_generator_url: "javascript:alert(1)",
+          },
+          annotations: {
+            summary: "[PROD] hostile-url",
+            description: "the description still has to reach the channel",
+          },
+          startsAt: new Date().toISOString(),
+        },
+      ],
+    }),
+  });
+  await boss.ensureIncidentThreads();
+
+  const incidentId = incidentOf("fp-hostile-url");
+  assert.ok(incidentId, "the signal was placed");
+  assert.ok(threadOf(incidentId), "the thread opened; the announcement was not lost");
+
+  const opening = fakeSlack.posts
+    .slice(before)
+    .map((post) => post.text)
+    .join("\n");
+  assert.match(opening, /opened\*/);
+  assert.ok(opening.includes("the description still has to reach the channel"));
+  assert.ok(!opening.includes("javascript:"), "and the url went nowhere near Slack");
+  // Degraded to the label, so the reader still learns what opened it.
+  assert.ok(opening.includes("a Grafana alert"), opening);
+});
+
 // --- recurrence ------------------------------------------------------------
 
 test("the same alert firing again after resolution opens a recurrence", async () => {

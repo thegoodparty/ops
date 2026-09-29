@@ -358,16 +358,16 @@ that met the bar did not hold. Three constraints carry the second:
 post-mortem often points at something that happened a third time under a
 different alert, and no key finds that.
 
-A *prior* incident's post-mortem is clipped in `toolapi`, not here, at
-`MAX_PRIOR_POSTMORTEM_CHARS` — head only, and it names the incident database
-as where the rest is. That is background rather than evidence this run went
-and fetched, and a reader is told where to find the whole of it, which is the
-distinction the rule below turns on. `get_incident` itself renders as JSON
-followed by the pending directives, uncut.
+A *prior* incident's post-mortem comes through `toolapi` whole. It used to be
+clipped at `MAX_PRIOR_POSTMORTEM_CHARS`, on the reasoning that the agent's own
+tool-output truncation kept a head and a tail so an unbounded post-mortem
+would eat the middle of the incident rather than itself — and that truncation
+is gone, so the cap outlived the thing it was protecting against.
+`get_incident` renders as JSON followed by the pending directives, uncut.
 
-## Nothing truncates a tool result, and nothing truncates a message to a person
+## Nothing is cut by character count, anywhere
 
-Two rules that used to be one cap.
+One rule. It used to be two, and before that it was one cap.
 
 **Tool results are never cut.** `DEFAULT_MAX_TOOL_CHARS` (20,000, about 5,000
 tokens) used to bound every one of them, and `truncateOutput` cut the middle
@@ -387,23 +387,28 @@ of what they cannot see is not something anybody can act on. So:
   and `awaitingHuman`, `CONTACT_HUMAN_MESSAGE_LIMIT` for the ask,
   `overThreadBudget` for everything the model posts itself. A refusal costs
   one turn and says what to move where; a clamp costs the reader the sentence.
-- The composed worst case of each harness message has to fit
-  `THREAD_PROSE_CHARS`, because `escalate` refuses a longer one and a nudge
-  that fails to post is dropped by design. `tools.test.ts` composes those
-  worst cases at the field limits, which is what keeps the refusals
-  load-bearing rather than decorative.
+- **A refusal needs an author to refuse to.** Where there is none — a probe's
+  stdout, a log line, a report somebody filed — the text is carried, not cut.
+  `postNotice` marks its posts `harnessComposed`, and the `/thread` route
+  splits those instead of refusing them (`http/toolapi.ts`). That is what
+  removed `STATUS_EXCERPT_CHARS` from the nudge and `LINK_LABEL_CHARS` from
+  the re-run notice.
+- **The stalled-wait brief is the one that cannot split**, because it goes
+  through `escalate` and answers to `overThreadBudget` like any brief. So it
+  does not carry the check's output at all: `stalledWaitStatus` posts that
+  under it, whole, on the harness path.
+- The composed worst case of each harness message still has to fit
+  `THREAD_PROSE_CHARS` for the part the harness *wrote*. `tools.test.ts`
+  composes those worst cases at the field limits, which is what keeps the
+  refusals load-bearing rather than decorative.
 - `CONTACT_HUMAN_MESSAGE_LIMIT` is 550 rather than something rounder because
   `unansweredBrief` quotes the ask **whole**, and that arithmetic is what buys
   it. Changing one means redoing the other.
-- The one thing still excerpted is a probe's own output
-  (`statusExcerpt`/`STATUS_EXCERPT_CHARS`): nobody authored it, it is
-  unbounded at the source, and a reader who wants all of it runs the check.
-  Head only, ending in an ellipsis, and it says nothing about its own size.
 
-The Slack agent's `truncate` in `slack/agent.ts` is the exception, and
-deliberately: that agent has no compaction configured at all, so its caps are
-the only thing bounding its context. Its call sites are tool results it reads,
-not messages it posts.
+The Slack agent is the one place a cap still stands. That agent has no
+compaction configured at all, so its per-result caps are the only thing
+bounding a transcript that grows across a run *and* across mentions. Removing
+them needs compaction built first, which is its own change.
 
 ## What it writes goes straight to Slack
 

@@ -69,7 +69,6 @@ export {
   RULE_NAME_LABEL,
   MAX_QUERIES_PER_ALERT,
   MAX_LINES,
-  MAX_LINE_BYTES,
   LOOKBACK_SECONDS,
 } from "./grafana";
 export type {
@@ -107,3 +106,6 @@ export {
   SLACK_MESSAGE_TS_LABEL,
 } from "./human";
 export type { HumanReport } from "./human";
+
+export { describeOrigin, signalOrigin } from "./link";
+export type { OriginLinker, SignalOrigin, SignalOriginRef } from "./link";

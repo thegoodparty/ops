@@ -132,7 +132,7 @@ beforeEach(async () => {
 
 describe("the mention policy", () => {
   const ordinary: RelayEvent[] = [
-    { type: "opened", incidentId: "inc-1", title: "500s on /campaigns", signalCount: 1 },
+    { type: "opened", incidentId: "inc-1", title: "500s on /campaigns", signalCount: 1, body: "", origin: null },
     { type: "merged", incidentId: "inc-1", into: "inc-2", reason: "same cause" },
     {
       type: "resolved",
@@ -242,9 +242,91 @@ describe("what a transition looks like in Slack", () => {
       incidentId: "inc-1",
       title: "500s parsing <Config> for a & b",
       signalCount: 2,
+      body: "",
+      origin: null,
     });
     assert.ok(text.includes("500s parsing &lt;Config&gt; for a &amp; b"), text);
     assert.ok(text.endsWith("nobody is being paged_"), text);
+  });
+
+  test("the opening message carries the report whole, not a title of it", () => {
+    // Incident 83 opened on "...I heard about 502s Can you op\u2026" -- the
+    // report cut at 120 characters, mid-word, in the message announcing the
+    // incident. The thread is where the report lives; the short form is the
+    // header above it, which carries the summary the agent writes.
+    const report =
+      "voter density queries are failing in prod, and they have for a while. " +
+      "I heard about 502s. Can you open an incident and work out whether it is " +
+      "the pool or the warehouse?";
+
+    const text = renderEvent({
+      type: "opened",
+      incidentId: "inc-83",
+      title: report,
+      body: report,
+      signalCount: 1,
+      origin: null,
+    });
+
+    assert.ok(text.includes(report), "the whole report is in the message");
+    assert.doesNotMatch(text, /\u2026/);
+    // And it is said once: the body already opens on the title.
+    assert.equal(text.split("voter density").length, 2);
+  });
+
+  test("a body that does not open on the title keeps both", () => {
+    // An alert with no summary annotation takes its title from the rule
+    // name, and the body has no other line for it.
+    const text = renderEvent({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "GpApiPoolSaturation",
+      body: "connections in use 24 of 25\nalert: https://goodparty.grafana.net/x",
+      signalCount: 1,
+      origin: null,
+    });
+
+    assert.ok(text.includes("GpApiPoolSaturation"));
+    assert.ok(text.includes("connections in use 24 of 25"));
+  });
+
+  test("the trailer links what opened the incident rather than only counting it", () => {
+    const text = renderEvent({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "t",
+      body: "t",
+      signalCount: 1,
+      origin: {
+        label: "a Grafana alert",
+        url: "https://goodparty.grafana.net/alerting/grafana/abc/view",
+      },
+    });
+
+    assert.ok(
+      text.includes(
+        "<https://goodparty.grafana.net/alerting/grafana/abc/view|a Grafana alert>",
+      ),
+      text,
+    );
+    assert.ok(text.includes("_1 signal \u00b7 <https"), text);
+  });
+
+  test("a signal with no link still says what kind of thing it was", () => {
+    // "1 signal" on its own told a reader nothing about what they were
+    // looking at. The label costs nothing and is most of the value, so a
+    // missing permalink loses the link and not the sentence.
+    const text = renderEvent({
+      type: "opened",
+      incidentId: "inc-1",
+      title: "t",
+      body: "t",
+      signalCount: 2,
+      origin: { label: "a Slack report", url: null },
+    });
+
+    assert.ok(text.includes("_2 signals \u00b7 a Slack report \u00b7"), text);
+    assert.ok(!text.includes("<"), "nothing is half a link");
   });
 
   test("a slug is code, and a count agrees with its noun", () => {
@@ -262,6 +344,8 @@ describe("what a transition looks like in Slack", () => {
         incidentId: "inc-1",
         title: "t",
         signalCount: 1,
+        body: "",
+        origin: null,
       }).includes("_1 signal ·"),
     );
   });
@@ -318,6 +402,8 @@ describe("what a transition looks like in Slack", () => {
       incidentId: "inc-1",
       title: "t",
       signalCount: 1,
+      body: "",
+      origin: null,
     });
     const evidence = Array.from(
       { length: 400 },
@@ -350,6 +436,8 @@ describe("threading", () => {
       incidentId: "inc-1",
       title: "500s on /campaigns",
       signalCount: 2,
+      body: "",
+      origin: null,
     });
 
     assert.equal(slack.posts[0].threadTs, null, "the opener is top level");
@@ -366,6 +454,8 @@ describe("threading", () => {
       incidentId: "inc-1",
       title: "t",
       signalCount: 1,
+      body: "",
+      origin: null,
     });
     await relay.emit({
       type: "resolved",
@@ -382,7 +472,14 @@ describe("threading", () => {
 describe("inbound", () => {
   const openThread = async (id: string, status = "INVESTIGATING") => {
     await seedIncident(id, status);
-    return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
+    return relay.emit({
+      type: "opened",
+      incidentId: id,
+      title: id,
+      signalCount: 1,
+      body: "",
+      origin: null,
+    });
   };
 
   /**
@@ -639,12 +736,16 @@ describe("a broken thread link", () => {
       incidentId: "inc-1",
       title: "t",
       signalCount: 1,
+      body: "",
+      origin: null,
     });
     const second = await relay.emit({
       type: "opened",
       incidentId: "inc-1",
       title: "t",
       signalCount: 1,
+      body: "",
+      origin: null,
     });
 
     assert.equal(second, first);
@@ -665,6 +766,8 @@ describe("a broken thread link", () => {
         incidentId: "inc-1",
         title: "t",
         signalCount: 1,
+        body: "",
+        origin: null,
       }),
     );
 
@@ -751,7 +854,14 @@ describe("a broken thread link", () => {
 describe("a message in an incident thread", () => {
   const openThread = async (id: string, status = "INVESTIGATING") => {
     await seedIncident(id, status);
-    return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
+    return relay.emit({
+      type: "opened",
+      incidentId: id,
+      title: id,
+      signalCount: 1,
+      body: "",
+      origin: null,
+    });
   };
 
   const reply = (thread: string, text: string, ts = "1700.1") =>
@@ -907,6 +1017,8 @@ describe("a button press", () => {
       incidentId,
       title: incidentId,
       signalCount: 1,
+      body: "",
+      origin: null,
     });
     await db.withWrite((d) => {
       d.prepare(

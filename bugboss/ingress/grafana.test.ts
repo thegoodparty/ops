@@ -6,7 +6,6 @@ import {
   ANNOTATION_PREFIX,
   KNOWN_CAUSES_ANNOTATION,
   MAX_LINES,
-  MAX_LINE_BYTES,
   MAX_QUERIES_PER_ALERT,
   META_PREFIX,
   createGrafanaAdapter,
@@ -492,21 +491,33 @@ test("caps returned lines at MAX_LINES", async () => {
 
 // --- the Loki response reader ---------------------------------------------
 
-test("linesFrom truncates a line on a byte boundary", () => {
-  const long = "x".repeat(MAX_LINE_BYTES + 500);
+test("linesFrom carries a long line whole", () => {
+  // It used to be cut at 2,000 bytes with an "…[truncated]" marker. A log
+  // line is the one thing in an alert nobody wrote for a reader, so there
+  // was nobody to refuse it to and the cut was silent -- and a stack trace
+  // cut at two kilobytes loses the frame the alert is about as readily as
+  // it loses noise. `MAX_LINES` is what bounds this block, and it counts
+  // lines.
+  const long = `${"x".repeat(50_000)}END`;
   const [line] = linesFrom({
     data: { resultType: "streams", result: [{ stream: {}, values: [["1", long]] }] },
   });
-  assert.ok(line.endsWith("…[truncated]"));
-  assert.ok(Buffer.from(line, "utf8").length < MAX_LINE_BYTES + 50);
+
+  assert.equal(line, long);
+  assert.doesNotMatch(line, /truncated/);
 });
 
-test("linesFrom truncates multi-byte content without splitting a character", () => {
-  const long = "é".repeat(MAX_LINE_BYTES);
+test("linesFrom leaves multi-byte content exactly as Loki sent it", () => {
+  // The byte-boundary cut had to repair a split code point afterwards. With
+  // no cut there is nothing to repair, which is the point: a replacement
+  // character in a log line was always our damage, never the source's.
+  const long = "é".repeat(10_000);
   const [line] = linesFrom({
     data: { resultType: "streams", result: [{ stream: {}, values: [["1", long]] }] },
   });
-  assert.ok(!line.includes("�"), "a split code point must be repaired, not passed on");
+
+  assert.equal(line, long);
+  assert.ok(!line.includes("�"));
 });
 
 test("linesFrom reads no lines out of a metric result", () => {

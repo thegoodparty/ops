@@ -53,36 +53,24 @@ export const CONTACT_HUMAN_MESSAGE_LIMIT = 550;
 export const CONTACT_HUMAN_MIN_WAIT_SECONDS = 1800;
 
 /**
- * How much of a probe's own output a nudge or a brief carries.
- *
- * The status block is the one thing in either that nobody authored: it is
- * whatever the model's check printed last, and it exists so a reader can see
- * whether the thing they are being nudged about has moved. So it is the one
- * thing here that is still excerpted, and what changed is the shape.
- *
- * Head only, and the cut says nothing about its own size. What used to sit
- * in these messages was `[... 549 characters elided ...]` from the middle of
- * the text -- a count of what the reader is missing, which tells them
- * nothing they can act on, and a cut through the middle, which is where the
- * answer usually is. A reader who wants the whole output runs the check; a
- * reader being nudged wants the top of it.
- */
-export const STATUS_EXCERPT_CHARS = 400;
-
-/**
  * A probe's last output, ready for a fenced block.
  *
- * The ellipsis is the whole of what the reader is told about the cut, and it
- * is deliberate rather than terse: a cut nobody can see is the silent
- * failure this file is built against, and a cut measured in characters is
- * noise dressed as precision.
+ * Whole. It used to be a 400-character head with an ellipsis, on the
+ * reasoning that a reader being nudged wants the top of the output and can
+ * run the check themselves for the rest. Both halves of that are wrong. The
+ * top of a failing check is the command echo; the answer is at the bottom.
+ * And "the reader can run it themselves" is a thing to say about a reader
+ * at a terminal, not one holding a phone at 2am, which is the only reader
+ * a nudge has.
+ *
+ * Nothing pays for this in refusals, because a nudge is posted on the
+ * harness path: `postNotice` marks it `harnessComposed`, so a long one is
+ * split into consecutive posts rather than refused to a model that stopped
+ * writing hours ago. See `http/toolapi.ts`.
  */
-export const statusExcerpt = (output: string): string => {
+export const probeOutput = (output: string): string => {
   const text = output.trim();
-  if (!text) return "(no output)";
-  return text.length <= STATUS_EXCERPT_CHARS
-    ? text
-    : `${text.slice(0, STATUS_EXCERPT_CHARS).trimEnd()}\u2026`;
+  return text ? text : "(no output)";
 };
 
 /**
@@ -343,13 +331,18 @@ export const HEARTBEAT_MAX_GAP_SECONDS = 86_400;
  * so and costs one turn, which is what every other over-long field in this
  * file already costs (`CONTACT_HUMAN_MESSAGE_LIMIT`, `overThreadBudget`).
  *
- * 200 is the number the composition needs, unchanged from when it was a
- * clamp: two of these, plus a `STATUS_EXCERPT_CHARS` block, plus a
- * `formatWaited` bounded at fifteen characters, plus template. The nudge
- * lands at 962 and the stalled-wait brief at 1,124, against the 1,200 a
- * thread post gets -- so the brief is the tight one and its wording has
- * about 75 characters of room. `tools.test.ts` composes both worst cases, so
- * the arithmetic stays true rather than staying written down.
+ * 200 is the number the composition needs, and it is now the *only* number
+ * in that composition that can move. It used to close an arithmetic against
+ * the thread budget -- two of these, plus a 400-character excerpt of the
+ * check's output, plus `formatWaited`, plus template -- and that arithmetic
+ * is what forced the excerpt: the one field nobody wrote was the one field
+ * with room to give. The check's output is no longer in either message's
+ * budget. The nudge is harness-composed and splits; the stalled-wait brief
+ * does not carry the output at all. So this limit answers to what somebody
+ * reads on a phone and to nothing else.
+ *
+ * `tools.test.ts` composes the worst case of both against the budget, so the
+ * remaining arithmetic stays true rather than staying written down.
  */
 export const MONITOR_FIELD_LIMIT = 200;
 
@@ -441,7 +434,7 @@ export const heartbeatMessage = (args: {
     "",
     "*What the check says now*",
     "```",
-    statusExcerpt(args.status),
+    probeOutput(args.status),
     "```",
     `Next nudge in ${formatWaited(args.nextSeconds * 1000)}.`,
   ].join("\n");
@@ -451,12 +444,19 @@ export const heartbeatMessage = (args: {
  * model would write -- the harness knows the wait and nothing else -- which
  * is why the prompt tells the model to escalate itself if it can see this
  * coming and say something more useful.
+ *
+ * The check's output is the one thing this does *not* carry, and that is the
+ * difference between it and the nudge. A brief goes through `escalate`,
+ * which refuses a post past `THREAD_PROSE_CHARS` -- correctly, for a brief a
+ * model wrote and can be asked to shorten, and uselessly here, where the
+ * author is the harness. So the output leaves on its own post immediately
+ * afterwards (`postStalledWaitStatus`), where it is harness-composed and
+ * splits. Cutting it to fit was the third option and is not one.
  */
 export const stalledWaitBrief = (args: {
   description: string;
   awaitingHuman: string;
   waitedMs: number;
-  status: string;
   nudges: number;
 }): string =>
   [
@@ -466,13 +466,16 @@ export const stalledWaitBrief = (args: {
     `${args.description} — ${args.awaitingHuman}`,
     "",
     "*Where it stands*",
-    "```",
-    statusExcerpt(args.status),
-    "```",
+    "What the check says now is in the message under this one.",
+    "",
     "Everything I found is in this thread. The work is done; this one step is not, and it is not something I can do.",
     "",
     "I am still on this and still checking. Nothing here needs taking over.",
   ].join("\n");
+
+/** The check's own output, posted under a stalled-wait escalation. */
+export const stalledWaitStatus = (status: string): string =>
+  ["*What the check says now*", "```", probeOutput(status), "```"].join("\n");
 
 /**
  * Dropping the marker at the end of a wait. The failure costs nothing the
@@ -501,9 +504,22 @@ const escalateStalledWait = async (
   heartbeat: HeartbeatDeps,
   reason: string,
   brief: string,
+  status: string,
 ): Promise<{ outcome: Escalation; directives: Directive[] }> => {
   try {
     const response = await heartbeat.escalate.escalate({ reason, brief });
+    // After the escalation and never instead of it. The hand-off is the
+    // effect; the check's output is context for whoever it reached. A post
+    // that fails here costs the context and is alarmed, which is the same
+    // trade the nudge makes -- and it cannot cost the escalation, because
+    // that has already landed.
+    if (response.ok) {
+      try {
+        await heartbeat.post(stalledWaitStatus(status));
+      } catch (error: unknown) {
+        alarm("wait_escalation_status_failed", { error: String(error) });
+      }
+    }
     return {
       outcome: response.ok
         ? { told: true, reason }
@@ -707,9 +723,9 @@ export const runMonitor = async (
               description: args.description,
               awaitingHuman: ask,
               waitedMs,
-              status: last,
               nudges: marker.pings,
             }),
+            last,
           );
           // Deliberately not released, and the wait deliberately not ended.
           // The marker is what carries `startedAt` and the ping count across

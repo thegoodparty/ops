@@ -22,9 +22,9 @@ import {
   runMonitor,
   heartbeatMessage,
   shellProbe,
+  probeOutput,
   stalledWaitBrief,
-  statusExcerpt,
-  STATUS_EXCERPT_CHARS,
+  stalledWaitStatus,
   unansweredBrief,
   type HeartbeatDeps,
   type HumanContactPort,
@@ -176,26 +176,35 @@ test("the real probe reports exit codes from the shell", async () => {
   assert.equal(failure.code, 3);
 });
 
-test("statusExcerpt leaves output that fits completely alone", () => {
-  assert.equal(statusExcerpt("  short  "), "short");
-  assert.equal(statusExcerpt("   "), "(no output)");
-  const exact = "z".repeat(STATUS_EXCERPT_CHARS);
-  assert.equal(statusExcerpt(exact), exact);
+test("probeOutput trims and names an empty result", () => {
+  assert.equal(probeOutput("  short  "), "short");
+  assert.equal(probeOutput("   "), "(no output)");
 });
 
-test("statusExcerpt keeps the head, shows the cut, and counts nothing", () => {
-  // The shape is the change. The old helper cut the middle out and said
-  // `[... 549 characters elided ...]`, which went into a Slack message
-  // somebody read on a phone: a count of what they are missing is not
-  // something anybody can act on, and the middle is where the answer
-  // usually is. A reader who wants all of it runs the check.
-  const text = "q".repeat(5000);
-  const excerpt = statusExcerpt(text);
+test("probeOutput carries the whole output, however long", () => {
+  // The bug this replaces: a 400-character head with an ellipsis, in the
+  // one block of a nudge nobody authored. The answer a failing check gives
+  // is at the bottom of its output, not the top, so a head is the half
+  // least likely to say anything.
+  const text = `${"q".repeat(5000)}\nFAILED: the thing the reader needed`;
 
-  assert.ok(excerpt.length <= STATUS_EXCERPT_CHARS + 1, `came back as ${excerpt.length}`);
-  assert.ok(text.startsWith(excerpt.slice(0, -1)), "what is kept is the head");
-  assert.ok(excerpt.endsWith("\u2026"), "the cut is visible");
-  assert.doesNotMatch(excerpt, /\d+ characters/);
+  assert.equal(probeOutput(text), text);
+});
+
+test("a nudge carries the whole check output rather than a head of it", () => {
+  const tail = "FAILED: the thing the reader needed";
+  const nudge = heartbeatMessage({
+    description: "the PR to be merged",
+    awaitingHuman: "somebody has to press merge",
+    waitedMs: 3_600_000,
+    status: `${"q".repeat(5000)}\n${tail}`,
+    nextSeconds: 7200,
+  });
+
+  assert.ok(nudge.includes(tail), "the end of the output is in the nudge");
+  assert.ok(nudge.includes("q".repeat(5000)), "and so is the rest of it");
+  assert.doesNotMatch(nudge, /\u2026/);
+  assert.doesNotMatch(nudge, /truncat|elided/);
 });
 
 const fakeContact = (pending: PendingQuestion | null = null) => {
@@ -1348,8 +1357,14 @@ test("the third nudge becomes an escalation, and the wait carries on", async () 
   assert.match(harness.escalations[0].brief, /still on this/);
   assert.match(harness.escalations[0].brief, /Nothing here needs taking over/);
   // The loud rung replaces the nudge rather than arriving beside it: the
-  // same facts, posted where the rotation sees them.
-  assert.equal(harness.posts.length, 0);
+  // same facts, posted where the rotation sees them. The one thread post it
+  // does make is the check's own output, which the brief cannot carry --
+  // `escalate` refuses a post past the thread budget and the harness is not
+  // an author it can refuse to, so a brief holding this would be dropped
+  // rather than shortened.
+  assert.equal(harness.posts.length, 1);
+  assert.ok(harness.posts[0].includes('{"state":"OPEN"}'));
+  assert.ok(!harness.escalations[0].brief.includes('{"state":"OPEN"}'));
 });
 
 test("the ladder gets louder rather than ending, for as long as the wait lasts", async () => {
@@ -1392,7 +1407,11 @@ test("the ladder gets louder rather than ending, for as long as the wait lasts",
       "nobody has ended a 63h wait after 6 nudges",
     ],
   );
-  assert.equal(harness.posts.length, 0, "past the third rung every nudge is loud");
+  // Past the third rung every nudge is loud, so nothing here is a quiet
+  // nudge: the four thread posts are one per escalation, each carrying the
+  // check's own output under the brief that cannot hold it.
+  assert.equal(harness.posts.length, harness.escalations.length);
+  assert.ok(harness.posts.every((post) => post.includes('{"state":"OPEN"}')));
   assert.equal(harness.clears(), 1, "dropped once, by the timeout that ended the wait");
 });
 
@@ -1608,7 +1627,9 @@ test("the escalation's brief counts the nudges that were actually sent", async (
     },
   );
 
-  assert.equal(harness.posts.length, 1);
+  // One quiet nudge, and one post of the check's output under the
+  // escalation that followed it.
+  assert.equal(harness.posts.length, 2);
   assert.match(harness.escalations[0].brief, /across 2 nudges/);
 });
 
@@ -1618,24 +1639,18 @@ test("the escalation's brief counts the nudges that were actually sent", async (
 // produce has to fit, and these are the tests that keep that true instead of
 // merely written down in a comment.
 
-test("the harness's nudge fits the thread budget at its worst", () => {
-  // The nudge is the one harness-composed thread post that carries two of the
-  // model's own fields *and* the status block, so it is the tightest of the
-  // three and the one that would fail first. A refused nudge is dropped on
-  // purpose -- losing a day-long wait to a 503 is the worse trade -- which
-  // means an over-long one produces an incident that waits all day, nudges
-  // nobody, and then hands off claiming it nudged three times.
-  //
-  // The two prose fields are at their real maximum rather than an absurd one,
-  // because what bounds them now is a refusal at the tool boundary rather
-  // than a clamp here. The test below is the one that keeps that refusal
-  // honest; without it this bound is arithmetic about nothing.
+test("everything a nudge writes itself fits the thread budget at its worst", () => {
+  // What this bound is now *about* has changed, and the change is the point.
+  // The nudge is harness-composed, so it goes out on the split path and the
+  // check's output is not in anybody's budget. What is still worth holding
+  // to a phone screen is the part the harness wrote: two of the model's own
+  // fields at their true maximum, plus the template, plus a gap no clock
+  // would produce. The test below keeps the refusal that bounds those two
+  // honest; without it this is arithmetic about nothing.
   const nudge = heartbeatMessage({
     description: "d".repeat(MONITOR_FIELD_LIMIT),
     awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
-    // Still unbounded at the source -- it is whatever the check printed --
-    // so it stays absurd.
-    status: "s".repeat(100_000_000),
+    status: "",
     waitedMs: Number.MAX_SAFE_INTEGER,
     // There is always a next nudge, and the sentence naming it grows with how
     // far away it is, so the worst case is a gap no clock would ever produce.
@@ -1720,10 +1735,12 @@ test("the harness's unanswered brief fits the thread budget at its worst", () =>
 });
 
 test("the harness's stalled-wait brief fits the thread budget at its worst", () => {
+  // Every term in it is now bounded by a refusal somebody can act on, which
+  // is what removing the check's output from it bought: the output was the
+  // one term with no author and so the one term that used to give way.
   const brief = stalledWaitBrief({
     description: "d".repeat(MONITOR_FIELD_LIMIT),
     awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
-    status: "s".repeat(100_000_000),
     waitedMs: Number.MAX_SAFE_INTEGER,
     nudges: 999_999,
   });
@@ -1735,6 +1752,24 @@ test("the harness's stalled-wait brief fits the thread budget at its worst", () 
   assert.ok(brief.includes("d".repeat(MONITOR_FIELD_LIMIT)));
   assert.ok(brief.includes("a".repeat(MONITOR_FIELD_LIMIT)));
   assert.doesNotMatch(brief, /characters elided/);
+});
+
+test("the check's output leaves a stalled wait on its own post, whole", () => {
+  const tail = "FAILED: the thing the reader needed";
+  const status = `${"s".repeat(50_000)}\n${tail}`;
+  const brief = stalledWaitBrief({
+    description: "the PR to be merged",
+    awaitingHuman: "somebody has to press merge",
+    waitedMs: 3_600_000,
+    nudges: 6,
+  });
+
+  // Not in the brief: `escalate` refuses a post past the thread budget and
+  // the harness is not an author it can refuse to, so a brief carrying this
+  // would be dropped rather than shortened.
+  assert.ok(!brief.includes(tail));
+  assert.ok(brief.includes("in the message under this one"));
+  assert.ok(stalledWaitStatus(status).includes(status));
 });
 
 test("a short harness brief is left exactly as written", () => {

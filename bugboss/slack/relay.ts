@@ -13,10 +13,11 @@
 // broadcasting them, so one agent's answer could arrive on another's socket.
 
 import type { Db } from "../db";
+import type { SignalOriginRef } from "../ingress/link";
 import type { Directive, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
 import type { SlackChoiceClick } from "./blocks";
-import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
+import { bullets, escape, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 
 const log = makeLog("slack-relay");
 
@@ -69,7 +70,19 @@ export interface RelayDeps {
  * different things and conflating them was a mistake in earlier drafts.
  */
 export type RelayEvent =
-  | { type: "opened"; incidentId: string; title: string; signalCount: number }
+  | {
+      type: "opened";
+      incidentId: string;
+      title: string;
+      /**
+       * The signal, whole. For a report this is what the person wrote; for
+       * an alert it is the annotations, values and links Grafana sent.
+       */
+      body: string;
+      signalCount: number;
+      /** What opened it and where to read it. See `ingress/link.ts`. */
+      origin: SignalOriginRef | null;
+    }
   | { type: "merged"; incidentId: string; into: string; reason: string }
   | {
       type: "resolved";
@@ -144,12 +157,33 @@ const prLink = (url: string): string => {
  */
 export const renderEvent = (event: RelayEvent): string => {
   switch (event.type) {
-    case "opened":
+    case "opened": {
+      // The signal whole, not a title. This message used to carry the
+      // first line of the report cut at 120 characters, which is how
+      // incident 83 opened on "...I heard about 502s Can you op…". The
+      // thread is where the report lives; the short form is the header
+      // above it, which carries the summary the agent writes.
+      //
+      // The title is only repeated when the body does not already start
+      // with it -- an alert with no summary annotation takes its title from
+      // the rule name, which the body has no other line for.
+      const body = event.body.trim();
+      const said = body.startsWith(event.title.trim())
+        ? [mrkdwn`${body}`]
+        : [mrkdwn`${event.title}`, mrkdwn`${body}`];
+      // Already mrkdwn in both branches, so it is interpolated with raw().
+      // The label is ours and `link` escapes what goes inside the entity.
+      const origin = !event.origin
+        ? ""
+        : event.origin.url
+          ? ` · ${link(event.origin.url, event.origin.label)}`
+          : ` · ${escape(event.origin.label)}`;
       return [
         mrkdwn`*Incident ${event.incidentId} opened*`,
-        mrkdwn`${event.title}`,
-        mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"} · an agent is investigating · nobody is being paged_`,
+        ...(body ? said : [mrkdwn`${event.title}`]),
+        mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"}${raw(origin)} · an agent is investigating · nobody is being paged_`,
       ].join("\n");
+    }
     case "merged":
       // Both references name the word "incident", which is what the outbound
       // pass keys off to render them as links. A bare id is a number.

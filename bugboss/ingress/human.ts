@@ -39,8 +39,6 @@ export const SLACK_CHANNEL_LABEL = "slack_channel";
 export const SLACK_THREAD_TS_LABEL = "slack_thread_ts";
 export const SLACK_MESSAGE_TS_LABEL = "slack_message_ts";
 
-const TITLE_MAX = 120;
-
 export interface HumanReport {
   /** What the reporter wrote. This is the evidence, so it is stored whole. */
   text: string;
@@ -57,14 +55,6 @@ export interface HumanReport {
   messageTs?: string | null;
   reportedAt?: number;
 }
-
-const firstLine = (text: string): string => {
-  const line = text.trim().split("\n").find((l) => l.trim().length > 0) ?? "";
-  const trimmed = line.trim();
-  return trimmed.length > TITLE_MAX
-    ? `${trimmed.slice(0, TITLE_MAX - 1)}…`
-    : trimmed;
-};
 
 const derivedId = (report: HumanReport): string => {
   if (report.id) return report.id;
@@ -102,7 +92,24 @@ export const humanSignal = (report: HumanReport): RawSignal => {
     source: HUMAN_SOURCE,
     sourceId: derivedId(report),
     kind: "bug_report",
-    title: firstLine(text),
+    // The whole report, and nothing reduces it on the way here.
+    //
+    // It used to be cut at 120 characters with an ellipsis, and that cut
+    // reached the channel: incident 83 opened on "...I heard about 502s Can
+    // you op…", stopped mid-word, in the message announcing it.
+    //
+    // Then it took the first line, which looked like a safe way to keep a
+    // one-line field one line. It was not safe so much as unreachable: the
+    // only caller is the composition root, and the text it passes has been
+    // through `stripBotMention`, which collapses every run of whitespace to
+    // a space. A report is already one line by the time it arrives. So that
+    // reduction never fired, and a reduction that never fires is worse than
+    // none -- it reads as a guarantee somebody may come to rely on.
+    //
+    // Nothing downstream needs it either. `slack/board.ts` collapses
+    // whitespace itself, because a signal title also comes out of an alert
+    // annotation and it will not take that on trust from any writer.
+    title: text,
     body: text,
     labels,
     reportedBy: report.reportedBy,

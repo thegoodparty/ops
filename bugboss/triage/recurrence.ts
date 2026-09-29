@@ -30,8 +30,6 @@ export const RECURRENCE_WINDOW_MS = 14 * DAY_MS;
 export const CANDIDATE_LOOKBACK_MS = 90 * DAY_MS;
 
 const MAX_CANDIDATES = 3;
-const MAX_CAUSE_CHARS = 400;
-const MAX_EVIDENCE_CHARS = 300;
 
 /**
  * `(source, sourceId)`: the dedup key every adapter must produce, and the one
@@ -87,9 +85,12 @@ const TAIL = `AND i.status IN ('RESOLVED','CLOSED')
   ORDER BY i.resolvedAt DESC
   LIMIT ?`;
 
-const clip = (text: string, max: number) =>
-  text.length > max ? `${text.slice(0, max)}...[truncated]` : text;
-
+/**
+ * The candidate's own fields, whole. `MAX_CANDIDATES` is the bound on this
+ * block and it is a count of incidents, not a count of characters: three
+ * candidates is what the prompt can usefully compare, and how long each one's
+ * recorded cause runs is not a thing triage gets to have an opinion about.
+ */
 const toCandidate = (
   row: CandidateRow,
   openedAt: number,
@@ -99,10 +100,8 @@ const toCandidate = (
   return {
     incidentId: row.incidentId,
     status: row.status,
-    rootCause: row.rootCause ? clip(row.rootCause, MAX_CAUSE_CHARS) : null,
-    resolvedEvidence: row.resolvedEvidence
-      ? clip(row.resolvedEvidence, MAX_EVIDENCE_CHARS)
-      : null,
+    rootCause: row.rootCause,
+    resolvedEvidence: row.resolvedEvidence,
     resolvedAt: row.resolvedAt,
     daysSince: Math.round((sinceMs / DAY_MS) * 10) / 10,
     // A negative interval is not an error and is not excluded: an alert that
@@ -150,7 +149,7 @@ const describe = (c: RecurrenceCandidate): string => {
       : `resolved ${c.daysSince}d before this signal started`;
   return [
     `- ${c.incidentId} | ${c.status} | ${when}${c.conclusive ? " | CONCLUSIVE" : ""}`,
-    `  its signal: ${clip(c.signalTitle, 200)}`,
+    `  its signal: ${c.signalTitle}`,
     `  rootCause: ${c.rootCause ?? "never established"}`,
     `  resolved because: ${c.resolvedEvidence ?? "no evidence recorded"}`,
   ].join("\n");

@@ -243,13 +243,6 @@ export const dollars = (value: number): string =>
 export const cell = (value: string): string =>
   value.replace(/\s+/g, " ").replaceAll("|", "\\|").trim();
 
-const clamp = (value: string, limit: number): string =>
-  value.length <= limit ? value : `${value.slice(0, limit - 1).trimEnd()}…`;
-
-/** The first line of prose, for a one-line summary of something longer. */
-const firstLine = (value: string): string =>
-  value.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
-
 /**
  * Push a block of the agent's own Markdown one heading level down, so its
  * `## Timeline` nests under this file's `## Post-mortem` instead of standing
@@ -537,12 +530,16 @@ const recurrence = (data: ReportData): string[] => {
 export const renderReportDocument = (data: ReportData): string => {
   const { incident } = data;
   const metrics = reportMetrics(data);
+  // Whole. It used to be the headline's first line, which is a cut by a
+  // different unit and not an exception to the rule: a reader has no way to
+  // know there were three more, and "it is in the file" does not help them
+  // when this *is* the file.
   const headline = data.signals[0]?.title ?? "No signal recorded";
 
   return [
     `# Incident ${incident.id}`,
     "",
-    firstLine(headline),
+    headline.trim(),
     "",
     `Closed ${incident.closedAt === null ? "at an unrecorded time" : timestamp(incident.closedAt)} · written by BugBoss.`,
     "",
@@ -572,9 +569,6 @@ export const renderReportDocument = (data: ReportData): string => {
 // ---------------------------------------------------------------------------
 // The thread summary
 // ---------------------------------------------------------------------------
-
-/** Room for the root cause without pushing the summary past one message. */
-const SUMMARY_CAUSE_CHARS = 300;
 
 /**
  * What goes in the thread beside the file.
@@ -631,8 +625,14 @@ export const renderThreadSummary = (
     `on ${run.modelId ?? "an unrecorded model"}${priced}`,
   ].join(" · ");
 
+  // The whole cause. Two cuts used to sit here: 300 characters, and before
+  // that only the first line. Both are the one thing a summary must not do
+  // -- a cause that reads as a finished sentence and stops before the clause
+  // naming what broke is worse than no cause at all, and a reader cannot
+  // tell a short cause from a cut one. Past one message this splits, because
+  // the whole summary already goes out through `splitForSlack`.
   const cause = incident.rootCause
-    ? toMrkdwn(clamp(firstLine(incident.rootCause), SUMMARY_CAUSE_CHARS))
+    ? toMrkdwn(incident.rootCause.trim())
     : "No root cause was recorded.";
 
   return [

@@ -519,25 +519,21 @@ test("a workflow name cannot break out of the link it is the label for", () => {
   assert.equal(notice.split(">").length, 2, "and exactly one closes it");
 });
 
-test("the notice fits a thread post even at its worst", () => {
-  // The notice goes out through the thread, which refuses a post past
-  // THREAD_PROSE_CHARS. The suspicion has its own limit, so the only other
-  // thing here that can run long is a name GitHub handed us -- and before it
-  // was clamped, a 200-character workflow name plus a maximal suspicion came
-  // to 1,205 against a budget of 1,200. That would have been a rerun_ci that
-  // fails on a workflow with a verbose name, which is nobody's idea of a
-  // reason.
+test("a workflow name GitHub gave us goes in whole, however long", () => {
+  // It used to be cut at 80 characters, to keep the notice under
+  // THREAD_PROSE_CHARS next to a suspicion already limited to 700. The
+  // arithmetic worked and the term it spent was the wrong one: the name is
+  // the only part of this notice with nobody to refuse it to, so it was the
+  // part that gave way. The notice is harness-composed now and splits.
+  const name = "nightly end to end suite ".repeat(12);
   const notice = rerunNotice(
     "thegoodparty/omni",
-    aRun({ name: "nightly end to end suite ".repeat(12) }),
+    aRun({ name }),
     "s".repeat(RERUN_SUSPICION_LIMIT),
   );
 
-  assert.ok(
-    notice.length <= THREAD_PROSE_CHARS,
-    `${notice.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
-  );
-  assert.match(notice, /…\|?>/, "the name is clamped where it ran long");
+  assert.ok(notice.includes(name.trim()), "the whole name is the label");
+  assert.doesNotMatch(notice, /…/);
 });
 
 test("a workflow name short enough to read is left alone", () => {

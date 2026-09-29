@@ -31,6 +31,7 @@ import {
   createIngress,
   createLokiQuery,
   humanSignal,
+  signalOrigin,
   HUMAN_SOURCE,
   SLUG_LABEL,
   type GrafanaVerifier,
@@ -561,6 +562,7 @@ export const createSlackAgentModel = (
     }
     messages.push({ role: "user", text: req.input });
 
+
     const tools = req.tools.map((tool) => ({
       name: tool.name,
       description: tool.description,
@@ -944,16 +946,32 @@ export const createBugBoss = async (
 
       let opened = 0;
       for (const row of rows) {
-        const signals = db.query<{ title: string }>(
-          "SELECT title FROM signal WHERE incidentId = ? ORDER BY openedAt, id",
+        // `body` and `labels` as well as the title: the opening message
+        // carries the signal whole, and the trailer links the thing that
+        // opened the incident rather than only counting it.
+        const signals = db.query<{
+          source: string;
+          title: string;
+          body: string;
+          labels: string;
+        }>(
+          "SELECT source, title, body, labels FROM signal WHERE incidentId = ? ORDER BY openedAt, id",
           [row.id],
         );
+        const first = signals[0];
         try {
           await relay.emit({
             type: "opened",
             incidentId: row.id,
-            title: signals[0]?.title ?? `Incident ${row.id}`,
+            title: first?.title ?? `Incident ${row.id}`,
+            body: first?.body ?? "",
             signalCount: signals.length,
+            origin: first
+              ? await signalOrigin(
+                  { source: first.source, labels: JSON.parse(first.labels) as Record<string, string> },
+                  deadlined,
+                )
+              : null,
           });
           opened++;
         } catch (err) {
