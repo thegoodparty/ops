@@ -75,8 +75,8 @@ undo any of it.
 Two counters, both **in memory on purpose**:
 
 - `fastFailures` — consecutive deaths inside `fastFailureMs`, a crash loop.
-- `launches` — total launches this container has made for an incident,
-  ceiling `maxAttempts * 3`.
+- `launches` — total launches for an incident since the last time the
+  dispatcher gave up on it, ceiling `maxAttempts * 3`.
 
 Neither is persisted, because every merge to ops `main` restarts this
 container and a restart is not evidence that an agent is crashing. So a fresh
@@ -92,16 +92,29 @@ open. Unlike the counters it is in the database, so the stop outlives a
 restart, and it is lifted by the cooldown, a reply or the stale sweep rather
 than by a deploy.
 
-An escalation that *failed* to post clears the counter instead, and the
-incident is relaunched. Holding the counter at the ceiling retried the same
-failing escalation every tick, which never resolved and never said so.
+**The counter is cleared at the ceiling either way**, and which thing replaces
+it is the only difference between the two arms. A told escalation is replaced
+by the park; an untold one has nothing to be replaced by, so the clear lets the
+incident relaunch rather than retrying a failing escalation every tick, which
+never resolved and never said so.
+
+Clearing it on the *told* arm matters just as much, because the park expires.
+A count left at the ceiling is met again by the cooldown: the wait lifts, the
+incident re-enters the eligible set, the same ceiling fires on a stale count,
+and the rotation is paged a second time for launches it was already paged for
+— then parked, expired, and paged again, once an hour for as long as the
+container lives. It also makes the cooldown a lie, since `park` promises
+another go and the counter silently withholds it. A loop that is still a loop
+refills the counter from real launches and escalates again, which is a page
+that has earned itself.
 
 ## Parking
 
 `incident_wait` is how an incident stops being relaunched. `Dispatcher.park`
 writes it at the two ceilings above with a `PARK_COOLDOWN_SECONDS` wake;
 `ToolApi.park` writes it for an agent that has nothing it can do yet;
-`relay.recordReply` deletes it on **any** reply in the thread.
+`relay.recordReply` deletes it on any reply in the thread **that the wait says
+lifts on one**, which a spent turn budget does not — see the stale sweep below.
 
 It exists because `owner = 'human'` was doing two jobs at once: saying who had
 the work, and stopping the relaunch. Only the second was load-bearing.

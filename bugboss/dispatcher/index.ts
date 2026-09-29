@@ -129,10 +129,12 @@ export interface DispatcherDeps {
    */
   fastFailureSeconds?: number;
   /**
-   * Launches on one incident within a single container lifetime before the
-   * dispatcher gives up and escalates. Defaults to three times maxAttempts,
-   * since a death slow enough to clear the fast-failure counter still did
-   * some work and deserves more rope than a crash loop.
+   * Launches on one incident before the dispatcher gives up and escalates.
+   * Defaults to three times maxAttempts, since a death slow enough to clear
+   * the fast-failure counter still did some work and deserves more rope than
+   * a crash loop. Counted from the last time it gave up rather than from
+   * container start, because giving up parks the incident and that park
+   * expires into another go.
    */
   maxLaunches?: number;
   /** How long a parked incident stays unrunnable before it is tried again. */
@@ -385,7 +387,7 @@ const stalledBrief = (row: EligibleRow, launches: number): string =>
     // whether the run spoke before it stopped.
     "Escalated by the dispatcher after too many launches without a finish.",
     "",
-    `It has been launched ${launches} times on this incident since this container came up and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
+    `It has been launched ${launches} times on this incident and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
     "",
     "What I believe now: whatever the agent last posted in this thread.",
     "What I ruled out: not recorded.",
@@ -429,6 +431,11 @@ export class Dispatcher {
    * on a replay it cannot get through — was relaunched every tick for as long
    * as the incident stayed open. The persisted `attempts` column cannot do
    * this job: it counts container restarts too, and those are routine.
+   *
+   * Cleared when the ceiling is reached and acted on, not just at restart.
+   * What replaces it is a park, and a park expires; a count that outlived it
+   * would meet the incident again at the cooldown and escalate it a second
+   * time on the strength of launches it had already been paged for.
    */
   private readonly launches = new Map<string, number>();
 
@@ -554,6 +561,19 @@ export class Dispatcher {
         // back to it. Keeping the counter at the ceiling with nothing else
         // changed retried the same failing escalation every tick for as long
         // as the incident stayed open, which never resolved and never said so.
+        //
+        // The counter goes either way, because past this point it can only be
+        // wrong. The park the told path falls back to *expires*: leaving the
+        // count at the ceiling means the cooldown lifts the wait into a
+        // dispatcher that still believes it has given up, so the incident
+        // re-enters the eligible set, this branch fires again on a stale
+        // count, and the rotation is paged once an hour with nothing having
+        // happened in between -- a second page for a first crash loop. That
+        // is also what makes the cooldown a lie: `park` promises another go
+        // and the counter silently withholds it. A loop that is still a loop
+        // refills this from real launches and escalates again, which is a
+        // page that has earned itself.
+        this.fastFailures.delete(row.id);
         if (ok) {
           await this.park(
             row.id,
@@ -562,7 +582,6 @@ export class Dispatcher {
           );
           escalated.push(row.id);
         } else {
-          this.fastFailures.delete(row.id);
           alarm("crash_loop_escalation_failed", {
             incidentId: row.id,
             failures,
@@ -579,7 +598,10 @@ export class Dispatcher {
           `${launches} launches on this incident without finishing one`,
           stalledBrief(row, launches),
         );
-        // Same rule as fastFailures above.
+        // Same rule as fastFailures above, and the same expiring park, so
+        // the same clear: a count left at the ceiling turns the cooldown into
+        // an hourly page instead of the retry it promises.
+        this.launches.delete(row.id);
         if (ok) {
           await this.park(
             row.id,
@@ -588,7 +610,6 @@ export class Dispatcher {
           );
           escalated.push(row.id);
         } else {
-          this.launches.delete(row.id);
           alarm("stalled_escalation_failed", {
             incidentId: row.id,
             launches,

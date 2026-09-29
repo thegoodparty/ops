@@ -570,9 +570,13 @@ describe("Dispatcher.tick", () => {
     assert.equal(launches, 2);
 
     // The cooldown is what lifts it, because none of the reasons it parked
-    // are permanent.
+    // are permanent -- and it has to lift on the container that gave up, not
+    // only on a fresh one. Ticking `restarted` here would prove nothing about
+    // that: it has never launched anything, so its counters are empty either
+    // way and it cannot tell a dispatcher that cleared its count at the
+    // ceiling from one that left it there. `d` is the one that parked this.
     clock += 3_600_000;
-    const woken = await restarted.tick();
+    const woken = await d.tick();
     assert.deepEqual(
       woken.started.map((a) => a.incidentId),
       ["i1"],
@@ -584,6 +588,65 @@ describe("Dispatcher.tick", () => {
     releases.forEach((r) => r());
     await d.drain();
     await restarted.drain();
+    cleanup();
+  });
+
+  it("gives a crash loop another go at the cooldown instead of paging again", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let clock = T0;
+    let launches = 0;
+    // Dies the instant it starts and dies badly, which is what the
+    // fast-failure counter is looking for.
+    const spawn: SpawnAgent = async () => {
+      launches += 1;
+      throw new Error("agent exited 1");
+    };
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn,
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+        maxLaunches: 99,
+        parkCooldownSeconds: 3600,
+        now: () => clock,
+      }),
+    );
+
+    // Three instant deaths: a crash loop, which escalates and parks.
+    // `maxLaunches` is held out of the way so this exercises the fast-failure
+    // path and only it.
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    const gaveUp = await d.tick();
+    await gaveUp.settled;
+    assert.deepEqual(gaveUp.escalated, ["i1"]);
+    assert.equal(escalations.length, 1);
+    assert.equal(launches, 3, "no relaunch past the ceiling");
+
+    // Nothing for the whole cooldown, on the same container.
+    const during = await d.tick();
+    await during.settled;
+    assert.deepEqual(during.started, []);
+    assert.equal(escalations.length, 1, "said once, not once a tick");
+
+    // The cooldown expires into the retry `park` promises. A count left at
+    // the ceiling would meet the incident here instead and page the rotation
+    // a second time for the same three launches -- then park, expire, and do
+    // it again every hour for as long as the container lives.
+    clock += 3_600_000;
+    const woken = await d.tick();
+    await woken.settled;
+    assert.deepEqual(
+      woken.started.map((a) => a.incidentId),
+      ["i1"],
+      "not now is not the same as not ever",
+    );
+    assert.equal(escalations.length, 1, "and nobody was paged twice for it");
+    await d.drain();
     cleanup();
   });
 
