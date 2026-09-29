@@ -1007,20 +1007,24 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           ? null
           : at + Math.max(0, args.wakeAfterSeconds) * 1000;
 
+      const liftsOnReply = args.liftsOnReply ?? true;
+
       await db.withWrite((w) =>
         w
           .prepare(
-            `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt)
-             VALUES (?, ?, ?, ?)
+            `INSERT INTO incident_wait
+               (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(incidentId) DO UPDATE SET
                waitingFor = excluded.waitingFor,
                wakeAt = excluded.wakeAt,
+               liftsOnReply = excluded.liftsOnReply,
                startedAt = excluded.startedAt`,
           )
-          .run(incidentId, args.waitingFor, wakeAt, at),
+          .run(incidentId, args.waitingFor, wakeAt, liftsOnReply ? 1 : 0, at),
       );
 
-      return { ok: true, data: { incidentId, wakeAt } };
+      return { ok: true, data: { incidentId, wakeAt, liftsOnReply } };
     });
 
   const getIncident: ToolApi["getIncident"] = () =>

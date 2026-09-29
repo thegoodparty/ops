@@ -957,11 +957,18 @@ export class Dispatcher {
   ): Promise<void> => {
     await this.db.withWrite((db) => {
       db.prepare(
-        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt)
-         VALUES (?, ?, ?, ?)
+        // liftsOnReply stays 1. What the dispatcher parks for -- a crash
+        // loop, a launch ceiling -- is a guess about the world rather than a
+        // fact about the run, and somebody replying to say they fixed the
+        // thing is exactly the kind of news that changes it. The cost of
+        // being wrong is one relaunch.
+        `INSERT INTO incident_wait
+           (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES (?, ?, ?, 1, ?)
          ON CONFLICT(incidentId) DO UPDATE SET
            waitingFor = excluded.waitingFor,
            wakeAt = excluded.wakeAt,
+           liftsOnReply = excluded.liftsOnReply,
            startedAt = excluded.startedAt`,
       ).run(incidentId, waitingFor, now + this.parkCooldownMs, now);
     });

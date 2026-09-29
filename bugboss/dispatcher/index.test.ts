@@ -585,6 +585,64 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  it("leaves a wait a reply cannot end alone, however much the thread talks", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+    // A run out of turns. A reply adds none, so waking on one relaunches an
+    // agent that stops again on its first turn and escalates again -- which
+    // is how every comment on a thread became a page for the rotation.
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait
+           (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES ('i1', 'a fresh turn budget', NULL, 0, ?)`,
+      )
+      .run(T0);
+
+    const spawned: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async (ctx) => {
+          spawned.push(ctx.incidentId);
+        },
+        toolApiFor,
+        now: () => T0,
+      }),
+    );
+
+    await (await d.tick()).settled;
+    assert.deepEqual(spawned, [], "parked, so nothing runs it");
+
+    // What the relay does on every reply. Three of them, because the failure
+    // was per-comment: each one woke it and each wake paged.
+    const reply = () =>
+      sqlite
+        .prepare(
+          "DELETE FROM incident_wait WHERE incidentId = 'i1' AND liftsOnReply = 1",
+        )
+        .run();
+    reply();
+    reply();
+    reply();
+
+    assert.equal(
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = 'i1'")
+        .length,
+      1,
+      "a reply is not news about a turn budget, so the wait stands",
+    );
+
+    await (await d.tick()).settled;
+    assert.deepEqual(
+      spawned,
+      [],
+      "and nothing relaunched it into the wall it just hit",
+    );
+    cleanup();
+  });
+
   it("wakes a parked incident the moment somebody replies in its thread", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();

@@ -36,6 +36,12 @@ export interface LateColumn {
  */
 export const LATE_COLUMNS: LateColumn[] = [
   { table: "incident", column: "recurrenceAnalysis", type: "TEXT" },
+  // Whole declaration, default included, for the reason spelled out below.
+  {
+    table: "incident_wait",
+    column: "liftsOnReply",
+    type: "INTEGER NOT NULL DEFAULT 1",
+  },
   // The 1h cache-write share, which prices at 2x base input where the
   // rest of the write is 1.25x. Same full declaration as the signal
   // columns below, for the reason given there.

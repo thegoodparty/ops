@@ -329,6 +329,15 @@ export interface ToolApi {
     waitingFor: string;
     /** Runnable again after this long. Omitted means only a reply lifts it. */
     wakeAfterSeconds?: number;
+    /**
+     * Whether a reply in the thread ends this wait. Defaults to true, which
+     * is the wait on a person: somebody replying is exactly the signal it is
+     * over. Pass false when a reply cannot change the thing being waited on
+     * -- a run out of turns is the case that forced this -- because waking
+     * on one relaunches an agent that stops again immediately and escalates
+     * again, and every comment on the thread becomes a page.
+     */
+    liftsOnReply?: boolean;
   }): Promise<ToolResponse>;
 
   /** Rehydration after resume, plus pending directives. */

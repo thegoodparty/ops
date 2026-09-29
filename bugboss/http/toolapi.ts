@@ -108,6 +108,7 @@ const BODIES = {
   park: z.object({
     waitingFor: z.string().min(1),
     wakeAfterSeconds: z.number().int().nonnegative().optional(),
+    liftsOnReply: z.boolean().optional(),
   }),
   none: z.object({}),
 };

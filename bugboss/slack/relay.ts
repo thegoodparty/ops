@@ -691,16 +691,22 @@ export class SlackRelay {
     msg: { channel: string; user: string; text: string; ts: string },
   ): Promise<boolean> {
     return this.db.withWrite((d) => {
-      // Talking to an incident wakes it. No exception, no judgement, and
-      // deliberately upstream of anything that reads what the message meant:
-      // the whole failure this system had was a reply landing on an incident
-      // nothing would ever run again, and every version of the fix that asked
-      // a model to recognise the right words is a version that goes quiet the
+      // Talking to an incident wakes it. No judgement, and deliberately
+      // upstream of anything that reads what the message meant: the whole
+      // failure this system had was a reply landing on an incident nothing
+      // would ever run again, and every version of the fix that asked a
+      // model to recognise the right words is a version that goes quiet the
       // first time somebody phrases it their own way. A reply that turns out
       // to be two people talking to each other costs one relaunch.
-      d.prepare("DELETE FROM incident_wait WHERE incidentId = ?").run(
-        incidentId,
-      );
+      //
+      // The one exception is a kind, not a reading. A wait that a reply
+      // cannot end -- a run out of turns is the case -- stays put, because
+      // waking it relaunches an agent that stops again on its first turn and
+      // escalates again, so every comment on the thread pages the rotation.
+      // Still no message read: the parker said which kind it was.
+      d.prepare(
+        "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1",
+      ).run(incidentId);
       const res = d
         .prepare(
           `INSERT OR IGNORE INTO thread_reply

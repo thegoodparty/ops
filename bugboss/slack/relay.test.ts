@@ -115,6 +115,7 @@ beforeEach(async () => {
     d.prepare("DELETE FROM pending_directive").run();
     d.prepare("DELETE FROM pending_question").run();
     d.prepare("DELETE FROM thread_reply").run();
+    d.prepare("DELETE FROM incident_wait").run();
     d.prepare("DELETE FROM signal").run();
     d.prepare("DELETE FROM incident").run();
   });
@@ -382,6 +383,80 @@ describe("inbound", () => {
     await seedIncident(id, status);
     return relay.emit({ type: "opened", incidentId: id, title: id, signalCount: 1 });
   };
+
+  /**
+   * The delete that wakes a parked incident lives here, upstream of anything
+   * that reads what the message said. These two drive it through the real
+   * relay rather than restating its SQL, because a test that restates the
+   * statement cannot notice the statement changing -- which is exactly what
+   * happened: the dispatcher-side version of this passed with the condition
+   * removed from this file.
+   */
+  const park = (id: string, liftsOnReply: 0 | 1, waitingFor: string) =>
+    db.withWrite((d) =>
+      d
+        .prepare(
+          `INSERT INTO incident_wait
+             (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+           VALUES (?, ?, NULL, ?, ?)`,
+        )
+        .run(id, waitingFor, liftsOnReply, Date.now()),
+    );
+
+  const stillParked = (id: string) =>
+    db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id])
+      .length === 1;
+
+  test("a reply lifts a wait on a person", async () => {
+    const thread = await openThread("inc-1");
+    await park("inc-1", 1, "somebody to merge the PR");
+
+    await relay.handle({
+      type: "message",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: "merged it",
+      ts: "1700.5",
+      thread_ts: thread,
+    });
+
+    assert.equal(
+      stillParked("inc-1"),
+      false,
+      "talking to an incident wakes it, with no model in the path",
+    );
+  });
+
+  test("a reply does not lift a wait it cannot end", async () => {
+    const thread = await openThread("inc-1");
+    await park("inc-1", 0, "a fresh turn budget");
+
+    // Three, because the failure was per-comment: each reply woke the
+    // incident, the relaunched agent stopped on its first turn and
+    // escalated, and the rotation was paged again.
+    for (const ts of ["1700.6", "1700.7", "1700.8"]) {
+      await relay.handle({
+        type: "message",
+        channel: CHANNEL,
+        user: "U0HUMAN",
+        text: "any progress?",
+        ts,
+        thread_ts: thread,
+      });
+    }
+
+    assert.equal(
+      stillParked("inc-1"),
+      true,
+      "a reply adds no turns, so it is not news about this wait",
+    );
+    // Still recorded and still delivered: what it loses is the power to
+    // relaunch, not its place on the record.
+    assert.equal(
+      db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-1'").length,
+      3,
+    );
+  });
 
   test("an untagged reply is recorded against the incident", async () => {
     const thread = await openThread("inc-1");
