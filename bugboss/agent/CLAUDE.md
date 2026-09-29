@@ -75,14 +75,24 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   launch would bound nothing. `createTurnBudget` is seeded from
   `sumSessionUsage` over the restored transcript, which counts assistant
   messages — the same unit `turn_end` fires on.
-- **It hands off, it does not just stop.** Same two layers as the deadline:
-  at `maxTurns - TURN_BUDGET_GRACE_TURNS` the blocking-tool abort fires and
-  the model is steered to write a brief, and at `maxTurns` the harness calls
-  `hand_off` itself and aborts the session. The harness hand-off is the
-  floor under the steer, exactly as it is for an unanswered `contact_human`:
-  an incident stopped on its budget with `owner: agent` is invisible — the
-  dispatcher will not relaunch one an agent still holds and nothing lists it
-  as unclaimed.
+- **It announces and parks; it does not just stop.** Same two layers as the
+  deadline: at `maxTurns - TURN_BUDGET_GRACE_TURNS` the blocking-tool abort
+  fires and the model is steered to write a brief, and at `maxTurns` the
+  harness does it on the agent's behalf. Two calls, and only one of them is
+  optional. `escalate` is the announcement and is skipped when the agent
+  already escalated inside its grace. **`park` is not skippable.** Nothing
+  else stops the dispatcher relaunching, and a relaunched agent is instantly
+  over budget again, so without it the run escalates, stops, relaunches and
+  escalates every tick — the hot loop `park` exists for, named in its own
+  doc comment in `types.ts`. Announcing is what a person sees; parking is
+  what makes it stop.
+- **The agent escalating itself wins the announcement.** The steer asks for
+  exactly that and the model can answer on its very last grace turn, which
+  ends the same `turn_end` the cap fires on. The budget watches
+  `toolResults` for a successful `escalate`, because both posting puts "it
+  never wrote a brief" directly under the brief it just wrote. A *refused*
+  escalation does not count — nobody was told, which is the case the
+  harness exists for.
 - **The grace is clamped to half the budget.** `TURN_BUDGET_GRACE_TURNS` is
   a constant and `maxTurns` is settable, so the two configure into nonsense
   at small budgets: unclamped, `BUGBOSS_MAX_TURNS=10` puts the soft edge at
@@ -100,8 +110,9 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
 **This is not the Slack agent's budget.** `SLACK_AGENT_MAX_TURNS` is 24 and
 ends by posting that the run is out of steps, which is right when a person is
 waiting in a thread for an answer. Nobody is watching an investigator, so its
-ending is a hand-off. Same mechanism, different number, different last act —
-the names say which is which so the next change picks the right one.
+ending is an escalation and a park. Same mechanism, different number,
+different last act — the names say which is which so the next change picks
+the right one.
 
 `turn_end` cannot stop the loop. Pi reads a boundary result's `continue` as
 "force another turn" and never as "stop", so the stop is `session.abort()` —

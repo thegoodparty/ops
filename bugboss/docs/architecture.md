@@ -424,8 +424,9 @@ inside a single turn waiting on a person. So the run is also bounded in
 nine-hour run against a ceiling of 200. Both bounds have the same two
 layers: the child steers itself to write a brief at the soft edge, then it
 is stopped. The wall clock's stop is the parent's SIGKILL, strictly later;
-the turn budget's is `session.abort()` in the child, with the harness
-handing off first so nothing is left owned by a dead agent.
+the turn budget's is `session.abort()` in the child, after the harness has
+escalated (so a person is told, with the spend) and parked (so the
+dispatcher does not relaunch it into the same exhausted budget).
 
 Turns rather than dollars because dollars here are an estimate (below) and a
 cap on an estimate is a cap on arithmetic. 200 is a bound before a price

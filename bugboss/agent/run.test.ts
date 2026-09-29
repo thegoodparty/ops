@@ -550,6 +550,16 @@ const turnEndHandlerFor = (budget: { extension: (pi: ExtensionAPI) => void }) =>
   return handlers.turn_end;
 };
 
+const turnWithEscalate = (isError = false) =>
+  [
+    {
+      type: "turn_end",
+      message: { usage: {} },
+      toolResults: [{ toolName: "escalate", isError }],
+    },
+    {},
+  ] as const;
+
 const turn = (
   usage: Partial<{
     input: number;
@@ -682,7 +692,52 @@ test("the brief quotes the grace that was given, not the constant", async () => 
 
   for (let i = 0; i < 10; i++) await turnEnd(...turn());
 
-  assert.match(brief, /did not hand off in the 5 it was asked to/);
+  assert.match(brief, /did not escalate in the 5 it was asked to/);
+});
+
+test("an agent that escalates inside its grace is not escalated over", async () => {
+  // The steer asks for an escalation and the model can answer on its very
+  // last grace turn, which ends the same turn_end the cap fires on. Both
+  // posting puts "it never wrote a brief" directly under the brief it just
+  // wrote, in the thread a person is reading. The park still has to happen:
+  // announcing is not stopping, and nothing else ends the relaunch loop.
+  const states: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 3,
+    graceTurns: 1,
+    onGrace: () => {},
+    onExhausted: (state) => void states.push(state),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  await turnEnd(...turn());
+  await turnEnd(...turnWithEscalate());
+  await turnEnd(...turn());
+
+  assert.equal(states.length, 1, "the cap still stops the run");
+  assert.equal(states[0].escalated, true, "and the caller is told not to post again");
+});
+
+test("a refused escalate leaves the harness to announce it", async () => {
+  // `isError` is the whole difference: an escalation the tool API rejected
+  // told nobody anything, so treating it as done means the budget runs out
+  // in silence -- which is the failure this bound exists to prevent.
+  const states: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 2,
+    graceTurns: 1,
+    onGrace: () => {},
+    onExhausted: (state) => void states.push(state),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  await turnEnd(...turnWithEscalate(true));
+  await turnEnd(...turn());
+
+  assert.equal(states.length, 1);
+  assert.equal(states[0].escalated, false);
 });
 
 test("the budget carries what the run spent, so the escalation can say it", async () => {
@@ -718,6 +773,7 @@ test("the escalation brief names the spend and never states the price as a fact"
       used: 200,
       max: 200,
       graceTurns: 10,
+      escalated: false,
       usage: {
         ...emptySessionUsage(),
         turns: 200,
@@ -769,6 +825,7 @@ test("a run the provider priced at nothing says so rather than reporting it free
     used: 5,
     max: 5,
     graceTurns: 1,
+    escalated: false,
     usage: { ...emptySessionUsage(), turns: 5 },
   });
 
@@ -781,12 +838,13 @@ test("the steer says the budget does not come back, because a restart looks like
     used: 190,
     max: 200,
     graceTurns: 10,
+    escalated: false,
     usage: emptySessionUsage(),
   });
 
   assert.match(message, /190 of the 200 turns/);
   assert.match(message, /across every launch/);
-  assert.match(message, /calling hand_off/);
+  assert.match(message, /calling escalate/);
   assert.match(message, /A restart does not give the turns back/);
 });
 

@@ -57,9 +57,9 @@ nothing here acts on it. That is deliberate: the count lives in the restored
 session file, which the dispatcher never reads, and the escalation has to
 carry what the run spent — which the incident row does not have yet, because
 `rollUpUsage` runs after the child exits and after this has already
-escalated. So the child owns both halves. It counts, it hands off with live
-numbers, and the work leaves it as `owner: human` before this ever sees the
-exit. See `agent/CLAUDE.md`.
+escalated. So the child owns both halves. It counts, it escalates with live
+numbers, and it calls `park` so this does not relaunch it into the same
+exhausted budget. See `agent/CLAUDE.md`.
 
 The one thing to know here: the child hands off and then aborts, which
 leaves an error message behind. `exitCodeFor` exempts that case, so a budget

@@ -131,6 +131,14 @@ export const INCIDENT_AGENT_MAX_TURNS = 200;
 export const TURN_BUDGET_GRACE_TURNS = 10;
 
 /**
+ * Named once, because two things key off it: the tool the agent calls, and
+ * the turn budget watching for whether it called it. A literal in both
+ * places is a rename away from a budget that silently stops noticing -- and
+ * this tool has already been renamed once, from `hand_off`.
+ */
+export const ESCALATE_TOOL = "escalate";
+
+/**
  * How long a signalled exit waits for its last session flush to reach S3.
  *
  * Well inside ECS's 30-second default stop timeout, because the flush is one
@@ -530,7 +538,7 @@ export const createBossTools = async (args: {
         ),
     },
     {
-      name: "escalate",
+      name: ESCALATE_TOOL,
       label: "Escalate",
       description:
         "Says this incident needs a person, in the thread and at the rotation, and posts your brief. It changes nothing and does not end your run: this incident is yours either way, and you keep working it. Use it when you are blocked on something only a person can do, or when you are out of ideas. Before calling it without a root cause, you must propose either a change to the alert rule as a PR or a named piece of missing instrumentation.",
@@ -862,6 +870,12 @@ export interface TurnBudgetState {
   max: number;
   /** The grace actually in force, after clamping. Not the constant. */
   graceTurns: number;
+  /**
+   * The agent called `escalate` itself, so a person has already been told
+   * and a brief is already in the thread. The harness must not post a
+   * second one. It must still park: announcing is not stopping.
+   */
+  escalated: boolean;
   usage: SessionUsage;
 }
 
@@ -877,7 +891,7 @@ const compactTokens = (n: number): string =>
  * same shape as `deadlineMessage`: one bound, two layers, one instruction.
  */
 export const turnBudgetMessage = (state: TurnBudgetState): string =>
-  `You have used ${state.used} of the ${state.max} turns this incident gets, counted across every launch. Stop investigating. Spend what is left calling hand_off with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing. A restart does not give the turns back, so there is no later.`;
+  `You have used ${state.used} of the ${state.max} turns this incident gets, counted across every launch. Stop investigating. Spend what is left calling escalate with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing. A restart does not give the turns back, so there is no later.`;
 
 /**
  * The brief the harness writes when the model did not write one.
@@ -893,7 +907,7 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
   const { usage } = state;
   const tokens = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
   return [
-    "This is yours because the agent ran out of turns, not because it finished.",
+    "This needs a person because the agent ran out of turns, not because it finished.",
     "",
     // Two cases, because one sentence cannot honestly cover both. A launch
     // that spent the budget got its grace and ignored it. A launch that
@@ -904,7 +918,7 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     // reader distrust the rest of the brief.
     state.used > state.max
       ? `Its ${state.max}-turn budget for this incident was already spent when this launch started, so it stopped on its first turn back rather than investigating on borrowed time. ${state.used} turns have gone into it across every launch. Everything it found is in this thread.`
-      : `It used all ${state.max} turns this incident gets, across every launch, and did not hand off in the ${state.graceTurns} it was asked to. Everything it found is in this thread.`,
+      : `It used all ${state.max} turns this incident gets, across every launch, and did not escalate in the ${state.graceTurns} it was asked to. Everything it found is in this thread.`,
     "",
     "*What it spent*",
     `${state.used} turns on ${usage.modelId ?? "an unrecorded model"} · ${compactTokens(tokens)} tokens (${usage.tokensIn} in, ${usage.tokensOut} out, ${usage.cacheRead} cache read, ${usage.cacheWrite} cache write)`,
@@ -914,11 +928,13 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     "",
     "*Where it stands*",
     "What I believe now: whatever the agent last posted in this thread.",
-    "What I ruled out: not recorded; it never got to write a brief.",
+    "What I ruled out: not recorded; it never wrote a brief of its own.",
     state.used > state.max
       ? "What I was about to do: nothing yet on this launch; the budget was gone before it started."
       : "What I was about to do: unknown. It was still working when the budget ran out.",
     "Side effects: check the incident for PRs it opened.",
+    "",
+    "It is parked until somebody replies here, so nothing will relaunch into the same exhausted budget in the meantime.",
   ].join("\n");
 };
 
@@ -986,11 +1002,13 @@ export const createTurnBudget = (args: {
   const graceTurns = Math.max(1, Math.min(args.graceTurns, Math.floor(args.maxTurns / 2)));
   let steered = false;
   let stopped = false;
+  let escalated = false;
 
   const state = (): TurnBudgetState => ({
     used: usage.turns,
     max: args.maxTurns,
     graceTurns,
+    escalated,
     usage: { ...usage },
   });
 
@@ -1000,6 +1018,15 @@ export const createTurnBudget = (args: {
     extension: (pi: ExtensionAPI): void => {
       pi.on("turn_end", async (event) => {
         usage.turns += 1;
+        // Watched on every turn, not just the last: the agent can escalate at
+        // any point in its grace and the budget only learns about it here.
+        // `isError` matters -- a refused escalation told nobody anything.
+        const results = (event as { toolResults?: { toolName?: string; isError?: boolean }[] })
+          .toolResults;
+        if (results?.some((r) => r.toolName === ESCALATE_TOOL && !r.isError)) {
+          escalated = true;
+        }
+
         const turn = (event.message as { usage?: TurnUsage }).usage;
         if (turn) {
           usage.tokensIn += turn.input ?? 0;
@@ -1461,25 +1488,79 @@ const launch = async (args: {
           estimatedCostUsd: state.usage.costUsd,
         }),
       );
-      // The harness hands off on the agent's behalf, the way an unanswered
-      // `contact_human` does. Without it an incident stopped on its budget
-      // keeps `owner: agent`, which nothing lists as unclaimed and the
-      // dispatcher will not relaunch -- invisible work, which is the shape
-      // this whole subsystem exists to avoid.
-      try {
-        const response = await api.handOff({
-          reason: `turn budget of ${state.max} turns exhausted`,
-          brief: turnBudgetBrief(state),
-        });
-        if (!response.ok) {
+      // Two calls, and they are not interchangeable.
+      //
+      // `escalate` is the announcement: it reaches the thread and the
+      // rotation, and it carries the spend, which is the whole reason a turn
+      // cap shipped before a price cap. It is skipped when the agent already
+      // escalated inside its grace, because the steer asks for exactly that
+      // and the model can answer on the same `turn_end` this fires on --
+      // both posting puts "it never wrote a brief" under the brief it just
+      // wrote.
+      //
+      // `park` is the one that cannot be skipped. Nothing else stops the
+      // dispatcher relaunching, and a relaunched agent is instantly over
+      // budget again: it would escalate, stop, relaunch and escalate again
+      // every tick, which is the hot loop `park` was added for. Announcing
+      // is what a person sees; parking is what makes it stop.
+      if (state.escalated) {
+        console.log(
+          JSON.stringify({
+            component: "agent",
+            event: "turn_budget_escalation_skipped",
+            incidentId: options.incidentId,
+            used: state.used,
+            note: "the agent escalated on its own inside the grace window",
+          }),
+        );
+      } else {
+        try {
+          const response = await api.escalate({
+            reason: `turn budget of ${state.max} turns exhausted`,
+            brief: turnBudgetBrief(state),
+          });
+          if (!response.ok) {
+            console.error(
+              JSON.stringify({
+                component: "agent",
+                level: "error",
+                event: "turn_budget_escalation_refused",
+                incidentId: options.incidentId,
+                error: response.error ?? "the escalation was refused without a reason",
+                note: "nobody was told the budget ran out; the park below still stops the relaunch, so this goes quiet rather than looping",
+              }),
+            );
+          }
+        } catch (err: unknown) {
           console.error(
             JSON.stringify({
               component: "agent",
               level: "error",
-              event: "turn_budget_handoff_refused",
+              event: "turn_budget_escalation_failed",
               incidentId: options.incidentId,
-              error: response.error ?? "the hand off was refused without a reason",
-              note: "the incident is still the agent's and nobody was told; the next launch re-attempts this on its first turn",
+              error: String(err),
+              note: "nobody was told the budget ran out; the park below still stops the relaunch, so this goes quiet rather than looping",
+            }),
+          );
+        }
+      }
+
+      try {
+        const parked = await api.park({
+          waitingFor: `a person, after the ${state.max}-turn budget for this incident ran out`,
+        });
+        if (!parked.ok) {
+          // The loud one. A failed park is the hot loop: the dispatcher
+          // relaunches, the new agent is over budget on its first turn, and
+          // the rotation gets pinged again every tick until someone notices.
+          console.error(
+            JSON.stringify({
+              component: "agent",
+              level: "error",
+              event: "turn_budget_park_refused",
+              incidentId: options.incidentId,
+              error: parked.error ?? "the park was refused without a reason",
+              note: "the dispatcher will relaunch this into the same exhausted budget; expect a repeat every tick until a person replies",
             }),
           );
         }
@@ -1488,15 +1569,16 @@ const launch = async (args: {
           JSON.stringify({
             component: "agent",
             level: "error",
-            event: "turn_budget_handoff_failed",
+            event: "turn_budget_park_failed",
             incidentId: options.incidentId,
             error: String(err),
-            note: "the incident is still the agent's and nobody was told; the next launch re-attempts this on its first turn",
+            note: "the dispatcher will relaunch this into the same exhausted budget; expect a repeat every tick until a person replies",
           }),
         );
       }
-      // Stopped either way. A budget that keeps running when its hand-off
-      // fails is not a budget, and the failure is loud above.
+
+      // Stopped whatever the two calls did. A budget that keeps running when
+      // its announcement fails is not a budget, and both failures are loud.
       await live?.abort().catch(() => {});
     },
   });

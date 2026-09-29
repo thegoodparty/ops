@@ -536,7 +536,8 @@ describe("triage's spend columns reach a database that already exists", () => {
  * it is safe.
  *
  * The retirement rule says to drop a column from `schema.sql` and stop naming
- * it anywhere. That works for `costUsd`, which is `REAL NOT NULL DEFAULT 0`:
+ * it anywhere. That works for a column with a default, as the retired
+ * `costUsd` was (`REAL NOT NULL DEFAULT 0`):
  * a database that keeps the column accepts an `INSERT` that has stopped
  * naming it. `owner` is `NOT NULL` with **no default**, so the same treatment
  * makes every write fail against the restored snapshot, which is every write
@@ -606,8 +607,8 @@ describe("the write-only owner column", () => {
       await db.withWrite((w) => {
         w.prepare(
           `INSERT INTO incident
-             (id, status, owner, prUrls, firstSignalAt, attempts, costUsd,
-              tokensIn, tokensOut, cacheRead, cacheWrite)
+             (id, status, owner, prUrls, firstSignalAt, attempts,
+              tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
            VALUES ('i1', 'INVESTIGATING', 'agent', '[]', 1, 0, 0, 0, 0, 0, 0)`,
         ).run();
       });
@@ -668,7 +669,7 @@ describe("the write-only owner column", () => {
     seeded
       .prepare(
         `INSERT INTO incident (id, status, owner, prUrls, firstSignalAt, attempts,
-            costUsd, tokensIn, tokensOut, cacheRead, cacheWrite)
+            tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h)
          VALUES ('stranded', 'FIXING', 'human', '[]', 1, 4, 0, 0, 0, 0, 0)`,
       )
       .run();
