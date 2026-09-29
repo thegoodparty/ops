@@ -83,6 +83,15 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   an incident stopped on its budget with `owner: agent` is invisible — the
   dispatcher will not relaunch one an agent still holds and nothing lists it
   as unclaimed.
+- **The grace is clamped to half the budget.** `TURN_BUDGET_GRACE_TURNS` is
+  a constant and `maxTurns` is settable, so the two configure into nonsense
+  at small budgets: unclamped, `BUGBOSS_MAX_TURNS=10` puts the soft edge at
+  turn 0 and the agent is told to wrap up before it has done anything, with
+  nine turns left unused. The clamp is on the grace rather than a floor
+  under `maxTurns`, because a small budget is a legitimate ask and the
+  honest reading of it is "wrap up sooner". `TurnBudgetState.graceTurns`
+  carries what was actually given, so the brief cannot quote a window nobody
+  had.
 - **The brief carries what the run spent.** Turns, tokens and a cost
   estimate, because shipping 200 before a dollar cap is only worth anything
   if somebody learns what 200 turns costs. It is called an estimate there

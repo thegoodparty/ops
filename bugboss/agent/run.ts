@@ -860,6 +860,8 @@ export const exitRecordFor = (args: {
 export interface TurnBudgetState {
   used: number;
   max: number;
+  /** The grace actually in force, after clamping. Not the constant. */
+  graceTurns: number;
   usage: SessionUsage;
 }
 
@@ -887,13 +889,13 @@ export const turnBudgetMessage = (state: TurnBudgetState): string =>
  * same reason it is called one everywhere else -- it is arithmetic over
  * tokens against a price table that goes stale silently, not an invoice.
  */
-export const turnBudgetBrief = (state: TurnBudgetState, graceTurns: number): string => {
+export const turnBudgetBrief = (state: TurnBudgetState): string => {
   const { usage } = state;
   const tokens = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
   return [
     "This is yours because the agent ran out of turns, not because it finished.",
     "",
-    `It used all ${state.max} turns this incident gets, across every launch, and did not hand off in the ${graceTurns} it was asked to. Everything it found is in this thread.`,
+    `It used all ${state.max} turns this incident gets, across every launch, and did not hand off in the ${state.graceTurns} it was asked to. Everything it found is in this thread.`,
     "",
     "*What it spent*",
     `${state.used} turns on ${usage.modelId ?? "an unrecorded model"} · ${compactTokens(tokens)} tokens (${usage.tokensIn} in, ${usage.tokensOut} out, ${usage.cacheRead} cache read, ${usage.cacheWrite} cache write)`,
@@ -957,12 +959,27 @@ export const createTurnBudget = (args: {
   onExhausted: (state: TurnBudgetState) => void | Promise<void>;
 }): TurnBudget => {
   const usage: SessionUsage = { ...args.prior };
+  // Never more than half the budget, and never zero.
+  //
+  // `graceTurns` is a constant and `maxTurns` is settable, so the two can be
+  // configured into nonsense: at `BUGBOSS_MAX_TURNS=10` the raw subtraction
+  // puts the soft edge at turn 0, the first `turn_end` clears it, and the
+  // agent is told to wrap up before it has done anything -- while the other
+  // nine turns sit there unused. Anyone shrinking the budget to exercise
+  // this path is exactly who would hit that, and the symptom looks like the
+  // agent is broken rather than like the number is.
+  //
+  // Clamping the grace rather than raising the floor on `maxTurns`, because
+  // a small budget is a legitimate thing to ask for and the honest reading
+  // of it is "wrap up sooner", not "we will overrule you".
+  const graceTurns = Math.max(1, Math.min(args.graceTurns, Math.floor(args.maxTurns / 2)));
   let steered = false;
   let stopped = false;
 
   const state = (): TurnBudgetState => ({
     used: usage.turns,
     max: args.maxTurns,
+    graceTurns,
     usage: { ...usage },
   });
 
@@ -988,7 +1005,7 @@ export const createTurnBudget = (args: {
           await args.onExhausted(state());
           return;
         }
-        if (usage.turns >= args.maxTurns - args.graceTurns && !steered) {
+        if (usage.turns >= args.maxTurns - graceTurns && !steered) {
           steered = true;
           await args.onGrace(state());
         }
@@ -1397,7 +1414,7 @@ const launch = async (args: {
           incidentId: options.incidentId,
           used: state.used,
           max: state.max,
-          graceTurns: TURN_BUDGET_GRACE_TURNS,
+          graceTurns: state.graceTurns,
         }),
       );
       // Same pair as the deadline: free a blocking tool so the steer lands,
@@ -1441,7 +1458,7 @@ const launch = async (args: {
       try {
         const response = await api.handOff({
           reason: `turn budget of ${state.max} turns exhausted`,
-          brief: turnBudgetBrief(state, TURN_BUDGET_GRACE_TURNS),
+          brief: turnBudgetBrief(state),
         });
         if (!response.ok) {
           console.error(

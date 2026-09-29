@@ -29,6 +29,7 @@ import {
   reserveTokensFor,
   signalExitCode,
   toolListDrift,
+  TURN_BUDGET_GRACE_TURNS,
   turnBudgetBrief,
   turnBudgetMessage,
   type TurnBudgetState,
@@ -627,6 +628,63 @@ test("each layer fires once, because a model cannot act on the same sentence twi
   assert.equal(exhausted.length, 1, "a second hand-off posts a second brief over the first");
 });
 
+test("a budget smaller than the grace window still gets turns to work in", async () => {
+  // `graceTurns` is a constant and `maxTurns` is settable, so the two can be
+  // configured into nonsense. Unclamped, BUGBOSS_MAX_TURNS=10 puts the soft
+  // edge at turn 0: the first turn_end clears it and the agent is told to
+  // wrap up before it has done anything, with nine turns left unused. The
+  // person who shrinks the budget to exercise this path is exactly who hits
+  // it, and it reads as a broken agent rather than a bad number.
+  const order: string[] = [];
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 10,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: (state) => void order.push(`grace@${state.used}`),
+    onExhausted: (state) => void order.push(`exhausted@${state.used}`),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  for (let i = 0; i < 10; i++) await turnEnd(...turn());
+
+  assert.deepEqual(order, ["grace@5", "exhausted@10"], "half the budget, not all of it");
+});
+
+test("a two-turn budget keeps one turn of work and one of grace", async () => {
+  const order: string[] = [];
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 2,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: (state) => void order.push(`grace@${state.used}`),
+    onExhausted: (state) => void order.push(`exhausted@${state.used}`),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  await turnEnd(...turn());
+  await turnEnd(...turn());
+
+  assert.deepEqual(order, ["grace@1", "exhausted@2"]);
+});
+
+test("the brief quotes the grace that was given, not the constant", async () => {
+  // Clamped to 5 by the budget above. A brief that said "did not hand off in
+  // the 10 it was asked to" would be describing a window nobody had.
+  let brief = "";
+  const budget = createTurnBudget({
+    prior: emptySessionUsage(),
+    maxTurns: 10,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: () => {},
+    onExhausted: (state) => void (brief = turnBudgetBrief(state)),
+  });
+  const turnEnd = turnEndHandlerFor(budget);
+
+  for (let i = 0; i < 10; i++) await turnEnd(...turn());
+
+  assert.match(brief, /did not hand off in the 5 it was asked to/);
+});
+
 test("the budget carries what the run spent, so the escalation can say it", async () => {
   // The point of shipping a turn cap before a dollar cap is to find out what
   // 200 turns costs. That only happens if the number reaches a person.
@@ -659,6 +717,7 @@ test("the escalation brief names the spend and never states the price as a fact"
     {
       used: 200,
       max: 200,
+      graceTurns: 10,
       usage: {
         ...emptySessionUsage(),
         turns: 200,
@@ -670,7 +729,6 @@ test("the escalation brief names the spend and never states the price as a fact"
         costUsd: 41.2345,
       },
     },
-    10,
   );
 
   assert.match(brief, /ran out of turns, not because it finished/);
@@ -681,10 +739,12 @@ test("the escalation brief names the spend and never states the price as a fact"
 });
 
 test("a run the provider priced at nothing says so rather than reporting it free", () => {
-  const brief = turnBudgetBrief(
-    { used: 5, max: 5, usage: { ...emptySessionUsage(), turns: 5 } },
-    1,
-  );
+  const brief = turnBudgetBrief({
+    used: 5,
+    max: 5,
+    graceTurns: 1,
+    usage: { ...emptySessionUsage(), turns: 5 },
+  });
 
   assert.match(brief, /No cost estimate: the provider reported no prices/);
   assert.doesNotMatch(brief, /\$0\.00/);
@@ -694,6 +754,7 @@ test("the steer says the budget does not come back, because a restart looks like
   const message = turnBudgetMessage({
     used: 190,
     max: 200,
+    graceTurns: 10,
     usage: emptySessionUsage(),
   });
 
