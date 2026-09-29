@@ -86,9 +86,11 @@ const permissionSets = {
     name: "ReadOnlyAccess",
     sessionDuration: "PT8H",
     // `AWSSecretsManagerClientReadOnlyAccess` reads as metadata-only, but its
-    // policy includes `secretsmanager:GetSecretValue`. This set can therefore
-    // read secret values. Verified against the AWS-managed policy reference at
-    // pr-previews step 10; narrowing it is its own follow-up.
+    // policy includes `secretsmanager:GetSecretValue`. It is being removed in
+    // two applies: this one clears its `protect` flag (see
+    // `ATTACHMENTS_TO_UNPROTECT`), the next drops it from this list. Nothing
+    // needs the value read through `gp-readonly` — step 3 removed the preview
+    // program's `GetSecretValue` call.
     managedPolicies: [
       "arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess",
       "arn:aws:iam::aws:policy/ReadOnlyAccess",
@@ -228,6 +230,20 @@ const accounts = {
   },
 } satisfies Record<string, Account>;
 
+/**
+ * Managed-policy attachments to leave unprotected in this apply so a later one
+ * can delete them.
+ *
+ * `protect: true` means destroying an attachment needs its own pull request,
+ * so a removal is staged: this apply clears the flag, the next drops the entry
+ * from `permissionSets`. Only `readOnly`'s
+ * `AWSSecretsManagerClientReadOnlyAccess` is here, the pr-previews step 10
+ * follow-up. Empty this set when its entry is gone.
+ */
+const ATTACHMENTS_TO_UNPROTECT = new Set([
+  "arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess",
+]);
+
 export const createIdentityCenter = () => {
   const entries = Object.entries(permissionSets) as [string, PermissionSet][];
 
@@ -306,7 +322,7 @@ export const createIdentityCenter = () => {
             ...(existingArn
               ? { import: `${managedPolicyArn},${existingArn},${INSTANCE_ARN}` }
               : {}),
-            protect: true,
+            protect: !ATTACHMENTS_TO_UNPROTECT.has(managedPolicyArn),
           },
         ),
       );
