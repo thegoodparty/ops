@@ -94,7 +94,7 @@ the consumer by a different workflow, and nothing sequences the two.
       `gp-readonly`. Verified from the AWS-managed reference: the managed
       `ReadOnlyAccess` covers the ops/org preview reads, and
       `AWSSecretsManagerClientReadOnlyAccess` includes `GetSecretValue`
-      (removed in two applies: PR #171 clears its `protect` flag, a follow-up
+      (removed in two applies: PR #171 cleared its `protect` flag, PR #175
       deletes the attachment). The passphrase
       `Environment=prod` tag was not checked — the sandbox has no
       management-account session — so it stays the open question below.)
@@ -373,8 +373,8 @@ Verify then, and record the finding: whether
 preview even before step 3, the "How to resume" claim that preview needs
 `gp-admin` is already stale, and the set is broader than its name suggests.
 That last point is its own follow-up: `protect: true` means destroying the
-attachment needs its own pull request, so PR #171 clears the flag and a
-follow-up drops the entry from `permissionSets`. `ReadOnlyAccess` already
+attachment needs its own pull request, so PR #171 cleared the flag and PR
+#175 drops the entry from `permissionSets`. `ReadOnlyAccess` already
 carries the metadata reads, so nothing is lost. It did not change this
 decision: step 10 added only the workbench hop.
 
