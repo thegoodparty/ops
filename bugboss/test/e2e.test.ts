@@ -49,6 +49,11 @@ type QueuedDecision = TriageDecision & { recurrenceOf?: string };
  * in triage/triage.ts all run against these decisions.
  */
 const fakeModel = {
+  /**
+   * Wide enough that nothing here compacts. The Slack agent reads this off
+   * its model to decide what to drop; compaction has its own tests.
+   */
+  contextWindow: 1_000_000,
   // `recurrenceOf` rides along on a new_incident decision; the decide tool's
   // schema carries it even though TriageDecision itself does not.
   triageDecisions: [] as QueuedDecision[],

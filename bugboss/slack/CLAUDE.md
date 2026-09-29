@@ -661,6 +661,41 @@ identically.
 optional field nobody sets is a fix that exists in the source and not in
 production, which had already happened three times here.
 
+## The Slack agent compacts; it does not narrow its results
+
+Its loop is hand-rolled (`createSlackAgentModel`, in the composition root)
+and its transcript is persisted per thread, so it grows across a run *and*
+across mentions. That used to be bounded the only way it could be with no
+compaction: every tool result was cut — each SQL row at 2,000 characters,
+the session tail at 24,000, `get_incident` at 100,000. A row cut in half is
+a row the model reads as complete and answers off, which is the failure
+those caps were buying protection from a different failure with.
+
+`compactTranscript` replaced them, on the shape Pi uses for the incident
+agent: measure after a result lands, before the next request, and drop the
+oldest **whole round** rather than narrowing anything.
+
+- Rounds, not turns. Anthropic rejects a tool result that is not immediately
+  behind the assistant message that called for it, so a cut between the two
+  is a 400 and not a smaller request. A round starts at a `user` *or* an
+  `assistant` turn — assistant matters, because one mention is one user turn
+  and then however many tool rounds it takes, so user turns alone give one
+  boundary per mention and nothing to drop inside the run that is growing.
+- The question survives. If the cut reaches past it, it goes back on the
+  front: a transcript has to open on a user turn, and that is the turn worth
+  spending.
+- The model is **told** what is gone, on that turn. A round that vanishes
+  silently is a round it will go and read again.
+- The window is read off the model (`SizedModelClient.contextWindow`), never
+  chosen. `resolveBedrockModel` throws rather than substitute one for the
+  same reason: a wrong window is invisible in both directions.
+- One round larger than the window is kept whole. It fails loudly at the
+  provider and the reader is told the question was too big, which beats
+  being answered off half a row.
+
+What is left bounding this surface counts **things**: `MAX_SQL_ROWS`,
+`MAX_SESSION_TAIL_LINES`, the reply `LIMIT`. Never a width.
+
 ## A budget spent reading is a question left unanswered
 
 Every tool call costs the Slack agent a turn, and the run stops when the

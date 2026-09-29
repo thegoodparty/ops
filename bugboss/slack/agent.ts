@@ -26,6 +26,7 @@ import {
 import { boardOnRequest } from "../board";
 import { describeOutcome, readSessionOutcome, sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
+import type { ModelTurn } from "../model";
 import { prepareQuery, searchTool, usageForLog, type ModelUsage } from "../triage";
 
 const log = makeLog("slack-agent");
@@ -495,6 +496,189 @@ export const SLACK_AGENT_MAX_TURNS = 24;
 
 /** One model call's wall-clock bound, which every turn gets its own of. */
 export const SLACK_AGENT_BUDGET_MS = 120_000;
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/** The most this loop asks for in one reply. Matches the `maxTokens` it sends. */
+export const SLACK_AGENT_MAX_OUTPUT_TOKENS = 4096;
+
+/**
+ * Room held back for everything that is not the transcript.
+ *
+ * The system prompt and the tool schemas ride on every request and are not
+ * in `messages`, so compacting `messages` to the whole window would still
+ * overflow. The reply comes out of the same window too, which is the term
+ * `reserveTokensFor` in `agent/run.ts` exists to get right -- a reserve
+ * under `maxTokens` asks for output that cannot fit whatever else is going
+ * on. 16,000 covers this agent's prompt and its six tool schemas several
+ * times over.
+ */
+export const SLACK_AGENT_RESERVE_TOKENS = SLACK_AGENT_MAX_OUTPUT_TOKENS + 16_000;
+
+/**
+ * Characters per token, low on purpose.
+ *
+ * Nothing here can count tokens -- the tokenizer is the provider's -- so the
+ * estimate errs towards compacting sooner. English prose runs about four
+ * characters a token and JSON runs worse, and most of what this transcript
+ * holds is JSON rows and session entries. Three is the pessimistic end of
+ * that range, so the projection over-reads and the agent compacts early
+ * rather than discovering the ceiling as a provider error.
+ */
+const CHARS_PER_TOKEN = 3;
+
+const turnChars = (turn: ModelTurn): number =>
+  turn.text.length +
+  (turn.role === "assistant"
+    ? turn.toolCalls.reduce(
+        (total, call) => total + call.name.length + JSON.stringify(call.input).length,
+        0,
+      )
+    : 0);
+
+/**
+ * What the model is told about what is gone. It is told: a round that
+ * vanishes silently is a round the model will answer as though it had never
+ * happened, and go and read the same thing again.
+ */
+const droppedNote = (dropped: number): string =>
+  `[${dropped} earlier turn${dropped === 1 ? "" : "s"} in this thread are no longer in ` +
+  "context. Everything they read is still in the incident database; ask again " +
+  "for anything from them rather than recalling it.]";
+
+/** A note this function wrote on an earlier pass. No `]` appears inside one. */
+const NOTE = /^\[(\d+) earlier turns? in this thread [^\]]*\]\n\n/;
+
+/**
+ * Peel a note off a turn that already carries one, and say what it stood
+ * for.
+ *
+ * A long run compacts more than once, and the second pass lands on the head
+ * turn the first pass wrote onto. Left alone the notes stack, and each one
+ * counts only its own pass -- so a transcript that had lost eight turns said
+ * "4 earlier turns are gone" twice. Two claims that are each wrong, in the
+ * one sentence whose entire job is to be accurate about what the model
+ * cannot see any more.
+ */
+const priorNote = (text: string): { text: string; dropped: number } => {
+  const found = NOTE.exec(text);
+  return found
+    ? { text: text.slice(found[0].length), dropped: Number(found[1]) }
+    : { text, dropped: 0 };
+};
+
+/**
+ * Where each round starts: a user turn, or an assistant turn and the tool
+ * results behind it.
+ *
+ * Rounds rather than turns, because Anthropic rejects a tool result that is
+ * not immediately behind the assistant message that called for it -- so a
+ * cut between the two is a 400, not a smaller request.
+ *
+ * Assistant turns and not only user turns, which is the thing that makes
+ * this work at all here. One mention is one user turn followed by however
+ * many tool rounds it takes, so a transcript with user turns as its only
+ * boundaries has exactly one boundary per mention and nothing to drop
+ * inside the run that is currently growing.
+ */
+const roundStarts = (messages: ModelTurn[]): number[] =>
+  messages
+    .map((turn, index) => (turn.role === "toolResult" ? -1 : index))
+    .filter((index) => index >= 0);
+
+/**
+ * Drop whole rounds off the front of a transcript until it fits.
+ *
+ * This is what replaced the per-result character caps, and the difference is
+ * the whole point: nothing here cuts text. A tool result lands whole, the
+ * transcript is measured, and what gives way is the oldest *complete* round
+ * -- the same trade Pi makes for the incident agent, for the same reason. A
+ * row cut in half is a row the model reads as complete and acts on; a round
+ * that is gone is a round the model is told is gone.
+ *
+ * The question survives whatever else does not. If the cut reaches past it,
+ * it is put back on the front -- a transcript has to open on a user turn,
+ * and the one worth spending that turn on is the one being answered.
+ *
+ * The last round is kept whatever it measures. A single tool result larger
+ * than the window is out of scope here exactly as it is for the incident
+ * agent: the request fails loudly and the reader is told the question was
+ * too big, which beats answering it off half a row.
+ */
+export const compactTranscript = (
+  messages: ModelTurn[],
+  contextWindow: number,
+): { messages: ModelTurn[]; dropped: number } => {
+  const budget =
+    Math.max(0, contextWindow - SLACK_AGENT_RESERVE_TOKENS) * CHARS_PER_TOKEN;
+
+  let total = 0;
+  for (const turn of messages) total += turnChars(turn);
+  if (total <= budget) return { messages, dropped: 0 };
+
+  const starts = roundStarts(messages);
+  // Latest first: the newest boundary that still fits keeps the most recent
+  // work, which is what the question being asked now is about. The last
+  // boundary is the floor, so there is always a round left to send.
+  let cut = starts[starts.length - 1] ?? 0;
+  for (const start of [...starts].reverse()) {
+    let kept = 0;
+    for (let i = start; i < messages.length; i++) kept += turnChars(messages[i]);
+    if (kept > budget) break;
+    cut = start;
+  }
+  if (cut === 0) return { messages, dropped: 0 };
+
+  const kept = messages.slice(cut);
+  const before = messages.slice(0, cut);
+
+  /**
+   * What an earlier pass's notes already stood for.
+   *
+   * A note is a claim about turns that are gone, so its count has to carry
+   * forward however the next cut falls -- whether that note is on the turn
+   * that survives, or on one of the turns now being dropped. Left behind
+   * either way, the running total understates what the model cannot see,
+   * which is the one thing this sentence exists to get right.
+   */
+  const carried = (turns: ModelTurn[]): number =>
+    turns.reduce((total, turn) => total + priorNote(turn.text).dropped, 0);
+
+  const head = kept[0];
+  if (head?.role === "user") {
+    const prior = priorNote(head.text);
+    return {
+      messages: [
+        {
+          role: "user",
+          text: `${droppedNote(cut + carried(before) + prior.dropped)}\n\n${prior.text}`,
+        },
+        ...kept.slice(1),
+      ],
+      dropped: cut,
+    };
+  }
+
+  // The cut went past the question. Anthropic needs a user turn in front of
+  // an assistant one anyway, so the turn that has to exist carries the
+  // question back rather than being spent on the note alone.
+  const question = [...before].reverse().find((turn) => turn.role === "user");
+  const lost = before.filter((turn) => turn !== question);
+  // Putting the question back is not dropping it, so a cut that reached
+  // nothing else has freed nothing and has nothing to announce. This is the
+  // single-oversized-round case: it goes out whole and says so by saying
+  // nothing.
+  if (lost.length === 0) return { messages, dropped: 0 };
+  const prior = question ? priorNote(question.text) : null;
+  const gone = lost.length + carried(lost) + (prior?.dropped ?? 0);
+  kept.unshift({
+    role: "user",
+    text: prior ? `${droppedNote(gone)}\n\n${prior.text}` : droppedNote(gone),
+  });
+  return { messages: kept, dropped: lost.length };
+};
 
 /**
  * The lock has to outlive the run it stands in front of, or it is not a lock:

@@ -53,6 +53,7 @@ import {
 } from "./http";
 import { parseWorkingHours } from "./agent/tools";
 import {
+  compactTranscript,
   SLACK_AGENT_BUDGET_MS,
   SlackAgent,
   type ObjectStore,
@@ -125,6 +126,7 @@ import {
   ModelRequestFailed,
   usageForLog,
   type ModelClient,
+  type SizedModelClient,
   type ModelReply,
   type ModelToolCall,
   type ModelTurn,
@@ -249,7 +251,12 @@ export interface CreateBugBossOptions {
    */
   loki?: LokiQuery;
   /** The Boss's own bounded calls: triage, correlation, the Slack agent. */
-  model: ModelClient;
+  /**
+   * Sized rather than bare, because the Slack agent owns its own loop and
+   * has to know what it can hold -- see `compactTranscript`. Everything else
+   * here takes it as a plain `ModelClient`.
+   */
+  model: SizedModelClient;
   /**
    * Reads what an inbound Slack message means. Defaults to `model`, because
    * this is the same shape of bounded call triage makes and the prompt is a
@@ -471,7 +478,7 @@ const sharedBossRuntime = (): Promise<ModelRuntime> => {
 
 export const createBossModelClient = async (
   cfg: { modelId: string },
-): Promise<ModelClient> => {
+): Promise<SizedModelClient> => {
   const runtime = await sharedBossRuntime();
   const model = await resolveBedrockModel({ id: cfg.modelId });
 
@@ -544,7 +551,7 @@ const noAnswerReply = (
  * a deliberate floor for a read-only question box, not an oversight.
  */
 export const createSlackAgentModel = (
-  model: ModelClient,
+  model: SizedModelClient,
   store: ObjectStore,
 ): SlackAgentModel => ({
   run: async (req) => {
@@ -562,6 +569,28 @@ export const createSlackAgentModel = (
     }
     messages.push({ role: "user", text: req.input });
 
+    /**
+     * Just in time, like Pi's: the transcript is measured after a result has
+     * landed on it and before the next request goes out, so a tool result is
+     * never cut to fit -- it arrives whole, and what gives way is the oldest
+     * round. Called in both places a request is built, because the wrap-up
+     * is a request too and is the one made when the transcript is at its
+     * widest.
+     */
+    const fitted = (): ModelTurn[] => {
+      const { messages: kept, dropped } = compactTranscript(
+        messages,
+        model.contextWindow,
+      );
+      if (dropped > 0) {
+        log("slack_agent_compacted", { sessionKey: req.sessionKey, dropped });
+        // Persisted too. The transcript is what a follow-up mention resumes
+        // from, so leaving the full one on disk would re-grow the context on
+        // the next question and compact it again, every time.
+        messages = kept;
+      }
+      return [...kept];
+    };
 
     const tools = req.tools.map((tool) => ({
       name: tool.name,
@@ -583,7 +612,7 @@ export const createSlackAgentModel = (
       try {
         reply = await model.complete({
           system: req.system,
-          messages: [...messages],
+          messages: fitted(),
           tools,
           maxTokens: 4096,
           signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),
@@ -627,7 +656,7 @@ export const createSlackAgentModel = (
       try {
         const wrapUp = await model.complete({
           system: `${req.system}\n\n${WRAP_UP_SYSTEM}`,
-          messages: [...messages],
+          messages: fitted(),
           tools: [],
           maxTokens: 4096,
           signal: AbortSignal.timeout(SLACK_AGENT_BUDGET_MS),

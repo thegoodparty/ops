@@ -32,11 +32,11 @@ import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 import {
   ModelRequestFailed,
-  type ModelClient,
   type ModelToolCall,
   type ModelToolSpec,
   type ModelTurn,
   type ModelUsage,
+  type SizedModelClient,
 } from "../model";
 import { BEDROCK_INVOKE_MODEL_API, type BedrockInvokeModelApi } from "./options";
 import { BEDROCK_PROVIDER_ID } from "./runtime";
@@ -129,7 +129,12 @@ export interface PiModelClientDeps {
   model: Model<BedrockInvokeModelApi>;
 }
 
-export const createPiModelClient = ({ runtime, model }: PiModelClientDeps): ModelClient => ({
+export const createPiModelClient = ({
+  runtime,
+  model,
+}: PiModelClientDeps): SizedModelClient => ({
+  contextWindow: model.contextWindow,
+
   complete: async (request) => {
     const context: Context = {
       systemPrompt: request.system,

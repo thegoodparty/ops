@@ -13,10 +13,18 @@ import { indexIncident, toMatchQuery } from "../db/search";
 // so it is tested here with the rest of that surface.
 import { createSlackAgentModel } from "../index";
 import { emptyModelUsage, ModelRequestFailed } from "../model";
-import type { ModelClient, ModelReply, ModelRequest, ModelUsage } from "../triage";
+import type {
+  ModelReply,
+  ModelRequest,
+  ModelTurn,
+  ModelUsage,
+  SizedModelClient,
+} from "../triage";
 import {
+  compactTranscript,
   MAX_SQL_ROWS,
   SLACK_AGENT_BUDGET_MS,
+  SLACK_AGENT_RESERVE_TOKENS,
   SLACK_AGENT_MAX_TURNS,
   SLACK_AGENT_SYSTEM,
   SlackAgent,
@@ -815,6 +823,13 @@ const countingTool = (results: string[]) => ({
   },
 });
 
+/**
+ * A window wide enough that nothing in these tests compacts. Compaction has
+ * its own tests, which set it deliberately small; here it would only be a
+ * second thing going on.
+ */
+const TEST_CONTEXT_WINDOW = 1_000_000;
+
 const runRequest = (
   tools: SlackAgentTool[],
   maxTurns: number,
@@ -831,7 +846,8 @@ describe("a run that uses its whole budget", () => {
   test("answers with what it read instead of an apology", async () => {
     const { store } = memoryStore();
     const requests: ModelRequest[] = [];
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: (request) => {
         requests.push(request);
         // The wrap-up is the call that arrives with nothing to call.
@@ -889,7 +905,8 @@ describe("a run that uses its whole budget", () => {
 
   test("keeps its own prose when the wrap-up itself fails", async () => {
     const { store } = memoryStore();
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: (request) => {
         if (request.tools.length === 0) {
           return Promise.reject(new Error("bedrock throttled"));
@@ -920,7 +937,8 @@ describe("a run that uses its whole budget", () => {
     const { store } = memoryStore();
     const seen: ModelRequest[] = [];
     let wrapUpFails = true;
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: (request) => {
         seen.push(request);
         if (request.tools.length === 0) {
@@ -977,7 +995,8 @@ describe("a run that uses its whole budget", () => {
     const { store } = memoryStore();
     // Burns every turn on tool calls, so the budget really does run out, and
     // then answers the wrap-up with nothing.
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: (request) =>
         Promise.resolve(
           request.tools.length === 0
@@ -1034,7 +1053,8 @@ describe("a run that uses its whole budget", () => {
     // blaming it would be a fabrication and "ask me again" is the right
     // advice rather than the wrong one.
     const { store } = memoryStore();
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: () =>
         Promise.resolve({
           text: "",
@@ -1071,7 +1091,8 @@ describe("the turn budget", () => {
     const { store } = memoryStore();
     const reads: string[] = [];
     let turn = 0;
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: () => {
         turn++;
         // The shape the real run took: one broad query, then depth on each
@@ -1194,7 +1215,8 @@ describe("what a question cost", () => {
 
   test("every turn is banked, the wrap-up included", async () => {
     const { store } = memoryStore();
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: (request) =>
         Promise.resolve(
           request.tools.length === 0
@@ -1229,7 +1251,8 @@ describe("what a question cost", () => {
   // most needs costing: it is the one that cost the most and answered least.
   test("a wrap-up that throws still reports what it spent", async () => {
     const { store } = memoryStore();
-    const model: ModelClient = {
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
       complete: (request) =>
         request.tools.length === 0
           ? Promise.reject(new ModelRequestFailed("bedrock throttled", spent(7)))
@@ -1343,5 +1366,308 @@ describe("read_agent_session", () => {
       }),
     ]);
     assert.match(out, /ended on purpose \(completed\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("compacting the transcript instead of cutting results", () => {
+  const round = (n: number, width: number): ModelTurn[] => [
+    { role: "user", text: `question ${n}` },
+    {
+      role: "assistant",
+      text: "",
+      toolCalls: [{ id: `call-${n}`, name: "query_incidents", input: {} }],
+    },
+    { role: "toolResult", toolCallId: `call-${n}`, text: `${n}:${"r".repeat(width)}` },
+  ];
+
+  test("a transcript that fits is handed back untouched", () => {
+    const messages = [...round(1, 100), ...round(2, 100)];
+    const { messages: kept, dropped } = compactTranscript(messages, 1_000_000);
+
+    assert.equal(dropped, 0);
+    assert.deepEqual(kept, messages);
+  });
+
+  test("the oldest rounds go, whole, and the newest work stays", () => {
+    // Four rounds at 30k characters each against a window that leaves room
+    // for roughly two of them.
+    const messages = [1, 2, 3, 4].flatMap((n) => round(n, 30_000));
+    const window = SLACK_AGENT_RESERVE_TOKENS + 25_000;
+
+    const { messages: kept, dropped } = compactTranscript(messages, window);
+
+    assert.ok(dropped > 0, "something had to give");
+    const text = kept.map((turn) => turn.text).join("\n");
+    assert.ok(text.includes(`4:${"r".repeat(30_000)}`), "the newest result is whole");
+    assert.ok(!text.includes("1:"), "the oldest round is gone");
+    // Nothing anywhere is a fragment of a result.
+    for (const turn of kept) {
+      if (turn.role !== "toolResult") continue;
+      assert.match(turn.text, /^\d+:r{30000}$/, "a result is whole or it is absent");
+    }
+  });
+
+  test("the cut lands on a round boundary, never between a call and its result", () => {
+    const messages = [1, 2, 3, 4, 5].flatMap((n) => round(n, 30_000));
+    const { messages: kept } = compactTranscript(
+      messages,
+      SLACK_AGENT_RESERVE_TOKENS + 25_000,
+    );
+
+    // Anthropic rejects a tool result that does not sit behind the assistant
+    // message that called for it, so a transcript opening on one is a 400
+    // rather than a smaller request.
+    assert.equal(kept[0]?.role, "user");
+    for (const [index, turn] of kept.entries()) {
+      if (turn.role !== "toolResult") continue;
+      assert.equal(kept[index - 1]?.role, "assistant", "a result follows its call");
+    }
+  });
+
+  test("the model is told rounds are gone rather than left to infer it", () => {
+    const messages = [1, 2, 3, 4].flatMap((n) => round(n, 30_000));
+    const { messages: kept, dropped } = compactTranscript(
+      messages,
+      SLACK_AGENT_RESERVE_TOKENS + 25_000,
+    );
+
+    // On a user turn rather than as a turn of its own: two consecutive user
+    // messages is a shape the request builder rejects.
+    assert.equal(kept[0]?.role, "user");
+    assert.match(kept[0].text, new RegExp(`${dropped} earlier turns`));
+    assert.match(kept[0].text, /no longer in context/);
+  });
+
+  test("the question survives a cut that reached past it", () => {
+    // One mention is one user turn and then however many tool rounds it
+    // takes, so the cut routinely lands inside the run rather than on a
+    // mention boundary -- and a transcript that opens on the third round
+    // of an investigation, with nothing saying what was asked, is a model
+    // answering a question it cannot see.
+    const messages: ModelTurn[] = [
+      { role: "user", text: "what is the state of the various incidents?" },
+      ...[1, 2, 3, 4].flatMap((n) => round(n, 30_000).slice(1)),
+    ];
+
+    const { messages: kept } = compactTranscript(
+      messages,
+      SLACK_AGENT_RESERVE_TOKENS + 25_000,
+    );
+
+    assert.equal(kept[0]?.role, "user");
+    assert.ok(kept[0].text.includes("what is the state of the various incidents?"));
+    assert.equal(kept[1]?.role, "assistant", "and a round follows it");
+  });
+
+  test("a second compaction folds its count into the first note, not on top of it", () => {
+    // A long run compacts more than once, and the second pass lands on a
+    // head turn the first pass already wrote a note onto. Stacked, the
+    // model is told "4 earlier turns are gone" twice when the truth is
+    // eight -- two claims that are each wrong, in place of one that is
+    // right, in the one sentence whose whole job is to be accurate about
+    // what it cannot see.
+    const tail = (n: number): ModelTurn[] => [
+      {
+        role: "assistant",
+        text: "",
+        toolCalls: [{ id: `c${n}`, name: "query_incidents", input: {} }],
+      },
+      { role: "toolResult", toolCallId: `c${n}`, text: `${n}:${"r".repeat(30_000)}` },
+    ];
+    const window = SLACK_AGENT_RESERVE_TOKENS + 25_000;
+    const question = "what is the state of the various incidents?";
+
+    const first = compactTranscript(
+      [{ role: "user", text: question }, ...[1, 2, 3, 4].flatMap(tail)],
+      window,
+    );
+    const second = compactTranscript(
+      [...first.messages, ...tail(5), ...tail(6)],
+      window,
+    );
+
+    const head = second.messages[0];
+    assert.equal(head.role, "user");
+    const notes = head.text.match(/earlier turns? in this thread/g) ?? [];
+    assert.equal(notes.length, 1, `one note, not ${notes.length}`);
+    // And it stands for everything gone, not just this pass.
+    assert.match(head.text, /\[8 earlier turns/);
+    assert.ok(head.text.endsWith(question), "the question is still the last thing in it");
+  });
+
+  test("a note in the part being dropped carries its count forward too", () => {
+    // The other half of the same accounting. Across mentions the surviving
+    // head is a *later* question with no note of its own, and the noted
+    // turn is in the region going away -- so its count leaves with it
+    // unless it is carried, and the running total silently understates
+    // what the model has lost.
+    const tail = (n: number): ModelTurn[] => [
+      {
+        role: "assistant",
+        text: "",
+        toolCalls: [{ id: `c${n}`, name: "query_incidents", input: {} }],
+      },
+      { role: "toolResult", toolCallId: `c${n}`, text: `${n}:${"r".repeat(30_000)}` },
+    ];
+    const window = SLACK_AGENT_RESERVE_TOKENS + 25_000;
+
+    // A head that already carries a note, produced rather than hand-written
+    // so the test does not encode the note's wording.
+    const first = compactTranscript(
+      [
+        { role: "user", text: "the first question" },
+        ...[1, 2, 3, 4].flatMap(tail),
+      ],
+      window,
+    );
+    const noted = first.messages[0];
+    assert.match(noted.text, /\[4 earlier turns/, "the fixture's premise");
+
+    // A later mention: a fresh question and more rounds behind it.
+    const second = compactTranscript(
+      [noted, ...tail(5), { role: "user", text: "the second question" }, ...tail(6), ...tail(7)],
+      window,
+    );
+
+    const head = second.messages[0];
+    assert.equal(head.role, "user");
+    assert.ok(head.text.endsWith("the second question"), "the live question survives");
+    // Three turns went this pass and the note that went with them stood for
+    // four more.
+    assert.match(head.text, /\[7 earlier turns/);
+    assert.equal((head.text.match(/earlier turns? in this thread/g) ?? []).length, 1);
+  });
+
+  test("one round larger than the window is kept rather than cut to fit", () => {
+    // The same trade the incident agent makes. A result this size fails
+    // loudly at the provider, and the reader is told the question was too
+    // big -- which beats being answered off half a row.
+    const messages = round(1, 5_000_000);
+    const { messages: kept, dropped } = compactTranscript(messages, 200_000);
+
+    assert.equal(dropped, 0);
+    assert.deepEqual(kept, messages);
+  });
+});
+
+describe("the turn loop compacts before it asks, not after", () => {
+  /** A window that fits the reserve and about one wide result. */
+  const NARROW = SLACK_AGENT_RESERVE_TOKENS + 20_000;
+
+  const wideTool = (width: number): SlackAgentTool => ({
+    name: "query_incidents",
+    description: "Run one read-only SQL SELECT.",
+    inputSchema: { type: "object" } as Record<string, unknown>,
+    run: () => Promise.resolve("w".repeat(width)),
+  });
+
+  test("a wide tool result reaches the model whole, and older rounds go instead", async () => {
+    const { store } = memoryStore();
+    const requests: ModelRequest[] = [];
+    const model: SizedModelClient = {
+      contextWindow: NARROW,
+      complete: (request) => {
+        requests.push(request);
+        // Three tool-calling turns, then an answer.
+        if (requests.length > 3) {
+          return Promise.resolve({
+            text: "here is what I found",
+            toolCalls: [],
+            usage: emptyModelUsage(),
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: "",
+          toolCalls: [
+            { id: `call-${requests.length}`, name: "query_incidents", input: {} },
+          ],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply);
+      },
+    };
+
+    const result = await createSlackAgentModel(model, store).run(
+      runRequest([wideTool(25_000)], 6),
+    );
+
+    assert.equal(result.text, "here is what I found");
+    // Every result the model was shown is a whole one. This is the
+    // assertion the old caps failed: they made each result narrow enough to
+    // fit, which is a row the model reads as complete and answers off.
+    for (const request of requests) {
+      for (const turn of request.messages) {
+        if (turn.role !== "toolResult") continue;
+        assert.equal(turn.text, "w".repeat(25_000), "a result arrives whole");
+      }
+    }
+    // And the last request is smaller than the sum of everything that
+    // happened, which is only true if something was dropped.
+    const last = requests[requests.length - 1];
+    assert.ok(
+      last.messages.filter((turn) => turn.role === "toolResult").length < 3,
+      "older rounds gave way rather than the results being narrowed",
+    );
+  });
+
+  test("what it persists is a transcript the next mention can resume", async () => {
+    // The failure this is here for does not show up in the run that causes
+    // it. Compaction rewrites the array that is then written to the store,
+    // and a follow-up mention loads that array back -- so a transcript left
+    // opening on a tool result, or on two user turns, breaks hours later in
+    // another process with nothing pointing back at the run that wrote it.
+    const { store, objects } = memoryStore();
+    const requests: ModelRequest[] = [];
+    const model: SizedModelClient = {
+      contextWindow: NARROW,
+      complete: (request) => {
+        requests.push(request);
+        if (requests.length > 3) {
+          return Promise.resolve({
+            text: "here is what I found",
+            toolCalls: [],
+            usage: emptyModelUsage(),
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: "",
+          toolCalls: [
+            { id: `call-${requests.length}`, name: "query_incidents", input: {} },
+          ],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply);
+      },
+    };
+
+    const run = runRequest([wideTool(25_000)], 6);
+    await createSlackAgentModel(model, store).run(run);
+
+    const stored = objects.get(`${run.sessionKey}transcript.json`);
+    assert.ok(stored, "the transcript is written");
+    const turns = JSON.parse(stored) as ModelTurn[];
+
+    assert.ok(turns.length > 0);
+    assert.equal(turns[0].role, "user", "a transcript has to open on a user turn");
+    assert.equal(
+      turns[turns.length - 1].role,
+      "assistant",
+      "and must not end on tool results, or the next load puts two user turns together",
+    );
+    for (const [index, turn] of turns.entries()) {
+      if (turn.role === "toolResult") {
+        assert.equal(turns[index - 1]?.role, "assistant", "no orphaned result");
+      }
+      if (turn.role === "user" && index > 0) {
+        assert.notEqual(turns[index - 1]?.role, "user", "no two user turns together");
+      }
+    }
+    // It is the compacted one, not the whole history re-saved -- otherwise
+    // the next question re-grows the context and compacts it again, every
+    // time.
+    assert.ok(
+      turns.filter((turn) => turn.role === "toolResult").length < 3,
+      "the compacted transcript is what was persisted",
+    );
   });
 });
