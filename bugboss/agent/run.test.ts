@@ -835,9 +835,17 @@ test("an exhausted run parks on a wait a reply cannot lift", () => {
 });
 
 test("the brief does not promise that replying will continue the work", () => {
-  // It used to. A reply wakes the incident and the new agent is over budget
-  // before it starts, so the person types into a thread that cannot act on
-  // it and gets another page for their trouble.
+  // It used to, and the mechanism it was wrong about has since changed
+  // twice, so the history matters more than the assertion. First wording:
+  // "nothing will relaunch into the same exhausted budget" — false, because
+  // a reply deleted the park and relaunched an over-budget agent. Second:
+  // "replying here wakes it, but it will stop again immediately" — true
+  // when written, false once the park stopped lifting on a reply. Now a
+  // reply does not wake a budget wait at all, and the brief says so.
+  //
+  // Asserting the absence of both dead sentences on purpose: each was
+  // written in good faith against the behaviour of its day, which is
+  // exactly how a brief comes to lie to the person reading it.
   const brief = turnBudgetBrief({
     used: 200,
     max: 200,
@@ -851,12 +859,12 @@ test("the brief does not promise that replying will continue the work", () => {
   assert.doesNotMatch(
     brief,
     /nothing will relaunch into the same exhausted budget/,
-    "the original wording promised a reply was harmless, which it was not",
+    "first wording: a reply did relaunch it",
   );
   assert.doesNotMatch(
     brief,
-    /Replying here wakes it/,
-    "a budget wait is not lifted by a reply, so this would send a person nowhere",
+    /wakes it/,
+    "second wording: a budget wait is not lifted by a reply, so it does not wake",
   );
 });
 

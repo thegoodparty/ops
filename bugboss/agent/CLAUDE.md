@@ -102,14 +102,25 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   honest reading of it is "wrap up sooner". `TurnBudgetState.graceTurns`
   carries what was actually given, so the brief cannot quote a window nobody
   had.
-- **The announcement happens once per incident, the park every time.** A
-  reply deletes the park and the dispatcher relaunches, so this fires again
-  on turn one of a launch that is already over budget. Announcing each time
-  pages the rotation on every comment with a fact it already has, so
-  `shouldAnnounceExhaustion` suppresses it; parking is never suppressed.
-  The brief says plainly that a reply wakes the incident but does not buy
-  more turns, because it does not — raising `BUGBOSS_MAX_TURNS` or taking
-  the work over is what continues it.
+- **The park is the stop, and it opts out of lifting on a reply.**
+  `ToolApi.park` defaults `liftsOnReply` to true, which is right for a wait
+  on a person and wrong for this one: a reply is not news about having run
+  out of turns. Without `liftsOnReply: false` every comment on the thread
+  woke an agent that was over budget before it started, stopped again, and
+  paged the rotation. The argument is in `turnBudgetPark` rather than at the
+  call site so a test fails if it is dropped.
+- **The announcement is suppressed only when the agent already made it.**
+  `shouldAnnounceExhaustion` is `!state.escalated` and nothing more. There
+  was a second arm for a launch that began over budget, and it was treating
+  the wake rather than preventing it; once a budget wait survives a reply
+  the wake does not happen. It would also have been actively wrong now: the
+  only thing left that lifts a budget wait is the once-a-day stale sweep, so
+  suppressing there would make the sweep's wake silent — relaunch,
+  re-exhaust, re-park, nobody told. An incident a day quiet and still out of
+  turns is exactly what should be said out loud.
+  The brief says plainly that replying will not restart it, because it will
+  not — raising `BUGBOSS_MAX_TURNS` or taking the work over is what
+  continues it.
 - **The brief carries what the run spent.** Turns, tokens and a cost
   estimate, because shipping 200 before a dollar cap is only worth anything
   if somebody learns what 200 turns costs. It is called an estimate there
