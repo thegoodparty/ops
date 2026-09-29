@@ -150,59 +150,105 @@ export interface BoardSweep {
 }
 
 /**
- * Bring every incident thread's header up to date.
+ * How many headers one tick may rewrite.
  *
- * Driven off a comparison rather than off a hook at each transition, which
- * is what makes it one place instead of six and what makes it self-healing:
- * a header lost to a Slack error, a restart mid-transition or a status
- * changed by a path nobody thought about is corrected on the next tick. The
- * cost of that is a header being at most one tick stale, which for a line
- * people re-read rather than get notified about is the right trade.
+ * `chat.update` is Tier 3, roughly fifty calls a minute, and it shares the
+ * workspace budget with every post BugBoss makes. A steady state costs
+ * nothing -- only a header whose text actually changed is written -- but a
+ * mass status change, or the first sweep after this ships, is a burst. A
+ * header is a reference somebody re-reads rather than a notification, so the
+ * rest waiting thirty seconds costs nobody anything, and the cap is what
+ * stops a burst competing with the posts that *are* notifications.
+ */
+export const MAX_HEADER_UPDATES_PER_TICK = 8;
+
+/**
+ * One incident, as the header sweep needs to see it: the three board fields,
+ * plus what was last written above its thread.
+ *
+ * `opening` is deliberately not selected here. It is a whole alert body, and
+ * this reads every incident that has ever had a thread; it is fetched one
+ * row at a time, only for the handful about to be written.
+ */
+interface HeaderRow extends BoardRow {
+  slackThreadTs: string | null;
+  header: string | null;
+}
+
+/**
+ * Bring incident thread headers up to date.
+ *
+ * Driven off a comparison rather than a hook at each transition, which is
+ * what makes it one place instead of six and what makes it self-healing: a
+ * header lost to a Slack error, a restart mid-transition or a status changed
+ * by a path nobody thought about is corrected on the next tick. The cost of
+ * that is a header being at most one tick stale, which for a line people
+ * re-read rather than get notified about is the right trade.
+ *
+ * **What it compares is the copy we last successfully wrote**, not Slack's.
+ * Reading Slack's would cost a call per thread per tick to learn nothing;
+ * and the drift that choice risks -- our record saying something the message
+ * does not -- is closed by only recording a write that returned. A failed
+ * update leaves the stored value alone, so the next tick sees the same
+ * difference and tries again.
+ *
+ * **Closed incidents are finalised, then left.** This runs over every
+ * incident with a thread, not only the open ones, so an incident that closes
+ * gets one last header saying so rather than freezing on "Fixing" forever --
+ * which is a lie, and the kind a thread keeps telling for months. After that
+ * write the rendered text stops changing, so the comparison stops matching
+ * and the thread is never touched again. Nothing is ever removed: the header
+ * sits above the message the thread opened with, which is untouched
+ * throughout.
  *
  * An incident with no recorded opening gets nothing. `chat.update` replaces
  * the whole message, so writing a header without knowing what is underneath
- * it would delete somebody's alert text -- and that is unrecoverable where a
- * missing header is merely missing.
+ * it would delete somebody's alert text -- unrecoverable, where a missing
+ * header merely looks unfinished. Those incidents are counted once at boot
+ * (`index.ts`) rather than named every thirty seconds here.
  */
-const sweepHeaders = async (
-  deps: BoardDeps,
-  rows: readonly BoardRow[],
-): Promise<number> => {
-  // Scoped to the open incidents rather than every thread ever opened. The
-  // opening is a whole alert body, so an unscoped read pulls the entire
-  // corpus of them off disk twice a minute forever to find the handful that
-  // could have changed.
-  const threads = new Map(
-    deps.db
-      .query<{
-        incidentId: string;
-        slackThreadTs: string | null;
-        opening: string;
-        header: string | null;
-      }>(
-        `SELECT t.incidentId AS incidentId, i.slackThreadTs AS slackThreadTs,
-                t.opening AS opening, t.header AS header
-           FROM incident_thread t JOIN incident i ON i.id = t.incidentId
-          WHERE i.status IN (${OPEN_LIST})`,
-      )
-      .map((row) => [row.incidentId, row]),
+const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
+  const candidates = deps.db.query<HeaderRow>(
+    `SELECT i.id AS incidentId,
+            i.status AS status,
+            i.summary AS summary,
+            i.slackThreadTs AS slackThreadTs,
+            t.header AS header,
+            (SELECT title FROM signal WHERE incidentId = i.id
+              ORDER BY openedAt, id LIMIT 1) AS firstSignalTitle,
+            (SELECT waitingFor FROM incident_wait WHERE incidentId = i.id)
+              AS waitingFor
+       FROM incident_thread t JOIN incident i ON i.id = t.incidentId
+      ORDER BY CAST(i.id AS INTEGER)`,
   );
 
   let written = 0;
-  for (const row of rows) {
-    const thread = threads.get(row.incidentId);
-    if (!thread?.slackThreadTs) continue;
+  for (const row of candidates) {
+    if (written >= MAX_HEADER_UPDATES_PER_TICK) {
+      log("header_sweep_capped", { cap: MAX_HEADER_UPDATES_PER_TICK });
+      break;
+    }
+    if (!row.slackThreadTs) continue;
     const header = renderHeader(row);
-    if (header === thread.header) continue;
+    if (header === row.header) continue;
+
+    const opening = deps.db.get<{ opening: string }>(
+      "SELECT opening FROM incident_thread WHERE incidentId = ?",
+      [row.incidentId],
+    )?.opening;
+    if (opening === undefined) continue;
+
     try {
       await deps.update(
         deps.channel,
-        thread.slackThreadTs,
-        `${header}\n\n${thread.opening}`,
+        row.slackThreadTs,
+        `${header}\n\n${opening}`,
       );
     } catch (err) {
-      // One thread's failed edit must not stop the others, and it must not
-      // be recorded as written -- the next tick tries again.
+      // One thread's failed edit is one stale header. Letting it out would
+      // make it every thread, plus the morning board and the all-clear. A
+      // 429 arrives here as the client's ten-second deadline expiring, and
+      // it is not recorded as written, so the next tick tries again.
       alarm("header_update_failed", {
         incidentId: row.incidentId,
         error: String(err),
@@ -236,7 +282,15 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
   const settleMs = deps.settleMs ?? ALL_CLEAR_SETTLE_MS;
 
   const rows = openBoard(deps.db);
-  const headers = await sweepHeaders(deps, rows);
+  // Isolated from the rest of the sweep: a Slack that will not take edits
+  // must not cost the morning board or the all-clear, which are the two
+  // things here that are notifications rather than references.
+  let headers = 0;
+  try {
+    headers = await sweepHeaders(deps);
+  } catch (err) {
+    alarm("header_sweep_failed", { error: String(err) });
+  }
   const today = dateIn(timeZone, now);
 
   const state = deps.db.get<BoardState>(

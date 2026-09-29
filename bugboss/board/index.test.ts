@@ -7,7 +7,14 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
-import { BOARD_TIME_ZONE, dateIn, hourIn, openBoard, sweepBoard } from ".";
+import {
+  BOARD_TIME_ZONE,
+  MAX_HEADER_UPDATES_PER_TICK,
+  dateIn,
+  hourIn,
+  openBoard,
+  sweepBoard,
+} from ".";
 import { DEFAULT_WORKING_HOURS } from "../agent/tools";
 
 const CHANNEL = "C0DEVALERTS";
@@ -566,15 +573,104 @@ describe("thread headers", () => {
     assert.equal(attempts, 2);
   });
 
-  test("a closed incident's header stops being maintained", async () => {
+  /**
+   * A header that froze on "Fixing" the moment the incident closed is a lie
+   * the thread goes on telling for months. So a closed incident gets one
+   * last header and is then never touched again -- the rendered text stops
+   * changing, so the comparison stops matching.
+   */
+  test("a closed incident is finalised once, then left alone", async () => {
     await seed("1");
     await openThread("1", "400.0");
     await harness(easternAt(9)).sweep();
     await close("1");
 
-    const after = harness(easternAt(9) + 30_000);
-    await after.sweep();
+    const closing = harness(easternAt(9) + 30_000);
+    await closing.sweep();
+    assert.equal(closing.edits.length, 1);
+    assert.match(closing.edits[0].text, /Closed/);
+    assert.match(closing.edits[0].text, /this incident is over/);
+    assert.ok(
+      closing.edits[0].text.endsWith("*Incident 1 opened*"),
+      "and the original message is still under it",
+    );
 
-    assert.deepEqual(after.edits, []);
+    const after = harness(easternAt(9) + 60_000);
+    await after.sweep();
+    assert.deepEqual(after.edits, [], "nothing changes again, so nothing is written");
+  });
+
+  /**
+   * `chat.update` is Tier 3 and shares the workspace budget with every post.
+   * The first sweep after this ships finds every open thread stale at once,
+   * which is the burst the cap exists for; a header is a reference rather
+   * than a notification, so the rest waiting a tick costs nobody anything.
+   */
+  test("a burst of stale headers is spread across ticks", async () => {
+    for (let i = 1; i <= MAX_HEADER_UPDATES_PER_TICK + 3; i++) {
+      await seed(String(i));
+      await openThread(String(i), `${i}00.0`);
+    }
+
+    const first = harness(easternAt(9));
+    await first.sweep();
+    assert.equal(first.edits.length, MAX_HEADER_UPDATES_PER_TICK);
+
+    const second = harness(easternAt(9) + 30_000);
+    await second.sweep();
+    assert.equal(second.edits.length, 3, "the rest arrive on the next tick");
+
+    const third = harness(easternAt(9) + 60_000);
+    await third.sweep();
+    assert.deepEqual(third.edits, [], "and then it is quiet again");
+  });
+
+  /**
+   * The per-thread failure path is covered above. This is the one outside
+   * it: the write that records a successful edit. A header sweep that
+   * throws must not cost the morning board or the all-clear, which are the
+   * two things here that are notifications rather than references.
+   */
+  test("a header sweep that throws outright does not cost the daily board", async () => {
+    await seed("1");
+    await openThread("1", "400.0");
+    await harness(easternAt(6)).sweep();
+    // Something for the sweep to have to write, so it reaches the record.
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET summary = 'moved on' WHERE id = '1'").run();
+    });
+
+    // Reads work; every write is refused, the way a halted Db behaves.
+    const halted = {
+      query: (sql: string, params?: unknown[]) => db.query(sql, params),
+      get: (sql: string, params?: unknown[]) => db.get(sql, params),
+      withWrite: () => Promise.reject(new Error("writes halted: snapshot PUT failed")),
+    } as unknown as Db;
+
+    const posts: string[] = [];
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (line: unknown) => errors.push(String(line));
+    try {
+      await sweepBoard({
+        db: halted,
+        post: (text) => {
+          posts.push(text);
+          return Promise.resolve({ ts: "x" });
+        },
+        update: () => Promise.resolve(),
+        channel: CHANNEL,
+        now: () => easternAt(7),
+      }).catch(() => undefined);
+    } finally {
+      console.error = original;
+    }
+
+    assert.equal(posts.length, 1, "the morning board still went out");
+    assert.match(posts[0], /1 open/);
+    assert.ok(
+      errors.some((line) => line.includes("header_sweep_failed")),
+      errors.join("\n"),
+    );
   });
 });

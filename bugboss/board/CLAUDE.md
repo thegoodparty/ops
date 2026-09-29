@@ -63,6 +63,20 @@ deploy is exactly the in-memory-cron behaviour the whole design avoids.
 Started *before* the hour, the day is left open, so that morning's board
 still goes out.
 
+## An incident with no recorded opening gets no header
+
+`chat.update` replaces a message whole, and the only way to read the original
+back is `conversations.replies` at roughly one request a minute. So a thread
+whose opening was never recorded is skipped: writing a header without knowing
+what is underneath it would delete the alert text somebody is scrolling back
+for, which is unrecoverable where a missing header merely looks unfinished.
+
+Every incident opened from here on records its opening as it posts it, so
+this empties itself. The ones that predate it are **counted once at boot**
+(`threads_without_a_recorded_opening` in `index.ts`) rather than named every
+thirty seconds by the sweep that skips them — a known gap rather than an
+invisible one.
+
 ## Headers are swept, not hooked
 
 A thread's header is rewritten when the text it renders to differs from
@@ -73,9 +87,34 @@ status changed by a path nobody thought about is corrected on the next tick.
 The cost is a header up to one tick stale, which for a line people re-read
 rather than get notified about is the right trade.
 
-A failed edit is **not** recorded as written, so the next tick retries it,
-and one thread refusing an edit never stops the others — or the morning
-board, or the all-clear.
+**What it compares is the copy we last successfully wrote**, not Slack's.
+Reading Slack's back would be a call per thread per tick to learn nothing.
+The drift that choice risks — our record claiming something the message does
+not say — is closed at the other end: only an update that returned is
+recorded, so a failed one leaves the stored value alone and the next tick
+sees the same difference and tries again.
+
+**A closed incident is finalised, then left.** The sweep runs over every
+incident that has a thread, not only the open ones, so an incident that
+closes gets one last header saying so instead of freezing on "Fixing"
+forever — which is a lie, and the kind a thread goes on telling for months.
+After that write the rendered text stops changing, the comparison stops
+matching, and the thread is never touched again. Nothing is removed at any
+point: the header sits above the message the thread opened with.
+
+**At most `MAX_HEADER_UPDATES_PER_TICK` edits per tick.** `chat.update` is
+Tier 3, roughly fifty a minute, and it shares the workspace budget with every
+post BugBoss makes. Steady state costs nothing, because only a header whose
+text actually changed is written — but a mass status change, or the first
+sweep after this ships, is a burst. The rest arrive on the next tick, which
+costs nobody anything precisely because a header is a reference rather than a
+notification. There is no starvation: a header that gets written stops
+differing, so the queue drains.
+
+One thread refusing an edit never stops the others, and the whole header
+pass is wrapped so that a Slack which will not take edits at all cannot cost
+the morning board or the all-clear — those are the two things here that
+*are* notifications.
 
 ## Order inside a sweep
 

@@ -666,11 +666,10 @@ parks the caller inside the SDK with nothing thrown and nothing logged.
 The client pins a five-minute policy, and posts are off the ingest request.
 Both matter: an agent blocked in `contact_human` still waits on one.
 
-`chat.update` shares that budget, which is the bound worth remembering if you
-change what the board sweep does. It edits only threads whose rendered header
-has actually changed, so a steady state costs nothing and the worst tick is
-one edit per incident that moved -- and each one goes through the same
-ten-second deadline, so a Slack that is refusing edits costs the sweep a tick
-rather than the process. Widening it to "rewrite every open thread each tick"
-would be fifteen edits every thirty seconds forever, for no change anybody
-can see.
+`chat.update` is Tier 3, roughly fifty a minute, and shares that budget.
+The board sweep edits only threads whose rendered header actually changed,
+so a steady state costs nothing, and it caps what one tick may rewrite so a
+mass status change cannot burst against the posts that are notifications.
+Each edit goes through the same ten-second deadline, so a Slack refusing
+edits costs the sweep a tick rather than the process. `board/CLAUDE.md` has
+the rest.

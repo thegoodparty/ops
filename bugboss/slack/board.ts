@@ -81,9 +81,21 @@ const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 const titleOf = (row: BoardRow): string =>
   oneLine(row.summary ?? row.firstSignalTitle ?? "no title recorded");
 
-/** What a person has to do, or that they have to do nothing. */
+/**
+ * What a person has to do, or that they have to do nothing.
+ *
+ * A terminal incident says so rather than reading "nothing needed from
+ * anyone", which on a closed thread sounds like an incident nobody is
+ * getting to. It is the last thing this header will ever say: see the
+ * finalising pass in `board/index.ts`.
+ */
 const neededOf = (row: BoardRow): string =>
-  oneLine(row.waitingFor ?? "nothing needed from anyone");
+  oneLine(
+    row.waitingFor ??
+      (OPEN_STATUSES.includes(row.status)
+        ? "nothing needed from anyone"
+        : "nothing further — this incident is over"),
+  );
 
 /**
  * The header that sits above an incident thread's original message.

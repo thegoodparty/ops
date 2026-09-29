@@ -2857,6 +2857,21 @@ test("an incident named in another incident's thread is capitalised and linked",
   assert.ok(!/\bincident \d/.test(said), `never lower case: ${said}`);
 });
 
+/**
+ * Sweep until the headers stop changing. One sweep rewrites at most
+ * `MAX_HEADER_UPDATES_PER_TICK` of them, deliberately -- `chat.update` is
+ * Tier 3 and a burst of stale headers has to spread across ticks -- and this
+ * file has accumulated a channel's worth of incidents by now.
+ */
+const drainBoard = async () => {
+  for (let i = 0; i < 20; i++) {
+    const before = fakeSlack.edits.length;
+    await boss.sweepBoard();
+    if (fakeSlack.edits.length === before) return;
+  }
+  assert.fail("headers never settled");
+};
+
 test("a thread carries a header above the message that opened it", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "header" });
   const before = fakeSlack.posts.length;
@@ -2867,11 +2882,14 @@ test("a thread carries a header above the message that opened it", async () => {
     .slice(before)
     .find((p) => p.threadTs === null)!;
 
+  // Settle whatever this file has accumulated, then make one change and
+  // watch exactly that reach the thread.
+  await drainBoard();
+  fakeSlack.edits.length = 0;
   await boss.toolApiFor(incidentId).setSummary({
     summary: "Board header errors on the briefings route",
   });
-  fakeSlack.edits.length = 0;
-  await boss.sweepBoard();
+  await drainBoard();
 
   const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
   assert.ok(edit, JSON.stringify(fakeSlack.edits));
@@ -2888,7 +2906,7 @@ test("the header follows the incident and is not rewritten when it has not moved
   await boss.ingest("grafana", grafanaBody("fp-brd-4", "board-moves-errors"));
   const incidentId = incidentOf("fp-brd-4")!;
   const threadTs = threadOf(incidentId)!;
-  await boss.sweepBoard();
+  await drainBoard();
 
   fakeSlack.edits.length = 0;
   await boss.sweepBoard();
@@ -2905,7 +2923,7 @@ test("the header follows the incident and is not rewritten when it has not moved
     cause: "the pool is saturated",
     explainedSignalIds: [signal.id],
   });
-  await boss.sweepBoard();
+  await drainBoard();
 
   const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
   assert.ok(edit, "a status change reaches the header");
