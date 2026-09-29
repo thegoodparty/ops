@@ -18,6 +18,8 @@
 // It does not bind the management account,
 // which is exempt from SCPs by design and is where production runs.
 
+import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
+
 type PolicyValue = string | string[];
 
 type PolicyStatement = {
@@ -34,7 +36,6 @@ type PolicyDocument = {
   Statement: PolicyStatement[];
 };
 
-const WORKBENCH_ACCOUNT_ID = "024901689212";
 const REGION = "us-west-2";
 
 /**

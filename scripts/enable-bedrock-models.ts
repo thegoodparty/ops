@@ -69,10 +69,8 @@ import {
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
 import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
-import {
-  WORKBENCH_ACCOUNT_ID,
-  WORKBENCH_MODELS,
-} from "../utils/bedrock-models";
+import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
+import { WORKBENCH_MODELS } from "../utils/bedrock-models";
 
 /**
  * The same role `deploy-workbench/index.ts` has its provider assume: the way

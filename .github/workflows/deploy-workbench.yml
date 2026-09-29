@@ -33,6 +33,9 @@ on:
       # is the exact failure the script exists to prevent, an invocation that
       # works for up to fifteen minutes and then turns into AccessDenied.
       - "utils/bedrock-models.ts"
+      # The account id the provider assumes into. It lives outside this
+      # project now, so an edit to it must still re-apply this stack.
+      - "utils/accounts.ts"
 
 # Its own group. This is a different stack with a different S3 lock from
 # deploy.yml's and deploy-org.yml's, so there is nothing to serialize between

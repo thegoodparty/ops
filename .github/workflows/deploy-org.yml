@@ -18,6 +18,10 @@ on:
     branches: ["main"]
     paths:
       - "deploy-org/**"
+      # The workbench account id, now imported by deploy-org/policies.ts. It
+      # feeds the SCP's `DenyS3OutsideThisAccount` condition, so an edit has to
+      # re-apply the org stack or the live guardrail keeps the previous id.
+      - "utils/accounts.ts"
       - ".github/workflows/deploy-org.yml"
 
 # Its own group, independent of deploy.yml's: these are different stacks with

@@ -13,6 +13,7 @@
 // (the first statement below). The policy document is still as adopted.
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
+import { WORKBENCH_ACCOUNT_ID } from "../../../utils/accounts";
 
 // The assume-role document carries a Principal, which PolicyStatement does
 // not model, so it gets its own narrow type rather than widening that one.
@@ -791,13 +792,10 @@ export const githubActionsOrgDeploy: PolicyDocument = {
 // deploy-workbench.yml on main, and holds the assume grant below plus this
 // project's Pulumi backend access. Nothing else in this account.
 //
-// The account id is written out rather than imported from a constant.
-// Hardcoding matches house style (identity-center.ts does the same), and the
-// grant has twice had to be applied before the project that consumes it —
-// see "Apply ordering between workflows": the grant is in `deploy/` and
+// The grant has twice had to be applied before the project that consumes it
+// — see "Apply ordering between workflows": the grant is in `deploy/` and
 // applied by `deploy.yml`, while its consumer is applied by
 // `deploy-workbench.yml`.
-const WORKBENCH_ACCOUNT_ID = "024901689212";
 
 export const githubActionsWorkbenchDeploy: PolicyDocument = {
   Version: "2012-10-17",

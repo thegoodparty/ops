@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 import { createPreviewRole } from "./preview-role";
 
@@ -25,12 +26,11 @@ import { createPreviewRole } from "./preview-role";
  * the wrong account.
  */
 
-// Hardcoded rather than read from the `org` stack. See "Cross-project
-// dependencies" in the doc: an account id is immutable for the life of the
-// account, so a StackReference would buy propagation that can never fire, at
-// the cost of backend read access and the state passphrase in every consuming
-// project. Matches how identity-center.ts hardcodes ACCOUNT_ID.
-const WORKBENCH_ACCOUNT_ID = "024901689212";
+// The account id is a module constant rather than a read from the `org`
+// stack. See "Cross-project dependencies" in the doc: an account id is
+// immutable for the life of the account, so a StackReference would buy
+// propagation that can never fire, at the cost of backend read access and the
+// state passphrase in every consuming project.
 
 /**
  * The way into the account.

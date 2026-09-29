@@ -68,7 +68,8 @@ pulls the whole PR into human review.
 **The non-obvious part.** Three of those entries are owned because something
 outside their directory reaches in, and you cannot see it from the file:
 `deploy/components/identity-center/policies.ts` imports its permission-set
-resource ARNs from `utils/bedrock-models.ts`; `deploy-workbench.yml` runs
+resource ARNs from `utils/bedrock-models.ts` and its account ids from
+`utils/accounts.ts`; `deploy-workbench.yml` runs
 `scripts/enable-bedrock-models.ts` under a deploy role; and `run-script.ts`
 dynamically imports anything in `scripts/`. Before you assume a file is
 harmless, check what executes it, or what reads it: `CLAUDE.md` is owned for

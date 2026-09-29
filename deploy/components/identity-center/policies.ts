@@ -3,6 +3,7 @@
 // parses this field as JSON, so how it serialises does not have to match how
 // AWS stores it.
 
+import { WORKBENCH_ACCOUNT_ID } from "../../../utils/accounts";
 import { bedrockInvokeResources } from "../../../utils/bedrock-models";
 
 type PolicyValue = string | string[];
@@ -88,13 +89,6 @@ export const engineerAccess: PolicyDocument = {
     },
   ],
 };
-
-/**
- * The workbench account. Matches `WORKBENCH_ACCOUNT_ID` in
- * deploy/components/ci-roles/policies.ts and the constant in
- * deploy-workbench/index.ts.
- */
-const WORKBENCH_ACCOUNT_ID = "024901689212";
 
 export const readOnlyAccess: PolicyDocument = {
   Version: "2012-10-17",

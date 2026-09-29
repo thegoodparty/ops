@@ -1,3 +1,5 @@
+import { WORKBENCH_ACCOUNT_ID } from "./accounts";
+
 /**
  * The Bedrock models the coding sandbox may use.
  *
@@ -15,9 +17,6 @@
  *
  * See `docs/workbench-account.md`, steps 11 and 15.
  */
-
-/** The workbench account. Step 6 of `docs/workbench-account.md`. */
-export const WORKBENCH_ACCOUNT_ID = "024901689212";
 
 export type BedrockModel = {
   /**
