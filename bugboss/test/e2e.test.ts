@@ -497,17 +497,16 @@ test("a button press answers an agent the same way typing does", async () => {
 });
 
 /**
- * The failure this pair exists for. `pending_question` outlives the agent
- * that wrote it, and the dispatcher only launches for `owner = 'agent'`, so a
- * press on a human-owned incident passes the EXISTS guard, writes a directive
- * and is consumed by nobody. It used to be acknowledged in exactly the words
- * a live agent's press got.
+ * The failure this pair exists for. A press whose directive nothing will
+ * consume was acknowledged in word-for-word the acknowledgement a press a
+ * live agent was about to act on got, so the thread could not tell them
+ * apart. A closed incident is the case that cannot be argued with: the
+ * dispatcher will never run one again.
  */
 test("a press nothing will read says so, rather than implying an agent has it", async () => {
   const incident = boss.db.get<{ id: string; slackThreadTs: string }>(
     `SELECT id, slackThreadTs FROM incident
-      WHERE slackThreadTs IS NOT NULL
-        AND status IN ('INVESTIGATING', 'FIXING', 'RESOLVED')
+      WHERE slackThreadTs IS NOT NULL AND status = 'CLOSED'
       LIMIT 1`,
   )!;
   const client = bossClientFor(incident.id, boss.mintToken(incident.id));
@@ -515,14 +514,6 @@ test("a press nothing will read says so, rather than implying an agent has it", 
   const question = "The fix is merged. Roll back now, or wait for the deploy?";
   await client.recordPending(question);
   await client.post(question, ["Roll back", "Wait for the deploy"]);
-
-  // What a hand-off does, without running one: the dispatcher stops
-  // launching, and nothing is left to drain pending_directive.
-  await boss.db.withWrite((w) => {
-    w.prepare("UPDATE incident SET owner = 'human' WHERE id = ?").run(
-      incident.id,
-    );
-  });
 
   const marker = boss.db.get<{ messageTs: string }>(
     "SELECT messageTs FROM pending_question WHERE incidentId = ?",
@@ -557,7 +548,7 @@ test("a press nothing will read says so, rather than implying an agent has it", 
         entry.directive.type === "human_message" &&
         entry.directive.text === "Roll back",
     ),
-    "a press is a reply whoever is running",
+    "a press is a reply whatever is running",
   );
 
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -568,14 +559,8 @@ test("a press nothing will read says so, rather than implying an agent has it", 
     /The agent has that as its answer/,
     "nothing is running, so nothing may claim to have it",
   );
-  assert.match(ack.text, /no agent has read it/);
-  assert.match(ack.text, /handing it back/);
+  assert.match(ack.text, /no agent will run on it again/);
 
-  await boss.db.withWrite((w) => {
-    w.prepare("UPDATE incident SET owner = 'agent' WHERE id = ?").run(
-      incident.id,
-    );
-  });
   await client.clearPending();
 });
 

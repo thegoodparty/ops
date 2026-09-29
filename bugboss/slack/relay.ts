@@ -288,14 +288,11 @@ export type ChoiceRoute =
 
 /**
  * Who will read what a press wrote. Derived from the dispatcher's own
- * eligibility, so the three places that ask "is this available" keep
- * agreeing:
+ * eligibility, so the places that ask "is this available" keep agreeing:
  *
  *   agent   one is on it, or the dispatcher resumes one within a tick.
- *   nobody  a person owns it. Handing it back starts one, and the answer
- *           is waiting when it does.
- *   closed  the incident is over, and no hand-back is legal, so nothing
- *           will ever read this.
+ *   nobody  not available to the dispatcher, but still in a status it runs.
+ *   closed  past those statuses, so nothing will ever read this.
  */
 export type ChoiceReader = "agent" | "nobody" | "closed";
 
@@ -523,10 +520,9 @@ export class SlackRelay {
       return { kind: "ignore", reason: "thread is not an incident thread" };
     }
 
-    // The dispatcher's own eligibility, read off the same list it uses, and
-    // the ownership claim's, which refuses a hand-back on the statuses it
-    // does not cover. A press writes a directive; whether anything is coming
-    // to consume it is this, and the thread has to say which.
+    // The dispatcher's own eligibility, read off the same list it uses. A
+    // press writes a directive; whether anything is coming to consume it is
+    // this, and the thread has to say which.
     const reader: ChoiceReader = !AGENT_RUNNING_STATUSES.includes(
       incident.status,
     )

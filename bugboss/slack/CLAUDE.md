@@ -315,37 +315,30 @@ who pressed it would go on waiting for an agent that never heard them.
 
 Saying the press landed is only half of it, and the wrong half. The two
 guards above ask whether the press is *the* answer to the question an agent
-posed; neither asks whether an agent is still there. `pending_question`
-outlives the run that wrote it — `clearPending` does not run when a child is
-killed mid-wait — and the dispatcher launches only for `owner = 'agent'` in
-an agent status. So a press on an incident a person has taken over passes
-`EXISTS`, writes its `thread_reply` row and its `pending_directive`, and
-nothing is coming to consume either. That press was acknowledged in exactly
-the words a live agent's press got: "chose Merged", full stop. Somebody
-pressed, read that, and waited on an agent that did not exist.
+posed; neither asks whether anything is still there to read it.
+`pending_question` outlives the run that wrote it — `clearPending` does not
+run when a child is killed mid-wait — so a press can pass `EXISTS`, write its
+`thread_reply` row and its `pending_directive`, and have nothing come to
+consume either. That press was acknowledged in exactly the words a live
+agent's press got: "chose Merged", full stop. Somebody pressed, read that,
+and waited on an agent that was not coming.
 
-So `ChoiceRoute` carries `reader`, read off the same
-`AGENT_RUNNING_STATUSES` the dispatcher's `ELIGIBLE_SQL` runs on, and the
-acknowledgement's second line is that field. It is three-valued rather than a
-boolean because the two ways to have no reader take different advice:
-`nobody` is a person holding an incident the dispatcher would otherwise run,
-and a hand-back starts one with the answer already waiting; `closed` is an
-incident past those statuses, where `claimOwnership` refuses the hand-back
-too, so telling somebody to try one is the same kind of false promise in a
-smaller font. All three sentences are true. The old one was true half the
-time and unfalsifiable the rest.
+So `ChoiceRoute` carries `reader`, read off the same `AGENT_RUNNING_STATUSES`
+the dispatcher's `ELIGIBLE_SQL` runs on, and the acknowledgement's second
+line is that field rather than a restatement that a row went down. Every
+value has a sentence that is true of it, and none of them promises a reader
+the state does not have.
 
-**Nothing here hands the incident back on its own.** A false handover is the
-expensive direction in the other places that read one, and a press is a
-weaker signal of intent than a sentence — it is one tap, often on a question
-whose agent has been gone for hours. The thread says what to type instead.
+**Nothing here moves the incident on its own.** A press is one tap, often on
+a question whose agent has been gone for hours — a weaker signal of intent
+than a sentence, and the wrong thing to infer a transition from. The thread
+says what to type instead.
 
 The same field fixes the other two. A second press is told *which* answer
 won and who pressed it, since the first press is the only one and the loser
 otherwise learns only that theirs was not it. A press on a closed question
-is told nothing is waiting on that answer — and, when no agent is running,
-not told to "reply in the thread and it will read you", which was the same
-false promise in the other branch.
+is told nothing is waiting on that answer, and is not told an agent will
+read a reply when none will.
 
 A press whose thread matches no incident is the remaining silence, and it is
 an `alarm` now rather than a log: a button only exists on a question BugBoss
