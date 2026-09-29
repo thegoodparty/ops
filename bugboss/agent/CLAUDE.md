@@ -115,11 +115,12 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   `shouldAnnounceExhaustion` is `!state.escalated` and nothing more. There
   was a second arm for a launch that began over budget, and it was treating
   the wake rather than preventing it; once a budget wait survives a reply
-  the wake does not happen. It would also have been actively wrong now: the
-  only thing left that lifts a budget wait is the once-a-day stale sweep, so
-  suppressing there would make the sweep's wake silent — relaunch,
-  re-exhaust, re-park, nobody told. An incident a day quiet and still out of
-  turns is exactly what should be said out loud.
+  the wake does not happen. Nothing lifts a budget wait now: the stale sweep
+  reads `liftsOnReply` too, so it announces one and leaves it standing
+  rather than relaunching an agent that would exhaust before its first turn.
+  Suppressing here as well would only take away the saying-so, and an
+  incident a day quiet and still out of turns is exactly what should be said
+  out loud.
   The brief says plainly that replying will not restart it, because it will
   not — raising `BUGBOSS_MAX_TURNS` or taking the work over is what
   continues it.

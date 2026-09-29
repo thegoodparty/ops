@@ -301,7 +301,7 @@ through nothing, and two reads:
 | `report_resolved` | `FIXING → RESOLVED`, with evidence |
 | `report_analysis` | `RESOLVED → CLOSED`, terminal |
 | `escalate` | None. Posts the brief and reaches the rotation; the agent keeps the incident and keeps working |
-| `park` | None. Stops the relaunch until a reply, the cooldown or the stale sweep; the agent keeps the incident |
+| `park` | None. Stops the relaunch until a reply, the cooldown or the stale sweep; the agent keeps the incident. A park with `liftsOnReply: false` is out of turns rather than waiting on news, so none of the three lift it and the sweep only announces it |
 
 `escalate` and `park` answer different questions, and neither is a hand-off,
 because there is nothing to hand to. Escalating says a person is needed;

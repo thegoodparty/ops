@@ -149,7 +149,11 @@ export interface TickResult {
   running: number;
   /** The ceiling stopped a launch. Something is wrong; a human should look. */
   circuitOpen: boolean;
-  /** Incidents that had gone quiet long enough for the sweep to say so. */
+  /**
+   * Incidents that had gone quiet long enough for the sweep to say so. Not
+   * all of them were made runnable: a spent turn budget is announced and left
+   * waiting. See `sweepStale`.
+   */
   swept: string[];
   /** Resolves when everything this tick started has exited. */
   settled: Promise<void>;
@@ -198,6 +202,11 @@ interface StaleRow {
   sweeps: number;
   /** SQLite has no boolean: 1 when an `incident_wait` row exists. */
   parked: number;
+  /**
+   * The wait's `liftsOnReply`, or NULL when there is no wait row to read it
+   * from. 0 is the one value the sweep must not lift; see `sweepStale`.
+   */
+  liftsOnReply: number | null;
 }
 
 // Deliberately wider than `lastStartedAt`. A reply and an escalation each
@@ -228,7 +237,8 @@ const STALE_SQL = `
          (SELECT COUNT(*) FROM incident_action
            WHERE incidentId = i.id AND action = '${STALE_SWEPT_ACTION}')
            AS sweeps,
-         (w.incidentId IS NOT NULL) AS parked
+         (w.incidentId IS NOT NULL) AS parked,
+         w.liftsOnReply AS liftsOnReply
   FROM incident i
   LEFT JOIN incident_wait w ON w.incidentId = i.id
   WHERE i.status NOT IN ('CLOSED', 'MERGED')
@@ -329,22 +339,43 @@ export const resumeNotice = (deadSeconds: number): string => {
 };
 
 /**
+ * What the sweep did with the wait it found, which is the distinction the
+ * thread has to carry: being told is not the same as being relaunched.
+ *
+ * `held` is the case a boolean could not express. A wait that does not lift
+ * on a reply is a spent turn budget, and no amount of elapsed time adds
+ * turns to it, so the sweep says so and leaves the wait standing.
+ */
+export type StaleOutcome = "quiet" | "unparked" | "held";
+
+/**
  * What the thread is told. Leads with the silence, because that is the part
  * nobody in the thread can see: the last message there is still true, and
  * reads as patience.
  *
  * It promises no hand-off and no change of owner, because neither exists --
- * an open incident is always an agent's, and all the sweep does is make it
- * runnable again and say that it went quiet.
+ * an open incident is always an agent's, and all the sweep does is say that
+ * it went quiet and, where a reply would have been the thing that moved it,
+ * make it runnable again.
+ *
+ * The `held` arm names the two things that actually move a budget wait, and
+ * both are outside the thread. It deliberately does not invite a reply: the
+ * closing brief the agent already posted says replying will not restart it,
+ * and a nudge here promising otherwise would make that a lie a day later.
  */
-export const staleNotice = (quietSeconds: number, unparked: boolean): string => {
+export const staleNotice = (
+  quietSeconds: number,
+  outcome: StaleOutcome,
+): string => {
   const minutes = Math.round(quietSeconds / 60);
   const span = minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 6) / 10}h`;
   return [
     `Nothing has happened on this incident for ${span}.`,
-    unparked
+    outcome === "unparked"
       ? "It was waiting on somebody and nobody came back, so it is no longer waiting: an agent will pick it up again and carry on from where it stopped."
-      : "An agent still has it and will pick it up again; quiet this long usually means something is stuck rather than in progress.",
+      : outcome === "held"
+        ? "It is still waiting, and this notice does not change that: the turn budget for this incident is spent, and time passing does not add turns. Raising BUGBOSS_MAX_TURNS or picking the work up yourself are the two things that move it."
+        : "An agent still has it and will pick it up again; quiet this long usually means something is stuck rather than in progress.",
   ].join(" ");
 };
 
@@ -618,8 +649,8 @@ export class Dispatcher {
   };
 
   /**
-   * Notice that an incident has gone unaddressed, say so once, and make it
-   * runnable again.
+   * Notice that an incident has gone unaddressed, say so once, and -- where
+   * the thing it is waiting for is a person -- make it runnable again.
    *
    * Nothing else here asks whether anything is still happening. Every other
    * guard watches a run -- a deadline, a crash loop, a launch ceiling -- and
@@ -656,6 +687,31 @@ export class Dispatcher {
       if (quietSeconds < this.staleAfterSeconds) continue;
 
       const parked = row.parked === 1;
+
+      // Announce either way; lift only a wait that a reply would have lifted.
+      //
+      // `liftsOnReply = 0` is a spent turn budget, and a day going by adds no
+      // turns to it. Deleting that row makes the incident eligible again, so
+      // the next tick launches an agent that is over budget before its first
+      // turn: it exhausts, parks, escalates, pages -- and then the marker
+      // this sweep just wrote ages out and the whole thing repeats tomorrow.
+      // That is the loop `liftsOnReply` exists to end, rebuilt on a 24-hour
+      // timer instead of on every comment in the thread, and it would make
+      // the closing brief's "replying here will not restart it" false by a
+      // second route. Announcing it is not a consolation for waking it: the
+      // relaunch is what costs the turns and pages the rotation.
+      //
+      // Silence is the failure on the other side, though, so the
+      // announcement stays unconditional. An incident out of budget and
+      // untouched for a day is exactly what nobody should be unaware of, and
+      // a wait that nothing lifts would otherwise be a permanent park with no
+      // one watching it. Told, not relaunched.
+      const outcome: StaleOutcome = !parked
+        ? "quiet"
+        : row.liftsOnReply === 0
+          ? "held"
+          : "unparked";
+
       // The marker is also activity, and that is the whole trick. The clock
       // above reads `incident_action`, so writing this row resets the clock
       // the sweep itself reads. One mechanism buys all three things this
@@ -681,7 +737,11 @@ export class Dispatcher {
           `nothing happened on this incident for ${quietSeconds}s`,
           now,
         );
-        db.prepare("DELETE FROM incident_wait WHERE incidentId = ?").run(row.id);
+        if (outcome === "unparked") {
+          db.prepare("DELETE FROM incident_wait WHERE incidentId = ?").run(
+            row.id,
+          );
+        }
       });
       swept.push(row.id);
 
@@ -690,8 +750,12 @@ export class Dispatcher {
         status: row.status,
         quietSeconds,
         parked,
+        outcome,
         sweeps: row.sweeps + 1,
-        note: "nothing has touched this incident in a long time; it is runnable again",
+        note:
+          outcome === "held"
+            ? "nothing has touched this incident in a long time and its turn budget is spent; it was announced and left waiting, because relaunching it would only exhaust it again"
+            : "nothing has touched this incident in a long time; it is runnable again",
       });
 
       if (!this.postNotice) {
@@ -702,7 +766,7 @@ export class Dispatcher {
         });
         continue;
       }
-      await this.postNotice(row.id, staleNotice(quietSeconds, parked)).catch(
+      await this.postNotice(row.id, staleNotice(quietSeconds, outcome)).catch(
         (err: unknown) =>
           alarm("stale_notice_failed", { incidentId: row.id, error: String(err) }),
       );

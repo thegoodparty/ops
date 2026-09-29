@@ -166,10 +166,28 @@ dispatcher *cannot* run. Anything runnable was launched moments earlier in
 the same tick. In practice that is parked incidents, and incidents the
 concurrency ceiling keeps skipping.
 
-When it fires it writes a `stale_swept` `incident_action`, **deletes the
-`incident_wait` row**, alarms, and posts to the thread. So a park is not a
-permanent stop even when nothing ever replies: the sweep is the third way out
-of one, after a reply and the cooldown.
+When it fires it writes a `stale_swept` `incident_action`, alarms, posts to
+the thread, and **deletes the `incident_wait` row only if that wait says
+`liftsOnReply`**. So a wait on a person is not a permanent stop even when
+nobody ever replies: the sweep is the third way out of one, after a reply and
+the cooldown.
+
+A wait that does *not* lift on a reply is announced and left standing. The
+only thing that writes one is `turnBudgetPark`, for a run that is out of
+turns, and elapsed time adds no turns: deleting that row makes the incident
+eligible again, so the next tick launches an agent that exhausts before its
+first turn, escalates and pages -- and since the marker above is activity, it
+ages out and the whole thing repeats tomorrow. That is precisely the loop
+`liftsOnReply` exists to end, rebuilt on a 24-hour timer instead of on every
+comment in the thread, and it costs a full agent launch each time round.
+
+Announcing is unconditional, though, because the failure on the other side is
+a permanent park nobody is watching. **Being told is not the same as being
+relaunched**: the thread notice for a held incident names the two things that
+actually move it, raising `BUGBOSS_MAX_TURNS` or taking the work over, and
+deliberately does not invite a reply, which is what the agent's own closing
+brief already promised. Nothing lifts such a wait automatically, so clearing
+one after the budget is raised is still a manual step.
 
 The marker is itself activity, and that is the whole trick. The clock reads
 `incident_action`, so writing the marker resets the clock the sweep reads.

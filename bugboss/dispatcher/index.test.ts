@@ -1518,6 +1518,21 @@ describe("Dispatcher stale sweep", () => {
       )
       .run(id, at);
 
+  // The same row `turnBudgetPark` writes: a wait on a person that a reply
+  // does not end, because what it is short of is turns rather than news.
+  const budgetPark = (sqlite: Database.Database, id: string, at: number) =>
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait
+           (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES (?, 'a person, after the 200-turn budget ran out', NULL, 0, ?)`,
+      )
+      .run(id, at);
+
+  const waits = (db: DispatcherDb, id: string) =>
+    db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id])
+      .length;
+
   const reply = (sqlite: Database.Database, id: string, at: number) =>
     sqlite
       .prepare(
@@ -1883,16 +1898,138 @@ describe("Dispatcher stale sweep", () => {
     );
     cleanup();
   });
+
+  it("lifts the wait on a person and leaves the spent budget waiting", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    // Two incidents, equally quiet, one tick. The only difference between
+    // them is `liftsOnReply`, so a sweep that reads it sends them different
+    // ways and a sweep that does not sends them both the same way. Asserting
+    // the pair rather than the budget one alone is what makes this fail if
+    // the sweep is simply switched off for everything.
+    for (const id of ["i1", "i2"]) {
+      insertIncident(sqlite, id, {
+        status: "FIXING",
+        firstSignalAt: T0 - 3 * DAY,
+        lastStartedAt: T0 - 2 * DAY,
+      });
+    }
+    park(sqlite, "i1", T0 - 2 * DAY);
+    budgetPark(sqlite, "i2", T0 - 2 * DAY);
+
+    const spawned: string[] = [];
+    const posts: Array<[string, string]> = [];
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async (ctx) => {
+          spawned.push(ctx.incidentId);
+        },
+        toolApiFor,
+        postNotice: async (id, text) => {
+          posts.push([id, text]);
+        },
+      }),
+    );
+
+    const first = await d.tick();
+    await first.settled;
+
+    // Both are announced. Being out of budget for a day is not a reason for
+    // nobody to hear about it; it is a reason not to relaunch it.
+    assert.deepEqual(first.swept.sort(), ["i1", "i2"]);
+    assert.equal(posts.length, 2);
+    assert.equal(waits(db, "i1"), 0, "nobody came back, so it stops waiting");
+    assert.equal(
+      waits(db, "i2"),
+      1,
+      "a day passing adds no turns, so the budget wait still stands",
+    );
+
+    const [, heldText] = posts.find(([id]) => id === "i2") ?? ["", ""];
+    assert.match(heldText, /turn budget for this incident is spent/);
+    assert.equal(heldText.includes("no longer waiting"), false, heldText);
+
+    // The half that matters: the next tick runs the one that was waiting on a
+    // person and does not touch the one that is out of turns. Relaunching i2
+    // would exhaust it before its first turn, escalate, and page -- every
+    // day, which is the loop `liftsOnReply` was added to end.
+    const second = await d.tick();
+    await second.settled;
+    assert.deepEqual(spawned, ["i1"]);
+    cleanup();
+  });
+
+  it("does not relaunch a spent budget on any later tick either", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      firstSignalAt: T0 - 3 * DAY,
+      lastStartedAt: T0 - 2 * DAY,
+    });
+    budgetPark(sqlite, "i1", T0 - 2 * DAY);
+
+    const spawned: string[] = [];
+    const posts: string[] = [];
+    let clock = T0;
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async (ctx) => {
+          spawned.push(ctx.incidentId);
+        },
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+        now: () => clock,
+      }),
+    );
+
+    // Three days of ticks a day apart. The marker the sweep writes is itself
+    // activity, so it says this once a day rather than once a tick -- and
+    // each of those days would have been a relaunch, a re-exhaustion and a
+    // page under a sweep that deleted the row.
+    for (let day = 0; day < 3; day += 1) {
+      const result = await d.tick();
+      await result.settled;
+      clock += DAY;
+    }
+
+    assert.deepEqual(spawned, [], "nothing ever relaunched it");
+    assert.equal(waits(db, "i1"), 1, "the wait outlived every sweep");
+    assert.equal(sweeps(db, "i1"), 3, "and was still said out loud each day");
+    assert.equal(posts.length, 3);
+    cleanup();
+  });
 });
 
 describe("staleNotice", () => {
   it("leads with how long it has been quiet", () => {
-    assert.match(staleNotice(26 * 3600, false), /for 26h\./);
-    assert.match(staleNotice(45 * 60, false), /for 45m\./);
+    assert.match(staleNotice(26 * 3600, "quiet"), /for 26h\./);
+    assert.match(staleNotice(45 * 60, "quiet"), /for 45m\./);
   });
 
   it("only claims to have un-parked when it did", () => {
-    assert.match(staleNotice(86_400, true), /no longer waiting/);
-    assert.equal(staleNotice(86_400, false).includes("no longer waiting"), false);
+    assert.match(staleNotice(86_400, "unparked"), /no longer waiting/);
+    assert.equal(
+      staleNotice(86_400, "quiet").includes("no longer waiting"),
+      false,
+    );
+    assert.equal(
+      staleNotice(86_400, "held").includes("no longer waiting"),
+      false,
+    );
+  });
+
+  it("tells a held incident what actually moves it, and does not ask for a reply", () => {
+    const held = staleNotice(86_400, "held");
+    assert.match(held, /still waiting/);
+    assert.match(held, /turn budget for this incident is spent/);
+    assert.match(held, /BUGBOSS_MAX_TURNS/);
+    // The agent's closing brief already said replying will not restart it.
+    // A nudge inviting one a day later would make that brief a lie.
+    assert.equal(/\breply\b|\breplying\b/i.test(held), false, held);
   });
 });
