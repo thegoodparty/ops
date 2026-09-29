@@ -1498,11 +1498,14 @@ const launch = async (args: {
       // both posting puts "it never wrote a brief" under the brief it just
       // wrote.
       //
-      // `park` is the one that cannot be skipped. Nothing else stops the
-      // dispatcher relaunching, and a relaunched agent is instantly over
-      // budget again: it would escalate, stop, relaunch and escalate again
-      // every tick, which is the hot loop `park` was added for. Announcing
-      // is what a person sees; parking is what makes it stop.
+      // `park` is the one that cannot be skipped -- including when the agent
+      // parked itself, which it can. Parking twice sets the same wait state
+      // and costs nothing; not parking once is the hot loop `park` was added
+      // for, because a relaunched agent is instantly over budget again and
+      // would escalate, stop, relaunch and escalate every tick. The two
+      // calls are asymmetric for that reason: a duplicate announcement is a
+      // contradiction a person reads, a duplicate park is a no-op.
+      // Announcing is what a person sees; parking is what makes it stop.
       if (state.escalated) {
         console.log(
           JSON.stringify({
