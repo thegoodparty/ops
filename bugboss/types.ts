@@ -340,8 +340,52 @@ export interface ToolApi {
     liftsOnReply?: boolean;
   }): Promise<ToolResponse>;
 
-  /** Rehydration after resume, plus pending directives. */
-  getIncident(): Promise<ToolResponse<IncidentView>>;
+  /**
+   * Rehydration after resume, plus pending directives. With an id, any
+   * incident: reads are not contained.
+   *
+   * Containment is about writes. The argument for it -- a compromised agent
+   * re-partitions its own record and nothing else -- says nothing about
+   * reading, and withholding the read only made this system incoherent from
+   * the outside. An agent could already read a stranger's whole post-mortem
+   * through `searchIncidents`, which is scoped to RESOLVED and CLOSED, and
+   * could not see the open incident beside it: fluent about the past, blind
+   * to the present. The Slack question box has served any incident to anyone
+   * in the channel the whole time, and serves more of it than this does.
+   */
+  getIncident(args?: {
+    /** Defaults to the caller's own incident. */
+    incidentId?: string;
+  }): Promise<ToolResponse<IncidentView>>;
+
+  /**
+   * Ask for this incident and another to be combined. The agent proposes;
+   * it does not decide and it writes nothing across.
+   *
+   * An agent that works out its partition is wrong has to be able to say so.
+   * Before this its only legal move was to create a *third* incident, which
+   * is how a thread with days of history was abandoned for one opened
+   * minutes earlier -- the rule that keeps blast radius at one record was
+   * manufacturing the churn. The proposal goes to the Boss, which compares
+   * the two on the same judgement it uses after a root cause, and `assign`
+   * decides which record survives. So a captured agent can put one pair in
+   * front of that judgement and can still move nothing.
+   */
+  proposeMerge(args: {
+    /** The incident this one should be combined with. */
+    incidentId: string;
+    reason: string;
+  }): Promise<ToolResponse<MergeOutcomeView>>;
+}
+
+/** What became of a `proposeMerge`, in terms of incidents rather than steps. */
+export interface MergeOutcomeView {
+  /** True when the two were combined. */
+  combined: boolean;
+  /** The incident of record afterwards. The caller's own when nothing moved. */
+  incidentOfRecord: string;
+  /** Plain sentence for the agent, and for anything it repeats to a person. */
+  detail: string;
 }
 
 /**

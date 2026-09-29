@@ -93,13 +93,27 @@ Who may call it:
 | Actor | May |
 | --- | --- |
 | `agent` | re-partition its own incident only: create, split, and nothing that reaches a second record |
-| `human` | combine the incident whose thread they are in with one other, at a verified Slack identity |
-| `boss` | triage placement and root-cause correlation |
+| `human` | combine two incidents, at a verified Slack identity |
+| `boss` | triage placement, root-cause correlation, and a merge an agent asked for |
 
 An agent that concludes its partition is wrong cannot consolidate — that is
-what keeps a compromised one to a single record. Its refusal names the path
-that exists: say so in the thread, and a person there can. That request is
-read by `slack/intent.ts` and applied by the composition root as `human`.
+what keeps a compromised one to a single record. It asks instead, through
+`propose_merge`: the Boss compares the two on the judgement it already uses
+after a root cause, and `assign` decides which record survives. A person asks
+by saying so in Slack, which `slack/intent.ts` reads and the composition root
+applies as `human`.
+
+## Reads are not contained
+
+Containment is a rule about writes. Any agent can read any incident —
+`get_incident` takes an id — because the argument for confining it is entirely
+about what it can move, and confining the read only made the system
+incoherent: `search_incidents` reaches `RESOLVED` and `CLOSED` incidents in
+full, so an agent knew the past and could not see the open incident beside it,
+while the Slack question box served that incident to anyone in the channel.
+
+The credential is still scoped: the loopback route refuses a path id that is
+not the caller's, and every write goes to that one record.
 
 ## Two agents
 

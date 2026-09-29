@@ -20,6 +20,46 @@ one place:
 `logAssign` is emitted **after** the transaction, never inside it, so a
 rolled-back assign leaves no record claiming it happened.
 
+## Reads are not contained; writes are
+
+The containment rule justifies itself on blast radius — "a compromised agent
+re-partitions its own incident and nothing else" — and that is an argument
+about **writes**. It was applied to reads as well, and the result was a system
+that made no sense from the outside: `searchIncidents` returns other
+incidents' root causes and post-mortems in full, but only for `RESOLVED` and
+`CLOSED` ones, so an agent was fluent about the past and blind to the present.
+It could not open the open incident beside it. `GET /incidents/:id` even took
+an id and threw it away.
+
+So `getIncident` takes an optional id and reads any incident, defaulting to
+the caller's own. This is strictly less than the Slack question box has
+served to anyone in the channel since it was written, and it is what makes
+`proposeMerge` worth having: an agent claiming two incidents are the same
+problem should have read the other one.
+
+The token still scopes every **write** to one record, and the loopback route
+still 403s a path id that is not the caller's. A read of another incident
+drains only the caller's own directives.
+
+## An agent asks; it does not decide
+
+`proposeMerge` is the agent's whole reach across incidents. It writes nothing:
+the proposal goes to `Correlator.judgeMerge`, the same judgement and the same
+confident-or-nothing rule as root-cause correlation with one candidate instead
+of every open incident, and `assign` picks which record survives. A captured
+agent can put one pair in front of that judgement and still move nothing.
+
+`MergeVerdict.compared` separates a considered no from nothing having weighed
+them. They point at different next moves — stop asking, or ask a person — and
+an agent handed one sentence for both takes a dead model for a verdict.
+
+**Nothing this returns names a kind of caller.** The agent repeats these
+sentences into a Slack thread, and "an agent may only re-partition its own
+incident" shows a person a boundary they cannot see, did not ask about and can
+do nothing with. Every outcome is stated in incidents and signals. The same
+rule is why `assign`'s containment error names `propose_merge` rather than
+explaining actors — it is a guard now, off the path anything normally takes.
+
 ## Which incident survives
 
 Left to the caller, the survivor was an accident of who was acting:
@@ -37,12 +77,14 @@ oldest one; it is also never recomputed on absorb. Ids come from `MAX(id)+1`,
 so they are the only monotonic record of when the incident itself was opened,
 and the one thing a merge cannot move.
 
-An agent is still confined to its own incident and cannot merge at all. Its
-one move was to create a *new* incident, which is what manufactured the churn
-of fresh records the rule exists to stop, so the refusal now names the path
-that does exist: say so in the thread, and a person there can combine them.
-That request is executed by the composition root as the `human` actor — see
-`slack/CLAUDE.md`.
+An agent still cannot merge. It asks, through `proposeMerge`; a person asks
+by saying so in Slack, which the composition root applies as the `human`
+actor — see `slack/CLAUDE.md`.
+
+`firstSignalAt` moves with the signals, because it is the input to time to
+detect and it was never recomputed on absorb: incident 79 held a signal from
+the 27th and reported the 28th. Only a move *in* runs the recompute, so the
+value can only fall.
 
 ## Guard in the statement
 

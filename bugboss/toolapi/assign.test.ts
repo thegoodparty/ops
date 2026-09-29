@@ -316,7 +316,22 @@ describe("assign: containment", () => {
         { signalIds: ["sig-a"], target: b, reason: "steal" },
         { kind: "agent", incidentId: a },
       ),
-      /cannot assign into incident/,
+      (err: Error) => {
+        // It still refuses -- writes stay contained however reads opened up.
+        assert.match(err.message, /not something this call does/);
+        // And it says what to call instead. An agent repeats a tool error
+        // into a Slack thread, and "an agent may only re-partition its own
+        // incident" is a boundary the person reading it cannot see, did not
+        // ask about, and can do nothing with.
+        assert.match(err.message, /propose_merge/);
+        assert.doesNotMatch(err.message, /\bagent\b|\bboss\b|\bhuman\b/i);
+        return true;
+      },
+    );
+    assert.deepEqual(
+      signalsOn(b),
+      ["sig-b"],
+      "and nothing moved, which is the half that matters",
     );
   });
 
@@ -436,6 +451,59 @@ describe("assign: containment", () => {
 
     assert.deepEqual(result.merged, [newer]);
     assert.equal(incident(newer)?.mergedInto, older);
+  });
+});
+
+describe("firstSignalAt follows the signals", () => {
+  it("falls to the earliest signal the incident now holds", async () => {
+    await seed("sig-late");
+    await seed("sig-early");
+    // seed() stamps openedAt in call order, so the second is the later one.
+    // Swap them, because the case is an incident absorbing signals that
+    // started before it did -- which is exactly how incident 79 came to
+    // report the 28th while holding a signal from the 27th.
+    await db.withWrite((w) => {
+      w.prepare("UPDATE signal SET openedAt = ? WHERE id = ?").run(500, "sig-early");
+    });
+
+    const holder = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-late"], target: "NEW", reason: "late" },
+        { kind: "boss" },
+      )
+    ).target;
+    assert.equal(incident(holder)?.firstSignalAt, 1000);
+
+    await applyAssign(
+      db,
+      { signalIds: ["sig-early"], target: holder, reason: "older than this" },
+      { kind: "boss" },
+    );
+
+    // Not cosmetic: this is the input to time to detect, and an incident
+    // that absorbed an older signal really did start earlier than its own
+    // column said.
+    assert.equal(incident(holder)?.firstSignalAt, 500);
+  });
+
+  it("is left alone when nothing moved in", async () => {
+    await seed("sig-a");
+    const incidentId = (
+      await applyAssign(
+        db,
+        { signalIds: ["sig-a"], target: "NEW", reason: "a" },
+        { kind: "boss" },
+      )
+    ).target;
+
+    await applyAssign(
+      db,
+      { signalIds: ["sig-a"], target: incidentId, reason: "already home" },
+      { kind: "boss" },
+    );
+
+    assert.equal(incident(incidentId)?.firstSignalAt, 1000);
   });
 });
 

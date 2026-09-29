@@ -69,6 +69,10 @@ const BODIES = {
     impactQuery: z.string().optional(),
     impactStartedAt: z.number().int().positive().optional(),
   }),
+  proposeMerge: z.object({
+    incidentId: z.string().min(1),
+    reason: z.string().min(1),
+  }),
   impact: z.object({
     usersImpacted: z.number(),
     query: z.string().min(1),
@@ -172,7 +176,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
    */
   const tool = <S extends z.ZodType>(
     schema: S,
-    run: (api: ToolApi, body: z.infer<S>) => Promise<unknown>,
+    run: (api: ToolApi, body: z.infer<S>, c: Context) => Promise<unknown>,
   ) =>
     async (c: Context) => {
       const caller = authorize(c);
@@ -206,10 +210,26 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       }
 
       const api = deps.toolApiFor(caller.incidentId, caller.token);
-      return c.json(await run(api, parsed.data));
+      return c.json(await run(api, parsed.data, c));
     };
 
-  app.get("/incidents/:id", tool(BODIES.none, (api) => api.getIncident()));
+  // `?incident=` reads another incident. The path id still has to be the
+  // caller's own -- `authorize` rejects anything else, and the token is what
+  // scopes the writes -- so this asks for a read without widening the
+  // credential. Absent, it is the caller's own incident, which is every call
+  // that existed before reads opened up.
+  app.get(
+    "/incidents/:id",
+    tool(BODIES.none, (api, _body, c) => {
+      const other = c.req.query("incident");
+      return api.getIncident(other ? { incidentId: other } : undefined);
+    }),
+  );
+
+  app.post(
+    "/incidents/:id/propose-merge",
+    tool(BODIES.proposeMerge, (api, body) => api.proposeMerge(body)),
+  );
 
   app.post(
     "/incidents/:id/root-cause",

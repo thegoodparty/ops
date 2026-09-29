@@ -8,9 +8,18 @@ import type Database from "better-sqlite3";
 import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
-import type { Evidence, IncidentView, ToolApi } from "../types";
+import type {
+  Evidence,
+  IncidentView,
+  MergeOutcomeView,
+  ToolApi,
+} from "../types";
 import { applyAssign } from "./assign";
-import { createToolApi, type CorrelationMerge } from "./index";
+import {
+  createToolApi,
+  type CorrelationMerge,
+  type MergeVerdict,
+} from "./index";
 import jwt from "jsonwebtoken";
 
 import { mintAgentToken, verifyAgentToken } from "./token";
@@ -74,8 +83,13 @@ const slack = {
   },
 };
 
+/** Queued verdicts for `proposeMerge`. Empty means "not the same problem". */
+const verdicts: MergeVerdict[] = [];
+
 const correlator = {
   correlate: async () => merges.splice(0, merges.length),
+  judgeMerge: async () =>
+    verdicts.shift() ?? { merge: null, compared: true },
 };
 
 const evidence = { load: async () => evidenceRows };
@@ -702,6 +716,167 @@ describe("the scoped token", () => {
     assert.match(res.error ?? "", /invalid agent token/);
     assert.deepEqual(res.directives, [], "an unidentified caller drains nothing");
     assert.equal(incidentRow(id)?.status, "INVESTIGATING");
+  });
+});
+
+describe("reads are not contained", () => {
+  it("reads an incident that is not the caller's", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const mine = await openIncident(["sig-a"]);
+    const theirs = await openIncident(["sig-b"]);
+
+    const res = await toolsFor(mine).getIncident({ incidentId: theirs });
+
+    assert.equal(res.ok, true, res.error);
+    const view = res.data as IncidentView;
+    assert.equal(view.incident.id, theirs);
+    assert.deepEqual(
+      view.signals.map((s) => s.id),
+      ["sig-b"],
+      "the signals come with it, or the read cannot answer what it is for",
+    );
+  });
+
+  it("reads the caller's own incident when no id is given", async () => {
+    await seed("sig-a");
+    const mine = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(mine).getIncident();
+
+    assert.equal((res.data as IncidentView).incident.id, mine);
+  });
+
+  it("reading another incident moves nothing and drains only the caller's own", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const mine = await openIncident(["sig-a"]);
+    const theirs = await openIncident(["sig-b"]);
+    await db.withWrite((w) => {
+      w.prepare(
+        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
+      ).run(theirs, JSON.stringify({ type: "stop", reason: "not yours" }), 1);
+    });
+
+    const res = await toolsFor(mine).getIncident({ incidentId: theirs });
+
+    assert.equal(res.ok, true, res.error);
+    assert.deepEqual(
+      res.directives,
+      [],
+      "a read of somebody else's incident does not collect their directives",
+    );
+    assert.equal(
+      db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [theirs])
+        .length,
+      1,
+      "and leaves them where the agent that owns them will find them",
+    );
+    assert.deepEqual(signalsOn(theirs), ["sig-b"], "reading is not moving");
+  });
+});
+
+describe("proposeMerge: the agent asks", () => {
+  it("combines the two when the proposal is agreed", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    verdicts.push({
+      merge: { absorb: newer, into: older, reason: "one pool, two alerts" },
+      compared: true,
+    });
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "the same connection pool",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const data = res.data as MergeOutcomeView;
+    assert.equal(data.combined, true);
+    assert.equal(data.incidentOfRecord, older);
+    assert.equal(incidentRow(newer)?.status, "MERGED");
+    assert.deepEqual(signalsOn(older), ["sig-a", "sig-b"]);
+  });
+
+  it("writes nothing when the two are judged different problems", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "both are 500s",
+    });
+
+    assert.equal(res.ok, true, res.error);
+    const data = res.data as MergeOutcomeView;
+    assert.equal(data.combined, false);
+    assert.equal(data.incidentOfRecord, newer);
+    assert.match(data.detail, /not the same problem/);
+    assert.equal(incidentRow(older)?.status, "INVESTIGATING");
+    assert.deepEqual(signalsOn(older), ["sig-a"], "asking moved nothing");
+  });
+
+  it("tells a considered no apart from nothing having compared them", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    verdicts.push({ merge: null, compared: false });
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "the same connection pool",
+    });
+
+    // One means stop asking; the other means ask a person. An agent handed
+    // the same sentence for both would take a dead judgement for a verdict.
+    const data = res.data as MergeOutcomeView;
+    assert.match(data.detail, /could not be compared/);
+    assert.doesNotMatch(data.detail, /not the same problem/);
+  });
+
+  it("says nothing about kinds of caller in anything it hands back", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const older = await openIncident(["sig-a"]);
+    const newer = await openIncident(["sig-b"]);
+    await db.withWrite((w) => {
+      w.prepare(
+        `UPDATE incident SET status = 'CLOSED', resolvedAt = 1, closedAt = 2,
+           postmortem = 'closed by the test' WHERE id = ?`,
+      ).run(older);
+    });
+
+    const res = await toolsFor(newer).proposeMerge({
+      incidentId: older,
+      reason: "the same connection pool",
+    });
+
+    // The agent repeats these into a Slack thread. A person reading "an
+    // agent may not do that" is being shown a boundary they cannot see, did
+    // not ask about and can do nothing with. Every sentence here is about
+    // incidents and signals.
+    const data = res.data as MergeOutcomeView;
+    assert.equal(data.combined, false);
+    assert.match(data.detail, /is CLOSED and is not taking signals/);
+    assert.doesNotMatch(data.detail, /\bagent\b|\bboss\b|\bhuman\b|\bpermission\b/i);
+  });
+
+  it("refuses to weigh an incident against itself", async () => {
+    await seed("sig-a");
+    const mine = await openIncident(["sig-a"]);
+
+    const res = await toolsFor(mine).proposeMerge({
+      incidentId: mine,
+      reason: "the same as me",
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is this incident/);
   });
 });
 

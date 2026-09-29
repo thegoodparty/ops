@@ -144,16 +144,24 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
     reportAnalysis: async () => response,
     escalate: async () => response,
     getIncident: async () => response,
+    proposeMerge: async () => response,
     searchIncidents: async () => response,
   }) as unknown as ToolApi;
 
-// Two reads now, not one: search_incidents is how an agent reaches the
-// post-mortems of incidents nobody pointed it at.
+// Two reads, and both of them now reach incidents nobody pointed the agent
+// at: search_incidents finds the post-mortems, get_incident reads an open
+// one by id. That asymmetry used to run the other way -- fluent about the
+// past, blind to the present -- and it is the reason an agent could discover
+// that another incident existed and then do nothing with it.
 //
 // Four transitions, not five: `escalate` sits in this list but writes no
 // state. It says the incident needs a person and leaves the agent driving,
 // which is why it is named for what it does rather than for what it moves.
-test("the boss tools are the four transitions, escalate, park and the two reads", async () => {
+//
+// `propose_merge` is a ninth thing and is neither. It writes nothing on the
+// agent's word: it asks, the two incidents are compared, and the rules pick
+// which record survives.
+test("the boss tools are the four transitions, the ask, escalate, park and the two reads", async () => {
   const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
 
   assert.deepEqual(
@@ -162,6 +170,7 @@ test("the boss tools are the four transitions, escalate, park and the two reads"
       "escalate",
       "get_incident",
       "park",
+      "propose_merge",
       "report_analysis",
       "report_impact",
       "report_resolved",
@@ -170,6 +179,28 @@ test("the boss tools are the four transitions, escalate, park and the two reads"
     ],
   );
   assert.ok(!tools.some((tool) => BUILTIN_TOOLS.includes(tool.name)));
+});
+
+test("get_incident takes an id, so an agent can read an incident that is not its own", async () => {
+  // The read an agent could not make. Without it `propose_merge` is a guess:
+  // an agent naming another incident would be doing it off a search hit it
+  // was not allowed to open.
+  const asked: unknown[] = [];
+  const tools = await createBossTools({
+    api: {
+      ...stubApi({ ok: true, directives: [] }),
+      getIncident: async (args: unknown) => {
+        asked.push(args);
+        return { ok: true as const, directives: [] };
+      },
+    } as unknown as ToolApi,
+  });
+  const read = tools.find((tool) => tool.name === "get_incident")!;
+
+  await read.execute("call-1", { incidentId: "79" } as never, undefined, undefined, {} as never);
+  await read.execute("call-2", {} as never, undefined, undefined, {} as never);
+
+  assert.deepEqual(asked, [{ incidentId: "79" }, {}]);
 });
 
 test("park reaches the boss, because a wait nothing can write is a hot loop", async () => {

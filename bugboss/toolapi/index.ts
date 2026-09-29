@@ -28,6 +28,7 @@ import type {
   IncidentStatus,
   IncidentMatch,
   IncidentView,
+  MergeOutcomeView,
   PriorIncident,
   RecurrenceAnalysis,
   Signal,
@@ -95,6 +96,25 @@ export interface Correlator {
     incidentId: string;
     rootCause: string;
   }): Promise<CorrelationMerge[]>;
+  /**
+   * The same judgement, asked by an agent instead of triggered by a root
+   * cause. Scoped to the one incident it named.
+   */
+  judgeMerge(args: {
+    incidentId: string;
+    withIncidentId: string;
+    reason: string;
+  }): Promise<MergeVerdict>;
+}
+
+/**
+ * `compared: false` is not a quiet no. Nothing weighed the two, which is a
+ * different thing to tell the agent than "these are not the same problem" --
+ * one means stop asking and the other means ask a person.
+ */
+export interface MergeVerdict {
+  merge: CorrelationMerge | null;
+  compared: boolean;
 }
 
 /** Job 5. The Boss posts status transitions; the agent posts its own work. */
@@ -928,8 +948,21 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       return { ok: true, data: { incidentId, wakeAt, liftsOnReply } };
     });
 
-  const getIncident: ToolApi["getIncident"] = () =>
-    call<IncidentView>("getIncident", async (incidentId) => {
+  /**
+   * Any incident, not only the caller's. Containment is a rule about writes:
+   * "a compromised agent re-partitions its own incident and nothing else" is
+   * an argument about what it can move, and it says nothing about what it
+   * can look at. Withholding the read bought nothing and cost coherence --
+   * `searchIncidents` already returns other incidents' root causes and
+   * post-mortems in full, and the Slack question box has served any incident
+   * to anyone in the channel since it was written.
+   *
+   * It is also what makes `proposeMerge` worth having. An agent asking for
+   * two incidents to be combined should have read the other one first.
+   */
+  const getIncident: ToolApi["getIncident"] = (args) =>
+    call<IncidentView>("getIncident", async (own) => {
+      const incidentId = args?.incidentId ?? own;
       const incident = readIncident(incidentId);
       if (!incident) return reject(`unknown incident: ${incidentId}`);
 
@@ -982,6 +1015,101 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       }
     });
 
+  /**
+   * The agent's half of a cross-incident merge: it asks, and that is all it
+   * does. Nothing here writes to another incident on the agent's word.
+   *
+   * Every sentence this returns is about incidents and signals. None of it
+   * mentions which part of the system answered, because the agent repeats
+   * these to people in a Slack thread and "an agent may not do that" is a
+   * boundary they cannot see and did not ask about. Either it happened, or
+   * they are told what is true about the work.
+   */
+  const proposeMerge: ToolApi["proposeMerge"] = (args) =>
+    call<MergeOutcomeView>("proposeMerge", async (incidentId) => {
+      const stay = (detail: string): Body<MergeOutcomeView> => ({
+        ok: true,
+        data: { combined: false, incidentOfRecord: incidentId, detail },
+      });
+
+      if (args.incidentId === incidentId) {
+        return reject(`incident ${incidentId} is this incident`);
+      }
+      const mine = readIncident(incidentId);
+      if (!mine) return reject(`unknown incident: ${incidentId}`);
+      const other = readIncident(args.incidentId);
+      if (!other) return reject(`unknown incident: ${args.incidentId}`);
+      // Read off before the narrowing: `mergeable` is a type predicate, so
+      // the branch where it is false has no row left to ask.
+      const otherStatus = other.status;
+      const myStatus = mine.status;
+      if (!mergeable(other)) {
+        return stay(
+          `Incident ${args.incidentId} is ${otherStatus} and is not taking signals, so the two cannot be combined. A signal arriving after a resolution is a recurrence rather than the same incident.`,
+        );
+      }
+      if (!mergeable(mine)) {
+        return stay(
+          `Incident ${incidentId} is ${myStatus} and is not taking signals, so the two cannot be combined.`,
+        );
+      }
+
+      let verdict;
+      try {
+        verdict = await correlator.judgeMerge({
+          incidentId,
+          withIncidentId: args.incidentId,
+          reason: args.reason,
+        });
+      } catch (err) {
+        alarm("merge_request_failed", {
+          incidentId,
+          withIncidentId: args.incidentId,
+          error: String(err),
+        });
+        verdict = { merge: null, compared: false };
+      }
+
+      if (!verdict.merge) {
+        return stay(
+          verdict.compared
+            ? `Incident ${args.incidentId} was compared against this one and they are not the same problem, so both stay open. If you are sure, say why in the thread: a person there can combine them.`
+            : `Incident ${args.incidentId} could not be compared against this one just now. Say in the thread what the two have in common, and a person there can combine them.`,
+        );
+      }
+
+      const merge = verdict.merge;
+      const outcome = await db.withWrite((w) => applyMerge(w, merge));
+      if (outcome.kind === "declined") {
+        log("merge_declined", {
+          incidentId,
+          absorb: outcome.merge.absorb,
+          into: outcome.merge.into,
+          proposedBecause: outcome.merge.reason,
+          ...outcome.why,
+        });
+        return stay(
+          `Incident ${args.incidentId} moved on while this was being weighed, so nothing was combined. Read it again before asking a second time.`,
+        );
+      }
+
+      logAssign(outcome.result);
+      await announceMerge(outcome.result);
+
+      const record = outcome.result.target;
+      return {
+        ok: true,
+        data: {
+          combined: true,
+          incidentOfRecord: record,
+          detail:
+            record === incidentId
+              ? `Incident ${args.incidentId} is now part of this one, and its signals are here. Incident ${incidentId} is the older record, so it keeps the thread everything is posted to.`
+              : `This incident is now part of incident ${record}, which is the older record and keeps the thread everything is posted to. Its agent has the signals and the reason given here.`,
+        },
+      };
+    });
+
   return {
     reportRootCause,
     reportImpact,
@@ -990,6 +1118,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     escalate,
     park,
     getIncident,
+    proposeMerge,
     searchIncidents: searchIncidentsTool,
   };
 };

@@ -355,3 +355,100 @@ export const runCorrelation = async (
     return { merges: [], splits, fellBack: true };
   }
 };
+
+// ---------------------------------------------------------------------------
+// An agent asking, rather than a root cause triggering
+// ---------------------------------------------------------------------------
+
+/** One agent's request that its incident be combined with a named one. */
+export interface MergeRequest {
+  /** The agent's own incident. */
+  incidentId: string;
+  /** The one it believes is the same problem. */
+  withIncidentId: string;
+  /** Why it thinks so, in its own words. */
+  reason: string;
+  /** Both incidents, as digests. The Boss re-reads rather than trusting these. */
+  openIncidents: IncidentDigest[];
+}
+
+/**
+ * The Boss's answer to an agent that asked for a merge.
+ *
+ * Same judgement as `runCorrelation`, same prompt, same confident-or-nothing
+ * rule, one candidate instead of every open incident. It is a separate entry
+ * point rather than a flag because the two have different triggers and
+ * different failure meanings -- correlation falling back means two incidents
+ * quietly stay apart, and this falling back means an agent that asked a
+ * question got no answer, which it has to be told.
+ *
+ * The agent's reason stands in for a root cause in the prompt. That is what
+ * it is: a claim about what these two share, written by the thing that has
+ * read both. It is untrusted for the same reason a root cause is, and the
+ * model is told so by the same system prompt.
+ */
+export const judgeMerge = async (
+  deps: CorrelateDeps,
+  req: MergeRequest,
+): Promise<{ merge: MergeProposal | null; fellBack: boolean }> => {
+  const started = Date.now();
+  const usage = emptyModelUsage();
+
+  const candidate = req.openIncidents.find((i) => i.id === req.withIncidentId);
+  if (!candidate || !MERGEABLE.includes(candidate.status)) {
+    log("merge_request_no_candidate", {
+      incidentId: req.incidentId,
+      withIncidentId: req.withIncidentId,
+      status: candidate?.status ?? "gone",
+    });
+    return { merge: null, fellBack: false };
+  }
+
+  const asCorrelation: CorrelationRequest = {
+    incidentId: req.incidentId,
+    rootCause: req.reason,
+    explainedSignalIds: [],
+    openIncidents: req.openIncidents,
+  };
+
+  try {
+    const answer = await runStructuredCall({
+      model: deps.model,
+      system: SYSTEM,
+      prompt: renderPrompt(asCorrelation, [candidate]),
+      answer: { spec: PROPOSE, schema: answerSchema },
+      tools: [queryTool(deps.db)],
+      budgetMs: deps.budgetMs ?? DEFAULT_BUDGET_MS,
+      maxRounds: deps.maxRounds ?? DEFAULT_MAX_ROUNDS,
+      maxInvalid: 2,
+      maxTokens: deps.maxTokens ?? DEFAULT_MAX_TOKENS,
+      usage,
+    });
+
+    const [merge] = applyRules(asCorrelation, [candidate], answer.merges);
+    recordCall(SITE, false);
+    log("merge_request_judged", {
+      incidentId: req.incidentId,
+      withIncidentId: req.withIncidentId,
+      agreed: !!merge,
+      ms: Date.now() - started,
+      ...usageForLog(usage),
+    });
+    return { merge: merge ?? null, fellBack: false };
+  } catch (err) {
+    const health = recordCall(SITE, true);
+    // Told apart from a considered no on purpose. An agent that asked and
+    // was answered "not the same cause" stops asking; an agent told nothing
+    // compared them should ask a person instead, and cannot work out which
+    // happened from an empty answer.
+    alarm("merge_request_unjudged", {
+      incidentId: req.incidentId,
+      withIncidentId: req.withIncidentId,
+      error: String(err),
+      ms: Date.now() - started,
+      ...health,
+      ...usageForLog(usage),
+    });
+    return { merge: null, fellBack: true };
+  }
+};

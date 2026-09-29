@@ -236,22 +236,24 @@ test("an injected instruction is fenced, and the answer can name one incident an
   );
   assert.deepEqual(
     Object.keys(read).sort(),
-    ["addressed", "combineWith", "fellBack", "reason"],
-    "the answer names at most one incident, and no user and no action",
+    ["addressed", "combineIds", "fellBack", "reason"],
+    "the answer names incidents, and no user and no action",
   );
-  assert.equal(
-    read.combineWith,
-    null,
+  assert.deepEqual(
+    read.combineIds,
+    [],
     "an answer that did not ask for a combine does not carry one",
   );
 });
 
 test("a combine request is carried through as the model wrote it, unresolved", async () => {
-  const { model } = fakeModel([answers({ addressed: "agent", combineWith: "79" })]);
+  const { model } = fakeModel([
+    answers({ addressed: "agent", combineIds: ["79"] }),
+  ]);
 
   const read = await asked(model, "this is the same bug as 79, merge them");
 
-  assert.equal(read.combineWith, "79");
+  assert.deepEqual(read.combineIds, ["79"]);
   assert.equal(read.addressed, "agent", "the two fields are independent");
 });
 
@@ -261,9 +263,9 @@ test("a read that fell back asks for no combine", async () => {
   );
 
   assert.equal(value.addressed, "unclear");
-  assert.equal(
-    value.combineWith,
-    null,
+  assert.deepEqual(
+    value.combineIds,
+    [],
     "a dead model must not fall back into moving incidents around",
   );
 });

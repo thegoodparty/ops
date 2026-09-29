@@ -602,13 +602,49 @@ test("the loopback API refuses anything but this incident's own token", async ()
   });
   assert.equal(forged.status, 401);
 
-  // The incident comes from the token, so a valid token cannot be pointed at
-  // a different one: that is the whole containment story for a co-located
-  // agent that reads attacker-writable log lines for a living.
+  // The credential comes from the token, so a valid token cannot be pointed
+  // at a different incident: that is the containment story for a co-located
+  // agent that reads attacker-writable log lines for a living. It is about
+  // what the token may *write*.
   const crossed = await boss.loopbackApp.request(`/incidents/${second.id}`, {
     headers: { authorization: `Bearer ${boss.mintToken(first.id)}` },
   });
   assert.equal(crossed.status, 403);
+});
+
+/**
+ * And reading is the other half, which the same route used to refuse by
+ * accident. `/incidents/:id` took an id and threw it away, so an agent could
+ * find another incident through `search_incidents` and had no way to open
+ * it. The token still scopes every write to one record; the read is not a
+ * write, and the Slack question box has served any incident to anyone in the
+ * channel the whole time.
+ */
+test("an agent reads another incident over the loopback, with its own token", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "mine" });
+  await boss.ingest("grafana", grafanaBody("fp-read-a", "cross-read-mine"));
+  const mine = incidentOf("fp-read-a")!;
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "theirs" });
+  await boss.ingest("grafana", grafanaBody("fp-read-b", "cross-read-theirs"));
+  const theirs = incidentOf("fp-read-b")!;
+
+  const res = await boss.loopbackApp.request(
+    `/incidents/${mine}?incident=${theirs}`,
+    { headers: { authorization: `Bearer ${boss.mintToken(mine)}` } },
+  );
+
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    ok: boolean;
+    data: { incident: { id: string }; signals: { sourceId: string }[] };
+  };
+  assert.equal(body.ok, true);
+  assert.equal(body.data.incident.id, theirs);
+  assert.deepEqual(
+    body.data.signals.map((s) => s.sourceId),
+    ["fp-read-b"],
+  );
 });
 
 test("health is a flat 200, which is what the target group checks", async () => {
@@ -1686,7 +1722,7 @@ test("a person asking for a merge in a thread gets the merge, not a refusal", as
   const { older, newer } = await twoIncidents("comb");
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "others", combineWith: older });
+  fakeModel.intents.push({ addressed: "others", combineIds: [older] });
   await boss.slackEvent(
     replyIn(threadOf(newer)!, `this is the same bug as ${older}, merge them`),
   );
@@ -1734,7 +1770,7 @@ test("the established incident survives even when the person asks the other way"
   const { older, newer } = await twoIncidents("rev");
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineWith: newer });
+  fakeModel.intents.push({ addressed: "agent", combineIds: [newer] });
   await boss.slackEvent(
     replyIn(threadOf(older)!, `merge this one into ${newer}, same root cause`),
   );
@@ -1788,7 +1824,7 @@ test("an incident id the person never typed is dropped, not merged", async () =>
   const { older, newer } = await twoIncidents("ghost");
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "others", combineWith: older });
+  fakeModel.intents.push({ addressed: "others", combineIds: [older] });
   await boss.slackEvent(
     replyIn(threadOf(newer)!, "still seeing this on the checkout path"),
   );
@@ -1814,7 +1850,7 @@ test("a combine naming an incident that cannot take signals is declined out loud
   });
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineWith: older });
+  fakeModel.intents.push({ addressed: "agent", combineIds: [older] });
   await boss.slackEvent(
     replyIn(threadOf(newer)!, `isn't this the same as ${older}? merge them`),
   );
@@ -1822,7 +1858,7 @@ test("a combine naming an incident that cannot take signals is declined out loud
   assert.equal(statusOf(newer).status, "INVESTIGATING");
   const said = fakeSlack.posts.slice(before);
   assert.ok(
-    said.some((p) => /is CLOSED, so these two cannot be combined/.test(p.text)),
+    said.some((p) => /is CLOSED and is not taking signals/.test(p.text)),
     "a person who asked for something impossible is told, not ignored",
   );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
@@ -1846,7 +1882,7 @@ test("a combine is refused when the thread's own incident closed while it was be
   });
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineWith: older });
+  fakeModel.intents.push({ addressed: "agent", combineIds: [older] });
   await boss.slackEvent(
     replyIn(threadOf(newer)!, `this is the same bug as ${older}`),
   );
@@ -1860,8 +1896,69 @@ test("a combine is refused when the thread's own incident closed while it was be
   assert.ok(
     fakeSlack.posts
       .slice(before)
-      .some((p) => /this incident is CLOSED now/.test(p.text)),
+      .some((p) =>
+        new RegExp(`incident ${newer} is CLOSED and is not taking signals`).test(
+          p.text,
+        ),
+      ),
     "and the person is told why, rather than watching nothing happen",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+/**
+ * The same request, typed at the bot instead of into a thread.
+ *
+ * This is the "fluidity" complaint as a test. Out here there is no incident
+ * thread, so the mention used to be read as a question and handed to the
+ * read-only box, which answered that it could not -- while the identical
+ * sentence typed four lines lower, inside a thread, merged two incidents.
+ * A person cannot see the boundary that makes those differ and did not ask
+ * about it. One executor answers both.
+ */
+test("the same ask typed at the bot outside a thread does the same thing", async () => {
+  const { older, newer } = await twoIncidents("mention");
+
+  fakeModel.intents.push({ intent: "combine", combineIds: [newer, older] });
+  await boss.slackEvent({
+    type: "app_mention",
+    channel: "C0TEST",
+    user: "U-swain",
+    text: `<@B0BOSS> ${newer} and ${older} are the same bug, merge them`,
+    ts: "2100.1",
+  });
+
+  assert.equal(statusOf(newer).status, "MERGED");
+  assert.equal(statusOf(newer).mergedInto, older);
+  assert.deepEqual(signalsOn(older), ["fp-mention-new", "fp-mention-old"]);
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+test("a mention naming only one incident is asked which two, not refused", async () => {
+  const { older, newer } = await twoIncidents("lonely");
+  const before = fakeSlack.posts.length;
+
+  fakeModel.intents.push({ intent: "combine", combineIds: [older] });
+  await boss.slackEvent({
+    type: "app_mention",
+    channel: "C0TEST",
+    user: "U-swain",
+    text: `<@B0BOSS> merge ${older} into the other one`,
+    ts: "2101.1",
+  });
+
+  assert.equal(statusOf(older).status, "INVESTIGATING");
+  assert.equal(statusOf(newer).status, "INVESTIGATING");
+  const said = fakeSlack.posts.slice(before);
+  assert.ok(
+    said.some((p) => /which two incidents/.test(p.text)),
+    "out here nothing supplies the other side, so it asks for it",
+  );
+  // The thing this whole change is about. "I cannot do that" is never the
+  // answer, and neither is silence.
+  assert.ok(
+    said.every((p) => !/cannot|can't|unable/i.test(p.text)),
+    "and never tells them it cannot",
   );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });

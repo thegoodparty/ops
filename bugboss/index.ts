@@ -960,6 +960,22 @@ export const createBugBoss = async (
         reason: merge.reason,
       }));
     },
+    judgeMerge: async ({ incidentId, withIncidentId, reason }) => {
+      const { merge, fellBack } = await triage.judgeMerge({
+        incidentId,
+        withIncidentId,
+        reason,
+        openIncidents: openIncidents(),
+      });
+      return {
+        merge: merge
+          ? { absorb: merge.incidentId, into: merge.into, reason: merge.reason }
+          : null,
+        // A judgement that fell back compared nothing, which the agent has to
+        // be able to tell from a considered no.
+        compared: !fellBack,
+      };
+    },
   };
 
   // Process-scoped, so a token cannot outlive the agents it was minted for:
@@ -1842,130 +1858,154 @@ export const createBugBoss = async (
   const COMBINABLE: readonly IncidentStatus[] = ["INVESTIGATING", "FIXING"];
 
   /**
-   * Somebody in a thread has asked for this incident and another one to be
-   * combined. This is where that becomes a thing that happened.
+   * Somebody has asked for two incidents to be made one. This is where that
+   * becomes a thing that happened, wherever they said it.
    *
-   * It exists because the alternative was a refusal. An agent may only
-   * re-partition its own incident -- rightly, that is what keeps a
-   * compromised one to a single record -- so when a person asked for a merge
-   * the agent in the thread had exactly one legal move, which was to create
-   * a *third* incident. It said it could not instead, and the ask went
-   * nowhere. The authority to do this already existed as the `human` actor;
-   * nothing had ever routed anything to it. Nothing here weakens the agent's
-   * containment. The request simply stops being executed under it.
+   * One executor for every surface, and that is the point rather than tidy
+   * factoring. The same sentence typed as a thread reply and typed at a
+   * mention used to do two different things -- merge, and be handed to a
+   * read-only box that answered that it could not -- and a person cannot see
+   * the boundary that makes those differ. They asked the same question.
+   *
+   * It exists at all because the alternative was a refusal. An agent may
+   * only re-partition its own incident, so when a person asked one for a
+   * merge, its single legal move was to open a *third* incident. That is how
+   * a thread with four days of conversation was abandoned for one opened
+   * minutes earlier. Agent containment is untouched and should stay that
+   * way; an agent asks now, through proposeMerge, and a person asks here.
    *
    * Three things bound it, none of them a reading of the sentence:
    *
-   *   - The thread supplies one side. A message can name the other incident
-   *     and nothing else, so no wording reaches a pair of incidents the
-   *     person was not standing in front of.
-   *   - The named id must appear literally in what they typed. A model that
-   *     invents a plausible number gets dropped here rather than obeyed, and
-   *     the drop is logged with what it said.
-   *   - Which of the two survives is not theirs to pick, and is not read out
+   *   - Every id must appear literally in what they typed. A model that
+   *     invents a plausible number is dropped here, not obeyed.
+   *   - Both must be incidents that can still take signals, re-read after
+   *     the model call rather than trusted from the route.
+   *   - Which of the two survives is not theirs to pick and is not read out
    *     of the message. `assign` holds that rule.
    */
-  const combineIncidents = async (
-    route: Extract<InboundRoute, { kind: "incident_reply" }>,
-    named: string,
-    said: string,
-  ): Promise<void> => {
-    const say = (text: string) => sayInThread(route.channel, route.threadTs, text);
+  const combineIncidents = async (args: {
+    channel: string;
+    threadTs: string;
+    user: string;
+    /** What they typed, with the bot mention stripped. */
+    said: string;
+    /** The ids the read came back with, unvalidated. */
+    named: string[];
+    /** The incident whose thread this was said in, if it was said in one. */
+    here: string | null;
+  }): Promise<void> => {
+    const say = (text: string) => sayInThread(args.channel, args.threadTs, text);
     const decline = (why: string, note: string) => {
-      log("combine_declined", { incidentId: route.incidentId, named, why });
-      return say(mrkdwn`${raw(userMention(route.user))} ${raw(note)}`);
+      log("combine_declined", { here: args.here, named: args.named, why });
+      return say(mrkdwn`${raw(userMention(args.user))} ${raw(note)}`);
     };
 
-    // Digits first, so the boundary match below cannot be fed a pattern.
-    if (!/^\d+$/.test(named)) {
-      log("combine_dropped", { incidentId: route.incidentId, named, why: "not an incident id" });
-      return;
-    }
-    // Not the model's word for it. An id it read out of the message is in the
-    // message; an id it did not is a number it made up, and acting on one is
-    // a merge nobody asked for.
-    if (!new RegExp(`(^|\\D)${named}(\\D|$)`).test(said)) {
-      log("combine_dropped", { incidentId: route.incidentId, named, why: "not in the message" });
-      return;
-    }
-    if (named === route.incidentId) {
-      log("combine_dropped", { incidentId: route.incidentId, named, why: "already this incident" });
-      return;
-    }
-
-    const other = db.get<{ id: string; status: IncidentStatus }>(
-      "SELECT id, status FROM incident WHERE id = ?",
-      [named],
+    // Not the model's word for it. An id it read out of the message is in
+    // the message; an id it did not is a number it made up, and acting on
+    // one combines two incidents nobody asked about. Digits first, so the
+    // boundary match below cannot be handed a pattern.
+    const ids = [...new Set(args.named)].filter(
+      (id) =>
+        /^\d+$/.test(id) && new RegExp(`(^|\\D)${id}(\\D|$)`).test(args.said),
     );
-    if (!other) {
-      return decline("unknown incident", `there is no incident ${named}, so I have left this one alone.`);
-    }
-    if (!COMBINABLE.includes(other.status)) {
-      return decline(
-        `incident ${named} is ${other.status}`,
-        `incident ${named} is ${other.status}, so these two cannot be combined. A signal arriving after a resolution is a recurrence, not the same incident.`,
-      );
+    if (ids.length !== args.named.length) {
+      log("combine_ids_dropped", { named: args.named, kept: ids });
     }
 
+    // The thread supplies the second side when they only named one, which is
+    // how people actually write it: "this is the same as 79". Out in the
+    // channel there is no thread to supply it, so two is the whole ask.
+    const pair =
+      ids.length >= 2
+        ? ids.slice(0, 2)
+        : ids.length === 1 && args.here && ids[0] !== args.here
+          ? [ids[0], args.here]
+          : null;
+
+    if (!pair) {
+      if (!args.here && ids.length < 2) {
+        return decline(
+          "one id outside a thread",
+          "which two incidents? Name both and I will combine them.",
+        );
+      }
+      log("combine_dropped", { here: args.here, named: args.named, kept: ids });
+      return;
+    }
+
+    const rows = pair.map((id) => ({
+      id,
+      status: db.get<{ status: IncidentStatus }>(
+        "SELECT status FROM incident WHERE id = ?",
+        [id],
+      )?.status,
+    }));
     // Read now rather than trusted from the route. The route was built when
-    // the message arrived and this runs after a model call, so the incident
-    // the person is standing in can have been resolved or merged away since.
-    const here = db.get<{ status: IncidentStatus }>(
-      "SELECT status FROM incident WHERE id = ?",
-      [route.incidentId],
-    );
-    if (!here || !COMBINABLE.includes(here.status)) {
-      return decline(
-        `incident ${route.incidentId} is ${here?.status ?? "gone"}`,
-        `this incident is ${here?.status ?? "gone"} now, so these two cannot be combined.`,
-      );
+    // the message arrived and this runs after a model call, so an incident
+    // can have been resolved, closed or merged away since.
+    for (const row of rows) {
+      if (!row.status) {
+        return decline(
+          `unknown incident ${row.id}`,
+          `there is no incident ${row.id}, so I have left these alone.`,
+        );
+      }
+      if (!COMBINABLE.includes(row.status)) {
+        return decline(
+          `incident ${row.id} is ${row.status}`,
+          `incident ${row.id} is ${row.status} and is not taking signals, so these cannot be combined. A signal arriving after a resolution is a recurrence rather than the same incident.`,
+        );
+      }
     }
 
-    // The rule, applied before anything moves, so what gets said matches what
-    // gets written. Not negotiable from the message: a person asking for the
-    // merge the other way round still gets this one, and is told so.
-    const into = establishedOf(route.incidentId, named);
-    const absorb = into === named ? route.incidentId : named;
+    // The rule, applied before anything moves, so what gets said matches
+    // what gets written. Not negotiable from the message: a person asking
+    // for the merge the other way round still gets this one, and is told.
+    const into = establishedOf(pair[0], pair[1]);
+    const absorb = into === pair[0] ? pair[1] : pair[0];
 
     const signalIds = db
       .query<{ id: string }>("SELECT id FROM signal WHERE incidentId = ?", [absorb])
       .map((r) => r.id);
     if (signalIds.length === 0) {
-      return decline("nothing to move", `incident ${absorb} has no signals left to move, so there is nothing to combine.`);
+      return decline(
+        "nothing to move",
+        `incident ${absorb} has no signals left to move, so there is nothing to combine.`,
+      );
     }
 
     let result: AssignResult;
     try {
       result = await applyAssign(
         db,
-        { signalIds, target: into, reason: said },
-        { kind: "human", slackUserId: route.user },
+        { signalIds, target: into, reason: args.said },
+        { kind: "human", slackUserId: args.user },
       );
     } catch (err) {
       alarm("combine_failed", {
-        incidentId: route.incidentId,
-        named,
+        here: args.here,
+        pair,
         error: String(err),
       });
       await say(
-        mrkdwn`${raw(userMention(route.user))} I could not combine these two -- ${err instanceof AssignError ? String((err as Error).message) : "the write failed and the error is in the BugBoss logs"}.`,
+        mrkdwn`${raw(userMention(args.user))} I could not combine these two -- ${err instanceof AssignError ? String((err as Error).message) : "the write failed and the error is in the BugBoss logs"}.`,
       );
       return;
     }
 
     // Their answer goes first, and announce's closing message last, because
-    // one of the two threads announce writes into is this one -- and "this is
-    // the last message in this thread" has to be true when it is read.
+    // one of the two threads announce writes into can be this one -- and
+    // "this is the last message in this thread" has to be true when it is
+    // read.
     //
-    // Which is also why this says nothing about the thread ending when they
-    // are standing in the one being absorbed. Two messages both claiming to
-    // be the end is worse than one: the first is false by the time it is
-    // read, and the one that carries the link to where everything moved is
-    // the one that has to be believed.
+    // Which is also why this says nothing about a thread ending. Two
+    // messages both claiming to be the end is worse than one: the first is
+    // false by the time it is read, and the one that carries the link to
+    // where everything moved is the one that has to be believed.
     await say(
       [
-        mrkdwn`${raw(userMention(route.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
-        mrkdwn`_Incident ${into} is the older record, so it stays the one of account and keeps its thread.${absorb === route.incidentId ? "" : " Everything carries on here."}_`,
+        mrkdwn`${raw(userMention(args.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
+        mrkdwn`_Incident ${into} is the older record, so it stays the one of account and keeps its thread.${args.here === into ? " Everything carries on here." : ""}_`,
       ].join("\n"),
     );
     await announce.announceMerge(result);
@@ -2024,7 +2064,7 @@ export const createBugBoss = async (
       incidentId: route.incidentId,
       addressed,
       modelAddressed: read.addressed,
-      combineWith: read.combineWith,
+      combineIds: read.combineIds,
       tagged: route.interrupt,
       blocked: outstanding !== null,
       fellBack: read.fellBack,
@@ -2035,7 +2075,16 @@ export const createBugBoss = async (
     // is no less real for being addressed sideways. The agent has the message
     // either way; this is the half of it that needs doing rather than
     // reading.
-    if (read.combineWith) await combineIncidents(route, read.combineWith, said);
+    if (read.combineIds.length > 0) {
+      await combineIncidents({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        user: route.user,
+        said,
+        named: read.combineIds,
+        here: route.incidentId,
+      });
+    }
 
     // Only worth saying while something is blocked on it. With no outstanding
     // question there is no wait to end, the directive is context either way,
@@ -2110,6 +2159,22 @@ export const createBugBoss = async (
     }
 
     if (read.intent === "question") return ask();
+
+    // The surface that used to answer this with "I cannot". A mention is
+    // not in an incident thread, so nothing supplies a second id and both
+    // have to be named -- but the request is the same request, and it runs
+    // through the same executor rather than a second implementation that
+    // drifts from it.
+    if (read.intent === "combine") {
+      return combineIncidents({
+        channel: route.channel,
+        threadTs: route.threadTs,
+        user: route.user,
+        said,
+        named: read.combineIds,
+        here: null,
+      });
+    }
 
     log("mention_unclear", { user: route.user, ts: route.ts, fellBack: read.fellBack });
     await sayInThread(

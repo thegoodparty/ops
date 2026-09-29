@@ -73,7 +73,7 @@ export interface IntentDeps {
 /** Who a reply was for. `others` is recorded and never ends a wait. */
 export type Addressed = "agent" | "others" | "unclear";
 
-export type MentionIntent = "bug_report" | "question" | "unclear";
+export type MentionIntent = "bug_report" | "question" | "combine" | "unclear";
 
 /** True when the model never answered and the safe labels were taken. */
 interface Fallible {
@@ -85,15 +85,21 @@ interface Fallible {
 export interface ReplyRead extends Fallible {
   addressed: Addressed;
   /**
-   * An incident this person is asking the thread's incident to be combined
-   * with, or null. Unvalidated: the caller checks that it was really in the
-   * message and that it names an incident that can take signals.
+   * Incidents this person is asking to be combined, as they wrote them.
+   * Empty unless they asked. Unvalidated: the caller checks each id was
+   * really in the message and names an incident that can take signals, and
+   * supplies the thread's own incident when only one was named.
    */
-  combineWith: string | null;
+  combineIds: string[];
 }
 
 export interface MentionRead extends Fallible {
   intent: MentionIntent;
+  /**
+   * The incidents a `combine` names. Two, out here: there is no thread to
+   * supply the other side. Same validation by the caller as the reply read.
+   */
+  combineIds: string[];
 }
 
 const INTENT_TOOL = "read_intent";
@@ -150,10 +156,11 @@ const REPLY_TOOL: ModelToolSpec = {
         description:
           "agent: they are talking to the agent working this incident. others: they are talking to the other people in the thread. unclear: you cannot tell.",
       },
-      combineWith: {
-        type: "string",
+      combineIds: {
+        type: "array",
+        items: { type: "string" },
         description:
-          "The id of another incident this person is asking to combine this one with, copied exactly from their message. Leave this out unless they plainly ask for that.",
+          "Incident ids this person is asking to be combined, copied exactly from their message. Leave it out unless they plainly ask for that.",
       },
       reason: REASON_PROPERTY,
     },
@@ -164,7 +171,7 @@ const REPLY_TOOL: ModelToolSpec = {
 
 const replySchema = z.object({
   addressed: z.enum(ADDRESSEES),
-  combineWith: z.string().optional(),
+  combineIds: z.array(z.string()).optional(),
   reason: REASON_SCHEMA,
 });
 
@@ -196,12 +203,12 @@ message answers it when it supplies what was asked for, even tersely -- "yes",
 subject is not automatically an answer: "did anyone check org X?" is one
 person asking another, not a reply to the agent.
 
-Second, and separately: are they asking for this incident and another one to
-be combined? Two incidents turn out to be one bug often enough that people say
-so, and until now nothing could act on it. Set combineWith to the other
-incident's id, copied exactly from their message, when they plainly ask for
-that -- "this is the same as 79", "merge these into 79", "82 and this one are
-the same bug, put them together". Leave it out otherwise.
+Second, and separately: are they asking for incidents to be combined? Two
+incidents turn out to be one bug often enough that people say so. Put the ids
+they named in combineIds, copied exactly from their message, when they plainly
+ask for that -- "this is the same as 79", "merge these into 79", "82 and this
+one are the same bug, put them together". One id is the usual answer, because
+the thread they are standing in is the other side. Leave it empty otherwise.
 
 Leave it out when they are asking whether two incidents are related, or saying
 they look similar, or mentioning another incident in passing. A question is not
@@ -219,7 +226,12 @@ ${INJECTION_NOTE}`;
 // A mention outside any incident thread
 // ---------------------------------------------------------------------------
 
-const MENTION_INTENTS = ["bug_report", "question", "unclear"] as const;
+const MENTION_INTENTS = [
+  "bug_report",
+  "question",
+  "combine",
+  "unclear",
+] as const;
 
 const MENTION_TOOL: ModelToolSpec = {
   name: INTENT_TOOL,
@@ -232,7 +244,13 @@ const MENTION_TOOL: ModelToolSpec = {
         type: "string",
         enum: [...MENTION_INTENTS],
         description:
-          "bug_report: they are telling you something is broken. question: they are asking you something. unclear: it could be either and you cannot tell.",
+          "bug_report: they are telling you something is broken. question: they are asking you something. combine: they are asking for two incidents to be made one. unclear: you cannot tell.",
+      },
+      combineIds: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "For combine only: the incident ids they named, copied exactly from their message.",
       },
       reason: REASON_PROPERTY,
     },
@@ -243,6 +261,7 @@ const MENTION_TOOL: ModelToolSpec = {
 
 const mentionSchema = z.object({
   intent: z.enum(MENTION_INTENTS),
+  combineIds: z.array(z.string()).optional(),
   reason: REASON_SCHEMA,
 });
 
@@ -261,7 +280,10 @@ The three answers:
 - question: they are asking you something you could look up -- what is open,
   what happened to an incident, what an agent found -- or anything else that
   wants an answer rather than an investigation. A read-only agent answers it.
-- unclear: it could be either. They will be asked which they meant.
+- combine: they are asking for two incidents to be made one, and you put both
+  ids in combineIds. "merge 82 into 79", "79 and 82 are the same bug". Asking
+  *whether* two are related is a question, not this.
+- unclear: you cannot tell. They will be asked which they meant.
 
 Someone asking about something broken is asking a question, not filing a
 report: "did anyone look at the checkout errors?" wants what is already known.
@@ -367,14 +389,14 @@ export const readReplyIntent = async (
     });
     return {
       addressed: answer.addressed,
-      combineWith: answer.combineWith ?? null,
+      combineIds: answer.combineIds ?? [],
       reason: answer.reason ?? "",
       fellBack: false,
     };
   } catch (err) {
     return {
       addressed: "unclear",
-      combineWith: null,
+      combineIds: [],
       reason: String(err),
       fellBack: true,
     };
@@ -396,10 +418,16 @@ export const readMentionIntent = async (
     });
     return {
       intent: answer.intent,
+      combineIds: answer.combineIds ?? [],
       reason: answer.reason ?? "",
       fellBack: false,
     };
   } catch (err) {
-    return { intent: "unclear", reason: String(err), fellBack: true };
+    return {
+      intent: "unclear",
+      combineIds: [],
+      reason: String(err),
+      fellBack: true,
+    };
   }
 };

@@ -775,7 +775,8 @@ export class Dispatcher {
         return response;
       },
       park: (args) => tools.park(args),
-      getIncident: () => tools.getIncident(),
+      getIncident: (args) => tools.getIncident(args),
+      proposeMerge: (args) => tools.proposeMerge(args),
       searchIncidents: (args) => tools.searchIncidents(args),
       incidentId: row.id,
       sessionRef: row.sessionRef,

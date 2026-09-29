@@ -125,6 +125,7 @@ const makeTools = () => {
   const escalations: { incidentId: string; reason: string; brief: string }[] = [];
   const toolApiFor = (incidentId: string): ToolApi => ({
     reportRootCause: ok,
+    proposeMerge: ok,
     reportImpact: ok,
     reportResolved: ok,
     reportAnalysis: ok,

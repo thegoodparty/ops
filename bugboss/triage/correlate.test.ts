@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { IncidentDigest } from "../types";
-import { runCorrelation, type CorrelationRequest } from "./correlate";
+import {
+  judgeMerge,
+  runCorrelation,
+  type CorrelationRequest,
+} from "./correlate";
 import { resetFallbackRates } from "./health";
 import { emptyModelUsage } from "./model";
 import type { ModelClient, ModelReply, ModelRequest } from "./model";
@@ -318,4 +322,109 @@ test("a candidate the model was unsure about does not get a vote on the survivor
   assert.deepEqual(result.merges, [
     { incidentId: "90", into: "82", reason: "definitely the same" },
   ]);
+});
+
+// --- an agent asking, rather than a root cause triggering ------------------
+
+/**
+ * The same judgement from the other direction. An agent that has read
+ * another incident and thinks it is the same bug gets to say so; what it
+ * does not get is the decision, or the direction.
+ */
+test("an agreed proposal comes back pointed at the established incident", async () => {
+  const { model } = scripted([
+    proposeCall([{ incidentId: "79", confident: true, reason: "same pool" }]),
+  ]);
+
+  const { merge, fellBack } = await judgeMerge(
+    { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+    {
+      incidentId: "82",
+      withIncidentId: "79",
+      reason: "both exhaust the same connection pool",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79" }),
+      ],
+    },
+  );
+
+  assert.equal(fellBack, false);
+  // The agent asked from 82 and 82 is the one absorbed. Which record
+  // survives is not the asker's to pick and not the model's either.
+  assert.deepEqual(merge, { incidentId: "82", into: "79", reason: "same pool" });
+});
+
+test("an unconfident answer is no merge, and is not a failure", async () => {
+  const { model } = scripted([
+    proposeCall([{ incidentId: "79", confident: false, reason: "maybe" }]),
+  ]);
+
+  const { merge, fellBack } = await judgeMerge(
+    { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+    {
+      incidentId: "82",
+      withIncidentId: "79",
+      reason: "both are 500s",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79" }),
+      ],
+    },
+  );
+
+  assert.equal(merge, null);
+  assert.equal(
+    fellBack,
+    false,
+    "a considered no is not the same answer as nothing having compared them",
+  );
+});
+
+test("a dead model says so, rather than passing for a considered no", async () => {
+  const model: ModelClient = {
+    complete: () => Promise.reject(new Error("bedrock is down")),
+  };
+
+  const { result, alarms } = await capture(() =>
+    judgeMerge(
+      { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+      {
+        incidentId: "82",
+        withIncidentId: "79",
+        reason: "both exhaust the same connection pool",
+        openIncidents: [
+          digest({ id: "82", status: "FIXING" }),
+          digest({ id: "79" }),
+        ],
+      },
+    ),
+  );
+
+  assert.equal(result.merge, null);
+  // The agent is going to repeat one of two sentences into a Slack thread,
+  // and they point at different next moves: stop asking, or ask a person.
+  assert.equal(result.fellBack, true);
+  assert.ok(alarms.some((a) => a.event === "merge_request_unjudged"));
+});
+
+test("an incident that is not open is not put in front of the model at all", async () => {
+  const { model, requests } = scripted([]);
+
+  const { merge, fellBack } = await judgeMerge(
+    { model, db: fakeDb(["s1"]), budgetMs: 2000 },
+    {
+      incidentId: "82",
+      withIncidentId: "79",
+      reason: "the same pool",
+      openIncidents: [
+        digest({ id: "82", status: "FIXING" }),
+        digest({ id: "79", status: "CLOSED" }),
+      ],
+    },
+  );
+
+  assert.equal(merge, null);
+  assert.equal(fellBack, false);
+  assert.equal(requests.length, 0, "and nothing was spent finding that out");
 });

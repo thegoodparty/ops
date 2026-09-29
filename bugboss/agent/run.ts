@@ -16,6 +16,7 @@ import type {
   Directive,
   IncidentMatch,
   IncidentView,
+  MergeOutcomeView,
   ToolApi,
   ToolResponse,
 } from "../types";
@@ -347,7 +348,13 @@ export const createBossClient = (args: {
     reportAnalysis: (payload) => call<ToolResponse>("POST", "/analysis", payload),
     escalate: (payload) => call<ToolResponse>("POST", "/escalate", payload),
     park: (payload) => call<ToolResponse>("POST", "/park", payload),
-    getIncident: () => call<ToolResponse<IncidentView>>("GET", ""),
+    getIncident: (payload) =>
+      call<ToolResponse<IncidentView>>(
+        "GET",
+        payload?.incidentId ? `?incident=${encodeURIComponent(payload.incidentId)}` : "",
+      ),
+    proposeMerge: (payload) =>
+      call<ToolResponse<MergeOutcomeView>>("POST", "/propose-merge", payload),
     searchIncidents: (payload) =>
       call<ToolResponse<IncidentMatch[]>>("POST", "/search", payload),
     peekDirectives: () => call<PendingDirective[]>("GET", "/directives"),
@@ -407,9 +414,44 @@ export const createBossTools = async (args: {
       name: "get_incident",
       label: "Get incident",
       description:
-        "Re-read the incident, its signals and its prefetched evidence, and collect any pending directives. Call it first on every start and after any long wait.",
-      parameters: Type.Object({}),
-      execute: async () => bossToolResult(await args.api.getIncident(), maxChars),
+        "Re-read an incident, its signals and its prefetched evidence, and collect any pending directives. Without an id it is your own, which is what to call first on every start and after any long wait. With one, any other incident -- read it before you say two incidents are the same problem.",
+      parameters: Type.Object({
+        incidentId: Type.Optional(
+          Type.String({
+            description:
+              "Another incident to read. Omit for your own.",
+          }),
+        ),
+      }),
+      execute: async (_id: string, params: unknown) =>
+        bossToolResult(
+          await args.api.getIncident(
+            params as unknown as Parameters<ToolApi["getIncident"]>[0],
+          ),
+          maxChars,
+        ),
+    },
+    {
+      name: "propose_merge",
+      label: "Propose merge",
+      description:
+        "Ask for your incident and another one to be combined, when they are the same problem. Read the other incident first. The two are compared before anything moves and the older of them keeps the thread, which may be yours or may be theirs -- if it is theirs, your signals go there and you are done.",
+      parameters: Type.Object({
+        incidentId: Type.String({
+          description: "The incident you believe is the same problem as yours.",
+        }),
+        reason: Type.String({
+          description:
+            "What the two share, specifically: the same mechanism, not the same symptom.",
+        }),
+      }),
+      execute: async (_id: string, params: unknown) =>
+        bossToolResult(
+          await args.api.proposeMerge(
+            params as unknown as Parameters<ToolApi["proposeMerge"]>[0],
+          ),
+          maxChars,
+        ),
     },
     {
       name: "report_root_cause",

@@ -7,9 +7,12 @@
 
 import type { TriageContext, TriageDecision } from "../types";
 import {
+  judgeMerge,
   runCorrelation,
   type CorrelationRequest,
   type CorrelationResult,
+  type MergeProposal,
+  type MergeRequest,
 } from "./correlate";
 import type { ModelClient } from "./model";
 import type { IncidentReader } from "./sql";
@@ -33,16 +36,22 @@ export interface Triage {
    */
   decideDetailed(ctx: TriageContext): Promise<TriageOutcome>;
   correlate(req: CorrelationRequest): Promise<CorrelationResult>;
+  /** The same judgement, asked by an agent about one named incident. */
+  judgeMerge(req: MergeRequest): Promise<{
+    merge: MergeProposal | null;
+    fellBack: boolean;
+  }>;
 }
 
 export const createTriage = (config: TriageConfig): Triage => ({
   decide: async (ctx) => (await runTriage(config, ctx)).decision,
   decideDetailed: (ctx) => runTriage(config, ctx),
   correlate: (req) => runCorrelation(config, req),
+  judgeMerge: (req) => judgeMerge(config, req),
 });
 
 export { runTriage } from "./triage";
-export { runCorrelation } from "./correlate";
+export { runCorrelation, judgeMerge } from "./correlate";
 export { prepareQuery, QUERY_TOOL, SEARCH_TOOL, searchTool } from "./sql";
 export {
   conclusiveRecurrence,
@@ -68,6 +77,7 @@ export type {
   CorrelationRequest,
   CorrelationResult,
   MergeProposal,
+  MergeRequest,
 } from "./correlate";
 export type { IncidentReader } from "./sql";
 export type { RecurrenceCandidate } from "./recurrence";

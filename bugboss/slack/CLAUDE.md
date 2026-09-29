@@ -377,7 +377,7 @@ either interface:
   the agent — an instruction to stand down, which it reads and acts on — not
   a transfer for the Boss to record.
 - **On a mention anywhere else**, whether somebody is reporting something
-  broken or asking a question.
+  broken, asking a question, or asking for two incidents to be combined.
 
 This used to be a string matcher on the first word — `report`, `bug` or
 `broken` — so `@bugboss Pro upgrades are failing` was answered as a question
@@ -463,26 +463,37 @@ the agent, nothing happens, and nothing says so.
 
 ### Combining two incidents, when a person asks
 
-Somebody in a thread says "this is the same bug as 79, merge them" and it
-happens. It did not used to: an agent may only re-partition its own incident,
-so the one legal move left to the agent being asked was to open a *third*
-incident — which is exactly what happened the day this was found, leaving the
-thread with the history abandoned and its signals in a record minutes old.
-The agent's containment rule is right and is untouched. What was missing was
-anything routing the request to the `human` actor that had been sitting in
-`AssignActor`, unconstructed, since it was written.
+Somebody says "this is the same bug as 79, merge them" and it happens. It did
+not used to: an agent may only re-partition its own incident, so the one legal
+move left to the agent being asked was to open a *third* incident — which is
+exactly what happened the day this was found, leaving the thread with the
+history abandoned and its signals in a record minutes old. The agent's write
+containment is right and is untouched. What was missing was anything routing
+the request to the `human` actor that had been sitting in `AssignActor`,
+unconstructed, since it was written.
 
-`combineIncidents` in the composition root runs it. It does not choose a
-direction: the more established incident survives, which is `assign`'s rule,
-and a person who asks for the other direction gets this one and is told so in
-the thread. What follows is the same pair of messages correlation leaves —
-the absorbed thread is closed out with a permalink to the survivor, and the
-survivor is told where the signals came from.
+**One executor, every surface.** `combineIncidents` in the composition root
+runs it, and both the thread reply and the bare mention call it. That is the
+point rather than tidy factoring: the same sentence typed into a thread and
+typed at the bot used to do two different things — merge, and be handed to
+the read-only box, which answered that it could not. A person cannot see the
+boundary that makes those differ and did not ask about it.
+
+In a thread the person usually names one incident and the thread supplies the
+other. Outside one there is nothing to supply it, so both have to be named,
+and a mention with only one is **asked which two** rather than told no.
+
+It does not choose a direction: the more established incident survives, which
+is `assign`'s rule, and a person who asks for the other direction gets this
+one and is told so. What follows is the same pair of messages correlation
+leaves — the absorbed thread closed out with a permalink to the survivor, and
+the survivor told where the signals came from.
 
 A button press does **not** reach this: `handleChoice` treats a press as
-addressed to the agent by construction and never reads it, on purpose. So an
-agent that wants a merge asks in prose rather than posting a choice, and its
-containment error says so.
+addressed to the agent by construction and never reads it, on purpose. An
+agent with a merge in mind calls `propose_merge` rather than posting a
+choice, so the case is hard to reach — but it is still a difference, and
+closing it means a model call on every press.
 
 ## The Slack agent is read-only, deliberately
 

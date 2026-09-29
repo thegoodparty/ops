@@ -227,15 +227,14 @@ export const assign = (
         `signal ${foreign.id} is not attached to incident ${actor.incidentId}`,
       );
     }
-    // The refusal names the move that is open to it. An agent that has
-    // worked out its partition is wrong used to be told only that it may not
-    // fix it, and its one legal move was to create a new incident -- so the
-    // rule that keeps the blast radius at one record is also what manufactured
-    // a churn of fresh incidents nobody could follow. It still may not reach
-    // another record itself. It can ask the people in its thread, who can.
+    // Off the normal path now: proposeMerge is how signals reach another
+    // incident, and it goes through a judgement and lands here as the Boss.
+    // So this is a guard rather than an answer, and it says what to call
+    // instead -- not which kinds of caller exist, which is a shape of this
+    // system nobody outside it should have to learn from an error.
     if (req.target !== "NEW" && req.target !== actor.incidentId) {
       throw new AssignError(
-        `incident ${actor.incidentId} cannot assign into incident ${req.target}: an agent may only re-partition its own incident. Say in your Slack thread that these two are the same problem and name incident ${req.target}, and a person there can combine them.`,
+        `moving signals into incident ${req.target} is not something this call does; propose_merge asks for the two incidents to be combined`,
       );
     }
   }
@@ -319,6 +318,24 @@ export const assign = (
     db.prepare(
       `UPDATE signal SET incidentId = ?, explained = 0 WHERE id IN (${placeholders(moved.length)})`,
     ).run(target, ...moved);
+  }
+
+  // firstSignalAt follows the signals, because it is the input to time to
+  // detect and an incident that has absorbed older signals really did start
+  // earlier than its own column said. Left alone, incident 79 held a signal
+  // from the 27th and reported the 28th.
+  //
+  // It cannot go up here: only a move *in* runs this, so the minimum over
+  // what the target holds can only fall. The EXISTS guard is for the column
+  // being NOT NULL -- an empty target would write a null and throw, which a
+  // move into it cannot produce, but the guard costs nothing and the throw
+  // would roll back a legitimate re-partition.
+  if (!created && moved.length > 0) {
+    db.prepare(
+      `UPDATE incident
+          SET firstSignalAt = (SELECT MIN(openedAt) FROM signal WHERE incidentId = ?)
+        WHERE id = ? AND EXISTS (SELECT 1 FROM signal WHERE incidentId = ?)`,
+    ).run(target, target, target);
   }
 
   // An emptied source is a merge only when the signals landed somewhere that
