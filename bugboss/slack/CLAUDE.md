@@ -324,14 +324,16 @@ nothing is coming to consume either. That press was acknowledged in exactly
 the words a live agent's press got: "chose Merged", full stop. Somebody
 pressed, read that, and waited on an agent that did not exist.
 
-So `ChoiceRoute` carries `agentRunning`, read off the same
-`AGENT_RUNNING_STATUSES` an inbound reply uses and the same predicate
-`ELIGIBLE_SQL` runs on — a press is a reply, so it answers to the same field.
-The acknowledgement's second line is that field: the agent has it and carries
-on, or nothing is running to read it and here is the one move that changes
-that, which is saying in the thread that you are handing it back. Both are
-true sentences; the old one was true only half the time and unfalsifiable the
-rest.
+So `ChoiceRoute` carries `reader`, read off the same
+`AGENT_RUNNING_STATUSES` the dispatcher's `ELIGIBLE_SQL` runs on, and the
+acknowledgement's second line is that field. It is three-valued rather than a
+boolean because the two ways to have no reader take different advice:
+`nobody` is a person holding an incident the dispatcher would otherwise run,
+and a hand-back starts one with the answer already waiting; `closed` is an
+incident past those statuses, where `claimOwnership` refuses the hand-back
+too, so telling somebody to try one is the same kind of false promise in a
+smaller font. All three sentences are true. The old one was true half the
+time and unfalsifiable the rest.
 
 **Nothing here hands the incident back on its own.** A false handover is the
 expensive direction in the other places that read one, and a press is a

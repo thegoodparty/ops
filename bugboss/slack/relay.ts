@@ -253,11 +253,9 @@ export type InboundRoute =
  * earns a line in the thread, because a button that does nothing and says
  * nothing is indistinguishable from a broken one.
  *
- * `agentRunning` is the same field an inbound reply carries and is read off
- * the same predicate, because a press is a reply. Without it the thread was
- * told a press had been recorded and nothing else, which reads identically
- * whether an agent is about to act on it or whether the directive it wrote
- * will never be consumed by anyone.
+ * Each carries `reader`, because "recorded" reads identically whether an
+ * agent is about to act on the press or whether the directive it wrote will
+ * never be consumed by anyone.
  */
 export type ChoiceRoute =
   | { kind: "ignore"; reason: string }
@@ -266,20 +264,20 @@ export type ChoiceRoute =
       incidentId: string;
       choice: string;
       slackUserId: string;
-      /** False when nothing will read the directive this press just wrote. */
-      agentRunning: boolean;
+      /** Who will read the directive this press just wrote, if anyone. */
+      reader: ChoiceReader;
     }
   | {
       kind: "stale";
       incidentId: string;
       slackUserId: string;
-      agentRunning: boolean;
+      reader: ChoiceReader;
     }
   | {
       kind: "duplicate";
       incidentId: string;
       slackUserId: string;
-      agentRunning: boolean;
+      reader: ChoiceReader;
       /**
        * The answer that won, so a second presser is told what was filed
        * rather than only that their own press was not. Null if the row it
@@ -287,6 +285,19 @@ export type ChoiceRoute =
        */
       recorded: { choice: string; slackUserId: string } | null;
     };
+
+/**
+ * Who will read what a press wrote. Derived from the dispatcher's own
+ * eligibility, so the three places that ask "is this available" keep
+ * agreeing:
+ *
+ *   agent   one is on it, or the dispatcher resumes one within a tick.
+ *   nobody  a person owns it. Handing it back starts one, and the answer
+ *           is waiting when it does.
+ *   closed  the incident is over, and no hand-back is legal, so nothing
+ *           will ever read this.
+ */
+export type ChoiceReader = "agent" | "nobody" | "closed";
 
 /** The statuses during which the dispatcher keeps an agent on an incident. */
 const AGENT_RUNNING_STATUSES: readonly IncidentStatus[] = [
@@ -512,12 +523,17 @@ export class SlackRelay {
       return { kind: "ignore", reason: "thread is not an incident thread" };
     }
 
-    // The dispatcher's own eligibility, read off the same list it uses. A
-    // press on an incident this is false for writes a directive that nothing
-    // is coming to consume, and the thread has to say so.
-    const agentRunning =
-      incident.owner === "agent" &&
-      AGENT_RUNNING_STATUSES.includes(incident.status);
+    // The dispatcher's own eligibility, read off the same list it uses, and
+    // the ownership claim's, which refuses a hand-back on the statuses it
+    // does not cover. A press writes a directive; whether anything is coming
+    // to consume it is this, and the thread has to say which.
+    const reader: ChoiceReader = !AGENT_RUNNING_STATUSES.includes(
+      incident.status,
+    )
+      ? "closed"
+      : incident.owner === "agent"
+        ? "agent"
+        : "nobody";
 
     // Both writes are one transaction because they are one act. The reply row
     // is what the thread shows and the directive is the only thing the agent
@@ -581,14 +597,14 @@ export class SlackRelay {
         incidentId: incident.id,
         user: click.user,
         messageTs: click.messageTs,
-        agentRunning,
+        reader,
       });
       if (kind === "stale") {
         return {
           kind,
           incidentId: incident.id,
           slackUserId: click.user,
-          agentRunning,
+          reader,
         };
       }
       // The derived id is what made the first press the only one, so it is
@@ -601,7 +617,7 @@ export class SlackRelay {
         kind,
         incidentId: incident.id,
         slackUserId: click.user,
-        agentRunning,
+        reader,
         recorded: won
           ? { choice: won.text, slackUserId: won.slackUserId }
           : null,
@@ -612,14 +628,14 @@ export class SlackRelay {
       incidentId: incident.id,
       user: click.user,
       ts: click.actionTs,
-      agentRunning,
+      reader,
     });
     return {
       kind: "answered",
       incidentId: incident.id,
       choice: click.choice,
       slackUserId: click.user,
-      agentRunning,
+      reader,
     };
   }
 

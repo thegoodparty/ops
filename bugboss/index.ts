@@ -2148,33 +2148,38 @@ export const createBugBoss = async (
     }
 
     const who = raw(userMention(route.slackUserId));
-    // Stated once, because the honest half of all three lines is the same
-    // question: is anything running that will read this thread.
-    const handBack =
-      "_No agent is running on this incident. Say in the thread that you are handing it back and one will start within a tick._";
+    // The half "recorded" left out, and the only one the presser cannot see
+    // for themselves. `landed` separates the press that became the answer
+    // from the two that did not, because "the agent has that" is true of one
+    // of them and a claim about nothing for the others.
+    const next = (landed: boolean): string => {
+      switch (route.reader) {
+        case "agent":
+          return landed
+            ? "_The agent has that as its answer and carries on from here._"
+            : "_Reply in the thread and the agent will read you._";
+        case "nobody":
+          return landed
+            ? "_It is recorded and waiting, but a person owns this incident, so no agent has read it. Say in the thread that you are handing it back and one picks it up, this answer included._"
+            : "_A person owns this incident, so no agent is reading the thread. Say in the thread that you are handing it back and one will._";
+        case "closed":
+          return "_This incident is over and no agent will run on it again, so nothing here reaches one._";
+      }
+    };
 
     const text =
       route.kind === "answered"
-        ? [
-            mrkdwn`${who} chose *${route.choice}*.`,
-            route.agentRunning
-              ? "_The agent has that as its answer and carries on from here._"
-              : `_It is recorded and waiting, but nothing is running to read it._\n${handBack}`,
-          ].join("\n")
+        ? [mrkdwn`${who} chose *${route.choice}*.`, next(true)].join("\n")
         : route.kind === "duplicate"
           ? [
               route.recorded
                 ? mrkdwn`${who} that question already has an answer: *${route.recorded.choice}*, from ${raw(userMention(route.recorded.slackUserId))}.`
                 : mrkdwn`${who} that question already has an answer.`,
-              route.agentRunning
-                ? "_Reply in the thread if you meant something else; the agent reads it._"
-                : handBack,
+              next(false),
             ].join("\n")
           : [
               mrkdwn`${who} that question is closed — nothing is waiting on that answer any more.`,
-              route.agentRunning
-                ? "_Reply in the thread and the agent will read you._"
-                : handBack,
+              next(false),
             ].join("\n");
 
     await say(text, route.incidentId);

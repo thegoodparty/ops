@@ -813,7 +813,7 @@ describe("a button press", () => {
       incidentId: "inc-1",
       choice: "Roll back",
       slackUserId: "U0HUMAN",
-      agentRunning: true,
+      reader: "agent",
     });
 
     const replies = db.query<{ text: string; slackUserId: string }>(
@@ -850,7 +850,7 @@ describe("a button press", () => {
       kind: "duplicate",
       incidentId: "inc-1",
       slackUserId: "U0OTHER",
-      agentRunning: true,
+      reader: "agent",
       // The answer that won, so the thread can name it rather than only tell
       // the second presser that theirs was not it.
       recorded: { choice: "Roll back", slackUserId: "U0HUMAN" },
@@ -875,7 +875,7 @@ describe("a button press", () => {
       kind: "stale",
       incidentId: "inc-1",
       slackUserId: "U0HUMAN",
-      agentRunning: true,
+      reader: "agent",
     });
     assert.equal(
       db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-1'").length,
@@ -902,7 +902,7 @@ describe("a button press", () => {
    * there. The route has to carry that, or the thread cannot tell the two
    * apart.
    */
-  test("a press on a human-owned incident is answered, and says nothing will read it", async () => {
+  test("a press on a human-owned incident is answered, and names its reader", async () => {
     const thread = await askWithButtons("inc-2", "FIXING", "human");
     const route = await press(thread);
 
@@ -911,7 +911,7 @@ describe("a button press", () => {
       incidentId: "inc-2",
       choice: "Roll back",
       slackUserId: "U0HUMAN",
-      agentRunning: false,
+      reader: "nobody",
     });
     // Still recorded, and still the same row a typed reply writes. Nothing
     // about the equivalence changes; what changes is what the thread says.
@@ -920,6 +920,44 @@ describe("a button press", () => {
         .length,
       1,
     );
+  });
+
+  /**
+   * The other way to have no reader, and it takes different advice:
+   * `claimOwnership` refuses a hand-back outside the agent statuses, so
+   * offering one here would be the same false promise in a smaller font.
+   */
+  test("a press on an incident that is over is told nothing will run on it again", async () => {
+    // CLOSED carries its own CHECK -- an incident is closed only once it has
+    // been written up -- so this one cannot go through seedIncident.
+    const at = Date.now();
+    await db.withWrite((d) => {
+      d.prepare(
+        `INSERT INTO incident
+           (id, status, owner, firstSignalAt, resolvedAt, closedAt, postmortem)
+         VALUES ('inc-5', 'CLOSED', 'agent', ?, ?, ?, 'written up')`,
+      ).run(at, at, at);
+    });
+    const thread = await relay.emit({
+      type: "opened",
+      incidentId: "inc-5",
+      title: "inc-5",
+      signalCount: 1,
+    });
+    await db.withWrite((d) => {
+      d.prepare(
+        "INSERT INTO pending_question (incidentId, messageTs, askedAt, message) VALUES (?, ?, ?, ?)",
+      ).run("inc-5", QUESTION_TS, at, "Roll back, or wait?");
+    });
+
+    const route = await press(thread);
+    assert.deepEqual(route, {
+      kind: "answered",
+      incidentId: "inc-5",
+      choice: "Roll back",
+      slackUserId: "U0HUMAN",
+      reader: "closed",
+    });
   });
 
   test("a stale press on a human-owned incident carries that too", async () => {
@@ -932,7 +970,7 @@ describe("a button press", () => {
       kind: "stale",
       incidentId: "inc-4",
       slackUserId: "U0HUMAN",
-      agentRunning: false,
+      reader: "nobody",
     });
   });
 

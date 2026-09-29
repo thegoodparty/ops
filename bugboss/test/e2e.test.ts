@@ -505,7 +505,10 @@ test("a button press answers an agent the same way typing does", async () => {
  */
 test("a press nothing will read says so, rather than implying an agent has it", async () => {
   const incident = boss.db.get<{ id: string; slackThreadTs: string }>(
-    "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL LIMIT 1",
+    `SELECT id, slackThreadTs FROM incident
+      WHERE slackThreadTs IS NOT NULL
+        AND status IN ('INVESTIGATING', 'FIXING', 'RESOLVED')
+      LIMIT 1`,
   )!;
   const client = bossClientFor(incident.id, boss.mintToken(incident.id));
 
@@ -565,7 +568,7 @@ test("a press nothing will read says so, rather than implying an agent has it", 
     /The agent has that as its answer/,
     "nothing is running, so nothing may claim to have it",
   );
-  assert.match(ack.text, /nothing is running to read it/);
+  assert.match(ack.text, /no agent has read it/);
   assert.match(ack.text, /handing it back/);
 
   await boss.db.withWrite((w) => {
