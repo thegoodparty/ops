@@ -122,26 +122,35 @@ export const runStructuredCall = async <T>(call: StructuredCall<T>): Promise<T> 
       if (remaining <= 0) throw new Error("budget exhausted before an answer");
 
       let reply: ModelReply;
-      try {
-        reply = await withDeadline(
-          call.model.complete({
-            system: call.system,
-            messages: [...messages],
-            tools,
-            maxTokens: call.maxTokens,
-            signal: controller.signal,
-          }),
-          remaining,
-          "model call",
-        );
-      } catch (err) {
-        // A request that failed after reaching the model still spent what it
-        // spent. Banking it here is the only place that can: every failure
-        // path out of this loop is an exception, and the caller reads the
-        // total afterwards precisely because it cannot read a return value.
+      const pending = call.model.complete({
+        system: call.system,
+        messages: [...messages],
+        tools,
+        maxTokens: call.maxTokens,
+        signal: controller.signal,
+      });
+
+      // The deadline below races this promise, so when it wins the request is
+      // still in flight and its tokens are not known yet. They were still
+      // spent, so they are banked if and when they arrive. Best effort by
+      // construction: the throw propagates immediately and a caller reading
+      // the total in its own catch may read it before this lands. Better a
+      // figure that is sometimes late than one that is reliably short, and
+      // the alternative -- dropping the racing backstop and trusting the
+      // abort signal alone -- trades a known undercount for an unbounded
+      // hang if a provider ever stops honouring it.
+      pending.catch((err: unknown) => {
         if (call.usage && err instanceof ModelRequestFailed) {
           addModelUsage(call.usage, err.usage);
         }
+      });
+
+      try {
+        reply = await withDeadline(pending, remaining, "model call");
+      } catch (err) {
+        // Nothing to bank here: a ModelRequestFailed was already taken by the
+        // handler above, and a deadline error carries no usage of its own.
+        // Rethrown so every caller keeps taking its conservative default.
         throw err;
       }
       if (call.usage) addModelUsage(call.usage, reply.usage);

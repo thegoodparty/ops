@@ -12,7 +12,7 @@ import { test } from "node:test";
 import { type BedrockInvoke, resolveBedrockModel } from "./index";
 import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "./runtime";
 import { createPiModelClient } from "./client";
-import { addModelUsage, emptyModelUsage } from "../model";
+import { addModelUsage, emptyModelUsage, ModelRequestFailed } from "../model";
 import { runStructuredCall } from "../triage/model";
 import { z } from "zod";
 
@@ -335,5 +335,76 @@ test("consecutive tool results are coalesced into one user message", async () =>
     const results = body.messages[2].content;
     assert.equal(results.length, 2);
     for (const block of results) assert.equal(block.type, "tool_result");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the shared body builder does by default, and must not do here
+// ---------------------------------------------------------------------------
+
+test("a Boss call sends no thinking config", async () => {
+  await withAwsEnv(async () => {
+    const { client, bodies } = await harness([{ text: "ok" }]);
+    await client.complete(request({ maxTokens: 512 }));
+
+    // The builder turns adaptive thinking on for any model whose catalog
+    // entry says it reasons, and the Boss's budgets cannot carry it: at 512
+    // tokens a thinking block can spend the whole allowance before the
+    // answer tool is reached, and the call falls back having produced
+    // nothing. Asserted on the body rather than on an option, because the
+    // default lives in the builder and not at this call site.
+    const body = bodies[0] as { thinking?: unknown };
+    assert.equal(body.thinking, undefined);
+  });
+});
+
+test("a request that outlives its deadline still reports what it spent", async () => {
+  await withAwsEnv(async () => {
+    // A client that fails slowly, the way a throttled or stalled request
+    // does. runStructuredCall races its own deadline against the request, so
+    // when the deadline wins the tokens are not known yet -- they arrive
+    // afterwards and still have to land.
+    const usage = emptyModelUsage();
+    const slow: Parameters<typeof runStructuredCall>[0]["model"] = {
+      complete: () =>
+        new Promise((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new ModelRequestFailed("ThrottlingException", {
+                  ...emptyModelUsage(),
+                  tokensIn: 500,
+                  costUsd: 0.002,
+                  calls: 1,
+                }),
+              ),
+            30,
+          ),
+        ),
+    };
+
+    await assert.rejects(
+      runStructuredCall({
+        model: slow,
+        system: "decide",
+        prompt: "place this signal",
+        answer: {
+          spec: { name: "decide", description: "d", inputSchema: { type: "object" } },
+          schema: z.object({ action: z.string() }),
+        },
+        tools: [],
+        budgetMs: 10,
+        maxRounds: 1,
+        maxInvalid: 1,
+        maxTokens: 2048,
+        usage,
+      }),
+    );
+
+    // Best effort and deliberately so: the throw propagates on the deadline,
+    // and the tokens land when the request finally settles.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(usage.calls, 1, "a request that outran its deadline was never costed");
+    assert.equal(usage.tokensIn, 500);
   });
 });

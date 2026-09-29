@@ -144,6 +144,14 @@ export const createPiModelClient = ({ runtime, model }: PiModelClientDeps): Mode
     const message = await runtime.complete(model, context, {
       maxTokens: request.maxTokens,
       signal: request.signal,
+      // Off, and not by omission. The shared body builder turns adaptive
+      // thinking on for any model whose catalog entry says it reasons, and
+      // these calls cannot afford it: triage caps output at 2048 tokens and
+      // the inbound-language read at 512, so a thinking block can spend the
+      // whole budget before the answer tool is reached and the call falls
+      // back having produced nothing. The agent wants thinking and asks for
+      // it; a bounded call that answers with a label does not.
+      thinkingEnabled: false,
     });
 
     const usage: ModelUsage = {
