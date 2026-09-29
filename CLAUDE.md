@@ -185,18 +185,16 @@ On push to `main`, the GitHub Actions workflow:
 5. Runs `pulumi up` via `deploy/deploy.sh`
 
 PRs run type-checking and builds but skip the deploy step, and run
-`pulumi preview` for the stacks they touch under a scoped read-only role,
-posting the result as a PR comment. See
-[`docs/pr-previews.md`](./docs/pr-previews.md).
-
-Pulumi previews on PRs, under a scoped read-only role, are in progress:
-plan, reasoning and progress checklist in
-[`docs/pr-previews.md`](./docs/pr-previews.md). Read it before touching
+`pulumi preview` for `ops`, `org` and `workbench` under the scoped read-only
+`github-actions-pulumi-preview` role, posting one comment per project per run.
+Read [`docs/pr-previews.md`](./docs/pr-previews.md) before touching
 `deploy/components/ci-roles*`, the `deploy.sh` scripts, or PR-triggered
-workflows.
+workflows; it records the role, its threat model, and how to run a preview
+locally under `gp-readonly`.
 
-Narrowing that role's trust for the other repositories that assume it, and
-sizing roles for their PR-triggered workflows, is a separate plan:
+Narrowing the shared deploy role's trust for the other repositories that
+assume it, and sizing roles for their PR-triggered workflows, is a separate
+plan:
 [`docs/deploy-role-trust.md`](./docs/deploy-role-trust.md). Read it alongside
 the above before editing `githubActionsPulumiDeployTrust`.
 
