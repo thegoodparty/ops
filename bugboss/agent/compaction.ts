@@ -151,7 +151,7 @@ export const createStageCompaction = (args: {
   log: (event: string, fields: Record<string, unknown>) => void;
 }): StageCompaction => {
   const minTokens = args.minTokens ?? STAGE_COMPACTION_MIN_TOKENS;
-  let requested: CompactionStage | null = null;
+  const requested: CompactionStage[] = [];
   let armed: CompactionStage | null = null;
 
   const disarm = (): void => {
@@ -161,16 +161,22 @@ export const createStageCompaction = (args: {
 
   return {
     request: (stage) => {
-      requested = stage;
+      requested.push(stage);
     },
     extension: (pi: ExtensionAPI): void => {
       // Armed at the end of the turn rather than inside the tool, because
       // this is where the size of the context is known, and because Pi's
       // between-turn check is the next thing to run.
       pi.on("turn_end", (event) => {
-        if (!requested) return;
-        const stage = requested;
-        requested = null;
+        if (requested.length === 0) return;
+        // One boundary gets one compaction. Two transitions in one turn -- a
+        // root cause and a PR in the same batch -- compact once, for the later
+        // stage, since that is the one the next turn is in.
+        const stage = requested[requested.length - 1];
+        if (requested.length > 1) {
+          args.log("stage_compaction_coalesced", { stages: [...requested], stage });
+        }
+        requested.length = 0;
         const tokens = contextTokensOf(event.message);
         if (tokens < minTokens) {
           args.log("stage_compaction_skipped", { stage, tokens, minTokens });

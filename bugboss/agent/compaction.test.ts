@@ -213,6 +213,27 @@ describe("stage compaction, through a real Pi session", () => {
     assert.equal(run.reserveAfter, roomy.reserveTokens, "the backstop's reserve is back");
   });
 
+  test("two transitions in one turn compact once, for the later stage", async () => {
+    const run = await runSession({
+      ...roomy,
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("get_incident", {})),
+        fauxAssistantMessage([
+          fauxToolCall("report_root_cause", { cause: "a missing index", explainedSignalIds: ["s1"] }),
+          fauxToolCall("track_incident_timeline_event", {
+            kind: "fix_pr_opened",
+            occurredAt: Date.parse("2026-09-30T19:40:14Z"),
+            summary: "opened omni#2260",
+          }),
+        ]),
+        fauxAssistantMessage("done"),
+      ],
+    });
+
+    assert.deepEqual(run.compactions.map((entry) => entry.details?.stage), ["fix_opened"]);
+    assert.ok(run.logs.some((log) => log.event === "stage_compaction_coalesced"));
+  });
+
   test("the session file keeps every entry from before a compaction", async () => {
     const run = await runSession({
       ...roomy,
