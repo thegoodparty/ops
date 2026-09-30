@@ -97,11 +97,12 @@ export const lokiBatches = (logs: LogLine[]): LokiStream[][] => {
 export const pushLoki = async (
   baseUrl: string,
   logs: LogLine[],
+  tenant: string,
 ): Promise<void> => {
   for (const streams of lokiBatches(logs)) {
     const response = await fetch(`${baseUrl}/loki/api/v1/push`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-scope-orgid": tenant },
       body: JSON.stringify({ streams }),
     });
     if (!response.ok) {
@@ -217,8 +218,9 @@ const SAMPLES_PER_WRITE = 20_000;
 export const pushPrometheus = async (
   baseUrl: string,
   samples: Sample[],
+  tenant: string,
 ): Promise<void> => {
-  const series = toSeries(samples);
+  const series = toSeries(samples.map((s) => ({ ...s, labels: { ...s.labels, [RUN_LABEL]: tenant } })));
   let batch: Series[] = [];
   let count = 0;
   const send = async () => {
@@ -256,28 +258,18 @@ export interface PushCounts {
   samples: number;
 }
 
+/**
+ * One stack serves every run. Loki keeps each run's logs apart as a tenant;
+ * Prometheus has no tenants, so each run's samples carry this label and
+ * prom-label-proxy enforces it on every query from that run's Grafana org.
+ */
+export const RUN_LABEL = "eval_run";
+
 export const pushBatch = async (
-  urls: { lokiUrl: string; prometheusUrl: string },
+  urls: { lokiUrl: string; prometheusUrl: string; tenant: string },
   batch: TelemetryBatch,
 ): Promise<PushCounts> => {
-  await pushLoki(urls.lokiUrl, batch.logs);
-  await pushPrometheus(urls.prometheusUrl, batch.samples);
+  await pushLoki(urls.lokiUrl, batch.logs, urls.tenant);
+  await pushPrometheus(urls.prometheusUrl, batch.samples, urls.tenant);
   return { logs: batch.logs.length, samples: batch.samples.length };
 };
-
-export const backfill = async (args: {
-  generator: TelemetryGenerator;
-  lokiUrl: string;
-  prometheusUrl: string;
-  alertAt: number;
-  hoursBefore: number;
-  seed: number;
-}): Promise<PushCounts> =>
-  pushBatch(
-    args,
-    args.generator.backfill({
-      alertAt: args.alertAt,
-      hoursBefore: args.hoursBefore,
-      seed: args.seed,
-    }),
-  );

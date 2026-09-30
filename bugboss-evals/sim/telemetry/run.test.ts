@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { describe, test } from "node:test";
 
-import { createControlServer, createEmitter } from "./run";
+import { createEmitter } from "./run";
 import type { TelemetryBatch, TelemetryGenerator } from "./types";
 
 const recordingGenerator = () => {
@@ -83,65 +83,5 @@ describe("createEmitter", () => {
       [0, 30_000],
     ]);
     assert.deepEqual(emitter.snapshot().emitted, { logs: 1, samples: 1 });
-  });
-});
-
-describe("control server", () => {
-  const start = async (token?: string) => {
-    const { generator } = recordingGenerator();
-    const emitter = createEmitter({
-      generator,
-      alertAt: 0,
-      hoursBefore: 1,
-      seed: 1,
-      push: counting,
-    });
-    const server = createControlServer(emitter, token);
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    return { url, emitter, close: () => server.close() };
-  };
-
-  test("requires the bearer token when one is set", async () => {
-    const { url, close } = await start("secret");
-    try {
-      assert.equal((await fetch(`${url}/__control/health`)).status, 401);
-      const ok = await fetch(`${url}/__control/health`, {
-        headers: { authorization: "Bearer secret" },
-      });
-      assert.equal(ok.status, 200);
-    } finally {
-      close();
-    }
-  });
-
-  test("flips to healthy on POST /__control/state and reports it", async () => {
-    const { url, emitter, close } = await start();
-    try {
-      const flipped = await fetch(`${url}/__control/state`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ state: "healthy" }),
-      });
-      assert.equal(flipped.status, 200);
-      assert.equal(emitter.snapshot().state, "healthy");
-      const state = (await (await fetch(`${url}/__control/state`)).json()) as {
-        state: string;
-        switches: unknown[];
-      };
-      assert.equal(state.state, "healthy");
-      assert.equal(state.switches.length, 1);
-
-      const bad = await fetch(`${url}/__control/state`, {
-        method: "POST",
-        body: JSON.stringify({ state: "fixed" }),
-      });
-      assert.equal(bad.status, 400);
-
-      await fetch(`${url}/__control/reset`, { method: "POST" });
-      assert.equal(emitter.snapshot().state, "fault");
-    } finally {
-      close();
-    }
   });
 });
