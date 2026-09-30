@@ -14,8 +14,8 @@ import {
   computePaths,
   createBossClient,
   createBossTools,
+  createDirectiveWatcher,
   createTurnBudget,
-  directiveDeliveryExtension,
   INCIDENT_AGENT_MAX_TURNS,
   DEFAULT_TIMEOUT_SECONDS,
   MODEL_BINDING_MISMATCH,
@@ -39,6 +39,8 @@ import {
   type TurnBudgetState,
 } from "./run";
 import { resolveBedrockModel } from "../bedrock";
+import { createMonitorTool, createWaitInterrupt, type PendingDirective, type PendingWait } from "./tools";
+import type { Directive } from "../types";
 import { notesPrefixFor } from "./notes";
 import { emptySessionUsage, PROMPT_ENTRY_TYPE } from "./session";
 
@@ -1178,65 +1180,171 @@ test("the turn budget reaches the agent from the environment the dispatcher buil
   }
 });
 
-test("a Boss message rides on a bash result, and a stop waits for a Boss tool (incident 94)", async () => {
-  const queue = [
-    { id: 1, directive: { type: "boss_message" as const, text: "the fix hides the bug; re-scope before shipping", at: 1 } },
-    { id: 2, directive: { type: "stop" as const, reason: "closed" } },
-  ];
-  const consumed: number[] = [];
-  const failures: unknown[] = [];
-  const handlers: Record<string, (...args: unknown[]) => unknown> = {};
-  const pi = {
-    on: (event: string, handler: (...args: unknown[]) => unknown) => {
-      handlers[event] = handler;
-      return () => {};
-    },
-  } as never;
+// ---------------------------------------------------------------------------
+// A Boss message is a user message (incident 94)
+// ---------------------------------------------------------------------------
 
-  directiveDeliveryExtension(
-    {
-      peekDirectives: async () => queue.filter((entry) => !consumed.includes(entry.id)),
-      consumeDirective: async (id) => {
+/**
+ * The loopback queue as the child sees it: an entry shows up once it has been
+ * pushed and goes away only when consumed.
+ */
+const directiveQueue = () => {
+  const entries: PendingDirective[] = [];
+  const consumed: number[] = [];
+  return {
+    push: (directive: Directive) => entries.push({ id: entries.length + 1, directive }),
+    consumed,
+    api: {
+      peekDirectives: async () => entries.filter((entry) => !consumed.includes(entry.id)),
+      consumeDirective: async (id: number) => {
         consumed.push(id);
       },
     },
-    (error) => failures.push(error),
-  )(pi);
+  };
+};
 
-  const bash = { type: "tool_result", toolName: "bash", content: [{ type: "text", text: "pass: 36" }] };
-  const first = (await handlers.tool_result(bash, {})) as { content: { type: string; text: string }[] };
-  assert.equal(first.content[0].text, "pass: 36", "the tool's own output is untouched");
-  assert.match(first.content.at(-1)?.text ?? "", /FROM THE BOSS: the fix hides the bug; re-scope before shipping/);
-  assert.doesNotMatch(first.content.at(-1)?.text ?? "", /STOP/);
-  assert.deepEqual(consumed, [1]);
+/**
+ * Incident 94's merge wait: a check that never passes, on a person, with the
+ * board saying so. The watcher's tick is driven by the probe, standing in
+ * for the ten-second interval landing mid-wait.
+ */
+const mergeWait = async (onProbe: (count: number) => Promise<void>) => {
+  const waits = createWaitInterrupt();
+  let marker: PendingWait | null = null;
+  let probes = 0;
+  let now = 1_790_798_712_708;
+  const tool = await createMonitorTool({
+    waitSignal: waits.signal,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    probe: async () => {
+      probes += 1;
+      await onProbe(probes);
+      return { code: 1, output: '{"state":"OPEN"}' };
+    },
+    heartbeat: {
+      marker: {
+        recordWait: async (command) => {
+          const recorded: PendingWait = { command, startedAt: now, pings: 0, lastPingAt: null };
+          marker = recorded;
+          return recorded;
+        },
+        recordPing: async () => marker as PendingWait,
+        clearWait: async () => {
+          marker = null;
+        },
+      },
+      boss: { tellBoss: async () => {}, escalationsSince: async () => ({ count: 0, lastAt: null }) },
+    },
+  });
+  const run = () =>
+    tool.execute(
+      "call-1",
+      {
+        command: "gh pr view 2260 --repo thegoodparty/omni --json state --jq .state | grep -qE 'MERGED|CLOSED'",
+        intervalSeconds: 60,
+        timeoutSeconds: 86_400,
+        description: "PR 2260 to be merged",
+        waitingFor: "someone to merge omni#2260",
+        awaitingHuman: "Merge https://github.com/thegoodparty/omni/pull/2260",
+      },
+      undefined,
+      undefined,
+      undefined as never,
+    ) as Promise<{ content: { type: string; text: string }[]; terminate?: boolean }>;
+  return { waits, run, probes: () => probes, marker: () => marker };
+};
 
-  assert.equal(await handlers.tool_result(bash, {}), undefined, "delivered once");
-  assert.deepEqual(failures, []);
+test("a Boss message mid-wait ends the wait within a poll and reaches the model as a user message", async () => {
+  const queue = directiveQueue();
+  const steered: string[] = [];
+  let tickedAt = 0;
+  const redirect = "Scope correction: your fix silences the alert and hides the bug the candidate hit.";
+  const wait = await mergeWait(async (count) => {
+    if (count !== 3) return;
+    queue.push({ type: "boss_message", text: redirect, at: 1_790_798_720_000 });
+    tickedAt = count;
+    await watch();
+  });
+  const watch = createDirectiveWatcher({
+    api: queue.api,
+    steer: async (text) => steered.push(text),
+    interruptWait: wait.waits.interrupt,
+    onFailure: (error) => assert.fail(String(error)),
+  });
+
+  const out = await wait.run();
+
+  assert.match(out.content[0].text, /^STOPPED WAITING for: PR 2260 to be merged \(interrupted\)/);
+  assert.ok(wait.probes() - tickedAt <= 1, `ended within a poll, took ${wait.probes() - tickedAt}`);
+  assert.deepEqual(steered, [`The Boss says: ${redirect}`]);
+  assert.deepEqual(queue.consumed, [1]);
+  assert.equal(wait.marker(), null, "the board no longer says it is waiting on a merge");
+
+  await watch();
+  assert.equal(steered.length, 1, "delivered once");
+  assert.equal(wait.waits.signal().aborted, false, "the next wait starts clean");
 });
 
-test("a failed directive read leaves the tool result as it was", async () => {
-  const failures: unknown[] = [];
-  const handlers: Record<string, (...args: unknown[]) => unknown> = {};
-  const pi = {
-    on: (event: string, handler: (...args: unknown[]) => unknown) => {
-      handlers[event] = handler;
-      return () => {};
-    },
-  } as never;
-  directiveDeliveryExtension(
-    {
-      peekDirectives: async () => {
-        throw new Error("the Boss said 503");
-      },
-      consumeDirective: async () => {},
-    },
-    (error) => failures.push(error),
-  )(pi);
+test("a stop mid-wait ends the wait and stays queued for the Boss tool that ends the run", async () => {
+  const queue = directiveQueue();
+  const steered: string[] = [];
+  const wait = await mergeWait(async (count) => {
+    if (count !== 2) return;
+    queue.push({ type: "stop", reason: "closed by a person" });
+    await watch();
+  });
+  const watch = createDirectiveWatcher({
+    api: queue.api,
+    steer: async (text) => steered.push(text),
+    interruptWait: wait.waits.interrupt,
+    onFailure: (error) => assert.fail(String(error)),
+  });
 
-  const result = await handlers.tool_result(
-    { type: "tool_result", toolName: "bash", content: [{ type: "text", text: "ok" }] },
-    {},
-  );
-  assert.equal(result, undefined);
+  const out = await wait.run();
+  assert.match(out.content[0].text, /\(interrupted\)/);
+  assert.ok(wait.probes() <= 3, `ended within a poll, took ${wait.probes() - 2}`);
+  assert.deepEqual(steered, []);
+  assert.deepEqual(queue.consumed, [], "left for get_incident to drain");
+
+  const pending = (await queue.api.peekDirectives()).map((entry) => entry.directive);
+  const tools = await createBossTools({
+    api: stubApi({ ok: true, data: {}, directives: pending }),
+    boss: { tellBoss: async () => {} },
+  });
+  const getIncident = tools.find((tool) => tool.name === "get_incident");
+  const result = (await getIncident?.execute("call-2", {}, undefined, undefined, undefined as never)) as {
+    terminate?: boolean;
+  };
+  assert.equal(result.terminate, true);
+});
+
+test("a steer that fails is tried again on the next tick and the message is kept", async () => {
+  const queue = directiveQueue();
+  queue.push({ type: "boss_message", text: "answer the three questions", at: 1 });
+  let attempts = 0;
+  const failures: unknown[] = [];
+  let interrupts = 0;
+  const watch = createDirectiveWatcher({
+    api: queue.api,
+    steer: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("session busy");
+    },
+    interruptWait: () => {
+      interrupts += 1;
+    },
+    onFailure: (error) => failures.push(error),
+  });
+
+  await watch();
+  assert.deepEqual(queue.consumed, []);
+  assert.equal(interrupts, 0);
+  await watch();
+  assert.deepEqual(queue.consumed, [1]);
+  assert.equal(interrupts, 1);
   assert.equal(failures.length, 1);
 });

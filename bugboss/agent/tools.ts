@@ -133,8 +133,37 @@ export const shellProbe: Probe = (command, timeoutMs) =>
     );
   });
 
-const wait = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const wait = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+
+/**
+ * The signal that ends whichever wait is running now. A Boss message is a
+ * user message, and `steer` only lands between tool batches, so a wait that
+ * could not be cut short would hold it for as long as the wait lasts --
+ * fifteen minutes and then a merge wait, on incident 94. `wrapUpAbort` is
+ * one-shot and means "wrap up"; this one is replaced after every interrupt,
+ * so the next wait starts clean. Tools read it when a call starts.
+ */
+export const createWaitInterrupt = () => {
+  let current = new AbortController();
+  return {
+    signal: (): AbortSignal => current.signal,
+    interrupt: (): void => {
+      const ended = current;
+      current = new AbortController();
+      ended.abort();
+    },
+  };
+};
 
 /**
  * Pi's per-call signal and the harness's deadline signal, both honoured.
@@ -410,12 +439,8 @@ export interface MonitorDeps {
   signal?: AbortSignal;
   /** Absent means no wait is ever reported, whatever the model asks for. */
   heartbeat?: HeartbeatDeps;
-  /**
-   * Where a word from the Boss is seen mid-wait. Absent means a wait only ends
-   * on its own condition, which is how a redirection sat unread behind a
-   * merge wait on incident 94.
-   */
-  directives?: DirectivePeek;
+  /** The current wait's interrupt, read when a call starts. */
+  waitSignal?: () => AbortSignal;
 }
 
 export interface MonitorArgs {
@@ -439,12 +464,6 @@ export interface MonitorArgs {
 export interface MonitorResult {
   output: string;
   timedOut: boolean;
-  /** What the Boss said that ended the wait early. Absent when nothing did. */
-  bossMessage?: string | null;
-  /** Everything else the poll saw. The caller renders these. */
-  directives?: Directive[];
-  /** A `stop` or a `merged` arrived: the incident is no longer the agent's. */
-  terminate?: boolean;
 }
 
 /**
@@ -463,7 +482,7 @@ export const runMonitor = async (
   deps: MonitorDeps = {},
 ): Promise<MonitorResult> => {
   const probe = deps.probe ?? shellProbe;
-  const sleep = deps.sleep ?? wait;
+  const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
   const now = deps.now ?? Date.now;
   const probeTimeoutMs =
     (deps.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000;
@@ -508,47 +527,6 @@ export const runMonitor = async (
     if (deps.signal?.aborted || now() >= deadline) {
       if (heartbeat) await release(heartbeat, args.command);
       return { output: last, timedOut: true };
-    }
-
-    // A person's word only reaches an agent through the Boss, so a wait that
-    // cannot hear it is a wait nobody can redirect. The answer is consumed
-    // here because this call's result is what delivers it; everything else
-    // stays queued for the next Boss tool to drain.
-    if (deps.directives) {
-      let entries: PendingDirective[] = [];
-      try {
-        entries = await deps.directives.peekDirectives();
-      } catch (error: unknown) {
-        alarm("monitor_directive_peek_failed", {
-          command: args.command,
-          error: String(error),
-        });
-      }
-      const answers = entries.filter((entry) => bossMessageText(entry.directive) !== null);
-      const terminate = entries.some(
-        (entry) =>
-          entry.directive.type === "stop" || entry.directive.type === "merged",
-      );
-      if (answers.length || terminate) {
-        if (heartbeat) await release(heartbeat, args.command);
-        for (const answer of answers) await deps.directives.consumeDirective(answer.id);
-        log("monitor_interrupted", {
-          command: args.command,
-          answers: answers.length,
-          terminate,
-        });
-        return {
-          output: last,
-          timedOut: false,
-          bossMessage: answers.length
-            ? answers.map((entry) => bossMessageText(entry.directive)).join("\n\n")
-            : null,
-          directives: entries
-            .filter((entry) => !answers.includes(entry))
-            .map((entry) => entry.directive),
-          terminate,
-        };
-      }
     }
 
     if (heartbeat && marker) {
@@ -682,6 +660,8 @@ export interface MessageBossDeps {
   minWaitSeconds?: number;
   maxGapSeconds?: number;
   signal?: AbortSignal;
+  /** The current wait's interrupt, read when a call starts. */
+  waitSignal?: () => AbortSignal;
 }
 
 export interface MessageBossArgs {
@@ -742,7 +722,7 @@ export const runMessageBoss = async (
     return { answer: null, timedOut: false, directives: [], terminate: false };
   }
 
-  const sleep = deps.sleep ?? wait;
+  const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
   const now = deps.now ?? Date.now;
   const pollMs = (deps.pollSeconds ?? MESSAGE_BOSS_POLL_SECONDS) * 1000;
   const minWaitSeconds = deps.minWaitSeconds ?? MESSAGE_BOSS_MIN_WAIT_SECONDS;
@@ -837,6 +817,9 @@ export const runMessageBoss = async (
   }
 };
 
+const INTERRUPTED =
+  "The Boss spoke: its message reaches you next. If none does, call get_incident before you do anything else.";
+
 const MONITOR_DESCRIPTION = [
   "Block until a shell command exits 0, then return its output whole. Use it for",
   "every wait: a merge, a deploy, a migration, an alert going quiet. Never poll",
@@ -914,26 +897,19 @@ export const createMonitorTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MonitorArgs;
+      const interrupt = deps.waitSignal?.();
       const result = await runMonitor(args, {
         ...deps,
-        signal: eitherSignal(signal, deps.signal),
+        signal: eitherSignal(signal, deps.signal, interrupt),
       });
-      const interrupted = result.bossMessage !== undefined;
-      const header = result.timedOut
-        ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
-        : interrupted
-          ? `STOPPED WAITING for: ${args.description}. The condition is not met; the Boss spoke, so act on that first.`
+      const header = interrupt?.aborted && result.timedOut
+        ? `STOPPED WAITING for: ${args.description} (interrupted). ${INTERRUPTED}`
+        : result.timedOut
+          ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
           : `Condition met: ${args.description}`;
-      const said = result.bossMessage ? `\n\nThe Boss said: ${result.bossMessage}` : "";
       return {
-        content: [
-          {
-            type: "text",
-            text: `${header}${said}\n\n${result.output}${renderDirectives(result.directives ?? [])}`,
-          },
-        ],
-        details: { timedOut: result.timedOut, command: args.command, interrupted },
-        terminate: result.terminate === true,
+        content: [{ type: "text", text: `${header}\n\n${result.output}` }],
+        details: { timedOut: result.timedOut, command: args.command },
       };
     },
   } as ToolDefinition;
@@ -967,15 +943,18 @@ export const createMessageBossTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MessageBossArgs;
+      const interrupt = deps.waitSignal?.();
       const result = await runMessageBoss(args, {
         ...deps,
-        signal: eitherSignal(signal, deps.signal),
+        signal: eitherSignal(signal, deps.signal, interrupt),
       });
       const text = !args.wait
         ? "Sent to the Boss."
         : result.answer !== null
           ? `The Boss answered: ${result.answer}`
-          : result.timedOut
+          : interrupt?.aborted
+            ? `Stopped waiting for the Boss's answer (interrupted). ${INTERRUPTED}`
+            : result.timedOut
             ? "Your deadline ended this wait. Escalate now, with a brief."
             : "The wait ended on a directive rather than an answer.";
       return {

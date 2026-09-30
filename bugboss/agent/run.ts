@@ -40,6 +40,7 @@ import {
   bossMessageText,
   createMessageBossTool,
   createMonitorTool,
+  createWaitInterrupt,
   renderDirectives,
   type BossInboxPort,
   type DirectivePeek,
@@ -761,44 +762,54 @@ export const prefixDriftExtension =
     });
   };
 
+export const DIRECTIVE_POLL_MS = 10_000;
+
 /**
- * A word from the Boss rides on every tool result, not only the Boss tools'.
- * Those are the only calls that drain, and an agent writing a fix or watching
- * CI makes none of them for minutes: incident 94's agent ran ten bash and
- * monitor calls past a redirection, told the Boss the fix was ready, and read
- * it only when a deploy restarted it. `stop`, `merged` and the rest stay
- * queued, because only a Boss tool's result can end the run on them.
+ * A person's word reaches the agent as a user message, the way Pi means one
+ * to: `steer`. The Boss writes it to a queue in another process, so the child
+ * polls. The Boss tools used to be the only reader, and an agent writing a fix
+ * or waiting on CI calls none of them for minutes: incident 94's agent ran ten
+ * bash and monitor calls past a redirection, told the Boss its fix was ready,
+ * and read it only when a deploy restarted it.
+ *
+ * Consumed after the steer, because the steered message is then in the
+ * session and a restart keeps it. `stop` and `merged` only interrupt: they
+ * stay queued so the next Boss tool drains them and ends the run, which only
+ * a tool result can do.
  */
-export const directiveDeliveryExtension =
-  (api: DirectivePeek, onFailure: (error: unknown) => void) =>
-  (pi: ExtensionAPI): void => {
-    pi.on("tool_result", async (event) => {
-      let entries: PendingDirective[];
-      try {
-        entries = await api.peekDirectives();
-      } catch (error: unknown) {
-        onFailure(error);
-        return;
-      }
-      const delivered: PendingDirective[] = [];
+export const createDirectiveWatcher = (args: {
+  api: DirectivePeek;
+  steer: (text: string) => Promise<unknown>;
+  interruptWait: () => void;
+  onFailure: (error: unknown) => void;
+}): (() => Promise<void>) => {
+  const handled = new Set<number>();
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      const entries = await args.api.peekDirectives();
       for (const entry of entries) {
-        if (bossMessageText(entry.directive) === null) continue;
-        try {
-          await api.consumeDirective(entry.id);
-          delivered.push(entry);
-        } catch (error: unknown) {
-          onFailure(error);
+        if (handled.has(entry.id)) continue;
+        const text = bossMessageText(entry.directive);
+        if (text !== null) {
+          await args.steer(`The Boss says: ${text}`);
+          handled.add(entry.id);
+          args.interruptWait();
+          await args.api.consumeDirective(entry.id);
+        } else if (entry.directive.type === "stop" || entry.directive.type === "merged") {
+          handled.add(entry.id);
+          args.interruptWait();
         }
       }
-      if (!delivered.length) return;
-      return {
-        content: [
-          ...event.content,
-          { type: "text", text: renderDirectives(delivered.map((entry) => entry.directive)) },
-        ],
-      };
-    });
+    } catch (error: unknown) {
+      args.onFailure(error);
+    } finally {
+      running = false;
+    }
   };
+};
 
 // ---------------------------------------------------------------------------
 // The run
@@ -1430,6 +1441,7 @@ const launch = async (args: {
   // hand-off request never reaches an agent in the state it spends most of a
   // long incident in.
   const wrapUpAbort = new AbortController();
+  const waits = createWaitInterrupt();
 
   const bossTools = await createBossTools({
     api,
@@ -1439,7 +1451,7 @@ const launch = async (args: {
   const localTools = [
     await createMonitorTool({
       signal: wrapUpAbort.signal,
-      directives: api,
+      waitSignal: waits.signal,
       heartbeat: {
         marker: api,
         boss: api,
@@ -1451,6 +1463,7 @@ const launch = async (args: {
       boss: api,
       api,
       signal: wrapUpAbort.signal,
+      waitSignal: waits.signal,
     }),
     // Reads the token at each call rather than closing over it: the App
     // credentials are refreshed in place every twenty minutes, and an incident
@@ -1833,17 +1846,6 @@ const launch = async (args: {
       prefixDriftExtension((message) =>
         console.warn(`[bugboss ${options.incidentId}] ${message}`),
       ),
-      directiveDeliveryExtension(api, (error) =>
-        console.error(
-          JSON.stringify({
-            component: "agent",
-            level: "error",
-            event: "directive_delivery_failed",
-            incidentId: options.incidentId,
-            error: String(error),
-          }),
-        ),
-      ),
     ],
   });
   await resourceLoader.reload();
@@ -1879,6 +1881,22 @@ const launch = async (args: {
     () => void session.abort().catch(() => {}),
     (timeoutSeconds + DEADLINE_GRACE_SECONDS) * 1000,
   );
+  const watchDirectives = createDirectiveWatcher({
+    api,
+    steer: (text) => session.steer(text),
+    interruptWait: waits.interrupt,
+    onFailure: (failure) =>
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "directive_watch_failed",
+          incidentId: options.incidentId,
+          error: String(failure),
+        }),
+      ),
+  });
+  const directiveWatch = setInterval(() => void watchDirectives(), DIRECTIVE_POLL_MS);
 
   let error: string | null = null;
   try {
@@ -1888,6 +1906,7 @@ const launch = async (args: {
   } finally {
     clearTimeout(deadline);
     clearTimeout(hardStop);
+    clearInterval(directiveWatch);
     releaseSignals();
     error = session.state.errorMessage ?? null;
     // Before the flush, not after: the sync is a whole-file PUT, so a record
