@@ -21,7 +21,7 @@ const row = (over: Partial<BoardRow> = {}): BoardRow => ({
   waitStartedAt: null,
   questionAskedAt: null,
   questionText: null,
-  monitorCommand: null,
+  monitorWaitingFor: null,
   monitorStartedAt: null,
   unreadQuestions: 0,
   ...over,

@@ -241,6 +241,10 @@ CREATE TABLE IF NOT EXISTS pending_wait (
   -- Matched on resume. clearWait does not run when the child is SIGKILLed
   -- mid-wait, so a marker outlives the wait it was written for.
   command           TEXT NOT NULL,
+  -- The agent's own sentence for what it waits on, which is what the board
+  -- and the card show. The command is a shell line and never shown. Null on
+  -- a wait recorded before monitor asked for one.
+  waitingFor        TEXT,
   startedAt         INTEGER NOT NULL,
   pings             INTEGER NOT NULL DEFAULT 0,
   -- The backoff counts from the last nudge, not from the start. Without it a

@@ -62,7 +62,7 @@ test("monitor returns as soon as the command exits 0", async () => {
   };
 
   const result = await runMonitor(
-    { command: "gh pr view x", intervalSeconds: 30, timeoutSeconds: 3600, description: "the PR" },
+    { command: "gh pr view x", intervalSeconds: 30, timeoutSeconds: 3600, description: "the PR", waitingFor: "the PR" },
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
@@ -80,7 +80,7 @@ test("monitor keeps waiting through non-zero exits and costs one call", async ()
   };
 
   const result = await runMonitor(
-    { command: "check", intervalSeconds: 30, timeoutSeconds: 3600, description: "a deploy" },
+    { command: "check", intervalSeconds: 30, timeoutSeconds: 3600, description: "a deploy", waitingFor: "a deploy" },
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
@@ -97,7 +97,7 @@ test("monitor gives up at the deadline and returns the last output", async () =>
   };
 
   const result = await runMonitor(
-    { command: "check", intervalSeconds: 60, timeoutSeconds: 300, description: "quiet" },
+    { command: "check", intervalSeconds: 60, timeoutSeconds: 300, description: "quiet", waitingFor: "quiet" },
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
@@ -111,7 +111,7 @@ test("monitor stops when the turn is aborted", async () => {
   controller.abort();
 
   const result = await runMonitor(
-    { command: "check", intervalSeconds: 5, timeoutSeconds: 86400, description: "anything" },
+    { command: "check", intervalSeconds: 5, timeoutSeconds: 86400, description: "anything", waitingFor: "anything" },
     { probe: async () => ({ code: 1, output: "no" }), sleep: clock.sleep, now: clock.now, signal: controller.signal },
   );
 
@@ -142,6 +142,7 @@ test("monitor's description does not tell the agent to pre-summarise", async () 
       intervalSeconds: 1,
       timeoutSeconds: 1,
       description: "a big log",
+      waitingFor: "a big log",
     } as never,
     new AbortController().signal,
     undefined,
@@ -164,7 +165,7 @@ test("monitor hands back everything the probe printed", async () => {
   const needle = "NEEDLE_IN_THE_MIDDLE";
   const output = `${"x".repeat(25_000)}${needle}${"x".repeat(25_000)}`;
   const result = await runMonitor(
-    { command: "cat huge", intervalSeconds: 1, timeoutSeconds: 1, description: "a big log" },
+    { command: "cat huge", intervalSeconds: 1, timeoutSeconds: 1, description: "a big log", waitingFor: "a big log" },
     { probe: async () => ({ code: 0, output }) },
   );
 
@@ -240,7 +241,7 @@ test("the harness deadline interrupts a blocking tool, not just the turn", async
   assert.equal(piSignal.aborted, false);
   const result = await tool.execute(
     "call-1",
-    { command: "check", intervalSeconds: 30, timeoutSeconds: 86400, description: "quiet" } as never,
+    { command: "check", intervalSeconds: 30, timeoutSeconds: 86400, description: "quiet", waitingFor: "quiet" } as never,
     piSignal,
     undefined,
     {} as never,
@@ -345,6 +346,7 @@ const heartbeatHarness = (args: {
   const events: string[] = [];
   const told: { kind: BossInboxKind; text: string; at: string; pingsWhenTold: number | null }[] = [];
   let recordWaitCalls = 0;
+  const labels: string[] = [];
   let pingCalls = 0;
   let clears = 0;
 
@@ -364,9 +366,10 @@ const heartbeatHarness = (args: {
 
   const deps: HeartbeatDeps = {
     marker: {
-      recordWait: async (command) => {
+      recordWait: async (command, waitingFor) => {
         recordWaitCalls += 1;
         events.push("recordWait");
+        labels.push(waitingFor);
         if (!marker || marker.command !== command) {
           marker = { command, startedAt: args.now(), pings: 0, lastPingAt: null };
         }
@@ -398,6 +401,7 @@ const heartbeatHarness = (args: {
     clears: () => clears,
     pingCalls: () => pingCalls,
     recordWaitCalls: () => recordWaitCalls,
+    labels,
   };
 };
 
@@ -406,6 +410,7 @@ const stalled: Probe = async () => ({ code: 1, output: '{"state":"OPEN"}' });
 const PR_WAIT = {
   command: "gh pr view 2150 --json state -q .state | grep -q MERGED",
   description: "the PR to be merged",
+  waitingFor: "the PR to be merged",
   awaitingHuman:
     "Merge <https://github.com/thegoodparty/omni/pull/2150|omni#2150>. I cannot merge it myself.",
 };
@@ -544,6 +549,7 @@ test("a resumed agent carries on waiting instead of telling the Boss again", asy
   );
 
   assert.equal(harness.recordWaitCalls(), 1);
+  assert.deepEqual(harness.labels, [PR_WAIT.waitingFor], "the label reaches the marker the board reads");
   assert.equal(harness.told.length, 0);
   assert.equal(result.timedOut, true);
   // The timeout is measured from when the wait began, not from this process,
@@ -583,6 +589,7 @@ test("a wait with nobody to remind tells the Boss nothing and records no marker"
       intervalSeconds: 1800,
       timeoutSeconds: 14_400,
       description: "the release train to deploy abc123",
+      waitingFor: "the release train to deploy abc123",
     },
     { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
   );
@@ -1522,4 +1529,25 @@ test("message_boss honours the harness deadline alongside pi's signal", async ()
   assert.ok(harness.events.includes("recordPending"), "the premise: the question was outstanding");
   assert.equal(harness.pending(), null);
   assert.equal(harness.escalations().length, 0, "the deadline is its own escalation path");
+});
+
+test("monitor refuses a wait with no waitingFor, before it runs anything", async () => {
+  let probes = 0;
+  const tool = await createMonitorTool({
+    probe: async () => {
+      probes += 1;
+      return { code: 0, output: "" };
+    },
+  });
+  for (const waitingFor of ["", "   "]) {
+    const out = await tool.execute(
+      "c1",
+      { command: "true", intervalSeconds: 1, timeoutSeconds: 1, description: "x", waitingFor } as never,
+      new AbortController().signal,
+      undefined,
+      {} as never,
+    );
+    assert.match(toolText(out), /^Rejected: waitingFor is empty/);
+  }
+  assert.equal(probes, 0, "a refused wait runs no command");
 });

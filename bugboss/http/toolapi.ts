@@ -460,30 +460,40 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
    * startedAt there would restart the elapsed clock and defer every reminder for
    * as long as the restarts last. A different command is a different wait, and
    * inherits neither the clock nor the reminder count.
+   *
+   * `waitingFor` is taken on every call, the same command included: it is
+   * the label people read, and a replay that words it better should show.
    */
   app.post("/incidents/:id/pending-wait", async (c) => {
     const caller = authorize(c);
     if (caller instanceof Response) return caller;
 
     let command = "";
+    let waitingFor = "";
     try {
-      command = String(((await c.req.json()) as { command?: unknown }).command ?? "");
+      const body = (await c.req.json()) as { command?: unknown; waitingFor?: unknown };
+      command = String(body.command ?? "");
+      waitingFor = String(body.waitingFor ?? "").trim();
     } catch {
       return c.json({ error: "body was not JSON" }, 400);
     }
     if (!command.trim()) return c.json({ error: "command is empty" }, 400);
+    if (!waitingFor) return c.json({ error: "waitingFor is empty" }, 400);
 
     const row = await deps.db.withWrite((w) => {
       w.prepare(
-        `INSERT INTO pending_wait (incidentId, command, startedAt, pings, lastPingAt)
-         VALUES (?, ?, ?, 0, NULL)
+        `INSERT INTO pending_wait (incidentId, command, waitingFor, startedAt, pings, lastPingAt)
+         VALUES (?, ?, ?, ?, 0, NULL)
          ON CONFLICT(incidentId) DO UPDATE SET
-           command = excluded.command,
-           startedAt = excluded.startedAt,
-           pings = 0,
-           lastPingAt = NULL
-         WHERE pending_wait.command <> excluded.command`,
-      ).run(caller.incidentId, command, now());
+           waitingFor = excluded.waitingFor,
+           startedAt = CASE WHEN pending_wait.command = excluded.command
+             THEN pending_wait.startedAt ELSE excluded.startedAt END,
+           pings = CASE WHEN pending_wait.command = excluded.command
+             THEN pending_wait.pings ELSE 0 END,
+           lastPingAt = CASE WHEN pending_wait.command = excluded.command
+             THEN pending_wait.lastPingAt ELSE NULL END,
+           command = excluded.command`,
+      ).run(caller.incidentId, command, waitingFor, now());
       return w
         .prepare(
           "SELECT command, startedAt, pings, lastPingAt FROM pending_wait WHERE incidentId = ?",

@@ -203,6 +203,10 @@ came out of the wait with anything.
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
+- `monitor(…, waitingFor)` — required: one plain sentence for the incident
+  board and status card ("someone to merge omni#2189"). They show it in place
+  of the command, which is shell and never shown. An empty one is refused
+  before anything runs.
 - `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
   what the wait is on, and the harness tells the Boss when they do not turn
   up. Unset, the wait is silent, which is right for a deploy, a migration or
@@ -343,7 +347,8 @@ opens. Counting the gap from the last rung rather than from the start is what
 stops that morning from arriving as the whole ladder at once.
 
 **Re-entrancy is the `pending_wait` marker**: idempotent for the same command,
-replaced by a different one. It holds `startedAt` and the rung count, so a
+replaced by a different one. It holds `startedAt`, the rung count and the
+`waitingFor` label (which a replay may reword without restarting anything), so a
 resumed agent resumes the wait it was in and the timeout is measured from
 `startedAt`. The rung is counted *before* it is sent, deliberately: a crash
 between the two costs one rung, where the other order repeats it on every

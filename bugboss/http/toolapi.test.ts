@@ -429,8 +429,8 @@ test("unknown keys are stripped rather than passed through", async () => {
   assert.deepEqual(body.data, { cause: "bad column", explainedSignalIds: ["s1"] });
 });
 
-const startWait = (command: string) =>
-  authed("/pending-wait", { method: "POST", body: JSON.stringify({ command }) });
+const startWait = (command: string, waitingFor = "someone to merge omni#2150") =>
+  authed("/pending-wait", { method: "POST", body: JSON.stringify({ command, waitingFor }) });
 
 type WaitRow = {
   command: string;
@@ -481,6 +481,27 @@ test("a replayed wait keeps its clock and its nudge count", async () => {
     db.get<WaitRow>("SELECT command FROM pending_wait WHERE incidentId = ?", [
       INCIDENT,
     ]),
+    undefined,
+  );
+});
+
+test("a wait keeps the agent's label, and a replay can reword it without restarting the clock", async () => {
+  clock = 1_000_000;
+  await startWait("gh pr view 2189", "someone to merge omni#2189");
+  clock = 2_000_000;
+  await startWait("gh pr view 2189", "someone to merge omni#2189 or #2195");
+  assert.deepEqual(
+    db.get("SELECT waitingFor, startedAt FROM pending_wait WHERE incidentId = ?", [INCIDENT]),
+    { waitingFor: "someone to merge omni#2189 or #2195", startedAt: 1_000_000 },
+  );
+  await authed("/pending-wait", { method: "DELETE" });
+});
+
+test("a wait with no label is refused", async () => {
+  const res = await startWait("gh pr view 2189", "  ");
+  assert.equal(res.status, 400);
+  assert.equal(
+    db.get("SELECT 1 FROM pending_wait WHERE incidentId = ?", [INCIDENT]),
     undefined,
   );
 });
