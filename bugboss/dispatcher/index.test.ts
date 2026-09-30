@@ -131,6 +131,7 @@ const makeTools = () => {
     reportAnalysis: ok,
     getIncident: ok,
     searchIncidents: ok,
+    trackTimelineEvent: ok,
     escalate: async ({ reason, brief }) => {
       escalations.push({ incidentId, reason, brief });
       return { ok: true, directives: [] };

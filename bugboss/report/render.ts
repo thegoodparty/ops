@@ -9,7 +9,7 @@
 // column -- so `cell()` is the only escaping in this file, and it is applied
 // nowhere else.
 
-import type { Incident, RecurrenceAnalysis, RecurrenceCategory } from "../types";
+import type { Incident, RecurrenceAnalysis, RecurrenceCategory, TimelineEvent } from "../types";
 
 // ---------------------------------------------------------------------------
 // What a report is made of
@@ -79,6 +79,8 @@ export interface ReportData {
   mergedIn: string[];
   prs: ReportPr[];
   actions: ReportAction[];
+  /** What the agent recorded as it went, oldest first. */
+  timeline: TimelineEvent[];
   run: ReportRun;
   /**
    * Why an earlier resolution did not hold, for an incident that came back.
@@ -411,6 +413,31 @@ const signalTable = (data: ReportData): string[] => {
   ];
 };
 
+/**
+ * The agent's own record of when things happened, as it recorded them. Kept
+ * beside the post-mortem rather than merged into it: the post-mortem is the
+ * closer's account, and this is the evidence it was written from.
+ */
+const timelineTable = (data: ReportData): string[] => {
+  if (data.timeline.length === 0) return [];
+  return [
+    "## Recorded timeline",
+    "",
+    "| When | What | Evidence |",
+    "| --- | --- | --- |",
+    ...data.timeline.map((event) =>
+      [
+        "",
+        timestamp(event.occurredAt),
+        cell(`${event.kind}: ${event.summary}`),
+        cell(event.evidenceUrl ?? "—"),
+        "",
+      ].join(" | ").trim(),
+    ),
+    "",
+  ];
+};
+
 const actionTable = (data: ReportData): string[] => {
   if (data.actions.length === 0) return [];
   return [
@@ -535,6 +562,7 @@ export const renderReportDocument = (data: ReportData): string => {
     ...section("Root cause", incident.rootCause ?? ""),
     ...recurrence(data),
     ...section("Post-mortem", incident.postmortem ?? ""),
+    ...timelineTable(data),
     ...section(
       "Impact",
       incident.usersImpacted === null

@@ -360,6 +360,28 @@ CREATE TABLE IF NOT EXISTS incident_action (
 CREATE INDEX IF NOT EXISTS incident_action_incident_idx
   ON incident_action (incidentId, at);
 
+-- The incident's timeline as the agent lived it: first error, impact
+-- confirmed, root cause, fix opened, merged, deployed, verified. `occurredAt`
+-- is when it happened, from the evidence, and `recordedAt` is when the agent
+-- wrote it down; the two differ on every event found after the fact.
+--
+-- A table rather than the agent's memory, because the agent's context is
+-- compacted at every stage and the closer writes the post-mortem long after
+-- the first error scrolled out of it. `kind` is checked in the tool API, not
+-- here: a CHECK cannot change on a live table, and the list will grow.
+CREATE TABLE IF NOT EXISTS incident_timeline_event (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  incidentId        TEXT NOT NULL REFERENCES incident(id),
+  kind              TEXT NOT NULL,
+  occurredAt        INTEGER NOT NULL,
+  recordedAt        INTEGER NOT NULL,
+  summary           TEXT NOT NULL,
+  evidenceUrl       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS incident_timeline_event_incident_idx
+  ON incident_timeline_event (incidentId, occurredAt);
+
 -- How an incident thread's top-level message is rendered. A table of its
 -- own rather than columns on `incident`, because `getIncidentRow` is
 -- `SELECT *` and spreads the row, so anything added there arrives in the

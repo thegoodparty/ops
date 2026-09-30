@@ -233,8 +233,8 @@ queued: the next Boss tool drains them, and only its result can end the run.
 **One turn is not one bill, and the prompt used to say it was.** A block that
 outlives the prompt cache pays a full cache write on the turn after it, which
 on a nine-hour incident was 41% of what that incident cost. So the prompt
-prices the wait honestly and says what to do with it — refresh impact, write
-notes, draft the post-mortem — because the cost lands whether or not the agent
+prices the wait honestly and says what to do with it — refresh impact, record
+timeline events, draft the post-mortem — because the cost lands whether or not the agent
 came out of the wait with anything.
 
 - `monitor(command, …)` — **the command must be read-only.** On a container
@@ -527,46 +527,75 @@ nothing and alarming on it would alarm on every crash at boot.
 backstop uses it, so the absence of a record is still the common signature of
 a kill -- which is exactly what `killed` means.
 
-## The notes directory
+## Compaction at each stage
 
-`/work/<id>/notes/` is where an agent keeps its own record of the work,
-mirrored to `sessions/incident/<id>/notes/` and restored before the session
-opens. Pi has no persisted-workspace concept — a cwd and a session file are
-all it keeps — so `notes.ts` is ours, hung off the same `turn_end` and
-`session_shutdown` hooks the session sync uses so there is one durability
-cadence, not two.
+The agent's context is summarised at every stage transition, by Pi, with a
+prompt that keeps only what the next stage needs. `compaction.ts`; the
+threshold backstop at ~85% of the window is still there underneath it.
 
-**It is a record, not scratch space, and the mirror is append-only.**
-`NotesStore` has no `delete` and neither does the S3 store any more, so
-nothing in the agent's path can take a note out of the record — not a tidy-up
-reflex, not a bad `rm`. Agents are told in the prompt to leave their dead ends
-behind, because a dead end is what stops the next investigation walking down
-it again. A delete would also reclaim nothing: the bucket is versioned and
-nothing under `sessions/` expires.
+Why: the backstop never fired. No incident got past 431k of a 1M window, so
+every turn re-read everything the agent had ever seen, and cache reads of
+history were half of what the fleet spent. Incidents 80, 86 and 94 hit the
+turn cap carrying an investigation they had finished hours earlier.
 
-A resumed agent therefore gets back notes it deleted locally. The prompt says
-so, or the reappearance reads as a broken harness.
+- **Three transitions, all tool calls.** `report_root_cause` succeeding
+  (`root_cause`), and `track_incident_timeline_event` recording `fix_pr_opened`
+  (`fix_opened`) or `fix_merged` (`fix_merged`). The tools report them through
+  `onRootCause` / `onTimelineEvent`; nothing reads what the agent wrote.
+- **Pi does the compaction.** The turn that made the transition arms it by
+  raising `reserveTokens` to the whole window, so Pi's own between-turn check
+  compacts before the next request. `session_before_compact` puts the reserve
+  back, then calls Pi's exported `compact()` on Pi's preparation with the
+  stage's instructions and the timeline. A `turn_start` with the stage still
+  armed means Pi found nothing to compact, and disarms too: a reserve left at
+  the window would compact every turn after.
+- **The split turn is folded in.** An incident is one user-message span, so
+  Pi's cut nearly always lands inside it, and Pi summarises that prefix with
+  a fixed prompt that takes no instructions. `createPiSummarizer` moves the
+  prefix into the history so one call, with the stage's focus, covers it all.
+- **Skipped below `STAGE_COMPACTION_MIN_TOKENS` (50k).** A summary is a model
+  call over the history plus a cache rewrite after it, and on a small context
+  that costs more than it saves.
+- **The timeline goes into every stage prompt, verbatim**, read through the
+  non-draining `GET /incidents/:id/timeline`. A failed read or a failed
+  summary logs and falls back to Pi's default summary; the context still
+  shrinks, it just loses the stage's focus.
 
-The same no-deletes rule is why restore has to tolerate a name used twice. An
-agent that writes the note `findings` and later makes `findings/` a directory
-leaves both keys standing, and no filesystem holds both. Restore skips the one
-it cannot place, logs `notes_restore_conflict` and carries on: it runs before
-the session opens, so a throw there killed every relaunch of that incident on
-the same two keys, and nothing in the agent's reach could clear either.
+The replay of incidents 94 and 86 at these three transitions came to about
+43% less spend on the two ($31 of $73.50), nearly all of it cache reads.
 
-It is a **sibling** of the checkout, not a folder in it: under the checkout a
-note is one `git add -A` away from the pull request the agent asks a human to
-merge.
+## The transcript keeps everything compaction summarised
 
-The prefix is derived from the session key rather than rebuilt from the
-incident id, for the same reason `BUGBOSS_SESSION_REF` is required: a second
-independent derivation is how notes come to be written where nothing reads.
+Pi's compaction appends a `compaction` entry (`summary`, `firstKeptEntryId`,
+`tokensBefore`, `details`) and deletes nothing, so the session file -- and the
+whole-file copy of it at `s3://bugboss-prod/sessions/incident/<id>/session.jsonl`
+-- still holds every entry the summary replaced. That was checked in Pi's
+`session-manager.js`, not assumed: `appendCompaction` goes through
+`_appendEntry`, and the only whole-file rewrites are a version migration
+(which keeps every entry) and branching (a new file, which this agent never
+does). `compaction.test.ts` pins it against a real session.
 
-**The bound is measured over the record, not the directory**, because with no
-deletes a rename is what grows S3. It refuses the whole directory rather than
-part of it: a partial mirror restores a state the agent never had. Crossing it
-logs and steers once on the edge, and the message does not tell the agent to
-delete, because deleting cannot bring it back under.
+**The compaction entry is the anchor.** To read what a summary stands for,
+take the entries between the previous compaction's `firstKeptEntryId` (or
+the start of the file) and this one's `firstKeptEntryId`; those are verbatim.
+To rebuild the context as it was before a compaction, stop reading the file
+at that compaction entry: `SessionManager.open` over the truncated copy
+projects the uncompacted conversation. A stage compaction also carries
+`details.stage`.
+
+## The timeline
+
+`track_incident_timeline_event` records a moment in the incident: `kind`
+from `TIMELINE_EVENT_KINDS`, `occurredAt` when it happened (from the
+evidence, not when the agent noticed), a one-sentence summary and an
+evidence link. Rows go in `incident_timeline_event`, idempotent on the whole
+event so a replayed call after a restart records nothing twice.
+
+It exists because of compaction. The first error scrolls out of the context
+long before the closer writes the post-mortem, so the closer reads the
+timeline from `get_incident` instead of rebuilding it, and the closing
+report prints it as "Recorded timeline" under the post-mortem. The prompt
+asks for events on the turn they are learned, not at the end.
 
 **The model is pinned in the session.** On resume it resolves from the
 stored prefix, not from env — Bedrock does not restore it, and the SSM

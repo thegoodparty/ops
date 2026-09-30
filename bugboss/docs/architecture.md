@@ -394,24 +394,12 @@ expire.
 Every merge to ops `main` restarts this container, so resume is the normal
 path, not the exceptional one.
 
-**An agent also keeps a written record, in a directory that outlives the
-restart.** The transcript records what an agent said; it does not give it a
-cheap place to keep what it worked out. `/work/<id>/notes/` is mirrored to
-`sessions/incident/<id>/notes/` on the same `turn_end` hook as the session and
-restored before the next one starts, so a ruled-out ledger survives a redeploy
-and costs nothing in context until the agent reads it back.
-
-The mirror is **append-only, and has no delete in it**. Those notes are the
-record of the work — for the next launch, for the thread, and for whoever
-opens the incident again later — and a dead end is the most useful thing in
-there. Agents are not asked to tidy up after themselves, and nothing in their
-path can remove an object from this bucket. Deleting would not reclaim
-anything anyway: the bucket is versioned and nothing under `sessions/`
-expires, so a delete writes a marker over a version that stays.
-
-That puts the bound on the record rather than on the directory, since a
-rename leaves the old key behind. Crossing it stops the mirror loudly, and
-deleting is not the way back.
+**The story of the incident lives in its timeline, not in the context.**
+The agent records key moments with `track_incident_timeline_event` as they
+happen -- first error, impact confirmed, root cause, fix opened, merged,
+deployed, verified -- into `incident_timeline_event`. Its context is
+summarised at each stage, so the closer builds the post-mortem timeline from
+those rows, and the closing report prints them.
 
 ## Layout
 
@@ -510,6 +498,12 @@ So a result never has to be cut to fit: it lands whole, gets measured, and
 what gives way is summarised history, which the session transcript still
 holds. Cutting the result instead meant losing the middle of a stack trace or
 a log dump the run had just paid a tool call to fetch.
+
+That threshold is the backstop. The ordinary compaction happens at each stage
+transition -- root cause reported, fix PR opened, fix merged -- with a prompt
+that keeps what the next stage needs and the timeline (`agent/CLAUDE.md`,
+"Compaction at each stage"). Compaction appends; the session file keeps every
+entry it summarised.
 
 `reserveTokensFor` is `maxTokens + keepRecentTokens` — the most the model can
 emit in one response, plus the tail compaction will not summarise. It was 5%

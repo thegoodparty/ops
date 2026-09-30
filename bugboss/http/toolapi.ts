@@ -23,7 +23,8 @@ import { z } from "zod";
 
 import { recordForBoss } from "../boss/inbox";
 import type { Db } from "../db";
-import { verifyAgentToken } from "../toolapi";
+import { readTimelineEvents, verifyAgentToken } from "../toolapi";
+import { TIMELINE_EVENT_KINDS } from "../types";
 import type { Directive, ToolApi, WakeBoss } from "../types";
 
 const log = makeLog("boss-http");
@@ -108,6 +109,12 @@ const BODIES = {
   }),
   search: z.object({
     text: z.string().min(1),
+  }),
+  timeline: z.object({
+    kind: z.enum(TIMELINE_EVENT_KINDS),
+    occurredAt: z.number().int().positive(),
+    summary: z.string().trim().min(1),
+    evidenceUrl: z.url().optional(),
   }),
   park: z.object({
     waitingFor: z.string().min(1),
@@ -269,6 +276,22 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     "/incidents/:id/search",
     tool(BODIES.search, (api, body) => api.searchIncidents(body)),
   );
+
+  app.post(
+    "/incidents/:id/timeline",
+    tool(BODIES.timeline, (api, body) => api.trackTimelineEvent(body)),
+  );
+
+  /**
+   * Read-only, for the stage compaction: it runs between turns, and a read
+   * through `getIncident` would drain directives into a result the model
+   * never sees.
+   */
+  app.get("/incidents/:id/timeline", (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    return c.json(readTimelineEvents(deps.db, caller.incidentId));
+  });
 
   // -------------------------------------------------------------------------
   // message_boss: the inbox, the directive poll and the outstanding-question

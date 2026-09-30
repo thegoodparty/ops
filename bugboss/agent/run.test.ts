@@ -42,7 +42,6 @@ import {
 import { resolveBedrockModel } from "../bedrock";
 import { createMessageBossTool, createMonitorTool, createWaitInterrupt, type PendingDirective, type PendingWait } from "./tools";
 import type { Directive } from "../types";
-import { notesPrefixFor } from "./notes";
 import { emptySessionUsage, PROMPT_ENTRY_TYPE } from "./session";
 
 test("paths are derived from the incident, not the process", () => {
@@ -52,20 +51,6 @@ test("paths are derived from the incident, not the process", () => {
   assert.equal(paths.sessionFile, "/work/inc-7/session/inc-7.jsonl");
   assert.equal(paths.npmCiDone, "/work/inc-7/npm-ci.done");
   assert.deepEqual(computePaths("/work", "inc-7"), paths);
-});
-
-test("the notes directory is a sibling of the checkout, never inside it", () => {
-  const paths = computePaths("/work", "inc-7");
-
-  assert.equal(paths.notesDir, "/work/inc-7/notes");
-  // Inside the checkout a note is one `git add -A` away from being in the
-  // pull request the agent asks a human to merge.
-  assert.ok(!paths.notesDir.startsWith(`${paths.checkout}/`));
-  assert.equal(
-    notesPrefixFor("sessions/incident/inc-7/session.jsonl"),
-    "sessions/incident/inc-7/notes/",
-    "notes belong with that incident's material, not somewhere new",
-  );
 });
 
 // The old assertions restated the formula -- `reserveTokensFor(1000000)` is
@@ -225,6 +210,7 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
     getIncident: async () => response,
     proposeMerge: async () => response,
     searchIncidents: async () => response,
+    trackTimelineEvent: async () => response,
   }) as unknown as ToolApi;
 
 // Two reads, and both of them now reach incidents nobody pointed the agent
@@ -241,7 +227,7 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
 // `propose_merge` is neither a transition nor a read. It writes nothing on
 // the agent's word: it asks, the two incidents are compared, and the rules
 // pick which record survives.
-test("the boss tools are the four transitions, the title, the ask, escalate, park and the two reads", async () => {  const tools = await createBossTools({
+test("the boss tools are the four transitions, the title, the ask, escalate, park, the timeline and the two reads", async () => {  const tools = await createBossTools({
     api: stubApi({ ok: true, directives: [] }),
     boss: { tellBoss: async () => {} },
   });
@@ -259,6 +245,7 @@ test("the boss tools are the four transitions, the title, the ask, escalate, par
       "report_root_cause",
       "search_incidents",
       "set_summary",
+      "track_incident_timeline_event",
     ],
   );
   assert.ok(!tools.some((tool) => BUILTIN_TOOLS.includes(tool.name)));
@@ -702,19 +689,6 @@ test("a drained agent exits clean and an interrupted one does not", () => {
   assert.equal(signalExitCode("SIGINT"), 1);
 });
 
-// The notes are the other half of what a killed run leaves behind, and they
-// ride the same turn_end the session does. Neither event fires on the way
-// out of a signal handler, so a shutdown that flushes one and not the other
-// loses every note written since the last turn.
-test("a signalled shutdown flushes the notes as well as the session", async () => {
-  const flushed: string[] = [];
-  await flushDurable(
-    { flush: async () => void flushed.push("session") },
-    { flush: async () => void flushed.push("notes") },
-  );
-  assert.deepEqual(flushed.sort(), ["notes", "session"]);
-});
-
 test("one failing store does not stop the other, or the exit", async () => {
   const flushed: string[] = [];
   await flushDurable(
@@ -723,9 +697,9 @@ test("one failing store does not stop the other, or the exit", async () => {
         throw new Error("S3 is down");
       },
     },
-    { flush: async () => void flushed.push("notes") },
+    { flush: async () => void flushed.push("other") },
   );
-  assert.deepEqual(flushed, ["notes"]);
+  assert.deepEqual(flushed, ["other"]);
 });
 
 // SIGTERM from a draining task, then an impatient Ctrl-C. Re-entering the

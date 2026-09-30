@@ -11,15 +11,23 @@ import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import type { ExtensionAPI, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  ExtensionAPI,
+  ModelRuntime,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type {
   Directive,
   IncidentMatch,
   IncidentView,
   MergeOutcomeView,
+  TimelineEvent,
+  TimelineEventKind,
   ToolApi,
   ToolResponse,
 } from "../types";
+import { TIMELINE_EVENT_KINDS } from "../types";
 import {
   DEFAULT_MODEL_ID,
   invokeModelIdFor,
@@ -53,19 +61,10 @@ import {
   type PendingQuestion,
 } from "./tools";
 import {
-  createNotesSync,
-  notesPrefixFor,
-  notesOverLimitMessage,
-  notesSyncExtension,
-  notesSyncFailedMessage,
-  restoreNotesDir,
-  NOTES_DIR_NAME,
-  NOTES_LIMITS,
-  NOTES_SYNC_FAILURE_LIMIT,
-  type NoteRecord,
-  type NotesStore,
-  type NotesSync,
-} from "./notes";
+  createPiSummarizer,
+  createStageCompaction,
+  STAGE_FOR_TIMELINE_KIND,
+} from "./compaction";
 import {
   EXIT_ENTRY_TYPE,
   createSessionSync,
@@ -163,19 +162,6 @@ export const signalExitCode = (signal: NodeJS.Signals): number =>
   signal === "SIGTERM" ? 0 : 1;
 
 /**
- * Everything that has to reach S3 before the process goes.
- *
- * Both, in parallel. The session and the notes sync on the same `turn_end`
- * -- one durability cadence, not two -- and neither that event nor
- * `session_shutdown` fires on the way out of a signal handler. Flushing only
- * the session loses every note written since the last turn, which is the
- * half of the run a reader most wants after a kill.
- *
- * `allSettled`, because one failing store must not stop the other from
- * trying, and because a rejection here would leave the process alive with
- * nothing scheduled to end it.
- */
-/**
  * Wraps a shutdown so only the first signal runs it.
  *
  * A second signal before the exit lands -- SIGTERM from a draining task,
@@ -194,6 +180,15 @@ export const onceOnly = <T extends unknown[]>(
   };
 };
 
+/**
+ * Everything that has to reach S3 before the process goes. Neither `turn_end`
+ * nor `session_shutdown` fires on the way out of a signal handler, so this is
+ * the flush that does.
+ *
+ * `allSettled`, because one failing store must not stop another from trying,
+ * and because a rejection here would leave the process alive with nothing
+ * scheduled to end it.
+ */
 export const flushDurable = async (
   ...syncs: readonly { flush: () => Promise<void> }[]
 ): Promise<void> => {
@@ -212,13 +207,6 @@ export const BUILTIN_TOOLS = ["bash", "edit", "find", "grep", "ls", "read", "wri
 export interface AgentPaths {
   workDir: string;
   checkout: string;
-  /**
-   * The agent's own scratch directory. A sibling of the checkout rather than
-   * a folder inside it: anything under the checkout shows up in `git status`
-   * and is one `git add -A` away from being in the pull request the agent
-   * asks a human to merge.
-   */
-  notesDir: string;
   sessionDir: string;
   sessionFile: string;
   npmCiLog: string;
@@ -233,7 +221,6 @@ export const computePaths = (workRoot: string, incidentId: string): AgentPaths =
   return {
     workDir,
     checkout,
-    notesDir: join(workDir, NOTES_DIR_NAME),
     sessionDir,
     sessionFile: sessionFileFor(sessionDir, incidentId),
     npmCiLog: join(workDir, "npm-ci.log"),
@@ -363,7 +350,17 @@ export type BossClient = Omit<ToolApi, "escalate"> &
   QuestionMarkerPort &
   DirectivePeek &
   WaitMarkerPort &
-  BossInboxPort;
+  BossInboxPort &
+  TimelinePeek;
+
+/**
+ * The timeline without the drain. The stage compaction reads it between
+ * turns, where a directive drained through `getIncident` would land in a
+ * result the model never sees.
+ */
+export interface TimelinePeek {
+  timelineEvents(): Promise<TimelineEvent[]>;
+}
 
 export const createBossClient = (args: {
   baseUrl: string;
@@ -405,6 +402,9 @@ export const createBossClient = (args: {
       call<ToolResponse<MergeOutcomeView>>("POST", "/propose-merge", payload),
     searchIncidents: (payload) =>
       call<ToolResponse<IncidentMatch[]>>("POST", "/search", payload),
+    trackTimelineEvent: (payload) =>
+      call<ToolResponse<TimelineEvent>>("POST", "/timeline", payload),
+    timelineEvents: () => call<TimelineEvent[]>("GET", "/timeline"),
     peekDirectives: () => call<PendingDirective[]>("GET", "/directives"),
     consumeDirective: (id) =>
       call<void>("DELETE", `/directives/${id}`).then(() => undefined),
@@ -453,6 +453,7 @@ export const createBossTools = async (args: {
   api: Omit<ToolApi, "escalate">;
   boss: Pick<BossInboxPort, "tellBoss">;
   onRootCause?: () => void;
+  onTimelineEvent?: (kind: TimelineEventKind) => void;
 }): Promise<ToolDefinition[]> => {
   const { Type } = await import("typebox");
 
@@ -594,7 +595,7 @@ export const createBossTools = async (args: {
       name: "report_analysis",
       label: "Report analysis",
       description:
-        "RESOLVED -> CLOSED, your last act. Markdown post-mortem: summary, timeline, humans involved, impact, root cause with five whys, owned prevention items. On a recurrence, `recurrence` is required.",
+        "RESOLVED -> CLOSED, your last act. Markdown post-mortem: summary, timeline (built from get_incident's timeline), humans involved, impact, root cause with five whys, owned prevention items. On a recurrence, `recurrence` is required.",
       parameters: Type.Object({
         postmortem: Type.String(),
         usersImpacted: Type.Number(),
@@ -665,6 +666,38 @@ export const createBossTools = async (args: {
             (directive) => directive.type === "stop" || directive.type === "merged",
           ),
         };
+      },
+    },
+    {
+      name: "track_incident_timeline_event",
+      label: "Track timeline event",
+      description:
+        "Record a key moment in this incident when it happens: first error, impact confirmed, root cause found, mitigated, fix PR opened, merged, deployed, verified. The closer writes the post-mortem timeline from these, and they survive when your context is summarised.",
+      parameters: Type.Object({
+        kind: Type.Union(
+          TIMELINE_EVENT_KINDS.map((kind) => Type.Literal(kind)),
+          {
+            description:
+              "fix_pr_opened and fix_merged also summarise your context for the next stage.",
+          },
+        ),
+        occurredAt: Type.Number({
+          description:
+            "Epoch millis of when it happened, from the evidence, not when you noticed it.",
+        }),
+        summary: Type.String({ description: "What happened, in one sentence." }),
+        evidenceUrl: Type.Optional(
+          Type.String({
+            description: "A link that shows it: the PR, the Grafana query, the deploy run.",
+          }),
+        ),
+      }),
+      execute: async (_id: string, params: unknown) => {
+        const response = await args.api.trackTimelineEvent(
+          params as unknown as Parameters<ToolApi["trackTimelineEvent"]>[0],
+        );
+        if (response.ok && response.data) args.onTimelineEvent?.(response.data.kind);
+        return bossToolResult(response);
       },
     },
     {
@@ -857,7 +890,7 @@ export interface RunIncidentAgentOptions {
   grafana?: { url: string; token: string; command?: string; args?: string[] };
   /** From `BUGBOSS_ALERT_SLUGS`: which rules fired, so the prompt carries them. */
   alertSlugs?: string[];
-  store?: SessionStore & NotesStore;
+  store?: SessionStore;
   api?: BossClient;
   skipClone?: boolean;
 }
@@ -1346,32 +1379,6 @@ export const runIncidentAgent = async (
     await cloneOmni(options.omniRepoUrl ?? DEFAULT_OMNI_REPO, paths.checkout);
   }
   const restored = await restoreSessionFile({ store, key, sessionFile: paths.sessionFile });
-  const notesPrefix = notesPrefixFor(key);
-  const notes = await restoreNotesDir({ store, prefix: notesPrefix, dir: paths.notesDir });
-  console.log(
-    JSON.stringify({
-      component: "agent",
-      event: "notes_restored",
-      incidentId: options.incidentId,
-      prefix: notesPrefix,
-      files: notes.fileCount,
-    }),
-  );
-  if (notes.conflicts.length > 0) {
-    // A note that cannot be put back on disk. The record still has it, so this
-    // is the only place anyone learns the agent is starting without part of
-    // its own work -- and the only prompt to go and delete the stale key.
-    console.error(
-      JSON.stringify({
-        component: "agent",
-        level: "error",
-        event: "notes_restore_conflict",
-        incidentId: options.incidentId,
-        prefix: notesPrefix,
-        entries: notes.conflicts,
-      }),
-    );
-  }
   // The turn budget is over the incident, not over this process, so a launch
   // starts from what the restored transcript already spent. Read here rather
   // than inside `launch` for the same reason the pinned model is: both are
@@ -1443,8 +1450,6 @@ export const runIncidentAgent = async (
       modelRuntime,
       mcp,
       restored,
-      notesPrefix,
-      notesSeen: notes.seen,
       storedPrefix: pinned.storedPrefix,
       priorUsage,
     });
@@ -1456,7 +1461,7 @@ export const runIncidentAgent = async (
 const launch = async (args: {
   options: RunIncidentAgentOptions;
   paths: AgentPaths;
-  store: SessionStore & NotesStore;
+  store: SessionStore;
   key: string;
   api: BossClient;
   pi: typeof import("@earendil-works/pi-coding-agent");
@@ -1464,8 +1469,6 @@ const launch = async (args: {
   modelRuntime: ModelRuntime;
   mcp: McpToolset[];
   restored: boolean;
-  notesPrefix: string;
-  notesSeen: Map<string, NoteRecord>;
   storedPrefix: StoredPrefix | null;
   priorUsage: SessionUsage;
 }): Promise<RunIncidentAgentResult> => {
@@ -1480,10 +1483,46 @@ const launch = async (args: {
   const wrapUpAbort = new AbortController();
   const waits = createWaitInterrupt();
 
+  const settings = pi.SettingsManager.inMemory({
+    compaction: {
+      enabled: true,
+      reserveTokens: reserveTokensFor(model),
+      keepRecentTokens: COMPACTION_KEEP_RECENT_TOKENS,
+    },
+  });
+
+  // Assigned once the session exists; nothing that reads it runs before then.
+  let live: Pick<AgentSession, "steer" | "abort" | "thinkingLevel" | "agent"> | null = null;
+
+  const stages = createStageCompaction({
+    settings,
+    reserveTokens: reserveTokensFor(model),
+    contextWindow: model.contextWindow,
+    timeline: () => api.timelineEvents(),
+    summarize: createPiSummarizer({
+      compact: pi.compact,
+      modelRuntime,
+      model,
+      settings,
+      session: () => live,
+    }),
+    log: (event, fields) =>
+      console.log(
+        JSON.stringify({ component: "agent", event, incidentId: options.incidentId, ...fields }),
+      ),
+  });
+
   const bossTools = await createBossTools({
     api,
     boss: api,
-    onRootCause: () => startNpmCi(paths),
+    onRootCause: () => {
+      startNpmCi(paths);
+      stages.request("root_cause");
+    },
+    onTimelineEvent: (kind) => {
+      const stage = STAGE_FOR_TIMELINE_KIND[kind];
+      if (stage) stages.request(stage);
+    },
   });
   const localTools = [
     await createMonitorTool({
@@ -1525,8 +1564,6 @@ const launch = async (args: {
         systemPrompt: composeSystemPrompt({
           incidentId: options.incidentId,
           checkoutPath: paths.checkout,
-          notesDir: paths.notesDir,
-          notesLimits: NOTES_LIMITS,
           toolNames,
           npmCiDoneMarker: paths.npmCiDone,
           npmCiFailedMarker: paths.npmCiFailed,
@@ -1584,14 +1621,6 @@ const launch = async (args: {
     }
   };
 
-  const notesSync = createNotesSync({
-    store,
-    prefix: args.notesPrefix,
-    dir: paths.notesDir,
-    seen: args.notesSeen,
-    limits: NOTES_LIMITS,
-  });
-
   // SIGKILL cannot be caught and the dispatcher's backstop uses it, so this
   // upgrades only the kills that arrive politely: a container stopping, a
   // deploy draining, an operator scaling the service down. Those are the
@@ -1620,7 +1649,7 @@ const launch = async (args: {
     // exit itself -- and on a timer as well as on the flush, because a hung
     // PUT must not be what keeps a draining container alive.
     const quit = (): void => process.exit(signalExitCode(signal));
-    void flushDurable(sync, notesSync).then(quit, quit);
+    void flushDurable(sync).then(quit, quit);
     setTimeout(quit, SIGNAL_FLUSH_GRACE_MS).unref();
   });
   for (const signal of signals) process.on(signal, onSignal);
@@ -1628,11 +1657,6 @@ const launch = async (args: {
     for (const signal of signals) process.off(signal, onSignal);
   };
 
-  // Assigned once the session exists; the first flush cannot precede it.
-  let live: {
-    steer: (message: string) => Promise<unknown>;
-    abort: () => Promise<unknown>;
-  } | null = null;
   const onSyncFailure = (error: Error, streak: number): void => {
     console.error(
       JSON.stringify({
@@ -1648,75 +1672,6 @@ const launch = async (args: {
     if (streak === SESSION_SYNC_FAILURE_LIMIT) {
       void live?.steer(sessionSyncFailedMessage(streak)).catch(() => {});
     }
-  };
-
-  // Reported on the edge rather than every turn, for the log as much as for
-  // the steer: the agent cannot act on the same sentence twice, and an error
-  // line repeated once a turn for a day says no more than the first one did
-  // while making the run look like it is failing continuously. Cleared on the
-  // way back under, so a second breach is as loud as the first and an
-  // operator can see it recover.
-  let announcedOverLimit = false;
-  const onNotesFlush = (sync: NotesSync): void => {
-    const error = sync.lastError();
-    if (error) {
-      console.error(
-        JSON.stringify({
-          component: "agent",
-          level: "error",
-          event: "notes_sync_failed",
-          incidentId: options.incidentId,
-          prefix: args.notesPrefix,
-          streak: sync.failureStreak(),
-          error: error.message,
-        }),
-      );
-      if (sync.failureStreak() === NOTES_SYNC_FAILURE_LIMIT) {
-        void live?.steer(notesSyncFailedMessage(sync.failureStreak())).catch(() => {});
-      }
-    }
-
-    const skipped = sync.skipped();
-    if (skipped.length > 0) {
-      console.warn(
-        JSON.stringify({
-          component: "agent",
-          level: "warn",
-          event: "notes_entries_skipped",
-          incidentId: options.incidentId,
-          entries: skipped,
-        }),
-      );
-    }
-
-    const breach = sync.overLimit();
-    if (!breach) {
-      if (announcedOverLimit) {
-        announcedOverLimit = false;
-        console.log(
-          JSON.stringify({
-            component: "agent",
-            event: "notes_within_limit",
-            incidentId: options.incidentId,
-          }),
-        );
-      }
-      return;
-    }
-    if (announcedOverLimit) return;
-    announcedOverLimit = true;
-    console.error(
-      JSON.stringify({
-        component: "agent",
-        level: "error",
-        event: "notes_over_limit",
-        incidentId: options.incidentId,
-        totalBytes: breach.totalBytes,
-        fileCount: breach.fileCount,
-        limits: breach.limits,
-      }),
-    );
-    void live?.steer(notesOverLimitMessage(breach)).catch(() => {});
   };
 
   const maxTurns = options.maxTurns ?? INCIDENT_AGENT_MAX_TURNS;
@@ -1853,14 +1808,6 @@ const launch = async (args: {
     },
   });
 
-  const settings = pi.SettingsManager.inMemory({
-    compaction: {
-      enabled: true,
-      reserveTokens: reserveTokensFor(model),
-      keepRecentTokens: COMPACTION_KEEP_RECENT_TOKENS,
-    },
-  });
-
   const resourceLoader = new pi.DefaultResourceLoader({
     cwd: paths.checkout,
     agentDir: pi.getAgentDir(),
@@ -1872,8 +1819,8 @@ const launch = async (args: {
     appendSystemPromptOverride: () => [],
     extensionFactories: [
       sessionSyncExtension(sync, onSyncFailure),
-      notesSyncExtension(notesSync, onNotesFlush),
       turnBudget.extension,
+      stages.extension,
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
       // every thinking block is signed against.
@@ -1962,8 +1909,6 @@ const launch = async (args: {
     await sync.flush();
     const lost = sync.lastError();
     if (lost) onSyncFailure(lost, sync.failureStreak());
-    await notesSync.flush();
-    onNotesFlush(notesSync);
     session.dispose();
   }
 

@@ -874,6 +874,7 @@ export class Dispatcher {
       getIncident: (args) => tools.getIncident(args),
       proposeMerge: (args) => tools.proposeMerge(args),
       searchIncidents: (args) => tools.searchIncidents(args),
+      trackTimelineEvent: (args) => tools.trackTimelineEvent(args),
       incidentId: row.id,
       sessionRef: row.sessionRef,
       attempt,

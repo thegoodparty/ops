@@ -526,3 +526,36 @@ test("counting a nudge against no wait is an error, not a new wait", async () =>
     "a missing marker is not invented at the moment of the fault",
   );
 });
+
+test("the timeline reads back without a drain, and only for the caller's incident", async () => {
+  await db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO incident_timeline_event (incidentId, kind, occurredAt, recordedAt, summary, evidenceUrl)
+       VALUES (?, 'first_error', 5, 6, 'first 502', NULL), (?, 'first_error', 5, 6, 'not yours', NULL)`,
+    ).run(INCIDENT, OTHER);
+    w.prepare("INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)").run(
+      INCIDENT,
+      JSON.stringify({ type: "stop", reason: "still queued" }),
+      clock,
+    );
+  });
+
+  const events = (await (await authed("/timeline")).json()) as { summary: string }[];
+
+  assert.deepEqual(events.map((event) => event.summary), ["first 502"]);
+  const queued = db.query<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM pending_directive WHERE incidentId = ?",
+    [INCIDENT],
+  )[0].n;
+  assert.ok(queued >= 1, "reading the timeline drains nothing");
+});
+
+test("a timeline event is validated before it reaches the tool API", async () => {
+  const before = reached;
+  const bad = await authed("/timeline", {
+    method: "POST",
+    body: JSON.stringify({ kind: "vibes", occurredAt: 5, summary: "hm" }),
+  });
+  assert.equal(((await bad.json()) as { ok: boolean }).ok, false);
+  assert.equal(reached, before);
+});

@@ -1403,6 +1403,71 @@ describe("getIncident", () => {
   });
 });
 
+describe("the timeline", () => {
+  it("keeps what happened when, and hands it to whoever reads the incident", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    // Recorded out of order, the way an agent finds things out.
+    const late = await tools.trackTimelineEvent({
+      kind: "root_cause_found",
+      occurredAt: 3_000,
+      summary: "a missing index on outreach",
+    });
+    const early = await tools.trackTimelineEvent({
+      kind: "first_error",
+      occurredAt: 1_000,
+      summary: "first 502",
+      evidenceUrl: "https://goodparty.grafana.net/explore?q=1",
+    });
+    assert.equal(late.ok, true, late.error);
+    assert.equal(early.ok, true, early.error);
+
+    const view = (await tools.getIncident()).data as IncidentView;
+    assert.deepEqual(
+      view.timeline.map((event) => [event.kind, event.occurredAt, event.evidenceUrl]),
+      [
+        ["first_error", 1_000, "https://goodparty.grafana.net/explore?q=1"],
+        ["root_cause_found", 3_000, null],
+      ],
+      "oldest first by when it happened, not when it was written down",
+    );
+    assert.ok(view.timeline.every((event) => event.recordedAt >= event.occurredAt));
+  });
+
+  it("does not record a replayed call twice", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    const event = { kind: "fix_pr_opened" as const, occurredAt: 2_000, summary: "opened omni#1" };
+
+    const first = await tools.trackTimelineEvent(event);
+    const replay = await tools.trackTimelineEvent(event);
+
+    assert.equal(replay.data?.id, first.data?.id);
+    assert.equal(((await tools.getIncident()).data as IncidentView).timeline.length, 1);
+  });
+
+  it("refuses a kind it does not know and a time that is not one", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    const kind = await tools.trackTimelineEvent({
+      kind: "vibes" as never,
+      occurredAt: 1_000,
+      summary: "it felt off",
+    });
+    const when = await tools.trackTimelineEvent({ kind: "other", occurredAt: 0, summary: "sometime" });
+
+    assert.equal(kind.ok, false);
+    assert.match(kind.error ?? "", /first_error/, "the refusal lists what it would take");
+    assert.equal(when.ok, false);
+    assert.equal(((await tools.getIncident()).data as IncidentView).timeline.length, 0);
+  });
+});
+
 describe("assign never attaches across RESOLVED", () => {
   it("refuses a resolved incident as a target", async () => {
     await seed("sig-a");

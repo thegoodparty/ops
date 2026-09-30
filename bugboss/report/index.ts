@@ -20,7 +20,7 @@ import { makeAlarm, makeLog } from "../logging";
 import { mrkdwn } from "../slack/format";
 import { agentClosedDetail, bossClosedDetail, closedNotice } from "../toolapi/announce";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
-import type { RecurrenceAnalysis } from "../types";
+import type { RecurrenceAnalysis, TimelineEvent } from "../types";
 import { renderReportPdf } from "./pdf";
 import {
   renderReportDocument,
@@ -204,6 +204,13 @@ export const readReportData = async (
     ],
   );
 
+  const timeline = deps.db.query<TimelineEvent>(
+    `SELECT id, kind, occurredAt, recordedAt, summary, evidenceUrl
+       FROM incident_timeline_event WHERE incidentId = ?
+       ORDER BY occurredAt, id`,
+    [incidentId],
+  );
+
   // Tokens and modelId are the record and come off the row. Turns and the
   // estimated price are read back out of the same session file rollUpUsage
   // summed, so they are simply missing once it ages out -- which is the
@@ -271,6 +278,7 @@ export const readReportData = async (
     signals,
     mergedIn,
     actions,
+    timeline,
     prs: incident.prUrls.map((url) => ({ url, state: states[url] ?? null })),
     recurrence,
     run: {
