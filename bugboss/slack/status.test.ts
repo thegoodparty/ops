@@ -187,6 +187,21 @@ describe("the card, one per lifecycle state", () => {
     assert.doesNotMatch(card, /PARKED/);
   });
 
+  /**
+   * A Boss close leaves the spent-budget wait row behind, which is exactly
+   * incident 2. The premise is that the row is still there when it closes.
+   */
+  test("a closed or merged incident is never shown parked, whatever wait row is left", () => {
+    const leftover = { waitingFor: "a person to decide", liftsOnReply: 0, waitStartedAt: AT - MIN };
+    assert.match(renderStatusLine(facts({ ...leftover, status: "INVESTIGATING" })), /PARKED/, "premise");
+    for (const status of ["CLOSED", "MERGED"] as const) {
+      const done = facts({ ...leftover, status, mergedInto: status === "MERGED" ? "79" : null });
+      assert.doesNotMatch(renderStatusCard(view({ facts: done })), /PARKED/);
+      assert.doesNotMatch(renderStatusLine(done), /PARKED/);
+      assert.doesNotMatch(renderStatusHeader(done), /PARKED/);
+    }
+  });
+
   test("with no session, the activity and spend say so instead of inventing a number", () => {
     const card = renderStatusCard(
       view({ lastActivityAt: null, spend: null, now: "the agent has not recorded a turn yet" }),

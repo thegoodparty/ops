@@ -116,9 +116,15 @@ export const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim(
 export const titleOf = (facts: StatusFacts): string =>
   oneLine(facts.summary ?? facts.firstSignalTitle ?? "no title recorded");
 
-/** A wait on a spent turn budget: parked, and a message will not wake it. */
+/**
+ * A wait on a spent turn budget: parked, and a message will not wake it.
+ * Only while the incident is open: a close does not delete the wait row, so a
+ * closed or merged incident would otherwise keep claiming it can be woken.
+ */
 export const isParked = (facts: StatusFacts): boolean =>
-  facts.waitingFor !== null && facts.liftsOnReply === 0;
+  OPEN_STATUSES.includes(facts.status) &&
+  facts.waitingFor !== null &&
+  facts.liftsOnReply === 0;
 
 /** "4 min ago", from two epoch-ms instants. Whole units only. */
 export const ago = (at: number, now: number): string => {
