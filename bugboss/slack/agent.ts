@@ -1435,8 +1435,15 @@ export class SlackAgent {
       // Resume does both things: the session carries this agent's own
       // reasoning and tool results, and a thread fetch covers the human
       // chatter that arrived while it was away.
+      // A first mention in a thread somebody else started is usually about
+      // what was said above it: "log an incident for this" under a report.
+      // Without the thread the Boss is answering a pointer to nothing.
       const missed =
-        fresh || !prior ? [] : await this.missedMessages(mention, prior.lastSeenTs);
+        fresh || !prior
+          ? mention.threadTs === mention.ts
+            ? []
+            : await this.missedMessages(mention, "0", true)
+          : await this.missedMessages(mention, prior.lastSeenTs);
 
       // A tagged mention is always answered. An untagged follow-up may be
       // two people talking under a Boss answer, so there, as in an incident
@@ -1455,7 +1462,7 @@ export class SlackAgent {
         tools,
         sessionKey,
         fresh,
-        input: this.buildInput(mention, missed),
+        input: this.buildInput(mention, missed, fresh || !prior),
         maxTurns: this.cfg.maxTurns ?? SLACK_AGENT_MAX_TURNS,
         allowSilence,
       });
@@ -1575,6 +1582,7 @@ export class SlackAgent {
   private async missedMessages(
     mention: SlackMention,
     lastSeenTs: string,
+    withBots = false,
   ): Promise<SlackMessage[]> {
     try {
       const all = await this.slack.replies({
@@ -1586,7 +1594,8 @@ export class SlackAgent {
         (m) =>
           tsAfter(m.ts, lastSeenTs) &&
           m.ts !== mention.ts &&
-          !m.botId &&
+          tsAfter(mention.ts, m.ts) &&
+          (withBots || !m.botId) &&
           m.user !== this.cfg.botUserId,
       );
     } catch (err) {
@@ -1596,7 +1605,7 @@ export class SlackAgent {
     }
   }
 
-  private buildInput(mention: SlackMention, missed: SlackMessage[]): string {
+  private buildInput(mention: SlackMention, missed: SlackMessage[], firstTime: boolean): string {
     const said = stripBotMention(mention.text, this.cfg.botUserId);
     const line = said
       ? `<@${mention.user}> says: ${said}`
@@ -1606,7 +1615,9 @@ export class SlackAgent {
       .map((m) => `<@${m.user ?? "unknown"}>: ${m.text}`)
       .join("\n");
     return [
-      `Said in this thread since you last answered (${missed.length} message(s)):`,
+      firstTime
+        ? `Said in this thread before you were tagged (${missed.length} message(s)):`
+        : `Said in this thread since you last answered (${missed.length} message(s)):`,
       transcript,
       "",
       line,

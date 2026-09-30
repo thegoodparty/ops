@@ -718,6 +718,31 @@ describe("session persistence", () => {
     assert.equal(slack.state.calls.length, 0, "nothing to catch up on");
   });
 
+  test("a first mention in a reply thread reads what was said above it", async () => {
+    // Prod, 2026-09-30: a support lead reported a double charge, an engineer
+    // replied "@bugboss please log an incident for this", and the Boss,
+    // handed only that line, asked what "this" was.
+    const { model, slack, agent } = build();
+    slack.state.replies = [
+      { user: "U0NATE", botId: null, text: "A candidate got double charged for one text today.", ts: "100.0" },
+      { user: null, botId: "B0GRAFANA", text: "[PROD] Route errors on POST /v1/payments/events", ts: "110.0" },
+      { user: BOT, botId: "B0BUGBOSS", text: "an earlier BugBoss post", ts: "115.0" },
+      { user: "U0SWAIN", botId: null, text: `<@${BOT}> please log an incident for this`, ts: "120.0" },
+      { user: "U0NATE", botId: null, text: "said after the tag", ts: "130.0" },
+    ];
+    await agent.handle(mention({ ts: "120.0", threadTs: "100.0", text: `<@${BOT}> please log an incident for this` }));
+
+    const run = model.runs[0];
+    assert.equal(run.fresh, true);
+    assert.equal(slack.state.calls.length, 1, "premise: the thread was fetched");
+    assert.match(run.input, /before you were tagged \(2 message\(s\)\)/);
+    assert.match(run.input, /double charged for one text/);
+    assert.match(run.input, /Route errors on POST \/v1\/payments\/events/, "another bot's post above the tag is context too");
+    assert.doesNotMatch(run.input, /an earlier BugBoss post/);
+    assert.doesNotMatch(run.input, /said after the tag/);
+    assert.match(run.input, /log an incident for this$/, "the ask comes last");
+  });
+
   test("a resume loads the session and fetches only what it missed", async () => {
     const { model, slack, objects, agent } = build();
     await agent.handle(mention({ ts: "100.0" }));
