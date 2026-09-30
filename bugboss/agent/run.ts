@@ -1081,9 +1081,9 @@ export const shouldAnnounceExhaustion = (state: TurnBudgetState): boolean =>
  * cannot be dropped without a test noticing.
  *
  * `liftsOnReply: false` is the whole point and it is not the default. A
- * reply is not news about having run out of turns, so waking on one
+ * Boss message is not news about having run out of turns, so waking on one
  * relaunches an agent that is over budget before it starts: it stops again
- * immediately, announces again, and every comment on the thread becomes a
+ * immediately, announces again, and everything the Boss relays becomes a
  * page. It is also what makes the closing brief's "replying here will not
  * restart it" true rather than a wish.
  */

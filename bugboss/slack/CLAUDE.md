@@ -67,10 +67,9 @@ Boss answers, stays silent, or tells the agent something with a
 `boss_message` directive. Nothing on the way reads what the message meant, and
 no human text reaches an agent except through the Boss.
 
-That is why there is no reply classifier, no "who was that for" and no
-`@bugboss` override in a thread. Those existed because a reply went straight
-to the agent and could end its wait on an offhand remark. The Boss is the
-reader now, and two people talking to each other is a message it lets pass.
+Nothing classifies a reply or asks who it was for, and a thread needs no
+`@bugboss` to be heard. The Boss reads every message, and two people talking
+to each other is a message it lets pass.
 
 The `thread_reply` insert stays inside the Slack ack because its id derives
 from `(channel, ts)`: it is what collapses a Slack retry, so the Boss does not
@@ -174,15 +173,21 @@ thread post is capped at about 200 words and a longer one is handed back. The
 two numbers are not alternatives and should not be merged: splitting a 400-word
 post into two 200-word posts does not make it shorter.
 
-The budget binds **every** path into a thread, which is the only way it is a
-budget rather than a habit one of four callers keeps:
+The budget binds every path into a thread that carries free text and still
+has an author to refuse it to:
 
 | Path | Bound |
 | --- | --- |
-| `contact_human`'s ask | 700, tighter still, refused (`tools.ts`) |
-| the loopback `/thread` route | `THREAD_PROSE_CHARS`, refused with a 400 |
-| `report_resolved`'s evidence, `escalate`'s brief | `THREAD_PROSE_CHARS`, rejected ahead of the post |
+| `report_resolved`'s evidence | `THREAD_PROSE_CHARS`, rejected ahead of the transition (`toolapi/index.ts`) |
+| the Boss's `close_incident` and `page_rotation` reasons | `THREAD_PROSE_CHARS`, rejected before anything changes (`boss/commands.ts`) |
+| a dispatcher escalation brief (crash loop, launch cap, deadline) | `THREAD_PROSE_CHARS`, through the tool API's `escalate` |
+| the Boss's own answer (`slack/agent.ts`) | its prompt's "about 200 words"; `postProse` splits it, nothing refuses it |
+| code-composed notices: `report_root_cause`'s split and merge notices, impact changes, closed notices, the dispatcher's stale and resume notices | none; code writes them |
 | `report_analysis`'s post-mortem | **none** |
+
+An agent's `escalate` and `message_boss` are not on the list. Both land in
+`boss_inbox` (`boss/inbox.ts`), and the Boss decides what of them reaches the
+thread.
 
 **The thread is short; the document is complete.** The post-mortem is the
 exemption because it does not go to the thread as text — it leaves as the
@@ -190,31 +195,6 @@ closing report, a Markdown file (`report/CLAUDE.md`). The one place the
 document does reach the thread is the degraded path when the upload fails, and
 that call is `postDocument` rather than `postProse` so the exemption is a name
 somebody can grep for instead of a check somebody forgot.
-
-Harness-written posts are the exception to the exception: `unansweredBrief`,
-`stalledWaitBrief` and `heartbeatMessage` are composed when the model is no
-longer in the loop, so there is nobody to refuse them to — and the wait nudge
-is *dropped* on a failed post by design, because losing a day-long wait to a
-503 is the worse trade. An over-long one would therefore mean an incident that
-waits all day, nudges nobody, and then escalates claiming it nudged three
-times.
-
-They used to buy the fit by clamping the one field with nobody behind it: the
-check's own output, cut to 400 characters. **They do not clamp anything now.**
-
-- The nudge and the re-run notice go out through `postNotice`, which marks
-  them `harnessComposed` on the wire. The `/thread` route skips the budget
-  for those and sends them through `postDocument`, so a long one splits.
-  Splitting a post nobody can rewrite is the whole point: it costs a second
-  message, where a refusal costs the message.
-- The stalled-wait brief cannot take that route, because it goes through
-  `escalate` and a brief is a brief. So it carries no output at all and says
-  the output is in the message below it — `stalledWaitStatus` posts that,
-  whole, on the harness path, right after the escalation lands.
-
-What still has to fit `THREAD_PROSE_CHARS` is the part the harness *wrote*,
-with the model's own fields at their refused maximum. `tools.test.ts`
-composes the worst case of each to keep that true.
 
 ## Incident references are rendered by code, on the way out
 

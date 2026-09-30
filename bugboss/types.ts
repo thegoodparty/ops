@@ -396,7 +396,7 @@ export interface ToolApi {
    * the outside. An agent could already read a stranger's whole post-mortem
    * through `searchIncidents`, which is scoped to RESOLVED and CLOSED, and
    * could not see the open incident beside it: fluent about the past, blind
-   * to the present. The Slack question box has served any incident to anyone
+   * to the present. The Boss has served any incident to anyone
    * in the channel the whole time, and serves more of it than this does.
    */
   getIncident(args?: {
@@ -582,7 +582,7 @@ export interface DispatcherConfig {
   tickSeconds: number;
   /**
    * Wall clock, per launch. A poor proxy for work done and never the only
-   * bound: `monitor` and `contact_human` each cost one turn however long
+   * bound: `monitor` and `message_boss` each cost one turn however long
    * they block, so one real incident spent eight of its nine hours parked on
    * a human and the clock counted all of it.
    */

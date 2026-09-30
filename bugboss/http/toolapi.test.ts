@@ -29,6 +29,7 @@ let clock = 1_000_000;
 let reached = 0;
 let dbPath: string;
 const wakes: { incidentId: string; unseen: BossInboxItem[] }[] = [];
+const escalationsNoted: string[] = [];
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-http-"));
@@ -64,6 +65,9 @@ before(async () => {
       } finally {
         reader.close();
       }
+    },
+    noteEscalated: (incidentId) => {
+      escalationsNoted.push(incidentId);
     },
     now: () => clock,
   });
@@ -247,6 +251,22 @@ test("the Boss is woken only once the row it is woken for is committed", async (
     "a separate connection already sees the row when the wake fires",
   );
   assert.equal(wakes[0].unseen[0].seenAt, null);
+});
+
+test("an escalation tells the dispatcher, and nothing else sent up does", async () => {
+  await clearInbox();
+  escalationsNoted.length = 0;
+
+  for (const kind of ["message", "question"]) {
+    assert.equal((await sendToBoss({ kind, text: `a ${kind}` })).status, 200);
+  }
+  assert.deepEqual(escalationsNoted, [], "the premise: a message or question is not one");
+
+  assert.equal(
+    (await sendToBoss({ kind: "escalation", text: "needs a person" })).status,
+    200,
+  );
+  assert.deepEqual(escalationsNoted, [INCIDENT]);
 });
 
 test("text reaches the inbox whole, with no length limit", async () => {

@@ -543,6 +543,7 @@ test("the re-run notice lands in the Boss's inbox and wakes it, through the real
       wakeBoss: (id) => {
         woken.push(id);
       },
+      noteEscalated: () => {},
       now: () => 2_000_000,
     });
 

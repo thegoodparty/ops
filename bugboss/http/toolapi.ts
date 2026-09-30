@@ -36,6 +36,12 @@ export interface ToolApiHttpDeps {
   toolApiFor: (incidentId: string, token: string) => ToolApi;
   /** Runs the Boss for an incident whose inbox just gained a row. */
   wakeBoss: WakeBoss;
+  /**
+   * Tells the dispatcher an escalation went up from this incident's live run,
+   * so its deadline does not post a placeholder brief over the agent's own.
+   * A real child reaches this route with no dispatcher in the call.
+   */
+  noteEscalated: (incidentId: string) => void;
   now?: () => number;
 }
 
@@ -315,6 +321,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       kind: parsed.data.kind,
       id,
     });
+    if (parsed.data.kind === "escalation") deps.noteEscalated(caller.incidentId);
     deps.wakeBoss(caller.incidentId);
     return c.json({ id });
   });

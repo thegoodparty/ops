@@ -2,8 +2,7 @@
 // "When a human gets pinged" in Layer 4.
 //
 // Outbound is incident status transitions and two notifications. The incident
-// agent posts its own hypotheses, questions and PR links with its own token,
-// so none of that passes through here.
+// agent never posts free text to Slack; what it says goes to the Boss.
 //
 // Inbound records a message in an incident thread against its incident and
 // hands it to the Boss. The agent never reads Slack: the Boss decides what it

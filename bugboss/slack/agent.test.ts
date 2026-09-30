@@ -1197,6 +1197,69 @@ describe("a run that uses its whole budget", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("a run that may stay silent", () => {
+  const narratingThen = (finalText: string): SizedModelClient => {
+    let calls = 0;
+    return {
+      contextWindow: TEST_CONTEXT_WINDOW,
+      complete: () => {
+        calls++;
+        if (calls === 1) {
+          return Promise.resolve({
+            text: "Let me look at the incident first.",
+            toolCalls: [
+              { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+            ],
+            usage: emptyModelUsage(),
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: finalText,
+          toolCalls: [],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply);
+      },
+    };
+  };
+
+  test("hands back nothing, not narration or an apology, when the last turn says nothing", async () => {
+    const { store } = memoryStore();
+    const reads: string[] = [];
+    let answer: string | null = null;
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(narratingThen(""), store).run({
+        ...runRequest([countingTool(reads)], 3),
+        allowSilence: true,
+      });
+      answer = result.text;
+    });
+
+    assert.deepEqual(reads, ["inc-1"], "the narrating turn really did call a tool first");
+    assert.equal(answer, "");
+    assert.ok(!lines.some((l) => l.includes("slack_agent_no_answer")));
+  });
+
+  test("hands back only the final turn's text", async () => {
+    const { store } = memoryStore();
+    const reads: string[] = [];
+    const result = await createSlackAgentModel(
+      narratingThen("inc-1 is being worked by an agent."),
+      store,
+    ).run({ ...runRequest([countingTool(reads)], 3), allowSilence: true });
+
+    assert.deepEqual(reads, ["inc-1"]);
+    assert.equal(result.text, "inc-1 is being worked by an agent.");
+  });
+
+  test("a mention without silence still answers from the narration rather than apologising", async () => {
+    const { store } = memoryStore();
+    const result = await createSlackAgentModel(narratingThen(""), store).run(
+      runRequest([countingTool([])], 3),
+    );
+    assert.equal(result.text, "Let me look at the incident first.");
+  });
+});
+
 describe("the turn budget", () => {
   /** What was open the day a question about all of them went unanswered. */
   const OPEN_INCIDENTS = 11;

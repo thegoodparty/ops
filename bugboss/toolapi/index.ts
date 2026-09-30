@@ -119,7 +119,7 @@ export interface MergeVerdict {
   compared: boolean;
 }
 
-/** Job 5. The Boss posts status transitions; the agent posts its own work. */
+/** Job 5. Status transitions, posted by code whoever caused them. */
 export interface ThreadPoster {
   post(threadTs: string | null, text: string): Promise<{ ts: string }>;
   /**
@@ -834,10 +834,10 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
   /**
    * The one invariant a `CHECK` constraint would have carried if the schema
-   * could still take one. Refused at the tool, like the over-long
-   * `contact_human` message: an agent that cannot say why the last resolution
-   * failed has not finished, and leaving the incident open and escalated is
-   * the correct place for a recurrence nobody can explain.
+   * could still take one. Refused at the tool: an agent that cannot say why
+   * the last resolution failed has not finished, and leaving the incident
+   * open and escalated is the correct place for a recurrence nobody can
+   * explain.
    */
   const recurrenceGap = (
     incident: Incident,
@@ -950,15 +950,16 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     });
 
   /**
-   * The half of the old `handOff` that was always the point. It says in the
-   * thread that this incident needs a person and then changes nothing: the
-   * agent is still driving, so there is no transition to lose a race on and
-   * nothing to retract when the post fails.
+   * The dispatcher's escalation, for a crash loop, a stall or a deadline the
+   * agent did not answer. It says in the thread that this incident needs a
+   * person and then changes nothing: an agent is still driving, so there is
+   * no transition to lose a race on and nothing to retract when the post
+   * fails. An agent's own escalation goes to the Boss's inbox instead.
    *
    * Rejected on a failed post, unlike every notification elsewhere in this
    * module. Everywhere else the state is already committed and the message is
    * commentary; here the message is the entire effect, so an escalation
-   * nobody was told about has not happened and the agent has to know that.
+   * nobody was told about has not happened and the caller has to know that.
    */
   const escalate: ToolApi["escalate"] = (args) =>
     call("escalate", async (incidentId) => {
@@ -972,10 +973,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       }
 
       // The brief is the first thing the person reading this sees, on a
-      // phone, so it answers to the thread budget like every other post. The
-      // harness writes briefs too and cannot be asked to shorten one, which
-      // is why `unansweredBrief` clamps the question it echoes rather than
-      // relying on this staying generous.
+      // phone, so it answers to the thread budget like every other post.
       const longBrief = overThreadBudget("brief", args.brief);
       if (longBrief) return reject(longBrief);
 
@@ -1034,7 +1032,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    * an argument about what it can move, and it says nothing about what it
    * can look at. Withholding the read bought nothing and cost coherence --
    * `searchIncidents` already returns other incidents' root causes and
-   * post-mortems in full, and the Slack question box has served any incident
+   * post-mortems in full, and the Boss has served any incident
    * to anyone in the channel since it was written.
    *
    * It is also what makes `proposeMerge` worth having. An agent asking for

@@ -119,7 +119,7 @@ Containment is a rule about writes. Any agent can read any incident —
 about what it can move, and confining the read only made the system
 incoherent: `search_incidents` reaches `RESOLVED` and `CLOSED` incidents in
 full, so an agent knew the past and could not see the open incident beside it,
-while the Slack question box served that incident to anyone in the channel.
+while the Boss served that incident to anyone in the channel.
 
 The credential is still scoped: the loopback route refuses a path id that is
 not the caller's, and every write goes to that one record.
@@ -132,11 +132,10 @@ root-cause correlation, the inbound-language read and the incident commander
 in `slack/agent.ts`. They share one request path (`bedrock/client.ts`), one
 read-only query guard (`triage/sql.ts`) and one usage accumulator.
 
-The commander is the only interface between people and agents: people talk
-to it in incident threads, agents send it what they need from people, and it
-relays, answers, closes, merges, stops and pages. Every Boss write is an ask
-from the model and a decision made by code -- an answer-tool schema, or a
-write tool that takes an incident and a reason and runs the same guarded
+The commander sits between people and agents (see "The human boundary"),
+and besides relaying it can close, merge, stop and page. Every Boss write is
+an ask from the model and a decision made by code -- an answer-tool schema,
+or a write tool that takes an incident and a reason and runs the same guarded
 transition an agent's call does -- which is what makes "the model proposes;
 the rules decide" structural rather than remembered. The numbered steps below
 are stages of one pipeline, not separate agents.
@@ -294,8 +293,8 @@ through nothing, and two reads:
 | `report_impact` | Repeatable; impact grows during an incident |
 | `report_resolved` | `FIXING → RESOLVED`, with evidence |
 | `report_analysis` | `RESOLVED → CLOSED`, terminal |
-| `escalate` | None. Posts the brief and reaches the rotation; the agent keeps the incident and keeps working |
-| `park` | None. Stops the relaunch until a reply, the cooldown or the stale sweep; the agent keeps the incident. A park with `liftsOnReply: false` is out of turns rather than waiting on news, so none of the three lift it and the sweep only announces it |
+| `escalate` | None. Hands the Boss the brief as an `escalation`; the Boss decides who to reach. The agent keeps the incident and keeps working |
+| `park` | None. Stops the relaunch until a Boss message, the cooldown or the stale sweep; the agent keeps the incident. A park with `liftsOnReply: false` is out of turns rather than waiting on news, so none of the three lift it and the sweep only announces it |
 
 `escalate` and `park` answer different questions, and neither is a hand-off,
 because there is nothing to hand to. Escalating says a person is needed;
@@ -315,10 +314,11 @@ that ever misses the prompt cache, which is why the prefix is written with a
 
 - `monitor(command, interval, timeout, awaitingHuman?)` — block until a
   read-only check passes. The general primitive: PR merged, deploy shipped,
-  alert quiet. With `awaitingHuman` set it nudges the thread inside working
-  hours when the person does not turn up, backing off 1h/2h/4h/8h/16h and then
-  once a day, getting loud enough to reach the rotation and never stopping;
-  without it the wait is silent, because nobody is being asked for anything
+  alert quiet. With `awaitingHuman` set it sends the Boss an `escalation`
+  inside working hours when the person does not turn up, backing off
+  1h/2h/4h/8h/16h and then once a day and never stopping; the Boss decides
+  whether and how loudly to reach anyone. Without it the wait is silent,
+  because nobody is being asked for anything
 - `message_boss(message, wait?, seconds?)` — tell the Boss something, and
   with `wait` block until it answers. The Boss decides whether a person needs
   asking; see "The human boundary". Re-entrant: the marker is written before
@@ -489,7 +489,7 @@ from the other killed every incident agent while triage carried on working.
 
 **Two bounds on a run, and the wall clock is the weaker one.** A deadline is
 external, so it costs nothing in harness capability, but it does not measure
-work: `monitor` and `contact_human` each cost one turn however long they
+work: `monitor` and `message_boss` each cost one turn however long they
 block, and the first nine-hour incident spent about eight of those hours
 inside a single turn waiting on a person. So the run is also bounded in
 **turns**, counted across every launch of one incident -- 92 turns for that
@@ -497,7 +497,7 @@ nine-hour run against a ceiling of 200. Both bounds have the same two
 layers: the child steers itself to write a brief at the soft edge, then it
 is stopped. The wall clock's stop is the parent's SIGKILL, strictly later;
 the turn budget's is `session.abort()` in the child, after the harness has
-escalated (so a person is told, with the spend) and parked (so the
+escalated to the Boss (so a person can be told, with the spend) and parked (so the
 dispatcher does not relaunch it into the same exhausted budget).
 
 Turns rather than dollars because dollars here are an estimate (below) and a
@@ -571,9 +571,11 @@ claimed with an `incident_action` row before it posts, because two publishers
 race in normal operation and a container that dies mid-upload must stay quiet
 rather than post twice.
 
-**The thread is short; the document is complete.** Every path into a thread is
-capped at about 200 words and refuses a longer post -- the ask, the evidence
-under it, the resolution evidence, the escalation brief. The post-mortem is the
+**The thread is short; the document is complete.** Every path code posts into
+a thread is capped at about 200 words and refuses a longer post -- the
+resolution evidence, the dispatcher's escalation brief, the reason on a Boss
+close or page. The Boss's own replies are held to the same length by its
+prompt. The post-mortem is the
 one field with no cap, because it leaves as the file rather than as thread
 text. `slack/CLAUDE.md` has the table of which bound applies where. `report/CLAUDE.md` has the rest, including why the
 publish happens after usage roll-up and not inside the tool call.

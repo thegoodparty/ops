@@ -465,9 +465,8 @@ describe("a failed upload degrades instead of breaking the close", () => {
     // The claim is what stops the sweep ever coming back, so leaving it
     // standing here would lose the report for good -- nothing relaunches an
     // agent on a CLOSED incident. Nothing landed, so a retry cannot post a
-    // second copy, and `contact_human` already settled this trade for the
-    // whole codebase: re-posting can at worst say it twice, not posting
-    // cannot be recovered from at all.
+    // second copy: re-posting can at worst say it twice, not posting cannot
+    // be recovered from at all.
     assert.equal(markers("inc-9"), 0);
     assert.equal(
       db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'inc-9'")

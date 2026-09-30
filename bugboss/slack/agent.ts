@@ -1072,7 +1072,7 @@ export class SlackAgent {
 
       // Resume does both things: the session carries this agent's own
       // reasoning and tool results, and a thread fetch covers the human
-      // chatter and incident-agent posts that arrived while it was away.
+      // chatter that arrived while it was away.
       const missed =
         fresh || !prior ? [] : await this.missedMessages(mention, prior.lastSeenTs);
 

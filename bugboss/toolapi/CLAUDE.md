@@ -32,7 +32,7 @@ It could not open the open incident beside it. `GET /incidents/:id` even took
 an id and threw it away.
 
 So `getIncident` takes an optional id and reads any incident, defaulting to
-the caller's own. This is strictly less than the Slack question box has
+the caller's own. This is strictly less than the Boss has
 served to anyone in the channel since it was written, and it is what makes
 `proposeMerge` worth having: an agent claiming two incidents are the same
 problem should have read the other one.

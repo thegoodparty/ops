@@ -42,9 +42,8 @@ published ahead of it would quote zero tokens.
 ## Published once, marked before it posts
 
 The marker is an `incident_action` row (`report_published`), written **before**
-the upload, in one guarded `INSERT` — the same shape `contact_human` uses for
-its question, and for the same reason: a container that dies mid-post must
-stay quiet rather than post twice on the way back up. Two publishers do race
+the upload, in one guarded `INSERT`, because a container that dies mid-post
+must stay quiet rather than post twice on the way back up. Two publishers do race
 in normal operation (the launch's `finally` and the tick's sweep), and the
 write queue plus the `NOT EXISTS` predicate inside the statement is what
 orders them.
@@ -61,9 +60,8 @@ and nothing is ever posted.
 The claim is handed **back** in exactly one case: the thread took nothing at
 all. Then the marker asserts a report that does not exist, and it is the marker
 that stops the sweep ever returning -- so leaving it would lose the report for
-good. A retry cannot duplicate what never landed, and `contact_human` settled
-this trade for the whole codebase: re-posting can at worst say it twice, not
-posting cannot be recovered from at all. A *partial* post keeps its claim, and
+good. A retry cannot duplicate what never landed: re-posting can at worst
+say it twice, not posting cannot be recovered from at all. A *partial* post keeps its claim, and
 that is the case the ordering was always right about -- half a report somebody
 can read beats a duplicate they have to reconcile.
 

@@ -17,7 +17,7 @@ import {
 import { retryPolicies, WebClient } from "@slack/web-api";
 
 import { makeAlarm } from "../logging";
-import type { ObjectStore, SlackClient } from "./agent";
+import type { ObjectStore, SlackClient, SlackMessage } from "./agent";
 import type { FileUploader } from "../report";
 
 /**
@@ -30,8 +30,10 @@ const alarm = makeAlarm("slack-client");
 
 /**
  * `conversations.replies` is throttled to roughly one request a minute for
- * newer non-Marketplace apps. The Slack agent calls it once per resume and
- * agents never call it at all, which is what keeps us under that.
+ * newer non-Marketplace apps. The Boss calls it once per page per run and
+ * agents never call it at all, which is what keeps us under that. A thread
+ * is read to the end, however many pages that takes: the newest messages are
+ * the last page, and they are the ones a run is for.
  */
 const REPLIES_PAGE_LIMIT = 200;
 
@@ -204,18 +206,29 @@ export const createSlackClient = (
     },
     permalink: linker.permalink,
     replies: async ({ channel, threadTs, oldest }) => {
-      const res = await web.conversations.replies({
-        channel,
-        ts: threadTs,
-        oldest,
-        limit: REPLIES_PAGE_LIMIT,
-      });
-      return (res.messages ?? []).map((m) => ({
-        user: m.user ?? null,
-        botId: m.bot_id ?? null,
-        text: m.text ?? "",
-        ts: String(m.ts ?? ""),
-      }));
+      const byTs = new Map<string, SlackMessage>();
+      let cursor: string | undefined;
+      do {
+        const res = await web.conversations.replies({
+          channel,
+          ts: threadTs,
+          oldest,
+          limit: REPLIES_PAGE_LIMIT,
+          cursor,
+        });
+        // Every page leads with the thread's parent, so it is keyed out.
+        for (const m of res.messages ?? []) {
+          const ts = String(m.ts ?? "");
+          byTs.set(ts, {
+            user: m.user ?? null,
+            botId: m.bot_id ?? null,
+            text: m.text ?? "",
+            ts,
+          });
+        }
+        cursor = res.response_metadata?.next_cursor || undefined;
+      } while (cursor);
+      return [...byTs.values()];
     },
   };
 };

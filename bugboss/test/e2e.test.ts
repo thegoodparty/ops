@@ -479,7 +479,7 @@ test("the loopback API refuses anything but this incident's own token", async ()
  * accident. `/incidents/:id` took an id and threw it away, so an agent could
  * find another incident through `search_incidents` and had no way to open
  * it. The token still scopes every write to one record; the read is not a
- * write, and the Slack question box has served any incident to anyone in the
+ * write, and the Boss has served any incident to anyone in the
  * channel the whole time.
  */
 test("an agent reads another incident over the loopback, with its own token", async () => {
@@ -1072,7 +1072,7 @@ test("an incident created by a split gets a thread of its own", async () => {
   assert.notEqual(split, parent, "the unexplained signal splits into its own incident");
   assert.ok(
     threadOf(split),
-    "without a thread its agent posts top level and contact_human can never be answered",
+    "without a thread nobody can talk to the Boss about it",
   );
 });
 
@@ -1168,7 +1168,7 @@ test("the alerts in one delivery triage together, not one after another", async 
  * somebody had already been called in on opened a *second* incident, with its
  * own thread and its own agent, describing the same outage.
  *
- * Nothing writes ownership now. `escalate` is a Slack post, the incident
+ * Nothing writes ownership now. An escalation is a message, the incident
  * stays whole, and the next alert for that cause lands where it belongs.
  */
 test("a signal for a cause somebody was called in on attaches to it", async () => {
@@ -1734,8 +1734,7 @@ test("an untagged reply in an incident thread reaches the Boss with the incident
 });
 
 /**
- * The half of the old `contact_human` that survives: an agent can still ask
- * and block until it gets an answer. The answer now comes from the Boss, and
+ * An agent can still ask and block until it gets an answer. The answer now comes from the Boss, and
  * the wait has to have been real -- a wait that had already ended, or never
  * started, would pass the outcome assertions just as well.
  */
@@ -1861,6 +1860,94 @@ test("the Boss closing an incident posts the same closed notice an agent's close
     { actorKind: "boss", action: "close" },
     "and the trail says who did it",
   );
+});
+
+/**
+ * A trigger that lands while the thread's run is in flight is never told
+ * the Boss is busy: the holder runs again before it lets go. So the
+ * premise is that the first run was still going when the second message
+ * arrived, and the outcome is that a later run was shown it.
+ */
+test("a message that arrives while the Boss is mid-run is read, not dropped", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-boss-busy", "search-errors"));
+  const id = incidentOf("fp-boss-busy")!;
+  const thread = threadOf(id)!;
+
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let running = false;
+  fakeSlackAgent.script = async () => {
+    running = true;
+    await gate;
+    running = false;
+    return "";
+  };
+
+  const askedBefore = fakeSlackAgent.asked.length;
+  const first = await boss.slackEventAccepted({
+    ...replyIn(thread, "search is slow for me too"),
+    ts: "5000.1",
+  });
+  await until(() => running, "the first run to start");
+
+  const second = await boss.slackEventAccepted({
+    ...replyIn(thread, "it is only the people search, not the district one"),
+    ts: "5000.2",
+  });
+  await second.settled;
+  assert.equal(running, true, "the premise: the first run was still going");
+  assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "and nothing else had run");
+
+  release();
+  await first.settled;
+
+  assert.equal(fakeSlackAgent.asked.length, askedBefore + 2, "the holder ran again");
+  assert.match(
+    fakeSlackAgent.asked.at(-1)!,
+    /only the people search, not the district one/,
+    "on the message that arrived mid-run",
+  );
+  assert.ok(
+    fakeSlack.posts.every((p) => !/busy/i.test(p.text)),
+    "and nobody was told the Boss was busy",
+  );
+});
+
+/**
+ * An agent's escalation is a row in the Boss's inbox, and reaching people is
+ * the Boss's call. When it makes it, the page is composed by code, so it is
+ * the rotation mention and not text the model typed.
+ */
+test("an agent's escalation wakes the Boss, and the Boss's page reaches the rotation", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-esc-page", "refund-errors"));
+  const id = incidentOf("fp-esc-page")!;
+  const thread = threadOf(id)!;
+  const paged = () =>
+    fakeSlack.posts.filter(
+      (p) => p.threadTs === thread && p.text.startsWith(`<!here> *Incident ${id} needs a person*`),
+    );
+  assert.deepEqual(paged(), [], "the premise: nobody has been paged in this thread");
+
+  const brief = "The refund fix needs a person with Stripe dashboard access to confirm it.";
+  let shown = "";
+  fakeSlackAgent.script = async (req) => {
+    shown = req.input;
+    await bossTool(req, "page_rotation", {
+      incidentId: id,
+      reason: "Somebody with Stripe dashboard access needs to confirm the refund fix before it ships.",
+    });
+    return "";
+  };
+  await bossClientFor(id, boss.mintToken(id)).tellBoss("escalation", brief);
+  await until(() => paged().length > 0, "the Boss to page the rotation");
+
+  assert.ok(shown.includes(brief), "the Boss paged on the escalation it was shown");
+  assert.equal(paged().length, 1, "once");
+  assert.match(paged()[0].text, /Stripe dashboard access/);
 });
 
 // --- a person combining two incidents --------------------------------------
@@ -2009,9 +2096,8 @@ test("a combine naming an incident that cannot take signals is declined out loud
 });
 
 /**
- * A merge asked for out in the channel. The mention used to be read as a
- * question and handed to a read-only box, which answered that it could not.
- * Out here there is no incident thread, so both ids come from the message.
+ * A merge asked for out in the channel. There is no incident thread out
+ * here, so both ids come from the message.
  */
 test("a merge asked for at the bot outside a thread is done", async () => {
   const { older, newer } = await twoIncidents("mention");

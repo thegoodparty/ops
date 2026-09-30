@@ -191,7 +191,7 @@ eligible again, so the next tick launches an agent that exhausts before its
 first turn, escalates and pages -- and since the marker above is activity, it
 ages out and the whole thing repeats tomorrow. That is precisely the loop
 `liftsOnReply` exists to end, rebuilt on a 24-hour timer instead of on every
-comment in the thread, and it costs a full agent launch each time round.
+Boss message, and it costs a full agent launch each time round.
 
 Announcing is unconditional, though, because the failure on the other side is
 a permanent park nobody is watching. **Being told is not the same as being

@@ -2,7 +2,7 @@
 --
 -- The control plane's own access patterns are trivial. This is SQL because
 -- the agents need it: triage asks arbitrary questions while deciding, and the
--- Slack agent gives people an open-ended question box.
+-- Boss answers people's open-ended questions from it.
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -220,12 +220,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS incident_fts USING fts5(
   tokenize = 'porter unicode61'
 );
 
--- A question asked by contact_human that has not been answered yet. Lets a
--- resumed agent find the message it already posted rather than asking twice.
+-- A question an agent asked the Boss with message_boss(wait: true) that has
+-- not been answered yet. Lets a resumed agent carry on waiting from askedAt
+-- rather than asking twice.
 CREATE TABLE IF NOT EXISTS pending_question (
   incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
-  -- Empty until the post that follows the marker succeeds. The marker has to
-  -- be durable before the message exists, so there is no ts to record yet.
+  -- Always ''. The question goes to the Boss's inbox, not to a Slack post, so
+  -- there is no ts; the column stays because a live table cannot drop it.
   messageTs         TEXT NOT NULL,
   askedAt           INTEGER NOT NULL,
   message           TEXT NOT NULL DEFAULT ''

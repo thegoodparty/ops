@@ -130,8 +130,8 @@ triage's guard must all agree — they have disagreed before.
 Waiting on a person is a row in `incident_wait`, not a field on the incident.
 It says the dispatcher must not relaunch this incident yet, and nothing more:
 the agent still has the work, and it still holds its dispatcher slot. The
-Boss telling the agent something deletes the row; a reply in the thread goes
-to the Boss and does not. `dispatcher/CLAUDE.md` has the mechanism.
+Boss telling the agent something deletes the row, unless the wait is a spent
+turn budget; a reply in the thread goes to the Boss and does not. `dispatcher/CLAUDE.md` has the mechanism.
 
 **Evidence, not assertion.** `RESOLVED` means no users are affected any more
 and no further alerts should occur, confirmed. Every number the agent
@@ -155,7 +155,7 @@ written down rather than implied. Re-running a failed CI job is the case:
 `gh run rerun` in bash is reachable the way `gh pr merge` is, so `rerun_ci`
 (`agent/rerun.ts`) is an affordance with its discipline attached — one attempt
 per run, read from GitHub's own `run_attempt`; a budget across the incident;
-and a notice posted to the thread by the tool rather than by the model
+and a notice sent to the Boss by the tool rather than by the model
 remembering to mention it. What the App holds and what it deliberately does
 not is [`github-app.md`](./github-app.md).
 

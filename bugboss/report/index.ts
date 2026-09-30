@@ -267,9 +267,8 @@ export type PublishOutcome = "published" | "degraded" | "skipped";
  * Guarded in the INSERT rather than by a read before it, like every other
  * transition here: two publishers can race -- the fast path after an agent
  * exits and the sweep -- and the write queue is the only thing that orders
- * them. `contact_human` sets the same precedent for the ordering: the marker
- * is durable *before* the message exists, so a container that dies mid-post
- * stays quiet rather than saying it twice. A resumed agent cannot re-enter
+ * them. The marker is durable *before* the message exists, so a container
+ * that dies mid-post stays quiet rather than saying it twice. A resumed agent cannot re-enter
  * this at all, since `reportAnalysis` will not run twice against a CLOSED
  * row, but the container restarts on every merge to ops main and the sweep
  * runs on every tick.
@@ -301,11 +300,9 @@ const claim = (db: Db, incidentId: string, at: number): Promise<boolean> =>
  * thread, so the marker says a report was posted that was not, and the sweep
  * should come round again.
  *
- * Deliberately not done after a partial post. `contact_human` can re-ask
- * because an unposted question is detectable -- its marker carries an empty
- * `messageTs` -- and a report has no equivalent, so the choice here is
- * between half a report somebody can see and a duplicate they have to
- * reconcile. Half wins.
+ * Deliberately not done after a partial post. A report has no way to tell
+ * which of its parts landed, so the choice here is between half a report
+ * somebody can see and a duplicate they have to reconcile. Half wins.
  */
 const release = (db: Db, incidentId: string): Promise<void> =>
   db

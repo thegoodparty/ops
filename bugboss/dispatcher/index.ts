@@ -300,7 +300,7 @@ const deadlineBrief = (e: Entry, ranSeconds: number): string =>
     "",
     `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not finish in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed.`,
     "",
-    "What I believe now: whatever the agent last posted in this thread.",
+    "What I believe now: whatever the agent last reported on this incident.",
     "What I ruled out: not recorded.",
     "What I was about to do: unknown. It was still working when time ran out.",
     "Side effects: check the incident for PRs it opened before it died.",
@@ -322,7 +322,7 @@ const crashLoopBrief = (
     "",
     `Its last ${failures} launches each died within ${fastFailureSeconds}s of starting, which is a crash loop rather than an interrupted investigation, so relaunching stopped. Total launches to date: ${row.attempts}.`,
     "",
-    "What I believe now: whatever the agent last posted in this thread.",
+    "What I believe now: whatever the agent last reported on this incident.",
     "What I ruled out: not recorded.",
     "What I was about to do: unknown; each launch died before saying.",
     "Side effects: check the incident for PRs an earlier launch opened.",
@@ -362,7 +362,7 @@ export type StaleOutcome = "quiet" | "unparked" | "held";
  *
  * The `held` arm names the two things that actually move a budget wait, and
  * both are outside the thread. It deliberately does not invite a reply: the
- * closing brief the agent already posted says replying will not restart it,
+ * turn-budget brief the Boss was handed says replying will not restart it,
  * and a nudge here promising otherwise would make that a lie a day later.
  */
 export const staleNotice = (
@@ -389,7 +389,7 @@ const stalledBrief = (row: EligibleRow, launches: number): string =>
     "",
     `It has been launched ${launches} times on this incident and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
     "",
-    "What I believe now: whatever the agent last posted in this thread.",
+    "What I believe now: whatever the agent last reported on this incident.",
     "What I ruled out: not recorded.",
     "What I was about to do: unknown; no launch got far enough to say.",
     "Side effects: check the incident for PRs an earlier launch opened.",
@@ -496,9 +496,9 @@ export class Dispatcher {
    * Needed because the spawn context is not the path a real child takes. In
    * process -- the E2E, the unit tests -- the child calls the context's
    * `escalate` and the dispatcher sees it directly. A real child is a
-   * separate process calling the loopback API, which reaches `toolApiFor`
-   * without the dispatcher in the call at all. So the composition root, which
-   * already wraps that call to add the rotation ping, tells us.
+   * separate process calling the loopback API, which records its escalation
+   * in the Boss's inbox without the dispatcher in the call at all. So the
+   * loopback's inbox route tells us.
    *
    * A no-op for an incident with no live run, which is the honest answer:
    * there is no placeholder pending for one, and nothing to suppress.

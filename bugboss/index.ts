@@ -532,7 +532,8 @@ const noAnswerReply = (
  *
  * It does not carry thinking blocks across a resume the way the incident
  * agent's Pi session does: ModelReply has nowhere to put a signature. That is
- * a deliberate floor for a read-only question box, not an oversight.
+ * a deliberate floor: a Boss run is short, and a resume carries its answers
+ * and tool results, which is what it reasons from next time.
  */
 export const createSlackAgentModel = (
   model: SizedModelClient,
@@ -1128,17 +1129,13 @@ export const createBugBoss = async (
 
     return {
       ...api,
-      // The only call that has to reach the rotation. The tool API posts the
-      // brief itself; this adds the ping, which is the one thing it cannot
-      // know to do.
+      // The dispatcher's own escalations, which have no agent run behind
+      // them to tell the Boss: a crash loop, a stall, a deadline. The tool
+      // API posts the brief itself; this adds the ping, which is the one
+      // thing it cannot know to do.
       escalate: async (args) => {
         const response = await api.escalate(args);
         if (response.ok) {
-          // The dispatcher cannot see this call: a real child reaches the
-          // tool API over the loopback, with no dispatcher in the path. It
-          // has to know, or its deadline posts a placeholder brief on top of
-          // the one this agent just wrote.
-          dispatcher.noteEscalated(incidentId);
           await slack
             .post(
               db.get<{ slackThreadTs: string | null }>(
@@ -2254,6 +2251,7 @@ export const createBugBoss = async (
     toolApiFor,
     now,
     wakeBoss,
+    noteEscalated: dispatcher.noteEscalated,
   });
 
   let servers: BugBossServers | null = null;
