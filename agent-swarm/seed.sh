@@ -259,4 +259,41 @@ PY
   printf '  installed  incident-commander identity on the lead (%s chars)\n' "$IDENTITY_CHARS"
 fi
 
+# ---------------------------------------------------------------------------
+# The task contract
+# ---------------------------------------------------------------------------
+#
+# agent-swarm's assigned-task prompt ends with output instructions, and that is
+# the last thing the lead reads before it works. Complying with those came at the
+# expense of the Slack thread: incidents ran and none opened one, with no Slack
+# send ever attempted, because the platform's contract is "return an output" and
+# the incident procedure was only ever an instruction sitting above it.
+#
+# So the requirement is stated in the same place, in the user turn. Scoped to the
+# lead, not global: boot triage, the board jobs and the coders use this same
+# template and none of them should open incident threads. `PUT` upserts, and the
+# global default is left untouched so this is visible as an override rather than a
+# silent change to the platform.
+TASK_TEMPLATE_BODY='{{work_on_task_cmd}} {{task_id}}{{task_desc_section}}{{attachments_section}}{{output_instructions}}
+
+If the task text begins with `Incident `, you are the incident commander and this is not optional: BEFORE you investigate anything, open a Slack thread in #swain-grafana-testing with slack-start-thread, post the incident header with slack-post, and write the incident to the KV namespace shared/incidents. Get the channel id from `printenv SWARM_INCIDENT_CHANNEL` rather than searching for it. Returning an output with no thread is an incomplete incident, however good the analysis inside it. If you cannot post, say why in your output.'
+
+TEMPLATE_JSON="$(BODY="$TASK_TEMPLATE_BODY" LEAD="$LEAD" python3 - <<'PY'
+import json, os
+print(json.dumps({
+    "eventType": "task.trigger.assigned",
+    "scope": "agent",
+    "scopeId": os.environ["LEAD"],
+    "state": "enabled",
+    "body": os.environ["BODY"],
+    "changeSource": "seed.sh",
+    "changeReason": "State the incident-reporting requirement where the platform states its own output contract",
+}))
+PY
+)"
+request PUT "/api/prompt-templates" "$TEMPLATE_JSON"
+[ "$RESP_STATUS" = "200" ] ||
+  fail "PUT /api/prompt-templates returned $RESP_STATUS: $RESP_BODY"
+printf '  installed  incident-reporting requirement in the assigned-task prompt (lead-scoped)\n'
+
 echo "done. schedules are enabled and will dispatch tasks to the lead agent."

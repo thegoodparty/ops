@@ -59,15 +59,30 @@ agent fleet:
 
 | Piece | Size | What it does |
 | --- | --- | --- |
-| [`bridge/`](./bridge) | 469 lines | Verifies Grafana's signature, de-duplicates by fingerprint, numbers incidents, creates the task |
-| [`incident-commander.md`](./incident-commander.md) | 534 lines of prompt | The state machine, the KV schema, the three Slack report shapes, the board, evidence rules |
-| [`seed.sh`](./seed.sh) | 219 lines | Creates the three recurring jobs: morning board, all-clear, stale sweep |
+| [`bridge/`](./bridge) | 537 lines | Verifies Grafana's signature, splits a delivery into per-alert incidents, numbers them, and carries the output contract |
+| [`incident-commander.md`](./incident-commander.md) | 561 lines of prompt | The operating procedure: state machine, KV schema, Slack report shapes, board, evidence rules |
+| [`incident-commander-soul.md`](./incident-commander-soul.md) | 126 lines of prompt | The identity, installed as the lead's SOUL so it sits at the top of agent-swarm's own base prompt rather than below it |
+| [`seed.sh`](./seed.sh) | 299 lines | The lead's identity, the task output contract, and the three recurring jobs |
 | [`deploy.sh`](./deploy.sh) | Infra | Everything in AWS, idempotent |
 | [`docker-compose.yml`](./docker-compose.yml) | Config | The stack above |
 
-Those three lines of real code and prompt are the whole incident system: 1,222
-lines against BugBoss's 24,594. Everything else in that count is a shell script
-that creates AWS resources or a compose file that starts containers.
+1,523 lines of prompt and glue against BugBoss's 24,594. Everything else in that
+count creates AWS resources or starts containers.
+
+### The one place the platform is made to enforce something
+
+BugBoss's Slack surface comes from code that cannot be skipped. agent-swarm's comes
+from a model deciding to post, and it did not: across eight incidents, with the
+requirement stated three ways, the lead opened no thread and made no Slack call at
+all. What it does follow is the task text, every time that text states something
+explicitly.
+
+So the bridge attaches an `outputSchema` to every incident task, requiring a thread
+permalink, a status and a summary. agent-swarm rejects a completion whose output
+does not match the schema, which turns opening the thread into a precondition of
+finishing rather than a request. It is the same move BugBoss makes in code, written
+in the platform's own schema language, and it is the only piece of BugBoss's
+structural rigor this deployment gets back.
 
 Incidents live in agent-swarm's key-value store, one key per incident at
 `incident:<n>`, with BugBoss's exact status vocabulary:

@@ -168,6 +168,51 @@ const send = (res, status, body) => {
   res.end(payload)
 }
 
+// The task's output contract, and the reason it is a schema rather than a request.
+//
+// agent-swarm rejects a completion whose output does not match this schema, so the
+// Slack thread becomes a precondition of finishing the task rather than an
+// instruction the agent may skip. Instructions alone did not work: three layers of
+// them, the last scoped to this agent and placed in the user turn right after the
+// platform's own output instruction, produced no thread and no Slack call at all
+// across eight incidents. The same agent follows the task text every time that
+// text states a requirement explicitly, so the requirement goes where the agent
+// reliably reads it and the platform enforces it.
+const OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    incidentThreadUrl: {
+      type: 'string',
+      description: 'Permalink to the Slack thread opened for this incident',
+    },
+    status: {
+      type: 'string',
+      enum: ['INVESTIGATING', 'FIXING', 'RESOLVED', 'CLOSED', 'MERGED'],
+    },
+    summary: {
+      type: 'string',
+      description: 'A few words saying what this incident is, not what was concluded about it',
+    },
+  },
+  required: ['incidentThreadUrl', 'status', 'summary'],
+}
+
+const REPORT_CONTRACT = [
+  '',
+  'Required output',
+  '',
+  'Open a Slack thread in the incident channel and report in it as you work. When you',
+  'finish, your task output must be a JSON object matching this schema, and the task',
+  'cannot be completed without one:',
+  '',
+  '  incidentThreadUrl  permalink to the incident thread you opened',
+  '  status             exactly one of INVESTIGATING, FIXING, RESOLVED, CLOSED, MERGED',
+  '  summary            a few words saying what this incident IS',
+  '',
+  'No thread permalink means no completion. If you cannot open a thread, say why, and',
+  'still record the incident in KV at shared/incidents.',
+]
+
 const fingerprintFor = (alert, labels, annotations) => {
   const declared = str(alert.fingerprint)
   if (declared) return declared
@@ -238,6 +283,8 @@ const renderTask = (incident, alert, root, fingerprint) => {
   if (str(alert.silenceURL)) links.push(`  Silence: ${alert.silenceURL}`)
   if (str(root.externalURL)) links.push(`  Grafana: ${root.externalURL}`)
   if (links.length > 0) lines.push('', 'Links:', ...links)
+
+  lines.push(...REPORT_CONTRACT)
 
   const machine = {
     incident,
@@ -396,6 +443,7 @@ const handleGrafana = async (req, res) => {
       tags: [INCIDENT_TAG, `${INCIDENT_TAG}:${incident}`, 'alert'],
       priority: priorityFor(labels.severity),
       contextKey: fingerprint,
+      outputSchema: OUTPUT_SCHEMA,
     }
 
     let taskId
