@@ -39,7 +39,7 @@ import {
   type TurnBudgetState,
 } from "./run";
 import { resolveBedrockModel } from "../bedrock";
-import { createMonitorTool, createWaitInterrupt, type PendingDirective, type PendingWait } from "./tools";
+import { createMessageBossTool, createMonitorTool, createWaitInterrupt, type PendingDirective, type PendingWait } from "./tools";
 import type { Directive } from "../types";
 import { notesPrefixFor } from "./notes";
 import { emptySessionUsage, PROMPT_ENTRY_TYPE } from "./session";
@@ -1377,4 +1377,63 @@ test("a consume that fails is retried without steering the message twice", async
   assert.equal(failures.length, 1);
   await watch();
   assert.equal(consumeCalls, 2);
+});
+
+test("a Boss message the watcher took ends a message_boss wait with the interrupted instruction", async () => {
+  const waits = createWaitInterrupt();
+  const queue = directiveQueue();
+  const steered: string[] = [];
+  let pending: { message: string; askedAt: number } | null = null;
+  let polls = 0;
+  let now = 1_790_798_000_000;
+  const watch = createDirectiveWatcher({
+    api: queue.api,
+    steer: async (text) => steered.push(text),
+    interruptWait: waits.interrupt,
+    onFailure: (error) => assert.fail(String(error)),
+  });
+  const tool = await createMessageBossTool({
+    waitSignal: waits.signal,
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    marker: {
+      getPending: async () => pending,
+      recordPending: async (message) => {
+        pending = { message, askedAt: now };
+        return pending;
+      },
+      clearPending: async () => {
+        pending = null;
+      },
+    },
+    boss: { tellBoss: async () => {}, escalationsSince: async () => ({ count: 0, lastAt: null }) },
+    api: {
+      peekDirectives: async () => {
+        polls += 1;
+        if (polls === 2) {
+          queue.push({ type: "boss_message", text: "do not ship it as scoped", at: now });
+          await watch();
+        }
+        return queue.api.peekDirectives();
+      },
+      consumeDirective: queue.api.consumeDirective,
+    },
+  });
+
+  const out = (await tool.execute(
+    "call-1",
+    { message: "Can someone merge omni#2260?", wait: true },
+    undefined,
+    undefined,
+    undefined as never,
+  )) as { content: { type: string; text: string }[] };
+
+  assert.match(out.content[0].text, /^Stopped waiting for the Boss's answer \(interrupted\)/);
+  assert.deepEqual(steered, ["The Boss says: do not ship it as scoped"]);
+  assert.deepEqual(queue.consumed, [1]);
+  assert.equal(pending, null, "the question no longer looks outstanding");
+  assert.ok(polls <= 3, `ended within a poll, took ${polls - 2}`);
 });
