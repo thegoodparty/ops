@@ -83,6 +83,7 @@ const agentStep = (body: Body, patchPath: string): Answer => {
         intervalSeconds: 20,
         timeoutSeconds: 7200,
         description: "the PR to be merged",
+        waitingFor: `someone to merge ${prUrl}`,
         awaitingHuman: `Merge ${prUrl}`,
       },
     },

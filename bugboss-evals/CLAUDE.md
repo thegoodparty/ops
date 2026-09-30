@@ -2,8 +2,9 @@
 
 Tells whether a BugBoss change, a model change included, made it better or
 worse. Comment `bugboss eval` on an open ops PR: main's BugBoss and the PR's
-run the same three scenarios three times each, and one advisory table comes
-back on the PR. Nothing gates on it.
+run every scenario three times each, and one advisory table comes back on the
+PR. Nothing gates on it. `bugboss eval stub` runs the same pipeline once with
+the scripted model, at zero model spend.
 
 ## What a run is
 
@@ -23,7 +24,9 @@ to end. The harness (`sim/run.ts`) is everything outside it:
   makes the agent's clone see its run's branch as main, and the harness moves
   each new PR onto it. It then plays the reviewer (an `Approved.` /
   `Recommendation: approve` review on every new head and every
-  `delegate review`) and the human who merges once CI is green.
+  `delegate review`) and the human who merges once CI is green, or, when the
+  scenario's `human.merge.after` is `asked`, only once the thread shows the
+  agent waiting on a merge and `delaySeconds` have passed, saying nothing.
 - **Merge means deploy.** The hidden check (`scenarios/<id>/check/`) runs on
   what merged. If it passes, the telemetry flips healthy. It never runs in the
   sandbox's visible CI.
@@ -35,6 +38,8 @@ to end. The harness (`sim/run.ts`) is everything outside it:
   denied. S3 (its snapshot and session files) is `sim/s3.ts`, on disk.
 - **Postgres** for omni's tests is one container per run, as
   `OMNI_TEST_POSTGRES_URL`.
+- **npm** reads one cache per job, warmed from each scenario's lockfile
+  before the runs start; every run's HOME links `.npm` to it.
 
 The BugBoss options this needs are all unset in production:
 `BUGBOSS_GITHUB_TOKEN_FILE`, `SLACK_API_URL`, `BUGBOSS_OMNI_REPO`,
@@ -43,8 +48,13 @@ The BugBoss options this needs are all unset in production:
 ## What the table says
 
 Per scenario and in total, per side: gates passed (closed, fix check passes
-after merge, CI green at every merge, nothing pushed to main), mean cost and
-mean time from alert to close. Quality is the candidate's wins-losses-ties
+after merge, CI green at every merge, nothing pushed to main), mean estimated
+cost (priced from tokens; BugBoss stores tokens, never dollars) and mean time
+from alert to close. A scenario can add its own gates (`gates` in
+`scenario.json`, `core/gates.ts`): checks over the thread, the incident's
+statuses and root cause, the first PR's files and the agent's tool calls,
+such as "the thread heard the merge within fifteen minutes". They get their
+own table. Quality is the candidate's wins-losses-ties
 from `core/judge.ts`: blind (`core/blind.ts`), order-swapped, over each pair's
 root cause, fix diff and post-mortem, with a sign test. Tokens by class are in
 the details. Cost is priced from `core/price.ts` over the agents' session
@@ -65,8 +75,18 @@ In CI: the `bugboss eval` comment. It needs the `bugboss-eval` environment
 (main only) with `BUGBOSS_GP_APP_ID`, `BUGBOSS_GP_INSTALLATION_ID` and
 `BUGBOSS_GP_PRIVATE_KEY`.
 
-Locally, at zero model spend, with a scripted model that applies each
-scenario's proving fix (`sim/stub-model.ts`):
+Every PR touching BugBoss or the evals runs `bugboss-evals-ci.yml`, which
+holds no secrets: it proves each changed scenario's hidden check against omni
+(public), and runs the harness `--offline` against the stub, with a local
+bare repository as the sandbox, up to the root cause. The GitHub leg is
+proven only by `bugboss eval stub`, once the trusted parts are on main.
+
+`--until root_cause|pr_opened|closed` stops each run at a milestone; `closed`,
+the default, is the whole lifecycle.
+
+Never run any of this on a Mac: host git and docker there reach the macOS
+keychain and prompt without end. With a scripted model that applies each
+scenario's proving fix (`sim/stub-model.ts`), on Linux:
 
     npx tsx bugboss-evals/sim/token.ts /tmp/token &   # needs the App env vars
     npx tsx bugboss-evals/sim/compare.ts run --baseline HEAD --candidate HEAD \
@@ -80,6 +100,7 @@ Without `--stub` it spends real Bedrock money.
 A directory under `scenarios/` with `scenario.json` (`core/scenario.ts`), the
 alert, a telemetry generator, a vetted `reference.md` and a hidden check that
 exits 1 at `baseSha` and 0 at `provingFixSha` (`scenarios/prove.test.ts`
-proves it when pointed at an omni clone). Add it to `SCENARIO_IDS` and the
-workflow matrix, then re-seed the sandbox:
+proves it when pointed at an omni clone). A variant of another scenario
+points its files at that one's by relative path (`../<id>/...`). Add it to
+`SCENARIO_IDS` and both workflows' matrices, then re-seed the sandbox:
 `npx tsx bugboss-evals/sim/sandbox.ts seed ~/Repos/thegoodparty/omni`.
