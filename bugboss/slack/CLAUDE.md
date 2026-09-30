@@ -429,6 +429,17 @@ settle, so its inbox rows stay unseen and the watermark stays put. A close or
 merge posts its own notice; when that is the whole answer the Boss still has
 to say so with `stay_silent`.
 
+**Calling `stay_silent` is terminal.** The turn loop (`createSlackAgentModel`
+in `../index.ts`) ends the run the instant that tool is called: no further
+model request goes out, and any text the same turn also wrote is discarded
+and logged, never posted. A tool called alongside it in the same turn --
+`close_incident`, say -- still runs, because its effect is real; what changes
+is that nothing more is read or posted afterward. Incident 2's second failure
+on 2026-09-30 was this exact gap: `close_incident` posted its own notice, the
+Boss called `stay_silent` as the prompt instructs, and the harness asked for
+one more turn anyway, which is where the literal text `(silpersisted)`
+reached the thread after silence had already been chosen.
+
 **It can change state, on evidence.** The write tools are in
 `boss/commands.ts`, appended after the read tools in a fixed order because
 the tools array is part of the cache prefix:

@@ -225,6 +225,15 @@ export const tsAfter = (a: string, b: string): boolean => {
 // ---------------------------------------------------------------------------
 
 /**
+ * Named so the turn loop (`createSlackAgentModel`) can recognise a call to it
+ * without string literals drifting between the two files. Calling this tool
+ * is terminal: the harness that drives this tool set ends the run the moment
+ * it is called, before another model request goes out, and discards any text
+ * the same turn also wrote. See `createSlackAgentModel` in `../index.ts`.
+ */
+export const STAY_SILENT_TOOL = "stay_silent";
+
+/**
  * Whether this run chose to say nothing, and why. One per run, written by
  * `stay_silent` and read by the run once the model is done.
  */
@@ -584,9 +593,9 @@ export const buildTools = ({
       },
     },
     {
-      name: "stay_silent",
+      name: STAY_SILENT_TOOL,
       description:
-        "Post nothing in reply. Only in an incident thread, and only for a message that is not for you -- people talking to each other. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer.",
+        "Post nothing in reply. Only in an incident thread, and only for a message that is not for you -- people talking to each other. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. Calling this ends the run: nothing more is read from you, whether or not you write anything else in this turn.",
       inputSchema: {
         type: "object",
         properties: {
@@ -605,7 +614,7 @@ export const buildTools = ({
         }
         silence.reason = reason;
         return Promise.resolve(
-          "Silence recorded. End your run now without writing anything; any text you write will still be posted.",
+          "Silence recorded. The run ends here; anything else you write in this turn is discarded, not posted.",
         );
       },
     },

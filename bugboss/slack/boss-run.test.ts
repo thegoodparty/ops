@@ -347,6 +347,54 @@ describe("incident 2, replayed", () => {
     assert.ok(chose);
     assert.match(chose, /the message was for another person in the thread/);
   });
+
+  // Incident 2's real second failure, the same day: the Boss closed the
+  // incident correctly, then called stay_silent as the prompt instructs --
+  // and the harness asked the model for one more turn anyway, which is
+  // where the literal text "(silpersisted)" reached the thread after
+  // silence had already been chosen.
+  test("stay_silent is terminal: a turn requested after it is chosen never happens, whatever it would have written", async () => {
+    const { model, requests, reply } = incidentTwoModel((request) => {
+      // Never reached if the fix holds. Requesting this turn at all is the
+      // bug: production got exactly this shape and posted its answer.
+      const silenced = request.messages.some(
+        (m) => m.role === "toolResult" && /Silence recorded/.test(m.text),
+      );
+      if (silenced) return reply("(silpersisted)");
+      const closed = request.messages.some(
+        (m) => m.role === "assistant" && m.toolCalls.some((c) => c.name === "close_incident"),
+      );
+      return closed
+        ? reply("", "stay_silent", { reason: "the closed notice already says it" })
+        : reply("", "close_incident", {
+            incidentId: "2",
+            reason: "Swain removed this alert rule completely, said so in the thread, and the agent's own last turn found it gone from the repo.",
+          });
+    });
+    const { agent, slack, returned } = build(model);
+
+    const lines = await captureLogs(() => agent.handleIncident({ incidentId: "2", trigger: human }));
+
+    assert.deepEqual(returned, [""], "the run ended on the turn that chose silence, not the one after it");
+    assert.ok(
+      !requests.some((r) => r.messages.some((m) => m.role === "toolResult" && /Silence recorded/.test(m.text))),
+      "no request was ever built from a transcript that already recorded silence -- that request never went out",
+    );
+
+    assert.equal(
+      db.get<{ status: string }>("SELECT status FROM incident WHERE id = '2'")?.status,
+      "CLOSED",
+      "close_incident, from the turn before, still ran",
+    );
+    const inThread = slack.posts.filter((p) => p.threadTs === THREAD);
+    assert.ok(inThread.some((p) => /^\*Incident 2 closed\*/.test(p.text)), "the closed notice posted");
+    assert.ok(
+      !inThread.some((p) => p.text.includes("silpersisted")),
+      "nothing from a turn after stay_silent reached the thread",
+    );
+    assert.ok(!lines.some((l) => l.includes('"level":"error"')), lines.join("\n"));
+    assert.ok(lines.some((l) => l.includes('"event":"stay_silent"')));
+  });
 });
 
 describe("incident_status through the real harness", () => {
