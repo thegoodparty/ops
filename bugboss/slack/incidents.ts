@@ -23,7 +23,6 @@
 // it by default rather than by somebody remembering.
 
 import { link, PROTECTED } from "./format";
-import type { SlackBlock } from "./blocks";
 import { makeAlarm } from "../logging";
 
 const alarm = makeAlarm("slack-incidents");
@@ -250,11 +249,6 @@ export interface ReferencePoster {
     text: string,
     channel?: string,
   ): Promise<{ ts: string }>;
-  postChoice(
-    threadTs: string | null,
-    text: string,
-    blocks: readonly SlackBlock[],
-  ): Promise<{ ts: string }>;
   update(channel: string, ts: string, text: string): Promise<void>;
 }
 
@@ -277,8 +271,6 @@ export const withIncidentReferences = <T extends ReferencePoster>(
   ...slack,
   post: async (threadTs, text, channel) =>
     slack.post(threadTs, await refs.render(text, threadTs), channel),
-  postChoice: async (threadTs, text, blocks) =>
-    slack.postChoice(threadTs, await refs.render(text, threadTs), blocks),
   // A header update names its own incident and nothing else, so `ts` is both
   // the message being rewritten and the thread it heads.
   update: async (channel, ts, text) =>

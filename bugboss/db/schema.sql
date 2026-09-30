@@ -268,20 +268,19 @@ CREATE TABLE IF NOT EXISTS incident_wait (
   incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
   -- What is being waited on, in one line, for the thread and the digest.
   waitingFor        TEXT NOT NULL,
-  -- Runnable again from this moment. NULL means nothing but a reply or the
+  -- Runnable again from this moment. NULL means nothing but a Boss message or the
   -- stale sweep will lift it, which is the right shape for a wait on a person
   -- with no deadline of its own.
   wakeAt            INTEGER,
-  -- Whether a reply in the thread ends this wait.
+  -- Whether the Boss messaging the agent ends this wait.
   --
   -- Named for the rule rather than for who parked, because that is the
-  -- question a new caller has to answer: would somebody replying mean this
-  -- is over? Waiting on a person is yes, and it is the reason the delete in
-  -- `recordReply` reads no message and asks no model -- talking to an
-  -- incident wakes it, full stop. Waiting because the run is out of budget
-  -- is no: a reply adds no turns, so waking on one relaunches an agent that
-  -- exhausts again immediately and escalates again, which turned every
-  -- comment on the thread into a page for the rotation.
+  -- question a new caller has to answer: would news reaching the agent mean
+  -- this is over? Waiting on a person is yes, and it is why the delete in
+  -- `pushDirective` reads no message and asks no model -- a `boss_message`
+  -- wakes the incident, full stop. Waiting because the run is out of budget
+  -- is no: a message adds no turns, so waking on one relaunches an agent that
+  -- exhausts again immediately and escalates again.
   --
   -- Defaults to lifting, which is both the older behaviour and the safer
   -- side: a wait that lifts when it should not costs one relaunch, where one
@@ -290,7 +289,8 @@ CREATE TABLE IF NOT EXISTS incident_wait (
   startedAt         INTEGER NOT NULL
 );
 
--- Slack replies the Boss has relayed, which agents poll for.
+-- Every message a person writes in an incident thread, recorded on arrival.
+-- The id derives from (channel, ts), which is what collapses a Slack retry.
 CREATE TABLE IF NOT EXISTS thread_reply (
   id                TEXT PRIMARY KEY,
   incidentId        TEXT NOT NULL REFERENCES incident(id),

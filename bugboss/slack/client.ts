@@ -14,10 +14,9 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { retryPolicies, WebClient, type KnownBlock } from "@slack/web-api";
+import { retryPolicies, WebClient } from "@slack/web-api";
 
 import { makeAlarm } from "../logging";
-import type { ChoicePoster } from "./blocks";
 import type { ObjectStore, SlackClient } from "./agent";
 import type { FileUploader } from "../report";
 
@@ -155,12 +154,12 @@ export const createCachingLinker = (
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
-): SlackClient & ChoicePoster & SlackLinker & SlackUpdater => {
+): SlackClient & SlackLinker & SlackUpdater => {
   // The SDK defaults to ten retries over about thirty minutes and does not
   // reject a rate-limited call, so a 429 parks the caller inside the SDK with
   // nothing thrown and nothing logged. Posts are off the ingest request now,
-  // but an agent blocked in contact_human still waits on one, so the ceiling
-  // has to be minutes rather than half an hour.
+  // but a run waiting on a post still waits on one, so the ceiling has to be
+  // minutes rather than half an hour.
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
   });
@@ -193,21 +192,6 @@ export const createSlackClient = (
     },
     react: async (channel, ts, name) => {
       await web.reactions.add({ channel, timestamp: ts, name });
-    },
-    // `text` goes alongside the blocks rather than being replaced by them:
-    // without it every notification for this message reads "This content
-    // can't be displayed", which is the whole question on a phone.
-    postChoice: async (threadTs, text, blocks) => {
-      const res = await web.chat.postMessage({
-        channel: defaultChannel,
-        thread_ts: threadTs ?? undefined,
-        text,
-        blocks: blocks as KnownBlock[],
-        unfurl_links: false,
-        unfurl_media: false,
-      });
-      if (!res.ts) throw new Error("chat.postMessage returned no ts");
-      return { ts: res.ts };
     },
     // `text` replaces the whole message, so the caller passes the header and
     // the original body together. There is no partial edit and no append.

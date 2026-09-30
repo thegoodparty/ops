@@ -50,10 +50,10 @@ take zero pull requests or four.
 
 Waiting on a person is a row in **`incident_wait`**, not a field on the
 incident. It says one thing: do not relaunch this incident yet. The agent
-still has the work and still holds its dispatcher slot. Any reply in the
-thread deletes the row, and that delete is deliberately upstream of anything
-that reads what the reply meant, so talking to an incident wakes it with no
-model in the path.
+still has the work and still holds its dispatcher slot. The Boss telling the
+agent something deletes the row: a person's word reaches an agent only
+through the Boss, so a `boss_message` is the news a wait on a person is
+waiting for.
 
 `incident.summary` is the one field that says what the incident **is**,
 rather than what was concluded about it. The row carried `rootCause`,
@@ -108,8 +108,9 @@ An agent that concludes its partition is wrong cannot consolidate — that is
 what keeps a compromised one to a single record. It asks instead, through
 `propose_merge`: the Boss compares the two on the judgement it already uses
 after a root cause, and `assign` decides which record survives. A person asks
-by saying so in Slack, which `slack/intent.ts` reads and the composition root
-applies as `human`.
+the Boss in an incident thread, which merges with `merge_incidents`, or asks
+at the bot in the channel, which `slack/intent.ts` reads and the composition
+root applies as `human`.
 
 ## Reads are not contained
 
@@ -201,7 +202,7 @@ two children on one incident, and both would write the same session file.
 The dispatcher is also the only thing that notices an incident nobody is
 working. Every other guard watches a run, so an incident with no run at all
 is invisible to all of them, and `park` makes that state reachable: a wait
-with no wake is lifted by a reply that may never come. `sweepStale` reads one
+with no wake is lifted by a Boss message that may never come. `sweepStale` reads one
 clock over the incident's own timestamps, its thread replies and its recorded
 actions, and an incident quiet for `BUGBOSS_STALE_HOURS` is un-parked, said
 out loud in the thread and alarmed. The marker it writes is itself activity,
@@ -237,35 +238,27 @@ fixes, opens a PR, waits for a merge and a deploy, and writes a post-mortem.
 ## The human boundary
 
 Everything a person says to BugBoss is a sentence, not a command. There is no
-slash command, no button and no phrase to learn: inbound Slack text is read
-by a bounded model call (`slack/intent.ts`) which answers one label, and
-that is the only thing in this system that reads what a person wrote.
+slash command, no button and no phrase to learn.
 
-Two interfaces use it. In an incident thread it answers one thing about one
-message: whether it was for the agent at all. On a mention anywhere else it
-answers whether somebody is reporting something broken or asking a question —
-the two things a mention can be, and previously the difference between a first
-word of `report` and any other first word.
+**The Boss is the only interface between people and incident agents.** Every
+message in an incident thread, tagged or not, goes to the Boss with the
+incident as context. The Boss answers, stays silent, or tells the agent
+something with a `boss_message` directive. An agent never posts free text to
+Slack and never reads it: when it needs something from a person it writes to
+the Boss's inbox (`boss/inbox.ts`), and the Boss decides whether and how to
+ask. An agent can still block on a question, and any `boss_message` ends the
+wait.
 
-The first question exists because `contact_human` ends its wait on the first
-reply after its question, so two people talking to each other while an agent
-was blocked ended it on whichever of them spoke first. A message somebody sent
-to the thread rather than to the agent is still recorded and still delivered;
-it just cannot end a wait. An explicit `@bugboss` overrides the read and
-always means "this is for you", decided in code so it survives the model being
-down.
+State-change notices are not conversation. Opened, root cause, resolved,
+closed and merged posts are emitted by code on the transition, whether the
+agent or the Boss caused it.
 
-It is advisory, on the same split as triage. The model reads the sentence;
-the code holds the invariants. A wrong read is bounded structurally rather
-than by the model behaving: the incident comes from the thread the message
-arrived in and never from the message, the answer is a bare enum with no field
-that could name one, and nothing it answers writes to the incident at all —
-the only effect is which directive the agent sees and whether it may end a
-wait. An ambiguous read asks in the thread, and a failed call says the read
-failed. Nothing goes quiet, which is what the old
-string matchers did whenever somebody phrased it their own way.
-
-The read runs off the Slack ack, beside the Slack agent, for the reason the
+A mention outside any incident thread is read by a bounded model call
+(`slack/intent.ts`) which answers whether somebody is reporting something
+broken, asking a question, or asking for two incidents to be combined. It is
+advisory, on the same split as triage: the model reads the sentence, the code
+holds the invariants, an ambiguous read asks, and a failed call says the read
+failed. The read runs off the Slack ack, beside the Boss, for the reason the
 webhook acknowledges before it works.
 
 ## The agent boundary
@@ -326,21 +319,18 @@ that ever misses the prompt cache, which is why the prefix is written with a
   hours when the person does not turn up, backing off 1h/2h/4h/8h/16h and then
   once a day, getting loud enough to reach the rotation and never stopping;
   without it the wait is silent, because nobody is being asked for anything
-- `contact_human(message, details, timeout, options?)` — post to the thread
-  and block for a reply that was **for the agent**; see "The human boundary".
-  Re-entrant: the marker is written before the post, so a resumed agent
-  resumes waiting rather than asking twice. `details` is a second, separate
-  post underneath the ask, so evidence is available without being the first
-  thing read. `options` render as buttons on the ask; pressing one is recorded
-  and delivered as an ordinary reply, typing something else always works, and
-  a button nobody presses is an unanswered question like any other. A wait
-  nobody answers escalates, and the agent goes on waiting
+- `message_boss(message, wait?, seconds?)` — tell the Boss something, and
+  with `wait` block until it answers. The Boss decides whether a person needs
+  asking; see "The human boundary". Re-entrant: the marker is written before
+  the wait, so a resumed agent resumes waiting rather than asking twice. Any
+  `boss_message` ends the wait. A wait nobody answers escalates to the Boss,
+  and the agent goes on waiting
 
 ### How an agent learns things changed
 
 There is no push channel and an agent is never addressable. Directives ride
 back on responses to calls the agent was already making — `stop`, `merged`,
-`new_signals`, `human_message`, `resumed_after`.
+`new_signals`, `boss_message`, `resumed_after`.
 
 `new_signals` names the incidents that were emptied into this one, when that
 is how the signals arrived. Without it a merge reaches the surviving agent as
@@ -436,7 +426,7 @@ deleting is not the way back.
 | `dispatcher/` | Launch, deadlines, escalation, parking, the stale sweep, the circuit breaker |
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
 | `bedrock/` | The Pi provider over Bedrock `InvokeModel`, and the Boss's client on it |
-| `slack/` | Outbound relay, inbound intent, the incident commander, and how outbound text is rendered |
+| `slack/` | Outbound relay, inbound routing to the Boss, the mention read, the incident commander, and how outbound text is rendered |
 | `board/` | When the status board says anything: headers, the morning post, the all-clear |
 | `report/` | The closing report: assemble, render, publish once |
 | `http/` | Public routes and the loopback tool API |

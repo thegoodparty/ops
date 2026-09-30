@@ -64,9 +64,9 @@ It stays because `ignored` is load-bearing. The HTTP layer decides whether a
 delivery earns its :eyes: by excluding `ignored`, so the kind is not just a
 description — it is the difference between somebody seeing an
 acknowledgement and seeing nothing. Collapsing an untagged reply in an
-incident thread into `ignored` therefore takes the acknowledgement off the
-one message most likely to be an answer a blocked agent is waiting for, which
-is the failure the natural-language work exists to remove.
+incident thread into `ignored` therefore takes the acknowledgement off how a
+person talks to the Boss about an incident, which is the failure the
+natural-language work exists to remove.
 
 The invariant, tested in `test/e2e.test.ts`: **nothing the relay acts on may
 be `ignored` here.** The reverse is allowed on purpose — an acknowledgement

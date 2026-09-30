@@ -3,20 +3,21 @@
 // This layer answers what a signature, an event envelope and a thread id can
 // answer, and stops there:
 //
-//   incident_reply  the message is in a thread BugBoss owns. Whoever it was
-//                   for, the Boss does something with it.
+//   incident_reply  the message is in a thread BugBoss owns, tagged or not.
+//                   It goes to the Boss with the incident as context.
 //   mention         the app was tagged anywhere else.
 //   ignored         nothing will come of this: a bot echo, an edit, a message
 //                   nobody addressed to us in a thread we do not own.
 //
 // `ignored` has to keep meaning exactly that, because the HTTP layer decides
 // whether a delivery earns its :eyes: by excluding it. An untagged reply in an
-// incident thread is the documented way to answer a waiting agent, so calling
-// it ignored is how somebody answers an agent and sees nothing happen.
+// incident thread is how a person talks to the Boss about that incident, so
+// calling it ignored is how somebody answers a question and sees nothing
+// happen.
 //
-// What the message *means* is not here. Whether it hands the incident over,
-// whether it was for the agent, whether a mention is a report or a question
-// -- all model calls, made off the Slack ack in the composition root. Nothing
+// What the message *means* is not here. Whether a mention is a report or a
+// question is a model call made off the Slack ack in the composition root,
+// and what a reply in an incident thread asks for is the Boss's to read. Nothing
 // here reads the words a person chose, so there is no verb to learn and no
 // phrasing that silently does nothing.
 //
@@ -27,7 +28,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import type { IncomingRequest } from "../types";
-import { CHOICE_ACTION_PREFIX, type SlackChoiceClick } from "../slack/blocks";
 
 export const SIGNATURE_HEADER = "X-Slack-Signature";
 export const TIMESTAMP_HEADER = "X-Slack-Request-Timestamp";
@@ -229,88 +229,4 @@ export const classifySlackEvent = async (
   }
 
   return { kind: "mention", message };
-};
-
-// ---------------------------------------------------------------------------
-// Interactivity
-// ---------------------------------------------------------------------------
-
-/**
- * Slack posts a button press to the same request URL as an event, signed the
- * same `v0=` way over the same raw body, and answers on the same three-second
- * budget. Only the encoding differs: a form body with one `payload` field
- * holding the JSON. Nothing else BugBoss receives is form-encoded, so the
- * content type is the whole discriminator.
- */
-export const INTERACTION_CONTENT_TYPE = "application/x-www-form-urlencoded";
-
-export const isInteractionDelivery = (req: IncomingRequest): boolean =>
-  (headerValue(req, "Content-Type") ?? "")
-    .toLowerCase()
-    .includes(INTERACTION_CONTENT_TYPE);
-
-export type SlackInteraction =
-  | { kind: "choice"; click: SlackChoiceClick }
-  | { kind: "ignored"; reason: string };
-
-const field = (source: unknown, key: string): string => {
-  if (typeof source !== "object" || source === null) return "";
-  const value = (source as Record<string, unknown>)[key];
-  return typeof value === "string" ? value : "";
-};
-
-/**
- * Verify and classify one button press. Throws on an inauthentic delivery for
- * the same reason the event path does: this endpoint is public, and an
- * unverified one lets anyone answer an agent's question in somebody's name.
- */
-export const classifySlackInteraction = (
-  req: IncomingRequest,
-  config: SlackConfig = {},
-): SlackInteraction => {
-  createSlackVerifier(config)(req);
-
-  const encoded = new URLSearchParams(req.rawBody).get("payload");
-  if (!encoded) throw new Error("slack ingress: interaction had no payload field");
-
-  let payload: unknown;
-  try {
-    payload = JSON.parse(encoded);
-  } catch {
-    throw new Error("slack ingress: interaction payload was not JSON");
-  }
-  if (typeof payload !== "object" || payload === null) {
-    throw new Error("slack ingress: interaction payload was not an object");
-  }
-
-  const body = payload as Record<string, unknown>;
-  if (body.type !== "block_actions") {
-    return { kind: "ignored", reason: `interaction type ${String(body.type)}` };
-  }
-
-  const actions = Array.isArray(body.actions) ? body.actions : [];
-  const action = actions.find((entry) =>
-    field(entry, "action_id").startsWith(CHOICE_ACTION_PREFIX),
-  );
-  if (!action) return { kind: "ignored", reason: "not a bugboss choice button" };
-
-  const channel = field(body.channel, "id");
-  const user = field(body.user, "id");
-  const messageTs = field(body.message, "ts");
-  // A question is always posted into the incident thread, so thread_ts is
-  // there. Falling back to the message's own ts keeps a top-level question —
-  // which only exists if the thread link broke — answerable rather than
-  // silently dropped.
-  const threadTs = field(body.message, "thread_ts") || messageTs;
-  const choice = field(action, "value");
-  const actionTs = field(action, "action_ts");
-
-  if (!channel || !user || !messageTs || !choice || !actionTs) {
-    return { kind: "ignored", reason: "incomplete interaction" };
-  }
-
-  return {
-    kind: "choice",
-    click: { channel, user, messageTs, threadTs, choice, actionTs },
-  };
 };

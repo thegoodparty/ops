@@ -59,22 +59,28 @@ its own `p<ts>`; every caller here asks about a thread's parent, and the links
 derived afterwards are built from the timestamp the caller passed. Reading one
 back out of the url would point later links at the wrong message.
 
-## A plain reply answers; a mention also interrupts
+## Every reply in an incident thread goes to the Boss
 
-Every message in an incident thread becomes a `human_message`
-directive. `contact_human` waits on directives alone and nothing else reads
-`thread_reply` on an agent's behalf, so without this the documented way to
-answer an agent — reply in thread, no tag — did nothing at all, and the
-agent waited out its full timeout.
+Tagged or not, a message in an incident thread is recorded in `thread_reply`
+and handed to `SlackAgent.handleIncident` with the incident as context. The
+Boss answers, stays silent, or tells the agent something with a
+`boss_message` directive. Nothing on the way reads what the message meant, and
+no human text reaches an agent except through the Boss.
 
-`mentioned` still drives `interrupt`. So a mention answers *and* interrupts;
-a plain reply answers.
+That is why there is no reply classifier, no "who was that for" and no
+`@bugboss` override in a thread. Those existed because a reply went straight
+to the agent and could end its wait on an offhand remark. The Boss is the
+reader now, and two people talking to each other is a message it lets pass.
 
-A reply here also has to stay visible at ingress: `classifySlackEvent` keeps
-an `incident_reply` kind, and the HTTP layer keys its :eyes: off not being
-`ignored`. An untagged reply is the documented way to answer an agent, so it
-is the last delivery that should arrive unacknowledged. See
-`ingress/CLAUDE.md`.
+The `thread_reply` insert stays inside the Slack ack because its id derives
+from `(channel, ts)`: it is what collapses a Slack retry, so the Boss does not
+run twice on one message. A reply does **not** lift an `incident_wait`. The
+Boss telling the agent something does (`pushDirective` on a `boss_message`),
+because an agent relaunched for chatter has nothing new to read.
+
+A reply here has to stay visible at ingress: `classifySlackEvent` keeps an
+`incident_reply` kind, and the HTTP layer keys its :eyes: off not being
+`ignored`. See `ingress/CLAUDE.md`.
 
 ## The :eyes: goes on before the work, not after it
 
@@ -94,9 +100,8 @@ Since ingress stopped reading words (see "The human boundary" in
 `docs/architecture.md`), the kinds left are what a signature, an event
 envelope and a thread id can answer. `mention` earns one — covering a report
 and a question alike, because telling those apart is a model call further in
-— and so does `incident_reply`, an untagged reply in a thread BugBoss owns,
-which is the likeliest message in the system to be the answer a blocked agent
-is waiting for. The invariant that keeps the two layers honest, tested in
+— and so does `incident_reply`, any reply in a thread BugBoss owns, which is
+how a person talks to the Boss about an incident. The invariant that keeps the two layers honest, tested in
 `test/e2e.test.ts`: **nothing the relay acts on may be `ignored` at ingress.**
 
 `createSlackAck` returns **`void`, not a promise**, and that is the contract.
@@ -115,46 +120,10 @@ are invisible.
 
 **Nothing removes the reaction.** There is no one completion event to swap it
 for: a mention is done when the answer posts, a report is done somewhere
-between triage and resolution, and a thread reply is done when an agent reads
-the directive — which is not something the HTTP edge can see at all. A ✅ would
+between triage and resolution, and a thread reply is done when the Boss has
+answered or chosen not to — which is not something the HTTP edge can see. A ✅ would
 have to pick one and be wrong for the others, and a swap that half-fails leaves
 a reaction that lies. The :eyes: means "received", and that stays true.
-
-### Which reply, though
-
-`contact_human` ends its wait on the **first** reply after the question. Two
-people talking to each other while an agent is blocked therefore ended it on
-whichever of them spoke first, and no field anywhere records that — the
-investigation just turns on an offhand remark and nothing downstream can tell.
-
-The fix is not syntax. Requiring an `@bugboss` tag to answer would make the
-common case ceremony, and answering a direct question should not need any. So
-the message is read: `intent.ts` answers **who it was for**, the directive
-carries `addressed`, and `firstReplyAfter` ends a wait only on `agent` (or a
-missing label, which is what the rows in flight across the deploy that added
-it meant).
-
-**Recording is not consuming.** Chatter is still recorded in `thread_reply`
-and still delivered as a directive, so it stays in the incident's history and
-the agent reads it as context. What it loses is the right to end a wait.
-Nothing is ever dropped, including a message no model could read — that one
-arrives as `unclear`, which cannot end a wait either.
-
-Two rules sit in code on top of what the model said, the same way
-`applyRules` does in triage:
-
-- **An explicit `@bugboss` always means "this is for you".** That is the
-  escape hatch for somebody who wants certainty, and because it is decided in
-  the composition root rather than by the model, it is the one path that keeps
-  working while the model is down.
-- **`unclear` asks**, in the thread, and says the message went through as
-  context anyway. Asking costs a sentence; ending a wait wrongly costs an
-  investigation. It is said only while a question is outstanding — with
-  nothing blocked there is no wait to end and narrating it is noise. Asking is
-  also **not** an else: somebody who tagged `@bugboss` in a thread with no
-  agent running asked a question, and a message nothing could read is a
-  footnote to that rather than a reason to answer them with a clarification
-  and nothing else.
 
 ## Slack renders mrkdwn, and Markdown renders wrong
 
@@ -188,11 +157,6 @@ muted. They escape, so they render as literal text rather than vanishing.
 Conversion happens **at the Slack boundary only**. What the incident stores is
 what the agent wrote, so the Slack agent reading `postmortem` back out of the
 database gets prose and not `&lt;`-riddled markup.
-
-A `plain_text` field is **not** escaped, and that is not an oversight. Slack
-does not parse it for entities, so there is nothing to prevent — escaping only
-renders a literal `&amp;` on a button face and grows a string whose length
-limit was measured before the escape ran.
 
 ## Two length rules, and they answer to different people
 
@@ -365,181 +329,35 @@ request a minute. So the relay records the opening text in `incident_thread`
 when it posts it. An incident opened before that table existed has no row and
 gets **no header** — the one answer that cannot delete somebody's alert text.
 
-## Block Kit for one message: a question with its answers
-
-Every message here is plain `text` mrkdwn — except an agent's `contact_human`
-question when it passes `options`, which posts as `blocks` with a button per
-option (`blocks.ts`). Nothing else earns them. Block Kit's other offering is
-visual structure, which is mostly `header` blocks: `plain_text` only and
-capped at 150 characters, so they cannot carry an incident title anyway.
-
-**Buttons are an affordance, never a command language.** The rule this system
-runs on is that every human interface takes natural language; a button is a
-shortcut past typing, not a thing you have to press. So the same question is
-always answerable as prose: the options are numbered in the message body, the
-`text` fallback carries the whole question, and a typed reply reaches the
-agent by the path it always did. An agent that writes a question only a
-button can answer has written the wrong question, and the tool says so.
-
-Three constraints hold whatever the message:
-
-- `blocks` **needs** a `text` too, or every notification for it reads "This
-  content can't be displayed" — which on a phone is the entire question.
-- `section` text is mrkdwn, so the escaping in `format.ts` applies unchanged.
-  A button *label* is `plain_text` and capped at 75 characters; it escapes for
-  display, but the `value` that comes back stays raw, because that value is
-  the answer the agent reads.
-- A section block and a Slack message share a 3,000 character ceiling, so a
-  question longer than one message posts its front half as plain text and the
-  buttons hang off the last part — the one that ends in the question.
-
-An ask is two posts: the question, then `details` underneath it. The buttons
-go on the **question**, which is also the message `pending_question.messageTs`
-records — `/thread` fills that column only while it is blank, so the later
-`details` post cannot repoint it and a press keeps matching the message it was
-made on. A press that changed nothing is still silence: the wait floor and the
-automatic escalation in `agent/tools.ts` run exactly as they do without
-buttons.
-
-## A press is a reply, and is recorded as one
-
-`SlackRelay.handleChoice` writes the same `thread_reply` row and pushes the
-same `human_message` directive a typed answer does, carrying the label the
-agent wrote. So `contact_human` cannot tell the two apart, and everything
-downstream of it — including whatever classifies an answer — only ever sees
-prose.
-
-Both writes are **one `withWrite`**, so they are one transaction. They were
-two, and the gap between them had no reconciler: the reply row is what the
-thread shows and the directive is the only thing the agent waits on, so
-committing the first and losing the second stalls the incident looking
-answered. Keep them in the same callback.
-
-Anyone in the channel may press. The two guards that keeps honest are in the
-`INSERT` statement rather than around it:
-
-- `WHERE EXISTS (… pending_question … messageTs = ?)` — that table holds the
-  one question an agent is actually waiting on. A press quoting any other
-  message is a press on a question already answered or timed out, and filing
-  it would answer whatever is being asked *now* with a label from before.
-- the derived id `<channel>:<question ts>:choice` — one question takes one
-  answer, however many people press and however often Slack redelivers.
-
-A press that changes nothing still gets a line in the thread. A button that
-silently does nothing is indistinguishable from a broken one, and the person
-who pressed it would go on waiting for an agent that never heard them.
-
-### The line has to say what happens next
-
-Saying the press landed is only half of it, and the wrong half. The two
-guards above ask whether the press is *the* answer to the question an agent
-posed; neither asks whether anything is still there to read it.
-`pending_question` outlives the run that wrote it — `clearPending` does not
-run when a child is killed mid-wait — so a press can pass `EXISTS`, write its
-`thread_reply` row and its `pending_directive`, and have nothing come to
-consume either. That press was acknowledged in exactly the words a live
-agent's press got: "chose Merged", full stop. Somebody pressed, read that,
-and waited on an agent that was not coming.
-
-So `ChoiceRoute` carries `reader`, read off the same `AGENT_RUNNING_STATUSES`
-the dispatcher's `ELIGIBLE_SQL` runs on, and the acknowledgement's second
-line is that field rather than a restatement that a row went down. Every
-value has a sentence that is true of it, and none of them promises a reader
-the state does not have.
-
-**Nothing here moves the incident on its own.** A press is one tap, often on
-a question whose agent has been gone for hours — a weaker signal of intent
-than a sentence, and the wrong thing to infer a transition from. The thread
-says what to type instead.
-
-The same field fixes the other two. A second press is told *which* answer
-won and who pressed it, since the first press is the only one and the loser
-otherwise learns only that theirs was not it. A press on a closed question
-is told nothing is waiting on that answer, and is not told an agent will
-read a reply when none will.
-
-A press whose thread matches no incident is the remaining silence, and it is
-an `alarm` now rather than a log: a button only exists on a question BugBoss
-posted into an incident thread, so no match means the thread link is gone and
-the press is lost. The presser is told, in the thread, rather than watching a
-button that did nothing.
-
-## Interactivity arrives down `/slack`, as a form
-
-Slack posts a press to the Interactivity Request URL as
-`application/x-www-form-urlencoded` with the JSON in a `payload` field —
-different parsing from the Events API, the same `v0=` signature over the same
-raw body, the same three-second budget. The content type is the whole
-discriminator (`isInteractionDelivery`).
-
-It shares `/slack` rather than taking a path of its own because the ALB
-listener rules in `deploy/components/bugboss.ts` are an allowlist: a new path
-is a Pulumi change and a deploy before a click can reach the process at all.
-
-The route answers an **empty** 200. A JSON body there is read by Slack as a
-replacement for the message that was clicked, which would delete the question
-and its buttons out from under everyone else in the thread.
-
-`settings.interactivity` in `slack-app-manifest.yaml` is what makes any of
-this reachable, and that file is applied by a person at api.slack.com, not by
-CI. Until somebody applies it, the buttons post and render but a press shows
-the presser a Slack error; the numbered options and free text still answer.
-
 ## Nothing here reads the words a person chose
 
-`intent.ts` is the only place inbound human text is read for meaning, and it
-is a model call. There is no keyword, no verb and no phrase to know — for
-either interface:
+Two readers of inbound human text, and both are models:
 
-- **In an incident thread**, whether the message was for the agent at all,
-  and whether it asks for this incident to be combined with another one. Two
-  fields, one call — a combine request is a thing said in the middle of an
-  ordinary sentence, so a separate classifier would read the same message
-  twice. Somebody saying they are taking the incident on is a message *to*
-  the agent — an instruction to stand down, which it reads and acts on — not
-  a transfer for the Boss to record.
-- **On a mention anywhere else**, whether somebody is reporting something
-  broken, asking a question, or asking for two incidents to be combined.
+- **In an incident thread**, the Boss itself, with the incident, the thread
+  and its inbox in front of it. There is no separate classifier.
+- **On a mention anywhere else**, `intent.ts`: whether somebody is reporting
+  something broken, asking a question, or asking for two incidents to be
+  combined.
 
-This used to be a string matcher on the first word — `report`, `bug` or
-`broken` — so `@bugboss Pro upgrades are failing` was answered as a question
-and opened nothing. A magic phrase nobody can discover is not an interface.
+The mention read used to be a string matcher on the first word — `report`,
+`bug` or `broken` — so `@bugboss Pro upgrades are failing` was answered as a
+question and opened nothing. A magic phrase nobody can discover is not an
+interface. Every outcome of the read is said out loud: an ambiguous read asks
+which it was, and a failed model call says the call failed. Silence is what
+the old matcher did, and silence is indistinguishable from the bot not reading
+you.
 
-The reasoning the old comment gave for matching whole words is still right
-and is still enforced — it just is not enforced by matching strings:
+The relay records and routes; it does not decide what a message meant.
 
-- **The read that acts is the expensive direction.** Ending a wait on a
-  message that was not for the agent sends a long investigation wherever an
-  offhand remark points. So the prompt is asymmetric — prefer `unclear` over a
-  guess — and `unclear` **asks in the thread** rather than guessing.
-- **Every outcome is said out loud.** An ambiguous read asks and a failed
-  model call says the call failed. Silence is what the old matcher did, and
-  silence is indistinguishable from the bot not reading you.
-
-The relay records and routes; it does not decide what a message meant. The
-read lives in the composition root, off the Slack ack.
-
-### The model is advisory here too
+### The mention read is advisory
 
 Same split as `triage/`: the model reads the sentence, the code keeps the
-invariants. Two things bound a wrong or captured read, and neither of them is
-the model behaving:
-
-- **It can name at most half of what it acts on.** One side of a combine is
-  always the thread the message arrived in, never the message, so the answer
-  can carry one other incident id and nothing else. Three code-side checks
-  bound that id: it must appear literally in what the person typed, it must
-  name an incident that can still take signals, and which of the two survives
-  is `assign`'s rule rather than anything said in the message. So a fully
-  captured read reaches a pair of open incidents somebody was already
-  standing in front of, at a verified person's request, announced in both
-  threads.
-- **Nothing it answers is a transition except that one, and that one is a
-  person's.** For `addressed`, the read decides which directive the agent is
-  handed and whether it may end a wait; it writes nothing. A combine does
-  write, and it writes under the `human` actor because that is whose request
-  it is — the Slack user id comes off the verified event, never out of the
-  text.
+invariants. The only read that writes is a combine, and three code-side checks
+bound it: every id must appear literally in what the person typed, both must
+name incidents that can still take signals, and which of the two survives is
+`assign`'s rule rather than anything said in the message. It writes under the
+`human` actor, with the Slack user id off the verified event, never out of the
+text.
 
 The message is fenced in a `<MESSAGE untrusted="true">` block with the rule
 stated in the system prompt, the same framing triage puts around an alert
@@ -547,91 +365,46 @@ body. That is worth having and is not what the containment rests on.
 
 ### Cost, latency and the failure path
 
-One bounded call per inbound message: a few hundred tokens in, a label or two
-out, no tools and no database access. The agent's outstanding question goes
-into the prompt when there is one, because whether a message answers it is
-most of what `addressed` is asking. It runs on the same `ModelClient` triage
-uses, so there is no second credential and no second model to subscribe;
-`BUGBOSS_INTENT_MODEL_ID` moves it to a smaller model without a deploy when
-one is available. The bill is set by how much people type, not by how many
-alerts fire.
+One bounded call per mention: a few hundred tokens in, a label or two out, no
+tools and no database access. It runs on the same `ModelClient` triage uses;
+`BUGBOSS_INTENT_MODEL_ID` moves it to a smaller model without a deploy.
 
 It runs **off the Slack ack**, in the `settled` promise, next to the Slack
-agent. Slack wants three seconds and the relay's writes are what a retry
-collapses onto, so recording stays in the request and reading stays out of
-it.
-
-That costs a report its durability before the ack, and the trade is worth
-stating. A report used to be a signal row written inside the request, so a
-restart between the 200 and the work could not lose it. It cannot be any
-more: what makes a mention a report is the model call, and recording every
-mention as a signal first would open an incident for every question. A
-report typed into the window between the ack and the read — this container
-restarts on every merge to ops `main`, so that window is real — is lost with
-a 200 already sent. That is the exposure a mention already had, since the
-Slack agent has always run out there, and closing it properly means a
-durable inbox rather than a different place to put the model call.
+agent. That costs a report its durability before the ack: what makes a mention
+a report is the model call, and recording every mention as a signal first
+would open an incident for every question. A report typed into the window
+between the ack and the read is lost with a 200 already sent. This container
+restarts on every merge to ops `main`, so that window is real, and closing it
+properly means a durable inbox rather than a different place to put the call.
 
 A failed call answers `unclear`, alarms with the module's fallback rate
-(`triage/health.ts`), and posts a line in the thread that says the read
-failed rather than that the message was ambiguous. Those are two different
-sentences on purpose.
+(`triage/health.ts`), and posts a line saying the read failed rather than that
+the message was ambiguous. Those are two different sentences on purpose.
 
-The cost of that is real and it is the right side of the trade: while the
-model is down, every reply in an incident thread gets a line saying it could
-not be read. That is bounded by how many people are typing, and the
-alternative is the failure this whole file exists to remove — somebody answers
-the agent, nothing happens, and nothing says so.
+### Combining two incidents from a mention
 
-### Combining two incidents, when a person asks
+Somebody says "82 and 79 are the same bug, merge them" at the bot and it
+happens. An agent may only re-partition its own incident, so before this the
+one legal move left to an agent being asked was to open a *third* incident.
+From inside an incident thread the same request is the Boss's to act on, with
+`merge_incidents`, which calls the same `assign` and `announceMerge` pair.
 
-Somebody says "this is the same bug as 79, merge them" and it happens. It did
-not used to: an agent may only re-partition its own incident, so the one legal
-move left to the agent being asked was to open a *third* incident — which is
-exactly what happened the day this was found, leaving the thread with the
-history abandoned and its signals in a record minutes old. The agent's write
-containment is right and is untouched. What was missing was anything routing
-the request to the `human` actor that had been sitting in `AssignActor`,
-unconstructed, since it was written.
-
-**One executor, every surface.** `combineIncidents` in the composition root
-runs it, and both the thread reply and the bare mention call it. That is the
-point rather than tidy factoring: the same sentence typed into a thread and
-typed at the bot used to do two different things — merge, and be handed to
-the read-only box, which answered that it could not. A person cannot see the
-boundary that makes those differ and did not ask about it.
-
-In a thread the person usually names one incident and the thread supplies the
-other. Outside one there is nothing to supply it, so both have to be named.
-
-**It is never silent.** Every way a pair fails to form — the model named an
-incident that is not in the sentence, or named the one they are standing in,
-or named one thing out in the channel — is invisible to the person, so each
-one asks which incident rather than dropping the message. That includes a
-read that was simply wrong: from inside, a hallucinated id and a real request
-look the same, and the cost of asking on a misread is one line while the cost
-of silence is the failure this file exists to remove.
+`combineIncidents` in the composition root runs it. Out in the channel
+nothing supplies a second side, so both have to be named, and every way a pair
+fails to form asks which incidents rather than dropping the message. A
+hallucinated id and a real request look the same from inside, and the cost of
+asking on a misread is one line.
 
 Everything it checks, it checks **inside the write**: both incidents still
 exist, both can still take signals, and which signals move. The write queue
-serializes behind a synchronous S3 PUT, so the gap between reading a list of
-ids and assigning them is hundreds of milliseconds of other people's writes
-— a correlation merge landing in it would move those signals to a third
-incident, and a list read beforehand would drag them back out. A human-actor
-assign has no containment to stop that. Same reason every transition in
-`toolapi/` puts its predicate in the statement.
+serializes behind a synchronous S3 PUT, so a list read beforehand could drag
+signals out of a third incident a correlation merge moved them to in the gap.
 
-It does not choose a direction: the more established incident survives, which
-is `assign`'s rule, and a person who asks for the other direction gets this
-one and is told so. What follows is the same pair of messages correlation
-leaves — the absorbed thread closed out with a permalink to the survivor, and
-the survivor told where the signals came from.
-
-A button press does **not** reach this: `handleChoice` treats a press as
-addressed to the agent by construction and never reads it, on purpose. An
-agent with a merge in mind calls `propose_merge` rather than posting a
-choice, so the case is hard to reach — but it is still a difference, and
-closing it means a model call on every press.
+It does not choose a direction: the more established incident survives, and a
+person who asks for the other direction gets this one and is told so. What
+follows is the same pair of messages correlation leaves — the absorbed thread
+closed out with a permalink to the survivor, and the survivor told where the
+signals came from.
 
 ## The commander is the only interface
 
@@ -845,7 +618,7 @@ about thirty minutes and does **not** reject a rate-limited call, so a 429
 parks the caller inside the SDK with nothing thrown and nothing logged.
 
 The client pins a five-minute policy, and posts are off the ingest request.
-Both matter: an agent blocked in `contact_human` still waits on one.
+Both matter: every transition notice waits on one.
 
 `chat.update` is Tier 3, roughly fifty a minute, and shares that budget.
 The board sweep edits only threads whose rendered header actually changed,

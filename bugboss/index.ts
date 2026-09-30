@@ -61,7 +61,6 @@ import {
   type SlackClient,
 } from "./slack/agent";
 import { createSlackAck } from "./slack/ack";
-import type { ChoicePoster, SlackChoiceClick } from "./slack/blocks";
 import { mrkdwn, raw, userMention } from "./slack/format";
 import {
   createRotationReader,
@@ -80,20 +79,15 @@ import {
   SlackRelay,
   mentionPrefix,
   stripBotMention,
-  type ChoiceRoute,
   type InboundRoute,
   type SlackEvent,
 } from "./slack/relay";
-import {
-  readMentionIntent,
-  readReplyIntent,
-  type Addressed,
-  type IntentDeps,
-} from "./slack/intent";
+import { readMentionIntent, type IntentDeps } from "./slack/intent";
 import {
   applyAssign,
   assign,
   AssignError,
+  closeIncidentByBoss,
   createAnnouncer,
   createToolApi,
   establishedOf,
@@ -153,7 +147,6 @@ import type {
   BugBossConfig,
   Evidence,
   IncidentDigest,
-  Directive,
   IncidentStatus,
   IncomingRequest,
   RawSignal,
@@ -162,6 +155,7 @@ import type {
   TestDatabase,
   ToolApi,
   TriageDecision,
+  WakeBoss,
 } from "./types";
 
 const log = makeLog("boss");
@@ -333,12 +327,6 @@ export interface AcceptedSlackEvent {
   settled: Promise<void>;
 }
 
-/** A button press: recorded inside the ack, acknowledged in the thread after. */
-export interface AcceptedSlackInteraction {
-  routed: ChoiceRoute["kind"];
-  settled: Promise<void>;
-}
-
 export interface BugBoss {
   readonly db: Db;
   readonly dispatcher: Dispatcher;
@@ -359,10 +347,6 @@ export interface BugBoss {
   slackEvent(event: SlackEvent): Promise<void>;
   /** Relay now, answer after. What the webhook route calls. */
   slackEventAccepted(event: SlackEvent): Promise<AcceptedSlackEvent>;
-  /** Record a verified button press, then say so in the thread. */
-  slackInteractionAccepted(
-    click: SlackChoiceClick,
-  ): Promise<AcceptedSlackInteraction>;
   /** One dispatcher tick, waited out. Agents normally outlive a tick. */
   dispatchOnce(): Promise<TickResult>;
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
@@ -627,7 +611,11 @@ export const createSlackAgentModel = (
         text: reply.text,
         toolCalls: reply.toolCalls,
       });
-      if (reply.text) answer = reply.text;
+      // An incident run may end in silence, so what it posts is the last
+      // turn's text and nothing earlier: narration between tool calls is not
+      // an answer, and keeping it would post it.
+      if (req.allowSilence) answer = reply.text;
+      else if (reply.text) answer = reply.text;
       if (reply.toolCalls.length === 0) break;
 
       for (const call of reply.toolCalls) {
@@ -688,9 +676,16 @@ export const createSlackAgentModel = (
       }
     }
 
-    const text =
-      answer || noAnswerReply(exhausted, req.maxTurns, Date.now() - startedAt);
-    if (!answer) alarm("slack_agent_no_answer", { sessionKey: req.sessionKey });
+    // Silence is a normal end to an incident run: two people talking to each
+    // other is not a message for the Boss. Running out of turns is not, and
+    // still says so.
+    const silent = !answer && req.allowSilence && !exhausted;
+    const text = silent
+      ? ""
+      : answer || noAnswerReply(exhausted, req.maxTurns, Date.now() - startedAt);
+    if (!answer && !silent) {
+      alarm("slack_agent_no_answer", { sessionKey: req.sessionKey });
+    }
 
     // The transcript has to end on the assistant, because that is how the
     // conversation ended: whatever is returned here is posted in the thread.
@@ -733,21 +728,16 @@ const withDeadline = <T>(work: Promise<T>, what: string): Promise<T> => {
 };
 
 /**
- * Everything the Boss needs from Slack: posts, buttons, thread reads, and the
+ * Everything the Boss needs from Slack: posts, thread reads, and the
  * permalink a merged or split incident links the other thread by.
  */
-export type BossSlackClient = SlackClient &
-  ChoicePoster &
-  SlackLinker &
-  SlackUpdater;
+export type BossSlackClient = SlackClient & SlackLinker & SlackUpdater;
 
 export const withSlackDeadline = (slack: BossSlackClient): BossSlackClient => ({
   post: (threadTs, text, channel) =>
     withDeadline(slack.post(threadTs, text, channel), "chat.postMessage"),
   react: (channel, ts, name) =>
     withDeadline(slack.react(channel, ts, name), "reactions.add"),
-  postChoice: (threadTs, text, blocks) =>
-    withDeadline(slack.postChoice(threadTs, text, blocks), "chat.postMessage"),
   update: (channel, ts, text) =>
     withDeadline(slack.update(channel, ts, text), "chat.update"),
   permalink: (messageTs, channel) =>
@@ -938,7 +928,9 @@ export const createBugBoss = async (
       // unset made that whole path unreachable in production.
       alertChannel: config.slackChannelId,
       rotationGroupId: secrets.slackRotationGroupId ?? null,
+      incidentChannel: config.slackChannelId,
     },
+    closeIncident: (args) => closeIncidentByBoss({ db, slack: threads }, args),
   });
 
   /**
@@ -957,9 +949,9 @@ export const createBugBoss = async (
    * A thread belongs to an incident, not to the ingest that happened to open
    * one. reportRootCause splits unexplained signals into incidents of their
    * own without passing anywhere near ingest, and a post that fails leaves an
-   * incident threadless for good; in both cases the agent posts top level and
-   * contact_human can never be answered, because answering it is matching a
-   * reply against slackThreadTs. So this keys off the incident and retries.
+   * incident threadless for good; in both cases its notices post top level
+   * and nobody can talk to the Boss about it, because a reply reaches the Boss
+   * by matching slackThreadTs. So this keys off the incident and retries.
    */
   let threading: Promise<unknown> = Promise.resolve();
 
@@ -1950,41 +1942,6 @@ export const createBugBoss = async (
   // Inbound Slack
   // -------------------------------------------------------------------------
 
-  /**
-   * The one thing that reaches a running agent from Slack. `contact_human`
-   * waits on directives alone and nothing else reads `thread_reply` on an
-   * agent's behalf, so a message that never becomes one is a message the
-   * agent does not have -- which is why this happens whatever the read said,
-   * and only `addressed` varies.
-   *
-   * The relay recorded the reply inside the request and this runs after it,
-   * so a task replaced in that window leaves the message on the record with
-   * no directive: the agent waits out its timeout and escalates to a person,
-   * which is visible. The alternative is labelling a message before knowing
-   * what it is.
-   */
-  const pushHumanMessage = async (
-    route: Extract<InboundRoute, { kind: "incident_reply" }>,
-    addressed: "agent" | "others",
-  ): Promise<void> => {
-    await db.withWrite((w: Database.Database) => {
-      w.prepare(
-        `INSERT INTO pending_directive (incidentId, payload, createdAt)
-         VALUES (?, ?, ?)`,
-      ).run(
-        route.incidentId,
-        JSON.stringify({
-          type: "human_message",
-          from: route.user,
-          text: route.text,
-          ts: route.ts,
-          addressed,
-        } satisfies Directive),
-        now(),
-      );
-    });
-  };
-
   const sayInThread = (
     channel: string,
     threadTs: string,
@@ -2001,21 +1958,15 @@ export const createBugBoss = async (
   const COMBINABLE: readonly IncidentStatus[] = ["INVESTIGATING", "FIXING"];
 
   /**
-   * Somebody has asked for two incidents to be made one. This is where that
-   * becomes a thing that happened, wherever they said it.
-   *
-   * One executor for every surface, and that is the point rather than tidy
-   * factoring. The same sentence typed as a thread reply and typed at a
-   * mention used to do two different things -- merge, and be handed to a
-   * read-only box that answered that it could not -- and a person cannot see
-   * the boundary that makes those differ. They asked the same question.
+   * Somebody has asked, in a mention, for two incidents to be made one. This
+   * is where that becomes a thing that happened.
    *
    * It exists at all because the alternative was a refusal. An agent may
    * only re-partition its own incident, so when a person asked one for a
-   * merge, its single legal move was to open a *third* incident. That is how
-   * a thread with four days of conversation was abandoned for one opened
-   * minutes earlier. Agent containment is untouched and should stay that
-   * way; an agent asks now, through proposeMerge, and a person asks here.
+   * merge, its single legal move was to open a *third* incident. Agent
+   * containment is untouched and should stay that way; an agent asks through
+   * proposeMerge, the Boss merges from an incident thread, and a mention
+   * lands here.
    *
    * Three things bound it, none of them a reading of the sentence:
    *
@@ -2034,12 +1985,10 @@ export const createBugBoss = async (
     said: string;
     /** The ids the read came back with, unvalidated. */
     named: string[];
-    /** The incident whose thread this was said in, if it was said in one. */
-    here: string | null;
   }): Promise<void> => {
     const say = (text: string) => sayInThread(args.channel, args.threadTs, text);
     const decline = (why: string, note: string) => {
-      log("combine_declined", { here: args.here, named: args.named, why });
+      log("combine_declined", { named: args.named, why });
       return say(mrkdwn`${raw(userMention(args.user))} ${raw(note)}`);
     };
 
@@ -2055,30 +2004,19 @@ export const createBugBoss = async (
       log("combine_ids_dropped", { named: args.named, kept: ids });
     }
 
-    // The thread supplies the second side when they only named one, which is
-    // how people actually write it: "this is the same as 79". Out in the
-    // channel there is no thread to supply it, so two is the whole ask.
-    const pair =
-      ids.length >= 2
-        ? ids.slice(0, 2)
-        : ids.length === 1 && args.here && ids[0] !== args.here
-          ? [ids[0], args.here]
-          : null;
+    // Out in the channel there is no thread to supply a second side, so two
+    // is the whole ask.
+    const pair = ids.length >= 2 ? ids.slice(0, 2) : null;
 
-    // Never silent. A message read as a combine is somebody asking for one,
-    // and the reasons a pair cannot be formed are all invisible to them: the
-    // model named an incident that is not in their sentence, or named the
-    // one they are already standing in, or named one thing out in the
-    // channel where nothing supplies the second. Saying nothing to any of
-    // those is the failure this whole change is about, and the cost of
-    // saying something on a misread is one line in a thread.
+    // Never silent. The reasons a pair cannot be formed are all invisible to
+    // them -- the model named an incident that is not in their sentence, or
+    // named one thing -- and the cost of saying something on a misread is
+    // one line in a thread.
     if (!pair) {
-      log("combine_incomplete", { here: args.here, named: args.named, kept: ids });
+      log("combine_incomplete", { named: args.named, kept: ids });
       return decline(
         "could not make a pair",
-        args.here
-          ? "I could not tell which other incident you meant. Name it and I will combine it with this one."
-          : "which two incidents? Name both and I will combine them.",
+        "which two incidents? Name both and I will combine them.",
       );
     }
 
@@ -2131,7 +2069,6 @@ export const createBugBoss = async (
       });
     } catch (err) {
       alarm("combine_failed", {
-        here: args.here,
         pair,
         error: String(err),
       });
@@ -2174,116 +2111,10 @@ export const createBugBoss = async (
     await say(
       [
         mrkdwn`${raw(userMention(args.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
-        mrkdwn`_Incident ${into} is the older record, so it stays the incident of record and keeps its thread.${args.here === into ? " Everything carries on here." : ""}_`,
+        mrkdwn`_Incident ${into} is the older record, so it stays the incident of record and keeps its thread._`,
       ].join("\n"),
     );
     await announce.announceMerge(result);
-  };
-
-  /**
-   * Something a person said in an incident's thread. The relay has recorded
-   * it; this decides who it was for, off the Slack ack.
-   *
-   * One question now, where there were two. The other asked whether the
-   * message handed the incident between a person and an agent, and no such
-   * move exists: an agent drives every open incident. What is left is the
-   * question that was always doing the work -- `contact_human` ends its wait
-   * on the first reply it sees, and two people talking to each other while an
-   * agent is blocked used to end that wait on whichever of them spoke first.
-   * The answer to that is not syntax: answering a direct question should not
-   * need ceremony, so the message is read rather than required to carry a tag.
-   *
-   * Two rules sit in code, on top of what the model says, for the same
-   * reason `applyRules` does in triage:
-   *
-   *   - An explicit @bugboss always means "this is for you". That is the
-   *     escape hatch for somebody who wants certainty, and because it is
-   *     decided here rather than by the model it keeps working while the
-   *     model is down.
-   *   - Nothing is ever dropped. A message that could not be read is still
-   *     delivered as context; what it loses is the right to end a wait.
-   *
-   * And the incident comes from the thread the message arrived in, never from
-   * the message, so no wording -- including wording pasted out of a log line
-   * -- reaches a different incident.
-   */
-  const answerIncidentMessage = async (
-    route: Extract<InboundRoute, { kind: "incident_reply" }>,
-  ): Promise<void> => {
-    const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
-    const outstanding =
-      db.get<{ message: string }>(
-        "SELECT message FROM pending_question WHERE incidentId = ?",
-        [route.incidentId],
-      )?.message ?? null;
-
-    const read = await readReplyIntent(intent, {
-      text: said,
-      outstandingQuestion: outstanding,
-    });
-
-    const addressed: Addressed = route.interrupt ? "agent" : read.addressed;
-
-    // Delivered before anything else, so the agent has what was said whatever
-    // the rest of this decides. `others` and `unclear` ride through as
-    // context; only `agent` can end a wait.
-    await pushHumanMessage(route, addressed === "agent" ? "agent" : "others");
-
-    log("reply_read", {
-      incidentId: route.incidentId,
-      addressed,
-      modelAddressed: read.addressed,
-      combineIds: read.combineIds,
-      tagged: route.interrupt,
-      blocked: outstanding !== null,
-      fellBack: read.fellBack,
-    });
-
-    // Independent of `addressed`. Asking for two incidents to be combined is
-    // a thing people say to each other as much as to the agent, and the ask
-    // is no less real for being addressed sideways. The agent has the message
-    // either way; this is the half of it that needs doing rather than
-    // reading.
-    if (read.combineIds.length > 0) {
-      await combineIncidents({
-        channel: route.channel,
-        threadTs: route.threadTs,
-        user: route.user,
-        said,
-        named: read.combineIds,
-        here: route.incidentId,
-      });
-    }
-
-    // Only worth saying while something is blocked on it. With no outstanding
-    // question there is no wait to end, the directive is context either way,
-    // and narrating that is noise about nothing.
-    if (addressed === "unclear" && outstanding !== null) {
-      await sayInThread(
-        route.channel,
-        route.threadTs,
-        [
-          read.fellBack
-            ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. The agent has it as context either way.`
-            : mrkdwn`${raw(userMention(route.user))} I could not tell whether that was for the agent. It has it as context either way.`,
-          "If it was the answer the agent is waiting for, tag me and say it again, so it counts as one.",
-        ].join("\n"),
-      );
-    }
-
-    // Independent of the above, not an else. Somebody who tags @bugboss in a
-    // thread with no agent running has asked a question, and an unreadable
-    // message is a footnote to that rather than a reason to leave them
-    // without an answer.
-    if (route.interrupt && !route.agentRunning) {
-      await slackAgent.handle({
-        channel: route.channel,
-        threadTs: route.threadTs,
-        ts: route.ts,
-        user: route.user,
-        text: route.text,
-      });
-    }
   };
 
   /**
@@ -2341,7 +2172,6 @@ export const createBugBoss = async (
         user: route.user,
         said,
         named: read.combineIds,
-        here: null,
       });
     }
 
@@ -2365,7 +2195,21 @@ export const createBugBoss = async (
     // ack, so both run past the response.
     const route = await relay.handle(event);
     if (route.kind === "incident_reply") {
-      return { routed: route.kind, settled: answerIncidentMessage(route) };
+      // Every message in an incident thread, tagged or not, is the Boss's,
+      // with the incident as context. It answers, stays silent, or talks to
+      // the agent; nothing here reads what the message meant.
+      return {
+        routed: route.kind,
+        settled: slackAgent.handleIncident({
+          incidentId: route.incidentId,
+          trigger: {
+            kind: "human",
+            user: route.user,
+            text: route.text,
+            ts: route.ts,
+          },
+        }),
+      };
     }
     if (route.kind !== "slack_agent") {
       return { routed: route.kind, settled: Promise.resolve() };
@@ -2378,95 +2222,17 @@ export const createBugBoss = async (
   };
 
   /**
-   * A button press, once the relay has decided what it was.
-   *
-   * The thread is the incident's record, so every press leaves a line in it —
-   * including the two that changed nothing. A button that silently does
-   * nothing is indistinguishable from a broken one, and the person who
-   * pressed it would reasonably go on waiting for an agent that never heard
-   * them.
-   *
-   * What the line has to carry is what happens *next*. "Chose Merged" was
-   * only the first half: a press on an incident the dispatcher will not run
-   * writes a directive nothing is coming to consume, and it read exactly the
-   * same as a press an agent was about to act on. So every line here says
-   * whether an agent will read this, and when none will, the one move that
-   * changes that. A confident acknowledgement over an inert press is worse
-   * than silence, because silence at least does not claim.
+   * An agent wrote to the Boss's inbox. The Boss drains the inbox itself, so
+   * a wake that lands while it is already running for this incident is picked
+   * up by that run. Nothing waits on it, so its failure alarms here or nobody
+   * hears of it: the agent's question would sit unread.
    */
-  const acknowledgeChoice = async (
-    route: ChoiceRoute,
-    click: SlackChoiceClick,
-  ): Promise<void> => {
-    const say = (text: string, incidentId: string | null) =>
-      slack
-        .post(click.threadTs, text, click.channel)
-        .then(() => undefined)
-        .catch((err: unknown) =>
-          alarm("choice_post_failed", { incidentId, error: String(err) }),
-        );
-
-    if (route.kind === "ignore") {
-      // A button only exists on a question BugBoss posted into an incident
-      // thread, so a press whose thread matches no incident means the thread
-      // link is gone and the press is lost. That is an alarm, not a log, and
-      // the presser hears about it rather than watching a dead button.
-      alarm("choice_unmatched", {
-        reason: route.reason,
-        user: click.user,
-        threadTs: click.threadTs,
-      });
-      await say(
-        [
-          mrkdwn`${raw(userMention(click.user))} I cannot match this thread to an incident, so that press reached no agent.`,
-          "_Tag me here and say what you meant, and I will pick it up._",
-        ].join("\n"),
-        null,
+  const wakeBoss: WakeBoss = (incidentId) => {
+    void slackAgent
+      .handleIncident({ incidentId, trigger: { kind: "inbox" } })
+      .catch((err: unknown) =>
+        alarm("boss_wake_failed", { incidentId, error: String(err) }),
       );
-      return;
-    }
-
-    const who = raw(userMention(route.slackUserId));
-    // The half "recorded" left out, and the only one the presser cannot see
-    // for themselves. `landed` separates the press that became the answer
-    // from the two that did not, because "the agent has that" is true of one
-    // of them and a claim about nothing for the others.
-    const next = (landed: boolean): string => {
-      switch (route.reader) {
-        case "agent":
-          return landed
-            ? "_The agent has that as its answer and carries on from here._"
-            : "_Reply in the thread and the agent will read you._";
-        case "closed":
-          return "_This incident is over and no agent will run on it again, so nothing here reaches one._";
-      }
-    };
-
-    const text =
-      route.kind === "answered"
-        ? [mrkdwn`${who} chose *${route.choice}*.`, next(true)].join("\n")
-        : route.kind === "duplicate"
-          ? [
-              route.recorded
-                ? mrkdwn`${who} that question already has an answer: *${route.recorded.choice}*, from ${raw(userMention(route.recorded.slackUserId))}.`
-                : mrkdwn`${who} that question already has an answer.`,
-              next(false),
-            ].join("\n")
-          : [
-              mrkdwn`${who} that question is closed — nothing is waiting on that answer any more.`,
-              next(false),
-            ].join("\n");
-
-    await say(text, route.incidentId);
-  };
-
-  const slackInteractionAccepted = async (
-    click: SlackChoiceClick,
-  ): Promise<AcceptedSlackInteraction> => {
-    // The write is bounded and idempotent on the question's ts, so it stays
-    // inside the three seconds Slack gives an interaction. The post does not.
-    const route = await relay.handleChoice(click);
-    return { routed: route.kind, settled: acknowledgeChoice(route, click) };
   };
 
   // -------------------------------------------------------------------------
@@ -2480,15 +2246,14 @@ export const createBugBoss = async (
     // answers alarms on the same ten-second budget every other Slack call
     // has rather than sitting as a detached promise forever.
     acknowledgeSlack: createSlackAck(slack),
-    slackInteractionAccepted,
     slackConfig: slackIngress,
   });
   const loopbackApp = createToolApiRoutes({
     db,
     tokenSecret,
     toolApiFor,
-    slack,
     now,
+    wakeBoss,
   });
 
   let servers: BugBossServers | null = null;
@@ -2547,7 +2312,6 @@ export const createBugBoss = async (
     ingestAccepted,
     slackEvent,
     slackEventAccepted,
-    slackInteractionAccepted,
     dispatchOnce,
     sweepOrphans,
     ensureIncidentThreads,

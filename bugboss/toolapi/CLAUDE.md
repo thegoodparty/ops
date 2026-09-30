@@ -169,6 +169,20 @@ either, but it changes nothing about runnability: it posts the brief, reaches
 the rotation, and leaves the incident with its agent still working. An agent
 that is both blocked and needs somebody calls both.
 
+## The Boss closes through here, not around it
+
+`closeIncidentByBoss` is the Boss's close, from any open status, and it lives
+beside `reportAnalysis` so the two cannot drift: one guarded `UPDATE`, the
+same `closeOpenSignals` and `indexIncident` in the same write, a `stop` for
+the agent, and the same `closedNotice` headline in the thread.
+
+A CLOSED row must carry `resolvedAt` and `postmortem`, and that CHECK cannot
+change on a live table. An incident closed from FIXING has neither, so both
+are filled with `COALESCE`, and only where missing. The post-mortem it writes
+says plainly that the Boss closed the incident and why, so the closing report
+never passes the Boss's reason off as an agent's analysis. The `incident_action`
+row names `boss` as the actor.
+
 ## Correlation
 
 Triggered by `report_root_cause`, because that is the first moment an

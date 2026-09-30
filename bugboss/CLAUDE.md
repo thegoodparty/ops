@@ -90,17 +90,15 @@ alarm that fires during normal operation teaches people to ignore alarms.
 **Every interface a person talks to is natural language.** Nothing here
 decides what somebody wants by matching their words against a list. One thing
 did — the bug-report verb — and it was a magic phrase nobody could discover
-and everybody mistyped, failing silently when they did. Intent is a model call
-(`slack/intent.ts`), advisory the way triage is: the model reads the sentence,
-the code keeps the invariants, and an ambiguous read asks in the thread rather
-than guessing. Who a message was for is read the same way, because requiring a
-tag to answer a direct question is the same mistake in the other direction.
+and everybody mistyped, failing silently when they did. In an incident thread
+the Boss reads every message itself, with the incident as context; out in the
+channel a mention is read by a model call (`slack/intent.ts`), advisory the
+way triage is: the model reads the sentence, the code keeps the invariants,
+and an ambiguous read asks rather than guessing.
 
-An entity check — "does this text contain `<@U…>`", "is this string empty" —
-is not a language interface. One of those is load-bearing: an explicit
-`@bugboss` always means "this is for you", and because code decides that
-rather than the model, it is the escape hatch that still works when the model
-does not.
+An entity check — "does this text contain `<@U…>`", "is this thread an
+incident's" — is not a language interface. Those decide where a message is
+routed, never what it meant.
 
 **Anything a reader sees the same way twice is rendered once, in code.** An
 incident reference, a status-board row and a thread's header are all
@@ -131,9 +129,9 @@ triage's guard must all agree — they have disagreed before.
 
 Waiting on a person is a row in `incident_wait`, not a field on the incident.
 It says the dispatcher must not relaunch this incident yet, and nothing more:
-the agent still has the work, and it still holds its dispatcher slot. Any
-reply in the thread deletes the row, before anything reads what the reply
-meant. `dispatcher/CLAUDE.md` has the mechanism.
+the agent still has the work, and it still holds its dispatcher slot. The
+Boss telling the agent something deletes the row; a reply in the thread goes
+to the Boss and does not. `dispatcher/CLAUDE.md` has the mechanism.
 
 **Evidence, not assertion.** `RESOLVED` means no users are affected any more
 and no further alerts should occur, confirmed. Every number the agent

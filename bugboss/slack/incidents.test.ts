@@ -7,7 +7,6 @@ import {
   withIncidentReferences,
   type IncidentLinks,
 } from "./incidents";
-import type { SlackBlock } from "./blocks";
 
 const PERMALINK = "https://goodparty.slack.com/archives/C09/p1700000000000100";
 
@@ -280,23 +279,13 @@ describe("createIncidentReferences", () => {
 
 const fakeClient = () => {
   const posts: { threadTs: string | null; text: string }[] = [];
-  const choices: { text: string; blocks: readonly SlackBlock[] }[] = [];
   const edits: { channel: string; ts: string; text: string }[] = [];
   return {
     posts,
-    choices,
     edits,
     post: (threadTs: string | null, text: string) => {
       posts.push({ threadTs, text });
       return Promise.resolve({ ts: "ts-1" });
-    },
-    postChoice: (
-      _threadTs: string | null,
-      text: string,
-      blocks: readonly SlackBlock[],
-    ) => {
-      choices.push({ text, blocks });
-      return Promise.resolve({ ts: "ts-2" });
     },
     update: (channel: string, ts: string, text: string) => {
       edits.push({ channel, ts, text });
@@ -324,21 +313,6 @@ describe("withIncidentReferences", () => {
       inner.posts[0].text,
       `same cause as <${PERMALINK}/700.0|Incident 7>`,
     );
-  });
-
-  /**
-   * A question with buttons is the one message BugBoss builds with Block
-   * Kit, and its fallback text is what every notification shows. It is a
-   * different call on the client, which is exactly how a pass that sat on
-   * `post` alone would miss it.
-   */
-  test("a question with buttons goes through it too", async () => {
-    const inner = fakeClient();
-    const slack = withIncidentReferences(inner, refs());
-
-    await slack.postChoice("400.0", "is this incident 7?", []);
-
-    assert.equal(inner.choices[0].text, `is this <${PERMALINK}/700.0|Incident 7>?`);
   });
 
   test("a header rewrite resolves against its own thread", async () => {

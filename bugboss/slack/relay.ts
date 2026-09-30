@@ -5,18 +5,13 @@
 // agent posts its own hypotheses, questions and PR links with its own token,
 // so none of that passes through here.
 //
-// Inbound records thread replies against the incident they belong to, and an
-// agent finds them by polling getIncident. The agent never reads Slack:
-// conversations.replies is throttled to roughly one request a minute for newer
-// non-Marketplace apps, and per-agent Socket Mode is not a workaround because
-// Slack load-balances events across an app's connections rather than
-// broadcasting them, so one agent's answer could arrive on another's socket.
+// Inbound records a message in an incident thread against its incident and
+// hands it to the Boss. The agent never reads Slack: the Boss decides what it
+// needs to hear and tells it with a directive.
 
 import type { Db } from "../db";
 import type { SignalOriginRef } from "../ingress/link";
-import type { Directive, IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
-import type { SlackChoiceClick } from "./blocks";
 import { bullets, escape, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 
 const log = makeLog("slack-relay");
@@ -245,19 +240,13 @@ export interface SlackEvent {
 export type InboundRoute =
   | { kind: "ignore"; reason: string }
   /**
-   * A message in an incident's thread, already recorded and already pushed to
-   * the agent as a directive. What it *means* -- an answer, a question, or the
-   * incident changing hands -- is a model call the caller makes off the Slack
-   * ack, so everything that read needs travels on the route.
-   *
+   * A message in an incident's thread, tagged or not, already recorded. It
+   * goes to the Boss with the incident as context; what it means is the
+   * Boss's to read.
    */
   | {
       kind: "incident_reply";
       incidentId: string;
-      /** The message tagged the bot, so a directive interrupts as well. */
-      interrupt: boolean;
-      /** False when no agent is on it, so a mention is a question for Job 6. */
-      agentRunning: boolean;
       channel: string;
       threadTs: string;
       ts: string;
@@ -272,64 +261,6 @@ export type InboundRoute =
       user: string;
       text: string;
     };
-
-/**
- * What a button press did. `answered` is the only one that moved anything;
- * the other two are a press that arrived too late or second, and each still
- * earns a line in the thread, because a button that does nothing and says
- * nothing is indistinguishable from a broken one.
- *
- * Each carries `reader`, because "recorded" reads identically whether an
- * agent is about to act on the press or whether the directive it wrote will
- * never be consumed by anyone.
- */
-export type ChoiceRoute =
-  | { kind: "ignore"; reason: string }
-  | {
-      kind: "answered";
-      incidentId: string;
-      choice: string;
-      slackUserId: string;
-      /** Who will read the directive this press just wrote, if anyone. */
-      reader: ChoiceReader;
-    }
-  | {
-      kind: "stale";
-      incidentId: string;
-      slackUserId: string;
-      reader: ChoiceReader;
-    }
-  | {
-      kind: "duplicate";
-      incidentId: string;
-      slackUserId: string;
-      reader: ChoiceReader;
-      /**
-       * The answer that won, so a second presser is told what was filed
-       * rather than only that their own press was not. Null if the row it
-       * names has since gone.
-       */
-      recorded: { choice: string; slackUserId: string } | null;
-    };
-
-/**
- * Who will read what a press wrote. Derived from the dispatcher's own
- * eligibility, so the places that ask "is this available" keep agreeing:
- *
- *   agent   one is on it, or the dispatcher resumes one within a tick.
- *   closed  past those statuses, so nothing will ever read this.
- *
- * There used to be a third answer for an incident in a running status that no
- * agent could reach. Nothing can be in that state now.
- */
-export type ChoiceReader = "agent" | "closed";
-
-/** The statuses during which the dispatcher keeps an agent on an incident. */
-const AGENT_RUNNING_STATUSES: readonly IncidentStatus[] = [
-  "INVESTIGATING",
-  "FIXING",
-  "RESOLVED",
-];
 
 export const mentionsBot = (text: string, botUserId: string): boolean =>
   text.includes(`<@${botUserId}>`);
@@ -451,9 +382,8 @@ export class SlackRelay {
   }
 
   /**
-   * Classify one inbound event and act on it. Recording happens here; the
-   * returned route tells the caller whether it still has to run the Slack
-   * agent.
+   * Classify one inbound event and record it. The returned route tells the
+   * caller which of the Boss's entry points answers it.
    */
   async handle(event: SlackEvent): Promise<InboundRoute> {
     if (event.bot_id) return ignore("bot message");
@@ -496,13 +426,10 @@ export class SlackRelay {
         : ignore("thread is not an incident thread");
     }
 
-    const agentRunning = AGENT_RUNNING_STATUSES.includes(incident.status);
-
-    // Recorded before anything decides what it meant, including a mention
-    // this incident has no agent for. Two reasons. The thread is the record,
-    // so a message in it belongs in thread_reply whoever ends up answering;
-    // and the insert is what collapses a Slack retry, so a delivery that used
-    // to skip it could run the Slack agent twice on one question.
+    // Recorded before the Boss reads it. The thread is the record, so a
+    // message in it belongs in thread_reply whatever it turns out to mean;
+    // and the insert is what collapses a Slack retry, so a delivery that
+    // skipped it could run the Boss twice on one message.
     const inserted = await this.recordReply(incident.id, {
       channel,
       user,
@@ -511,159 +438,15 @@ export class SlackRelay {
     });
     if (!inserted) return ignore("duplicate delivery");
 
-    // Handing it to the agent is the caller's, because whether it is an
-    // answer, a handover or two people talking to each other is a model call
-    // and this has to be back inside Slack's three seconds.
-    log(mentioned ? "interrupt_recorded" : "reply_recorded", {
-      incidentId: incident.id,
-      ts,
-    });
+    log("reply_recorded", { incidentId: incident.id, ts, mentioned });
     return {
       kind: "incident_reply",
       incidentId: incident.id,
-      interrupt: mentioned,
-      agentRunning,
       channel,
       threadTs,
       ts,
       user,
       text,
-    };
-  }
-
-  /**
-   * One press of a button on a question. It is recorded and delivered exactly
-   * as a typed reply is — a `thread_reply` row and a `human_message` directive
-   * carrying the label the agent wrote — so `contact_human` cannot tell the
-   * two apart and free text stays the answer of record.
-   *
-   * Anyone in the channel may press. Both guards that keeps honest are in the
-   * statement rather than around it, like every other transition here:
-   *
-   *   EXISTS — `pending_question` holds the one question the agent is waiting
-   *   on. A marker for a different message means this question has already
-   *   been answered or has timed out, and delivering a press against it would
-   *   file "Roll back" as the answer to whatever is being asked now.
-   *
-   *   The derived id — one question takes one answer, however many people
-   *   press, and however many times Slack redelivers.
-   */
-  async handleChoice(click: SlackChoiceClick): Promise<ChoiceRoute> {
-    const incident = this.incidentForThread(click.threadTs);
-    if (!incident) {
-      return { kind: "ignore", reason: "thread is not an incident thread" };
-    }
-
-    // The dispatcher's own eligibility, read off the same list it uses. A
-    // press writes a directive; whether anything is coming to consume it is
-    // this, and the thread has to say which.
-    const reader: ChoiceReader = AGENT_RUNNING_STATUSES.includes(
-      incident.status,
-    )
-      ? "agent"
-      : "closed";
-
-    // Both writes are one transaction because they are one act. The reply row
-    // is what the thread shows and the directive is the only thing the agent
-    // waits on, so a press that commits the first and loses the second leaves
-    // an incident that looks answered and is not acting on the answer, with
-    // nothing downstream to reconcile it. `withWrite` wraps the callback in a
-    // SQLite transaction, so a throw here rolls the reply back with it.
-    const recorded = await this.db.withWrite((d) => {
-      const inserted =
-        d
-          .prepare(
-            `INSERT OR IGNORE INTO thread_reply
-               (id, incidentId, slackUserId, text, ts, receivedAt)
-             SELECT ?, ?, ?, ?, ?, ?
-              WHERE EXISTS (
-                SELECT 1 FROM pending_question
-                 WHERE incidentId = ? AND messageTs = ?
-              )`,
-          )
-          .run(
-            `${click.channel}:${click.messageTs}:choice`,
-            incident.id,
-            click.user,
-            click.choice,
-            click.actionTs,
-            Date.now(),
-            incident.id,
-            click.messageTs,
-          ).changes > 0;
-      if (!inserted) return false;
-
-      // Pressing an agent's own button is addressed to it by construction, so
-      // unlike a typed reply there is nothing here for a model to read and this
-      // stays inside the relay's write rather than moving to the composition
-      // root with the rest of the directive push.
-      d.prepare(
-        `INSERT INTO pending_directive (incidentId, payload, createdAt)
-         VALUES (?, ?, ?)`,
-      ).run(
-        incident.id,
-        JSON.stringify({
-          type: "human_message",
-          from: click.user,
-          text: click.choice,
-          ts: click.actionTs,
-          addressed: "agent",
-        } satisfies Directive),
-        Date.now(),
-      );
-      return true;
-    });
-
-    if (!recorded) {
-      const outstanding = this.db.get<{ messageTs: string }>(
-        "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-        [incident.id],
-      );
-      const kind =
-        outstanding?.messageTs === click.messageTs ? "duplicate" : "stale";
-      log(`choice_${kind}`, {
-        incidentId: incident.id,
-        user: click.user,
-        messageTs: click.messageTs,
-        reader,
-      });
-      if (kind === "stale") {
-        return {
-          kind,
-          incidentId: incident.id,
-          slackUserId: click.user,
-          reader,
-        };
-      }
-      // The derived id is what made the first press the only one, so it is
-      // also how the answer that won is found again.
-      const won = this.db.get<{ text: string; slackUserId: string }>(
-        "SELECT text, slackUserId FROM thread_reply WHERE id = ?",
-        [`${click.channel}:${click.messageTs}:choice`],
-      );
-      return {
-        kind,
-        incidentId: incident.id,
-        slackUserId: click.user,
-        reader,
-        recorded: won
-          ? { choice: won.text, slackUserId: won.slackUserId }
-          : null,
-      };
-    }
-
-    log("choice_recorded", {
-      incidentId: incident.id,
-      user: click.user,
-      ts: click.actionTs,
-      reader,
-    });
-    return {
-      kind: "answered",
-      incidentId: incident.id,
-      choice: click.choice,
-      slackUserId: click.user,
-      reader,
     };
   }
 
@@ -745,13 +528,11 @@ export class SlackRelay {
     return "unwritable";
   }
 
-  private incidentForThread(
-    threadTs: string,
-  ): { id: string; status: IncidentStatus } | undefined {
-    return this.db.get<{
-      id: string;
-      status: IncidentStatus;
-    }>("SELECT id, status FROM incident WHERE slackThreadTs = ?", [threadTs]);
+  private incidentForThread(threadTs: string): { id: string } | undefined {
+    return this.db.get<{ id: string }>(
+      "SELECT id FROM incident WHERE slackThreadTs = ?",
+      [threadTs],
+    );
   }
 
   /**
@@ -764,22 +545,6 @@ export class SlackRelay {
     msg: { channel: string; user: string; text: string; ts: string },
   ): Promise<boolean> {
     return this.db.withWrite((d) => {
-      // Talking to an incident wakes it. No judgement, and deliberately
-      // upstream of anything that reads what the message meant: the whole
-      // failure this system had was a reply landing on an incident nothing
-      // would ever run again, and every version of the fix that asked a
-      // model to recognise the right words is a version that goes quiet the
-      // first time somebody phrases it their own way. A reply that turns out
-      // to be two people talking to each other costs one relaunch.
-      //
-      // The one exception is a kind, not a reading. A wait that a reply
-      // cannot end -- a run out of turns is the case -- stays put, because
-      // waking it relaunches an agent that stops again on its first turn and
-      // escalates again, so every comment on the thread pages the rotation.
-      // Still no message read: the parker said which kind it was.
-      d.prepare(
-        "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1",
-      ).run(incidentId);
       const res = d
         .prepare(
           `INSERT OR IGNORE INTO thread_reply
