@@ -810,7 +810,7 @@ describe("session persistence", () => {
     assert.equal(run.fresh, true, "premise: the old session expired");
     assert.match(run.input, /You \(BugBoss\): Opened incident 95 for this\./, "so it can see it already opened one");
     assert.match(run.input, /double charged for one text/);
-    assert.doesNotMatch(run.input, /before you were tagged/);
+    assert.match(run.input, /Earlier in this thread, before this message/, "an expired session rereads the thread as history");
   });
 
   test("a thread idle for more than seven days starts clean", async () => {
