@@ -68,7 +68,7 @@ describe('POST /v1/ecanvasser/:id/sync on a large door-knocking backlog', () => 
       data: {
         slug,
         ownerId: service.user.id,
-        overrideDistrictId: 'district-check-1',
+        overrideDistrictId: '20000000-0000-4000-8000-000000000001',
       },
     })
     const campaign = await service.prisma.campaign.create({
@@ -133,6 +133,13 @@ describe('POST /v1/ecanvasser/:id/sync on a large door-knocking backlog', () => 
         `sync answered ${status ?? 'nothing'} after ${elapsedMs}ms, ` +
           `${statements} voter statements run`,
       )
+
+      // Not the symptom: a sync that never reaches a voter lookup answers fast
+      // for the wrong reason, and must not count as a pass.
+      expect(
+        statements,
+        'the sync never reached the voter warehouse, so the check proves nothing',
+      ).toBeGreaterThan(0)
 
       expect(
         status,

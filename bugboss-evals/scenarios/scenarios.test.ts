@@ -93,7 +93,9 @@ for (const id of ids) {
       assert.ok(series.namespace && series.metricName && series.unit);
       assert.equal(typeof series.dimensions, "object");
       for (const point of series.datapoints) {
-        assert.equal(typeof point.ts, "number");
+        // Offsets in ms from the alert, never absolute: the stand-in shifts
+        // them onto the run's clock, as the telemetry loader does for logs.
+        assert.ok(Number.isInteger(point.ts) && point.ts <= 0, "datapoint ts is an offset before the alert");
         assert.equal(typeof point.value, "number");
       }
     }
