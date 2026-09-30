@@ -59,12 +59,27 @@ export const AWS_CREDENTIAL_PATH_VARS = [
   "AWS_CONTAINER_AUTHORIZATION_TOKEN",
 ] as const;
 
+/**
+ * Where a child clones from, works, reads its GitHub token and sends its AWS
+ * calls. Production sets none of them, so a production child gets nothing
+ * from here. The eval harness sets them all: without them the agent would be
+ * the one process in the run still pointed at omni and real S3.
+ */
+export const CHILD_EVAL_ENV_NAMES = [
+  "BUGBOSS_OMNI_REPO",
+  "BUGBOSS_WORK_ROOT",
+  "BUGBOSS_GITHUB_TOKEN_FILE",
+] as const;
+
+const AWS_ENDPOINT = /^AWS_ENDPOINT_URL(_[A-Z0-9_]+)?$/;
+
 export const CHILD_BASE_ENV_NAMES = [
   "PATH",
   "HOME",
   "TMPDIR",
   "LANG",
   ...AWS_CREDENTIAL_PATH_VARS,
+  ...CHILD_EVAL_ENV_NAMES,
 ] as const;
 
 /** Explicit opt-in for the handful of parent variables a child needs. */
@@ -75,6 +90,9 @@ export const pickBaseEnv = (
   for (const name of CHILD_BASE_ENV_NAMES) {
     const value = src[name];
     if (value !== undefined) out[name] = value;
+  }
+  for (const [name, value] of Object.entries(src)) {
+    if (value !== undefined && AWS_ENDPOINT.test(name)) out[name] = value;
   }
   return out;
 };

@@ -137,7 +137,7 @@ import {
 } from "./agent/session";
 import { INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
-import { createInstallationToken, createPrStateReader } from "./github";
+import { createInstallationToken, createPrStateReader, tokenFromFile } from "./github";
 import { createGhExec, type GhExec } from "./slack/gh";
 import { makeAlarm, makeLog } from "./logging";
 import type {
@@ -2346,8 +2346,9 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
     alarm("test_database_report_failed", { error: String(error) }),
   );
 
-  const githubToken =
-    secrets.githubAppId &&
+  const githubToken = env.BUGBOSS_GITHUB_TOKEN_FILE
+    ? tokenFromFile(env.BUGBOSS_GITHUB_TOKEN_FILE)
+    : secrets.githubAppId &&
     secrets.githubAppPrivateKey &&
     secrets.githubAppInstallationId
       ? createInstallationToken({

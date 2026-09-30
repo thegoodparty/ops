@@ -243,6 +243,12 @@ A launch whose environment carries no credential path at all alarms:
 without it the agent loses Bedrock, and that surfaces a turn later as a model
 call failing with nothing pointing back at the environment.
 
+The eval harness (`bugboss-evals/`) passes four more things through, and
+production sets none of them: `BUGBOSS_OMNI_REPO` (clone the sandbox, not
+omni), `BUGBOSS_WORK_ROOT`, `BUGBOSS_GITHUB_TOKEN_FILE` (a sandbox-scoped
+token the harness keeps fresh, read instead of the App's credentials) and
+any `AWS_ENDPOINT_URL_*`.
+
 ## A resume tells the agent and alarms, and posts nothing
 
 Relaunch is automatic: an incident in an agent status gets a new child on
