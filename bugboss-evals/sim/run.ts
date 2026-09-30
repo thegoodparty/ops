@@ -75,10 +75,23 @@ const freePort = (): Promise<number> =>
     });
   });
 
+/**
+ * With `runAs`, the command runs as a user that holds nothing: not the App
+ * key, not the workflow's token, not the runner's sudo. umask 0 so the
+ * harness, as the runner, can still read and write what it leaves behind.
+ */
 const asUser = (runAs: string | undefined, command: string, args: string[], env: Record<string, string>) =>
   runAs
-    ? { command: "sudo", args: ["-u", runAs, "env", "-i", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), command, ...args] }
+    ? {
+        command: "sudo",
+        args: ["-u", runAs, "env", "-i", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), "sh", "-c", 'umask 0; exec "$0" "$@"', command, ...args],
+        env: undefined,
+      }
     : { command, args, env };
+
+const shareWith = async (runAs: string | undefined, path: string): Promise<void> => {
+  if (runAs) await exec("chmod", ["-R", "a+rwX", path]);
+};
 
 const grafana = async <T>(stack: Stack, path: string, init: { method?: string; body?: unknown; org?: number } = {}): Promise<T> => {
   const res = await fetch(`${stack.grafanaUrl}${path}`, {
@@ -231,7 +244,7 @@ const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: s
   const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
   if ((await exec("git", ["-c", auth, "clone", "-q", "--filter=blob:none", "--no-checkout", SANDBOX_URL, dir])) !== 0) return false;
   if ((await exec("git", ["-C", dir, "-c", auth, "checkout", "-q", sha])) !== 0) return false;
-  if (spec.runAs) await exec("sudo", ["chown", "-R", spec.runAs, dir]);
+  await shareWith(spec.runAs, dir);
   for (const [step, timeout] of [
     [check.setup, 1800],
     [check.command, check.timeoutSeconds],
@@ -291,7 +304,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     },
   });
 
-  if (spec.runAs) spawnSync("sudo", ["chown", "-R", spec.runAs, spec.root]);
+  await shareWith(spec.runAs, spec.root);
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: home,
@@ -323,7 +336,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const logFd = join(spec.root, "bugboss.log");
   writeFileSync(logFd, "");
   const boss: ChildProcess = spawn(launch.command, launch.args, {
-    env: launch.env,
+    env: launch.env ?? process.env,
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
