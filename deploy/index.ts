@@ -6,6 +6,7 @@ import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createBugBoss } from "./components/bugboss";
+import { createBugBossEvalRole } from "./components/bugboss-eval";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -45,6 +46,7 @@ export = async () => {
 
   createIdentityCenter();
   createCiRoles();
+  createBugBossEvalRole();
 
   // Gated rather than unconditional because deploy.yml still builds and
   // pushes only delegate-worker, so there is no BugBoss image to pull and the
