@@ -167,7 +167,14 @@ export const runPhase = async (args: {
       throw new Error(`the checkpoint's checkout ${checkout} is not <workRoot>/${suffix}`);
     }
     const workRoot = checkout.slice(0, -suffix.length - 1);
-    const ghHost = new URL(env.github.gitUrl).host;
+    const gitUrl = new URL(env.github.gitUrl);
+    // gh matches the checkout's remote to GH_HOST by hostname alone and then
+    // calls https://<host>/api/v3, so a stand-in on any port but 443 leaves
+    // every gh call in the checkout with no matching remote.
+    if (gitUrl.protocol !== "https:" || gitUrl.port !== "") {
+      throw new Error(`the GitHub stand-in must be https on port 443 for gh to reach it; got ${env.github.gitUrl}`);
+    }
+    const ghHost = gitUrl.host;
     const checkpoint = { ...recorded, jsonl: rewriteGitHubHost(recorded.jsonl, ghHost) };
     if (!checkpoint.view) throw new Error("the checkpoint holds no get_incident view to resume from");
 
@@ -258,6 +265,7 @@ export const runPhase = async (args: {
       GH_PROMPT_DISABLED: "1",
       GIT_TERMINAL_PROMPT: "0",
       BUGBOSS_OMNI_REPO: env.github.gitUrl,
+      BUGBOSS_GITHUB_URL: gitUrl.origin,
       ...(env.grafanaUrl ? { GRAFANA_URL: env.grafanaUrl } : {}),
       ...(env.caFile
         ? { SSL_CERT_FILE: env.caFile, NODE_EXTRA_CA_CERTS: env.caFile, GIT_SSL_CAINFO: env.caFile }
