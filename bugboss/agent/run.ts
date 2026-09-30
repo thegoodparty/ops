@@ -784,6 +784,7 @@ export const createDirectiveWatcher = (args: {
   onFailure: (error: unknown) => void;
 }): (() => Promise<void>) => {
   const handled = new Set<number>();
+  const steered = new Set<number>();
   let running = false;
   return async () => {
     if (running) return;
@@ -794,10 +795,13 @@ export const createDirectiveWatcher = (args: {
         if (handled.has(entry.id)) continue;
         const text = bossMessageText(entry.directive);
         if (text !== null) {
-          await args.steer(`The Boss says: ${text}`);
-          handled.add(entry.id);
-          args.interruptWait();
+          if (!steered.has(entry.id)) {
+            await args.steer(`The Boss says: ${text}`);
+            steered.add(entry.id);
+            args.interruptWait();
+          }
           await args.api.consumeDirective(entry.id);
+          handled.add(entry.id);
         } else if (entry.directive.type === "stop" || entry.directive.type === "merged") {
           handled.add(entry.id);
           args.interruptWait();

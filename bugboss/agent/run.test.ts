@@ -1348,3 +1348,33 @@ test("a steer that fails is tried again on the next tick and the message is kept
   assert.equal(interrupts, 1);
   assert.equal(failures.length, 1);
 });
+
+test("a consume that fails is retried without steering the message twice", async () => {
+  const queue = directiveQueue();
+  queue.push({ type: "boss_message", text: "answer the three questions", at: 1 });
+  const steered: string[] = [];
+  const failures: unknown[] = [];
+  let consumeCalls = 0;
+  const watch = createDirectiveWatcher({
+    api: {
+      peekDirectives: queue.api.peekDirectives,
+      consumeDirective: async (id) => {
+        consumeCalls += 1;
+        if (consumeCalls === 1) throw new Error("the Boss said 503");
+        await queue.api.consumeDirective(id);
+      },
+    },
+    steer: async (text) => steered.push(text),
+    interruptWait: () => {},
+    onFailure: (error) => failures.push(error),
+  });
+
+  await watch();
+  assert.deepEqual(queue.consumed, []);
+  await watch();
+  assert.deepEqual(queue.consumed, [1]);
+  assert.equal(steered.length, 1);
+  assert.equal(failures.length, 1);
+  await watch();
+  assert.equal(consumeCalls, 2);
+});
