@@ -207,7 +207,10 @@ $5.25 in cold rewrites for the two wakes. A longer request is clamped, not
 refused: the result says the call was capped and nothing timed out, and the
 agent calls again. A capped `monitor` keeps its wait marker, so the re-armed
 call resumes the original clock and heartbeat ladder (without that, the first
-reminder at one hour would never land). A capped `message_boss` keeps its
+reminder at one hour would never land). A capped wait with no marker has
+nothing to resume, so its result names the `timeoutSeconds` left and the
+agent passes that; passing the original again would restart the clock every
+call and the wait would never end. A capped `message_boss` keeps its
 question marker, so calling again with the same message does not re-ask.
 
 **A Boss message is a user message, and it ends a wait.** The Boss writes it

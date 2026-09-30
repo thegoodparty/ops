@@ -477,6 +477,12 @@ export interface MonitorResult {
   timedOut: boolean;
   /** The call hit `MAX_BLOCK_SECONDS` before the requested timeout. */
   capped: boolean;
+  /**
+   * On a capped wait with no marker to resume from, what is left of the
+   * requested timeout. The next call starts a fresh clock, so the agent has
+   * to pass this rather than the original or the wait never ends.
+   */
+  remainingSeconds?: number;
 }
 
 /**
@@ -548,7 +554,14 @@ export const runMonitor = async (
       // again, which at a 55-minute cap would mean the first reminder at one
       // hour never came.
       if (heartbeat && !capped) await release(heartbeat, args.command);
-      return { output: last, timedOut: !capped, capped };
+      return capped && !heartbeat
+        ? {
+            output: last,
+            timedOut: false,
+            capped,
+            remainingSeconds: Math.ceil((requestedDeadline - now()) / 1000),
+          }
+        : { output: last, timedOut: !capped, capped };
     }
 
     if (heartbeat && marker) {
@@ -839,8 +852,11 @@ export const runMessageBoss = async (
         alarm("question_escalation_failed", { error: String(error) });
       }
     }
-    // The marker stays, so calling again with the same message resumes this
-    // wait and its escalation clock rather than asking the Boss twice.
+    // `deadline` above is when the Boss is told, not when this wait ends: an
+    // unanswered question keeps waiting, and only the harness signal times it
+    // out. So reaching the cap is never a timeout, whatever `seconds` was. The
+    // marker stays, so calling again with the same message resumes this wait
+    // and its escalation clock rather than asking the Boss twice.
     if (now() >= capAt) {
       return { answer: null, timedOut: false, capped: true, directives: rest, terminate: false };
     }
@@ -857,7 +873,7 @@ const MONITOR_DESCRIPTION = [
   "with bash in a loop. It costs one turn. One call blocks for at most",
   `${MAX_BLOCK_SECONDS} seconds (55 minutes), inside the one-hour prompt cache, and`,
   "returns saying so if `timeoutSeconds` asked for longer. If you still need to",
-  "wait, call it again with the same arguments: the wait and its reminders carry on.",
+  "wait, call it again the way the result tells you to.",
   "",
   "`waitingFor` is what people see on the incident board: one short plain",
   "sentence, no shell, e.g. \"someone to merge omni#2189 or #2195\" or \"the",
@@ -940,7 +956,11 @@ export const createMonitorTool = async (
       const header = interrupt?.aborted && result.timedOut
         ? `STOPPED WAITING for: ${args.description} (interrupted). ${INTERRUPTED}`
         : result.capped
-          ? `STILL WAITING for: ${args.description}. This call was capped at ${MAX_BLOCK_SECONDS}s of the ${args.timeoutSeconds}s you asked for, so the prompt cache stays warm. Nothing has timed out. If you still need to wait, call monitor again with the same arguments.`
+          ? `STILL WAITING for: ${args.description}. This call was capped at ${MAX_BLOCK_SECONDS}s of the ${args.timeoutSeconds}s you asked for, so the prompt cache stays warm. Nothing has timed out. ${
+              result.remainingSeconds === undefined
+                ? "If you still need to wait, call monitor again with the same arguments."
+                : `If you still need to wait, call monitor again with timeoutSeconds: ${result.remainingSeconds}, which is what is left of your wait.`
+            }`
           : result.timedOut
             ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
             : `Condition met: ${args.description}`;

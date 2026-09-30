@@ -1590,8 +1590,28 @@ test("a monitor asked for four hours returns inside the cache TTL and says it wa
   const text = toolText(out);
   assert.match(text, /^STILL WAITING for: the ratio to settle\./);
   assert.match(text, /capped at 3300s of the 14400s you asked for/);
-  assert.match(text, /call monitor again with the same arguments/);
+  assert.match(text, /call monitor again with timeoutSeconds: 11100, which is what is left/);
   assert.doesNotMatch(text, /TIMED OUT/);
+});
+
+test("a capped wait with no marker carries the rest of its timeout, so re-arming still ends", async () => {
+  const clock = fakeClock();
+  const started = clock.now();
+  const deps = { probe: stalled, sleep: clock.sleep, now: clock.now };
+  let timeoutSeconds = 7200;
+  const results = [];
+  for (let call = 0; call < 5; call += 1) {
+    const result = await runMonitor(
+      { command: "check", intervalSeconds: 300, timeoutSeconds, description: "the deploy", waitingFor: "the deploy" },
+      deps,
+    );
+    results.push(result);
+    if (!result.capped) break;
+    timeoutSeconds = result.remainingSeconds ?? assert.fail("a capped wait with no marker says what is left");
+  }
+
+  assert.deepEqual(results.map((r) => [r.capped, r.timedOut]), [[true, false], [true, false], [false, true]]);
+  assert.equal(clock.now() - started, 7200 * 1000, "the two-hour wait ends at two hours, across the re-arms");
 });
 
 test("a wait shorter than the cap still times out as asked", async () => {
@@ -1613,6 +1633,7 @@ test("a capped wait on a person keeps its marker, so the re-armed call still rem
 
   const first = await runMonitor(args, deps);
   assert.equal(first.capped, true);
+  assert.equal(first.remainingSeconds, undefined, "the marker resumes the clock, so the same arguments are right");
   assert.equal(harness.clears(), 0, "a capped wait is not over, so the marker stays");
   assert.equal(harness.told.length, 0, "55 minutes in, no reminder is due yet");
 
@@ -1658,4 +1679,21 @@ test("a question with no answer returns at the cap and keeps its marker", async 
     1,
     "re-arming does not ask the Boss twice",
   );
+});
+
+test("a question whose escalation falls on the cap is still waiting, not timed out", async () => {
+  // `seconds` is when the Boss is told, not when the wait ends, so an
+  // escalation and the cap landing together leave the question outstanding.
+  const clock = fakeClock();
+  const harness = questionHarness({ clock });
+
+  const result = await runMessageBoss(
+    { message: "Can someone merge omni#2192?", wait: true, seconds: MAX_BLOCK_SECONDS },
+    { ...harness.deps, maxBlockSeconds: MAX_BLOCK_SECONDS },
+  );
+
+  assert.equal(harness.escalations().length, 1, "the Boss was told at `seconds`");
+  assert.equal(result.capped, true);
+  assert.equal(result.timedOut, false);
+  assert.notEqual(harness.pending(), null, "and the question is still outstanding");
 });
