@@ -586,7 +586,7 @@ export const buildTools = ({
     {
       name: "stay_silent",
       description:
-        "Post nothing in reply. Only in an incident thread, and only for a message that is not for you -- people talking to each other. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer.",
+        "Post nothing in reply. Only in an incident thread or for an untagged message in a thread you are already in, and only for a message that is not for you -- people talking to each other. A message that tags you is always answered. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer.",
       inputSchema: {
         type: "object",
         properties: {
@@ -979,6 +979,13 @@ export interface SlackMention {
   ts: string;
   user: string;
   text: string;
+  /**
+   * False for an untagged follow-up in a thread the Boss already talks in.
+   * That one may not be for the Boss at all, so, as in an incident thread,
+   * it may choose silence with `stay_silent`. Absent is tagged: the safe
+   * side of this is an answer nobody needed, not a question left unanswered.
+   */
+  tagged?: boolean;
 }
 
 export interface SlackAgentConfig {
@@ -1422,9 +1429,10 @@ export class SlackAgent {
       const missed =
         fresh || !prior ? [] : await this.missedMessages(mention, prior.lastSeenTs);
 
-      // Silence is not an outcome here -- the harness is told so -- but the
-      // tool is in the list anyway, because the list is byte-stable across
-      // every run and a mention thread can later become a thread it is in.
+      // A tagged mention is always answered. An untagged follow-up may be
+      // two people talking under a Boss answer, so there, as in an incident
+      // thread, silence is allowed -- but only chosen with stay_silent.
+      const allowSilence = mention.tagged === false;
       const silence: SilenceChoice = { reason: null };
       const tools = this.tools(silence, {
         user: mention.user,
@@ -1440,11 +1448,31 @@ export class SlackAgent {
         fresh,
         input: this.buildInput(mention, missed),
         maxTurns: this.cfg.maxTurns ?? SLACK_AGENT_MAX_TURNS,
-        allowSilence: false,
+        allowSilence,
       });
 
+      if (!text.trim()) {
+        if (silence.reason === null) {
+          alarm("followup_run_silent_unchosen", {
+            thread: lockKey,
+            trigger: "human",
+            triggerTs: mention.ts,
+            triggerUser: mention.user,
+            ...usageForLog(usage),
+          });
+          await this.reportFailure(mention, new Error("the run ended with no reply and without choosing silence"));
+          return;
+        }
+        log("stay_silent", { thread: lockKey, reason: silence.reason });
+        try {
+          await this.writeState(stateKey, { lastSeenTs: mention.ts, lastActivityAt: Date.now() });
+        } catch (err) {
+          log("state_write_failed", { thread: lockKey, error: String(err) });
+        }
+        return;
+      }
       if (silence.reason !== null) {
-        log("stay_silent_outside_incident", { thread: lockKey, reason: silence.reason });
+        log("stay_silent_overridden", { thread: lockKey, reason: silence.reason });
       }
       await postProse(
         (part) => this.slack.post(mention.threadTs, part, mention.channel),

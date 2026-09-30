@@ -429,6 +429,14 @@ settle, so its inbox rows stay unseen and the watermark stays put. A close or
 merge posts its own notice; when that is the whole answer the Boss still has
 to say so with `stay_silent`.
 
+An untagged follow-up in a non-incident thread the Boss already talks in
+gets the same rule, because it may be two people talking under a Boss
+answer: `handle` runs it with silence allowed, `stay_silent` posts nothing,
+and an empty run without it alarms (`followup_run_silent_unchosen`) and
+posts the failure reply. An intent read of `unclear` on one goes to the Boss
+rather than asking "report or question?". A tagged mention is always
+answered.
+
 **It can change state, on evidence.** The write tools are in
 `boss/commands.ts`, appended after the read tools in a fixed order because
 the tools array is part of the cache prefix:

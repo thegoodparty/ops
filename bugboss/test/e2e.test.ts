@@ -1760,6 +1760,33 @@ test("an untagged follow-up in a Boss conversation thread reaches the Boss", asy
   );
 });
 
+/**
+ * Delegate's catch: an untagged follow-up may be two people talking under a
+ * Boss answer. Asked "report or question?" of them, or given an apology for a
+ * silence the Boss chose, is a reply nobody wanted.
+ */
+test("an untagged follow-up the Boss chooses to ignore gets no reply at all", async () => {
+  await boss.slackEvent({
+    type: "app_mention",
+    channel: "C0TEST",
+    user: "U-swain",
+    text: "<@B0BOSS> what is open right now",
+    ts: "2150.1",
+  });
+  const postsBefore = fakeSlack.posts.length;
+  const asked = fakeSlackAgent.asked.length;
+
+  fakeSlackAgent.script = async (req) => {
+    assert.equal(req.allowSilence, true, "premise: an untagged follow-up may be silent");
+    await bossTool(req, "stay_silent", { reason: "two people deciding where to eat" });
+    return "";
+  };
+  await deliver(threaded("2150.2", "2150.1", "want to grab lunch after this?"));
+  await until(() => fakeSlackAgent.asked.length > asked, "the Boss to read the follow-up");
+
+  assert.equal(fakeSlack.posts.length, postsBefore, "no clarifying question and no apology");
+});
+
 test("the same words in a thread the Boss has never spoken in stay ignored", async () => {
   const asked = fakeSlackAgent.asked.length;
   const reactions = fakeSlack.reactions.length;
@@ -3136,8 +3163,9 @@ test("a close request tagged in a board thread reaches the Boss, which acts on i
   const event = taggedIn("2400.2", board, said);
 
   // The mention path, the one the classifier stood in front of: the board's
-  // thread belongs to no incident.
-  assert.equal((await boss.relay.handle(event)).kind, "slack_agent");
+  // thread belongs to no incident. Checked on its own ts, because the relay
+  // now collapses a second delivery of one message as a Slack retry.
+  assert.equal((await boss.relay.handle({ ...event, ts: "2400.9" })).kind, "slack_agent");
 
   const calls = fakeModel.calls;
   const posts = fakeSlack.posts.length;

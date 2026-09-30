@@ -535,6 +535,50 @@ describe("prefix binding", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("an untagged follow-up in a thread the Boss is already in", () => {
+  const build = () => {
+    const model = fakeModel();
+    const slack = fakeSlack();
+    const { store } = memoryStore();
+    const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
+      openIncident: refuseOpen,
+      db,
+      store,
+      slack: slack.client,
+      model: model.model,
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
+    });
+    return { model, slack, agent };
+  };
+
+  test("may choose silence, which posts nothing and is logged", async () => {
+    const { model, slack, agent } = build();
+    model.state.reply = "";
+    model.state.silence = "they are talking to each other";
+    const lines = await captureLogs(() => agent.handle(mention({ ts: "100.2", text: "lunch?", tagged: false })));
+    assert.equal(model.runs[0].allowSilence, true, "premise: the harness was told silence is allowed");
+    assert.equal(slack.posts.length, 0);
+    assert.ok(lines.some((l) => l.includes('"event":"stay_silent"') && l.includes("talking to each other")));
+  });
+
+  test("an empty run without stay_silent is a failure the thread hears about", async () => {
+    const { model, slack, agent } = build();
+    model.state.reply = "";
+    const lines = await captureLogs(() => agent.handle(mention({ ts: "100.2", text: "can you close incident 2?", tagged: false })));
+    assert.ok(lines.some((l) => l.includes("followup_run_silent_unchosen") && l.includes('"level":"error"')));
+    assert.equal(slack.posts.length, 1);
+    assert.match(slack.posts[0].text, /could not finish/);
+  });
+
+  test("a tagged mention is never allowed silence", async () => {
+    const { model, agent } = build();
+    await captureLogs(() => agent.handle(mention({ ts: "100.3" })));
+    assert.equal(model.runs[0].allowSilence, false);
+  });
+});
+
 describe("the per-thread lock", () => {
   test("a held thread cannot be acquired twice", async () => {
     const lock = createMemoryThreadLock();
