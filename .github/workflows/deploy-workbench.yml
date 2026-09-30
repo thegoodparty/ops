@@ -67,6 +67,10 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
+      # Before any credentials exist. Dependency changes merge on a bot
+      # approval, so an install script must never run holding a deploy role.
+      - run: npm ci
+
       # The first hop. This role lives in the management account; index.ts
       # makes the second hop into 024901689212 by assuming pulumi-deploy
       # through an explicit provider.
@@ -81,7 +85,6 @@ jobs:
         with:
           pulumi-version: "^3"
 
-      - run: npm ci
 
       - name: Deploy
         working-directory: deploy-workbench

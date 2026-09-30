@@ -66,10 +66,11 @@
 # are singletons referenced by name from an owned path, where there is no
 # "one file over" to add.
 #
-# Before adding a path to the unowned side, check what executes it. The
-# ordering in `deploy.yml` -- install, test and build strictly before the
-# credentials step -- is load-bearing for every unowned path in this repo, and
-# is the only reason an unowned test file is not an admin-credentialled shell.
+# Before adding a path to the unowned side, check what executes it. Every
+# deploy workflow installs before its credentials step, and `deploy.yml` also
+# tests and builds there. That ordering is load-bearing for every unowned path,
+# dependency changes included: it is the only reason an unowned test file or
+# an install script is not a credentialled shell.
 #
 # Narrowing this list is a security change. It is also, by construction, a
 # change to a path on the list, so it needs a human.

@@ -52,15 +52,11 @@ no owner satisfies the code-owner half vacuously, so on those paths a
   the trees that define IAM, CI and the reviewer itself
 - `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling
   code but are reached by IaC and by a credentialled workflow. See below.
-- `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore`
-- `bugboss/toolapi/`, `bugboss/dispatcher/`, `bugboss/github.ts`,
-  `bugboss/slack-app-manifest.yaml`, `bugboss/Dockerfile` — BugBoss's security
-  boundaries, as opposed to its application code
-- `CLAUDE.md`, at the root and in any directory — the reviewer is told to
-  read these as authoritative for conventions, so they shape what it accepts
+- `tsconfig.json`, `.dockerignore`
 
-**Everything else merges on a bot approval** — the rest of `bugboss/`,
-`docs/`, and `README.md`.
+**Everything else merges on a bot approval**: all of `bugboss/`, dependency
+changes (`package.json`, `package-lock.json`), every `CLAUDE.md`, `docs/`, and
+`README.md`.
 
 Keep changes that need a human in their own PR: one file under an owned path
 pulls the whole PR into human review.
@@ -72,14 +68,14 @@ resource ARNs from `utils/bedrock-models.ts` and its account ids from
 `utils/accounts.ts`; `deploy-workbench.yml` runs
 `scripts/enable-bedrock-models.ts` under a deploy role; and `run-script.ts`
 dynamically imports anything in `scripts/`. Before you assume a file is
-harmless, check what executes it, or what reads it: `CLAUDE.md` is owned for
-the second reason rather than the first.
+harmless, check what executes it, or what reads it.
 
-The same applies to CI ordering. `deploy.yml` runs install, test and build
-**strictly before** the Configure AWS Credentials step, because the deploy
-role carries `AdministratorAccess` and `npm test` executes
-`bugboss/**/*.test.ts` — unowned files. Do not move a step that runs
-repository code below that credentials step.
+The same applies to CI ordering. Every deploy workflow runs `npm ci` **strictly
+before** its Configure AWS Credentials step, and `deploy.yml` runs test and
+build there too. Dependency changes and `bugboss/**/*.test.ts` merge on a bot
+approval, and the deploy roles carry up to `AdministratorAccess`, so an install
+script or a test must never run holding a role. Do not move a step that runs
+repository code below a credentials step.
 
 Both halves are explained at length in `.github/CODEOWNERS`. Read it before
 adding a path to either side; scope by directory, not by file.
@@ -105,8 +101,8 @@ there. The three things most likely to catch you out:
 
 - **Nothing auto-closes**, and nothing may fail silently. This system's
   healthy state and its dead state both look like silence in Slack.
-- **Status and owner are orthogonal.** Status is where the work is; owner is
-  who has it. Do not collapse them.
+- **An agent always drives.** Incidents are never handed to a person. People
+  talk to the Boss, and the Boss talks to the incident agents.
 - **The schema's `CHECK` constraints cannot be added later.** SQLite cannot
   `ALTER TABLE ADD CHECK` and there is no migration runner.
 
