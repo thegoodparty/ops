@@ -13,6 +13,16 @@ const BUCKET_NAME = "bugboss-prod";
 const SECRET_NAME = "BUGBOSS";
 const CONTAINER_PORT = 3000;
 
+/**
+ * Where incident agents keep their workspaces, and the uid they write them
+ * as. Both are fixed elsewhere and checked against these by a test: the path
+ * is DEFAULT_WORK_ROOT in bugboss/agent/run.ts, and the uid is the `agent`
+ * user bugboss/Dockerfile creates. The access point forces every write on the
+ * volume to this uid, so a mismatch is a volume the container cannot write.
+ */
+export const WORK_MOUNT_PATH = "/work";
+export const AGENT_UID = 1001;
+
 // Fargate takes container `memory` as a hard limit whose sum may not exceed
 // the task's, and container `cpu` as a relative share a container may burst
 // past while others are idle. So the CPU slice is free and the memory one is
@@ -229,6 +239,69 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
+  // The agents' workspaces: `/work/<incidentId>`, which is an omni clone, its
+  // node_modules and whatever the agent has not committed yet. They were on
+  // the task's ephemeral storage, and every ops deploy replaces the task, so
+  // every deploy re-cloned omni for every open incident and threw away its
+  // uncommitted work -- incident 86 redid 29 turns of it. EFS outlives the
+  // task. The dispatcher deletes a workspace once its incident is closed or
+  // merged, which is the only thing keeping this from growing forever.
+  //
+  // Elastic throughput rather than bursting: bursting earns its throughput
+  // from the bytes stored, and an npm ci is a burst of small writes against a
+  // file system that is mostly empty between incidents.
+  const workFileSystem = new aws.efs.FileSystem("bugbossWorkFs", {
+    creationToken: "bugboss-work",
+    encrypted: true,
+    performanceMode: "generalPurpose",
+    throughputMode: "elastic",
+    tags: { ...TAGS, Name: "bugboss-work" },
+  });
+
+  const workSecurityGroup = new aws.ec2.SecurityGroup("bugbossWorkSg", {
+    name: "bugboss-work-efs",
+    description: "NFS to the BugBoss work file system from the BugBoss task only",
+    vpcId: VPC_ID,
+    ingress: [
+      {
+        protocol: "tcp",
+        fromPort: 2049,
+        toPort: 2049,
+        securityGroups: [serviceSecurityGroup.id],
+        description: "BugBoss task to EFS",
+      },
+    ],
+    tags: TAGS,
+  });
+
+  // One per subnet the service can place the task in, or a task landing in
+  // the other AZ has nothing to mount and fails to start.
+  const workMountTargets = config.subnetIds.map(
+    (subnetId, i) =>
+      new aws.efs.MountTarget(`bugbossWorkMount${i}`, {
+        fileSystemId: workFileSystem.id,
+        subnetId,
+        securityGroups: [workSecurityGroup.id],
+      }),
+  );
+
+  // The file system root is never exposed. The access point roots the mount at
+  // `/work` on EFS, creates it owned by the agent user, and makes every client
+  // write as that user whatever it runs as.
+  const workAccessPoint = new aws.efs.AccessPoint("bugbossWorkAccessPoint", {
+    fileSystemId: workFileSystem.id,
+    posixUser: { uid: AGENT_UID, gid: AGENT_UID },
+    rootDirectory: {
+      path: WORK_MOUNT_PATH,
+      creationInfo: {
+        ownerUid: AGENT_UID,
+        ownerGid: AGENT_UID,
+        permissions: "0755",
+      },
+    },
+    tags: { ...TAGS, Name: "bugboss-work" },
+  });
+
   const loadBalancer = new aws.lb.LoadBalancer("bugbossAlb", {
     name: "bugboss",
     loadBalancerType: "application",
@@ -399,6 +472,22 @@ export const createBugBoss = (config: BugBossConfig) => {
               Action: ["secretsmanager:GetSecretValue"],
               Resource: [secret.arn],
             },
+            // The task mounts the work file system through its access point
+            // with IAM auth, and this is the only way it is allowed to.
+            {
+              Sid: "WorkFileSystem",
+              Effect: "Allow",
+              Action: [
+                "elasticfilesystem:ClientMount",
+                "elasticfilesystem:ClientWrite",
+              ],
+              Resource: [workFileSystem.arn],
+              Condition: {
+                StringEquals: {
+                  "elasticfilesystem:AccessPointArn": workAccessPoint.arn,
+                },
+              },
+            },
             // The phase-to-model mapping lives in SSM so it retunes without a
             // deploy, which is also why the parameters are not declared here:
             // Pulumi would revert every retune on the next apply.
@@ -479,6 +568,42 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
+  // Without a file system policy EFS lets any client that reaches a mount
+  // target in, and the task role's grant above would limit nothing. With one,
+  // a mount needs an IAM allow, and this one says TLS, the task role, and
+  // only through the access point.
+  new aws.efs.FileSystemPolicy("bugbossWorkFsPolicy", {
+    fileSystemId: workFileSystem.id,
+    policy: pulumi.jsonStringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Sid: "TaskRoleThroughAccessPoint",
+          Effect: "Allow",
+          Principal: { AWS: taskRole.arn },
+          Action: [
+            "elasticfilesystem:ClientMount",
+            "elasticfilesystem:ClientWrite",
+          ],
+          Resource: workFileSystem.arn,
+          Condition: {
+            StringEquals: {
+              "elasticfilesystem:AccessPointArn": workAccessPoint.arn,
+            },
+          },
+        },
+        {
+          Sid: "TlsOnly",
+          Effect: "Deny",
+          Principal: { AWS: "*" },
+          Action: "*",
+          Resource: workFileSystem.arn,
+          Condition: { Bool: { "aws:SecureTransport": "false" } },
+        },
+      ],
+    }),
+  });
+
   // `copyFrom` a system-defined inference profile is what makes this an
   // application inference profile rather than a second cross-region one.
   // The tags are the whole point of the resource: they are what Cost
@@ -514,16 +639,29 @@ export const createBugBoss = (config: BugBossConfig) => {
       cpuArchitecture: "X86_64",
       operatingSystemFamily: "LINUX",
     },
-    // The Fargate maximum. Fifteen concurrent agents in `FIXING` hold a
-    // measured 4.79 GB omni tree each, which is 72 GB, plus the image, one
-    // shared npm cache, and the SQLite file with its `VACUUM INTO` snapshot.
-    // Investigating agents clone source only and cost a fraction of that, so
-    // the ceiling is rarely approached. Everything above the free 20 GiB runs
-    // about fifteen dollars a month, which is not worth trading against
-    // running out of disk halfway through an incident. The sidecar's data
-    // directory shares this too: near-empty schemas cloned per suite, which
-    // is single-digit gigabytes even with every agent testing at once.
+    // Sized when the agents' omni trees lived here: fifteen in `FIXING` at a
+    // measured 4.79 GB each. Those are on the work volume below now, so what
+    // is left is the image, one shared npm cache, the SQLite file with its
+    // `VACUUM INTO` snapshot, and the sidecar's near-empty per-suite schemas.
+    // Kept at 200 until that is measured rather than guessed; everything
+    // above the free 20 GiB is about fifteen dollars a month.
     ephemeralStorage: { sizeInGib: 200 },
+    // EFS on Fargate needs platform 1.4.0 or later, which is what the
+    // service gets by not pinning one (LATEST). Transit encryption and IAM
+    // auth are what the file system policy requires of the mount.
+    volumes: [
+      {
+        name: "work",
+        efsVolumeConfiguration: {
+          fileSystemId: workFileSystem.id,
+          transitEncryption: "ENABLED",
+          authorizationConfig: {
+            accessPointId: workAccessPoint.id,
+            iam: "ENABLED",
+          },
+        },
+      },
+    ],
     containerDefinitions: pulumi.jsonStringify([
       {
         name: "bugboss",
@@ -532,6 +670,9 @@ export const createBugBoss = (config: BugBossConfig) => {
         memory: BUGBOSS_MEMORY,
         essential: true,
         portMappings: [{ containerPort: CONTAINER_PORT, protocol: "tcp" }],
+        mountPoints: [
+          { sourceVolume: "work", containerPath: WORK_MOUNT_PATH, readOnly: false },
+        ],
         environment: [
           { name: "AWS_DEFAULT_REGION", value: REGION },
           { name: "PORT", value: String(CONTAINER_PORT) },
@@ -686,7 +827,7 @@ export const createBugBoss = (config: BugBossConfig) => {
       },
     ],
     tags: TAGS,
-  });
+  }, { dependsOn: workMountTargets });
 
   return {
     bucket,

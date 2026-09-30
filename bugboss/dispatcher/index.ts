@@ -23,6 +23,7 @@ import type {
 // The child's own grace, read rather than copied: the parent's backstop is
 // defined relative to it, so a change there must move this too.
 import { DEADLINE_GRACE_SECONDS, INCIDENT_AGENT_MAX_TURNS } from "../agent/run";
+import { emptyTrash, sweepWorkspaces } from "../agent/workspace";
 import { buildChildEnv, hasAwsCredentialPath } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
 import { makeAlarm, makeLog } from "../logging";
@@ -148,6 +149,12 @@ export interface DispatcherDeps {
   maxLaunches?: number;
   /** How long a parked incident stays unrunnable before it is tried again. */
   parkCooldownSeconds?: number;
+  /**
+   * Where agents keep their workspaces, which outlive the task. Given, the
+   * dispatcher deletes the ones whose incidents closed or were merged; absent,
+   * as in tests that run no real agent, it leaves the filesystem alone.
+   */
+  workRoot?: string;
   now?: () => number;
 }
 
@@ -408,6 +415,11 @@ export class Dispatcher {
   private readonly maxLaunches: number;
   private readonly parkCooldownMs: number;
   private readonly staleAfterSeconds: number;
+  private readonly workRoot: string | null;
+  /** The delete in flight, so two ticks never race one `rm` over the same tree. */
+  private emptying: Promise<void> | null = null;
+  /** Logged once each rather than every tick. */
+  private readonly orphanWorkspaces = new Set<string>();
   private readonly now: () => number;
   /** When this process began dispatching, the nearest clock to the last restart. */
   private readonly bootedAt: number;
@@ -458,6 +470,7 @@ export class Dispatcher {
     this.parkCooldownMs = (deps.parkCooldownSeconds ?? PARK_COOLDOWN_SECONDS) * 1000;
     this.staleAfterSeconds =
       deps.config.staleAfterSeconds ?? STALE_AFTER_SECONDS;
+    this.workRoot = deps.workRoot ?? null;
     this.now = deps.now ?? Date.now;
     this.bootedAt = this.now();
   }
@@ -539,6 +552,9 @@ export class Dispatcher {
   private runTick = async (): Promise<TickResult> => {
     const now = this.now();
     const expired = await this.enforceDeadlines(now);
+    // Before the launch loop, so a workspace is out of the way before
+    // anything could start into it.
+    await this.sweepWorkspaces();
 
     const eligible = this.db.query<EligibleRow>(ELIGIBLE_SQL, [now]);
     const started: RunningAgent[] = [];
@@ -670,6 +686,55 @@ export class Dispatcher {
       swept,
       settled: Promise.all(settling).then(() => undefined),
     };
+  };
+
+  /**
+   * Delete the workspaces nothing will relaunch into. Every tick rather than
+   * on an exit, so the first tick after boot is also the sweep of what the
+   * last task left, and an incident closed while it had no live agent is
+   * collected too.
+   *
+   * Only a row that says CLOSED or MERGED makes a workspace removable. A
+   * directory with no row at all is kept and logged: the database is restored
+   * from a snapshot at boot, and one that came back short would otherwise
+   * delete every workspace this mount exists to keep.
+   */
+  private sweepWorkspaces = async (): Promise<void> => {
+    const workRoot = this.workRoot;
+    if (!workRoot) return;
+    const status = new Map(
+      this.db
+        .query<{ id: string; status: IncidentStatus }>("SELECT id, status FROM incident")
+        .map((row) => [row.id, row.status]),
+    );
+    try {
+      const swept = await sweepWorkspaces({
+        workRoot,
+        removable: (incidentId) => {
+          if (this.running.has(incidentId)) return false;
+          const current = status.get(incidentId);
+          if (current === undefined) {
+            if (!this.orphanWorkspaces.has(incidentId)) {
+              this.orphanWorkspaces.add(incidentId);
+              log("workspace_without_incident", { incidentId });
+            }
+            return false;
+          }
+          return current === "CLOSED" || current === "MERGED";
+        },
+        now: this.now,
+      });
+      for (const incidentId of swept) log("workspace_deleted", { incidentId });
+    } catch (err) {
+      alarm("workspace_sweep_failed", { error: String(err) });
+      return;
+    }
+    if (this.emptying) return;
+    this.emptying = emptyTrash(workRoot)
+      .catch((err) => alarm("workspace_delete_failed", { error: String(err) }))
+      .finally(() => {
+        this.emptying = null;
+      });
   };
 
   /**

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -2552,5 +2552,74 @@ describe("staleNotice", () => {
     // The agent's closing brief already said replying will not restart it.
     // A nudge inviting one a day later would make that brief a lie.
     assert.equal(/\breply\b|\breplying\b/i.test(held), false, held);
+  });
+});
+
+describe("Dispatcher workspace sweep", () => {
+  const workspace = (root: string, id: string) => {
+    mkdirSync(join(root, id, "omni"), { recursive: true });
+    writeFileSync(join(root, id, "omni", "uncommitted.ts"), "work in progress");
+  };
+
+  const trashEmptied = async (root: string) => {
+    for (let i = 0; i < 100 && existsSync(join(root, ".trash")); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return !existsSync(join(root, ".trash"));
+  };
+
+  it("deletes a workspace once its incident is closed or merged, and keeps every other", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    const root = mkdtempSync(join(tmpdir(), "bugboss-work-"));
+    insertIncident(sqlite, "i1", { status: "FIXING" });
+    insertIncident(sqlite, "i2", { status: "RESOLVED" });
+    insertIncident(sqlite, "i4", { status: "CLOSED" });
+    insertIncident(sqlite, "i5", { status: "MERGED", mergedInto: "i1" });
+    for (const id of ["i1", "i2", "i4", "i5", "no-such-incident"]) workspace(root, id);
+
+    const held = heldSpawn();
+    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor, workRoot: root }));
+    await d.tick();
+
+    assert.ok(existsSync(join(root, "i1", "omni", "uncommitted.ts")));
+    assert.ok(existsSync(join(root, "i2", "omni", "uncommitted.ts")));
+    assert.ok(!existsSync(join(root, "i4")), "a closed incident's workspace is deleted");
+    assert.ok(!existsSync(join(root, "i5")), "a merged incident's workspace is deleted");
+    // No row is not evidence the incident is over: a database restored short
+    // would otherwise take every live workspace with it.
+    assert.ok(existsSync(join(root, "no-such-incident")));
+    assert.ok(await trashEmptied(root), "the deleted trees are removed from disk, not just moved");
+
+    held.releaseAll();
+    await d.drain();
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  });
+
+  it("keeps a closed incident's workspace until its agent has exited", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    const root = mkdtempSync(join(tmpdir(), "bugboss-work-"));
+    insertIncident(sqlite, "i1", { status: "RESOLVED" });
+    workspace(root, "i1");
+
+    const held = heldSpawn();
+    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor, workRoot: root }));
+    await d.tick();
+    sqlite
+      .prepare("UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = 'pm' WHERE id = 'i1'")
+      .run(T0);
+    await d.tick();
+    assert.ok(existsSync(join(root, "i1", "omni", "uncommitted.ts")), "its agent is still writing to it");
+
+    held.releaseAll();
+    await d.drain();
+    await d.tick();
+    assert.ok(!existsSync(join(root, "i1")));
+    assert.ok(await trashEmptied(root));
+
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
   });
 });
