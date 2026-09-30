@@ -34,12 +34,21 @@ export const ScenarioSchema = z
     check: z
       .object({
         setup: z.string().nullable(),
+        // Setup is an `npm ci` of omni and its builds, which a slow registry
+        // stretches far past any check, so it has its own budget.
+        setupTimeoutSeconds: Seconds.default(1800),
         command: z.string(),
         timeoutSeconds: Seconds,
         runsAt: z.literal("deploy"),
       })
       .strict(),
     reviewer: z.object({ requestChangesOnce: z.boolean() }).strict(),
+    // Production's App holds `actions: read`, so rerun_ci is refused unless a
+    // scenario grants `actions: write` to exercise it.
+    github: z
+      .object({ actionsWrite: z.boolean().default(false) })
+      .strict()
+      .default({ actionsWrite: false }),
     persona: z
       .object({
         file: z.string(),

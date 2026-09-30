@@ -2,17 +2,20 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  ECR_LIFECYCLE_POLICY,
   ECR_PULL_ACTIONS,
   ECS_AGENT_HEADROOM_MIB,
   INSTANCE_EGRESS,
+  INSTANCE_METADATA_OPTIONS,
   INSTANCE_MEMORY_MIB,
   INSTANCE_VCPU,
+  MODEL_ROLE_ARN,
   OPS_MAIN_SUBJECT,
-  RESULTS_BUCKET,
   RUNNER_CPU,
   RUNNER_MEMORY_RESERVATION_MIB,
   WORKFLOW_FILE,
-  instancePolicy,
+  modelPolicy,
+  runnerTaskPolicy,
   workflowPolicy,
   workflowTrust,
 } from "./components/bugboss-evals";
@@ -78,34 +81,40 @@ describe("the eval workflow role's trust", () => {
   });
 });
 
-describe("the eval host's inline role", () => {
-  // Every container on a bridge network reaches this role through IMDS, so
-  // anything added here is handed to the model proxy and the persona too.
-  it("holds nothing beyond Bedrock, ECR pull and the results bucket", () => {
-    const allowed = new Set([
-      "bedrock:InvokeModel*",
-      "ecr:GetAuthorizationToken",
-      ...ECR_PULL_ACTIONS,
-      "s3:GetObject",
-      "s3:PutObject",
-    ]);
-    for (const statement of instancePolicy().Statement) {
-      for (const action of statement.Action) {
-        assert.ok(allowed.has(action), `${action} is not an eval host action`);
-      }
-      if (statement.Action.some((action) => action.startsWith("s3:"))) {
-        for (const resource of statement.Resource) {
-          assert.ok(
-            resource.startsWith(`arn:aws:s3:::${RESULTS_BUCKET}/`),
-            `${resource} is outside the results bucket`,
-          );
-        }
-      }
-      if (statement.Action.some((action) => ECR_PULL_ACTIONS.includes(action))) {
-        assert.deepEqual(statement.Resource, [
-          "arn:aws:ecr:us-west-2:333022194791:repository/bugboss-evals",
-        ]);
-      }
+describe("the eval host's metadata", () => {
+  // Hop limit 1 is what keeps every container, the model proxy included, off
+  // the host role; tokens required is what stops a plain GET getting it.
+  it("is IMDSv2 only and ends one hop past the host", () => {
+    assert.deepEqual(INSTANCE_METADATA_OPTIONS, {
+      httpEndpoint: "enabled",
+      httpTokens: "required",
+      httpPutResponseHopLimit: 1,
+    });
+  });
+});
+
+describe("the model role", () => {
+  // Its session is written where the model proxy and the persona read it, so
+  // anything added here reaches both.
+  it("can call models and nothing else", () => {
+    const actions = modelPolicy().Statement.flatMap((statement) => statement.Action);
+    assert.deepEqual(actions, ["bedrock:InvokeModel*"]);
+  });
+
+  it("is the runner's only route to a model", () => {
+    const policy = runnerTaskPolicy("arn:log");
+    const actions = policy.Statement.flatMap((statement) => statement.Action);
+    assert.ok(!actions.some((action) => action.startsWith("bedrock:")), "the runner calls no model itself");
+    const assume = policy.Statement.filter((statement) => statement.Action.includes("sts:AssumeRole"));
+    assert.deepEqual(assume.flatMap((statement) => statement.Resource), [MODEL_ROLE_ARN]);
+  });
+});
+
+describe("the eval repository's lifecycle", () => {
+  it("never expires the runner tag the task definition names", () => {
+    for (const rule of ECR_LIFECYCLE_POLICY.rules) {
+      const patterns: string[] = ("tagPatternList" in rule.selection ? rule.selection.tagPatternList : undefined) ?? [];
+      assert.ok(!patterns.some((pattern) => "runner".startsWith(pattern.replace("*", ""))), JSON.stringify(rule));
     }
   });
 });

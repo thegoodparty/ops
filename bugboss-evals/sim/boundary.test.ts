@@ -158,6 +158,7 @@ describe("egress lockdown", { skip: dockerAvailable ? false : "docker is not ava
       runId: `boundary-${process.pid}`,
       workRoot,
       omniBundle: bundle,
+      modelCredentials: "none",
     });
     writeFileSync(join(prepared.runDir, "probe.js"), PROBE);
     writeFileSync(

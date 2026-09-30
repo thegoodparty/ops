@@ -187,6 +187,7 @@ describe("checker", () => {
       scenarioDir,
       checkSetup: null,
       checkCommand: "check/run.sh",
+      setupTimeoutSeconds: 30,
       timeoutSeconds: 30,
       baseSha: base,
       repoDir: repo,

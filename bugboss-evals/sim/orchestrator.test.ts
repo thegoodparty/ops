@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFile, execFileSync } from "node:child_process";
 import { createHmac, X509Certificate } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -11,14 +11,18 @@ import {
   alertBody,
   bugbossEnv,
   closedBy,
+  closingSummaryCause,
   dotenv,
   endCondition,
   makeSecrets,
   makeTls,
+  outputsFor,
   prepareRun,
   signedAlert,
   TLS_NAMES,
+  writeModelSession,
   type PreparedRun,
+  type SlackState,
 } from "./orchestrator";
 
 const run = promisify(execFile);
@@ -168,6 +172,7 @@ describe("the prepared run", { skip: dockerAvailable ? false : "docker is not av
       runId: "prepare-probe",
       workRoot,
       omniBundle: join(workRoot, "empty.bundle"),
+      modelCredentials: "none",
     });
   });
 
@@ -204,9 +209,89 @@ describe("the prepared run", { skip: dockerAvailable ? false : "docker is not av
     assert.ok(!hook.includes(prepared.secrets.controlToken), "the hook runs next to visible CI and holds no control token");
   });
 
+  test("only the model proxy and the persona can read model credentials", async () => {
+    const { stdout } = await prepared.compose(["config", "--format", "json"]);
+    const config = JSON.parse(stdout) as {
+      services: Record<string, { volumes?: { source?: string; target: string }[]; environment?: Record<string, string> }>;
+    };
+    const readers = Object.entries(config.services)
+      .filter(([, service]) => (service.volumes ?? []).some((volume) => volume.source === join(prepared.runDir, "model-aws")))
+      .map(([name]) => name)
+      .sort();
+    assert.deepEqual(readers, ["persona", "proxy"]);
+    for (const [name, service] of Object.entries(config.services)) {
+      for (const volume of service.volumes ?? []) {
+        assert.ok(!/\.aws$/.test(volume.source ?? ""), `${name} mounts an AWS profile directory: ${volume.source}`);
+      }
+    }
+    for (const name of readers) {
+      assert.equal(config.services[name].environment?.AWS_EC2_METADATA_DISABLED, "true", `${name} never falls back to IMDS`);
+      assert.equal(config.services[name].environment?.AWS_CONFIG_FILE, "/sim/model-aws/config");
+    }
+    assert.match(readFileSync(join(prepared.runDir, "model-aws", "config"), "utf8"), /credential_process = cat \/sim\/model-aws\/session.json/);
+    assert.ok(!existsSync(join(prepared.runDir, "model-aws", "session.json")), "a zero-spend run writes no session");
+  });
+
+  test("a model session is written whole, in the shape credential_process prints", () => {
+    const expiration = new Date("2026-09-30T00:00:00.000Z");
+    writeModelSession(prepared.runDir, { accessKeyId: "AKIA1", secretAccessKey: "s", sessionToken: "t", expiration });
+    const written = JSON.parse(readFileSync(join(prepared.runDir, "model-aws", "session.json"), "utf8"));
+    assert.deepEqual(written, { Version: 1, AccessKeyId: "AKIA1", SecretAccessKey: "s", SessionToken: "t", Expiration: expiration.toISOString() });
+    rmSync(join(prepared.runDir, "model-aws", "session.json"));
+  });
+
   test("the sim image leaves the scenarios out", async () => {
     const ignore = readFileSync(join(__dirname, "compose", "sim.Dockerfile.dockerignore"), "utf8");
     assert.match(ignore, /^bugboss-evals\/scenarios$/m);
     await run("true");
+  });
+});
+
+describe("the root cause the judge reads", () => {
+  const summary = (cause: string) =>
+    [
+      "*Incident 1 — closing report*",
+      cause,
+      "• 2 users · resolved in 41 min",
+      "• 1 signal · 1 PR (1 merged) · 2 agent launches",
+      "• 1.2M tokens · 88 turns · on us.anthropic.claude-opus-5 (est. $21.40)",
+    ].join("\n");
+  const state = (messages: { user: string; text: string }[]): SlackState => ({
+    threads: [{ channel: "C0SIMBUGS", ts: "1.0", messages: messages.map((m, i) => ({ ts: `1.${i + 1}`, ...m })) }],
+    files: [],
+    errors: [],
+    lastActivityAt: null,
+  });
+  const inputs = { end: { kind: "closed", detail: "" }, humans: [], slack: null, github: null, proxy: null, telemetry: null, checker: null, egress: [] };
+
+  test("is the closing summary's cause, whole, even across lines", () => {
+    const cause = "The sync awaits one voter lookup per interaction.\nAt 850 ms each, 500 of them outrun the 120 s gateway timeout.";
+    const slack = state([
+      { user: "U0BUGBOSS", text: "Root cause: probably the pool (a guess, later dropped)" },
+      { user: "U0BUGBOSS", text: summary(cause) },
+    ]);
+    assert.equal(closingSummaryCause(slack), cause);
+    const outputs = outputsFor(inputs, slack, "/nonexistent");
+    assert.equal(outputs.rootCause, cause);
+    assert.equal(outputs.rootCauseSource, "closing_summary");
+  });
+
+  test("reassembles a summary the inline fallback split across posts", () => {
+    const text = summary("A long cause.");
+    const [head, tail] = [text.split("\n").slice(0, 3).join("\n"), text.split("\n").slice(3).join("\n")];
+    assert.equal(closingSummaryCause(state([{ user: "U0BUGBOSS", text: head }, { user: "U0BUGBOSS", text: tail }])), "A long cause.");
+  });
+
+  test("falls back to the heuristic, and says so, when no summary carries a cause", () => {
+    const slack = state([
+      { user: "U0BUGBOSS", text: summary("No root cause was recorded.") },
+      { user: "U0BUGBOSS", text: "The root cause is the pool." },
+      { user: "U0ONCALL", text: "root cause?" },
+    ]);
+    assert.equal(closingSummaryCause(slack), null);
+    const outputs = outputsFor(inputs, slack, "/nonexistent");
+    assert.equal(outputs.rootCauseSource, "heuristic");
+    assert.equal(outputs.rootCause, "The root cause is the pool.");
+    assert.equal(outputsFor(inputs, state([]), "/nonexistent").rootCauseSource, null);
   });
 });

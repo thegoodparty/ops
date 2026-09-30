@@ -5,6 +5,10 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
+import { compare as comparePairs, signTest, type PairRecord, type RunRecord } from "../core/aggregate";
+import type { IncidentOutput } from "../core/blind";
+import { createBedrockJudgeModel, judgePair } from "../core/judge";
+import { renderComparison } from "../core/report";
 import { loadScenario } from "../core/scenario";
 import type { GateName, GateResult } from "./gates";
 import {
@@ -25,7 +29,8 @@ const USAGE = `Usage: npx tsx bugboss-evals/sim/cli.ts <command> [options]
   run      --scenario <id> (--ref <git ref> | --image <tag>) [--rep 1] [--side baseline]
            [--sim-image <tag>] [--run-id <id>] [--out <dir|s3://...>]
            [--omni-bundle <path|s3://...|auto>] [--omni-dir <omni checkout>]
-           [--actions-write]   (let rerun_ci work; production's App cannot)
+           [--zero-spend]      (no model credentials anywhere: every model call
+                                fails, so the run exercises the stack for $0)
   compare  --baseline <ref> --candidate <ref> [--scenarios a,b] [--reps 3]
            [--parallel 6] [--out <dir>] [--omni-dir <omni checkout>]
   aa       --ref <ref> [same options as compare]
@@ -199,9 +204,10 @@ const runOne = async (args: Args, simImage?: string): Promise<RunResult & { side
     runId,
     workRoot: defaults.workRoot,
     omniBundle: await resolveBundle(args, scenario.omni.baseSha),
-    awsDir: process.env.BUGBOSS_EVALS_WORK ? undefined : defaults.awsDir,
-    awsProfile: process.env.AWS_PROFILE,
-    actionsWrite: args["actions-write"] === true,
+    modelCredentials:
+      args["zero-spend"] === true
+        ? "none"
+        : { profile: process.env.AWS_PROFILE, roleArn: process.env.BUGBOSS_EVALS_MODEL_ROLE_ARN },
   });
   const side = sideOf(args, runId);
   writeFileSync(join(result.resultsDir, "result.json"), JSON.stringify({ ...result, side }, null, 2));
@@ -286,71 +292,9 @@ export const gateRegressions = (pairs: Pair[]): { scenario: string; gate: GateNa
 const money = (value: number | null) => (value === null ? "n/a" : `$${value.toFixed(2)}`);
 const minutes = (value: number | null) => (value === null ? "n/a" : `${(value / 60).toFixed(1)} min`);
 
-// W6 owns the judge, the statistics and the comparison report
-// (core/judge.ts, core/aggregate.ts, core/report.ts). They are loaded at run
-// time so this file works while they land; without them `report` falls back
-// to the deterministic summary below and says that quality was not judged.
 type SignTest = (wins: number, losses: number) => number | undefined;
 
-interface IncidentOutput {
-  rootCause: string | null;
-  diff: string | null;
-  postmortem: string | null;
-}
-
-interface W6 {
-  compare: (pairs: W6Pair[], options: { aa?: boolean }) => object;
-  renderComparison: (args: { comparison: object; tier: "Tier 1"; baselineRef: string; candidateRef: string }) => string;
-  judgePair: (args: { pairId: string; context: { alert: unknown; reference: string }; baseline: IncidentOutput; candidate: IncidentOutput; model: object }) => Promise<object>;
-  createBedrockJudgeModel: (args: object) => object;
-}
-
-interface W6Run {
-  status: "completed" | "timed_out" | "over_budget" | "stalled" | "error";
-  costUsd: number | null;
-  wallClockSeconds: number | null;
-  gates: Record<string, boolean>;
-}
-
-interface W6Pair {
-  pairId: string;
-  scenarioId: string;
-  rep: number;
-  baseline: W6Run;
-  candidate: W6Run;
-  verdict: object | null;
-}
-
-const load = async (module: string): Promise<Record<string, unknown> | null> => {
-  try {
-    return (await import(module)) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-};
-
-const loadW6 = async (): Promise<{ w6: W6 | null; signTest: SignTest | null }> => {
-  const [aggregate, judge, report] = await Promise.all([load("../core/aggregate"), load("../core/judge"), load("../core/report")]);
-  const signTest = typeof aggregate?.signTest === "function" ? (aggregate.signTest as SignTest) : null;
-  const complete =
-    typeof aggregate?.compare === "function" &&
-    typeof report?.renderComparison === "function" &&
-    typeof judge?.judgePair === "function" &&
-    typeof judge?.createBedrockJudgeModel === "function";
-  return {
-    signTest,
-    w6: complete
-      ? {
-          compare: aggregate.compare as W6["compare"],
-          renderComparison: report.renderComparison as W6["renderComparison"],
-          judgePair: judge.judgePair as W6["judgePair"],
-          createBedrockJudgeModel: judge.createBedrockJudgeModel as W6["createBedrockJudgeModel"],
-        }
-      : null,
-  };
-};
-
-export const statusOf = (kind: string): W6Run["status"] =>
+export const statusOf = (kind: string): RunRecord["status"] =>
   kind === "closed" || kind === "closed_inline"
     ? "completed"
     : kind === "wall_clock"
@@ -359,7 +303,7 @@ export const statusOf = (kind: string): W6Run["status"] =>
         ? kind
         : "error";
 
-const w6Run = (result: Stored): W6Run => ({
+const runRecord = (result: Stored): RunRecord => ({
   status: statusOf(result.end.kind),
   costUsd: result.costUsd,
   wallClockSeconds: result.wallClockSeconds,
@@ -368,6 +312,7 @@ const w6Run = (result: Stored): W6Run => ({
 
 interface StoredOutputs {
   rootCause: string | null;
+  rootCauseSource?: "closing_summary" | "heuristic" | null;
   closingReport: { content: string } | null;
   fixDiff: string | null;
 }
@@ -376,7 +321,12 @@ const incidentOutput = (result: Stored): IncidentOutput => {
   const path = join(result.dir, "outputs.json");
   if (!existsSync(path)) return { rootCause: null, diff: null, postmortem: null };
   const outputs = JSON.parse(readFileSync(path, "utf8")) as StoredOutputs;
-  return { rootCause: outputs.rootCause, diff: outputs.fixDiff, postmortem: outputs.closingReport?.content ?? null };
+  return {
+    rootCause: outputs.rootCause,
+    rootCauseSource: outputs.rootCauseSource,
+    diff: outputs.fixDiff,
+    postmortem: outputs.closingReport?.content ?? null,
+  };
 };
 
 export const renderReport = (args: { pairs: Pair[]; unpaired: Stored[]; signTest: SignTest | null; judged: string | null }): string => {
@@ -432,16 +382,15 @@ export const renderReport = (args: { pairs: Pair[]; unpaired: Stored[]; signTest
 
 const report = async (dir: string, out: string, scenariosDir: string): Promise<string> => {
   const { pairs, unpaired } = pairUp(findResults(dir));
-  const { w6, signTest } = await loadW6();
   let text: string;
-  if (w6 && pairs.length > 0) {
-    const model = w6.createBedrockJudgeModel({});
-    const records: W6Pair[] = [];
+  if (pairs.length > 0) {
+    const model = createBedrockJudgeModel({});
+    const records: PairRecord[] = [];
     for (const pair of pairs) {
       const scenarioDir = join(scenariosDir, pair.scenario);
       const { scenario } = loadScenario(join(scenarioDir, "scenario.json"));
       const pairId = `${pair.scenario}-r${pair.rep}`;
-      const verdict = await w6.judgePair({
+      const verdict = await judgePair({
         pairId,
         context: {
           alert: JSON.parse(readFileSync(join(scenarioDir, scenario.alert.file), "utf8")) as object,
@@ -451,11 +400,19 @@ const report = async (dir: string, out: string, scenariosDir: string): Promise<s
         candidate: incidentOutput(pair.candidate),
         model,
       });
-      records.push({ pairId, scenarioId: pair.scenario, rep: pair.rep, baseline: w6Run(pair.baseline), candidate: w6Run(pair.candidate), verdict });
+      records.push({
+        pairId,
+        scenarioId: pair.scenario,
+        rep: pair.rep,
+        baseline: runRecord(pair.baseline),
+        candidate: runRecord(pair.candidate),
+        verdict,
+        vettedReference: true,
+      });
     }
     const aa = pairs.every((pair) => pair.baseline.bugbossImage === pair.candidate.bugbossImage);
-    text = w6.renderComparison({
-      comparison: w6.compare(records, { aa }),
+    text = renderComparison({
+      comparison: comparePairs(records, { aa }),
       tier: "Tier 1",
       baselineRef: pairs[0].baseline.ref ?? pairs[0].baseline.bugbossImage,
       candidateRef: pairs[0].candidate.ref ?? pairs[0].candidate.bugbossImage,

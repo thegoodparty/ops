@@ -24,6 +24,8 @@ export const ECR_REPOSITORY = "bugboss-evals";
 export const RUNNER_IMAGE = `${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPOSITORY}:runner`;
 export const WORK_DIR = "/var/lib/bugboss-evals";
 export const WORKFLOW_ROLE_NAME = "github-actions-bugboss-eval";
+export const MODEL_ROLE_NAME = "bugboss-evals-model";
+export const MODEL_ROLE_ARN = `arn:aws:iam::${ACCOUNT_ID}:role/${MODEL_ROLE_NAME}`;
 export const WORKFLOW_FILE = "bugboss-eval.yml";
 export const OPS_MAIN_SUBJECT = "repo:thegoodparty/ops:ref:refs/heads/main";
 
@@ -113,13 +115,24 @@ const resultsReadWrite: Statement[] = [
 ];
 
 /**
- * What the EC2 host's own role may do, on top of the ECS agent's managed
- * policy. Every container on a normal bridge network reaches this role
- * through IMDS, which is how the model proxy gets real Bedrock credentials,
- * so it holds nothing an eval does not need. Containers on the internal sim
- * network, BugBoss among them, have no route to IMDS at all.
+ * IMDSv2 only, with a hop limit of 1: the token PUT's reply dies one hop past
+ * the host, so no container on any bridge network, the stack's or the
+ * runner's, can read the host role. Only the ECS agent, on the host network,
+ * reaches it, and the host role holds nothing but the agent's managed policy.
  */
-export const instancePolicy = (): PolicyDocument => ({
+export const INSTANCE_METADATA_OPTIONS = {
+  httpEndpoint: "enabled",
+  httpTokens: "required",
+  httpPutResponseHopLimit: 1,
+};
+
+/**
+ * The only real credentials in a run. The runner assumes this role from its
+ * task role and writes the session to a directory that only the model proxy
+ * and the persona mount (sim/orchestrator.ts), so it is scoped to model calls
+ * and nothing else.
+ */
+export const modelPolicy = (): PolicyDocument => ({
   Version: "2012-10-17",
   Statement: [
     {
@@ -128,25 +141,18 @@ export const instancePolicy = (): PolicyDocument => ({
       Action: ["bedrock:InvokeModel*"],
       Resource: BEDROCK_RESOURCES,
     },
-    ecrLogin,
-    {
-      Sid: "EcrPull",
-      Effect: "Allow",
-      Action: ECR_PULL_ACTIONS,
-      Resource: [ECR_REPOSITORY_ARN],
-    },
-    {
-      Sid: "ResultsObjects",
-      Effect: "Allow",
-      Action: ["s3:GetObject", "s3:PutObject"],
-      Resource: [`${RESULTS_BUCKET_ARN}/*`],
-    },
   ],
 });
 
 export const runnerTaskPolicy = (logGroupArn: string): PolicyDocument => ({
   Version: "2012-10-17",
   Statement: [
+    {
+      Sid: "AssumeModelRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: [MODEL_ROLE_ARN],
+    },
     ecrLogin,
     {
       Sid: "EcrPull",
@@ -240,6 +246,34 @@ export const INSTANCE_EGRESS = [443, 80].map((port) => ({
   cidrBlocks: ["0.0.0.0/0"],
 }));
 
+export const ECR_LIFECYCLE_POLICY = {
+  rules: [
+    {
+      rulePriority: 1,
+      description: "Per-commit variant and sim images outlive their eval by two weeks at most",
+      selection: {
+        tagStatus: "tagged",
+        tagPatternList: ["bugboss-*", "sim-*"],
+        countType: "sinceImagePushed",
+        countUnit: "days",
+        countNumber: 14,
+      },
+      action: { type: "expire" },
+    },
+    {
+      rulePriority: 2,
+      description: "Untagged layers left by re-pushing runner",
+      selection: {
+        tagStatus: "untagged",
+        countType: "sinceImagePushed",
+        countUnit: "days",
+        countNumber: 1,
+      },
+      action: { type: "expire" },
+    },
+  ],
+};
+
 const ecsTrust = (service: string) =>
   JSON.stringify({
     Version: "2012-10-17",
@@ -291,10 +325,21 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
     ],
   });
 
-  // The `bugboss-evals` ECR repository is created out of band, for the reason
-  // index.ts gives about `bugboss`: it keeps `ecr:CreateRepository` off the
-  // deploy role. It is named by ARN, never looked up, so a merge that lands
-  // before somebody creates it still deploys; only an eval fails, at pull.
+  // Mutable because the task definition names the `runner` tag, which every
+  // eval pushes afresh. Variant and sim images are tagged per commit and are
+  // no use after the eval that built them.
+  const repository = new aws.ecr.Repository("bugbossEvalsRepository", {
+    name: ECR_REPOSITORY,
+    imageTagMutability: "MUTABLE",
+    imageScanningConfiguration: { scanOnPush: false },
+    encryptionConfigurations: [{ encryptionType: "AES256" }],
+    tags: TAGS,
+  });
+
+  new aws.ecr.LifecyclePolicy("bugbossEvalsRepositoryLifecycle", {
+    repository: repository.name,
+    policy: JSON.stringify(ECR_LIFECYCLE_POLICY),
+  });
 
   const logGroup = new aws.cloudwatch.LogGroup("bugbossEvalsLogGroup", {
     name: "/aws/ecs/bugboss-evals",
@@ -312,9 +357,6 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
     assumeRolePolicy: ecsTrust("ec2.amazonaws.com"),
     managedPolicyArns: [
       "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role",
-    ],
-    inlinePolicies: [
-      { name: "inline", policy: JSON.stringify(instancePolicy()) },
     ],
     tags: TAGS,
   });
@@ -342,14 +384,7 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
     imageId: ami.value,
     instanceType: INSTANCE_TYPE,
     iamInstanceProfile: { arn: instanceProfile.arn },
-    // Hop limit 2 because the model proxy reaches IMDS from inside a bridge
-    // network, one hop past the host. Tokens required so a plain GET, the
-    // shape an SSRF takes, gets nothing.
-    metadataOptions: {
-      httpEndpoint: "enabled",
-      httpTokens: "required",
-      httpPutResponseHopLimit: 2,
-    },
+    metadataOptions: INSTANCE_METADATA_OPTIONS,
     networkInterfaces: [
       {
         associatePublicIpAddress: "true",
@@ -372,6 +407,10 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
       [
         "#!/bin/bash",
         `echo ECS_CLUSTER=${CLUSTER_NAME} >> /etc/ecs/ecs.config`,
+        // Task roles in bridge mode are off by default on Linux, and the
+        // runner's is the only route to the model role now that IMDS is
+        // closed to containers.
+        "echo ECS_ENABLE_TASK_IAM_ROLE=true >> /etc/ecs/ecs.config",
         `mkdir -p ${WORK_DIR}`,
       ].join("\n"),
     ).toString("base64"),
@@ -448,6 +487,21 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
     tags: TAGS,
   });
 
+  new aws.iam.Role("bugbossEvalsModelRole", {
+    name: MODEL_ROLE_NAME,
+    description: "Bedrock only. Assumed by the eval runner for the model proxy and the persona.",
+    assumeRolePolicy: taskRole.arn.apply((arn) =>
+      JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          { Action: "sts:AssumeRole", Effect: "Allow", Principal: { AWS: arn } },
+        ],
+      }),
+    ),
+    inlinePolicies: [{ name: "inline", policy: JSON.stringify(modelPolicy()) }],
+    tags: TAGS,
+  });
+
   const taskDefinition = new aws.ecs.TaskDefinition("bugbossEvalsTaskDef", {
     family: TASK_FAMILY,
     networkMode: "bridge",
@@ -480,6 +534,7 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
           { name: "AWS_DEFAULT_REGION", value: REGION },
           { name: "BUGBOSS_EVALS_WORK", value: WORK_DIR },
           { name: "EVALS_BUCKET", value: bucket.bucket },
+          { name: "BUGBOSS_EVALS_MODEL_ROLE_ARN", value: MODEL_ROLE_ARN },
         ],
         logConfiguration: {
           logDriver: "awslogs",
@@ -515,6 +570,7 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
   });
 
   return {
+    repository,
     bucket,
     cluster,
     taskDefinition,

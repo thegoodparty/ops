@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHmac, generateKeyPairSync, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   copyFileSync,
   cpSync,
   existsSync,
@@ -16,6 +17,8 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+
+import { fromNodeProviderChain, fromTemporaryCredentials } from "@aws-sdk/credential-providers";
 
 import { loadScenario, type Scenario } from "../core/scenario";
 import { evaluateGates, type GateInputs, type GateResult } from "./gates";
@@ -96,16 +99,16 @@ export interface RunSpec {
   /** Must be the same path on the docker host; see stack.yml. */
   workRoot: string;
   omniBundle: string;
-  /** Local runs mount a profile; the fan-out host uses IMDS and leaves it unset. */
-  awsProfile?: string;
-  awsDir?: string;
+  /**
+   * Where the model proxy's and the persona's real credentials come from.
+   * "none" gives them nothing, so every model call fails before it reaches
+   * Bedrock and the run spends $0. Otherwise the orchestrator resolves them
+   * here, from `profile` or the default chain, assuming `roleArn` when set,
+   * and writes the session where only those two containers can read it.
+   */
+  modelCredentials: ModelCredentials;
   pollSeconds?: number;
   log?: (event: string, fields?: Record<string, string | number | boolean | null>) => void;
-  /**
-   * Grants the stand-in App `actions: write`, so rerun_ci works. Production's
-   * App has `actions: read`, which is the default here.
-   */
-  actionsWrite?: boolean;
   /**
    * For integration tests: called once the stack is up and BugBoss is
    * healthy, and the run then ends there, with no alert sent and so no model
@@ -117,6 +120,8 @@ export interface RunSpec {
     prepared: PreparedRun;
   }) => Promise<void>;
 }
+
+export type ModelCredentials = "none" | { profile?: string; roleArn?: string };
 
 export const defaultLog = (event: string, fields: Record<string, string | number | boolean | null> = {}) =>
   console.error(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
@@ -231,6 +236,7 @@ export const makeTls = async (dir: string, names: string[] = TLS_NAMES): Promise
       "x509", "-req", "-in", join(work, "server.csr"), "-CA", join(dir, "ca.crt"), "-CAkey", ca,
       "-CAcreateserial", "-out", join(dir, "server.crt"), "-days", "7", "-extfile", ext,
     ]);
+    chmodSync(join(dir, "server.key"), 0o600);
   } finally {
     // The CA key never outlives this function, so nothing in the stack can
     // mint a certificate.
@@ -472,19 +478,29 @@ export const prepareRun = async (spec: RunSpec, now = Date.now()): Promise<Prepa
     [
       "#!/bin/sh",
       "set -eu",
-      `curl -fsS --max-time ${scenario.check.timeoutSeconds + 900} -X POST \\`,
+      `curl -fsS --max-time ${scenario.check.setupTimeoutSeconds + scenario.check.timeoutSeconds + 300} -X POST \\`,
       `  -H "Authorization: Bearer ${secrets.deployToken}" -H "content-type: application/json" \\`,
       `  --data "{\\"sha\\":\\"$1\\"}" http://checker:9006/deploy > /dev/null`,
       "",
     ].join("\n"),
-    { mode: 0o755 },
+    // Owner-only: it carries the deploy token, and visible CI runs as another
+    // user in the same container.
+    { mode: 0o700 },
   );
 
   const subnets = await pickSubnets();
   const seed = spec.rep;
   const alertAt = now;
-  const awsDir = spec.awsDir ?? join(runDir, "no-aws");
-  mkdirSync(awsDir, { recursive: true });
+  // A directory only the model proxy and the persona mount. It never holds a
+  // long-lived key: `credential_process` reads a session the orchestrator
+  // writes and refreshes, so neither container needs a profile, an SSO cache
+  // or the instance metadata endpoint, and none of those is mounted anywhere.
+  const modelAws = join(runDir, "model-aws");
+  mkdirSync(modelAws, { recursive: true });
+  writeFileSync(
+    join(modelAws, "config"),
+    ["[default]", "region = us-west-2", `credential_process = cat ${MODEL_SESSION_IN_CONTAINER}`, ""].join("\n"),
+  );
   const cacheRoot = join(spec.workRoot, "_cache");
   mkdirSync(join(cacheRoot, "npm"), { recursive: true });
   mkdirSync(join(cacheRoot, "prisma"), { recursive: true });
@@ -510,9 +526,10 @@ export const prepareRun = async (spec: RunSpec, now = Date.now()): Promise<Prepa
       BASE_SHA: scenario.omni.baseSha,
       CI_VISIBLE: JSON.stringify(scenario.ci.visible),
       REVIEWER_REQUEST_CHANGES_ONCE: String(scenario.reviewer.requestChangesOnce),
-      GITHUB_ACTIONS_WRITE: spec.actionsWrite ? "true" : "",
+      GITHUB_ACTIONS_WRITE: scenario.github.actionsWrite ? "true" : "",
       CHECK_SETUP: scenario.check.setup ?? "",
       CHECK_COMMAND: scenario.check.command,
+      CHECK_SETUP_TIMEOUT_SECONDS: String(scenario.check.setupTimeoutSeconds),
       CHECK_TIMEOUT_SECONDS: String(scenario.check.timeoutSeconds),
       PERSONA_FILE: scenario.persona.file,
       PERSONA_MODEL: scenario.persona.model,
@@ -531,8 +548,6 @@ export const prepareRun = async (spec: RunSpec, now = Date.now()): Promise<Prepa
       MINIO_ROOT_USER: secrets.awsAccessKeyId,
       MINIO_ROOT_PASSWORD: secrets.awsSecretAccessKey,
       BUGBOSS_BUCKET: BUCKET,
-      SIM_AWS_DIR: awsDir,
-      SIM_AWS_PROFILE: spec.awsProfile ?? "",
       NPM_CACHE_DIR: join(cacheRoot, "npm"),
       MIRROR_CACHE_DIR: join(cacheRoot, "prisma"),
     }),
@@ -633,6 +648,47 @@ export const alertBody = (raw: string, alertAt: number): string => {
   return JSON.stringify(shift(JSON.parse(raw.replaceAll("{{ALERT_AT_ISO}}", iso)) as Json));
 };
 
+const MODEL_SESSION_IN_CONTAINER = "/sim/model-aws/session.json";
+
+export interface ModelSession {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  expiration?: Date;
+}
+
+export const resolveModelSession = async (access: ModelCredentials): Promise<ModelSession | null> => {
+  if (access === "none") return null;
+  const base = fromNodeProviderChain(access.profile ? { profile: access.profile } : {});
+  const provider = access.roleArn
+    ? fromTemporaryCredentials({
+        masterCredentials: base,
+        // Role chaining caps a session at an hour; the run loop refreshes it.
+        params: { RoleArn: access.roleArn, RoleSessionName: "bugboss-eval", DurationSeconds: 3600 },
+      })
+    : base;
+  return provider();
+};
+
+/** The shape `credential_process` prints, written whole so a reader never sees half of it. */
+export const writeModelSession = (runDir: string, session: ModelSession): void => {
+  const path = join(runDir, "model-aws", "session.json");
+  writeFileSync(
+    `${path}.part`,
+    JSON.stringify({
+      Version: 1,
+      AccessKeyId: session.accessKeyId,
+      SecretAccessKey: session.secretAccessKey,
+      ...(session.sessionToken ? { SessionToken: session.sessionToken } : {}),
+      ...(session.expiration ? { Expiration: session.expiration.toISOString() } : {}),
+    }),
+    { mode: 0o600 },
+  );
+  renameSync(`${path}.part`, path);
+};
+
+const SESSION_REFRESH_MS = 15 * 60_000;
+
 interface ProxyState {
   spendUsd: number;
   turns: number;
@@ -641,7 +697,7 @@ interface ProxyState {
   lastActivityAt: number | null;
 }
 
-interface SlackState {
+export interface SlackState {
   threads: { channel: string; ts: string; messages: { ts: string; user: string; botId?: string; text: string; edits?: { previousText: string }[] }[] }[];
   files: { id: string; filename: string; title: string; content: string; threadTs: string; completed: boolean }[];
   errors: { at: number; method: string; error: string }[];
@@ -732,7 +788,7 @@ export const runScenario = async (spec: RunSpec): Promise<RunResult> => {
     await compose(["down", "-v", "--remove-orphans"]).catch((error: Error) =>
       log("teardown_failed", { error: error.message }),
     );
-    const proxyState = (states.proxy as ProxyState | undefined) ?? proxy;
+    const proxyState = (states.proxy as unknown as ProxyState | undefined) ?? proxy;
     const inputs: GateInputs = {
       end,
       humans: [HUMAN_LOGIN],
@@ -761,13 +817,23 @@ export const runScenario = async (spec: RunSpec): Promise<RunResult> => {
       gates: evaluateGates(inputs),
       resultsDir: results,
     };
-    writeFileSync(join(results, "outputs.json"), JSON.stringify(outputsFor(inputs, results), null, 2));
+    const slackState = (states.slack as unknown as SlackState | undefined) ?? null;
+    writeFileSync(join(results, "outputs.json"), JSON.stringify(outputsFor(inputs, slackState, results), null, 2));
     writeFileSync(join(results, "result.json"), JSON.stringify(result, null, 2));
     log("run_finished", { runId: spec.runId, end: end.kind, costUsd: result.costUsd, wallClockSeconds: result.wallClockSeconds });
     return result;
   };
 
+  let session: ModelSession | null = null;
+  const refreshSession = async () => {
+    if (session && (!session.expiration || session.expiration.getTime() - Date.now() > SESSION_REFRESH_MS)) return;
+    session = await resolveModelSession(spec.modelCredentials);
+    if (session) writeModelSession(runDir, session);
+  };
+
   try {
+    await refreshSession();
+    log("model_credentials", { mode: spec.modelCredentials === "none" ? "none" : "resolved" });
     await compose(["up", "-d", "--quiet-pull", "minio-init", "uv-warm", ...INFRA_SERVICES]);
     const { stdout } = await compose(["port", "gateway", "8900"]);
     const base = `http://${stdout.trim().replace("0.0.0.0", "127.0.0.1")}`;
@@ -842,6 +908,7 @@ export const runScenario = async (spec: RunSpec): Promise<RunResult> => {
 
     for (;;) {
       await sleep(pollMs);
+      await refreshSession();
       const now = Date.now();
       proxy = await client.json<ProxyState>("/proxy/__control/state");
       const slack = await client.json<SlackState>("/slack/__control/state");
@@ -884,29 +951,63 @@ export const runScenario = async (spec: RunSpec): Promise<RunResult> => {
 
 };
 
+const CLOSING_SUMMARY = /^\*Incident \d+ — closing report\*$/;
+// The summary's fixed tail: facts, then work ("N signals · ... agent
+// launches"), then spend. The cause is everything between the header and the
+// facts line.
+const WORK_LINE = /^• [\d,]+ signals? · .* agent launch(es)?$/;
+const NO_CAUSE = "No root cause was recorded.";
+
+/**
+ * The root cause as a person reads it: the closing summary BugBoss writes in
+ * code from the cause `report_root_cause` stored, posted with the report file
+ * or, when the upload fails, as thread text split across posts. Null when no
+ * summary was posted or it carries no cause.
+ */
+export const closingSummaryCause = (slack: SlackState): string | null => {
+  for (const thread of slack.threads) {
+    const bot = thread.messages.filter((message) => message.user === "U0BUGBOSS");
+    const start = bot.findIndex((message) => CLOSING_SUMMARY.test(message.text.split("\n")[0]));
+    if (start === -1) continue;
+    const lines: string[] = [];
+    for (const message of bot.slice(start)) {
+      lines.push(...message.text.split("\n"));
+      const work = lines.findIndex((line) => WORK_LINE.test(line));
+      if (work === -1) continue;
+      const cause = lines.slice(1, work - 1).join("\n").trim();
+      return cause && cause !== NO_CAUSE ? cause : null;
+    }
+  }
+  return null;
+};
+
 /**
  * What the judge reads for one side: the thread as people saw it, the fix
  * as merged, and the closing report. Everything else stays in the results
  * directory for a person.
  */
-export const outputsFor = (inputs: GateInputs, resultsDir: string) => {
-  const thread = (inputs.slack?.threads ?? []).map((t) => ({
+export const outputsFor = (inputs: GateInputs, slack: SlackState | null, resultsDir: string) => {
+  const thread = (slack?.threads ?? []).map((t) => ({
     ts: t.ts,
     messages: t.messages.map((m) => ({ user: m.user, text: m.text })),
   }));
-  const report = inputs.slack?.files.find((file) => /^incident-\d+\.md$/.test(file.filename)) ?? null;
+  const report = slack?.files.find((file) => /^incident-\d+\.md$/.test(file.filename)) ?? null;
   const merged = (inputs.github?.pulls ?? []).filter((pull) => pull.merged && pull.mergeCommitSha);
   const last = merged[merged.length - 1];
   const diffFile = last?.mergeCommitSha ? join(resultsDir, "deploys", `${last.mergeCommitSha}.diff`) : null;
-  // BugBoss has no single "root cause" post, so this is every bot message in
-  // the threads that names one. The closing report carries it too.
-  const rootCause = thread
+  const summary = slack ? closingSummaryCause(slack) : null;
+  // Only when there is no closing summary: every bot message that names a
+  // root cause, which the report flags, because it can include guesses the
+  // agent later dropped.
+  const heuristic = thread
     .flatMap((t) => t.messages)
-    .filter((m) => m.user === "U0BUGBOSS" && /root cause/i.test(m.text))
+    .filter((m) => m.user === "U0BUGBOSS" && /root cause/i.test(m.text) && !CLOSING_SUMMARY.test(m.text.split("\n")[0]))
     .map((m) => m.text);
+  const rootCause = summary ?? (heuristic.length > 0 ? heuristic.join("\n\n") : null);
   return {
     thread,
-    rootCause: rootCause.length > 0 ? rootCause.join("\n\n") : null,
+    rootCause,
+    rootCauseSource: summary ? ("closing_summary" as const) : heuristic.length > 0 ? ("heuristic" as const) : null,
     closingReport: report ? { filename: report.filename, content: report.content } : null,
     fixDiff: diffFile && existsSync(diffFile) ? readFileSync(diffFile, "utf8") : null,
     mergedPulls: merged.map((pull) => pull.number),
@@ -916,7 +1017,6 @@ export const outputsFor = (inputs: GateInputs, resultsDir: string) => {
 export const localDefaults = () => ({
   workRoot: process.env.BUGBOSS_EVALS_WORK ?? join(homedir(), ".cache", "bugboss-evals", "runs"),
   bundleCache: join(homedir(), ".cache", "bugboss-evals", "omni"),
-  awsDir: existsSync(join(homedir(), ".aws")) ? join(homedir(), ".aws") : undefined,
 });
 
 export const scenarioJsonFor = (idOrPath: string): string =>

@@ -47,6 +47,7 @@ export interface CheckerConfig {
   scenarioDir: string;
   checkSetup: string | null;
   checkCommand: string;
+  setupTimeoutSeconds: number;
   timeoutSeconds: number;
   baseSha: string;
   repoDir: string;
@@ -161,14 +162,13 @@ export const createChecker = (config: CheckerConfig) => {
     let setupExit: number | null = null;
     let timedOut = false;
     if (config.checkSetup) {
-      // Each step gets the whole timeout: setup is an `npm ci` of omni, and
-      // counting it against the check would fail a correct fix on a slow
-      // registry.
+      // Its own budget: setup is an `npm ci` of omni, and counting it against
+      // the check would fail a correct fix on a slow registry.
       const setup = await run("bash", [join(config.scenarioDir, config.checkSetup), sha, tree], {
         cwd: tree,
         env,
         log,
-        timeoutMs: config.timeoutSeconds * 1000,
+        timeoutMs: config.setupTimeoutSeconds * 1000,
         uid: config.checkUid,
       });
       setupExit = setup.code;
@@ -275,6 +275,7 @@ if (require.main === module) {
       scenarioDir: need("SCENARIO_DIR"),
       checkSetup: process.env.CHECK_SETUP || null,
       checkCommand: need("CHECK_COMMAND"),
+      setupTimeoutSeconds: Number(need("CHECK_SETUP_TIMEOUT_SECONDS")),
       timeoutSeconds: Number(need("CHECK_TIMEOUT_SECONDS")),
       baseSha: need("BASE_SHA"),
       repoDir,

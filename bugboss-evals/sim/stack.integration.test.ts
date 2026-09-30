@@ -1,8 +1,9 @@
 import { strict as assert } from "node:assert";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 
+import { loadScenario } from "../core/scenario";
 import { OPS_ROOT, buildBugbossImage, buildSimImage, localDefaults, omniBundle, runScenario, scenarioJsonFor } from "./orchestrator";
 
 /**
@@ -25,7 +26,6 @@ describe("the Tier 1 stack", { skip: enabled ? false : "set BUGBOSS_EVALS_STACK_
     const scenarioId = process.env.STACK_TEST_SCENARIO ?? "ecanvasser-sync-timeout";
     const scenarioJson = scenarioJsonFor(scenarioId);
     assert.ok(existsSync(scenarioJson), `no scenario at ${scenarioJson}`);
-    const { loadScenario } = await import("../core/scenario");
     const { scenario } = loadScenario(scenarioJson);
     const image = await buildBugbossImage(process.env.STACK_TEST_REF ?? "HEAD", OPS_ROOT);
     const sim = await buildSimImage();
@@ -41,8 +41,8 @@ describe("the Tier 1 stack", { skip: enabled ? false : "set BUGBOSS_EVALS_STACK_
       runId: `stack-${Date.now().toString(36)}`,
       workRoot: defaults.workRoot,
       omniBundle: bundle,
-      awsDir: defaults.awsDir,
-      afterBringUp: async ({ compose, gateway }) => {
+      modelCredentials: "none",
+      afterBringUp: async ({ compose, gateway, prepared }) => {
         const inBugboss = async (name: string, script: string) => {
           const out = await compose(["exec", "-T", "--user", "agent", "bugboss", "bash", "-lc", `${script} 2>&1; echo "exit=$?"`]).catch(
             (error: Error & { stdout?: string }) => ({ stdout: error.stdout ?? error.message }),
@@ -59,6 +59,23 @@ describe("the Tier 1 stack", { skip: enabled ? false : "set BUGBOSS_EVALS_STACK_
         await inBugboss("control", "curl -sS -m 3 http://github:9002/__control/state");
         await inBugboss("postgres", "pg_isready -h 127.0.0.1 -p 5432");
         await inBugboss("internet", "curl -sS -m 5 https://registry.npmjs.org/ -o /dev/null");
+        // The model session lives where only the proxy and the persona mount
+        // it. A canary written there now must reach the proxy and nothing
+        // BugBoss's shell can read, and neither metadata endpoint (the EC2
+        // host role, the ECS task role) may answer it. On a laptop there is
+        // no metadata endpoint to reach; on an eval host this is the check
+        // that hop limit 1 holds (deploy/components/bugboss-evals.ts).
+        writeFileSync(
+          join(prepared.runDir, "model-aws", "session.json"),
+          JSON.stringify({ Version: 1, AccessKeyId: "AKIACANARYSESSION", SecretAccessKey: "canary" }),
+        );
+        const proxySees = await compose(["exec", "-T", "proxy", "cat", "/sim/model-aws/session.json"]);
+        checks.proxySession = proxySees.stdout;
+        await inBugboss("session", "cat /sim/model-aws/session.json; ls -la /sim; grep -rl AKIACANARYSESSION /sim /home/agent /app /etc /tmp 2>/dev/null; true");
+        await inBugboss("imds", "curl -sS -m 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token");
+        await inBugboss("ecsCreds", "curl -sS -m 3 http://169.254.170.2/v2/credentials/");
+        await inBugboss("containerCredsEnv", "env | grep -E '^AWS_CONTAINER_|^AWS_WEB_IDENTITY' || echo none");
+        await inBugboss("identity", "aws sts get-caller-identity --output json");
         const health = await gateway.call("/telemetry/__control/state");
         checks.telemetry = await health.text();
       },
@@ -75,6 +92,12 @@ describe("the Tier 1 stack", { skip: enabled ? false : "set BUGBOSS_EVALS_STACK_
     assert.doesNotMatch(checks.control, /exit=0/, `the GitHub control port is not reachable from BugBoss: ${checks.control}`);
     assert.match(checks.postgres, /accepting connections/, `the agents' test database is on loopback: ${checks.postgres}`);
     assert.doesNotMatch(checks.internet, /exit=0/, `BugBoss cannot reach the internet: ${checks.internet}`);
+    assert.match(checks.proxySession, /AKIACANARYSESSION/, "the proxy reads the model session");
+    assert.doesNotMatch(checks.session, /AKIACANARYSESSION/, `BugBoss's shell cannot read the model session: ${checks.session}`);
+    assert.doesNotMatch(checks.imds, /exit=0/, `BugBoss cannot reach the EC2 metadata endpoint: ${checks.imds}`);
+    assert.doesNotMatch(checks.ecsCreds, /exit=0/, `BugBoss cannot reach the ECS credential endpoint: ${checks.ecsCreds}`);
+    assert.match(checks.containerCredsEnv, /^none/m, `BugBoss has no container credential variables: ${checks.containerCredsEnv}`);
+    assert.doesNotMatch(checks.identity, /"Arn"/, `BugBoss's AWS identity is fake: ${checks.identity}`);
     assert.match(checks.telemetry, /"backfilled":\{/, `telemetry backfilled: ${checks.telemetry}`);
     const egress = result.gates.find((gate) => gate.name === "no_reach_outside_sim");
     assert.equal(egress?.pass, false, "the deliberate internet probe above must show up in the egress gate");

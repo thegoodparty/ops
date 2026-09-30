@@ -35,6 +35,15 @@ x-sim: &sim
     - ${RUN_DIR}/tls:/sim/tls:ro
     - ${RUN_DIR}/results:/results
 
+# The only real credentials in the stack, for the model proxy and the
+# persona: the session the orchestrator writes into RUN_DIR/model-aws
+# (sim/orchestrator.ts), and no other source. No profile, no SSO cache and no
+# instance metadata is reachable through them.
+x-model-aws: &model-aws
+  AWS_CONFIG_FILE: /sim/model-aws/config
+  AWS_SHARED_CREDENTIALS_FILE: /sim/model-aws/no-credentials
+  AWS_EC2_METADATA_DISABLED: "true"
+
 networks:
   sim:
     internal: true
@@ -60,7 +69,7 @@ services:
     <<: *sim
     command: ["npx", "tsx", "bugboss-evals/sim/proxy/server.ts"]
     environment:
-      <<: *sim-env
+      <<: [*sim-env, *model-aws]
       PORT: "8443"
       CONTROL_PORT: "9001"
       CONTROL_HOST: ${CTL_NET}.11
@@ -70,13 +79,12 @@ services:
       PROXY_TRACE_FILE: /results/proxy.jsonl
       UPSTREAM_REGION: us-west-2
       AWS_REGION: us-west-2
-      AWS_PROFILE: ${SIM_AWS_PROFILE:-}
       # Undoes SSL_CERT_FILE for the one process that talks to real AWS.
       SSL_CERT_FILE: ""
     volumes:
       - ${RUN_DIR}/tls:/sim/tls:ro
       - ${RUN_DIR}/results:/results
-      - ${SIM_AWS_DIR}:/root/.aws
+      - ${RUN_DIR}/model-aws:/sim/model-aws:ro
     networks:
       sim: {}
       control:
@@ -332,6 +340,7 @@ services:
       SCENARIO_DIR: /sim/scenarios/${SCENARIO_ID}
       CHECK_SETUP: ${CHECK_SETUP}
       CHECK_COMMAND: ${CHECK_COMMAND}
+      CHECK_SETUP_TIMEOUT_SECONDS: ${CHECK_SETUP_TIMEOUT_SECONDS}
       CHECK_TIMEOUT_SECONDS: ${CHECK_TIMEOUT_SECONDS}
       BASE_SHA: ${BASE_SHA}
       SEED_BUNDLE: /sim/seed/omni.bundle
@@ -357,7 +366,7 @@ services:
     <<: *sim
     command: ["npx", "tsx", "bugboss-evals/sim/persona/run.ts"]
     environment:
-      <<: *sim-env
+      <<: [*sim-env, *model-aws]
       PERSONA_FILE: /sim/scenario/${PERSONA_FILE}
       PERSONA_MODEL: ${PERSONA_MODEL}
       PERSONA_REPLY_DELAY_SECONDS: ${PERSONA_REPLY_DELAY_SECONDS}
@@ -372,12 +381,11 @@ services:
       GITHUB_REPO: thegoodparty/omni
       GITHUB_HUMAN_TOKEN: ${PERSONA_GITHUB_TOKEN}
       AWS_REGION: us-west-2
-      AWS_PROFILE: ${SIM_AWS_PROFILE:-}
     volumes:
       - ${RUN_DIR}/tls:/sim/tls:ro
       - ${RUN_DIR}/results:/results
       - ${RUN_DIR}/scenario-persona:/sim/scenario:ro
-      - ${SIM_AWS_DIR}:/root/.aws
+      - ${RUN_DIR}/model-aws:/sim/model-aws:ro
     networks: [control, egress]
 
   # ----------------------------------------------------------- the variant
