@@ -1156,7 +1156,11 @@ export class Dispatcher {
     return Math.max(
       recorded,
       session ?? 0,
-      markerAt !== null && markerAt >= (session ?? 0) ? this.bootedAt : 0,
+      // No session, no way to tell a live wait from an orphan, and hiding a
+      // real gap is worse than announcing a false one the alarm above explains.
+      markerAt !== null && session !== null && markerAt >= session
+        ? this.bootedAt
+        : 0,
       row.lastStartedAt ?? row.firstSignalAt,
     );
   };

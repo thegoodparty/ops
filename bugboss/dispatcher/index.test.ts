@@ -1534,7 +1534,7 @@ describe("Dispatcher.tick", () => {
 
     const restartDuring = async (
       marker: "question" | "wait" | null,
-      sessionAt = T0 - ASKED_AGO_MS - 5_000,
+      sessionAt: number | null = T0 - ASKED_AGO_MS - 5_000,
     ) => {
       const { db, sqlite, cleanup } = makeDb();
       const { toolApiFor } = makeTools();
@@ -1576,7 +1576,10 @@ describe("Dispatcher.tick", () => {
           postNotice: async (_id, text) => {
             notices.push(text);
           },
-          lastSessionEventAt: async () => sessionAt,
+          lastSessionEventAt: async () => {
+            if (sessionAt === null) throw new Error("s3 is down");
+            return sessionAt;
+          },
         }),
       );
       clock = T0 + 45_000;
@@ -1610,6 +1613,12 @@ describe("Dispatcher.tick", () => {
     // A SIGKILL mid-wait leaves its marker behind, and a resumed agent that
     // never re-enters that wait leaves it there. Its later turns are newer
     // than the marker, which is how an orphan is told from a live wait.
+    it("a marker counts for nothing when the session cannot be read", async () => {
+      const { notices, alarms } = await restartDuring("question", null);
+      assert.equal(notices.length, 1);
+      assert.ok(alarms.includes("resume_session_read_failed"));
+    });
+
     it("an orphaned marker older than the session proves nothing", async () => {
       const { notices, directives } = await restartDuring(
         "question",

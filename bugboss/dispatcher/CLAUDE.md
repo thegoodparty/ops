@@ -258,7 +258,8 @@ while a turn is still open: `boss_inbox`, agent `incident_action`,
 still standing and newer than the session's last entry means the agent was
 blocked inside it when it was killed, and it counts as alive up to this
 process's start. One older than the session is an orphan from an earlier
-interrupted wait and counts for nothing. The session read is bounded by
+interrupted wait and counts for nothing, and so does any marker when the
+session could not be read, since nothing then tells the two apart. The session read is bounded by
 `SESSION_READ_TIMEOUT_MS`, because ticks are serialized and a hung read
 would stop every relaunch. Launch is only the floor. Measuring from
 launch told every thread on every deploy that an agent working minutes
