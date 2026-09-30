@@ -1,0 +1,45 @@
+{
+  "id": "incident-2-post-pr",
+  "sourceIncident": 2,
+  "phase": "post_pr",
+  "checkpoint": {
+    "session": "s3://bugboss-prod/sessions/incident/2/session.jsonl",
+    "prOrdinal": 1
+  },
+  "script": [
+    {
+      "on": "any",
+      "approveAndMerge": true,
+      "reply": "Approved and merged."
+    },
+    {
+      "on": "any",
+      "approveAndMerge": true,
+      "reply": "Approved and merged."
+    },
+    {
+      "on": "any",
+      "approveAndMerge": true,
+      "reply": "Approved and merged."
+    },
+    {
+      "on": "any",
+      "reply": "Thanks, carry on."
+    }
+  ],
+  "ci": {
+    "verdicts": [
+      {
+        "conclusion": "success"
+      }
+    ]
+  },
+  "stop": {
+    "turnCap": 60
+  },
+  "caps": {
+    "wallClockSeconds": 5400,
+    "modelUsd": 15
+  },
+  "scenario": "ecanvasser-sync-timeout"
+}
