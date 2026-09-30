@@ -727,9 +727,9 @@ export const enclosingObject = (lines: string[], index: number): string | null =
 
 /**
  * Deterministic, so the prefix it lands in is too: a literal `slug: '<slug>'`
- * first, then a template slug whose fixed parts match, then the longest
- * dash-separated prefix of the slug that appears as a quoted string, which is
- * how a slug assembled from parts is found without knowing how it is
+ * first, then a template slug whose fixed parts match, then the longest run
+ * of the slug's dash-separated parts that appears as a quoted string, which
+ * is how a slug assembled from parts is found without knowing how it is
  * assembled.
  */
 export const findFiredAlert = (slug: string, files: SourceFile[]): FiredAlert => {
@@ -741,24 +741,43 @@ export const findFiredAlert = (slug: string, files: SourceFile[]): FiredAlert =>
     }
   }
 
+  // A template only counts when its fixed text says something: `${a}-${b}`
+  // would match every dashed slug. The one with the most fixed text wins.
   const template = /slug:\s*`([^`]*\$\{[^`]*)`/;
+  let best: { file: SourceFile; index: number; fixed: number } | null = null;
   for (const file of files) {
     for (let index = 0; index < file.lines.length; index++) {
       const match = template.exec(file.lines[index]);
       if (!match) continue;
-      const pattern = match[1].split(/\$\{[^}]*\}/).map(escapeRegExp).join(".+");
-      if (new RegExp(`^${pattern}$`).test(slug)) {
-        return { slug, path: file.path, line: index + 1, definition: enclosingObject(file.lines, index) };
-      }
+      const fixedParts = match[1].split(/\$\{[^}]*\}/);
+      if (!fixedParts.some((part) => /[a-z0-9]{3,}/i.test(part))) continue;
+      const pattern = fixedParts.map(escapeRegExp).join(".+");
+      if (!new RegExp(`^${pattern}$`).test(slug)) continue;
+      const fixed = fixedParts.join("").length;
+      if (!best || fixed > best.fixed) best = { file, index, fixed };
     }
   }
+  if (best) {
+    return {
+      slug,
+      path: best.file.path,
+      line: best.index + 1,
+      definition: enclosingObject(best.file.lines, best.index),
+    };
+  }
 
+  // Any run of two or more dash-separated parts, longest first and then
+  // leftmost, so a fixed part at the end (`campaigns-route-errors`) is found
+  // as well as one at the start (`route-errors-serve`).
   const parts = slug.split("-");
   for (let length = parts.length - 1; length >= 2; length--) {
-    const quoted = new RegExp(`(['"\`])${escapeRegExp(parts.slice(0, length).join("-"))}\\1`);
-    for (const file of files) {
-      const index = file.lines.findIndex((line) => quoted.test(line));
-      if (index >= 0) return { slug, path: file.path, line: index + 1, definition: null };
+    for (let from = 0; from + length <= parts.length; from++) {
+      const run = parts.slice(from, from + length).join("-");
+      const quoted = new RegExp(`(['"\`])${escapeRegExp(run)}\\1`);
+      for (const file of files) {
+        const index = file.lines.findIndex((line) => quoted.test(line));
+        if (index >= 0) return { slug, path: file.path, line: index + 1, definition: null };
+      }
     }
   }
 

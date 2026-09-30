@@ -231,6 +231,33 @@ test("a slug assembled from parts gets a pointer, not a guess at its code", asyn
   );
 });
 
+test("a fixed part at the end of an assembled slug is found too", async () => {
+  const path = `${ALERTING_DIR}/route-alerts.ts`;
+  const root = await checkout({ [path]: ROUTE_ALERTS });
+
+  const { firedAlerts } = await loadPromptContext(root, {
+    alertSlugs: ["campaigns-route-errors"],
+  });
+
+  assert.deepEqual(firedAlerts[0], { slug: "campaigns-route-errors", path, line: 3, definition: null });
+});
+
+test("a template with no fixed text of its own claims nothing", async () => {
+  const generic = `${ALERTING_DIR}/a-generic.ts`;
+  const budget = `${ALERTING_DIR}/geoapify-budget-alerts.ts`;
+  const root = await checkout({
+    [generic]: ["export const any = () => ({", "  slug: `${name}-${kind}`,", "})"].join("\n"),
+    [budget]: BUDGET_ALERTS,
+  });
+
+  const { firedAlerts } = await loadPromptContext(root, {
+    alertSlugs: ["geoapify-daily-budget-80", "high-cpu"],
+  });
+
+  assert.equal(firedAlerts[0].path, budget);
+  assert.equal(firedAlerts[1].path, null);
+});
+
 test("a slug nowhere in the source says so and points at the provisioned list", async () => {
   const root = await checkout({ [ALERTS_PATH]: GLOBAL_ALERTS });
 
