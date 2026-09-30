@@ -285,8 +285,15 @@ jobs:
               --task-definition "$TASK_FAMILY" \
               --capacity-provider-strategy capacityProvider=bugboss-evals,weight=1 \
               --overrides "$overrides" \
-              --started-by "bugboss-eval-$EVAL_ID" \
-              --query 'tasks[0].taskArn' --output text >> tasks.txt
+              --started-by "bugboss-eval-$EVAL_ID" > started.json
+            # run-task exits 0 when it cannot place a task and reports that
+            # in failures[], so an unplaced run would otherwise be recorded
+            # as the string "None" and waited on forever.
+            if [ "$(jq '.failures | length' started.json)" != "0" ] || [ "$(jq '.tasks | length' started.json)" = "0" ]; then
+              echo "::error::could not start $run_id: $(jq -c .failures started.json)"
+              exit 1
+            fi
+            jq -r '.tasks[0].taskArn' started.json >> tasks.txt
           done
 
           deadline=$(( $(date +%s) + 290 * 60 ))
@@ -360,8 +367,15 @@ jobs:
               --task-definition "$TASK_FAMILY" \
               --capacity-provider-strategy capacityProvider=bugboss-evals,weight=1 \
               --overrides "$overrides" \
-              --started-by "bugboss-eval-$EVAL_ID" \
-              --query 'tasks[0].taskArn' --output text >> tasks.txt
+              --started-by "bugboss-eval-$EVAL_ID" > started.json
+            # run-task exits 0 when it cannot place a task and reports that
+            # in failures[], so an unplaced run would otherwise be recorded
+            # as the string "None" and waited on forever.
+            if [ "$(jq '.failures | length' started.json)" != "0" ] || [ "$(jq '.tasks | length' started.json)" = "0" ]; then
+              echo "::error::could not start $run_id: $(jq -c .failures started.json)"
+              exit 1
+            fi
+            jq -r '.tasks[0].taskArn' started.json >> tasks.txt
           done
 
           deadline=$(( $(date +%s) + 290 * 60 ))
