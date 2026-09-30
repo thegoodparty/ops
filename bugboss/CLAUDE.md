@@ -37,24 +37,22 @@ incident through the loopback tool API. It never reads Slack and never posts
 free text to it: everything it needs from a person goes up to the Boss.
 
 **The Boss** is everything else that talks to a model: triage, root-cause
-correlation, the inbound-language read (`slack/intent.ts`) and the incident
-commander (`slack/agent.ts`). They share one request path
-(`bedrock/client.ts`) and one read-only query guard (`triage/sql.ts`).
-
-The intent read is not a third agent. It has no tools and answers one label,
-so it is a capability of the Boss rather than a peer, and it is written
-against the same seam for the same reason.
+correlation and the incident commander (`slack/agent.ts`). They share one
+request path (`bedrock/client.ts`) and one read-only query guard
+(`triage/sql.ts`).
 
 **The commander is the only interface between people and agents.** Every
 message a person writes in an incident thread runs it, with that incident as
-context, and so does every row an agent writes to `boss_inbox`. It answers,
+context, and so does every `@bugboss` mention anywhere else and every row an
+agent writes to `boss_inbox`. It answers,
 stays silent, or talks to the agent with `message_agent`, which is the only
 way anything a person says reaches an agent. It can also close, merge and
-stop, and page the rotation. `slack/CLAUDE.md` has the mechanics.
+stop, page the rotation, and open an incident for something a person reports
+broken. `slack/CLAUDE.md` has the mechanics.
 
 **Every Boss write is a request the model makes and code decides.** That is
 the shape, and it is not a style preference. `decide` goes to `applyRules`.
-`read_intent` goes to the guarded `UPDATE` in the composition root. A merge
+A merge
 proposal goes to `toolapi`. The commander's write tools (`boss/commands.ts`)
 take an incident and a reason and nothing else: the guard, the transition and
 the notification are code, and they are the same code an agent's transition
@@ -92,10 +90,10 @@ alarm that fires during normal operation teaches people to ignore alarms.
 decides what somebody wants by matching their words against a list. One thing
 did — the bug-report verb — and it was a magic phrase nobody could discover
 and everybody mistyped, failing silently when they did. In an incident thread
-the Boss reads every message itself, with the incident as context; out in the
-channel a mention is read by a model call (`slack/intent.ts`), advisory the
-way triage is: the model reads the sentence, the code keeps the invariants,
-and an ambiguous read asks rather than guessing.
+the Boss reads every message itself, with the incident as context, and a
+mention anywhere else goes to the Boss too. Nothing reads a message before the
+Boss does, so nothing can decide a request to act is "a report or a question"
+and ask which.
 
 An entity check — "does this text contain `<@U…>`", "is this thread an
 incident's" — is not a language interface. Those decide where a message is

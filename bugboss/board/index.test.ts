@@ -10,12 +10,14 @@ import { Db } from "../db";
 import {
   BOARD_TIME_ZONE,
   MAX_HEADER_UPDATES_PER_TICK,
+  boardOnRequest,
   dateIn,
   hourIn,
   openBoard,
   sweepBoard,
 } from ".";
 import { DEFAULT_WORKING_HOURS } from "../agent/tools";
+import { STATUS_FACTS_SQL, renderStatusCard, type StatusFacts } from "../slack/status";
 
 const CHANNEL = "C0DEVALERTS";
 
@@ -112,6 +114,7 @@ beforeEach(async () => {
     d.prepare("DELETE FROM board_state").run();
     d.prepare("DELETE FROM incident_thread").run();
     d.prepare("DELETE FROM incident_wait").run();
+    d.prepare("DELETE FROM pending_wait").run();
     d.prepare("DELETE FROM signal").run();
     d.prepare("DELETE FROM incident").run();
   });
@@ -672,5 +675,56 @@ describe("thread headers", () => {
       errors.some((line) => line.includes("header_sweep_failed")),
       errors.join("\n"),
     );
+  });
+});
+
+describe("a monitor wait on the board and the card", () => {
+  // Verbatim from the prod board on 2026-09-30, where it was printed as the
+  // thing incident 82 was waiting on.
+  const PROD_COMMAND =
+    "cd /work/82/omni && S1=$(gh pr view 2189 --json state -q .state); S2=$(gh pr view 2195 --json state -q .state); echo \"$S1 $S2\" | grep -qE 'MERGED|CLOSED'";
+
+  const wait = (id: string, waitingFor: string | null) =>
+    db.withWrite((d) => {
+      d.prepare(
+        "INSERT INTO pending_wait (incidentId, command, waitingFor, startedAt) VALUES (?, ?, ?, ?)",
+      ).run(id, PROD_COMMAND, waitingFor, 1);
+    });
+
+  const card = (id: string): string => {
+    const facts = db.get<StatusFacts>(`${STATUS_FACTS_SQL} WHERE i.id = ?`, [id]);
+    assert.ok(facts);
+    return renderStatusCard({
+      facts,
+      usersImpacted: null,
+      prUrls: [],
+      now: "summary unavailable",
+      lastActivityAt: null,
+      spend: null,
+      at: 2,
+    });
+  };
+
+  test("shows what the agent said it waits for, never the command", async () => {
+    await seed("82");
+    await wait("82", "someone to merge omni#2189 or #2195");
+    const stored = db.get<{ command: string }>("SELECT command FROM pending_wait WHERE incidentId = '82'");
+    assert.equal(stored?.command, PROD_COMMAND, "premise: the command is on the row the board reads");
+
+    const board = boardOnRequest(db);
+    assert.match(board, /waiting on someone to merge omni#2189 or #2195/);
+    assert.match(card("82"), /\*Waiting on:\* someone to merge omni#2189 or #2195/);
+    for (const text of [board, card("82")]) {
+      assert.ok(!text.includes("gh pr view"), text);
+      assert.ok(!text.includes("/work/82"), text);
+    }
+  });
+
+  test("a wait recorded before it had a label shows the fallback", async () => {
+    await seed("82");
+    await wait("82", null);
+    assert.match(boardOnRequest(db), /waiting on a check the agent is running/);
+    assert.match(card("82"), /\*Waiting on:\* a check the agent is running/);
+    assert.ok(!boardOnRequest(db).includes("gh pr view"));
   });
 });

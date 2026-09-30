@@ -19,9 +19,8 @@
 // calling it ignored is how somebody answers a question and sees nothing
 // happen.
 //
-// What the message *means* is not here. Whether a mention is a report or a
-// question is a model call made off the Slack ack in the composition root,
-// and what a reply in an incident thread asks for is the Boss's to read. Nothing
+// What the message *means* is not here. Whether a mention or a reply is a
+// report, a question or a request to act is the Boss's to read. Nothing
 // here reads the words a person chose, so there is no verb to learn and no
 // phrasing that silently does nothing.
 //

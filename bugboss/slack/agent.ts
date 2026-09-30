@@ -233,6 +233,35 @@ export interface SilenceChoice {
 }
 
 /**
+ * The person whose message this run is answering. Taken from the Slack
+ * event, which is signed, so a report is attributed to whoever sent it and
+ * never to a name the model or the message supplied.
+ */
+export interface Reporter {
+  user: string;
+  channel: string;
+  /** Null for a top-level mention, which is its own thread. */
+  threadTs: string | null;
+  messageTs: string;
+}
+
+/** What placing a report did. Mirrors the composition root's PlacedSignal. */
+export interface OpenedReport {
+  incidentId: string | null;
+  action: string;
+  reason: string;
+}
+
+/** Files a human report through the same ingest every report takes. */
+export type OpenIncident = (report: {
+  text: string;
+  reportedBy: string;
+  channel: string;
+  threadTs: string | null;
+  messageTs: string;
+}) => Promise<OpenedReport[]>;
+
+/**
  * The one model-written line of the status card, cached per session position.
  * A position is the number of entries in the session, so asking twice about
  * an agent that has not moved costs one call, and a turn later costs another.
@@ -249,11 +278,15 @@ export interface ToolDeps {
   commands: BossCommandDeps;
   silence: SilenceChoice;
   status: StatusSummaries;
+  openIncident: OpenIncident;
+  /** Null when no person's message triggered this run. */
+  reporter: Reporter | null;
 }
 
 /**
- * Twelve tools, in a fixed order, built from literals: six that read,
- * `stay_silent`, then the five write tools from `boss/commands.ts`, appended. Nothing here may vary
+ * Thirteen tools, in a fixed order, built from literals: six that read,
+ * `stay_silent`, `open_incident`, then the five write tools from
+ * `boss/commands.ts`, appended. Nothing here may vary
  * between two builds in two processes: the tools array is part of the prefix
  * every thinking block in the session is bound to.
  *
@@ -345,6 +378,8 @@ export const buildTools = ({
   commands,
   silence,
   status,
+  openIncident,
+  reporter,
 }: ToolDeps): SlackAgentTool[] => {
   /**
    * Triage's tool, adapted to this surface's shape rather than rebuilt, so
@@ -574,6 +609,53 @@ export const buildTools = ({
         );
       },
     },
+    {
+      name: "open_incident",
+      description:
+        "Open an incident for something a person has told you is broken, and put an agent on it. The person whose message you are answering is recorded as the reporter and told when it is fixed. Not for a question, and not for something an open incident already covers.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          report: {
+            type: "string",
+            description:
+              "What is broken, in the reporter's own words. Quote their message whole; add only what they said elsewhere in this thread. This is the evidence the agent starts from.",
+          },
+        },
+        required: ["report"],
+        additionalProperties: false,
+      },
+      run: async (input) => {
+        const text = typeof input.report === "string" ? input.report.trim() : "";
+        if (!text) return "Refused: the report is empty. Nothing was opened.";
+        if (!reporter) {
+          return "Refused: no person's message started this run, so there is nobody to record as the reporter. Nothing was opened.";
+        }
+        let placed: OpenedReport[];
+        try {
+          placed = await openIncident({
+            text,
+            reportedBy: reporter.user,
+            channel: reporter.channel,
+            threadTs: reporter.threadTs,
+            messageTs: reporter.messageTs,
+          });
+        } catch (err) {
+          alarm("open_incident_failed", { error: String(err) });
+          return `Failed: the report could not be recorded (${String(err)}). Nothing was opened; say so.`;
+        }
+        const first = placed[0];
+        if (!first) return "Failed: the report was recorded but not placed. Say so.";
+        log("report_opened", { ...first, reportedBy: reporter.user });
+        if (first.action === "new_incident" || first.action === "attach") {
+          return `Filed as incident ${first.incidentId}${first.action === "attach" ? ", which was already open for the same problem" : ""}. Its thread announces it; tell the person the incident number in one line.`;
+        }
+        if (first.action === "duplicate") {
+          return `Already filed from this message${first.incidentId ? ` as incident ${first.incidentId}` : ""}. Nothing new was opened.`;
+        }
+        return `Not placed (${first.action}): ${first.reason}. Say so.`;
+      },
+    },
     ...buildCommandTools(commands),
   ];
 };
@@ -594,12 +676,14 @@ export const SLACK_AGENT_SYSTEM = [
   "",
   "You are the only interface between people and the incident agents. Every message a person writes in an incident thread comes to you, tagged or not, and everything an agent needs from a person comes to you. Agents never read Slack and never post in it: what they hear, they hear from you, and what people hear from them, they hear from you.",
   "",
-  "Where you are. A run in an incident thread opens by naming the incident, its status and its title, and shows you what has been said in the thread -- BugBoss posts included, because the opening alert and every transition notice are the incident's record -- and anything the incident's agent has sent you. A mention anywhere else is somebody asking about the incidents as a whole.",
+  "Where you are. A run in an incident thread opens by naming the incident, its status and its title, and shows you what has been said in the thread -- BugBoss posts included, because the opening alert and every transition notice are the incident's record -- and anything the incident's agent has sent you. A mention anywhere else can be a question, a report that something is broken, or a request to act on a named incident. You read which it is; nothing has read it before you.",
   "",
   "A message from a person:",
+  "- A report that something is broken: open an incident with open_incident, unless an open incident already covers it, then say which incident has it.",
   "- A question you can answer from what you can read: look it up, then answer it.",
   "- Something the agent needs -- an instruction, the answer to its question, a fact it does not have, or the thing it is parked waiting on (somebody merged the PR, somebody deployed): pass it down with message_agent. Nothing a person says reaches an agent, or wakes one that is parked, any other way. If you do not pass it down, the agent never hears it.",
-  "- A request to change something -- close, merge, stop: do it if you can cite the evidence, and say what you did. If you cannot, say what you would need to see.",
+  "- A request to change something -- close, merge, stop: do it if you can cite the evidence, and say what you did. If you cannot, say what you would need to see. \"See my message in that thread\" means read that incident's thread_reply rows.",
+  "- Never ask whether a message is a report or a question. Decide, and if you truly cannot tell what they want, ask about the thing itself.",
   "- A question about the status of an incident -- where it is, what its agent is doing, what it is waiting on, what it has cost: call incident_status and post the card exactly as it comes back, plus at most one sentence of your own after it, only if it says something the card does not. Never rewrite, reorder, reformat or summarise the card.",
   "- People talking to each other, or anything else not meant for you: call stay_silent with the reason, then end your run without writing anything. Silence has to be chosen. A run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. A request made of you is never met with silence: do it, or say what you would need to do it.",
   "",
@@ -617,6 +701,7 @@ export const SLACK_AGENT_SYSTEM = [
   "- incident_board: every open incident as one line each, already formatted. Paste it in verbatim when somebody asks what is open.",
   "- incident_status: one incident's status card, already formatted. Paste it in verbatim when somebody asks about an incident's status.",
   "- stay_silent: post nothing, for a message that is not for you. The only way to say nothing.",
+  "- open_incident: file what a person reported as broken, and put an agent on it.",
   "- search_incidents: text search over the post-mortems and root causes of incidents that are already over. Plain words describing the failure -- the mechanism, the component, the error text -- not a question and not SQL. \"0 matches\" means nothing that ended reads like this, which is an answer; an error means the search did not run, which is not the same thing and is never reported as nothing found.",
   "- message_agent: say something to an incident's agent. The only way to answer its question or wake it.",
   "- close_incident: close an incident, on evidence.",
@@ -921,6 +1006,8 @@ export interface SlackAgentDeps {
   config: SlackAgentConfig;
   /** The tool API's Boss close, so either closer leaves the same record. */
   closeIncident: CloseIncident;
+  /** The human-report ingest, so a report the Boss files lands as any report does. */
+  openIncident: OpenIncident;
   /**
    * Writes the one model line of the status card. A cheap direct call, not
    * the Boss's loop: one sentence out of a dozen rendered turns.
@@ -969,6 +1056,7 @@ export class SlackAgent {
   private readonly db: Db;
   private readonly commands: BossCommandDeps;
   private readonly summaries: StatusSummaries;
+  private readonly openIncident: OpenIncident;
   /**
    * Threads something arrived for while their run held the lock. Set before
    * the lock is tried and read after it is released, so a message landing in
@@ -989,6 +1077,7 @@ export class SlackAgent {
     this.cfg = deps.config;
     this.lock = deps.lock ?? createMemoryThreadLock();
     this.db = deps.db;
+    this.openIncident = deps.openIncident;
     const channel = deps.config.incidentChannel;
     this.commands = {
       db: deps.db,
@@ -1006,13 +1095,15 @@ export class SlackAgent {
     };
   }
 
-  private tools(silence: SilenceChoice): SlackAgentTool[] {
+  private tools(silence: SilenceChoice, reporter: Reporter | null): SlackAgentTool[] {
     return buildTools({
       db: this.db,
       store: this.store,
       commands: this.commands,
       silence,
       status: this.summaries,
+      openIncident: this.openIncident,
+      reporter,
     });
   }
 
@@ -1134,9 +1225,15 @@ export class SlackAgent {
       );
 
       const silence: SilenceChoice = { reason: null };
+      // The newest person in this run is who a report is filed for. A run
+      // woken by the agent alone has nobody to attribute one to.
+      const latest = humans.at(-1);
+      const reporter: Reporter | null = latest
+        ? { user: latest.user, channel, threadTs, messageTs: latest.ts }
+        : null;
       const { text, usage } = await this.model.run({
         system: SLACK_AGENT_SYSTEM,
-        tools: this.tools(silence),
+        tools: this.tools(silence, reporter),
         sessionKey,
         fresh,
         input: this.buildIncidentInput(incident, fresh, shown, inbox, question),
@@ -1329,7 +1426,12 @@ export class SlackAgent {
       // tool is in the list anyway, because the list is byte-stable across
       // every run and a mention thread can later become a thread it is in.
       const silence: SilenceChoice = { reason: null };
-      const tools = this.tools(silence);
+      const tools = this.tools(silence, {
+        user: mention.user,
+        channel: mention.channel,
+        threadTs: mention.threadTs === mention.ts ? null : mention.threadTs,
+        messageTs: mention.ts,
+      });
 
       const { text, usage } = await this.model.run({
         system: SLACK_AGENT_SYSTEM,
@@ -1458,8 +1560,11 @@ export class SlackAgent {
   }
 
   private buildInput(mention: SlackMention, missed: SlackMessage[]): string {
-    const question = stripBotMention(mention.text, this.cfg.botUserId);
-    if (missed.length === 0) return `<@${mention.user}> asks: ${question}`;
+    const said = stripBotMention(mention.text, this.cfg.botUserId);
+    const line = said
+      ? `<@${mention.user}> says: ${said}`
+      : `<@${mention.user}> tagged you and wrote nothing else.`;
+    if (missed.length === 0) return line;
     const transcript = missed
       .map((m) => `<@${m.user ?? "unknown"}>: ${m.text}`)
       .join("\n");
@@ -1467,7 +1572,7 @@ export class SlackAgent {
       `Said in this thread since you last answered (${missed.length} message(s)):`,
       transcript,
       "",
-      `<@${mention.user}> asks: ${question}`,
+      line,
     ].join("\n");
   }
 

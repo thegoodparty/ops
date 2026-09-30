@@ -333,7 +333,7 @@ export interface WaitMarkerPort {
    * what stops that stale marker from silencing the next wait's first
    * reminder.
    */
-  recordWait(command: string): Promise<PendingWait>;
+  recordWait(command: string, waitingFor: string | null): Promise<PendingWait>;
   recordPing(): Promise<PendingWait>;
   clearWait(): Promise<void>;
 }
@@ -418,6 +418,12 @@ export interface MonitorArgs {
   timeoutSeconds: number;
   description: string;
   /**
+   * What the board and the status card say is being waited for. Required of
+   * the model by the schema, and still optional here: a restart replays a
+   * call recorded before the argument existed, and that wait must resume.
+   */
+  waitingFor?: string;
+  /**
    * What a person has to do for this wait to end. Set only when one does: it
    * is what turns the heartbeat on.
    */
@@ -467,7 +473,9 @@ export const runMonitor = async (
   // costs one turn and the model reissues the call; swallowing it would start
   // a day-long wait with no marker, which is the silent no-heartbeat
   // behaviour this exists to end, with nothing in the agent's view saying so.
-  let marker = heartbeat ? await heartbeat.marker.recordWait(args.command) : null;
+  let marker = heartbeat
+    ? await heartbeat.marker.recordWait(args.command, args.waitingFor?.trim() || null)
+    : null;
 
   // Measured from when the wait began, not from this process start, which is
   // the whole reason the marker is durable: a restart is not progress, and a
@@ -783,6 +791,10 @@ const MONITOR_DESCRIPTION = [
   "cache writes your whole context again at the far end, so update your notes",
   "before a long one.",
   "",
+  "`waitingFor` is what people see on the incident board: one short plain",
+  "sentence, no shell, e.g. \"someone to merge omni#2189 or #2195\" or \"the",
+  "deploy of #2234 to finish\".",
+  "",
   "THE COMMAND MUST BE A READ-ONLY CHECK. A restart replays this call and runs",
   "the command again, so a side effect happens twice. `gh pr merge` here is a bug.",
   "",
@@ -829,6 +841,10 @@ export const createMonitorTool = async (
     }),
     description: Type.String({
       description: "What you are waiting for, in one line.",
+    }),
+    waitingFor: Type.String({
+      description:
+        "For the incident board: one short plain sentence naming what you wait for, with no shell in it. \"someone to merge omni#2189\", \"the deploy of #2234 to finish\".",
     }),
     awaitingHuman: Type.Optional(
       Type.String({

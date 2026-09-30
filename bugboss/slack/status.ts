@@ -72,8 +72,13 @@ export interface StatusFacts {
   /** `pending_question`: the agent is blocked on a question to the Boss. */
   questionAskedAt: number | null;
   questionText: string | null;
-  /** `pending_wait`: the agent is inside `monitor`, waiting on a person. */
-  monitorCommand: string | null;
+  /**
+   * `pending_wait`: the agent is inside `monitor`, waiting on a person, and
+   * `monitorStartedAt` is set whenever there is a row. The label is null on
+   * a wait recorded before monitor asked for one. The command is not read at
+   * all: it is a shell line, and the board is read by people.
+   */
+  monitorWaitingFor: string | null;
   monitorStartedAt: number | null;
   /** Questions the agent sent up that no Boss run has read yet. */
   unreadQuestions: number;
@@ -95,7 +100,7 @@ export const STATUS_FACTS_SQL = `SELECT i.id AS incidentId,
             w.startedAt AS waitStartedAt,
             q.askedAt AS questionAskedAt,
             q.message AS questionText,
-            p.command AS monitorCommand,
+            p.waitingFor AS monitorWaitingFor,
             p.startedAt AS monitorStartedAt,
             (SELECT COUNT(*) FROM boss_inbox b
               WHERE b.incidentId = i.id AND b.kind = 'question' AND b.seenAt IS NULL)
@@ -125,6 +130,11 @@ export const isParked = (facts: StatusFacts): boolean =>
   OPEN_STATUSES.includes(facts.status) &&
   facts.waitingFor !== null &&
   facts.liftsOnReply === 0;
+
+export const PARKED_WAITING_ON = "a person to decide what happens next; the turn budget is spent";
+
+/** What a wait recorded before `monitor` took a `waitingFor` shows instead. */
+export const LEGACY_MONITOR_WAIT = "a check the agent is running";
 
 /** "4 min ago", from two epoch-ms instants. Whole units only. */
 export const ago = (at: number, now: number): string => {
@@ -174,6 +184,11 @@ export const waitingOn = (facts: StatusFacts, now: number | null): string => {
   const since = (at: number | null, verb: string): string =>
     now !== null && at !== null ? ` (${verb} ${ago(at, now)})` : "";
 
+  // One sentence, whatever else is outstanding and whatever the wait row
+  // says: nothing moves a parked incident until a person picks it up, so a
+  // question it asked or a check it was running is not what they act on.
+  if (isParked(facts)) return `${PARKED_WAITING_ON}${since(facts.waitStartedAt, "since")}`;
+
   const parts: string[] = [];
   if (facts.waitingFor !== null) {
     parts.push(mrkdwn`${oneLine(facts.waitingFor)}${raw(since(facts.waitStartedAt, "since"))}`);
@@ -190,9 +205,9 @@ export const waitingOn = (facts: StatusFacts, now: number | null): string => {
       `the Boss to read ${facts.unreadQuestions} question${facts.unreadQuestions === 1 ? "" : "s"} from the agent`,
     );
   }
-  if (facts.monitorCommand !== null) {
+  if (facts.monitorStartedAt !== null) {
     parts.push(
-      mrkdwn`a person; the agent is checking \`${oneLine(facts.monitorCommand)}\` until it passes${raw(since(facts.monitorStartedAt, "since"))}`,
+      mrkdwn`${oneLine(facts.monitorWaitingFor ?? LEGACY_MONITOR_WAIT)}${raw(since(facts.monitorStartedAt, "since"))}`,
     );
   }
   if (parts.length > 0) return parts.join("; ");

@@ -36,6 +36,8 @@ import {
   incidentSessionPrefix,
   slackSessionPrefix,
   type ObjectStore,
+  type OpenIncident,
+  type SlackAgentModel,
   type SlackAgentRun,
   type SlackAgentTool,
   type SlackMention,
@@ -96,8 +98,13 @@ const noSummaryModel = {
   complete: () => Promise.reject(new Error("no summary expected in this test")),
 };
 
+/** The report ingest, for runs that never file one. */
+const refuseOpen = () => Promise.reject(new Error("no report expected in this test"));
+
 const toolExtras = () => ({
   silence: { reason: null as string | null },
+  openIncident: refuseOpen,
+  reporter: null,
   status: {
     summarise: () => Promise.reject(new Error("no summary expected in this test")),
     cache: new Map<string, { position: number; text: string }>(),
@@ -481,6 +488,7 @@ describe("prefix binding", () => {
         "incident_board",
         "incident_status",
         "stay_silent",
+        "open_incident",
         "message_agent",
         "close_incident",
         "merge_incidents",
@@ -503,6 +511,7 @@ describe("prefix binding", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -547,6 +556,7 @@ describe("the per-thread lock", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -577,6 +587,7 @@ describe("the per-thread lock", () => {
     const { store } = memoryStore();
     let calls = 0;
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -605,6 +616,7 @@ describe("the per-thread lock", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -635,6 +647,7 @@ describe("session persistence", () => {
     const slack = fakeSlack();
     const { store, objects } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -745,6 +758,7 @@ describe("session persistence", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store: { ...store, put: () => Promise.reject(new Error("s3 500")) },
@@ -766,6 +780,7 @@ describe("session persistence", () => {
     const { store } = memoryStore();
     const posts: string[] = [];
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -808,6 +823,7 @@ describe("when the answer itself fails", () => {
     const { store } = memoryStore();
     const posts: { channel?: string; text: string }[] = [];
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -846,6 +862,7 @@ describe("when the answer itself fails", () => {
     const { store } = memoryStore();
     const posts: { channel?: string; text: string }[] = [];
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -991,7 +1008,7 @@ const runRequest = (
   tools,
   sessionKey: "sessions/slack/C0DEVALERTS/100.0/",
   fresh: true,
-  input: "<@U0HUMAN> asks: what is the state of the various incidents?",
+  input: "<@U0HUMAN> says: what is the state of the various incidents?",
   maxTurns,
   allowSilence: false,
 });
@@ -1359,6 +1376,7 @@ describe("the turn budget", () => {
     const { store } = memoryStore();
     const leases: number[] = [];
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -1389,6 +1407,7 @@ describe("the turn budget", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -1506,6 +1525,7 @@ describe("what a question cost", () => {
     const { store } = memoryStore();
     const slack = fakeSlack();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -1924,6 +1944,7 @@ describe("the Boss in an incident thread", () => {
     const slack = fakeSlack();
     const { store, objects } = memoryStore();
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -2034,6 +2055,7 @@ describe("the Boss in an incident thread", () => {
     const slack = fakeSlack();
     slack.state.replies = [opening];
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
@@ -2055,6 +2077,7 @@ describe("the Boss in an incident thread", () => {
     const slack = fakeSlack();
     slack.state.replies = [opening];
     const agent = new SlackAgent({
+      openIncident: refuseOpen,
       summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
@@ -2307,6 +2330,7 @@ describe("the Boss's write tools", () => {
       const model = fakeModel();
       const slack = fakeSlack();
       const agent = new SlackAgent({
+        openIncident: refuseOpen,
         summaryModel: noSummaryModel,
         db,
         store: memoryStore().store,
@@ -2324,5 +2348,105 @@ describe("the Boss's write tools", () => {
     await agent.handleIncident({ incidentId: "inc-1", trigger: { kind: "human", user: "U0HUMAN", text: "x", ts: "800.2" } });
     assert.equal(slack.posts.length, 1);
     assert.ok(!slack.posts[0].text.startsWith("<!subteam^"), slack.posts[0].text);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("open_incident", () => {
+  const recordingOpen = () => {
+    const filed: Parameters<OpenIncident>[0][] = [];
+    const open: OpenIncident = (report) => {
+      filed.push(report);
+      return Promise.resolve([{ incidentId: "91", action: "new_incident", reason: "new" }]);
+    };
+    return { filed, open };
+  };
+
+  const agentWith = (open: OpenIncident, model: SlackAgentModel) =>
+    new SlackAgent({
+      openIncident: open,
+      summaryModel: noSummaryModel,
+      db,
+      store: memoryStore().store,
+      slack: fakeSlack().client,
+      model,
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
+    });
+
+  const filing = (report: Record<string, unknown>) => ({
+    run: async (req: SlackAgentRun) => {
+      const tool = req.tools.find((t) => t.name === "open_incident");
+      if (!tool) throw new Error("the Boss has no open_incident tool");
+      return { text: await tool.run(report), usage: emptyModelUsage() };
+    },
+  });
+
+  test("a report from a mention is filed for the person who sent it, never a name in the input", async () => {
+    const { filed, open } = recordingOpen();
+    const reply = { text: "" };
+    const model = filing({ report: "exports are stuck at 0%", reportedBy: "U0SOMEONEELSE" });
+    await agentWith(open, {
+      run: async (req) => {
+        const out = await model.run(req);
+        reply.text = out.text;
+        return out;
+      },
+    }).handle(mention({ ts: "300.0", threadTs: "300.0", text: `<@${BOT}> exports are stuck at 0%` }));
+
+    assert.deepEqual(filed, [
+      {
+        text: "exports are stuck at 0%",
+        reportedBy: "U0HUMAN",
+        channel: CHANNEL,
+        threadTs: null,
+        messageTs: "300.0",
+      },
+    ]);
+    assert.match(reply.text, /incident 91\b/);
+  });
+
+  test("a run no person started cannot file one", async () => {
+    const { filed, open } = recordingOpen();
+    const tool = buildTools({
+      db,
+      store: memoryStore().store,
+      ...toolExtras(),
+      openIncident: open,
+      reporter: null,
+      commands: commandDeps(),
+    }).find((t) => t.name === "open_incident")!;
+
+    assert.match(await tool.run({ report: "something broke" }), /^Refused/);
+    assert.deepEqual(filed, []);
+  });
+
+  test("a mention is framed as something said, not a question", async () => {
+    const model = fakeModel();
+    const slack = fakeSlack();
+    slack.state.replies = [
+      { user: "U0OTHER", botId: null, text: "the rule was a leftover test", ts: "401.0" },
+    ];
+    const { store } = memoryStore();
+    const agent = new SlackAgent({
+      openIncident: refuseOpen,
+      summaryModel: noSummaryModel,
+      db,
+      store,
+      slack: slack.client,
+      model: model.model,
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
+    });
+    const said = "Can you close incident 2? See my latest message in that incident thread for why.";
+    await agent.handle(mention({ ts: "400.0", threadTs: "400.0", text: `<@${BOT}> hello` }));
+    await agent.handle(mention({ ts: "402.0", threadTs: "400.0", text: `<@${BOT}> ${said}` }));
+
+    const input = model.runs.at(-1)!.input;
+    assert.ok(input.endsWith(`<@U0HUMAN> says: ${said}`), input);
+    // The framing this replaced, which told the Boss every mention was a question.
+    assert.ok(!input.includes(`<@U0HUMAN> asks: ${said}`));
+    assert.ok(input.includes("<@U0OTHER>: the rule was a leftover test"), "the history came too");
   });
 });

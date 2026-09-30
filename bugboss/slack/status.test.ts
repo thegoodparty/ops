@@ -25,7 +25,7 @@ const facts = (over: Partial<StatusFacts> = {}): StatusFacts => ({
   waitStartedAt: null,
   questionAskedAt: null,
   questionText: null,
-  monitorCommand: null,
+  monitorWaitingFor: null,
   monitorStartedAt: null,
   unreadQuestions: 0,
   ...over,
@@ -226,11 +226,49 @@ describe("waiting on", () => {
     );
   });
 
-  test("a monitor wait on a person names the check", () => {
+  test("a monitor wait shows what the agent said it waits for", () => {
     const card = renderStatusCard(
-      view({ facts: facts({ monitorCommand: "gh pr view 2234 --json state", monitorStartedAt: AT - 30 * MIN }) }),
+      view({
+        facts: facts({
+          monitorWaitingFor: "someone to merge omni#2189 or #2195",
+          monitorStartedAt: AT - 30 * MIN,
+        }),
+      }),
     );
-    assert.match(card, /a person; the agent is checking `gh pr view 2234 --json state` until it passes \(since 30 min ago\)/);
+    assert.match(card, /\*Waiting on:\* someone to merge omni#2189 or #2195 \(since 30 min ago\)/);
+  });
+
+  test("a monitor wait recorded before it had a label says a check is running", () => {
+    const one = facts({ monitorWaitingFor: null, monitorStartedAt: AT - 30 * MIN });
+    assert.match(renderStatusCard(view({ facts: one })), /\*Waiting on:\* a check the agent is running \(since 30 min ago\)/);
+    assert.match(renderStatusLine(one), /waiting on a check the agent is running$/);
+  });
+
+  /**
+   * The prod line this replaced ran two clauses into each other, because the
+   * spent-budget wait and the agent's open question were both parts of one
+   * list. A parked incident is waiting on a person to pick it up, and that is
+   * the whole of it.
+   */
+  test("a parked incident is one sentence, whatever else is outstanding", () => {
+    const parked = facts({
+      status: "INVESTIGATING",
+      waitingFor: "a person, after the 200-turn budget for this incident ran out",
+      liftsOnReply: 0,
+      waitStartedAt: AT - 2 * 60 * MIN,
+      questionAskedAt: AT - 3 * 60 * MIN,
+      questionText: "Should I revert #2189?",
+      monitorWaitingFor: null,
+      monitorStartedAt: AT - 3 * 60 * MIN,
+    });
+    assert.equal(
+      renderStatusLine(parked),
+      "• *Incident 85* · INVESTIGATING, PARKED · CallHub rate-limit rejection dropped a paid robocall run · waiting on a person to decide what happens next; the turn budget is spent",
+    );
+    assert.match(
+      renderStatusCard(view({ facts: parked })),
+      /\*Waiting on:\* a person to decide what happens next; the turn budget is spent \(since 2 h ago\)\n/,
+    );
   });
 
   test("questions nobody has read yet are the Boss's to read", () => {
@@ -247,7 +285,7 @@ describe("the one-line form", () => {
     );
     assert.equal(
       renderStatusLine(facts({ ...merge, liftsOnReply: 0 })),
-      "• *Incident 85* · FIXING, PARKED · CallHub rate-limit rejection dropped a paid robocall run · waiting on someone to merge thegoodparty/omni#2234",
+      "• *Incident 85* · FIXING, PARKED · CallHub rate-limit rejection dropped a paid robocall run · waiting on a person to decide what happens next; the turn budget is spent",
     );
   });
 
