@@ -25,18 +25,41 @@ printf '\n=== agent-swarm user-data %s ===\n' "$(date -Is)"
 # centos repo it publishes resolves `$releasever` to `2023` on AL2023, so the
 # repo path 404s and `dnf` fails outright.
 #
-# So the plugin is installed as what it actually is, a single binary the docker
-# CLI looks for in its plugin directory. Pin the version: an unpinned download
+# So each plugin is installed as what it actually is, a single binary the docker
+# CLI looks for in its plugin directory. Pin the versions: an unpinned download
 # in a boot script is a different Compose on every host that boots.
+#
+# Installed when the version differs, not when the command is missing. Presence
+# is not enough, and that cost a deploy: AL2023's docker package already ships
+# buildx, at 0.12.1, which is older than the 0.17.0 that compose's build path
+# requires. A presence check passes, and `compose build` still fails.
 if ! command -v docker >/dev/null 2>&1; then
   dnf install -y docker
 fi
-if ! docker compose version >/dev/null 2>&1; then
-  COMPOSE_VERSION="v5.5.1"
+
+install_cli_plugin() {
+  local name="$1" url="$2"
   install -d -m 0755 /usr/libexec/docker/cli-plugins
-  curl -fsSL -o /usr/libexec/docker/cli-plugins/docker-compose \
+  curl -fsSL -o "/usr/libexec/docker/cli-plugins/$name" "$url"
+  chmod 0755 "/usr/libexec/docker/cli-plugins/$name"
+}
+
+COMPOSE_VERSION="v5.5.1"
+if [ "$(docker compose version --short 2>/dev/null || true)" != "${COMPOSE_VERSION#v}" ]; then
+  install_cli_plugin docker-compose \
     "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
-  chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
+fi
+
+# buildx is not needed to RUN a container, but it is needed to BUILD one. Compose
+# v2 routes every service with a `build:` context through it, and the bridge is
+# built from source on this host so that the code in the tarball and the running
+# image cannot drift. Without a new enough one, `docker compose up` stops with
+# "compose build requires buildx 0.17.0 or later", which reads as a compose
+# problem and is not one.
+BUILDX_VERSION="v0.37.1"
+if [ "$(docker buildx version 2>/dev/null | awk '{print $2}')" != "${BUILDX_VERSION#v}" ]; then
+  install_cli_plugin docker-buildx \
+    "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
 fi
 
 # Fail here rather than three steps into bootstrap, where a missing plugin reads
@@ -45,6 +68,7 @@ fi
 # notices.
 command -v docker >/dev/null 2>&1 || { printf 'FATAL: docker is not installed\n' >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || { printf 'FATAL: the docker compose plugin is missing at /usr/libexec/docker/cli-plugins/docker-compose\n' >&2; exit 1; }
+docker buildx version >/dev/null 2>&1 || { printf 'FATAL: the docker buildx plugin is missing at /usr/libexec/docker/cli-plugins/docker-buildx\n' >&2; exit 1; }
 
 # Cap the json-file logs Docker keeps per container. The default is unbounded, and
 # on a box that runs a chatty agent swarm for weeks that fills the root volume and
@@ -82,6 +106,20 @@ mkdir -p /var/lib/agent-swarm/api-data
 mkdir -p /var/lib/agent-swarm/logs
 mkdir -p /var/lib/agent-swarm/shared
 mkdir -p /var/lib/agent-swarm/personal
+
+# The bridge's state directory is the one that needs an owner, because the bridge
+# is the one container in this stack that does not run as root: it runs as `node`,
+# uid 1000 in the node:22-alpine base. Docker creates a missing bind-mount
+# directory as root, so without this the bridge starts, serves health, and then
+# fails to write its own state file with EACCES. It also loses the seen-set and
+# the incident counter, which is worse than it sounds: incident numbering restarts
+# and alerts already being worked are re-opened as new.
+#
+# Everything else here runs as root and does not care. Set the owner explicitly
+# rather than letting Docker decide, and do it unconditionally so a directory
+# Docker already created wrong gets corrected.
+install -d -m 0755 /var/lib/agent-swarm/bridge
+chown 1000:1000 /var/lib/agent-swarm/bridge
 
 # ---------------------------------------------------------------------------
 # Log rotation for the bind-mounted logs

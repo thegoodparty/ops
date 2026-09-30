@@ -138,6 +138,7 @@ log "Pulling images"
 # image-pull output, and the cause is a host built without the plugin.
 command -v docker >/dev/null 2>&1 || die "docker is not installed on this host"
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is missing. user-data.sh installs it to /usr/libexec/docker/cli-plugins/docker-compose; run that script again on this host, then re-deploy."
+docker buildx version >/dev/null 2>&1 || die "the docker buildx plugin is missing. user-data.sh installs it to /usr/libexec/docker/cli-plugins/docker-buildx; the bridge is built from source on this host, so compose cannot start without it."
 docker compose pull
 
 log "Starting the stack"
