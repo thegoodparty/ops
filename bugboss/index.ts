@@ -135,6 +135,7 @@ import {
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { attachedSignalIds } from "./triage/sql";
 import {
+  lastSessionEventAt,
   readSessionOutcome,
   sessionKeyFor,
   sumSessionUsage,
@@ -996,6 +997,19 @@ export const createBugBoss = async (
               : null,
           });
           opened++;
+          // An agent can write to the Boss before its incident has a thread,
+          // and the wake for that row found nowhere to answer. Now there is.
+          const unseen = db.get(
+            "SELECT 1 FROM boss_inbox WHERE incidentId = ? AND seenAt IS NULL LIMIT 1",
+            [row.id],
+          );
+          if (unseen) {
+            void slackAgent
+              .handleIncident({ incidentId: row.id, trigger: { kind: "inbox" } })
+              .catch((err: unknown) =>
+                alarm("boss_wake_failed", { incidentId: row.id, error: String(err) }),
+              );
+          }
         } catch (err) {
           alarm("open_post_failed", { incidentId: row.id, error: String(err) });
         }
@@ -1885,6 +1899,10 @@ export const createBugBoss = async (
         return;
       }
       await slack.post(threadTs, text);
+    },
+    lastSessionEventAt: async (sessionRef) => {
+      const raw = await store.get(sessionRef);
+      return raw ? lastSessionEventAt(raw) : null;
     },
     childBaseEnv: {
       ...pickBaseEnv(process.env),

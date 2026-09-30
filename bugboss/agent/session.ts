@@ -531,6 +531,34 @@ export const readSessionOutcome = (contents: string): SessionOutcome => {
   return { kind: "killed", turns };
 };
 
+/**
+ * When the session last recorded anything, as epoch ms, or null when no line
+ * carries a readable timestamp.
+ *
+ * Every entry Pi writes is stamped when it happens, and the file is synced
+ * after every turn, so the newest stamp is the last moment the agent is
+ * known to have been working. Read from the content rather than from S3
+ * `LastModified`, which is when the object was last put and moves with a
+ * re-upload of unchanged bytes.
+ */
+export const lastSessionEventAt = (contents: string): number | null => {
+  let latest: number | null = null;
+  for (const line of contents.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: { timestamp?: unknown };
+    try {
+      entry = JSON.parse(trimmed) as typeof entry;
+    } catch {
+      continue;
+    }
+    if (typeof entry.timestamp !== "string") continue;
+    const at = Date.parse(entry.timestamp);
+    if (Number.isFinite(at) && (latest === null || at > latest)) latest = at;
+  }
+  return latest;
+};
+
 /** One line for a log or a thread, so the wording is not written twice. */
 export const describeOutcome = (outcome: SessionOutcome): string => {
   switch (outcome.kind) {

@@ -1383,6 +1383,273 @@ describe("Dispatcher.tick", () => {
     await d.drain();
     cleanup();
   });
+
+  // Prod, 2026-09-30: a deploy restarted the container and incident 10's
+  // thread was told its agent had been gone 4.5h and to disregard its last
+  // message. The agent had asked the Boss a question three minutes earlier.
+  // 4.5h was the time since launch, which is all the old clock read.
+  describe("after a restart kills an agent that was working", () => {
+    const LAUNCHED_AGO_MS = 16_200_000;
+    const ACTIVE_AGO_MS = 180_000;
+
+    const restartWith = async (signals: {
+      inbox: boolean;
+      session: boolean;
+    }) => {
+      const { db, sqlite, cleanup } = makeDb();
+      const { toolApiFor } = makeTools();
+      insertIncident(sqlite, "i1", {
+        status: "INVESTIGATING",
+        attempts: 1,
+        sessionRef: "sessions/incident/i1/session.jsonl",
+        lastStartedAt: T0 - LAUNCHED_AGO_MS,
+      });
+      if (signals.inbox) {
+        sqlite
+          .prepare(
+            "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES (?, 'question', ?, ?)",
+          )
+          .run("i1", "Is the 02:00 deploy yours?", T0 - ACTIVE_AGO_MS);
+      }
+
+      const notices: string[] = [];
+      const held = heldSpawn();
+      const d = createDispatcher(
+        deps({
+          db,
+          spawn: held.spawn,
+          toolApiFor,
+          postNotice: async (_id, text) => {
+            notices.push(text);
+          },
+          lastSessionEventAt: async () =>
+            signals.session ? T0 - ACTIVE_AGO_MS : null,
+        }),
+      );
+      const alarms = await captureAlarms(async () => {
+        await d.tick();
+      });
+      const directives = db
+        .query<{ payload: string }>("SELECT payload FROM pending_directive")
+        .map((r) => JSON.parse(r.payload));
+
+      held.releaseAll();
+      await d.drain();
+      cleanup();
+      return { notices, alarms, directives };
+    };
+
+    it("measured from launch, the old clock, this is a gap worth announcing", async () => {
+      assert.ok(LAUNCHED_AGO_MS / 1000 >= RESUME_NOTICE_SECONDS);
+      const { notices, alarms, directives } = await restartWith({
+        inbox: false,
+        session: false,
+      });
+      assert.equal(notices.length, 1, "with no activity to read, launch is the clock");
+      assert.ok(alarms.includes("agent_resumed_after_gap"));
+      assert.deepEqual(directives, [
+        { type: "resumed_after", seconds: LAUNCHED_AGO_MS / 1000 },
+      ]);
+    });
+
+    it("says nothing in the thread and logs the real three minutes", async () => {
+      const { notices, alarms, directives } = await restartWith({
+        inbox: true,
+        session: true,
+      });
+      assert.deepEqual(notices, []);
+      assert.ok(!alarms.includes("agent_resumed_after_gap"));
+      assert.deepEqual(directives, [
+        { type: "resumed_after", seconds: ACTIVE_AGO_MS / 1000 },
+      ]);
+    });
+
+    it("reads either clock on its own", async () => {
+      for (const signals of [
+        { inbox: true, session: false },
+        { inbox: false, session: true },
+      ]) {
+        const { notices, directives } = await restartWith(signals);
+        assert.deepEqual(notices, [], JSON.stringify(signals));
+        assert.deepEqual(directives, [
+          { type: "resumed_after", seconds: ACTIVE_AGO_MS / 1000 },
+        ]);
+      }
+    });
+  });
+
+  it("tells the thread the true gap when the agent really was idle, and nothing about the last message", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      status: "FIXING",
+      attempts: 1,
+      sessionRef: "sessions/incident/i1/session.jsonl",
+      lastStartedAt: T0 - 7_200_000,
+    });
+    sqlite
+      .prepare(
+        "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES (?, 'message', ?, ?)",
+      )
+      .run("i1", "PR is up", T0 - 3_900_000);
+    // A reply is a person, not the agent, and must not read as activity.
+    sqlite
+      .prepare(
+        "INSERT INTO thread_reply (id, incidentId, slackUserId, text, ts, receivedAt) VALUES ('r1', 'i1', 'U1', 'any news?', '1.0', ?)",
+      )
+      .run(T0 - 60_000);
+
+    const notices: string[] = [];
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          notices.push(text);
+        },
+        lastSessionEventAt: async () => T0 - 3_600_000,
+      }),
+    );
+    const alarms = await captureAlarms(async () => {
+      await d.tick();
+    });
+
+    assert.deepEqual(notices, [resumeNotice(3600)]);
+    assert.match(notices[0], /1h/);
+    assert.doesNotMatch(notices[0], /last message/);
+    assert.ok(alarms.includes("agent_resumed_after_gap"));
+
+    held.releaseAll();
+    await d.drain();
+    cleanup();
+  });
+
+  // A blocking wait writes nothing while it blocks. An agent an hour into a
+  // question to the Boss, or a wait on a person, looks idle by every
+  // timestamp, and a deploy killing it is still just a deploy.
+  describe("after a restart kills an agent inside a blocking wait", () => {
+    const ASKED_AGO_MS = 3_000_000;
+
+    const restartDuring = async (marker: "question" | "wait" | null) => {
+      const { db, sqlite, cleanup } = makeDb();
+      const { toolApiFor } = makeTools();
+      insertIncident(sqlite, "i1", {
+        attempts: 1,
+        sessionRef: "sessions/incident/i1/session.jsonl",
+        lastStartedAt: T0 - 16_200_000,
+      });
+      sqlite
+        .prepare(
+          "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES ('i1', 'question', 'Can I merge #12?', ?)",
+        )
+        .run(T0 - ASKED_AGO_MS);
+      if (marker === "question") {
+        sqlite
+          .prepare(
+            "INSERT INTO pending_question (incidentId, messageTs, askedAt, message) VALUES ('i1', '', ?, 'Can I merge #12?')",
+          )
+          .run(T0 - ASKED_AGO_MS);
+      }
+      if (marker === "wait") {
+        sqlite
+          .prepare(
+            "INSERT INTO pending_wait (incidentId, command, startedAt, pings, lastPingAt) VALUES ('i1', 'gh pr view 12', ?, 0, NULL)",
+          )
+          .run(T0 - ASKED_AGO_MS);
+      }
+
+      // The process boots at T0 and its first tick runs a tick later.
+      let clock = T0;
+      const notices: string[] = [];
+      const held = heldSpawn();
+      const d = createDispatcher(
+        deps({
+          db,
+          spawn: held.spawn,
+          toolApiFor,
+          now: () => clock,
+          postNotice: async (_id, text) => {
+            notices.push(text);
+          },
+          lastSessionEventAt: async () => T0 - ASKED_AGO_MS,
+        }),
+      );
+      clock = T0 + 45_000;
+      const alarms = await captureAlarms(async () => {
+        await d.tick();
+      });
+      const directives = db
+        .query<{ payload: string }>("SELECT payload FROM pending_directive")
+        .map((r) => JSON.parse(r.payload));
+
+      held.releaseAll();
+      await d.drain();
+      cleanup();
+      return { notices, alarms, directives };
+    };
+
+    it("without an open marker, the last timestamp alone reads as an hour gone", async () => {
+      const { notices } = await restartDuring(null);
+      assert.equal(notices.length, 1);
+    });
+
+    it("an open question or wait means it was alive until the restart", async () => {
+      for (const marker of ["question", "wait"] as const) {
+        const { notices, alarms, directives } = await restartDuring(marker);
+        assert.deepEqual(notices, [], marker);
+        assert.ok(!alarms.includes("agent_resumed_after_gap"), marker);
+        assert.deepEqual(directives, [{ type: "resumed_after", seconds: 45 }], marker);
+      }
+    });
+  });
+
+  it("falls back to the database when the session cannot be read", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      attempts: 1,
+      sessionRef: "sessions/incident/i1/session.jsonl",
+      lastStartedAt: T0 - 16_200_000,
+    });
+    sqlite
+      .prepare(
+        "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES ('i1', 'message', 'PR is up', ?)",
+      )
+      .run(T0 - 120_000);
+
+    const notices: string[] = [];
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          notices.push(text);
+        },
+        lastSessionEventAt: async () => {
+          throw new Error("s3 is down");
+        },
+      }),
+    );
+    const alarms = await captureAlarms(async () => {
+      await d.tick();
+    });
+
+    assert.deepEqual(notices, []);
+    assert.ok(alarms.includes("resume_session_read_failed"));
+    const directives = db.query<{ payload: string }>("SELECT payload FROM pending_directive");
+    assert.deepEqual(JSON.parse(directives[0].payload), {
+      type: "resumed_after",
+      seconds: 120,
+    });
+
+    held.releaseAll();
+    await d.drain();
+    cleanup();
+  });
 });
 
 describe("the spawned environment", () => {

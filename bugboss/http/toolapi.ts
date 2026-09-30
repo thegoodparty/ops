@@ -37,9 +37,10 @@ export interface ToolApiHttpDeps {
   /** Runs the Boss for an incident whose inbox just gained a row. */
   wakeBoss: WakeBoss;
   /**
-   * Tells the dispatcher an escalation went up from this incident's live run,
-   * so its deadline does not post a placeholder brief over the agent's own.
-   * A real child reaches this route with no dispatcher in the call.
+   * Tells the dispatcher the agent sent up its own escalation brief, so its
+   * deadline does not post a placeholder over it. A harness rung while the
+   * agent waits is not a brief and does not count. A real child reaches this
+   * route with no dispatcher in the call.
    */
   noteEscalated: (incidentId: string) => void;
   now?: () => number;
@@ -297,6 +298,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       .object({
         kind: z.enum(["message", "question", "escalation"]),
         text: z.string().trim().min(1),
+        ownBrief: z.boolean().optional(),
       })
       .safeParse(raw);
     if (!parsed.success) {
@@ -321,7 +323,9 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       kind: parsed.data.kind,
       id,
     });
-    if (parsed.data.kind === "escalation") deps.noteEscalated(caller.incidentId);
+    if (parsed.data.kind === "escalation" && parsed.data.ownBrief) {
+      deps.noteEscalated(caller.incidentId);
+    }
     deps.wakeBoss(caller.incidentId);
     return c.json({ id });
   });

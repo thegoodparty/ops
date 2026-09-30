@@ -284,7 +284,7 @@ test("get_incident takes an id, so an agent can read an incident that is not its
 });
 
 test("escalate goes to the Boss's inbox and never through the ToolApi escalate that posts to Slack", async () => {
-  const told: { kind: string; text: string }[] = [];
+  const told: { kind: string; text: string; ownBrief?: boolean }[] = [];
   let posted = 0;
   const tools = await createBossTools({
     api: {
@@ -295,8 +295,8 @@ test("escalate goes to the Boss's inbox and never through the ToolApi escalate t
       },
     } as unknown as ToolApi,
     boss: {
-      tellBoss: async (kind, text) => {
-        told.push({ kind, text });
+      tellBoss: async (kind, text, options) => {
+        told.push({ kind, text, ownBrief: options?.ownBrief });
       },
     },
   });
@@ -314,9 +314,38 @@ test("escalate goes to the Boss's inbox and never through the ToolApi escalate t
 
   assert.equal(posted, 0, "the Slack-posting escalate is never reached");
   assert.deepEqual(told, [
-    { kind: "escalation", text: "blocked on a merge\n\nWhat I believe now: the fix is ready." },
+    {
+      kind: "escalation",
+      text: "blocked on a merge\n\nWhat I believe now: the fix is ready.",
+      ownBrief: true,
+    },
   ]);
   assert.match(String(result.content[0].type === "text" && result.content[0].text), /^ok/);
+});
+
+test("escalate hands back a stop waiting behind it and ends the run on that turn", async () => {
+  let told = 0;
+  const tools = await createBossTools({
+    api: stubApi({ ok: true, directives: [{ type: "stop", reason: "the Boss closed it" }] }),
+    boss: {
+      tellBoss: async () => {
+        told += 1;
+      },
+    },
+  });
+  const escalate = tools.find((tool) => tool.name === "escalate")!;
+
+  const result = await escalate.execute(
+    "call-1",
+    { reason: "out of ideas", brief: "What I believe now: nothing new." } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.equal(told, 1, "the premise: the escalation went up first");
+  assert.match(String(result.content[0].type === "text" && result.content[0].text), /the Boss closed it/);
+  assert.equal(result.terminate, true);
 });
 
 test("park reaches the boss, because a wait nothing can write is a hot loop", async () => {
