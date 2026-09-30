@@ -81,15 +81,11 @@ export type {
 
 export {
   classifySlackEvent,
-  classifySlackInteraction,
   createSlackVerifier,
-  isInteractionDelivery,
-  INTERACTION_CONTENT_TYPE,
 } from "./slack";
 export type {
   SlackClassification,
   SlackConfig,
-  SlackInteraction,
   SlackMessage,
   SlackVerifier,
 } from "./slack";

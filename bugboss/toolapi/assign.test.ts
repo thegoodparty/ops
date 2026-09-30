@@ -14,6 +14,7 @@ import {
   AssignError,
   establishedOf,
   logAssign,
+  pushDirective,
 } from "./assign";
 
 const fakeS3 = () => {
@@ -525,5 +526,46 @@ describe("establishedOf: which record stays", () => {
     ]) {
       assert.equal(establishedOf(a, b), establishedOf(b, a), `${a} vs ${b}`);
     }
+  });
+});
+
+describe("pushDirective: the Boss's message wakes a parked incident", () => {
+  const park = (incidentId: string, liftsOnReply: number) =>
+    db.withWrite((w) => {
+      w.prepare(
+        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES (?, 'an answer', NULL, ?, 1)`,
+      ).run(incidentId, liftsOnReply);
+    });
+  const waiting = (incidentId: string) =>
+    db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM incident_wait WHERE incidentId = ?",
+      [incidentId],
+    )?.n;
+
+  it("lifts a wait on news, and only a boss_message does", async () => {
+    await seed("sig-a");
+    const id = (await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "r" }, { kind: "boss" })).target;
+    await park(id, 1);
+
+    await db.withWrite((w) => pushDirective(w, id, { type: "stop", reason: "r" }));
+    assert.equal(waiting(id), 1, "the premise: other directives leave the wait in place");
+
+    await db.withWrite((w) =>
+      pushDirective(w, id, { type: "boss_message", text: "org X only", at: 1 }),
+    );
+    assert.equal(waiting(id), 0);
+    assert.deepEqual(directivesFor(id).at(-1), { type: "boss_message", text: "org X only", at: 1 });
+  });
+
+  it("leaves a run that is out of turns parked", async () => {
+    await seed("sig-a");
+    const id = (await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "r" }, { kind: "boss" })).target;
+    await park(id, 0);
+
+    await db.withWrite((w) =>
+      pushDirective(w, id, { type: "boss_message", text: "carry on", at: 1 }),
+    );
+    assert.equal(waiting(id), 1);
   });
 });

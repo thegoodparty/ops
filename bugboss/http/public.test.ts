@@ -12,8 +12,6 @@ import { createHmac } from "node:crypto";
 import { test } from "node:test";
 
 import { IngestRejected } from "./errors";
-import { CHOICE_ACTION_PREFIX } from "../slack/blocks";
-import type { SlackChoiceClick } from "../slack/blocks";
 import type { SlackAck } from "../slack/ack";
 import { createPublicApp, type PublicAppDeps } from "./public";
 
@@ -39,7 +37,6 @@ const deps = (over: Partial<PublicAppDeps> = {}): PublicAppDeps => ({
   ingestAccepted: async () => ({ settled: Promise.resolve(), recorded: 1 }),
   slackEventAccepted: async () => ({ settled: Promise.resolve() }),
   acknowledgeSlack: () => {},
-  slackInteractionAccepted: async () => ({ settled: Promise.resolve() }),
   slackConfig: {},
   ...over,
 });
@@ -636,125 +633,4 @@ test("a throwing cancel does not turn the 413 into an alarm", async () => {
     0,
     `a throwing cancel must not alarm, got ${JSON.stringify(errors)}`,
   );
-});
-
-// --- interactivity shares the event path, not a new one --------------------
-
-const CLICK_PAYLOAD = {
-  type: "block_actions",
-  user: { id: "U0HUMAN" },
-  channel: { id: "C1" },
-  message: { ts: "2.0", thread_ts: "1.0" },
-  actions: [
-    { action_id: `${CHOICE_ACTION_PREFIX}0`, value: "Roll back", action_ts: "3.0" },
-  ],
-};
-
-/** A press, encoded the way Slack encodes one: a form body, not JSON. */
-const pressed = (
-  app: ReturnType<typeof createPublicApp>,
-  payload: unknown = CLICK_PAYLOAD,
-  signWith = SIGNING_SECRET,
-) => {
-  const raw = new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
-  const stamp = String(Math.floor(Date.now() / 1000));
-  return app.request("/slack", {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      "x-slack-request-timestamp": stamp,
-      "x-slack-signature": `v0=${createHmac("sha256", signWith)
-        .update(`v0:${stamp}:${raw}`, "utf8")
-        .digest("hex")}`,
-    },
-    body: raw,
-  });
-};
-
-test("a signed press reaches the relay down the same path as an event", async () => {
-  const clicks: SlackChoiceClick[] = [];
-  const app = createPublicApp(
-    deps({
-      slackConfig: { signingSecret: SIGNING_SECRET },
-      slackInteractionAccepted: async (click) => {
-        clicks.push(click);
-        return { settled: Promise.resolve() };
-      },
-    }),
-  );
-
-  const res = await pressed(app);
-
-  assert.equal(res.status, 200);
-  // A JSON body here is read by Slack as a replacement for the message that
-  // was clicked, which would delete the question out from under the thread.
-  assert.equal(await res.text(), "");
-  assert.equal(clicks.length, 1);
-  assert.equal(clicks[0].choice, "Roll back");
-  assert.equal(clicks[0].messageTs, "2.0");
-});
-
-test("an unsigned press is refused, and never reaches the relay", async () => {
-  let reached = false;
-  const app = createPublicApp(
-    deps({
-      slackConfig: { signingSecret: SIGNING_SECRET },
-      slackInteractionAccepted: async () => {
-        reached = true;
-        return { settled: Promise.resolve() };
-      },
-    }),
-  );
-
-  const res = await pressed(app, CLICK_PAYLOAD, "not-the-signing-secret");
-
-  assert.equal(res.status, 401);
-  assert.equal(reached, false, "an open endpoint would let anyone answer an agent");
-});
-
-test("an interaction that is not ours is ignored, and the event path is untouched", async () => {
-  let reached = false;
-  const app = createPublicApp(
-    deps({
-      slackConfig: { signingSecret: SIGNING_SECRET },
-      slackInteractionAccepted: async () => {
-        reached = true;
-        return { settled: Promise.resolve() };
-      },
-    }),
-  );
-
-  const res = await pressed(app, {
-    ...CLICK_PAYLOAD,
-    actions: [{ action_id: "someone_elses", value: "x", action_ts: "3.0" }],
-  });
-
-  assert.equal(res.status, 200);
-  assert.equal(reached, false);
-});
-
-test("a JSON event is still routed as an event", async () => {
-  let events = 0;
-  let clicks = 0;
-  const app = createPublicApp(
-    deps({
-      slackConfig: { signingSecret: SIGNING_SECRET },
-      slackEventAccepted: async () => {
-        events += 1;
-        return { settled: Promise.resolve() };
-      },
-      slackInteractionAccepted: async () => {
-        clicks += 1;
-        return { settled: Promise.resolve() };
-      },
-    }),
-  );
-
-  await signedSlack(app, {
-    type: "event_callback",
-    event: { type: "message", user: "U1", channel: "C1", ts: "1.0", text: "roll it back" },
-  });
-
-  assert.equal(events, 1, "free text answers by the path it always did");
-  assert.equal(clicks, 0);
 });

@@ -132,6 +132,15 @@ export const pushDirective = (
   db.prepare(
     "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
   ).run(incidentId, JSON.stringify(directive), Date.now());
+  // The Boss is the only thing a person's word reaches an agent through, so
+  // its message is what wakes a parked incident. A reply in the thread no
+  // longer can: it goes to the Boss, and relaunching an agent that has
+  // nothing new to read costs a launch for chatter.
+  if (directive.type === "boss_message") {
+    db.prepare(
+      "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1",
+    ).run(incidentId);
+  }
 };
 
 /**

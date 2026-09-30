@@ -41,13 +41,14 @@ import {
   getIncidentRow,
   getSignalsFor,
   logAssign,
+  pushDirective,
   rowToIncident,
   rowToSignal,
   type AssignResult,
   type IncidentRow,
   type SignalRow,
 } from "./assign";
-import { createAnnouncer } from "./announce";
+import { createAnnouncer, type AnnouncePoster } from "./announce";
 import { verifyAgentToken } from "./token";
 import {
   bullets,
@@ -157,6 +158,39 @@ export interface ToolApiDeps {
 // ---------------------------------------------------------------------------
 
 type Body<T> = { ok: true; data: T } | { ok: false; error: string };
+
+/**
+ * Resolution closes the incident's open signals. It does not split them.
+ *
+ * Splitting here asked the wrong question. "Has a resolve notification
+ * arrived yet" is not "is this still broken": the agent watches the alert
+ * go quiet and reports, and Grafana's resolved delivery lands after that,
+ * so on the ordinary path every single resolution split its own signal
+ * into a fresh incident and the dispatcher launched an agent on it. A
+ * source that cannot report resolution at all never closed.
+ *
+ * The evidence that a resolution was wrong is a signal arriving after it,
+ * which triage already judges: it may not attach to a RESOLVED incident
+ * and can point `recurrenceOf` at the one that claimed the ground. That is
+ * positive evidence rather than absence of contrary evidence, and it is
+ * the mechanism the spec describes. This is the only one now.
+ */
+const closeOpenSignals = (
+  w: Database.Database,
+  incidentId: string,
+  at: number,
+): void => {
+  w.prepare(
+    "UPDATE signal SET closedAt = ? WHERE incidentId = ? AND closedAt IS NULL",
+  ).run(at, incidentId);
+};
+
+/**
+ * The line every close posts, whoever closed it. A close reads one way in the
+ * thread whether an agent wrote the post-mortem or the Boss ended it.
+ */
+const closedNotice = (incidentId: string, detail: string): string =>
+  `${mrkdwn`*Incident ${incidentId} closed*`}\n${detail}`;
 
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
 
@@ -416,32 +450,6 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    * recurrenceOf, which is exactly what that field is for: this reopens
    * ground a resolution claimed.
    */
-  /**
-   * Resolution closes the incident's open signals. It does not split them.
-   *
-   * Splitting here asked the wrong question. "Has a resolve notification
-   * arrived yet" is not "is this still broken": the agent watches the alert
-   * go quiet and reports, and Grafana's resolved delivery lands after that,
-   * so on the ordinary path every single resolution split its own signal
-   * into a fresh incident and the dispatcher launched an agent on it. A
-   * source that cannot report resolution at all never closed.
-   *
-   * The evidence that a resolution was wrong is a signal arriving after it,
-   * which triage already judges: it may not attach to a RESOLVED incident
-   * and can point `recurrenceOf` at the one that claimed the ground. That is
-   * positive evidence rather than absence of contrary evidence, and it is
-   * the mechanism the spec describes. This is the only one now.
-   */
-  const closeOpenSignals = (
-    w: Database.Database,
-    incidentId: string,
-    at: number,
-  ): void => {
-    w.prepare(
-      "UPDATE signal SET closedAt = ? WHERE incidentId = ? AND closedAt IS NULL",
-    ).run(at, incidentId);
-  };
-
   /** Correlation moves records nobody else has claimed, in either direction. */
   const mergeable = (row: Incident | undefined): row is Incident =>
     !!row && (row.status === "INVESTIGATING" || row.status === "FIXING");
@@ -912,7 +920,10 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
       await notify(
         incident,
-        mrkdwn`*Incident ${incidentId} closed*\n_${args.usersImpacted} users impacted · post-mortem written._`,
+        closedNotice(
+          incidentId,
+          mrkdwn`_${args.usersImpacted} users impacted · post-mortem written._`,
+        ),
       );
 
       // A recurrence closes on a second answer the first incident never had
@@ -1192,4 +1203,88 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     proposeMerge,
     searchIncidents: searchIncidentsTool,
   };
+};
+
+/** The statuses the Boss may close from: every one an incident is still open in. */
+const BOSS_CLOSABLE: readonly IncidentStatus[] = [
+  "INVESTIGATING",
+  "FIXING",
+  "RESOLVED",
+];
+
+/**
+ * The Boss ending an incident, from any open status. `reason` is the evidence
+ * it can cite, and the closing report says the Boss closed it rather than
+ * dressing the reason up as an agent's analysis.
+ *
+ * A CLOSED row must carry `resolvedAt` and `postmortem` (`db/schema.sql`), and
+ * that CHECK cannot change on a live table. An incident closed from FIXING has
+ * neither, so both are filled here only where they are missing: a RESOLVED
+ * incident keeps the resolution time and evidence its agent recorded.
+ */
+export const closeIncidentByBoss = async (
+  deps: { db: Db; slack: AnnouncePoster },
+  args: { incidentId: string; reason: string },
+): Promise<{ ok: true; from: IncidentStatus } | { ok: false; error: string }> => {
+  const { db, slack } = deps;
+  const { incidentId, reason } = args;
+
+  if (!reason.trim()) {
+    return { ok: false, error: "a close needs the evidence it rests on as its reason" };
+  }
+  const long = overThreadBudget("reason", reason);
+  if (long) return { ok: false, error: long };
+
+  const note = `Closed by BugBoss, not by the incident's agent, so there is no post-mortem analysis. The evidence it closed on: ${reason}`;
+
+  const outcome = await db.withWrite(
+    (w): { ok: true; from: IncidentStatus } | { ok: false; error: string } => {
+      const row = getIncidentRow(w, incidentId);
+      if (!row) return { ok: false, error: `unknown incident: ${incidentId}` };
+      if (!BOSS_CLOSABLE.includes(row.status)) {
+        return {
+          ok: false,
+          error: `incident ${incidentId} is ${row.status}, so there is nothing left to close`,
+        };
+      }
+      const at = Date.now();
+      const taken = w
+        .prepare(
+          `UPDATE incident SET status = 'CLOSED', closedAt = ?,
+             resolvedAt = COALESCE(resolvedAt, ?),
+             postmortem = COALESCE(postmortem, ?)
+           WHERE id = ? AND status IN (${placeholders(BOSS_CLOSABLE.length)})`,
+        )
+        .run(at, at, note, incidentId, ...BOSS_CLOSABLE).changes;
+      if (taken === 0) {
+        return { ok: false, error: `incident ${incidentId} changed before it could be closed` };
+      }
+      w.prepare(
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES (?, 'boss', NULL, 'close', ?, ?)`,
+      ).run(incidentId, reason, at);
+      closeOpenSignals(w, incidentId, at);
+      indexIncident(w, incidentId);
+      pushDirective(w, incidentId, {
+        type: "stop",
+        reason: `BugBoss closed this incident: ${reason}`,
+      });
+      return { ok: true, from: row.status };
+    },
+  );
+  if (!outcome.ok) {
+    log("boss_close_refused", { incidentId, error: outcome.error });
+    return outcome;
+  }
+
+  log("boss_closed", { incidentId, from: outcome.from });
+  const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [incidentId]);
+  if (row) {
+    const incident = rowToIncident(row);
+    await createAnnouncer({ db, slack }).notify(
+      incident,
+      closedNotice(incidentId, `_Closed by BugBoss:_ ${toMrkdwn(reason)}`),
+    );
+  }
+  return outcome;
 };

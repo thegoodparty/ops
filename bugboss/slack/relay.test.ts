@@ -7,7 +7,6 @@ import { after, before, beforeEach, describe, test } from "node:test";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
-import type { SlackChoiceClick } from "./blocks";
 import {
   SlackRelay,
   earnsMention,
@@ -483,33 +482,23 @@ describe("inbound", () => {
   };
 
   /**
-   * The delete that wakes a parked incident lives here, upstream of anything
-   * that reads what the message said. These two drive it through the real
-   * relay rather than restating its SQL, because a test that restates the
-   * statement cannot notice the statement changing -- which is exactly what
-   * happened: the dispatcher-side version of this passed with the condition
-   * removed from this file.
+   * A reply used to lift a wait here, upstream of anything that read it. It
+   * goes to the Boss now, and the Boss messaging the agent is what wakes a
+   * parked incident (`pushDirective`), so chatter no longer costs a launch.
    */
-  const park = (id: string, liftsOnReply: 0 | 1, waitingFor: string) =>
-    db.withWrite((d) =>
+  test("a reply leaves a parked incident parked", async () => {
+    const thread = await openThread("inc-1");
+    await db.withWrite((d) =>
       d
         .prepare(
           `INSERT INTO incident_wait
              (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
-           VALUES (?, ?, NULL, ?, ?)`,
+           VALUES (?, 'somebody to merge the PR', NULL, 1, ?)`,
         )
-        .run(id, waitingFor, liftsOnReply, Date.now()),
+        .run("inc-1", Date.now()),
     );
 
-  const stillParked = (id: string) =>
-    db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id])
-      .length === 1;
-
-  test("a reply lifts a wait on a person", async () => {
-    const thread = await openThread("inc-1");
-    await park("inc-1", 1, "somebody to merge the PR");
-
-    await relay.handle({
+    const route = await relay.handle({
       type: "message",
       channel: CHANNEL,
       user: "U0HUMAN",
@@ -518,41 +507,10 @@ describe("inbound", () => {
       thread_ts: thread,
     });
 
+    assert.equal(route.kind, "incident_reply", "the premise: the reply was taken");
     assert.equal(
-      stillParked("inc-1"),
-      false,
-      "talking to an incident wakes it, with no model in the path",
-    );
-  });
-
-  test("a reply does not lift a wait it cannot end", async () => {
-    const thread = await openThread("inc-1");
-    await park("inc-1", 0, "a fresh turn budget");
-
-    // Three, because the failure was per-comment: each reply woke the
-    // incident, the relaunched agent stopped on its first turn and
-    // escalated, and the rotation was paged again.
-    for (const ts of ["1700.6", "1700.7", "1700.8"]) {
-      await relay.handle({
-        type: "message",
-        channel: CHANNEL,
-        user: "U0HUMAN",
-        text: "any progress?",
-        ts,
-        thread_ts: thread,
-      });
-    }
-
-    assert.equal(
-      stillParked("inc-1"),
-      true,
-      "a reply adds no turns, so it is not news about this wait",
-    );
-    // Still recorded and still delivered: what it loses is the power to
-    // relaunch, not its place on the record.
-    assert.equal(
-      db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-1'").length,
-      3,
+      db.query("SELECT incidentId FROM incident_wait WHERE incidentId = 'inc-1'").length,
+      1,
     );
   });
 
@@ -569,7 +527,6 @@ describe("inbound", () => {
 
     assert.equal(route.kind, "incident_reply");
     if (route.kind !== "incident_reply") return;
-    assert.equal(route.interrupt, false, "answering is not interrupting");
     assert.equal(route.incidentId, "inc-1");
     const replies = db.query<{ text: string; slackUserId: string }>(
       "SELECT text, slackUserId FROM thread_reply WHERE incidentId = 'inc-1'",
@@ -577,10 +534,8 @@ describe("inbound", () => {
     assert.equal(replies.length, 1);
     assert.equal(replies[0].slackUserId, "U0HUMAN");
 
-    // Handing it to the agent is the caller's, because whether it answers
-    // the agent or is two people talking to each other is a model call and
-    // this has to be back inside Slack's three seconds. Covered end to end in
-    // test/e2e.test.ts.
+    // Handing it to the Boss is the caller's, off Slack's three seconds.
+    // Covered end to end in test/e2e.test.ts.
     assert.equal(
       db.query("SELECT id FROM pending_directive").length,
       0,
@@ -610,7 +565,7 @@ describe("inbound", () => {
     );
   });
 
-  test("a mention is marked as an interrupt on the route", async () => {
+  test("a tagged reply routes exactly as an untagged one does", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "app_mention",
@@ -621,31 +576,15 @@ describe("inbound", () => {
       thread_ts: thread,
     });
 
-    assert.equal(route.kind, "incident_reply");
-    if (route.kind !== "incident_reply") return;
-    assert.equal(route.interrupt, true);
-    assert.equal(route.incidentId, "inc-1");
-    assert.equal(route.text, `<@${BOT}> stop, this is expected`);
-  });
-
-  test("a mention in a thread with no agent running says so on the route", async () => {
-    const thread = await openThread("inc-9", "CLOSED");
-    const route = await relay.handle({
-      type: "app_mention",
+    assert.deepEqual(route, {
+      kind: "incident_reply",
+      incidentId: "inc-1",
       channel: CHANNEL,
+      threadTs: thread,
+      ts: "1700.2",
       user: "U0HUMAN",
-      text: `<@${BOT}> what did the agent rule out?`,
-      ts: "1700.3",
-      thread_ts: thread,
+      text: `<@${BOT}> stop, this is expected`,
     });
-
-    // The relay does not decide that this is a question for the Slack agent
-    // rather than something for the incident's own agent -- that is the
-    // caller's, off the ack -- so it hands up the two facts that decide it.
-    assert.equal(route.kind, "incident_reply");
-    if (route.kind !== "incident_reply") return;
-    assert.equal(route.interrupt, true, "it was addressed to us");
-    assert.equal(route.agentRunning, false, "and there is no agent to interrupt");
   });
 
   test("a channel-level mention opens a new Slack agent thread on itself", async () => {
@@ -875,11 +814,8 @@ describe("a message in an incident thread", () => {
     });
 
   /**
-   * The relay used to decide this itself, by requiring the whole normalized
-   * message to equal "mine" or "back to you". That made "ok back to you" and
-   * "handing this back" do nothing at all, silently. It now records the
-   * message and hands it up with the context a model needs to read it, and
-   * nothing here looks at the words.
+   * Nothing here looks at the words. The relay records the message and hands
+   * it up whole; what it asks for is the Boss's to read.
    */
   test("every message routes the same way, whatever it says", async () => {
     const thread = await openThread("inc-1");
@@ -900,40 +836,26 @@ describe("a message in an incident thread", () => {
     }
   });
 
-  /**
-   * "I've got this one from here" is the sentence the relay used to act on by
-   * itself, and it acts on nothing now: an agent drives every open incident,
-   * so this is a message for the agent like any other. All the relay owes it
-   * is the row and the route.
-   */
-  test("a reply is recorded and owed to the agent before anything reads it", async () => {
+  test("a reply is recorded before anything reads it, and pushes nothing", async () => {
     const thread = await openThread("inc-1");
     const route = await reply(thread, "I've got this one from here");
 
     assert.equal(route.kind, "incident_reply");
-    if (route.kind !== "incident_reply") return;
-    assert.equal(route.interrupt, false);
-    assert.equal(route.agentRunning, true);
     assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
     assert.equal(
       db.query("SELECT id FROM pending_directive").length,
       0,
-      "the relay records; what the sentence meant is the caller's to read",
+      "the relay records; what the sentence meant is the Boss's to read",
     );
   });
 
-  /**
-   * Whether an agent is coming travels with the message, because it is what
-   * decides who answers: past the agent statuses nothing is polling for
-   * directives, so a reply here is a question for the Slack agent instead.
-   */
-  test("whether an agent is on it travels with the message", async () => {
+  test("a reply on an incident that is over still belongs to it", async () => {
     const thread = await openThread("inc-9", "CLOSED");
     const route = await reply(thread, "what did you rule out?");
 
     assert.equal(route.kind, "incident_reply");
     if (route.kind !== "incident_reply") return;
-    assert.equal(route.agentRunning, false);
+    assert.equal(route.incidentId, "inc-9");
     assert.equal(
       db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-9'").length,
       1,
@@ -941,27 +863,9 @@ describe("a message in an incident thread", () => {
     );
   });
 
-  test("a mention is marked as one so it interrupts as well as answers", async () => {
-    const thread = await openThread("inc-1");
-    const route = await relay.handle({
-      type: "app_mention",
-      channel: CHANNEL,
-      user: "U0HUMAN",
-      text: `<@${BOT}> what have you tried`,
-      ts: "1700.2",
-      thread_ts: thread,
-    });
-
-    assert.equal(route.kind, "incident_reply");
-    if (route.kind !== "incident_reply") return;
-    assert.equal(route.interrupt, true);
-    assert.equal(route.agentRunning, true);
-  });
-
   /**
-   * The old code returned before the insert for this one case, so Slack's
-   * retry of a mention in a thread with no agent ran the Slack agent twice
-   * on one question.
+   * A retry of a mention on an incident that is over must collapse too, or
+   * the Boss runs twice on one question.
    */
   test("a mention with no agent on the incident is recorded, so a retry collapses", async () => {
     const thread = await openThread("inc-9", "CLOSED");
@@ -1001,256 +905,6 @@ describe("mention text helpers", () => {
     assert.equal(
       stripBotMention(`<@${BOT}>  what is open   right now?`, BOT),
       "what is open right now?",
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-
-describe("a button press", () => {
-  const QUESTION_TS = "1800.5";
-
-  const askWithButtons = async (incidentId: string, status = "INVESTIGATING") => {
-    await seedIncident(incidentId, status);
-    const thread = await relay.emit({
-      type: "opened",
-      incidentId,
-      title: incidentId,
-      signalCount: 1,
-      body: "",
-      origin: null,
-    });
-    await db.withWrite((d) => {
-      d.prepare(
-        "INSERT INTO pending_question (incidentId, messageTs, askedAt, message) VALUES (?, ?, ?, ?)",
-      ).run(incidentId, QUESTION_TS, Date.now(), "Roll back, or wait?");
-    });
-    return thread;
-  };
-
-  const press = (thread: string, over: Partial<SlackChoiceClick> = {}) =>
-    relay.handleChoice({
-      channel: CHANNEL,
-      user: "U0HUMAN",
-      messageTs: QUESTION_TS,
-      threadTs: thread,
-      choice: "Roll back",
-      actionTs: "1800.9",
-      ...over,
-    });
-
-  test("is recorded and delivered exactly as a typed reply is", async () => {
-    const thread = await askWithButtons("inc-1");
-    const route = await press(thread);
-
-    assert.deepEqual(route, {
-      kind: "answered",
-      incidentId: "inc-1",
-      choice: "Roll back",
-      slackUserId: "U0HUMAN",
-      reader: "agent",
-    });
-
-    const replies = db.query<{ text: string; slackUserId: string }>(
-      "SELECT text, slackUserId FROM thread_reply WHERE incidentId = 'inc-1'",
-    );
-    assert.deepEqual(replies, [{ text: "Roll back", slackUserId: "U0HUMAN" }]);
-
-    // The agent waits on directives alone, and this is the one it reads. A
-    // press it cannot tell from prose is the whole contract.
-    const [directive] = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = 'inc-1'",
-    );
-    assert.deepEqual(JSON.parse(directive.payload), {
-      type: "human_message",
-      from: "U0HUMAN",
-      text: "Roll back",
-      ts: "1800.9",
-      // Pressing the agent's own button is addressed to it by construction,
-      // so this is the one human_message nothing has to read first.
-      addressed: "agent",
-    });
-  });
-
-  test("anyone in the channel may press, but a question takes one answer", async () => {
-    const thread = await askWithButtons("inc-1");
-    await press(thread);
-    const second = await press(thread, {
-      user: "U0OTHER",
-      choice: "Wait for the next deploy",
-      actionTs: "1801.0",
-    });
-
-    assert.deepEqual(second, {
-      kind: "duplicate",
-      incidentId: "inc-1",
-      slackUserId: "U0OTHER",
-      reader: "agent",
-      // The answer that won, so the thread can name it rather than only tell
-      // the second presser that theirs was not it.
-      recorded: { choice: "Roll back", slackUserId: "U0HUMAN" },
-    });
-    assert.equal(
-      db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-1'").length,
-      1,
-      "the second press delivers nothing",
-    );
-  });
-
-  test("a press on a question the agent has moved past changes nothing", async () => {
-    const thread = await askWithButtons("inc-1");
-    // What contact_human does once it has an answer, or once it times out.
-    await db.withWrite((d) => {
-      d.prepare("DELETE FROM pending_question WHERE incidentId = ?").run("inc-1");
-    });
-
-    const route = await press(thread);
-
-    assert.deepEqual(route, {
-      kind: "stale",
-      incidentId: "inc-1",
-      slackUserId: "U0HUMAN",
-      reader: "agent",
-    });
-    assert.equal(
-      db.query("SELECT id FROM thread_reply WHERE incidentId = 'inc-1'").length,
-      0,
-    );
-    assert.equal(
-      db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-1'").length,
-      0,
-      "a stale label must not be filed as the answer to whatever is asked now",
-    );
-  });
-
-  test("a press quoting an older question is stale, not an answer to this one", async () => {
-    const thread = await askWithButtons("inc-1");
-    const route = await press(thread, { messageTs: "1700.1" });
-    assert.equal(route.kind, "stale");
-  });
-
-  /**
-   * The press that started this: recorded, acknowledged, and read by nobody.
-   * `pending_question` outlives the agent that wrote it -- clearPending does
-   * not run when a child is killed mid-wait -- so the EXISTS guard says yes
-   * on an incident nothing will ever launch on again, and the directive sits
-   * there. The route has to carry that, or the thread thanks somebody for an
-   * answer no agent is coming for.
-   */
-  test("a press on an incident that is over is told nothing will run on it again", async () => {
-    const thread = await askWithButtons("inc-5", "CLOSED");
-    const route = await press(thread);
-
-    assert.deepEqual(route, {
-      kind: "answered",
-      incidentId: "inc-5",
-      choice: "Roll back",
-      slackUserId: "U0HUMAN",
-      reader: "closed",
-    });
-    // Still recorded, and still the same row a typed reply writes. Nothing
-    // about the equivalence changes; what changes is what the thread says.
-    assert.equal(
-      db.query("SELECT id FROM pending_directive WHERE incidentId = 'inc-5'")
-        .length,
-      1,
-    );
-  });
-
-  test("a stale press on an incident that is over carries that too", async () => {
-    const thread = await askWithButtons("inc-4", "CLOSED");
-    await db.withWrite((d) => {
-      d.prepare("DELETE FROM pending_question WHERE incidentId = ?").run("inc-4");
-    });
-    const route = await press(thread);
-    assert.deepEqual(route, {
-      kind: "stale",
-      incidentId: "inc-4",
-      slackUserId: "U0HUMAN",
-      reader: "closed",
-    });
-  });
-
-  test("a press in a thread that is not an incident is ignored", async () => {
-    await askWithButtons("inc-1");
-    const route = await press("9999.9");
-    assert.deepEqual(route, {
-      kind: "ignore",
-      reason: "thread is not an incident thread",
-    });
-  });
-
-  test("typing the answer still works while the buttons are up", async () => {
-    const thread = await askWithButtons("inc-1");
-    const route = await relay.handle({
-      type: "message",
-      channel: CHANNEL,
-      user: "U0HUMAN",
-      text: "neither — the deploy is already out, just verify it",
-      ts: "1800.8",
-      thread_ts: thread,
-    });
-
-    assert.deepEqual(route, {
-      kind: "incident_reply",
-      incidentId: "inc-1",
-      interrupt: false,
-      agentRunning: true,
-      channel: CHANNEL,
-      threadTs: thread,
-      ts: "1800.8",
-      user: "U0HUMAN",
-      text: "neither — the deploy is already out, just verify it",
-    });
-    // A typed reply's directive is the composition root's to write, once the
-    // intent read says who it was for. The relay's half is the record, and
-    // that is what this can see.
-    const replies = db.query<{ text: string }>(
-      "SELECT text FROM thread_reply WHERE incidentId = 'inc-1'",
-    );
-    assert.deepEqual(
-      replies,
-      [{ text: "neither — the deploy is already out, just verify it" }],
-      "an answer nobody offered as a button is recorded unchanged",
-    );
-  });
-
-  test("a crash after the reply row leaves neither the reply nor the directive", async () => {
-    const thread = await askWithButtons("inc-1");
-
-    // The seam this covers is the one a press used to be split across: the
-    // reply row and the directive were two `withWrite` calls, so a failure
-    // between them committed the first and lost the second. Renaming the
-    // directive table makes that second statement throw exactly where a
-    // crash would land, without stubbing anything the relay reaches through.
-    await db.withWrite((d) => {
-      d.exec("ALTER TABLE pending_directive RENAME TO pending_directive_gone");
-    });
-
-    await assert.rejects(() => press(thread), /pending_directive/);
-
-    const orphaned = db.query(
-      "SELECT text FROM thread_reply WHERE incidentId = 'inc-1'",
-    );
-    assert.deepEqual(
-      orphaned,
-      [],
-      "a reply recorded without its directive is an incident that looks answered and is not acting on the answer",
-    );
-
-    await db.withWrite((d) => {
-      d.exec("ALTER TABLE pending_directive_gone RENAME TO pending_directive");
-    });
-
-    // Nothing was committed, so the question is still answerable. That is
-    // the recovery the split version did not have: there, the press was
-    // already filed and the button would only ever report a duplicate.
-    const retried = await press(thread);
-    assert.equal(retried.kind, "answered");
-    assert.equal(
-      db.query("SELECT 1 FROM pending_directive WHERE incidentId = 'inc-1'")
-        .length,
-      1,
     );
   });
 });
