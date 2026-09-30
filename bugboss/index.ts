@@ -830,30 +830,6 @@ export const createBugBoss = async (
     }),
   );
 
-  // Said once, at boot, rather than every thirty seconds by the sweep that
-  // skips them. `chat.update` replaces a message whole and the only way to
-  // read the original back is `conversations.replies`, throttled to roughly
-  // one request a minute -- so an incident whose opening was never recorded
-  // gets no status header, because writing one without knowing what is
-  // underneath it would delete the alert text somebody is scrolling back
-  // for. That is a known gap rather than an invisible one, which is the
-  // whole difference, and it empties itself: every incident opened from
-  // here on records its opening as it posts it.
-  const headerless = db.get<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM incident i
-      WHERE i.slackThreadTs IS NOT NULL
-        AND i.status IN ('INVESTIGATING','FIXING','RESOLVED')
-        AND NOT EXISTS (
-          SELECT 1 FROM incident_thread t WHERE t.incidentId = i.id
-        )`,
-  )?.n ?? 0;
-  if (headerless > 0) {
-    log("threads_without_a_recorded_opening", {
-      incidents: headerless,
-      note: "these threads get no status header; their opening predates the record of it, and re-reading it off Slack is rate-limited",
-    });
-  }
-
   // The search index is derived state, so it is rebuilt from the incidents
   // rather than migrated. That is what makes a corpus older than the table
   // searchable at all -- schema.sql runs over a restored snapshot, so the
@@ -1037,16 +1013,14 @@ export const createBugBoss = async (
 
       let opened = 0;
       for (const row of rows) {
-        // `body` and `labels` as well as the title: the opening message
-        // carries the signal whole, and the trailer links the thing that
-        // opened the incident rather than only counting it.
+        // The labels as well as the title: the opening message links the
+        // signal that opened the incident.
         const signals = db.query<{
           source: string;
           title: string;
-          body: string;
           labels: string;
         }>(
-          "SELECT source, title, body, labels FROM signal WHERE incidentId = ? ORDER BY openedAt, id",
+          "SELECT source, title, labels FROM signal WHERE incidentId = ? ORDER BY openedAt, id LIMIT 1",
           [row.id],
         );
         const first = signals[0];
@@ -1055,8 +1029,6 @@ export const createBugBoss = async (
             type: "opened",
             incidentId: row.id,
             title: first?.title ?? `Incident ${row.id}`,
-            body: first?.body ?? "",
-            signalCount: signals.length,
             origin: first
               ? await signalOrigin(
                   { source: first.source, labels: JSON.parse(first.labels) as Record<string, string> },
@@ -1929,6 +1901,19 @@ export const createBugBoss = async (
       db,
       post: (text) => slack.post(null, text, config.slackChannelId),
       update: (channel, ts, text) => slack.update(channel, ts, text),
+      origin: async (incidentId) => {
+        const first = db.get<{ source: string; labels: string }>(
+          "SELECT source, labels FROM signal WHERE incidentId = ? ORDER BY openedAt, id LIMIT 1",
+          [incidentId],
+        );
+        return first
+          ? signalOrigin(
+              { source: first.source, labels: JSON.parse(first.labels) as Record<string, string> },
+              deadlined,
+              true,
+            )
+          : null;
+      },
       channel: config.slackChannelId,
       now,
     });

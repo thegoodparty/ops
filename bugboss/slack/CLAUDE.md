@@ -14,7 +14,9 @@ later `emit` takes the no-thread path and posts a **new top-level message**
 — so merged, resolved and closed become scattered orphans that do not
 even group, and Slack returns success each time. The fallback therefore
 alarms and adopts its own post as the thread, rather than logging quietly
-and fragmenting forever.
+and fragmenting forever. That post is a one-line notice and the transition
+goes under it in the thread, because the header sweep rewrites the
+top-level message whole on its next tick.
 
 A merge or a split leaves two threads that have to point at each other, and a
 thread is only findable by its permalink. `chat.getPermalink` builds one from
@@ -264,7 +266,7 @@ costs an API call. This pass asks for a link every time an answer names an
 incident, so it memoises per incident for the life of the process — an
 incident's thread is written once, under `WHERE slackThreadTs IS NULL`, so it
 never moves. Only answers are held. A *missing* one is re-asked, because the
-relay posts the rest of a split opening message into the thread before it
+relay posts the rest of a split message into the thread before it
 records that thread on the incident: "this thread belongs to no incident" is
 true for a moment and false forever after.
 
@@ -276,7 +278,7 @@ is facts, so it is rendered in `slack/status.ts` and the Boss pastes it.
 
 | Field | Where it comes from |
 | --- | --- |
-| lifecycle | `incident.status`, every state in order with the current one in bold caps; MERGED names the survivor; PARKED when an `incident_wait` has `liftsOnReply = 0` |
+| lifecycle | `incident.status`, every state in order with the current one in bold (`lifecycleSteps`, shared with the thread header); Merged names the survivor; PARKED when an `incident_wait` has `liftsOnReply = 0` |
 | the few-word title | `incident.summary`, falling back to the first signal's title |
 | waiting on | `incident_wait.waitingFor`, `pending_question`, `pending_wait.waitingFor` and unread inbox questions, or "nobody"; a parked incident is the one sentence "a person to decide what happens next; the turn budget is spent" and nothing else |
 | now | the one model-written line; see below |
@@ -287,8 +289,8 @@ disagree:
 
 - **The card**, `incident_status`: one incident, seven lines.
 - **The status line**: one incident on one line. The board, on request and
-  in the morning, is a list of them, and each thread's header is the same
-  words on two lines (`slack/board.ts` delegates to `slack/status.ts`).
+  in the morning, is a list of them (`slack/board.ts` delegates to
+  `slack/status.ts`). The thread header reads the same facts; see below.
 
 **A monitor wait shows the agent's `waitingFor`, never its command.** The
 command is a shell line, and the board once printed one verbatim as what an
@@ -321,15 +323,30 @@ header linking to itself, with no special case anywhere.
 
 The surfaces:
 
-- **The thread header.** Two lines above the message that opened the thread,
-  rewritten in place with `chat.update`. Nothing is removed: the alert text
-  that started the thread is what somebody scrolling back is looking for.
-  This division is why the opening message carries the signal **whole** and
-  the header carries the short form. Incident 83 opened on "*...I heard
-  about 502s Can you op…*" because the opening message tried to be the short
-  form too, on a title cut at 120 characters. The header has `summary`, the
-  few-word title the agent keeps current and that `setSummary` refuses
-  rather than truncates; the message under it has the report.
+- **The thread header.** The whole top-level message of an incident thread,
+  rewritten in place with `chat.update`:
+
+  ```
+  *Incident 92* · Domain search returns 502 on prod despite available domains
+  *Status*: Investigating → *Fixing* → Resolved → Closed
+  <generator url|original alert>
+  *Needs a human to merge omni#2240*
+  ```
+
+  The title is `summary`, falling back to the first signal's title. The
+  status is `lifecycleSteps`, the same steps the card shows; a merged
+  incident reads `*Merged* into incident N`. The link is the signal's own,
+  from `ingress/link.ts`, as a bare label: nothing about the alert goes in
+  the header, because that is the signal's data, not the incident's, and
+  the Grafana template pasted into Slack rendered broken. The agent reads the
+  signal; people click through. No url, no line.
+
+  The last line is there only while a person is needed (`neededFromHuman`):
+  a spent budget, a `monitor` wait on a person, a park only a person lifts,
+  or the agent's question once the Boss has read it. A `waitingFor` that
+  starts "someone to" reads as "Needs a human to"; any other label follows
+  a colon. Nothing is waiting on a person, no line.
+
   An edit is **silent** — Slack marks it "(edited)" and notifies nobody — so
   it is right for a header people re-read and wrong as a way to tell anyone
   anything. A change worth knowing about still posts in the thread as well.
@@ -340,16 +357,6 @@ The surfaces:
   same facts, disagreeing in whatever way that run happened to phrase it.
 - **The morning board** and **the all-clear**, both driven by the sweep in
   `board/index.ts`.
-
-The opening message's trailer links the signal that opened the incident —
-`<url|a Grafana alert>` or `<url|a Slack report>`, from `ingress/link.ts`.
-It used to say "1 signal" and give no way to reach it.
-
-`chat.update` replaces a message wholesale and the only way to read the
-original back is `conversations.replies`, which is throttled to roughly one
-request a minute. So the relay records the opening text in `incident_thread`
-when it posts it. An incident opened before that table existed has no row and
-gets **no header** — the one answer that cannot delete somebody's alert text.
 
 ## Nothing here reads the words a person chose
 

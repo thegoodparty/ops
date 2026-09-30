@@ -17,6 +17,9 @@ import {
   sweepBoard,
 } from ".";
 import { DEFAULT_WORKING_HOURS } from "../agent/tools";
+import { GRAFANA_SOURCE, META_PREFIX } from "../ingress/grafana";
+import { HUMAN_SOURCE, SLACK_CHANNEL_LABEL, SLACK_MESSAGE_TS_LABEL } from "../ingress/human";
+import { signalOrigin, type SignalOriginRef } from "../ingress/link";
 import { STATUS_FACTS_SQL, renderStatusCard, type StatusFacts } from "../slack/status";
 
 const CHANNEL = "C0DEVALERTS";
@@ -71,6 +74,23 @@ const openThread = (id: string, ts: string, opening = `*Incident ${id} opened*`)
     ).run(id, opening);
   });
 
+/** The workspace permalink shape, without Slack. */
+const linker = {
+  permalink: async (ts: string, channel?: string) =>
+    `https://goodparty.slack.com/archives/${channel}/p${ts.replace(".", "")}`,
+};
+
+/** What the composition root hands the sweep: the first signal's origin. */
+const origin = async (incidentId: string): Promise<SignalOriginRef | null> => {
+  const first = db.get<{ source: string; labels: string }>(
+    "SELECT source, labels FROM signal WHERE incidentId = ? ORDER BY openedAt, id LIMIT 1",
+    [incidentId],
+  );
+  return first
+    ? signalOrigin({ source: first.source, labels: JSON.parse(first.labels) }, linker)
+    : null;
+};
+
 const harness = (at: number) => {
   const posts: string[] = [];
   const edits: { ts: string; text: string }[] = [];
@@ -88,6 +108,7 @@ const harness = (at: number) => {
           edits.push({ ts, text });
           return Promise.resolve();
         },
+        origin,
         channel: CHANNEL,
         now: () => at,
       }),
@@ -432,31 +453,325 @@ describe("the all-clear", () => {
   });
 });
 
+// The top-level message of incident 92 as it was, verbatim from prod: the
+// header, then the whole Grafana alert, then the footer.
+const OLD_TOP_LEVEL = [
+  "*Incident 92 · FIXING* · Loki query rejections on gp-api",
+  "_Waiting on nobody_",
+  "",
+  "*Incident 92 opened*",
+  "[PROD] Loki query rejections",
+  "&lt;https://goodparty.grafana.net/d/abc|dashboard&gt; is **null**",
+  "<!subteam^S0ROTATION> please look",
+  "values: B=1, C=1",
+  "started: 2026-09-29T14:02:00Z",
+  "ended: 0001-01-01T00:00:00Z",
+  "alert: https://goodparty.grafana.net/alerting/grafana/abc/view",
+  "silence: https://goodparty.grafana.net/alerting/silence/new?matcher=alertname%3Dx",
+  "grafana: https://goodparty.grafana.net",
+  "_1 signal · <https://goodparty.grafana.net/alerting/grafana/abc/view|a Grafana alert> · an agent is investigating · nobody is being paged_",
+].join("\n");
+
+/** What the old message pasted and the new one must never carry. */
+const PASTED = [/\*\*null\*\*/, /subteam/, /values:/, /started:/, /ended:/, /silence/, /grafana:/, /signal ·/, /paged/, /an agent is investigating/, /Waiting on/];
+
+const GENERATOR = "https://goodparty.grafana.net/alerting/grafana/abc/view";
+const SILENCE = "https://goodparty.grafana.net/alerting/silence/new?matcher=alertname%3Dx";
+
+const grafanaSignal = (incidentId: string, title = "[PROD] Loki query rejections") =>
+  db.withWrite((d) => {
+    d.prepare(
+      `INSERT INTO signal (id, source, sourceId, kind, title, body, labels, openedAt, incidentId)
+       VALUES (?, ?, ?, 'alert', ?, ?, ?, 1, ?)`,
+    ).run(
+      `s-${incidentId}`,
+      GRAFANA_SOURCE,
+      `fp-${incidentId}`,
+      title,
+      OLD_TOP_LEVEL.split("\n").slice(4, 13).join("\n"),
+      // As ingress stored labels before silence links were dropped.
+      JSON.stringify({
+        alertname: "GpApiLokiRejections",
+        alert_slug: "loki-query-rejections",
+        endpoint: "/v1/campaigns/mine",
+        status_code: "502",
+        [`${META_PREFIX}generator_url`]: GENERATOR,
+        [`${META_PREFIX}silence_url`]: SILENCE,
+        [`${META_PREFIX}external_url`]: "https://goodparty.grafana.net",
+      }),
+      incidentId,
+    );
+  });
+
+const humanSignal = (incidentId: string) =>
+  db.withWrite((d) => {
+    d.prepare(
+      `INSERT INTO signal (id, source, sourceId, kind, title, body, labels, openedAt, incidentId)
+       VALUES (?, ?, ?, 'bug_report', ?, ?, ?, 1, ?)`,
+    ).run(
+      `s-${incidentId}`,
+      HUMAN_SOURCE,
+      "C0DEVALERTS:1727700000.123456",
+      "voter density queries are failing",
+      "voter density queries are failing in prod. Can you open an incident?",
+      JSON.stringify({
+        [SLACK_CHANNEL_LABEL]: "C0DEVALERTS",
+        [SLACK_MESSAGE_TS_LABEL]: "1727700000.123456",
+      }),
+      incidentId,
+    );
+  });
+
+const pendingWait = (incidentId: string, waitingFor: string | null) =>
+  db.withWrite((d) => {
+    d.prepare(
+      "INSERT INTO pending_wait (incidentId, command, waitingFor, startedAt) VALUES (?, 'gh pr view 2240 --json state', ?, 1)",
+    ).run(incidentId, waitingFor);
+  });
+
+const lastHeader = (incidentId: string) =>
+  db.get<{ header: string | null }>(
+    "SELECT header FROM incident_thread WHERE incidentId = ?",
+    [incidentId],
+  )?.header;
+
 describe("thread headers", () => {
-  test("go above the original message, never instead of it", async () => {
+  test("an old thread is rewritten once to the number, the title and the alert's link", async () => {
+    await seed("92", { status: "FIXING", summary: "Loki query rejections on gp-api" });
+    await grafanaSignal("92");
+    await openThread("92", "400.0", OLD_TOP_LEVEL);
+    // The premise: what is up there now is the whole pasted alert.
+    for (const pasted of PASTED) assert.match(OLD_TOP_LEVEL, pasted);
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.deepEqual(sweep.posts, [], "an edit, never a second post");
+    assert.equal(sweep.edits.length, 1);
+    assert.equal(sweep.edits[0].ts, "400.0");
+    assert.equal(
+      sweep.edits[0].text,
+      [
+        "*Incident 92* · Loki query rejections on gp-api",
+        "*Status*: Investigating → *Fixing* → Resolved → Closed",
+        `<${GENERATOR}|original alert>`,
+      ].join("\n"),
+    );
+
+    const again = harness(easternAt(9) + 30_000);
+    await again.sweep();
+    assert.deepEqual(again.edits, [], "once, not every tick");
+  });
+
+  test("not blocked: the title, the status and the link, and nothing else", async () => {
     await seed("1", { summary: "Loki reads rejected" });
-    await openThread("1", "400.0", "*Incident 1 opened*\nmemory above 90%");
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.deepEqual(sweep.edits[0].text.split("\n"), [
+      "*Incident 1* · Loki reads rejected",
+      "*Status*: *Investigating* → Fixing → Resolved → Closed",
+      `<${GENERATOR}|original alert>`,
+    ]);
+    assert.doesNotMatch(sweep.edits[0].text, /Needs a human|nobody/);
+  });
+
+  test("nothing in the header comes from the pasted alert text", async () => {
+    await seed("1", { summary: null });
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+    const body = db.get<{ body: string }>("SELECT body FROM signal WHERE incidentId = '1'")?.body ?? "";
+    // The premise: the signal the agent reads still carries all of it.
+    for (const pasted of [/\*\*null\*\*/, /subteam/, /values:/, /ended:/]) assert.match(body, pasted);
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    const header = sweep.edits[0].text;
+    for (const pasted of PASTED) assert.doesNotMatch(header, pasted);
+    for (const line of body.split("\n").slice(1)) {
+      assert.ok(!header.includes(line), `pasted: ${line}`);
+    }
+    // The title is the signal's own, which is not the body.
+    assert.match(header, /^\*Incident 1\* · \[PROD\] Loki query rejections$/m);
+  });
+
+  test("no alert text or label reaches the header: only the title, the link label and the blocked line", async () => {
+    await seed("1", { status: "FIXING", summary: "gp-api pool saturated" });
+    await grafanaSignal("1");
+    await openThread("1", "400.0", OLD_TOP_LEVEL);
+    await pendingWait("1", "someone to merge omni#2240");
+    const signal = db.get<{ title: string; body: string; labels: string }>(
+      "SELECT title, body, labels FROM signal WHERE incidentId = '1'",
+    );
+    assert.ok(signal);
+    const labels = JSON.parse(signal.labels) as Record<string, string>;
+    // The premise: the signal has plenty that could have leaked.
+    assert.ok(Object.keys(labels).length >= 6);
+    assert.match(signal.body, /values: B=1, C=1/);
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    const header = sweep.edits[0].text;
+    assert.deepEqual(header.split("\n"), [
+      "*Incident 1* · gp-api pool saturated",
+      "*Status*: Investigating → *Fixing* → Resolved → Closed",
+      `<${GENERATOR}|original alert>`,
+      "*Needs a human to merge omni#2240*",
+    ]);
+    // With the one link taken out, nothing of the signal is left in it.
+    const rest = header.replace(`<${GENERATOR}|original alert>`, "");
+    assert.ok(!rest.includes(signal.title), "not the alert's title");
+    for (const line of signal.body.split("\n")) {
+      assert.ok(!rest.includes(line.trim()), `pasted: ${line}`);
+    }
+    for (const [key, value] of Object.entries(labels)) {
+      assert.ok(!rest.includes(value), `label ${key}: ${value}`);
+    }
+  });
+
+  test("a Grafana incident links to the alert and never to a silence", async () => {
+    await seed("1");
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+    const labels = db.get<{ labels: string }>("SELECT labels FROM signal WHERE incidentId = '1'")?.labels ?? "";
+    assert.ok(labels.includes(SILENCE), "premise: the signal still carries a silence link");
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.ok(sweep.edits[0].text.includes(`<${GENERATOR}|`), sweep.edits[0].text);
+    assert.doesNotMatch(sweep.edits[0].text, /silence/);
+    assert.equal(sweep.edits[0].text.match(/<https?:/g)?.length, 1, "one link");
+  });
+
+  test("a human report links to the Slack message it came from", async () => {
+    await seed("1");
+    await humanSignal("1");
+    await openThread("1", "400.0");
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.equal(
+      sweep.edits[0].text.split("\n")[2],
+      "<https://goodparty.slack.com/archives/C0DEVALERTS/p1727700000123456|original report>",
+    );
+  });
+
+  test("blocked on a merge shows the line, and it goes when the wait clears", async () => {
+    await seed("1", { status: "FIXING", summary: "gp-api pool saturated" });
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+    await harness(easternAt(9)).sweep();
+    assert.equal(lastHeader("1")?.split("\n").length, 3, "premise: three lines before the wait");
+
+    await pendingWait("1", "someone to merge omni#2240");
+    const blocked = harness(easternAt(9) + 30_000);
+    await blocked.sweep();
+    assert.equal(blocked.edits.length, 1);
+    const lines = blocked.edits[0].text.split("\n");
+    assert.equal(lines.length, 4);
+    assert.equal(lines[3], "*Needs a human to merge omni#2240*");
+
+    await db.withWrite((d) => {
+      d.prepare("DELETE FROM pending_wait WHERE incidentId = '1'").run();
+    });
+    const cleared = harness(easternAt(9) + 60_000);
+    await cleared.sweep();
+    assert.equal(cleared.edits.length, 1);
+    assert.equal(cleared.edits[0].text.split("\n").length, 3);
+    assert.doesNotMatch(cleared.edits[0].text, /Needs a human/);
+  });
+
+  test("parked on a spent budget asks a human to decide", async () => {
+    await seed("1");
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+    await db.withWrite((d) => {
+      d.prepare(
+        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES ('1', 'a person to decide what happens next; the 200-turn budget is spent', NULL, 0, 1)`,
+      ).run();
+    });
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.equal(sweep.edits[0].text.split("\n")[3], "*Needs a human to decide what happens next*");
+  });
+
+  test("the title follows the agent's summary", async () => {
+    await seed("1", { summary: null });
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+    await harness(easternAt(9)).sweep();
+    assert.match(lastHeader("1") ?? "", /\[PROD\] Loki query rejections/, "premise: the signal's title first");
+
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET summary = 'Loki reads rejected by the ruler' WHERE id = '1'").run();
+    });
+    const after = harness(easternAt(9) + 30_000);
+    await after.sweep();
+
+    assert.equal(after.edits.length, 1);
+    assert.match(after.edits[0].text, /^\*Incident 1\* · Loki reads rejected by the ruler\n/);
+  });
+
+  test("the status line follows the state, in place", async () => {
+    await seed("1");
+    await grafanaSignal("1");
+    await openThread("1", "400.0");
+    await harness(easternAt(9)).sweep();
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET status = 'FIXING' WHERE id = '1'").run();
+    });
+
+    const after = harness(easternAt(9) + 30_000);
+    await after.sweep();
+
+    assert.equal(after.edits.length, 1);
+    assert.equal(after.edits[0].ts, "400.0");
+    assert.deepEqual(after.posts, []);
+    assert.equal(after.edits[0].text.split("\n")[1], "*Status*: Investigating → *Fixing* → Resolved → Closed");
+  });
+
+  test("a merged incident names the incident it went into", async () => {
+    await seed("7");
+    await seed("1");
+    await openThread("1", "400.0");
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET status = 'MERGED', mergedInto = '7' WHERE id = '1'").run();
+    });
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.equal(sweep.edits[0].text.split("\n")[1], "*Status*: *Merged* into incident 7");
+  });
+
+  test("an open incident whose thread predates the record still gets a header", async () => {
+    await seed("1");
+    await grafanaSignal("1");
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET slackThreadTs = '400.0' WHERE id = '1'").run();
+    });
 
     const sweep = harness(easternAt(9));
     await sweep.sweep();
 
     assert.equal(sweep.edits.length, 1);
-    assert.equal(sweep.edits[0].ts, "400.0");
-    assert.match(sweep.edits[0].text, /^\*Incident 1 · INVESTIGATING\*/);
-    assert.ok(
-      sweep.edits[0].text.endsWith("*Incident 1 opened*\nmemory above 90%"),
-      sweep.edits[0].text,
-    );
+    assert.match(sweep.edits[0].text, /^\*Incident 1\*/);
   });
 
-  /**
-   * chat.update replaces the whole message. An incident whose opening was
-   * never recorded -- every incident opened before this shipped -- would
-   * have its alert text deleted by a header written without it, and that is
-   * not recoverable where a missing header merely looks unfinished.
-   */
-  test("an incident with no recorded opening is left alone", async () => {
+  test("a closed incident whose thread predates the record is left alone", async () => {
     await seed("1");
+    await grafanaSignal("1");
+    await close("1");
     await db.withWrite((d) => {
       d.prepare("UPDATE incident SET slackThreadTs = '400.0' WHERE id = '1'").run();
     });
@@ -476,37 +791,6 @@ describe("thread headers", () => {
     await again.sweep();
 
     assert.deepEqual(again.edits, []);
-  });
-
-  test("follow the status", async () => {
-    await seed("1");
-    await openThread("1", "400.0");
-    await harness(easternAt(9)).sweep();
-    await db.withWrite((d) => {
-      d.prepare("UPDATE incident SET status = 'FIXING' WHERE id = '1'").run();
-    });
-
-    const after = harness(easternAt(9) + 30_000);
-    await after.sweep();
-
-    assert.equal(after.edits.length, 1);
-    assert.match(after.edits[0].text, /FIXING/);
-  });
-
-  test("follow the summary", async () => {
-    await seed("1", { summary: "memory alert" });
-    await openThread("1", "400.0");
-    await harness(easternAt(9)).sweep();
-    await db.withWrite((d) => {
-      d.prepare(
-        "UPDATE incident SET summary = 'Loki reads rejected' WHERE id = '1'",
-      ).run();
-    });
-
-    const after = harness(easternAt(9) + 30_000);
-    await after.sweep();
-
-    assert.match(after.edits[0].text, /Loki reads rejected/);
   });
 
   /**
@@ -533,6 +817,7 @@ describe("thread headers", () => {
           edited.push(ts);
           return Promise.resolve();
         },
+        origin,
         channel: CHANNEL,
         now: () => easternAt(9),
       });
@@ -560,6 +845,7 @@ describe("thread headers", () => {
         db,
         post: () => Promise.resolve({ ts: "x" }),
         update,
+        origin,
         channel: CHANNEL,
         now: () => at,
       });
@@ -576,27 +862,121 @@ describe("thread headers", () => {
     assert.equal(attempts, 2);
   });
 
+  test("the origin is asked for once, not every tick", async () => {
+    await seed("1");
+    await humanSignal("1");
+    await openThread("1", "400.0");
+    let asked = 0;
+    const run = (at: number) =>
+      sweepBoard({
+        db,
+        post: () => Promise.resolve({ ts: "x" }),
+        update: () => Promise.resolve(),
+        origin: (id) => {
+          asked += 1;
+          return origin(id);
+        },
+        channel: CHANNEL,
+        now: () => at,
+      });
+
+    await run(easternAt(9));
+    await run(easternAt(9) + 30_000);
+    assert.equal(asked, 1);
+  });
+
+  test("a permalink lookup that fails is retried on the next tick, not kept as no link", async () => {
+    await seed("1");
+    await humanSignal("1");
+    await openThread("1", "400.0");
+    let calls = 0;
+    const run = (at: number) =>
+      sweepBoard({
+        db,
+        post: () => Promise.resolve({ ts: "x" }),
+        update: (_c, _ts, text) => {
+          edits.push(text);
+          return Promise.resolve();
+        },
+        origin: (id) => {
+          calls += 1;
+          return calls === 1 ? Promise.reject(new Error("slack: ratelimited")) : origin(id);
+        },
+        channel: CHANNEL,
+        now: () => at,
+      });
+    const edits: string[] = [];
+
+    const original = console.error;
+    const errors: string[] = [];
+    console.error = (line: unknown) => errors.push(String(line));
+    try {
+      await run(easternAt(9));
+    } finally {
+      console.error = original;
+    }
+    assert.ok(errors.some((line) => line.includes("header_origin_failed")), "premise: the first lookup failed");
+    const kept = db.get<{ originLabel: string | null }>("SELECT originLabel FROM incident_thread WHERE incidentId = '1'");
+    assert.equal(kept?.originLabel, null, "nothing was kept from the failure");
+
+    await run(easternAt(9) + 30_000);
+    assert.equal(calls, 2);
+    assert.match(edits.at(-1) ?? "", /\|original report>$/);
+  });
+
+  test("an incident with no signal yet gets its link once one is attached", async () => {
+    await seed("1");
+    await openThread("1", "400.0");
+    const first = harness(easternAt(9));
+    await first.sweep();
+    assert.equal(first.edits[0].text.split("\n").length, 2, "premise: no signal, so no link line");
+
+    await grafanaSignal("1");
+    const later = harness(easternAt(9) + 30_000);
+    await later.sweep();
+    assert.equal(later.edits.length, 1);
+    assert.equal(later.edits[0].text.split("\n")[2], `<${GENERATOR}|original alert>`);
+  });
+
+  test("a tick that has used up its edits still resolves origins for the rows after them", async () => {
+    for (let i = 1; i <= MAX_HEADER_UPDATES_PER_TICK; i++) {
+      await seed(String(i));
+      await openThread(String(i), `${i}00.0`);
+      await db.withWrite((d) => {
+        d.prepare("UPDATE incident_thread SET originLabel = 'original alert' WHERE incidentId = ?").run(String(i));
+      });
+    }
+    const late = String(MAX_HEADER_UPDATES_PER_TICK + 1);
+    await seed(late);
+    await grafanaSignal(late);
+    await openThread(late, "900.0");
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.equal(sweep.edits.length, MAX_HEADER_UPDATES_PER_TICK, "premise: the edits ran out first");
+    assert.ok(!sweep.edits.some((e) => e.ts === "900.0"));
+    const kept = db.get<{ originUrl: string | null }>("SELECT originUrl FROM incident_thread WHERE incidentId = ?", [late]);
+    assert.equal(kept?.originUrl, GENERATOR);
+  });
+
   /**
-   * A header that froze on "Fixing" the moment the incident closed is a lie
-   * the thread goes on telling for months. So a closed incident gets one
-   * last header and is then never touched again -- the rendered text stops
-   * changing, so the comparison stops matching.
+   * A closed incident loses the line asking for a person, since nobody is
+   * needed any more, and is then never touched again.
    */
   test("a closed incident is finalised once, then left alone", async () => {
     await seed("1");
     await openThread("1", "400.0");
+    await pendingWait("1", "someone to merge omni#2240");
     await harness(easternAt(9)).sweep();
+    assert.match(lastHeader("1") ?? "", /Needs a human/, "premise: it was blocked");
     await close("1");
 
     const closing = harness(easternAt(9) + 30_000);
     await closing.sweep();
     assert.equal(closing.edits.length, 1);
-    assert.match(closing.edits[0].text, /CLOSED/);
-    assert.match(closing.edits[0].text, /this incident is over/);
-    assert.ok(
-      closing.edits[0].text.endsWith("*Incident 1 opened*"),
-      "and the original message is still under it",
-    );
+    assert.doesNotMatch(closing.edits[0].text, /Needs a human/);
+    assert.match(closing.edits[0].text, /→ \*Closed\*$/m);
 
     const after = harness(easternAt(9) + 60_000);
     await after.sweep();
@@ -662,6 +1042,7 @@ describe("thread headers", () => {
           return Promise.resolve({ ts: "x" });
         },
         update: () => Promise.resolve(),
+        origin,
         channel: CHANNEL,
         now: () => easternAt(7),
       }).catch(() => undefined);

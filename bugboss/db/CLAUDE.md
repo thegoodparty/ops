@@ -155,17 +155,11 @@ inbound delivery by `triage/recurrence.ts`.
 ## Two tables that are not incident state
 
 **`incident_thread`** holds how a thread's top-level message is rendered: the
-text it was opened with, and the header last written above it. It is a table
-rather than two columns on `incident` because `getIncidentRow` is `SELECT *`
-and spreads the row, so anything added there arrives in the agent's
-`get_incident` result — and the opening is the whole alert body, re-serialized
-into the prompt on every read.
-
-The opening is recorded when the relay posts it. `chat.update` replaces a
-message wholesale and the only way to read the original back is
-`conversations.replies`, throttled to roughly one request a minute. An
-incident with no row gets no header, which is the one answer that cannot
-delete somebody's alert text.
+header last written, and where it links (`originLabel`, `originUrl`), kept so
+a Slack report's permalink is asked for once. It is a table rather than
+columns on `incident` because `getIncidentRow` is `SELECT *` and spreads the
+row, so anything added there arrives in the agent's `get_incident` result.
+`opening` is what the relay first posted; nothing reads it back.
 
 **`board_state`** is one row, and it is the whole memory of everything
 recurring the board does. See `board/CLAUDE.md` for why every field in it is

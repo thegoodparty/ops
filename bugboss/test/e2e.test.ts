@@ -602,19 +602,15 @@ test("a human bug report resolves without spawning a recurrence", async () => {
 });
 
 /**
- * The test that makes `ingress/human.ts` taking a first line safe.
+ * A report is not cut on the way in. `stripBotMention` has already collapsed
+ * the newlines by the time the signal is stored, which is what makes the
+ * title a one-line field without anything having to cut it -- so title and
+ * body are the same whole report, and that is what the agent reads.
  *
- * That title is a *label*, not a reduction, and the only reason that is true
- * is this: the opening message renders the signal's `body`, so the whole
- * report is in front of the reader with the one-line header above it. It
- * used to render the `title`, and that is exactly how incident 83 opened on
- * "...I heard about 502s Can you op\u2026".
- *
- * So the two facts hold each other up, and this is the one that carries the
- * weight. A later change rendering `title` again would turn the first line
- * back into a real cut, silently, and nothing else here would fail.
+ * The thread's top-level message is only the header: the number, the title,
+ * the status, and a link back to the message the report was.
  */
-test("the opening message carries the whole report, not its first line", async () => {
+test("a report is stored whole, and the thread opens on a link back to it", async () => {
   const tail = "and it only started after the Tuesday deploy, around 14:00";
   const report = [
     "Voter density queries are failing in prod and have been for a while.",
@@ -639,41 +635,31 @@ test("the opening message carries the whole report, not its first line", async (
   });
   await boss.ensureIncidentThreads();
 
-  const opening = fakeSlack.posts
-    .slice(before)
-    .map((post) => post.text)
-    .join("\n");
-
-  assert.match(opening, /opened\*/, "the opening message went out");
-  assert.ok(opening.includes(tail), "the end of the report reached the channel");
-  assert.ok(
-    opening.includes("I heard about 502s from two people on the growth team,"),
-    "and the middle of it",
-  );
-  assert.doesNotMatch(opening, /\u2026/);
-
-  // And nothing reduced it on the way in either. `stripBotMention` has
-  // already collapsed the newlines by this point, which is what makes the
-  // title a one-line field without anything having to cut it -- so title
-  // and body are the same whole report.
-  const stored = boss.db.get<{ title: string; body: string }>(
-    "SELECT title, body FROM signal WHERE sourceId = ?",
+  const stored = boss.db.get<{ title: string; body: string; incidentId: string }>(
+    "SELECT title, body, incidentId FROM signal WHERE sourceId = ?",
     ["slack:C0BUGS:1764000000.001900"],
   );
   assert.ok(stored?.title.includes(tail), "the title is not a first line");
   assert.equal(stored?.title, stored?.body);
   assert.doesNotMatch(stored?.title ?? "", /\n/, "and it is still one line");
+
+  const opening = fakeSlack.posts.slice(before).find((post) => post.threadTs === null);
+  assert.ok(opening, "the opening message went out");
+  const lines = opening.text.split("\n");
+  assert.equal(lines.length, 3, opening.text);
+  assert.match(lines[0], new RegExp(`^\\*Incident ${stored?.incidentId}\\* · `));
+  assert.equal(lines[1], "*Status*: *Investigating* → Fixing → Resolved → Closed");
+  assert.equal(lines[2], "<https://goodparty.slack.com/archives/C09/p1764000000001900|original report>");
+  assert.doesNotMatch(opening.text, /…/);
 });
 
 /**
- * The same property for the other source, where it is a different claim.
- *
- * For a report the title and the body are now the same text, so a test on
- * the report path cannot tell "the message carries the body" from "the
- * message carries the title". An alert can: its title is the summary
- * annotation and its body is the description, the values and the links.
+ * An alert's body -- the description, the values, the links -- reaches the
+ * agent through the signal and nobody through the header. The header links
+ * to Grafana's own deeplink for the rule, carried on the webhook; nothing is
+ * rebuilt out of an instance host and a rule uid.
  */
-test("the opening message carries an alert's body, not just its summary", async () => {
+test("an alert's body stays on the signal, and the thread opens on a link to the alert", async () => {
   fakeModel.triageDecisions.push({
     action: "new_incident",
     reason: "nothing open looks like this",
@@ -694,6 +680,7 @@ test("the opening message carries an alert's body, not just its summary", async 
             description: "p99 on the density route is 24 of 25 connections in use",
           },
           generatorURL: "https://goodparty.grafana.net/alerting/grafana/abc/view",
+          silenceURL: "https://goodparty.grafana.net/alerting/silence/new?matcher=x",
           startsAt: new Date().toISOString(),
         },
       ],
@@ -701,23 +688,22 @@ test("the opening message carries an alert's body, not just its summary", async 
   });
   await boss.ensureIncidentThreads();
 
+  const body = boss.db.get<{ body: string }>(
+    "SELECT body FROM signal WHERE sourceId = 'fp-body'",
+  )?.body ?? "";
+  assert.ok(
+    body.includes("p99 on the density route is 24 of 25 connections in use"),
+    "the premise: the agent still has the description",
+  );
+
   const opening = fakeSlack.posts
     .slice(before)
     .map((post) => post.text)
     .join("\n");
-
-  assert.match(opening, /opened\*/);
+  assert.ok(!opening.includes("p99 on the density route"), opening);
+  assert.doesNotMatch(opening, /silence|signal ·|paged/);
   assert.ok(
-    opening.includes("p99 on the density route is 24 of 25 connections in use"),
-    "the description is in the message, so it is the body being rendered",
-  );
-  // And the trailer links the alert that opened it rather than only counting
-  // it. This is Grafana's own deeplink, carried on the webhook -- nothing is
-  // rebuilt out of an instance host and a rule uid.
-  assert.ok(
-    opening.includes(
-      "<https://goodparty.grafana.net/alerting/grafana/abc/view|a Grafana alert>",
-    ),
+    opening.includes("<https://goodparty.grafana.net/alerting/grafana/abc/view|original alert>"),
     opening,
   );
 });
@@ -754,7 +740,7 @@ test("an alert whose generator url is unusable still opens its thread", async ()
           },
           annotations: {
             summary: "[PROD] hostile-url",
-            description: "the description still has to reach the channel",
+            description: "the description",
           },
           startsAt: new Date().toISOString(),
         },
@@ -771,11 +757,11 @@ test("an alert whose generator url is unusable still opens its thread", async ()
     .slice(before)
     .map((post) => post.text)
     .join("\n");
-  assert.match(opening, /opened\*/);
-  assert.ok(opening.includes("the description still has to reach the channel"));
-  assert.ok(!opening.includes("javascript:"), "and the url went nowhere near Slack");
-  // Degraded to the label, so the reader still learns what opened it.
-  assert.ok(opening.includes("a Grafana alert"), opening);
+  assert.equal(
+    opening,
+    `*Incident ${incidentId}* · [PROD] hostile-url\n*Status*: *Investigating* → Fixing → Resolved → Closed`,
+    "no link line at all",
+  );
 });
 
 // --- recurrence ------------------------------------------------------------
@@ -3035,7 +3021,7 @@ const drainBoard = async () => {
   assert.fail("headers never settled");
 };
 
-test("a thread carries a header above the message that opened it", async () => {
+test("a thread's top-level message is the header, and follows the agent's summary", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "header" });
   const before = fakeSlack.posts.length;
   await boss.ingest("grafana", grafanaBody("fp-brd-3", "board-header-errors"));
@@ -3044,6 +3030,10 @@ test("a thread carries a header above the message that opened it", async () => {
   const opening = fakeSlack.posts
     .slice(before)
     .find((p) => p.threadTs === null)!;
+  assert.equal(
+    opening.text,
+    `*Incident ${incidentId}* · [PROD] board-header-errors\n*Status*: *Investigating* → Fixing → Resolved → Closed`,
+  );
 
   // Settle whatever this file has accumulated, then make one change and
   // watch exactly that reach the thread.
@@ -3056,15 +3046,15 @@ test("a thread carries a header above the message that opened it", async () => {
 
   const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
   assert.ok(edit, JSON.stringify(fakeSlack.edits));
-  assert.match(edit.text, /Board header errors on the briefings route/);
-  assert.match(edit.text, /INVESTIGATING/);
-  // Swain's constraint: nothing is removed from the original message except
-  // the status and the title, both of which are added above it.
-  assert.ok(edit.text.endsWith(opening.text), edit.text);
-  assert.match(opening.text, /board-header-errors/, "which is the alert text");
+  assert.equal(edit.text.split("\n")[0], `*Incident ${incidentId}* · Board header errors on the briefings route`);
+  assert.equal(
+    fakeSlack.posts.slice(before).filter((p) => p.threadTs === null).length,
+    1,
+    "rewritten in place, never posted again",
+  );
 });
 
-test("the header follows the incident and is not rewritten when it has not moved", async () => {
+test("the header follows the status and a wait on a person, and is not rewritten when it has not moved", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "moves" });
   await boss.ingest("grafana", grafanaBody("fp-brd-4", "board-moves-errors"));
   const incidentId = incidentOf("fp-brd-4")!;
@@ -3086,11 +3076,18 @@ test("the header follows the incident and is not rewritten when it has not moved
     cause: "the pool is saturated",
     explainedSignalIds: [signal.id],
   });
+  await boss.db.withWrite((d) => {
+    d.prepare(
+      "INSERT INTO pending_wait (incidentId, command, waitingFor, startedAt) VALUES (?, 'gh pr view 1', 'someone to merge omni#2240', ?)",
+    ).run(incidentId, Date.now());
+  });
   await drainBoard();
 
-  const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
-  assert.ok(edit, "a status change reaches the header");
-  assert.match(edit.text, /FIXING/);
+  const edit = fakeSlack.edits.filter((e) => e.ts === threadTs).at(-1);
+  assert.ok(edit, "the change reaches the header");
+  const lines = edit.text.split("\n");
+  assert.equal(lines[1], "*Status*: Investigating → *Fixing* → Resolved → Closed");
+  assert.equal(lines.at(-1), "*Needs a human to merge omni#2240*");
 });
 
 /**

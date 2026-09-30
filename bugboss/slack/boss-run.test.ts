@@ -448,7 +448,7 @@ describe("incident_status through the real harness", () => {
     assert.equal(cards.length, 2);
     assert.equal(summary.asked.length, 1, "asking twice about an agent that has not moved is one call");
     assert.equal(cards[0], cards[1]);
-    assert.match(cards[0], /^\*Incident 2\* · Stale alert on the export queue\n\*INVESTIGATING\* → Fixing → Resolved → Closed · \*PARKED\*/);
+    assert.match(cards[0], /^\*Incident 2\* · Stale alert on the export queue\n\*Investigating\* → Fixing → Resolved → Closed · \*PARKED\*/);
     assert.match(cards[0], /\*Now:\* It has parked itself because its turn budget is spent/);
     assert.doesNotMatch(cards[0], new RegExp(BURIED));
     assert.match(

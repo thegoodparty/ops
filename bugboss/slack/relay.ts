@@ -11,7 +11,8 @@
 import type { Db } from "../db";
 import type { SignalOriginRef } from "../ingress/link";
 import { makeAlarm, makeLog } from "../logging";
-import { bullets, escape, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
+import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
+import { lifecycleSteps, renderThreadHeader } from "./status";
 
 const log = makeLog("slack-relay");
 
@@ -84,12 +85,6 @@ export type RelayEvent =
       type: "opened";
       incidentId: string;
       title: string;
-      /**
-       * The signal, whole. For a report this is what the person wrote; for
-       * an alert it is the annotations, values and links Grafana sent.
-       */
-      body: string;
-      signalCount: number;
       /** What opened it and where to read it. See `ingress/link.ts`. */
       origin: SignalOriginRef | null;
     }
@@ -167,33 +162,16 @@ const prLink = (url: string): string => {
  */
 export const renderEvent = (event: RelayEvent): string => {
   switch (event.type) {
-    case "opened": {
-      // The signal whole, not a title. This message used to carry the
-      // first line of the report cut at 120 characters, which is how
-      // incident 83 opened on "...I heard about 502s Can you op…". The
-      // thread is where the report lives; the short form is the header
-      // above it, which carries the summary the agent writes.
-      //
-      // The title is only repeated when the body does not already start
-      // with it -- an alert with no summary annotation takes its title from
-      // the rule name, which the body has no other line for.
-      const body = event.body.trim();
-      const said = body.startsWith(event.title.trim())
-        ? [mrkdwn`${body}`]
-        : [mrkdwn`${event.title}`, mrkdwn`${body}`];
-      // Already mrkdwn in both branches, so it is interpolated with raw().
-      // The label is ours and `link` escapes what goes inside the entity.
-      const origin = !event.origin
-        ? ""
-        : event.origin.url
-          ? ` · ${link(event.origin.url, event.origin.label)}`
-          : ` · ${escape(event.origin.label)}`;
-      return [
-        mrkdwn`*Incident ${event.incidentId} opened*`,
-        ...(body ? said : [mrkdwn`${event.title}`]),
-        mrkdwn`_${event.signalCount} signal${event.signalCount === 1 ? "" : "s"}${raw(origin)} · an agent is investigating · nobody is being paged_`,
-      ].join("\n");
-    }
+    case "opened":
+      // The thread header, as the board sweep will keep it. Not the signal:
+      // the agent reads that, and people follow the link to it.
+      return renderThreadHeader({
+        incidentId: event.incidentId,
+        title: event.title,
+        lifecycle: lifecycleSteps({ status: "INVESTIGATING", mergedInto: null }),
+        origin: event.origin,
+        needed: null,
+      });
     case "merged":
       // Both references name the word "incident", which is what the outbound
       // pass keys off to render them as links. A bare id is a number.
@@ -336,7 +314,15 @@ export class SlackRelay {
       // won the race and this is a loose message, so recording its text as
       // the opening would later have the header sweep write it over the
       // winner's -- chat.update replaces a message whole.
-      if (linked === "linked") await this.recordOpening(event.incidentId, parts[0]);
+      if (linked === "linked") {
+        // An origin with no url may be a permalink lookup that failed, and
+        // no origin may be a signal not attached yet, so both are left for
+        // the sweep to resolve rather than kept as final.
+        await this.recordOpening(event.incidentId, parts[0], {
+          header: parts[0],
+          origin: event.origin?.url ? event.origin : undefined,
+        });
+      }
       if (linked === "unwritable") {
         // The thread exists and nothing points at it, so the rest of this
         // incident will not land here. Said in the thread, which is where
@@ -364,24 +350,30 @@ export class SlackRelay {
         incidentId: event.incidentId,
         type: event.type,
       });
-      const orphan = splitForSlack(
+      // The notice alone at the top, and the transition in the thread under
+      // it. The header sweep rewrites the top-level message whole on its
+      // next tick, so anything else put there would be deleted.
+      const { ts } = await this.slack.post(
+        null,
+        mrkdwn`${raw(ping)}*Incident ${event.incidentId} has no Slack thread*`,
+        this.cfg.channelId,
+      );
+      for (const part of splitForSlack(
         [
-          mrkdwn`${raw(ping)}*Incident ${event.incidentId} has no Slack thread*`,
-          "_Its thread link is missing, so this is posting at the top level and the rest of the incident will follow it here._",
+          "_Its thread link was missing, so this message is its thread from now on._",
           "",
           body,
         ].join("\n"),
-      );
-      const { ts } = await this.slack.post(null, orphan[0], this.cfg.channelId);
-      for (const part of orphan.slice(1)) {
+      )) {
         await this.slack.post(ts, part, this.cfg.channelId);
       }
       // Adopt this post as the thread. One recovered thread beats the loose
       // messages every later transition would otherwise add.
       const adopted = await this.linkThread(event.incidentId, ts);
-      // Recorded on the same terms as a normal open: whatever ends up being
-      // the thread's parent message is what a header has to sit above.
-      if (adopted === "linked") await this.recordOpening(event.incidentId, orphan[0]);
+      // No header and no origin recorded, so the sweep writes both.
+      if (adopted === "linked") {
+        await this.recordOpening(event.incidentId, "", { header: null, origin: undefined });
+      }
       log("posted_top_level", {
         incidentId: event.incidentId,
         type: event.type,
@@ -494,29 +486,36 @@ export class SlackRelay {
   }
 
   /**
-   * Keep the text of the message that started this thread, so a header can
-   * later be put above it without reading it back off Slack.
+   * Record what the thread's top-level message says, so the header sweep
+   * only edits it when the rendered text changes, and where it links to, so
+   * the sweep does not have to ask Slack for a permalink again.
    *
    * `INSERT OR IGNORE`: a re-emit that finds the thread already open never
-   * gets here, but a retry that raced one must not replace the opening with
-   * a later message. First write wins, like the thread link itself.
+   * gets here, but a retry that raced one must not replace the record with a
+   * later message. First write wins, like the thread link itself.
    *
-   * Never fatal. The thread exists and the incident is running; what is lost
-   * is a header, and losing it loudly is better than losing the transition
-   * that was being announced.
+   * `origin` undefined leaves it for the sweep to resolve. Never fatal: a
+   * lost record costs one edit, when the sweep finds nothing to compare
+   * against and writes the header anyway.
    */
-  private async recordOpening(incidentId: string, text: string): Promise<void> {
+  private async recordOpening(
+    incidentId: string,
+    text: string,
+    record: { header: string | null; origin: SignalOriginRef | undefined },
+  ): Promise<void> {
     try {
       await this.db.withWrite((d) => {
         d.prepare(
-          "INSERT OR IGNORE INTO incident_thread (incidentId, opening) VALUES (?, ?)",
-        ).run(incidentId, text);
+          `INSERT OR IGNORE INTO incident_thread
+             (incidentId, opening, header, originLabel, originUrl)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).run(incidentId, text, record.header, record.origin?.label ?? null, record.origin?.url ?? null);
       });
     } catch (err) {
       alarm("thread_opening_unrecorded", {
         incidentId,
         error: String(err),
-        note: "this incident's thread will carry no status header",
+        note: "the header sweep will rewrite this thread's top-level message once",
       });
     }
   }
