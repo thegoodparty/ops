@@ -55,6 +55,8 @@ names the missing permission rather than quietly falling back to asking.
 | `contents` | write | The agent pushes its fix branch. `git push` through the credential helper configured in `agent/run.ts`. |
 | `pull_requests` | write | `gh pr create`, `gh pr comment` (including the bare `delegate review` that fires the reviewer), and reading review state. Driven by the ship-pr skill the prompt points the agent at. The Boss's `gh` reads PRs, their files and reviews with it. |
 | `actions` | **write** (requested) | Reading workflow runs and jobs to tell whether a PR is green (`gh run list`, `gh run view`) needs only `read`. Re-running a run's failed jobs — `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`, via [`agent/rerun.ts`](./agent/rerun.ts) — needs `write`. |
+| `checks` | read | `gh pr checks` and the `statusCheckRollup` field of `gh pr view --json`, for the Boss and for agents watching CI. |
+| `issues` | read | `gh issue view` on a private repository, which `pull_requests` does not cover. |
 | `deployments` | read | Granted, with no caller in this repo. Kept because a read permission nobody uses is cheaper to leave than to remove and rediscover; drop it the next time anyone is in the settings page anyway. |
 
 `actions` is `read` today, and `read` is exactly enough to watch two E2E jobs
@@ -65,17 +67,6 @@ failure of initiative. See [`agent/rerun.ts`](./agent/rerun.ts) for why the
 capability is bounded in code rather than handed over whole — an agent that can
 re-run will otherwise re-run every time it sees red, which is retry-as-a-fix
 with a bigger budget.
-
-## What it does not have, and what that costs the Boss
-
-Neither is requested. Both are the next widening if the Boss needs them.
-
-- **No `checks`.** A check run is invisible to the App, so `gh pr checks` and
-  the `statusCheckRollup` field of `gh pr view --json` fail or come back
-  empty. CI is read through workflow runs instead (`gh run list --branch`,
-  `gh run view`), which `actions` covers.
-- **No `issues`.** Pull requests are covered by `pull_requests`; an issue in
-  a private repository is not, and `gh issue view` there answers 404.
 
 ## What it deliberately does not have
 
