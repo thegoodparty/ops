@@ -155,7 +155,7 @@ test("the eval's price table matches the rates the transcripts' cost fields impl
   assert.ok(Math.abs(rates.cacheRead - table.cacheRead) < 1e-15);
   assert.ok(Math.abs(rates.cacheWrite1h - table.cacheWrite1h) < 1e-15);
   assert.ok(Math.abs(rates.output - table.output) < 1e-15);
-  assert.equal(Object.keys(PRICE_TABLE).length, 1);
+  assert.deepEqual(Object.keys(PRICE_TABLE).sort(), ["us.anthropic.claude-opus-5", "us.anthropic.claude-sonnet-5"]);
   assert.throws(() => ratesFor("some-other-model"), /no price/);
 });
 

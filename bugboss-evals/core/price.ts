@@ -35,6 +35,17 @@ export const PRICE_TABLE: Record<string, Rates> = {
     cacheWrite5m: 6.875,
     cacheWrite1h: 11,
   }),
+  // No transcript runs on Sonnet, so this row is from Pi's Bedrock catalog
+  // (pi-ai 0.87.1, `us.anthropic.claude-sonnet-5`), whose Opus row matches the
+  // derived one above exactly. The 1h write is twice input, as Opus's is. The
+  // Boss's triage and the persona run on it.
+  "us.anthropic.claude-sonnet-5": perMillion({
+    input: 2.2,
+    output: 11,
+    cacheRead: 0.22,
+    cacheWrite5m: 2.75,
+    cacheWrite1h: 4.4,
+  }),
 };
 
 export const ratesFor = (model: string): Rates => {
