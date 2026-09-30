@@ -315,6 +315,7 @@ describe("host tools", () => {
     assert.ok(existsSync(join(env.DOCKER_CONFIG!, "contexts")), "the context the person uses still resolves");
     assert.equal(env.GIT_CONFIG_KEY_0, "credential.helper");
     assert.equal(env.GIT_CONFIG_VALUE_0, "");
+    assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
     rmSync(home, { recursive: true, force: true });
   });
 });

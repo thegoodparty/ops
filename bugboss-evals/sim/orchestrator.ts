@@ -60,6 +60,9 @@ export const isolateHostTools = (env: NodeJS.ProcessEnv = process.env): void => 
   }
   env.DOCKER_CONFIG = dir;
   env.BUGBOSS_EVALS_DOCKER_CONFIG_ISOLATED = "1";
+  // Apple's git names the keychain in its system gitconfig, which an empty
+  // helper alone does not stop reading.
+  env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_COUNT = "1";
   env.GIT_CONFIG_KEY_0 = "credential.helper";
   env.GIT_CONFIG_VALUE_0 = "";
