@@ -18,6 +18,7 @@ import {
   sumSessionUsage,
   describeOutcome,
   readSessionOutcome,
+  lastSessionEventAt,
   type SessionStore,
   type StoredExit,
 } from "./session";
@@ -462,4 +463,19 @@ test("describeOutcome says which of the three it is", () => {
     /ended on purpose \(timed_out\)/,
   );
   assert.match(describeOutcome({ kind: "empty" }), /before its first turn/);
+});
+
+test("lastSessionEventAt is the newest stamp in the file, whatever order it is in", () => {
+  const contents = [
+    JSON.stringify({ type: "session", id: "s", timestamp: "2026-09-29T21:30:00.000Z" }),
+    JSON.stringify({ type: "message", id: "a", timestamp: "2026-09-30T02:04:10.000Z" }),
+    JSON.stringify({ type: "message", id: "b", timestamp: "2026-09-30T01:56:00.000Z" }),
+    '{"type":"message","id":"c","timestamp":"2026-09-30T02:0',
+  ].join("\n");
+  assert.equal(lastSessionEventAt(contents), Date.parse("2026-09-30T02:04:10.000Z"));
+});
+
+test("lastSessionEventAt is null for a file with no readable stamp", () => {
+  assert.equal(lastSessionEventAt(""), null);
+  assert.equal(lastSessionEventAt(JSON.stringify({ type: "message" })), null);
 });
