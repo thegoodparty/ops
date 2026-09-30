@@ -52,11 +52,7 @@
 # anything in `scripts/`, so the entrypoint is generic even though the
 # workflow trigger is not.
 #
-# `/package.json`, `/package-lock.json`, `/tsconfig.json` -- one
-# `package.json` builds every image, so a dependency added for any one
-# service also installs into the delegate worker that holds the GitHub App
-# token.
-# `tsconfig.json` governs the same `tsc` that compiles `delegate/`.
+# `/tsconfig.json` -- it governs the same `tsc` that compiles `delegate/`.
 #
 # `/.dockerignore` -- the build context for both images.
 #
@@ -66,7 +62,7 @@
 # adding `deploy/components/evil.ts` touches no file-scoped path, so it would
 # need no human review. This repo has already been bitten by exactly that --
 # see the `job_workflow_ref` comment in
-# `deploy/components/ci-roles/policies.ts`. The five file-scoped entries below
+# `deploy/components/ci-roles/policies.ts`. The three file-scoped entries below
 # are singletons referenced by name from an owned path, where there is no
 # "one file over" to add.
 #
@@ -86,8 +82,6 @@
 /scripts/                        @thegoodparty/gp-contrib
 /utils/                          @thegoodparty/gp-contrib
 /run-script.ts                   @thegoodparty/gp-contrib
-/package.json                    @thegoodparty/gp-contrib
-/package-lock.json               @thegoodparty/gp-contrib
 /tsconfig.json                   @thegoodparty/gp-contrib
 /.dockerignore                   @thegoodparty/gp-contrib
 
