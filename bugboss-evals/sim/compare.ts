@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
@@ -91,7 +92,32 @@ const startStack = async (): Promise<Stack> => {
   throw new Error("the observability stack never became ready");
 };
 
+/**
+ * Nothing the harness starts may reach a credential store. On a Mac the
+ * user's docker config names the keychain as its credsStore, and the system
+ * gitconfig names it as a credential helper, so every pull and every https
+ * git call would prompt. Every child inherits this environment: docker gets a
+ * config with no credsStore (keeping the user's CLI plugins, compose among
+ * them), and git reads no system or global config.
+ */
+export const isolateFromKeychain = (): void => {
+  const dockerConfig = mkdtempSync(join(tmpdir(), "evb-docker-"));
+  writeFileSync(
+    join(dockerConfig, "config.json"),
+    JSON.stringify({ cliPluginsExtraDirs: [join(homedir(), ".docker", "cli-plugins")] }),
+  );
+  const gitConfig = join(dockerConfig, "gitconfig");
+  writeFileSync(gitConfig, "[credential]\n\thelper =\n");
+  Object.assign(process.env, {
+    DOCKER_CONFIG: dockerConfig,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: gitConfig,
+    GIT_TERMINAL_PROMPT: "0",
+  });
+};
+
 const run = async (argv: string[]): Promise<void> => {
+  isolateFromKeychain();
   const out = resolve(flag(argv, "out") ?? "bugboss-evals-out");
   const tokenFile = resolve(flag(argv, "token-file") ?? "");
   const baselineRef = flag(argv, "baseline") ?? "origin/main";

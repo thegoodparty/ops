@@ -132,6 +132,8 @@ jobs:
         options: --health-cmd pg_isready --health-interval 5s --health-retries 20
     env:
       OMNI_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      # gp-api's eslint runs out of the default 2 GB heap.
+      NODE_OPTIONS: --max-old-space-size=6144
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -160,8 +162,11 @@ export const patchShipPr = (text: string): string =>
  * cannot be pushed by the App, which holds no `workflows` permission):
  *
  *   npx tsx bugboss-evals/sim/sandbox.ts seed ~/Repos/thegoodparty/omni
+ *
+ * Changing an existing scenario's seed commit needs `--force`, with the
+ * sandbox's rulesets disabled for the push, because they refuse force-pushes.
  */
-export const seed = (omniDir: string, remote = `git@github.com:${SANDBOX_OWNER}/${SANDBOX_REPO}.git`): void => {
+export const seed = (omniDir: string, force = false, remote = `git@github.com:${SANDBOX_OWNER}/${SANDBOX_REPO}.git`): void => {
   const work = mkdtempSync(join(tmpdir(), "sandbox-seed-"));
   try {
     git(work, ["init", "-q"]);
@@ -191,17 +196,17 @@ export const seed = (omniDir: string, remote = `git@github.com:${SANDBOX_OWNER}/
       });
       refs.push(`${sha}:refs/heads/${scenarioBranch(scenario.id)}`);
     }
-    execFileSync("git", ["push", remote, ...refs], { cwd: work, stdio: "inherit" });
+    execFileSync("git", ["push", ...(force ? ["--force"] : []), remote, ...refs], { cwd: work, stdio: "inherit" });
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
 };
 
 if (require.main === module) {
-  const [command, omniDir] = process.argv.slice(2);
+  const [command, omniDir, force] = process.argv.slice(2);
   if (command !== "seed" || !omniDir) {
     console.error("usage: sandbox.ts seed <omni checkout>");
     process.exit(2);
   }
-  seed(omniDir);
+  seed(omniDir, force === "--force");
 }
