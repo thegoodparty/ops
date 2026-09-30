@@ -89,6 +89,8 @@ export const pickBaseEnv = (
  *
  * `AWS_ENDPOINT_URL_<SERVICE>` is a family rather than a list, because the
  * SDK and the CLI read one per service and the set the agent reaches grows.
+ * `PRISMA_ENGINES_MIRROR` is here because `npm ci` in omni downloads Prisma's
+ * engines from a host the harness has no route to.
  */
 export const CHILD_ENDPOINT_ENV_NAMES = [
   "BUGBOSS_OMNI_REPO",
@@ -98,6 +100,7 @@ export const CHILD_ENDPOINT_ENV_NAMES = [
   "GIT_SSL_CAINFO",
   "AWS_CA_BUNDLE",
   "npm_config_registry",
+  "PRISMA_ENGINES_MIRROR",
   "AWS_ENDPOINT_URL",
 ] as const;
 
