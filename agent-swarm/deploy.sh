@@ -73,9 +73,13 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ec2's --tag-specifications wants Tag structs, not the flat map other services
 # take, so this keeps the two tags spelled once and identically everywhere.
-RESOURCE_TAGS='{Key=Environment,Value=infra},{Key=Project,Value=agent-swarm}'
+#
+# Project is `bugboss-swarm` rather than `agent-swarm` on purpose: this is the
+# second system doing BugBoss's job, and naming it that way is what makes its
+# spend separable from BugBoss's in Cost Explorer when both are running.
+RESOURCE_TAGS='{Key=Environment,Value=infra},{Key=Project,Value=bugboss-swarm}'
 # The flat-map form the same two tags take on iam, elbv2 and logs.
-TAG_MAP=("Key=Environment,Value=infra" "Key=Project,Value=agent-swarm")
+TAG_MAP=("Key=Environment,Value=infra" "Key=Project,Value=bugboss-swarm")
 
 usage() {
   cat <<'EOF'
@@ -245,6 +249,10 @@ if [ -z "$ALB_SG" ] || [ "$ALB_SG" = "None" ]; then
 else
   report found "$ALB_SG_NAME ($ALB_SG)"
 fi
+# A found resource keeps whatever tags it already had, and no modify call can
+# change them, so enforcement has to be its own step or a resource created
+# before a tag change keeps the old value forever.
+"${AWS[@]}" ec2 create-tags --resources "$ALB_SG" --tags "${TAG_MAP[@]}" >/dev/null
 authorize_ingress_cidr "$ALB_SG" 443 0.0.0.0/0
 authorize_egress_all "$ALB_SG"
 
@@ -260,6 +268,7 @@ if [ -z "$HOST_SG" ] || [ "$HOST_SG" = "None" ]; then
 else
   report found "$HOST_SG_NAME ($HOST_SG)"
 fi
+"${AWS[@]}" ec2 create-tags --resources "$HOST_SG" --tags "${TAG_MAP[@]}" >/dev/null
 # Only the ALB may reach the containers. They publish to the host's network, so
 # a wider rule would put an unauthenticated API on the internet twice over.
 authorize_ingress_sg "$HOST_SG" "$API_PORT" "$ALB_SG"
@@ -289,10 +298,10 @@ JSON
 
 if "${AWS[@]}" iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
   report found "role $ROLE_NAME"
-  "${AWS[@]}" update-assume-role-policy --role-name "$ROLE_NAME" \
+  "${AWS[@]}" iam update-assume-role-policy --role-name "$ROLE_NAME" \
     --policy-document "file://$TMP/assume-role.json" >/dev/null
 else
-  "${AWS[@]}" create-role --role-name "$ROLE_NAME" \
+  "${AWS[@]}" iam create-role --role-name "$ROLE_NAME" \
     --description "agent-swarm host: S3 state, its own secret, and read-only investigation" \
     --assume-role-policy-document "file://$TMP/assume-role.json" \
     --tags "Key=Name,Value=$ROLE_NAME" "${TAG_MAP[@]}" >/dev/null
@@ -399,7 +408,7 @@ if "${AWS[@]}" iam get-role-policy --role-name "$ROLE_NAME" --policy-name "inlin
 else
   POLICY_STATE="created"
 fi
-"${AWS[@]}" put-role-policy --role-name "$ROLE_NAME" \
+"${AWS[@]}" iam put-role-policy --role-name "$ROLE_NAME" \
   --policy-name "inline" --policy-document "file://$TMP/role-policy.json" >/dev/null
 report "$POLICY_STATE" "inline policy on $ROLE_NAME"
 # Session Manager is the only way in -- there is no key pair and no SSH.
@@ -414,11 +423,11 @@ log "Instance profile $PROFILE_NAME"
 if "${AWS[@]}" iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null 2>&1; then
   report found "instance profile $PROFILE_NAME"
 else
-  "${AWS[@]}" create-instance-profile --instance-profile-name "$PROFILE_NAME" \
+  "${AWS[@]}" iam create-instance-profile --instance-profile-name "$PROFILE_NAME" \
     --tags "Key=Name,Value=$PROFILE_NAME" "${TAG_MAP[@]}" >/dev/null
   report created "instance profile $PROFILE_NAME"
 fi
-if "${AWS[@]}" add-role-to-instance-profile --instance-profile-name "$PROFILE_NAME" \
+if "${AWS[@]}" iam add-role-to-instance-profile --instance-profile-name "$PROFILE_NAME" \
   --role-name "$ROLE_NAME" >/dev/null 2>&1; then
   report created "role $ROLE_NAME attached to $PROFILE_NAME"
 else
@@ -487,7 +496,7 @@ if [ "$EXISTING_LOG_GROUP" = "$LOG_GROUP" ]; then
   report found "log group $LOG_GROUP"
 else
   "${AWS[@]}" logs create-log-group --log-group-name "$LOG_GROUP" \
-    --tags "Environment=infra,Project=agent-swarm" >/dev/null
+    --tags "Environment=infra,Project=bugboss-swarm" >/dev/null
   report created "log group $LOG_GROUP"
 fi
 "${AWS[@]}" logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 30
@@ -585,6 +594,9 @@ else
     --default-actions "$DEFAULT_ACTIONS" >/dev/null
   report found "listener 443 ($LISTENER_ARN)"
 fi
+# modify-listener cannot carry tags either, so this is the one place they are set.
+"${AWS[@]}" elbv2 add-tags --resource-arns "$LISTENER_ARN" \
+  --tags "Key=Name,Value=$ALB_NAME-listener" "${TAG_MAP[@]}" >/dev/null
 
 log "Listener rules"
 ensure_rule() {
@@ -593,14 +605,18 @@ ensure_rule() {
   arn="$("${AWS[@]}" elbv2 describe-rules --listener-arn "$LISTENER_ARN" \
     --query "Rules[?Priority=='$priority'].RuleArn | [0]" --output text 2>/dev/null || true)"
   if [ -z "$arn" ] || [ "$arn" = "None" ]; then
-    "${AWS[@]}" elbv2 create-rule --listener-arn "$LISTENER_ARN" \
-      --priority "$priority" --conditions "$conditions" --actions "$actions" >/dev/null
+    arn="$("${AWS[@]}" elbv2 create-rule --listener-arn "$LISTENER_ARN" \
+      --priority "$priority" --conditions "$conditions" --actions "$actions" \
+      --query 'Rules[0].RuleArn' --output text)"
     report created "rule $priority ($label)"
   else
     "${AWS[@]}" elbv2 modify-rule --rule-arn "$arn" \
       --conditions "$conditions" --actions "$actions" >/dev/null
     report found "rule $priority ($label)"
   fi
+  # Same reason as the listener: neither create nor modify carries tags here.
+  "${AWS[@]}" elbv2 add-tags --resource-arns "$arn" \
+    --tags "Key=Name,Value=$ALB_NAME-rule-$priority" "${TAG_MAP[@]}" >/dev/null
 }
 # Grafana's webhook path goes to the hook bridge, which listens on its own port
 # so a slow or wedged bridge cannot take the API down with it.
@@ -684,6 +700,19 @@ else
   }
 ]
 JSON
+  # Hop limit 2 rather than the hardened 1: a request from inside a container
+  # crosses the docker bridge before it reaches IMDS, which is one more hop than
+  # the limit counts at 1. At 1 the instance role is unreachable from every
+  # container, which silently breaks the agents' aws CLI and Litestream's S3
+  # replication. It is not a boundary either way, because the containers run on
+  # this host and share its identity, so this makes the granted permissions
+  # usable rather than widening anything.
+  #
+  # This comment sits above the whole invocation rather than beside the argument
+  # it explains, and that placement is load-bearing: a comment inside a backslash
+  # continuation starts a comment mid-command, so every argument after it is
+  # swallowed and the next line becomes a command of its own. `bash -n` reports
+  # that as clean, and it only shows up when the script runs.
   INSTANCE_ID="$("${AWS[@]}" ec2 run-instances \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
@@ -693,13 +722,6 @@ JSON
     --block-device-mappings "file://$TMP/block-devices.json" \
     --user-data "file://$SCRIPT_DIR/user-data.sh" \
     --associate-public-ip-address \
-    # Hop limit 2 rather than the hardened 1: a request from inside a container
-    # crosses the docker bridge before it reaches IMDS, which is one more hop
-    # than the limit counts at 1. At 1 the instance role is unreachable from
-    # every container, which silently breaks the agents' aws CLI and Litestream's
-    # S3 replication. It is not a boundary either way -- the containers run on
-    # this host and share its identity -- so this makes the granted permissions
-    # usable rather than widening anything.
     --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME_TAG},$RESOURCE_TAGS]" \
       "ResourceType=volume,Tags=[{Key=Name,Value=$NAME_TAG},$RESOURCE_TAGS]" \
@@ -710,8 +732,30 @@ fi
 # `instance` target groups route to an instance id, so the ALB will not serve a
 # byte until both are registered. Registration before SSM is online is fine and
 # keeps this from needing a second pass after the wait below.
-"${AWS[@]}" elbv2 register-targets --target-group-arn "$API_TG_ARN" --targets "Id=$INSTANCE_ID,Port=$API_PORT" >/dev/null
-"${AWS[@]}" elbv2 register-targets --target-group-arn "$HOOK_TG_ARN" --targets "Id=$INSTANCE_ID,Port=$HOOK_PORT" >/dev/null
+#
+# A just-launched instance is not immediately registerable. elbv2 answers
+# InvalidTarget with "the following instances do not exist" until EC2's launch
+# has propagated, which is its own documented lag rather than flakiness here, so
+# the real fix is to wait on the dependency: the instance actually running. The
+# bounded loop after that only covers the window between running and elbv2
+# agreeing, and it gives up out loud rather than proceeding to a load balancer
+# with no targets.
+log "Waiting for $INSTANCE_ID to be running"
+"${AWS[@]}" ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+register_target() {
+  local tg="$1" port="$2" attempt
+  for attempt in 1 2 3 4 5 6; do
+    if "${AWS[@]}" elbv2 register-targets --target-group-arn "$tg" \
+      --targets "Id=$INSTANCE_ID,Port=$port" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 10
+  done
+  die "could not register $INSTANCE_ID:$port with $tg after $((6 * 10))s. Check the instance is running and in $VPC_ID."
+}
+register_target "$API_TG_ARN" "$API_PORT"
+register_target "$HOOK_TG_ARN" "$HOOK_PORT"
 report created "instance $INSTANCE_ID registered with both target groups"
 
 log "Waiting for SSM to register $INSTANCE_ID"

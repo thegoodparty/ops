@@ -193,9 +193,9 @@ done
 
 log "Instance profile $PROFILE_NAME"
 if "${AWS[@]}" iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null 2>&1; then
-  "${AWS[@]}" remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" \
+  "${AWS[@]}" iam remove-role-from-instance-profile --instance-profile-name "$PROFILE_NAME" \
     --role-name "$ROLE_NAME" >/dev/null 2>&1 || true
-  "${AWS[@]}" delete-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null
+  "${AWS[@]}" iam delete-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null
   info "deleted instance profile"
 else
   skip "no instance profile named $PROFILE_NAME"
@@ -203,10 +203,10 @@ fi
 
 log "Role $ROLE_NAME"
 if "${AWS[@]}" iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-  "${AWS[@]}" detach-role-policy --role-name "$ROLE_NAME" \
+  "${AWS[@]}" iam detach-role-policy --role-name "$ROLE_NAME" \
     --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" >/dev/null 2>&1 || true
-  "${AWS[@]}" delete-role-policy --role-name "$ROLE_NAME" --policy-name "inline" >/dev/null 2>&1 || true
-  "${AWS[@]}" delete-role --role-name "$ROLE_NAME" >/dev/null
+  "${AWS[@]}" iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "inline" >/dev/null 2>&1 || true
+  "${AWS[@]}" iam delete-role --role-name "$ROLE_NAME" >/dev/null
   info "deleted role"
 else
   skip "no role named $ROLE_NAME"
