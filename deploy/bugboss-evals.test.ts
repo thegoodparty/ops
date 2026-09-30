@@ -144,3 +144,14 @@ describe("Tier 2's reads", () => {
     );
   });
 });
+
+describe("the eval workflow's task starts", () => {
+  it("can start eval tasks on the eval cluster only", () => {
+    const policy = workflowPolicy({ taskRoleArn: "arn:task", executionRoleArn: "arn:exec" });
+    const run = policy.Statement.filter((s) => s.Action.includes("ecs:RunTask"));
+    assert.equal(run.length, 1);
+    assert.deepEqual(run[0].Condition, {
+      ArnEquals: { "ecs:cluster": "arn:aws:ecs:us-west-2:333022194791:cluster/bugboss-evals" },
+    });
+  });
+});

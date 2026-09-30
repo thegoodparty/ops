@@ -71,6 +71,7 @@ const BEDROCK_RESOURCES = [
 
 const ECR_REPOSITORY_ARN = `arn:aws:ecr:${REGION}:${ACCOUNT_ID}:repository/${ECR_REPOSITORY}`;
 const RESULTS_BUCKET_ARN = `arn:aws:s3:::${RESULTS_BUCKET}`;
+const CLUSTER_ARN = `arn:aws:ecs:${REGION}:${ACCOUNT_ID}:cluster/${CLUSTER_NAME}`;
 
 // Tier 2 resumes real incidents from their recorded Pi sessions. The runner
 // reads one, cuts it at the PR, and hands the replay container only the cut;
@@ -95,6 +96,7 @@ type Statement = {
   Effect: "Allow";
   Action: string[];
   Resource: string[];
+  Condition?: Record<string, Record<string, string>>;
 };
 
 export type PolicyDocument = { Version: "2012-10-17"; Statement: Statement[] };
@@ -205,6 +207,9 @@ export const workflowPolicy = (args: {
       Resource: [
         `arn:aws:ecs:${REGION}:${ACCOUNT_ID}:task-definition/${TASK_FAMILY}:*`,
       ],
+      // RunTask's resource is the task definition, so without this the
+      // workflow could start eval tasks on any cluster in the account.
+      Condition: { ArnEquals: { "ecs:cluster": CLUSTER_ARN } },
     },
     {
       Sid: "WatchEvalTasks",
