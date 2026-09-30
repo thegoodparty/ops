@@ -48,17 +48,24 @@ export interface ChildEnvInput {
  * How the AWS SDK finds the task role inside a container. On Fargate only the
  * relative URI is ever set; the other two are how the same provider is fed
  * outside it, and they cost nothing to carry.
- *
- * `AWS_PROFILE` is the one path that is not the container provider. Production
- * never sets it. The eval harness does, pointing at fake keys in a mounted
- * credentials file, and Pi's Bedrock provider will not start without one of
- * these names in its environment even when the SDK could resolve a file.
  */
 export const AWS_CREDENTIAL_PATH_VARS = [
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-  "AWS_PROFILE",
+] as const;
+
+/**
+ * Static keys, which production never sets: the task role arrives through the
+ * container provider above. The eval harness sets fake ones, which MinIO
+ * accepts and the model proxy re-signs over, so the agent there holds nothing
+ * that reaches real AWS. A named profile is deliberately not here: it would
+ * hand the child whatever the parent's credentials file holds.
+ */
+export const AWS_STATIC_CREDENTIAL_VARS = [
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
 ] as const;
 
 export const CHILD_BASE_ENV_NAMES = [
@@ -67,6 +74,7 @@ export const CHILD_BASE_ENV_NAMES = [
   "TMPDIR",
   "LANG",
   ...AWS_CREDENTIAL_PATH_VARS,
+  ...AWS_STATIC_CREDENTIAL_VARS,
 ] as const;
 
 /** Explicit opt-in for the handful of parent variables a child needs. */
@@ -152,7 +160,8 @@ export const gitHubTokenEnv = (
 
 /** Whether a built child environment can resolve AWS credentials at all. */
 export const hasAwsCredentialPath = (env: Record<string, string>): boolean =>
-  AWS_CREDENTIAL_PATH_VARS.some((name) => env[name] !== undefined);
+  AWS_CREDENTIAL_PATH_VARS.some((name) => env[name] !== undefined) ||
+  (env.AWS_ACCESS_KEY_ID !== undefined && env.AWS_SECRET_ACCESS_KEY !== undefined);
 
 export const buildChildEnv = (
   input: ChildEnvInput,

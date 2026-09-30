@@ -297,7 +297,9 @@ describe("the child's environment", () => {
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
       ],
     );
     assert.deepEqual(pickBaseEnv({ ...PROD_ENV, BUGBOSS_GITHUB_URL: STANDIN }), {
@@ -307,11 +309,15 @@ describe("the child's environment", () => {
     });
   });
 
-  test("a sim parent's AWS_PROFILE reaches the child and counts as a credential path", () => {
-    const env = pickBaseEnv({ ...PROD_ENV, AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: undefined, AWS_PROFILE: "default" });
-    assert.equal(env.AWS_PROFILE, "default");
+  test("a sim parent's static keys reach the child and count as a credential path", () => {
+    const sim = { ...PROD_ENV, AWS_ACCESS_KEY_ID: "AKIASIM", AWS_SECRET_ACCESS_KEY: "fake", AWS_PROFILE: "default" };
+    delete (sim as Record<string, string | undefined>).AWS_CONTAINER_CREDENTIALS_RELATIVE_URI;
+    const env = pickBaseEnv(sim);
+    assert.equal(env.AWS_ACCESS_KEY_ID, "AKIASIM");
+    assert.equal(env.AWS_SECRET_ACCESS_KEY, "fake");
+    assert.equal("AWS_PROFILE" in env, false, "a named profile never reaches the child");
     assert.ok(hasAwsCredentialPath(env));
-    assert.equal("AWS_PROFILE" in pickBaseEnv(PROD_ENV), false);
+    assert.equal(hasAwsCredentialPath({ AWS_ACCESS_KEY_ID: "AKIASIM" }), false, "a key id alone is not a credential");
   });
 
   test("a sim parent hands over its endpoints, its trust, and GH_HOST", () => {

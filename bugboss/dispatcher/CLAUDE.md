@@ -231,9 +231,11 @@ passed through, so the child resolves the task role through the SDK's
 container provider and that provider refreshes for as long as the run lasts.
 A launch whose environment carries no credential path at all alarms:
 without it the agent loses Bedrock, and that surfaces a turn later as a model
-call failing with nothing pointing back at the environment. `AWS_PROFILE`
-counts as a credential path too; production never sets it, and the eval
-harness uses it to point the child at fake keys in a mounted file.
+call failing with nothing pointing back at the environment. Static keys
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) pass
+through too and count as a path. Production never sets them; the eval harness
+sets fake ones. A named profile never passes, because it would hand the child
+whatever the parent's credentials file holds.
 
 Endpoint overrides are the other pass-through (`pickEndpointEnv`): the omni
 remote, `BUGBOSS_GITHUB_URL`, the CA bundles, the npm registry, the Prisma
