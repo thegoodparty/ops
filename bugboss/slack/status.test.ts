@@ -352,6 +352,12 @@ describe("what the header asks of a person", () => {
     );
   });
 
+  test("a spent budget with a wake time of its own needs nobody", () => {
+    const parked = { waitingFor: "a person to decide", liftsOnReply: 0, waitStartedAt: AT };
+    assert.equal(neededFromHuman(facts(parked)), "Needs a human to decide what happens next", "premise");
+    assert.equal(neededFromHuman(facts({ ...parked, waitWakeAt: AT + 60 * MIN })), null);
+  });
+
   test("a closed incident needs nobody, whatever wait row is left", () => {
     assert.equal(neededFromHuman(facts({ status: "CLOSED", monitorWaitingFor: "someone to merge", monitorStartedAt: AT })), null);
   });

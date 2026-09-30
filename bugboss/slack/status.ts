@@ -261,7 +261,10 @@ const ACTOR = /^(?:someone|somebody|a person|a human|a reviewer|an engineer)\s+t
  */
 export const neededFromHuman = (facts: StatusFacts): string | null => {
   if (!OPEN_STATUSES.includes(facts.status)) return null;
-  if (isParked(facts)) return "Needs a human to decide what happens next";
+  // A park with a wake time ends on its own, so it needs nobody.
+  if (isParked(facts) && facts.waitWakeAt === null) {
+    return "Needs a human to decide what happens next";
+  }
   const task = (label: string): string => {
     const line = oneLine(label);
     return ACTOR.test(line)
