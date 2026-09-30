@@ -99,8 +99,18 @@ export const checks = async (sandbox: Sandbox, sha: string): Promise<CheckState>
 
 // ------------------------------------------------------------------ seeding
 
+// Fixed dates make every seed commit reproducible, so re-seeding pushes
+// nothing new: the sandbox refuses force-pushes, to main and to anything.
+const SEED_DATE = "2026-09-30T00:00:00Z";
+
 const git = (cwd: string, args: string[], input?: string): string =>
-  execFileSync("git", args, { cwd, encoding: "utf8", input, maxBuffer: 1 << 26 }).trim();
+  execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    input,
+    maxBuffer: 1 << 26,
+    env: { ...process.env, GIT_AUTHOR_DATE: SEED_DATE, GIT_COMMITTER_DATE: SEED_DATE },
+  }).trim();
 
 export const ciWorkflow = (scenario: Scenario): string => `name: CI
 on:
@@ -181,7 +191,7 @@ export const seed = (omniDir: string, remote = `git@github.com:${SANDBOX_OWNER}/
       });
       refs.push(`${sha}:refs/heads/${scenarioBranch(scenario.id)}`);
     }
-    execFileSync("git", ["push", "--force", remote, ...refs], { cwd: work, stdio: "inherit" });
+    execFileSync("git", ["push", remote, ...refs], { cwd: work, stdio: "inherit" });
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
