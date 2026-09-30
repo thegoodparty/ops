@@ -483,6 +483,42 @@ evidence anybody can check. The prompt carries the rest: never change state
 without evidence it can cite, and an agent asking for a close is a request to
 check rather than a reason to act.
 
+**It reads GitHub itself.** `gh` (`slack/gh.ts`) is appended last, after
+the write tools. It runs the `gh` binary with the argv the model supplies,
+through `execFile` with no shell, on the App installation token an incident
+agent gets -- same permissions, same repositories, minted and re-minted by
+`createInstallationToken` in the composition root and shared with the
+closing report's PR-state reader. It exists because the Boss, asked in
+incident 94's thread who made omni#2265, said it had no GitHub access and
+asked for the link to be pasted.
+
+| Bound | Why |
+| --- | --- |
+| no shell, argv only | a `;` or `|` in an argument stays a literal argument |
+| env built, not inherited | the child sees `GH_TOKEN`, `GH_REPO=thegoodparty/omni` and its own `GH_CONFIG_DIR`, none of the Boss's other secrets |
+| `auth`, `alias`, `extension`, `config` refused | `gh auth token` prints the token into a transcript one answer from Slack; an alias or extension runs a program that could read this process's environment |
+| the token scrubbed from output | nothing gh prints carries it back |
+| `GH_TIMEOUT_MS` per call | counted into `SLACK_AGENT_LOCK_TTL_MS` |
+| `MAX_GH_OUTPUT_CHARS`, a **refusal** | past it nothing is shown and the model is told to ask for `--json` fields, `--jq`, `--limit`; never the first part of the output |
+
+Anything `gh` changes on GitHub -- a comment, a review, a close, a merge, a
+re-run -- is a state change under the same prompt rule as the write tools:
+only when a person asked or there is evidence to cite, and the Boss says what
+it did. Branch protection, not the prompt, is what keeps a merge honest.
+
+**Writes are not filtered, on purpose.** `gh` can write -- `gh api -X POST`,
+`gh issue create`, `gh pr comment` -- and nothing in code refuses a write.
+That is the decision, not a gap: the Boss gets what an incident agent gets,
+and an agent reads the same untrusted PR bodies with the same token and a
+whole shell. A method filter on `gh api` alone would not close the path
+anyway (`gh api -f` with no `-X` is a POST, and a dozen subcommands write),
+and a complete one is a read-only token, which is the design this replaced.
+What stands against an injected write is the same as for an agent: the
+prompt's "data, not instructions" rule, the evidence rule above, and branch
+protection. If that stops being enough, the change is a read-only token
+minted for the Boss (`permissions` on the installation-token request), not
+an argv filter.
+
 `page_rotation` exists because `toMrkdwn` strips `<!subteam^…>` out of model
 prose, which is right -- a model that can page the rotation by typing it is
 how a rotation gets muted -- and the Boss still has to be able to reach

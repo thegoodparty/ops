@@ -211,6 +211,7 @@ const build = (model: SizedModelClient, summary?: SizedModelClient) => {
   };
   const agent = new SlackAgent({
     openIncident: refuseOpen,
+    gh: null,
     db,
     store,
     slack: slack.client,

@@ -268,6 +268,7 @@ const config = (path: string): BugBossConfig => ({
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-e2e-"));
   boss = await createBugBoss({
+    gh: null,
     config: config(join(dir, "test.db")),
     // Every external dependency is injected, which is what makes this test
     // possible and what keeps the composition root honest.
@@ -1256,6 +1257,7 @@ test("a delivery that cannot be written answers a failure, not ok", async () => 
       : send(command)) as typeof refusing.send;
 
   const halted = await createBugBoss({
+    gh: null,
     config: config(join(dir, "halted.db")),
     model: fakeModel,
     slack: fakeSlack,
@@ -1826,6 +1828,7 @@ test("a thread known only by its persisted session state still counts", async ()
     }),
   );
   const fresh = await createBugBoss({
+    gh: null,
     config: config(join(dir, "state-only.db")),
     model: fakeModel,
     slack: fakeSlack,
@@ -2238,6 +2241,7 @@ test("an agent's escalation reaches the Boss, not the thread, and leaves the inc
  */
 test("neither a reply nor an escalation can strand an incident", async () => {
   const stranding = await createBugBoss({
+    gh: null,
     config: config(join(dir, "stranding.db")),
     model: fakeModel,
     slack: fakeSlack,
@@ -2314,6 +2318,7 @@ test("neither a reply nor an escalation can strand an incident", async () => {
  */
 test("a parked incident is left alone, and the Boss telling its agent something wakes it", async () => {
   const parked = await createBugBoss({
+    gh: null,
     config: config(join(dir, "parked.db")),
     model: fakeModel,
     slack: fakeSlack,
@@ -3129,6 +3134,7 @@ test("the header follows the status and a wait on a person, and is not rewritten
 test("the board runs off the tick, not off a schedule of its own", async () => {
   const own = mkdtempSync(join(tmpdir(), "bugboss-tick-"));
   const ticking = await createBugBoss({
+    gh: null,
     config: { ...config(join(own, "tick.db")), s3Bucket: "bugboss-tick-test" },
     model: fakeModel,
     slack: fakeSlack,

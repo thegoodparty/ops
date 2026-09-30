@@ -138,6 +138,7 @@ import {
 import { INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
 import { createInstallationToken, createPrStateReader } from "./github";
+import { createGhExec, type GhExec } from "./slack/gh";
 import { makeAlarm, makeLog } from "./logging";
 import type {
   BugBossConfig,
@@ -267,6 +268,12 @@ export interface CreateBugBossOptions {
    * Absent leaves every PR rendered as "state not known".
    */
   prStates?: PrStateReader;
+  /**
+   * The Boss's `gh`, on the App's installation token. Null when the App is
+   * not configured: the tool still exists, so the prompt prefix does not
+   * change with configuration, and says it cannot run.
+   */
+  gh: GhExec | null;
   secrets?: BugBossSecrets;
   http?: HttpConfig;
   /**
@@ -978,6 +985,7 @@ export const createBugBoss = async (
     // small bounded call to a cheaper model (BUGBOSS_INTENT_MODEL_ID) without
     // a deploy.
     summaryModel: options.intentModel ?? options.model,
+    gh: options.gh,
     now,
   });
 
@@ -2338,6 +2346,16 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
     alarm("test_database_report_failed", { error: String(error) }),
   );
 
+  const githubToken =
+    secrets.githubAppId &&
+    secrets.githubAppPrivateKey &&
+    secrets.githubAppInstallationId
+      ? createInstallationToken({
+          appId: secrets.githubAppId,
+          privateKey: secrets.githubAppPrivateKey,
+          installationId: secrets.githubAppInstallationId,
+        })
+      : null;
   return createBugBoss({
     config,
     // Region is no longer passed: `resolveBedrockModel` takes it from an
@@ -2358,21 +2376,11 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
     // reinstalls the app -- until then the close notice goes out alone and
     // the retries end in an alarm.
     fileUploader: createSlackFileUploader(secrets.slackBotToken),
-    // Only when the App is configured. The Boss otherwise never mints a
-    // GitHub token of its own; this is the one thing it asks GitHub for, and
-    // a report without PR states is still a report.
-    prStates:
-      secrets.githubAppId &&
-      secrets.githubAppPrivateKey &&
-      secrets.githubAppInstallationId
-        ? createPrStateReader(
-            createInstallationToken({
-              appId: secrets.githubAppId,
-              privateKey: secrets.githubAppPrivateKey,
-              installationId: secrets.githubAppInstallationId,
-            }),
-          )
-        : undefined,
+    // Only when the App is configured; a report without PR states is still a
+    // report. One token source for both, cached and re-minted before expiry
+    // by @octokit/auth-app, the same way an incident agent's is.
+    prStates: githubToken ? createPrStateReader(githubToken) : undefined,
+    gh: githubToken ? createGhExec({ token: githubToken }) : null,
     // The merged env, not process.env: Loki's credentials come from the
     // secret blob, and settingsEnv builds a new object rather than mutating
     // the process.
