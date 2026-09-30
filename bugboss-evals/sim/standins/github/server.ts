@@ -21,7 +21,8 @@
 //   GITHUB_SEED_MAIN            commit main starts at (the bundle's HEAD)
 //   GITHUB_STANDIN_HUMANS       JSON {token: login} for human users
 //   GITHUB_APP_SLUG             the App's slug; its bot is "<slug>[bot]"
-//   GITHUB_STANDIN_ACTIONS_WRITE  "false" makes re-runs 403 as prod does today
+//   GITHUB_STANDIN_ACTIONS_WRITE  "true" lets the bot re-run CI. Off by default
+//                               because the production App holds actions: read
 //   CI_MODE                     run | scripted
 //   CI_VISIBLE                  JSON array of shell commands, one job each
 //   CI_TIMEOUT_SECONDS          per command (3600)
@@ -88,7 +89,7 @@ export const configFromEnv = (env: NodeJS.ProcessEnv): StandinConfig => {
     dataDir: env.GITHUB_DATA_DIR ?? mkdtempSync(join(tmpdir(), "github-standin-")),
     humans: parseJson<Record<string, string>>("GITHUB_STANDIN_HUMANS", env.GITHUB_STANDIN_HUMANS, {}),
     appLogin: `${env.GITHUB_APP_SLUG ?? "bugboss-gp"}[bot]`,
-    actionsWrite: env.GITHUB_STANDIN_ACTIONS_WRITE !== "false",
+    actionsWrite: env.GITHUB_STANDIN_ACTIONS_WRITE === "true",
     ciMode,
     ciVisible,
     ciTimeoutSeconds: Number(env.CI_TIMEOUT_SECONDS ?? 3600),

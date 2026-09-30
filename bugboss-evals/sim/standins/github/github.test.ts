@@ -239,7 +239,9 @@ const asHuman = async (w: World, method: string, path: string, body?: unknown) =
 describe("the GitHub stand-in under the real gh", { skip: skip ?? false }, () => {
   let w: World;
   before(async () => {
-    w = await setup();
+    // actions: write, which the App has requested and does not hold yet, so
+    // the re-run path can be driven here. The next suite runs without it.
+    w = await setup({ GITHUB_STANDIN_ACTIONS_WRITE: "true" });
   });
   after(async () => {
     if (w) await teardown(w);
@@ -538,6 +540,21 @@ describe("the reviewer and scripted CI", { skip: skip ?? false }, () => {
     assert.match(s.pulls[0].reviews[1].body, /Recommendation: approve/);
     assert.equal(s.pulls[0].reviews[1].commitId, s.pulls[0].headSha);
     assert.deepEqual(s.unhandled, []);
+  });
+
+  test("without actions: write a re-run is refused the way production refuses it", async () => {
+    const failed = (await state(w)).workflowRuns.find((r) => r.conclusion === "failure")!;
+    const viaGh = await gh(w, ["run", "rerun", String(failed.id), "--failed"]);
+    assert.notEqual(viaGh.code, 0);
+    assert.match(viaGh.stderr, /not accessible by integration/i);
+    const raw = await sh("curl", [
+      "-sS", "-o", "/dev/null", "-D", "-", "--cacert", join(w.dir, "ca.pem"), "-X", "POST",
+      "-H", `Authorization: token ${w.botToken}`,
+      `${w.web}/api/v3/repos/${REPO}/actions/runs/${failed.id}/rerun-failed-jobs`,
+    ]);
+    assert.match(raw.stdout, /^HTTP\/1\.1 403/);
+    assert.match(raw.stdout, /^x-accepted-github-permissions: actions=write\r?$/m);
+    assert.equal((await state(w)).workflowRuns.find((r) => r.id === failed.id)!.runAttempt, 1);
   });
 });
 
