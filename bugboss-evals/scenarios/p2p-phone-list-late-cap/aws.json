@@ -1,0 +1,54 @@
+{
+  "cloudwatch": [
+    {
+      "namespace": "AWS/ECS",
+      "metricName": "CPUUtilization",
+      "dimensions": { "ClusterName": "gp-api-prod", "ServiceName": "gp-api-prod" },
+      "unit": "Percent",
+      "datapoints": [
+        { "ts": -3600000, "value": 22.4 },
+        { "ts": -3000000, "value": 24.1 },
+        { "ts": -2400000, "value": 21.8 },
+        { "ts": -1800000, "value": 26.3 },
+        { "ts": -1200000, "value": 23.5 },
+        { "ts": -600000, "value": 25.0 },
+        { "ts": 0, "value": 24.2 }
+      ]
+    },
+    {
+      "namespace": "AWS/ApplicationELB",
+      "metricName": "HTTPCode_ELB_5XX_Count",
+      "dimensions": { "LoadBalancer": "app/gp-api-prod/0000000000000000" },
+      "unit": "Count",
+      "datapoints": [
+        { "ts": -3600000, "value": 0 },
+        { "ts": -3000000, "value": 0 },
+        { "ts": -2400000, "value": 0 },
+        { "ts": -1800000, "value": 0 },
+        { "ts": -1200000, "value": 0 },
+        { "ts": -600000, "value": 0 },
+        { "ts": 0, "value": 0 }
+      ]
+    }
+  ],
+  "ecs": {
+    "clusters": ["gp-api-prod", "gp-api-dev"],
+    "services": [
+      {
+        "cluster": "gp-api-prod",
+        "name": "gp-api-prod",
+        "desiredCount": 2,
+        "runningCount": 2,
+        "taskDefinition": "gp-api-prod:1"
+      },
+      {
+        "cluster": "gp-api-dev",
+        "name": "gp-api-dev",
+        "desiredCount": 1,
+        "runningCount": 1,
+        "taskDefinition": "gp-api-dev:1"
+      }
+    ]
+  },
+  "secretsManager": { "names": ["GP_API_PROD", "GP_API_DEV"] }
+}

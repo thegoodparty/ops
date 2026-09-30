@@ -1,0 +1,34 @@
+{
+  "id": "ecanvasser-sync-timeout",
+  "sourceIncident": 2,
+  "omni": {
+    "baseSha": "33e207e312e587e99fe63b08dce7ed25fe9e2574",
+    "packages": ["gp-api"],
+    "provingFixSha": "4d86389fb5492d9b6fbd18fbe15248c24f5fd236"
+  },
+  "alert": { "file": "alert.json", "refireEverySeconds": 600 },
+  "telemetry": { "generator": "telemetry.ts", "backfillHoursBefore": 6 },
+  "aws": { "data": "aws.json" },
+  "ci": {
+    "visible": [
+      "npm run test -w packages/gp-api -- src/vendors/ecanvasserIntegration",
+      "npm run lint -w packages/gp-api"
+    ]
+  },
+  "check": {
+    "setup": "check/setup.sh",
+    "command": "check/run.sh",
+    "timeoutSeconds": 420,
+    "runsAt": "deploy"
+  },
+  "reviewer": { "requestChangesOnce": false },
+  "persona": {
+    "file": "persona.md",
+    "model": "sonnet",
+    "replyDelaySeconds": [60, 600],
+    "mergeDelaySeconds": 4200
+  },
+  "chaos": { "restartBugbossAfterSeconds": null },
+  "caps": { "wallClockSeconds": 14400, "modelUsd": 35, "quietMinutes": 90 },
+  "reference": "reference.md"
+}
