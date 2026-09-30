@@ -20,19 +20,31 @@ printf '\n=== agent-swarm user-data %s ===\n' "$(date -Is)"
 # ---------------------------------------------------------------------------
 
 # The AL2023 `docker` package does not ship the compose plugin, and the
-# `docker compose` subcommand is what the stack is driven with. Try the distro
-# first (cheapest, and it exists on newer AL2023), then fall back to Docker's
-# own repository.
+# `docker compose` subcommand is what the stack is driven with. There is no
+# distro package for it, and Docker's own repository is not usable here: the
+# centos repo it publishes resolves `$releasever` to `2023` on AL2023, so the
+# repo path 404s and `dnf` fails outright.
+#
+# So the plugin is installed as what it actually is, a single binary the docker
+# CLI looks for in its plugin directory. Pin the version: an unpinned download
+# in a boot script is a different Compose on every host that boots.
 if ! command -v docker >/dev/null 2>&1; then
   dnf install -y docker
 fi
 if ! docker compose version >/dev/null 2>&1; then
-  if ! dnf install -y docker-compose-plugin >/dev/null 2>&1; then
-    dnf install -y dnf-plugins-core
-    dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-    dnf install -y docker-compose-plugin
-  fi
+  COMPOSE_VERSION="v5.5.1"
+  install -d -m 0755 /usr/libexec/docker/cli-plugins
+  curl -fsSL -o /usr/libexec/docker/cli-plugins/docker-compose \
+    "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+  chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
 fi
+
+# Fail here rather than three steps into bootstrap, where a missing plugin reads
+# as a stack that will not start rather than a host that was built wrong. This
+# script runs once, so a silent failure at this line is permanent until somebody
+# notices.
+command -v docker >/dev/null 2>&1 || { printf 'FATAL: docker is not installed\n' >&2; exit 1; }
+docker compose version >/dev/null 2>&1 || { printf 'FATAL: the docker compose plugin is missing at /usr/libexec/docker/cli-plugins/docker-compose\n' >&2; exit 1; }
 
 # Cap the json-file logs Docker keeps per container. The default is unbounded, and
 # on a box that runs a chatty agent swarm for weeks that fills the root volume and

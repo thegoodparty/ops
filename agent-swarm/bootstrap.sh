@@ -133,6 +133,11 @@ python3 "$TMP/render.py" "$TMP/secret.json" "$STACK_DIR/.env.example" "$STACK_DI
 chmod 600 "$STACK_DIR/.env"
 
 log "Pulling images"
+# Checked before the pull rather than left to fail inside it: "compose is not a
+# docker command" arrives as an opaque one-liner in the middle of a wall of
+# image-pull output, and the cause is a host built without the plugin.
+command -v docker >/dev/null 2>&1 || die "docker is not installed on this host"
+docker compose version >/dev/null 2>&1 || die "the docker compose plugin is missing. user-data.sh installs it to /usr/libexec/docker/cli-plugins/docker-compose; run that script again on this host, then re-deploy."
 docker compose pull
 
 log "Starting the stack"
