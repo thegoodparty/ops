@@ -56,8 +56,11 @@ services:
 
     environment:
       - API_KEY=${API_KEY}
-      # Preferred alias for stored/agent auth.
-      - AGENT_SWARM_API_KEY=${AGENT_SWARM_API_KEY:-}
+      # AGENT_SWARM_API_KEY is deliberately NOT set here. agent-swarm resolves the
+      # key with `AGENT_SWARM_API_KEY ?? API_KEY ?? ""`, so passing an empty
+      # string for the first name would win the nullish check and leave the
+      # control plane with an empty key. Leaving it unset is what makes the
+      # fallback to API_KEY work.
       # Explicit rather than auto-generated beside the database. Litestream
       # replicates the database but not that file, so a restore would bring back
       # rows nobody could decrypt. Held in Secrets Manager, the key travels with
@@ -267,7 +270,6 @@ services:
       # The bridge creates incident tasks through the API, so it authenticates
       # as a control-plane client.
       - API_KEY=${API_KEY}
-      - AGENT_SWARM_API_KEY=${AGENT_SWARM_API_KEY:-}
       - AGENT_SWARM_API_URL=http://api:3013
       # Matches the Grafana webhook contact point: the secret verifies the
       # payload, the password authenticates the request.
