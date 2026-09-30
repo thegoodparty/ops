@@ -5,7 +5,7 @@
 // from it is reached through a dynamic import. Types are imported normally and
 // cost nothing at runtime.
 
-import { createInstallationToken, gitHubAppFromEnv } from "../github";
+import { createInstallationToken, gitHubAppFromEnv, tokenFromFile } from "../github";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
@@ -1977,8 +1977,9 @@ const launch = async (args: {
  * already built and committed.
  */
 const keepGitHubTokenFresh = async (): Promise<void> => {
+  const tokenFile = process.env.BUGBOSS_GITHUB_TOKEN_FILE;
   const app = gitHubAppFromEnv(process.env);
-  if (!app) {
+  if (!app && !tokenFile) {
     console.log(
       JSON.stringify({
         component: "agent",
@@ -1988,7 +1989,7 @@ const keepGitHubTokenFresh = async (): Promise<void> => {
     );
     return;
   }
-  const mint = createInstallationToken(app);
+  const mint = tokenFile ? tokenFromFile(tokenFile) : createInstallationToken(app!);
   const refresh = async () => {
     try {
       const token = await mint();
