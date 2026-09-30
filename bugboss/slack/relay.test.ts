@@ -366,6 +366,26 @@ describe("what a transition looks like in Slack", () => {
 // ---------------------------------------------------------------------------
 
 describe("threading", () => {
+  test("an origin with no url is left for the sweep to resolve, and one with a url is kept", async () => {
+    await seedIncident("inc-1");
+    await seedIncident("inc-2");
+    await relay.emit({ type: "opened", incidentId: "inc-1", title: "t", origin: { label: "original report", url: null } });
+    await relay.emit({
+      type: "opened",
+      incidentId: "inc-2",
+      title: "t",
+      origin: { label: "original alert", url: "https://goodparty.grafana.net/alerting/grafana/abc/view" },
+    });
+    const kept = (id: string) =>
+      db.get<{ originLabel: string | null; originUrl: string | null; header: string | null }>(
+        "SELECT originLabel, originUrl, header FROM incident_thread WHERE incidentId = ?",
+        [id],
+      );
+    assert.equal(kept("inc-1")?.originLabel, null, "a failed permalink is not final");
+    assert.equal(kept("inc-2")?.originUrl, "https://goodparty.grafana.net/alerting/grafana/abc/view");
+    assert.equal(kept("inc-2")?.header, slack.posts[1].text, "what was posted is what the sweep compares");
+  });
+
   test("opened starts the thread and records its ts on the incident", async () => {
     await seedIncident("inc-1");
     const ts = await relay.emit({

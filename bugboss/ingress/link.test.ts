@@ -167,3 +167,12 @@ test("a source nobody has taught this about is named, not guessed at", async () 
     url: null,
   });
 });
+
+test("strict, a failed permalink lookup throws rather than degrading to no link", async () => {
+  const signal = {
+    source: HUMAN_SOURCE,
+    labels: { [SLACK_CHANNEL_LABEL]: "C0BUGS", [SLACK_MESSAGE_TS_LABEL]: "1764000000.001900" },
+  };
+  assert.deepEqual(await signalOrigin(signal, failing), { label: "original report", url: null }, "premise");
+  await assert.rejects(signalOrigin(signal, failing, true), /ratelimited/);
+});

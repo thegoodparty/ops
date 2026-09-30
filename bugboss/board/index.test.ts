@@ -885,6 +885,67 @@ describe("thread headers", () => {
     assert.equal(asked, 1);
   });
 
+  test("a permalink lookup that fails is retried on the next tick, not kept as no link", async () => {
+    await seed("1");
+    await humanSignal("1");
+    await openThread("1", "400.0");
+    let calls = 0;
+    const run = (at: number) =>
+      sweepBoard({
+        db,
+        post: () => Promise.resolve({ ts: "x" }),
+        update: (_c, _ts, text) => {
+          edits.push(text);
+          return Promise.resolve();
+        },
+        origin: (id) => {
+          calls += 1;
+          return calls === 1 ? Promise.reject(new Error("slack: ratelimited")) : origin(id);
+        },
+        channel: CHANNEL,
+        now: () => at,
+      });
+    const edits: string[] = [];
+
+    const original = console.error;
+    const errors: string[] = [];
+    console.error = (line: unknown) => errors.push(String(line));
+    try {
+      await run(easternAt(9));
+    } finally {
+      console.error = original;
+    }
+    assert.ok(errors.some((line) => line.includes("header_origin_failed")), "premise: the first lookup failed");
+    const kept = db.get<{ originLabel: string | null }>("SELECT originLabel FROM incident_thread WHERE incidentId = '1'");
+    assert.equal(kept?.originLabel, null, "nothing was kept from the failure");
+
+    await run(easternAt(9) + 30_000);
+    assert.equal(calls, 2);
+    assert.match(edits.at(-1) ?? "", /\|original report>$/);
+  });
+
+  test("a tick that has used up its edits still resolves origins for the rows after them", async () => {
+    for (let i = 1; i <= MAX_HEADER_UPDATES_PER_TICK; i++) {
+      await seed(String(i));
+      await openThread(String(i), `${i}00.0`);
+      await db.withWrite((d) => {
+        d.prepare("UPDATE incident_thread SET originLabel = '' WHERE incidentId = ?").run(String(i));
+      });
+    }
+    const late = String(MAX_HEADER_UPDATES_PER_TICK + 1);
+    await seed(late);
+    await grafanaSignal(late);
+    await openThread(late, "900.0");
+
+    const sweep = harness(easternAt(9));
+    await sweep.sweep();
+
+    assert.equal(sweep.edits.length, MAX_HEADER_UPDATES_PER_TICK, "premise: the edits ran out first");
+    assert.ok(!sweep.edits.some((e) => e.ts === "900.0"));
+    const kept = db.get<{ originUrl: string | null }>("SELECT originUrl FROM incident_thread WHERE incidentId = ?", [late]);
+    assert.equal(kept?.originUrl, GENERATOR);
+  });
+
   /**
    * A closed incident loses the line asking for a person, since nobody is
    * needed any more, and is then never touched again.

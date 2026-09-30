@@ -1910,6 +1910,7 @@ export const createBugBoss = async (
           ? signalOrigin(
               { source: first.source, labels: JSON.parse(first.labels) as Record<string, string> },
               deadlined,
+              true,
             )
           : null;
       },

@@ -89,7 +89,10 @@ predates `incident_thread` gets a row the first time it is swept.
 **Where the header links is resolved once.** A Slack report's link is a
 `chat.getPermalink` call, so the sweep asks `origin` once per incident, keeps
 the answer in `incident_thread.originLabel` and `originUrl`, and caps those
-calls per tick the same way.
+calls per tick the same way. A lookup that fails throws (`signalOrigin`'s
+strict mode) and is retried next tick, so a rate limit never becomes a
+thread with no link for good. The edit cap is checked per row, not by
+stopping the loop, so origins keep resolving after the edits run out.
 
 **A closed incident is finalised, then left.** The sweep runs over every
 open incident with a thread and every incident with a recorded one, so an

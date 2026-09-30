@@ -59,9 +59,16 @@ export const describeOrigin = (source: string): string =>
       ? "original alert"
       : "original signal";
 
+/**
+ * `strict` lets a failed permalink lookup throw instead of degrading to no
+ * url. The header sweep keeps what this returns, so a rate limit that
+ * degraded there would leave the thread with no way back to the report for
+ * good; thrown, it is retried on the next tick.
+ */
 export const signalOrigin = async (
   signal: SignalOrigin,
   linker: OriginLinker,
+  strict = false,
 ): Promise<SignalOriginRef> => {
   const label = describeOrigin(signal.source);
 
@@ -98,7 +105,8 @@ export const signalOrigin = async (
       // announcement.
       const url = await linker.permalink(messageTs, channel);
       return { label, url: isLinkable(url) ? url.trim() : null };
-    } catch {
+    } catch (err) {
+      if (strict) throw err;
       // The caller is about to announce an incident. Losing the link loses a
       // convenience; throwing here would lose the announcement.
       return { label, url: null };

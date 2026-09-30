@@ -218,11 +218,8 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
 
   let written = 0;
   let resolved = 0;
+  let capped = false;
   for (const row of candidates) {
-    if (written >= MAX_HEADER_UPDATES_PER_TICK) {
-      log("header_sweep_capped", { cap: MAX_HEADER_UPDATES_PER_TICK });
-      break;
-    }
     if (!row.slackThreadTs) continue;
 
     let origin: SignalOriginRef | null =
@@ -261,6 +258,12 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
       continue;
     }
     if (header === row.header) continue;
+    // Checked here rather than at the top of the loop, so a tick that has
+    // used up its edits still resolves origins for the rows after them.
+    if (written >= MAX_HEADER_UPDATES_PER_TICK) {
+      capped = true;
+      continue;
+    }
 
     try {
       await deps.update(deps.channel, row.slackThreadTs, header);
@@ -283,6 +286,7 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
     });
     written += 1;
   }
+  if (capped) log("header_sweep_capped", { cap: MAX_HEADER_UPDATES_PER_TICK });
   return written;
 };
 

@@ -315,9 +315,11 @@ export class SlackRelay {
       // the opening would later have the header sweep write it over the
       // winner's -- chat.update replaces a message whole.
       if (linked === "linked") {
+        // An origin with no url may be a permalink lookup that failed, so
+        // it is left for the sweep to resolve rather than kept as final.
         await this.recordOpening(event.incidentId, parts[0], {
           header: parts[0],
-          origin: event.origin,
+          origin: event.origin && !event.origin.url ? undefined : event.origin,
         });
       }
       if (linked === "unwritable") {
