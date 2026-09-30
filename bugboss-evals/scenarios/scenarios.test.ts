@@ -69,7 +69,8 @@ for (const id of ids) {
     for (const command of scenario.ci) {
       assert.doesNotMatch(command, /check\//, "visible CI does not run the hidden check");
     }
-    assert.match(scenario.check.command, /^check\//);
+    // A variant may share another scenario's check: `../<id>/check/`.
+    assert.match(scenario.check.command, /^(\.\.\/[a-z0-9-]+\/)?check\//);
   });
 
   test(`${id}: alert.json is a firing Grafana delivery BugBoss can ingest`, () => {

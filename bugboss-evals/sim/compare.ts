@@ -1,5 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -7,7 +7,8 @@ import { join, resolve } from "node:path";
 import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
 import { renderReport, type RunResult, type Side } from "../core/report";
 import { loadScenario, SCENARIO_IDS } from "../core/scenario";
-import { runOne, type Stack } from "./run";
+import { runOne, type Milestone, type Stack } from "./run";
+import { scenarioBranch, SANDBOX_URL } from "./sandbox";
 import { startStubModel } from "./stub-model";
 
 /**
@@ -16,7 +17,13 @@ import { startStubModel } from "./stub-model";
  * `report`: one or more results.json into the table posted on the PR.
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
- *     --token-file /tmp/token --out /tmp/evals [--scenarios a,b] [--reps 3] [--stub <omni>] [--run-as user]
+ *     --token-file /tmp/token --out /tmp/evals [--scenarios a,b] [--reps 3] [--stub <omni>] [--run-as user] \
+ *     [--until root_cause|pr_opened|closed] [--offline]
+ *
+ * `--offline` needs `--stub`: no GitHub and no token, the sandbox a local
+ * bare repository with the scenario's base as one commit, each run ending at
+ * the root cause. It proves everything up to the PR at zero spend and with no
+ * credential at all, which is what a pull request's CI can hold.
  *   npx tsx bugboss-evals/sim/compare.ts report --baseline main --candidate pr out1/results.json …
  */
 
@@ -116,10 +123,47 @@ export const isolateFromKeychain = (): void => {
   });
 };
 
+const git = (args: string[], cwd?: string) =>
+  execFileSync("git", ["-c", "user.name=bugboss-evals", "-c", "user.email=evals@invalid", ...args], { cwd, encoding: "utf8", maxBuffer: 1 << 26 }).trim();
+
+/** The scenario's base as a one-commit bare repository, for `--offline`. */
+const offlineRepo = (omni: string, id: string, out: string): { repo: string; baseSha: string } => {
+  const { scenario } = loadScenario(id);
+  const snap = join(out, "offline", id, "base");
+  const repo = join(out, "offline", id, "sandbox.git");
+  if (!existsSync(repo)) {
+    git(["-C", omni, "worktree", "add", "-q", "--detach", snap, scenario.omni.baseSha]);
+    rmSync(join(snap, ".git"));
+    git(["-C", omni, "worktree", "prune"]);
+    git(["init", "-q", "-b", "main"], snap);
+    git(["add", "-A"], snap);
+    git(["commit", "-q", "-m", `${id} base`], snap);
+    git(["init", "-q", "--bare", repo]);
+    git(["push", "-q", repo, "HEAD:refs/heads/main"], snap);
+  }
+  return { repo, baseSha: git(["rev-parse", "HEAD"], snap) };
+};
+
+/**
+ * One npm cache for every run, warmed with each scenario's lockfile, so the
+ * agents' installs and the hidden checks' read tarballs from disk instead of
+ * the registry. Each run's HOME links `.npm` to it.
+ */
+const warmNpmCache = async (cache: string, dir: string): Promise<void> => {
+  await new Promise<void>((resolve) =>
+    execFile("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", cache], { cwd: dir, maxBuffer: 1 << 26 }, (error) => {
+      if (error) log("npm_cache_warm_failed", { dir, error: error.message.slice(0, 500) });
+      resolve();
+    }),
+  );
+  rmSync(join(dir, "node_modules"), { recursive: true, force: true });
+};
+
 const run = async (argv: string[]): Promise<void> => {
   isolateFromKeychain();
   const out = resolve(flag(argv, "out") ?? "bugboss-evals-out");
-  const tokenFile = resolve(flag(argv, "token-file") ?? "");
+  const offline = argv.includes("--offline");
+  const tokenFile = offline ? join(out, "no-token") : resolve(flag(argv, "token-file") ?? "");
   const baselineRef = flag(argv, "baseline") ?? "origin/main";
   const candidateRef = flag(argv, "candidate") ?? "HEAD";
   const scenarios = flag(argv, "scenarios")?.split(",") ?? SCENARIO_IDS;
@@ -127,13 +171,36 @@ const run = async (argv: string[]): Promise<void> => {
   const stubOmni = flag(argv, "stub");
   const runAs = flag(argv, "run-as");
   const sides = (flag(argv, "sides")?.split(",") ?? ["baseline", "candidate"]) as Side[];
-  if (!existsSync(tokenFile)) throw new Error("--token-file must name the file the trusted minter keeps fresh");
+  const until = flag(argv, "until") as Milestone | undefined;
+  if (offline && !stubOmni) throw new Error("--offline runs only against the stub: pass --stub <omni>");
+  if (!offline && !existsSync(tokenFile)) throw new Error("--token-file must name the file the trusted minter keeps fresh");
   mkdirSync(out, { recursive: true });
+  const offlineRepos = offline ? Object.fromEntries(scenarios.map((id) => [id, offlineRepo(stubOmni!, id, out)])) : {};
+  if (offline) writeFileSync(tokenFile, "offline\n");
+
+  const npmCache = join(out, "npm-cache");
+  mkdirSync(npmCache, { recursive: true });
+  const warming = Promise.all(
+    [...new Set(scenarios.map((id) => loadScenario(id).scenario.omni.baseSha))].map(async (sha) => {
+      const id = scenarios.find((s) => loadScenario(s).scenario.omni.baseSha === sha)!;
+      if (offline) return warmNpmCache(npmCache, join(out, "offline", id, "base"));
+      const dir = join(out, "warm", id);
+      const token = readFileSync(tokenFile, "utf8").trim();
+      const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+      await new Promise<void>((resolve) =>
+        execFile("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--depth", "1", "--branch", scenarioBranch(id), SANDBOX_URL, dir], () => resolve()),
+      );
+      if (existsSync(join(dir, "package-lock.json"))) await warmNpmCache(npmCache, dir);
+      rmSync(dir, { recursive: true, force: true });
+    }),
+  );
 
   const builds = {
     baseline: buildRef(baselineRef, out),
     candidate: buildRef(candidateRef, out),
   };
+  await warming;
+  execFileSync("chmod", ["-R", "a+rwX", npmCache]);
   const stack = await startStack();
   const awsCredentialsUrl = await startCredentials(Boolean(stubOmni));
   const stamp = Date.now().toString(36);
@@ -162,6 +229,9 @@ const run = async (argv: string[]): Promise<void> => {
             stack,
             tokenFile,
             awsCredentialsUrl,
+            npmCache,
+            ...(offline ? { offline: offlineRepos[scenarioId] } : {}),
+            ...(until ? { until } : {}),
             ...(stub ? { stubModelUrl: stub.url } : {}),
             ...(runAs ? { runAs } : {}),
             seed: rep,
@@ -177,7 +247,11 @@ const run = async (argv: string[]): Promise<void> => {
 
   if (stubOmni) {
     const judgeStub = await startStubModel("/dev/null");
-    process.env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME = judgeStub.url;
+    Object.assign(process.env, {
+      AWS_ENDPOINT_URL_BEDROCK_RUNTIME: judgeStub.url,
+      AWS_ACCESS_KEY_ID: "AKIAEVALFAKE",
+      AWS_SECRET_ACCESS_KEY: "fake",
+    });
   }
   const model = createBedrockJudgeModel({ region: "us-west-2" });
   const verdicts: CaseVerdict[] = [];

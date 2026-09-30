@@ -31,9 +31,11 @@ export interface RunResult {
   rep: number;
   side: Side;
   ref: string;
-  /** How the run ended: `closed`, `wall_clock`, or `error: …`. */
+  /** How the run ended: `closed`, `root_cause`, `pr_opened`, `wall_clock`, or `error: …`. */
   end: string;
   gates: Gates;
+  /** The scenario's own gates (core/gates.ts), by id. */
+  scenarioGates: Record<string, boolean>;
   spend: Spend;
   /** From the alert to the close. Null when it never closed. */
   wallClockSeconds: number | null;
@@ -137,6 +139,17 @@ export const renderReport = (args: {
     return `| ${side} | ${tokens(s.input)} | ${tokens(s.output)} | ${tokens(s.cacheRead)} | ${tokens(s.cacheWrite)} | ${s.turns} | ${usd(s.usd)} |`;
   });
 
+  const scenarioGateRows = scenarios.flatMap((scenario) => {
+    const ids = [...new Set(args.runs.filter((r) => r.scenario === scenario).flatMap((r) => Object.keys(r.scenarioGates ?? {})))];
+    return ids.map((id) => {
+      const cell = (side: Side) => {
+        const runs = pick(scenario, side);
+        return `${runs.filter((r) => r.scenarioGates?.[id] === true).length}/${runs.length}`;
+      };
+      return `| ${scenario} | ${id} | ${cell("baseline")} | ${cell("candidate")} |`;
+    });
+  });
+
   const failures = args.runs.filter((r) => !gatesPass(r.gates));
   const excluded = args.verdicts.filter((v) => v.excluded !== null);
   const unpriced = [...new Set(args.runs.flatMap((r) => r.spend.unpriced))];
@@ -144,7 +157,7 @@ export const renderReport = (args: {
   return [
     "## BugBoss eval (advisory)",
     "",
-    `Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, mean cost per run, and mean time from alert to close. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
+    `Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, mean estimated cost per run (priced from tokens), and mean time from alert to close. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
     "",
     "| Scenario | Baseline gates | cost | wall | Candidate gates | cost | wall | Quality W-L-T |",
     "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -161,7 +174,10 @@ export const renderReport = (args: {
     `| --- |${" --- |".repeat(Object.keys(GATE_NAMES).length)}`,
     ...gateTable,
     "",
-    "| Side | Input | Output | Cache read | Cache write | Turns | Cost |",
+    ...(scenarioGateRows.length
+      ? ["| Scenario | Scenario gate | Baseline | Candidate |", "| --- | --- | --- | --- |", ...scenarioGateRows, ""]
+      : []),
+    "| Side | Input | Output | Cache read | Cache write | Turns | Cost (est.) |",
     "| --- | --- | --- | --- | --- | --- | --- |",
     ...spendTable,
     "",

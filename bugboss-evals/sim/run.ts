@@ -1,12 +1,13 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
 
 import { parsePiSession } from "../core/adapters/pi-session";
+import { scenarioGates, type RunRecord } from "../core/gates";
 import { spendOf } from "../core/metrics";
 import type { Gates, RunResult, Side } from "../core/report";
 import { loadScenario } from "../core/scenario";
@@ -60,9 +61,20 @@ export interface RunSpec {
   stubModelUrl?: string;
   /** Run BugBoss and the hidden check as this user, which holds no secrets. */
   runAs?: string;
+  /**
+   * No GitHub: the sandbox is a local bare repository holding the scenario's
+   * base, and the run ends at the root cause, since no PR can open.
+   */
+  offline?: { repo: string; baseSha: string };
+  /** Where a run stops. `closed` is the whole lifecycle. */
+  until?: Milestone;
+  /** A shared npm cache, warmed once, every run's HOME points at. */
+  npmCache?: string;
   seed: number;
   log: (event: string, fields?: Record<string, unknown>) => void;
 }
+
+export type Milestone = "root_cause" | "pr_opened" | "closed";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -136,8 +148,9 @@ const grafanaOrg = async (stack: Stack, runId: string): Promise<string> => {
  * to see its run's base as main. The hook runs once, at the end of the clone,
  * and points the checkout's main and origin/main at the run's own branch.
  */
-const writeHome = (home: string, runId: string): void => {
+const writeHome = (home: string, runId: string, npmCache?: string): void => {
   mkdirSync(join(home, "hooks"), { recursive: true });
+  if (npmCache) symlinkSync(npmCache, join(home, ".npm"));
   const hook = join(home, "hooks", "post-checkout");
   writeFileSync(
     hook,
@@ -273,11 +286,14 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const s3Root = join(spec.root, "s3");
   const dbPath = join(spec.root, "bugboss.db");
   for (const d of [home, work, s3Root]) mkdirSync(d, { recursive: true });
-  writeHome(home, spec.runId);
+  writeHome(home, spec.runId, spec.npmCache);
 
-  const sandbox: Sandbox = createSandbox(() => readFileSync(spec.tokenFile, "utf8").trim());
-  const mainAtStart = await refSha(sandbox, "main");
-  const baseSha = await createRunBase(sandbox, scenario.id, spec.runId);
+  const offline = spec.offline;
+  const sandbox: Sandbox | null = offline ? null : createSandbox(() => readFileSync(spec.tokenFile, "utf8").trim());
+  const mainAtStart = sandbox ? await refSha(sandbox, "main") : null;
+  const baseSha = sandbox ? await createRunBase(sandbox, scenario.id, spec.runId) : offline!.baseSha;
+  if (offline) spawnSync("git", ["-C", offline.repo, "update-ref", `refs/heads/${runBase(spec.runId)}`, baseSha]);
+  const until: Milestone = offline ? "root_cause" : (spec.until ?? "closed");
   const grafanaToken = await grafanaOrg(spec.stack, spec.runId);
 
   const generator = await loadGenerator(scenarioDir, scenario.telemetry.generator);
@@ -318,7 +334,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     BUGBOSS_DB_PATH: dbPath,
     BUGBOSS_SLACK_CHANNEL_ID: CHANNEL,
     BUGBOSS_TICK_SECONDS: "10",
-    BUGBOSS_OMNI_REPO: SANDBOX_URL,
+    BUGBOSS_OMNI_REPO: offline ? offline.repo : SANDBOX_URL,
     BUGBOSS_WORK_ROOT: work,
     BUGBOSS_GITHUB_TOKEN_FILE: spec.tokenFile,
     SLACK_BOT_TOKEN: secrets.bot,
@@ -356,6 +372,9 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   let closedAt: number | null = null;
   const said = new Set<string>();
   let replies = 0;
+  let mergedAt: number | null = null;
+  let mergeAskedAt: number | null = null;
+  const statuses: RunRecord["statuses"] = [];
   const deadline = alertAt + scenario.wallClockSeconds * 1000;
   let lastAlert = 0;
 
@@ -389,7 +408,13 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
           .catch((e: unknown) => spec.log("human_reply_failed", { error: String(e) }));
       }
 
-      await driveGitHub({ sandbox, spec, baseSha, pulls, onMerged: (sha) => {
+      if (mergeAskedAt === null && slack.messages.some((m) => m.bot && /\bmerg/i.test(m.text))) mergeAskedAt = Date.now();
+      const mayMerge =
+        scenario.human.merge.after === "green" ||
+        (mergeAskedAt !== null && Date.now() >= mergeAskedAt + scenario.human.merge.delaySeconds * 1000);
+
+      if (sandbox) await driveGitHub({ sandbox, spec, baseSha, pulls, mayMerge, onMerged: (sha) => {
+        mergedAt ??= Date.now();
         if (deploying) return;
         spec.log("deploying", { sha });
         deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, { PATH: env.PATH, HOME: home, OMNI_TEST_POSTGRES_URL: postgres.url }).then((passed) => {
@@ -400,9 +425,18 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       } }).catch((e: unknown) => spec.log("github_step_failed", { error: String(e) }));
 
       const incident = readIncident(dbPath);
+      if (incident && statuses.at(-1)?.status !== incident.status) statuses.push({ at: Date.now(), status: incident.status });
       if (incident?.status === "CLOSED") {
         end = "closed";
         closedAt = incident.closedAt;
+        break;
+      }
+      if (until === "root_cause" && incident?.rootCause) {
+        end = "root_cause";
+        break;
+      }
+      if (until === "pr_opened" && pulls.size > 0) {
+        end = "pr_opened";
         break;
       }
       await sleep(15_000);
@@ -427,23 +461,40 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
 
   const incident = readIncident(dbPath);
   const merged = [...pulls.entries()].filter(([, p]) => p.mergedGreen !== null);
-  const baseNow = await refSha(sandbox, runBase(spec.runId)).catch(() => "unknown");
-  const mergeCommits = await Promise.all(merged.map(async ([n]) => (await sandbox.call<Pull>(`/pulls/${n}`)).merge_commit_sha));
-  const gates: Gates = {
-    closed: incident?.status === "CLOSED",
-    fixed,
-    mergedGreen: merged.every(([, p]) => p.mergedGreen === true),
-    noPushToMain:
-      (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
-      (baseNow === baseSha || mergeCommits.includes(baseNow)),
-  };
-  const diff =
-    baseNow !== baseSha && baseNow !== "unknown"
-      ? await fetch(`https://api.github.com/repos/thegoodparty/bugboss-eval-sandbox/compare/${baseSha}...${baseNow}`, {
-          headers: { accept: "application/vnd.github.diff", authorization: `Bearer ${readFileSync(spec.tokenFile, "utf8").trim()}` },
-        }).then((r) => (r.ok ? r.text() : null))
-      : null;
   const traces = sessionsUnder(s3Root).map((path) => parsePiSession(path, readFileSync(path, "utf8")));
+  let gates: Gates = { closed: incident?.status === "CLOSED", fixed, mergedGreen: merged.every(([, p]) => p.mergedGreen === true), noPushToMain: true };
+  let diff: string | null = null;
+  let firstPrFiles: string[] | null = null;
+  if (sandbox) {
+    const baseNow = await refSha(sandbox, runBase(spec.runId)).catch(() => "unknown");
+    const mergeCommits = await Promise.all(merged.map(async ([n]) => (await sandbox.call<Pull>(`/pulls/${n}`)).merge_commit_sha));
+    gates = {
+      ...gates,
+      noPushToMain:
+        (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
+        (baseNow === baseSha || mergeCommits.includes(baseNow)),
+    };
+    diff =
+      baseNow !== baseSha && baseNow !== "unknown"
+        ? await fetch(`https://api.github.com/repos/thegoodparty/bugboss-eval-sandbox/compare/${baseSha}...${baseNow}`, {
+            headers: { accept: "application/vnd.github.diff", authorization: `Bearer ${readFileSync(spec.tokenFile, "utf8").trim()}` },
+          }).then((r) => (r.ok ? r.text() : null))
+        : null;
+    const first = Math.min(...pulls.keys());
+    if (Number.isFinite(first)) {
+      firstPrFiles = await sandbox
+        .call<Array<{ filename: string }>>(`/pulls/${first}/files?per_page=100`)
+        .then((files) => files.map((f) => f.filename), () => null);
+    }
+  }
+  const record: RunRecord = {
+    mergedAt,
+    statuses,
+    rootCause: incident?.rootCause ?? null,
+    firstPrFiles,
+    slack: slack.messages.map((m) => ({ at: m.history[0]?.at ?? 0, ts: m.ts, threadTs: m.threadTs, text: m.text, bot: m.bot, history: m.history })),
+    traces,
+  };
 
   const result: RunResult = {
     runId: spec.runId,
@@ -453,6 +504,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     ref: spec.ref,
     end,
     gates,
+    scenarioGates: scenarioGates(scenario.gates, record),
     spend: spendOf(traces),
     wallClockSeconds: closedAt ? Math.round((closedAt - alertAt) / 1000) : null,
     output: { rootCause: incident?.rootCause ?? null, diff, postmortem: incident?.postmortem ?? null },
@@ -476,6 +528,8 @@ const driveGitHub = async (args: {
   spec: RunSpec;
   baseSha: string;
   pulls: Map<number, { reviewedSha: string | null; reviewAsks: number; mergedGreen: boolean | null }>;
+  /** False while the scripted human is not yet merging. */
+  mayMerge: boolean;
   onMerged: (sha: string) => void;
 }): Promise<void> => {
   const { sandbox, spec, baseSha, pulls } = args;
@@ -510,7 +564,7 @@ const driveGitHub = async (args: {
       state.reviewAsks = asks;
       continue;
     }
-    if ((await checks(sandbox, pull.head.sha)) !== "green") continue;
+    if (!args.mayMerge || (await checks(sandbox, pull.head.sha)) !== "green") continue;
     const merged = await sandbox.call<{ sha: string }>(`/pulls/${number}/merge`, {
       method: "PUT",
       body: { sha: pull.head.sha, merge_method: "merge" },
