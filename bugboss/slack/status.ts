@@ -11,12 +11,17 @@
 // Two scales, one set of facts:
 //
 //   the card          `incident_status`, one incident, several lines.
-//   the status line   one incident on one line: the board on request, the
-//                     morning board and each thread's header.
+//   the status line   one incident on one line: the board on request and
+//                     the morning board.
 //
 // They share `waitingOn` and `lifecycleWord`, so the card and the board
 // cannot disagree about where an incident is or what it needs.
+//
+// The thread header is a third, smaller shape: the number, the title, the
+// signal that opened it, and a line only when a person is needed. It reads
+// the same facts through `neededFromHuman`.
 
+import type { SignalOriginRef } from "../ingress/link";
 import type { IncidentStatus } from "../types";
 import { link, mrkdwn, raw } from "./format";
 
@@ -69,6 +74,12 @@ export interface StatusFacts {
    */
   liftsOnReply: number | null;
   waitStartedAt: number | null;
+  /**
+   * `incident_wait.wakeAt`. Null is a wait only a person ends: the agent
+   * parked with no deadline. Set, it is a cooldown the dispatcher or the
+   * agent chose, which needs nobody.
+   */
+  waitWakeAt: number | null;
   /** `pending_question`: the agent is blocked on a question to the Boss. */
   questionAskedAt: number | null;
   questionText: string | null;
@@ -98,6 +109,7 @@ export const STATUS_FACTS_SQL = `SELECT i.id AS incidentId,
             w.waitingFor AS waitingFor,
             w.liftsOnReply AS liftsOnReply,
             w.startedAt AS waitStartedAt,
+            w.wakeAt AS waitWakeAt,
             q.askedAt AS questionAskedAt,
             q.message AS questionText,
             p.waitingFor AS monitorWaitingFor,
@@ -155,14 +167,22 @@ export const lifecycleWord = (facts: StatusFacts): string =>
   isParked(facts) ? `${facts.status}, PARKED` : facts.status;
 
 /**
- * Every state in order with the current one in bold caps, so where an
- * incident is and what is left are read off one line.
+ * Every state in order with the current one in bold, so where an incident is
+ * and what is left are read off one line. A merged incident has left the
+ * lifecycle, so it names the survivor instead. The card and the thread
+ * header both render this, so they cannot disagree.
  */
+export const lifecycleSteps = (facts: Pick<StatusFacts, "status" | "mergedInto">): string =>
+  facts.status === "MERGED"
+    ? mrkdwn`*Merged* into incident ${facts.mergedInto ?? "unknown"}`
+    : LIFECYCLE.map((s) => (s === facts.status ? `*${TITLE_CASE[s]}*` : TITLE_CASE[s])).join(" → ");
+
+/** The card's lifecycle line: the steps, and what they leave out. */
 export const lifecycleLine = (facts: StatusFacts): string => {
   if (facts.status === "MERGED") {
-    return mrkdwn`*MERGED* into incident ${facts.mergedInto ?? "unknown"}, which carries on from here · ${raw(LIFECYCLE.map((s) => TITLE_CASE[s]).join(" → "))} ended with it`;
+    return mrkdwn`${raw(lifecycleSteps(facts))}, which carries on from here · ${raw(LIFECYCLE.map((s) => TITLE_CASE[s]).join(" → "))} ended with it`;
   }
-  const steps = LIFECYCLE.map((s) => (s === facts.status ? `*${s}*` : TITLE_CASE[s])).join(" → ");
+  const steps = lifecycleSteps(facts);
   return isParked(facts)
     ? `${steps} · *PARKED*: the agent's turn budget is spent, so a message will not wake it`
     : steps;
@@ -219,14 +239,93 @@ export const renderStatusLine = (facts: StatusFacts): string =>
   mrkdwn`• *Incident ${facts.incidentId}* · ${lifecycleWord(facts)} · ${titleOf(facts)} · waiting on ${raw(waitingOn(facts, null))}`;
 
 /**
- * The header above an incident thread's opening message. Two lines, so it
- * stays a header, and the same words as the board line.
+ * Who a wait label names as the one to act, which the header already says.
+ * `monitor` asks for labels like "someone to merge omni#2189", so the header
+ * reads "Needs a human to merge omni#2189" rather than "to someone to".
  */
-export const renderStatusHeader = (facts: StatusFacts): string =>
+const ACTOR = /^(?:someone|somebody|a person|a human|a reviewer|an engineer)\s+to\s+/i;
+
+/**
+ * What a person has to do for this incident to move, or null when nobody is
+ * needed. Only open incidents need anyone.
+ *
+ * One answer even when several apply, because the header gives it one line:
+ * a spent budget first, since nothing else moves until a person decides;
+ * then a wait on a person the agent is sitting in; then a park only a person
+ * lifts; then the agent's question, once the Boss has read it and it is
+ * still unanswered, which means it is with a person.
+ *
+ * Returns the whole sentence, "Needs a human to ...". A label that does not
+ * start with somebody to act is not rewritten into one, so it follows a
+ * colon instead of "to".
+ */
+export const neededFromHuman = (facts: StatusFacts): string | null => {
+  if (!OPEN_STATUSES.includes(facts.status)) return null;
+  if (isParked(facts)) return "Needs a human to decide what happens next";
+  const task = (label: string): string => {
+    const line = oneLine(label);
+    return ACTOR.test(line)
+      ? `Needs a human to ${line.replace(ACTOR, "")}`
+      : `Needs a human: ${line}`;
+  };
+  if (facts.monitorStartedAt !== null) {
+    return facts.monitorWaitingFor === null
+      ? "Needs a human to do what the agent asked in this thread"
+      : task(facts.monitorWaitingFor);
+  }
+  if (facts.waitingFor !== null && facts.waitWakeAt === null) return task(facts.waitingFor);
+  if (facts.questionAskedAt !== null && facts.unreadQuestions === 0) {
+    return "Needs a human to answer the agent's question";
+  }
+  return null;
+};
+
+/** What the header needs that `StatusFacts` does not carry. */
+export interface ThreadHeader {
+  incidentId: string;
+  title: string;
+  /** `lifecycleSteps`, rendered. */
+  lifecycle: string;
+  /** The signal that opened the incident; null when it had none. */
+  origin: SignalOriginRef | null;
+  /** From `neededFromHuman`, or null for no line at all. */
+  needed: string | null;
+}
+
+/**
+ * The whole top-level message of an incident thread. Three lines, four
+ * while a person is needed:
+ *
+ *   *Incident 92* · <title>
+ *   *Status*: Investigating → *Fixing* → Resolved → Closed
+ *   <the signal's own link|original alert>
+ *   *Needs a human to merge omni#2240*
+ *
+ * Nothing else. The link is a bare label: nothing about the alert goes here,
+ * not its body, rule, endpoint or count, because that is the signal's data
+ * and not the incident's. The agent reads the signal and people click
+ * through to it. A signal with no link gets no line.
+ */
+export const renderThreadHeader = (h: ThreadHeader): string =>
   [
-    mrkdwn`*Incident ${facts.incidentId} · ${lifecycleWord(facts)}* · ${titleOf(facts)}`,
-    mrkdwn`_Waiting on ${raw(waitingOn(facts, null))}_`,
+    mrkdwn`*Incident ${h.incidentId}* · ${oneLine(h.title)}`,
+    `*Status*: ${h.lifecycle}`,
+    ...(h.origin?.url ? [link(h.origin.url, h.origin.label)] : []),
+    ...(h.needed === null ? [] : [mrkdwn`*${h.needed}*`]),
   ].join("\n");
+
+/** The header for an incident as the database has it. */
+export const renderStatusHeader = (
+  facts: StatusFacts,
+  origin: SignalOriginRef | null,
+): string =>
+  renderThreadHeader({
+    incidentId: facts.incidentId,
+    title: titleOf(facts),
+    lifecycle: lifecycleSteps(facts),
+    origin,
+    needed: neededFromHuman(facts),
+  });
 
 /** A pull request as `<url|owner/repo#7>`, since the number is what a reader wants. */
 const prLink = (url: string): string => {

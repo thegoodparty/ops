@@ -4,6 +4,7 @@ import { describe, test } from "node:test";
 import { toMrkdwn } from "./format";
 import {
   forModelToPaste,
+  neededFromHuman,
   renderStatusCard,
   renderStatusHeader,
   renderStatusLine,
@@ -23,6 +24,7 @@ const facts = (over: Partial<StatusFacts> = {}): StatusFacts => ({
   waitingFor: null,
   liftsOnReply: null,
   waitStartedAt: null,
+  waitWakeAt: null,
   questionAskedAt: null,
   questionText: null,
   monitorWaitingFor: null,
@@ -67,7 +69,7 @@ describe("the card, one per lifecycle state", () => {
       ),
       [
         "*Incident 85* · CallHub rate-limit rejection dropped a paid robocall run",
-        "*INVESTIGATING* → Fixing → Resolved → Closed",
+        "*Investigating* → Fixing → Resolved → Closed",
         "*Now:* It is reading CallHub's error logs to find when the rejections started.",
         "*Waiting on:* nobody",
         "*Impact:* not measured yet",
@@ -82,7 +84,7 @@ describe("the card, one per lifecycle state", () => {
       renderStatusCard(view({ facts: facts(merge) })),
       [
         "*Incident 85* · CallHub rate-limit rejection dropped a paid robocall run",
-        "Investigating → *FIXING* → Resolved → Closed",
+        "Investigating → *Fixing* → Resolved → Closed",
         "*Now:* Its fix is approved and green, and it is waiting for somebody to merge it.",
         "*Waiting on:* someone to merge thegoodparty/omni#2234 (since 12 min ago)",
         "*Impact:* 1 user affected",
@@ -103,7 +105,7 @@ describe("the card, one per lifecycle state", () => {
       ),
       [
         "*Incident 85* · CallHub rate-limit rejection dropped a paid robocall run",
-        "Investigating → Fixing → *RESOLVED* → Closed",
+        "Investigating → Fixing → *Resolved* → Closed",
         "*Now:* It is writing the post-mortem after two clean robocall runs.",
         "*Waiting on:* nobody; the agent is writing the post-mortem",
         "*Impact:* 1 user affected",
@@ -124,7 +126,7 @@ describe("the card, one per lifecycle state", () => {
       ),
       [
         "*Incident 85* · CallHub rate-limit rejection dropped a paid robocall run",
-        "Investigating → Fixing → Resolved → *CLOSED*",
+        "Investigating → Fixing → Resolved → *Closed*",
         "*Now:* It finished the post-mortem and ended its run.",
         "*Waiting on:* nobody; this incident is over",
         "*Impact:* 1 user affected",
@@ -146,7 +148,7 @@ describe("the card, one per lifecycle state", () => {
       ),
       [
         "*Incident 85* · CallHub rate-limit rejection dropped a paid robocall run",
-        "*MERGED* into incident 79, which carries on from here · Investigating → Fixing → Resolved → Closed ended with it",
+        "*Merged* into incident 79, which carries on from here · Investigating → Fixing → Resolved → Closed ended with it",
         "*Now:* It stopped when this incident was merged.",
         "*Waiting on:* nobody; it was merged into incident 79",
         "*Impact:* 0 users affected",
@@ -167,7 +169,7 @@ describe("the card, one per lifecycle state", () => {
       renderStatusCard(view({ facts: parked, now: "summary unavailable", prUrls: [] })),
       [
         "*Incident 85* · CallHub rate-limit rejection dropped a paid robocall run",
-        "*INVESTIGATING* → Fixing → Resolved → Closed · *PARKED*: the agent's turn budget is spent, so a message will not wake it",
+        "*Investigating* → Fixing → Resolved → Closed · *PARKED*: the agent's turn budget is spent, so a message will not wake it",
         "*Now:* summary unavailable",
         "*Waiting on:* a person to decide what happens next; the turn budget is spent (since 2 h ago)",
         "*Impact:* 1 user affected",
@@ -198,7 +200,7 @@ describe("the card, one per lifecycle state", () => {
       const done = facts({ ...leftover, status, mergedInto: status === "MERGED" ? "79" : null });
       assert.doesNotMatch(renderStatusCard(view({ facts: done })), /PARKED/);
       assert.doesNotMatch(renderStatusLine(done), /PARKED/);
-      assert.doesNotMatch(renderStatusHeader(done), /PARKED/);
+      assert.doesNotMatch(renderStatusHeader(done, null), /Needs a human/);
     }
   });
 
@@ -295,7 +297,7 @@ describe("the one-line form", () => {
    */
   test("carries no clock, so a header does not change while nothing happens", () => {
     const waiting = facts({ ...merge, questionAskedAt: AT - MIN, questionText: "q?" });
-    for (const text of [renderStatusLine(waiting), renderStatusHeader(waiting)]) {
+    for (const text of [renderStatusLine(waiting), renderStatusHeader(waiting, null)]) {
       assert.doesNotMatch(text, /ago/);
     }
   });
@@ -304,7 +306,7 @@ describe("the one-line form", () => {
     const one = facts(merge);
     const card = renderStatusCard(view({ facts: one }));
     const line = renderStatusLine(one);
-    assert.ok(card.includes("*FIXING*") && line.includes("· FIXING ·"));
+    assert.ok(card.includes("*Fixing*") && line.includes("· FIXING ·"));
     assert.ok(card.includes("someone to merge thegoodparty/omni#2234") && line.includes("someone to merge thegoodparty/omni#2234"));
   });
 });
@@ -322,5 +324,35 @@ describe("pasting", () => {
     );
     assert.match(card, /&lt;redis&gt; &amp; friends/, "premise: the rendered card is escaped");
     assert.equal(toMrkdwn(forModelToPaste(card)), card);
+  });
+});
+
+describe("what the header asks of a person", () => {
+  test("nothing waiting on a person is no line at all, not \"nobody\"", () => {
+    assert.equal(neededFromHuman(facts()), null);
+    assert.doesNotMatch(renderStatusHeader(facts(), null), /Needs a human|nobody/);
+  });
+
+  test("a park only a person lifts asks for them; a timed cooldown does not", () => {
+    const park = { waitingFor: "someone to flip the flag in Amplitude", liftsOnReply: 1, waitStartedAt: AT };
+    assert.equal(neededFromHuman(facts(park)), "Needs a human to flip the flag in Amplitude");
+    assert.equal(neededFromHuman(facts({ ...park, waitWakeAt: AT + 60 * MIN })), null);
+  });
+
+  test("the agent's question needs a person once the Boss has read it and not answered", () => {
+    const asked = { questionAskedAt: AT, questionText: "Which org is this?" };
+    assert.equal(neededFromHuman(facts({ ...asked, unreadQuestions: 1 })), null, "still with the Boss");
+    assert.equal(neededFromHuman(facts(asked)), "Needs a human to answer the agent's question");
+  });
+
+  test("a label that names nobody to act follows a colon rather than being bent into a verb", () => {
+    assert.equal(
+      neededFromHuman(facts({ monitorWaitingFor: "the fix PR to be reviewed and merged", monitorStartedAt: AT })),
+      "Needs a human: the fix PR to be reviewed and merged",
+    );
+  });
+
+  test("a closed incident needs nobody, whatever wait row is left", () => {
+    assert.equal(neededFromHuman(facts({ status: "CLOSED", monitorWaitingFor: "someone to merge", monitorStartedAt: AT })), null);
   });
 });

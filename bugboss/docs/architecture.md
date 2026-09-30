@@ -438,9 +438,10 @@ place `alarm` and `log` are defined.
 ## The status board
 
 Three fields — where the work is, what the incident is, and what is needed
-from a person — rendered once and shown at three scales: a header on each
-incident thread, a board somebody can ask for, and a board posted at 07:00
-Eastern on a morning when something is open. A fourth message, one-off, says
+from a person — rendered once and shown at three scales: a header that is
+each incident thread's whole top-level message, a board somebody can ask
+for, and a board posted at 07:00 Eastern on a morning when something is
+open. A fourth message, one-off, says
 the board is clear when the last open incident closes and stays closed.
 
 The fields are derived, not invented. "What is needed" is

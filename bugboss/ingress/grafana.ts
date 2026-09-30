@@ -373,7 +373,6 @@ const renderBody = (
     text(alert.generatorURL) ? `alert: ${alert.generatorURL}` : null,
     text(alert.dashboardURL) ? `dashboard: ${alert.dashboardURL}` : null,
     text(alert.panelURL) ? `panel: ${alert.panelURL}` : null,
-    text(alert.silenceURL) ? `silence: ${alert.silenceURL}` : null,
     text(root.externalURL) ? `grafana: ${root.externalURL}` : null,
     Number.isFinite(truncated) && truncated > 0
       ? `NOTE: Grafana truncated ${truncated} further alert(s) from this delivery`
@@ -545,7 +544,6 @@ export const createGrafanaAdapter = (
         group_key: groupKey,
         external_url: externalURL,
         generator_url: text(alert.generatorURL),
-        silence_url: text(alert.silenceURL),
         dashboard_url: text(alert.dashboardURL),
         panel_url: text(alert.panelURL),
         starts_at: text(alert.startsAt),

@@ -31,11 +31,13 @@ parts is a guess that looks like a fact, and it breaks silently the day
 either moves — so a Grafana alert that arrived without a `generatorURL` gets
 no link and says so by having none.
 
-`signalOrigin` always names the source (`a Grafana alert`, `a Slack report`)
-and may or may not have a url. "1 signal" on its own told a reader nothing
-about what they were looking at, the label costs nothing, and a permalink
-Slack refuses then loses the link rather than the sentence. The relay's
-`opened` message is the caller.
+`signalOrigin` gives a url, or null, and the link text: `original alert` or
+`original report`, never anything about the alert itself. A url with no path
+is the Grafana root, not the alert, and counts as none. The thread header is
+the only caller, and a signal with no url gets no link line there.
+
+A silence link is dropped at ingress: it is neither in a signal's body nor on
+its labels, so nothing downstream can offer one.
 
 ## Ingress does not read what a message says
 

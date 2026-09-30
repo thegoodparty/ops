@@ -29,6 +29,19 @@ const failing: OriginLinker = {
   permalink: () => Promise.reject(new Error("ratelimited")),
 };
 
+test("a Grafana alert never links to the Grafana root or a silence", async () => {
+  const labels = {
+    [`${META_PREFIX}generator_url`]: "https://goodparty.grafana.net/",
+    [`${META_PREFIX}silence_url`]: "https://goodparty.grafana.net/alerting/silence/new?alertmanager=grafana",
+    [`${META_PREFIX}external_url`]: "https://goodparty.grafana.net",
+  };
+  // The premise: an older signal still carries a silence link on its labels.
+  assert.ok(labels[`${META_PREFIX}silence_url`].includes("silence"));
+
+  const origin = await signalOrigin({ source: GRAFANA_SOURCE, labels }, failing);
+  assert.deepEqual(origin, { label: "original alert", url: null });
+});
+
 test("a Grafana alert links to the rule that fired", async () => {
   // Not `sourceId`. That is the Alertmanager fingerprint, which addresses
   // nothing -- the link is `generatorURL`, which Grafana sends beside it.
@@ -43,7 +56,7 @@ test("a Grafana alert links to the rule that fired", async () => {
   );
 
   assert.deepEqual(origin, {
-    label: "a Grafana alert",
+    label: "original alert",
     url: "https://goodparty.grafana.net/alerting/grafana/abc/view",
   });
 });
@@ -75,7 +88,7 @@ test("a generator_url Slack would refuse degrades to the label", async () => {
     );
     assert.deepEqual(
       origin,
-      { label: "a Grafana alert", url: null },
+      { label: "original alert", url: null },
       `${JSON.stringify(hostile)} should degrade, not travel`,
     );
   }
@@ -90,7 +103,7 @@ test("a Grafana alert that arrived without one says so by having no url", async 
     failing,
   );
 
-  assert.deepEqual(origin, { label: "a Grafana alert", url: null });
+  assert.deepEqual(origin, { label: "original alert", url: null });
 });
 
 test("a Slack report links to the message, resolved against its own channel", async () => {
@@ -106,7 +119,7 @@ test("a Slack report links to the message, resolved against its own channel", as
     slack.port,
   );
 
-  assert.equal(origin.label, "a Slack report");
+  assert.equal(origin.label, "original report");
   assert.equal(origin.url, "https://goodparty.slack.com/archives/C0D/p1700000000");
   // The channel matters: a report can arrive anywhere the bot is, and
   // chat.getPermalink needs the one the message is actually in.
@@ -127,7 +140,7 @@ test("a permalink Slack answers with but Slack would not render also degrades", 
     linker("slack://channel?id=C0D").port,
   );
 
-  assert.deepEqual(origin, { label: "a Slack report", url: null });
+  assert.deepEqual(origin, { label: "original report", url: null });
 });
 
 test("a permalink Slack refuses costs the link, never the announcement", async () => {
@@ -144,13 +157,13 @@ test("a permalink Slack refuses costs the link, never the announcement", async (
 
   // Naming the source is most of the value and costs nothing, so a failed
   // lookup degrades to the label rather than to silence.
-  assert.deepEqual(origin, { label: "a Slack report", url: null });
+  assert.deepEqual(origin, { label: "original report", url: null });
 });
 
 test("a source nobody has taught this about is named, not guessed at", async () => {
-  assert.equal(describeOrigin("sentry"), "a sentry signal");
+  assert.equal(describeOrigin("sentry"), "original signal");
   assert.deepEqual(await signalOrigin({ source: "sentry", labels: {} }, failing), {
-    label: "a sentry signal",
+    label: "original signal",
     url: null,
   });
 });

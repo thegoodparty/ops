@@ -631,3 +631,18 @@ test("the share of alerts arriving with no known causes is visible per delivery"
     "a rename on the omni side shows up here as this rate going to 1, and nowhere else",
   );
 });
+
+test("a silence link reaches neither the signal body nor its labels", async () => {
+  const silence = "https://goodparty.grafana.net/alerting/silence/new?matcher=alertname%3Dx";
+  const payload = firing("fp-1", { silenceURL: silence });
+  // The premise: Grafana sends one on every alert.
+  assert.equal((payload.alerts[0] as Record<string, unknown>).silenceURL, silence);
+
+  const [signal] = await adapter().parse(request(payload));
+  assert.ok(!signal.body.includes(silence), signal.body);
+  assert.doesNotMatch(signal.body, /silence/i);
+  assert.ok(!Object.values(signal.labels).includes(silence));
+  assert.ok(!Object.keys(signal.labels).some((key) => key.includes("silence")));
+  // What the agent reads is otherwise intact, including the alert's own link.
+  assert.match(signal.body, /alert: https:\/\/goodparty\.grafana\.net\/alerting\/grafana\/abc\/view/);
+});

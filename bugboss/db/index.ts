@@ -65,6 +65,8 @@ export const LATE_COLUMNS: LateColumn[] = [
   { table: "signal", column: "modelCalls", type: "INTEGER NOT NULL DEFAULT 0" },
   { table: "signal", column: "modelId", type: "TEXT" },
   { table: "pending_wait", column: "waitingFor", type: "TEXT" },
+  { table: "incident_thread", column: "originLabel", type: "TEXT" },
+  { table: "incident_thread", column: "originUrl", type: "TEXT" },
 ];
 
 const columnsOf = (db: Database.Database, table: string) =>

@@ -1,17 +1,16 @@
-// What an open incident looks like when it is one line rather than a thread.
+// What an open incident looks like when it is one line rather than a thread,
+// and the top-level message each thread hangs off.
 //
-// A status board row and an incident thread's top-level message are the same
-// three fields at different scales: where the work is, what the incident is,
-// and what is needed from a person. So they are one renderer. Two renderers
-// is how a board and a thread come to disagree about the same incident, and
-// the reader has no way to tell which one is stale.
+// A board row carries three fields: where the work is, what the incident is,
+// and what is needed from a person. The thread header carries the title and
+// what is needed from a person, from the same facts through `slack/status.ts`,
+// so a board and a thread cannot disagree about the same incident.
 //
-// None of the three fields is new state:
+// None of the fields is new state:
 //
 //   status       the incident row's own.
 //   summary      the few-word title the agent keeps current. Falls back to
-//                the first signal's title, which is what the thread's
-//                top-level message has always said.
+//                the first signal's title.
 //   needed       what the incident is waiting on: `incident_wait`, an
 //                unanswered agent question, a `monitor` wait on a person,
 //                or "nobody". Derived in `slack/status.ts`, the same words
@@ -21,6 +20,7 @@
 // `slack/incidents.ts` links it on the way out, which is also what keeps a
 // thread's own header from linking to itself.
 
+import type { SignalOriginRef } from "../ingress/link";
 import {
   OPEN_STATUSES,
   renderStatusHeader,
@@ -40,13 +40,11 @@ export { OPEN_STATUSES };
 export type BoardRow = StatusFacts;
 
 /**
- * The header that sits above an incident thread's original message.
- *
- * Above rather than instead of: the alert text that opened the thread is what
- * somebody scrolling back is looking for, and this is a header they re-read,
- * not a replacement for it. Two lines, so it stays a header.
+ * The whole top-level message of an incident thread: the number and title,
+ * the signal that opened it, and what a person has to do, if anything.
  */
-export const renderHeader = (row: BoardRow): string => renderStatusHeader(row);
+export const renderHeader = (row: BoardRow, origin: SignalOriginRef | null): string =>
+  renderStatusHeader(row, origin);
 
 /** One incident, on one line. */
 export const renderBoardLine = (row: BoardRow): string => renderStatusLine(row);
