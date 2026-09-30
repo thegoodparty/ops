@@ -281,7 +281,7 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
           return "The page did not post, so nobody has been told. It is worth calling again.";
         }
         log("rotation_paged", { incidentId });
-        return `The rotation has been paged in incident ${incidentId}'s thread. Do not repeat the page in your reply.`;
+        return `The rotation has been paged in incident ${incidentId}'s thread. Do not repeat or summarise it: if the page is the whole answer, call stay_silent.`;
       },
     },
   ];
