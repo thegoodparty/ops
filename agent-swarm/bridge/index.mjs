@@ -197,13 +197,25 @@ const OUTPUT_SCHEMA = {
   required: ['incidentThreadUrl', 'status', 'summary'],
 }
 
+// The incident channel, passed in verbatim rather than described.
+//
+// The first version of this contract told the agent the channel's name and that
+// it could read the id from its own environment. It opened the thread in the wrong
+// channel instead: a real team channel, because `slack-start-thread` falls back to
+// one when the caller does not say. Naming a channel leaves room to guess; an id
+// does not.
+const INCIDENT_CHANNEL = process.env.SWARM_INCIDENT_CHANNEL ?? ''
+
 const REPORT_CONTRACT = [
   '',
   'Required output',
   '',
-  'Open a Slack thread in the incident channel and report in it as you work. When you',
-  'finish, your task output must be a JSON object matching this schema, and the task',
-  'cannot be completed without one:',
+  INCIDENT_CHANNEL
+    ? `Open a Slack thread in channel ${INCIDENT_CHANNEL} with slack-start-thread, passing that exact channelId, and report in it as you work.`
+    : 'Open a Slack thread in the incident channel with slack-start-thread and report in it as you work.',
+  'Do not substitute another channel, and do not create one.',
+  'When you finish, your task output must be a JSON object matching this schema, and the',
+  'task cannot be completed without one:',
   '',
   '  incidentThreadUrl  permalink to the incident thread you opened',
   '  status             exactly one of INVESTIGATING, FIXING, RESOLVED, CLOSED, MERGED',

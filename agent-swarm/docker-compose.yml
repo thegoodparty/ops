@@ -275,6 +275,9 @@ services:
       # payload, the password authenticates the request.
       - GRAFANA_WEBHOOK_SECRET=${GRAFANA_WEBHOOK_SECRET}
       - GRAFANA_BASIC_AUTH_PASSWORD=${GRAFANA_BASIC_AUTH_PASSWORD}
+      # Passed through so the task text can name the channel by id. Described by
+      # name, the lead opened the thread somewhere else entirely.
+      - SWARM_INCIDENT_CHANNEL=${SWARM_INCIDENT_CHANNEL}
     volumes:
       # The seen-set and the incident counter. Without a mount these live in the
       # container's writable layer, so recreating the bridge forgets every
