@@ -216,4 +216,47 @@ ensure_schedule "swarm-incident-stale-sweep" \
     "$STALE_SWEEP_TEMPLATE" \
     "$LEAD")"
 
+# ---------------------------------------------------------------------------
+# The lead's identity
+# ---------------------------------------------------------------------------
+#
+# This is the step that makes the swarm behave like an incident system rather
+# than a general agent fleet.
+#
+# The operating procedure travels in the lead's operator prompt
+# (SYSTEM_PROMPT_FILE, incident-commander.md). But agent-swarm APPENDS that prompt
+# below a base it builds from the agent's persona and its 52 seeded skills, and in
+# practice the base framing won: with only the appended procedure, the lead worked
+# incidents by returning a text output. It never opened a Slack thread and never
+# wrote incident state.
+#
+# SOUL.md is section A of that base prompt, so the identity belongs there and the
+# procedure stays as the detail it defers to. It has to fit 10,000 characters:
+# above that agent-swarm accepts only updates that do not grow the stored value,
+# so a longer identity is refused rather than truncated.
+IDENTITY_FILE="$(cd "$(dirname "$0")" && pwd)/incident-commander-soul.md"
+if [ ! -f "$IDENTITY_FILE" ]; then
+  printf '  skipped    %s not found; the lead keeps whatever identity it has\n' "$IDENTITY_FILE"
+else
+  IDENTITY_CHARS="$(wc -m < "$IDENTITY_FILE" | tr -d ' ')"
+  if [ "$IDENTITY_CHARS" -ge 10000 ]; then
+    fail "$IDENTITY_FILE is $IDENTITY_CHARS characters. agent-swarm refuses a profile update that grows a stored value past 10000, so trim it before seeding."
+  fi
+  IDENTITY_BODY="$(IDENTITY_FILE="$IDENTITY_FILE" python3 - <<'PY'
+import json, os
+soul = open(os.environ["IDENTITY_FILE"]).read()
+print(json.dumps({
+    "description": "Incident commander for GoodParty production alerts. Owns each incident end to end and reports it in Slack.",
+    "soulMd": soul,
+    "changeSource": "seed.sh",
+    "changeReason": "Install the incident-commander identity so it sits at the top of the base prompt rather than below it",
+}))
+PY
+)"
+  request PUT "/api/agents/$LEAD/profile" "$IDENTITY_BODY"
+  [ "$RESP_STATUS" = "200" ] ||
+    fail "PUT /api/agents/$LEAD/profile returned $RESP_STATUS: $RESP_BODY"
+  printf '  installed  incident-commander identity on the lead (%s chars)\n' "$IDENTITY_CHARS"
+fi
+
 echo "done. schedules are enabled and will dispatch tasks to the lead agent."

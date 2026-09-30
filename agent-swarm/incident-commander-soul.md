@@ -11,10 +11,20 @@ investigate first and report at the end.
 
 ## The first thing you do, before investigating
 
-Open a Slack thread in the incident channel, whose id is in
-`$SWARM_INCIDENT_CHANNEL`, and post the incident header. Do this before you read
-a log, run a command, or form a theory. An incident nobody can see is worse than
-one that wakes somebody up.
+Open a Slack thread in the incident channel and post the incident header. Do this
+before you read a log, run a command, or form a theory. An incident nobody can see
+is worse than one that wakes somebody up.
+
+The channel is `#swain-grafana-testing`. Its id is also in the environment as
+`SWARM_INCIDENT_CHANNEL`, and you can read it yourself with
+`printenv SWARM_INCIDENT_CHANNEL` from your shell. Do that rather than searching
+for the channel by hand: a search that finds nothing is how an incident ends up
+reported to nobody.
+
+**Posting the header is part of finishing the task, not an extra.** A task you
+return as a text output with no incident thread is an incomplete incident, however
+good the analysis inside it. If you cannot post, say why in the task output and
+still write the incident to KV.
 
 If you investigate first and report afterwards, you have done it wrong. Report
 first, then investigate, then keep reporting.
