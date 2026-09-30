@@ -15,6 +15,8 @@
 // through the container credential provider, which refreshes on its own for
 // as long as the run lasts.
 
+import { gitHubEndpoints } from "../github";
+
 export interface ChildEnvInput {
   /**
    * Non-secret process essentials a child needs to run at all: PATH, HOME and
@@ -59,12 +61,26 @@ export const AWS_CREDENTIAL_PATH_VARS = [
   "AWS_CONTAINER_AUTHORIZATION_TOKEN",
 ] as const;
 
+/**
+ * Static keys, which production never sets: the task role arrives through the
+ * container provider above. The eval harness sets fake ones, which MinIO
+ * accepts and the model proxy re-signs over, so the agent there holds nothing
+ * that reaches real AWS. A named profile is deliberately not here: it would
+ * hand the child whatever the parent's credentials file holds.
+ */
+export const AWS_STATIC_CREDENTIAL_VARS = [
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+] as const;
+
 export const CHILD_BASE_ENV_NAMES = [
   "PATH",
   "HOME",
   "TMPDIR",
   "LANG",
   ...AWS_CREDENTIAL_PATH_VARS,
+  ...AWS_STATIC_CREDENTIAL_VARS,
 ] as const;
 
 /** Explicit opt-in for the handful of parent variables a child needs. */
@@ -79,9 +95,79 @@ export const pickBaseEnv = (
   return out;
 };
 
+/**
+ * Where a child's outbound calls go and which certificates it trusts, when
+ * the parent was told something other than the defaults.
+ *
+ * Production sets none of these, so a production child gets nothing from
+ * here and every endpoint is the SDK's, git's and `gh`'s own. They exist for
+ * the eval harness, which runs this container against stand-ins for GitHub,
+ * AWS and the npm registry behind a local certificate authority. Without
+ * them the agent in that harness would be the one process in the container
+ * still pointed at production -- with real-looking credentials and a real
+ * shell, which is the outcome the harness is built to make impossible.
+ *
+ * `AWS_ENDPOINT_URL_<SERVICE>` is a family rather than a list, because the
+ * SDK and the CLI read one per service and the set the agent reaches grows.
+ * `PRISMA_ENGINES_MIRROR` is here because `npm ci` in omni downloads Prisma's
+ * engines from a host the harness has no route to.
+ */
+export const CHILD_ENDPOINT_ENV_NAMES = [
+  "BUGBOSS_OMNI_REPO",
+  "BUGBOSS_GITHUB_URL",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "GIT_SSL_CAINFO",
+  "AWS_CA_BUNDLE",
+  "npm_config_registry",
+  "PRISMA_ENGINES_MIRROR",
+  "AWS_ENDPOINT_URL",
+] as const;
+
+const AWS_SERVICE_ENDPOINT = /^AWS_ENDPOINT_URL_[A-Z0-9_]+$/;
+
+/**
+ * The endpoint overrides the parent holds, plus `GH_HOST` when GitHub is not
+ * github.com: `gh` ignores the checkout's remote host for API calls unless it
+ * is told, and on any other host it reads `GH_ENTERPRISE_TOKEN` rather than
+ * `GH_TOKEN` (`gitHubTokenEnv` below sets that one, since the token is minted
+ * in the child).
+ */
+export const pickEndpointEnv = (
+  src: Record<string, string | undefined>,
+): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const name of CHILD_ENDPOINT_ENV_NAMES) {
+    const value = src[name];
+    if (value !== undefined) out[name] = value;
+  }
+  for (const [name, value] of Object.entries(src)) {
+    if (value !== undefined && AWS_SERVICE_ENDPOINT.test(name)) out[name] = value;
+  }
+  const github = gitHubEndpoints(src.BUGBOSS_GITHUB_URL);
+  if (github.enterprise) out.GH_HOST = github.host;
+  return out;
+};
+
+/**
+ * The variables an installation token is written to, in the child's own
+ * environment, each time it is minted. `git` reads `GITHUB_TOKEN` through the
+ * credential helper and `gh` reads `GH_TOKEN` for github.com; a `GH_HOST`
+ * that is anything else makes `gh` read `GH_ENTERPRISE_TOKEN` instead.
+ */
+export const gitHubTokenEnv = (
+  token: string,
+  env: Record<string, string | undefined>,
+): Record<string, string> => ({
+  GITHUB_TOKEN: token,
+  GH_TOKEN: token,
+  ...(env.GH_HOST ? { GH_ENTERPRISE_TOKEN: token } : {}),
+});
+
 /** Whether a built child environment can resolve AWS credentials at all. */
 export const hasAwsCredentialPath = (env: Record<string, string>): boolean =>
-  AWS_CREDENTIAL_PATH_VARS.some((name) => env[name] !== undefined);
+  AWS_CREDENTIAL_PATH_VARS.some((name) => env[name] !== undefined) ||
+  (env.AWS_ACCESS_KEY_ID !== undefined && env.AWS_SECRET_ACCESS_KEY !== undefined);
 
 export const buildChildEnv = (
   input: ChildEnvInput,

@@ -9,6 +9,7 @@
 // needs to hear and tells it with a directive.
 
 import type { Db } from "../db";
+import { gitHubEndpoints } from "../github";
 import type { SignalOriginRef } from "../ingress/link";
 import { makeAlarm, makeLog } from "../logging";
 import { bullets, escape, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
@@ -150,7 +151,10 @@ type LinkOutcome = "linked" | "lost" | "unwritable";
  * looking for and a bare GitHub URL buries it, since `unfurl_links` is off.
  */
 const prLink = (url: string): string => {
-  const parts = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/.exec(url);
+  // The host is github.com in production; in the evals sim it is the GitHub
+  // stand-in's, and a PR there would otherwise post as a bare URL.
+  const host = gitHubEndpoints(process.env.BUGBOSS_GITHUB_URL).host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = new RegExp(`${host}/([^/\\s]+/[^/\\s]+)/pull/(\\d+)`).exec(url);
   return parts ? link(url, `${parts[1]}#${parts[2]}`) : link(url);
 };
 

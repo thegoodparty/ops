@@ -23,6 +23,7 @@ import {
   createChildProcessSpawn,
   createDispatcher,
   pickBaseEnv,
+  pickEndpointEnv,
   type Dispatcher,
   type SpawnAgent,
   type TickResult,
@@ -143,7 +144,11 @@ import {
 } from "./agent/session";
 import { INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
-import { createInstallationToken, createPrStateReader } from "./github";
+import {
+  createInstallationToken,
+  createPrStateReader,
+  gitHubEndpoints,
+} from "./github";
 import { makeAlarm, makeLog } from "./logging";
 import type {
   BugBossConfig,
@@ -227,6 +232,13 @@ export interface BugBossSecrets {
   githubAppId?: string;
   githubAppPrivateKey?: string;
   githubAppInstallationId?: string;
+  /**
+   * Where Slack's Web API and GitHub are. Unset in production, which is
+   * slack.com and github.com; set only by the eval harness, which points both
+   * at its stand-ins.
+   */
+  slackApiUrl?: string;
+  githubUrl?: string;
   triageModelId?: string;
   intentModelId?: string;
   agentModelId?: string;
@@ -1964,6 +1976,13 @@ export const createBugBoss = async (
     },
     childBaseEnv: {
       ...pickBaseEnv(process.env),
+      // Empty in production. The GitHub url is taken from the secrets rather
+      // than process.env, so the Boss and its agents can never disagree about
+      // which GitHub they are talking to.
+      ...pickEndpointEnv({
+        ...process.env,
+        ...(secrets.githubUrl ? { BUGBOSS_GITHUB_URL: secrets.githubUrl } : {}),
+      }),
       AWS_REGION: secrets.awsRegion ?? process.env.AWS_REGION,
       AWS_DEFAULT_REGION: secrets.awsRegion ?? process.env.AWS_DEFAULT_REGION,
       BUGBOSS_BOSS_URL: `http://127.0.0.1:${
@@ -2441,6 +2460,8 @@ const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
   githubAppId: env.GITHUB_APP_ID,
   githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
   githubAppInstallationId: env.GITHUB_APP_INSTALLATION_ID,
+  slackApiUrl: env.SLACK_API_URL,
+  githubUrl: env.BUGBOSS_GITHUB_URL,
   triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
   intentModelId: env.BUGBOSS_INTENT_MODEL_ID,
   agentModelId: env.BUGBOSS_MODEL_ID,
@@ -2557,6 +2578,9 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
   const secrets = readSecrets(env);
   const config = bossConfigFromEnv(env);
   if (!secrets.slackBotToken) throw new Error("SLACK_BOT_TOKEN is required");
+  // Resolved at boot so a malformed override stops the container here rather
+  // than on the first closing report.
+  const github = gitHubEndpoints(secrets.githubUrl);
   // Started, not awaited. The wait above is up to ninety seconds and alert
   // ingest is what this container exists for; a test database is never worth
   // delaying it. Nothing downstream reads the result -- it is a log line.
@@ -2578,12 +2602,19 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
     intentModel: secrets.intentModelId
       ? await createBossModelClient({ modelId: secrets.intentModelId })
       : undefined,
-    slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
+    slack: createSlackClient(
+      secrets.slackBotToken,
+      config.slackChannelId,
+      secrets.slackApiUrl,
+    ),
     // The closing report uploads as a file. Same token as every other post,
     // but the `files:write` scope it needs is granted only when somebody
     // reinstalls the app -- until then the upload throws and the report goes
     // out inline, which is exactly what should happen.
-    fileUploader: createSlackFileUploader(secrets.slackBotToken),
+    fileUploader: createSlackFileUploader(
+      secrets.slackBotToken,
+      secrets.slackApiUrl,
+    ),
     // Only when the App is configured. The Boss otherwise never mints a
     // GitHub token of its own; this is the one thing it asks GitHub for, and
     // a report without PR states is still a report.
@@ -2592,11 +2623,15 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       secrets.githubAppPrivateKey &&
       secrets.githubAppInstallationId
         ? createPrStateReader(
-            createInstallationToken({
-              appId: secrets.githubAppId,
-              privateKey: secrets.githubAppPrivateKey,
-              installationId: secrets.githubAppInstallationId,
-            }),
+            createInstallationToken(
+              {
+                appId: secrets.githubAppId,
+                privateKey: secrets.githubAppPrivateKey,
+                installationId: secrets.githubAppInstallationId,
+              },
+              github,
+            ),
+            github,
           )
         : undefined,
     // The merged env, not process.env: Loki's credentials come from the
@@ -2609,6 +2644,7 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
       ? createRotationReader(
           secrets.slackBotToken,
           secrets.slackRotationGroupId,
+          secrets.slackApiUrl,
         )
       : undefined,
     s3: new S3Client({}),

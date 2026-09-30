@@ -1,0 +1,35 @@
+{
+  "id": "users-read-invalid-zip",
+  "sourceIncident": 10,
+  "omni": {
+    "baseSha": "ca5fe7bc3c8a5ef102c71f05782f1bae4a89fe4c",
+    "packages": ["gp-api", "contracts"],
+    "provingFixSha": "ec943248212940f4ee74959d2117b1a1a9c4cf0b"
+  },
+  "alert": { "file": "alert.json", "refireEverySeconds": 600 },
+  "telemetry": { "generator": "telemetry.ts", "backfillHoursBefore": 6 },
+  "aws": { "data": "aws.json" },
+  "ci": {
+    "visible": [
+      "npm test -w packages/contracts",
+      "npm test -w packages/gp-api",
+      "npm run lint -w packages/gp-api"
+    ]
+  },
+  "check": {
+    "setup": "check/setup.sh",
+    "command": "check/run.sh",
+    "timeoutSeconds": 900,
+    "runsAt": "deploy"
+  },
+  "reviewer": { "requestChangesOnce": false },
+  "persona": {
+    "file": "persona.md",
+    "model": "sonnet",
+    "replyDelaySeconds": [20, 90],
+    "mergeDelaySeconds": 300
+  },
+  "chaos": { "restartBugbossAfterSeconds": 1800 },
+  "caps": { "wallClockSeconds": 10800, "modelUsd": 35, "quietMinutes": 30 },
+  "reference": "reference.md"
+}

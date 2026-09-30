@@ -1,0 +1,31 @@
+{
+  "cloudwatch": [],
+  "ecs": {
+    "clusters": [
+      "gp-api-prod",
+      "gp-api-dev"
+    ],
+    "services": [
+      {
+        "cluster": "gp-api-prod",
+        "name": "gp-api-prod",
+        "desiredCount": 2,
+        "runningCount": 2,
+        "taskDefinition": "gp-api-prod:412"
+      },
+      {
+        "cluster": "gp-api-dev",
+        "name": "gp-api-dev",
+        "desiredCount": 1,
+        "runningCount": 1,
+        "taskDefinition": "gp-api-dev:988"
+      }
+    ]
+  },
+  "secretsManager": {
+    "names": [
+      "GP_API_PROD",
+      "GP_API_DEV"
+    ]
+  }
+}

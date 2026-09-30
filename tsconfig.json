@@ -6,8 +6,10 @@
     "deploy/**/*.ts",
     "deploy-org/**/*.ts",
     "deploy-workbench/**/*.ts",
-    "bugboss/**/*.ts"
+    "bugboss/**/*.ts",
+    "bugboss-evals/**/*.ts"
   ],
+  "exclude": ["bugboss-evals/scenarios/*/check/**"],
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",

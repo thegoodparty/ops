@@ -1,0 +1,24 @@
+# The npm exit. It proxies the public registry and nothing else: no
+# publishing, no web UI, and the only uplink is registry.npmjs.org.
+storage: /verdaccio/storage
+web:
+  enable: false
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+    timeout: 60s
+    maxage: 30m
+packages:
+  "**":
+    access: $all
+    publish: $nobody
+    unpublish: $nobody
+    proxy: npmjs
+server:
+  keepAliveTimeout: 60
+listen: 0.0.0.0:4873
+max_body_size: 200mb
+log:
+  type: stdout
+  format: json
+  level: http
