@@ -211,3 +211,15 @@ test("the report and CLI run end to end over a directory of transcripts", async 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("the CLI refuses a flag with no value and a source with no transcripts", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bugboss-evals-"));
+  try {
+    assert.equal(await main([dir, "--out"]), 2);
+    assert.equal(await main(["--focus", "--out", "x.md", dir]), 2);
+    assert.equal(await main([dir]), 2);
+    assert.throws(() => renderReport([]), /at least one transcript/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

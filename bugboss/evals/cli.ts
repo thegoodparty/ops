@@ -46,13 +46,31 @@ const byId = (a: Trace, b: Trace) => {
   return Number.isNaN(x) || Number.isNaN(y) ? a.id.localeCompare(b.id) : x - y;
 };
 
+class UsageError extends Error {}
+
 export const main = async (argv: string[]): Promise<number> => {
+  try {
+    return await run(argv);
+  } catch (error) {
+    if (!(error instanceof UsageError)) throw error;
+    console.error(`${error.message}\n\n${USAGE}`);
+    return 2;
+  }
+};
+
+const run = async (argv: string[]): Promise<number> => {
   let out: string | null = null;
   let focus: string[] = [];
   const sources: string[] = [];
+  const valueOf = (flag: string, value: string | undefined) => {
+    if (value === undefined || value.startsWith("--")) {
+      throw new UsageError(`${flag} needs a value`);
+    }
+    return value;
+  };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--out") out = argv[++i];
-    else if (argv[i] === "--focus") focus = argv[++i].split(",");
+    if (argv[i] === "--out") out = valueOf("--out", argv[++i]);
+    else if (argv[i] === "--focus") focus = valueOf("--focus", argv[++i]).split(",");
     else if (argv[i] === "--help" || argv[i] === "-h") {
       console.log(USAGE);
       return 0;
@@ -76,6 +94,9 @@ export const main = async (argv: string[]): Promise<number> => {
   )
     .flat()
     .sort(byId);
+  if (transcripts.length === 0) {
+    throw new UsageError(`no .jsonl transcripts found in ${sources.join(", ")}`);
+  }
   const report = renderReport(transcripts, { focus });
   if (out) {
     await writeFile(out, report);

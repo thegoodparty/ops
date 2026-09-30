@@ -183,6 +183,9 @@ export const renderReport = (
   transcripts: Trace[],
   options?: Partial<ReportOptions>,
 ): string => {
+  if (transcripts.length === 0) {
+    throw new Error("renderReport needs at least one transcript");
+  }
   const derivation: RateDerivation = deriveRates(transcripts);
   const models = [...new Set(transcripts.map((t) => t.model))];
   if (models.length !== 1) {
