@@ -8,14 +8,19 @@ import { test } from "node:test";
 
 import {
   ALERTING_DIR,
+  ALERTS_PATH,
   composeSystemPrompt,
+  enclosingObject,
   loadPromptContext,
-  OBSERVABILITY_DOC_PATHS,
-  SHIP_PR_SKILL_PATH,
+  PROVISIONED_ALERTS_PATH,
+  type FiredAlert,
   type PromptInput,
 } from "./prompt";
 import { NOTES_LIMITS } from "./notes";
+import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { createBossTools } from "./run";
+import { createMessageBossTool, createMonitorTool } from "./tools";
 import { TEST_DB_ENV_VAR } from "../testdb";
 
 const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
@@ -23,12 +28,15 @@ const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
   checkoutPath: "/work/inc-42/omni",
   notesDir: "/work/inc-42/notes",
   notesLimits: NOTES_LIMITS,
-  observabilityDocs: [
-    { path: "docs/observability.md", content: "Loki uid grafanacloud-logs" },
-    { path: "packages/gp-api/docs/observability.md", content: "route alerts are per-controller" },
+  firedAlerts: [
+    {
+      slug: "high-cpu",
+      path: ALERTS_PATH,
+      line: 12,
+      definition: "  {\n    slug: 'high-cpu',\n    threshold: 80,\n  },",
+    },
+    { slug: "route-errors-serve", path: `${ALERTING_DIR}/route-alerts.ts`, line: 369, definition: null },
   ],
-  alertDefinitions: [{ path: "a/alerts.types.ts", content: "export type KnownCause = {}" }],
-  shipPrSkill: "# ship-pr\nOpen the PR, drive delegate to Approved.",
   toolNames: ["read", "bash", "monitor", "message_boss"],
   npmCiDoneMarker: "/work/inc-42/npm-ci.done",
   npmCiFailedMarker: "/work/inc-42/npm-ci.failed",
@@ -48,10 +56,7 @@ test("input ordering cannot move a byte of the prompt", () => {
   const shuffled = composeSystemPrompt(
     input({
       toolNames: ["monitor", "read", "message_boss", "bash"],
-      observabilityDocs: [
-        { path: "packages/gp-api/docs/observability.md", content: "route alerts are per-controller" },
-        { path: "docs/observability.md", content: "Loki uid grafanacloud-logs" },
-      ],
+      firedAlerts: [...input().firedAlerts].reverse(),
     }),
   );
 
@@ -84,8 +89,8 @@ test("the load-bearing rules are all in there", () => {
   assert.match(prompt, /report_root_cause/);
   assert.match(prompt, /escalate/);
   assert.match(prompt, /resumed_after/);
-  assert.match(prompt, /Loki uid grafanacloud-logs/);
-  assert.match(prompt, /drive delegate to Approved/);
+  assert.match(prompt, /Never cut text by character count/);
+  assert.match(prompt, /read\s+`\.claude\/skills\/ship-pr\/SKILL\.md` in the checkout, all of it/);
 });
 
 test("the prompt names the difference between asking and escalating", () => {
@@ -140,59 +145,245 @@ test("the agent is told its notes are a record to keep, not scratch to tidy", ()
   assert.match(prompt, /outside the checkout/);
 });
 
-test("loadPromptContext reads the checkout deterministically", async () => {
+const checkout = async (files: Record<string, string>): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "bugboss-omni-"));
-  await mkdir(join(root, "docs"), { recursive: true });
-  await mkdir(join(root, "packages/gp-api/docs"), { recursive: true });
   await mkdir(join(root, ALERTING_DIR), { recursive: true });
-  await mkdir(join(root, ".claude/skills/ship-pr"), { recursive: true });
+  for (const [path, content] of Object.entries(files)) {
+    await writeFile(join(root, path), content);
+  }
+  return root;
+};
 
-  await writeFile(join(root, OBSERVABILITY_DOC_PATHS[0]), "top level observability");
-  await writeFile(join(root, OBSERVABILITY_DOC_PATHS[1]), "gp-api observability");
-  await writeFile(join(root, ALERTING_DIR, "controller-alerts.ts"), "controller alerts");
-  await writeFile(join(root, ALERTING_DIR, "controller-alerts.test.ts"), "a test nobody needs");
-  await writeFile(join(root, ALERTING_DIR, "alerts.types.ts"), "alert types");
-  await writeFile(join(root, SHIP_PR_SKILL_PATH), "ship-pr skill body");
+const GLOBAL_ALERTS = [
+  "export const GLOBAL_ALERTS: Alert[] = [",
+  "  {",
+  "    slug: 'high-cpu',",
+  "    expr: 'avg(process_cpu_utilization{service_name=\"gp-api\"}) * 100',",
+  "    message: [",
+  "      'CPU is high.',",
+  "    ].join('\\n\\n'),",
+  "  },",
+  "  {",
+  "    slug: 'high-memory',",
+  "    threshold: 90,",
+  "  },",
+  "]",
+].join("\n");
+
+const BUDGET_ALERTS = [
+  "export const budgetAlerts: Alert[] = TIERS.map((percent) => ({",
+  "  slug: `geoapify-daily-budget-${percent}`,",
+  "  threshold: percent,",
+  "}))",
+].join("\n");
+
+const ROUTE_ALERTS = [
+  "export const routeAlertGroups = () => {",
+  "  const slug = [",
+  "    'route-errors',",
+  "    naming.slug,",
+  "  ].join('-')",
+  "}",
+].join("\n");
+
+test("the rule that fired is inlined whole, and only that rule", async () => {
+  const root = await checkout({ [ALERTS_PATH]: GLOBAL_ALERTS });
+
+  const { firedAlerts } = await loadPromptContext(root, { alertSlugs: ["high-cpu"] });
+
+  assert.equal(firedAlerts.length, 1);
+  assert.equal(firedAlerts[0].path, ALERTS_PATH);
+  assert.equal(firedAlerts[0].line, 3);
+  assert.match(firedAlerts[0].definition ?? "", /slug: 'high-cpu'/);
+  assert.match(firedAlerts[0].definition ?? "", /CPU is high/);
+  // The neighbouring rule is the alerting estate the prompt no longer carries.
+  assert.doesNotMatch(firedAlerts[0].definition ?? "", /high-memory/);
+
+  const prompt = composeSystemPrompt(input({ firedAlerts }));
+  assert.match(prompt, /`high-cpu`, defined at `packages\/gp-api\/deploy\/components\/alerts\.ts:3`/);
+  assert.ok(prompt.includes("CPU is high."));
+  assert.doesNotMatch(prompt, /high-memory/);
+});
+
+test("a slug built from a template is found by its fixed parts", async () => {
+  const path = `${ALERTING_DIR}/geoapify-budget-alerts.ts`;
+  const root = await checkout({ [path]: BUDGET_ALERTS });
+
+  const { firedAlerts } = await loadPromptContext(root, {
+    alertSlugs: ["geoapify-daily-budget-80"],
+  });
+
+  assert.equal(firedAlerts[0].path, path);
+  assert.equal(firedAlerts[0].line, 2);
+  assert.equal(firedAlerts[0].definition, BUDGET_ALERTS);
+});
+
+test("a slug assembled from parts gets a pointer, not a guess at its code", async () => {
+  const path = `${ALERTING_DIR}/route-alerts.ts`;
+  const root = await checkout({ [path]: ROUTE_ALERTS });
+
+  const { firedAlerts } = await loadPromptContext(root, { alertSlugs: ["route-errors-serve"] });
+
+  assert.deepEqual(firedAlerts[0], { slug: "route-errors-serve", path, line: 3, definition: null });
+  assert.match(
+    composeSystemPrompt(input({ firedAlerts })),
+    /`route-errors-serve` is generated rather than written out\. It is built at `packages\/gp-api\/deploy\/components\/alerting\/route-alerts\.ts:3`/,
+  );
+});
+
+test("a slug nowhere in the source says so and points at the provisioned list", async () => {
+  const root = await checkout({ [ALERTS_PATH]: GLOBAL_ALERTS });
+
+  const { firedAlerts } = await loadPromptContext(root, { alertSlugs: ["nobody-wrote-this"] });
+
+  assert.deepEqual(firedAlerts[0], {
+    slug: "nobody-wrote-this",
+    path: null,
+    line: null,
+    definition: null,
+  });
+  const prompt = composeSystemPrompt(input({ firedAlerts }));
+  assert.match(prompt, /`nobody-wrote-this` is not written anywhere/);
+  assert.ok(prompt.includes(PROVISIONED_ALERTS_PATH));
+});
+
+test("tests are not alert source, and a missing checkout is not a crash", async () => {
+  const root = await checkout({
+    [`${ALERTING_DIR}/global-alerts.test.ts`]: "  slug: 'high-cpu',",
+  });
+  const { firedAlerts } = await loadPromptContext(root, { alertSlugs: ["high-cpu"] });
+  assert.equal(firedAlerts[0].path, null);
+
+  const missing = await loadPromptContext(join(root, "nowhere"), { alertSlugs: ["high-cpu"] });
+  assert.equal(missing.firedAlerts[0].path, null);
+});
+
+test("an incident with no alert slug says so rather than inlining the estate", async () => {
+  const root = await checkout({ [ALERTS_PATH]: GLOBAL_ALERTS });
 
   const context = await loadPromptContext(root);
+  assert.deepEqual(context.firedAlerts, []);
 
-  assert.deepEqual(
-    context.alertDefinitions.map((doc) => doc.path),
-    [`${ALERTING_DIR}/alerts.types.ts`, `${ALERTING_DIR}/controller-alerts.ts`],
-  );
-  assert.equal(context.shipPrSkill, "ship-pr skill body");
-  assert.deepEqual(
-    context.observabilityDocs.map((doc) => doc.content),
-    ["top level observability", "gp-api observability"],
-  );
+  const prompt = composeSystemPrompt(input(context));
+  assert.match(prompt, /did not open on a signal with an `alert_slug` label/);
+  assert.doesNotMatch(prompt, /high-cpu/);
+});
 
-  const again = await loadPromptContext(root);
+test("the fired-rule lookup is deterministic, so a resume replays the same bytes", async () => {
+  const root = await checkout({
+    [ALERTS_PATH]: GLOBAL_ALERTS,
+    [`${ALERTING_DIR}/route-alerts.ts`]: ROUTE_ALERTS,
+  });
+
+  const first = await loadPromptContext(root, { alertSlugs: ["route-errors-win", "high-cpu"] });
+  const second = await loadPromptContext(root, {
+    alertSlugs: ["high-cpu", "route-errors-win", "high-cpu"],
+  });
+
+  assert.deepEqual(first, second);
   assert.equal(
-    composeSystemPrompt(input({ ...context })),
-    composeSystemPrompt(input({ ...again })),
+    composeSystemPrompt(input({ ...first })),
+    composeSystemPrompt(input({ ...second })),
   );
 });
 
-test("a missing doc is recorded rather than silently dropped", async () => {
-  const root = await mkdtemp(join(tmpdir(), "bugboss-empty-"));
-  const context = await loadPromptContext(root);
-
-  assert.equal(context.observabilityDocs.length, 2);
-  assert.match(context.observabilityDocs[0].content, /not found at docs\/observability\.md/);
-  assert.deepEqual(context.alertDefinitions, []);
-  assert.match(context.shipPrSkill, /not found at \.claude\/skills\/ship-pr\/SKILL\.md/);
+test("enclosingObject gives up rather than guessing at an unformatted file", () => {
+  assert.equal(enclosingObject(["slug: 'x',"], 0), null);
+  assert.equal(enclosingObject(["{", "  slug: 'x',"], 1), null);
 });
 
-test("alert definitions stay inside their budget", async () => {
-  const root = await mkdtemp(join(tmpdir(), "bugboss-budget-"));
-  await mkdir(join(root, ALERTING_DIR), { recursive: true });
-  await writeFile(join(root, ALERTING_DIR, "a.ts"), "x".repeat(100));
-  await writeFile(join(root, ALERTING_DIR, "b.ts"), "y".repeat(100));
+test("no document is pasted in whole", () => {
+  const prompt = composeSystemPrompt(input());
 
-  const context = await loadPromptContext(root, { alertBudgetChars: 150 });
+  assert.doesNotMatch(prompt, /<document path=/);
+  // Each is an index entry: a path the agent can read, and when to read it.
+  for (const path of [
+    ".claude/skills/ship-pr/SKILL.md",
+    "docs/observability.md",
+    "packages/gp-api/docs/observability.md",
+    ALERTS_PATH,
+  ]) {
+    assert.ok(prompt.includes(`\`${path}\``), `${path} is not indexed`);
+  }
+});
 
-  assert.equal(context.alertDefinitions[0].content.length, 100);
-  assert.match(context.alertDefinitions[1].content, /omitted for length/);
+test("the query essentials every investigation needs are inline", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.ok(prompt.includes('{service_name="gp-api", deployment_environment_name="prod"}'));
+  assert.ok(prompt.includes("`grafanacloud-logs`"));
+  assert.ok(prompt.includes("`grafanacloud-prom`"));
+  assert.ok(prompt.includes("`grafanacloud-traces`"));
+  assert.match(prompt, /`Request completed` line/);
+  for (const field of ["request_endpoint", "response_statusCode", "responseTimeMs"]) {
+    assert.ok(prompt.includes(`\`${field}\``), field);
+  }
+  assert.match(prompt, /keep response_statusCode \[5m\]/);
+});
+
+test("the safety rules stay in the prompt, not one read away", () => {
+  const prompt = composeSystemPrompt(input());
+
+  assert.match(prompt, /Never cut text by character count/);
+  assert.match(prompt, /You never merge one/);
+  assert.match(prompt, /Evidence is what you observed stop\s+happening/);
+  assert.match(prompt, /You never talk to people and you never read what they write/);
+});
+
+// The prefix is re-sent on every turn, so its size multiplies by the turn
+// count. It was ~187,000 characters (~68k tokens at the 2.74 chars/token
+// measured on this prompt) while it pasted documents in. Raising these bounds
+// makes every turn of every incident dearer; do it deliberately.
+const MAX_SYSTEM_PROMPT_CHARS = 42_000;
+const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 58_000;
+
+test("the composed prefix stays under its bound", async () => {
+  const pi = await import("@earendil-works/pi-coding-agent");
+  const stub = {} as never;
+  const signal = new AbortController().signal;
+  const tools = [
+    ...(await createBossTools({ api: stub, boss: stub })),
+    await createMonitorTool({ signal }),
+    await createMessageBossTool({ marker: stub, boss: stub, api: stub, signal }),
+    await createRerunCiTool({ github: createGitHubRunsPort({ token: () => undefined }), boss: stub }),
+    ...[
+      pi.createBashToolDefinition,
+      pi.createEditToolDefinition,
+      pi.createFindToolDefinition,
+      pi.createGrepToolDefinition,
+      pi.createLsToolDefinition,
+      pi.createReadToolDefinition,
+      pi.createWriteToolDefinition,
+    ].map((create) => create("/work/inc-42/omni")),
+  ];
+  const toolChars = tools
+    .map((tool) =>
+      JSON.stringify({ name: tool.name, description: tool.description, input_schema: tool.parameters }),
+    )
+    .reduce((sum, json) => sum + json.length, 0);
+
+  // A large real rule: the Geoapify tier factory is ~3,300 characters.
+  const bigRule: FiredAlert = {
+    slug: "geoapify-daily-budget-80",
+    path: `${ALERTING_DIR}/geoapify-budget-alerts.ts`,
+    line: 110,
+    definition: "  // why this tier exists\n".repeat(130),
+  };
+  const prompt = composeSystemPrompt(
+    input({
+      firedAlerts: [bigRule],
+      toolNames: tools.map((tool) => tool.name).concat(Array.from({ length: 11 }, (_, i) => `grafana_${i}`)),
+    }),
+  );
+
+  assert.ok(
+    prompt.length <= MAX_SYSTEM_PROMPT_CHARS,
+    `system prompt is ${prompt.length} characters, bound ${MAX_SYSTEM_PROMPT_CHARS}`,
+  );
+  assert.ok(
+    prompt.length + toolChars <= MAX_PREFIX_CHARS_WITHOUT_GRAFANA,
+    `prefix without Grafana is ${prompt.length + toolChars} characters, bound ${MAX_PREFIX_CHARS_WITHOUT_GRAFANA}`,
+  );
 });
 
 test("the agent is told to write mrkdwn, not Markdown", () => {

@@ -16,7 +16,7 @@
 // to green is a defect shipped.
 //
 // The rule itself is not new. omni's own ship-pr skill — which the prompt
-// injects verbatim — already says "a single re-run for a suspected flake is
+// tells the agent to read before its first pull request — already says "a single re-run for a suspected flake is
 // fine, blind re-pushing is not". It has been a sentence in a document the
 // model reads. This makes it a bound.
 //
@@ -425,25 +425,21 @@ export const runRerunFailedJobs = async (
 };
 
 const RERUN_DESCRIPTION = [
-  "Re-run the failed jobs in one GitHub Actions workflow run, once, to confirm",
-  "that a failure is environmental rather than yours. It sends your reasoning to",
-  "the Boss before it reports back, so somebody can tell you that the failure is",
-  "your change.",
+  "Re-run the failed jobs in one GitHub Actions workflow run, once, to confirm a",
+  "failure is environmental. Your suspicion goes to the Boss, so somebody can tell",
+  "you it is your change.",
   "",
-  "THIS IS NOT A WAY TO GET A PULL REQUEST GREEN. Read the failure first. A test",
-  "that names something you touched is your change, and a second attempt at it",
-  "teaches you nothing and costs everyone the time it runs.",
+  "THIS IS NOT A WAY TO GET A PULL REQUEST GREEN. Read the failure first: a test",
+  "that names something you touched is your change.",
   "",
-  "A run can be re-run once. A failure that comes back on the second attempt is a",
-  `finding: report it. At most ${MAX_RERUNS_PER_INCIDENT} runs across this incident, and pushing an empty`,
-  "commit to buy a fresh run is the same thing wearing a different hat.",
+  "One attempt per run: a failure that comes back on the second is a finding to",
+  `report. At most ${MAX_RERUNS_PER_INCIDENT} runs across this incident, and pushing an empty commit to`,
+  "buy a fresh run is the same thing. A flake you confirm is a defect even when",
+  "the re-run is green: name the test, the job and what makes it",
+  "non-deterministic, and open a pull request if the fix is small.",
   "",
-  "A flake you confirm is a defect in its own right, even when the re-run is",
-  "green. Name it the way you would name a bad alert: which test, which job, what",
-  "makes it non-deterministic, and a pull request if the fix is small.",
-  "",
-  "The run id comes from `gh run list --commit <sha> --json databaseId`. Wait for",
-  "the re-run with monitor; it does not block.",
+  "The run id comes from `gh run list --commit <sha> --json databaseId`. It does",
+  "not block; wait for the re-run with monitor.",
 ].join("\n");
 
 export const createRerunCiTool = async (deps: {

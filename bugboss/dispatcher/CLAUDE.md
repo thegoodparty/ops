@@ -61,6 +61,10 @@ escalated. So the child owns both halves. It counts, it escalates with live
 numbers, and it calls `park` so this does not relaunch it into the same
 exhausted budget. See `agent/CLAUDE.md`.
 
+`BUGBOSS_ALERT_SLUGS` is the same kind of courier: the incident's
+`alert_slug`s, read in SQL at launch, so the child can put the rule that fired
+in its prompt without a `get_incident` that would drain its directives.
+
 The one thing to know here: the child hands off and then aborts, which
 leaves an error message behind. `exitCodeFor` exempts that case, so a budget
 doing its job arrives as a clean exit rather than as `agent_failed`.

@@ -75,9 +75,14 @@ export const mcpResultToText = (result: unknown): string => {
 };
 
 /**
- * The Grafana tools an incident agent reads with. Every one is a read: logs,
- * metrics, traces, the datasources behind them, and the dashboards that say
- * what somebody already thought was worth watching.
+ * The Grafana tools an incident agent reads with: the ones agents actually
+ * called. Every tool here is sent on every turn as part of the prefix, so a
+ * tool nobody calls is paid for on all of them. Twenty production incident
+ * sessions called eleven of the twenty-six this list used to hold; the other
+ * fifteen (dashboards, Tempo attribute and TraceQL-docs lookups, label-value
+ * and metric-metadata listings, histograms, trace search, datasource detail,
+ * label analysis) were never called once. A tool comes back with evidence
+ * that an investigation needed it.
  *
  * Alert *rule* reads are missing on purpose. In mcp-grafana v1.6.1 reading a
  * rule and creating one are the same tool (`alerting_manage_rules`, an
@@ -88,32 +93,17 @@ export const mcpResultToText = (result: unknown): string => {
  * and the write is not available at all.
  */
 export const GRAFANA_READ_TOOLS = [
-  "analyze_loki_labels",
   "check_datasources_health",
-  "get_dashboard_by_uid",
-  "get_dashboard_panel_queries",
-  "get_dashboard_property",
-  "get_dashboard_summary",
-  "get_datasource",
   "get_tempo_trace",
-  "get_tempo_traceql_docs",
   "list_datasources",
   "list_loki_label_names",
-  "list_loki_label_values",
   "list_prometheus_label_names",
-  "list_prometheus_label_values",
-  "list_prometheus_metric_metadata",
   "list_prometheus_metric_names",
-  "list_tempo_attribute_names",
-  "list_tempo_attribute_values",
   "query_loki_logs",
   "query_loki_patterns",
   "query_loki_stats",
   "query_prometheus",
-  "query_prometheus_histogram",
   "query_tempo_metrics",
-  "search_dashboards",
-  "search_tempo_traces",
 ] as const;
 
 /**
@@ -137,7 +127,7 @@ export const GRAFANA_READ_TOOLS = [
  */
 export const GRAFANA_MCP_ARGS = [
   "mcp-grafana",
-  "--enabled-tools=loki,prometheus,tempo,datasource,dashboard,search",
+  "--enabled-tools=loki,prometheus,tempo,datasource",
   "--disable-write",
   "--disable-api",
   "--disable-rendering",
@@ -166,9 +156,9 @@ export interface TimeRangeShape {
  *
  * - `startRfc3339`/`endRfc3339` — the Loki tools and the Prometheus metadata
  *   tools. RFC3339 or relative (`now`, `now-1h`).
- * - `startTime`/`endTime` — `query_prometheus`, `query_prometheus_histogram`.
+ * - `startTime`/`endTime` — `query_prometheus`.
  *   RFC3339 or relative, with units down to `ns`.
- * - `start`/`end` — `search_tempo_traces`, `query_tempo_metrics`. RFC3339.
+ * - `start`/`end` — `query_tempo_metrics`. RFC3339.
  *
  * Anything else is not clamped, and that is a decision, not an oversight. The
  * epoch-millisecond `from`/`to` of the annotation tools and the Pyroscope

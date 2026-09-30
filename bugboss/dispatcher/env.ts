@@ -40,6 +40,12 @@ export interface ChildEnvInput {
    */
   maxTurns: number;
   attempt: number;
+  /**
+   * The `alert_slug` of every signal on the incident at launch, so the child
+   * can put the rule that fired in its prompt without a read that would drain
+   * its directives. Not a credential and not a bound.
+   */
+  alertSlugs?: string[];
 }
 
 /**
@@ -95,6 +101,9 @@ export const buildChildEnv = (
   env.BUGBOSS_DEADLINE_AT = String(input.deadlineAt);
   env.BUGBOSS_MAX_TURNS = String(input.maxTurns);
   if (input.sessionRef) env.BUGBOSS_SESSION_REF = input.sessionRef;
+  if (input.alertSlugs?.length) {
+    env.BUGBOSS_ALERT_SLUGS = JSON.stringify([...new Set(input.alertSlugs)].sort());
+  }
 
   return env;
 };
