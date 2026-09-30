@@ -19,6 +19,8 @@ export interface Message {
   bot: boolean;
   /** An uploaded file's content, for the closing report. */
   file: string | null;
+  /** The text as posted, then after every chat.update, with epoch ms. */
+  history: { at: number; text: string }[];
 }
 
 export interface Slack {
@@ -55,7 +57,7 @@ export const startSlack = async (args: {
     ...(m.bot ? { bot_id: "B0EVALBOT" } : {}),
   });
   const postBot = (text: string, threadTs: string | null, file: string | null = null): Message => {
-    const message: Message = { ts: nextTs(), threadTs, user: BOT_USER, text, bot: true, file };
+    const message: Message = { ts: nextTs(), threadTs, user: BOT_USER, text, bot: true, file, history: [{ at: Date.now(), text }] };
     messages.push(message);
     args.onBotMessage?.(message);
     return message;
@@ -72,6 +74,7 @@ export const startSlack = async (args: {
       const m = messages.find((x) => x.ts === a.ts);
       if (!m) throw new Error("message_not_found");
       m.text = a.text ?? m.text;
+      m.history.push({ at: Date.now(), text: m.text });
       return { channel: CHANNEL, ts: m.ts, text: m.text };
     },
     "chat.getPermalink": (a) => ({
@@ -142,7 +145,7 @@ export const startSlack = async (args: {
     apiUrl: `http://127.0.0.1:${port}/api/`,
     messages,
     say: async (threadTs, text) => {
-      const message: Message = { ts: nextTs(), threadTs, user: HUMAN_USER, text, bot: false, file: null };
+      const message: Message = { ts: nextTs(), threadTs, user: HUMAN_USER, text, bot: false, file: null, history: [{ at: Date.now(), text }] };
       messages.push(message);
       const body = JSON.stringify({
         type: "event_callback",

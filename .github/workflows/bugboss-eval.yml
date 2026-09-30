@@ -1,5 +1,7 @@
 # Comment `bugboss eval` on an ops PR to run BugBoss from main against
 # BugBoss from the PR, on every scenario, and get one advisory table back.
+# `bugboss eval stub` does the same with the scripted model: one rep, no
+# Bedrock, real sandbox GitHub. It proves the pipeline, not the change.
 #
 # issue_comment runs this file, and the harness, from main, so a PR cannot
 # change how it is measured. The PR's BugBoss runs as an unprivileged user
@@ -21,13 +23,14 @@ jobs:
   gate:
     if: >-
       github.event.issue.pull_request &&
-      github.event.comment.body == 'bugboss eval' &&
+      contains(fromJSON('["bugboss eval","bugboss eval stub"]'), github.event.comment.body) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     outputs:
       sha: ${{ steps.pr.outputs.sha }}
+      stub: ${{ github.event.comment.body == 'bugboss eval stub' }}
     steps:
       - id: pr
         env:
@@ -58,7 +61,13 @@ jobs:
       matrix:
         # One runner per scenario: six omni checkouts, their installs and the
         # hidden check's fill one runner's disk, so this is the smallest split.
-        scenario: [ecanvasser-sync-timeout, users-read-invalid-zip, p2p-phone-list-late-cap]
+        scenario:
+          - ecanvasser-sync-timeout
+          - users-read-invalid-zip
+          - p2p-phone-list-late-cap
+          - missed-merge
+          - alert-vs-user-harm
+          - alert-vs-user-harm-paid-alert
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,7 +82,10 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: Free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: aws-actions/configure-aws-credentials@v4
+      - if: needs.gate.outputs.stub == 'true'
+        run: git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
+      - if: needs.gate.outputs.stub != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-bugboss-eval
           role-duration-seconds: 21600
@@ -91,10 +103,19 @@ jobs:
           for i in $(seq 60); do [ -s /tmp/bugboss-eval/github-token ] && exit 0; sleep 2; done
           cat /tmp/bugboss-eval/minter.log; exit 1
       - name: Run
+        env:
+          STUB: ${{ needs.gate.outputs.stub }}
         run: |
+          mode=(--reps 3)
+          # With no role assumed, the judge's stubbed Bedrock client still
+          # signs and needs some credentials to resolve. These are not real.
+          if [ "$STUB" = true ]; then
+            mode=(--reps 1 --stub /tmp/omni)
+            export AWS_ACCESS_KEY_ID=AKIAEVALFAKE AWS_SECRET_ACCESS_KEY=fake AWS_REGION=us-west-2
+          fi
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
             --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
-            --scenarios "${{ matrix.scenario }}" --reps 3 \
+            --scenarios "${{ matrix.scenario }}" "${mode[@]}" \
             --token-file /tmp/bugboss-eval/github-token --out /tmp/bugboss-eval/out --run-as bugboss-eval
       - if: always()
         uses: actions/upload-artifact@v4
@@ -130,11 +151,15 @@ jobs:
           path: results
       - env:
           GH_TOKEN: ${{ github.token }}
+          STUB: ${{ needs.gate.outputs.stub }}
         run: |
           files=$(ls results/*/results.json 2>/dev/null || true)
           if [ -z "$files" ]; then
             body="BugBoss eval produced no results: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
             body="$(npx tsx bugboss-evals/sim/compare.ts report --baseline main --candidate "${{ needs.gate.outputs.sha }}" $files)"
+          fi
+          if [ "$STUB" = true ]; then
+            body="**Stub run**: scripted model, one rep, no Bedrock. It shows the pipeline works, not whether the change is better."$'\n\n'"$body"
           fi
           gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$body"

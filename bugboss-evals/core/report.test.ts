@@ -20,6 +20,7 @@ const run = (scenario: string, rep: number, side: Side, over: Partial<RunResult>
   ref: side === "baseline" ? "main" : "pr",
   end: "closed",
   gates: { closed: true, fixed: true, mergedGreen: true, noPushToMain: true },
+  scenarioGates: {},
   spend: { ...ZERO_SPEND, usd: side === "baseline" ? 10 : 8, turns: 40, unpriced: [] },
   wallClockSeconds: 3600,
   output: { rootCause: "x", diff: "y", postmortem: "z" },
@@ -45,8 +46,8 @@ test("the report has a row per scenario and a total, and names the runs that fai
     runs: [
       run("a", 1, "baseline"),
       run("a", 1, "candidate", { end: "wall_clock", wallClockSeconds: null, gates: { closed: false, fixed: null, mergedGreen: true, noPushToMain: true } }),
-      run("b", 1, "baseline"),
-      run("b", 1, "candidate"),
+      run("b", 1, "baseline", { scenarioGates: { "merge-noticed": false } }),
+      run("b", 1, "candidate", { scenarioGates: { "merge-noticed": true } }),
     ],
     verdicts: [verdict("a/1", "baseline"), verdict("b/1", "candidate")],
     judgeUsd: 1,
@@ -54,5 +55,6 @@ test("the report has a row per scenario and a total, and names the runs that fai
   assert.match(text, /\| a \| 1\/1 \| \$10\.00 \| 60m \| 0\/1 \| \$8\.00 \| – \| 0-1-0 \|/);
   assert.match(text, /\| \*\*Total\*\* \| 2\/2 \| \$10\.00 \| 60m \| 1\/2 \| \$8\.00 \| 60m \| 1-1-0 \|/);
   assert.match(text, /- a rep 1 candidate: ended wall_clock; closed, fix check/);
+  assert.match(text, /\| b \| merge-noticed \| 0\/1 \| 1\/1 \|/);
   assert.match(text, /sign test p=1\.000 over 2 decisive pairs, so this could be chance/);
 });
