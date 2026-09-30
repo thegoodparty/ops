@@ -20,10 +20,6 @@ best supported by the evidence the output itself cites. Neither side is
 excused for lacking a reference, and neither is rewarded for agreeing with
 the other.
 
-Each root cause is labelled with where it came from. One joined from every
-message that mentions a root cause may repeat itself or carry a cause the
-agent later dropped; judge the cause the agent settled on, not the repetition.
-
 Judge only from these. Do not check claims against your own knowledge of the
 codebase or of the world, except where a claim is internally impossible or
 contradicts itself. Do not reward a fix for resembling one you would have
