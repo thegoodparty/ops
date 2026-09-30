@@ -578,7 +578,7 @@ export const createBossTools = async (args: {
       name: "report_resolved",
       label: "Report resolved",
       description:
-        "FIXING -> RESOLVED. Only after you have observed the problem stop: evidence is what you watched go quiet, not what you believe the fix does.",
+        "FIXING -> RESOLVED. Only after you have observed the harm stop: a user who repeats exactly what the affected user did is not harmed. Evidence is what you observed, not what you believe the fix does; a quiet alert is not evidence on its own.",
       parameters: Type.Object({
         prUrls: Type.Array(Type.String()),
         evidence: Type.String({ description: "What you observed stop happening, and how." }),
