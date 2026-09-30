@@ -247,6 +247,16 @@ and saying so each time would teach people to skip the message that matters.
 The agent is still told either way -- that is the `resumed_after` directive,
 and it is the one that has to re-check what moved.
 
+**The gap runs from the agent's last activity, never from its launch.** When
+this process watched the exit, the exit time is exact. After a container
+restart it did not: a deploy kills every child with no exit record. The clock
+is then the newest of the session's last entry timestamp (synced after every
+turn, via `lastSessionEventAt`) and what the agent's blocking tools write
+while a turn is still open: `boss_inbox`, agent `incident_action`,
+`pending_question`, `pending_wait`. Launch is only the floor. Measuring from
+launch told every thread on every deploy that an agent working minutes
+earlier had been gone for hours, and to disregard its last message.
+
 `postNotice` is optional on the deps because the unit tests and the E2E run
 without Slack, but a prod composition root that passes nothing makes the one
 event this exists to surface silent again, so its absence alarms rather than

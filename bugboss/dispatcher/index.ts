@@ -121,6 +121,13 @@ export interface DispatcherDeps {
    * so the composition root passing nothing is worth noticing.
    */
   postNotice?: (incidentId: string, text: string) => Promise<void>;
+  /**
+   * The newest timestamp in an incident's synced session, or null. Read on a
+   * resume the dispatcher did not watch exit, to learn when the agent was
+   * last working. Optional for the same reason as postNotice; without it the
+   * gap falls back to what the database recorded.
+   */
+  lastSessionEventAt?: (sessionRef: string) => Promise<number | null>;
   /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
   childBaseEnv?: Record<string, string | undefined>;
   /**
@@ -334,9 +341,8 @@ export const resumeNotice = (deadSeconds: number): string => {
   const minutes = Math.round(deadSeconds / 60);
   const span = minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 6) / 10}h`;
   return [
-    `The agent on this incident stopped without finishing and was gone for ${span}.`,
-    "Nothing was happening here in that time, whatever the last message says.",
-    "I have started it again; it will re-check anything time-sensitive before it continues.",
+    `The agent on this incident stopped without finishing, and nothing had been heard from it for ${span} when I started it again.`,
+    "It will re-check anything time-sensitive before it continues.",
   ].join(" ");
 };
 
@@ -405,6 +411,7 @@ export class Dispatcher {
   private readonly childCredentials: Record<string, string | undefined>;
   private readonly childBaseEnv: Record<string, string | undefined>;
   private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
+  private readonly lastSessionEventAt: ((sessionRef: string) => Promise<number | null>) | null;
   private readonly fastFailureMs: number;
   private readonly maxLaunches: number;
   private readonly parkCooldownMs: number;
@@ -450,6 +457,7 @@ export class Dispatcher {
     this.childCredentials = deps.childCredentials ?? {};
     this.childBaseEnv = deps.childBaseEnv ?? {};
     this.postNotice = deps.postNotice ?? null;
+    this.lastSessionEventAt = deps.lastSessionEventAt ?? null;
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
@@ -1062,31 +1070,93 @@ export class Dispatcher {
     log("parked", { incidentId, waitingFor, wakeAt: now + this.parkCooldownMs });
   };
 
+  /**
+   * The last moment the agent on this incident is known to have been alive.
+   *
+   * The session is the primary clock: the agent writes it and it is synced
+   * after every turn, so it tracks the agent working rather than anything
+   * else touching the incident. It cannot see inside a turn, and the blocking
+   * tools make a turn last as long as the wait, so the rows those tools write
+   * as they run count too: a question or message to the Boss, a wait on a
+   * person and its reminders, and anything the agent did through the tool
+   * API. Launch is only the floor. Measuring from it is what told every
+   * thread on every deploy that an agent working minutes earlier had been
+   * gone for hours.
+   *
+   * Human rows are left out on purpose. A reply in the thread says a person
+   * was there, not that the agent was.
+   */
+  private lastAliveAt = async (row: EligibleRow): Promise<number> => {
+    const recorded =
+      this.db.get<{ at: number }>(
+        `SELECT MAX(
+           COALESCE((SELECT MAX(createdAt) FROM boss_inbox
+                      WHERE incidentId = ?), 0),
+           COALESCE((SELECT MAX(at) FROM incident_action
+                      WHERE incidentId = ? AND actorKind = 'agent'), 0),
+           COALESCE((SELECT MAX(askedAt) FROM pending_question
+                      WHERE incidentId = ?), 0),
+           COALESCE((SELECT MAX(startedAt, COALESCE(lastPingAt, 0))
+                      FROM pending_wait WHERE incidentId = ?), 0)
+         ) AS at`,
+        [row.id, row.id, row.id, row.id],
+      )?.at ?? 0;
+
+    let session: number | null = null;
+    if (this.lastSessionEventAt && row.sessionRef) {
+      try {
+        session = await this.lastSessionEventAt(row.sessionRef);
+      } catch (err: unknown) {
+        alarm("resume_session_read_failed", {
+          incidentId: row.id,
+          sessionRef: row.sessionRef,
+          error: String(err),
+          note: "the gap is measured from the database alone, so it may read longer than it was",
+        });
+      }
+    }
+
+    return Math.max(
+      recorded,
+      session ?? 0,
+      row.lastStartedAt ?? row.firstSignalAt,
+    );
+  };
+
   private emitResumedAfter = async (
     row: EligibleRow,
     now: number,
   ): Promise<void> => {
     // Exact when we watched the exit ourselves. After a container restart we
-    // did not, and a SIGKILLed process writes no exit time, so the best
-    // available is when that run started: still an upper bound, but bounded
-    // by the agent's own lifecycle rather than by the incident's age.
-    const since =
-      this.lastExitAt.get(row.id) ?? row.lastStartedAt ?? row.firstSignalAt;
+    // did not, and a SIGKILLed process writes no exit time, so the gap runs
+    // from the last thing the agent is known to have done.
+    const exitedAt = this.lastExitAt.get(row.id);
+    const since = exitedAt ?? (await this.lastAliveAt(row));
     const seconds = Math.max(0, Math.round((now - since) / 1000));
     if (seconds < this.config.tickSeconds) return;
     await this.emitDirective(row.id, { type: "resumed_after", seconds });
-    if (seconds < RESUME_NOTICE_SECONDS) return;
+    if (seconds < RESUME_NOTICE_SECONDS) {
+      // The normal path: every merge to ops main restarts this container and
+      // every live agent with it.
+      log("agent_resumed", {
+        incidentId: row.id,
+        gapSeconds: seconds,
+        measuredFrom: exitedAt === undefined ? "last_activity" : "exit",
+      });
+      return;
+    }
 
     // Loud on both channels, because they answer different questions. The
     // alarm is how an operator learns agents are dying; the thread is how the
     // person watching this one incident learns that the quiet they were
-    // reading as progress was an agent that had not existed for an hour.
+    // reading as progress was an agent that had stopped.
     alarm("agent_resumed_after_gap", {
       incidentId: row.id,
       deadSeconds: seconds,
+      measuredFrom: exitedAt === undefined ? "last_activity" : "exit",
       attempts: row.attempts,
       status: row.status,
-      note: "the previous run stopped without finishing and nothing ran this incident in the meantime",
+      note: "the previous run stopped without finishing and nothing was heard from it for this long before the relaunch",
     });
     if (!this.postNotice) {
       alarm("resume_notice_undeliverable", {

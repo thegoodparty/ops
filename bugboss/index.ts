@@ -135,6 +135,7 @@ import {
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { attachedSignalIds } from "./triage/sql";
 import {
+  lastSessionEventAt,
   readSessionOutcome,
   sessionKeyFor,
   sumSessionUsage,
@@ -1898,6 +1899,10 @@ export const createBugBoss = async (
         return;
       }
       await slack.post(threadTs, text);
+    },
+    lastSessionEventAt: async (sessionRef) => {
+      const raw = await store.get(sessionRef);
+      return raw ? lastSessionEventAt(raw) : null;
     },
     childBaseEnv: {
       ...pickBaseEnv(process.env),
