@@ -154,7 +154,7 @@ git fetch -q origin && git checkout -q -B main origin/main
 };
 
 const startPostgres = (runId: string): { url: string; stop: () => void } => {
-  const name = `bugboss-eval-pg-${runId}`;
+  const name = `evb-pg-${runId}`;
   const run = spawnSync("docker", ["run", "-d", "--rm", "--name", name, "-e", "POSTGRES_PASSWORD=postgres", "-p", "127.0.0.1::5432", "postgres:16"], { encoding: "utf8" });
   if (run.status !== 0) throw new Error(`postgres: ${run.stderr}`);
   const port = spawnSync("docker", ["port", name, "5432"], { encoding: "utf8" }).stdout.trim().split(":").pop();
