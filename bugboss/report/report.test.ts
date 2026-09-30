@@ -499,6 +499,34 @@ describe("a failed upload is retried, never dumped into the thread", () => {
     assert.equal(uploads.length, 1, "attached once");
   });
 
+  it("re-sends a close notice Slack refused, on the file, rather than losing it", async () => {
+    await seed("inc-7f", { closedAt: NOW - 60_000 });
+    uploadFails = true;
+    let refuse = true;
+    const flaky = deps({
+      post: async (threadTs, text) => {
+        if (refuse) throw new Error("slack: ratelimited");
+        posts.push({ threadTs, text });
+        return { ts: "ts-1" };
+      },
+    });
+
+    assert.equal(await publishIncidentReport(flaky, "inc-7f"), "retrying");
+    assert.equal(posts.length, 0, "the premise: the notice never landed");
+
+    refuse = false;
+    uploadFails = false;
+    const later = NOW + REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS;
+    assert.equal(await publishPendingReports({ ...flaky, now: () => later }), 1);
+    assert.equal(uploads.length, 1);
+    assert.equal(
+      uploads[0].comment,
+      "*Incident inc-7f closed*\n_1240 users impacted · post-mortem written._",
+      "the retry carries the notice that never went out",
+    );
+    assert.equal(posts.length, 0);
+  });
+
   it("does not attach twice when the last step's answer never came back", async () => {
     // The file can land and the completion's answer still be lost -- a
     // timeout on files.completeUploadExternal, or a container that dies right
@@ -904,6 +932,39 @@ describe("an incident that came back explains itself", () => {
     assert.ok(data);
     assert.equal(data.recurrence, null);
     assert.doesNotMatch(renderReportDocument(data), /Why it came back/);
+  });
+});
+
+describe("every publisher reads the tokens the run spent", () => {
+  it("rolls usage up before the sweep renders, for a close whose container died", async () => {
+    // Nothing relaunches an agent on a CLOSED incident, so a container that
+    // died between the close and the publish may never have rolled up. The
+    // row's zero would then print as a free run.
+    await seed("inc-7g", { closedAt: NOW - REPORT_SWEEP_GRACE_MS - 1_000 });
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET tokensIn = 0 WHERE id = 'inc-7g'").run();
+    });
+    const order: string[] = [];
+
+    await publishPendingReports(
+      deps({
+        rollUpUsage: async (incidentId) => {
+          order.push("roll-up");
+          await db.withWrite((w) => {
+            w.prepare("UPDATE incident SET tokensIn = 7777 WHERE id = ?").run(incidentId);
+          });
+        },
+        uploader: {
+          upload: async (file) => {
+            order.push("upload");
+            uploads.push(file);
+          },
+        },
+      }),
+    );
+
+    assert.deepEqual(order, ["roll-up", "upload"]);
+    assert.match(uploads[0].content.toString(), /\| Input tokens \| 7,777 \|/);
   });
 });
 

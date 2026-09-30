@@ -1828,6 +1828,7 @@ export const createBugBoss = async (
         }),
     },
     prStates: options.prStates,
+    rollUpUsage: (incidentId) => rollUpUsage(incidentId, incidentSessionKey(incidentId)),
     now,
   };
 
@@ -1835,14 +1836,14 @@ export const createBugBoss = async (
    * The close's one message, sent by the close itself rather than by
    * anything that runs after the agent: the notice with the report attached.
    *
-   * Usage is rolled up first, from the session file as far as it has synced.
-   * The turn that called report_analysis and any after it are not in it yet,
-   * so the report's token figures are as of the close; the row catches up
-   * when the run exits. Never throws: the close has already committed.
+   * Usage is rolled up first (`reportDeps.rollUpUsage`), from the session
+   * file as far as it has synced. The turn that called report_analysis and
+   * any after it are not in it yet, so the report's token figures are as of
+   * the close; the row catches up when the run exits. Never throws: the close
+   * has already committed.
    */
   const announceClose = async (incidentId: string): Promise<void> => {
     try {
-      await rollUpUsage(incidentId, incidentSessionKey(incidentId));
       await publishIncidentReport(reportDeps, incidentId);
     } catch (err: unknown) {
       alarm("report_publish_failed", { incidentId, error: String(err) });

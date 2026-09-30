@@ -54,6 +54,13 @@ export const REPORT_PUBLISHED_ACTION = "report_published";
 export const REPORT_UPLOAD_FAILED_ACTION = "report_upload_failed";
 
 /**
+ * The close notice went out on its own, after a failed attempt. Without this
+ * row the next attempt carries the notice as the file's comment, so a notice
+ * Slack refused is re-sent rather than lost.
+ */
+export const REPORT_NOTICE_POSTED_ACTION = "report_notice_posted";
+
+/**
  * Attempts before the report is given up on, the one at close included. With
  * the retry spacing below that is about twenty minutes of Slack being unable
  * to take the file, which is weather that has lasted long enough for a
@@ -132,6 +139,13 @@ export interface ReportDeps {
   prStates?: PrStateReader;
   /** Defaults to the real PDF. Tests read the Markdown instead. */
   renderPdf?: (markdown: string) => Promise<Buffer>;
+  /**
+   * Writes the run's tokens onto the row from its session file, before the
+   * report reads them. Every publisher needs it, the sweep included: a
+   * container that died mid-close may never have rolled up at all, and zero
+   * tokens reads as a free run. Never throws.
+   */
+  rollUpUsage?: (incidentId: string) => Promise<void>;
   now?: () => number;
 }
 
@@ -180,9 +194,14 @@ export const readReportData = async (
 
   const actions: ReportAction[] = deps.db.query<ActionRow>(
     `SELECT actorKind, actorId, action, reason, at FROM incident_action
-       WHERE incidentId = ? AND action NOT IN (?, ?)
+       WHERE incidentId = ? AND action NOT IN (?, ?, ?)
        ORDER BY at, id`,
-    [incidentId, REPORT_PUBLISHED_ACTION, REPORT_UPLOAD_FAILED_ACTION],
+    [
+      incidentId,
+      REPORT_PUBLISHED_ACTION,
+      REPORT_UPLOAD_FAILED_ACTION,
+      REPORT_NOTICE_POSTED_ACTION,
+    ],
   );
 
   // Tokens and modelId are the record and come off the row. Turns and the
@@ -293,8 +312,7 @@ export const closeNoticeFor = (data: ReportData): string => {
 
 /**
  * Claim the right to publish, as one statement, and learn in the same
- * transaction whether an earlier attempt failed -- which is what says the
- * notice already went out.
+ * transaction whether the close notice has already gone out on its own.
  *
  * Guarded in the INSERT rather than by a read before it, like every other
  * transition here: two publishers can race -- the close and the sweep -- and
@@ -306,7 +324,7 @@ const claim = (
   db: Db,
   incidentId: string,
   at: number,
-): Promise<{ claimed: boolean; failures: number }> =>
+): Promise<{ claimed: boolean; failures: number; noticePosted: boolean }> =>
   db.withWrite((w: Database.Database) => {
     const res = w
       .prepare(
@@ -325,13 +343,35 @@ const claim = (
         incidentId,
         REPORT_PUBLISHED_ACTION,
       );
-    const failed = w
-      .prepare(
-        "SELECT COUNT(*) AS n FROM incident_action WHERE incidentId = ? AND action = ?",
-      )
-      .get(incidentId, REPORT_UPLOAD_FAILED_ACTION) as { n: number };
-    return { claimed: res.changes > 0, failures: failed.n };
+    const count = (action: string): number =>
+      (
+        w
+          .prepare(
+            "SELECT COUNT(*) AS n FROM incident_action WHERE incidentId = ? AND action = ?",
+          )
+          .get(incidentId, action) as { n: number }
+      ).n;
+    return {
+      claimed: res.changes > 0,
+      failures: count(REPORT_UPLOAD_FAILED_ACTION),
+      noticePosted: count(REPORT_NOTICE_POSTED_ACTION) > 0,
+    };
   });
+
+/**
+ * Written after the post rather than before it. A crash in between repeats
+ * the notice on the next attempt, and a repeated line is the lesser failure
+ * next to a close nobody was told about.
+ */
+const recordNotice = (db: Db, incidentId: string, at: number): Promise<void> =>
+  db
+    .withWrite((w: Database.Database) => {
+      w.prepare(
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES (?, 'boss', NULL, ?, 'close notice posted without the report', ?)`,
+      ).run(incidentId, REPORT_NOTICE_POSTED_ACTION, at);
+    })
+    .then(() => undefined);
 
 /**
  * Record a failed attempt and, unless that was the last one, hand the claim
@@ -365,10 +405,10 @@ const recordFailure = (
 /**
  * Attach the report to the incident thread, once.
  *
- * The first attempt carries the close notice as the file's message, so a
- * close is one message. If it fails, the notice goes out alone with a line
- * saying the report follows, and a later attempt attaches the file on its
- * own. Returns what happened rather than throwing: the callers are the close
+ * Until the close notice has reached the thread, every attempt carries it as
+ * the file's message, so a close is one message. If an attempt fails, the
+ * notice goes out alone with a line saying the report follows, and a later
+ * attempt attaches the file on its own. Returns what happened rather than throwing: the callers are the close
  * and a timer, and neither has anything to do with a failure except log it,
  * which this module has already done.
  */
@@ -378,16 +418,17 @@ export const publishIncidentReport = async (
 ): Promise<PublishOutcome> => {
   const now = deps.now ?? Date.now;
 
-  const { claimed, failures } = await claim(deps.db, incidentId, now());
+  const { claimed, failures, noticePosted } = await claim(deps.db, incidentId, now());
   if (!claimed) {
     log("publish_skipped", { incidentId, reason: "not closed, or already claimed" });
     return "skipped";
   }
-  const first = failures === 0;
+  const noticeDue = !noticePosted;
   log("publish_claimed", { incidentId, attempt: failures + 1 });
 
   let data: ReportData | null = null;
   try {
+    await deps.rollUpUsage?.(incidentId);
     data = await readReportData(deps, incidentId);
     if (!data) throw new Error("no such incident");
     const pdf = await (deps.renderPdf ?? renderReportPdf)(renderReportDocument(data));
@@ -397,7 +438,7 @@ export const publishIncidentReport = async (
       filename: `incident-${data.incident.id}.pdf`,
       title: `Incident ${data.incident.id} — closing report`,
       content: pdf,
-      comment: first ? closeNoticeFor(data) : null,
+      comment: noticeDue ? closeNoticeFor(data) : null,
     });
     log("published", {
       incidentId,
@@ -429,22 +470,33 @@ export const publishIncidentReport = async (
       of: REPORT_UPLOAD_ATTEMPTS,
     });
     const threadTs = data?.incident.slackThreadTs ?? readThreadTs(deps.db, incidentId);
-    const say = async (text: string): Promise<void> => {
+    const say = async (text: string): Promise<boolean> => {
       try {
         await deps.post(threadTs, text);
+        return true;
       } catch (postErr) {
         alarm("notice_failed", { incidentId, error: String(postErr) });
+        return false;
       }
     };
+    // The notice rides with the last word on the report, whichever that is,
+    // so a close is never announced in two posts when one would do.
+    const withNotice = async (line: string): Promise<void> => {
+      if (!noticeDue) {
+        await say(line);
+        return;
+      }
+      const text = data ? `${closeNoticeFor(data)}\n${line}` : closedNotice(incidentId, line);
+      if (await say(text)) await recordNotice(deps.db, incidentId, now());
+    };
 
-    if (first) {
-      const line = "_The closing report is attaching shortly._";
-      await say(data ? `${closeNoticeFor(data)}\n${line}` : closedNotice(incidentId, line));
+    if (attempts < REPORT_UPLOAD_ATTEMPTS) {
+      if (noticeDue) await withNotice("_The closing report is attaching shortly._");
+      return "retrying";
     }
-    if (attempts < REPORT_UPLOAD_ATTEMPTS) return "retrying";
 
     alarm("upload_abandoned", { incidentId, attempts, error: String(err) });
-    await say(
+    await withNotice(
       mrkdwn`_The closing report for Incident ${incidentId} could not be attached after ${attempts} attempts. It is saved with the incident._`,
     );
     return "abandoned";

@@ -33,8 +33,10 @@ retried; none propagates.
 ## Tokens are as of the close
 
 The tokens the report quotes reach the incident row from `rollUpUsage`, which
-reads the session file. The session syncs to S3 at the end of each turn, so
-`announceClose` rolls up first and gets everything but the turn that called
+reads the session file. Every publish rolls up first (`ReportDeps.rollUpUsage`),
+the sweep included, because a container that died mid-close may never have
+rolled up and a zero reads as a free run. The session syncs to S3 at the end
+of each turn, so at close that is everything but the turn that called
 `report_analysis` and any after it. The row catches up when the run exits;
 the report does not. That gap is the price of the close being one message
 sent at the moment it happens.
@@ -50,8 +52,11 @@ A failed attempt writes a `report_upload_failed` row and, in the same
 transaction, hands the claim back:
 
 - **The first failure** posts the close notice alone, with one line saying the
-  report is attaching shortly. The close is never silent because Slack would
-  not take a file.
+  report is attaching shortly, and records `report_notice_posted` once Slack
+  takes it. Until that row exists every attempt carries the notice as the
+  file's comment, so a notice Slack refused is re-sent rather than lost. The
+  row is written after the post: a crash in between repeats the notice, which
+  beats a close nobody was told about.
 - **The sweep** (`publishPendingReports`, on the dispatcher tick) retries
   `REPORT_UPLOAD_RETRY_MS` after the last failure. A retry that succeeds posts
   the file on its own, with no comment, because the notice already went out.
