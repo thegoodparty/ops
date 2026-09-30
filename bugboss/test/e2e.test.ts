@@ -3163,8 +3163,9 @@ test("a close request tagged in a board thread reaches the Boss, which acts on i
   const event = taggedIn("2400.2", board, said);
 
   // The mention path, the one the classifier stood in front of: the board's
-  // thread belongs to no incident.
-  assert.equal((await boss.relay.handle(event)).kind, "slack_agent");
+  // thread belongs to no incident. Checked on its own ts, because the relay
+  // now collapses a second delivery of one message as a Slack retry.
+  assert.equal((await boss.relay.handle({ ...event, ts: "2400.9" })).kind, "slack_agent");
 
   const calls = fakeModel.calls;
   const posts = fakeSlack.posts.length;
