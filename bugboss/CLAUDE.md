@@ -66,8 +66,9 @@ that lets the model decide *what* is written rather than *whether* to ask,
 would end that, quietly, and is the one change to this area worth refusing.
 
 Its answer is prose rather than a schema, because there is nothing to
-validate in "here is what I found". Code still decides what happens to it: an
-empty answer posts nothing, and anything else is posted whole.
+validate in "here is what I found". Code still decides what happens to it:
+anything it writes is posted whole, and it posts nothing only by calling
+`stay_silent`. An empty answer without that call is a failed run, and alarms.
 
 **Two loops, on purpose.** `runStructuredCall` bounds a whole call with one
 wall-clock budget and a round count, and throws so every caller takes its
@@ -101,12 +102,12 @@ incident's" — is not a language interface. Those decide where a message is
 routed, never what it meant.
 
 **Anything a reader sees the same way twice is rendered once, in code.** An
-incident reference, a status-board row and a thread's header are all
-formatting, and formatting asked for in a prompt is followed
+incident reference, a status-board row, a thread's header and an incident's
+status card are all formatting, and formatting asked for in a prompt is followed
 probabilistically -- which is how the same answer came to link some incidents
 and not others, and to spell the same word two ways in one message. The
-renderers are `slack/incidents.ts` and `slack/board.ts`; the model writes
-"incident 4" in prose and code decides what that looks like. This is the
+renderers are `slack/incidents.ts`, `slack/status.ts` and `slack/board.ts`;
+the model writes "incident 4" in prose and code decides what that looks like. This is the
 opposite of the language rule above, not an exception to it: that one is
 about reading what a person meant, this one is about our own output.
 

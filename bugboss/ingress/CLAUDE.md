@@ -60,6 +60,16 @@ BugBoss owns, was the app tagged. The thread check looks like interpretation
 and is not: it is a `slackThreadTs` lookup, injected because the Boss knows
 and ingress does not.
 
+The same goes for `isBossThread`, which makes an untagged reply in a thread
+outside any incident a `boss_thread_reply` when the Boss already has a
+conversation there — a `boss_thread` row, written when the Boss takes a
+mention or posts in a thread, or the Slack agent's persisted session state
+for threads older than the table. Production lost "Can you close incident 2?"
+typed without a tag under a Boss answer, because only incident threads and
+tagged mentions were routed. The relay is handed the same predicate, so the
+two layers answer this one way. Neither reads the text: the same sentence in a
+thread the Boss never spoke in is still `ignored`.
+
 It stays because `ignored` is load-bearing. The HTTP layer decides whether a
 delivery earns its :eyes: by excluding `ignored`, so the kind is not just a
 description — it is the difference between somebody seeing an

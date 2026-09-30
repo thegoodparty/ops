@@ -56,6 +56,7 @@ import {
   compactTranscript,
   SLACK_AGENT_BUDGET_MS,
   SlackAgent,
+  slackSessionPrefix,
   type ObjectStore,
   type SlackAgentModel,
   type SlackClient,
@@ -863,12 +864,63 @@ export const createBugBoss = async (
   // Ingress
   // -------------------------------------------------------------------------
 
+  /**
+   * Threads outside any incident where the Boss already has a conversation,
+   * which is where an untagged follow-up is still a message for the Boss.
+   * A `boss_thread` row, or the Slack agent's persisted session state for a
+   * thread that predates the table. Read from what the Boss did in the
+   * thread, never from what the message says.
+   *
+   * Positives are memoised: a thread never stops being one. Negatives are
+   * not, because the next mention makes it one.
+   */
+  const knownBossThreads = new Set<string>();
+  const isBossThread = async (channel: string, threadTs: string): Promise<boolean> => {
+    const key = `${channel}/${threadTs}`;
+    if (knownBossThreads.has(key)) return true;
+    const recorded =
+      db.get("SELECT 1 FROM boss_thread WHERE channel = ? AND threadTs = ?", [
+        channel,
+        threadTs,
+      ]) !== undefined;
+    let found = recorded;
+    if (!found) {
+      try {
+        found = (await store.get(`${slackSessionPrefix(channel, threadTs)}state.json`)) !== null;
+      } catch (err) {
+        // A store that cannot answer costs this follow-up its route, not the
+        // request. Loud, because the symptom is a reply that silently gets
+        // nothing.
+        alarm("boss_thread_lookup_failed", { channel, threadTs, error: String(err) });
+        found = false;
+      }
+    }
+    if (found) knownBossThreads.add(key);
+    return found;
+  };
+
+  const recordBossThread = async (channel: string, threadTs: string): Promise<void> => {
+    knownBossThreads.add(`${channel}/${threadTs}`);
+    try {
+      await db.withWrite((w) => {
+        w.prepare(
+          "INSERT OR IGNORE INTO boss_thread (channel, threadTs, since) VALUES (?, ?, ?)",
+        ).run(channel, threadTs, now());
+      });
+    } catch (err) {
+      // The in-process memo still routes follow-ups until the next restart;
+      // after that the thread is only found through its session state.
+      alarm("boss_thread_unrecorded", { channel, threadTs, error: String(err) });
+    }
+  };
+
   const slackIngress: SlackConfig = {
     signingSecret: secrets.slackSigningSecret,
     botUserId: secrets.slackBotUserId,
     isIncidentThread: (_channel, threadTs) =>
       db.get("SELECT id FROM incident WHERE slackThreadTs = ?", [threadTs]) !==
       undefined,
+    isBossThread,
     verifier: options.insecureTestVerifiers?.slack,
   };
 
@@ -916,6 +968,7 @@ export const createBugBoss = async (
       botUserId: secrets.slackBotUserId ?? "",
       rotationGroupId: secrets.slackRotationGroupId ?? null,
     },
+    isBossThread,
   });
 
   const slackAgent = new SlackAgent({
@@ -933,6 +986,11 @@ export const createBugBoss = async (
       incidentChannel: config.slackChannelId,
     },
     closeIncident: (args) => closeIncidentByBoss({ db, slack: threads }, args),
+    // The status card's one model-written sentence. The intent read's model,
+    // because it is the knob that already moves a small bounded call to a
+    // cheaper model (BUGBOSS_INTENT_MODEL_ID) without a deploy.
+    summaryModel: options.intentModel ?? options.model,
+    now,
   });
 
   /**
@@ -1964,7 +2022,8 @@ export const createBugBoss = async (
   ): Promise<void> =>
     slack
       .post(threadTs, text, channel)
-      .then(() => undefined)
+      // Whatever the Boss says in a thread, the reply to it is for the Boss.
+      .then(() => recordBossThread(channel, threadTs))
       .catch((err: unknown) =>
         alarm("intent_reply_failed", { channel, threadTs, error: String(err) }),
       );
@@ -2150,6 +2209,11 @@ export const createBugBoss = async (
         user: route.user,
         text: route.text,
       });
+
+    // Before the read, so a follow-up typed while this one is still being
+    // answered already reaches the Boss. A top-level mention's thread is the
+    // mention's own ts, which is where the answer goes.
+    await recordBossThread(route.channel, route.threadTs);
 
     const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
     // A bare @bugboss is somebody about to type. There is no sentence to

@@ -15,7 +15,15 @@ const row = (over: Partial<BoardRow> = {}): BoardRow => ({
   status: "FIXING",
   summary: "Loki reads are being rejected",
   firstSignalTitle: "memory above 90% on bugboss-prod",
+  mergedInto: null,
   waitingFor: null,
+  liftsOnReply: null,
+  waitStartedAt: null,
+  questionAskedAt: null,
+  questionText: null,
+  monitorCommand: null,
+  monitorStartedAt: null,
+  unreadQuestions: 0,
   ...over,
 });
 
@@ -49,8 +57,8 @@ describe("the three fields", () => {
    * you" worth trusting, which is why it is said out loud rather than left
    * to the absence of a line.
    */
-  test("an incident nobody is waiting on says nothing is needed", () => {
-    assert.match(renderHeader(row()), /nothing needed from anyone/);
+  test("an incident nobody is waiting on says so", () => {
+    assert.match(renderHeader(row()), /Waiting on nobody/);
   });
 
   test("a waiting incident shows what is being waited on, verbatim", () => {
@@ -71,7 +79,7 @@ describe("one renderer, two scales", () => {
     const one = row({ waitingFor: "a decision on the recording rules" });
     for (const text of [renderHeader(one), renderBoardLine(one)]) {
       assert.match(text, /Incident 4/);
-      assert.match(text, /Fixing/);
+      assert.match(text, /FIXING/);
       assert.match(text, /Loki reads are being rejected/);
       assert.match(text, /a decision on the recording rules/);
     }
@@ -129,6 +137,6 @@ describe("escaping", () => {
   test("a summary out of a model cannot eat the line", () => {
     const line = renderBoardLine(row({ summary: "reads of <redis> failing" }));
     assert.match(line, /&lt;redis&gt;/);
-    assert.ok(line.endsWith("_"), line);
+    assert.ok(line.endsWith("waiting on nobody"), line);
   });
 });
