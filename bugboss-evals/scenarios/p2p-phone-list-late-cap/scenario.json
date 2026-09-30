@@ -1,0 +1,34 @@
+{
+  "id": "p2p-phone-list-late-cap",
+  "sourceIncident": 5,
+  "omni": {
+    "baseSha": "fd76c9a1ea48ee52fd10029109daa129e5394822",
+    "packages": ["gp-api"],
+    "provingFixSha": "dbb9266ba97df84d64340580ec1d50a59382fd8f"
+  },
+  "alert": { "file": "alert.json", "refireEverySeconds": 600 },
+  "telemetry": { "generator": "telemetry.ts", "backfillHoursBefore": 24 },
+  "aws": { "data": "aws.json" },
+  "ci": {
+    "visible": [
+      "npm run test -w packages/gp-api -- src/contacts src/vendors/peerly src/outreach",
+      "npm run lint -w packages/gp-api"
+    ]
+  },
+  "check": {
+    "setup": "check/setup.sh",
+    "command": "check/run.sh",
+    "timeoutSeconds": 900,
+    "runsAt": "deploy"
+  },
+  "reviewer": { "requestChangesOnce": true },
+  "persona": {
+    "file": "persona.md",
+    "model": "sonnet",
+    "replyDelaySeconds": [20, 90],
+    "mergeDelaySeconds": 300
+  },
+  "chaos": { "restartBugbossAfterSeconds": null },
+  "caps": { "wallClockSeconds": 10800, "modelUsd": 35, "quietMinutes": 30 },
+  "reference": "reference.md"
+}
