@@ -328,6 +328,25 @@ describe("SQL access is read-only", () => {
     assert.doesNotThrow(() => JSON.parse(out), "and it is still JSON");
   });
 
+  test("stay_silent refuses, and records nothing, on a run that must answer", async () => {
+    const { store } = memoryStore();
+    const build = (allowed: boolean) => {
+      const extras = toolExtras();
+      extras.silence.allowed = allowed;
+      const tool = buildTools({ db, store, ...extras, commands: commandDeps() }).find((t) => t.name === STAY_SILENT_TOOL);
+      assert.ok(tool);
+      return { tool, silence: extras.silence };
+    };
+
+    const allowed = build(true);
+    assert.match(await allowed.tool.run({ reason: "two people talking" }), /^Silence recorded/, "premise: where silence is allowed it is recorded");
+    assert.equal(allowed.silence.reason, "two people talking");
+
+    const tagged = build(false);
+    assert.match(await tagged.tool.run({ reason: "two people talking" }), /^Refused: this message tags you/);
+    assert.equal(tagged.silence.reason, null);
+  });
+
   test("results are bounded", async () => {
     await db.withWrite((d) => {
       const stmt = d.prepare(
