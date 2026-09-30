@@ -67,7 +67,7 @@ const agentStep = (body: Body, patchPath: string): Answer => {
       input: {
         command: [
           "set -e",
-          "git checkout -q -b bugboss/eval-stub",
+          "git checkout -q -b bugboss/eval-stub-$(date +%s)-$$",
           `git apply ${patchPath}`,
           "git commit -qam 'Stub fix from the eval harness'",
           "git push -q -u origin HEAD",
