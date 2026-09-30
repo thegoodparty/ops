@@ -230,13 +230,17 @@ const stubApi = (response: ToolResponse<unknown>): ToolApi =>
 // that another incident existed and then do nothing with it.
 //
 // Four transitions, not five: `escalate` sits in this list but writes no
-// state. It says the incident needs a person and leaves the agent driving,
-// which is why it is named for what it does rather than for what it moves.
+// state. It tells the Boss the incident needs a person and leaves the agent
+// driving, which is why it is named for what it does rather than for what it
+// moves.
 //
 // `propose_merge` is neither a transition nor a read. It writes nothing on
 // the agent's word: it asks, the two incidents are compared, and the rules
 // pick which record survives.
-test("the boss tools are the four transitions, the title, the ask, escalate, park and the two reads", async () => {  const tools = await createBossTools({ api: stubApi({ ok: true, directives: [] }) });
+test("the boss tools are the four transitions, the title, the ask, escalate, park and the two reads", async () => {  const tools = await createBossTools({
+    api: stubApi({ ok: true, directives: [] }),
+    boss: { tellBoss: async () => {} },
+  });
 
   assert.deepEqual(
     tools.map((tool) => tool.name).sort(),
@@ -262,6 +266,7 @@ test("get_incident takes an id, so an agent can read an incident that is not its
   // was not allowed to open.
   const asked: unknown[] = [];
   const tools = await createBossTools({
+    boss: { tellBoss: async () => {} },
     api: {
       ...stubApi({ ok: true, directives: [] }),
       getIncident: async (args: unknown) => {
@@ -278,6 +283,42 @@ test("get_incident takes an id, so an agent can read an incident that is not its
   assert.deepEqual(asked, [{ incidentId: "79" }, {}]);
 });
 
+test("escalate goes to the Boss's inbox and never through the ToolApi escalate that posts to Slack", async () => {
+  const told: { kind: string; text: string }[] = [];
+  let posted = 0;
+  const tools = await createBossTools({
+    api: {
+      ...stubApi({ ok: true, directives: [] }),
+      escalate: async () => {
+        posted += 1;
+        return { ok: true as const, directives: [] };
+      },
+    } as unknown as ToolApi,
+    boss: {
+      tellBoss: async (kind, text) => {
+        told.push({ kind, text });
+      },
+    },
+  });
+  const escalate = tools.find((tool) => tool.name === "escalate");
+  assert.ok(escalate, "the model can see it");
+  assert.deepEqual(told, []);
+
+  const result = await escalate.execute(
+    "call-1",
+    { reason: "blocked on a merge", brief: "What I believe now: the fix is ready." } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.equal(posted, 0, "the Slack-posting escalate is never reached");
+  assert.deepEqual(told, [
+    { kind: "escalation", text: "blocked on a merge\n\nWhat I believe now: the fix is ready." },
+  ]);
+  assert.match(String(result.content[0].type === "text" && result.content[0].text), /^ok/);
+});
+
 test("park reaches the boss, because a wait nothing can write is a hot loop", async () => {
   // The gap this closes: `park` existed on the tool API and the loopback
   // route and was reachable by nothing the model could call, so an agent that
@@ -291,7 +332,7 @@ test("park reaches the boss, because a wait nothing can write is a hot loop", as
       return { ok: true as const, directives: [] };
     },
   };
-  const tools = await createBossTools({ api });
+  const tools = await createBossTools({ api, boss: { tellBoss: async () => {} } });
   const park = tools.find((tool) => tool.name === "park");
   assert.ok(park, "the model can see it");
 
@@ -308,6 +349,7 @@ test("park reaches the boss, because a wait nothing can write is a hot loop", as
 test("reporting a root cause starts the install, and directives reach the model", async () => {
   let started = 0;
   const tools = await createBossTools({
+    boss: { tellBoss: async () => {} },
     api: stubApi({ ok: true, directives: [{ type: "merged", into: "inc-9" }] }),
     onRootCause: () => {
       started += 1;
@@ -331,6 +373,7 @@ test("reporting a root cause starts the install, and directives reach the model"
 
 test("a failed boss call is reported rather than swallowed", async () => {
   const tools = await createBossTools({
+    boss: { tellBoss: async () => {} },
     api: stubApi({ ok: false, error: "incident is already CLOSED", directives: [] }),
   });
   const impact = tools.find((tool) => tool.name === "report_impact");
@@ -803,7 +846,7 @@ test("the brief quotes the grace that was given, not the constant", async () => 
 
   for (let i = 0; i < 10; i++) await turnEnd(...turn());
 
-  assert.match(brief, /did not escalate in the 5 it was asked to/);
+  assert.match(brief, /did not escalate in the 5 I was asked to/);
 });
 
 test("an agent that escalates inside its grace is not escalated over", async () => {
@@ -960,8 +1003,8 @@ test("the brief does not promise that replying will continue the work", () => {
     usage: { ...emptySessionUsage(), turns: 200 },
   });
 
-  assert.match(brief, /raise BUGBOSS_MAX_TURNS or pick it up yourself/);
-  assert.match(brief, /replying here will not restart it/);
+  assert.match(brief, /raise BUGBOSS_MAX_TURNS or pick it up themselves/);
+  assert.match(brief, /neither a reply in the thread nor a message to me will restart it/);
   assert.doesNotMatch(
     brief,
     /nothing will relaunch into the same exhausted budget/,
@@ -994,7 +1037,7 @@ test("the escalation brief names the spend and never states the price as a fact"
     },
   );
 
-  assert.match(brief, /ran out of turns, not because it finished/);
+  assert.match(brief, /ran out of turns, not because I finished/);
   assert.match(brief, /200 turns on us\.anthropic\.claude-opus-5/);
   assert.match(brief, /1\.3M tokens \(3000 in, 1200 out, 1200000 cache read, 90000 cache write\)/);
   assert.match(brief, /Estimated cost \$41\.23/);

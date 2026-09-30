@@ -7,28 +7,24 @@
 // routed by the ALB: the listener rules are an allowlist and /incidents is not
 // on it, which is the second fence behind the token.
 //
-// The routes at the bottom of this file are not ToolApi at all. contact_human
-// needs to record that a question is outstanding before it posts, so a
-// restarted agent resumes waiting instead of asking a human the same thing
-// twice, and ToolApi has nowhere to put that; it lives in the
-// pending_question table. It also has to watch for a reply without draining,
-// which no ToolApi call can do, so the directive read lives here too.
+// The routes at the bottom of this file are not ToolApi at all. message_boss
+// needs to record that a question is outstanding, so a restarted agent
+// resumes waiting instead of asking the Boss the same thing twice, and ToolApi
+// has nowhere to put that; it lives in the pending_question table. It also
+// has to watch for an answer without draining, which no ToolApi call can do,
+// so the directive read lives here too. And everything an agent says to a
+// person arrives at the Boss's inbox through here: no route on this app posts
+// to Slack.
 
 import { makeLog } from "../logging";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { z } from "zod";
 
+import { recordForBoss } from "../boss/inbox";
 import type { Db } from "../db";
-import type { ThreadPoster } from "../toolapi";
 import { verifyAgentToken } from "../toolapi";
-import {
-  choiceProblem,
-  renderChoiceQuestion,
-  type ChoicePoster,
-} from "../slack/blocks";
-import { overThreadBudget, postDocument, postProse } from "../slack/format";
-import type { Directive, ToolApi } from "../types";
+import type { Directive, ToolApi, WakeBoss } from "../types";
 
 const log = makeLog("boss-http");
 
@@ -38,13 +34,8 @@ export interface ToolApiHttpDeps {
   tokenSecret: string;
   /** Built against the token the caller presented, not a freshly minted one. */
   toolApiFor: (incidentId: string, token: string) => ToolApi;
-  /**
-   * Relaying one message the agent wrote, and posting its questions with
-   * their buttons. The tool API's own posts -- and the permalinks and thread
-   * opening a merge or split needs -- are the tool API's; this route only
-   * forwards.
-   */
-  slack: Pick<ThreadPoster, "post"> & ChoicePoster;
+  /** Runs the Boss for an incident whose inbox just gained a row. */
+  wakeBoss: WakeBoss;
   now?: () => number;
 }
 
@@ -110,10 +101,6 @@ const BODIES = {
   }),
   search: z.object({
     text: z.string().min(1),
-  }),
-  escalate: z.object({
-    reason: z.string().min(1),
-    brief: z.string().min(1),
   }),
   park: z.object({
     waitingFor: z.string().min(1),
@@ -263,11 +250,6 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   );
 
   app.post(
-    "/incidents/:id/escalate",
-    tool(BODIES.escalate, (api, body) => api.escalate(body)),
-  );
-
-  app.post(
     "/incidents/:id/park",
     tool(BODIES.park, (api, body) => api.park(body)),
   );
@@ -282,13 +264,85 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   );
 
   // -------------------------------------------------------------------------
-  // contact_human: the directive poll, the outstanding-question marker and
-  // the thread post
+  // message_boss: the inbox, the directive poll and the outstanding-question
+  // marker
   // -------------------------------------------------------------------------
 
   /**
+   * The only way anything an agent writes leaves it for a person. The row is
+   * committed before the Boss is woken, so a Boss run that starts on the wake
+   * always finds it, and a wake that lands while the Boss is already running
+   * is picked up by that run rather than lost.
+   *
+   * No length limit. The Boss is the reader, not a phone, and what reaches a
+   * person is the Boss's own words.
+   */
+  app.post("/incidents/:id/boss-inbox", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "body was not JSON" }, 400);
+    }
+    const parsed = z
+      .object({
+        kind: z.enum(["message", "question", "escalation"]),
+        text: z.string().trim().min(1),
+      })
+      .safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: describeIssues(parsed.error) }, 400);
+    }
+
+    const exists = deps.db.get<{ id: string }>(
+      "SELECT id FROM incident WHERE id = ?",
+      [caller.incidentId],
+    );
+    if (!exists) return c.json({ error: "unknown incident" }, 404);
+
+    const id = await deps.db.withWrite((w) =>
+      recordForBoss(w, {
+        incidentId: caller.incidentId,
+        kind: parsed.data.kind,
+        text: parsed.data.text,
+      }),
+    );
+    log("boss_inbox_recorded", {
+      incidentId: caller.incidentId,
+      kind: parsed.data.kind,
+      id,
+    });
+    deps.wakeBoss(caller.incidentId);
+    return c.json({ id });
+  });
+
+  /**
+   * How many escalations have gone up since a moment, and when the last one
+   * did. An unanswered question re-escalates on a doubling gap, and reading
+   * the gap off the inbox rather than off a counter is what lets it survive
+   * a restart: the rows are the record of what the Boss has been told.
+   */
+  app.get("/incidents/:id/boss-inbox/escalations", (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    const since = Number(c.req.query("since") ?? "0");
+    if (!Number.isFinite(since)) {
+      return c.json({ error: "since must be epoch millis" }, 400);
+    }
+    const row = deps.db.get<{ count: number; lastAt: number | null }>(
+      `SELECT COUNT(*) AS count, MAX(createdAt) AS lastAt FROM boss_inbox
+        WHERE incidentId = ? AND kind = 'escalation' AND createdAt >= ?`,
+      [caller.incidentId, since],
+    );
+    return c.json(row ?? { count: 0, lastAt: null });
+  });
+
+  /**
    * Read-only, and that is the whole point. Every ToolApi response drains the
-   * pending directives, so an agent blocked in contact_human polling
+   * pending directives, so an agent blocked in message_boss polling
    * `getIncident` for a reply would delete the `merged`, `stop` or
    * `resumed_after` it has not read yet. This route leaves them where they
    * are; the drain stays on the calls whose result the model actually reads.
@@ -311,7 +365,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   });
 
   /**
-   * Removes exactly one directive. contact_human uses it for the reply that
+   * Removes exactly one directive. message_boss uses it for the answer that
    * ended its wait, which it has already returned as that call's result;
    * re-delivering that one through get_incident would put "yes, go ahead"
    * in front of the model a second time with nothing marking it as answered.
@@ -337,8 +391,8 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   app.get("/incidents/:id/pending-question", (c) => {
     const caller = authorize(c);
     if (caller instanceof Response) return caller;
-    const row = deps.db.get<{ message: string; messageTs: string; askedAt: number }>(
-      "SELECT message, messageTs, askedAt FROM pending_question WHERE incidentId = ?",
+    const row = deps.db.get<{ message: string; askedAt: number }>(
+      "SELECT message, askedAt FROM pending_question WHERE incidentId = ?",
       [caller.incidentId],
     );
     return c.json(row ?? null);
@@ -348,13 +402,13 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
    * Idempotent for the same question, and only for the same question. A
    * restarted agent replays the tool call that has no result yet, and the
    * second attempt has to find the first question rather than overwrite its
-   * askedAt, which is the watermark replies are matched against.
+   * askedAt, which is what the unanswered-question clock runs from.
    *
    * A *different* question is the opposite case. clearPending does not run
    * when the child is SIGKILLed mid-wait, so the marker outlives the question
-   * it was written for; leaving it in place would mean the next question is
-   * never posted and the agent waits out its whole timeout on an answer to
-   * something nobody was ever asked.
+   * it was written for; leaving it in place would give the next question the
+   * old one's askedAt, and it would escalate as unanswered the moment it was
+   * asked.
    */
   app.post("/incidents/:id/pending-question", async (c) => {
     const caller = authorize(c);
@@ -369,27 +423,19 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     if (!message.trim()) return c.json({ error: "message is empty" }, 400);
 
     const row = await deps.db.withWrite((w) => {
-      // messageTs is empty until the post that follows this call succeeds:
-      // the marker has to be durable BEFORE the message exists, or a crash
-      // between the two asks the human twice.
+      // messageTs is written and read by nothing; it is NOT NULL with no
+      // default, so an insert still has to name it.
       w.prepare(
         `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
          VALUES (?, '', ?, ?)
          ON CONFLICT(incidentId) DO UPDATE SET
-           messageTs = '',
            askedAt = excluded.askedAt,
            message = excluded.message
          WHERE pending_question.message <> excluded.message`,
       ).run(caller.incidentId, now(), message);
       return w
-        .prepare(
-          "SELECT message, messageTs, askedAt FROM pending_question WHERE incidentId = ?",
-        )
-        .get(caller.incidentId) as {
-        message: string;
-        messageTs: string;
-        askedAt: number;
-      };
+        .prepare("SELECT message, askedAt FROM pending_question WHERE incidentId = ?")
+        .get(caller.incidentId) as { message: string; askedAt: number };
     });
 
     log("question_recorded", { incidentId: caller.incidentId, askedAt: row.askedAt });
@@ -400,9 +446,9 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
    * The wait marker monitor keeps while it is blocked on a person. Idempotent
    * for the same command, and only for the same command: a restart replays
    * the tool call and has to find the wait it was already in -- overwriting
-   * startedAt there would restart the elapsed clock and defer every nudge for
+   * startedAt there would restart the elapsed clock and defer every reminder for
    * as long as the restarts last. A different command is a different wait, and
-   * inherits neither the clock nor the nudge count.
+   * inherits neither the clock nor the reminder count.
    */
   app.post("/incidents/:id/pending-wait", async (c) => {
     const caller = authorize(c);
@@ -443,8 +489,8 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   });
 
   /**
-   * Counted before the nudge is posted, so a crash between the two costs one
-   * nudge rather than repeating it on every resume. A missing marker is an
+   * Counted before the reminder is sent, so a crash between the two costs one
+   * reminder rather than repeating it on every resume. A missing marker is an
    * error rather than an upsert: there is no wait to count against, and
    * inventing one would start the clock at the moment of the fault.
    */
@@ -495,147 +541,6 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       );
     });
     return c.body(null, 204);
-  });
-
-  app.post("/incidents/:id/thread", async (c) => {
-    const caller = authorize(c);
-    if (caller instanceof Response) return caller;
-
-    let message = "";
-    // Whether this post is the one an outstanding question is waiting on.
-    // It used to be positional -- the next post after the marker sealed it --
-    // which held only while every post through here was the model's. The
-    // harness posts too now (monitor's heartbeat), and one of those landing on
-    // a blank marker would make a question whose Slack post had failed look
-    // sent, so the next attempt would skip the post and wait out its timeout
-    // on an answer to something nobody was ever asked.
-    let seals = true;
-    // Whether the harness composed this post rather than the model. It
-    // decides whether the thread budget is a refusal or a split -- see the
-    // budget check below.
-    let harnessComposed = false;
-    let options: string[] = [];
-    try {
-      const body = (await c.req.json()) as {
-        message?: unknown;
-        options?: unknown;
-        sealsPendingQuestion?: unknown;
-        harnessComposed?: unknown;
-      };
-      message = String(body.message ?? "");
-      seals = body.sealsPendingQuestion !== false;
-      harnessComposed = body.harnessComposed === true;
-      if (body.options !== undefined) {
-        if (
-          !Array.isArray(body.options) ||
-          body.options.some((option) => typeof option !== "string")
-        ) {
-          return c.json({ error: "options must be an array of strings" }, 400);
-        }
-        options = body.options as string[];
-      }
-    } catch {
-      return c.json({ error: "body was not JSON" }, 400);
-    }
-    if (!message.trim()) return c.json({ error: "message is empty" }, 400);
-    // The tool checks these too, so a 400 here means something other than the
-    // tool composed the call. This is the side of the socket that does not
-    // trust the child, so it is the check that counts.
-    if (options.length) {
-      const problem = choiceProblem(options);
-      if (problem) return c.json({ error: problem }, 400);
-    }
-    // Every post the *agent* causes comes through here -- the ask, the
-    // evidence under it, the rerun notice, the wait heartbeat -- which is
-    // what makes this the place the budget can be one thing rather than a
-    // rule four callers each keep separately.
-    //
-    // For text the model wrote it refuses instead of splitting: two posts of
-    // 200 words are not shorter than one of 400, they are worse. The
-    // uncapped long form is the post-mortem, which leaves as a file rather
-    // than as thread text.
-    //
-    // `harnessComposed` is not an exemption from that rule. It is the rest
-    // of the rule, and the rule is already written two paragraphs up: the
-    // Boss's own posts go out via `notify` and the relay, and they *split
-    // rather than refuse, because there is nobody to refuse them to*. This
-    // extends that to the posts that follow the same logic and happen to
-    // need the agent's token to reach the thread.
-    //
-    // A wait nudge and a re-run notice are composed after the model has
-    // stopped. Refusing one does not shorten it, because the author it
-    // would be refused to is gone -- it deletes it. And a nudge that fails
-    // to post is dropped by design (losing a day-long wait to a 503 is the
-    // worse trade), so this route refusing one produced an incident that
-    // waited all day, nudged nobody, and then escalated saying it had
-    // nudged three times. That is what the 400-character cut through the
-    // middle of the check's output was buying.
-    //
-    // **This is not a hole in the budget, and it is not a way round it.**
-    // Nothing the model can call sets the flag. `postNotice` is the
-    // harness's own client method; every model-facing path goes through
-    // `post`, and `contact_human` and `escalate` check the budget in
-    // process before they ever reach this route. The literal `=== true`
-    // above is deliberate: a truthy value is not the exemption.
-    if (!harnessComposed) {
-      const tooLong = overThreadBudget("message", message);
-      if (tooLong) return c.json({ error: tooLong }, 400);
-    }
-
-    const incident = deps.db.get<{ slackThreadTs: string | null }>(
-      "SELECT slackThreadTs FROM incident WHERE id = ?",
-      [caller.incidentId],
-    );
-    if (!incident) return c.json({ error: "unknown incident" }, 404);
-
-    // The agent writes mrkdwn by instruction (agent/prompt.ts) and this is
-    // where that is made true rather than hoped for: the Markdown it slips
-    // into is converted, `&`, `<` and `>` are escaped so a quoted log line
-    // cannot eat the rest of the post, and anything past one message becomes
-    // the next post in the thread instead of being truncated by Slack.
-    //
-    // Only the Slack copy is converted. What the incident stores stays as the
-    // agent wrote it, so the Slack agent reading it back later gets prose and
-    // not markup.
-    let ts: string;
-    if (options.length === 0) {
-      const send = harnessComposed ? postDocument : postProse;
-      ({ ts } = await send(
-        (part) => deps.slack.post(incident.slackThreadTs, part),
-        message,
-        { incidentId: caller.incidentId },
-      ));
-    } else {
-      const question = renderChoiceQuestion(message, options);
-      for (const part of question.lead) {
-        await deps.slack.post(incident.slackThreadTs, part);
-      }
-      ({ ts } = await deps.slack.postChoice(
-        incident.slackThreadTs,
-        question.text,
-        question.blocks,
-      ));
-      log("choice_posted", {
-        incidentId: caller.incidentId,
-        options: options.length,
-      });
-    }
-
-    // Fills in the ts the marker could not know when it was written. Scoped to
-    // a blank one so a later post does not repoint an older question.
-    //
-    // For a choice this is the ts of the message carrying the buttons, which
-    // is what a press comes back quoting: the marker is how the relay tells a
-    // press on the live question from one on a question already answered.
-    if (seals) {
-      await deps.db.withWrite((w) => {
-        w.prepare(
-          "UPDATE pending_question SET messageTs = ? WHERE incidentId = ? AND messageTs = ''",
-        ).run(ts, caller.incidentId);
-      });
-    }
-
-    return c.json({ ts });
   });
 
   return app;

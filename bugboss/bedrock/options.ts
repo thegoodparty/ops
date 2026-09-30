@@ -42,7 +42,7 @@ export const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08
 /**
  * WHY THE 1h TIER IS THE DEFAULT HERE AND NOT PI'S "short":
  *
- * `monitor` and `contact_human` each cost one turn however long they block --
+ * `monitor` and `message_boss` each cost one turn however long they block --
  * that is the mechanism that stops a multi-day incident saturating context on
  * polling. A tool that blocks for ten minutes and then resumes therefore lands
  * the next request outside a 5-minute cache lifetime, and the agent rebuilds

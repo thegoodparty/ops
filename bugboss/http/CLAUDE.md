@@ -83,8 +83,15 @@ schemas.
 Those schemas are the trust boundary. The child validates too, but that is
 the untrusted side, so validation here is the one that counts.
 
-## One route that is not a tool
+## Routes that are not tools
 
 `GET /incidents/:id/directives` is a **non-draining** read on the read-only
-connection, because the `contact_human` poll would otherwise destroy
+connection, because the `message_boss` poll would otherwise destroy
 directives it has not read.
+
+`POST /incidents/:id/boss-inbox` is the only way anything an agent writes
+leaves it for a person, and nothing on the loopback app posts to Slack. It
+commits the row, then calls `wakeBoss`, so a Boss run started by the wake
+always finds it. `GET /incidents/:id/boss-inbox/escalations` counts the
+escalations already sent, which is what the unanswered-question ladder
+reads its gap from across a restart.

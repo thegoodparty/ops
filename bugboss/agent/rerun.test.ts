@@ -9,10 +9,9 @@ import { createMemoryS3 } from "../index";
 import { createToolApiRoutes } from "../http/toolapi";
 import { mintAgentToken } from "../toolapi";
 import { createBossClient } from "./run";
-import type { ToolApi } from "../types";
+import type { BossInboxKind, ToolApi } from "../types";
 import {
   MAX_RERUNS_PER_INCIDENT,
-  RERUN_SUSPICION_LIMIT,
   createGitHubRunsPort,
   createRerunCiTool,
   githubMessage,
@@ -23,7 +22,7 @@ import {
   type GitHubRunsPort,
   type WorkflowRunView,
 } from "./rerun";
-import { THREAD_PROSE_CHARS } from "../slack/format";
+import { unseenByBoss } from "../boss/inbox";
 
 const aRun = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView => ({
   id: 42,
@@ -37,9 +36,10 @@ const aRun = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView => ({
 
 interface Harness {
   github: GitHubRunsPort;
-  thread: { postNotice: (message: string) => Promise<void> };
+  boss: { tellBoss: (kind: BossInboxKind, text: string) => Promise<void> };
   attempted: Set<string>;
   posts: string[];
+  kinds: BossInboxKind[];
   reruns: string[];
 }
 
@@ -50,9 +50,11 @@ const harness = (options: {
   postFails?: string;
 } = {}): Harness => {
   const posts: string[] = [];
+  const kinds: BossInboxKind[] = [];
   const reruns: string[] = [];
   return {
     posts,
+    kinds,
     reruns,
     attempted: new Set<string>(),
     github: {
@@ -63,10 +65,11 @@ const harness = (options: {
         return options.rerun ?? { ok: true, data: null };
       },
     },
-    thread: {
-      postNotice: async (message: string) => {
+    boss: {
+      tellBoss: async (kind: BossInboxKind, text: string) => {
         if (options.postFails) throw new Error(options.postFails);
-        posts.push(message);
+        kinds.push(kind);
+        posts.push(text);
       },
     },
   };
@@ -78,7 +81,7 @@ const args = {
   suspicion: "The two E2E failures are preview-environment timeouts, not my change.",
 };
 
-test("a first re-run reaches GitHub and tells the thread why", async () => {
+test("a first re-run reaches GitHub and tells the Boss why", async () => {
   const h = harness();
 
   const result = await runRerunFailedJobs(args, h);
@@ -89,6 +92,7 @@ test("a first re-run reaches GitHub and tells the thread why", async () => {
   assert.equal(result.postError, null);
   assert.deepEqual(h.reruns, ["thegoodparty/omni#42"]);
   assert.equal(h.posts.length, 1);
+  assert.deepEqual(h.kinds, ["message"]);
   assert.match(h.posts[0], /preview-environment timeouts/);
   assert.match(h.posts[0], /report it as a real failure/);
   assert.deepEqual([...h.attempted], ["thegoodparty/omni#42"]);
@@ -115,7 +119,7 @@ test("the attempt bound survives a replay, because it is read from GitHub", asyn
   const reruns: string[] = [];
   const deps = {
     attempted: new Set<string>(),
-    thread: { postNotice: async () => {} },
+    boss: { tellBoss: async () => {} },
     github: {
       getRun: async (): Promise<GitHubResult<WorkflowRunView>> => ({
         ok: true,
@@ -183,11 +187,11 @@ test("a missing permission is named, not reported as a generic failure", async (
   assert.match(result.error ?? "", /This is a permission/);
   assert.match(result.error ?? "", /actions=write/);
   assert.match(result.error ?? "", /rerun-failed-jobs/);
-  assert.match(result.error ?? "", /contact_human/);
+  assert.match(result.error ?? "", /message_boss/);
   assert.deepEqual(h.posts, []);
 });
 
-test("nothing is announced when GitHub refuses, so the thread never sees a re-run that did not happen", async () => {
+test("nothing is announced when GitHub refuses, so the Boss never hears of a re-run that did not happen", async () => {
   const h = harness({
     rerun: { ok: false, status: 403, message: "nope", acceptedPermissions: "actions=write" },
   });
@@ -199,12 +203,12 @@ test("nothing is announced when GitHub refuses, so the thread never sees a re-ru
 });
 
 test("a re-run whose announcement fails says so and hands back the text", async () => {
-  const h = harness({ postFails: "slack 503" });
+  const h = harness({ postFails: "boss 503" });
 
   const result = await runRerunFailedJobs(args, h);
 
   assert.equal(result.started, true);
-  assert.match(result.postError ?? "", /slack 503/);
+  assert.match(result.postError ?? "", /boss 503/);
   assert.match(result.notice, /preview-environment timeouts/);
 });
 
@@ -279,18 +283,6 @@ test("a suspicion is required, because an unexplained re-run cannot be disagreed
   assert.deepEqual(h.reruns, []);
 });
 
-test("an over-long suspicion is refused rather than truncated", async () => {
-  const h = harness();
-
-  const result = await runRerunFailedJobs(
-    { ...args, suspicion: "x".repeat(RERUN_SUSPICION_LIMIT + 1) },
-    h,
-  );
-
-  assert.equal(result.started, false);
-  assert.match(result.refused ?? "", new RegExp(`limit is ${RERUN_SUSPICION_LIMIT}`));
-});
-
 test("a repo that is not owner/name never reaches a url", async () => {
   const h = harness();
 
@@ -311,10 +303,11 @@ test("a run id that is not a positive integer is refused", async () => {
   }
 });
 
-test("the notice carries the run link so the thread can check it", () => {
+test("the notice carries the run link so whoever the Boss shows it to can check it", () => {
   const notice = rerunNotice("thegoodparty/omni", aRun(), "flaky preview");
 
-  assert.match(notice, /<https:\/\/github\.com\/thegoodparty\/omni\/actions\/runs\/42\|E2E>/);
+  assert.ok(notice.includes("https://github.com/thegoodparty/omni/actions/runs/42"));
+  assert.ok(notice.includes('"E2E"'));
   assert.match(notice, /flaky preview/);
 });
 
@@ -340,7 +333,7 @@ test("a 403 GitHub did not blame on a permission is not blamed on one here", () 
   assert.match(text, /created over a month ago/);
   assert.match(text, /did not say a permission was missing/);
   assert.doesNotMatch(text, /actions: read/);
-  assert.doesNotMatch(text, /contact_human/);
+  assert.doesNotMatch(text, /message_boss/);
 });
 
 test("GitHub's own answer to what was needed is what the agent is told to ask for", () => {
@@ -355,7 +348,7 @@ test("GitHub's own answer to what was needed is what the agent is told to ask fo
   assert.match(text, /This is a permission/);
   assert.match(text, /actions=write/);
   assert.match(text, /rerun-failed-jobs/);
-  assert.match(text, /contact_human/);
+  assert.match(text, /message_boss/);
 });
 
 test("a 404 names the installation as a candidate, because GitHub masks it as one", () => {
@@ -427,7 +420,7 @@ const call = async (tool: Tool, params: object): Promise<string> => {
 
 test("the tool keeps one budget ledger for the life of the process", async () => {
   const h = harness();
-  const tool = await createRerunCiTool({ github: h.github, thread: h.thread });
+  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
 
   for (let i = 0; i < MAX_RERUNS_PER_INCIDENT; i += 1) {
     await call(tool, { ...args, runId: 200 + i });
@@ -448,7 +441,7 @@ test("the tool result for a 403 reaches the model with the permission named", as
       acceptedPermissions: "actions=write",
     },
   });
-  const tool = await createRerunCiTool({ github: h.github, thread: h.thread });
+  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
 
   const text = await call(tool, args);
 
@@ -459,7 +452,7 @@ test("the tool result for a 403 reaches the model with the permission named", as
 
 test("a successful tool call tells the model the flake is still a defect", async () => {
   const h = harness();
-  const tool = await createRerunCiTool({ github: h.github, thread: h.thread });
+  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
 
   const text = await call(tool, args);
 
@@ -468,15 +461,15 @@ test("a successful tool call tells the model the flake is still a defect", async
   assert.match(text, /monitor/);
 });
 
-test("a tool call whose announcement fails hands the model the text to post", async () => {
-  const h = harness({ postFails: "slack 503" });
-  const tool = await createRerunCiTool({ github: h.github, thread: h.thread });
+test("a tool call whose announcement fails hands the model the text to send", async () => {
+  const h = harness({ postFails: "boss 503" });
+  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
 
   const text = await call(tool, args);
 
-  assert.match(text, /The thread was NOT told/);
-  assert.match(text, /slack 503/);
-  assert.match(text, /Post this yourself now/);
+  assert.match(text, /The Boss was NOT told/);
+  assert.match(text, /boss 503/);
+  assert.match(text, /Send this yourself with message_boss now/);
 });
 
 test("a thrown fetch becomes a result the model can act on, not a stack", async () => {
@@ -507,57 +500,24 @@ test("a body that is not JSON on a 200 is a refusal, not a crash", async () => {
   assert.equal(result.ok, false);
 });
 
-test("a workflow name cannot break out of the link it is the label for", () => {
-  const notice = rerunNotice(
-    "thegoodparty/omni",
-    aRun({ name: "E2E <prod> | nightly" }),
-    "flaky",
-  );
-
-  assert.match(notice, /\|E2E prod nightly>/);
-  assert.equal(notice.split("<").length, 2, "exactly one entity opens");
-  assert.equal(notice.split(">").length, 2, "and exactly one closes it");
-});
-
 test("a workflow name GitHub gave us goes in whole, however long", () => {
-  // It used to be cut at 80 characters, to keep the notice under
-  // THREAD_PROSE_CHARS next to a suspicion already limited to 700. The
-  // arithmetic worked and the term it spent was the wrong one: the name is
-  // the only part of this notice with nobody to refuse it to, so it was the
-  // part that gave way. The notice is harness-composed now and splits.
   const name = "nightly end to end suite ".repeat(12);
   const notice = rerunNotice(
     "thegoodparty/omni",
     aRun({ name }),
-    "s".repeat(RERUN_SUSPICION_LIMIT),
+    "s".repeat(700),
   );
 
   assert.ok(notice.includes(name.trim()), "the whole name is the label");
   assert.doesNotMatch(notice, /…/);
 });
 
-test("a workflow name short enough to read is left alone", () => {
-  const notice = rerunNotice("thegoodparty/omni", aRun({ name: "E2E" }), "flaky");
-
-  assert.match(notice, /\|E2E>/);
-  assert.doesNotMatch(notice, /…/);
-});
-
 /**
- * The wiring, not the tool. `runRerunFailedJobs` is honest about needing a
- * port that does not seal; whether the one it is handed at launch is that
- * port is a fact about `agent/run.ts` and the `/thread` route, so this drives
- * all three.
- *
- * The state under test is the one `contact_human` leaves when Slack throws
- * between recording the marker and posting the ask: a `pending_question` row
- * with a blank `messageTs`. That blank is the only thing telling the next
- * attempt to post the question again. Anything that fills it in makes a
- * question nobody was ever asked look sent, and the agent then waits out its
- * whole timeout on it -- quietly, which is the failure mode this repo does
- * not allow.
+ * The wiring, not the tool: whether the port it is handed at launch reaches
+ * the Boss's inbox is a fact about `agent/run.ts` and the `/boss-inbox`
+ * route, so this drives all three.
  */
-test("the re-run notice does not seal a question whose Slack post never landed", async () => {
+test("the re-run notice lands in the Boss's inbox and wakes it, through the real client", async () => {
   const dir = mkdtempSync(join(tmpdir(), "bugboss-rerun-"));
   const incidentId = "inc-rerun";
   const secret = "test-secret";
@@ -573,24 +533,20 @@ test("the re-run notice does not seal a question whose Slack post never landed",
       w.prepare(
         "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
       ).run(incidentId, 1_000_000);
-      w.prepare(
-        `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
-         VALUES (?, '', ?, ?)`,
-      ).run(incidentId, 1_000_000, "Shall I roll the deploy back?");
     });
+    const woken: string[] = [];
 
     const app = createToolApiRoutes({
       db,
       tokenSecret: secret,
       toolApiFor: () => ({}) as unknown as ToolApi,
-      slack: {
-        post: async () => ({ ts: "ts-rerun-notice" }),
-        postChoice: async () => ({ ts: "ts-choice" }),
+      wakeBoss: (id) => {
+        woken.push(id);
       },
       now: () => 2_000_000,
     });
 
-    const thread = createBossClient({
+    const boss = createBossClient({
       baseUrl: "http://boss.local",
       incidentId,
       authToken: mintAgentToken(secret, { incidentId, attempt: 1 }, 3600),
@@ -598,22 +554,25 @@ test("the re-run notice does not seal a question whose Slack post never landed",
         app.fetch(new Request(input, init))) as typeof fetch,
     });
 
+    await db.withWrite((w) => {
+      assert.deepEqual(unseenByBoss(w, incidentId), [], "the inbox starts empty");
+    });
+
     const result = await runRerunFailedJobs(args, {
       github: harness().github,
-      thread,
+      boss,
       attempted: new Set<string>(),
     });
 
     assert.equal(result.started, true);
-    assert.equal(result.postError, null, "the notice reached the thread");
-    assert.equal(
-      db.get<{ messageTs: string }>(
-        "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-        [incidentId],
-      )?.messageTs,
-      "",
-      "and the undelivered question still looks undelivered, so it is asked again",
-    );
+    assert.equal(result.postError, null);
+    await db.withWrite((w) => {
+      const rows = unseenByBoss(w, incidentId);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].kind, "message");
+      assert.equal(rows[0].text, result.notice);
+    });
+    assert.deepEqual(woken, [incidentId]);
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
