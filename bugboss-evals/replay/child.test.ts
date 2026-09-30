@@ -18,7 +18,7 @@ const CONFIG: ChildConfig = {
   script: [{ on: "question", approveAndMerge: true, reply: "Merged." }],
   turnCap: 3,
   timeoutSeconds: 60,
-  github: { apiUrl: "https://github:8444/api/v3", owner: "o", repo: "r", prNumber: 5, humanToken: "h" },
+  github: { apiUrl: "https://github/api/v3", owner: "o", repo: "r", prNumber: 5, humanToken: "h" },
   outPath: "/dev/null",
 };
 

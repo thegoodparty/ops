@@ -9,15 +9,15 @@
  * fan-out runs them in parallel containers and hands the JSON to `compare`.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { compare, type PairRecord } from "../core/aggregate";
-import { createBedrockJudgeModel, DEFAULT_JUDGE_MODEL, judgePair } from "../core/judge";
+import { createBedrockJudgeModel, DEFAULT_JUDGE_MODEL, judgePair, type JudgeContext } from "../core/judge";
 import { renderComparison } from "../core/report";
-import { loadCase } from "./case";
+import { loadCase, referenceFor } from "./case";
 import { cutAtPrOpen, readSession } from "./checkpoint";
 import { runPhase, type SideResult } from "./run-phase";
 
@@ -27,6 +27,8 @@ const USAGE = `usage:
               --proxy-url <url> --proxy-control <url> --out <result.json>
               [--grafana-url <url>] [--ca-file <pem>] [--cache-dir <dir>] [--omni-source <repo>]
               [--model-id <id>] [--region <aws region>]
+  side reads REPLAY_GITHUB_CONTROL_TOKEN and REPLAY_PROXY_CONTROL_TOKEN from the
+  environment when the stand-in or the proxy sets CONTROL_TOKEN.
   cli.ts compare --case <case.json> --baseline <result.json>... --candidate <result.json>...
               --out <report.md> [--aa] [--no-judge] [--judge-model <id>] [--region <aws region>]`;
 
@@ -56,8 +58,11 @@ const parse = (argv: string[]) => {
 };
 
 const side = async (args: ReturnType<typeof parse>) => {
+  const replayCase = loadCase(args.one("case"));
+  // Fails here, before any work, when the case names a scenario that is not there.
+  referenceFor(replayCase);
   const result = await runPhase({
-    replayCase: loadCase(args.one("case")),
+    replayCase,
     rep: Number(args.one("rep")),
     ref: args.one("ref"),
     variantRoot: args.one("variant-root"),
@@ -67,8 +72,13 @@ const side = async (args: ReturnType<typeof parse>) => {
         gitUrl: args.one("github-git"),
         controlUrl: args.one("github-control"),
         humanToken: args.one("human-token"),
+        controlToken: process.env.REPLAY_GITHUB_CONTROL_TOKEN || undefined,
       },
-      proxy: { url: args.one("proxy-url"), controlUrl: args.one("proxy-control") },
+      proxy: {
+        url: args.one("proxy-url"),
+        controlUrl: args.one("proxy-control"),
+        controlToken: process.env.REPLAY_PROXY_CONTROL_TOKEN || undefined,
+      },
       grafanaUrl: args.maybe("grafana-url"),
       caFile: args.maybe("ca-file"),
       awsRegion: args.maybe("region"),
@@ -80,9 +90,6 @@ const side = async (args: ReturnType<typeof parse>) => {
   await writeFile(args.one("out"), JSON.stringify(result, null, 2));
   console.log(`${result.caseId} rep ${result.rep} (${result.ref}): ${result.run.status}. ${result.detail}`);
 };
-
-const NO_REFERENCE =
-  "No vetted reference exists for this incident. Compare the two post-mortems against each other and against the evidence each one cites.";
 
 const compareSides = async (args: ReturnType<typeof parse>) => {
   const replayCase = loadCase(args.one("case"));
@@ -98,15 +105,15 @@ const compareSides = async (args: ReturnType<typeof parse>) => {
   const judging = !args.has("no-judge");
   const judgeModelId = args.maybe("judge-model") ?? DEFAULT_JUDGE_MODEL;
   const model = judging ? createBedrockJudgeModel({ modelId: judgeModelId, region: args.maybe("region") }) : null;
-  let context: { alert: unknown; reference: string } | null = null;
+  const reference = referenceFor(replayCase);
+  let context: JudgeContext | null = null;
   if (judging) {
     const checkpoint = cutAtPrOpen(await readSession(replayCase.checkpoint.session, args.maybe("region")), replayCase.checkpoint.prOrdinal);
-    const referencePath = replayCase.scenario
-      ? join(__dirname, "..", "scenarios", replayCase.scenario, "reference.md")
-      : null;
+    // The recorded signals are what the agent was answering; the scenario's
+    // synthetic alert stands in only when the checkpoint holds none.
     context = {
-      alert: checkpoint.view?.signals ?? null,
-      reference: referencePath && existsSync(referencePath) ? readFileSync(referencePath, "utf8") : NO_REFERENCE,
+      alert: checkpoint.view?.signals ?? (reference.vetted ? reference.alert : null),
+      reference: reference.vetted ? reference.reference : null,
     };
   }
 
@@ -121,12 +128,13 @@ const compareSides = async (args: ReturnType<typeof parse>) => {
       pairId,
       scenarioId: replayCase.id,
       rep: baseline.rep,
+      vettedReference: reference.vetted,
       baseline: baseline.run,
       candidate: candidate.run,
       verdict: judgeable
         ? await judgePair({
             pairId,
-            context: context as { alert: unknown; reference: string },
+            context: context as JudgeContext,
             baseline: baseline.output,
             candidate: candidate.output,
             model,

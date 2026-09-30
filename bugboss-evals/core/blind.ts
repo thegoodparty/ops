@@ -138,10 +138,24 @@ export const blind = (text: string, kind: TextKind, options: BlindOptions = {}):
   return { text: substitute(kept, identifying), droppedLines: dropped };
 };
 
+/**
+ * Where a side's root cause text came from. `closing_summary` is BugBoss's
+ * own deterministic closing post; `heuristic` is every bot message that
+ * mentions a root cause, joined, used when no closing summary was found;
+ * `checkpoint` is the `report_root_cause` call recorded before a Tier 2
+ * replay resumed, so it is the same text on both sides.
+ */
+export type RootCauseSource = "closing_summary" | "heuristic" | "checkpoint";
+
 /** What one side of a pair produced, before or after blinding. */
 export interface IncidentOutput {
   /** As posted in the thread. Null when the run never reported one. */
   rootCause: string | null;
+  /**
+   * Null when there is no root cause. Absent in outputs written before the
+   * field existed, which the judge reports as unknown rather than guessing.
+   */
+  rootCauseSource?: RootCauseSource | null;
   /** From the scenario's base commit to the merge commit. Null when nothing merged. */
   diff: string | null;
   /** The closing report file. Null when the incident never closed. */
@@ -162,6 +176,7 @@ export const blindOutput = (
   return {
     output: {
       rootCause: prose(output.rootCause),
+      rootCauseSource: output.rootCauseSource,
       diff: output.diff === null ? null : blind(output.diff, "diff", options).text,
       postmortem: prose(output.postmortem),
     },

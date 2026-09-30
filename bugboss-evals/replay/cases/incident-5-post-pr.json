@@ -41,5 +41,5 @@
     "wallClockSeconds": 5400,
     "modelUsd": 15
   },
-  "scenario": null
+  "scenario": "p2p-phone-list-late-cap"
 }

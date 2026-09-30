@@ -41,5 +41,6 @@
     "wallClockSeconds": 5400,
     "modelUsd": 15
   },
-  "scenario": "election-api-pool-exhaustion"
+  "scenario": null,
+  "noVettedReference": true
 }

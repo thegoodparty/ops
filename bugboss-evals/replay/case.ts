@@ -1,5 +1,8 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
+
+import { loadScenario } from "../core/scenario";
 
 const Step = z
   .object({
@@ -49,10 +52,48 @@ export const ReplayCaseSchema = z
      * Grafana is absent and the agent's confirmation has nothing to read.
      */
     scenario: z.string().nullable(),
+    /**
+     * Required, and only allowed, when `scenario` is null: the incident has
+     * no human-vetted reference, so the judge compares the sides against
+     * each other and the report says so for this case.
+     */
+    noVettedReference: z.literal(true).optional(),
   })
-  .strict();
+  .strict()
+  .refine((c) => (c.scenario === null) === (c.noVettedReference === true), {
+    message: "a case names a scenario or sets noVettedReference: true, exactly one",
+  });
 
 export type ReplayCase = z.infer<typeof ReplayCaseSchema>;
+
+export const SCENARIOS_DIR = join(__dirname, "..", "scenarios");
+
+export type CaseReference =
+  | { vetted: true; scenario: string; reference: string; alert: unknown }
+  | { vetted: false };
+
+/**
+ * The scenario behind a case: its vetted reference and its alert. A case that
+ * names a scenario which is missing, or which came from another incident, is
+ * an error, never a quiet fall back to judging without a reference.
+ */
+export const referenceFor = (c: ReplayCase, scenariosDir = SCENARIOS_DIR): CaseReference => {
+  if (c.scenario === null) return { vetted: false };
+  const json = join(scenariosDir, c.scenario, "scenario.json");
+  if (!existsSync(json)) throw new Error(`case ${c.id} names scenario ${c.scenario}, which has no ${json}`);
+  const { scenario, dir } = loadScenario(json);
+  if (scenario.sourceIncident !== c.sourceIncident) {
+    throw new Error(
+      `case ${c.id} is incident ${c.sourceIncident} but scenario ${c.scenario} is incident ${scenario.sourceIncident}`,
+    );
+  }
+  return {
+    vetted: true,
+    scenario: scenario.id,
+    reference: readFileSync(join(dir, scenario.reference), "utf8"),
+    alert: JSON.parse(readFileSync(join(dir, scenario.alert.file), "utf8")) as unknown,
+  };
+};
 
 export const loadCase = (path: string): ReplayCase =>
   ReplayCaseSchema.parse(JSON.parse(readFileSync(path, "utf8")));

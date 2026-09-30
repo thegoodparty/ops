@@ -41,5 +41,6 @@
     "wallClockSeconds": 5400,
     "modelUsd": 15
   },
-  "scenario": null
+  "scenario": null,
+  "noVettedReference": true
 }

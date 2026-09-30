@@ -12,6 +12,8 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+
 import type { RunIncidentAgentOptions, RunIncidentAgentResult } from "../../bugboss/agent/run";
 import type { IncidentView } from "../../bugboss/types";
 import { createFakeBoss, type BossRecord, type MergeOutcome, type ScriptStep } from "./fake-boss";
@@ -57,9 +59,6 @@ export interface ChildOutput {
   endedAt: number;
 }
 
-type TurnEndHandler = (event: unknown, ctx: { abort: () => void }) => unknown;
-type ExtensionApi = { on: (event: "turn_end", handler: TurnEndHandler) => void };
-
 /**
  * Stops the replay after `turnCap` turns by aborting the session, the same
  * stop BugBoss's own turn budget uses. The variant's budget is left alone:
@@ -67,7 +66,7 @@ type ExtensionApi = { on: (event: "turn_end", handler: TurnEndHandler) => void }
  */
 export const createStopExtension = (turnCap: number) => {
   const state: StopState = { turns: 0, capped: false, honoured: false };
-  const extension = (pi: ExtensionApi) => {
+  const extension: ExtensionFactory = (pi) => {
     state.honoured = true;
     pi.on("turn_end", (_event, ctx) => {
       state.turns += 1;
@@ -136,7 +135,7 @@ export const replayOnce = async (args: {
   let result: RunIncidentAgentResult | null = null;
   let error: string | null = null;
   try {
-    const options: RunIncidentAgentOptions & { extensions: unknown[] } = {
+    const options: RunIncidentAgentOptions = {
       incidentId: config.incidentId,
       // Never dialled: `api` replaces the client this would build.
       bossBaseUrl: "http://boss.invalid",

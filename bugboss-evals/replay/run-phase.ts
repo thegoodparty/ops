@@ -9,22 +9,23 @@
  *
  * What it needs running already: a model proxy (sim/proxy) and a GitHub
  * stand-in (sim/standins/github), each with its control port reachable from
- * here. Both are reset at the start, so one pair of them serves many runs.
+ * here. Both are reset at the start, so one pair of them serves many runs
+ * one after another, never two at once.
  */
 
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 import type { IncidentView } from "../../bugboss/types";
 import type { RunRecord, RunStatus } from "../core/aggregate";
+import { parseProxyLog } from "../core/adapters/proxy-log";
 import type { IncidentOutput } from "../core/blind";
 import { measure } from "../core/metrics";
 import { ratesFor } from "../core/price";
-import type { Trace } from "../core/trace";
 import type { ReplayCase } from "./case";
 import { cutAtPrOpen, readSession, rewriteGitHubHost, type Checkpoint } from "./checkpoint";
 import type { ChildConfig, ChildOutput } from "./child";
@@ -33,19 +34,23 @@ const exec = promisify(execFile);
 
 export interface ReplayEnvironment {
   github: {
-    /** REST base the agent's `gh` and the human merge reach, e.g. https://github:8444/api/v3. */
+    /** REST base the agent's `gh` and the human merge reach, e.g. https://github/api/v3. */
     apiUrl: string;
-    /** Clone URL of omni on the stand-in, e.g. https://github:8444/thegoodparty/omni.git. */
+    /** Clone URL of omni on the stand-in, e.g. https://github/thegoodparty/omni.git. */
     gitUrl: string;
     /** Control listener, e.g. http://github:9002. */
     controlUrl: string;
     /** A token listed in the stand-in's GITHUB_STANDIN_HUMANS. */
     humanToken: string;
+    /** The stand-in's CONTROL_TOKEN, when it sets one. */
+    controlToken?: string;
   };
   proxy: {
     /** What the agent's Bedrock client dials: AWS_ENDPOINT_URL_BEDROCK_RUNTIME. */
     url: string;
     controlUrl: string;
+    /** The proxy's CONTROL_TOKEN, when it sets one. */
+    controlToken?: string;
   };
   /** The Tier 1 stack's Grafana, when the case has a scenario behind it. */
   grafanaUrl?: string;
@@ -69,10 +74,19 @@ export interface SideResult {
   } | null;
 }
 
-const control = async (base: string, path: string, body?: unknown): Promise<unknown> => {
-  const response = await fetch(`${base.replace(/\/$/, "")}${path}`, {
+const controlHeaders = (token?: string): Record<string, string> => ({
+  "content-type": "application/json",
+  ...(token ? { authorization: `Bearer ${token}` } : {}),
+});
+
+const control = async (
+  target: { controlUrl: string; controlToken?: string },
+  path: string,
+  body?: unknown,
+): Promise<unknown> => {
+  const response = await fetch(`${target.controlUrl.replace(/\/$/, "")}${path}`, {
     method: body === undefined ? "GET" : "POST",
-    headers: { "content-type": "application/json" },
+    headers: controlHeaders(target.controlToken),
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await response.text();
@@ -123,6 +137,42 @@ export const resolvePrCommits = async (args: {
   return { mirror, headSha: atOpen.sha, baseSha: base.stdout.trim() };
 };
 
+/**
+ * Why this host cannot run a side, or null. The recorded session was made on
+ * Linux inside the BugBoss image, and the resumed agent's shell, paths and
+ * tools assume it.
+ */
+export const hostProblem = (platform: NodeJS.Platform = process.platform): string | null =>
+  platform === "linux"
+    ? null
+    : `Tier 2 runs only on Linux, inside the BugBoss image, one container per side; this host is ${platform}. Run each side as its own task (see replay/cli.ts side).`;
+
+export const SIDE_LOCK = ".tier2-side.lock";
+
+/**
+ * Claims the work root for one side. The recorded prompt fixes the checkout
+ * at <workRoot>/<id>/omni, which this run deletes and re-clones, and the run
+ * resets the GitHub stand-in and the model proxy it was given; a second side
+ * on the same work root would do both to the first. So one side per work
+ * root, and a second one is refused, not queued.
+ */
+export const claimWorkRoot = async (workRoot: string, label: string): Promise<() => Promise<void>> => {
+  const path = join(workRoot, SIDE_LOCK);
+  let handle;
+  try {
+    handle = await open(path, "wx");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const holder = await readFile(path, "utf8").catch(() => "");
+    throw new Error(
+      `another Tier 2 side holds ${path} (${holder.trim() || "no holder recorded"}). Two sides cannot share a work root: each needs /work/<id>/omni and its own stand-ins to itself. Run each side in its own container; delete the file only if no side is running.`,
+    );
+  }
+  await handle.writeFile(`${label} pid ${process.pid} on ${hostname()} since ${new Date().toISOString()}\n`);
+  await handle.close();
+  return () => rm(path, { force: true });
+};
+
 export const statusOf = (args: {
   killed: boolean;
   overBudget: boolean;
@@ -158,7 +208,10 @@ export const runPhase = async (args: {
   modelId?: string;
 }): Promise<SideResult> => {
   const { replayCase: c, env } = args;
+  const problem = hostProblem();
+  if (problem) throw new Error(problem);
   const scratch = await mkdtemp(join(tmpdir(), `replay-${c.id}-`));
+  let release: (() => Promise<void>) | null = null;
   try {
     const recorded = cutAtPrOpen(await readSession(c.checkpoint.session, env.awsRegion), c.checkpoint.prOrdinal);
     const checkout = recorded.cwd;
@@ -167,6 +220,11 @@ export const runPhase = async (args: {
       throw new Error(`the checkpoint's checkout ${checkout} is not <workRoot>/${suffix}`);
     }
     const workRoot = checkout.slice(0, -suffix.length - 1);
+    // The recorded prompt names this path, so the checkout has to be exactly here.
+    if (!existsSync(workRoot)) {
+      throw new Error(`${workRoot} does not exist; run Tier 2 inside the BugBoss image or on a host where it is writable`);
+    }
+    release = await claimWorkRoot(workRoot, `${c.id} rep ${args.rep} (${args.ref})`);
     const gitUrl = new URL(env.github.gitUrl);
     // gh matches the checkout's remote to GH_HOST by hostname alone and then
     // calls https://<host>/api/v3, so a stand-in on any port but 443 leaves
@@ -180,14 +238,14 @@ export const runPhase = async (args: {
 
     const commits = await resolvePrCommits({ checkpoint, cacheDir: args.cacheDir, omniSource: args.omniSource });
     const repo = `${checkpoint.pr.owner}/${checkpoint.pr.repo}`;
-    await control(env.github.controlUrl, "/__control/reset", {});
-    await control(env.github.controlUrl, "/__control/seed", {
+    await control(env.github, "/__control/reset", {});
+    await control(env.github, "/__control/seed", {
       repo,
       source: commits.mirror,
       main: commits.baseSha,
       branches: { [checkpoint.branch]: commits.headSha },
     });
-    await control(env.github.controlUrl, "/__control/pulls", {
+    await control(env.github, "/__control/pulls", {
       repo,
       head: checkpoint.branch,
       base: "main",
@@ -196,13 +254,16 @@ export const runPhase = async (args: {
       number: checkpoint.pr.number,
       user: "bugboss[bot]",
     });
-    await control(env.github.controlUrl, "/__control/ci", { mode: "scripted", verdicts: c.ci.verdicts });
-    await control(env.proxy.controlUrl, "/__control/reset", {});
-
-    // The recorded prompt names this path, so the checkout has to be exactly here.
-    if (!existsSync(workRoot)) {
-      throw new Error(`${workRoot} does not exist; run Tier 2 inside the BugBoss image or on a host where it is writable`);
+    await control(env.github, "/__control/ci", { mode: "scripted", verdicts: c.ci.verdicts });
+    const proxyAtStart = (await control(env.proxy, "/__control/reset", {})) as { budgetUsd?: number };
+    // The proxy's budget is fixed when it starts (PROXY_BUDGET_USD), so a
+    // proxy started for another case would hold this run to the wrong cap.
+    if (proxyAtStart.budgetUsd !== c.caps.modelUsd) {
+      throw new Error(
+        `the model proxy's budget is ${proxyAtStart.budgetUsd}, but case ${c.id} caps model spend at ${c.caps.modelUsd}; start the proxy with PROXY_BUDGET_USD=${c.caps.modelUsd}`,
+      );
     }
+
     await rm(dirname(checkout), { recursive: true, force: true });
     await mkdir(dirname(checkout), { recursive: true });
     const gitEnv = {
@@ -289,16 +350,15 @@ export const runPhase = async (args: {
     const output: ChildOutput | null = existsSync(outPath)
       ? (JSON.parse(await readFile(outPath, "utf8")) as ChildOutput)
       : null;
-    const proxyState = (await control(env.proxy.controlUrl, "/__control/state")) as {
+    const proxyState = (await control(env.proxy, "/__control/state")) as {
       spendUsd?: number;
       overBudget?: boolean;
     };
-    const traceText = await (await fetch(`${env.proxy.controlUrl.replace(/\/$/, "")}/__control/trace`)).text();
-    // Required at use rather than imported: the adapter lands with the proxy
-    // (evals-proxy), and this keeps the rest of replay/ loadable without it.
-    const { parseProxyLog } = require("../core/adapters/proxy-log") as {
-      parseProxyLog: (jsonl: string) => Trace[];
-    };
+    const traceText = await (
+      await fetch(`${env.proxy.controlUrl.replace(/\/$/, "")}/__control/trace`, {
+        headers: controlHeaders(env.proxy.controlToken),
+      })
+    ).text();
     const agentTrace = parseProxyLog(traceText).find((t) => t.toolNames.includes("monitor")) ?? null;
     const card = agentTrace ? measure(agentTrace, ratesFor(agentTrace.model)) : null;
 
@@ -342,6 +402,7 @@ export const runPhase = async (args: {
       },
       output: {
         rootCause: checkpoint.rootCause,
+        rootCauseSource: checkpoint.rootCause === null ? null : "checkpoint",
         diff: diff && diff.trim() !== "" ? diff : null,
         postmortem: boss?.analysis?.postmortem ?? null,
       },
@@ -351,6 +412,7 @@ export const runPhase = async (args: {
         : null,
     };
   } finally {
+    await release?.();
     await rm(scratch, { recursive: true, force: true });
   }
 };

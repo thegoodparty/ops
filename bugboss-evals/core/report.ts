@@ -4,6 +4,7 @@ import {
   pct,
   type Comparison,
   type DeltaSummary,
+  type PairRecord,
   type Section,
 } from "./aggregate";
 import { measure, PHASES, type ColdCause, type Scorecard } from "./metrics";
@@ -387,6 +388,25 @@ const pValue = (p: number | undefined) => (p === undefined ? "-" : p.toFixed(3))
 const tableCell = (text: string) =>
   text.split(/\s+/).filter(Boolean).join(" ").replace(/\|/g, "\\|");
 
+const vettedOf = (p: PairRecord): boolean => p.vettedReference ?? p.verdict?.vettedReference ?? true;
+
+/**
+ * What a reader must know about what the judge was given for one pair: no
+ * vetted reference, or a side whose root cause is the joined fallback rather
+ * than BugBoss's closing summary, or of unknown origin.
+ */
+export const judgeInputCaveats = (p: PairRecord): string[] => {
+  const caveats: string[] = [];
+  if (!vettedOf(p)) caveats.push("no vetted reference");
+  const sources = p.verdict?.rootCauseSources;
+  if (!sources) return caveats;
+  for (const role of ["baseline", "candidate"] as const) {
+    if (sources[role] === "heuristic") caveats.push(`${role} root cause is heuristic`);
+    if (sources[role] === "unknown") caveats.push(`${role} root cause source unknown`);
+  }
+  return caveats;
+};
+
 const deltaRow = (label: string, d: DeltaSummary, fmt: (v: number | undefined) => string, signedFmt: (v: number | undefined) => string) =>
   `| ${label} | ${fmt(d.medianBaseline)} | ${fmt(d.medianCandidate)} | ${signedFmt(d.medianDelta)} | ${d.lower} lower / ${d.equal} equal / ${d.higher} higher | ${pValue(d.signTestP)} | ${d.verdict} |`;
 
@@ -454,14 +474,36 @@ export const renderComparison = (args: {
     "Read these as well as the total: a change that helps two scenarios and breaks one can hide in a tally.",
     "",
   );
+  const unvetted = new Set(c.pairs.filter((p) => !vettedOf(p)).map((p) => p.scenarioId));
   for (const [id, s] of Object.entries(c.byScenario)) {
-    lines.push(`### ${id}`, "", ...sectionLines(s), "");
+    lines.push(
+      `### ${id}`,
+      "",
+      ...(unvetted.has(id)
+        ? ["**No vetted reference.** The judge compared the two sides against each other and the evidence each cites, not against a root cause a human signed off.", ""]
+        : []),
+      ...sectionLines(s),
+      "",
+    );
   }
+  const flagged = c.pairs.filter((p) => judgeInputCaveats(p).length > 0);
   lines.push(
+    "## Judge input caveats",
+    "",
+    ...(flagged.length === 0
+      ? ["None. Every pair had a vetted reference, and every judged root cause came from BugBoss's closing summary or the recorded checkpoint."]
+      : [
+          "A heuristic root cause is every BugBoss message that mentions a root cause, joined, used because no closing summary was found. An unknown one comes from an output written before its source was recorded.",
+          "",
+          "| Pair | Scenario | Caveats |",
+          "| --- | --- | --- |",
+          ...flagged.map((p) => `| ${p.pairId} | ${p.scenarioId} | ${judgeInputCaveats(p).join("; ")} |`),
+        ]),
+    "",
     "## Per pair",
     "",
-    "| Pair | Scenario | Rep | Baseline | Candidate | Cost delta | Wall-clock delta | Verdict | Why |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| Pair | Scenario | Rep | Baseline | Candidate | Cost delta | Wall-clock delta | Verdict | Judge input | Why |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ...c.pairs.map((p) => {
       const v = p.verdict;
       const verdict = !v ? "not judged" : v.excluded ? "excluded" : v.flipped ? "unstable" : v.winner === "tie" ? "tie" : `${v.winner} ${v.margin}`;
@@ -470,7 +512,7 @@ export const renderComparison = (args: {
         typeof p.baseline[field] === "number" && typeof p.candidate[field] === "number"
           ? (p.candidate[field] as number) - (p.baseline[field] as number)
           : undefined;
-      return `| ${p.pairId} | ${p.scenarioId} | ${p.rep} | ${p.baseline.status} | ${p.candidate.status} | ${signedMoney(d("costUsd"))} | ${signedSecs(d("wallClockSeconds"))} | ${verdict} | ${tableCell(why)} |`;
+      return `| ${p.pairId} | ${p.scenarioId} | ${p.rep} | ${p.baseline.status} | ${p.candidate.status} | ${signedMoney(d("costUsd"))} | ${signedSecs(d("wallClockSeconds"))} | ${verdict} | ${judgeInputCaveats(p).join("; ") || "-"} | ${tableCell(why)} |`;
     }),
     "",
     "## How this was run",

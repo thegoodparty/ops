@@ -95,8 +95,8 @@ test("the second PR's phase is reachable, with its branch from --head", () => {
 
 test("the GitHub host is rewritten in tool results only", () => {
   const withAssistantUrl = `${SESSION}\n${assistant("a9", [{ id: "c9", name: "bash", arguments: { command: "gh pr view https://github.com/thegoodparty/omni/pull/2213" } }], 8000)}`;
-  const rewritten = rewriteGitHubHost(withAssistantUrl, "github:8444");
-  assert.match(rewritten, /https:\/\/github:8444\/thegoodparty\/omni\/pull\/2213/);
+  const rewritten = rewriteGitHubHost(withAssistantUrl, "github");
+  assert.match(rewritten, /https:\/\/github\/thegoodparty\/omni\/pull\/2213/);
   const last = JSON.parse(rewritten.trim().split("\n").at(-1) as string);
   assert.match(JSON.stringify(last), /https:\/\/github\.com\/thegoodparty/);
   // Lines that are not tool results come through byte for byte.

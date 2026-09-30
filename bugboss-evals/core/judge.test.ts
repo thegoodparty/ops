@@ -7,6 +7,7 @@ import {
   createBedrockJudgeModel,
   judgePair,
   loadRubric,
+  NO_REFERENCE,
   PromptTooLongError,
   reconcile,
   type JudgeModel,
@@ -210,4 +211,43 @@ test("the Bedrock judge turns a context overflow into a refusal", async () => {
     },
   };
   await assert.rejects(createBedrockJudgeModel({ client })({ system: "S", prompt: "P" }), PromptTooLongError);
+});
+
+test("without a vetted reference the judge is told so and the verdict records it", async () => {
+  const { model, calls } = fakeModel(() => ({ winner: "tie", margin: "tie" }));
+  const verdict = await judgePair({
+    pairId: "incident-80-post-pr/rep-1",
+    context: { alert: CONTEXT.alert, reference: null },
+    baseline: side("ALPHA_SIDE"),
+    candidate: side("BETA_SIDE"),
+    model,
+    rubric: "RUBRIC",
+  });
+  assert.equal(verdict.vettedReference, false);
+  assert.match(calls[0].prompt, new RegExp(NO_REFERENCE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.ok(!/vetted by a human/.test(calls[0].prompt));
+});
+
+test("the root cause's source reaches the prompt heading and the verdict; missing is unknown", async () => {
+  const { model, calls } = fakeModel(() => ({ winner: "tie", margin: "tie" }));
+  const verdict = await judgePair({
+    pairId: "pool-exhaustion/rep-2",
+    context: CONTEXT,
+    baseline: side("ALPHA_SIDE", { rootCauseSource: "heuristic" }),
+    candidate: side("BETA_SIDE"),
+    model,
+    rubric: "RUBRIC",
+  });
+  assert.deepEqual(verdict.rootCauseSources, { baseline: "heuristic", candidate: "unknown" });
+  assert.equal(verdict.vettedReference, true);
+  assert.match(calls[0].prompt, /every message of the agent's that mentions one/);
+  const none = await judgePair({
+    pairId: "pool-exhaustion/rep-3",
+    context: CONTEXT,
+    baseline: side("A", { rootCause: null, rootCauseSource: null }),
+    candidate: side("B", { rootCauseSource: "closing_summary" }),
+    model,
+    rubric: "RUBRIC",
+  });
+  assert.deepEqual(none.rootCauseSources, { baseline: "none", candidate: "closing_summary" });
 });

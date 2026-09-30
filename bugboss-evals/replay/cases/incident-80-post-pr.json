@@ -41,5 +41,6 @@
     "wallClockSeconds": 5400,
     "modelUsd": 15
   },
-  "scenario": "loki-query-budget"
+  "scenario": null,
+  "noVettedReference": true
 }

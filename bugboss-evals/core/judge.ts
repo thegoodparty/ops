@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { blindOutput, type BlindOptions, type IncidentOutput } from "./blind";
+import { blindOutput, type BlindOptions, type IncidentOutput, type RootCauseSource } from "./blind";
 import { priceTokens, ratesFor } from "./price";
 
 export const RUBRIC_DIR = join(__dirname, "rubrics");
@@ -164,9 +164,34 @@ export const loadRubric = (name = "incident", dir = RUBRIC_DIR): string =>
 export interface JudgeContext {
   /** The Grafana webhook body that opened the incident. */
   alert: unknown;
-  /** The vetted root cause, `reference.md`. Never the real fix diff. */
-  reference: string;
+  /**
+   * The vetted root cause, `reference.md`. Never the real fix diff. Null when
+   * no human-vetted reference exists for the incident; the judge is told so
+   * and the verdict records it.
+   */
+  reference: string | null;
 }
+
+export const NO_REFERENCE =
+  "No vetted reference exists for this incident. Compare the two outputs against each other and against the evidence each one cites.";
+
+/**
+ * What the judge was given as a side's root cause. `none` means the side
+ * produced no root cause; `unknown` means its output predates the source
+ * field, so nobody can say whether the text is the agent's own summary.
+ */
+export type RootCauseLabel = RootCauseSource | "none" | "unknown";
+
+export const rootCauseLabel = (output: IncidentOutput): RootCauseLabel =>
+  output.rootCause === null ? "none" : (output.rootCauseSource ?? "unknown");
+
+const ROOT_CAUSE_HEADING: Record<RootCauseLabel, string> = {
+  closing_summary: "Root cause, from the agent's closing summary",
+  heuristic: "Root cause, every message of the agent's that mentions one, joined in order",
+  checkpoint: "Root cause, as the agent reported it before the part being compared",
+  none: "Root cause",
+  unknown: "Root cause, as posted in the thread",
+};
 
 /**
  * A fence longer than any backtick run in the text, so a diff or post-mortem
@@ -186,7 +211,7 @@ const part = (title: string, value: string | null, lang = ""): string[] =>
 const renderOutput = (label: string, output: IncidentOutput): string[] => [
   `## ${label}`,
   "",
-  ...part("Root cause, as posted in the thread", output.rootCause),
+  ...part(ROOT_CAUSE_HEADING[rootCauseLabel(output)], output.rootCause),
   ...part("Fix diff", output.diff, "diff"),
   ...part("Post-mortem", output.postmortem),
 ];
@@ -206,9 +231,9 @@ export const buildPrompt = (
       "json",
     ),
     "",
-    "## Reference root cause, vetted by a human",
-    "",
-    fenced(context.reference),
+    ...(context.reference === null
+      ? ["## Reference root cause", "", NO_REFERENCE]
+      : ["## Reference root cause, vetted by a human", "", fenced(context.reference)]),
     "",
     ...renderOutput("Output 1", first),
     ...renderOutput("Output 2", second),
@@ -239,6 +264,10 @@ export interface CaseVerdict {
   judgeCostUsd: number;
   /** Prose lines blinding removed, both sides and both passes counted once. */
   blindedLines: number;
+  /** False when the judge had no vetted reference to compare against. */
+  vettedReference?: boolean;
+  /** Where each side's root cause text came from, for the report to flag. */
+  rootCauseSources?: { baseline: RootCauseLabel; candidate: RootCauseLabel };
 }
 
 const MARGIN_RANK: Record<Margin, number> = { tie: 0, better: 1, much_better: 2 };
@@ -358,6 +387,10 @@ export const judgePair = async (args: {
   const baseline = blindOutput(args.baseline, args.blinding);
   const candidate = blindOutput(args.candidate, args.blinding);
   const blindedLines = baseline.droppedLines + candidate.droppedLines;
+  const inputs = {
+    vettedReference: args.context.reference !== null,
+    rootCauseSources: { baseline: rootCauseLabel(args.baseline), candidate: rootCauseLabel(args.candidate) },
+  };
   const orders = [baselineFirst(args.pairId), !baselineFirst(args.pairId)];
 
   const judgements: SingleJudgement[] = [];
@@ -391,8 +424,9 @@ export const judgePair = async (args: {
           : `judge failed: ${message}`,
       judgeCostUsd: judgements.reduce((sum, j) => sum + j.costUsd, 0),
       blindedLines,
+      ...inputs,
     };
   }
   const [first, second] = judgements;
-  return reconcile(args.pairId, first, second, blindedLines);
+  return { ...reconcile(args.pairId, first, second, blindedLines), ...inputs };
 };

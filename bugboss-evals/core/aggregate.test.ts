@@ -12,7 +12,7 @@ import {
   type PairRecord,
   type RunRecord,
 } from "./aggregate";
-import type { CaseVerdict, Margin } from "./judge";
+import type { CaseVerdict, Margin, RootCauseLabel } from "./judge";
 import { renderComparison } from "./report";
 
 const verdict = (
@@ -165,4 +165,34 @@ test("an A/A report describes noise instead of a ship decision", () => {
   assert.match(text, /A\/A calibration/);
   assert.match(text, /run-to-run noise/);
   assert.ok(!/Ship rule/.test(text));
+});
+
+test("the report flags a heuristic or unknown root cause per pair, and names the side", () => {
+  const withSources = (id: string, baseline: RootCauseLabel, candidate: RootCauseLabel): CaseVerdict => ({
+    ...verdict(id, "candidate", "better"),
+    vettedReference: true,
+    rootCauseSources: { baseline, candidate },
+  });
+  const pairs = [
+    pair(1, "pool", runRecord(20, 3600), runRecord(12, 3000), withSources("pool/1", "closing_summary", "heuristic")),
+    pair(2, "pool", runRecord(20, 3600), runRecord(12, 3000), withSources("pool/2", "unknown", "closing_summary")),
+    pair(3, "pool", runRecord(20, 3600), runRecord(12, 3000), withSources("pool/3", "closing_summary", "closing_summary")),
+  ];
+  const text = renderComparison({ comparison: compare(pairs), tier: "Tier 1", baselineRef: "main", candidateRef: "feat/x" });
+  assert.match(text, /## Judge input caveats/);
+  assert.match(text, /\| pool\/1 \| pool \| candidate root cause is heuristic \|/);
+  assert.match(text, /\| pool\/2 \| pool \| baseline root cause source unknown \|/);
+  assert.ok(!/\| pool\/3 \| pool \| [a-z]/.test(text));
+});
+
+test("a scenario with no vetted reference says so, even when no pair was judged", () => {
+  const pairs = [
+    { ...pair(1, "incident-80-post-pr", runRecord(20, 3600), runRecord(12, 3000)), vettedReference: false },
+    pair(1, "incident-2-post-pr", runRecord(20, 3600), runRecord(12, 3000)),
+  ];
+  const text = renderComparison({ comparison: compare(pairs), tier: "Tier 2", baselineRef: "main", candidateRef: "feat/x" });
+  const section = text.split("### incident-80-post-pr")[1].split("###")[0];
+  assert.match(section, /No vetted reference/);
+  assert.ok(!/No vetted reference/.test(text.split("### incident-2-post-pr")[1].split("###")[0]));
+  assert.match(text, /\| incident-80-post-pr\/1 \| incident-80-post-pr \| no vetted reference \|/);
 });

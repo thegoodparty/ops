@@ -51,6 +51,11 @@ export interface PairRecord {
   candidate: RunRecord;
   /** Null when the pair was not judged at all, which Tier 2 allows. */
   verdict: CaseVerdict | null;
+  /**
+   * False when the scenario or case has no human-vetted reference. Set here
+   * as well as on the verdict so an unjudged pair still carries it.
+   */
+  vettedReference?: boolean;
 }
 
 const choose = (n: number, k: number) => {
