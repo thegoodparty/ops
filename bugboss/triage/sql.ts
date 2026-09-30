@@ -38,7 +38,9 @@ Timestamps are epoch milliseconds. Labels and prUrls are JSON text; use
 json_extract(labels, '$.alert_slug') to read one.
 There is no cost column. Spend is recorded in tokens because prices move and
 tokens do not; a dollar figure is arithmetic over these and modelId, and is an
-estimate whenever you quote one.`;
+estimate whenever you quote one. An incident's tokens are its own agent's
+only; the incidents merged into it keep theirs on their own rows (mergedInto
+is that id), so add those when somebody asks what an incident cost in all.`;
 
 // The guard below used to exist twice, against the same database, with
 // different answers: this one allowed SELECT and WITH and checked the raw

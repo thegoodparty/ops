@@ -152,3 +152,46 @@ export const resolveBedrockModel = async ({
 
   return toInvokeModelModel(entry, { id, ...(cost ? { cost } : {}), ...overrides });
 };
+
+export interface TokenCounts {
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** The 1h share of `cacheWrite`. */
+  cacheWrite1h: number;
+}
+
+/**
+ * Dollars for a token count, at one model's catalog rates.
+ *
+ * Each class at its own rate, the way Pi's `calculateCost` prices a turn: a
+ * 5m cache write at the catalog's `cacheWrite` and a 1h write at 2x base
+ * input, which is Anthropic's rule and the one the catalog has no field for.
+ * Summed tokens price the same as summed turns because the Bedrock catalog
+ * carries no volume tiers for these models; `rates.tiers` is refused rather
+ * than ignored so the day one appears this cannot silently misprice.
+ */
+export const priceTokens = (rates: ModelCost, tokens: TokenCounts): number => {
+  if (rates.tiers && rates.tiers.length > 0) {
+    throw new Error("tiered rates price per request, not over summed tokens");
+  }
+  const shortWrite = tokens.cacheWrite - tokens.cacheWrite1h;
+  return (
+    (rates.input * tokens.tokensIn +
+      rates.output * tokens.tokensOut +
+      rates.cacheRead * tokens.cacheRead +
+      rates.cacheWrite * shortWrite +
+      rates.input * 2 * tokens.cacheWrite1h) /
+    1_000_000
+  );
+};
+
+/** The catalog's rates for `modelId`, or null when the catalog has no entry. */
+export const catalogRatesFor = async (modelId: string): Promise<ModelCost | null> => {
+  try {
+    return (await resolveBedrockModel({ id: modelId })).cost;
+  } catch {
+    return null;
+  }
+};

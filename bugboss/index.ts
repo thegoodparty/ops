@@ -355,6 +355,10 @@ export interface BugBoss {
   sweepReports(): Promise<number>;
   /** One pass of the status board: headers, the morning post, the all-clear. */
   sweepBoard(): Promise<unknown>;
+  /** Roll the running agents' spend onto their rows. Returns rows changed. */
+  sweepUsage(): Promise<number>;
+  /** Recompute every row's spend from its session file. Returns rows changed. */
+  reconcileUsage(): Promise<number>;
   start(): void;
   stop(): void;
 }
@@ -1703,7 +1707,7 @@ export const createBugBoss = async (
       // never gets to report, and the file is on disk either way. So the
       // numbers survive exactly the runs you most want them for.
       void noteRunOutcome(ctx.incidentId, sessionRef);
-      void rollUpUsage(ctx.incidentId, sessionRef);
+      void rollUpUsage([ctx.incidentId]);
     });
   };
 
@@ -1767,88 +1771,151 @@ export const createBugBoss = async (
   };
 
   /**
-   * Sum the run's token usage onto the incident.
+   * Put each incident's spend on its row: tokens by class, summed from its
+   * session file.
    *
-   * Tokens rather than dollars. Bedrock returns tokens; a price is
-   * arithmetic we do locally against Pi's per-model table, and the day AWS
-   * moves a rate that table goes stale with nothing in a stored dollar
-   * figure that could ever say so. Tokens plus `modelId` stay true and
-   * re-price whenever someone asks, so there is no cost column to write and
-   * every figure a human sees is derived at the point it is shown.
+   * Tokens rather than dollars. Bedrock returns tokens; a price is arithmetic
+   * against a table that goes stale the day AWS moves a rate, and a stored
+   * dollar figure has nothing in it that could ever say so. Tokens plus
+   * `modelId` re-price whenever someone asks, so every dollar figure is an
+   * estimate derived where it is shown (`priceTokens`).
    *
-   * The 1h cache-write share goes with them for the same reason: it prices
-   * at 2x base input where the rest of the write is 1.25x, so a re-pricing
-   * without it is wrong by most of that gap on every run here.
+   * Runs after every child exits, on every tick for the agents that are
+   * running, and over every row at boot. The boot pass is what makes the
+   * rest safe to miss: every merge to ops `main` replaces this container,
+   * which kills the children and the `.finally` that would have rolled them
+   * up, so before this existed a long-running incident showed zero and a
+   * finished one lost whatever it spent after its last clean exit.
+   *
+   * Idempotent. Totals are absolute over the whole file, so a re-read counts
+   * every launch once, and a row is only written when a number changed. A
+   * total below the one already stored is never written, because a session
+   * file only grows: a smaller one is an older read that lost a race with a
+   * newer one, or a file that aged out and was replaced, and in both cases
+   * the stored number is the truer one. The check is repeated inside the
+   * write for the race. A missing file leaves the row alone.
+   *
+   * One write for the whole batch, because every write is a snapshot PUT.
+   * Returns how many rows changed.
    */
-  const rollUpUsage = async (
-    incidentId: string,
-    sessionRef: string,
-  ): Promise<void> => {
-    try {
-      const raw = await store.get(sessionRef);
-      if (!raw) {
-        // The child is spawned before its first turn syncs, so a crash at
-        // boot legitimately leaves no session. Say so rather than writing a
-        // zero that reads as a free run.
-        log("usage_roll_up_skipped", { incidentId, sessionRef, reason: "no session file" });
-        return;
-      }
-      const usage = sumSessionUsage(raw);
-      const total = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
-      if (total === 0) {
-        // A zero is never written, whatever produced it. The columns already
-        // default to zero, and on a resume the row may hold real tokens an
-        // earlier launch stored -- whose session object ages out under the
-        // lifecycle rule, so overwriting it loses the only copy.
-        if (usage.turns > 0) {
-          // A turn that reached the model always spends tokens, so this is not
-          // a cheap run: it is a reader that no longer matches what Pi writes.
-          alarm("usage_missing", {
-            incidentId,
-            sessionRef,
-            turns: usage.turns,
-            modelId: usage.modelId,
-          });
-        } else {
-          log("usage_roll_up_skipped", {
-            incidentId,
-            sessionRef,
-            reason: "session holds no turns",
-          });
+  const rollUpUsage = async (incidentIds: readonly string[]): Promise<number> => {
+    type Spend = {
+      tokensIn: number;
+      tokensOut: number;
+      cacheRead: number;
+      cacheWrite: number;
+      cacheWrite1h: number;
+      modelId: string | null;
+    };
+    const totalOf = (s: Spend): number => s.tokensIn + s.tokensOut + s.cacheRead + s.cacheWrite;
+    const SPEND_SQL = `SELECT tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h,
+                              modelId FROM incident WHERE id = ?`;
+
+    const changed: { incidentId: string; spend: Spend }[] = [];
+    for (const incidentId of incidentIds) {
+      const sessionRef = incidentSessionKey(incidentId);
+      try {
+        const row = db.get<Spend>(SPEND_SQL, [incidentId]);
+        if (!row) continue;
+        let spend: Spend = row;
+
+        const raw = await store.get(sessionRef);
+        if (raw) {
+          const usage = sumSessionUsage(raw);
+          const summed: Spend = {
+            tokensIn: usage.tokensIn,
+            tokensOut: usage.tokensOut,
+            cacheRead: usage.cacheRead,
+            cacheWrite: usage.cacheWrite,
+            cacheWrite1h: usage.cacheWrite1h,
+            modelId: usage.modelId ?? row.modelId,
+          };
+          if (totalOf(summed) === 0 && usage.turns > 0) {
+            // A turn that reached the model always spends tokens, so this is
+            // not a cheap run: it is a reader that no longer matches what Pi
+            // writes.
+            alarm("usage_missing", {
+              incidentId,
+              sessionRef,
+              turns: usage.turns,
+              modelId: usage.modelId,
+            });
+          }
+          if (totalOf(summed) >= totalOf(row)) spend = summed;
+          else {
+            log("usage_behind_row", {
+              incidentId,
+              sessionRef,
+              fileTotal: totalOf(summed),
+              rowTotal: totalOf(row),
+            });
+          }
         }
-        return;
+
+        const same =
+          spend.tokensIn === row.tokensIn &&
+          spend.tokensOut === row.tokensOut &&
+          spend.cacheRead === row.cacheRead &&
+          spend.cacheWrite === row.cacheWrite &&
+          spend.cacheWrite1h === row.cacheWrite1h &&
+          spend.modelId === row.modelId;
+        if (!same) changed.push({ incidentId, spend });
+      } catch (err: unknown) {
+        // Never fatal. Losing a cost number is not worth failing a run over.
+        alarm("usage_roll_up_failed", { incidentId, error: String(err) });
       }
-      await db.withWrite((w: Database.Database) => {
-        w.prepare(
+    }
+    if (changed.length === 0) return 0;
+
+    try {
+      const flushed = await db.withWrite((w: Database.Database) => {
+        const read = w.prepare(SPEND_SQL);
+        const update = w.prepare(
           `UPDATE incident
              SET tokensIn = ?, tokensOut = ?, cacheRead = ?, cacheWrite = ?,
                  cacheWrite1h = ?, modelId = COALESCE(?, modelId)
            WHERE id = ?`,
-        ).run(
-          usage.tokensIn,
-          usage.tokensOut,
-          usage.cacheRead,
-          usage.cacheWrite,
-          usage.cacheWrite1h,
-          usage.modelId,
-          incidentId,
         );
+        const done: typeof changed = [];
+        for (const entry of changed) {
+          const { incidentId, spend } = entry;
+          const current = read.get(incidentId) as Spend | undefined;
+          if (!current || totalOf(spend) < totalOf(current)) continue;
+          update.run(
+            spend.tokensIn,
+            spend.tokensOut,
+            spend.cacheRead,
+            spend.cacheWrite,
+            spend.cacheWrite1h,
+            spend.modelId,
+            incidentId,
+          );
+          done.push(entry);
+        }
+        return done;
       });
-      log("usage_rolled_up", {
-        incidentId,
-        tokensIn: usage.tokensIn,
-        tokensOut: usage.tokensOut,
-        cacheRead: usage.cacheRead,
-        cacheWrite: usage.cacheWrite,
-        cacheWrite1h: usage.cacheWrite1h,
-        turns: usage.turns,
-        modelId: usage.modelId,
-      });
+      for (const { incidentId, spend } of flushed) {
+        log("usage_rolled_up", { incidentId, ...spend });
+      }
+      return flushed.length;
     } catch (err: unknown) {
-      // Never fatal. Losing a cost number is not worth failing a run over.
-      alarm("usage_roll_up_failed", { incidentId, error: String(err) });
+      alarm("usage_roll_up_failed", {
+        incidentIds: changed.map((c) => c.incidentId),
+        error: String(err),
+      });
+      return 0;
     }
   };
+
+  /** The running agents' spend, on every tick. */
+  const sweepUsage = (): Promise<number> =>
+    rollUpUsage(dispatcher.list().map((agent) => agent.incidentId));
+
+  /** Every row's tokens, recomputed from its session file. Run at boot. */
+  const reconcileUsage = (): Promise<number> =>
+    rollUpUsage(
+      db.query<{ id: string }>("SELECT id FROM incident ORDER BY id").map((row) => row.id),
+    );
 
   // -------------------------------------------------------------------------
   // The closing report
@@ -1872,7 +1939,14 @@ export const createBugBoss = async (
         }),
     },
     prStates: options.prStates,
-    rollUpUsage: (incidentId) => rollUpUsage(incidentId, incidentSessionKey(incidentId)),
+    // The merged-in rows too, since the report prices their tokens and a row
+    // whose agent was killed by a deploy may not have been rolled up since.
+    rollUpUsage: async (incidentId) => {
+      const merged = db
+        .query<{ id: string }>("SELECT id FROM incident WHERE mergedInto = ?", [incidentId])
+        .map((row) => row.id);
+      await rollUpUsage([incidentId, ...merged]);
+    },
     now,
   };
 
@@ -2135,8 +2209,14 @@ export const createBugBoss = async (
     // signal and every threadless incident on disk is real rather than young.
     background("startup_sweep", sweepOrphans);
     background("startup_threads", ensureIncidentThreads);
-    background("startup_reports", sweepReports);
+    // Usage first: a report the last container never published is about to
+    // price these rows' tokens, and this pass is what makes them whole.
+    background("startup_usage_and_reports", async () => {
+      await reconcileUsage();
+      await sweepReports();
+    });
     resolutionTimer = setInterval(() => {
+      background("usage_sweep", sweepUsage);
       background("orphan_sweep", sweepOrphans);
       background("thread_sweep", ensureIncidentThreads);
       // After the thread sweep, so an incident whose thread was opened on
@@ -2179,6 +2259,8 @@ export const createBugBoss = async (
     ensureIncidentThreads,
     sweepReports,
     sweepBoard: sweepTheBoard,
+    sweepUsage,
+    reconcileUsage,
     start,
     stop,
   };

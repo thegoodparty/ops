@@ -14,6 +14,7 @@ import {
   invokeModelIdFor,
   type InvokeModelBody,
   parseInferenceProfiles,
+  priceTokens,
   registerBedrockInvokeModelProvider,
   resolveBedrockModel,
 } from "./index";
@@ -520,4 +521,35 @@ test("the profile map is refused at parse time rather than dropped at request ti
   assert.throws(() => parseInferenceProfiles('{"m":123}'), /non-empty profile ARN/);
   assert.throws(() => parseInferenceProfiles('{"m":""}'), /non-empty profile ARN/);
   assert.throws(() => parseInferenceProfiles("{nope"), SyntaxError);
+});
+
+test("priceTokens bills each token class at its own catalog rate", async () => {
+  const { cost } = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  // A million of each, and a write split 1M at 5m and 1M at 1h, so every
+  // term is its per-million rate and a class billed at another's shows.
+  const price = priceTokens(cost, {
+    tokensIn: 1_000_000,
+    tokensOut: 1_000_000,
+    cacheRead: 1_000_000,
+    cacheWrite: 2_000_000,
+    cacheWrite1h: 1_000_000,
+  });
+  assert.equal(price, 5.5 + 27.5 + 0.55 + 6.875 + 11);
+});
+
+test("priceTokens refuses tiered rates rather than misprice summed tokens", () => {
+  assert.throws(
+    () =>
+      priceTokens(
+        {
+          input: 1,
+          output: 1,
+          cacheRead: 1,
+          cacheWrite: 1,
+          tiers: [{ inputTokensAbove: 200_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }],
+        },
+        { tokensIn: 1, tokensOut: 1, cacheRead: 1, cacheWrite: 1, cacheWrite1h: 0 },
+      ),
+    /tiered/,
+  );
 });
