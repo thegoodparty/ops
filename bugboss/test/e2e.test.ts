@@ -29,7 +29,8 @@ import { classifySlackEvent, type SlackConfig } from "../ingress";
 import { runMessageBoss } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
 import type { SlackAgentRun } from "../slack/agent";
-import type { SlackEvent } from "../slack/relay";
+import { SlackRelay, type SlackEvent } from "../slack/relay";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { emptyModelUsage } from "../model";
 import type { ModelReply, ModelRequest, ModelUsage } from "../triage";
 import type { ReportUpload } from "../report";
@@ -1532,6 +1533,11 @@ test("nothing the relay acts on is ignored at ingress", async () => {
     isIncidentThread: (_channel, ts) =>
       boss.db.get("SELECT id FROM incident WHERE slackThreadTs = ?", [ts]) !==
       undefined,
+    isBossThread: (channel, ts) =>
+      boss.db.get("SELECT 1 FROM boss_thread WHERE channel = ? AND threadTs = ?", [
+        channel,
+        ts,
+      ]) !== undefined,
   };
 
   const deliveries: {
@@ -1558,6 +1564,19 @@ test("nothing the relay acts on is ignored at ingress", async () => {
         user: "U-ada",
         text: "<@B0BOSS> what is open right now",
         ts: "1800.2",
+      },
+      intent: { intent: "question" },
+    },
+    {
+      // Under the mention just above, which is now a Boss conversation.
+      what: "an untagged follow-up under a Boss answer",
+      event: {
+        type: "message",
+        channel: "C0TEST",
+        user: "U-ada",
+        text: "and which of those is waiting on me?",
+        ts: "1800.21",
+        thread_ts: "1800.2",
       },
       intent: { intent: "question" },
     },
@@ -1665,6 +1684,139 @@ test("the wired endpoint acknowledges an untagged reply in an incident thread", 
     "the reply earns its :eyes: through the config createBugBoss built",
   );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+// --- a follow-up under a Boss answer reaches the Boss ------------------------
+
+/** A threaded message as Slack delivers it, tagged or not. */
+const threaded = (ts: string, threadTs: string, text: string) => ({
+  type: "message",
+  channel: "C0TEST",
+  user: "U-swain",
+  text,
+  ts,
+  thread_ts: threadTs,
+});
+
+/** Drive the real webhook, then wait out the answer it settles behind. */
+const deliver = async (event: Record<string, unknown>): Promise<void> => {
+  const res = await boss.publicApp.fetch(
+    new Request("http://boss/slack", {
+      method: "POST",
+      body: JSON.stringify({ type: "event_callback", event }),
+    }),
+  );
+  assert.equal(res.status, 200);
+};
+
+/**
+ * Production, 2026-09-30: a thread began with a channel-level @bugboss and
+ * the Boss answered in it. "Can you close incident 2?", typed underneath
+ * without a tag, never reached it -- only incident threads and tagged
+ * mentions were routed, so this was chatter at both layers and got neither
+ * an answer nor an :eyes:.
+ *
+ * The route is decided by the thread's identity and what the Boss has done
+ * in it, never by the words: the same sentence in a thread the Boss has
+ * never spoken in is still nobody's business.
+ */
+test("an untagged follow-up in a Boss conversation thread reaches the Boss", async () => {
+  const followUp = threaded("2100.2", "2100.1", "Can you close incident 2?");
+
+  // The premise. Without the thread check, both layers drop this message,
+  // which is exactly what production did.
+  const blind = await classifySlackEvent(
+    { headers: {}, rawBody: JSON.stringify({ type: "event_callback", event: followUp }) },
+    { botUserId: "B0BOSS", verifier: () => undefined },
+  );
+  assert.equal(blind.kind, "ignored", "premise: the old ingress ignores it");
+  const blindRelay = new SlackRelay({
+    db: boss.db,
+    slack: fakeSlack,
+    config: { channelId: "C0TEST", botUserId: "B0BOSS", rotationGroupId: null },
+    isBossThread: () => false,
+  });
+  assert.equal(
+    (await blindRelay.handle(followUp)).kind,
+    "ignore",
+    "premise: the old relay ignores it",
+  );
+
+  // The channel-level mention that starts the conversation.
+  fakeModel.intents.push({ intent: "question" });
+  await boss.slackEvent({
+    type: "app_mention",
+    channel: "C0TEST",
+    user: "U-swain",
+    text: "<@B0BOSS> what is open right now",
+    ts: "2100.1",
+  });
+
+  const asked = fakeSlackAgent.asked.length;
+  const reactions = fakeSlack.reactions.length;
+  fakeModel.intents.push({ intent: "question" });
+  await deliver(followUp);
+  await until(() => fakeSlackAgent.asked.length > asked, "the Boss to be asked the follow-up");
+
+  assert.match(fakeSlackAgent.asked.at(-1)!, /Can you close incident 2\?/);
+  assert.deepEqual(
+    fakeSlack.reactions.slice(reactions).map((r) => r.ts),
+    ["2100.2"],
+    "the follow-up earns its :eyes: through the wired config",
+  );
+  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+test("the same words in a thread the Boss has never spoken in stay ignored", async () => {
+  const asked = fakeSlackAgent.asked.length;
+  const reactions = fakeSlack.reactions.length;
+  const stranger = threaded("2200.2", "2200.1", "Can you close incident 2?");
+
+  await deliver(stranger);
+  assert.equal((await boss.relay.handle(stranger)).kind, "ignore");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(fakeSlackAgent.asked.length, asked, "the Boss was not run");
+  assert.equal(fakeSlack.reactions.length, reactions, "no :eyes: on chatter");
+});
+
+/**
+ * Threads the Boss answered before `boss_thread` existed have no row, and
+ * are still its conversations: the Slack agent's persisted session state
+ * says so. A fresh process, so no memo from an earlier test can answer.
+ */
+test("a thread known only by its persisted session state still counts", async () => {
+  const s3 = createMemoryS3();
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: "bugboss-test",
+      Key: "sessions/slack/C0TEST/2300.1/state.json",
+      Body: JSON.stringify({ lastSeenTs: "2300.1", lastActivityAt: Date.now() }),
+    }),
+  );
+  const fresh = await createBugBoss({
+    config: config(join(dir, "state-only.db")),
+    model: fakeModel,
+    slack: fakeSlack,
+    spawnAgent: fakeAgent,
+    s3,
+    secrets: { slackBotUserId: "B0BOSS" },
+    slackAgentModel: fakeSlackAgent,
+    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
+  });
+  try {
+    assert.equal(
+      fresh.db.get("SELECT 1 FROM boss_thread WHERE threadTs = '2300.1'"),
+      undefined,
+      "premise: no row records this thread",
+    );
+    const route = await fresh.relay.handle(threaded("2300.2", "2300.1", "and the other one?"));
+    assert.equal(route.kind, "slack_agent");
+    const unrelated = await fresh.relay.handle(threaded("2400.2", "2400.1", "and the other one?"));
+    assert.equal(unrelated.kind, "ignore");
+  } finally {
+    fresh.stop();
+  }
 });
 
 // --- a reply reaches the Boss, and cannot take the incident away -----------

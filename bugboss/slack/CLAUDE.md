@@ -81,6 +81,16 @@ A reply here has to stay visible at ingress: `classifySlackEvent` keeps an
 `incident_reply` kind, and the HTTP layer keys its :eyes: off not being
 `ignored`. See `ingress/CLAUDE.md`.
 
+**A follow-up under a Boss answer goes to the Boss too.** Outside incident
+threads the route used to be "tagged or dropped", so a person replying to the
+Boss the way people reply to anyone — without an `@` — was talking to nobody.
+A thread where the Boss already has a conversation (a `boss_thread` row,
+recorded by `answerMention` and `sayInThread` in the composition root, or a
+persisted session `state.json` under `slackSessionPrefix`) routes an untagged
+reply to `slack_agent`, exactly as a tagged one in that thread. Ingress calls
+it `boss_thread_reply` so it keeps its :eyes:. Both layers take the one
+predicate built in `index.ts`, and it is handed the thread, never the text.
+
 ## The :eyes: goes on before the work, not after it
 
 `ack.ts`. Slack's three-second ack is answered by the HTTP layer and seen by
@@ -100,7 +110,8 @@ Since ingress stopped reading words (see "The human boundary" in
 envelope and a thread id can answer. `mention` earns one — covering a report
 and a question alike, because telling those apart is a model call further in
 — and so does `incident_reply`, any reply in a thread BugBoss owns, which is
-how a person talks to the Boss about an incident. The invariant that keeps the two layers honest, tested in
+how a person talks to the Boss about an incident, and `boss_thread_reply`, an
+untagged follow-up in a thread where the Boss already has a conversation. The invariant that keeps the two layers honest, tested in
 `test/e2e.test.ts`: **nothing the relay acts on may be `ignored` at ingress.**
 
 `createSlackAck` returns **`void`, not a promise**, and that is the contract.

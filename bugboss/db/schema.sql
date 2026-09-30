@@ -396,3 +396,20 @@ CREATE TABLE IF NOT EXISTS board_state (
   -- event it can honestly announce.
   clearAnnounced    INTEGER NOT NULL DEFAULT 0
 );
+
+-- Threads outside any incident where the Boss already has a conversation:
+-- somebody mentioned @bugboss there, or the Boss posted there. An untagged
+-- follow-up in one of these is a reply to the Boss, the same as a tagged one,
+-- and without this row it was dropped at ingress as chatter nobody addressed
+-- to us -- "Can you close incident 2?" under a Boss answer vanished that way.
+--
+-- A row rather than a reading of the message: whether a thread is the Boss's
+-- is a fact about the thread, decided by what the Boss did in it, never by
+-- the words somebody chose. The Slack agent's persisted session state is the
+-- other half of the same answer, for threads that predate this table.
+CREATE TABLE IF NOT EXISTS boss_thread (
+  channel           TEXT NOT NULL,
+  threadTs          TEXT NOT NULL,
+  since             INTEGER NOT NULL,
+  PRIMARY KEY (channel, threadTs)
+);
