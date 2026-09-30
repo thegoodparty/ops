@@ -133,8 +133,37 @@ export const shellProbe: Probe = (command, timeoutMs) =>
     );
   });
 
-const wait = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const wait = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+
+/**
+ * The signal that ends whichever wait is running now. A Boss message is a
+ * user message, and `steer` only lands between tool batches, so a wait that
+ * could not be cut short would hold it for as long as the wait lasts --
+ * fifteen minutes and then a merge wait, on incident 94. `wrapUpAbort` is
+ * one-shot and means "wrap up"; this one is replaced after every interrupt,
+ * so the next wait starts clean. Tools read it when a call starts.
+ */
+export const createWaitInterrupt = () => {
+  let current = new AbortController();
+  return {
+    signal: (): AbortSignal => current.signal,
+    interrupt: (): void => {
+      const ended = current;
+      current = new AbortController();
+      ended.abort();
+    },
+  };
+};
 
 /**
  * Pi's per-call signal and the harness's deadline signal, both honoured.
@@ -410,6 +439,8 @@ export interface MonitorDeps {
   signal?: AbortSignal;
   /** Absent means no wait is ever reported, whatever the model asks for. */
   heartbeat?: HeartbeatDeps;
+  /** The current wait's interrupt, read when a call starts. */
+  waitSignal?: () => AbortSignal;
 }
 
 export interface MonitorArgs {
@@ -451,7 +482,7 @@ export const runMonitor = async (
   deps: MonitorDeps = {},
 ): Promise<MonitorResult> => {
   const probe = deps.probe ?? shellProbe;
-  const sleep = deps.sleep ?? wait;
+  const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
   const now = deps.now ?? Date.now;
   const probeTimeoutMs =
     (deps.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000;
@@ -629,6 +660,8 @@ export interface MessageBossDeps {
   minWaitSeconds?: number;
   maxGapSeconds?: number;
   signal?: AbortSignal;
+  /** The current wait's interrupt, read when a call starts. */
+  waitSignal?: () => AbortSignal;
 }
 
 export interface MessageBossArgs {
@@ -689,7 +722,7 @@ export const runMessageBoss = async (
     return { answer: null, timedOut: false, directives: [], terminate: false };
   }
 
-  const sleep = deps.sleep ?? wait;
+  const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
   const now = deps.now ?? Date.now;
   const pollMs = (deps.pollSeconds ?? MESSAGE_BOSS_POLL_SECONDS) * 1000;
   const minWaitSeconds = deps.minWaitSeconds ?? MESSAGE_BOSS_MIN_WAIT_SECONDS;
@@ -784,6 +817,9 @@ export const runMessageBoss = async (
   }
 };
 
+const INTERRUPTED =
+  "The Boss spoke: its message reaches you next. If none does, call get_incident before you do anything else.";
+
 const MONITOR_DESCRIPTION = [
   "Block until a shell command exits 0, then return its output whole. Use it for",
   "every wait: a merge, a deploy, a migration, an alert going quiet. Never poll",
@@ -861,13 +897,16 @@ export const createMonitorTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MonitorArgs;
+      const interrupt = deps.waitSignal?.();
       const result = await runMonitor(args, {
         ...deps,
-        signal: eitherSignal(signal, deps.signal),
+        signal: eitherSignal(signal, deps.signal, interrupt),
       });
-      const header = result.timedOut
-        ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
-        : `Condition met: ${args.description}`;
+      const header = interrupt?.aborted && result.timedOut
+        ? `STOPPED WAITING for: ${args.description} (interrupted). ${INTERRUPTED}`
+        : result.timedOut
+          ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
+          : `Condition met: ${args.description}`;
       return {
         content: [{ type: "text", text: `${header}\n\n${result.output}` }],
         details: { timedOut: result.timedOut, command: args.command },
@@ -904,15 +943,18 @@ export const createMessageBossTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MessageBossArgs;
+      const interrupt = deps.waitSignal?.();
       const result = await runMessageBoss(args, {
         ...deps,
-        signal: eitherSignal(signal, deps.signal),
+        signal: eitherSignal(signal, deps.signal, interrupt),
       });
       const text = !args.wait
         ? "Sent to the Boss."
         : result.answer !== null
           ? `The Boss answered: ${result.answer}`
-          : result.timedOut
+          : interrupt?.aborted
+            ? `Stopped waiting for the Boss's answer (interrupted). ${INTERRUPTED}`
+            : result.timedOut
             ? "Your deadline ended this wait. Escalate now, with a brief."
             : "The wait ended on a directive rather than an answer.";
       return {

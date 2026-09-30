@@ -193,6 +193,23 @@ matter how long they wait. That is what keeps a multi-day incident from
 saturating context on polling, and it is why the prompt forbids polling with
 bash in a loop.
 
+**A Boss message is a user message, and it ends a wait.** The Boss writes it
+to `pending_directive` from another process, so `createDirectiveWatcher`
+(`run.ts`) polls every ten seconds and delivers each `boss_message` with
+`session.steer`, then consumes it; the steered message is in the session, so a
+restart keeps it. Only the Boss tools drain the queue, and an agent writing a
+fix or watching CI calls none of them for minutes: incident 94's agent ran ten
+bash and monitor calls past a redirection and read it only when a deploy
+restarted it.
+
+A steer lands between tool batches, so a wait has to be cancellable or it
+holds the message for as long as it lasts. `createWaitInterrupt` (`tools.ts`)
+is a per-wait `AbortController`, replaced after every interrupt, and the
+blocking tools combine it with `wrapUpAbort` at call start. An interrupted
+`monitor` says `(interrupted)` and clears its wait marker, so the board stops
+saying what it was waiting on. `stop` and `merged` interrupt too but stay
+queued: the next Boss tool drains them, and only its result can end the run.
+
 **One turn is not one bill, and the prompt used to say it was.** A block that
 outlives the prompt cache pays a full cache write on the turn after it, which
 on a nine-hour incident was 41% of what that incident cost. So the prompt
