@@ -71,11 +71,12 @@ const drop = (dir: string) => {
 const run = (
   scenarioDir: string,
   script: string,
+  sha: string,
   omniDir: string,
   timeoutSeconds: number,
   log: string,
 ) => {
-  const r = spawnSync("bash", [join(scenarioDir, script), omniDir], {
+  const r = spawnSync("bash", [join(scenarioDir, script), sha, omniDir], {
     cwd: scenarioDir,
     env: env(),
     encoding: "utf8",
@@ -101,7 +102,7 @@ for (const id of ids) {
         try {
           const stem = join(ROOT, `${id}-${c.sha.slice(0, 12)}`);
           if (fresh && scenario.check.setup) {
-            const setup = run(dir, scenario.check.setup, omniDir, 1800, `${stem}-setup.log`);
+            const setup = run(dir, scenario.check.setup, c.sha, omniDir, 1800, `${stem}-setup.log`);
             assert.equal(setup.status, 0, `setup failed, see ${stem}-setup.log`);
             writeFileSync(join(omniDir, ".bugboss-setup-done"), "");
           }
@@ -109,6 +110,7 @@ for (const id of ids) {
           const check = run(
             dir,
             scenario.check.command,
+            c.sha,
             omniDir,
             scenario.check.timeoutSeconds,
             `${stem}-check.log`,

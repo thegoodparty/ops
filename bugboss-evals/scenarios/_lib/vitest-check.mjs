@@ -13,9 +13,16 @@
 //
 // Usage: vitest-check.mjs <omni checkout> <package dir> <check file>
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+
+// Node exits 1 on an uncaught error, which would read as "the fault is
+// present". Anything unexpected here is the check failing to run.
+process.on("uncaughtException", (error) => {
+  console.error(`vitest-check: ${error.stack ?? error}`);
+  process.exit(2);
+});
 
 const [omniArg, pkgArg, checkArg] = process.argv.slice(2);
 if (!omniArg || !pkgArg || !checkArg) {
@@ -23,7 +30,7 @@ if (!omniArg || !pkgArg || !checkArg) {
   process.exit(2);
 }
 
-const omni = resolve(omniArg);
+const omni = realpathSync(resolve(omniArg));
 const pkgDir = join(omni, pkgArg);
 const check = resolve(checkArg);
 if (!existsSync(join(pkgDir, "package.json"))) {
@@ -35,7 +42,8 @@ if (!existsSync(join(pkgDir, "package.json"))) {
 // package's vitest include covers, and its relative imports (./test-service)
 // are written against it. It is removed afterwards so the check never lands
 // in the checkout the agent or CI sees.
-const placed = join(pkgDir, "src", basename(check).replace(/\.vitest\.ts$/, ".test.ts"));
+const relative = join("src", basename(check).replace(/\.vitest\.ts$/, ".test.ts"));
+const placed = join(pkgDir, relative);
 const report = join(tmpdir(), `bugboss-check-${process.pid}-${Date.now()}.json`);
 
 copyFileSync(check, placed);
@@ -43,7 +51,9 @@ let run;
 try {
   run = spawnSync(
     "npx",
-    ["vitest", "run", placed, "--reporter=json", `--outputFile=${report}`, "--reporter=default"],
+    // Relative, because vitest matches its filter against real paths and a
+    // temp directory reached through a symlink (macOS /var) never matches.
+    ["vitest", "run", relative, "--reporter=json", `--outputFile=${report}`, "--reporter=default"],
     { cwd: pkgDir, stdio: "inherit", env: process.env },
   );
 } finally {
