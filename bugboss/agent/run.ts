@@ -1060,6 +1060,8 @@ export interface TurnBudgetState {
    * is not stopping.
    */
   escalated: boolean;
+  /** The restored transcript had already spent the budget before this launch. */
+  spentAtLaunch: boolean;
   usage: SessionUsage;
 }
 
@@ -1096,12 +1098,12 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     // Two cases, because one sentence cannot honestly cover both. A launch
     // that spent the budget got its grace and ignored it. A launch that
     // started already over -- the previous one died before its hand-off
-    // landed -- never had a grace window at all, and `used` is past `max`.
+    // landed -- never had a grace window at all, and `used` is already at `max` or past it.
     // One sentence quoting `max` produced "used all 200 turns" directly
     // above "201 turns on ...", which is the sort of thing that makes a
     // reader distrust the rest of the brief.
-    state.used > state.max
-      ? `The ${state.max}-turn budget for this incident was already spent when this launch started, so I stopped on my first turn back rather than investigating on borrowed time. ${state.used} turns have gone into it across every launch.`
+    state.spentAtLaunch
+      ? `The ${state.max}-turn budget for this incident was already spent when this launch started, so I stopped before taking a turn rather than investigating on borrowed time. ${state.used} turns have gone into it across every launch.`
       : `I used all ${state.max} turns this incident gets, across every launch, and did not escalate in the ${state.graceTurns} I was asked to.`,
     "",
     "What it spent:",
@@ -1113,7 +1115,7 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     "Where it stands:",
     "What I believe now: whatever I last reported on this incident.",
     "What I ruled out: not recorded; this brief is the harness's, not mine.",
-    state.used > state.max
+    state.spentAtLaunch
       ? "What I was about to do: nothing yet on this launch; the budget was gone before it started."
       : "What I was about to do: unknown. I was still working when the budget ran out.",
     "Side effects: check the incident for PRs I opened.",
@@ -1188,6 +1190,11 @@ export interface TurnBudget {
   extension: (pi: ExtensionAPI) => void;
   state: () => TurnBudgetState;
   exhausted: () => boolean;
+  /**
+   * Runs the exhausted hand-off now, before any model call, when the restored
+   * transcript has already spent the budget. True when it did.
+   */
+  stopIfSpent: () => Promise<boolean>;
 }
 
 /**
@@ -1240,12 +1247,21 @@ export const createTurnBudget = (args: {
     max: args.maxTurns,
     graceTurns,
     escalated,
+    spentAtLaunch: args.prior.turns >= args.maxTurns,
     usage: { ...usage },
   });
 
   return {
     state,
     exhausted: () => stopped,
+    stopIfSpent: async () => {
+      if (usage.turns < args.maxTurns) return false;
+      if (!stopped) {
+        stopped = true;
+        await args.onExhausted(state());
+      }
+      return true;
+    },
     extension: (pi: ExtensionAPI): void => {
       pi.on("turn_end", async (event) => {
         usage.turns += 1;
@@ -1289,6 +1305,23 @@ export const createTurnBudget = (args: {
       });
     },
   };
+};
+
+/**
+ * The first model call of a launch, unless the budget is already spent.
+ *
+ * `turn_end` only fires after a turn has been paid for, and the first turn of
+ * a relaunch rewrites the whole restored context into the cache. Incident 80
+ * came back at 266 of 200 turns and spent $4.04 on one `get_incident` before
+ * the budget stopped it. Checking first takes the same announce-and-park path
+ * with no request at all.
+ */
+export const promptWithinBudget = async (
+  budget: Pick<TurnBudget, "stopIfSpent">,
+  prompt: () => Promise<void>,
+): Promise<void> => {
+  if (await budget.stopIfSpent()) return;
+  await prompt();
 };
 
 export const deadlineMessage = (graceSeconds: number): string =>
@@ -1904,8 +1937,8 @@ const launch = async (args: {
 
   let error: string | null = null;
   try {
-    await session.prompt(
-      restored ? resumeMessage() : kickoffMessage(options.incidentId),
+    await promptWithinBudget(turnBudget, () =>
+      session.prompt(restored ? resumeMessage() : kickoffMessage(options.incidentId)),
     );
   } finally {
     clearTimeout(deadline);

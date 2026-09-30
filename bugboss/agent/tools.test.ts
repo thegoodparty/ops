@@ -8,6 +8,7 @@ import {
   createMonitorTool,
   formatWaited,
   HEARTBEAT_MAX_GAP_SECONDS,
+  MAX_BLOCK_SECONDS,
   heartbeatGapSeconds,
   insideWorkingHours,
   MESSAGE_BOSS_MIN_WAIT_SECONDS,
@@ -66,7 +67,7 @@ test("monitor returns as soon as the command exits 0", async () => {
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.deepEqual(result, { output: "MERGED\n", timedOut: false });
+  assert.deepEqual(result, { output: "MERGED\n", timedOut: false, capped: false });
   assert.equal(calls.length, 1);
   assert.equal(clock.sleeps(), 0);
 });
@@ -84,7 +85,7 @@ test("monitor keeps waiting through non-zero exits and costs one call", async ()
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.deepEqual(result, { output: "success", timedOut: false });
+  assert.deepEqual(result, { output: "success", timedOut: false, capped: false });
   assert.equal(attempts, 4);
 });
 
@@ -101,7 +102,7 @@ test("monitor gives up at the deadline and returns the last output", async () =>
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.deepEqual(result, { output: "still firing (6)", timedOut: true });
+  assert.deepEqual(result, { output: "still firing (6)", timedOut: true, capped: false });
   assert.equal(attempts, 6);
 });
 
@@ -115,7 +116,7 @@ test("monitor stops when the turn is aborted", async () => {
     { probe: async () => ({ code: 1, output: "no" }), sleep: clock.sleep, now: clock.now, signal: controller.signal },
   );
 
-  assert.deepEqual(result, { output: "no", timedOut: true });
+  assert.deepEqual(result, { output: "no", timedOut: true, capped: false });
 });
 
 test("monitor's description does not tell the agent to pre-summarise", async () => {
@@ -321,6 +322,10 @@ test("a directive that is not the Boss speaking has no boss text", () => {
   assert.equal(bossMessageText({ type: "resumed_after", seconds: 60 }), null);
 });
 
+// These tests follow one wait across hours of fake clock, so they lift the
+// per-call cap. The cap has its own tests.
+const UNCAPPED = Number.POSITIVE_INFINITY;
+
 // ---------------------------------------------------------------------------
 // The heartbeat on a wait that needs a person
 // ---------------------------------------------------------------------------
@@ -436,10 +441,10 @@ test("a wait on a person tells the Boss once it has gone an hour inside working 
 
   const result = await runMonitor(
     { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
-  assert.deepEqual(result, { output: '{"state":"OPEN"}', timedOut: true });
+  assert.deepEqual(result, { output: '{"state":"OPEN"}', timedOut: true, capped: false });
   assert.deepEqual(
     harness.told.map(({ kind, at }) => ({ kind, at })),
     [{ kind: "escalation", at: "2026-09-28T16:00:00.000Z" }],
@@ -475,6 +480,7 @@ test("the probe output reaches the Boss whole, however long", async () => {
       probe: async () => ({ code: 1, output }),
       sleep: clock.sleep,
       now: clock.now,
+      maxBlockSeconds: UNCAPPED,
       heartbeat: { ...harness.deps, workingHours: ALWAYS, firstSeconds: 60 },
     },
   );
@@ -497,7 +503,7 @@ test("a wait that spans a night is silent until the window opens", async () => {
 
   await runMonitor(
     { ...PR_WAIT, intervalSeconds: 3600, timeoutSeconds: 72_000 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   // Not one rung overnight, then one as the window opens on Tuesday and a
@@ -521,7 +527,7 @@ test("the working-hours window gates every rung, not only the first", async () =
 
   await runMonitor(
     { ...PR_WAIT, intervalSeconds: 600, timeoutSeconds: 12 * 3_600_000 / 1000 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.equal(harness.told.length, 0);
@@ -545,7 +551,7 @@ test("a resumed agent carries on waiting instead of telling the Boss again", asy
 
   const result = await runMonitor(
     { ...PR_WAIT, intervalSeconds: 600, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.equal(harness.recordWaitCalls(), 1);
@@ -572,7 +578,7 @@ test("a stale marker for a different command does not silence the next wait", as
 
   await runMonitor(
     { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.deepEqual(harness.told.map((call) => call.at), ["2026-09-28T16:00:00.000Z"]);
@@ -591,7 +597,7 @@ test("a wait with nobody to remind tells the Boss nothing and records no marker"
       description: "the release train to deploy abc123",
       waitingFor: "the release train to deploy abc123",
     },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.equal(result.timedOut, true);
@@ -607,7 +613,7 @@ test("a blank awaitingHuman is the same as none", async () => {
 
   await runMonitor(
     { ...PR_WAIT, awaitingHuman: "   ", intervalSeconds: 1800, timeoutSeconds: 14_400 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.equal(harness.told.length, 0);
@@ -625,6 +631,7 @@ test("the ladder doubles and then holds at the ceiling", async () => {
       probe: stalled,
       sleep: clock.sleep,
       now: clock.now,
+      maxBlockSeconds: UNCAPPED,
       heartbeat: { ...harness.deps, workingHours: ALWAYS, firstSeconds: 60, maxGapSeconds: 600 },
     },
   );
@@ -664,6 +671,7 @@ test("the ladder never ends the wait, for as long as the wait lasts", async () =
       probe: stalled,
       sleep: clock.sleep,
       now: clock.now,
+      maxBlockSeconds: UNCAPPED,
       heartbeat: { ...harness.deps, workingHours: ALWAYS },
     },
   );
@@ -700,7 +708,7 @@ test("the ping is counted before the Boss is told", async () => {
 
   await runMonitor(
     { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.deepEqual(harness.events, ["recordWait", "recordPing", "tellBoss:escalation", "clearWait"]);
@@ -718,6 +726,7 @@ test("a Boss inbox failure costs the rung, not the wait, and is not retried in p
       probe: stalled,
       sleep: clock.sleep,
       now: clock.now,
+      maxBlockSeconds: UNCAPPED,
       heartbeat: { ...harness.deps, workingHours: ALWAYS, firstSeconds: 60 },
     },
   );
@@ -740,7 +749,7 @@ test("a Boss failure while counting a rung costs the rung, not the wait", async 
 
   const result = await runMonitor(
     { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
   );
 
   assert.ok(harness.pingCalls() > 0, "the premise: a rung came due and counting it failed");
@@ -760,12 +769,13 @@ test("a Boss failure while dropping the marker does not lose a wait that just en
       probe: async () => ({ code: 0, output: "MERGED" }),
       sleep: clock.sleep,
       now: clock.now,
+      maxBlockSeconds: UNCAPPED,
       heartbeat: harness.deps,
     },
   );
 
   assert.ok(harness.events.includes("clearWait"), "the premise: the clear was tried");
-  assert.deepEqual(result, { output: "MERGED", timedOut: false });
+  assert.deepEqual(result, { output: "MERGED", timedOut: false, capped: false });
 });
 
 test("recording the wait is the one marker call that is allowed to fail loudly", async () => {
@@ -781,7 +791,7 @@ test("recording the wait is the one marker call that is allowed to fail loudly",
   await assert.rejects(
     runMonitor(
       { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
-      { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+      { probe: stalled, sleep: clock.sleep, now: clock.now, maxBlockSeconds: UNCAPPED, heartbeat: harness.deps },
     ),
     /503/,
   );
@@ -804,6 +814,7 @@ test("a monitor rung that tells the Boss does not stop the agent", async () => {
     probe: stalled,
     sleep: clock.sleep,
     now: clock.now,
+    maxBlockSeconds: UNCAPPED,
     heartbeat: harness.deps,
   });
   const out = await tool.execute(
@@ -939,6 +950,7 @@ const questionHarness = (args: {
     },
     sleep: args.clock.sleep,
     now,
+    maxBlockSeconds: UNCAPPED,
   };
 
   return {
@@ -1552,4 +1564,98 @@ test("a replayed monitor call from before waitingFor existed still resumes", asy
   );
   assert.doesNotMatch(toolText(out), /^Rejected/);
   assert.equal(probes, 1, "the recorded wait ran its check");
+});
+
+// ---------------------------------------------------------------------------
+// The per-call cap under the prompt cache TTL
+// ---------------------------------------------------------------------------
+
+test("a monitor asked for four hours returns inside the cache TTL and says it was capped", async () => {
+  assert.ok(MAX_BLOCK_SECONDS < 3600, "the premise: the cap is under the one-hour cache TTL");
+  const clock = fakeClock();
+  const started = clock.now();
+  const tool = await createMonitorTool({ probe: stalled, sleep: clock.sleep, now: clock.now });
+
+  const out = await tool.execute(
+    "call-1",
+    { command: "check", intervalSeconds: 300, timeoutSeconds: 14_400, description: "the ratio to settle", waitingFor: "the ratio to settle" } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.ok(clock.now() - started <= MAX_BLOCK_SECONDS * 1000, "waited no longer than the cap");
+  assert.equal(clock.now() - started, MAX_BLOCK_SECONDS * 1000, "and did not give up early either");
+  assert.equal((out.details as { timedOut: boolean }).timedOut, false, "a capped wait has not timed out");
+  const text = toolText(out);
+  assert.match(text, /^STILL WAITING for: the ratio to settle\./);
+  assert.match(text, /capped at 3300s of the 14400s you asked for/);
+  assert.match(text, /call monitor again with the same arguments/);
+  assert.doesNotMatch(text, /TIMED OUT/);
+});
+
+test("a wait shorter than the cap still times out as asked", async () => {
+  const clock = fakeClock();
+  const result = await runMonitor(
+    { command: "check", intervalSeconds: 60, timeoutSeconds: 900, description: "npm ci", waitingFor: "npm ci" },
+    { probe: stalled, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.deepEqual(result, { output: '{"state":"OPEN"}', timedOut: true, capped: false });
+});
+
+test("a capped wait on a person keeps its marker, so the re-armed call still reminds at an hour", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({ now: clock.now });
+  const deps = { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: { ...harness.deps, workingHours: ALWAYS } };
+  const args = { ...PR_WAIT, intervalSeconds: 300, timeoutSeconds: 86_400 };
+
+  const first = await runMonitor(args, deps);
+  assert.equal(first.capped, true);
+  assert.equal(harness.clears(), 0, "a capped wait is not over, so the marker stays");
+  assert.equal(harness.told.length, 0, "55 minutes in, no reminder is due yet");
+
+  const second = await runMonitor(args, deps);
+  assert.equal(second.capped, true);
+  assert.equal(harness.recordWaitCalls(), 2);
+  assert.deepEqual(
+    harness.told.map((call) => (Date.parse(call.at) - started) / 1000),
+    [3600],
+    "the first reminder lands an hour after the wait began, across the re-arm",
+  );
+});
+
+test("a question with no answer returns at the cap and keeps its marker", async () => {
+  const clock = fakeClock();
+  const started = clock.now();
+  const harness = questionHarness({ clock });
+  const tool = await createMessageBossTool({ ...harness.deps, maxBlockSeconds: MAX_BLOCK_SECONDS });
+
+  const out = await tool.execute(
+    "call-1",
+    { message: "Can someone merge omni#2192?", wait: true, seconds: 86_400 } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.ok(clock.now() - started <= MAX_BLOCK_SECONDS * 1000);
+  assert.match(toolText(out), /^No answer yet\. This call was capped at 3300s/);
+  assert.match(toolText(out), /call message_boss again with the same message and wait: true/);
+  assert.equal((out.details as { timedOut: boolean }).timedOut, false);
+  assert.notEqual(harness.pending(), null, "the question is still outstanding");
+
+  await tool.execute(
+    "call-2",
+    { message: "Can someone merge omni#2192?", wait: true, seconds: 86_400 } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+  assert.equal(
+    harness.told.filter((call) => call.kind === "question").length,
+    1,
+    "re-arming does not ask the Boss twice",
+  );
 });

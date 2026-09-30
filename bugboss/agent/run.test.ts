@@ -23,6 +23,7 @@ import {
   exitRecordFor,
   flushDurable,
   onceOnly,
+  promptWithinBudget,
   npmCiCommand,
   pinnedSessionModel,
   PREFIX_DRIFT_DIAGNOSTIC,
@@ -1001,7 +1002,7 @@ test("the model comes off the turn, so a first launch can still be re-priced", a
 });
 
 test("the announcement is suppressed only when the agent already made it", () => {
-  const base = { graceTurns: 10, usage: emptySessionUsage() };
+  const base = { graceTurns: 10, spentAtLaunch: false, usage: emptySessionUsage() };
 
   assert.equal(
     shouldAnnounceExhaustion({ ...base, used: 200, max: 200, escalated: false }),
@@ -1032,6 +1033,7 @@ test("an exhausted run parks on a wait a reply cannot lift", () => {
     max: 200,
     graceTurns: 10,
     escalated: false,
+    spentAtLaunch: false,
     usage: emptySessionUsage(),
   });
 
@@ -1056,6 +1058,7 @@ test("the brief does not promise that replying will continue the work", () => {
     max: 200,
     graceTurns: 10,
     escalated: false,
+    spentAtLaunch: false,
     usage: { ...emptySessionUsage(), turns: 200 },
   });
 
@@ -1080,6 +1083,7 @@ test("the escalation brief names the spend and never states the price as a fact"
       max: 200,
       graceTurns: 10,
       escalated: false,
+      spentAtLaunch: false,
       usage: {
         ...emptySessionUsage(),
         turns: 200,
@@ -1126,12 +1130,76 @@ test("a brief for an already-spent budget does not contradict its own numbers", 
   );
 });
 
+test("a relaunch with the budget spent makes no model request and still parks", async () => {
+  // Incident 80: relaunched at 266 of 200 turns, it paid $4.04 to rewrite a
+  // 367k context for one get_incident before turn_end could stop it.
+  const exhausted: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 266 },
+    maxTurns: 200,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: () => assert.fail("there is no grace left to give"),
+    onExhausted: (state) => void exhausted.push(state),
+  });
+  let requests = 0;
+
+  await promptWithinBudget(budget, async () => {
+    requests += 1;
+  });
+
+  assert.equal(requests, 0, "no model request on a budget already spent");
+  assert.deepEqual(exhausted.map((s) => s.used), [266], "the same hand-off turn_end would have run");
+  assert.equal(budget.exhausted(), true, "so the exit record names the budget");
+  const brief = turnBudgetBrief(exhausted[0]);
+  assert.match(brief, /already spent when this launch started, so I stopped before taking a turn/);
+  assert.match(brief, /nothing yet on this launch/);
+});
+
+test("a budget spent to the turn at launch is spent, not one turn short", async () => {
+  const exhausted: TurnBudgetState[] = [];
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 200 },
+    maxTurns: 200,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: () => assert.fail("there is no grace left to give"),
+    onExhausted: (state) => void exhausted.push(state),
+  });
+  let requests = 0;
+
+  await promptWithinBudget(budget, async () => {
+    requests += 1;
+  });
+
+  assert.equal(requests, 0);
+  assert.equal(exhausted.length, 1);
+  assert.doesNotMatch(turnBudgetBrief(exhausted[0]), /used all 200 turns/);
+});
+
+test("a launch with turns left prompts as usual and hands off nothing", async () => {
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 199 },
+    maxTurns: 200,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: () => {},
+    onExhausted: () => assert.fail("one turn is left"),
+  });
+  let requests = 0;
+
+  await promptWithinBudget(budget, async () => {
+    requests += 1;
+  });
+
+  assert.equal(requests, 1);
+  assert.equal(budget.exhausted(), false);
+});
+
 test("a run the provider priced at nothing says so rather than reporting it free", () => {
   const brief = turnBudgetBrief({
     used: 5,
     max: 5,
     graceTurns: 1,
     escalated: false,
+    spentAtLaunch: false,
     usage: { ...emptySessionUsage(), turns: 5 },
   });
 
@@ -1145,6 +1213,7 @@ test("the steer says the budget does not come back, because a restart looks like
     max: 200,
     graceTurns: 10,
     escalated: false,
+    spentAtLaunch: false,
     usage: emptySessionUsage(),
   });
 

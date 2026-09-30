@@ -34,6 +34,16 @@ export const MESSAGE_BOSS_POLL_SECONDS = 30;
 export const MESSAGE_BOSS_MIN_WAIT_SECONDS = 1800;
 
 /**
+ * The longest one blocking call may hold a turn, set under the one-hour prompt
+ * cache TTL. Waking inside it is a warm read of the context; waking after it
+ * writes the whole context again. Incident 80 asked monitor for 2h and 4h and
+ * paid $5.25 in cold rewrites for the two wakes, where re-arming every 55
+ * minutes would have cost about $0.90. A longer request is not refused: the
+ * call returns at the cap, says so, and the agent calls again.
+ */
+export const MAX_BLOCK_SECONDS = 3300;
+
+/**
  * A probe's last output, whole. The top of a failing check is the command
  * echo and the answer is at the bottom, so any cut loses the part that
  * matters.
@@ -441,6 +451,7 @@ export interface MonitorDeps {
   heartbeat?: HeartbeatDeps;
   /** The current wait's interrupt, read when a call starts. */
   waitSignal?: () => AbortSignal;
+  maxBlockSeconds?: number;
 }
 
 export interface MonitorArgs {
@@ -464,6 +475,8 @@ export interface MonitorArgs {
 export interface MonitorResult {
   output: string;
   timedOut: boolean;
+  /** The call hit `MAX_BLOCK_SECONDS` before the requested timeout. */
+  capped: boolean;
 }
 
 /**
@@ -514,7 +527,11 @@ export const runMonitor = async (
   // every time round. `now()` only wins if the marker is ahead of this clock,
   // which is skew rather than a wait that started in the future.
   const startedAt = marker ? Math.min(marker.startedAt, now()) : now();
-  const deadline = startedAt + Math.max(0, args.timeoutSeconds) * 1000;
+  const requestedDeadline = startedAt + Math.max(0, args.timeoutSeconds) * 1000;
+  // Per call, not per wait: a re-armed wait resumes an older marker, and
+  // measuring the cap from that would return at once.
+  const capAt = now() + (deps.maxBlockSeconds ?? MAX_BLOCK_SECONDS) * 1000;
+  const deadline = Math.min(requestedDeadline, capAt);
 
   let last = "";
   for (;;) {
@@ -522,11 +539,16 @@ export const runMonitor = async (
     last = result.output;
     if (result.code === 0) {
       if (heartbeat) await release(heartbeat, args.command);
-      return { output: last, timedOut: false };
+      return { output: last, timedOut: false, capped: false };
     }
     if (deps.signal?.aborted || now() >= deadline) {
-      if (heartbeat) await release(heartbeat, args.command);
-      return { output: last, timedOut: true };
+      const capped = !deps.signal?.aborted && capAt < requestedDeadline;
+      // A capped wait is not over, so the marker stays: the re-armed call
+      // resumes its clock and its heartbeat ladder instead of starting both
+      // again, which at a 55-minute cap would mean the first reminder at one
+      // hour never came.
+      if (heartbeat && !capped) await release(heartbeat, args.command);
+      return { output: last, timedOut: !capped, capped };
     }
 
     if (heartbeat && marker) {
@@ -662,6 +684,7 @@ export interface MessageBossDeps {
   signal?: AbortSignal;
   /** The current wait's interrupt, read when a call starts. */
   waitSignal?: () => AbortSignal;
+  maxBlockSeconds?: number;
 }
 
 export interface MessageBossArgs {
@@ -677,6 +700,8 @@ export interface MessageBossResult {
   answer: string | null;
   /** Set when the harness deadline ended the wait. */
   timedOut: boolean;
+  /** The call hit `MAX_BLOCK_SECONDS` with the question still outstanding. */
+  capped?: boolean;
   /** Everything the poll saw that was not the answer. The caller renders these. */
   directives: Directive[];
   /** A `stop` or a `merged` arrived: the incident is no longer the agent's. */
@@ -752,6 +777,7 @@ export const runMessageBoss = async (
   // ahead of this clock, which is skew rather than a question from the future.
   const askedAt = Math.min(pending.askedAt, now());
   const deadline = askedAt + waitSeconds * 1000;
+  const capAt = now() + (deps.maxBlockSeconds ?? MAX_BLOCK_SECONDS) * 1000;
 
   for (;;) {
     const entries = await deps.api.peekDirectives();
@@ -813,7 +839,12 @@ export const runMessageBoss = async (
         alarm("question_escalation_failed", { error: String(error) });
       }
     }
-    await sleep(pollMs);
+    // The marker stays, so calling again with the same message resumes this
+    // wait and its escalation clock rather than asking the Boss twice.
+    if (now() >= capAt) {
+      return { answer: null, timedOut: false, capped: true, directives: rest, terminate: false };
+    }
+    await sleep(Math.min(pollMs, Math.max(0, capAt - now())));
   }
 };
 
@@ -823,9 +854,10 @@ const INTERRUPTED =
 const MONITOR_DESCRIPTION = [
   "Block until a shell command exits 0, then return its output whole. Use it for",
   "every wait: a merge, a deploy, a migration, an alert going quiet. Never poll",
-  "with bash in a loop. It costs one turn, but a block that outlives the prompt",
-  "cache writes your whole context again at the far end, so update your notes",
-  "before a long one.",
+  "with bash in a loop. It costs one turn. One call blocks for at most",
+  `${MAX_BLOCK_SECONDS} seconds (55 minutes), inside the one-hour prompt cache, and`,
+  "returns saying so if `timeoutSeconds` asked for longer. If you still need to",
+  "wait, call it again with the same arguments: the wait and its reminders carry on.",
   "",
   "`waitingFor` is what people see on the incident board: one short plain",
   "sentence, no shell, e.g. \"someone to merge omni#2189 or #2195\" or \"the",
@@ -857,6 +889,9 @@ const MESSAGE_BOSS_DESCRIPTION = [
   "",
   "If nobody answers within `seconds`, the Boss is told, again on a doubling gap",
   "up to a day, and you keep waiting. That ends nothing: the incident stays yours.",
+  `One call blocks for at most ${MAX_BLOCK_SECONDS} seconds (55 minutes), inside the`,
+  "one-hour prompt cache. If it returns with no answer yet, call it again with the",
+  "same message and `wait: true` to keep waiting.",
   "Safe to call again after a restart: an outstanding question resumes waiting",
   "rather than asking twice.",
 ].join("\n");
@@ -873,7 +908,7 @@ export const createMonitorTool = async (
       description: "Seconds between attempts. 30 for a deploy, 300 for a quiet signal.",
     }),
     timeoutSeconds: Type.Number({
-      description: "Give up after this long and return the last output.",
+      description: `Give up after this long and return the last output. One call returns after at most ${MAX_BLOCK_SECONDS}s; call again to keep waiting.`,
     }),
     description: Type.String({
       description: "What you are waiting for, in one line.",
@@ -904,9 +939,11 @@ export const createMonitorTool = async (
       });
       const header = interrupt?.aborted && result.timedOut
         ? `STOPPED WAITING for: ${args.description} (interrupted). ${INTERRUPTED}`
-        : result.timedOut
-          ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
-          : `Condition met: ${args.description}`;
+        : result.capped
+          ? `STILL WAITING for: ${args.description}. This call was capped at ${MAX_BLOCK_SECONDS}s of the ${args.timeoutSeconds}s you asked for, so the prompt cache stays warm. Nothing has timed out. If you still need to wait, call monitor again with the same arguments.`
+          : result.timedOut
+            ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
+            : `Condition met: ${args.description}`;
       return {
         content: [{ type: "text", text: `${header}\n\n${result.output}` }],
         details: { timedOut: result.timedOut, command: args.command },
@@ -954,6 +991,8 @@ export const createMessageBossTool = async (
           ? `The Boss answered: ${result.answer}`
           : interrupt?.aborted
             ? `Stopped waiting for the Boss's answer (interrupted). ${INTERRUPTED}`
+            : result.capped
+            ? `No answer yet. This call was capped at ${MAX_BLOCK_SECONDS}s so the prompt cache stays warm. The question is still with the Boss. If you still need the answer, call message_boss again with the same message and wait: true; it will not be asked twice.`
             : result.timedOut
             ? "Your deadline ended this wait. Escalate now, with a brief."
             : "The wait ended on a directive rather than an answer.";

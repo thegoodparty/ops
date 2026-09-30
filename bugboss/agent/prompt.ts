@@ -11,7 +11,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { THREAD_PROSE_CHARS } from "../slack/format";
-import { MESSAGE_BOSS_MIN_WAIT_SECONDS } from "./tools";
+import { MAX_BLOCK_SECONDS, MESSAGE_BOSS_MIN_WAIT_SECONDS } from "./tools";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
 import { TEST_DB_ENV_VAR } from "../testdb";
 import type { NotesLimits } from "./notes";
@@ -362,10 +362,17 @@ report_impact so the number is current, check the failure is not still
 spreading, write where things stand in your notes, and start the post-mortem
 you are going to need anyway.
 
-Two things are worse than one long block. Splitting it into short waits you
-re-issue is the polling loop again: the cache is cold at the end either way
-and you have paid a turn for every re-issue. And re-asking a question the
-Boss already has is worse than waiting — at 04:00 silence is the hour, not a
+**One call waits at most ${MAX_BLOCK_SECONDS} seconds (55 minutes).** That keeps
+every wake inside the one-hour prompt cache, where coming back is a cheap read
+instead of writing your whole context again. Ask for the wait you actually
+need; if it is longer, the call returns saying it was capped and nothing has
+timed out. Call it again with the same arguments: the wait's clock and its
+reminders to the Boss carry on from where they were. message_boss with wait:
+true works the same way: call it again with the same message and it resumes
+without asking twice. Re-arming like this is not polling. Polling is bash in a
+loop, or short waits you pick yourself.
+
+And re-asking a question the Boss already has is worse than waiting — at 04:00 silence is the hour, not a
 refusal, and the Boss is being reminded for you.`;
 
 const SHIP_PR = `## Shipping a fix
