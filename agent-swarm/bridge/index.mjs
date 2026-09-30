@@ -206,7 +206,12 @@ const OUTPUT_SCHEMA = {
 // does not.
 const INCIDENT_CHANNEL = process.env.SWARM_INCIDENT_CHANNEL ?? ''
 
-const REPORT_CONTRACT = [
+// Built per incident so the KV namespace and key are stated as exact values with
+// the real number in them. Described in the abstract, the lead wrote
+// `namespace=shared, key=incidents/9` where the board jobs read
+// `namespace=shared/incidents, key=incident:9`, and a board that reads a namespace
+// nobody writes reports nothing while looking healthy.
+const reportContract = (incident) => [
   '',
   'Required output',
   '',
@@ -214,6 +219,14 @@ const REPORT_CONTRACT = [
     ? `Open a Slack thread in channel ${INCIDENT_CHANNEL} with slack-start-thread, passing that exact channelId, and report in it as you work.`
     : 'Open a Slack thread in the incident channel with slack-start-thread and report in it as you work.',
   'Do not substitute another channel, and do not create one.',
+  '',
+  'Record the incident in KV with exactly these values, using kv-set:',
+  '',
+  '  namespace  shared/incidents',
+  `  key        incident:${incident}`,
+  '',
+  `Add ${incident} to the array at namespace shared/incidents, key board:index.`,
+  '',
   'When you finish, your task output must be a JSON object matching this schema, and the',
   'task cannot be completed without one:',
   '',
@@ -222,7 +235,7 @@ const REPORT_CONTRACT = [
   '  summary            a few words saying what this incident IS',
   '',
   'No thread permalink means no completion. If you cannot open a thread, say why, and',
-  'still record the incident in KV at shared/incidents.',
+  'still record the incident as above.',
 ]
 
 const fingerprintFor = (alert, labels, annotations) => {
@@ -296,7 +309,7 @@ const renderTask = (incident, alert, root, fingerprint) => {
   if (str(root.externalURL)) links.push(`  Grafana: ${root.externalURL}`)
   if (links.length > 0) lines.push('', 'Links:', ...links)
 
-  lines.push(...REPORT_CONTRACT)
+  lines.push(...reportContract(incident))
 
   const machine = {
     incident,
