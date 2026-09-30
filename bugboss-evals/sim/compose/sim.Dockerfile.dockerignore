@@ -1,0 +1,10 @@
+# The stand-ins run in this image, and the GitHub stand-in runs visible CI,
+# which is agent-authored code. So no scenario's hidden check, reference root
+# cause or persona goes into it; the orchestrator mounts each container the
+# part of a scenario it needs.
+node_modules
+.git
+.worktrees
+.claude
+dist
+bugboss-evals/scenarios

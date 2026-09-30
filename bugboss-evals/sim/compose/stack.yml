@@ -1,0 +1,421 @@
+# One Tier 1 run: BugBoss and everything it talks to, on networks it cannot
+# leave. The orchestrator (sim/orchestrator.ts) writes the run directory and
+# the env file this reads, then drives it with `docker compose -p <runId>`.
+# Every bind mount is under RUN_DIR, because on the fan-out host compose runs
+# inside a container against the host daemon, and a bind mount resolves on
+# the host.
+#
+# Networks:
+#   sim      internal, no default route. BugBoss lives only here.
+#   control  internal. /__control listeners, the telemetry emitter, the
+#            checker and the persona. BugBoss is never on it.
+#   egress   an ordinary bridge with a route out. Only the model proxy, the
+#            npm proxy, the Prisma engine mirror and the persona are on it,
+#            and each of those forwards to fixed upstreams only.
+#   hostlink an ordinary bridge holding only the gateway, which publishes the
+#            one port the orchestrator uses.
+#
+# Static addresses exist for two reasons: a control listener binds to its
+# control-network address only (CONTROL_HOST), so it is not listening on the
+# sim network at all, and BugBoss's resolver is the DNS sentinel, which needs
+# a fixed address. Dynamic addresses come from the top half of each subnet so
+# they never collide with a static one.
+
+name: bugboss-sim
+
+x-sim: &sim
+  image: ${SIM_IMAGE}
+  working_dir: /app
+  restart: "no"
+  environment: &sim-env
+    NODE_EXTRA_CA_CERTS: /sim/tls/ca.crt
+    SSL_CERT_FILE: /sim/tls/ca.crt
+    CONTROL_TOKEN: ${CONTROL_TOKEN}
+  volumes: &sim-volumes
+    - ${RUN_DIR}/tls:/sim/tls:ro
+    - ${RUN_DIR}/results:/results
+
+networks:
+  sim:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${SIM_NET}.0/24
+          ip_range: ${SIM_NET}.128/25
+  control:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CTL_NET}.0/24
+          ip_range: ${CTL_NET}.128/25
+  egress: {}
+  hostlink: {}
+
+volumes:
+  uvcache: {}
+
+services:
+  # ---------------------------------------------------------------- exits
+  proxy:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/proxy/server.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "8443"
+      CONTROL_PORT: "9001"
+      CONTROL_HOST: ${CTL_NET}.11
+      TLS_CERT_FILE: /sim/tls/server.crt
+      TLS_KEY_FILE: /sim/tls/server.key
+      PROXY_BUDGET_USD: ${BUDGET_USD}
+      PROXY_TRACE_FILE: /results/proxy.jsonl
+      UPSTREAM_REGION: us-west-2
+      AWS_REGION: us-west-2
+      AWS_PROFILE: ${SIM_AWS_PROFILE:-}
+      # Undoes SSL_CERT_FILE for the one process that talks to real AWS.
+      SSL_CERT_FILE: ""
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${SIM_AWS_DIR}:/root/.aws
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.11
+      egress: {}
+
+  npm:
+    image: verdaccio/verdaccio:6.1.2
+    volumes:
+      - ${RUN_DIR}/sim/verdaccio.yaml:/verdaccio/conf/config.yaml:ro
+      - ${NPM_CACHE_DIR}:/verdaccio/storage
+    networks: [sim, control, egress]
+
+  mirror:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/compose/mirror.ts"]
+    environment:
+      <<: *sim-env
+      SSL_CERT_FILE: ""
+      NODE_EXTRA_CA_CERTS: ""
+      PORT: "4874"
+      MIRROR_UPSTREAM: https://binaries.prisma.sh
+      MIRROR_CACHE_DIR: /cache
+      MIRROR_LOG: /results/mirror.jsonl
+    volumes:
+      - ${RUN_DIR}/results:/results
+      - ${MIRROR_CACHE_DIR}:/cache
+    networks: [sim, control, egress]
+
+  # ------------------------------------------------------------ stand-ins
+  github:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/standins/github/server.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "443"
+      CONTROL_PORT: "9002"
+      CONTROL_HOST: ${CTL_NET}.12
+      TLS_CERT_FILE: /sim/tls/server.crt
+      TLS_KEY_FILE: /sim/tls/server.key
+      GITHUB_PUBLIC_URL: https://github
+      GITHUB_SEED_BUNDLE: /sim/seed/omni.bundle
+      GITHUB_SEED_MAIN: ${BASE_SHA}
+      GITHUB_DATA_DIR: /data
+      GITHUB_STANDIN_HUMANS: ${GITHUB_STANDIN_HUMANS}
+      CI_MODE: run
+      CI_VISIBLE: ${CI_VISIBLE}
+      REVIEWER_REQUEST_CHANGES_ONCE: ${REVIEWER_REQUEST_CHANGES_ONCE}
+      # Production's App holds `actions: read`, so rerun_ci is refused unless
+      # a run opts in.
+      GITHUB_STANDIN_ACTIONS_WRITE: ${GITHUB_ACTIONS_WRITE}
+      DEPLOY_HOOK_COMMAND: /sim/hooks/deploy.sh
+      npm_config_registry: http://npm:4873/
+      PRISMA_ENGINES_MIRROR: http://mirror:4874
+      OMNI_TEST_POSTGRES_URL: postgresql://test_user:test_password@cidb:5432/postgres
+      GIT_SSL_CAINFO: /sim/tls/ca.crt
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${RUN_DIR}/seed:/sim/seed:ro
+      - ${RUN_DIR}/hooks:/sim/hooks:ro
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.12
+
+  slack:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/standins/slack/main.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "8445"
+      CONTROL_PORT: "9003"
+      CONTROL_HOST: ${CTL_NET}.13
+      TLS_CERT_FILE: /sim/tls/server.crt
+      TLS_KEY_FILE: /sim/tls/server.key
+      SLACK_PUBLIC_URL: https://slack:8445
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_BOT_USER_ID: U0BUGBOSS
+      SLACK_CHANNEL_ID: ${SLACK_CHANNEL_ID}
+      SLACK_CHANNEL_IDS: ${SLACK_CHANNEL_ID}
+      SLACK_USERS: '[{"id":"U0ONCALL","name":"oncall","realName":"On-call Engineer"}]'
+      SLACK_USERGROUPS: '{"S0ROTATION":["U0ONCALL"]}'
+      BUGBOSS_EVENTS_URL: http://bugboss:3000/slack
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.13
+
+  aws:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/standins/aws/server.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "8446"
+      CONTROL_PORT: "9004"
+      CONTROL_HOST: ${CTL_NET}.14
+      TLS_CERT_FILE: /sim/tls/server.crt
+      TLS_KEY_FILE: /sim/tls/server.key
+      AWS_DATA_FILE: /app/bugboss-evals/scenarios/${SCENARIO_ID}/${AWS_DATA_FILE}
+      ALERT_AT: ${ALERT_AT}
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${RUN_DIR}/scenario-public:/app/bugboss-evals/scenarios/${SCENARIO_ID}:ro
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.14
+
+  # ------------------------------------------------------ observability
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/sim.yaml"]
+    volumes:
+      - ${RUN_DIR}/sim/loki.yaml:/etc/loki/sim.yaml:ro
+    networks: [sim, control]
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/sim.yml
+      - --web.enable-remote-write-receiver
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ${RUN_DIR}/sim/prometheus.yml:/etc/prometheus/sim.yml:ro
+    networks: [sim, control]
+
+  tempo:
+    image: grafana/tempo:2.7.1
+    command: ["-config.file=/etc/tempo/sim.yaml"]
+    volumes:
+      - ${RUN_DIR}/sim/tempo.yaml:/etc/tempo/sim.yaml:ro
+    networks: [sim]
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - ${RUN_DIR}/sim/grafana-provisioning:/etc/grafana/provisioning:ro
+    networks: [sim, control]
+
+  telemetry:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/telemetry/run.ts"]
+    environment:
+      <<: *sim-env
+      SCENARIO_DIR: /app/bugboss-evals/scenarios/${SCENARIO_ID}
+      TELEMETRY_GENERATOR: ${TELEMETRY_GENERATOR}
+      LOKI_URL: http://loki:3100
+      PROMETHEUS_URL: http://prometheus:9090
+      ALERT_AT: ${ALERT_AT}
+      BACKFILL_HOURS: ${BACKFILL_HOURS}
+      SEED: ${SEED}
+      CONTROL_PORT: "9005"
+      CONTROL_HOST: 0.0.0.0
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${RUN_DIR}/scenario-public:/app/bugboss-evals/scenarios/${SCENARIO_ID}:ro
+    networks: [control]
+
+  # --------------------------------------------------------------- storage
+  minio:
+    # minio/minio left Docker Hub, so this is Chainguard's build of the same
+    # server, pinned by digest.
+    image: cgr.dev/chainguard/minio@sha256:71674988a1c7ddd5724928633199152b11e4ddefd6c6ce2d60772ff4a8f22ca9
+    command: ["server", "/tmp/minio", "--console-address", ":9011"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # Virtual-host addressing: BugBoss builds `new S3Client({})` with no
+      # path-style flag, so it asks for <bucket>.minio.
+      MINIO_DOMAIN: minio
+    networks:
+      sim:
+        aliases: ["${BUGBOSS_BUCKET}.minio"]
+      control: {}
+
+  minio-init:
+    image: ${SIM_IMAGE}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until aws --endpoint-url http://minio:9000 s3 ls > /dev/null 2>&1; do sleep 1; done
+        && aws --endpoint-url http://minio:9000 s3 mb "s3://$$BUCKET"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-west-2
+      BUCKET: ${BUGBOSS_BUCKET}
+    depends_on: [minio]
+    networks: [control]
+
+  cidb:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "max_connections=200"]
+    environment: &pg-env
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: postgres
+    networks: [control]
+
+  checkdb:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "max_connections=200"]
+    environment: *pg-env
+    networks: [control]
+
+  # ----------------------------------------------- orchestration plumbing
+  gateway:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/compose/gateway.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "8900"
+    ports:
+      - "127.0.0.1::8900"
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.9
+      hostlink: {}
+
+  sentinel:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/compose/sentinel.ts"]
+    environment:
+      <<: *sim-env
+      SENTINEL_LOG: /results/egress-dns.jsonl
+      SENTINEL_BIND: ${SIM_NET}.53
+    networks:
+      sim:
+        ipv4_address: ${SIM_NET}.53
+
+  checker:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/compose/checker.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "9006"
+      CONTROL_HOST: ${CTL_NET}.16
+      DEPLOY_TOKEN: ${DEPLOY_TOKEN}
+      SCENARIO_DIR: /sim/scenarios/${SCENARIO_ID}
+      CHECK_SETUP: ${CHECK_SETUP}
+      CHECK_COMMAND: ${CHECK_COMMAND}
+      CHECK_TIMEOUT_SECONDS: ${CHECK_TIMEOUT_SECONDS}
+      BASE_SHA: ${BASE_SHA}
+      SEED_BUNDLE: /sim/seed/omni.bundle
+      GIT_REMOTE: https://github/thegoodparty/omni.git
+      CHECKER_GITHUB_TOKEN: ${CHECKER_GITHUB_TOKEN}
+      GIT_SSL_CAINFO: /sim/tls/ca.crt
+      TELEMETRY_CONTROL_URL: http://telemetry:9005
+      AWS_CONTROL_URL: http://aws:9004
+      DEPLOY_RESULTS_DIR: /results/deploys
+      npm_config_registry: http://npm:4873/
+      PRISMA_ENGINES_MIRROR: http://mirror:4874
+      OMNI_TEST_POSTGRES_URL: postgresql://test_user:test_password@checkdb:5432/postgres
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${RUN_DIR}/seed:/sim/seed:ro
+      - ${RUN_DIR}/scenario-hidden:/sim/scenarios:ro
+    networks:
+      control:
+        ipv4_address: ${CTL_NET}.16
+
+  persona:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/persona/run.ts"]
+    environment:
+      <<: *sim-env
+      PERSONA_FILE: /sim/scenario/${PERSONA_FILE}
+      PERSONA_MODEL: ${PERSONA_MODEL}
+      PERSONA_REPLY_DELAY_SECONDS: ${PERSONA_REPLY_DELAY_SECONDS}
+      PERSONA_MERGE_DELAY_SECONDS: ${PERSONA_MERGE_DELAY_SECONDS}
+      PERSONA_SEED: ${SEED}
+      PERSONA_OUT: /results/persona.json
+      PERSONA_USER_ID: U0ONCALL
+      SLACK_CONTROL_URL: http://slack:9003
+      SLACK_CHANNEL_ID: ${SLACK_CHANNEL_ID}
+      SLACK_BOT_USER_ID: U0BUGBOSS
+      GITHUB_API_URL: https://github/api/v3
+      GITHUB_REPO: thegoodparty/omni
+      GITHUB_HUMAN_TOKEN: ${PERSONA_GITHUB_TOKEN}
+      AWS_REGION: us-west-2
+      AWS_PROFILE: ${SIM_AWS_PROFILE:-}
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${RUN_DIR}/scenario-persona:/sim/scenario:ro
+      - ${SIM_AWS_DIR}:/root/.aws
+    networks: [control, egress]
+
+  # ----------------------------------------------------------- the variant
+  # mcp-grafana is fetched by `uvx` at agent launch, and the sim has no route
+  # to PyPI. This fills the agent's uv cache from the same image before the
+  # run starts, and uv.toml below makes the agent's uv read it offline.
+  uv-warm:
+    image: ${BUGBOSS_IMAGE}
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        HOME=/home/agent UV_CACHE_DIR=/home/agent/.cache/uv uvx mcp-grafana --version
+        && chown -R agent:agent /home/agent/.cache/uv
+    volumes:
+      - uvcache:/home/agent/.cache/uv
+    networks: [egress]
+
+  bugboss:
+    image: ${BUGBOSS_IMAGE}
+    init: true
+    env_file: ["${RUN_DIR}/bugboss.env"]
+    dns: ["${SIM_NET}.53"]
+    volumes:
+      - uvcache:/home/agent/.cache/uv
+      - ${RUN_DIR}/tls/ca.crt:/etc/ssl/certs/ca-certificates.crt:ro
+      - ${RUN_DIR}/tls/ca.crt:/sim/tls/ca.crt:ro
+      - ${RUN_DIR}/agent-home/aws:/home/agent/.aws:ro
+      - ${RUN_DIR}/agent-home/uv.toml:/home/agent/.config/uv/uv.toml:ro
+      - ${RUN_DIR}/agent-home/npmrc:/usr/local/etc/npmrc:ro
+      - ${RUN_DIR}/agent-home/gitconfig:/etc/gitconfig:ro
+    networks: [sim]
+
+  # The agents' test database, on BugBoss's own loopback exactly as the prod
+  # sidecar is: bugboss/testdb refuses a test database URL that is not
+  # loopback.
+  postgres:
+    image: postgres:16-alpine
+    network_mode: service:bugboss
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "max_connections=400"]
+    environment: *pg-env
