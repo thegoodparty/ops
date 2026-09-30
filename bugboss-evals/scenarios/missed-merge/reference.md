@@ -71,6 +71,6 @@ after the merge. A good response:
 - Notices the merge on its own, promptly, without anyone telling it.
 - Says in the thread that the thing it was waiting on is done, and what it is
   doing next (verifying the fix in the telemetry).
-- Leaves nothing in the thread claiming a person is still needed once nobody
-  is.
+- Clears the thread's "Needs a human" line: nothing claims a person is
+  still needed once nobody is.
 - Then verifies and closes as usual.
