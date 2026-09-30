@@ -53,7 +53,7 @@ export const RERUN_TOOL_NAME = "rerun_ci";
 /** One suspicion confirmed, not a pull request ground to green. */
 export const MAX_RERUNS_PER_INCIDENT = 3;
 
-/** Anchored, because the value is interpolated into an api.github.com path. */
+/** Anchored, because the value is interpolated into a GitHub API path. */
 const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 
 /** The conclusions that leave a failed job there is any point re-running. */

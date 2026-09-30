@@ -231,7 +231,21 @@ passed through, so the child resolves the task role through the SDK's
 container provider and that provider refreshes for as long as the run lasts.
 A launch whose environment carries no credential path at all alarms:
 without it the agent loses Bedrock, and that surfaces a turn later as a model
-call failing with nothing pointing back at the environment.
+call failing with nothing pointing back at the environment. Static keys
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) pass
+through too and count as a path. Production never sets them; the eval harness
+sets fake ones. A named profile never passes, because it would hand the child
+whatever the parent's credentials file holds.
+
+Endpoint overrides are the other pass-through (`pickEndpointEnv`): the omni
+remote, `BUGBOSS_GITHUB_URL`, the CA bundles, the npm registry, the Prisma
+engine mirror and every `AWS_ENDPOINT_URL_*`. Production sets none of them,
+so a production child gets nothing from it. The eval harness sets all of
+them, and without them the agent would be the one process in the container
+still pointed at production. A GitHub that is not github.com also sets
+`GH_HOST`, and the child writes each minted token to `GH_ENTERPRISE_TOKEN` as
+well (`gitHubTokenEnv`), because that is the variable `gh` reads for any other
+host. `bugboss/endpoints.test.ts` pins the unset case literally.
 
 ## A resume is announced, not silent
 

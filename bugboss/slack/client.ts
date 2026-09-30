@@ -153,9 +153,24 @@ export const createCachingLinker = (
   };
 };
 
+/**
+ * The Web API base for a WebClient, from `SLACK_API_URL`. Unset is nothing at
+ * all, not slack.com spelled out, so a production client is constructed with
+ * exactly the options it always was and the SDK keeps its own default. Only
+ * the eval harness sets it, to reach its Slack stand-in.
+ *
+ * The SDK joins the method name straight onto this, so the trailing slash is
+ * what makes `https://slack:8445/api` and `https://slack:8445/api/` the same.
+ */
+export const slackApiOptions = (
+  apiUrl: string | undefined,
+): { slackApiUrl?: string } =>
+  apiUrl ? { slackApiUrl: apiUrl.endsWith("/") ? apiUrl : `${apiUrl}/` } : {};
+
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
+  apiUrl?: string,
 ): SlackClient & SlackLinker & SlackUpdater => {
   // The SDK defaults to ten retries over about thirty minutes and does not
   // reject a rate-limited call, so a 429 parks the caller inside the SDK with
@@ -164,6 +179,7 @@ export const createSlackClient = (
   // minutes rather than half an hour.
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    ...slackApiOptions(apiUrl),
   });
   const linker = createCachingLinker(
     {
@@ -247,7 +263,10 @@ export const createSlackClient = (
  * the app. Until then `files.completeUploadExternal` answers `missing_scope`,
  * which is a throw here and an alarm plus an inline post in `report/`.
  */
-export const createSlackFileUploader = (token: string): FileUploader => {
+export const createSlackFileUploader = (
+  token: string,
+  apiUrl?: string,
+): FileUploader => {
   const web = new WebClient(token, {
     // No retries, deliberately, and this is the one WebClient here without
     // them. The SDK's default spreads five attempts over five minutes, which
@@ -258,6 +277,7 @@ export const createSlackFileUploader = (token: string): FileUploader => {
     // that is the wrong way round.
     retryConfig: { retries: 0 },
     timeout: UPLOAD_CALL_TIMEOUT_MS,
+    ...slackApiOptions(apiUrl),
   });
   return {
     upload: async (file) => {
@@ -355,11 +375,13 @@ export const createS3ObjectStore = (
 export const createRotationReader = (
   token: string,
   usergroupId: string,
+  apiUrl?: string,
   ttlMs = 5 * 60 * 1000,
   now: () => number = Date.now,
 ): (() => Promise<string[] | null>) => {
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    ...slackApiOptions(apiUrl),
   });
   let cached: { at: number; members: string[] } | null = null;
 
