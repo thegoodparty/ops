@@ -2,7 +2,7 @@
 # own Grafana org whose datasources carry the run as a tenant (Loki, Tempo)
 # or an enforced label (Prometheus, through prom-label-proxy), under the uids
 # production uses.
-name: bugboss-evals
+name: evb-bugboss-evals
 services:
   loki:
     image: grafana/loki:3.4.2
