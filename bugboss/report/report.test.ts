@@ -268,6 +268,35 @@ describe("the report assembles from a real incident row", () => {
     assert.match(doc, /U-SWAIN \| merge \| same connection pool as inc-9/);
   });
 
+  it("carries the timeline the agent recorded, in the order things happened", async () => {
+    await seed("inc-30");
+    await db.withWrite((w) => {
+      const insert = w.prepare(
+        `INSERT INTO incident_timeline_event (incidentId, kind, occurredAt, recordedAt, summary, evidenceUrl)
+         VALUES ('inc-30', ?, ?, ?, ?, ?)`,
+      );
+      insert.run("fix_merged", OPENED + 3_000_000, OPENED + 3_000_000, "omni#42 merged", "https://github.com/thegoodparty/omni/pull/42");
+      insert.run("first_error", OPENED - 600_000, OPENED + 60_000, "first 502 | on outreach", null);
+    });
+
+    const data = await readReportData(deps(), "inc-30");
+    assert.ok(data);
+    assert.deepEqual(data.timeline.map((event) => event.kind), ["first_error", "fix_merged"]);
+
+    const doc = renderReportDocument(data);
+    assert.match(doc, /## Recorded timeline/);
+    assert.match(doc, /first_error: first 502 \\\| on outreach \| —/, "an event is one cell, pipes and all");
+    assert.match(doc, /fix_merged: omni#42 merged \| https:\/\/github\.com\/thegoodparty\/omni\/pull\/42/);
+    assert.ok(doc.indexOf("## Post-mortem") < doc.indexOf("## Recorded timeline"));
+  });
+
+  it("leaves the timeline out when nothing was recorded", async () => {
+    await seed("inc-31");
+    const data = await readReportData(deps(), "inc-31");
+    assert.ok(data);
+    assert.doesNotMatch(renderReportDocument(data), /Recorded timeline/);
+  });
+
   it("says so rather than inventing a number it does not have", async () => {
     await seed("inc-2", { sessionRef: null });
     await db.withWrite((w) => {

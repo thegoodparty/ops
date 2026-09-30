@@ -33,9 +33,12 @@ import type {
   RecurrenceAnalysis,
   Signal,
   SignalView,
+  TimelineEvent,
+  TimelineEventKind,
   ToolApi,
   ToolResponse,
 } from "../types";
+import { TIMELINE_EVENT_KINDS } from "../types";
 import {
   assign,
   getIncidentRow,
@@ -198,6 +201,22 @@ const closeOpenSignals = (
 };
 
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
+
+/**
+ * Oldest first by when it happened, which is the order a timeline is read
+ * in. The id breaks ties, so two events in the same millisecond keep the
+ * order they were recorded in.
+ */
+export const readTimelineEvents = (
+  db: Pick<Db, "query">,
+  incidentId: string,
+): TimelineEvent[] =>
+  db.query<TimelineEvent>(
+    `SELECT id, kind, occurredAt, recordedAt, summary, evidenceUrl
+       FROM incident_timeline_event WHERE incidentId = ?
+       ORDER BY occurredAt, id`,
+    [incidentId],
+  );
 
 export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   const { db, correlator, slack, evidence } = deps;
@@ -953,6 +972,58 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     });
 
   /**
+   * Any status, including CLOSED: a closer that remembers a moment while
+   * writing the post-mortem still has somewhere to put it.
+   *
+   * Idempotent on the whole event. On a restart the session holds a tool
+   * call with no result and the tool runs again, and a replay must not put
+   * the same moment in the timeline twice.
+   */
+  const trackTimelineEvent: ToolApi["trackTimelineEvent"] = (args) =>
+    call<TimelineEvent>("trackTimelineEvent", async (incidentId) => {
+      if (!(TIMELINE_EVENT_KINDS as readonly string[]).includes(args.kind)) {
+        return reject(
+          `unknown timeline event kind ${args.kind}; use one of ${TIMELINE_EVENT_KINDS.join(", ")}`,
+        );
+      }
+      if (!Number.isFinite(args.occurredAt) || args.occurredAt <= 0) {
+        return reject(
+          "occurredAt must be epoch millis of when it happened; if you cannot point at a time, use the time of the evidence you have",
+        );
+      }
+      if (!readIncident(incidentId)) return reject(`unknown incident: ${incidentId}`);
+
+      const kind = args.kind as TimelineEventKind;
+      const evidenceUrl = args.evidenceUrl ?? null;
+      const event = await db.withWrite((w): TimelineEvent => {
+        const existing = w
+          .prepare(
+            `SELECT id, kind, occurredAt, recordedAt, summary, evidenceUrl
+               FROM incident_timeline_event
+              WHERE incidentId = ? AND kind = ? AND occurredAt = ? AND summary = ?
+                AND evidenceUrl IS ?`,
+          )
+          .get(incidentId, kind, args.occurredAt, args.summary, evidenceUrl) as
+          | TimelineEvent
+          | undefined;
+        if (existing) return existing;
+        const recordedAt = Date.now();
+        const id = Number(
+          w
+            .prepare(
+              `INSERT INTO incident_timeline_event
+                 (incidentId, kind, occurredAt, recordedAt, summary, evidenceUrl)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+            )
+            .run(incidentId, kind, args.occurredAt, recordedAt, args.summary, evidenceUrl)
+            .lastInsertRowid,
+        );
+        return { id, kind, occurredAt: args.occurredAt, recordedAt, summary: args.summary, evidenceUrl };
+      });
+      return { ok: true, data: event };
+    });
+
+  /**
    * The dispatcher's escalation, for a crash loop, a stall or a deadline the
    * agent did not answer. It says in the thread that this incident needs a
    * person and then changes nothing: an agent is still driving, so there is
@@ -1062,6 +1133,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           evidence: loaded,
           priorIncident: readPriorIncident(incident.recurrenceOf),
           absorbed: readAbsorbed(incidentId),
+          timeline: readTimelineEvents(db, incidentId),
         },
       };
     });
@@ -1203,6 +1275,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     getIncident,
     proposeMerge,
     searchIncidents: searchIncidentsTool,
+    trackTimelineEvent,
   };
 };
 

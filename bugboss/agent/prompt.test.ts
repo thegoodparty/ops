@@ -16,7 +16,6 @@ import {
   type FiredAlert,
   type PromptInput,
 } from "./prompt";
-import { NOTES_LIMITS } from "./notes";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
 import { createBossTools } from "./run";
@@ -26,8 +25,6 @@ import { TEST_DB_ENV_VAR } from "../testdb";
 const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
   incidentId: "inc-42",
   checkoutPath: "/work/inc-42/omni",
-  notesDir: "/work/inc-42/notes",
-  notesLimits: NOTES_LIMITS,
   firedAlerts: [
     {
       slug: "high-cpu",
@@ -85,7 +82,7 @@ test("the load-bearing rules are all in there", () => {
   assert.match(prompt, /gh pr view <url> --json state/);
   assert.match(prompt, /gh run list --commit <sha>/);
   assert.match(prompt, /npm-ci\.done/);
-  assert.match(prompt, /95% of the context window/);
+  assert.match(prompt, /85% of the context window/);
   assert.match(prompt, /report_root_cause/);
   assert.match(prompt, /escalate/);
   assert.match(prompt, /resumed_after/);
@@ -125,24 +122,15 @@ test("the agent talks only to the Boss and is told not to narrate", () => {
   assert.doesNotMatch(prompt, /\bnudge/);
 });
 
-test("the agent is told its notes are a record to keep, not scratch to tidy", () => {
+test("the agent is told to record the timeline as it happens, and why", () => {
   const prompt = composeSystemPrompt(input());
 
-  assert.match(prompt, /\/work\/inc-42\/notes/);
-  assert.match(prompt, /survives a restart/);
-  assert.match(prompt, /restored before you resume/);
-  assert.match(prompt, /Keeping that record is part of the job/);
-  assert.match(prompt, /Leave it all behind when you finish/);
-  assert.match(prompt, /Dead ends are the most valuable thing/);
-  assert.match(prompt, /do not spend turns\ncurating/);
-  // An agent that is not told the mirror keeps what it deletes will read a
-  // note reappearing after a restart as the harness being broken.
-  assert.match(prompt, /deleting a file locally\ndoes not remove it/);
-  // Without the bound in the prompt, the first the agent hears of it is a
-  // steer telling it the mirror has already stopped.
-  assert.match(prompt, /at most 256 notes and 16 MB/);
-  assert.match(prompt, /deleting will not win\nit back/);
-  assert.match(prompt, /outside the checkout/);
+  assert.match(prompt, /track_incident_timeline_event as they\nhappen/);
+  assert.match(prompt, /taken from the evidence\nrather than from when you noticed/);
+  // The closer reads the table, so the agent has to know the post-mortem is
+  // built from it rather than from a context that has been summarised.
+  assert.match(prompt, /build its timeline from the `timeline` get_incident returns/);
+  assert.doesNotMatch(prompt, /notes/);
 });
 
 const checkout = async (files: Record<string, string>): Promise<string> => {

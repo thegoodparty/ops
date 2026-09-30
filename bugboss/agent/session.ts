@@ -5,19 +5,24 @@
 // `turn_end` extension point, and restore it to local disk at container start.
 //
 // Whole-file rather than append: Pi's session-manager rewrites the file
-// wholesale in several paths (branching, migration, compaction), so an
-// append-only object would diverge from the file the next process opens.
-// Worst case on a SIGKILL is losing the turn in progress.
+// wholesale when it migrates an old session version, so an append-only object
+// would diverge from the file the next process opens. Worst case on a SIGKILL
+// is losing the turn in progress.
+//
+// Compaction is not one of those paths, and the transcript depends on that.
+// Pi appends a `compaction` entry carrying the summary and `firstKeptEntryId`
+// and deletes nothing: every entry before it stays in the file, and so in
+// S3. The compaction entry is the anchor for reading the conversation it
+// replaced -- everything between the previous compaction's `firstKeptEntryId`
+// (or the start) and this one's is what the summary stands for, verbatim.
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { NotesStore } from "./notes";
 
 export interface SessionStore {
   get(key: string): Promise<Buffer | null>;
-  /** `contentType` is for ./notes.ts; the session itself is always NDJSON. */
-  put(key: string, body: Buffer, contentType?: string): Promise<void>;
+  put(key: string, body: Buffer): Promise<void>;
 }
 
 export interface SessionSync {
@@ -41,7 +46,7 @@ export const sessionFileFor = (sessionDir: string, incidentId: string): string =
 export const createS3SessionStore = (
   bucket: string,
   region?: string,
-): SessionStore & NotesStore => {
+): SessionStore => {
   let clientPromise: Promise<any> | null = null;
   const client = (): Promise<any> => {
     if (!clientPromise) {
@@ -70,7 +75,7 @@ export const createS3SessionStore = (
         throw err;
       }
     },
-    put: async (key, body, contentType) => {
+    put: async (key, body) => {
       const [{ PutObjectCommand }, s3] = await Promise.all([
         import("@aws-sdk/client-s3"),
         client(),
@@ -80,37 +85,9 @@ export const createS3SessionStore = (
           Bucket: bucket,
           Key: key,
           Body: body,
-          // The session is the only caller that does not name one, and it is
-          // the only NDJSON in the bucket.
-          ContentType: contentType ?? "application/x-ndjson",
+          ContentType: "application/x-ndjson",
         }),
       );
-    },
-    // list exists for the notes mirror in ./notes.ts, which is a directory
-    // rather than one object and has to know what S3 already holds. There is
-    // deliberately no delete: nothing in the agent's path removes an object
-    // from this bucket.
-    list: async (prefix) => {
-      const [{ ListObjectsV2Command }, s3] = await Promise.all([
-        import("@aws-sdk/client-s3"),
-        client(),
-      ]);
-      const keys: string[] = [];
-      let token: string | undefined;
-      do {
-        const res = await s3.send(
-          new ListObjectsV2Command({
-            Bucket: bucket,
-            Prefix: prefix,
-            ContinuationToken: token,
-          }),
-        );
-        for (const object of res.Contents ?? []) {
-          if (object.Key) keys.push(object.Key);
-        }
-        token = res.IsTruncated ? res.NextContinuationToken : undefined;
-      } while (token);
-      return keys;
     },
   };
 };

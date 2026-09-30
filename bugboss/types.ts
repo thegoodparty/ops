@@ -387,6 +387,20 @@ export interface ToolApi {
   }): Promise<ToolResponse>;
 
   /**
+   * Record one moment in the incident's timeline, when it happened rather
+   * than when it was written down. The closer builds the post-mortem's
+   * timeline from these rows, and every stage compaction carries them
+   * forward, so they are the part of the story that survives the context.
+   */
+  trackTimelineEvent(args: {
+    kind: TimelineEventKind;
+    /** Epoch millis of when it happened, from the evidence. */
+    occurredAt: number;
+    summary: string;
+    evidenceUrl?: string;
+  }): Promise<ToolResponse<TimelineEvent>>;
+
+  /**
    * Rehydration after resume, plus pending directives. With an id, any
    * incident: reads are not contained.
    *
@@ -507,10 +521,40 @@ export type SignalView = Omit<
   "tokensIn" | "tokensOut" | "cacheRead" | "cacheWrite" | "modelCalls" | "modelId"
 >;
 
+/**
+ * The moments a post-mortem timeline is made of. A closed list rather than
+ * free text, because the stage compactions key off two of them and code
+ * never reads the words an agent chose.
+ */
+export const TIMELINE_EVENT_KINDS = [
+  "first_error",
+  "impact_confirmed",
+  "root_cause_found",
+  "mitigated",
+  "fix_pr_opened",
+  "fix_merged",
+  "fix_deployed",
+  "fix_verified",
+  "other",
+] as const;
+
+export type TimelineEventKind = (typeof TIMELINE_EVENT_KINDS)[number];
+
+export interface TimelineEvent {
+  id: number;
+  kind: TimelineEventKind;
+  occurredAt: number;
+  recordedAt: number;
+  summary: string;
+  evidenceUrl: string | null;
+}
+
 export interface IncidentView {
   incident: Incident;
   signals: SignalView[];
   evidence: Evidence[];
+  /** What the agent recorded with `trackTimelineEvent`, oldest first. */
+  timeline: TimelineEvent[];
   /** Non-null only when this incident reopens ground that one claimed. */
   priorIncident: PriorIncident | null;
   /**

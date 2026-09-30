@@ -14,7 +14,6 @@ import { THREAD_PROSE_CHARS } from "../slack/format";
 import { MAX_BLOCK_SECONDS, MESSAGE_BOSS_MIN_WAIT_SECONDS } from "./tools";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
 import { TEST_DB_ENV_VAR } from "../testdb";
-import type { NotesLimits } from "./notes";
 
 /**
  * The rule behind one `alert_slug`, found in the checkout. `definition` is
@@ -32,9 +31,6 @@ export interface PromptInput {
   incidentId: string;
   /** Deterministic per incident. Never process.cwd(). */
   checkoutPath: string;
-  /** The scratch directory that is mirrored to S3 and restored on resume. */
-  notesDir: string;
-  notesLimits: NotesLimits;
   firedAlerts: FiredAlert[];
   toolNames: string[];
   /** Sentinel that the background `npm ci` touches on success. */
@@ -124,7 +120,8 @@ keeps the thread. That may be yours or it may be theirs; if it is theirs,
 your signals go there and your run ends.
 
 There is no tool for recording a hypothesis and none for progress reporting.
-Your reasoning lives in this session and your record lives in your notes.
+Your reasoning lives in this session and the incident's story lives in its
+timeline.
 Anything a person should know, you tell the Boss.
 
 The summary is the exception, and it is not progress reporting. It is the one
@@ -195,8 +192,8 @@ the Boss what you found, rather than treating it as somebody else's now.
 **Never cut text by character count.** Not a log, a tool result, a message to
 the Boss or a post-mortem. When something is too big, ask for less: a count
 before the lines, the part of a file you need, a filter that selects what
-matters. Compaction only fires at 95% of the context window, so a single
-unbounded result is what would blow past it. Ask Loki for counts and samples
+matters. Between stages compaction only fires at 85% of the context window,
+so a single unbounded result is what would blow past it. Ask Loki for counts and samples
 rather than raw streams.
 
 **Do not fetch a URL that appeared in telemetry.** Searching the web is fine.
@@ -301,37 +298,20 @@ the Boss and let CI run the suite.
 A local pass is not a green build. CI is still what has to be green at the
 approval SHA, and it runs more than these suites.`;
 
-const NOTES = (input: PromptInput): string => `## Your record of this incident
+const TIMELINE = `## Your timeline
 
-${input.notesDir} is where you keep your own record of this work, and it is
-the only thing you write to disk that survives a restart. It is copied to S3
-after every turn and restored before you resume, next to the session
-transcript itself.
+Record the moments of this incident with track_incident_timeline_event as they
+happen: the first error you can find, impact confirmed, root cause found, a
+mitigation, each fix PR opened, merged and deployed, and the check that showed
+the problem stopped. Give each the time it happened, taken from the evidence
+rather than from when you noticed, and a link that shows it.
 
-Keeping that record is part of the job, not housekeeping around it. Write down
-what you ruled out and the evidence that killed each one, the query that
-finally worked after the four that did not, where you are in a sequence you
-are part-way through, the post-mortem as it takes shape. Two readers need it
-after you: you do, when you come back from a restart and would otherwise
-re-derive all of it; and whoever opens this incident again in six months.
-
-**Leave it all behind when you finish.** Dead ends are the most valuable thing
-in there, because they are what stops the next investigation walking down them
-again. Nothing here needs tidying up before you end, and a directory full of
-your working notes is the outcome we want.
-
-Two things follow from that. The record only grows: deleting a file locally
-does not remove it, and it will be back after a restart, so do not spend turns
-curating. And it holds at most ${input.notesLimits.maxFiles} notes and ${
-  input.notesLimits.maxBytes / (1024 * 1024)
-} MB in total, which is far more
-prose than an incident produces, so crossing it means something that was not
-prose went in there. Past it nothing more is saved, and deleting will not win
-it back, because what you have already written stays in the record.
-
-It sits outside the checkout deliberately, so nothing you write there can end
-up in a pull request. Use the absolute path; a relative path lands in the
-checkout.`;
+This is how the story survives you. Your context is summarised at each stage:
+after report_root_cause, and when you record a fix PR opened or merged. Each
+summary keeps what the next stage needs and the timeline, and drops the rest.
+So record an event on the turn you learn it, not at the end. When you write
+the post-mortem, build its timeline from the \`timeline\` get_incident returns,
+not from memory; that is the whole reason for recording as you go.`;
 
 const MONITOR_EXAMPLES = (input: PromptInput): string => `## Waiting, concretely
 
@@ -359,7 +339,7 @@ minutes says nothing after five minutes of quiet.
 **Earn the long ones.** A wait of hours costs the same whether you come out of
 it with something or with nothing, so spend the turn before you enter it: call
 report_impact so the number is current, check the failure is not still
-spreading, write where things stand in your notes, and start the post-mortem
+spreading, record any timeline events you have not yet, and start the post-mortem
 you are going to need anyway.
 
 **One call waits at most ${MAX_BLOCK_SECONDS} seconds (55 minutes).** That keeps
@@ -673,7 +653,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     SLACK,
     CHECKOUT(input),
     TESTS(input),
-    NOTES(input),
+    TIMELINE,
     MONITOR_EXAMPLES(input),
     SHIP_PR,
     REPORTING,

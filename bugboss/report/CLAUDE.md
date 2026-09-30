@@ -153,3 +153,11 @@ the tables and headings mrkdwn has no way to express. It costs one scope.
 every scope there it does nothing until somebody reinstalls the app. Until
 then the completion answers `missing_scope`: the notice goes out alone, the
 retries fail, and `upload_abandoned` alarms.
+
+## The recorded timeline is the agent's, printed as it recorded it
+
+`incident_timeline_event` rows go under the post-mortem as "Recorded
+timeline", oldest first by when each thing happened. The post-mortem is the
+closer's account and this is the evidence it was written from, so the two
+stay side by side rather than merged. Both close paths get it: the rows are
+read at publish time, not carried by `report_analysis`.
