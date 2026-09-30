@@ -503,6 +503,10 @@ export const prepareRun = async (spec: RunSpec, now = Date.now()): Promise<Prepa
   );
   const cacheRoot = join(spec.workRoot, "_cache");
   mkdirSync(join(cacheRoot, "npm"), { recursive: true });
+  // Verdaccio runs as uid 10001 and answers 500 to every fetch it cannot
+  // cache. A Linux host resolves bind-mount ownership literally, so the
+  // directory has to be writable by that user; it holds only public packages.
+  chmodSync(join(cacheRoot, "npm"), 0o777);
   mkdirSync(join(cacheRoot, "prisma"), { recursive: true });
 
   writeFileSync(join(runDir, "bugboss.env"), "");

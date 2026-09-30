@@ -413,7 +413,7 @@ const incidentOutput = (result: Stored): IncidentOutput => {
   };
 };
 
-export const renderReport = (args: { pairs: Pair[]; unpaired: Stored[]; signTest: SignTest | null; judged: string | null }): string => {
+export const renderReport = (args: { pairs: Pair[]; unpaired: Stored[]; signTest: SignTest; judged: string | null }): string => {
   const { pairs } = args;
   const lines: string[] = ["## BugBoss Tier 1 eval", ""];
   const regressions = gateRegressions(pairs);
@@ -435,12 +435,11 @@ export const renderReport = (args: { pairs: Pair[]; unpaired: Stored[]; signTest
       .filter((diff): diff is number => diff !== null);
     const lower = diffs.filter((diff) => diff < 0).length;
     const higher = diffs.filter((diff) => diff > 0).length;
-    const p = args.signTest ? args.signTest(lower, higher) : undefined;
+    const p = args.signTest(lower, higher);
     return `${label}: candidate lower in ${lower} of ${diffs.length} pairs, higher in ${higher}${p === undefined ? "" : `, sign test p = ${p.toFixed(3)}`}.`;
   };
   lines.push("### Cost and wall clock", "");
   lines.push(direction((r) => r.costUsd, "Cost"), direction((r) => r.wallClockSeconds, "Wall clock"), "");
-  if (!args.signTest) lines.push("The sign test (core/aggregate.ts) is not available in this build, so no direction is claimed.", "");
 
   lines.push("| Scenario | Rep | Baseline cost | Candidate cost | Baseline time | Candidate time | Baseline end | Candidate end |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
@@ -457,7 +456,7 @@ export const renderReport = (args: { pairs: Pair[]; unpaired: Stored[]; signTest
       `- ${scenario}: median cost ${money(median(group.flatMap((p) => (p.baseline.costUsd === null ? [] : [p.baseline.costUsd]))))} -> ${money(median(group.flatMap((p) => (p.candidate.costUsd === null ? [] : [p.candidate.costUsd]))))}, median time ${minutes(median(group.flatMap((p) => (p.baseline.wallClockSeconds === null ? [] : [p.baseline.wallClockSeconds]))))} -> ${minutes(median(group.flatMap((p) => (p.candidate.wallClockSeconds === null ? [] : [p.candidate.wallClockSeconds]))))}`,
     );
   }
-  lines.push("", "### Quality", "", args.judged ?? "The judge (core/judge.ts) is not available in this build, so quality was not judged.", "");
+  lines.push("", "### Quality", "", args.judged ?? (pairs.length === 0 ? "No baseline and candidate runs paired up, so nothing was judged." : "Quality was not judged."), "");
   if (args.unpaired.length > 0) {
     lines.push(`${args.unpaired.length} runs had no partner and are not counted: ${args.unpaired.map((r) => r.runId).join(", ")}.`, "");
   }

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -166,6 +166,8 @@ export const prepareReplaySide = async (spec: ReplaySideSpec): Promise<PreparedR
   );
   const npmCache = join(spec.workRoot, "_cache", "npm");
   mkdirSync(npmCache, { recursive: true });
+  // Verdaccio runs as uid 10001; see the same line in orchestrator.ts.
+  chmodSync(npmCache, 0o777);
 
   const subnets = await pickSubnets();
   const controlToken = randomBytes(24).toString("hex");

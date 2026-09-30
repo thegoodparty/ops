@@ -115,14 +115,15 @@ describe("report", () => {
     assert.deepEqual(gateRegressions(pairs), []);
   });
 
-  test("says when the sign test and the judge are missing instead of claiming a direction", () => {
+  test("says when nothing was judged, and gives the sign test's direction", () => {
     const pairs: Pair[] = [
       { scenario: "a", rep: 1, baseline: result({ scenario: "a", rep: 1, side: "baseline" }), candidate: result({ scenario: "a", rep: 1, side: "candidate", costUsd: 10 }) },
     ];
-    const text = renderReport({ pairs, unpaired: [], signTest: null, judged: null });
+    const text = renderReport({ pairs, unpaired: [], signTest: () => undefined, judged: null });
     assert.match(text, /Cost: candidate lower in 1 of 1 pairs, higher in 0\./);
-    assert.match(text, /no direction is claimed/);
-    assert.match(text, /quality was not judged/);
+    assert.match(text, /Quality was not judged/);
+    assert.doesNotMatch(text, /not available/);
+    assert.match(renderReport({ pairs: [], unpaired: [], signTest: () => undefined, judged: null }), /nothing was judged/);
     const withStats = renderReport({ pairs, unpaired: [], signTest: () => 1, judged: "judged." });
     assert.match(withStats, /sign test p = 1\.000/);
     assert.match(withStats, /judged\./);

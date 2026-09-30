@@ -36,6 +36,10 @@ export const OPS_MAIN_SUBJECT = "repo:thegoodparty/ops:ref:refs/heads/main";
 // runs, and pairs start together on one host more often than not, which is
 // what keeps Bedrock latency comparable between the two sides.
 export const INSTANCE_TYPE = "m6i.4xlarge";
+
+// Resolved by EC2 at each launch rather than read by Pulumi, so a preview
+// needs no SSM grant and a new recommended AMI is not a diff.
+export const ECS_AMI = "resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id";
 export const INSTANCE_MEMORY_MIB = 65536;
 export const INSTANCE_VCPU = 16;
 export const ROOT_VOLUME_GIB = 200;
@@ -393,13 +397,9 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
     tags: TAGS,
   });
 
-  const ami = aws.ssm.getParameterOutput({
-    name: "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id",
-  });
-
   const launchTemplate = new aws.ec2.LaunchTemplate("bugbossEvalsLaunchTemplate", {
     name: "bugboss-evals",
-    imageId: ami.value,
+    imageId: ECS_AMI,
     instanceType: INSTANCE_TYPE,
     iamInstanceProfile: { arn: instanceProfile.arn },
     metadataOptions: INSTANCE_METADATA_OPTIONS,
