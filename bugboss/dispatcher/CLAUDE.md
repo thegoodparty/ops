@@ -89,8 +89,8 @@ Hitting either ceiling escalates and then **parks**, and the park is what
 stops the relaunching *and* the re-deciding. Without it the same escalation
 goes to the thread every thirty seconds for as long as the incident stays
 open. Unlike the counters it is in the database, so the stop outlives a
-restart, and it is lifted by the cooldown, a reply or the stale sweep rather
-than by a deploy.
+restart, and it is lifted by the cooldown, a Boss message or the stale sweep
+rather than by a deploy.
 
 **The counter is cleared at the ceiling either way**, and which thing replaces
 it is the only difference between the two arms. A told escalation is replaced
@@ -113,8 +113,9 @@ that has earned itself.
 `incident_wait` is how an incident stops being relaunched. `Dispatcher.park`
 writes it at the two ceilings above with a `PARK_COOLDOWN_SECONDS` wake;
 `ToolApi.park` writes it for an agent that has nothing it can do yet;
-`relay.recordReply` deletes it on any reply in the thread **that the wait says
-lifts on one**, which a spent turn budget does not — see the stale sweep below.
+`pushDirective` deletes it when the Boss sends the agent a `boss_message`,
+**if the wait says it lifts on one**, which a spent turn budget does not — see
+the stale sweep below.
 
 It exists because `owner = 'human'` was doing two jobs at once: saying who had
 the work, and stopping the relaunch. Only the second was load-bearing.
@@ -136,16 +137,14 @@ for is permanent: a crash loop and a launch ceiling both say "not now" rather
 than "not ever", and a container that has come back healthy should pick the
 work up without needing a person. `wakeAt` of `NULL`, which is what
 `ToolApi.park` writes when the agent gives no `wakeAfterSeconds`, means only a
-reply or the stale sweep lifts it, and that is the right shape for a wait on a
+Boss message or the stale sweep lifts it, and that is the right shape for a wait on a
 person with no deadline of its own.
 
-A reply lifting the wait is **upstream of anything that reads what the message
-meant**. Talking to an incident wakes it, with no model in the path. That is
-the property that makes the original failure unreachable, and it is why the
-delete sits in `recordReply` rather than behind the intent read: every version
-of this that asks a model to recognise the right words goes quiet the first
-time somebody phrases it their own way. A reply that turns out to be two
-people talking to each other costs one relaunch.
+A Boss message lifting the wait reads no words and asks no model: any
+`boss_message` is news for the agent, because the Boss is the only way
+anything a person says reaches it. A reply in the thread does not lift it. It
+goes to the Boss, and relaunching an agent for chatter the Boss let pass costs
+a launch with nothing new to read.
 
 ## The stale sweep
 
@@ -153,7 +152,7 @@ people talking to each other costs one relaunch.
 happening. Every other guard watches a *run*: a deadline, a crash loop, a
 launch ceiling. An incident with no run at all is invisible to all of them,
 and `park` makes that state reachable on purpose, since a wait with a `NULL`
-`wakeAt` is lifted by a reply that may never come.
+`wakeAt` is lifted by a Boss message that may never come.
 
 The clock is one `MAX` over four columns: `firstSignalAt`, `lastStartedAt`,
 the newest `thread_reply`, and the newest `incident_action`. Anything past
@@ -182,17 +181,17 @@ concurrency ceiling keeps skipping.
 When it fires it writes a `stale_swept` `incident_action`, alarms, posts to
 the thread, and **deletes the `incident_wait` row only if that wait says
 `liftsOnReply`**. So a wait on a person is not a permanent stop even when
-nobody ever replies: the sweep is the third way out of one, after a reply and
-the cooldown.
+nobody ever answers: the sweep is the third way out of one, after a Boss
+message and the cooldown.
 
-A wait that does *not* lift on a reply is announced and left standing. The
+A wait that does *not* lift on a Boss message is announced and left standing. The
 only thing that writes one is `turnBudgetPark`, for a run that is out of
 turns, and elapsed time adds no turns: deleting that row makes the incident
 eligible again, so the next tick launches an agent that exhausts before its
 first turn, escalates and pages -- and since the marker above is activity, it
 ages out and the whole thing repeats tomorrow. That is precisely the loop
 `liftsOnReply` exists to end, rebuilt on a 24-hour timer instead of on every
-comment in the thread, and it costs a full agent launch each time round.
+Boss message, and it costs a full agent launch each time round.
 
 Announcing is unconditional, though, because the failure on the other side is
 a permanent park nobody is watching. **Being told is not the same as being

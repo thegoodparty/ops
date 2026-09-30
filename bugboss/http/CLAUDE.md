@@ -35,21 +35,6 @@ registered on the app, not per route, so a route added later cannot forget
 it. The 401 paths return their response rather than throwing, so a refused
 delivery stays a `log` and does not reach it.
 
-## `/slack` carries two encodings
-
-Events arrive as JSON; a button press on an agent's question arrives at the
-same path as `application/x-www-form-urlencoded` with the JSON in a `payload`
-field. Same `v0=` signature over the same raw body, same three-second budget,
-different parsing — so the content type is the whole discriminator.
-
-One path rather than two because the ALB listener rules
-(`deploy/components/bugboss.ts`) are an allowlist: a second path is a Pulumi
-change and a deploy before a click can reach the process.
-
-A press answers an **empty** 200. A JSON body there is read by Slack as a
-replacement for the clicked message, which would delete the question and its
-buttons out from under the thread.
-
 ## `/health` is deliberately flat
 
 It returns 200 whenever the process is up, and does not check the database.
@@ -83,8 +68,19 @@ schemas.
 Those schemas are the trust boundary. The child validates too, but that is
 the untrusted side, so validation here is the one that counts.
 
-## One route that is not a tool
+## Routes that are not tools
 
 `GET /incidents/:id/directives` is a **non-draining** read on the read-only
-connection, because the `contact_human` poll would otherwise destroy
+connection, because the `message_boss` poll would otherwise destroy
 directives it has not read.
+
+`POST /incidents/:id/boss-inbox` is the only way anything an agent writes
+leaves it for a person, and nothing on the loopback app posts to Slack. It
+commits the row, then calls `wakeBoss`, so a Boss run started by the wake
+always finds it. An escalation marked `ownBrief` is the agent's own `escalate`
+and also calls `noteEscalated`, because a real child reaches this route with
+no dispatcher in the call, and without it the deadline posts a placeholder
+brief over the agent's. The harness's rungs while it waits are not marked.
+`GET /incidents/:id/boss-inbox/escalations` counts the
+escalations already sent, which is what the unanswered-question ladder
+reads its gap from across a restart.

@@ -1,50 +1,57 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { Directive, ToolResponse } from "../types";
-import type { PendingDirective } from "./tools";
-import { MAX_CHOICE_OPTIONS } from "../slack/blocks";
-import { THREAD_PROSE_CHARS } from "../slack/format";
+import type { BossInboxKind, Directive } from "../types";
 import {
-  CONTACT_HUMAN_MESSAGE_LIMIT,
-  createContactHumanTool,
+  bossMessageText,
+  createMessageBossTool,
   createMonitorTool,
-  MONITOR_FIELD_LIMIT,
-  HEARTBEAT_LOUD_AFTER_PINGS,
+  formatWaited,
   HEARTBEAT_MAX_GAP_SECONDS,
-  directiveTimestampMillis,
-  escalationText,
-  firstReplyAfter,
   heartbeatGapSeconds,
   insideWorkingHours,
+  MESSAGE_BOSS_MIN_WAIT_SECONDS,
   parseWorkingHours,
-  runContactHuman,
-  runMonitor,
-  heartbeatMessage,
-  shellProbe,
   probeOutput,
-  stalledWaitBrief,
-  stalledWaitStatus,
-  unansweredBrief,
+  renderDirectives,
+  runMessageBoss,
+  runMonitor,
+  shellProbe,
+  waitEscalation,
+  type BossInboxPort,
   type HeartbeatDeps,
-  type HumanContactPort,
+  type MessageBossDeps,
+  type PendingDirective,
   type PendingQuestion,
   type PendingWait,
   type Probe,
+  type QuestionMarkerPort,
 } from "./tools";
 
 const fakeClock = () => {
   let now = 1_000_000;
+  let sleeps = 0;
   return {
     now: () => now,
     sleep: async (ms: number) => {
+      sleeps += 1;
       now += ms;
     },
     advance: (ms: number) => {
       now += ms;
     },
+    sleeps: () => sleeps,
   };
 };
+
+const toolText = (result: { content: { type: string; text?: string }[] }): string => {
+  const first = result.content[0];
+  return first.type === "text" ? String(first.text) : "";
+};
+
+// ---------------------------------------------------------------------------
+// monitor
+// ---------------------------------------------------------------------------
 
 test("monitor returns as soon as the command exits 0", async () => {
   const clock = fakeClock();
@@ -59,14 +66,9 @@ test("monitor returns as soon as the command exits 0", async () => {
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.deepEqual(result, {
-    output: "MERGED\n",
-    timedOut: false,
-    escalation: null,
-    rejected: null,
-    directives: [],
-  });
+  assert.deepEqual(result, { output: "MERGED\n", timedOut: false });
   assert.equal(calls.length, 1);
+  assert.equal(clock.sleeps(), 0);
 });
 
 test("monitor keeps waiting through non-zero exits and costs one call", async () => {
@@ -82,8 +84,7 @@ test("monitor keeps waiting through non-zero exits and costs one call", async ()
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.equal(result.timedOut, false);
-  assert.equal(result.output, "success");
+  assert.deepEqual(result, { output: "success", timedOut: false });
   assert.equal(attempts, 4);
 });
 
@@ -100,8 +101,7 @@ test("monitor gives up at the deadline and returns the last output", async () =>
     { probe, sleep: clock.sleep, now: clock.now },
   );
 
-  assert.equal(result.timedOut, true);
-  assert.match(result.output, /still firing/);
+  assert.deepEqual(result, { output: "still firing (6)", timedOut: true });
   assert.equal(attempts, 6);
 });
 
@@ -115,7 +115,7 @@ test("monitor stops when the turn is aborted", async () => {
     { probe: async () => ({ code: 1, output: "no" }), sleep: clock.sleep, now: clock.now, signal: controller.signal },
   );
 
-  assert.equal(result.timedOut, true);
+  assert.deepEqual(result, { output: "no", timedOut: true });
 });
 
 test("monitor's description does not tell the agent to pre-summarise", async () => {
@@ -147,11 +147,13 @@ test("monitor's description does not tell the agent to pre-summarise", async () 
     undefined,
     {} as never,
   );
-  const text = out.content[0].type === "text" ? out.content[0].text : "";
+  const text = toolText(out);
+  assert.ok(text.startsWith("Condition met: a big log\n\n"));
   assert.ok(
     text.includes("x".repeat(50_000)),
     "the description says whole and the tool must deliver whole",
   );
+  assert.ok(!out.terminate, "a met condition is not the end of the incident");
 });
 
 test("monitor hands back everything the probe printed", async () => {
@@ -191,717 +193,29 @@ test("probeOutput carries the whole output, however long", () => {
   assert.equal(probeOutput(text), text);
 });
 
-test("a nudge carries the whole check output rather than a head of it", () => {
+test("a wait escalation carries the whole check output rather than a head of it", () => {
   const tail = "FAILED: the thing the reader needed";
-  const nudge = heartbeatMessage({
+  const text = waitEscalation({
     description: "the PR to be merged",
     awaitingHuman: "somebody has to press merge",
     waitedMs: 3_600_000,
+    rung: 1,
     status: `${"q".repeat(5000)}\n${tail}`,
     nextSeconds: 7200,
   });
 
-  assert.ok(nudge.includes(tail), "the end of the output is in the nudge");
-  assert.ok(nudge.includes("q".repeat(5000)), "and so is the rest of it");
-  assert.doesNotMatch(nudge, /\u2026/);
-  assert.doesNotMatch(nudge, /truncat|elided/);
+  assert.ok(text.includes(tail), "the end of the output is in the escalation");
+  assert.ok(text.includes("q".repeat(5000)), "and so is the rest of it");
+  assert.doesNotMatch(text, /…/);
+  assert.doesNotMatch(text, /truncat|elided/);
 });
 
-const fakeContact = (pending: PendingQuestion | null = null) => {
-  const state = {
-    pending,
-    posts: [] as string[],
-    options: [] as (readonly string[] | undefined)[],
-    cleared: 0,
-    recorded: 0,
-  };
-  const port: HumanContactPort = {
-    getPending: async () => state.pending,
-    recordPending: async (message) => {
-      state.recorded += 1;
-      state.pending = state.pending?.message === message
-        ? state.pending
-        : { message, messageTs: "", askedAt: 1_000_000 };
-      return state.pending;
-    },
-    post: async (message, options) => {
-      state.posts.push(message);
-      state.options.push(options);
-      if (state.pending) {
-        state.pending = { ...state.pending, messageTs: `ts-${state.posts.length}` };
-      }
-    },
-    clearPending: async () => {
-      state.cleared += 1;
-      state.pending = null;
-    },
-  };
-  return { state, port };
-};
-
-/**
- * The escalation port the harness reaches for when nobody answers.
- * Recording, because the assertion that matters is that the rotation was
- * actually told: the call writes nothing, so the only evidence it happened
- * is that it was made and what it said.
- */
-const recordingEscalate = (
-  response: { ok: boolean; error?: string; directives?: Directive[] } = { ok: true },
-) => {
-  const calls: { reason: string; brief: string }[] = [];
-  return {
-    calls,
-    port: {
-      escalate: async (args: { reason: string; brief: string }) => {
-        calls.push(args);
-        return {
-          ok: response.ok,
-          error: response.error,
-          directives: response.directives ?? [],
-        };
-      },
-    },
-  };
-};
-
-/**
- * The non-draining read the poll makes. A batch stays readable for as long as
- * the fake is asked for it, which is the property the real route has and the
- * draining `getIncident` did not. `consumeDirective` is the one removal, so
- * a consumed directive really is gone from every later read.
- */
-const directiveFeed = (...batches: Directive[][]) => {
-  let index = 0;
-  const reads: number[] = [];
-  const consumed = new Set<number>();
-  const peekDirectives = async (): Promise<PendingDirective[]> => {
-    const batch = batches[Math.min(index, batches.length - 1)] ?? [];
-    index += 1;
-    const live = batch
-      .map((directive, position) => ({ id: position + 1, directive }))
-      .filter((entry) => !consumed.has(entry.id));
-    reads.push(live.length);
-    return live;
-  };
-  return {
-    peekDirectives,
-    consumeDirective: async (id: number) => {
-      consumed.add(id);
-    },
-    reads,
-    consumed,
-  };
-};
-
-test("contact_human records the question before posting, then waits for a reply", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed(
-    [],
-    [{ type: "human_message", from: "U1", text: "restarted it", ts: "1000.500000" }],
-  );
-
-  const result = await runContactHuman(
-    { message: "Can someone restart the worker?", timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.deepEqual(result, {
-    reply: "restarted it",
-    timedOut: false,
-    directives: [],
-    terminate: false,
-    rejected: null,
-    escalation: null,
-  });
-  assert.equal(state.recorded, 1);
-  assert.deepEqual(state.posts, ["Can someone restart the worker?"]);
-  assert.equal(state.cleared, 1);
-});
-
-test("a resumed agent resumes waiting instead of asking twice", async () => {
-  const clock = fakeClock();
-  // The marker the pre-restart run wrote before it posted.
-  const { state, port } = fakeContact({
-    message: "Can someone restart the worker?",
-    messageTs: "ts-1",
-    askedAt: 999_000,
-  });
-  const escalate = recordingEscalate();
-  const api = directiveFeed([
-    { type: "human_message", from: "U1", text: "done", ts: "1000.000000" },
-  ]);
-
-  const result = await runContactHuman(
-    { message: "Can someone restart the worker?", timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(result.reply, "done");
-  assert.equal(result.timedOut, false);
-  assert.equal(state.posts.length, 0);
-  assert.equal(state.recorded, 0);
-});
-
-test("a question nobody answers gets loud, and the agent keeps the incident", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 120 },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      pollSeconds: 30,
-      minWaitSeconds: 600,
-    },
-  );
-
-  assert.deepEqual(result, {
-    reply: null,
-    timedOut: true,
-    directives: [],
-    // The escalation moved nothing, so silence is not a reason to stop: the
-    // agent is still the only thing that can finish this incident, and a run
-    // that exited here would leave it with nobody driving it at all.
-    terminate: false,
-    rejected: null,
-    escalation: { told: true, reason: "no reply in 10 minutes" },
-  });
-  assert.equal(escalate.calls.length, 1, "the rotation has to actually be told");
-  assert.match(escalate.calls[0].brief, /What I asked/);
-  assert.match(escalate.calls[0].brief, /anyone\?/);
-  // The question is no longer outstanding: it was asked, it went unanswered,
-  // and that has now been said out loud. A later ask starts its own wait.
-  assert.equal(state.cleared, 1);
-  assert.equal(state.pending, null);
-});
-
-test("a wait shorter than the floor is raised to it, not answered early", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 60 },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      pollSeconds: 60,
-      minWaitSeconds: 600,
-    },
-  );
-
-  // Ten minutes of polling, not one: the model cannot shorten its way out of
-  // the escalation by asking for a wait nobody could answer inside.
-  assert.equal(api.reads.length, 11);
-  assert.equal(escalate.calls[0].reason, "no reply in 10 minutes");
-});
-
-test("a failed escalation says nobody was told, so the agent says it itself", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate({
-    ok: false,
-    error: "could not post the brief",
-  });
-  const api = directiveFeed([]);
-
-  const tool = await createContactHumanTool({
-    contact: port,
-    api,
-    escalate: escalate.port,
-    sleep: clock.sleep,
-    now: clock.now,
-    minWaitSeconds: 600,
-  });
-  const result = await tool.execute(
-    "call-1",
-    { message: "anyone?", timeoutSeconds: 600 } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
-
-  // An unanswered question never terminates now, told or untold. The
-  // difference the failure makes is what the model is asked to do next: a
-  // landed escalation is already in the thread, an unsent one is not, and
-  // only the model can put it there.
-  assert.equal(result.terminate, false);
-  const text = String(result.content[0].type === "text" && result.content[0].text);
-  assert.match(text, /could not post the brief/);
-  assert.match(text, /Nobody has been told/);
-  assert.match(text, /say it in the thread yourself/);
-});
-
-test("directives the escalation drained are handed back", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate({
-    ok: true,
-    directives: [{ type: "new_signals", count: 3, summary: "three more 500s" }],
-  });
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 600 },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      minWaitSeconds: 600,
-    },
-  );
-
-  assert.deepEqual(result.directives, [
-    { type: "new_signals", count: 3, summary: "three more 500s" },
-  ]);
-});
-
-test("an ask longer than the limit is refused before anything is posted", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    { message: "x".repeat(CONTACT_HUMAN_MESSAGE_LIMIT + 1), timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(result.timedOut, false);
-  assert.match(String(result.rejected), /move the queries, counts and rule ids into "details"/);
-  assert.deepEqual(state.posts, [], "a refused ask is not a half-posted one");
-  assert.equal(state.recorded, 0);
-  assert.equal(escalate.calls.length, 0);
-});
-
-test("details longer than a thread post is refused before the ask goes out", async () => {
-  // The order is what makes this worth a test of its own. `details` is posted
-  // after the ask and after the marker, so leaving the check to the loopback
-  // route would 400 with the question already in the thread and no wait
-  // started -- an ask nobody is waiting on, which is the failure this whole
-  // tool is built around.
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    {
-      message: "Is the rollback safe?",
-      details: "x".repeat(THREAD_PROSE_CHARS + 1),
-      timeoutSeconds: 3600,
-    },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.match(String(result.rejected), /details is \d+ characters/);
-  assert.match(String(result.rejected), /post-mortem/);
-  assert.deepEqual(state.posts, [], "the ask is not posted either");
-  assert.equal(state.recorded, 0, "and no marker is left behind to resume on");
-  assert.equal(escalate.calls.length, 0);
-});
-
-test("details that fit go out as their own post under the ask", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  await runContactHuman(
-    {
-      message: "Is the rollback safe?",
-      details: "x".repeat(THREAD_PROSE_CHARS),
-      timeoutSeconds: 0,
-    },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(state.posts.length, 2, "the ask, then the evidence beneath it");
-});
-
-test("a resume re-posts the evidence rather than losing it silently", async () => {
-  const clock = fakeClock();
-  // The ask landed and set messageTs; the process died before the evidence
-  // post. The marker cannot tell the two apart, and a skipped evidence post
-  // has no error attached to it.
-  const { state, port } = fakeContact({
-    message: "can someone check #dev-alerts?",
-    messageTs: "ts-1",
-    askedAt: 1_000_000,
-  });
-  const escalate = recordingEscalate();
-  const api = directiveFeed(
-    [],
-    [{ type: "human_message", from: "U1", text: "checked", ts: "1000.500000" }],
-  );
-
-  await runContactHuman(
-    {
-      message: "can someone check #dev-alerts?",
-      details: "Zero 5xx over 24h (3.4M lines).",
-      timeoutSeconds: 3600,
-    },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.deepEqual(
-    state.posts,
-    ["Zero 5xx over 24h (3.4M lines)."],
-    "the ask is not repeated; the evidence is not dropped",
-  );
-});
-
-test("the escalation clock runs from the question, not from this process", async () => {
-  const clock = fakeClock();
-  // A marker 700 seconds old: the agent asked, the container died, and the
-  // replacement replays the call. A fresh wait here would let a crash loop
-  // defer the escalation for as long as the crashes last.
-  const { port } = fakeContact({
-    message: "anyone?",
-    messageTs: "ts-1",
-    askedAt: 1_000_000 - 700_000,
-  });
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 600 },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      minWaitSeconds: 600,
-    },
-  );
-
-  assert.deepEqual(api.reads.length, 1, "already past the budget on the first poll");
-  assert.equal(result.escalation?.reason, "no reply in 12 minutes");
-});
-
-test("a failed escalation keeps the marker, so the next attempt does not restart the wait", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate({ ok: false, error: "Slack is down" });
-  const api = directiveFeed([]);
-
-  await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 600 },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      minWaitSeconds: 600,
-    },
-  );
-
-  assert.equal(state.cleared, 0);
-  assert.equal(state.pending?.message, "anyone?");
-});
-
-test("a stop the failed escalation drained still stops the agent", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate({
-    ok: false,
-    error: "Slack is down",
-    directives: [{ type: "stop", reason: "a human took it" }],
-  });
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 600 },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      minWaitSeconds: 600,
-    },
-  );
-
-  // A `stop` is the one thing that does end the run, and it arrived on the
-  // escalation's response rather than on a poll. The escalation failing does
-  // not make it any less a stop.
-  assert.equal(result.terminate, true, "a stop ends the run however it arrived");
-});
-
-test("the evidence is posted under the ask, as its own message", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed(
-    [],
-    [{ type: "human_message", from: "U1", text: "checked", ts: "1000.500000" }],
-  );
-
-  await runContactHuman(
-    {
-      message: "*Incident 6 — no customer impact.* Can someone check #dev-alerts?",
-      details: "Zero 5xx over 24h (3.4M lines). Control test at >= 400 returns 39,305.",
-      timeoutSeconds: 3600,
-    },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.deepEqual(state.posts, [
-    "*Incident 6 — no customer impact.* Can someone check #dev-alerts?",
-    "Zero 5xx over 24h (3.4M lines). Control test at >= 400 returns 39,305.",
-  ]);
-});
-
-test("replies older than the question are not answers to it", () => {
-  const pending: PendingDirective[] = [
-    { id: 1, directive: { type: "human_message", from: "U1", text: "earlier chatter", ts: "900.000000" } },
-    { id: 2, directive: { type: "new_signals", count: 2, summary: "two more" } },
-    { id: 3, directive: { type: "human_message", from: "U2", text: "the answer", ts: "1100.000000" } },
-  ];
-
-  const found = firstReplyAfter(pending, 1_000_000);
-  assert.equal(found?.directive.text, "the answer");
-  assert.equal(found?.id, 3, "the id is what lets the wait consume just this one");
-  assert.equal(firstReplyAfter([pending[0]], 1_000_000), null);
-});
-
-/**
- * The wait used to end on whichever human spoke first after the question,
- * which meant two people talking to each other could answer a question that
- * was never put to them. Who a message was for is read at the Slack boundary
- * and recorded on the directive; this is the half that acts on it.
- */
-test("a message people sent each other does not end the wait", () => {
-  const pending: PendingDirective[] = [
-    {
-      id: 1,
-      directive: {
-        type: "human_message",
-        from: "U1",
-        text: "did anyone check org X?",
-        ts: "1100.000000",
-        addressed: "others",
-      },
-    },
-    {
-      id: 2,
-      directive: {
-        type: "human_message",
-        from: "U2",
-        text: "yes, org X bypasses it",
-        ts: "1200.000000",
-        addressed: "agent",
-      },
-    },
-  ];
-
-  const found = firstReplyAfter(pending, 1_000_000);
-  assert.equal(found?.id, 2, "the first message for the agent, not the first message");
-  assert.equal(
-    firstReplyAfter([pending[0]], 1_000_000),
-    null,
-    "chatter alone leaves the agent waiting rather than answering it wrongly",
-  );
-});
-
-/**
- * `unclear` is the label `slack/intent.ts` coaches the model towards whenever
- * it cannot tell, on the stated grounds that being unsure "costs somebody
- * re-sending one sentence". It costs that only while it leaves the agent
- * waiting; ending the wait on it is the wrong-`agent` outcome the coaching
- * exists to avoid, reached by the label meant to avoid it.
- */
-test("a message nobody could place does not end the wait", () => {
-  // Built the way a real one arrives: `JSON.parse` of a `pending_directive`
-  // row. Nothing validates the payload against `Directive` on the way in, so
-  // what ends a wait is decided by the label that was written, not by the
-  // type that was meant.
-  const pending: PendingDirective[] = [
-    {
-      id: 4,
-      directive: JSON.parse(
-        JSON.stringify({
-          type: "human_message",
-          from: "U1",
-          text: "yeah, roll it back",
-          ts: "1100.000000",
-          addressed: "unclear",
-        }),
-      ) as Directive,
-    },
-  ];
-
-  assert.equal(
-    firstReplyAfter(pending, 1_000_000),
-    null,
-    "an offhand remark the read could not place is context, not an answer",
-  );
-});
-
-test("a directive written before addressed existed still ends a wait", () => {
-  // Rows in flight across the deploy that added the field. They meant "for
-  // the agent", which was the only thing a reply could be.
-  const pending: PendingDirective[] = [
-    {
-      id: 7,
-      directive: { type: "human_message", from: "U1", text: "go ahead", ts: "1100.000000" },
-    },
-  ];
-  assert.equal(firstReplyAfter(pending, 1_000_000)?.id, 7);
-});
-
-test("slack and millisecond timestamps both compare", () => {
-  assert.equal(directiveTimestampMillis("1758700000.000200"), 1758700000000.2);
-  assert.equal(directiveTimestampMillis("1758700000000"), 1758700000000);
-  assert.equal(directiveTimestampMillis("2026-09-24T00:00:00.000Z"), Date.parse("2026-09-24T00:00:00.000Z"));
-});
-
-test("a merged directive ends the wait rather than being swallowed by it", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([], [{ type: "merged", into: "inc-9" }]);
-
-  const result = await runContactHuman(
-    { message: "can someone merge the PR?", timeoutSeconds: 86400 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(result.terminate, true);
-  assert.equal(result.timedOut, false);
-  assert.equal(result.reply, null);
-  assert.deepEqual(result.directives, [{ type: "merged", into: "inc-9" }]);
-  assert.equal(state.cleared, 1);
-});
-
-test("a stop directive ends the wait", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([{ type: "stop", reason: "a human took it" }]);
-
-  const result = await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 86400 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(result.terminate, true);
-  assert.deepEqual(result.directives, [{ type: "stop", reason: "a human took it" }]);
-});
-
-test("directives that are not the reply are handed back, not dropped", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([
-    { type: "resumed_after", seconds: 420 },
-    { type: "new_signals", count: 2, summary: "two more 500s" },
-    { type: "human_message", from: "U1", text: "on it", ts: "1000.500000" },
-  ]);
-
-  const result = await runContactHuman(
-    { message: "anyone?", timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(result.reply, "on it");
-  assert.deepEqual(result.directives, [
-    { type: "resumed_after", seconds: 420 },
-    { type: "new_signals", count: 2, summary: "two more 500s" },
-  ]);
-});
-
-test("a marker left by a killed run does not silence the next, different question", async () => {
-  const clock = fakeClock();
-  // SIGKILL mid-wait skips clearPending, so the marker outlives the question.
-  const { state, port } = fakeContact({
-    message: "can someone merge the PR?",
-    messageTs: "ts-1",
-    askedAt: 900_000,
-  });
-  const escalate = recordingEscalate();
-  const api = directiveFeed(
-    [],
-    [{ type: "human_message", from: "U1", text: "rolled back", ts: "1000.500000" }],
-  );
-
-  const result = await runContactHuman(
-    { message: "should I roll back the deploy?", timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.deepEqual(state.posts, ["should I roll back the deploy?"]);
-  assert.equal(state.recorded, 1);
-  assert.equal(result.reply, "rolled back");
-});
-
-test("the contact_human tool stops the agent on a terminating directive", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([{ type: "merged", into: "inc-9" }]);
-
-  const tool = await createContactHumanTool({
-    contact: port,
-    api,
-    escalate: escalate.port,
-    sleep: clock.sleep,
-    now: clock.now,
-  });
-  const result = await tool.execute(
-    "call-1",
-    { message: "anyone?", timeoutSeconds: 3600 } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
-
-  assert.equal(result.terminate, true);
-  assert.match(
-    String(result.content[0].type === "text" && result.content[0].text),
-    /MERGED: this incident is now part of inc-9/,
-  );
-});
-
-test("a marker whose post never landed is asked again, not waited on", async () => {
-  const clock = fakeClock();
-  // recordPending succeeded and post threw: the marker exists but no human
-  // ever saw the question. Waiting on it is indistinguishable from being
-  // ignored, and the design budgets 24 hours for that wait.
-  const { state, port } = fakeContact({
-    message: "can someone merge the PR?",
-    messageTs: "",
-    askedAt: 999_000,
-  });
-  const escalate = recordingEscalate();
-  const api = directiveFeed(
-    [],
-    [{ type: "human_message", from: "U1", text: "merged", ts: "1000.500000" }],
-  );
-
-  const result = await runContactHuman(
-    { message: "can someone merge the PR?", timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.deepEqual(state.posts, ["can someone merge the PR?"]);
-  assert.equal(result.reply, "merged");
+test("formatWaited rounds to minutes and never says zero", () => {
+  assert.equal(formatWaited(0), "1m");
+  assert.equal(formatWaited(10 * 60_000), "10m");
+  assert.equal(formatWaited(90 * 60_000), "1h 30m");
+  assert.equal(formatWaited(2 * 3_600_000), "2h");
+  assert.equal(formatWaited(63 * 3_600_000), "63h");
 });
 
 test("the harness deadline interrupts a blocking tool, not just the turn", async () => {
@@ -922,222 +236,89 @@ test("the harness deadline interrupts a blocking tool, not just the turn", async
 
   // Pi passes its own signal, which is not aborted. The tool has to honour
   // both, or the soft deadline cannot reach an agent parked in a 24h wait.
+  const piSignal = new AbortController().signal;
+  assert.equal(piSignal.aborted, false);
   const result = await tool.execute(
     "call-1",
     { command: "check", intervalSeconds: 30, timeoutSeconds: 86400, description: "quiet" } as never,
-    new AbortController().signal,
+    piSignal,
     undefined,
     {} as never,
   );
 
   assert.equal(attempts, 1);
-  assert.match(String(result.content[0].type === "text" && result.content[0].text), /TIMED OUT/);
+  assert.equal(
+    toolText(result),
+    "TIMED OUT after 86400s waiting for: quiet\n\nstill firing",
+  );
+  assert.ok(!result.terminate, "a timed-out wait leaves the incident with the agent");
 });
 
-test("contact_human honours the harness deadline alongside pi's signal", async () => {
-  const clock = fakeClock();
-  const deadline = new AbortController();
-  deadline.abort();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
+// ---------------------------------------------------------------------------
+// renderDirectives
+// ---------------------------------------------------------------------------
 
-  const tool = await createContactHumanTool({
-    contact: port,
-    api,
-    escalate: escalate.port,
-    sleep: clock.sleep,
-    now: clock.now,
-    signal: deadline.signal,
-  });
-  const result = await tool.execute(
-    "call-1",
-    { message: "anyone?", timeoutSeconds: 86400 } as never,
-    new AbortController().signal,
-    undefined,
-    {} as never,
+test("no directives render as nothing", () => {
+  assert.equal(renderDirectives([]), "");
+});
+
+test("stop and merged render as the instruction to end", () => {
+  assert.equal(
+    renderDirectives([{ type: "stop", reason: "a human took it" }]),
+    "\n\nDIRECTIVES\nSTOP: a human took it",
+  );
+  assert.equal(
+    renderDirectives([{ type: "merged", into: "inc-9" }]),
+    "\n\nDIRECTIVES\nMERGED: this incident is now part of inc-9. Stop work and exit.",
+  );
+});
+
+test("new signals render plainly, and name what was absorbed with agreement", () => {
+  assert.equal(
+    renderDirectives([{ type: "new_signals", count: 2, summary: "two more 500s" }]),
+    "\n\nDIRECTIVES\nNEW SIGNALS (2): two more 500s",
   );
 
-  assert.equal((result.details as { timedOut: boolean }).timedOut, true);
-  assert.equal(state.cleared, 1);
-  assert.deepEqual(api.reads, [0], "one poll, then the deadline ends it");
-  // The run steers the model to write a real brief inside the grace window.
-  // Handing off here would spend the turn that brief needs.
-  assert.equal(escalate.calls.length, 0, "the deadline is its own escalation path");
-});
-
-test("the answered reply is consumed, so it cannot return as a fresh instruction", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([
-    { type: "new_signals", count: 1, summary: "one more 500" },
-    { type: "human_message", from: "U1", text: "yes, go ahead and restart it", ts: "1000.500000" },
+  const one = renderDirectives([
+    { type: "new_signals", count: 3, summary: "same root cause", absorbed: ["82"] },
   ]);
+  assert.match(one, /NEW SIGNALS \(3\): incident 82 has been merged into yours and its signals are now yours\./);
+  assert.match(one, /Why: same root cause\./);
+  assert.match(one, /what that incident had already found/);
 
-  const result = await runContactHuman(
-    { message: "can I restart the worker?", timeoutSeconds: 3600 },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.equal(result.reply, "yes, go ahead and restart it");
-  assert.deepEqual([...api.consumed], [2], "only the reply, by id");
-  assert.deepEqual(
-    await api.peekDirectives(),
-    [{ id: 1, directive: { type: "new_signals", count: 1, summary: "one more 500" } }],
-    "get_incident still owes the agent everything else, and only that",
-  );
-});
-
-// --- options are an affordance on the same ask ----------------------------
-
-test("options travel with the ask, and free text still answers it", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed(
-    [],
-    // Typed, not pressed. An answer nobody offered has to land the same way.
-    [{ type: "human_message", from: "U1", text: "neither, hold", ts: "1000.500000" }],
-  );
-
-  const result = await runContactHuman(
-    {
-      message: "Roll back, or wait?",
-      details: "the migration is half applied",
-      timeoutSeconds: 3600,
-      options: ["Roll back", "Wait"],
-    },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  // The buttons ride on the ask. `details` is its own post underneath, and
-  // the thing a reader answers is the one above it.
-  assert.deepEqual(state.posts, ["Roll back, or wait?", "the migration is half applied"]);
-  assert.deepEqual(state.options, [["Roll back", "Wait"], undefined]);
-  assert.equal(result.reply, "neither, hold", "free text still answers");
-  assert.equal(result.escalation, null);
-  assert.equal(state.cleared, 1, "the marker is cleared exactly as it always was");
-});
-
-test("a button nobody presses is silence, and silence still escalates", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  const result = await runContactHuman(
-    {
-      message: "Roll back, or wait?",
-      timeoutSeconds: 60,
-      options: ["Roll back", "Wait for the next deploy"],
-    },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      pollSeconds: 60,
-      minWaitSeconds: 600,
-    },
-  );
-
-  // The floor, the deadline and the escalation all apply unchanged. Options
-  // that skipped any of them would be a way to ask without being escalatable.
-  assert.equal(api.reads.length, 11, "the floor is not opted out of by offering buttons");
-  assert.deepEqual(result.escalation, { told: true, reason: "no reply in 10 minutes" });
-  assert.equal(result.terminate, false, "the incident is still the agent's");
-  assert.equal(state.cleared, 1);
-});
-
-test("the harness brief carries what was offered, for whoever picks it up", async () => {
-  const clock = fakeClock();
-  const { port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  await runContactHuman(
-    {
-      message: "Roll back, or wait?",
-      timeoutSeconds: 600,
-      options: ["Roll back", "Wait for the next deploy"],
-    },
-    {
-      contact: port,
-      api,
-      escalate: escalate.port,
-      sleep: clock.sleep,
-      now: clock.now,
-      pollSeconds: 600,
-      minWaitSeconds: 600,
-    },
-  );
-
-  const { brief } = escalate.calls[0];
-  assert.match(brief, /What I offered/);
-  assert.match(brief, /• Roll back/);
-  assert.match(brief, /• Wait for the next deploy/);
-});
-
-test("a question asked without options says nothing about offering any", () => {
-  assert.equal(unansweredBrief("anyone?", 30).includes("What I offered"), false);
-});
-
-test("a resumed agent does not re-post a question whose buttons are already up", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact({
-    message: "Roll back, or wait?",
-    messageTs: "ts-1",
-    askedAt: 999_000,
-  });
-  const escalate = recordingEscalate();
-  const api = directiveFeed([
-    { type: "human_message", from: "U1", text: "Roll back", ts: "1000.000000" },
+  const many = renderDirectives([
+    { type: "new_signals", count: 5, summary: "same root cause", absorbed: ["81", "82", "83"] },
   ]);
-
-  await runContactHuman(
-    {
-      message: "Roll back, or wait?",
-      timeoutSeconds: 3600,
-      options: ["Roll back", "Wait"],
-    },
-    { contact: port, api, escalate: escalate.port, sleep: clock.sleep, now: clock.now },
-  );
-
-  assert.deepEqual(state.posts, [], "a second set of buttons would be a second question");
+  assert.match(many, /incidents 81, 82 and 83 have been merged into yours and their signals are now yours\./);
+  assert.match(many, /what those incidents had already found/);
 });
 
-test("unusable options are refused before anything is posted", async () => {
-  const clock = fakeClock();
-  const { state, port } = fakeContact();
-  const escalate = recordingEscalate();
-  const api = directiveFeed([]);
-
-  const tool = await createContactHumanTool({
-    contact: port,
-    api,
-    escalate: escalate.port,
-    sleep: clock.sleep,
-    now: clock.now,
-  });
-  const result = await tool.execute(
-    "call-1",
-    { message: "pick", timeoutSeconds: 3600, options: ["only one"] } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
-
-  assert.deepEqual(state.posts, [], "nothing reaches the thread");
-  assert.equal(state.recorded, 0, "and no marker is left behind for it");
-  assert.equal(escalate.calls.length, 0, "a refusal is not an unanswered question");
-  assert.match(
-    String(result.content[0].type === "text" && result.content[0].text),
-    /at least two/,
+test("a boss message renders as the Boss speaking", () => {
+  const directive: Directive = { type: "boss_message", text: "hold the rollback", at: 1_000 };
+  assert.equal(bossMessageText(directive), "hold the rollback");
+  assert.equal(
+    renderDirectives([directive]),
+    "\n\nDIRECTIVES\nFROM THE BOSS: hold the rollback",
   );
 });
 
+test("a legacy human_message row renders the same way a boss message does", () => {
+  // Built the way a real one arrives: `JSON.parse` of a `pending_directive`
+  // row written before the type was renamed. Nothing validates it on the way
+  // in, so the cast is what the runtime actually sees.
+  const legacy = JSON.parse(
+    JSON.stringify({ type: "human_message", from: "U1", text: "go ahead", ts: "1000.500000" }),
+  ) as Directive;
+  assert.notEqual(legacy.type, "boss_message", "the premise: this is not the new shape");
+
+  assert.equal(bossMessageText(legacy), "go ahead");
+  assert.equal(renderDirectives([legacy]), "\n\nDIRECTIVES\nFROM THE BOSS: go ahead");
+});
+
+test("a directive that is not the Boss speaking has no boss text", () => {
+  assert.equal(bossMessageText({ type: "stop", reason: "done" }), null);
+  assert.equal(bossMessageText({ type: "resumed_after", seconds: 60 }), null);
+});
 
 // ---------------------------------------------------------------------------
 // The heartbeat on a wait that needs a person
@@ -1156,58 +337,66 @@ const clockAt = (iso: string) => {
 const heartbeatHarness = (args: {
   now: () => number;
   existing?: PendingWait;
-  escalation?: ToolResponse;
-  postFails?: boolean;
+  tellFails?: boolean;
   pingFails?: boolean;
   clearFails?: boolean;
 }) => {
   let marker: PendingWait | null = args.existing ?? null;
-  const posts: string[] = [];
-  const postTimes: string[] = [];
-  const escalations: { reason: string; brief: string }[] = [];
+  const events: string[] = [];
+  const told: { kind: BossInboxKind; text: string; at: string; pingsWhenTold: number | null }[] = [];
   let recordWaitCalls = 0;
+  let pingCalls = 0;
   let clears = 0;
+
+  const boss: BossInboxPort = {
+    tellBoss: async (kind, text) => {
+      events.push(`tellBoss:${kind}`);
+      told.push({
+        kind,
+        text,
+        at: new Date(args.now()).toISOString(),
+        pingsWhenTold: marker?.pings ?? null,
+      });
+      if (args.tellFails) throw new Error("the Boss said 503");
+    },
+    escalationsSince: async () => ({ count: 0, lastAt: null }),
+  };
 
   const deps: HeartbeatDeps = {
     marker: {
       recordWait: async (command) => {
         recordWaitCalls += 1;
+        events.push("recordWait");
         if (!marker || marker.command !== command) {
           marker = { command, startedAt: args.now(), pings: 0, lastPingAt: null };
         }
         return marker;
       },
       recordPing: async () => {
+        pingCalls += 1;
+        events.push("recordPing");
         if (args.pingFails) throw new Error("the Boss said 503");
         if (!marker) throw new Error("no wait is recorded");
         marker = { ...marker, pings: marker.pings + 1, lastPingAt: args.now() };
         return marker;
       },
       clearWait: async () => {
+        events.push("clearWait");
         if (args.clearFails) throw new Error("the Boss said 503");
         clears += 1;
         marker = null;
       },
     },
-    post: async (message) => {
-      if (args.postFails) throw new Error("slack said no");
-      posts.push(message);
-      postTimes.push(new Date(args.now()).toISOString());
-    },
-    escalate: {
-      escalate: async (payload) => {
-        escalations.push(payload);
-        return args.escalation ?? { ok: true, directives: [] };
-      },
-    },
+    boss,
   };
 
   return {
     deps,
-    posts,
-    postTimes,
-    escalations,
+    events,
+    told,
+    marker: () => marker,
     clears: () => clears,
+    pingCalls: () => pingCalls,
     recordWaitCalls: () => recordWaitCalls,
   };
 };
@@ -1220,93 +409,6 @@ const PR_WAIT = {
   awaitingHuman:
     "Merge <https://github.com/thegoodparty/omni/pull/2150|omni#2150>. I cannot merge it myself.",
 };
-
-test("a wait on a person nudges the thread once it has gone an hour inside working hours", async () => {
-  // Monday, 11:00 in New York.
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now });
-
-  const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
-
-  assert.equal(result.timedOut, true);
-  assert.equal(result.escalation, null);
-  assert.equal(harness.posts.length, 1);
-  assert.match(harness.posts[0], /Still waiting on someone: the PR to be merged/);
-  assert.match(harness.posts[0], /1h so far/);
-  assert.match(harness.posts[0], /omni#2150/);
-  // The check's own current answer, which is the only part that can have
-  // changed since the ask.
-  assert.match(harness.posts[0], /"state":"OPEN"/);
-  assert.match(harness.posts[0], /Next nudge in 2h/);
-});
-
-test("a wait that spans a night is silent until the window opens", async () => {
-  // Monday, 18:00 in New York: one hour inside the window, then fifteen out.
-  const clock = clockAt("2026-09-28T22:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now });
-
-  await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 3600, timeoutSeconds: 72_000 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
-
-  // Not one post overnight, then one as the window opens on Tuesday and a
-  // second two hours later, rather than the whole ladder at once.
-  assert.deepEqual(harness.postTimes, [
-    "2026-09-29T14:00:00.000Z",
-    "2026-09-29T16:00:00.000Z",
-  ]);
-  assert.match(harness.posts[0], /16h so far/);
-});
-
-test("a resumed agent carries on waiting instead of nudging again", async () => {
-  // Monday, 12:00 in New York. The wait began ninety minutes ago and was
-  // nudged thirty minutes ago; the container restarted in between.
-  const clock = clockAt("2026-09-28T16:00:00Z");
-  const started = clock.now();
-  const harness = heartbeatHarness({
-    now: clock.now,
-    existing: {
-      ...PR_WAIT,
-      startedAt: started - 5_400_000,
-      pings: 1,
-      lastPingAt: started - 1_800_000,
-    },
-  });
-
-  const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 600, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
-
-  assert.equal(harness.posts.length, 0);
-  assert.equal(result.timedOut, true);
-  // The timeout is measured from when the wait began, not from this process,
-  // so the restart did not buy another two hours.
-  assert.equal(clock.now() - started, 1_800_000);
-});
-
-test("a wait with nobody to nudge posts nothing and records no marker", async () => {
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now });
-
-  const result = await runMonitor(
-    {
-      command: "gh run list --commit abc123 -q '.[0].conclusion' | grep -q success",
-      intervalSeconds: 1800,
-      timeoutSeconds: 14_400,
-      description: "the release train to deploy abc123",
-    },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
-
-  assert.equal(result.timedOut, true);
-  assert.equal(harness.posts.length, 0);
-  assert.equal(harness.recordWaitCalls(), 0);
-});
 
 /**
  * Round the clock, for the tests that care about the ladder's shape rather
@@ -1321,69 +423,234 @@ const ALWAYS = {
   days: [0, 1, 2, 3, 4, 5, 6],
 };
 
-test("the third nudge becomes an escalation, and the wait carries on", async () => {
+test("a wait on a person tells the Boss once it has gone an hour inside working hours", async () => {
+  // Monday, 11:00 in New York.
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  assert.equal(insideWorkingHours(clock.now()), true, "the premise: the window is open");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.deepEqual(result, { output: '{"state":"OPEN"}', timedOut: true });
+  assert.deepEqual(
+    harness.told.map(({ kind, at }) => ({ kind, at })),
+    [{ kind: "escalation", at: "2026-09-28T16:00:00.000Z" }],
+    "one rung, an hour in, and it is an escalation to the Boss",
+  );
+  const text = harness.told[0].text;
+  assert.match(text, /nothing has changed in 1h\./);
+  assert.match(text, /This is reminder 1; the next comes in 2h/);
+  assert.ok(text.includes(`Waiting for: ${PR_WAIT.description}`));
+  assert.ok(text.includes(`What a person has to do: ${PR_WAIT.awaitingHuman}`));
+  // The check's own current answer, which is the only part that can have
+  // changed since the ask.
+  assert.ok(text.includes('{"state":"OPEN"}'));
+  assert.equal(harness.clears(), 1, "the timeout drops the marker");
+});
+
+test("the heartbeat has only the Boss to tell", () => {
+  // The deps have no Slack port at all, so the only way a rung can leave the
+  // harness is the inbox.
+  const harness = heartbeatHarness({ now: () => 0 });
+  assert.deepEqual(Object.keys(harness.deps).sort(), ["boss", "marker"]);
+});
+
+test("the probe output reaches the Boss whole, however long", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+  const tail = "FAILED: the thing the reader needed";
+  const output = `${"s".repeat(50_000)}\n${tail}`;
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 120 },
+    {
+      probe: async () => ({ code: 1, output }),
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: { ...harness.deps, workingHours: ALWAYS, firstSeconds: 60 },
+    },
+  );
+
+  assert.equal(harness.told.length, 1);
+  assert.ok(harness.told[0].text.includes(output));
+  assert.doesNotMatch(harness.told[0].text, /truncat|elided|…/);
+});
+
+test("a wait that spans a night is silent until the window opens", async () => {
+  // Monday, 18:00 in New York: one hour inside the window, then fifteen out.
+  const clock = clockAt("2026-09-28T22:00:00Z");
+  assert.equal(insideWorkingHours(clock.now()), true, "the premise: the wait starts inside");
+  assert.equal(
+    insideWorkingHours(Date.parse("2026-09-28T23:00:00Z")),
+    false,
+    "and the hour it becomes due is already outside",
+  );
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 3600, timeoutSeconds: 72_000 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  // Not one rung overnight, then one as the window opens on Tuesday and a
+  // second two hours later, rather than the whole ladder at once.
+  assert.deepEqual(
+    harness.told.map((call) => call.at),
+    ["2026-09-29T14:00:00.000Z", "2026-09-29T16:00:00.000Z"],
+  );
+  assert.match(harness.told[0].text, /nothing has changed in 16h\./);
+});
+
+test("the working-hours window gates every rung, not only the first", async () => {
+  // Saturday, all day, with a wait long past due.
+  const clock = clockAt("2026-09-26T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    existing: { ...PR_WAIT, startedAt: started - 10 * 3_600_000, pings: 0, lastPingAt: null },
+  });
+  assert.equal(insideWorkingHours(started), false, "the premise: a weekend is outside");
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 600, timeoutSeconds: 12 * 3_600_000 / 1000 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(harness.told.length, 0);
+  assert.equal(harness.pingCalls(), 0, "and nothing was counted either");
+});
+
+test("a resumed agent carries on waiting instead of telling the Boss again", async () => {
+  // Monday, 12:00 in New York. The wait began ninety minutes ago and the Boss
+  // was told thirty minutes ago; the container restarted in between.
   const clock = clockAt("2026-09-28T16:00:00Z");
   const started = clock.now();
-  // Two nudges gone and the third one due: the rung that used to end the
-  // ladder by handing the incident to a person and stopping the agent.
   const harness = heartbeatHarness({
     now: clock.now,
     existing: {
-      ...PR_WAIT,
-      startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
-      lastPingAt: started - 8 * 3_600_000,
+      command: PR_WAIT.command,
+      startedAt: started - 5_400_000,
+      pings: 1,
+      lastPingAt: started - 1_800_000,
     },
   });
 
   const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 },
+    { ...PR_WAIT, intervalSeconds: 600, timeoutSeconds: 7200 },
     { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
   );
 
-  // The wait ran to its own deadline. Getting loud is not an exit: the agent
-  // is still the only thing that can finish this incident, so the ladder has
-  // nowhere to hand it and nothing to hand it to.
+  assert.equal(harness.recordWaitCalls(), 1);
+  assert.equal(harness.told.length, 0);
   assert.equal(result.timedOut, true);
-  assert.equal(
-    result.escalation,
-    null,
-    "the monitor never reports an escalation as an outcome, because it is not one",
-  );
-
-  assert.equal(harness.escalations.length, 1);
-  assert.match(harness.escalations[0].reason, /a 15h wait after 3 nudges/);
-  assert.match(harness.escalations[0].brief, /the PR to be merged/);
-  assert.match(harness.escalations[0].brief, /still on this/);
-  assert.match(harness.escalations[0].brief, /Nothing here needs taking over/);
-  // The loud rung replaces the nudge rather than arriving beside it: the
-  // same facts, posted where the rotation sees them. The one thread post it
-  // does make is the check's own output, which the brief cannot carry --
-  // `escalate` refuses a post past the thread budget and the harness is not
-  // an author it can refuse to, so a brief holding this would be dropped
-  // rather than shortened.
-  assert.equal(harness.posts.length, 1);
-  assert.ok(harness.posts[0].includes('{"state":"OPEN"}'));
-  assert.ok(!harness.escalations[0].brief.includes('{"state":"OPEN"}'));
+  // The timeout is measured from when the wait began, not from this process,
+  // so the restart did not buy another two hours.
+  assert.equal(clock.now() - started, 1_800_000);
 });
 
-test("the ladder gets louder rather than ending, for as long as the wait lasts", async () => {
+test("a stale marker for a different command does not silence the next wait", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({
+    now: clock.now,
+    existing: {
+      command: "gh pr view 9999 --json state",
+      startedAt: started - 50 * 3_600_000,
+      pings: 7,
+      lastPingAt: started - 60_000,
+    },
+  });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.deepEqual(harness.told.map((call) => call.at), ["2026-09-28T16:00:00.000Z"]);
+  assert.match(harness.told[0].text, /This is reminder 1;/);
+});
+
+test("a wait with nobody to remind tells the Boss nothing and records no marker", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  const result = await runMonitor(
+    {
+      command: "gh run list --commit abc123 -q '.[0].conclusion' | grep -q success",
+      intervalSeconds: 1800,
+      timeoutSeconds: 14_400,
+      description: "the release train to deploy abc123",
+    },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.ok(clock.now() - Date.parse("2026-09-28T15:00:00Z") >= 3_600_000, "the premise: an hour passed");
+  assert.equal(harness.told.length, 0);
+  assert.equal(harness.recordWaitCalls(), 0);
+  assert.equal(harness.pingCalls(), 0);
+});
+
+test("a blank awaitingHuman is the same as none", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, awaitingHuman: "   ", intervalSeconds: 1800, timeoutSeconds: 14_400 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.equal(harness.told.length, 0);
+  assert.equal(harness.recordWaitCalls(), 0);
+});
+
+test("the ladder doubles and then holds at the ceiling", async () => {
+  const clock = clockAt("2026-09-28T16:00:00Z");
+  const started = clock.now();
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 3600 },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: { ...harness.deps, workingHours: ALWAYS, firstSeconds: 60, maxGapSeconds: 600 },
+    },
+  );
+
+  assert.equal(harness.marker(), null, "the timeout dropped the marker");
+  const offsets = harness.told.map((call) => (Date.parse(call.at) - started) / 1000);
+  // Gaps 60, 120, 240, 480, then 600 for as long as the wait lasts.
+  assert.deepEqual(offsets, [60, 180, 420, 900, 1500, 2100, 2700, 3300]);
+  assert.ok(harness.told.every((call) => call.kind === "escalation"));
+  assert.deepEqual(
+    harness.told.map((call) => /This is reminder (\d+);/.exec(call.text)?.[1]),
+    ["1", "2", "3", "4", "5", "6", "7", "8"],
+  );
+  assert.match(harness.told[0].text, /the next comes in 2m/);
+  assert.match(harness.told[4].text, /the next comes in 10m/);
+});
+
+test("the ladder never ends the wait, for as long as the wait lasts", async () => {
   const clock = clockAt("2026-09-28T16:00:00Z");
   const started = clock.now();
   const harness = heartbeatHarness({
     now: clock.now,
     existing: {
-      ...PR_WAIT,
+      command: PR_WAIT.command,
       startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
+      pings: 2,
       lastPingAt: started - 8 * 3_600_000,
     },
   });
 
   // Three days of wall clock on a wait that nobody ever ends. Terminating
   // here is what stranded incidents: the wait ended, the incident moved to a
-  // person, and nothing in the system could reach it again -- so the only
-  // thing left that can change is the volume.
+  // person, and nothing in the system could reach it again.
   const result = await runMonitor(
     { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 3 * 86_400 },
     {
@@ -1397,21 +664,11 @@ test("the ladder gets louder rather than ending, for as long as the wait lasts",
   assert.equal(result.timedOut, true);
   // 8h, then 16h, then a day and a day: the gap doubles and then stops, and
   // the elapsed figure keeps climbing from the wait's original start, which
-  // is the marker surviving each escalation rather than being dropped by it.
+  // is the marker surviving each rung rather than being dropped by it.
   assert.deepEqual(
-    harness.escalations.map((call) => call.reason),
-    [
-      "nobody has ended a 15h wait after 3 nudges",
-      "nobody has ended a 23h wait after 4 nudges",
-      "nobody has ended a 39h wait after 5 nudges",
-      "nobody has ended a 63h wait after 6 nudges",
-    ],
+    harness.told.map((call) => /nothing has changed in ([^.]+)\./.exec(call.text)?.[1]),
+    ["15h", "23h", "39h", "63h"],
   );
-  // Past the third rung every nudge is loud, so nothing here is a quiet
-  // nudge: the four thread posts are one per escalation, each carrying the
-  // check's own output under the brief that cannot hold it.
-  assert.equal(harness.posts.length, harness.escalations.length);
-  assert.ok(harness.posts.every((post) => post.includes('{"state":"OPEN"}')));
   assert.equal(harness.clears(), 1, "dropped once, by the timeout that ended the wait");
 });
 
@@ -1427,56 +684,111 @@ test("the gap doubles to a day and then stops doubling", () => {
     HEARTBEAT_MAX_GAP_SECONDS,
     "2**50 hours is still a day; nothing open goes quiet for longer than that",
   );
+  assert.equal(heartbeatGapSeconds(3, 600, 1800), 1800);
 });
 
-test("a failed escalation costs the escalation, not the wait", async () => {
+test("the ping is counted before the Boss is told", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.deepEqual(harness.events, ["recordWait", "recordPing", "tellBoss:escalation", "clearWait"]);
+  assert.equal(harness.told[0].pingsWhenTold, 1, "the marker had already moved when the Boss heard");
+});
+
+test("a Boss inbox failure costs the rung, not the wait, and is not retried in place", async () => {
   const clock = clockAt("2026-09-28T16:00:00Z");
   const started = clock.now();
-  const harness = heartbeatHarness({
-    now: clock.now,
-    escalation: { ok: false, error: "slack said no", directives: [] },
-    existing: {
-      ...PR_WAIT,
-      startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
-      lastPingAt: started - 8 * 3_600_000,
-    },
-  });
+  const harness = heartbeatHarness({ now: clock.now, tellFails: true });
 
   const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 90_000 },
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 600 },
     {
       probe: stalled,
       sleep: clock.sleep,
       now: clock.now,
-      heartbeat: { ...harness.deps, workingHours: ALWAYS },
+      heartbeat: { ...harness.deps, workingHours: ALWAYS, firstSeconds: 60 },
     },
   );
 
-  // Nothing is retried in place. Retried every interval, with no backoff to
-  // advance, the escalation would be the spam the ladder exists to avoid; the
-  // next rung is hours away, still arrives, and carries the wait that accrued
-  // in between.
+  assert.ok(harness.told.length > 0, "the premise: the Boss was tried, and it threw");
+  // Three rungs at 60, 180 and 420 seconds, not one every minute: the count
+  // moved before each send, so a failure advances the ladder like a success.
   assert.deepEqual(
-    harness.escalations.map((call) => call.reason),
-    [
-      "nobody has ended a 15h wait after 3 nudges",
-      "nobody has ended a 23h wait after 4 nudges",
-    ],
+    harness.told.map((call) => (Date.parse(call.at) - started) / 1000),
+    [60, 180, 420],
   );
-  assert.equal(result.timedOut, true, "an unsent Slack message ends no wait");
+  assert.equal(result.timedOut, true, "an undelivered rung ends no wait");
+  assert.equal(clock.now() - started, 600_000, "the wait ran to its own deadline");
   assert.equal(harness.clears(), 1);
 });
 
-test("an escalation that lands does not stop the agent", async () => {
+test("a Boss failure while counting a rung costs the rung, not the wait", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, pingFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
+    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+
+  assert.ok(harness.pingCalls() > 0, "the premise: a rung came due and counting it failed");
+  assert.equal(result.timedOut, true);
+  // Nothing is sent when the count did not move: retried every interval
+  // with no backoff to advance, the rung would be the spam.
+  assert.equal(harness.told.length, 0);
+});
+
+test("a Boss failure while dropping the marker does not lose a wait that just ended", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now, clearFails: true });
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
+    {
+      probe: async () => ({ code: 0, output: "MERGED" }),
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: harness.deps,
+    },
+  );
+
+  assert.ok(harness.events.includes("clearWait"), "the premise: the clear was tried");
+  assert.deepEqual(result, { output: "MERGED", timedOut: false });
+});
+
+test("recording the wait is the one marker call that is allowed to fail loudly", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+  harness.deps.marker.recordWait = async () => {
+    throw new Error("the Boss said 503");
+  };
+
+  // Nothing has been waited on yet, so the model gets an error and reissues
+  // the call. Swallowing it would start a day-long wait with no marker and no
+  // heartbeat, which is the behaviour this whole file exists to end.
+  await assert.rejects(
+    runMonitor(
+      { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
+      { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+    ),
+    /503/,
+  );
+});
+
+test("a monitor rung that tells the Boss does not stop the agent", async () => {
   const clock = clockAt("2026-09-28T16:00:00Z");
   const started = clock.now();
   const harness = heartbeatHarness({
     now: clock.now,
     existing: {
-      ...PR_WAIT,
+      command: PR_WAIT.command,
       startedAt: started - 15 * 3_600_000,
-      pings: HEARTBEAT_LOUD_AFTER_PINGS - 1,
+      pings: 2,
       lastPingAt: started - 8 * 3_600_000,
     },
   });
@@ -1494,38 +806,12 @@ test("an escalation that lands does not stop the agent", async () => {
     undefined,
     {} as never,
   );
-  const text = String(out.content[0].type === "text" && out.content[0].text);
 
-  // The rotation was told and the wait then ran out on its own deadline, so
-  // what the model gets back is an ordinary timeout on an incident it still
-  // holds. `terminate` is reserved for a `stop` or a `merged`.
-  assert.equal(harness.escalations.length, 1);
-  assert.match(text, /TIMED OUT/);
-  assert.equal(out.terminate, false);
-});
-
-test("an escalation tells the model the incident is still its own", () => {
-  assert.match(
-    escalationText({ told: true, reason: "no reply in 10 minutes" }),
-    /This incident is still yours/,
-  );
-  assert.match(
-    escalationText({ told: false, reason: "no reply in 10 minutes", error: "503" }),
-    /Nobody has been told/,
-  );
-});
-
-test("a Slack failure costs the nudge, not the wait", async () => {
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now, postFails: true });
-
-  const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
-
-  assert.equal(result.timedOut, true);
-  assert.equal(harness.posts.length, 0);
+  // The Boss was told and the wait then ran out on its own deadline, so what
+  // the model gets back is an ordinary timeout on an incident it still holds.
+  assert.equal(harness.told.length, 1);
+  assert.match(toolText(out), /^TIMED OUT after 86400s waiting for: the PR to be merged/);
+  assert.ok(!out.terminate);
 });
 
 test("working hours are a window in one zone, and a weekend is outside it", () => {
@@ -1559,225 +845,681 @@ test("a working-hours spec is parsed, and a malformed one throws", () => {
   assert.throws(() => parseWorkingHours("UTC:10-19:9"), /days must be 0-6/);
 });
 
-test("a Boss failure while counting a nudge costs the nudge, not the wait", async () => {
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now, pingFails: true });
+// ---------------------------------------------------------------------------
+// message_boss
+// ---------------------------------------------------------------------------
 
-  const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 7200 },
-    { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-  );
+type FeedEntry = { directive: Directive; at?: number };
 
-  assert.equal(result.timedOut, true);
-  // Nothing is posted when the count did not move: retried every interval
-  // with no backoff to advance, the nudge would be the spam.
-  assert.equal(harness.posts.length, 0);
+/**
+ * The Boss's side of a question, faked end to end. The inbox is a list of
+ * what was told and when, and `escalationsSince` is read back from it, which
+ * is the property the real one has: the ladder's memory is the inbox itself.
+ *
+ * The directive feed is time-based and does not drain. An entry becomes
+ * visible once the clock reaches its `at`, and `consumeDirective` is the one
+ * removal, so a consumed directive really is gone from every later read.
+ */
+const questionHarness = (args: {
+  clock: { now: () => number; sleep: (ms: number) => Promise<void> };
+  pending?: PendingQuestion | null;
+  priorEscalations?: number[];
+  escalationFails?: boolean;
+  feed?: FeedEntry[];
+}) => {
+  const now = args.clock.now;
+  let pending: PendingQuestion | null = args.pending ?? null;
+  const events: string[] = [];
+  const told: { kind: BossInboxKind; text: string; at: number; pendingWhenTold: PendingQuestion | null }[] = [];
+  const escalationTimes = [...(args.priorEscalations ?? [])];
+  const sinceCalls: number[] = [];
+  let markerCalls = 0;
+  const consumed = new Set<number>();
+  const reads: number[] = [];
+  const entries = (args.feed ?? []).map((entry, index) => ({ id: index + 1, ...entry }));
+
+  const marker: QuestionMarkerPort = {
+    getPending: async () => {
+      markerCalls += 1;
+      events.push("getPending");
+      return pending;
+    },
+    recordPending: async (message) => {
+      markerCalls += 1;
+      events.push("recordPending");
+      pending = { message, askedAt: now() };
+      return pending;
+    },
+    clearPending: async () => {
+      markerCalls += 1;
+      events.push("clearPending");
+      pending = null;
+    },
+  };
+
+  const boss: BossInboxPort = {
+    tellBoss: async (kind, text) => {
+      events.push(`tellBoss:${kind}`);
+      told.push({ kind, text, at: now(), pendingWhenTold: pending });
+      if (kind === "escalation") {
+        if (args.escalationFails) throw new Error("the Boss said 503");
+        escalationTimes.push(now());
+      }
+    },
+    escalationsSince: async (since) => {
+      sinceCalls.push(since);
+      const hits = escalationTimes.filter((at) => at >= since);
+      return { count: hits.length, lastAt: hits.length ? Math.max(...hits) : null };
+    },
+  };
+
+  const peekDirectives = async (): Promise<PendingDirective[]> => {
+    reads.push(now());
+    return entries
+      .filter((entry) => (entry.at ?? Number.NEGATIVE_INFINITY) <= now() && !consumed.has(entry.id))
+      .map(({ id, directive }) => ({ id, directive }));
+  };
+
+  const deps: MessageBossDeps = {
+    marker,
+    boss,
+    api: {
+      peekDirectives,
+      consumeDirective: async (id) => {
+        events.push(`consume:${id}`);
+        consumed.add(id);
+      },
+    },
+    sleep: args.clock.sleep,
+    now,
+  };
+
+  return {
+    deps,
+    events,
+    told,
+    escalations: () => told.filter((call) => call.kind === "escalation"),
+    sinceCalls,
+    reads,
+    consumed,
+    peekDirectives,
+    pending: () => pending,
+    markerCalls: () => markerCalls,
+  };
+};
+
+const boss = (text: string, at = 0): Directive => ({ type: "boss_message", text, at });
+
+test("message_boss without wait tells the Boss once and returns at once", async () => {
+  for (const wait of [undefined, false]) {
+    const clock = fakeClock();
+    const harness = questionHarness({ clock, feed: [{ directive: boss("never read") }] });
+
+    const result = await runMessageBoss(
+      { message: "PR #2150 is up and needs a merge.", wait },
+      harness.deps,
+    );
+
+    assert.deepEqual(result, { answer: null, timedOut: false, directives: [], terminate: false });
+    assert.deepEqual(
+      harness.told.map(({ kind, text }) => ({ kind, text })),
+      [{ kind: "message", text: "PR #2150 is up and needs a merge." }],
+    );
+    assert.equal(harness.markerCalls(), 0, "nothing is outstanding, so nothing is recorded");
+    assert.equal(harness.reads.length, 0, "and nothing is waited for");
+    assert.equal(clock.sleeps(), 0);
+    assert.equal(harness.consumed.size, 0, "a Boss message sitting in the queue is left for get_incident");
+  }
 });
 
-test("a Boss failure while dropping the marker does not lose a wait that just ended", async () => {
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now, clearFails: true });
+test("a question goes to the Boss before the marker is written, then waits for the answer", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("restarted it"), at: 1_000_000 + 90_000 }],
+  });
 
-  const result = await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
-    {
-      probe: async () => ({ code: 0, output: "MERGED" }),
-      sleep: clock.sleep,
-      now: clock.now,
-      heartbeat: harness.deps,
-    },
+  const result = await runMessageBoss(
+    { message: "Can someone restart the worker?", wait: true },
+    { ...harness.deps, pollSeconds: 30 },
   );
 
+  assert.deepEqual(result, {
+    answer: "restarted it",
+    timedOut: false,
+    directives: [],
+    terminate: false,
+  });
+  assert.deepEqual(harness.events, [
+    "getPending",
+    "tellBoss:question",
+    "recordPending",
+    "clearPending",
+    "consume:1",
+  ]);
+  assert.equal(harness.told[0].pendingWhenTold, null, "the marker did not exist when the Boss was asked");
+  assert.deepEqual(harness.reads.length, 4, "polled at 0, 30, 60 and 90 seconds");
+  assert.equal(harness.pending(), null);
+});
+
+test("a resumed agent resumes waiting instead of asking twice", async () => {
+  const clock = fakeClock();
+  const marker = { message: "Can someone restart the worker?", askedAt: 999_000 };
+  const harness = questionHarness({
+    clock,
+    pending: marker,
+    feed: [{ directive: boss("done") }],
+  });
+  assert.equal(harness.pending()?.message, "Can someone restart the worker?", "the premise: the marker matches");
+
+  const result = await runMessageBoss(
+    { message: "Can someone restart the worker?", wait: true },
+    harness.deps,
+  );
+
+  assert.equal(result.answer, "done");
+  assert.equal(harness.told.length, 0, "the question already reached the Boss once");
+  assert.ok(!harness.events.includes("recordPending"));
+});
+
+test("a marker left by a killed run does not silence the next, different question", async () => {
+  const clock = fakeClock();
+  // SIGKILL mid-wait skips clearPending, so the marker outlives the question.
+  const harness = questionHarness({
+    clock,
+    pending: { message: "can someone merge the PR?", askedAt: 900_000 },
+    feed: [{ directive: boss("rolled back"), at: 1_000_000 + 30_000 }],
+  });
+  assert.equal(harness.pending()?.message, "can someone merge the PR?", "the premise: a stale marker");
+
+  const result = await runMessageBoss(
+    { message: "should I roll back the deploy?", wait: true },
+    { ...harness.deps, pollSeconds: 30 },
+  );
+
+  assert.deepEqual(
+    harness.told.map(({ kind, text }) => ({ kind, text })),
+    [{ kind: "question", text: "should I roll back the deploy?" }],
+  );
+  assert.ok(harness.events.includes("recordPending"));
+  assert.equal(result.answer, "rolled back");
+});
+
+test("any word from the Boss ends the wait, whenever it was written", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    pending: { message: "anyone?", askedAt: 1_000_000 },
+    feed: [{ directive: boss("stand down", 1) }],
+  });
+  const directive = harness.deps.api;
+  const before = await directive.peekDirectives();
+  assert.equal(before.length, 1);
+  assert.ok(
+    (before[0].directive as { at: number }).at < 1_000_000,
+    "the premise: the message is older than the question",
+  );
+
+  const result = await runMessageBoss({ message: "anyone?", wait: true }, harness.deps);
+
+  assert.equal(result.answer, "stand down");
+  assert.equal(result.terminate, false);
+});
+
+test("a legacy human_message ends the wait as the Boss's answer", async () => {
+  const clock = fakeClock();
+  const legacy = JSON.parse(
+    JSON.stringify({ type: "human_message", from: "U1", text: "go ahead", ts: "1000.500000" }),
+  ) as Directive;
+  assert.notEqual(legacy.type, "boss_message", "the premise: this is the old shape");
+  const harness = questionHarness({ clock, feed: [{ directive: legacy }] });
+
+  const result = await runMessageBoss({ message: "may I restart it?", wait: true }, harness.deps);
+
+  assert.equal(result.answer, "go ahead");
+  assert.deepEqual([...harness.consumed], [1]);
+  assert.deepEqual(result.directives, []);
+});
+
+test("several Boss messages are one answer, and all of them are consumed", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [
+      { directive: boss("yes, roll it back") },
+      { directive: { type: "resumed_after", seconds: 420 } },
+      { directive: boss("and tell me when it is done") },
+    ],
+  });
+
+  const result = await runMessageBoss({ message: "roll back?", wait: true }, harness.deps);
+
+  assert.equal(result.answer, "yes, roll it back\n\nand tell me when it is done");
+  assert.deepEqual([...harness.consumed].sort(), [1, 3]);
+  assert.deepEqual(
+    await harness.peekDirectives(),
+    [{ id: 2, directive: { type: "resumed_after", seconds: 420 } }],
+    "get_incident would otherwise deliver the second half as a fresh instruction",
+  );
+});
+
+test("the marker is cleared before the answer is consumed", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({ clock, feed: [{ directive: boss("a") }, { directive: boss("b") }] });
+
+  await runMessageBoss({ message: "?", wait: true }, harness.deps);
+
+  const clearAt = harness.events.indexOf("clearPending");
+  assert.ok(clearAt >= 0);
+  assert.deepEqual(harness.events.slice(clearAt), ["clearPending", "consume:1", "consume:2"]);
+});
+
+test("directives that are not the answer are handed back and left in the queue", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [
+      { directive: { type: "resumed_after", seconds: 420 } },
+      { directive: { type: "new_signals", count: 2, summary: "two more 500s" } },
+      { directive: boss("on it") },
+    ],
+  });
+
+  const result = await runMessageBoss({ message: "anyone?", wait: true }, harness.deps);
+
+  assert.equal(result.answer, "on it");
+  assert.deepEqual(result.directives, [
+    { type: "resumed_after", seconds: 420 },
+    { type: "new_signals", count: 2, summary: "two more 500s" },
+  ]);
+  assert.deepEqual([...harness.consumed], [3], "only the answer, by id");
+  assert.deepEqual((await harness.peekDirectives()).map((entry) => entry.id), [1, 2]);
+});
+
+test("directives other than an answer or an end do not end the wait", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [
+      { directive: { type: "new_signals", count: 1, summary: "one more" }, at: 1_000_000 },
+      { directive: boss("ok"), at: 1_000_000 + 120_000 },
+    ],
+  });
+
+  const result = await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, pollSeconds: 30 },
+  );
+
+  assert.equal(harness.reads.length, 5, "the new signals were seen on four polls and did not end it");
+  assert.equal(result.answer, "ok");
+  assert.deepEqual(result.directives, [{ type: "new_signals", count: 1, summary: "one more" }]);
+});
+
+test("a stop ends the wait and the run", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: { type: "stop", reason: "a human took it" }, at: 1_000_000 + 60_000 }],
+  });
+
+  const result = await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, pollSeconds: 30 },
+  );
+
+  assert.ok(harness.events.includes("recordPending"), "the premise: a question was outstanding");
+  assert.deepEqual(result, {
+    answer: null,
+    timedOut: false,
+    directives: [{ type: "stop", reason: "a human took it" }],
+    terminate: true,
+  });
+  assert.equal(harness.pending(), null);
+  assert.equal(harness.consumed.size, 0, "a stop is get_incident's to deliver, not the wait's to eat");
+});
+
+test("a merged directive ends the wait rather than being swallowed by it", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: { type: "merged", into: "inc-9" }, at: 1_000_000 + 30_000 }],
+  });
+
+  const result = await runMessageBoss(
+    { message: "can someone merge the PR?", wait: true },
+    { ...harness.deps, pollSeconds: 30 },
+  );
+
+  assert.equal(harness.reads.length, 2);
+  assert.equal(result.terminate, true);
+  assert.equal(result.answer, null);
+  assert.deepEqual(result.directives, [{ type: "merged", into: "inc-9" }]);
+  assert.equal(harness.pending(), null);
+});
+
+test("a wait shorter than the floor is raised to it, not escalated early", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("here"), at: start + 900_000 }],
+  });
+
+  await runMessageBoss(
+    { message: "anyone?", wait: true, seconds: 60 },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+  );
+
+  // Ten minutes, not one: the model cannot shorten its way out of the
+  // escalation by asking for a wait nobody could answer inside.
+  assert.deepEqual(
+    harness.escalations().map((call) => (call.at - start) / 1000),
+    [600],
+  );
+  assert.ok(harness.reads.some((at) => at - start === 60_000), "the premise: the requested minute was polled through");
+});
+
+test("the default floor is MESSAGE_BOSS_MIN_WAIT_SECONDS", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("here"), at: start + (MESSAGE_BOSS_MIN_WAIT_SECONDS + 60) * 1000 }],
+  });
+
+  await runMessageBoss(
+    { message: "anyone?", wait: true, seconds: 5 },
+    { ...harness.deps, pollSeconds: 60 },
+  );
+
+  assert.deepEqual(
+    harness.escalations().map((call) => (call.at - start) / 1000),
+    [MESSAGE_BOSS_MIN_WAIT_SECONDS],
+  );
+});
+
+test("a longer requested wait is honoured", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("here"), at: start + 3_000_000 }],
+  });
+
+  await runMessageBoss(
+    { message: "anyone?", wait: true, seconds: 2400 },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+  );
+
+  assert.deepEqual(harness.escalations().map((call) => (call.at - start) / 1000), [2400]);
+});
+
+test("the escalation clock runs from the question, not from this process", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  // A marker 700 seconds old: the agent asked, the container died, and the
+  // replacement replays the call. A fresh wait here would let a crash loop
+  // defer the escalation for as long as the crashes last.
+  const harness = questionHarness({
+    clock,
+    pending: { message: "anyone?", askedAt: start - 700_000 },
+    feed: [{ directive: boss("here"), at: start + 60_000 }],
+  });
+
+  await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+  );
+
+  assert.equal(harness.told.filter((call) => call.kind === "question").length, 0, "the premise: this is a resume");
+  assert.deepEqual(
+    harness.escalations().map((call) => call.at - start),
+    [0],
+    "already past the budget on the first poll",
+  );
+  assert.deepEqual(harness.sinceCalls, [start - 700_000], "the inbox is read from when it was asked");
+  assert.match(harness.escalations()[0].text, /in 12m and I am still blocked/);
+});
+
+test("an unanswered question escalates with the question whole, and the wait carries on", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const question = `${"q".repeat(20_000)}\nWhich of the two rollbacks is safe?`;
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("the second one"), at: start + 900_000 }],
+  });
+
+  const result = await runMessageBoss(
+    { message: question, wait: true },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+  );
+
+  const escalations = harness.escalations();
+  assert.equal(escalations.length, 1);
+  assert.ok(escalations[0].pendingWhenTold, "the question was still outstanding when it escalated");
+  assert.ok(escalations[0].text.includes(question), "the question goes to the Boss whole");
+  assert.match(escalations[0].text, /Nobody has answered my question in 10m/);
+  assert.doesNotMatch(escalations[0].text, /truncat|elided|…/);
+  assert.ok(
+    harness.reads.some((at) => at > escalations[0].at),
+    "polling went on after the escalation",
+  );
+  assert.deepEqual(result, {
+    answer: "the second one",
+    timedOut: false,
+    directives: [],
+    terminate: false,
+  });
+});
+
+test("an unanswered question re-escalates on a doubling gap read from the inbox", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("finally"), at: start + 10_000_000 }],
+  });
+
+  await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+  );
+
+  // 600s to the first, then gaps of 1200, 2400 and 4800.
+  assert.deepEqual(
+    harness.escalations().map((call) => (call.at - start) / 1000),
+    [600, 1800, 4200, 9000],
+  );
+  assert.ok(harness.escalations().every((call) => call.pendingWhenTold !== null));
+});
+
+test("the re-escalation gap stops at the ceiling", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = questionHarness({
+    clock,
+    feed: [{ directive: boss("finally"), at: start + 7_000_000 }],
+  });
+
+  await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600, maxGapSeconds: 1800 },
+  );
+
+  // 600, then gaps of 1200, 1800, 1800, 1800.
+  assert.deepEqual(
+    harness.escalations().map((call) => (call.at - start) / 1000),
+    [600, 1800, 3600, 5400],
+  );
+});
+
+test("a restart that finds a recent escalation does not escalate again at once", async () => {
+  const run = async (priorEscalations: number[]) => {
+    const clock = fakeClock();
+    const start = clock.now();
+    const harness = questionHarness({
+      clock,
+      pending: { message: "anyone?", askedAt: start - 700_000 },
+      priorEscalations,
+      feed: [{ directive: boss("here"), at: start + 1_000_000 }],
+    });
+    await runMessageBoss(
+      { message: "anyone?", wait: true },
+      { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+    );
+    return { start, harness };
+  };
+
+  // Without the earlier escalation this resume is past its deadline and
+  // escalates on the first poll, which is what makes the case below mean
+  // something.
+  const control = await run([]);
+  assert.deepEqual(control.harness.escalations().map((call) => call.at - control.start), [0]);
+
+  // One went up 100 seconds ago, before the restart. The next is owed 1200
+  // seconds after it, which is past the answer.
+  const resumed = await run([1_000_000 - 100_000]);
+  assert.deepEqual(resumed.harness.sinceCalls[0], resumed.start - 700_000);
+  assert.equal(resumed.harness.escalations().length, 0);
+});
+
+test("a failed escalation costs the escalation, not the wait", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = questionHarness({
+    clock,
+    escalationFails: true,
+    feed: [{ directive: boss("here"), at: start + 720_000 }],
+  });
+
+  const result = await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
+  );
+
+  assert.ok(harness.escalations().length > 0, "the premise: the escalation was tried and threw");
+  assert.equal(result.answer, "here");
   assert.equal(result.timedOut, false);
-  assert.equal(result.output, "MERGED");
 });
 
-test("recording the wait is the one marker call that is allowed to fail loudly", async () => {
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now });
-  harness.deps.marker.recordWait = async () => {
-    throw new Error("the Boss said 503");
-  };
-
-  // Nothing has been waited on yet, so the model gets an error and reissues
-  // the call. Swallowing it would start a day-long wait with no marker and no
-  // heartbeat, which is the behaviour this whole file exists to end.
-  await assert.rejects(
-    runMonitor(
-      { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 7200 },
-      { probe: stalled, sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
-    ),
-    /503/,
-  );
-});
-
-test("the escalation's brief counts the nudges that were actually sent", async () => {
-  const clock = clockAt("2026-09-28T15:00:00Z");
-  const harness = heartbeatHarness({ now: clock.now });
-
-  // Loud from the second rung, so the first one is a quiet nudge and the
-  // count in the brief has something to be wrong about.
-  await runMonitor(
-    { ...PR_WAIT, intervalSeconds: 1800, timeoutSeconds: 14_400 },
-    {
-      probe: stalled,
-      sleep: clock.sleep,
-      now: clock.now,
-      heartbeat: { ...harness.deps, loudAfterPings: 2 },
-    },
-  );
-
-  // One quiet nudge, and one post of the check's output under the
-  // escalation that followed it.
-  assert.equal(harness.posts.length, 2);
-  assert.match(harness.escalations[0].brief, /across 2 nudges/);
-});
-
-// A brief the harness writes has nobody to refuse it to: the model is not in
-// the loop by the time either of these is composed, and `escalate` now
-// rejects a brief past the thread budget. So the worst case each of them can
-// produce has to fit, and these are the tests that keep that true instead of
-// merely written down in a comment.
-
-test("everything a nudge writes itself fits the thread budget at its worst", () => {
-  // What this bound is now *about* has changed, and the change is the point.
-  // The nudge is harness-composed, so it goes out on the split path and the
-  // check's output is not in anybody's budget. What is still worth holding
-  // to a phone screen is the part the harness wrote: two of the model's own
-  // fields at their true maximum, plus the template, plus a gap no clock
-  // would produce. The test below keeps the refusal that bounds those two
-  // honest; without it this is arithmetic about nothing.
-  const nudge = heartbeatMessage({
-    description: "d".repeat(MONITOR_FIELD_LIMIT),
-    awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
-    status: "",
-    waitedMs: Number.MAX_SAFE_INTEGER,
-    // There is always a next nudge, and the sentence naming it grows with how
-    // far away it is, so the worst case is a gap no clock would ever produce.
-    nextSeconds: Number.MAX_SAFE_INTEGER,
+test("the harness deadline clears the marker and ends the wait without escalating", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const deadline = new AbortController();
+  deadline.abort();
+  // Long past its escalation point, so an escalation here would be due.
+  const harness = questionHarness({
+    clock,
+    pending: { message: "anyone?", askedAt: start - 7_200_000 },
+    feed: [{ directive: { type: "new_signals", count: 1, summary: "one more" } }],
   });
+  assert.ok(harness.pending(), "the premise: a question is outstanding");
 
-  assert.ok(
-    nudge.length <= THREAD_PROSE_CHARS,
-    `a maximal nudge is ${nudge.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
-  );
-  // Both fields whole, and nothing anywhere telling the reader how much of
-  // something they cannot see they are missing.
-  assert.ok(nudge.includes("d".repeat(MONITOR_FIELD_LIMIT)));
-  assert.ok(nudge.includes("a".repeat(MONITOR_FIELD_LIMIT)));
-  assert.doesNotMatch(nudge, /characters elided/);
-});
-
-test("monitor refuses a field too long to survive a nudge, before waiting", async () => {
-  // The bound above only holds because of this. Both fields are echoed
-  // verbatim into messages the harness composes with the model no longer in
-  // the loop, so this call is the last moment at which being too long is
-  // something anybody can fix -- and it has to refuse *before* the marker,
-  // or a refused call leaves a wait nobody is serving.
-  let recorded = 0;
-  const marker = {
-    recordWait: async () => {
-      recorded += 1;
-      return { command: "check", startedAt: 0, pings: 0, lastPingAt: null };
-    },
-    recordPing: async () => ({ command: "check", startedAt: 0, pings: 1, lastPingAt: 0 }),
-    clearWait: async () => {},
-  };
-  let probed = 0;
-
-  const result = await runMonitor(
-    {
-      command: "gh pr view 42 --json mergedAt",
-      intervalSeconds: 5,
-      timeoutSeconds: 86_400,
-      description: "d".repeat(MONITOR_FIELD_LIMIT + 1),
-      awaitingHuman: "somebody has to merge it",
-    },
-    {
-      probe: async () => {
-        probed += 1;
-        return { code: 0, output: "" };
-      },
-      heartbeat: {
-        marker,
-        post: async () => {},
-        escalate: { escalate: async () => ({ ok: true, directives: [] }) },
-      },
-    },
+  const result = await runMessageBoss(
+    { message: "anyone?", wait: true },
+    { ...harness.deps, minWaitSeconds: 600, signal: deadline.signal },
   );
 
-  assert.ok(result.rejected, "an over-long description was accepted");
-  assert.match(result.rejected, /description is 201 characters/);
-  assert.equal(recorded, 0, "a refused call must not leave a wait marker behind");
-  assert.equal(probed, 0, "a refused call must not start waiting");
-});
-
-test("the harness's unanswered brief fits the thread budget at its worst", () => {
-  // The question is bounded by the tool, so this is its true maximum; the
-  // minute count is not bounded anywhere, so it gets an absurd one.
-  const question = "q".repeat(CONTACT_HUMAN_MESSAGE_LIMIT);
-  const brief = unansweredBrief(
-    question,
-    999_999_999,
-    Array.from({ length: MAX_CHOICE_OPTIONS }, (_, i) => `${i}`.padEnd(75, "o")),
-  );
-
-  assert.ok(
-    brief.length <= THREAD_PROSE_CHARS,
-    `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
-  );
-  // The question goes in whole, which is what `CONTACT_HUMAN_MESSAGE_LIMIT`
-  // is sized for. It used to be clamped here, so the person picking up the
-  // incident got the start of the question and a count of the rest.
-  assert.ok(brief.includes(question), "the question a reader must answer is cut");
-  assert.doesNotMatch(brief, /characters elided/);
-  assert.ok(brief.includes("What I offered"), "the buttons a reader saw survive");
-});
-
-test("the harness's stalled-wait brief fits the thread budget at its worst", () => {
-  // Every term in it is now bounded by a refusal somebody can act on, which
-  // is what removing the check's output from it bought: the output was the
-  // one term with no author and so the one term that used to give way.
-  const brief = stalledWaitBrief({
-    description: "d".repeat(MONITOR_FIELD_LIMIT),
-    awaitingHuman: "a".repeat(MONITOR_FIELD_LIMIT),
-    waitedMs: Number.MAX_SAFE_INTEGER,
-    nudges: 999_999,
+  assert.deepEqual(result, {
+    answer: null,
+    timedOut: true,
+    directives: [{ type: "new_signals", count: 1, summary: "one more" }],
+    terminate: false,
   });
+  assert.equal(harness.pending(), null);
+  // The run steers the model to write a real brief inside the grace window.
+  // Escalating here would spend the turn that brief needs.
+  assert.equal(harness.escalations().length, 0);
+  assert.equal(harness.reads.length, 1);
+});
 
-  assert.ok(
-    brief.length <= THREAD_PROSE_CHARS,
-    `a maximal brief is ${brief.length} characters against a budget of ${THREAD_PROSE_CHARS}`,
+test("the message_boss tool says the message was sent, and does not end the run", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({ clock });
+  const tool = await createMessageBossTool(harness.deps);
+
+  const out = await tool.execute(
+    "call-1",
+    { message: "PR is up" } as never,
+    undefined,
+    undefined,
+    {} as never,
   );
-  assert.ok(brief.includes("d".repeat(MONITOR_FIELD_LIMIT)));
-  assert.ok(brief.includes("a".repeat(MONITOR_FIELD_LIMIT)));
-  assert.doesNotMatch(brief, /characters elided/);
+
+  assert.equal(toolText(out), "Sent to the Boss.");
+  assert.equal(out.terminate, false);
+  assert.equal(harness.told.length, 1);
 });
 
-test("the check's output leaves a stalled wait on its own post, whole", () => {
-  const tail = "FAILED: the thing the reader needed";
-  const status = `${"s".repeat(50_000)}\n${tail}`;
-  const brief = stalledWaitBrief({
-    description: "the PR to be merged",
-    awaitingHuman: "somebody has to press merge",
-    waitedMs: 3_600_000,
-    nudges: 6,
+test("the message_boss tool hands back the answer and renders what else arrived", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({
+    clock,
+    feed: [
+      { directive: { type: "new_signals", count: 2, summary: "two more 500s" } },
+      { directive: boss("yes, restart it") },
+    ],
   });
+  const tool = await createMessageBossTool(harness.deps);
 
-  // Not in the brief: `escalate` refuses a post past the thread budget and
-  // the harness is not an author it can refuse to, so a brief carrying this
-  // would be dropped rather than shortened.
-  assert.ok(!brief.includes(tail));
-  assert.ok(brief.includes("in the message under this one"));
-  assert.ok(stalledWaitStatus(status).includes(status));
+  const out = await tool.execute(
+    "call-1",
+    { message: "can I restart the worker?", wait: true } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.equal(
+    toolText(out),
+    "The Boss answered: yes, restart it\n\nDIRECTIVES\nNEW SIGNALS (2): two more 500s",
+  );
+  assert.equal(out.terminate, false);
 });
 
-test("a short harness brief is left exactly as written", () => {
-  // The clamp must not be visible on the normal path, which is every real
-  // one: a reader seeing an elision marker on a two-line brief would go
-  // looking for text that was never there.
-  const brief = unansweredBrief("Is the rollback safe?", 30);
+test("the message_boss tool stops the agent on a terminating directive", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({ clock, feed: [{ directive: { type: "merged", into: "inc-9" } }] });
+  const tool = await createMessageBossTool(harness.deps);
 
-  assert.ok(brief.includes("Is the rollback safe?"));
-  assert.doesNotMatch(brief, /elided/);
+  const out = await tool.execute(
+    "call-1",
+    { message: "anyone?", wait: true } as never,
+    undefined,
+    undefined,
+    {} as never,
+  );
+
+  assert.equal(out.terminate, true);
+  assert.equal(
+    toolText(out),
+    "The wait ended on a directive rather than an answer.\n\nDIRECTIVES\nMERGED: this incident is now part of inc-9. Stop work and exit.",
+  );
+});
+
+test("message_boss honours the harness deadline alongside pi's signal", async () => {
+  const clock = fakeClock();
+  const deadline = new AbortController();
+  deadline.abort();
+  const harness = questionHarness({ clock });
+  const tool = await createMessageBossTool({ ...harness.deps, signal: deadline.signal });
+
+  const piSignal = new AbortController().signal;
+  assert.equal(piSignal.aborted, false);
+  const out = await tool.execute(
+    "call-1",
+    { message: "anyone?", wait: true } as never,
+    piSignal,
+    undefined,
+    {} as never,
+  );
+
+  assert.equal(toolText(out), "Your deadline ended this wait. Escalate now, with a brief.");
+  assert.equal((out.details as { timedOut: boolean }).timedOut, true);
+  assert.equal(out.terminate, false);
+  assert.ok(harness.events.includes("recordPending"), "the premise: the question was outstanding");
+  assert.equal(harness.pending(), null);
+  assert.equal(harness.escalations().length, 0, "the deadline is its own escalation path");
 });

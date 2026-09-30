@@ -14,11 +14,10 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { retryPolicies, WebClient, type KnownBlock } from "@slack/web-api";
+import { retryPolicies, WebClient } from "@slack/web-api";
 
 import { makeAlarm } from "../logging";
-import type { ChoicePoster } from "./blocks";
-import type { ObjectStore, SlackClient } from "./agent";
+import type { ObjectStore, SlackClient, SlackMessage } from "./agent";
 import type { FileUploader } from "../report";
 
 /**
@@ -31,8 +30,10 @@ const alarm = makeAlarm("slack-client");
 
 /**
  * `conversations.replies` is throttled to roughly one request a minute for
- * newer non-Marketplace apps. The Slack agent calls it once per resume and
- * agents never call it at all, which is what keeps us under that.
+ * newer non-Marketplace apps. The Boss calls it once per page per run and
+ * agents never call it at all, which is what keeps us under that. A thread
+ * is read to the end, however many pages that takes: the newest messages are
+ * the last page, and they are the ones a run is for.
  */
 const REPLIES_PAGE_LIMIT = 200;
 
@@ -155,12 +156,12 @@ export const createCachingLinker = (
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
-): SlackClient & ChoicePoster & SlackLinker & SlackUpdater => {
+): SlackClient & SlackLinker & SlackUpdater => {
   // The SDK defaults to ten retries over about thirty minutes and does not
   // reject a rate-limited call, so a 429 parks the caller inside the SDK with
   // nothing thrown and nothing logged. Posts are off the ingest request now,
-  // but an agent blocked in contact_human still waits on one, so the ceiling
-  // has to be minutes rather than half an hour.
+  // but a run waiting on a post still waits on one, so the ceiling has to be
+  // minutes rather than half an hour.
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
   });
@@ -194,21 +195,6 @@ export const createSlackClient = (
     react: async (channel, ts, name) => {
       await web.reactions.add({ channel, timestamp: ts, name });
     },
-    // `text` goes alongside the blocks rather than being replaced by them:
-    // without it every notification for this message reads "This content
-    // can't be displayed", which is the whole question on a phone.
-    postChoice: async (threadTs, text, blocks) => {
-      const res = await web.chat.postMessage({
-        channel: defaultChannel,
-        thread_ts: threadTs ?? undefined,
-        text,
-        blocks: blocks as KnownBlock[],
-        unfurl_links: false,
-        unfurl_media: false,
-      });
-      if (!res.ts) throw new Error("chat.postMessage returned no ts");
-      return { ts: res.ts };
-    },
     // `text` replaces the whole message, so the caller passes the header and
     // the original body together. There is no partial edit and no append.
     update: async (channel, ts, text) => {
@@ -220,18 +206,29 @@ export const createSlackClient = (
     },
     permalink: linker.permalink,
     replies: async ({ channel, threadTs, oldest }) => {
-      const res = await web.conversations.replies({
-        channel,
-        ts: threadTs,
-        oldest,
-        limit: REPLIES_PAGE_LIMIT,
-      });
-      return (res.messages ?? []).map((m) => ({
-        user: m.user ?? null,
-        botId: m.bot_id ?? null,
-        text: m.text ?? "",
-        ts: String(m.ts ?? ""),
-      }));
+      const byTs = new Map<string, SlackMessage>();
+      let cursor: string | undefined;
+      do {
+        const res = await web.conversations.replies({
+          channel,
+          ts: threadTs,
+          oldest,
+          limit: REPLIES_PAGE_LIMIT,
+          cursor,
+        });
+        // Every page leads with the thread's parent, so it is keyed out.
+        for (const m of res.messages ?? []) {
+          const ts = String(m.ts ?? "");
+          byTs.set(ts, {
+            user: m.user ?? null,
+            botId: m.bot_id ?? null,
+            text: m.text ?? "",
+            ts,
+          });
+        }
+        cursor = res.response_metadata?.next_cursor || undefined;
+      } while (cursor);
+      return [...byTs.values()];
     },
   };
 };

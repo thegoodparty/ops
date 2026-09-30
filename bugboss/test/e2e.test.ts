@@ -25,19 +25,15 @@ import {
   type BugBoss,
 } from "../index";
 import { createBossClient } from "../agent/run";
-import {
-  CHOICE_ACTION_PREFIX,
-  CHOICE_BLOCK_ID,
-  type SlackBlock,
-} from "../slack/blocks";
 import { classifySlackEvent, type SlackConfig } from "../ingress";
-import { firstReplyAfter } from "../agent/tools";
+import { runMessageBoss } from "../agent/tools";
 import type { AgentSpawnContext } from "../dispatcher";
+import type { SlackAgentRun } from "../slack/agent";
 import type { SlackEvent } from "../slack/relay";
 import { emptyModelUsage } from "../model";
 import type { ModelReply, ModelRequest, ModelUsage } from "../triage";
 import type { ReportUpload } from "../report";
-import type { BugBossConfig, Directive, TriageDecision } from "../types";
+import type { BugBossConfig, TriageDecision } from "../types";
 
 type QueuedDecision = TriageDecision & { recurrenceOf?: string };
 
@@ -63,6 +59,8 @@ const fakeModel = {
    * and the real @bugboss override run against it.
    */
   intents: [] as (Record<string, unknown> | Error)[],
+  /** Every read_intent call, so a test can show a path made none. */
+  intentReads: 0,
   /** Held, every triage call blocks on it. Stands in for a slow model. */
   gate: null as Promise<void> | null,
   /** Runs once, inside a triage call, after its digest of open incidents. */
@@ -103,6 +101,7 @@ const fakeModel = {
       return call("propose", { merges: [] });
     }
     if (request.tools.some((tool) => tool.name === "read_intent")) {
+      this.intentReads++;
       const next = this.intents.shift();
       if (!next) throw new Error("fakeModel: no intent queued");
       if (next instanceof Error) throw next;
@@ -137,12 +136,6 @@ const fakeModel = {
 /** Captures what would have been posted, so assertions can read the thread. */
 const fakeSlack = {
   posts: [] as { threadTs: string | null; text: string }[],
-  /** The question posts that carried buttons, blocks and all. */
-  choices: [] as {
-    threadTs: string | null;
-    text: string;
-    blocks: readonly SlackBlock[];
-  }[],
   /** One refused post. Slack being down for a moment is the normal case. */
   failNextPost: false,
   post(threadTs: string | null, text: string) {
@@ -158,11 +151,6 @@ const fakeSlack = {
   react(channel: string, ts: string, name: string) {
     this.reactions.push({ channel, ts, name });
     return Promise.resolve();
-  },
-  postChoice(threadTs: string | null, text: string, blocks: readonly SlackBlock[]) {
-    this.choices.push({ threadTs, text, blocks });
-    this.posts.push({ threadTs, text });
-    return Promise.resolve({ ts: `ts-${this.posts.length}` });
   },
   /** Edits, keyed by the message they rewrote. The board's headers land here. */
   edits: [] as { channel: string; ts: string; text: string }[],
@@ -206,19 +194,34 @@ const fakeAgent = async (tools: AgentSpawnContext) => {
 };
 
 /**
- * The read-only Slack agent's harness. Only what it was asked matters here:
- * the point of the assertions below is that somebody who asked a question
- * got as far as something that answers it.
+ * The Boss's harness. A run records what it was given and, when a test has
+ * scripted one, acts through the real tools the Boss was handed -- so a write
+ * it makes goes down the same guarded path a model's would. Unscripted, it
+ * answers with a line and touches nothing.
  */
 const fakeSlackAgent = {
   asked: [] as string[],
-  run(req: { input: string }) {
+  script: null as ((req: SlackAgentRun) => Promise<string>) | null,
+  async run(req: SlackAgentRun) {
     fakeSlackAgent.asked.push(req.input);
-    return Promise.resolve({
-      text: "two incidents are open right now.",
+    const script = fakeSlackAgent.script;
+    fakeSlackAgent.script = null;
+    return {
+      text: script ? await script(req) : "two incidents are open right now.",
       usage: emptyModelUsage(),
-    });
+    };
   },
+};
+
+/** One of the Boss's real tools, called the way the harness would. */
+const bossTool = (
+  req: SlackAgentRun,
+  name: string,
+  input: Record<string, unknown>,
+): Promise<string> => {
+  const tool = req.tools.find((t) => t.name === name);
+  if (!tool) throw new Error(`the Boss has no ${name} tool`);
+  return tool.run(input);
 };
 
 /** Slack's user group, which changes under us and keeps no history. */
@@ -429,7 +432,7 @@ test("an incident agent reaches its own incident over the loopback API", async (
   assert.ok(view.data!.signals.length > 0, "the agent can see its signals");
 });
 
-test("contact_human records the question before it posts, and only once", async () => {
+test("an agent's question marker is recorded once, however often it is replayed", async () => {
   const incidentId = boss.db.get<{ id: string }>(
     "SELECT id FROM incident WHERE status = 'INVESTIGATING' LIMIT 1",
   )!.id;
@@ -437,166 +440,14 @@ test("contact_human records the question before it posts, and only once", async 
 
   assert.equal(await client.getPending(), null);
 
-  const asked = await client.recordPending("Can someone merge the PR?");
-  await client.post("Can someone merge the PR?");
-  assert.equal(
-    fakeSlack.posts.at(-1)?.text,
-    "Can someone merge the PR?",
-    "the agent posts its own question, in the incident thread",
-  );
-  assert.notEqual(
-    boss.db.get<{ messageTs: string }>(
-      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-      [incidentId],
-    )?.messageTs,
-    "",
-    "the ts of the posted message is recorded once it exists",
-  );
-
   // A restart replays the tool call with no result. The second run has to
-  // find the first question rather than ask the human twice.
+  // find the first question rather than ask twice.
+  const asked = await client.recordPending("Can someone merge the PR?");
   const replayed = await client.recordPending("Can someone merge the PR?");
   assert.equal(replayed.askedAt, asked.askedAt);
 
   await client.clearPending();
   assert.equal(await client.getPending(), null);
-});
-
-test("a button press answers an agent the same way typing does", async () => {
-  const incident = boss.db.get<{ id: string; slackThreadTs: string }>(
-    "SELECT id, slackThreadTs FROM incident WHERE status = 'INVESTIGATING' AND slackThreadTs IS NOT NULL LIMIT 1",
-  )!;
-  const client = bossClientFor(incident.id, boss.mintToken(incident.id));
-
-  const question = "The fix is merged. Roll back now, or wait for the deploy?";
-  await client.recordPending(question);
-  await client.post(question, ["Roll back", "Wait for the deploy"]);
-
-  const posted = fakeSlack.choices.at(-1)!;
-  const actions = posted.blocks.find((block) => block.type === "actions");
-  assert.ok(actions && actions.type === "actions");
-  assert.equal(actions.block_id, CHOICE_BLOCK_ID);
-  assert.ok(
-    posted.text.includes("1. Roll back"),
-    "the same question is answerable with the blocks thrown away",
-  );
-
-  const marker = boss.db.get<{ messageTs: string }>(
-    "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-    [incident.id],
-  )!;
-
-  const payload = JSON.stringify({
-    type: "block_actions",
-    user: { id: "U0ADA" },
-    channel: { id: "C0DEVALERTS" },
-    message: { ts: marker.messageTs, thread_ts: incident.slackThreadTs },
-    actions: [
-      {
-        action_id: `${CHOICE_ACTION_PREFIX}0`,
-        value: "Roll back",
-        action_ts: String(Date.now() / 1000),
-      },
-    ],
-  });
-  const res = await boss.publicApp.request("/slack", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ payload }).toString(),
-  });
-  assert.equal(res.status, 200);
-
-  // contact_human waits on directives alone, and this is the one it reads.
-  const directives = await client.peekDirectives();
-  const answer = directives.find(
-    (entry) => entry.directive.type === "human_message",
-  );
-  assert.ok(answer, "the press reaches the agent as an ordinary message");
-  assert.equal(
-    answer.directive.type === "human_message" ? answer.directive.text : null,
-    "Roll back",
-  );
-
-  await client.consumeDirective(answer.id);
-
-  // The press has to say what happens next, not just that a row went down.
-  // "Chose Roll back" on its own reads the same whether an agent is about to
-  // act on it or whether nothing will ever read it.
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  const ack = fakeSlack.posts.at(-1)!;
-  assert.equal(ack.threadTs, incident.slackThreadTs);
-  assert.match(ack.text, /chose \*Roll back\*/);
-  assert.match(ack.text, /The agent has that as its answer/);
-
-  await client.clearPending();
-});
-
-/**
- * The failure this pair exists for. A press whose directive nothing will
- * consume was acknowledged in word-for-word the acknowledgement a press a
- * live agent was about to act on got, so the thread could not tell them
- * apart. A closed incident is the case that cannot be argued with: the
- * dispatcher will never run one again.
- */
-test("a press nothing will read says so, rather than implying an agent has it", async () => {
-  const incident = boss.db.get<{ id: string; slackThreadTs: string }>(
-    `SELECT id, slackThreadTs FROM incident
-      WHERE slackThreadTs IS NOT NULL AND status = 'CLOSED'
-      LIMIT 1`,
-  )!;
-  const client = bossClientFor(incident.id, boss.mintToken(incident.id));
-
-  const question = "The fix is merged. Roll back now, or wait for the deploy?";
-  await client.recordPending(question);
-  await client.post(question, ["Roll back", "Wait for the deploy"]);
-
-  const marker = boss.db.get<{ messageTs: string }>(
-    "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-    [incident.id],
-  )!;
-  const payload = JSON.stringify({
-    type: "block_actions",
-    user: { id: "U0ADA" },
-    channel: { id: "C0DEVALERTS" },
-    message: { ts: marker.messageTs, thread_ts: incident.slackThreadTs },
-    actions: [
-      {
-        action_id: `${CHOICE_ACTION_PREFIX}0`,
-        value: "Roll back",
-        action_ts: String(Date.now() / 1000),
-      },
-    ],
-  });
-  const res = await boss.publicApp.request("/slack", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ payload }).toString(),
-  });
-  assert.equal(res.status, 200);
-
-  // The press is still recorded, and still the same row and directive a
-  // typed reply writes. That equivalence is load-bearing and does not move.
-  const directives = await client.peekDirectives();
-  assert.ok(
-    directives.some(
-      (entry) =>
-        entry.directive.type === "human_message" &&
-        entry.directive.text === "Roll back",
-    ),
-    "a press is a reply whatever is running",
-  );
-
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  const ack = fakeSlack.posts.at(-1)!;
-  assert.match(ack.text, /chose \*Roll back\*/);
-  assert.doesNotMatch(
-    ack.text,
-    /The agent has that as its answer/,
-    "nothing is running, so nothing may claim to have it",
-  );
-  assert.match(ack.text, /no agent will run on it again/);
-
-  await client.clearPending();
 });
 
 test("the loopback API refuses anything but this incident's own token", async () => {
@@ -628,7 +479,7 @@ test("the loopback API refuses anything but this incident's own token", async ()
  * accident. `/incidents/:id` took an id and threw it away, so an agent could
  * find another incident through `search_incidents` and had no way to open
  * it. The token still scopes every write to one record; the read is not a
- * write, and the Slack question box has served any incident to anyone in the
+ * write, and the Boss has served any incident to anyone in the
  * channel the whole time.
  */
 test("an agent reads another incident over the loopback, with its own token", async () => {
@@ -1221,7 +1072,7 @@ test("an incident created by a split gets a thread of its own", async () => {
   assert.notEqual(split, parent, "the unexplained signal splits into its own incident");
   assert.ok(
     threadOf(split),
-    "without a thread its agent posts top level and contact_human can never be answered",
+    "without a thread nobody can talk to the Boss about it",
   );
 });
 
@@ -1237,6 +1088,34 @@ test("a thread that failed to open is opened on the next pass", async () => {
   assert.ok(threadOf(incidentId), "a refused post costs a delay, not the thread");
 });
 
+/**
+ * An agent can write to the Boss before its incident has a thread, and the
+ * wake for that row has nowhere to answer. Opening the thread is what gives
+ * it one, so opening it is what wakes the Boss.
+ */
+test("an agent's message sent before its thread opened reaches the Boss once it opens", async () => {
+  fakeSlack.failNextPost = true;
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "slack is down" });
+  await boss.ingest("grafana", grafanaBody("fp-61", "threadless-errors"));
+  const incidentId = incidentOf("fp-61")!;
+  assert.equal(threadOf(incidentId), null, "the premise: no thread yet");
+
+  const said = "The webhook secret rotated at 09:10 and every failure starts then.";
+  const askedBefore = fakeSlackAgent.asked.length;
+  let shown = "";
+  fakeSlackAgent.script = async (req) => {
+    shown = req.input;
+    return "";
+  };
+  await bossClientFor(incidentId, boss.mintToken(incidentId)).tellBoss("message", said);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fakeSlackAgent.asked.length, askedBefore, "and the wake found no thread to run in");
+
+  assert.ok((await boss.ensureIncidentThreads()) >= 1);
+  await until(() => shown !== "", "the Boss to run once the thread opened");
+  assert.ok(shown.includes(said), "on the row that was waiting for it");
+});
+
 // --- Slack cannot hold anything open ---------------------------------------
 
 test("a Slack call that never answers is bounded, not silently queued", async () => {
@@ -1245,7 +1124,6 @@ test("a Slack call that never answers is bounded, not silently queued", async ()
     const stalled = withSlackDeadline({
       post: () => new Promise(() => {}),
       react: () => new Promise(() => {}),
-      postChoice: () => new Promise(() => {}),
       update: () => new Promise(() => {}),
       permalink: () => new Promise(() => {}),
       replies: () => new Promise(() => {}),
@@ -1318,7 +1196,7 @@ test("the alerts in one delivery triage together, not one after another", async 
  * somebody had already been called in on opened a *second* incident, with its
  * own thread and its own agent, describing the same outage.
  *
- * Nothing writes ownership now. `escalate` is a Slack post, the incident
+ * Nothing writes ownership now. An escalation is a message, the incident
  * stays whole, and the next alert for that cause lands where it belongs.
  */
 test("a signal for a cause somebody was called in on attaches to it", async () => {
@@ -1329,10 +1207,7 @@ test("a signal for a cause somebody was called in on attaches to it", async () =
   await boss.ingest("grafana", grafanaBody("fp-95", "escalated-marker-errors"));
   const escalated = incidentOf("fp-95")!;
 
-  const called = await bossClientFor(
-    escalated,
-    boss.mintToken(escalated),
-  ).escalate({
+  const called = await boss.toolApiFor(escalated).escalate({
     reason: "the fix touches the payment path and wants a person to sign it off",
     brief: "The bad write is in the upgrade webhook. DNS and the CDN are ruled out.",
   });
@@ -1674,7 +1549,6 @@ test("nothing the relay acts on is ignored at ingress", async () => {
         ts: "1800.1",
         thread_ts: thread,
       },
-      intent: { addressed: "others" },
     },
     {
       what: "a top-level mention",
@@ -1766,7 +1640,6 @@ test("the wired endpoint acknowledges an untagged reply in an incident thread", 
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-ack-2'`,
   )!.slackThreadTs!;
 
-  fakeModel.intents.push({ addressed: "others" });
   const before = fakeSlack.reactions.length;
   const res = await boss.publicApp.fetch(
     new Request("http://boss/slack", {
@@ -1794,7 +1667,7 @@ test("the wired endpoint acknowledges an untagged reply in an incident thread", 
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
-// --- a reply reaches the agent, and cannot take the incident away ----------
+// --- a reply reaches the Boss, and cannot take the incident away -----------
 
 /** A reply in an incident's thread, as Slack delivers it. */
 const replyIn = (threadTs: string, text: string, user = "U-swain") => ({
@@ -1813,12 +1686,12 @@ const replyIn = (threadTs: string, text: string, user = "U-swain") => ({
  * that way, one of them for thirty-two hours, while people went on replying
  * into threads no agent was reading.
  *
- * So a reply is a reply. "Stand down" is an instruction the agent reads and
- * decides about, not a transfer this layer records, and the incident stays
- * exactly where the dispatcher can find it. A human is something an incident
- * can be waiting on; it is never something an incident is given to.
+ * So a reply is a reply. It goes to the Boss, which decides what, if
+ * anything, the agent hears, and the incident stays exactly where the
+ * dispatcher can find it. A human is something an incident can be waiting
+ * on; it is never something an incident is given to.
  */
-test("a person saying they have it reaches the agent and keeps the incident", async () => {
+test("a person saying they have it reaches the Boss and keeps the incident", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
   await boss.ingest("grafana", grafanaBody("fp-own", "checkout-errors"));
 
@@ -1827,33 +1700,22 @@ test("a person saying they have it reaches the agent and keeps the incident", as
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own'`,
   )!;
   assert.ok(row.slackThreadTs, "a reply can only arrive in a thread");
-
   const was = boss.db.get<Record<string, unknown>>(
     "SELECT * FROM incident WHERE id = ?",
     [row.id],
   );
 
-  // A whole sentence, and one written as an order. The old matcher read this
-  // as a claim and acted on it; nothing reads it as anything but a message
-  // for the agent now.
-  fakeModel.intents.push({ addressed: "agent" });
+  const askedBefore = fakeSlackAgent.asked.length;
   await boss.slackEvent(
     replyIn(row.slackThreadTs!, "ok I've got this one from here, stand down"),
   );
 
-  const directives = boss.db
-    .query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-      [row.id],
-    )
-    .map((d) => JSON.parse(d.payload) as Directive & { addressed?: string });
+  assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "the Boss read it");
   assert.deepEqual(
-    directives.map((d) => d.type),
-    ["human_message"],
-    "it arrives as what it is: something a person said, for the agent to read",
+    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [row.id]),
+    [],
+    "nothing reaches the agent that the Boss did not send",
   );
-  assert.equal(directives[0].addressed, "agent");
-
   assert.deepEqual(
     boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [
       row.id,
@@ -1866,7 +1728,254 @@ test("a person saying they have it reaches the agent and keeps the incident", as
     [],
     "there was no transition, so there is no action to record either",
   );
-  assert.equal(fakeModel.intents.length, 0, "intents drained");
+});
+
+// --- the Boss is the interface ----------------------------------------------
+
+/**
+ * Every message in an incident thread goes to the Boss, tagged or not, and it
+ * arrives knowing which incident it is about. Nothing on the way reads what
+ * the message meant: the read that used to decide whether it was for the
+ * agent is gone, so the premise here is that no such read ran.
+ */
+test("an untagged reply in an incident thread reaches the Boss with the incident as context", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-boss-reply", "invite-errors"));
+  const id = incidentOf("fp-boss-reply")!;
+  const said = "it started right after the morning deploy";
+  assert.ok(!said.includes("<@"), "the premise: nobody tagged the bot");
+
+  const askedBefore = fakeSlackAgent.asked.length;
+  const readsBefore = fakeModel.intentReads;
+  await boss.slackEvent(replyIn(threadOf(id)!, said));
+
+  assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "the Boss ran on it");
+  const input = fakeSlackAgent.asked.at(-1)!;
+  assert.ok(input.includes(said), "carrying what was said, whole");
+  assert.match(input, new RegExp(`\\b${id}\\b`), "and the incident it was said under");
+  assert.equal(fakeModel.intentReads, readsBefore, "no model read decided who it was for");
+  assert.deepEqual(
+    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [id]),
+    [],
+    "the agent hears nothing the Boss did not choose to tell it",
+  );
+});
+
+/**
+ * An agent can still ask and block until it gets an answer. The answer now comes from the Boss, and
+ * the wait has to have been real -- a wait that had already ended, or never
+ * started, would pass the outcome assertions just as well.
+ */
+test("an agent's question is answered by the Boss, and the agent's wait ends on that answer", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-boss-ask", "billing-errors"));
+  const id = incidentOf("fp-boss-ask")!;
+  const client = bossClientFor(id, boss.mintToken(id));
+  const question = "Is this every org, or only org X?";
+  const answer = "Only org X. The other orgs never touch that webhook.";
+
+  let settled = false;
+  const premise: {
+    marker: boolean;
+    question: boolean;
+    settled: boolean;
+    input: string;
+  } = { marker: false, question: false, settled: true, input: "" };
+
+  fakeSlackAgent.script = async (req) => {
+    // The inbox row wakes the Boss, and the marker may land a moment later,
+    // so the Boss waits for the agent to be visibly blocked before answering.
+    await until(
+      () =>
+        boss.db.get("SELECT 1 FROM pending_question WHERE incidentId = ?", [id]) !==
+        undefined,
+      "the agent's wait marker",
+    );
+    premise.marker = true;
+    premise.question =
+      boss.db.get(
+        "SELECT 1 FROM boss_inbox WHERE incidentId = ? AND kind = 'question' AND text LIKE ?",
+        [id, `%${question}%`],
+      ) !== undefined;
+    premise.settled = settled;
+    premise.input = req.input;
+    await bossTool(req, "message_agent", { incidentId: id, text: answer });
+    return "";
+  };
+
+  const postsBefore = fakeSlack.posts.length;
+  const result = await runMessageBoss(
+    { message: question, wait: true, seconds: 600 },
+    {
+      marker: client,
+      boss: client,
+      api: client,
+      sleep: () => new Promise((resolve) => setTimeout(resolve, 5)),
+    },
+  ).finally(() => {
+    settled = true;
+  });
+
+  assert.equal(premise.marker, true, "the agent was blocked when the Boss answered");
+  assert.equal(premise.question, true, "on a question row in the Boss's inbox");
+  assert.equal(premise.settled, false, "and its wait had not ended yet");
+  assert.ok(premise.input.includes(question), "the Boss was shown the question");
+
+  assert.equal(result.timedOut, false);
+  assert.equal(result.answer, answer, "the wait ends on the Boss's answer");
+  assert.equal(
+    boss.db.get("SELECT 1 FROM pending_question WHERE incidentId = ?", [id]),
+    undefined,
+    "and the marker goes with it",
+  );
+  assert.deepEqual(
+    fakeSlack.posts.slice(postsBefore),
+    [],
+    "a question the Boss could answer itself reached nobody in Slack",
+  );
+});
+
+/**
+ * State-change notices are records, not conversation, so they are emitted by
+ * code on the transition whoever caused it. The Boss closing an incident has
+ * to leave the same line in the thread an agent's close does.
+ */
+test("the Boss closing an incident posts the same closed notice an agent's close does", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-boss-close", "export-errors"));
+  const id = incidentOf("fp-boss-close")!;
+  const thread = threadOf(id)!;
+
+  const before = boss.db.get<{ status: string; postmortem: string | null }>(
+    "SELECT status, postmortem FROM incident WHERE id = ?",
+    [id],
+  )!;
+  assert.equal(before.status, "INVESTIGATING", "the premise: open, and no agent close");
+  assert.equal(before.postmortem, null);
+  assert.ok(
+    fakeSlack.posts.every((p) => !(p.threadTs === thread && /closed\*/.test(p.text))),
+    "nothing has announced a close in this thread yet",
+  );
+
+  const reason =
+    "the alert was a test rule somebody forgot to delete, and it has been deleted";
+  fakeSlackAgent.script = async (req) => {
+    await bossTool(req, "close_incident", { incidentId: id, reason });
+    return "";
+  };
+  await boss.slackEvent(replyIn(thread, "that alert was a leftover test rule, I deleted it"));
+
+  assert.equal(
+    boss.db.get<{ status: string }>("SELECT status FROM incident WHERE id = ?", [id])
+      ?.status,
+    "CLOSED",
+  );
+  const notice = fakeSlack.posts.filter((p) => p.threadTs === thread).at(-1)!;
+  assert.equal(notice.text.split("\n")[0], `*Incident ${id} closed*`);
+
+  // The agent's close from the first test in this file, for the same line.
+  const agentClose = fakeSlack.posts.find(
+    (p) => p.threadTs !== thread && /^\*Incident \d+ closed\*\n/.test(p.text),
+  );
+  assert.ok(agentClose, "an agent's close is on record to compare against");
+  assert.equal(
+    notice.text.split("\n")[0].replace(id, "N"),
+    agentClose.text.split("\n")[0].replace(/\d+/, "N"),
+    "one headline, whoever closed it",
+  );
+  assert.deepEqual(
+    boss.db.get("SELECT actorKind, action FROM incident_action WHERE incidentId = ?", [id]),
+    { actorKind: "boss", action: "close" },
+    "and the trail says who did it",
+  );
+});
+
+/**
+ * A trigger that lands while the thread's run is in flight is never told
+ * the Boss is busy: the holder runs again before it lets go. So the
+ * premise is that the first run was still going when the second message
+ * arrived, and the outcome is that a later run was shown it.
+ */
+test("a message that arrives while the Boss is mid-run is read, not dropped", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-boss-busy", "search-errors"));
+  const id = incidentOf("fp-boss-busy")!;
+  const thread = threadOf(id)!;
+
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let running = false;
+  fakeSlackAgent.script = async () => {
+    running = true;
+    await gate;
+    running = false;
+    return "";
+  };
+
+  const askedBefore = fakeSlackAgent.asked.length;
+  const first = await boss.slackEventAccepted({
+    ...replyIn(thread, "search is slow for me too"),
+    ts: "5000.1",
+  });
+  await until(() => running, "the first run to start");
+
+  const second = await boss.slackEventAccepted({
+    ...replyIn(thread, "it is only the people search, not the district one"),
+    ts: "5000.2",
+  });
+  await second.settled;
+  assert.equal(running, true, "the premise: the first run was still going");
+  assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "and nothing else had run");
+
+  release();
+  await first.settled;
+
+  assert.equal(fakeSlackAgent.asked.length, askedBefore + 2, "the holder ran again");
+  assert.match(
+    fakeSlackAgent.asked.at(-1)!,
+    /only the people search, not the district one/,
+    "on the message that arrived mid-run",
+  );
+  assert.ok(
+    fakeSlack.posts.every((p) => !/busy/i.test(p.text)),
+    "and nobody was told the Boss was busy",
+  );
+});
+
+/**
+ * An agent's escalation is a row in the Boss's inbox, and reaching people is
+ * the Boss's call. When it makes it, the page is composed by code, so it is
+ * the rotation mention and not text the model typed.
+ */
+test("an agent's escalation wakes the Boss, and the Boss's page reaches the rotation", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
+  await boss.ingest("grafana", grafanaBody("fp-esc-page", "refund-errors"));
+  const id = incidentOf("fp-esc-page")!;
+  const thread = threadOf(id)!;
+  const paged = () =>
+    fakeSlack.posts.filter(
+      (p) => p.threadTs === thread && p.text.startsWith(`<!here> *Incident ${id} needs a person*`),
+    );
+  assert.deepEqual(paged(), [], "the premise: nobody has been paged in this thread");
+
+  const brief = "The refund fix needs a person with Stripe dashboard access to confirm it.";
+  let shown = "";
+  fakeSlackAgent.script = async (req) => {
+    shown = req.input;
+    await bossTool(req, "page_rotation", {
+      incidentId: id,
+      reason: "Somebody with Stripe dashboard access needs to confirm the refund fix before it ships.",
+    });
+    return "";
+  };
+  await bossClientFor(id, boss.mintToken(id)).tellBoss("escalation", brief);
+  await until(() => paged().length > 0, "the Boss to page the rotation");
+
+  assert.ok(shown.includes(brief), "the Boss paged on the escalation it was shown");
+  assert.equal(paged().length, 1, "once");
+  assert.match(paged()[0].text, /Stripe dashboard access/);
 });
 
 // --- a person combining two incidents --------------------------------------
@@ -1899,6 +2008,15 @@ const statusOf = (incidentId: string) =>
     [incidentId],
   )!;
 
+/** A mention out in the channel, as Slack delivers it. */
+const mentionSaying = (text: string, ts: string) => ({
+  type: "app_mention",
+  channel: "C0TEST",
+  user: "U-swain",
+  text: `<@B0BOSS> ${text}`,
+  ts,
+});
+
 const signalsOn = (incidentId: string) =>
   boss.db
     .query<{ sourceId: string }>(
@@ -1907,61 +2025,19 @@ const signalsOn = (incidentId: string) =>
     )
     .map((r) => r.sourceId);
 
-test("a person asking for a merge in a thread gets the merge, not a refusal", async () => {
-  const { older, newer } = await twoIncidents("comb");
-  const before = fakeSlack.posts.length;
-
-  fakeModel.intents.push({ addressed: "others", combineIds: [older] });
-  await boss.slackEvent(
-    replyIn(threadOf(newer)!, `this is the same bug as ${older}, merge them`),
-  );
-
-  assert.equal(statusOf(newer).status, "MERGED");
-  assert.equal(statusOf(newer).mergedInto, older);
-  assert.equal(statusOf(older).status, "INVESTIGATING");
-  assert.deepEqual(signalsOn(older), ["fp-comb-new", "fp-comb-old"]);
-  assert.deepEqual(signalsOn(newer), []);
-
-  const said = fakeSlack.posts.slice(before);
-  assert.ok(
-    said.some(
-      (p) => p.threadTs === threadOf(newer) && /Done -- .*is now part of/.test(p.text),
-    ),
-    "the person who asked is answered in the thread they asked in",
-  );
-  assert.equal(
-    said.filter(
-      (p) =>
-        p.threadTs === threadOf(newer) &&
-        /last message in this thread|thread stops here/.test(p.text),
-    ).length,
-    1,
-    "exactly one message says this thread is ending, and it is the one carrying the link",
-  );
-  assert.ok(
-    said.some(
-      (p) =>
-        p.threadTs === threadOf(older) &&
-        /is the same problem as this one/.test(p.text),
-    ),
-    "and the surviving thread says where the signals came from",
-  );
-  assert.equal(fakeModel.intents.length, 0, "intents drained");
-});
-
 /**
- * The direction is not the asker's to pick. Somebody standing in the older
- * thread saying "fold this into the new one" is describing the merge they
- * want, not choosing which record survives, and obeying them is how a thread
- * with history gets abandoned for one with none.
+ * The direction is not the asker's to pick. Somebody saying "fold the old one
+ * into the new one" is describing the merge they want, not choosing which
+ * record survives, and obeying them is how a thread with history gets
+ * abandoned for one with none.
  */
 test("the established incident survives even when the person asks the other way", async () => {
   const { older, newer } = await twoIncidents("rev");
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineIds: [newer] });
+  fakeModel.intents.push({ intent: "combine", combineIds: [older, newer] });
   await boss.slackEvent(
-    replyIn(threadOf(older)!, `merge this one into ${newer}, same root cause`),
+    mentionSaying(`merge ${older} into ${newer}, same root cause`, "2102.1"),
   );
 
   assert.equal(
@@ -1973,36 +2049,19 @@ test("the established incident survives even when the person asks the other way"
   assert.equal(statusOf(older).status, "INVESTIGATING");
 
   // Getting the opposite of what you asked for and being told nothing is the
-  // failure this whole change is about, one layer down: the merge happened,
-  // the other way round, and the person is still watching their own thread.
-  const said = fakeSlack.posts.slice(before);
+  // failure this is about: the merge happened, the other way round, and the
+  // person is still watching the message they typed.
   assert.ok(
-    said.some(
-      (p) =>
-        p.threadTs === threadOf(older) &&
-        /Done -- .*is now part of/.test(p.text),
-    ),
-    "the person who asked is answered in the thread they asked in",
-  );
-  assert.ok(
-    said.some(
-      (p) =>
-        p.threadTs === threadOf(older) &&
-        /is the older record, so it stays the incident of record/.test(p.text),
-    ),
+    fakeSlack.posts
+      .slice(before)
+      .some(
+        (p) =>
+          p.threadTs === "2102.1" &&
+          /is the older record, so it stays the incident of record/.test(p.text),
+      ),
     // "incident of record" is the term assign.ts, types.ts and the docs all
-    // use for this. Somebody reading the thread and somebody reading the
-    // design should not have to work out that two phrases mean one thing.
+    // use for this.
     "and told why it went the way it did, in the words the rest of this uses",
-  );
-  assert.equal(
-    said.filter(
-      (p) =>
-        p.threadTs === threadOf(older) &&
-        /last message in this thread|carries on here/.test(p.text),
-    ).length,
-    1,
-    "the surviving thread is told it continues, once, and never that it ends",
   );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
@@ -2011,21 +2070,16 @@ test("the established incident survives even when the person asks the other way"
  * The model reads a message written by whoever is in the channel, and an
  * incident id is two digits. An id it produces that is not in what they
  * typed is a number it made up, and acting on one merges two incidents at
- * nobody's request.
- *
- * It is not silent about it, though. From in here the two cases are
- * indistinguishable -- a model that hallucinated an id, and a person whose
- * sentence this read as a combine -- and the second of those asked. Saying
- * nothing to somebody who asked is the failure this change exists to
- * remove; the cost of the mistake in the other direction is one line.
+ * nobody's request. It still answers, because from in here a hallucinated id
+ * and a real request look the same.
  */
 test("an incident id the person never typed is not merged, and is not ignored", async () => {
   const { older, newer } = await twoIncidents("ghost");
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "others", combineIds: [older] });
+  fakeModel.intents.push({ intent: "combine", combineIds: [older, newer] });
   await boss.slackEvent(
-    replyIn(threadOf(newer)!, "still seeing this on the checkout path"),
+    mentionSaying(`${newer} looks like the same checkout bug, merge it`, "2103.1"),
   );
 
   assert.equal(statusOf(newer).status, "INVESTIGATING");
@@ -2034,8 +2088,8 @@ test("an incident id the person never typed is not merged, and is not ignored", 
 
   const said = fakeSlack.posts.slice(before);
   assert.ok(
-    said.some((p) => /which other incident you meant/.test(p.text)),
-    "it asks which incident rather than going quiet on a request",
+    said.some((p) => /which two incidents/.test(p.text)),
+    "it asks which incidents rather than going quiet on a request",
   );
   assert.ok(
     said.every((p) => !/cannot|can't|unable/i.test(p.text)),
@@ -2054,73 +2108,26 @@ test("a combine naming an incident that cannot take signals is declined out loud
   });
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineIds: [older] });
+  fakeModel.intents.push({ intent: "combine", combineIds: [newer, older] });
   await boss.slackEvent(
-    replyIn(threadOf(newer)!, `isn't this the same as ${older}? merge them`),
+    mentionSaying(`isn't ${newer} the same as ${older}? merge them`, "2104.1"),
   );
 
   assert.equal(statusOf(newer).status, "INVESTIGATING");
-  const said = fakeSlack.posts.slice(before);
   assert.ok(
-    said.some((p) => /is CLOSED and is not taking signals/.test(p.text)),
+    fakeSlack.posts
+      .slice(before)
+      .some((p) => /is CLOSED and is not taking signals/.test(p.text)),
     "a person who asked for something impossible is told, not ignored",
   );
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
 /**
- * The thread the message arrived in was open when it arrived. Reading what
- * the message meant is a model call, and an incident can be resolved and
- * closed while that call is in flight -- which is the one window where the
- * route in hand is stale. Without the re-read the signals leave a closed
- * incident, quietly: `assign` guards the target's status and not the
- * source's, so the move lands and the record it emptied stays CLOSED.
+ * A merge asked for out in the channel. There is no incident thread out
+ * here, so both ids come from the message.
  */
-test("a combine is refused when the thread's own incident closed while it was being read", async () => {
-  const { older, newer } = await twoIncidents("stale");
-  await boss.db.withWrite((w) => {
-    w.prepare(
-      `UPDATE incident SET status = 'CLOSED', resolvedAt = 1, closedAt = 2,
-         postmortem = 'closed by the test' WHERE id = ?`,
-    ).run(newer);
-  });
-  const before = fakeSlack.posts.length;
-
-  fakeModel.intents.push({ addressed: "agent", combineIds: [older] });
-  await boss.slackEvent(
-    replyIn(threadOf(newer)!, `this is the same bug as ${older}`),
-  );
-
-  assert.deepEqual(
-    signalsOn(newer),
-    ["fp-stale-new"],
-    "nothing leaves a closed incident",
-  );
-  assert.deepEqual(signalsOn(older), ["fp-stale-old"]);
-  assert.ok(
-    fakeSlack.posts
-      .slice(before)
-      .some((p) =>
-        new RegExp(`${newer}.{0,40}is CLOSED and is not taking signals`).test(
-          p.text,
-        ),
-      ),
-    "and the person is told why, rather than watching nothing happen",
-  );
-  assert.equal(fakeModel.intents.length, 0, "intents drained");
-});
-
-/**
- * The same request, typed at the bot instead of into a thread.
- *
- * This is the "fluidity" complaint as a test. Out here there is no incident
- * thread, so the mention used to be read as a question and handed to the
- * read-only box, which answered that it could not -- while the identical
- * sentence typed four lines lower, inside a thread, merged two incidents.
- * A person cannot see the boundary that makes those differ and did not ask
- * about it. One executor answers both.
- */
-test("the same ask typed at the bot outside a thread does the same thing", async () => {
+test("a merge asked for at the bot outside a thread is done", async () => {
   const { older, newer } = await twoIncidents("mention");
 
   const before = fakeSlack.posts.length;
@@ -2210,9 +2217,9 @@ test("a combine naming an incident that does not exist says so", async () => {
   const { newer } = await twoIncidents("nosuch");
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineIds: ["9999"] });
+  fakeModel.intents.push({ intent: "combine", combineIds: [newer, "9999"] });
   await boss.slackEvent(
-    replyIn(threadOf(newer)!, "this is the same bug as 9999, merge them"),
+    mentionSaying(`${newer} is the same bug as 9999, merge them`, "2105.1"),
   );
 
   assert.equal(statusOf(newer).status, "INVESTIGATING");
@@ -2238,9 +2245,9 @@ test("a combine with nothing left to move says so rather than writing", async ()
   });
   const before = fakeSlack.posts.length;
 
-  fakeModel.intents.push({ addressed: "agent", combineIds: [older] });
+  fakeModel.intents.push({ intent: "combine", combineIds: [newer, older] });
   await boss.slackEvent(
-    replyIn(threadOf(newer)!, `same thing as ${older}, merge them`),
+    mentionSaying(`${newer} is the same thing as ${older}, merge them`, "2106.1"),
   );
 
   assert.equal(statusOf(newer).status, "INVESTIGATING");
@@ -2258,55 +2265,49 @@ test("a combine with nothing left to move says so rather than writing", async ()
 /**
  * `escalate` is the surviving half of `handOff`. The other half wrote
  * `owner = 'human'`, and that made one call mean two things: "somebody
- * should look at this" and "nobody is working this any more". An agent out
- * of ideas fired both.
+ * should look at this" and "nobody is working this any more".
  *
- * What is left is a post in the thread and a ping at the rotation. The last
- * assertion is the one that proves the fix -- the incident row is byte for
- * byte what it was before the call.
+ * An agent never posts to Slack now. Its escalation lands in the Boss's
+ * inbox and wakes it; whether and how people are reached is the Boss's call.
+ * The premise is that the Boss chose silence here, so any post would have to
+ * be the agent's own.
  */
-test("an escalation is a post and a ping, and leaves the incident alone", async () => {
+test("an agent's escalation reaches the Boss, not the thread, and leaves the incident alone", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
   await boss.ingest("grafana", grafanaBody("fp-esc", "payment-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-esc'`,
-  )!;
+  const id = incidentOf("fp-esc")!;
   const was = boss.db.get<Record<string, unknown>>(
     "SELECT * FROM incident WHERE id = ?",
-    [row.id],
+    [id],
   );
 
+  const brief = "The fix touches the payment path and wants a person to sign it off.";
+  let shown = "";
+  fakeSlackAgent.script = async (req) => {
+    shown = req.input;
+    return "";
+  };
   const before = fakeSlack.posts.length;
-  const response = await bossClientFor(row.id, boss.mintToken(row.id)).escalate({
-    reason: "the fix touches the payment path and wants a person to sign it off",
-    brief: "Ruled out DNS and the CDN. The bad write is in the upgrade webhook.",
-  });
-  assert.ok(response.ok, response.error);
+  await bossClientFor(id, boss.mintToken(id)).tellBoss("escalation", brief);
+  await until(() => shown !== "", "the Boss to wake on the escalation");
 
-  const said = fakeSlack.posts.slice(before);
-  assert.equal(said.length, 2, "the brief in the thread, the ping at the rotation");
-  assert.equal(said[0].threadTs, row.slackThreadTs);
-  assert.match(said[0].text, /needs a person to look/);
-  assert.match(said[0].text, /bad write is in the upgrade webhook/);
-  assert.match(
-    said[0].text,
-    /An agent is still working this incident/,
-    "the thread is told the thing that used to be false",
-  );
-  assert.match(said[1].text, /needs a human/, "and the rotation is pinged");
-
-  assert.deepEqual(
-    boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [
-      row.id,
-    ]),
-    was,
-    "nothing was written: an escalation is an announcement, not a transition",
+  assert.ok(shown.includes(brief), "the Boss was shown what the agent sent up");
+  assert.ok(
+    boss.db.get(
+      "SELECT 1 FROM boss_inbox WHERE incidentId = ? AND kind = 'escalation'",
+      [id],
+    ),
+    "as an escalation in its inbox",
   );
   assert.deepEqual(
-    boss.db.query("SELECT id FROM incident_action WHERE incidentId = ?", [row.id]),
+    fakeSlack.posts.slice(before),
     [],
-    "and there is no transition to record in the trail",
+    "the agent posted nothing itself, and the Boss chose to say nothing",
+  );
+  assert.deepEqual(
+    boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [id]),
+    was,
+    "nothing was written: an escalation is a message, not a transition",
   );
 });
 
@@ -2338,6 +2339,7 @@ test("neither a reply nor an escalation can strand an incident", async () => {
     s3: undefined,
     rotationMembers: async () => rotation.members,
     secrets: { slackBotUserId: "B0BOSS" },
+    slackAgentModel: fakeSlackAgent,
     insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
   });
 
@@ -2348,7 +2350,6 @@ test("neither a reply nor an escalation can strand an incident", async () => {
       "SELECT id, slackThreadTs FROM incident",
     )!;
 
-    fakeModel.intents.push({ addressed: "agent" });
     await stranding.slackEvent(
       replyIn(row.slackThreadTs!, "I'll take this one, stand down"),
     );
@@ -2391,18 +2392,15 @@ test("neither a reply nor an escalation can strand an incident", async () => {
  *
  * An agent that stops driving has to leave something saying "do not relaunch
  * me yet", or the dispatcher puts it straight back into whatever stopped it
- * and the incident becomes a hot loop instead of a stalled one. `owner` used
- * to be that something, and deleting it without a replacement would have
- * traded eight quiet incidents for eight noisy ones.
+ * and the incident becomes a hot loop instead of a stalled one.
  *
- * So the replacement has to hold two properties at once, and this drives both
- * through the real wiring: the park keeps the dispatcher off it, and a reply
- * in the thread lifts it. The reply path matters most, because it is the
- * exact sentence that used to vanish -- and nothing on that path reads what
- * the message meant, so it cannot go quiet the day somebody phrases it their
- * own way.
+ * What lifts that now is the Boss telling the agent something, because the
+ * Boss is the only way anything a person says reaches it. A reply the Boss
+ * lets pass is chatter, and relaunching an agent for chatter costs a launch
+ * for nothing to read -- so the premise is that the first reply really did
+ * reach the Boss and really did leave the wait in place.
  */
-test("a parked incident is left alone, and any reply wakes it", async () => {
+test("a parked incident is left alone, and the Boss telling its agent something wakes it", async () => {
   const parked = await createBugBoss({
     config: config(join(dir, "parked.db")),
     model: fakeModel,
@@ -2418,6 +2416,7 @@ test("a parked incident is left alone, and any reply wakes it", async () => {
     s3: undefined,
     rotationMembers: async () => rotation.members,
     secrets: { slackBotUserId: "B0BOSS" },
+    slackAgentModel: fakeSlackAgent,
     insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
   });
 
@@ -2427,48 +2426,36 @@ test("a parked incident is left alone, and any reply wakes it", async () => {
     const row = parked.db.get<{ id: string; slackThreadTs: string | null }>(
       "SELECT id, slackThreadTs FROM incident",
     )!;
+    const waiting = () =>
+      parked.db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [row.id]) !==
+      undefined;
 
     const first = await parked.dispatchOnce();
     assert.deepEqual(first.started.map((a) => a.incidentId), [row.id]);
+    assert.ok(waiting(), "the agent left something saying not yet");
 
-    assert.equal(
-      parked.db.get<{ waitingFor: string }>(
-        "SELECT waitingFor FROM incident_wait WHERE incidentId = ?",
-        [row.id],
-      )?.waitingFor,
-      "the credential rotation",
-      "the agent left something saying not yet",
-    );
-
-    // The property `owner` used to provide, and the reason this is not just a
-    // deletion: without it this tick relaunches into the same dead end.
     const whileParked = await parked.dispatchOnce();
     assert.deepEqual(
       whileParked.started,
       [],
       "parked, so the dispatcher leaves it alone instead of looping on it",
     );
-    assert.equal(
-      parked.db.get<{ status: string }>(
-        "SELECT status FROM incident WHERE id = ?",
-        [row.id],
-      )?.status,
-      "INVESTIGATING",
-      "and parking is not a status change; the agent still has this one",
-    );
 
-    // An ordinary sentence. Not a claim, not a magic phrase, and read by no
-    // model on the path that lifts the wait.
-    fakeModel.intents.push({ addressed: "agent" });
+    const askedBefore = fakeSlackAgent.asked.length;
+    fakeSlackAgent.script = async () => "";
+    await parked.slackEvent(replyIn(row.slackThreadTs!, "anyone know who owns the rotation?"));
+    assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "the Boss read it");
+    assert.ok(waiting(), "and chatter the Boss let pass does not wake the agent");
+
+    fakeSlackAgent.script = async (req) => {
+      await bossTool(req, "message_agent", {
+        incidentId: row.id,
+        text: "The credential rotation is done; Ada did it at 10:40.",
+      });
+      return "";
+    };
     await parked.slackEvent(replyIn(row.slackThreadTs!, "rotation is done"));
-
-    assert.equal(
-      parked.db.get("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [
-        row.id,
-      ]),
-      undefined,
-      "talking to an incident wakes it",
-    );
+    assert.equal(waiting(), false, "the Boss telling the agent is what wakes it");
 
     const woken = await parked.dispatchOnce();
     assert.deepEqual(
@@ -2476,94 +2463,24 @@ test("a parked incident is left alone, and any reply wakes it", async () => {
       [row.id],
       "and the next tick puts an agent back on it",
     );
-    assert.equal(fakeModel.intents.length, 0, "intents drained");
   } finally {
     parked.stop();
   }
 });
 
 /**
- * The message nobody can place. `contact_human` ends its wait on the first
- * reply it sees, so this is the one case where saying nothing is expensive:
- * the person walks away believing their answer landed as an answer, and the
- * agent is still sitting on the question.
- *
- * So it is asked about, and the ask is specific -- tag me and say it again --
- * because that is the single move that turns the message into an answer.
- *
- * Everything else happens regardless: the message is on the incident's record
- * and the agent has it as context. That is the whole cost of being wrong
- * here, and it is why the read prefers unclear over a wrong `agent`.
- */
-test("a reply nothing can place is asked about while a question is outstanding", async () => {
-  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
-  await boss.ingest("grafana", grafanaBody("fp-own-3", "upload-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-3'`,
-  )!;
-  await boss.db.withWrite((w) => {
-    w.prepare(
-      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
-       VALUES (?, ?, ?, ?)`,
-    ).run(row.id, "ts-q", Date.now() - 1000, "Shall I restart the worker?");
-  });
-
-  fakeModel.intents.push({ addressed: "unclear" });
-  const before = fakeSlack.posts.length;
-  await boss.slackEvent(replyIn(row.slackThreadTs!, "ok whatever you think"));
-
-  const asked = fakeSlack.posts.slice(before);
-  assert.equal(asked.length, 1, "one message earns one post");
-  assert.equal(asked[0].threadTs, row.slackThreadTs);
-  assert.match(asked[0].text, /could not tell whether that was for the agent/);
-  assert.match(
-    asked[0].text,
-    /the answer the agent is waiting for, tag me/,
-    "the half that used to be dropped",
-  );
-  assert.equal(
-    boss.db.query("SELECT id FROM thread_reply WHERE incidentId = ?", [row.id])
-      .length,
-    1,
-    "the message is on the record whatever could be read of it",
-  );
-  const [directive] = boss.db.query<{ payload: string }>(
-    "SELECT payload FROM pending_directive WHERE incidentId = ?",
-    [row.id],
-  );
-  assert.equal(
-    (JSON.parse(directive.payload) as Directive & { addressed?: string })
-      .addressed,
-    "others",
-    "and the agent has it as context, which is all an unplaceable one earns",
-  );
-  assert.equal(fakeModel.intents.length, 0, "intents drained");
-});
-
-/**
  * An incident that is over still has a thread, and people still ask things in
- * it. Nothing is ever launched on a closed incident, so the directive a reply
- * there writes will never be read -- which used to be the end of the story.
- * The branch that handled a message it could not place returned before the
- * read-only Slack agent ran, so somebody who tagged @bugboss in a quiet
- * thread got a clarification and no answer.
- *
- * The two are independent now rather than an if/else: a tagged question in a
- * thread no agent is on goes to the thing that can answer it.
+ * it. Nothing is ever launched on a closed incident, but the Boss answers
+ * there the same as anywhere.
  */
-test("a tagged question in a thread no agent is on is still answered", async () => {
+test("a question in the thread of an incident that is over still reaches the Boss", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
   await boss.ingest("grafana", grafanaBody("fp-own-7", "queue-lag"));
   const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
     `SELECT i.id, i.slackThreadTs FROM incident i
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-7'`,
   )!;
-  // Closed is the one state that cannot be argued with: the dispatcher will
-  // never run this incident again, so nothing is listening in its thread. The
-  // three companion columns are not decoration -- a CHECK constraint refuses
-  // a CLOSED row without them, because a close with no write-up is the
-  // failure the schema exists to make impossible.
+  // A CHECK constraint refuses a CLOSED row without these three columns.
   await boss.db.withWrite((w) => {
     w.prepare(
       `UPDATE incident
@@ -2572,260 +2489,23 @@ test("a tagged question in a thread no agent is on is still answered", async () 
     ).run(Date.now(), Date.now(), "# Summary\nThe queue was never lagging.", row.id);
   });
 
-  fakeModel.intents.push({ addressed: "agent" });
   const askedBefore = fakeSlackAgent.asked.length;
-  await boss.slackEvent({
-    type: "app_mention",
-    channel: "C0TEST",
-    user: "U-swain",
-    text: "<@B0BOSS> what did you find on this one?",
-    ts: `${Date.now() / 1000}`,
-    thread_ts: row.slackThreadTs!,
-  });
+  await boss.slackEvent(replyIn(row.slackThreadTs!, "what did you find on this one?"));
 
   assert.equal(
     fakeSlackAgent.asked.length,
     askedBefore + 1,
     "the question reaches something that can answer it",
   );
-  assert.match(
-    fakeSlackAgent.asked.at(-1) ?? "",
-    /what did you find on this one/,
-    "carrying what was actually asked, with the bot mention stripped",
-  );
-  assert.equal(fakeModel.intents.length, 0, "intents drained");
+  assert.match(fakeSlackAgent.asked.at(-1) ?? "", /what did you find on this one/);
 });
 
 /**
- * The inverse: nothing is blocked, so there is no wait to end and no reason
- * to narrate that the message went through as context.
- */
-test("an unreadable addressee with nothing blocked on it says nothing extra", async () => {
-  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
-  await boss.ingest("grafana", grafanaBody("fp-own-6", "index-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-6'`,
-  )!;
-
-  fakeModel.intents.push({ addressed: "unclear" });
-  const before = fakeSlack.posts.length;
-  await boss.slackEvent(replyIn(row.slackThreadTs!, "hmm"));
-
-  assert.equal(fakeSlack.posts.length, before, "no question is outstanding");
-  assert.equal(
-    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [row.id])
-      .length,
-    1,
-    "and the agent has it anyway",
-  );
-});
-
-test("a message nothing could read is said out loud, not swallowed", async () => {
-  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
-  await boss.ingest("grafana", grafanaBody("fp-own-4", "export-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-own-4'`,
-  )!;
-  // Something is blocked on an answer, which is the only state in which a
-  // message nobody could place is worth narrating at all.
-  await boss.db.withWrite((w) => {
-    w.prepare(
-      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
-       VALUES (?, ?, ?, ?)`,
-    ).run(row.id, "ts-q", Date.now() - 1000, "Is the worker safe to restart?");
-  });
-  const was = boss.db.get<Record<string, unknown>>(
-    "SELECT * FROM incident WHERE id = ?",
-    [row.id],
-  );
-
-  fakeModel.intents.push(new Error("bedrock: ThrottlingException"));
-  const before = fakeSlack.posts.length;
-  const errors: string[] = [];
-  const original = console.error;
-  console.error = (line: unknown) => errors.push(String(line));
-  try {
-    await boss.slackEvent(replyIn(row.slackThreadTs!, "I'm taking this one"));
-  } finally {
-    console.error = original;
-  }
-
-  assert.deepEqual(
-    boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [
-      row.id,
-    ]),
-    was,
-    "a dead model cannot move an incident, because nothing on this path does",
-  );
-  assert.ok(
-    errors.some((line) => line.includes('"event":"unreadable"')),
-    "the failure reaches the log, which does not depend on Slack",
-  );
-  const said = fakeSlack.posts.slice(before);
-  assert.equal(said.length, 1);
-  assert.match(said[0].text, /the error is in the BugBoss logs/);
-});
-
-// --- who a reply was for ----------------------------------------------------
-
-/**
- * `contact_human` ends its wait on the first reply it sees. Two people
- * talking to each other while an agent is blocked therefore used to end that
- * wait on whichever of them spoke first, and nothing anywhere records that it
- * happened -- the investigation simply turns on an offhand remark, and the
- * person who was actually asked never finds out their answer went unread.
- *
- * This is the whole job the reply read is left doing, now that there is no
- * second question about who the incident belongs to.
- */
-test("two people talking do not end an agent's wait, but the agent still sees it", async () => {
-  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
-  await boss.ingest("grafana", grafanaBody("fp-addr-1", "webhook-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-addr-1'`,
-  )!;
-
-  const askedAt = Date.now() - 1000;
-  await boss.db.withWrite((w) => {
-    w.prepare(
-      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
-       VALUES (?, ?, ?, ?)`,
-    ).run(row.id, "ts-q", askedAt, "Does org X bypass the Stripe webhook?");
-  });
-
-  fakeModel.intents.push({ addressed: "others" });
-  await boss.slackEvent(
-    replyIn(row.slackThreadTs!, "did anyone check org X?", "U-ada"),
-  );
-
-  fakeModel.intents.push({ addressed: "agent" });
-  await boss.slackEvent(
-    replyIn(row.slackThreadTs!, "yes, org X bypasses it", "U-grace"),
-  );
-
-  const pending = boss.db
-    .query<{ id: number; payload: string }>(
-      "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-      [row.id],
-    )
-    .map((d) => ({ id: d.id, directive: JSON.parse(d.payload) as Directive }));
-
-  assert.equal(pending.length, 2, "both messages reach the agent");
-  assert.equal(
-    boss.db.query("SELECT id FROM thread_reply WHERE incidentId = ?", [row.id])
-      .length,
-    2,
-    "and both are on the incident's record",
-  );
-
-  const ended = firstReplyAfter(pending, askedAt);
-  assert.ok(ended, "the wait does end");
-  assert.equal(
-    ended.directive.text,
-    "yes, org X bypasses it",
-    "on the message that was for the agent, not the one that came first",
-  );
-});
-
-/**
- * The escape hatch. Requiring a tag for everything makes answering a direct
- * question ceremony, so it is not required -- but when somebody wants
- * certainty it is absolute, and because it is applied in code rather than by
- * the model it is the one path that still works while the model is down.
- */
-test("tagging the bot always means the message is for the agent", async () => {
-  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
-  await boss.ingest("grafana", grafanaBody("fp-addr-2", "import-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-addr-2'`,
-  )!;
-
-  const askedAt = Date.now() - 1000;
-  await boss.db.withWrite((w) => {
-    w.prepare(
-      `INSERT INTO pending_question (incidentId, messageTs, askedAt, message)
-       VALUES (?, ?, ?, ?)`,
-    ).run(row.id, "ts-q", askedAt, "Shall I restart the worker?");
-  });
-
-  // The model is down. The tag is still the answer.
-  fakeModel.intents.push(new Error("bedrock: ThrottlingException"));
-  const errors: string[] = [];
-  const original = console.error;
-  console.error = (line: unknown) => errors.push(String(line));
-  try {
-    await boss.slackEvent({
-      type: "app_mention",
-      channel: "C0TEST",
-      user: "U-swain",
-      text: "<@B0BOSS> yes, go ahead and restart it",
-      ts: `${Date.now() / 1000}`,
-      thread_ts: row.slackThreadTs!,
-    });
-  } finally {
-    console.error = original;
-  }
-
-  const pending = boss.db
-    .query<{ id: number; payload: string }>(
-      "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-      [row.id],
-    )
-    .map((d) => ({ id: d.id, directive: JSON.parse(d.payload) as Directive }));
-
-  const ended = firstReplyAfter(pending, askedAt);
-  assert.ok(ended, "a tagged message ends the wait with no model in the loop");
-  assert.match(ended.directive.text, /go ahead and restart it/);
-  assert.ok(
-    errors.some((line) => line.includes('"event":"unreadable"')),
-    "and the failed read is still said out loud",
-  );
-});
-
-test("a message nothing could read still reaches the agent as context", async () => {
-  fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
-  await boss.ingest("grafana", grafanaBody("fp-addr-3", "render-errors"));
-  const row = boss.db.get<{ id: string; slackThreadTs: string | null }>(
-    `SELECT i.id, i.slackThreadTs FROM incident i
-       JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-addr-3'`,
-  )!;
-
-  fakeModel.intents.push(new Error("bedrock: ThrottlingException"));
-  const original = console.error;
-  console.error = () => undefined;
-  try {
-    await boss.slackEvent(replyIn(row.slackThreadTs!, "it started at 09:12"));
-  } finally {
-    console.error = original;
-  }
-
-  const [directive] = boss.db.query<{ payload: string }>(
-    "SELECT payload FROM pending_directive WHERE incidentId = ?",
-    [row.id],
-  );
-  const parsed = JSON.parse(directive.payload) as Directive & {
-    addressed?: string;
-  };
-  assert.equal(parsed.type, "human_message");
-  assert.equal(
-    parsed.addressed,
-    "others",
-    "a message nobody could read is context, never the answer to a pending question",
-  );
-});
-
-/**
- * The classifier reads attacker-influenceable text -- pasted log lines, an
- * alert body somebody outside the company can write -- and its answer decides
- * whether an agent's wait ends. So the property that has to hold is
- * structural rather than a matter of the model being hard to talk round: the
- * incident comes from the thread the message arrived in, never from the
- * message. A reply that names another incident and gives orders about it
- * reaches exactly as far as any other reply in its own thread.
+ * A reply is attacker-influenceable text -- pasted log lines, an alert body
+ * somebody outside the company can write. The incident it is about comes
+ * from the thread it arrived in, never from the message, and routing it
+ * writes nothing to any incident. A reply that names another incident and
+ * gives orders about it reaches the Boss for its own thread and nothing else.
  */
 test("a message cannot reach the incident it names", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
@@ -2846,7 +2526,6 @@ test("a message cannot reach the incident it names", async () => {
     [other.id],
   );
 
-  fakeModel.intents.push({ addressed: "agent" });
   await boss.slackEvent(
     replyIn(
       mine.slackThreadTs!,
@@ -2855,16 +2534,17 @@ test("a message cannot reach the incident it names", async () => {
   );
 
   assert.deepEqual(
-    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [
+    boss.db.query("SELECT id FROM pending_directive WHERE incidentId IN (?, ?)", [
       other.id,
+      mine.id,
     ]),
     [],
-    "the incident it named hears nothing, whatever the model answered",
+    "routing tells no agent anything, whatever the words said",
   );
   assert.deepEqual(
     boss.db.query("SELECT id FROM thread_reply WHERE incidentId = ?", [other.id]),
     [],
-    "and nothing lands on its record either",
+    "and nothing lands on the named incident's record",
   );
   assert.deepEqual(
     boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [
@@ -2873,14 +2553,6 @@ test("a message cannot reach the incident it names", async () => {
     otherWas,
     "and its row is untouched, so the wording bought nothing at all",
   );
-  assert.equal(
-    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [
-      mine.id,
-    ]).length,
-    1,
-    "the only incident a reply can reach is the one whose thread it was in",
-  );
-  assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
 // --- the reaction that says the message landed -----------------------------
@@ -2891,9 +2563,6 @@ test("a verified Slack delivery is acknowledged through the real wiring", async 
   // acknowledgeSlack: wired to nothing, both of those stay green and the
   // channel still gets no :eyes:.
   //
-  // Tagged rather than a plain reply, because ingress stopped reading words:
-  // an untagged reply is `ignored` at this layer and earns no reaction, even
-  // though the relay still acts on it. See slack/CLAUDE.md.
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
   await boss.ingest("grafana", grafanaBody("fp-ack", "upgrade-errors"));
   const row = boss.db.get<{ slackThreadTs: string | null }>(
@@ -2901,7 +2570,6 @@ test("a verified Slack delivery is acknowledged through the real wiring", async 
        JOIN signal s ON s.incidentId = i.id WHERE s.sourceId = 'fp-ack'`,
   )!;
 
-  fakeModel.intents.push({ addressed: "agent" });
   const res = await boss.publicApp.request("/slack", {
     method: "POST",
     headers: { "content-type": "application/json" },

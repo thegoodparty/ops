@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { applyAssign } from "./assign";
 import {
+  closeIncidentByBoss,
   createToolApi,
   type CorrelationMerge,
   type MergeVerdict,
@@ -2349,5 +2350,126 @@ describe("an incident that absorbed another one", () => {
       (view.data as IncidentView).absorbed.map((r) => r.id),
       [absorbed],
     );
+  });
+});
+
+describe("the Boss closing an incident", () => {
+  it("closes from FIXING with no resolution or post-mortem, into a row every CHECK accepts", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    await withThread(id);
+    const rootCause = await toolsFor(id).reportRootCause({
+      cause: "c",
+      explainedSignalIds: ["sig-a"],
+    });
+    assert.equal(rootCause.ok, true, rootCause.error);
+
+    // The premise: the two columns a CLOSED row must carry are both absent,
+    // so a close that forgot either would be refused by the schema.
+    const before = incidentRow(id);
+    assert.equal(before?.status, "FIXING");
+    assert.equal(before?.resolvedAt, null);
+    assert.equal(before?.postmortem, null);
+
+    const closed = await closeIncidentByBoss(
+      { db, slack },
+      { incidentId: id, reason: "incident 4 fixed this and the alert has been quiet for a day" },
+    );
+
+    assert.deepEqual(closed, { ok: true, from: "FIXING" });
+    const row = incidentRow(id);
+    assert.equal(row?.status, "CLOSED");
+    assert.ok(row?.closedAt);
+    assert.ok(row?.resolvedAt);
+    assert.match(row?.postmortem ?? "", /^Closed by BugBoss, not by the incident's agent/);
+    assert.match(row?.postmortem ?? "", /quiet for a day/);
+
+    const action = db.get<{ actorKind: string; action: string; reason: string }>(
+      "SELECT actorKind, action, reason FROM incident_action WHERE incidentId = ?",
+      [id],
+    );
+    assert.deepEqual(action, {
+      actorKind: "boss",
+      action: "close",
+      reason: "incident 4 fixed this and the alert has been quiet for a day",
+    });
+    assert.equal(
+      db.get<{ open: number }>(
+        "SELECT COUNT(*) AS open FROM signal WHERE incidentId = ? AND closedAt IS NULL",
+        [id],
+      )?.open,
+      0,
+    );
+
+    const directives = (await toolsFor(id).getIncident()).directives;
+    assert.ok(
+      directives.some((d) => d.type === "stop"),
+      "the agent still on it is told to stop",
+    );
+
+    const notice = postsIn(id).at(-1) ?? "";
+    assert.equal(notice.split("\n")[0], `*Incident ${id} closed*`);
+    assert.match(notice, /Closed by BugBoss/);
+  });
+
+  it("posts the same headline an agent's close does", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    await withThread(id);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await goesQuiet("sig-a");
+    await tools.reportResolved({ prUrls: [], evidence: "clean for an hour" });
+    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    const agentHeadline = (postsIn(id).at(-1) ?? "").split("\n")[0];
+
+    await seed("sig-b");
+    const other = await openIncident(["sig-b"]);
+    await withThread(other);
+    await closeIncidentByBoss({ db, slack }, { incidentId: other, reason: "a duplicate report" });
+    const bossHeadline = (postsIn(other).at(-1) ?? "").split("\n")[0];
+
+    assert.equal(agentHeadline, `*Incident ${id} closed*`);
+    assert.equal(bossHeadline.replace(other, id), agentHeadline);
+  });
+
+  it("keeps the resolution a RESOLVED incident already recorded", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await goesQuiet("sig-a");
+    await tools.reportResolved({ prUrls: [], evidence: "clean for an hour" });
+    const resolvedAt = incidentRow(id)?.resolvedAt;
+    assert.ok(resolvedAt);
+
+    const closed = await closeIncidentByBoss({ db, slack }, { incidentId: id, reason: "the agent stalled" });
+
+    assert.deepEqual(closed, { ok: true, from: "RESOLVED" });
+    assert.equal(incidentRow(id)?.resolvedAt, resolvedAt);
+  });
+
+  it("refuses an incident that is already over, and one with no reason", async () => {
+    await seed("sig-a");
+    await seed("sig-b");
+    const into = await openIncident(["sig-a"]);
+    const gone = await openIncident(["sig-b"]);
+    await mergedAway("sig-b", into);
+    assert.equal(incidentRow(gone)?.status, "MERGED");
+
+    const merged = await closeIncidentByBoss({ db, slack }, { incidentId: gone, reason: "r" });
+    assert.equal(merged.ok, false);
+    assert.equal(incidentRow(gone)?.status, "MERGED");
+
+    await closeIncidentByBoss({ db, slack }, { incidentId: into, reason: "r" });
+    const again = await closeIncidentByBoss({ db, slack }, { incidentId: into, reason: "r" });
+    assert.equal(again.ok, false);
+    assert.match(again.ok ? "" : again.error, /is CLOSED/);
+
+    await seed("sig-c");
+    const open = await openIncident(["sig-c"]);
+    const bare = await closeIncidentByBoss({ db, slack }, { incidentId: open, reason: "  " });
+    assert.equal(bare.ok, false);
+    assert.equal(incidentRow(open)?.status, "INVESTIGATING");
   });
 });

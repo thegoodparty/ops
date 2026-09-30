@@ -308,11 +308,9 @@ export const MAX_MESSAGE_CHARS = 3000;
  * **This is the thread's budget and only the thread's**, and it is a budget
  * on text somebody is in a position to rewrite. The closing report is a file
  * and is deliberately exempt: the thread is short, the document is complete.
- * So is anything the harness composed after the model has stopped, because
- * refusing a post to an author who is gone does not shorten it, it deletes
- * it. Both exemptions are `postDocument` below -- a different function
- * rather than a bigger number -- so the long things are call sites you can
- * grep for rather than a check somebody forgot.
+ * The exemption is `postDocument` below -- a different function rather than
+ * a bigger number -- so the long thing is a call site you can grep for
+ * rather than a check somebody forgot.
  */
 export const THREAD_PROSE_CHARS = 1200;
 
@@ -481,18 +479,9 @@ export const splitForSlack = (
  * a decision somebody has to defend in review, and a new caller of
  * `postProse` is not.
  *
- * Two callers, and they are the same exemption seen twice. The budget is a
- * refusal, and a refusal only means anything where there is an author to
- * refuse to:
- *
- *   - The closing report, when it could not be uploaded as a file and the
- *     thread is the only place left for it. The thread is short and the
- *     document is complete.
- *   - A harness-composed post -- the wait nudge, the re-run notice -- which
- *     the model is not in the loop for by the time it is written. Refusing
- *     one drops it, and a nudge that nudges nobody is the failure the tool
- *     that sends it exists to prevent. See the `harnessComposed` branch in
- *     `http/toolapi.ts`.
+ * One caller: the closing report, when it could not be uploaded as a file
+ * and the thread is the only place left for it. The thread is short and the
+ * document is complete.
  */
 export const postDocument = (
   post: (text: string) => Promise<{ ts: string }>,

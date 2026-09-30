@@ -2,7 +2,7 @@
 --
 -- The control plane's own access patterns are trivial. This is SQL because
 -- the agents need it: triage asks arbitrary questions while deciding, and the
--- Slack agent gives people an open-ended question box.
+-- Boss answers people's open-ended questions from it.
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -220,12 +220,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS incident_fts USING fts5(
   tokenize = 'porter unicode61'
 );
 
--- A question asked by contact_human that has not been answered yet. Lets a
--- resumed agent find the message it already posted rather than asking twice.
+-- A question an agent asked the Boss with message_boss(wait: true) that has
+-- not been answered yet. Lets a resumed agent carry on waiting from askedAt
+-- rather than asking twice.
 CREATE TABLE IF NOT EXISTS pending_question (
   incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
-  -- Empty until the post that follows the marker succeeds. The marker has to
-  -- be durable before the message exists, so there is no ts to record yet.
+  -- Always ''. The question goes to the Boss's inbox, not to a Slack post, so
+  -- there is no ts; the column stays because a live table cannot drop it.
   messageTs         TEXT NOT NULL,
   askedAt           INTEGER NOT NULL,
   message           TEXT NOT NULL DEFAULT ''
@@ -268,20 +269,19 @@ CREATE TABLE IF NOT EXISTS incident_wait (
   incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
   -- What is being waited on, in one line, for the thread and the digest.
   waitingFor        TEXT NOT NULL,
-  -- Runnable again from this moment. NULL means nothing but a reply or the
+  -- Runnable again from this moment. NULL means nothing but a Boss message or the
   -- stale sweep will lift it, which is the right shape for a wait on a person
   -- with no deadline of its own.
   wakeAt            INTEGER,
-  -- Whether a reply in the thread ends this wait.
+  -- Whether the Boss messaging the agent ends this wait.
   --
   -- Named for the rule rather than for who parked, because that is the
-  -- question a new caller has to answer: would somebody replying mean this
-  -- is over? Waiting on a person is yes, and it is the reason the delete in
-  -- `recordReply` reads no message and asks no model -- talking to an
-  -- incident wakes it, full stop. Waiting because the run is out of budget
-  -- is no: a reply adds no turns, so waking on one relaunches an agent that
-  -- exhausts again immediately and escalates again, which turned every
-  -- comment on the thread into a page for the rotation.
+  -- question a new caller has to answer: would news reaching the agent mean
+  -- this is over? Waiting on a person is yes, and it is why the delete in
+  -- `pushDirective` reads no message and asks no model -- a `boss_message`
+  -- wakes the incident, full stop. Waiting because the run is out of budget
+  -- is no: a message adds no turns, so waking on one relaunches an agent that
+  -- exhausts again immediately and escalates again.
   --
   -- Defaults to lifting, which is both the older behaviour and the safer
   -- side: a wait that lifts when it should not costs one relaunch, where one
@@ -290,7 +290,8 @@ CREATE TABLE IF NOT EXISTS incident_wait (
   startedAt         INTEGER NOT NULL
 );
 
--- Slack replies the Boss has relayed, which agents poll for.
+-- Every message a person writes in an incident thread, recorded on arrival.
+-- The id derives from (channel, ts), which is what collapses a Slack retry.
 CREATE TABLE IF NOT EXISTS thread_reply (
   id                TEXT PRIMARY KEY,
   incidentId        TEXT NOT NULL REFERENCES incident(id),
@@ -302,6 +303,21 @@ CREATE TABLE IF NOT EXISTS thread_reply (
 
 CREATE INDEX IF NOT EXISTS thread_reply_incident_idx
   ON thread_reply (incidentId, ts);
+
+-- What incident agents have sent up to the Boss. Nothing an agent writes
+-- reaches a person directly; it lands here and the Boss decides what to do
+-- with it. seenAt is set once a Boss run has been shown the row.
+CREATE TABLE IF NOT EXISTS boss_inbox (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  incidentId        TEXT NOT NULL REFERENCES incident(id),
+  kind              TEXT NOT NULL CHECK (kind IN ('message','question','escalation')),
+  text              TEXT NOT NULL,
+  createdAt         INTEGER NOT NULL,
+  seenAt            INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS boss_inbox_unseen_idx
+  ON boss_inbox (incidentId, seenAt);
 
 -- Directives waiting for an agent to pick up on its next call.
 CREATE TABLE IF NOT EXISTS pending_directive (

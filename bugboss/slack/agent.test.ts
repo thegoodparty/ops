@@ -20,6 +20,9 @@ import type {
   ModelUsage,
   SizedModelClient,
 } from "../triage";
+import type { BossCommandDeps, CloseIncident } from "../boss/commands";
+import { recordForBoss } from "../boss/inbox";
+import type { Directive } from "../types";
 import {
   compactTranscript,
   MAX_SQL_ROWS,
@@ -147,6 +150,20 @@ const fakeSlack = () => {
   };
 };
 
+const refuseClose: CloseIncident = () =>
+  Promise.resolve({ ok: false, error: "closing is not what this test is about" });
+
+const commandDeps = (over: Partial<BossCommandDeps> = {}): BossCommandDeps => ({
+  db,
+  threads: {
+    post: () => Promise.resolve({ ts: "ts-command" }),
+    permalink: (ts: string) => Promise.resolve(permalinkFor(ts)),
+  },
+  closeIncident: refuseClose,
+  rotationGroupId: ROTATION,
+  ...over,
+});
+
 const mention = (over: Partial<SlackMention> = {}): SlackMention => ({
   channel: CHANNEL,
   threadTs: "100.0",
@@ -176,7 +193,10 @@ after(() => {
 
 beforeEach(async () => {
   await db.withWrite((d) => {
-    d.prepare("DELETE FROM thread_reply").run();
+    d.prepare("DELETE FROM boss_inbox").run();
+    d.prepare("DELETE FROM pending_directive").run();
+    d.prepare("DELETE FROM pending_question").run();
+    d.prepare("DELETE FROM incident_wait").run();
     d.prepare("DELETE FROM signal").run();
     d.prepare("DELETE FROM incident_thread").run();
     d.prepare("DELETE FROM incident").run();
@@ -206,7 +226,7 @@ describe("SQL access is read-only", () => {
 
   test("the tool refuses a write and leaves the row alone", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store });
+    const [, query] = buildTools({ db, store, commands: commandDeps() });
     const out = await query.run({ sql: "DELETE FROM incident" });
 
     assert.match(out, /^Rejected: /);
@@ -220,7 +240,7 @@ describe("SQL access is read-only", () => {
   // shared guard accepts actually runs.
   test("a refusal carries the shared guard's reason in this surface's shape", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store });
+    const [, query] = buildTools({ db, store, commands: commandDeps() });
 
     assert.equal(
       await query.run({ sql: "SELECT 1; DROP TABLE incident" }),
@@ -239,7 +259,7 @@ describe("SQL access is read-only", () => {
 
   test("a read the guard accepts runs, semicolon and quoted keywords included", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store });
+    const [, query] = buildTools({ db, store, commands: commandDeps() });
 
     assert.match(await query.run({ sql: "SELECT id FROM incident;" }), /inc-1/);
     assert.equal(
@@ -267,7 +287,7 @@ describe("SQL access is read-only", () => {
     });
 
     const { store } = memoryStore();
-    const tool = buildTools({ db, store }).find((t) => t.name === "get_incident");
+    const tool = buildTools({ db, store, commands: commandDeps() }).find((t) => t.name === "get_incident");
     assert.ok(tool);
     const out = await tool.run({ incidentId: "inc-wide" });
 
@@ -286,7 +306,7 @@ describe("SQL access is read-only", () => {
     });
 
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store });
+    const [, query] = buildTools({ db, store, commands: commandDeps() });
     const out = await query.run({ sql: "SELECT * FROM signal" });
 
     assert.equal(out.split("\n").length, MAX_SQL_ROWS + 1, "rows are capped");
@@ -307,7 +327,7 @@ describe("SQL access is read-only", () => {
 describe("search_incidents on the Slack agent", () => {
   const searchTool = () => {
     const { store } = memoryStore();
-    const tool = buildTools({ db, store }).find(
+    const tool = buildTools({ db, store, commands: commandDeps() }).find(
       (t) => t.name === "search_incidents",
     );
     assert.ok(tool, "the Slack agent can reach the search triage has");
@@ -413,7 +433,7 @@ describe("prefix binding", () => {
   test("the tool specs are byte-identical across builds and database states", async () => {
     const specs = () =>
       JSON.stringify(
-        buildTools({ db, store: memoryStore().store }).map(
+        buildTools({ db, store: memoryStore().store, commands: commandDeps() }).map(
           ({ name, description, inputSchema }) => ({ name, description, inputSchema }),
         ),
       );
@@ -427,15 +447,20 @@ describe("prefix binding", () => {
 
     assert.equal(specs(), before);
     assert.deepEqual(
-      buildTools({ db, store: memoryStore().store }).map((t) => t.name),
+      buildTools({ db, store: memoryStore().store, commands: commandDeps() }).map((t) => t.name),
       [
         "get_incident",
         "query_incidents",
         "read_agent_session",
         "search_incidents",
         "incident_board",
+        "message_agent",
+        "close_incident",
+        "merge_incidents",
+        "stop_agent",
+        "page_rotation",
       ],
-      "order is part of the prefix",
+      "order is part of the prefix, and the write tools come after the reads",
     );
   });
 
@@ -455,7 +480,8 @@ describe("prefix binding", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     await agent.handle(mention({ ts: "100.0" }));
@@ -497,7 +523,8 @@ describe("the per-thread lock", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     model.state.hold = true;
@@ -531,7 +558,8 @@ describe("the per-thread lock", () => {
           return { text: "second time lucky", usage: emptyModelUsage() };
         },
       },
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     await agent.handle(mention({ ts: "100.0" }));
@@ -551,7 +579,8 @@ describe("the per-thread lock", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     model.state.hold = true;
@@ -579,7 +608,8 @@ describe("session persistence", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
     return { model, slack, store, objects, agent };
   };
@@ -687,7 +717,8 @@ describe("session persistence", () => {
       store: { ...store, put: () => Promise.reject(new Error("s3 500")) },
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     const lines = await captureLogs(() => agent.handle(mention({ ts: "100.0" })));
@@ -713,7 +744,8 @@ describe("session persistence", () => {
         replies: () => Promise.reject(new Error("ratelimited")),
       },
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     await agent.handle(mention({ ts: "100.0" }));
@@ -756,7 +788,8 @@ describe("when the answer itself fails", () => {
         replies: () => Promise.resolve([]),
       },
       model: { run: () => Promise.reject(new Error("bedrock said no")) },
-      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION },
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     const lines = await captureLogs(() => agent.handle(mention({ ts: "100.0" })));
@@ -792,7 +825,8 @@ describe("when the answer itself fails", () => {
         replies: () => Promise.resolve([]),
       },
       model: { run: () => Promise.reject(new Error("bedrock said no")) },
-      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION },
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     const lines = await captureLogs(() => agent.handle(mention({ ts: "100.0" })));
@@ -814,7 +848,7 @@ describe("reading another agent's session", () => {
       "sessions/incident/inc-1/session.jsonl",
       ["{\"role\":\"user\"}", "{\"role\":\"assistant\"}", "{\"role\":\"tool\"}"].join("\n"),
     );
-    const [, , read] = buildTools({ db, store });
+    const [, , read] = buildTools({ db, store, commands: commandDeps() });
 
     const out = await read.run({ incidentId: "inc-1", tailLines: 2 });
     assert.match(out, /3 entries, last 2/);
@@ -823,7 +857,7 @@ describe("reading another agent's session", () => {
 
   test("a missing session says so rather than inventing one", async () => {
     const { store } = memoryStore();
-    const [, , read] = buildTools({ db, store });
+    const [, , read] = buildTools({ db, store, commands: commandDeps() });
     const out = await read.run({ incidentId: "inc-404" });
     assert.match(out, /No session under sessions\/incident\/inc-404\//);
   });
@@ -854,7 +888,7 @@ describe("the Slack agent hands back no links of its own", () => {
 
   test("get_incident reports the thread ts, never a url", async () => {
     await withThread("inc-1", "400.0");
-    const [get] = buildTools({ db, store: memoryStore().store });
+    const [get] = buildTools({ db, store: memoryStore().store, commands: commandDeps() });
 
     const out = await get.run({ incidentId: "inc-1" });
 
@@ -865,7 +899,7 @@ describe("the Slack agent hands back no links of its own", () => {
 
   test("query_incidents does not decorate a row that names a thread", async () => {
     await withThread("inc-1", "400.0");
-    const [, query] = buildTools({ db, store: memoryStore().store });
+    const [, query] = buildTools({ db, store: memoryStore().store, commands: commandDeps() });
 
     const out = await query.run({
       sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL",
@@ -919,6 +953,7 @@ const runRequest = (
   fresh: true,
   input: "<@U0HUMAN> asks: what is the state of the various incidents?",
   maxTurns,
+  allowSilence: false,
 });
 
 describe("a run that uses its whole budget", () => {
@@ -1162,6 +1197,69 @@ describe("a run that uses its whole budget", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("a run that may stay silent", () => {
+  const narratingThen = (finalText: string): SizedModelClient => {
+    let calls = 0;
+    return {
+      contextWindow: TEST_CONTEXT_WINDOW,
+      complete: () => {
+        calls++;
+        if (calls === 1) {
+          return Promise.resolve({
+            text: "Let me look at the incident first.",
+            toolCalls: [
+              { id: "call-1", name: "get_incident", input: { incidentId: "inc-1" } },
+            ],
+            usage: emptyModelUsage(),
+          } satisfies ModelReply);
+        }
+        return Promise.resolve({
+          text: finalText,
+          toolCalls: [],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply);
+      },
+    };
+  };
+
+  test("hands back nothing, not narration or an apology, when the last turn says nothing", async () => {
+    const { store } = memoryStore();
+    const reads: string[] = [];
+    let answer: string | null = null;
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(narratingThen(""), store).run({
+        ...runRequest([countingTool(reads)], 3),
+        allowSilence: true,
+      });
+      answer = result.text;
+    });
+
+    assert.deepEqual(reads, ["inc-1"], "the narrating turn really did call a tool first");
+    assert.equal(answer, "");
+    assert.ok(!lines.some((l) => l.includes("slack_agent_no_answer")));
+  });
+
+  test("hands back only the final turn's text", async () => {
+    const { store } = memoryStore();
+    const reads: string[] = [];
+    const result = await createSlackAgentModel(
+      narratingThen("inc-1 is being worked by an agent."),
+      store,
+    ).run({ ...runRequest([countingTool(reads)], 3), allowSilence: true });
+
+    assert.deepEqual(reads, ["inc-1"]);
+    assert.equal(result.text, "inc-1 is being worked by an agent.");
+  });
+
+  test("a mention without silence still answers from the narration rather than apologising", async () => {
+    const { store } = memoryStore();
+    const result = await createSlackAgentModel(narratingThen(""), store).run(
+      runRequest([countingTool([])], 3),
+    );
+    assert.equal(result.text, "Let me look at the incident first.");
+  });
+});
+
 describe("the turn budget", () => {
   /** What was open the day a question about all of them went unanswered. */
   const OPEN_INCIDENTS = 11;
@@ -1225,7 +1323,8 @@ describe("the turn budget", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
       lock: {
         acquire: (_key, ttlMs) => {
           leases.push(ttlMs);
@@ -1253,7 +1352,8 @@ describe("the turn budget", () => {
       store,
       slack: slack.client,
       model: model.model,
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     await agent.handle(mention());
@@ -1363,7 +1463,8 @@ describe("what a question cost", () => {
       store,
       slack: slack.client,
       model: { run: () => Promise.resolve({ text: "two are open.", usage: spent(120) }) },
-      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null },
+      config: { botUserId: BOT, alertChannel: ALERT_CHANNEL, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
     });
 
     const lines = await captureLogs(() => agent.handle(mention()));
@@ -1387,7 +1488,7 @@ describe("read_agent_session", () => {
   const readSession = async (lines: string[]) => {
     const { store, objects } = memoryStore();
     objects.set(sessionKeyFor("inc-1"), lines.join("\n"));
-    const tools = buildTools({ db, store });
+    const tools = buildTools({ db, store, commands: commandDeps() });
     const tool = tools.find((t) => t.name === "read_agent_session");
     assert.ok(tool);
     return tool.run({ incidentId: "inc-1" });
@@ -1752,5 +1853,417 @@ describe("the turn loop compacts before it asks, not after", () => {
       turns.filter((turn) => turn.role === "toolResult").length < 3,
       "the compacted transcript is what was persisted",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("the Boss in an incident thread", () => {
+  const THREAD = "500.000100";
+
+  const seed = async () => {
+    await db.withWrite((d) => {
+      d.prepare(
+        "INSERT INTO incident (id, status, firstSignalAt, slackThreadTs, summary) VALUES ('7','FIXING',5,?,'Checkout failing')",
+      ).run(THREAD);
+    });
+  };
+
+  const build = (over: { closeIncident?: CloseIncident } = {}) => {
+    const model = fakeModel();
+    const slack = fakeSlack();
+    const { store, objects } = memoryStore();
+    const agent = new SlackAgent({
+      db,
+      store,
+      slack: slack.client,
+      model: model.model,
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION, incidentChannel: CHANNEL },
+      closeIncident: over.closeIncident ?? refuseClose,
+    });
+    return { model, slack, store, objects, agent };
+  };
+
+  const human = (ts: string, text: string) => ({ kind: "human" as const, user: "U0HUMAN", text, ts });
+
+  const opening: SlackMessage = {
+    user: BOT,
+    botId: "B0BUGBOSS",
+    text: "*Checkout 5xx above 2%* -- opened by a Grafana alert",
+    ts: THREAD,
+  };
+
+  test("a fresh session is told which incident this is and reads the whole thread, BugBoss posts included", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [
+      opening,
+      { user: BOT, botId: "B0BUGBOSS", text: "*Root cause found* -- the pool is too small", ts: "500.000200" },
+      { user: "U0HUMAN", botId: null, text: "is this why checkout is slow?", ts: "500.000300" },
+    ];
+
+    await agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "is this why checkout is slow?") });
+
+    assert.equal(model.runs.length, 1);
+    assert.equal(slack.state.calls.length, 1, "a fresh session fetches the thread");
+    assert.equal(slack.state.calls[0].threadTs, THREAD);
+    assert.equal(slack.state.calls[0].channel, CHANNEL);
+    assert.equal(slack.state.calls[0].oldest, undefined, "the whole thread, not a stretch of it");
+    const input = model.runs[0].input;
+    assert.match(input, /incident 7\. Status: FIXING\. Title: Checkout failing\./);
+    assert.match(input, /BugBoss: \*Checkout 5xx above 2%\*/, "the opening message is the record");
+    assert.match(input, /BugBoss: \*Root cause found\*/, "and so is every transition notice");
+    assert.match(input, /<@U0HUMAN>: is this why checkout is slow\?/);
+    assert.equal(model.runs[0].sessionKey, slackSessionPrefix(CHANNEL, THREAD));
+    assert.equal(model.runs[0].allowSilence, true);
+  });
+
+  test("a resume reads everything since the watermark, bot posts included, except its own replies", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    // Slack-shaped ts for what the Boss posts, so its own reply can come back
+    // in the fetch the way it would in production.
+    const post = slack.client.post;
+    slack.client.post = async (threadTs, text, channel) => {
+      await post(threadTs, text, channel);
+      return { ts: `500.00040${slack.posts.length}` };
+    };
+    slack.state.replies = [opening, { user: "U0HUMAN", botId: null, text: "first", ts: "500.000300" }];
+    model.state.reply = "It is, yes.";
+    await agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "first") });
+    assert.equal(slack.posts[0].text, "It is, yes.");
+    assert.equal(slack.posts[0].threadTs, THREAD);
+    assert.equal(slack.posts[0].channel, CHANNEL);
+
+    slack.state.replies = [
+      opening,
+      { user: "U0HUMAN", botId: null, text: "first", ts: "500.000300" },
+      { user: BOT, botId: "B0BUGBOSS", text: "It is, yes.", ts: "500.000401" },
+      { user: BOT, botId: "B0BUGBOSS", text: "*Incident 7 resolved*", ts: "500.000500" },
+      { user: "U0OTHER", botId: null, text: "second", ts: "500.000600" },
+    ];
+    await agent.handleIncident({ incidentId: "7", trigger: human("500.000600", "second") });
+
+    assert.equal(model.runs.length, 2);
+    assert.equal(model.runs[1].fresh, false);
+    assert.equal(slack.state.calls[1].oldest, "500.000300");
+    const input = model.runs[1].input;
+    assert.match(input, /BugBoss: \*Incident 7 resolved\*/, "a notice posted since is shown");
+    assert.match(input, /<@U0OTHER>: second/);
+    assert.doesNotMatch(input, /It is, yes\./, "its own reply is already in its session");
+    assert.doesNotMatch(input, /<@U0HUMAN>: first/, "nothing from before the watermark");
+  });
+
+  test("an agent's unseen rows are in the input as the agent's, and are seen once the run is over", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [opening];
+    await db.withWrite((w) => {
+      recordForBoss(w, { incidentId: "7", kind: "question", text: "Can someone confirm the deploy at 14:02 was a rollback?" });
+      recordForBoss(w, { incidentId: "7", kind: "message", text: "PR opened." });
+      recordForBoss(w, { incidentId: "7", kind: "escalation", text: "Still waiting after 2 hours." });
+    });
+
+    await agent.handleIncident({ incidentId: "7", trigger: { kind: "inbox" } });
+
+    const input = model.runs[0].input;
+    assert.match(input, /From incident 7's agent, not seen by you before \(3\)/);
+    assert.match(input, /\[question -- it is blocked until you answer it with message_agent\] Can someone confirm/);
+    assert.match(input, /\[message\] PR opened\./);
+    assert.match(input, /\[escalation -- it needs a person\] Still waiting/);
+    assert.equal(
+      db.query("SELECT id FROM boss_inbox WHERE seenAt IS NULL").length,
+      0,
+      "every row it was shown is marked",
+    );
+  });
+
+  test("a run that fails leaves the rows unseen for the next one, and nobody in the thread is told", async () => {
+    await seed();
+    const slack = fakeSlack();
+    slack.state.replies = [opening];
+    const agent = new SlackAgent({
+      db,
+      store: memoryStore().store,
+      slack: slack.client,
+      model: { run: () => Promise.reject(new Error("bedrock said no")) },
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
+    });
+    await db.withWrite((w) => recordForBoss(w, { incidentId: "7", kind: "question", text: "q?" }));
+
+    await captureLogs(() => agent.handleIncident({ incidentId: "7", trigger: { kind: "inbox" } }));
+
+    assert.equal(db.query("SELECT id FROM boss_inbox WHERE seenAt IS NULL").length, 1);
+    assert.equal(slack.posts.length, 0, "an inbox run has nobody waiting in the thread");
+  });
+
+  test("a failed run a person triggered tells them", async () => {
+    await seed();
+    const slack = fakeSlack();
+    slack.state.replies = [opening];
+    const agent = new SlackAgent({
+      db,
+      store: memoryStore().store,
+      slack: slack.client,
+      model: { run: () => Promise.reject(new Error("bedrock said no")) },
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION, incidentChannel: CHANNEL },
+      closeIncident: refuseClose,
+    });
+    await captureLogs(() => agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "hello?") }));
+    assert.equal(slack.posts.length, 1);
+    assert.match(slack.posts[0].text, /could not finish/);
+    assert.equal(slack.posts[0].threadTs, THREAD);
+  });
+
+  test("an empty answer posts nothing, and that is not a failure", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [opening];
+    model.state.reply = "";
+    const lines = await captureLogs(() =>
+      agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "@dana can you look at this?") }),
+    );
+    assert.equal(model.runs.length, 1, "premise: the Boss did read it");
+    assert.equal(slack.posts.length, 0);
+    assert.ok(lines.some((l) => l.includes("incident_answered") && l.includes('"spoke":false')));
+  });
+
+  test("a second message while the thread's run is in flight is not answered busy, and the same holder runs it", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [opening, { user: "U0HUMAN", botId: null, text: "first", ts: "500.000300" }];
+    model.state.hold = true;
+
+    const first = agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "first") });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(model.runs.length, 1, "premise: the first run is in flight and holds the thread");
+
+    // Slack has not caught up with the second message yet: it is only in the
+    // trigger, which is the case the in-memory queue is for.
+    await agent.handleIncident({ incidentId: "7", trigger: human("500.000400", "second, while you were thinking") });
+    assert.equal(model.runs.length, 1, "no second run beside the first -- one session writer");
+    assert.equal(slack.posts.length, 0, "and no busy reply");
+    assert.doesNotMatch(model.runs[0].input, /second, while you were thinking/, "premise: the first run never saw it");
+
+    model.state.hold = false;
+    model.release();
+    await first;
+
+    assert.equal(model.runs.length, 2, "the holder ran again before letting go");
+    assert.match(model.runs[1].input, /<@U0HUMAN>: second, while you were thinking/);
+    assert.doesNotMatch(model.runs[1].input, /<@U0HUMAN>: first/, "the first message is not repeated");
+    assert.ok(slack.posts.every((p) => !/Still working/.test(p.text)));
+  });
+
+  test("an agent row landing mid-run is read before the lock is released, even with no wake", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [opening];
+    model.state.hold = true;
+
+    const first = agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "status?") });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(model.runs.length, 1);
+    await db.withWrite((w) =>
+      recordForBoss(w, { incidentId: "7", kind: "question", text: "Is the 14:02 deploy a rollback?" }),
+    );
+    assert.doesNotMatch(model.runs[0].input, /14:02/, "premise: the row was not there for the first run");
+
+    model.state.hold = false;
+    model.release();
+    await first;
+
+    assert.equal(model.runs.length, 2);
+    assert.match(model.runs[1].input, /\[question -- it is blocked until you answer it with message_agent\] Is the 14:02 deploy a rollback\?/);
+    assert.equal(db.query("SELECT id FROM boss_inbox WHERE seenAt IS NULL").length, 0);
+  });
+
+  test("a run with nothing new says nothing and spends nothing", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [opening];
+    await agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "hi") });
+    await agent.handleIncident({ incidentId: "7", trigger: { kind: "inbox" } });
+    assert.equal(model.runs.length, 1, "the wake had nothing behind it");
+  });
+
+  test("the agent's outstanding question is named in the input", async () => {
+    await seed();
+    const { model, slack, agent } = build();
+    slack.state.replies = [opening];
+    await db.withWrite((w) =>
+      w
+        .prepare("INSERT INTO pending_question (incidentId, messageTs, askedAt, message) VALUES ('7','',?,?)")
+        .run(Date.now() - 5 * 60_000, "Was the 14:02 deploy a rollback?"),
+    );
+    await agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "yes it was") });
+    assert.match(model.runs[0].input, /blocked on a question it asked 5 minute\(s\) ago.*Was the 14:02 deploy a rollback\?/);
+  });
+
+  test("an incident with no thread alarms and leaves its rows for later", async () => {
+    await db.withWrite((d) => {
+      d.prepare("INSERT INTO incident (id, status, firstSignalAt) VALUES ('8','INVESTIGATING',5)").run();
+      recordForBoss(d, { incidentId: "8", kind: "question", text: "q?" });
+    });
+    const { model, agent } = build();
+    const lines = await captureLogs(() => agent.handleIncident({ incidentId: "8", trigger: { kind: "inbox" } }));
+    assert.equal(model.runs.length, 0);
+    assert.ok(lines.some((l) => l.includes("incident_thread_missing")));
+    assert.equal(db.query("SELECT id FROM boss_inbox WHERE seenAt IS NULL").length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("the Boss's write tools", () => {
+  const tool = (name: string, over: Partial<BossCommandDeps> = {}) => {
+    const found = buildTools({ db, store: memoryStore().store, commands: commandDeps(over) }).find(
+      (t) => t.name === name,
+    );
+    assert.ok(found, name);
+    return found;
+  };
+
+  const directives = (incidentId: string): Directive[] =>
+    db
+      .query<{ payload: string }>("SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id", [incidentId])
+      .map((r) => JSON.parse(r.payload) as Directive);
+
+  const EVIDENCE = "The error rate query has read zero for the last two hours and the agent's session shows the rollback deployed at 14:02.";
+
+  test("message_agent hands the agent a boss_message", async () => {
+    assert.equal(directives("inc-1").length, 0, "premise: nothing pending");
+    const out = await tool("message_agent").run({ incidentId: "inc-1", text: "Dana says it was a rollback." });
+    assert.match(out, /^Sent/);
+    const [sent] = directives("inc-1");
+    assert.equal(sent.type, "boss_message");
+    assert.equal(sent.type === "boss_message" && sent.text, "Dana says it was a rollback.");
+  });
+
+  test("message_agent refuses an incident no agent is working", async () => {
+    await db.withWrite((d) => {
+      d.prepare(
+        "INSERT INTO incident (id, status, firstSignalAt, resolvedAt, closedAt, postmortem) VALUES ('c1','CLOSED',1,2,3,'pm')",
+      ).run();
+    });
+    const out = await tool("message_agent").run({ incidentId: "c1", text: "hello" });
+    assert.match(out, /^Rejected: incident c1 is CLOSED/);
+    assert.equal(directives("c1").length, 0);
+  });
+
+  test("close_incident goes through the tool API's close and refuses a reason that is not evidence", async () => {
+    const calls: { incidentId: string; reason: string }[] = [];
+    const closeIncident: CloseIncident = (args) => {
+      calls.push(args);
+      return Promise.resolve({ ok: true, from: "FIXING" });
+    };
+    const close = tool("close_incident", { closeIncident });
+
+    assert.match(await close.run({ incidentId: "inc-1", reason: "fixed" }), /^Rejected: close_incident needs a reason that is evidence/);
+    assert.equal(calls.length, 0, "a one-word reason never reaches the transition");
+
+    const out = await close.run({ incidentId: "inc-1", reason: EVIDENCE });
+    assert.deepEqual(calls, [{ incidentId: "inc-1", reason: EVIDENCE }]);
+    assert.match(out, /closed \(it was FIXING\)/);
+  });
+
+  test("close_incident hands a refusal back as a refusal", async () => {
+    const out = await tool("close_incident", {
+      closeIncident: () => Promise.resolve({ ok: false, error: "incident inc-1 is MERGED" }),
+    }).run({ incidentId: "inc-1", reason: EVIDENCE });
+    assert.equal(out, "Rejected: incident inc-1 is MERGED");
+  });
+
+  test("merge_incidents keeps the older incident, moves the signals, and tells both threads through announce", async () => {
+    await db.withWrite((d) => {
+      d.prepare("INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES ('11','FIXING',1,'600.1')").run();
+      d.prepare("INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES ('12','INVESTIGATING',2,'700.1')").run();
+      d.prepare(
+        "INSERT INTO signal (id, source, sourceId, kind, title, body, openedAt, incidentId) VALUES ('s12','grafana','fp12','alert','t','b',2,'12')",
+      ).run();
+    });
+    const posts: { threadTs: string | null; text: string }[] = [];
+    const merge = tool("merge_incidents", {
+      threads: {
+        post: (threadTs, text) => {
+          posts.push({ threadTs, text });
+          return Promise.resolve({ ts: "x" });
+        },
+        permalink: (ts) => Promise.resolve(permalinkFor(ts)),
+      },
+    });
+
+    // Named the wrong way round on purpose: the older record survives.
+    const out = await merge.run({ fromIncidentId: "11", intoIncidentId: "12", reason: EVIDENCE });
+
+    assert.match(out, /Incident 12 is now part of incident 11/);
+    assert.equal(db.get<{ status: string }>("SELECT status FROM incident WHERE id = '12'")?.status, "MERGED");
+    assert.equal(db.get<{ incidentId: string }>("SELECT incidentId FROM signal WHERE id = 's12'")?.incidentId, "11");
+    assert.deepEqual(directives("12"), [{ type: "merged", into: "11" }]);
+    assert.equal(directives("11")[0]?.type, "new_signals");
+    assert.equal(posts[0].threadTs, "700.1", "the absorbed thread is told first");
+    assert.match(posts[0].text, /same problem as incident 11/);
+    assert.equal(posts[1].threadTs, "600.1");
+    assert.match(posts[1].text, /Incident 12 is the same problem as this one/);
+  });
+
+  test("merge_incidents refuses what cannot take signals, and moves nothing", async () => {
+    await db.withWrite((d) => {
+      d.prepare("INSERT INTO incident (id, status, firstSignalAt, resolvedAt) VALUES ('21','RESOLVED',1,2)").run();
+      d.prepare("INSERT INTO incident (id, status, firstSignalAt) VALUES ('22','FIXING',2)").run();
+    });
+    const out = await tool("merge_incidents").run({ fromIncidentId: "22", intoIncidentId: "21", reason: EVIDENCE });
+    assert.match(out, /^Rejected: incident 21 is RESOLVED/);
+    assert.equal(directives("22").length, 0);
+  });
+
+  test("stop_agent pushes a stop carrying the reason", async () => {
+    const out = await tool("stop_agent").run({ incidentId: "inc-1", reason: EVIDENCE });
+    assert.match(out, /will stop/);
+    assert.deepEqual(directives("inc-1"), [{ type: "stop", reason: EVIDENCE }]);
+  });
+
+  test("page_rotation posts the rotation mention through code, into the incident's thread", async () => {
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET slackThreadTs = '800.1' WHERE id = 'inc-1'").run();
+    });
+    const posts: { threadTs: string | null; text: string }[] = [];
+    const out = await tool("page_rotation", {
+      threads: {
+        post: (threadTs, text) => {
+          posts.push({ threadTs, text });
+          return Promise.resolve({ ts: "x" });
+        },
+        permalink: (ts) => Promise.resolve(permalinkFor(ts)),
+      },
+    }).run({ incidentId: "inc-1", reason: "The agent needs someone with prod access to confirm the migration ran." });
+    assert.match(out, /has been paged/);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].threadTs, "800.1");
+    assert.ok(posts[0].text.startsWith(`<!subteam^${ROTATION}> `), posts[0].text);
+  });
+
+  test("a mention the model writes itself still posts as literal text", async () => {
+    const { model, slack, agent } = (() => {
+      const model = fakeModel();
+      const slack = fakeSlack();
+      const agent = new SlackAgent({
+        db,
+        store: memoryStore().store,
+        slack: slack.client,
+        model: model.model,
+        config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: ROTATION, incidentChannel: CHANNEL },
+        closeIncident: refuseClose,
+      });
+      return { model, slack, agent };
+    })();
+    await db.withWrite((d) => {
+      d.prepare("UPDATE incident SET slackThreadTs = '800.1' WHERE id = 'inc-1'").run();
+    });
+    model.state.reply = `<!subteam^${ROTATION}> wake up`;
+    await agent.handleIncident({ incidentId: "inc-1", trigger: { kind: "human", user: "U0HUMAN", text: "x", ts: "800.2" } });
+    assert.equal(slack.posts.length, 1);
+    assert.ok(!slack.posts[0].text.startsWith("<!subteam^"), slack.posts[0].text);
   });
 });

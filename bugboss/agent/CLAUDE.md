@@ -64,7 +64,7 @@ truncates a tool result" below.
 ## Two bounds, and the turn budget is the one that measures work
 
 The wall clock bounds how long a launch may run. It does not bound what the
-run does: `monitor` and `contact_human` each cost **one turn** however long
+run does: `monitor` and `message_boss` each cost **one turn** however long
 they block, so the first nine-hour incident spent about eight of those hours
 inside a single turn waiting on a person. 92 turns, $18.51, against a
 24-hour deadline that fifteen agents could each have spent in full.
@@ -91,9 +91,9 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
 - **The agent escalating itself wins the announcement.** The steer asks for
   exactly that and the model can answer on its very last grace turn, which
   ends the same `turn_end` the cap fires on. The budget watches
-  `toolResults` for a successful `escalate`, because both posting puts "it
-  never wrote a brief" directly under the brief it just wrote. A *refused*
-  escalation does not count — nobody was told, which is the case the
+  `toolResults` for a successful `escalate`, because sending both puts "it
+  never wrote a brief" directly under the brief it just wrote. A *failed*
+  escalation does not count — the Boss was never told, which is the case the
   harness exists for.
 - **The grace is clamped to half the budget.** `TURN_BUDGET_GRACE_TURNS` is
   a constant and `maxTurns` is settable, so the two configure into nonsense
@@ -142,47 +142,55 @@ which leaves an error message behind exactly as a failing turn does. That is
 why `exitCodeFor` exempts `turnsExhausted`: without it a bound working as
 designed reaches the dispatcher as `agent_failed` and alarms every time.
 
+## It talks to the Boss and nobody else
+
+An incident agent never posts to Slack and never reads it. Everything it has
+to say to a person goes into the Boss's inbox (`boss_inbox`, through
+`POST /incidents/:id/boss-inbox`), which wakes the Boss, and the Boss decides
+whether anybody hears it, who, and in what words. Everything a person says
+reaches the agent as a `boss_message` directive the Boss chose to send.
+`BossInboxPort` in `tools.ts` is the whole of that surface: `tellBoss(kind,
+text)` and `escalationsSince(since)`. There is no thread-posting method on the
+Boss client.
+
+What does still reach Slack from an agent's words is deterministic and posted
+by `toolapi` on a transition: the root cause, the resolution evidence and the
+post-mortem. Those are records, not conversation.
+
 ## The two blocking tools
 
-`monitor` and `contact_human` each cost **one turn** no matter how long they
-wait. That is what keeps a multi-day incident from saturating context on
-polling, and it is why the prompt forbids polling with bash in a loop.
+`monitor` and `message_boss` (with `wait: true`) each cost **one turn** no
+matter how long they wait. That is what keeps a multi-day incident from
+saturating context on polling, and it is why the prompt forbids polling with
+bash in a loop.
 
 **One turn is not one bill, and the prompt used to say it was.** A block that
 outlives the prompt cache pays a full cache write on the turn after it, which
 on a nine-hour incident was 41% of what that incident cost. So the prompt
-prices the wait honestly and says what to do with it — refresh impact, post
-state, draft the post-mortem — because the cost lands whether or not the agent
+prices the wait honestly and says what to do with it — refresh impact, write
+notes, draft the post-mortem — because the cost lands whether or not the agent
 came out of the wait with anything.
 
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
 - `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
-  what the wait is on, and the harness nudges the thread when they do not
-  turn up. Unset, the wait is silent, which is right for a deploy, a
-  migration or an alert going quiet: nobody is being asked for anything. The
-  argument decides it rather than the command string, because a harness that
-  pattern-matched `gh pr` would stop nudging the day somebody wrote the same
+  what the wait is on, and the harness tells the Boss when they do not turn
+  up. Unset, the wait is silent, which is right for a deploy, a migration or
+  an alert going quiet: nobody is being asked for anything. The argument
+  decides it rather than the command string, because a harness that
+  pattern-matched `gh pr` would stop reporting the day somebody wrote the same
   check differently.
 
   The `command` has to **observe the thing itself** — `gh pr view --json
   state,mergedAt`, a flag read, a health check — not park until somebody says
-  in Slack that they did it. Being told is the fallback. That is instruction
-  (`prompt.ts`, the tool description) rather than a validator: what a command
-  observes is not readable from its text, and this codebase does not
-  pattern-match human-facing behaviour.
-- `contact_human(message, …)` — re-entrant. The marker is written *before*
-  the post, so a resumed agent resumes waiting rather than asking twice. It
-  re-posts when the stored message differs from the new one, and when
-  `messageTs` is empty because the post itself failed — otherwise one Slack
-  hiccup becomes a silent 24-hour wait that escalates for the wrong reason.
-  Optional `options` render as buttons on the ask (`slack/blocks.ts`); they
-  change what the question looks like and nothing else. A press comes back as
-  the same `human_message` directive a typed reply does, so the wait, the
-  marker and the timeout are untouched and an answer nobody offered still
-  lands. The options are checked before anything is posted, so a refusal
-  costs no marker and no message.
+  they did it. Being told is the fallback. That is instruction (`prompt.ts`,
+  the tool description) rather than a validator: what a command observes is
+  not readable from its text, and this codebase does not pattern-match
+  human-facing behaviour.
+- `message_boss(message, wait?, seconds?)` — without `wait` it records a
+  `message` row and returns. With it, it records a `question` row, writes the
+  `pending_question` marker, and blocks until **any** `boss_message` arrives.
 
 ## Re-running CI: the capability and its bound are one object
 
@@ -209,14 +217,14 @@ affordance is the tool, and the tool carries the discipline:
   runs out. Process-scoped, and a restart hands it back — but every run
   already re-run is still at attempt 2, so what a restart buys is only runs it
   has not touched.
-- **The thread is told by the tool, not by the model.** The `suspicion`
-  argument is required and is posted verbatim, so a human reading the thread
-  can say "that is not a flake, that is your change". Posted *after* the
-  re-run rather than before it, which is the opposite of `contact_human`'s
-  marker: until the permission is granted every call ends in a 403, and a
-  notice posted first would announce a re-run that never happened, over and
-  over. A post that fails afterwards is recoverable and loud — the result
-  hands the agent the text and tells it to post it.
+- **The Boss is told by the tool, not by the model.** The `suspicion`
+  argument is required and goes to the Boss's inbox verbatim, so somebody it
+  shows it to can say "that is not a flake, that is your change". Sent
+  *after* the re-run rather than before it, which is the opposite of
+  `message_boss`'s order: until the permission is granted every call ends in
+  a 403, and a notice sent first would announce a re-run that never
+  happened, over and over. A send that fails afterwards is recoverable and
+  loud — the result hands the agent the text and tells it to send it.
 - **A permission refusal names the permission.** Not "the re-run failed". It
   says which endpoint, what GitHub itself says the call needed, that the App
   holds `read`, and that asking a human is fine *only* if the ask says why —
@@ -237,93 +245,80 @@ forbids it; that is advice, not a control. If a reviewer wants this closed,
 the only real answer is a second, narrower token for the agent's shell, which
 is a bigger change than this one.
 
-## contact_human is a question, and an unanswered one gets loud
+## An unanswered question gets loud, and the wait continues
 
 Both tools that reach a person leave the incident exactly where it was.
-`contact_human` asks for one fact or one action; `escalate` says the incident
-needs a person and reaches the rotation. Neither moves the work and neither is
-an exit — the agent keeps the incident and keeps driving it, because it is the
-only thing that can finish it.
+`message_boss` asks for one fact or one action; `escalate` says the incident
+needs a person, urgently, and records an `escalation` row. Neither moves the
+work and neither is an exit — the agent keeps the incident and keeps driving
+it, because it is the only thing that can finish it.
 
-So an unanswered wait escalates rather than ending. `runContactHuman` calls
-`escalate` itself and carries on; only a `stop` or a `merged` directive
-terminates the run. The details it rests on:
+So an unanswered question escalates rather than ending. `runMessageBoss`
+records an `escalation` row saying what it asked and how long it has waited,
+and carries on waiting; only an answer, a `stop`, a `merged` or the harness
+deadline ends it. The details it rests on:
 
-- **The floor.** A requested wait below `CONTACT_HUMAN_MIN_WAIT_SECONDS` is
-  raised to it, not answered early. Without that, the escalation is opt-out:
-  ask for two minutes and no timeout ever means anything.
+- **Any `boss_message` is the answer.** The Boss does not chat, so every
+  message it sends is deliberate. Several pending at once are one answer, all
+  consumed, rather than one answer and a leftover that `get_incident` would
+  deliver again.
+- **A legacy `human_message` reads as the Boss.** Rows written before the
+  directive was renamed can still be pending; `bossMessageText` is the one
+  place that knows the old shape.
+- **The question goes up before the marker.** A crash between the two asks the
+  Boss twice; the other order leaves a marker for a question the Boss never
+  received, and a wait on an answer to nothing.
+- **The floor.** A requested wait below `MESSAGE_BOSS_MIN_WAIT_SECONDS` is
+  raised to it, not answered early. Without that, the escalation is opt-out.
 - **Not on the deadline abort.** The soft deadline has its own path — the run
   steers the model to write a real brief inside the grace window — and
   escalating here would spend the turn that brief needs.
-- **A failed escalation is loud.** Nobody was told, so the result says so and
-  tells the model to say it in the thread itself. The prompt is where the model
-  is asked to escalate first; this is the floor under it, and the brief the
-  harness writes is deliberately thinner.
 - **The clock runs from `askedAt`, not from process start.** A restart is not
   an answer. A deadline of `now() + wait` hands a crash-looping agent a fresh
   wait every time and defers the escalation for as long as the crashes last.
-- **The marker is cleared after the escalation, and only if it landed.**
-  Clearing first and dying in between replays as a brand-new question:
-  re-posted, with a fresh `askedAt` that makes a reply already in the thread
-  look too old to be one.
-- **Buttons do not opt out of any of it.** A button nobody presses is
-  silence, so a question with `options` hits the same floor, the same
-  deadline and the same escalation. The labels go into the harness's brief,
-  because they were part of the question and whoever reads it was not
-  watching the thread.
-
-`message` is capped at `CONTACT_HUMAN_MESSAGE_LIMIT` and a longer one is
-refused rather than truncated — truncating would cut off the question, which
-is the part at the bottom. The limit is also what lets `unansweredBrief` quote
-the ask whole when nobody answers, which is the one thing the person picking
-the incident up cannot reconstruct. The evidence goes in `details`, posted as its own
-message under the ask — and posted *outside* the re-entrancy guard, because
-`messageTs` only records that the ask landed. A crash between the two posts
-leaves a marker that looks complete, so a resume re-posts the evidence rather
-than dropping it with no error and nobody aware. The split is the structure: the reader sees a
-conclusion and one request, and the proof is one scroll away rather than in
-front of it. `prompt.ts` carries the budget, the shape and a worked example
-("What a human reads"); this is what makes it more than advice.
+- **The ladder is read off the inbox.** After the first escalation the next
+  one is due on the heartbeat's doubling gap, capped at a day, measured from
+  the last escalation row for the incident since `askedAt`. The rows are the
+  record of what the Boss has been told, so a restart neither repeats a rung
+  nor skips one, and `pending_question` needs no counter.
+- **No length limit.** The Boss reads the question, not a phone, so nothing
+  about it is refused for length or cut.
 
 ## The heartbeat on a wait that needs a person
 
-An agent that posts "please merge this" and then blocks is indistinguishable
-from one that has died, and a merge nobody notices is the stall that matters
-most — the human's only job in this system is the merge. So a wait with
-`awaitingHuman` set nudges the thread on its own: due an hour in, then two,
-then four. Past `HEARTBEAT_LOUD_AFTER_PINGS` the nudge becomes an `escalate` —
-the same facts, posted where the rotation sees them — and the wait continues.
+An agent that asks for a merge and then blocks is indistinguishable from one
+that has died, and a merge nobody notices is the stall that matters most — the
+human's only job in this system is the merge. So a wait with `awaitingHuman`
+set tells the Boss on its own: an hour in, then two, then four, each rung an
+`escalation` row carrying what is being waited for, what a person has to do,
+how long it has been and what the check says now, whole. The Boss decides
+who to reach and how loudly.
 
 **The ladder does not terminate**, because the agent is the only thing that
-can finish the work: volume is the only thing left that can change.
-`HEARTBEAT_MAX_GAP_SECONDS` clamps the doubling at a day, so it runs 1h, 2h,
-4h, 8h, 16h and then daily for as long as the wait lasts. Nothing open goes
-quiet for more than a day. Left doubling, the eighth nudge would land a
-fortnight after the seventh, which is indistinguishable from having given up.
+can finish the work. `HEARTBEAT_MAX_GAP_SECONDS` clamps the doubling at a day,
+so it runs 1h, 2h, 4h, 8h, 16h and then daily for as long as the wait lasts.
+Nothing open goes quiet for more than a day.
 
 It lives in the wait loop rather than in the prompt for the same two reasons
-`runContactHuman`'s escalation does. It must cost **no turns** — a model asked
-to nudge itself has to come back for a turn to do it, which is the polling
-loop the tool exists to replace. And an agent that has gone quiet cannot
-notice its own silence.
+the question's escalation does. It must cost **no turns** — a model asked to
+remind itself has to come back for a turn to do it, which is the polling loop
+the tool exists to replace. And an agent that has gone quiet cannot notice its
+own silence.
 
-**Nudges are gated on working hours, and the backoff counts from the last
-nudge.** The window is `BUGBOSS_WORKING_HOURS`
-(`America/New_York:10-19:1,2,3,4,5` by default — 07:00–16:00 Pacific, so
-nobody on a continental-US team is pinged before 07:00 or after 19:00 local).
-The elapsed clock is wall clock and the window only gates the *post*, so a
-wait that spans a night stays silent and speaks on the first poll after the
-window opens. Counting the gap from the last nudge rather than from the start
-is what stops that morning from arriving as the whole ladder at once.
+**Rungs are gated on working hours, and the backoff counts from the last
+rung.** The window is `BUGBOSS_WORKING_HOURS`
+(`America/New_York:10-19:1,2,3,4,5` by default — 07:00–16:00 Pacific). The
+elapsed clock is wall clock and the window only gates the *send*, so a wait
+that spans a night stays silent and speaks on the first poll after the window
+opens. Counting the gap from the last rung rather than from the start is what
+stops that morning from arriving as the whole ladder at once.
 
-**Re-entrancy is the `pending_wait` marker**, on the same contract as the
-question marker: idempotent for the same command, replaced by a different one.
-It holds `startedAt` and the nudge count, so a resumed agent resumes the wait
-it was in — and the timeout is measured from `startedAt`, so a crash-looping
-agent does not get a fresh day each time round. The nudge is counted *before*
-it is posted, which is the opposite order from the question and deliberate: a
-crash between the two costs one nudge, where the other order re-nudges on
-every resume, and every merge to ops `main` resumes every agent.
+**Re-entrancy is the `pending_wait` marker**: idempotent for the same command,
+replaced by a different one. It holds `startedAt` and the rung count, so a
+resumed agent resumes the wait it was in and the timeout is measured from
+`startedAt`. The rung is counted *before* it is sent, deliberately: a crash
+between the two costs one rung, where the other order repeats it on every
+resume, and every merge to ops `main` resumes every agent.
 
 Both blocking tools take the harness's deadline signal combined with Pi's own,
 so the soft deadline can interrupt a blocking tool. Without that, `steer` only lands
@@ -367,8 +362,6 @@ is gone, so the cap outlived the thing it was protecting against.
 
 ## Nothing is cut by character count, anywhere
 
-One rule. It used to be two, and before that it was one cap.
-
 **Tool results are never cut.** `DEFAULT_MAX_TOOL_CHARS` (20,000, about 5,000
 tokens) used to bound every one of them, and `truncateOutput` cut the middle
 out to do it. The outputs it actually fired on were stack traces, log dumps
@@ -377,62 +370,45 @@ the session by destroying the evidence the run had just paid a tool call to
 fetch. Pi compacts just in time instead (`docs/architecture.md`), so a result
 lands whole and summarised history is what gives way. Do not add a cap back.
 
-**A message to a person is never cut by character count.** The nudge used to
-post `[... 549 characters elided ...]` in place of the middle of the sentence
-saying what was being waited for, to somebody reading it on a phone. A count
-of what they cannot see is not something anybody can act on. So:
+**What the agent sends the Boss is never cut or refused for length.** The Boss
+reads it, and what reaches a person is the Boss's own words, so there is no
+Slack budget to enforce on this side. The limits that used to sit on the ask,
+on `monitor`'s prose fields and on the re-run suspicion all answered to a
+phone screen, and each one caused retry loops in the runs that hit it.
 
-- Every prose field that a harness-composed Slack message echoes is **refused
-  at the tool boundary** — `MONITOR_FIELD_LIMIT` for `monitor`'s `description`
-  and `awaitingHuman`, `CONTACT_HUMAN_MESSAGE_LIMIT` for the ask,
-  `overThreadBudget` for everything the model posts itself. A refusal costs
-  one turn and says what to move where; a clamp costs the reader the sentence.
-- **A refusal needs an author to refuse to.** Where there is none — a probe's
-  stdout, a log line, a report somebody filed — the text is carried, not cut.
-  `postNotice` marks its posts `harnessComposed`, and the `/thread` route
-  splits those instead of refusing them (`http/toolapi.ts`). That is what
-  removed `STATUS_EXCERPT_CHARS` from the nudge and `LINK_LABEL_CHARS` from
-  the re-run notice.
-- **The stalled-wait brief is the one that cannot split**, because it goes
-  through `escalate` and answers to `overThreadBudget` like any brief. So it
-  does not carry the check's output at all: `stalledWaitStatus` posts that
-  under it, whole, on the harness path.
-- The composed worst case of each harness message still has to fit
-  `THREAD_PROSE_CHARS` for the part the harness *wrote*. `tools.test.ts`
-  composes those worst cases at the field limits, which is what keeps the
-  refusals load-bearing rather than decorative.
-- `CONTACT_HUMAN_MESSAGE_LIMIT` is 550 rather than something rounder because
-  `unansweredBrief` quotes the ask **whole**, and that arithmetic is what buys
-  it. Changing one means redoing the other.
+What the agent writes that does reach Slack is posted by `toolapi` on a
+transition, and that is where the thread budget lives: resolution evidence
+is refused past `THREAD_PROSE_CHARS`, and the post-mortem has no cap.
 
-The Slack agent used to be the exception. It had no compaction, so its
-per-result caps were the only thing bounding its context. It has compaction
-now — `compactTranscript` in `slack/agent.ts`, wired into the loop in the
-composition root — and the caps are gone with it. What is left on that surface
+The Slack agent has compaction too — `compactTranscript` in `slack/agent.ts`,
+wired into the loop in the composition root — so what is left on that surface
 bounds *rows and entries*, never widths.
 
-## What it writes goes straight to Slack
+## What reaches Slack is mrkdwn
 
-`contact_human`, the escalation brief, the root cause, the resolution evidence
-and the post-mortem are all posted as the agent wrote them, so the prompt
-carries the mrkdwn contract ("Writing to Slack" in `prompt.ts`). The model is
-told **not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at
-the boundary, and a model that pre-escapes would post `&amp;amp;`.
+The root cause, the resolution evidence and the post-mortem are posted as the
+agent wrote them, so the prompt carries the mrkdwn contract ("What reaches
+Slack" in `prompt.ts`) for those three and nothing else. The model is told
+**not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at the
+boundary, and a model that pre-escapes would post `&amp;amp;`.
 
 The conversion is a backstop, not the mechanism. It only fires on the Markdown
 that slips through anyway, and it runs on the Slack copy alone: the stored
 root cause and post-mortem stay as the agent wrote them.
 
+The prompt also tells the agent not to narrate in plain text between tool
+calls. Nothing reads it: one run wrote 56,000 characters of it.
+
 ## Directives
 
-The poll in `contact_human` uses a **non-draining** read
+The poll in `message_boss` uses a **non-draining** read
 (`GET /incidents/:id/directives`). Draining there destroyed `stop`,
 `merged`, `new_signals` and `resumed_after` — including the
 `resumed_after` the dispatcher inserts at launch, which the agent's first
 replayed call would eat before it ever ran `get_incident`.
 
-The one reply it acts on is consumed by id. Everything else stays pending
-for `get_incident` to deliver. A `human_message` left pending would
+The answer it acts on is consumed by id. Everything else stays pending
+for `get_incident` to deliver. A `boss_message` left pending would
 otherwise come back a turn later and read as a *new* instruction, since
 directives render as prose.
 

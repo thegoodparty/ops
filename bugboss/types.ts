@@ -259,24 +259,36 @@ export type Directive =
       absorbed?: string[];
     }
   /**
-   * Something a person said in the incident thread. `addressed` is whether it
-   * was for the agent: `contact_human` ends its wait on a reply that was, and
-   * carries one that was not through as context. Two people talking to each
-   * other while an agent is blocked used to end the wait on whichever of them
-   * spoke first.
-   *
-   * Optional only for the rows in flight across the deploy that added it. A
-   * missing value reads as "for the agent", which is what those rows meant.
+   * The Boss talking to this incident's agent. It is the only way anything a
+   * person says reaches an agent: people talk to the Boss, and the Boss
+   * decides what the agent needs to hear. Every one is deliberate, so any
+   * of them ends a wait for an answer.
    */
-  | {
-      type: "human_message";
-      from: string;
-      text: string;
-      ts: string;
-      addressed?: "agent" | "others";
-    }
+  | { type: "boss_message"; text: string; at: number }
   /** Carries how long the agent was gone, so it can re-check before continuing. */
   | { type: "resumed_after"; seconds: number };
+
+/**
+ * What an incident agent sends up. `question` is one it is blocked on until
+ * the Boss answers; `escalation` is one that needs a person urgently.
+ */
+export type BossInboxKind = "message" | "question" | "escalation";
+
+export interface BossInboxItem {
+  id: number;
+  incidentId: string;
+  kind: BossInboxKind;
+  text: string;
+  createdAt: number;
+  seenAt: number | null;
+}
+
+/**
+ * Runs the Boss for an incident because its inbox has something new. Returns
+ * immediately; the Boss drains the inbox itself, so a wake that lands while
+ * it is already running is picked up by that run rather than lost.
+ */
+export type WakeBoss = (incidentId: string) => void;
 
 export interface ToolApi {
   /** INVESTIGATING -> FIXING. Triggers correlation and splits the unexplained. */
@@ -384,7 +396,7 @@ export interface ToolApi {
    * the outside. An agent could already read a stranger's whole post-mortem
    * through `searchIncidents`, which is scoped to RESOLVED and CLOSED, and
    * could not see the open incident beside it: fluent about the past, blind
-   * to the present. The Slack question box has served any incident to anyone
+   * to the present. The Boss has served any incident to anyone
    * in the channel the whole time, and serves more of it than this does.
    */
   getIncident(args?: {
@@ -570,7 +582,7 @@ export interface DispatcherConfig {
   tickSeconds: number;
   /**
    * Wall clock, per launch. A poor proxy for work done and never the only
-   * bound: `monitor` and `contact_human` each cost one turn however long
+   * bound: `monitor` and `message_boss` each cost one turn however long
    * they block, so one real incident spent eight of its nine hours parked on
    * a human and the clock counted all of it.
    */

@@ -365,7 +365,11 @@ export const consumeAnthropicStream = async ({
         if (mapped.errorMessage) output.errorMessage = mapped.errorMessage;
       }
       if (event.usage) {
-        applyUsage(output, event.usage, cacheRetention, onUnhonouredCacheRetention);
+        // No retention check here: message_delta carries only the write total,
+        // never the cache_creation split, so every turn would report a false
+        // cache_retention_not_honoured. message_start carries the split and is
+        // where the check runs.
+        applyUsage(output, event.usage);
       }
       applyCost();
       continue;

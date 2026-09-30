@@ -3,7 +3,7 @@ import { describe, test } from "node:test";
 
 import axios, { type AxiosResponse, type InternalAxiosRequestConfig } from "axios";
 
-import { createCachingLinker, createSlackFileUploader } from "./client";
+import { createCachingLinker, createSlackClient, createSlackFileUploader } from "./client";
 import type { ReportUpload } from "../report";
 
 const INCIDENTS = "C0DEVALERTS";
@@ -548,5 +548,55 @@ describe("the upload does not retry its way past the tick it has", () => {
       run.api.length * bounds[0] < 30_000,
       `${run.api.length} calls at ${bounds[0]}ms must fit one 30s tick`,
     );
+  });
+});
+
+describe("a thread is read to the end", () => {
+  test("every page is fetched, and the newest messages on the last page are kept", async () => {
+    const realAdapter = axios.defaults.adapter;
+    const cursors: (string | null)[] = [];
+    const parent = { ts: "100.000100", user: "B0BOSS", text: "*Incident 7 opened*" };
+    const page = (from: number, to: number) =>
+      Array.from({ length: to - from }, (_, i) => ({
+        ts: `${200 + from + i}.000000`,
+        user: "U-ada",
+        text: `reply ${from + i}`,
+      }));
+    const pages: Record<string, { messages: unknown[]; next?: string }> = {
+      first: { messages: [parent, ...page(0, 200)], next: "c2" },
+      c2: { messages: [parent, ...page(200, 400)], next: "c3" },
+      c3: { messages: [parent, ...page(400, 450)] },
+    };
+    axios.defaults.adapter = ((config: InternalAxiosRequestConfig) => {
+      const cursor = new URLSearchParams(String(config.data ?? "")).get("cursor");
+      cursors.push(cursor);
+      const served = pages[cursor ?? "first"];
+      return Promise.resolve({
+        data: {
+          ok: true,
+          messages: served.messages,
+          response_metadata: { next_cursor: served.next ?? "" },
+        },
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: { path: "/api/conversations.replies" },
+      } as AxiosResponse);
+    }) as typeof axios.defaults.adapter;
+
+    try {
+      const read = await createSlackClient("xoxb-test", INCIDENTS).replies({
+        channel: INCIDENTS,
+        threadTs: parent.ts,
+      });
+
+      assert.deepEqual(cursors, [null, "c2", "c3"], "the premise: the thread spans three pages");
+      assert.equal(read.length, 451, "every reply, and the parent once");
+      assert.equal(read.filter((m) => m.ts === parent.ts).length, 1);
+      assert.equal(read.at(-1)?.text, "reply 449", "the newest message is the last one read");
+    } finally {
+      axios.defaults.adapter = realAdapter;
+    }
   });
 });
