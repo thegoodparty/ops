@@ -303,6 +303,21 @@ CREATE TABLE IF NOT EXISTS thread_reply (
 CREATE INDEX IF NOT EXISTS thread_reply_incident_idx
   ON thread_reply (incidentId, ts);
 
+-- What incident agents have sent up to the Boss. Nothing an agent writes
+-- reaches a person directly; it lands here and the Boss decides what to do
+-- with it. seenAt is set once a Boss run has been shown the row.
+CREATE TABLE IF NOT EXISTS boss_inbox (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  incidentId        TEXT NOT NULL REFERENCES incident(id),
+  kind              TEXT NOT NULL CHECK (kind IN ('message','question','escalation')),
+  text              TEXT NOT NULL,
+  createdAt         INTEGER NOT NULL,
+  seenAt            INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS boss_inbox_unseen_idx
+  ON boss_inbox (incidentId, seenAt);
+
 -- Directives waiting for an agent to pick up on its next call.
 CREATE TABLE IF NOT EXISTS pending_directive (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
