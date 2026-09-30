@@ -2507,11 +2507,10 @@ test("a verified Slack delivery is acknowledged through the real wiring", async 
   );
 });
 
-// A threadless incident is a real state: opening a thread can fail, and it
-// can fail for good. `slack.post(null, ...)` is a top-level channel message,
-// so announcing a resume anyway would put "the agent on this incident
-// stopped" in the channel with nothing saying which incident.
-test("a resume notice is not posted out of context when there is no thread", async () => {
+// A resume after a long gap alarms for operators and tells the agent, and
+// posts nothing: the relaunch is automatic, so a post would ask nothing of
+// anyone. Threadless, so any post at all would land at channel root.
+test("a long resume alarms and posts nothing", async () => {
   const id = "orphan-resume";
   await boss.db.withWrite((w) => {
     w.prepare(
@@ -2539,28 +2538,23 @@ test("a resume notice is not posted out of context when there is no thread", asy
 
   assert.ok(
     alarms.some((line) => {
-      if (!line.includes("resume_notice_undeliverable")) return false;
+      if (!line.includes("agent_resumed_after_gap")) return false;
       const parsed = JSON.parse(line) as { event: string; incidentId?: string };
-      return parsed.event === "resume_notice_undeliverable" && parsed.incidentId === id;
+      return parsed.event === "agent_resumed_after_gap" && parsed.incidentId === id;
     }),
-    "the resume that could not be announced is alarmed, naming the incident",
+    "the long resume is alarmed, naming the incident",
   );
 
-  // Only the resume notice. The fake agent runs this incident through to a
-  // close, and those posts are top-level for the same threadless reason --
-  // they are not what this test is about.
-  const orphaned = fakeSlack.posts
+  // The fake agent runs this incident through to a close, and those posts
+  // are top-level for the threadless reason -- they are not what this test
+  // is about.
+  const resumePosts = fakeSlack.posts
     .slice(before)
-    .filter((p) => /stopped without finishing/.test(p.text));
-  assert.deepEqual(
-    orphaned,
-    [],
-    "a resume nobody can place is alarmed, not posted at channel root",
-  );
+    .filter((p) => /stopped without finishing|started it again/.test(p.text));
+  assert.deepEqual(resumePosts, [], "the resume is not posted anywhere");
 
-  // And the resume itself still happened. A notice nobody can place must not
-  // cost the relaunch -- the directive is gone by now because the agent read
-  // it, so the launch is what is left to look at.
+  // And the resume itself still happened. The directive is gone by now
+  // because the agent read it, so the launch is what is left to look at.
   assert.equal(
     boss.db.get<{ attempts: number }>(
       "SELECT attempts FROM incident WHERE id = ?",

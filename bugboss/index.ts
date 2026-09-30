@@ -1934,8 +1934,8 @@ export const createBugBoss = async (
     mintToken,
     // The dispatcher has no Slack of its own and the tool API cannot say
     // anything that is not a transition, so the one thing it needs to tell a
-    // human -- that the agent they were waiting on had been dead for an hour
-    // -- is handed over the same way the tool API's thread poster is.
+    // human -- that nothing has touched their incident in a long time -- is
+    // handed over the same way the tool API's thread poster is.
     postNotice: async (incidentId, text) => {
       const threadTs =
         db.get<{ slackThreadTs: string | null }>(
@@ -1944,14 +1944,14 @@ export const createBugBoss = async (
         )?.slackThreadTs ?? null;
       // A threadless incident is a real state -- opening one can fail, and
       // it can fail for good. `slack.post(null, ...)` is a top-level channel
-      // message, so posting anyway would put "the agent on this incident
-      // stopped" in the channel with nothing saying which incident. Alarming
+      // message, so posting anyway would put a notice about "this incident"
+      // in the channel with nothing saying which incident. Alarming
       // is the same answer the dispatcher gives when no poster is wired in
       // at all: the event still reaches somebody, out of context does not.
       if (!threadTs) {
-        alarm("resume_notice_undeliverable", {
+        alarm("stale_notice_undeliverable", {
           incidentId,
-          note: "the incident has no Slack thread, so the resume was not announced where anyone is watching",
+          note: "the incident has no Slack thread, so the notice was not posted where anyone is watching",
         });
         return;
       }

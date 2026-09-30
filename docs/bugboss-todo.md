@@ -269,13 +269,12 @@ them would be caught by a test.
   the transition into the merge wait. Going further needs ECS task exit codes
   or Boss-side logs; the session files do not carry a cause.
 
-- **Resume was never the missing piece; saying so was.** The dispatcher
+- **Resume was never the missing piece; noticing was.** The dispatcher
   already relaunches an agent-owned incident on its next tick whatever killed
   the last one, so incident 5 was not un-resumable -- it was un-noticed. A gap
-  longer than `RESUME_NOTICE_SECONDS` now alarms and posts to the thread, and
-  a killed run alarms when its child exits. Shorter gaps stay quiet on purpose:
-  a deploy puts every agent back within a tick or two, and announcing that
-  would teach people to skip the message that matters.
+  longer than `RESUME_ALARM_SECONDS` now alarms, and a killed run alarms when
+  its child exits. The thread is not told: the relaunch is automatic and the
+  agent learns of the gap through `resumed_after`.
 
   Still open: nothing outside the container watches the container. If the Boss
   itself is down, no in-process detection fires. That needs infrastructure,

@@ -46,17 +46,16 @@ const log = makeLog("dispatcher");
 const alarm = makeAlarm("dispatcher");
 
 /**
- * How long an agent has to have been gone before its resume is announced.
+ * How long an agent has to have been gone before its resume alarms.
  *
- * A deploy or a container restart puts an agent back within a tick or two,
- * and saying so every time would be noise on a routine event. A gap longer
- * than this is not routine: the run was killed and nothing picked it up for
- * minutes, which is the shape of the three real runs that died at the same
- * lifecycle position and were never noticed. The resume was always automatic;
- * what was missing is that it was silent, so a thread whose last message was
- * true read as patience while nothing was happening.
+ * A container restart puts an agent back within a tick or two, and alarming
+ * on that would be noise on a routine event. A gap longer than this means the
+ * run was killed and nothing picked it up for minutes, which is the shape of
+ * the three real runs that died at the same lifecycle position and were never
+ * noticed. Operators need to hear about that; the thread does not, because
+ * the resume is automatic and the agent is told through `resumed_after`.
  */
-export const RESUME_NOTICE_SECONDS = 300;
+export const RESUME_ALARM_SECONDS = 300;
 
 /**
  * How long an incident the dispatcher gave up on stays unrunnable.
@@ -338,16 +337,6 @@ const crashLoopBrief = (
     "Side effects: check the incident for PRs an earlier launch opened.",
     `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
   ].join("\n");
-
-/** Minutes, because a gap worth announcing is never seconds. */
-export const resumeNotice = (deadSeconds: number): string => {
-  const minutes = Math.round(deadSeconds / 60);
-  const span = minutes < 60 ? `${minutes}m` : `${Math.round(minutes / 6) / 10}h`;
-  return [
-    `The agent on this incident stopped without finishing, and nothing had been heard from it for ${span} when I started it again.`,
-    "It will re-check anything time-sensitive before it continues.",
-  ].join(" ");
-};
 
 /**
  * What the sweep did with the wait it found, which is the distinction the
@@ -1164,7 +1153,7 @@ export class Dispatcher {
       recorded,
       session ?? 0,
       // No session, no way to tell a live wait from an orphan, and hiding a
-      // real gap is worse than announcing a false one the alarm above explains.
+      // real gap is worse than reporting a false one the alarm above explains.
       markerAt !== null && session !== null && markerAt >= session
         ? this.bootedAt
         : 0,
@@ -1184,7 +1173,7 @@ export class Dispatcher {
     const seconds = Math.max(0, Math.round((now - since) / 1000));
     if (seconds < this.config.tickSeconds) return;
     await this.emitDirective(row.id, { type: "resumed_after", seconds });
-    if (seconds < RESUME_NOTICE_SECONDS) {
+    if (seconds < RESUME_ALARM_SECONDS) {
       // The normal path: every merge to ops main restarts this container and
       // every live agent with it.
       log("agent_resumed", {
@@ -1195,10 +1184,6 @@ export class Dispatcher {
       return;
     }
 
-    // Loud on both channels, because they answer different questions. The
-    // alarm is how an operator learns agents are dying; the thread is how the
-    // person watching this one incident learns that the quiet they were
-    // reading as progress was an agent that had stopped.
     alarm("agent_resumed_after_gap", {
       incidentId: row.id,
       deadSeconds: seconds,
@@ -1207,17 +1192,6 @@ export class Dispatcher {
       status: row.status,
       note: "the previous run stopped without finishing and nothing was heard from it for this long before the relaunch",
     });
-    if (!this.postNotice) {
-      alarm("resume_notice_undeliverable", {
-        incidentId: row.id,
-        deadSeconds: seconds,
-        note: "no thread poster is wired in, so nobody watching this incident was told",
-      });
-      return;
-    }
-    await this.postNotice(row.id, resumeNotice(seconds)).catch((err: unknown) =>
-      alarm("resume_notice_failed", { incidentId: row.id, error: String(err) }),
-    );
   };
 
   private emitDirective = async (

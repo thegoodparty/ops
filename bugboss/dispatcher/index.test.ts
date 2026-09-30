@@ -11,9 +11,8 @@ import Database from "better-sqlite3";
 import { DEADLINE_GRACE_SECONDS } from "../agent/run";
 import type { DispatcherConfig, ToolApi } from "../types";
 import {
-  RESUME_NOTICE_SECONDS,
+  RESUME_ALARM_SECONDS,
   createDispatcher,
-  resumeNotice,
   staleNotice,
   type DispatcherDb,
   type DispatcherDeps,
@@ -1256,46 +1255,54 @@ describe("Dispatcher.tick", () => {
   });
 
   // The three real runs that were killed were resumed automatically and
-  // silently, so the thread's last message -- still true -- read as patience
-  // while nothing was running. The resume was never the missing piece; saying
-  // it happened was.
-  it("says in the thread when it resumes an agent that has been gone a long time", async () => {
+  // nobody noticed. Operators learn from the alarm and the agent from the
+  // directive; the thread is not told, because the post asked nothing of
+  // anyone and fired on every ordinary deploy.
+  it("alarms and tells the agent, and posts nothing, when it resumes an agent gone a long time", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
       sessionRef: "s-1",
-      lastStartedAt: T0 - (RESUME_NOTICE_SECONDS + 60) * 1000,
+      lastStartedAt: T0 - (RESUME_ALARM_SECONDS + 60) * 1000,
     });
 
-    const notices: { incidentId: string; text: string }[] = [];
+    const notices: string[] = [];
     const held = heldSpawn();
     const d = createDispatcher(
       deps({
         db,
         spawn: held.spawn,
         toolApiFor,
-        postNotice: async (incidentId, text) => {
-          notices.push({ incidentId, text });
+        postNotice: async (_id, text) => {
+          notices.push(text);
         },
       }),
     );
-    await d.tick();
+    let started: string[] = [];
+    const alarms = await captureAlarms(async () => {
+      started = (await d.tick()).started.map((a) => a.incidentId);
+    });
 
-    assert.equal(notices.length, 1, "the thread is told exactly once");
-    assert.equal(notices[0].incidentId, "i1");
-    assert.equal(notices[0].text, resumeNotice(RESUME_NOTICE_SECONDS + 60));
-    assert.match(notices[0].text, /stopped without finishing/);
+    assert.deepEqual(started, ["i1"]);
+    assert.deepEqual(notices, [], "nothing is posted to the thread");
+    assert.ok(alarms.includes("agent_resumed_after_gap"));
+    const directives = db
+      .query<{ payload: string }>("SELECT payload FROM pending_directive")
+      .map((r) => JSON.parse(r.payload));
+    assert.deepEqual(directives, [
+      { type: "resumed_after", seconds: RESUME_ALARM_SECONDS + 60 },
+    ]);
 
     held.releaseAll();
     await d.drain();
     cleanup();
   });
 
-  // A deploy puts every agent back within a tick or two. Saying so each time
-  // would teach people to skip the message that matters.
-  it("says nothing for a resume quick enough to be a deploy", async () => {
+  // A restart puts every agent back within a tick or two, which is routine
+  // and not worth an alarm.
+  it("stays quiet for a resume quick enough to be a restart", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
@@ -1317,48 +1324,17 @@ describe("Dispatcher.tick", () => {
         },
       }),
     );
-    await d.tick();
+    const alarms = await captureAlarms(async () => {
+      await d.tick();
+    });
 
     assert.deepEqual(notices, []);
+    assert.ok(!alarms.includes("agent_resumed_after_gap"));
     // The agent is still told, because it is the one that has to re-check.
     const directives = db.query<{ payload: string }>(
       "SELECT payload FROM pending_directive",
     );
     assert.equal(directives.length, 1);
-
-    held.releaseAll();
-    await d.drain();
-    cleanup();
-  });
-
-  it("launches anyway when the thread cannot be reached", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1", {
-      status: "FIXING",
-      attempts: 1,
-      sessionRef: "s-1",
-      lastStartedAt: T0 - 3_600_000,
-    });
-
-    const held = heldSpawn();
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn: held.spawn,
-        toolApiFor,
-        postNotice: async () => {
-          throw new Error("slack is down");
-        },
-      }),
-    );
-    const result = await d.tick();
-
-    assert.deepEqual(
-      result.started.map((a) => a.incidentId),
-      ["i1"],
-      "a notice nobody can deliver must not cost the resume",
-    );
 
     held.releaseAll();
     await d.drain();
@@ -1439,20 +1415,23 @@ describe("Dispatcher.tick", () => {
       return { notices, alarms, directives };
     };
 
-    it("measured from launch, the old clock, this is a gap worth announcing", async () => {
-      assert.ok(LAUNCHED_AGO_MS / 1000 >= RESUME_NOTICE_SECONDS);
+    it("measured from launch, the old clock, this is a gap worth alarming", async () => {
+      assert.ok(LAUNCHED_AGO_MS / 1000 >= RESUME_ALARM_SECONDS);
       const { notices, alarms, directives } = await restartWith({
         inbox: false,
         session: false,
       });
-      assert.equal(notices.length, 1, "with no activity to read, launch is the clock");
-      assert.ok(alarms.includes("agent_resumed_after_gap"));
+      assert.ok(
+        alarms.includes("agent_resumed_after_gap"),
+        "with no activity to read, launch is the clock",
+      );
+      assert.deepEqual(notices, []);
       assert.deepEqual(directives, [
         { type: "resumed_after", seconds: LAUNCHED_AGO_MS / 1000 },
       ]);
     });
 
-    it("says nothing in the thread and logs the real three minutes", async () => {
+    it("does not alarm and logs the real three minutes", async () => {
       const { notices, alarms, directives } = await restartWith({
         inbox: true,
         session: true,
@@ -1478,7 +1457,7 @@ describe("Dispatcher.tick", () => {
     });
   });
 
-  it("tells the thread the true gap when the agent really was idle, and nothing about the last message", async () => {
+  it("alarms and tells the agent the true gap when the agent really was idle", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
@@ -1516,10 +1495,12 @@ describe("Dispatcher.tick", () => {
       await d.tick();
     });
 
-    assert.deepEqual(notices, [resumeNotice(3600)]);
-    assert.match(notices[0], /1h/);
-    assert.doesNotMatch(notices[0], /last message/);
+    assert.deepEqual(notices, []);
     assert.ok(alarms.includes("agent_resumed_after_gap"));
+    const directives = db
+      .query<{ payload: string }>("SELECT payload FROM pending_directive")
+      .map((r) => JSON.parse(r.payload));
+    assert.deepEqual(directives, [{ type: "resumed_after", seconds: 3600 }]);
 
     held.releaseAll();
     await d.drain();
@@ -1597,8 +1578,9 @@ describe("Dispatcher.tick", () => {
     };
 
     it("without an open marker, the last timestamp alone reads as an hour gone", async () => {
-      const { notices } = await restartDuring(null);
-      assert.equal(notices.length, 1);
+      const { notices, alarms } = await restartDuring(null);
+      assert.ok(alarms.includes("agent_resumed_after_gap"));
+      assert.deepEqual(notices, []);
     });
 
     it("an open question or wait means it was alive until the restart", async () => {
@@ -1615,16 +1597,18 @@ describe("Dispatcher.tick", () => {
     // than the marker, which is how an orphan is told from a live wait.
     it("a marker counts for nothing when the session cannot be read", async () => {
       const { notices, alarms } = await restartDuring("question", null);
-      assert.equal(notices.length, 1);
+      assert.ok(alarms.includes("agent_resumed_after_gap"));
       assert.ok(alarms.includes("resume_session_read_failed"));
+      assert.deepEqual(notices, []);
     });
 
     it("an orphaned marker older than the session proves nothing", async () => {
-      const { notices, directives } = await restartDuring(
+      const { notices, alarms, directives } = await restartDuring(
         "question",
         T0 - ASKED_AGO_MS + 600_000,
       );
-      assert.equal(notices.length, 1);
+      assert.ok(alarms.includes("agent_resumed_after_gap"));
+      assert.deepEqual(notices, []);
       assert.deepEqual(directives, [
         { type: "resumed_after", seconds: (ASKED_AGO_MS - 600_000 + 45_000) / 1000 },
       ]);
