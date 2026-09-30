@@ -1,6 +1,6 @@
 # Docker Compose for the GoodParty agent-swarm host.
 #
-# One EC2 host (m7i.2xlarge, Amazon Linux 2023) runs the whole system: a
+# One EC2 host (m6a.xlarge by default, Amazon Linux 2023) runs the whole system: a
 # control-plane API, a lead agent that commands incidents, two coder agents that
 # work them in parallel, a Litestream sidecar that replicates the incident
 # database to S3, and a bridge that turns Grafana alerts into incident tasks.

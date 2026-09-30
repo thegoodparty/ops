@@ -31,7 +31,7 @@ what that costs and what it gives up.
 
 ## What actually gets deployed
 
-One EC2 host (`m7i.2xlarge`, Amazon Linux 2023) running six containers:
+One EC2 host (`m6a.xlarge` by default, Amazon Linux 2023) running six containers:
 
 | Service | What it is |
 | --- | --- |
@@ -154,8 +154,35 @@ with SSH, and `docker compose logs -f lead` is where you watch it think.
 
 ## Cost
 
-Roughly $350 a month if left running: the instance is the bulk of it, then the load
-balancer and 200 GB of disk. Stopping the instance when you are not watching costs
-almost nothing but the swarm stops receiving alerts. `./teardown.sh` removes
-everything except the S3 bucket, which holds the incident history; pass
-`--purge-bucket` only if you mean to destroy the record.
+The instance is the lever. Defaults are `m6a.xlarge` (4 vCPU, 16 GiB) and a
+100 GiB disk, which is about **$135 a month**: roughly $4.15 a day for the host,
+$8 for the disk, and $16 to $20 for the load balancer. The load balancer is fixed
+whatever the instance size, so the instance is where a saving lives.
+
+| Instance | vCPU / GiB | Per day | Per month |
+| --- | --- | --- | --- |
+| `m6a.xlarge` (default) | 4 / 16 | $4.15 | $126 |
+| `m6a.2xlarge` | 8 / 32 | $8.29 | $252 |
+| `m7i.2xlarge` | 8 / 32 | $9.68 | $294 |
+
+Sizes are set by flag, not by editing the script:
+
+```bash
+./deploy.sh --instance-type m6a.2xlarge --disk-size 200
+```
+
+Two things not to do. Do not use a **Graviton** instance (`m7g`, `m6g`): both
+swarm images are built for `linux/amd64` only, so on arm64 they run under
+emulation, slowly and occasionally wrongly. And do not expect a **Spot** instance
+to keep watching alerts: it is cheap until it is reclaimed, which takes the whole
+system down with no restart.
+
+Upstream publishes no host size at all, only per-container requests, and its
+minimal two-pool example asks for 750m CPU and 1.5 GiB. The default here is a
+judgement with headroom rather than a recommendation being honoured, and the
+workload is I/O bound, so memory is the thing to keep room in rather than CPU.
+
+Stopping the instance when you are not watching costs almost nothing but the
+swarm stops receiving alerts. `./teardown.sh --yes` removes everything except the
+S3 bucket, which holds the incident history; pass `--purge-bucket` only if you
+mean to destroy the record.

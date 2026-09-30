@@ -23,8 +23,19 @@ HOSTNAME="agent-swarm.goodparty.org"
 BUCKET="agent-swarm-prod"
 SECRET_NAME="AGENT_SWARM"
 
-INSTANCE_TYPE="m7i.2xlarge"
-ROOT_VOLUME_GIB=200
+# Sized for the whole stack on one host, not for one container: the API is light,
+# the lead mostly waits on model calls, and the two coders burst when a build or
+# a test suite runs. Work here is I/O bound, so vCPU is rarely the constraint and
+# memory is the thing to keep room in. Upstream publishes no host size, only
+# per-container requests (its minimal two-pool example asks for 750m and 1.5 GiB),
+# so this is a judgement with headroom rather than a recommendation to honour.
+#
+# AMD rather than Intel because it is materially cheaper for the same shape, and
+# x86 rather than Graviton because both swarm images are built for linux/amd64
+# only: on an arm64 host they would run under emulation, which is slow and
+# occasionally wrong.
+INSTANCE_TYPE="m6a.xlarge"
+ROOT_VOLUME_GIB=100
 NAME_TAG="agent-swarm"
 
 ALB_NAME="agent-swarm"
@@ -68,13 +79,18 @@ TAG_MAP=("Key=Environment,Value=infra" "Key=Project,Value=agent-swarm")
 
 usage() {
   cat <<'EOF'
-Usage: deploy.sh [--profile NAME] [--region REGION]
+Usage: deploy.sh [--profile NAME] [--region REGION] [--instance-type TYPE] [--disk-size GIB]
 
 Creates or updates the agent-swarm host, its load balancer and DNS, and then
 deploys the stack in this directory to it over SSM.
 
-  --profile NAME   AWS CLI profile to use (default: $AWS_PROFILE)
-  --region REGION  AWS region (default: us-west-2)
+  --profile NAME       AWS CLI profile to use (default: $AWS_PROFILE)
+  --region REGION      AWS region (default: us-west-2)
+  --instance-type TYPE EC2 instance type (default: m6a.xlarge, 4 vCPU / 16 GiB)
+  --disk-size GIB      Root volume size (default: 100)
+
+Only an existing instance's type is left alone: this refuses to resize a running
+host, because that is a stop/start that would interrupt a live incident.
 EOF
 }
 
@@ -86,6 +102,10 @@ while [ $# -gt 0 ]; do
     --profile=*) PROFILE="${1#*=}"; shift ;;
     --region) REGION="${2:-}"; shift 2 ;;
     --region=*) REGION="${1#*=}"; shift ;;
+    --instance-type) INSTANCE_TYPE="${2:-}"; shift 2 ;;
+    --instance-type=*) INSTANCE_TYPE="${1#*=}"; shift ;;
+    --disk-size) ROOT_VOLUME_GIB="${2:-}"; shift 2 ;;
+    --disk-size=*) ROOT_VOLUME_GIB="${1#*=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
@@ -633,14 +653,25 @@ if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
   case "$INSTANCE_ID" in
     *" "*|*$'\n'*|*$'\t'*) die "more than one instance is tagged Name=$NAME_TAG ($INSTANCE_ID). Terminate the strays first, or tear down with teardown.sh." ;;
   esac
-  report found "instance $INSTANCE_ID"
+  # Re-running must not silently resize a host that is mid-incident, and a type
+  # change needs a stop/start this script will not do behind your back.
+  CURRENT_TYPE="$("${AWS[@]}" ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].InstanceType' --output text)"
+  if [ "$CURRENT_TYPE" != "$INSTANCE_TYPE" ]; then
+    report found "instance $INSTANCE_ID ($CURRENT_TYPE, left as-is)"
+    info "you asked for $INSTANCE_TYPE, and resizing is a stop/start, so it is not done here."
+    info "to change it: aws ec2 stop-instances --instance-ids $INSTANCE_ID, then modify-instance-attribute, then start-instances"
+  else
+    report found "instance $INSTANCE_ID ($CURRENT_TYPE)"
+  fi
 else
   AMI_ID="$("${AWS[@]}" ssm get-parameter \
     --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
     --query 'Parameter.Value' --output text)"
-  # 200 GiB gp3, because the whole point of the box is to hold several agent
-  # workspaces plus a Docker image cache. The root volume is delete-on-
-  # termination so a teardown leaves nothing billable behind.
+  # gp3 because the box holds several agent workspaces plus a Docker image cache,
+  # which is the only reason a disk this size exists: the images alone are about
+  # 13 GB across the API, the worker and Litestream. The root volume is
+  # delete-on-termination so a teardown leaves nothing billable behind.
   cat > "$TMP/block-devices.json" <<JSON
 [
   {
