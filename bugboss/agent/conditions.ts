@@ -403,11 +403,13 @@ const prChecks = (ref: PrRef, github: GitHubReadPort): ConditionCheck => async (
   ];
   const verdict = failed.length
     ? "RESULT: FAILED. Stopped at the first failure; the pending checks are still running."
-    : pending.length
+    : pending.length && state === "OPEN"
       ? null
-      : cancelled.length
-        ? "RESULT: FINISHED, NOT GREEN. Nothing failed, but some checks were cancelled."
-        : "RESULT: ALL PASSED.";
+      : pending.length
+        ? `RESULT: FINISHED, NOT GREEN. ${ref.label} is ${state} with ${pending.length} ${pending.length === 1 ? "check" : "checks"} that never completed, so there is nothing left to wait for.`
+        : cancelled.length
+          ? "RESULT: FINISHED, NOT GREEN. Nothing failed, but some checks were cancelled."
+          : "RESULT: ALL PASSED.";
   return {
     done: verdict !== null,
     output: [verdict ?? "", summary, ...detail].filter(Boolean).join("\n"),

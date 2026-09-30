@@ -720,3 +720,24 @@ test("pr_checks on a PR that closed with no checks ends instead of waiting out i
   assert.equal(result.timedOut, false);
   assert.match(result.output, /^RESULT: NO CHECKS\. omni#2262 is MERGED/);
 });
+
+test("pr_checks on a PR that closed with a check stuck pending ends instead of waiting out its timeout", async () => {
+  const clock = fakeClock();
+  const github = fakeGitHub((check) => {
+    github.world.checks = [
+      checkRun("Test", "COMPLETED", "SUCCESS"),
+      { __typename: "StatusContext", context: "external-ci", state: "PENDING", targetUrl: "https://ci.example" },
+    ];
+    if (check === 3) Object.assign(github.world.pull, { state: "closed", merged: true });
+  });
+
+  const result = await runMonitor(
+    { ...base, condition: "pr_checks", pr: "omni#2262" },
+    { github: github.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.equal(github.checks(), 3, "waited while open, ended once merged");
+  assert.equal(result.timedOut, false);
+  assert.match(result.output, /^RESULT: FINISHED, NOT GREEN\. omni#2262 is MERGED with 1 check that never completed/);
+  assert.match(result.output, /- pending: external-ci https:\/\/ci\.example/);
+});
