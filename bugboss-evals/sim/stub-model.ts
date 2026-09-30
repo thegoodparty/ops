@@ -54,7 +54,7 @@ const allText = (body: Body): string => JSON.stringify(body.messages ?? []);
 const agentStep = (body: Body, patchPath: string): Answer => {
   const turn = (body.messages ?? []).filter((m) => m.role === "assistant").length;
   const seen = allText(body);
-  const signalIds = [...new Set([...seen.matchAll(/\\"id\\":\\"(sig[-_][\w-]+)\\"/g)].map((m) => m[1]))];
+  const signalIds = [...new Set([...seen.matchAll(/\\"id\\":\s*\\"(sig-[\w-]+)\\"/g)].map((m) => m[1]))];
   const prUrl = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/.exec(seen)?.[0] ?? "";
   const script: Answer[] = [
     { tool: "get_incident", input: {} },
