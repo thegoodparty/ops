@@ -6,6 +6,10 @@
 //   incident_reply  the message is in a thread BugBoss owns, tagged or not.
 //                   It goes to the Boss with the incident as context.
 //   mention         the app was tagged anywhere else.
+//   boss_thread_reply
+//                   an untagged reply in a thread outside any incident where
+//                   the Boss already has a conversation. It goes to the Boss
+//                   exactly as a tagged mention in that thread would.
 //   ignored         nothing will come of this: a bot echo, an edit, a message
 //                   nobody addressed to us in a thread we do not own.
 //
@@ -15,9 +19,8 @@
 // calling it ignored is how somebody answers a question and sees nothing
 // happen.
 //
-// What the message *means* is not here. Whether a mention is a report or a
-// question is a model call made off the Slack ack in the composition root,
-// and what a reply in an incident thread asks for is the Boss's to read. Nothing
+// What the message *means* is not here. Whether a mention or a reply is a
+// report, a question or a request to act is the Boss's to read. Nothing
 // here reads the words a person chose, so there is no verb to learn and no
 // phrasing that silently does nothing.
 //
@@ -54,6 +57,7 @@ export type SlackClassification =
   | { kind: "url_verification"; challenge: string }
   | { kind: "incident_reply"; message: SlackMessage }
   | { kind: "mention"; message: SlackMessage }
+  | { kind: "boss_thread_reply"; message: SlackMessage }
   | { kind: "ignored"; reason: string };
 
 /** Throws when the request is not an authentic Slack delivery. */
@@ -72,6 +76,16 @@ export interface SlackConfig {
    * incident.slackThreadTs; ingress does not, so it is injected.
    */
   isIncidentThread?: (
+    channel: string,
+    threadTs: string,
+  ) => boolean | Promise<boolean>;
+  /**
+   * Whether the Boss already has a conversation in this thread: it was
+   * mentioned there, or posted there. Like `isIncidentThread`, a fact about
+   * the thread and never about the words in the message, injected because
+   * the Boss's stored state knows and ingress does not.
+   */
+  isBossThread?: (
     channel: string,
     threadTs: string,
   ) => boolean | Promise<boolean>;
@@ -224,6 +238,17 @@ export const classifySlackEvent = async (
   const mentioned =
     event.type === "app_mention" ||
     (config.botUserId ? rawText.includes(`<@${config.botUserId}>`) : false);
+  // An untagged follow-up under a Boss answer is still addressed to the Boss.
+  // Checked after the mention so a tagged message keeps its own kind, and
+  // decided by the thread alone -- the relay routes the same way, off the
+  // same predicate, which is what keeps this from being `ignored` while the
+  // relay works it.
+  if (!mentioned && threadTs) {
+    const inBossThread = config.isBossThread ?? (() => false);
+    if (await inBossThread(channel, threadTs)) {
+      return { kind: "boss_thread_reply", message };
+    }
+  }
   if (!mentioned) {
     return { kind: "ignored", reason: "not addressed to bugboss" };
   }

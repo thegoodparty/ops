@@ -476,6 +476,30 @@ test("the dispatcher's environment is the whole launch contract", () => {
   });
 });
 
+test("the alert slugs reach the options, and a bad list costs only the list", () => {
+  const base = {
+    BUGBOSS_INCIDENT_ID: "inc-7",
+    BUGBOSS_S3_BUCKET: "b",
+    BUGBOSS_SESSION_REF: "sessions/incident/inc-7/session.jsonl",
+  };
+
+  assert.deepEqual(
+    agentOptionsFromEnv({ ...base, BUGBOSS_ALERT_SLUGS: '["high-cpu","route-errors-win"]' })
+      .alertSlugs,
+    ["high-cpu", "route-errors-win"],
+  );
+  assert.equal(agentOptionsFromEnv(base).alertSlugs, undefined);
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (line: string) => errors.push(line);
+  try {
+    assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_ALERT_SLUGS: "not json" }).alertSlugs, undefined);
+  } finally {
+    console.error = original;
+  }
+  assert.match(errors.join("\n"), /alert_slugs_unreadable/);
+});
+
 test("an expired deadline still leaves room to escalate", () => {
   const options = agentOptionsFromEnv(
     {
@@ -1009,7 +1033,7 @@ test("an exhausted run parks on a wait a reply cannot lift", () => {
   });
 
   assert.equal(park.liftsOnReply, false);
-  assert.match(park.waitingFor, /200-turn budget for this incident ran out/);
+  assert.equal(park.waitingFor, "a person to decide what happens next; the 200-turn budget is spent");
 });
 
 test("the brief does not promise that replying will continue the work", () => {

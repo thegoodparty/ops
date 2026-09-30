@@ -134,9 +134,9 @@ test("alarms when the slack relay write fails", async () => {
 });
 
 /**
- * Reading what a mention meant is a model call and answering it is an agent,
- * so both run past the response. What must not happen is either of them
- * failing into silence: a rejection out there has no caller left to tell.
+ * Answering a mention is an agent, so it runs past the response. What must
+ * not happen is that failing into silence: a rejection out there has no
+ * caller left to tell.
  */
 test("a deferred slack answer that fails alarms rather than vanishing", async () => {
   const app = createPublicApp(
@@ -250,7 +250,7 @@ test("a mention is acknowledged before the agent that answers it runs", async ()
 
 test("a report-shaped mention is acknowledged before the work behind it", async () => {
   // Ingress stopped reading verbs, so "report ..." is a mention like any
-  // other and what it is asking for is a model call further in. What still
+  // other and what it is asking for is the Boss's to read. What still
   // has to hold is that the reaction lands before that work, and that no
   // report is routed straight into ingest from this layer any more.
   const acknowledged: SlackAck[] = [];

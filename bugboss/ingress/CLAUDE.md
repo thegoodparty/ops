@@ -31,17 +31,19 @@ parts is a guess that looks like a fact, and it breaks silently the day
 either moves — so a Grafana alert that arrived without a `generatorURL` gets
 no link and says so by having none.
 
-`signalOrigin` always names the source (`a Grafana alert`, `a Slack report`)
-and may or may not have a url. "1 signal" on its own told a reader nothing
-about what they were looking at, the label costs nothing, and a permalink
-Slack refuses then loses the link rather than the sentence. The relay's
-`opened` message is the caller.
+`signalOrigin` gives a url, or null, and the link text: `original alert` or
+`original report`, never anything about the alert itself. A url with no path
+is the Grafana root, not the alert, and counts as none. The thread header is
+the only caller, and a signal with no url gets no link line there.
+
+A silence link is dropped at ingress: it is neither in a signal's body nor on
+its labels, so nothing downstream can offer one.
 
 ## Ingress does not read what a message says
 
 Slack is **not** an adapter. A person reports something by mentioning
-`@bugboss`, and whether that mention is a report or a question is a model
-call the composition root makes off the ack (`slack/intent.ts`), not
+`@bugboss`, and whether that mention is a report is the Boss's to read, off
+the ack. When it is, the Boss files it with `open_incident`. It is not
 something a body can be parsed for.
 
 This used to be a verb: the first word had to be `report`, `bug` or `broken`.
@@ -59,6 +61,16 @@ thread id can answer — is this authentic, is it a message, is it in a thread
 BugBoss owns, was the app tagged. The thread check looks like interpretation
 and is not: it is a `slackThreadTs` lookup, injected because the Boss knows
 and ingress does not.
+
+The same goes for `isBossThread`, which makes an untagged reply in a thread
+outside any incident a `boss_thread_reply` when the Boss already has a
+conversation there — a `boss_thread` row, written when the Boss takes a
+mention or posts in a thread, or the Slack agent's persisted session state
+for threads older than the table. Production lost "Can you close incident 2?"
+typed without a tag under a Boss answer, because only incident threads and
+tagged mentions were routed. The relay is handed the same predicate, so the
+two layers answer this one way. Neither reads the text: the same sentence in a
+thread the Boss never spoke in is still `ignored`.
 
 It stays because `ignored` is load-bearing. The HTTP layer decides whether a
 delivery earns its :eyes: by excluding `ignored`, so the kind is not just a

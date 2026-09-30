@@ -44,7 +44,7 @@ names the missing permission rather than quietly falling back to asking.
 | --- | --- | --- |
 | `metadata` | read | Mandatory for every App. Nothing calls it directly. |
 | `contents` | write | The agent pushes its fix branch. `git push` through the credential helper configured in `agent/run.ts`. |
-| `pull_requests` | write | `gh pr create`, `gh pr comment` (including the bare `delegate review` that fires the reviewer), and reading review state. Driven by the ship-pr skill the prompt carries. |
+| `pull_requests` | write | `gh pr create`, `gh pr comment` (including the bare `delegate review` that fires the reviewer), and reading review state. Driven by the ship-pr skill the prompt points the agent at. |
 | `actions` | **write** (requested) | Reading workflow runs and jobs to tell whether a PR is green (`gh run list`, `gh run view`) needs only `read`. Re-running a run's failed jobs — `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`, via [`agent/rerun.ts`](./agent/rerun.ts) — needs `write`. |
 | `deployments` | read | Granted, with no caller in this repo. Kept because a read permission nobody uses is cheaper to leave than to remove and rediscover; drop it the next time anyone is in the settings page anyway. |
 

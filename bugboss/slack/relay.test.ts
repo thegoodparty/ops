@@ -124,6 +124,7 @@ beforeEach(async () => {
     db,
     slack,
     config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+  isBossThread: () => false,
   });
 });
 
@@ -131,7 +132,7 @@ beforeEach(async () => {
 
 describe("the mention policy", () => {
   const ordinary: RelayEvent[] = [
-    { type: "opened", incidentId: "inc-1", title: "500s on /campaigns", signalCount: 1, body: "", origin: null },
+    { type: "opened", incidentId: "inc-1", title: "500s on /campaigns", origin: null },
     { type: "merged", incidentId: "inc-1", into: "inc-2", reason: "same cause" },
     {
       type: "resolved",
@@ -224,6 +225,7 @@ describe("the mention policy", () => {
       db,
       slack: solo,
       config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: null },
+    isBossThread: () => false,
     });
     await seedIncident("inc-1");
     await r.emit(ordinary[0]);
@@ -240,95 +242,43 @@ describe("what a transition looks like in Slack", () => {
       type: "opened",
       incidentId: "inc-1",
       title: "500s parsing <Config> for a & b",
-      signalCount: 2,
-      body: "",
       origin: null,
     });
     assert.ok(text.includes("500s parsing &lt;Config&gt; for a &amp; b"), text);
-    assert.ok(text.endsWith("nobody is being paged_"), text);
   });
 
-  test("the opening message carries the report whole, not a title of it", () => {
-    // Incident 83 opened on "...I heard about 502s Can you op\u2026" -- the
-    // report cut at 120 characters, mid-word, in the message announcing the
-    // incident. The thread is where the report lives; the short form is the
-    // header above it, which carries the summary the agent writes.
-    const report =
-      "voter density queries are failing in prod, and they have for a while. " +
-      "I heard about 502s. Can you open an incident and work out whether it is " +
-      "the pool or the warehouse?";
-
+  test("the opening message is the header: the number, the title and the signal's link", () => {
     const text = renderEvent({
       type: "opened",
-      incidentId: "inc-83",
-      title: report,
-      body: report,
-      signalCount: 1,
-      origin: null,
-    });
-
-    assert.ok(text.includes(report), "the whole report is in the message");
-    assert.doesNotMatch(text, /\u2026/);
-    // And it is said once: the body already opens on the title.
-    assert.equal(text.split("voter density").length, 2);
-  });
-
-  test("a body that does not open on the title keeps both", () => {
-    // An alert with no summary annotation takes its title from the rule
-    // name, and the body has no other line for it.
-    const text = renderEvent({
-      type: "opened",
-      incidentId: "inc-1",
-      title: "GpApiPoolSaturation",
-      body: "connections in use 24 of 25\nalert: https://goodparty.grafana.net/x",
-      signalCount: 1,
-      origin: null,
-    });
-
-    assert.ok(text.includes("GpApiPoolSaturation"));
-    assert.ok(text.includes("connections in use 24 of 25"));
-  });
-
-  test("the trailer links what opened the incident rather than only counting it", () => {
-    const text = renderEvent({
-      type: "opened",
-      incidentId: "inc-1",
-      title: "t",
-      body: "t",
-      signalCount: 1,
+      incidentId: "92",
+      title: "Loki query rejections on gp-api",
       origin: {
-        label: "a Grafana alert",
+        label: "original alert",
         url: "https://goodparty.grafana.net/alerting/grafana/abc/view",
       },
     });
-
-    assert.ok(
-      text.includes(
-        "<https://goodparty.grafana.net/alerting/grafana/abc/view|a Grafana alert>",
-      ),
+    assert.equal(
       text,
+      [
+        "*Incident 92* · Loki query rejections on gp-api",
+        "*Status*: *Investigating* → Fixing → Resolved → Closed",
+        "<https://goodparty.grafana.net/alerting/grafana/abc/view|original alert>",
+      ].join("\n"),
     );
-    assert.ok(text.includes("_1 signal \u00b7 <https"), text);
+    assert.doesNotMatch(text, /signal ·|investigating|paged/);
   });
 
-  test("a signal with no link still says what kind of thing it was", () => {
-    // "1 signal" on its own told a reader nothing about what they were
-    // looking at. The label costs nothing and is most of the value, so a
-    // missing permalink loses the link and not the sentence.
+  test("a signal with no link gets no link line, rather than an unlinked label", () => {
     const text = renderEvent({
       type: "opened",
       incidentId: "inc-1",
       title: "t",
-      body: "t",
-      signalCount: 2,
-      origin: { label: "a Slack report", url: null },
+      origin: { label: "original report", url: null },
     });
-
-    assert.ok(text.includes("_2 signals \u00b7 a Slack report \u00b7"), text);
-    assert.ok(!text.includes("<"), "nothing is half a link");
+    assert.equal(text, "*Incident inc-1* · t\n*Status*: *Investigating* → Fixing → Resolved → Closed");
   });
 
-  test("a slug is code, and a count agrees with its noun", () => {
+  test("a slug is code", () => {
     assert.ok(
       renderEvent({
         type: "prod_critical_signal",
@@ -336,16 +286,6 @@ describe("what a transition looks like in Slack", () => {
         signalTitle: "checkout down",
         slug: "payments-5xx",
       }).includes("(`payments-5xx`)"),
-    );
-    assert.ok(
-      renderEvent({
-        type: "opened",
-        incidentId: "inc-1",
-        title: "t",
-        signalCount: 1,
-        body: "",
-        origin: null,
-      }).includes("_1 signal ·"),
     );
   });
 
@@ -400,8 +340,6 @@ describe("what a transition looks like in Slack", () => {
       type: "opened",
       incidentId: "inc-1",
       title: "t",
-      signalCount: 1,
-      body: "",
       origin: null,
     });
     const evidence = Array.from(
@@ -428,14 +366,32 @@ describe("what a transition looks like in Slack", () => {
 // ---------------------------------------------------------------------------
 
 describe("threading", () => {
+  test("an origin with no url is left for the sweep to resolve, and one with a url is kept", async () => {
+    await seedIncident("inc-1");
+    await seedIncident("inc-2");
+    await relay.emit({ type: "opened", incidentId: "inc-1", title: "t", origin: { label: "original report", url: null } });
+    await relay.emit({
+      type: "opened",
+      incidentId: "inc-2",
+      title: "t",
+      origin: { label: "original alert", url: "https://goodparty.grafana.net/alerting/grafana/abc/view" },
+    });
+    const kept = (id: string) =>
+      db.get<{ originLabel: string | null; originUrl: string | null; header: string | null }>(
+        "SELECT originLabel, originUrl, header FROM incident_thread WHERE incidentId = ?",
+        [id],
+      );
+    assert.equal(kept("inc-1")?.originLabel, null, "a failed permalink is not final");
+    assert.equal(kept("inc-2")?.originUrl, "https://goodparty.grafana.net/alerting/grafana/abc/view");
+    assert.equal(kept("inc-2")?.header, slack.posts[1].text, "what was posted is what the sweep compares");
+  });
+
   test("opened starts the thread and records its ts on the incident", async () => {
     await seedIncident("inc-1");
     const ts = await relay.emit({
       type: "opened",
       incidentId: "inc-1",
       title: "500s on /campaigns",
-      signalCount: 2,
-      body: "",
       origin: null,
     });
 
@@ -452,8 +408,6 @@ describe("threading", () => {
       type: "opened",
       incidentId: "inc-1",
       title: "t",
-      signalCount: 1,
-      body: "",
       origin: null,
     });
     await relay.emit({
@@ -475,8 +429,6 @@ describe("inbound", () => {
       type: "opened",
       incidentId: id,
       title: id,
-      signalCount: 1,
-      body: "",
       origin: null,
     });
   };
@@ -641,6 +593,90 @@ describe("inbound", () => {
     );
   });
 
+  /**
+   * "Can you close incident 2?", untagged, under a Boss answer that began
+   * with a channel-level mention. It was dropped here as chatter. The route
+   * turns on whether the Boss has a conversation in that thread, and the
+   * predicate is handed the thread and never the text.
+   */
+  test("an untagged follow-up in a Boss conversation thread goes to the Boss", async () => {
+    const asked: string[][] = [];
+    const followUp = {
+      type: "message",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: "Can you close incident 2?",
+      ts: "1800.2",
+      thread_ts: "1800.1",
+    };
+
+    const blind = new SlackRelay({
+      db,
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: () => false,
+    });
+    assert.equal((await blind.handle(followUp)).kind, "ignore", "premise: dropped without the check");
+
+    const routed = new SlackRelay({
+      db,
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: (...args: string[]) => {
+        asked.push(args);
+        return Promise.resolve(args[1] === "1800.1");
+      },
+    });
+    const route = await routed.handle(followUp);
+    assert.equal(route.kind, "slack_agent");
+    if (route.kind !== "slack_agent") return;
+    assert.equal(route.threadTs, "1800.1", "answered in the same thread");
+    assert.equal(route.text, "Can you close incident 2?");
+    assert.deepEqual(asked, [[CHANNEL, "1800.1"]], "decided from the thread alone");
+
+    assert.equal(
+      (await routed.handle({ ...followUp, ts: "1900.2", thread_ts: "1900.1" })).kind,
+      "ignore",
+      "the same words in another thread are chatter",
+    );
+    assert.equal(
+      (await routed.handle({ ...followUp, ts: "1800.3", thread_ts: undefined })).kind,
+      "ignore",
+      "top-level chatter never asks the thread check",
+    );
+  });
+
+  /**
+   * Slack retries any delivery it did not see answered in three seconds. On
+   * the three routes that end at the Boss outside an incident thread, the
+   * retry used to be handed over a second time: the Boss either answered
+   * twice or the thread lock turned the second run into a "still working"
+   * reply nobody asked for.
+   */
+  test("a Slack retry of a message for the Boss reaches the Boss once", async () => {
+    const routed = new SlackRelay({
+      db,
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: (_channel: string, threadTs: string) => Promise.resolve(threadTs === "2400.1"),
+    });
+    const deliveries = [
+      { type: "app_mention", channel: CHANNEL, user: "U0HUMAN", text: `<@${BOT}> what is open?`, ts: "2300.1" },
+      { type: "app_mention", channel: CHANNEL, user: "U0HUMAN", text: `<@${BOT}> and now?`, ts: "2300.2", thread_ts: "2300.1" },
+      { type: "message", channel: CHANNEL, user: "U0HUMAN", text: "can you close incident 2?", ts: "2400.2", thread_ts: "2400.1" },
+    ];
+    for (const event of deliveries) {
+      const first = await routed.handle(event);
+      assert.equal(first.kind, "slack_agent", `premise: ${event.ts} is the Boss's on first delivery`);
+      const retry = await routed.handle(event);
+      assert.equal(retry.kind, "ignore", `${event.ts}: the retry is not handed to the Boss again`);
+    }
+    assert.equal(
+      db.query("SELECT ts FROM boss_message_seen WHERE ts IN ('2300.1','2300.2','2400.2')").length,
+      3,
+    );
+  });
+
   test("a threaded mention arriving twice is only handled once", async () => {
     const thread = await openThread("inc-1");
     const shared = {
@@ -674,16 +710,12 @@ describe("a broken thread link", () => {
       type: "opened",
       incidentId: "inc-1",
       title: "t",
-      signalCount: 1,
-      body: "",
       origin: null,
     });
     const second = await relay.emit({
       type: "opened",
       incidentId: "inc-1",
       title: "t",
-      signalCount: 1,
-      body: "",
       origin: null,
     });
 
@@ -697,6 +729,7 @@ describe("a broken thread link", () => {
       db: writeFailingDb(),
       slack,
       config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+    isBossThread: () => false,
     });
 
     const errors = await captureErrors(() =>
@@ -704,8 +737,6 @@ describe("a broken thread link", () => {
         type: "opened",
         incidentId: "inc-1",
         title: "t",
-        signalCount: 1,
-        body: "",
         origin: null,
       }),
     );
@@ -723,10 +754,18 @@ describe("a broken thread link", () => {
     await seedIncident("inc-1");
     const errors = await captureErrors(() => relay.emit(resolved));
 
-    assert.equal(slack.posts.length, 1);
+    assert.equal(slack.posts.length, 2, "the notice, then the transition under it");
     assert.equal(slack.posts[0].threadTs, null, "there is no thread to use");
     assert.match(slack.posts[0].text, new RegExp(`^<!subteam\\^${ROTATION}> `));
-    assert.match(slack.posts[0].text, /quiet for an hour/, "the news still gets out");
+    // Only the notice at the top: the header sweep rewrites that message
+    // whole, so the transition goes in the thread where it survives.
+    assert.doesNotMatch(slack.posts[0].text, /quiet for an hour/);
+    assert.equal(slack.posts[1].threadTs, "ts-1");
+    assert.match(slack.posts[1].text, /quiet for an hour/, "the news still gets out");
+    const record = db.get<{ header: string | null; originLabel: string | null }>(
+      "SELECT header, originLabel FROM incident_thread WHERE incidentId = 'inc-1'",
+    );
+    assert.deepEqual(record, { header: null, originLabel: null }, "left for the sweep to write");
     assert.ok(
       errors.some((line) => line.includes("thread_link_broken")),
       "a human-visible ping and an error, not an info log",
@@ -747,7 +786,11 @@ describe("a broken thread link", () => {
       ]),
     );
 
-    assert.equal(slack.posts.length, 2, "both posts are already out");
+    assert.equal(
+      slack.posts.filter((p) => p.threadTs === null).length,
+      2,
+      "both top-level notices are already out",
+    );
     const row = db.get<{ slackThreadTs: string | null }>(
       "SELECT slackThreadTs FROM incident WHERE id = 'inc-1'",
     );
@@ -760,7 +803,7 @@ describe("a broken thread link", () => {
       reason: "same cause",
     });
     assert.equal(
-      slack.posts[2].threadTs,
+      slack.posts.at(-1)?.threadTs,
       "ts-1",
       "one thread from here, not two competing ones",
     );
@@ -781,7 +824,7 @@ describe("a broken thread link", () => {
       reason: "same cause",
     });
     assert.equal(
-      slack.posts[1].threadTs,
+      slack.posts.at(-1)?.threadTs,
       "ts-1",
       "one recovered thread beats a channel of loose messages",
     );
@@ -797,8 +840,6 @@ describe("a message in an incident thread", () => {
       type: "opened",
       incidentId: id,
       title: id,
-      signalCount: 1,
-      body: "",
       origin: null,
     });
   };

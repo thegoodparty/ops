@@ -33,8 +33,11 @@ prompt used to say otherwise and was wrong.
 hold it at once. On 2026-09-28 a third of all Loki read volume was ad-hoc MCP
 queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
 
-- **`GRAFANA_READ_TOOLS` is the surface.** Reads only: Loki, Prometheus,
-  Tempo, datasources, dashboards. Alert-*rule* reads are absent because
+- **`GRAFANA_READ_TOOLS` is the surface.** Reads only, and only the ones
+  agents call: every tool definition rides in the prefix of every turn, so
+  an unused tool is paid for on all of them. The list was cut to the eleven
+  that production incident sessions actually called; add one back when an
+  investigation shows it needed it. Alert-*rule* reads are absent because
   mcp-grafana v1.6.1 puts reading and creating a rule in one tool
   (`alerting_manage_rules`); the firing alert already arrives through
   `ingress/grafana.ts` and the rules are checked into omni.
@@ -60,6 +63,32 @@ There is no output cap to help with any of this, and there never was one that
 did: a cap bounds bytes returned, and Loki bills bytes scanned. Results now
 arrive whole and Pi compacts the conversation to make room — see "Nothing
 truncates a tool result" below.
+
+## The prompt carries rules, not documents
+
+The system prompt and the tools array are re-sent on every turn, so every
+character in them is multiplied by the turn count. It used to paste whole
+documents in -- both observability docs, the ship-pr skill and the whole
+alerting source tree -- and that was most of what each turn re-read.
+
+Now `prompt.ts` inlines only what an agent needs on every turn to act safely
+(the rules, the lifecycle, the Slack contract) and what nearly every
+investigation needs for its first queries (the Loki selector and the
+`Request completed` fields). Everything else is an index entry: a path, what
+it answers and when to read it. The agent has the checkout.
+
+**The alert that fired is the one exception.** The dispatcher passes the
+incident's `alert_slug`s to the child as `BUGBOSS_ALERT_SLUGS`, read in
+SQL at launch rather than through `get_incident`, which would drain the
+directives the agent has not seen yet. `findFiredAlert` locates each slug in
+omni's alert source -- a literal `slug:`, then a template slug, then the
+longest quoted dash-prefix, for a slug assembled from parts -- and inlines
+the enclosing object literal, or a `file:line` pointer when there is no
+literal to show.
+
+`prompt.test.ts` pins an upper bound on the composed prefix. Raising it is a
+decision to make every turn of every incident dearer; make it in the PR, not
+by editing the number to pass.
 
 ## Two bounds, and the turn budget is the one that measures work
 
@@ -174,6 +203,11 @@ came out of the wait with anything.
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
+- `monitor(…, waitingFor)` — required: one plain sentence for the incident
+  board and status card ("someone to merge omni#2189"). They show it in place
+  of the command, which is shell and never shown. Required by the schema
+  only: a restart replays calls recorded before it existed, so a missing one
+  runs anyway and the board says "a check the agent is running".
 - `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
   what the wait is on, and the harness tells the Boss when they do not turn
   up. Unset, the wait is silent, which is right for a deploy, a migration or
@@ -314,7 +348,8 @@ opens. Counting the gap from the last rung rather than from the start is what
 stops that morning from arriving as the whole ladder at once.
 
 **Re-entrancy is the `pending_wait` marker**: idempotent for the same command,
-replaced by a different one. It holds `startedAt` and the rung count, so a
+replaced by a different one. It holds `startedAt`, the rung count and the
+`waitingFor` label (which a replay may reword without restarting anything), so a
 resumed agent resumes the wait it was in and the timeout is measured from
 `startedAt`. The rung is counted *before* it is sent, deliberately: a crash
 between the two costs one rung, where the other order repeats it on every

@@ -328,7 +328,26 @@ test("the allowlist is reads only, and the server is told the same thing", () =>
   assert.ok(GRAFANA_READ_TOOLS.includes("query_loki_logs"));
   assert.equal(DEFAULT_LOOKBACK_HOURS, 6);
   assert.equal(MAX_LOOKBACK_HOURS, 24);
-  assert.ok(GRAFANA_READ_TOOLS.length < 40);
+  // Every allowlisted tool rides in the prefix of every turn. These are the
+  // eleven production incident sessions actually called; growing the list is
+  // a decision to make every turn dearer, and wants the evidence that an
+  // investigation needed the tool.
+  assert.deepEqual(
+    [...GRAFANA_READ_TOOLS],
+    [
+      "check_datasources_health",
+      "get_tempo_trace",
+      "list_datasources",
+      "list_loki_label_names",
+      "list_prometheus_label_names",
+      "list_prometheus_metric_names",
+      "query_loki_logs",
+      "query_loki_patterns",
+      "query_loki_stats",
+      "query_prometheus",
+      "query_tempo_metrics",
+    ],
+  );
 
   // --enabled-tools is category-granular, so the flag alone cannot express
   // this allowlist; --disable-write is what removes the write tools inside

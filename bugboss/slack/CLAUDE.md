@@ -14,7 +14,9 @@ later `emit` takes the no-thread path and posts a **new top-level message**
 — so merged, resolved and closed become scattered orphans that do not
 even group, and Slack returns success each time. The fallback therefore
 alarms and adopts its own post as the thread, rather than logging quietly
-and fragmenting forever.
+and fragmenting forever. That post is a one-line notice and the transition
+goes under it in the thread, because the header sweep rewrites the
+top-level message whole on its next tick.
 
 A merge or a split leaves two threads that have to point at each other, and a
 thread is only findable by its permalink. `chat.getPermalink` builds one from
@@ -81,6 +83,16 @@ A reply here has to stay visible at ingress: `classifySlackEvent` keeps an
 `incident_reply` kind, and the HTTP layer keys its :eyes: off not being
 `ignored`. See `ingress/CLAUDE.md`.
 
+**A follow-up under a Boss answer goes to the Boss too.** Outside incident
+threads the route used to be "tagged or dropped", so a person replying to the
+Boss the way people reply to anyone — without an `@` — was talking to nobody.
+A thread where the Boss already has a conversation (a `boss_thread` row,
+recorded by `answerMention` in the composition root, or a
+persisted session `state.json` under `slackSessionPrefix`) routes an untagged
+reply to `slack_agent`, exactly as a tagged one in that thread. Ingress calls
+it `boss_thread_reply` so it keeps its :eyes:. Both layers take the one
+predicate built in `index.ts`, and it is handed the thread, never the text.
+
 ## The :eyes: goes on before the work, not after it
 
 `ack.ts`. Slack's three-second ack is answered by the HTTP layer and seen by
@@ -97,10 +109,10 @@ it is working on something it will never answer.
 
 Since ingress stopped reading words (see "The human boundary" in
 `docs/architecture.md`), the kinds left are what a signature, an event
-envelope and a thread id can answer. `mention` earns one — covering a report
-and a question alike, because telling those apart is a model call further in
-— and so does `incident_reply`, any reply in a thread BugBoss owns, which is
-how a person talks to the Boss about an incident. The invariant that keeps the two layers honest, tested in
+envelope and a thread id can answer. `mention` earns one, bare or not,
+because what it asks for is the Boss's to read — and so does `incident_reply`, any reply in a thread BugBoss owns, which is
+how a person talks to the Boss about an incident, and `boss_thread_reply`, an
+untagged follow-up in a thread where the Boss already has a conversation. The invariant that keeps the two layers honest, tested in
 `test/e2e.test.ts`: **nothing the relay acts on may be `ignored` at ingress.**
 
 `createSlackAck` returns **`void`, not a promise**, and that is the contract.
@@ -254,25 +266,56 @@ costs an API call. This pass asks for a link every time an answer names an
 incident, so it memoises per incident for the life of the process — an
 incident's thread is written once, under `WHERE slackThreadTs IS NULL`, so it
 never moves. Only answers are held. A *missing* one is re-asked, because the
-relay posts the rest of a split opening message into the thread before it
+relay posts the rest of a split message into the thread before it
 records that thread on the incident: "this thread belongs to no incident" is
 true for a moment and false forever after.
 
-## One renderer, three surfaces
+## One set of status facts, rendered by code at two scales
 
-A status-board row and an incident thread's top-level message are the same
-three fields at different scales, so they are one renderer (`slack/board.ts`):
+Asked "what is the status of this incident?", the Boss used to compose an
+answer from what it had read and wrote a different shape every time. Status
+is facts, so it is rendered in `slack/status.ts` and the Boss pastes it.
 
 | Field | Where it comes from |
 | --- | --- |
-| status | the incident row |
+| lifecycle | `incident.status`, every state in order with the current one in bold (`lifecycleSteps`, shared with the thread header); Merged names the survivor; PARKED when an `incident_wait` has `liftsOnReply = 0` |
 | the few-word title | `incident.summary`, falling back to the first signal's title |
-| what is needed | `incident_wait.waitingFor`, or "nothing needed from anyone" |
+| waiting on | `incident_wait.waitingFor`, `pending_question`, `pending_wait.waitingFor` and unread inbox questions, or "nobody"; a parked incident is the one sentence "a person to decide what happens next; the turn budget is spent" and nothing else |
+| now | the one model-written line; see below |
+| impact, PR, spend | `usersImpacted`, `prUrls`, and `describeSpend` over the session, with its estimate wording |
 
-None of the three is new state. The third in particular is derived rather
-than invented: `waitingFor` is already *"what is being waited on, in one line,
-for the thread and the digest"*, and an incident with no wait needs nothing.
-Saying that out loud is what makes the ones that do worth trusting.
+Two scales, and `waitingOn` and `lifecycleWord` are shared so they cannot
+disagree:
+
+- **The card**, `incident_status`: one incident, seven lines.
+- **The status line**: one incident on one line. The board, on request and
+  in the morning, is a list of them (`slack/board.ts` delegates to
+  `slack/status.ts`). The thread header reads the same facts; see below.
+
+**A monitor wait shows the agent's `waitingFor`, never its command.** The
+command is a shell line, and the board once printed one verbatim as what an
+incident was waiting on. `STATUS_FACTS_SQL` does not read `pending_wait.command`
+at all. A wait recorded before `monitor` asked for a label shows "a check the
+agent is running".
+
+**The one-line forms carry no clock.** A header is rewritten whenever its
+text changes, so "asked 12 min ago" in it would rewrite every thread's header
+every minute against a Tier 3 budget. Only the card shows ages.
+
+**Exactly one line is written by a model.** "Now" is a direct bounded call
+(`createStatusSummariser`, on `intentModel` so `BUGBOSS_INTENT_MODEL_ID` can
+move it somewhere cheaper) over the agent's
+last `STATUS_SUMMARY_TURNS` rendered turns. It is cached per incident at a
+**session position**, the number of entries in the session, so asking twice
+about an agent that has not moved costs one call. A failed call renders
+"summary unavailable" and alarms; it never falls back to raw lines, and a
+failure is not cached.
+
+**The card is pasted, not posted by code**, like the board: what the Boss
+writes goes through `toMrkdwn`, which escapes, and escaping is not
+idempotent. So the tools hand the model `forModelToPaste(rendered)`, which
+undoes exactly what `escape` did, and the one pass at the boundary gives back
+the card code rendered. `status.test.ts` holds the round trip.
 
 Nothing in the renderer resolves a link. Every line names its incident in
 prose and the pass above links it — which is also what stops a thread's own
@@ -280,111 +323,69 @@ header linking to itself, with no special case anywhere.
 
 The surfaces:
 
-- **The thread header.** Two lines above the message that opened the thread,
-  rewritten in place with `chat.update`. Nothing is removed: the alert text
-  that started the thread is what somebody scrolling back is looking for.
-  This division is why the opening message carries the signal **whole** and
-  the header carries the short form. Incident 83 opened on "*...I heard
-  about 502s Can you op…*" because the opening message tried to be the short
-  form too, on a title cut at 120 characters. The header has `summary`, the
-  few-word title the agent keeps current and that `setSummary` refuses
-  rather than truncates; the message under it has the report.
+- **The thread header.** The whole top-level message of an incident thread,
+  rewritten in place with `chat.update`:
+
+  ```
+  *Incident 92* · Domain search returns 502 on prod despite available domains
+  *Status*: Investigating → *Fixing* → Resolved → Closed
+  <generator url|original alert>
+  *Needs a human to merge omni#2240*
+  ```
+
+  The title is `summary`, falling back to the first signal's title. The
+  status is `lifecycleSteps`, the same steps the card shows; a merged
+  incident reads `*Merged* into incident N`. The link is the signal's own,
+  from `ingress/link.ts`, as a bare label: nothing about the alert goes in
+  the header, because that is the signal's data, not the incident's, and
+  the Grafana template pasted into Slack rendered broken. The agent reads the
+  signal; people click through. No url, no line.
+
+  The last line is there only while a person is needed (`neededFromHuman`):
+  a spent budget, a `monitor` wait on a person, a park only a person lifts,
+  or the agent's question once the Boss has read it. A `waitingFor` that
+  starts "someone to" reads as "Needs a human to"; any other label follows
+  a colon. Nothing is waiting on a person, no line.
+
   An edit is **silent** — Slack marks it "(edited)" and notifies nobody — so
   it is right for a header people re-read and wrong as a way to tell anyone
   anything. A change worth knowing about still posts in the thread as well.
-- **The board on request.** `incident_board`, a tool on the Slack agent that
-  hands back the rendered text for it to paste verbatim. A board the model
-  composed from `query_incidents` would be a fourth rendering of the same
-  three fields, disagreeing in whatever way that run happened to phrase it.
+- **The board on request** and **the card on request.** `incident_board` and
+  `incident_status`, tools on the Slack agent that hand back rendered text
+  for it to paste verbatim, plus at most one sentence of its own. A status
+  the model composed from `query_incidents` would be another rendering of the
+  same facts, disagreeing in whatever way that run happened to phrase it.
 - **The morning board** and **the all-clear**, both driven by the sweep in
   `board/index.ts`.
 
-The opening message's trailer links the signal that opened the incident —
-`<url|a Grafana alert>` or `<url|a Slack report>`, from `ingress/link.ts`.
-It used to say "1 signal" and give no way to reach it.
-
-`chat.update` replaces a message wholesale and the only way to read the
-original back is `conversations.replies`, which is throttled to roughly one
-request a minute. So the relay records the opening text in `incident_thread`
-when it posts it. An incident opened before that table existed has no row and
-gets **no header** — the one answer that cannot delete somebody's alert text.
-
 ## Nothing here reads the words a person chose
 
-Two readers of inbound human text, and both are models:
+One reader of inbound human text, and it is the Boss. In an incident thread
+it has the incident, the thread and its inbox in front of it; on a mention
+anywhere else it has the mention and what was said in that thread since it
+last answered. There is no classifier in front of it.
 
-- **In an incident thread**, the Boss itself, with the incident, the thread
-  and its inbox in front of it. There is no separate classifier.
-- **On a mention anywhere else**, `intent.ts`: whether somebody is reporting
-  something broken, asking a question, or asking for two incidents to be
-  combined.
+There used to be two. The mention path first ran a string matcher on the
+first word, then a model call that knew three labels: report, question,
+combine. A request to act fit none, so "Can you close incident 2?" was
+answered "Which is it?". The Boss reads which a message is and does it: a
+report goes through `open_incident`, a request to close, merge or stop goes
+through its write tools, and a question gets an answer.
 
-The mention read used to be a string matcher on the first word — `report`,
-`bug` or `broken` — so `@bugboss Pro upgrades are failing` was answered as a
-question and opened nothing. A magic phrase nobody can discover is not an
-interface. Every outcome of the read is said out loud: an ambiguous read asks
-which it was, and a failed model call says the call failed. Silence is what
-the old matcher did, and silence is indistinguishable from the bot not reading
-you.
+`buildInput` frames a mention as `<@user> says: …`, never `asks:`, so the
+framing does not presuppose a question.
+
+### `open_incident`
+
+Files a report through `reportAccepted` in the composition root, the same
+human-signal ingest every report takes. The model supplies only the text. The
+reporter is the person whose message started the run, off the signed Slack
+event: the mention's user, or in an incident thread the newest person in the
+run. A run only an agent's inbox started has nobody to attribute a report to,
+so the tool refuses. The mention's ts is the dedup key, so a retry of the
+same call in the same run files nothing new.
 
 The relay records and routes; it does not decide what a message meant.
-
-### The mention read is advisory
-
-Same split as `triage/`: the model reads the sentence, the code keeps the
-invariants. The only read that writes is a combine, and three code-side checks
-bound it: every id must appear literally in what the person typed, both must
-name incidents that can still take signals, and which of the two survives is
-`assign`'s rule rather than anything said in the message. It writes under the
-`human` actor, with the Slack user id off the verified event, never out of the
-text.
-
-The message is fenced in a `<MESSAGE untrusted="true">` block with the rule
-stated in the system prompt, the same framing triage puts around an alert
-body. That is worth having and is not what the containment rests on.
-
-### Cost, latency and the failure path
-
-One bounded call per mention: a few hundred tokens in, a label or two out, no
-tools and no database access. It runs on the same `ModelClient` triage uses;
-`BUGBOSS_INTENT_MODEL_ID` moves it to a smaller model without a deploy.
-
-It runs **off the Slack ack**, in the `settled` promise, next to the Slack
-agent. That costs a report its durability before the ack: what makes a mention
-a report is the model call, and recording every mention as a signal first
-would open an incident for every question. A report typed into the window
-between the ack and the read is lost with a 200 already sent. This container
-restarts on every merge to ops `main`, so that window is real, and closing it
-properly means a durable inbox rather than a different place to put the call.
-
-A failed call answers `unclear`, alarms with the module's fallback rate
-(`triage/health.ts`), and posts a line saying the read failed rather than that
-the message was ambiguous. Those are two different sentences on purpose.
-
-### Combining two incidents from a mention
-
-Somebody says "82 and 79 are the same bug, merge them" at the bot and it
-happens. An agent may only re-partition its own incident, so before this the
-one legal move left to an agent being asked was to open a *third* incident.
-From inside an incident thread the same request is the Boss's to act on, with
-`merge_incidents`, which calls the same `assign` and `announceMerge` pair.
-
-`combineIncidents` in the composition root runs it. Out in the channel
-nothing supplies a second side, so both have to be named, and every way a pair
-fails to form asks which incidents rather than dropping the message. A
-hallucinated id and a real request look the same from inside, and the cost of
-asking on a misread is one line.
-
-Everything it checks, it checks **inside the write**: both incidents still
-exist, both can still take signals, and which signals move. The write queue
-serializes behind a synchronous S3 PUT, so a list read beforehand could drag
-signals out of a third incident a correlation merge moved them to in the gap.
-
-It does not choose a direction: the more established incident survives, and a
-person who asks for the other direction gets this one and is told so. What
-follows is the same pair of messages correlation leaves — the absorbed thread
-closed out with a permalink to the survivor, and the survivor told where the
-signals came from.
 
 ## The commander is the only interface
 
@@ -409,6 +410,15 @@ labelled as the agent's and saying which one it is blocked on, and are marked
 seen after the run -- so a run that died before answering leaves them for the
 next one.
 
+**A mention outside an incident reads the thread above it, once.** The first
+`@bugboss` in a thread somebody else started is handed every message before
+it, other bots' posts included, because "log an incident for this" under a
+report means that report. The same holds when an old session expired: the
+Boss reads the thread again, its own earlier posts marked as its own, so it
+does not redo what it already did. A mention that starts its own thread has
+nothing above it and fetches nothing. A resume reads only what people said
+since the watermark.
+
 **It never drops a trigger.** A message that arrives while the thread's run
 is in flight marks the thread dirty rather than being told the Boss is busy,
 and the holder runs again before it lets go: while the thread is dirty, and
@@ -420,10 +430,39 @@ triggering message is also queued in memory, since a message posted a moment
 ago is not guaranteed to be in the fetch yet. A run with nothing new since the
 last one does not call the model.
 
-**Silence is an answer.** Two people talking to each other are not talking to
-the Boss. A run that ends without writing anything posts nothing, and the
-harness is told so (`allowSilence`), so it hands back empty rather than an
-apology. This is not a magic string: empty means nothing to say.
+**Silence is chosen, never inferred.** Two people talking to each other are
+not talking to the Boss, and it says nothing by calling `stay_silent` with a
+reason, which is logged at info. The harness is still told silence is
+allowed (`allowSilence`), so it hands back empty rather than an apology.
+
+Empty text alone used to be read as that choice, and that is how a request
+to close incident 2 vanished: the Boss read 199,928 characters of raw
+session, its next turn came back with no text and no tool call, and nothing
+was posted or logged. So a run that ends empty **without** `stay_silent` is a
+failure: `incident_run_silent_unchosen` alarms with the thread and the
+trigger, the person who spoke gets the failure reply, and the run does not
+settle, so its inbox rows stay unseen and the watermark stays put. A close, merge
+or page posts its own notice; when that is the whole answer the Boss still has
+to say so with `stay_silent`.
+
+An untagged follow-up in a non-incident thread the Boss already talks in
+gets the same rule, because it may be two people talking under a Boss
+answer: `handle` runs it with silence allowed, `stay_silent` posts nothing,
+and an empty run without it alarms (`followup_run_silent_unchosen`) and
+posts the failure reply. An intent read of `unclear` on one goes to the Boss
+rather than asking "report or question?". A tagged mention is always
+answered.
+
+**Calling `stay_silent` is terminal.** The turn loop (`createSlackAgentModel`
+in `../index.ts`) ends the run the instant that tool is called: no further
+model request goes out, and any text the same turn also wrote is discarded
+and logged, never posted. A tool called alongside it in the same turn --
+`close_incident`, say -- still runs, because its effect is real; what changes
+is that nothing more is read or posted afterward. Incident 2's second failure
+on 2026-09-30 was this exact gap: `close_incident` posted its own notice, the
+Boss called `stay_silent` as the prompt instructs, and the harness asked for
+one more turn anyway, which is where the literal text `(silpersisted)`
+reached the thread after silence had already been chosen.
 
 **It can change state, on evidence.** The write tools are in
 `boss/commands.ts`, appended after the read tools in a fixed order because
@@ -433,7 +472,7 @@ the tools array is part of the cache prefix:
 | --- | --- |
 | `message_agent` | pushes a `boss_message` directive, which ends a blocked agent's wait and lifts a wait on a person |
 | `close_incident` | the tool API's Boss close, which posts the same closed notice an agent's close does |
-| `merge_incidents` | `assign` then `announceMerge`, the pair `combineIncidents` uses; the older incident survives whichever way round it was asked |
+| `merge_incidents` | `assign` then `announceMerge`, inside one write; the older incident survives whichever way round it was asked |
 | `stop_agent` | pushes a `stop` directive; the dispatcher starts a fresh run on its next tick |
 | `page_rotation` | posts the rotation mention into the thread through code |
 
@@ -509,7 +548,14 @@ oldest **whole round** rather than narrowing anything.
   being answered off half a row.
 
 What is left bounding this surface counts **things**: `MAX_SQL_ROWS`,
-`MAX_SESSION_TAIL_LINES`, the reply `LIMIT`. Never a width.
+`MAX_SESSION_TURNS`, the reply `LIMIT`. Never a width.
+
+`read_agent_session` renders turns, not JSONL (`slack/session-view.ts`): per
+turn, each tool call with its key arguments and a one-line outcome, and the
+model's own text only where it is short enough to show whole. A text too long
+for that is shown as its whole first line or paragraph, labelled, or
+described ("read 12,400 characters from `alerts.ts`"). Nothing is cut
+mid-content; sixty raw lines of one session were 199,928 characters.
 
 ## A budget spent reading is a question left unanswered
 
@@ -582,13 +628,12 @@ before it starts. That break surfaces hours later in another process with
 nothing pointing back at the run that caused it, which is why it is closed by
 construction rather than on the one branch somebody noticed.
 
-**An on-call answer has a shape**, and it is the commonest question this
-surface gets: what is blocked on a person and what that person has to do,
-what is running and needs nothing, and the count first so the reader knows
-the size of it. Around 200 words, in plain terms — what the system is doing
-and what users see, not file paths, function names or column names. Plain is
-not vague: the numbers stay, the identifiers go, and depth comes when
-somebody asks for it.
+**A status answer is the rendered one.** "What needs me?" and "what is
+open?" are the board, and "what is the status of incident 4?" is the card,
+each pasted with at most one sentence after it. Anything else is around 200
+words, in plain terms — what the system is doing and what users see, not
+file paths, function names or column names. Plain is not vague: the numbers
+stay, the identifiers go, and depth comes when somebody asks for it.
 
 ## Rate limits
 

@@ -410,7 +410,8 @@ export const createBossClient = (args: {
     recordPending: (message) =>
       call<PendingQuestion>("POST", "/pending-question", { message }),
     clearPending: () => call<void>("DELETE", "/pending-question").then(() => undefined),
-    recordWait: (command) => call<PendingWait>("POST", "/pending-wait", { command }),
+    recordWait: (command, waitingFor) =>
+      call<PendingWait>("POST", "/pending-wait", { command, waitingFor }),
     recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
     clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
     tellBoss: (kind, text, options) =>
@@ -458,7 +459,7 @@ export const createBossTools = async (args: {
       name: "get_incident",
       label: "Get incident",
       description:
-        "Re-read an incident, its signals and its prefetched evidence, and collect any pending directives. Without an id it is your own, which is what to call first on every start and after any long wait. With one, any other incident -- read it before you say two incidents are the same problem.",
+        "Re-read an incident, its signals and prefetched evidence, and collect pending directives. Without an id it is yours: call it first on every start and after any long wait. With one, any other incident; read it before you say two are the same problem.",
       parameters: Type.Object({
         incidentId: Type.Optional(
           Type.String({
@@ -478,7 +479,7 @@ export const createBossTools = async (args: {
       name: "propose_merge",
       label: "Propose merge",
       description:
-        "Ask for your incident and another one to be combined, when they are the same problem. Read the other incident first. The two are compared before anything moves and the older of them keeps the thread, which may be yours or may be theirs -- if it is theirs, your signals go there and you are done.",
+        "Ask for your incident and another to be combined when they are the same problem. Read the other first. They are compared before anything moves and the older keeps the thread; if that is theirs, your signals go there and you are done.",
       parameters: Type.Object({
         incidentId: Type.String({
           description: "The incident you believe is the same problem as yours.",
@@ -512,7 +513,7 @@ export const createBossTools = async (args: {
         impactStartedAt: Type.Optional(
           Type.Number({
             description:
-              "Epoch millis of the earliest bad event you found, which is when impact began rather than when we were told. Omit it if you cannot point at a specific event; a guess here is worse than nothing.",
+              "Epoch millis of the earliest bad event you found, not when we were told. Omit it if you cannot point at one; a guess is worse than nothing.",
           }),
         ),
       }),
@@ -528,7 +529,7 @@ export const createBossTools = async (args: {
       name: "search_incidents",
       label: "Search incidents",
       description:
-        "Search the post-mortems, root causes and resolution evidence of incidents that were RESOLVED or CLOSED. Plain words describing the failure, not a question and not SQL. The only way to find the same cause returning under a different alert.",
+        "Search the post-mortems, root causes and resolution evidence of RESOLVED and CLOSED incidents, in plain words describing the failure, not a question or SQL. The only way to find the same cause returning under a different alert.",
       parameters: Type.Object({
         text: Type.String({
           description: "The failing operation, the component, the error text.",
@@ -545,11 +546,11 @@ export const createBossTools = async (args: {
       name: "set_summary",
       label: "Set summary",
       description:
-        "Set or rewrite this incident's summary: a few words naming what is broken and who it is broken for. It is the title people read on the status board and at the top of this thread, and it should always be true of the incident as you currently understand it. Call it as soon as you know more than the first alert said, and again whenever that stops being accurate.",
+        "This incident's title: a few words on what is broken and for whom. It heads the thread and the status board. Set it as soon as you know more than the first alert said, and again whenever it stops being true.",
       parameters: Type.Object({
         summary: Type.String({
           description:
-            "A few words. What is broken and who it is broken for, not why and not what you are doing about it.",
+            "What is broken and for whom, not why and not what you are doing about it.",
         }),
       }),
       execute: async (_id: string, params: unknown) =>
@@ -561,7 +562,7 @@ export const createBossTools = async (args: {
       name: "report_impact",
       label: "Report impact",
       description:
-        "Update how many users are affected. Callable repeatedly; impact grows during an incident and humans need the current number.",
+        "How many users are affected. Call it again as impact grows; people need the current number.",
       parameters: Type.Object({
         usersImpacted: Type.Number(),
         query: Type.String({ description: "The query that produced the number." }),
@@ -591,7 +592,7 @@ export const createBossTools = async (args: {
       name: "report_analysis",
       label: "Report analysis",
       description:
-        "RESOLVED -> CLOSED, and your last act. Markdown post-mortem: summary, timeline, humans involved, impact, root cause analysis with five whys, and owned prevention items. On a recurrence the recurrence argument is required and the call is refused without it.",
+        "RESOLVED -> CLOSED, your last act. Markdown post-mortem: summary, timeline, humans involved, impact, root cause with five whys, owned prevention items. On a recurrence, `recurrence` is required.",
       parameters: Type.Object({
         postmortem: Type.String(),
         usersImpacted: Type.Number(),
@@ -616,12 +617,11 @@ export const createBossTools = async (args: {
               }),
               remedy: Type.String({
                 description:
-                  "What you changed so it does not recur again, or plainly that you changed nothing and why. For a bugboss_defect, the change you would make in ops and who you raised it with.",
+                  "What you changed so it does not recur, or that you changed nothing and why. For a bugboss_defect, the change you would make in ops and who you raised it with.",
               }),
             },
             {
-              description:
-                "Required when this incident recurred. Answers the second question a recurrence carries.",
+              description: "Required when this incident recurred.",
             },
           ),
         ),
@@ -637,7 +637,7 @@ export const createBossTools = async (args: {
       name: ESCALATE_TOOL,
       label: "Escalate",
       description:
-        "Tells the Boss this incident needs a person, urgently, with your brief. The Boss decides who to reach and how. It changes nothing and does not end your run: this incident is yours either way, and you keep working it. Use it when you are blocked on something only a person can do, or when you are out of ideas. Before calling it without a root cause, you must propose either a change to the alert rule as a PR or a named piece of missing instrumentation.",
+        "Tell the Boss this incident needs a person, urgently, with your brief; the Boss decides who and how. It changes nothing and does not end your run: you keep working it. Without a root cause, first propose an alert-rule change as a PR or a named piece of missing instrumentation.",
       parameters: Type.Object({
         reason: Type.String(),
         brief: Type.String({
@@ -669,16 +669,16 @@ export const createBossTools = async (args: {
       name: "park",
       label: "Park",
       description:
-        "Say this incident has nothing you can do yet, so nothing relaunches you into the same dead end. Use it when the only thing left is a person acting and you are about to stop: you have escalated, there is no check you could monitor, and continuing would just burn turns. It is not a hand-off and it does not end the incident -- it is still yours, and a message from the Boss brings you straight back. Prefer monitor with awaitingHuman when you can write a command that detects the thing being waited for, because that keeps you here and wakes you the moment it happens. Park is for when you cannot.",
+        "Say there is nothing you can do until a person acts, so nothing relaunches you into the same dead end. Not a hand-off: the incident stays yours and a Boss message brings you back. Prefer monitor with awaitingHuman whenever a command can detect the thing; park is for when none can.",
       parameters: Type.Object({
         waitingFor: Type.String({
           description:
-            "What has to happen before this is worth picking up again, in one line.",
+            "What has to happen first, in one line.",
         }),
         wakeAfterSeconds: Type.Optional(
           Type.Number({
             description:
-              "Come back anyway after this long. Leave it out when only a person can end the wait.",
+              "Come back anyway after this long. Omit when only a person can end the wait.",
           }),
         ),
       }),
@@ -800,6 +800,8 @@ export interface RunIncidentAgentOptions {
    */
   attempt?: number;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
+  /** From `BUGBOSS_ALERT_SLUGS`: which rules fired, so the prompt carries them. */
+  alertSlugs?: string[];
   store?: SessionStore & NotesStore;
   api?: BossClient;
   skipClone?: boolean;
@@ -834,6 +836,22 @@ const readInferenceProfiles = (
     );
     return {};
   }
+};
+
+/**
+ * A malformed list costs the prompt its fired-rule section, never the run:
+ * the rule is also in the checkout and in the signal get_incident returns.
+ */
+const readAlertSlugs = (raw: string | undefined): string[] => {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter((slug): slug is string => typeof slug === "string");
+  } catch {}
+  console.error(
+    JSON.stringify({ component: "agent", level: "error", event: "alert_slugs_unreadable", raw }),
+  );
+  return [];
 };
 
 /**
@@ -876,6 +894,7 @@ export const agentOptionsFromEnv = (
   // default rather than to zero, which `Number("")` would otherwise make
   // finite and hand every agent a budget of nothing.
   const maxTurns = Number(env.BUGBOSS_MAX_TURNS);
+  const alertSlugs = readAlertSlugs(env.BUGBOSS_ALERT_SLUGS);
 
   return {
     incidentId,
@@ -892,6 +911,7 @@ export const agentOptionsFromEnv = (
     maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : INCIDENT_AGENT_MAX_TURNS,
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
+    ...(alertSlugs.length ? { alertSlugs } : {}),
     ...(grafanaToken
       ? {
           grafana: {
@@ -1105,7 +1125,7 @@ export const shouldAnnounceExhaustion = (state: TurnBudgetState): boolean =>
 export const turnBudgetPark = (
   state: TurnBudgetState,
 ): { waitingFor: string; liftsOnReply: boolean } => ({
-  waitingFor: `a person, after the ${state.max}-turn budget for this incident ran out`,
+  waitingFor: `a person to decide what happens next; the ${state.max}-turn budget is spent`,
   liftsOnReply: false,
 });
 
@@ -1407,7 +1427,9 @@ const launch = async (args: {
   const prefix: StoredPrefix =
     storedPrefix ??
     (await (async () => {
-      const context = await loadPromptContext(paths.checkout);
+      const context = await loadPromptContext(paths.checkout, {
+        alertSlugs: options.alertSlugs ?? [],
+      });
       return {
         systemPrompt: composeSystemPrompt({
           incidentId: options.incidentId,

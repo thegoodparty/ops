@@ -63,20 +63,6 @@ deploy is exactly the in-memory-cron behaviour the whole design avoids.
 Started *before* the hour, the day is left open, so that morning's board
 still goes out.
 
-## An incident with no recorded opening gets no header
-
-`chat.update` replaces a message whole, and the only way to read the original
-back is `conversations.replies` at roughly one request a minute. So a thread
-whose opening was never recorded is skipped: writing a header without knowing
-what is underneath it would delete the alert text somebody is scrolling back
-for, which is unrecoverable where a missing header merely looks unfinished.
-
-Every incident opened from here on records its opening as it posts it, so
-this empties itself. The ones that predate it are **counted once at boot**
-(`threads_without_a_recorded_opening` in `index.ts`) rather than named every
-thirty seconds by the sweep that skips them — a known gap rather than an
-invisible one.
-
 ## Headers are swept, not hooked
 
 A thread's header is rewritten when the text it renders to differs from
@@ -94,13 +80,26 @@ not say — is closed at the other end: only an update that returned is
 recorded, so a failed one leaves the stored value alone and the next tick
 sees the same difference and tries again.
 
+**The header is the whole message.** `chat.update` replaces it, so the
+first sweep after a format change rewrites every open thread once, capped per
+tick like any other burst. The sweep only ever edits, never posts, so no
+rewrite can put a second message at the top of the channel. A thread that
+predates `incident_thread` gets a row the first time it is swept.
+
+**Where the header links is resolved once.** A Slack report's link is a
+`chat.getPermalink` call, so the sweep asks `origin` once per incident, keeps
+the answer in `incident_thread.originLabel` and `originUrl`, and caps those
+calls per tick the same way. A lookup that fails throws (`signalOrigin`'s
+strict mode) and is retried next tick, so a rate limit never becomes a
+thread with no link for good. The edit cap is checked per row, not by
+stopping the loop, so origins keep resolving after the edits run out.
+
 **A closed incident is finalised, then left.** The sweep runs over every
-incident that has a thread, not only the open ones, so an incident that
-closes gets one last header saying so instead of freezing on "Fixing"
-forever — which is a lie, and the kind a thread goes on telling for months.
-After that write the rendered text stops changing, the comparison stops
-matching, and the thread is never touched again. Nothing is removed at any
-point: the header sits above the message the thread opened with.
+open incident with a thread and every incident with a recorded one, so an
+incident that closes gets one last header saying so instead of freezing on
+"Fixing" forever. After that write the rendered text stops changing, the
+comparison stops matching, and the thread is never touched again. A closed
+incident that predates the record is left as it is.
 
 **At most `MAX_HEADER_UPDATES_PER_TICK` edits per tick.** `chat.update` is
 Tier 3, roughly fifty a minute, and it shares the workspace budget with every

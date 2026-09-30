@@ -241,6 +241,10 @@ CREATE TABLE IF NOT EXISTS pending_wait (
   -- Matched on resume. clearWait does not run when the child is SIGKILLed
   -- mid-wait, so a marker outlives the wait it was written for.
   command           TEXT NOT NULL,
+  -- The agent's own sentence for what it waits on, which is what the board
+  -- and the card show. The command is a shell line and never shown. Null on
+  -- a wait recorded before monitor asked for one.
+  waitingFor        TEXT,
   startedAt         INTEGER NOT NULL,
   pings             INTEGER NOT NULL DEFAULT 0,
   -- The backoff counts from the last nudge, not from the start. Without it a
@@ -319,6 +323,16 @@ CREATE TABLE IF NOT EXISTS boss_inbox (
 CREATE INDEX IF NOT EXISTS boss_inbox_unseen_idx
   ON boss_inbox (incidentId, seenAt);
 
+-- Slack messages outside an incident thread that have been handed to the
+-- Boss. The insert is what collapses a Slack retry of the same message, the
+-- way thread_reply does for incident threads.
+CREATE TABLE IF NOT EXISTS boss_message_seen (
+  channel           TEXT NOT NULL,
+  ts                TEXT NOT NULL,
+  receivedAt        INTEGER NOT NULL,
+  PRIMARY KEY (channel, ts)
+);
+
 -- Directives waiting for an agent to pick up on its next call.
 CREATE TABLE IF NOT EXISTS pending_directive (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,27 +360,26 @@ CREATE TABLE IF NOT EXISTS incident_action (
 CREATE INDEX IF NOT EXISTS incident_action_incident_idx
   ON incident_action (incidentId, at);
 
--- What the thread's top-level message is made of, so a header can be put
--- above it without guessing at what is already there.
---
--- A table of its own rather than two columns on `incident`, because
--- `getIncidentRow` is `SELECT *` and spreads the row, so anything added
--- there arrives in the agent's `get_incident` result -- and the opening is
--- the whole alert body, re-serialized into the prompt on every read. This is
--- how the message is rendered, not what the incident is.
---
--- chat.update replaces a message wholesale and the only way to read the
--- original back is conversations.replies, which is throttled to roughly one
--- request a minute. So the opening is recorded when it is posted. An
--- incident opened before this table existed has no row, and gets no header:
--- the one answer that cannot destroy somebody's alert text.
+-- How an incident thread's top-level message is rendered. A table of its
+-- own rather than columns on `incident`, because `getIncidentRow` is
+-- `SELECT *` and spreads the row, so anything added there arrives in the
+-- agent's `get_incident` result.
 CREATE TABLE IF NOT EXISTS incident_thread (
   incidentId        TEXT PRIMARY KEY REFERENCES incident(id),
+  -- What the relay first posted. Nothing reads it back: the sweep rewrites
+  -- the message whole from `header`. '' on a row the sweep created for a
+  -- thread that predates this table.
   opening           TEXT NOT NULL,
-  -- The header last written above it, so the sweep can tell whether anything
-  -- changed rather than rewriting the message every thirty seconds. Compared
-  -- before the outbound link pass runs, so the value is stable.
-  header            TEXT
+  -- The message last written, so the sweep can tell whether anything
+  -- changed rather than rewriting it every thirty seconds. Compared before
+  -- the outbound link pass runs, so the value is stable.
+  header            TEXT,
+  -- The signal that opened the incident, as the header links it. Resolved
+  -- once and kept, because a Slack report's permalink is an API call.
+  -- `originLabel` NULL means not resolved yet, including an incident with
+  -- no signal so far. `originUrl` NULL is a source with no link to give.
+  originLabel       TEXT,
+  originUrl         TEXT
 );
 
 -- When the board last said something, so that saying it again is a decision
@@ -395,4 +408,21 @@ CREATE TABLE IF NOT EXISTS board_state (
   -- empty board: a board this process never watched become empty is not an
   -- event it can honestly announce.
   clearAnnounced    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Threads outside any incident where the Boss already has a conversation:
+-- somebody mentioned @bugboss there, or the Boss posted there. An untagged
+-- follow-up in one of these is a reply to the Boss, the same as a tagged one,
+-- and without this row it was dropped at ingress as chatter nobody addressed
+-- to us -- "Can you close incident 2?" under a Boss answer vanished that way.
+--
+-- A row rather than a reading of the message: whether a thread is the Boss's
+-- is a fact about the thread, decided by what the Boss did in it, never by
+-- the words somebody chose. The Slack agent's persisted session state is the
+-- other half of the same answer, for threads that predate this table.
+CREATE TABLE IF NOT EXISTS boss_thread (
+  channel           TEXT NOT NULL,
+  threadTs          TEXT NOT NULL,
+  since             INTEGER NOT NULL,
+  PRIMARY KEY (channel, threadTs)
 );

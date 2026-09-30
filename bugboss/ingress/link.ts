@@ -34,26 +34,41 @@ export interface OriginLinker {
 /**
  * What opened an incident: what it was, and where to read it.
  *
- * `label` is set whatever happens and `url` may be null. Naming the source
- * costs nothing and is most of the value -- "a Grafana alert" and "a Slack
- * report" are different things to be told at 2am -- so a permalink Slack
- * would not give us degrades to the label rather than to silence.
+ * `label` is the link's text in the thread header, and says only which kind
+ * of thing is behind it: nothing about the alert itself goes in the header.
+ * `url` may be null, and then the header has no link line at all.
  */
 export interface SignalOriginRef {
   label: string;
   url: string | null;
 }
 
+const isBareHost = (url: string): boolean => {
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.pathname.replace(/\/+$/, "") === "" && !parsed.search && !parsed.hash;
+  } catch {
+    return true;
+  }
+};
+
 export const describeOrigin = (source: string): string =>
   source === HUMAN_SOURCE
-    ? "a Slack report"
+    ? "original report"
     : source === GRAFANA_SOURCE
-      ? "a Grafana alert"
-      : `a ${source} signal`;
+      ? "original alert"
+      : "original signal";
 
+/**
+ * `strict` lets a failed permalink lookup throw instead of degrading to no
+ * url. The header sweep keeps what this returns, so a rate limit that
+ * degraded there would leave the thread with no way back to the report for
+ * good; thrown, it is retried on the next tick.
+ */
 export const signalOrigin = async (
   signal: SignalOrigin,
   linker: OriginLinker,
+  strict = false,
 ): Promise<SignalOriginRef> => {
   const label = describeOrigin(signal.source);
 
@@ -72,8 +87,10 @@ export const signalOrigin = async (
     // that turns any throw into `open_post_failed`. Unchecked, a hostile or
     // simply malformed url costs the whole announcement, on every tick, and
     // leaves an alarm as the only trace.
+    //
+    // A url with no path is the Grafana root, which is not this alert.
     const url = signal.labels[`${META_PREFIX}generator_url`] ?? "";
-    return { label, url: isLinkable(url) ? url.trim() : null };
+    return { label, url: isLinkable(url) && !isBareHost(url) ? url.trim() : null };
   }
 
   if (signal.source === HUMAN_SOURCE) {
@@ -88,7 +105,8 @@ export const signalOrigin = async (
       // announcement.
       const url = await linker.permalink(messageTs, channel);
       return { label, url: isLinkable(url) ? url.trim() : null };
-    } catch {
+    } catch (err) {
+      if (strict) throw err;
       // The caller is about to announce an incident. Losing the link loses a
       // convenience; throwing here would lose the announcement.
       return { label, url: null };

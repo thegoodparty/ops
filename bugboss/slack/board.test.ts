@@ -15,14 +15,23 @@ const row = (over: Partial<BoardRow> = {}): BoardRow => ({
   status: "FIXING",
   summary: "Loki reads are being rejected",
   firstSignalTitle: "memory above 90% on bugboss-prod",
+  mergedInto: null,
   waitingFor: null,
+  liftsOnReply: null,
+  waitStartedAt: null,
+  waitWakeAt: null,
+  questionAskedAt: null,
+  questionText: null,
+  monitorWaitingFor: null,
+  monitorStartedAt: null,
+  unreadQuestions: 0,
   ...over,
 });
 
 describe("the three fields", () => {
   test("the summary is what the incident is, not the alert that opened it", () => {
-    assert.match(renderHeader(row()), /Loki reads are being rejected/);
-    assert.doesNotMatch(renderHeader(row()), /memory above 90%/);
+    assert.match(renderBoardLine(row()), /Loki reads are being rejected/);
+    assert.doesNotMatch(renderBoardLine(row()), /memory above 90%/);
   });
 
   /**
@@ -32,14 +41,14 @@ describe("the three fields", () => {
    */
   test("with no summary it falls back to the first signal's title", () => {
     assert.match(
-      renderHeader(row({ summary: null })),
+      renderBoardLine(row({ summary: null })),
       /memory above 90% on bugboss-prod/,
     );
   });
 
   test("with neither, it says so rather than leaving a gap", () => {
     assert.match(
-      renderHeader(row({ summary: null, firstSignalTitle: null })),
+      renderBoardLine(row({ summary: null, firstSignalTitle: null })),
       /no title recorded/,
     );
   });
@@ -49,41 +58,39 @@ describe("the three fields", () => {
    * you" worth trusting, which is why it is said out loud rather than left
    * to the absence of a line.
    */
-  test("an incident nobody is waiting on says nothing is needed", () => {
-    assert.match(renderHeader(row()), /nothing needed from anyone/);
+  test("an incident nobody is waiting on says so", () => {
+    assert.match(renderBoardLine(row()), /waiting on nobody/);
   });
 
   test("a waiting incident shows what is being waited on, verbatim", () => {
     assert.match(
-      renderHeader(row({ waitingFor: "the fix PR to be reviewed and merged" })),
+      renderBoardLine(row({ waitingFor: "the fix PR to be reviewed and merged" })),
       /the fix PR to be reviewed and merged/,
     );
   });
 
   test("RESOLVED reads as what is left, not as a word that contradicts the board", () => {
-    const header = renderHeader(row({ status: "RESOLVED" }));
+    const header = renderBoardLine(row({ status: "RESOLVED" }));
     assert.match(header, /writing the post-mortem/);
   });
 });
 
-describe("one renderer, two scales", () => {
-  test("the header and the board line say the same three things", () => {
-    const one = row({ waitingFor: "a decision on the recording rules" });
-    for (const text of [renderHeader(one), renderBoardLine(one)]) {
+describe("one set of facts, two shapes", () => {
+  test("the header and the board line agree on the title and on the person needed", () => {
+    const one = row({ monitorWaitingFor: "someone to merge omni#2240", monitorStartedAt: 1 });
+    const header = renderHeader(one, null);
+    const line = renderBoardLine(one);
+    for (const text of [header, line]) {
       assert.match(text, /Incident 4/);
-      assert.match(text, /Fixing/);
       assert.match(text, /Loki reads are being rejected/);
-      assert.match(text, /a decision on the recording rules/);
+      assert.match(text, /merge omni#2240/);
     }
+    assert.doesNotMatch(header, /FIXING/, "the header carries no status");
   });
 
   test("a board line is one line, whatever is in it", () => {
     const line = renderBoardLine(row({ waitingFor: "somebody\nto look" }));
     assert.equal(line.split("\n").length, 1);
-  });
-
-  test("the header is two lines, so it stays a header", () => {
-    assert.equal(renderHeader(row()).split("\n").length, 2);
   });
 });
 
@@ -129,6 +136,6 @@ describe("escaping", () => {
   test("a summary out of a model cannot eat the line", () => {
     const line = renderBoardLine(row({ summary: "reads of <redis> failing" }));
     assert.match(line, /&lt;redis&gt;/);
-    assert.ok(line.endsWith("_"), line);
+    assert.ok(line.endsWith("waiting on nobody"), line);
   });
 });

@@ -1,8 +1,9 @@
 // Human reports. Design spec: bugboss/docs/architecture.md, Job 1 / Human reports.
 //
 // An employee reports the same way they do anything else: @bugboss in Slack.
-// Whether a mention is a report at all is a model call in the composition
-// root, which then builds the signal here -- so a report is its own kind of
+// Whether a mention is a report at all is the Boss's call, through its
+// open_incident tool, and the composition root builds the signal here -- so a
+// report is its own kind of
 // signal rather than a flag on the alert path, and it is never a verb a
 // person has to know. Four things differ from an alert, and all four are
 // encoded below:

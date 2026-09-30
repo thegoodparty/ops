@@ -37,24 +37,22 @@ incident through the loopback tool API. It never reads Slack and never posts
 free text to it: everything it needs from a person goes up to the Boss.
 
 **The Boss** is everything else that talks to a model: triage, root-cause
-correlation, the inbound-language read (`slack/intent.ts`) and the incident
-commander (`slack/agent.ts`). They share one request path
-(`bedrock/client.ts`) and one read-only query guard (`triage/sql.ts`).
-
-The intent read is not a third agent. It has no tools and answers one label,
-so it is a capability of the Boss rather than a peer, and it is written
-against the same seam for the same reason.
+correlation and the incident commander (`slack/agent.ts`). They share one
+request path (`bedrock/client.ts`) and one read-only query guard
+(`triage/sql.ts`).
 
 **The commander is the only interface between people and agents.** Every
 message a person writes in an incident thread runs it, with that incident as
-context, and so does every row an agent writes to `boss_inbox`. It answers,
+context, and so does every `@bugboss` mention anywhere else and every row an
+agent writes to `boss_inbox`. It answers,
 stays silent, or talks to the agent with `message_agent`, which is the only
 way anything a person says reaches an agent. It can also close, merge and
-stop, and page the rotation. `slack/CLAUDE.md` has the mechanics.
+stop, page the rotation, and open an incident for something a person reports
+broken. `slack/CLAUDE.md` has the mechanics.
 
 **Every Boss write is a request the model makes and code decides.** That is
 the shape, and it is not a style preference. `decide` goes to `applyRules`.
-`read_intent` goes to the guarded `UPDATE` in the composition root. A merge
+A merge
 proposal goes to `toolapi`. The commander's write tools (`boss/commands.ts`)
 take an incident and a reason and nothing else: the guard, the transition and
 the notification are code, and they are the same code an agent's transition
@@ -66,8 +64,9 @@ that lets the model decide *what* is written rather than *whether* to ask,
 would end that, quietly, and is the one change to this area worth refusing.
 
 Its answer is prose rather than a schema, because there is nothing to
-validate in "here is what I found". Code still decides what happens to it: an
-empty answer posts nothing, and anything else is posted whole.
+validate in "here is what I found". Code still decides what happens to it:
+anything it writes is posted whole, and it posts nothing only by calling
+`stay_silent`. An empty answer without that call is a failed run, and alarms.
 
 **Two loops, on purpose.** `runStructuredCall` bounds a whole call with one
 wall-clock budget and a round count, and throws so every caller takes its
@@ -91,22 +90,22 @@ alarm that fires during normal operation teaches people to ignore alarms.
 decides what somebody wants by matching their words against a list. One thing
 did — the bug-report verb — and it was a magic phrase nobody could discover
 and everybody mistyped, failing silently when they did. In an incident thread
-the Boss reads every message itself, with the incident as context; out in the
-channel a mention is read by a model call (`slack/intent.ts`), advisory the
-way triage is: the model reads the sentence, the code keeps the invariants,
-and an ambiguous read asks rather than guessing.
+the Boss reads every message itself, with the incident as context, and a
+mention anywhere else goes to the Boss too. Nothing reads a message before the
+Boss does, so nothing can decide a request to act is "a report or a question"
+and ask which.
 
 An entity check — "does this text contain `<@U…>`", "is this thread an
 incident's" — is not a language interface. Those decide where a message is
 routed, never what it meant.
 
 **Anything a reader sees the same way twice is rendered once, in code.** An
-incident reference, a status-board row and a thread's header are all
-formatting, and formatting asked for in a prompt is followed
+incident reference, a status-board row, a thread's header and an incident's
+status card are all formatting, and formatting asked for in a prompt is followed
 probabilistically -- which is how the same answer came to link some incidents
 and not others, and to spell the same word two ways in one message. The
-renderers are `slack/incidents.ts` and `slack/board.ts`; the model writes
-"incident 4" in prose and code decides what that looks like. This is the
+renderers are `slack/incidents.ts`, `slack/status.ts` and `slack/board.ts`;
+the model writes "incident 4" in prose and code decides what that looks like. This is the
 opposite of the language rule above, not an exception to it: that one is
 about reading what a person meant, this one is about our own output.
 

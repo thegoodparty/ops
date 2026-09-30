@@ -171,9 +171,9 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
         const into = establishedOf(from, to);
         const absorb = into === from ? to : from;
 
-        // Statuses and signals are read inside the write, the same as
-        // combineIncidents: a correlation merge landing between a read and
-        // this assign would otherwise have its signals dragged back out.
+        // Statuses and signals are read inside the write: a correlation
+        // merge landing between a read and this assign would otherwise have
+        // its signals dragged back out.
         let outcome:
           | { kind: "refused"; why: string }
           | { kind: "assigned"; result: AssignResult };
@@ -281,7 +281,7 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
           return "The page did not post, so nobody has been told. It is worth calling again.";
         }
         log("rotation_paged", { incidentId });
-        return `The rotation has been paged in incident ${incidentId}'s thread. Do not repeat the page in your reply.`;
+        return `The rotation has been paged in incident ${incidentId}'s thread. Do not repeat or summarise it: if the page is the whole answer, call stay_silent.`;
       },
     },
   ];

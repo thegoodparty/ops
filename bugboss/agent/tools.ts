@@ -333,7 +333,7 @@ export interface WaitMarkerPort {
    * what stops that stale marker from silencing the next wait's first
    * reminder.
    */
-  recordWait(command: string): Promise<PendingWait>;
+  recordWait(command: string, waitingFor: string | null): Promise<PendingWait>;
   recordPing(): Promise<PendingWait>;
   clearWait(): Promise<void>;
 }
@@ -418,6 +418,12 @@ export interface MonitorArgs {
   timeoutSeconds: number;
   description: string;
   /**
+   * What the board and the status card say is being waited for. Required of
+   * the model by the schema, and still optional here: a restart replays a
+   * call recorded before the argument existed, and that wait must resume.
+   */
+  waitingFor?: string;
+  /**
    * What a person has to do for this wait to end. Set only when one does: it
    * is what turns the heartbeat on.
    */
@@ -467,7 +473,9 @@ export const runMonitor = async (
   // costs one turn and the model reissues the call; swallowing it would start
   // a day-long wait with no marker, which is the silent no-heartbeat
   // behaviour this exists to end, with nothing in the agent's view saying so.
-  let marker = heartbeat ? await heartbeat.marker.recordWait(args.command) : null;
+  let marker = heartbeat
+    ? await heartbeat.marker.recordWait(args.command, args.waitingFor?.trim() || null)
+    : null;
 
   // Measured from when the wait began, not from this process start, which is
   // the whole reason the marker is durable: a restart is not progress, and a
@@ -777,63 +785,44 @@ export const runMessageBoss = async (
 };
 
 const MONITOR_DESCRIPTION = [
-  "Block until a shell command exits 0, then return its output. Use this for",
-  "every wait: a PR merging, a deploy finishing, a migration running, an alert",
-  "going quiet. It takes one turn no matter how long it waits, so never poll by",
-  "calling bash in a loop. The turn is not the whole cost: a block that outlives",
-  "the prompt cache pays for your context to be written again at the far end, so",
-  "leave your notes somewhere useful before you enter a long one.",
+  "Block until a shell command exits 0, then return its output whole. Use it for",
+  "every wait: a merge, a deploy, a migration, an alert going quiet. Never poll",
+  "with bash in a loop. It costs one turn, but a block that outlives the prompt",
+  "cache writes your whole context again at the far end, so update your notes",
+  "before a long one.",
   "",
-  "THE COMMAND MUST BE A READ-ONLY CHECK. On a container restart the session",
-  "holds this tool call with no result and the command runs again, so anything",
-  "with a side effect happens twice. `monitor` with `gh pr merge` is a bug.",
+  "`waitingFor` is what people see on the incident board: one short plain",
+  "sentence, no shell, e.g. \"someone to merge omni#2189 or #2195\" or \"the",
+  "deploy of #2234 to finish\".",
   "",
-  "Each invocation of the command is a short exec with its own timeout; the",
-  "waiting happens inside the tool. Output comes back whole, so the command can",
-  "print a whole log -- do not pre-summarise it. The answer is usually in the",
-  "middle, and the context is compacted to make room rather than the log cut.",
+  "THE COMMAND MUST BE A READ-ONLY CHECK. A restart replays this call and runs",
+  "the command again, so a side effect happens twice. `gh pr merge` here is a bug.",
   "",
-  "SET `awaitingHuman` WHEN A PERSON IS THE THING YOU ARE WAITING FOR: merge",
-  "this PR, flip this flag, restart that worker. Say what they have to do and",
-  "include the link. It turns on the heartbeat -- once the wait passes an hour",
-  "inside working hours the Boss is told you are blocked on a person, again at",
-  "a doubling gap up to a day and then daily, and the Boss decides who to",
-  "reach. It never stops you: this incident is yours until it closes.",
+  "Set `awaitingHuman` when a person must act for the wait to end: what they must",
+  "do, with the link. The Boss is then told once the wait passes an hour inside",
+  "working hours, and again on a doubling gap up to a day. The incident stays",
+  "yours. Leave it unset for a deploy, a migration, npm ci or an alert going quiet.",
   "",
-  "THE COMMAND MUST STILL DETECT THE THING THE PERSON WAS ASKED TO DO. This is",
-  "the part that gets skipped. `awaitingHuman` controls whether the Boss hears",
-  "about the wait; the command is what ends it, and if it does not actually",
-  "observe the outcome then the wait can only end by somebody telling you,",
-  "which is the slowest path there is and often never happens at all. A merge",
-  "is `gh pr view <url> --json state,mergedAt` and a grep for merged. A flag",
-  "flip is a read of the flag. A restart is the health check.",
-  "",
-  "Leave it unset for a deploy, a migration, npm ci or an alert going quiet.",
-  "Nobody is being asked for anything, so nobody is told.",
+  "THE COMMAND MUST STILL DETECT WHAT THE PERSON WAS ASKED TO DO, or the wait only",
+  "ends when somebody tells you, which is slow and often never. A merge is",
+  "`gh pr view <url> --json state,mergedAt`, a flag flip is a read of the flag, a",
+  "restart is the health check.",
 ].join("\n");
 
 const MESSAGE_BOSS_DESCRIPTION = [
-  "Send a message to the Boss, the incident commander that sits between you and",
-  "every person. You never talk to people directly: the Boss reads the thread,",
-  "decides who needs to hear what, and relays answers back to you. It can reach",
-  "the rotation, read other incidents, and merge, close or stop incidents.",
+  "Send the Boss a message. The Boss is the incident commander between you and",
+  "every person: it reads the thread, decides who hears what, and relays answers.",
+  "You never talk to people directly.",
   "",
-  "Without `wait`, this records the message and returns at once. Use it to say",
-  "something the Boss should know: a finding, a PR that needs a merge, that you",
-  "are standing down.",
+  "Without `wait`, it records the message and returns: a finding, a PR that needs",
+  "a merge, that you are standing down. With `wait: true`, it asks a question and",
+  "blocks until the Boss answers: one fact or one action you cannot take",
+  "yourself. Say what you need and why, in plain prose.",
   "",
-  "With `wait: true`, it asks a question and blocks until the Boss answers. Use",
-  "it for one fact or one action you cannot take yourself: merge a PR, restart a",
-  "worker, check a dashboard you cannot see. The Boss answers from what it can",
-  "read if it can, and asks a person if it cannot. Say exactly what you need and",
-  "why; the Boss is the reader, so plain prose is fine.",
-  "",
-  "If nobody answers within `seconds`, the Boss is told the question is still",
-  "unanswered, again on a doubling gap up to a day, and you keep waiting. This",
-  "is not an escalation and it does not end anything: the incident stays yours.",
-  "",
-  "Safe to call again after a restart: an outstanding question is recorded, so a",
-  "repeated call resumes waiting rather than asking twice.",
+  "If nobody answers within `seconds`, the Boss is told, again on a doubling gap",
+  "up to a day, and you keep waiting. That ends nothing: the incident stays yours.",
+  "Safe to call again after a restart: an outstanding question resumes waiting",
+  "rather than asking twice.",
 ].join("\n");
 
 export const createMonitorTool = async (
@@ -853,10 +842,14 @@ export const createMonitorTool = async (
     description: Type.String({
       description: "What you are waiting for, in one line.",
     }),
+    waitingFor: Type.String({
+      description:
+        "For the incident board: one short plain sentence naming what you wait for, with no shell in it. \"someone to merge omni#2189\", \"the deploy of #2234 to finish\".",
+    }),
     awaitingHuman: Type.Optional(
       Type.String({
         description:
-          "Only when a person has to act for this wait to end: what they must do, with the link. The command must still be a check that detects them having done it -- `gh pr view --json state,mergedAt` for a merge, a flag read for a flag flip -- not a placeholder that waits to be told. Unset for a deploy, a migration or an alert going quiet.",
+          "Only when a person must act for this wait to end: what they must do, with the link. The command must still detect that they did it.",
       }),
     ),
   });

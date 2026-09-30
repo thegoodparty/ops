@@ -82,6 +82,13 @@ describe("buildChildEnv", () => {
     assert.equal(env.BUGBOSS_ATTEMPT, "3");
   });
 
+  it("carries the incident's alert slugs sorted and once each", () => {
+    const env = buildChildEnv(input({ alertSlugs: ["route-errors-win", "high-cpu", "high-cpu"] }));
+    assert.equal(env.BUGBOSS_ALERT_SLUGS, '["high-cpu","route-errors-win"]');
+    assert.equal(buildChildEnv(input()).BUGBOSS_ALERT_SLUGS, undefined);
+    assert.equal(buildChildEnv(input({ alertSlugs: [] })).BUGBOSS_ALERT_SLUGS, undefined);
+  });
+
   it("omits the session reference on a first launch", () => {
     const env = buildChildEnv(input({ sessionRef: null }));
     assert.equal(env.BUGBOSS_SESSION_REF, undefined);

@@ -3,8 +3,8 @@
 // Three surfaces, one renderer (`slack/board.ts`), and everything here is
 // about *when*:
 //
-//   - every incident thread's top-level message carries a header, kept
-//     current in place;
+//   - every incident thread's top-level message is a header, kept current
+//     in place;
 //   - the board is posted once a morning, and only when something is open;
 //   - the board emptying is announced once, when it stays empty.
 //
@@ -29,6 +29,7 @@
 import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
+import type { SignalOriginRef } from "../ingress/link";
 import type { IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
 import { DEFAULT_WORKING_HOURS } from "../agent/tools";
@@ -39,6 +40,7 @@ import {
   renderHeader,
   type BoardRow,
 } from "../slack/board";
+import { STATUS_FACTS_SQL } from "../slack/status";
 
 const log = makeLog("board");
 
@@ -66,7 +68,7 @@ export const ALL_CLEAR_SETTLE_MS = 10 * 60 * 1000;
 const OPEN_LIST = OPEN_STATUSES.map((s) => `'${s}'`).join(",");
 
 /**
- * Every open incident, with the three fields a row is made of. One query:
+ * Every open incident, with the facts a row is made of. One query:
  * the board is read on every tick, and a read per incident is how a query
  * that runs twice a minute grows with the size of the corpus.
  */
@@ -74,14 +76,7 @@ export const openBoard = (db: {
   query<T>(sql: string, params?: unknown[]): T[];
 }): BoardRow[] =>
   db.query<BoardRow>(
-    `SELECT i.id AS incidentId,
-            i.status AS status,
-            i.summary AS summary,
-            (SELECT title FROM signal WHERE incidentId = i.id
-              ORDER BY openedAt, id LIMIT 1) AS firstSignalTitle,
-            (SELECT waitingFor FROM incident_wait WHERE incidentId = i.id)
-              AS waitingFor
-       FROM incident i
+    `${STATUS_FACTS_SQL}
       WHERE i.status IN (${OPEN_LIST})
       ORDER BY CAST(i.id AS INTEGER)`,
   );
@@ -133,6 +128,12 @@ export interface BoardDeps {
   post(text: string): Promise<unknown>;
   /** Rewrites one incident thread's top-level message. */
   update(channel: string, ts: string, text: string): Promise<void>;
+  /**
+   * The signal that opened an incident, as the header links it; null when
+   * it has none. Asked once per incident and kept in `incident_thread`,
+   * because a Slack report's link is a `chat.getPermalink` call.
+   */
+  origin(incidentId: string): Promise<SignalOriginRef | null>;
   channel: string;
   timeZone?: string;
   postHour?: number;
@@ -163,16 +164,15 @@ export interface BoardSweep {
 export const MAX_HEADER_UPDATES_PER_TICK = 8;
 
 /**
- * One incident, as the header sweep needs to see it: the three board fields,
- * plus what was last written above its thread.
- *
- * `opening` is deliberately not selected here. It is a whole alert body, and
- * this reads every incident that has ever had a thread; it is fetched one
- * row at a time, only for the handful about to be written.
+ * One incident, as the header sweep needs to see it: the board fields, plus
+ * what was last written as its thread's top-level message and where that
+ * links to.
  */
 interface HeaderRow extends BoardRow {
   slackThreadTs: string | null;
   header: string | null;
+  originLabel: string | null;
+  originUrl: string | null;
 }
 
 /**
@@ -192,58 +192,91 @@ interface HeaderRow extends BoardRow {
  * update leaves the stored value alone, so the next tick sees the same
  * difference and tries again.
  *
- * **Closed incidents are finalised, then left.** This runs over every
- * incident with a thread, not only the open ones, so an incident that closes
- * gets one last header saying so rather than freezing on "Fixing" forever --
- * which is a lie, and the kind a thread keeps telling for months. After that
- * write the rendered text stops changing, so the comparison stops matching
- * and the thread is never touched again. Nothing is ever removed: the header
- * sits above the message the thread opened with, which is untouched
- * throughout.
+ * **The header is the whole message.** `chat.update` replaces it, and
+ * nothing else belongs there, so a thread whose old top-level message
+ * carried the alert text is rewritten once to the header like any other.
+ * Only an edit is ever made here, never a post, so no rewrite can duplicate
+ * a thread.
  *
- * An incident with no recorded opening gets nothing. `chat.update` replaces
- * the whole message, so writing a header without knowing what is underneath
- * it would delete somebody's alert text -- unrecoverable, where a missing
- * header merely looks unfinished. Those incidents are counted once at boot
- * (`index.ts`) rather than named every thirty seconds here.
+ * **Closed incidents are finalised, then left.** A closed incident with a
+ * recorded thread gets one last header, without the line asking for a
+ * person, and then its rendered text stops changing. A closed incident that
+ * predates the record is left as it is: nobody is reading it for its status.
  */
 const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
   const candidates = deps.db.query<HeaderRow>(
-    `SELECT i.id AS incidentId,
-            i.status AS status,
-            i.summary AS summary,
-            i.slackThreadTs AS slackThreadTs,
+    `SELECT f.*, i.slackThreadTs AS slackThreadTs,
             t.header AS header,
-            (SELECT title FROM signal WHERE incidentId = i.id
-              ORDER BY openedAt, id LIMIT 1) AS firstSignalTitle,
-            (SELECT waitingFor FROM incident_wait WHERE incidentId = i.id)
-              AS waitingFor
-       FROM incident_thread t JOIN incident i ON i.id = t.incidentId
-      ORDER BY CAST(i.id AS INTEGER)`,
+            t.originLabel AS originLabel, t.originUrl AS originUrl
+       FROM (${STATUS_FACTS_SQL}) f
+       JOIN incident i ON i.id = f.incidentId
+       LEFT JOIN incident_thread t ON t.incidentId = f.incidentId
+      WHERE i.slackThreadTs IS NOT NULL
+        AND (t.incidentId IS NOT NULL OR f.status IN (${OPEN_LIST}))
+      ORDER BY CAST(f.incidentId AS INTEGER)`,
   );
 
   let written = 0;
+  let resolved = 0;
+  let capped = false;
   for (const row of candidates) {
-    if (written >= MAX_HEADER_UPDATES_PER_TICK) {
-      log("header_sweep_capped", { cap: MAX_HEADER_UPDATES_PER_TICK });
-      break;
-    }
     if (!row.slackThreadTs) continue;
-    const header = renderHeader(row);
-    if (header === row.header) continue;
 
-    const opening = deps.db.get<{ opening: string }>(
-      "SELECT opening FROM incident_thread WHERE incidentId = ?",
-      [row.incidentId],
-    )?.opening;
-    if (opening === undefined) continue;
+    let origin: SignalOriginRef | null =
+      row.originLabel === null ? null : { label: row.originLabel, url: row.originUrl };
+    if (row.originLabel === null) {
+      // The same cap as the edits, for the same reason: the first sweep
+      // after this ships resolves every thread at once, and a Slack
+      // report's link is an API call.
+      // An incident with no signal costs no API call, so it does not count:
+      // asked again every tick, it would otherwise starve the rows after it.
+      if (resolved >= MAX_HEADER_UPDATES_PER_TICK) continue;
+      try {
+        origin = await deps.origin(row.incidentId);
+      } catch (err) {
+        resolved += 1;
+        alarm("header_origin_failed", { incidentId: row.incidentId, error: String(err) });
+        continue;
+      }
+      if (origin !== null) resolved += 1;
+      // No signal yet is not final: one may still be attached, so the row
+      // is made (the header write below needs it) and the origin is left
+      // for the next tick to ask again.
+      const found = origin;
+      await deps.db.withWrite((w: Database.Database) => {
+        if (found === null) {
+          w.prepare(
+            "INSERT INTO incident_thread (incidentId, opening) VALUES (?, '') ON CONFLICT(incidentId) DO NOTHING",
+          ).run(row.incidentId);
+          return;
+        }
+        w.prepare(
+          `INSERT INTO incident_thread (incidentId, opening, originLabel, originUrl)
+           VALUES (?, '', ?, ?)
+           ON CONFLICT(incidentId) DO UPDATE SET
+             originLabel = excluded.originLabel,
+             originUrl = excluded.originUrl`,
+        ).run(row.incidentId, found.label, found.url ?? null);
+      });
+    }
+
+    let header: string;
+    try {
+      header = renderHeader(row, origin);
+    } catch (err) {
+      alarm("header_render_failed", { incidentId: row.incidentId, error: String(err) });
+      continue;
+    }
+    if (header === row.header) continue;
+    // Checked here rather than at the top of the loop, so a tick that has
+    // used up its edits still resolves origins for the rows after them.
+    if (written >= MAX_HEADER_UPDATES_PER_TICK) {
+      capped = true;
+      continue;
+    }
 
     try {
-      await deps.update(
-        deps.channel,
-        row.slackThreadTs,
-        `${header}\n\n${opening}`,
-      );
+      await deps.update(deps.channel, row.slackThreadTs, header);
     } catch (err) {
       // One thread's failed edit is one stale header. Letting it out would
       // make it every thread, plus the morning board and the all-clear. A
@@ -263,6 +296,7 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
     });
     written += 1;
   }
+  if (capped) log("header_sweep_capped", { cap: MAX_HEADER_UPDATES_PER_TICK });
   return written;
 };
 
