@@ -10,6 +10,7 @@ import type { IncidentOutput } from "../core/blind";
 import { createBedrockJudgeModel, judgePair } from "../core/judge";
 import { renderComparison } from "../core/report";
 import { loadScenario } from "../core/scenario";
+import { loadCase } from "../replay/case";
 import type { GateName, GateResult } from "./gates";
 import {
   OPS_ROOT,
@@ -21,6 +22,7 @@ import {
   scenarioJsonFor,
   type RunResult,
 } from "./orchestrator";
+import { CASES_DIR, buildReplayBundle, bundleUrlFor, caseJsonFor, runReplaySide } from "./replay-side";
 
 const run = promisify(execFile);
 
@@ -39,12 +41,24 @@ const USAGE = `Usage: npx tsx bugboss-evals/sim/cli.ts <command> [options]
            [--scenarios-dir bugboss-evals/scenarios]
   seed-bundle --sha <omni sha> [--omni-dir <omni checkout>] [--upload]
 
+  Tier 2, one side per call (the fan-out runs each as its own task):
+  replay-side  --case <id|case.json> --ref <name> --rep <n> --variant-tar <path|s3://...>
+               --sim-image <tag> --out <dir|s3://...> [--run-id <id>]
+               [--checkpoint <path|s3://...>]   (default: the case's own S3 URI)
+               [--omni-bundle <path|s3://...>]  (default: s3://$EVALS_BUCKET/replay/<case>.bundle)
+               [--zero-spend]
+  replay-bundle --case <id|case.json> [--omni-dir <omni checkout>] [--upload]
+               builds a case's omni bundle on your machine, with your AWS and gh
+               credentials: the PR's head when it opened and its merge base
+  plan         --comment "bugboss eval replay [aa] [cases=a,b] [reps=N]" ... plans Tier 2
+
 A run is one whole incident, black box, against the stack in sim/compose.
 Model calls cost real money: every run is capped by its scenario's caps, and
 compare, aa and plan refuse anything past the caps below.`;
 
 // The spend ceiling lives here, in code, so a comment cannot raise it.
 export const CAPS = { reps: 3, scenarios: 6, runs: 36, totalUsd: 700 };
+export const REPLAY_CAPS = { reps: 3, cases: 6, runs: 36, totalUsd: 600 };
 
 type Args = Record<string, string | true>;
 
@@ -142,6 +156,76 @@ export const planFromComment = (args: {
   if (maxUsd > CAPS.totalUsd) throw new Error(`worst-case model spend $${maxUsd} is over the cap of $${CAPS.totalUsd}`);
   return { evalId, mode, scenarios, reps, maxUsd, runs };
 };
+
+export interface PlannedSide {
+  case: string;
+  side: "baseline" | "candidate";
+  ref: string;
+  rep: number;
+  runId: string;
+}
+
+export interface ReplayPlan {
+  tier: "replay";
+  evalId: string;
+  mode: "ab" | "aa";
+  cases: string[];
+  reps: number;
+  maxUsd: number;
+  runs: PlannedSide[];
+}
+
+export const isReplayComment = (comment: string): boolean => comment.trim().split(/\s+/)[2]?.toLowerCase() === "replay";
+
+/** `bugboss eval replay [aa] [cases=a,b] [reps=N]`: Tier 2, one task per (case, side, rep). */
+export const planReplayFromComment = (args: {
+  comment: string;
+  baseline: string;
+  candidate: string;
+  available: string[];
+  capUsd: (caseId: string) => number;
+  evalId?: string;
+}): ReplayPlan => {
+  const words = args.comment.trim().split(/\s+/);
+  if (words[0]?.toLowerCase() !== "bugboss" || words[1]?.toLowerCase() !== "eval" || words[2]?.toLowerCase() !== "replay") {
+    throw new Error('the comment must start with "bugboss eval replay"');
+  }
+  let mode: ReplayPlan["mode"] = "ab";
+  let cases = args.available;
+  let reps = REPLAY_CAPS.reps;
+  for (const word of words.slice(3)) {
+    if (word === "aa") mode = "aa";
+    else if (word.startsWith("cases=")) cases = word.slice("cases=".length).split(",").filter(Boolean);
+    else if (word.startsWith("reps=")) reps = Number(word.slice("reps=".length));
+    else throw new Error(`unrecognised option "${word}"; the syntax is: bugboss eval replay [aa] [cases=a,b] [reps=N]`);
+  }
+  const unknown = cases.filter((id) => !args.available.includes(id));
+  if (unknown.length > 0) throw new Error(`no such case: ${unknown.join(", ")} (have: ${args.available.join(", ")})`);
+  if (cases.length === 0) throw new Error("no cases to run");
+  if (!Number.isInteger(reps) || reps < 1 || reps > REPLAY_CAPS.reps) throw new Error(`reps must be 1 to ${REPLAY_CAPS.reps}`);
+  if (cases.length > REPLAY_CAPS.cases) throw new Error(`at most ${REPLAY_CAPS.cases} cases per eval`);
+  const evalId = args.evalId ?? `${Date.now().toString(36)}${randomBytes(3).toString("hex")}`;
+  const sides: [PlannedSide["side"], string][] =
+    mode === "aa" ? [["baseline", args.baseline], ["candidate", args.baseline]] : [["baseline", args.baseline], ["candidate", args.candidate]];
+  const runs: PlannedSide[] = [];
+  for (const id of cases) {
+    for (let rep = 1; rep <= reps; rep++) {
+      for (const [side, ref] of sides) runs.push({ case: id, side, ref, rep, runId: `${evalId}-${id}-${side}-r${rep}` });
+    }
+  }
+  if (runs.length > REPLAY_CAPS.runs) throw new Error(`${runs.length} sides is over the cap of ${REPLAY_CAPS.runs}`);
+  const maxUsd = runs.reduce((sum, planned) => sum + args.capUsd(planned.case), 0);
+  if (maxUsd > REPLAY_CAPS.totalUsd) throw new Error(`worst-case model spend $${maxUsd} is over the cap of $${REPLAY_CAPS.totalUsd}`);
+  return { tier: "replay", evalId, mode, cases, reps, maxUsd, runs };
+};
+
+export const listCases = (dir: string): string[] =>
+  existsSync(dir)
+    ? readdirSync(dir)
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => loadCase(join(dir, name)).id)
+        .sort()
+    : [];
 
 // ------------------------------------------------------------------ bundles
 
@@ -518,6 +602,18 @@ export const main = async (argv: string[]): Promise<number> => {
     case "plan": {
       const root = scenariosRoot(args);
       try {
+        if (isReplayComment(str(args, "comment"))) {
+          const dir = resolve(str(args, "cases-dir", CASES_DIR));
+          const plan = planReplayFromComment({
+            comment: str(args, "comment"),
+            baseline: str(args, "baseline"),
+            candidate: str(args, "candidate"),
+            available: listCases(dir),
+            capUsd: (id) => loadCase(join(dir, `${id}.json`)).caps.modelUsd,
+          });
+          console.log(JSON.stringify(plan));
+          return 0;
+        }
         const plan = planFromComment({
           comment: str(args, "comment"),
           baseline: str(args, "baseline"),
@@ -541,6 +637,49 @@ export const main = async (argv: string[]): Promise<number> => {
         await run("aws", ["s3", "cp", "--only-show-errors", path, url]);
         console.log(url);
       } else console.log(path);
+      return 0;
+    }
+    case "replay-side": {
+      const caseJson = caseJsonFor(str(args, "case"));
+      const replayCase = loadCase(caseJson);
+      const rep = Number(str(args, "rep", "1"));
+      const bucket = process.env.EVALS_BUCKET ?? "goodparty-bugboss-evals";
+      const outcome = await runReplaySide({
+        caseJson,
+        ref: str(args, "ref"),
+        rep,
+        runId: str(args, "run-id", `${replayCase.id}-r${rep}-${randomBytes(3).toString("hex")}`),
+        simImage: str(args, "sim-image"),
+        workRoot: localDefaults().workRoot,
+        variantTar: str(args, "variant-tar"),
+        checkpoint: typeof args.checkpoint === "string" ? args.checkpoint : undefined,
+        omniBundle: str(args, "omni-bundle", bundleUrlFor(bucket, replayCase.id)),
+        modelCredentials:
+          args["zero-spend"] === true
+            ? "none"
+            : { profile: process.env.AWS_PROFILE, roleArn: process.env.BUGBOSS_EVALS_MODEL_ROLE_ARN },
+        out: str(args, "out"),
+        region: process.env.AWS_REGION,
+      });
+      console.log(JSON.stringify(outcome));
+      return outcome.status === "error" ? 1 : 0;
+    }
+    case "replay-bundle": {
+      const replayCase = loadCase(caseJsonFor(str(args, "case")));
+      const cache = join(homedir(), ".cache", "bugboss-evals");
+      mkdirSync(join(cache, "replay"), { recursive: true });
+      const built = await buildReplayBundle({
+        replayCase,
+        omniDir: str(args, "omni-dir", process.env.OMNI_DIR ?? join(homedir(), "Repos", "thegoodparty", "omni")),
+        cacheDir: cache,
+        out: join(cache, "replay", `${replayCase.id}.bundle`),
+        region: process.env.AWS_REGION,
+      });
+      if (args.upload === true) {
+        const url = bundleUrlFor(process.env.EVALS_BUCKET ?? "goodparty-bugboss-evals", replayCase.id);
+        await run("aws", ["s3", "cp", "--only-show-errors", built.path, url]);
+        console.log(JSON.stringify({ ...built, url }));
+      } else console.log(JSON.stringify(built));
       return 0;
     }
     default:

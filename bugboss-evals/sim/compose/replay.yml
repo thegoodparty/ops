@@ -1,0 +1,199 @@
+# One Tier 2 side: the variant's BugBoss internals resumed from a checkpoint
+# (bugboss-evals/replay), with the model proxy and the GitHub stand-in it
+# talks to. sim/replay-side.ts writes the run directory and the env file this
+# reads, then drives it with `docker compose -p <runId>`. As in stack.yml,
+# every bind mount is under RUN_DIR, because on the fan-out host compose runs
+# inside a container against the host daemon.
+#
+# The replay process loads the variant's code in-process (replay/child.ts),
+# so the `replay` container is treated as BugBoss is in Tier 1: internal
+# networks only, fake credentials, no docker socket, no AWS access. The
+# runner fetched the checkpoint and the variant with its own credentials and
+# mounts them here read-only.
+#
+# Networks:
+#   sim      internal, no default route. The proxy's and the stand-in's
+#            public listeners, and the npm proxy.
+#   control  internal. The /__control listeners. Unlike BugBoss in Tier 1,
+#            the replay container is on it: run-phase.ts resets and seeds the
+#            stand-in and reads the proxy's spend and trace through it.
+#   egress   an ordinary bridge. Only the model proxy and the npm proxy.
+
+name: bugboss-replay
+
+x-sim: &sim
+  image: ${SIM_IMAGE}
+  working_dir: /app
+  restart: "no"
+  environment: &sim-env
+    NODE_EXTRA_CA_CERTS: /sim/tls/ca.crt
+    SSL_CERT_FILE: /sim/tls/ca.crt
+    CONTROL_TOKEN: ${CONTROL_TOKEN}
+
+networks:
+  sim:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${SIM_NET}.0/24
+          ip_range: ${SIM_NET}.128/25
+  control:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CTL_NET}.0/24
+          ip_range: ${CTL_NET}.128/25
+  egress: {}
+
+volumes:
+  # The recorded prompt names /work/<id>/omni, so the checkout has to be
+  # there, and only the replay container mounts it.
+  work: {}
+
+services:
+  proxy:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/proxy/server.ts"]
+    environment:
+      <<: *sim-env
+      # The only real credentials here: the session replay-side.ts writes
+      # into RUN_DIR/model-aws, and no other source.
+      AWS_CONFIG_FILE: /sim/model-aws/config
+      AWS_SHARED_CREDENTIALS_FILE: /sim/model-aws/no-credentials
+      AWS_EC2_METADATA_DISABLED: "true"
+      PORT: "8443"
+      CONTROL_PORT: "9001"
+      CONTROL_HOST: ${CTL_NET}.11
+      TLS_CERT_FILE: /sim/tls/server.crt
+      TLS_KEY_FILE: /sim/tls/server.key
+      PROXY_BUDGET_USD: ${BUDGET_USD}
+      PROXY_TRACE_FILE: /results/proxy.jsonl
+      UPSTREAM_REGION: us-west-2
+      AWS_REGION: us-west-2
+      # Undoes SSL_CERT_FILE for the one process that talks to real AWS.
+      SSL_CERT_FILE: ""
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/results:/results
+      - ${RUN_DIR}/model-aws:/sim/model-aws:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$CONTROL_TOKEN\" http://$$CONTROL_HOST:9001/__control/health"]
+      interval: 2s
+      retries: 90
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.11
+      egress: {}
+
+  npm:
+    image: verdaccio/verdaccio:6.1.2
+    volumes:
+      - ${RUN_DIR}/sim/verdaccio.yaml:/verdaccio/conf/config.yaml:ro
+      - ${NPM_CACHE_DIR}:/verdaccio/storage
+    networks: [sim, egress]
+
+  github:
+    <<: *sim
+    command: ["npx", "tsx", "bugboss-evals/sim/standins/github/server.ts"]
+    environment:
+      <<: *sim-env
+      PORT: "443"
+      CONTROL_PORT: "9002"
+      CONTROL_HOST: ${CTL_NET}.12
+      TLS_CERT_FILE: /sim/tls/server.crt
+      TLS_KEY_FILE: /sim/tls/server.key
+      GITHUB_PUBLIC_URL: https://github
+      GITHUB_DATA_DIR: /data
+      GITHUB_STANDIN_HUMANS: ${GITHUB_STANDIN_HUMANS}
+      GITHUB_APP_SLUG: bugboss
+      # run-phase.ts seeds the repository and posts the case's CI verdicts
+      # through /__control, so nothing is seeded at boot and no CI runs.
+      CI_MODE: scripted
+      GIT_SSL_CAINFO: /sim/tls/ca.crt
+    volumes:
+      - ${RUN_DIR}/tls:/sim/tls:ro
+      - ${RUN_DIR}/seed:/sim/seed:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $$CONTROL_TOKEN\" http://$$CONTROL_HOST:9002/__control/health"]
+      interval: 2s
+      retries: 90
+    networks:
+      sim: {}
+      control:
+        ipv4_address: ${CTL_NET}.12
+
+  replay:
+    <<: *sim
+    entrypoint: ["/bin/sh", "-c"]
+    # The variant's node_modules are installed here, through the npm proxy,
+    # never on the runner, which holds the docker socket and real credentials.
+    command:
+      - >-
+        cd /variant && npm ci --no-audit --no-fund --loglevel=error
+        && cd /app && exec npx tsx bugboss-evals/replay/cli.ts side "$$@"
+      - replay
+      - --case
+      - /app/bugboss-evals/replay/cases/${CASE_ID}.json
+      - --rep
+      - ${REP}
+      - --ref
+      - ${REF}
+      - --variant-root
+      - /variant
+      - --github-api
+      - https://github/api/v3
+      - --github-git
+      - https://github/thegoodparty/omni.git
+      - --github-control
+      - http://${CTL_NET}.12:9002
+      - --human-token
+      - ${HUMAN_TOKEN}
+      - --proxy-url
+      - https://proxy:8443
+      - --proxy-control
+      - http://${CTL_NET}.11:9001
+      - --ca-file
+      - /sim/tls/ca.crt
+      - --checkpoint
+      - /sim/checkpoint/session.jsonl
+      - --seed
+      - /sim/seed/omni.bundle
+      - --head-sha
+      - ${HEAD_SHA}
+      - --base-sha
+      - ${BASE_SHA}
+      - --skip-reference-check
+      - --region
+      - us-west-2
+      - --out
+      - /out/result.json
+    environment:
+      <<: *sim-env
+      CONTROL_TOKEN: ""
+      REPLAY_GITHUB_CONTROL_TOKEN: ${CONTROL_TOKEN}
+      REPLAY_PROXY_CONTROL_TOKEN: ${CONTROL_TOKEN}
+      GIT_SSL_CAINFO: /sim/tls/ca.crt
+      npm_config_registry: http://npm:4873/
+      # Fake, so nothing in this container can sign a real AWS request, and
+      # every AWS endpoint but the proxy is a closed port.
+      AWS_ACCESS_KEY_ID: AKIAREPLAYFAKE000000
+      AWS_SECRET_ACCESS_KEY: replay-fake
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_ENDPOINT_URL: http://127.0.0.1:9
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${RUN_DIR}/tls/ca.crt:/sim/tls/ca.crt:ro
+      - ${RUN_DIR}/seed:/sim/seed:ro
+      - ${RUN_DIR}/checkpoint:/sim/checkpoint:ro
+      - ${RUN_DIR}/variant:/variant
+      - ${RUN_DIR}/replay-out:/out
+      - ${RUN_DIR}/replay-home/npmrc:/usr/local/etc/npmrc:ro
+      - work:/work
+    depends_on:
+      proxy: { condition: service_healthy }
+      github: { condition: service_healthy }
+      npm: { condition: service_started }
+    networks: [sim, control]

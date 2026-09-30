@@ -27,10 +27,17 @@ const USAGE = `usage:
               --proxy-url <url> --proxy-control <url> --out <result.json>
               [--grafana-url <url>] [--ca-file <pem>] [--cache-dir <dir>] [--omni-source <repo>]
               [--model-id <id>] [--region <aws region>]
+              [--checkpoint <session.jsonl> --seed <bundle> --head-sha <sha> --base-sha <sha>]
+              [--skip-reference-check]
+  --checkpoint reads the session from a local file instead of the case's S3
+  URI. --seed, --head-sha and --base-sha give the PR's commits already
+  resolved, so the side never reaches github.com; the stand-in must read
+  --seed at the same path.
   side reads REPLAY_GITHUB_CONTROL_TOKEN and REPLAY_PROXY_CONTROL_TOKEN from the
   environment when the stand-in or the proxy sets CONTROL_TOKEN.
   cli.ts compare --case <case.json> --baseline <result.json>... --candidate <result.json>...
-              --out <report.md> [--aa] [--no-judge] [--judge-model <id>] [--region <aws region>]`;
+              --out <report.md> [--aa] [--no-judge] [--judge-model <id>] [--region <aws region>]
+              [--checkpoint <session.jsonl>]`;
 
 const parse = (argv: string[]) => {
   const flags = new Map<string, string[]>();
@@ -38,7 +45,7 @@ const parse = (argv: string[]) => {
     const arg = argv[i];
     if (!arg.startsWith("--")) throw new Error(`unexpected argument ${arg}\n${USAGE}`);
     const name = arg.slice(2);
-    if (name === "aa" || name === "no-judge") {
+    if (name === "aa" || name === "no-judge" || name === "skip-reference-check") {
       flags.set(name, ["true"]);
       continue;
     }
@@ -59,8 +66,12 @@ const parse = (argv: string[]) => {
 
 const side = async (args: ReturnType<typeof parse>) => {
   const replayCase = loadCase(args.one("case"));
-  // Fails here, before any work, when the case names a scenario that is not there.
-  referenceFor(replayCase);
+  // Fails here, before any work, when the case names a scenario that is not
+  // there. The fan-out's runner checks it instead and passes
+  // --skip-reference-check, because the replay container holds no scenarios.
+  if (!args.has("skip-reference-check")) referenceFor(replayCase);
+  const seed = args.maybe("seed");
+  const commits = seed ? { mirror: seed, headSha: args.one("head-sha"), baseSha: args.one("base-sha") } : undefined;
   const result = await runPhase({
     replayCase,
     rep: Number(args.one("rep")),
@@ -86,6 +97,8 @@ const side = async (args: ReturnType<typeof parse>) => {
     cacheDir: args.maybe("cache-dir") ?? join(homedir(), ".cache", "bugboss-evals"),
     omniSource: args.maybe("omni-source"),
     modelId: args.maybe("model-id"),
+    checkpointSource: args.maybe("checkpoint"),
+    commits,
   });
   await writeFile(args.one("out"), JSON.stringify(result, null, 2));
   console.log(`${result.caseId} rep ${result.rep} (${result.ref}): ${result.run.status}. ${result.detail}`);
@@ -108,7 +121,10 @@ const compareSides = async (args: ReturnType<typeof parse>) => {
   const reference = referenceFor(replayCase);
   let context: JudgeContext | null = null;
   if (judging) {
-    const checkpoint = cutAtPrOpen(await readSession(replayCase.checkpoint.session, args.maybe("region")), replayCase.checkpoint.prOrdinal);
+    const checkpoint = cutAtPrOpen(
+      await readSession(args.maybe("checkpoint") ?? replayCase.checkpoint.session, args.maybe("region")),
+      replayCase.checkpoint.prOrdinal,
+    );
     // The recorded signals are what the agent was answering; the scenario's
     // synthetic alert stands in only when the checkpoint holds none.
     context = {

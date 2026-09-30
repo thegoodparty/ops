@@ -1,7 +1,23 @@
 import { strict as assert } from "node:assert";
 import { describe, test } from "node:test";
 
-import { CAPS, gateRegressions, pairUp, parseArgs, planFromComment, renderReport, statusOf, type Pair } from "./cli";
+import { join } from "node:path";
+
+import { loadCase } from "../replay/case";
+import {
+  CAPS,
+  REPLAY_CAPS,
+  gateRegressions,
+  isReplayComment,
+  listCases,
+  pairUp,
+  parseArgs,
+  planFromComment,
+  planReplayFromComment,
+  renderReport,
+  statusOf,
+  type Pair,
+} from "./cli";
 import type { GateResult } from "./gates";
 import type { RunResult } from "./orchestrator";
 
@@ -110,5 +126,60 @@ describe("report", () => {
     const withStats = renderReport({ pairs, unpaired: [], signTest: () => 1, judged: "judged." });
     assert.match(withStats, /sign test p = 1\.000/);
     assert.match(withStats, /judged\./);
+  });
+});
+
+describe("replay plan", () => {
+  const replay = (comment: string, available = ["c1", "c2", "c3"], cap = 15) =>
+    planReplayFromComment({ comment, baseline: "base", candidate: "head", available, capUsd: () => cap, evalId: "e2" });
+
+  test("a replay comment is told apart from a Tier 1 one", () => {
+    assert.equal(isReplayComment("bugboss eval replay"), true);
+    assert.equal(isReplayComment("bugboss eval aa scenarios=replay"), false);
+    assert.equal(isReplayComment("bugboss eval"), false);
+  });
+
+  test("defaults to every case, three reps, one side per task", () => {
+    const result = replay("bugboss eval replay");
+    assert.equal(result.tier, "replay");
+    assert.equal(result.runs.length, 18);
+    assert.equal(result.maxUsd, 270);
+    assert.deepEqual(result.runs.slice(0, 2).map((side) => [side.case, side.side, side.ref, side.runId]), [
+      ["c1", "baseline", "base", "e2-c1-baseline-r1"],
+      ["c1", "candidate", "head", "e2-c1-candidate-r1"],
+    ]);
+  });
+
+  test("picks cases and reps, and aa runs the baseline on both sides", () => {
+    const result = replay("bugboss eval replay cases=c2 reps=2");
+    assert.deepEqual(result.cases, ["c2"]);
+    assert.equal(result.runs.length, 4);
+    assert.ok(replay("bugboss eval replay aa cases=c1 reps=1").runs.every((side) => side.ref === "base"));
+  });
+
+  test("refuses past every cap, and anything it does not recognise", () => {
+    assert.throws(() => replay("bugboss eval replay reps=4"), /reps must be 1 to 3/);
+    assert.throws(() => replay("bugboss eval replay reps=0"), /reps must be 1 to 3/);
+    const seven = ["a", "b", "c", "d", "e", "f", "g"];
+    assert.throws(() => replay(`bugboss eval replay cases=${seven.join(",")}`, seven), /at most 6 cases/);
+    assert.throws(() => replay("bugboss eval replay", ["c1", "c2", "c3"], 40), /over the cap of \$600/);
+    assert.throws(() => replay("bugboss eval replay cases=nope"), /no such case/);
+    assert.throws(() => replay("bugboss eval replay scenarios=c1"), /unrecognised option "scenarios=c1"/);
+    assert.throws(() => replay("bugboss eval"), /must start with "bugboss eval replay"/);
+    assert.equal(REPLAY_CAPS.runs, REPLAY_CAPS.cases * REPLAY_CAPS.reps * 2);
+  });
+
+  test("the six committed cases at their committed caps fit under the total cap", () => {
+    const dir = join(__dirname, "..", "replay", "cases");
+    const cases = listCases(dir);
+    assert.ok(cases.length > 0);
+    const result = planReplayFromComment({
+      comment: "bugboss eval replay",
+      baseline: "base",
+      candidate: "head",
+      available: cases,
+      capUsd: (id) => loadCase(join(dir, `${id}.json`)).caps.modelUsd,
+    });
+    assert.ok(result.maxUsd <= REPLAY_CAPS.totalUsd);
   });
 });

@@ -196,6 +196,10 @@ export const statusOf = (args: {
   return { status: "stalled", detail: "the agent ended before merge and confirmation" };
 };
 
+/** The case's checkpoint, cut at its PR, from `source` when given, else from the case's S3 URI. */
+export const loadCheckpoint = async (c: ReplayCase, source?: string, region?: string): Promise<Checkpoint> =>
+  cutAtPrOpen(await readSession(source ?? c.checkpoint.session, region), c.checkpoint.prOrdinal);
+
 export const runPhase = async (args: {
   replayCase: ReplayCase;
   rep: number;
@@ -206,6 +210,18 @@ export const runPhase = async (args: {
   cacheDir: string;
   omniSource?: string;
   modelId?: string;
+  /**
+   * Read the checkpoint from this local file instead of the case's S3 URI:
+   * the fan-out's runner fetches it with its own credentials, so the replay
+   * container holds no AWS access.
+   */
+  checkpointSource?: string;
+  /**
+   * The PR's commits, already resolved, so nothing here reaches github.com.
+   * `mirror` is a bundle or repository the GitHub stand-in can read at the
+   * same path; see `sim/replay-side.ts` for how one is built.
+   */
+  commits?: { mirror: string; headSha: string; baseSha: string };
 }): Promise<SideResult> => {
   const { replayCase: c, env } = args;
   const problem = hostProblem();
@@ -213,7 +229,7 @@ export const runPhase = async (args: {
   const scratch = await mkdtemp(join(tmpdir(), `replay-${c.id}-`));
   let release: (() => Promise<void>) | null = null;
   try {
-    const recorded = cutAtPrOpen(await readSession(c.checkpoint.session, env.awsRegion), c.checkpoint.prOrdinal);
+    const recorded = await loadCheckpoint(c, args.checkpointSource, env.awsRegion);
     const checkout = recorded.cwd;
     const suffix = join(recorded.incidentId, "omni");
     if (!checkout.endsWith(`/${suffix}`)) {
@@ -236,7 +252,8 @@ export const runPhase = async (args: {
     const checkpoint = { ...recorded, jsonl: rewriteGitHubHost(recorded.jsonl, ghHost) };
     if (!checkpoint.view) throw new Error("the checkpoint holds no get_incident view to resume from");
 
-    const commits = await resolvePrCommits({ checkpoint, cacheDir: args.cacheDir, omniSource: args.omniSource });
+    const commits =
+      args.commits ?? (await resolvePrCommits({ checkpoint, cacheDir: args.cacheDir, omniSource: args.omniSource }));
     const repo = `${checkpoint.pr.owner}/${checkpoint.pr.repo}`;
     await control(env.github, "/__control/reset", {});
     await control(env.github, "/__control/seed", {

@@ -1,13 +1,15 @@
 name: BugBoss eval
 
-# Tier 1 BugBoss evals, started by a PR comment:
+# BugBoss evals, started by a PR comment:
 #
-#   bugboss eval [aa] [scenarios=a,b] [reps=N]
+#   bugboss eval [aa] [scenarios=a,b] [reps=N]          Tier 1, whole incidents
+#   bugboss eval replay [aa] [cases=a,b] [reps=N]       Tier 2, the after-PR phase
 #
 # Baseline is the PR's base commit and candidate its head (`aa` runs the base
 # against itself). The caps live in code, in `cli.ts plan`, not here, so a
-# comment cannot talk its way past them. Each run is one ECS task on the
-# bugboss-evals cluster (deploy/components/bugboss-evals.ts).
+# comment cannot talk its way past them. Each Tier 1 run and each Tier 2 side
+# is one ECS task on the bugboss-evals cluster
+# (deploy/components/bugboss-evals.ts).
 
 on:
   issue_comment:
@@ -44,6 +46,7 @@ jobs:
       plan: ${{ steps.plan.outputs.plan }}
       refs: ${{ steps.plan.outputs.refs }}
       eval_id: ${{ steps.plan.outputs.eval_id }}
+      tier: ${{ steps.plan.outputs.tier }}
     steps:
       # issue_comment runs on the default branch, so this is trusted code.
       - uses: actions/checkout@v6
@@ -92,6 +95,7 @@ jobs:
           echo "plan=$(jq -c . plan.json)" >> "$GITHUB_OUTPUT"
           echo "refs=$(jq -c '[.runs[].ref] | unique' plan.json)" >> "$GITHUB_OUTPUT"
           echo "eval_id=$(jq -r .evalId plan.json)" >> "$GITHUB_OUTPUT"
+          echo "tier=$(jq -r '.tier // "sim"' plan.json)" >> "$GITHUB_OUTPUT"
           jq -r '"Starting \(.runs | length) runs, model spend capped at $\(.maxUsd)."' plan.json > body.md
           gh pr comment "$PR" --body-file body.md
 
@@ -103,6 +107,8 @@ jobs:
   # process it left behind could read those credentials from a later step.
   build-variant:
     needs: plan
+    # Tier 2 runs the variant's source, not its image.
+    if: needs.plan.outputs.tier != 'replay'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -174,26 +180,55 @@ jobs:
           docker push "$ECR:runner"
 
   # A fresh machine that has run no PR code, so assuming the role here is safe.
+  # For Tier 2 it also makes each variant's source tarball: `git archive`
+  # reads the ref's tree and runs none of it.
   push-variants:
     needs: [plan, build-variant]
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      (needs.build-variant.result == 'success' || needs.build-variant.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - if: needs.plan.outputs.tier != 'replay'
+        uses: actions/download-artifact@v4
         with:
           pattern: bugboss-*
           path: images
+
+      - if: needs.plan.outputs.tier == 'replay'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Archive each variant's source
+        if: needs.plan.outputs.tier == 'replay'
+        env:
+          REFS: ${{ needs.plan.outputs.refs }}
+        run: |
+          set -euo pipefail
+          mkdir -p variants
+          for ref in $(echo "$REFS" | jq -r '.[]'); do
+            git fetch --quiet --no-tags origin "$ref"
+            git archive --format=tar -o "variants/$ref.tar" "$ref"
+          done
 
       - uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ env.ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - uses: aws-actions/amazon-ecr-login@v2
+      - if: needs.plan.outputs.tier != 'replay'
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - env:
+      - name: Upload each variant's source
+        if: needs.plan.outputs.tier == 'replay'
+        run: aws s3 cp --only-show-errors --recursive variants/ "s3://$BUCKET/variants/"
+
+      - if: needs.plan.outputs.tier != 'replay'
+        env:
           REFS: ${{ needs.plan.outputs.refs }}
         run: |
           set -euo pipefail
@@ -204,6 +239,7 @@ jobs:
 
   run:
     needs: [plan, build-sim, push-variants]
+    if: needs.plan.outputs.tier != 'replay'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     permissions:
@@ -275,8 +311,83 @@ jobs:
             --query 'tasks[].[taskArn,containers[0].exitCode,stoppedReason]' \
             --output text --tasks < tasks.txt
 
+  # One task per (case, side, rep): the recorded prompt names /work/<id>/omni,
+  # so two sides cannot share a host's replay container. Each task stops the
+  # side at the case's wall-clock cap; the deadline here is the backstop.
+  run-replay:
+    needs: [plan, build-sim, push-variants]
+    if: needs.plan.outputs.tier == 'replay'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Start and wait for every side
+        env:
+          PLAN: ${{ needs.plan.outputs.plan }}
+          EVAL_ID: ${{ needs.plan.outputs.eval_id }}
+          SIM_IMAGE: ${{ needs.build-sim.outputs.sim_image }}
+        run: |
+          set -euo pipefail
+          : > tasks.txt
+          echo "$PLAN" | jq -c '.runs[]' | while read -r entry; do
+            case_id=$(echo "$entry" | jq -r .case)
+            ref=$(echo "$entry" | jq -r .ref)
+            rep=$(echo "$entry" | jq -r .rep)
+            run_id=$(echo "$entry" | jq -r .runId)
+            command=$(jq -cn \
+              --arg case "$case_id" \
+              --arg ref "$ref" \
+              --arg rep "$rep" \
+              --arg run "$run_id" \
+              --arg sim "$SIM_IMAGE" \
+              --arg tar "s3://$BUCKET/variants/$ref.tar" \
+              --arg out "s3://$BUCKET/runs/$EVAL_ID/$run_id/" \
+              '["npx","tsx","bugboss-evals/sim/cli.ts","replay-side",
+                "--case",$case,"--ref",$ref,"--rep",$rep,"--run-id",$run,
+                "--variant-tar",$tar,"--sim-image",$sim,"--out",$out]')
+            overrides=$(jq -cn --argjson command "$command" \
+              '{containerOverrides:[{name:"runner",command:$command}]}')
+            aws ecs run-task \
+              --cluster "$CLUSTER" \
+              --task-definition "$TASK_FAMILY" \
+              --capacity-provider-strategy capacityProvider=bugboss-evals,weight=1 \
+              --overrides "$overrides" \
+              --started-by "bugboss-eval-$EVAL_ID" \
+              --query 'tasks[0].taskArn' --output text >> tasks.txt
+          done
+
+          deadline=$(( $(date +%s) + 290 * 60 ))
+          while true; do
+            running=$(xargs aws ecs describe-tasks --cluster "$CLUSTER" \
+              --query "tasks[?lastStatus!='STOPPED'].taskArn" --output text --tasks < tasks.txt)
+            if [ -z "$running" ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              for task in $running; do
+                aws ecs stop-task --cluster "$CLUSTER" --task "$task" \
+                  --reason "bugboss eval workflow deadline" >/dev/null
+              done
+              echo "stopped sides still going at the deadline: $running"
+              break
+            fi
+            sleep 60
+          done
+
+          xargs aws ecs describe-tasks --cluster "$CLUSTER" \
+            --query 'tasks[].[taskArn,containers[0].exitCode,stoppedReason]' \
+            --output text --tasks < tasks.txt
+
   report:
-    needs: [plan, run]
+    needs: [plan, run, run-replay]
     if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
@@ -302,12 +413,64 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Judge and report
+        if: needs.plan.outputs.tier != 'replay'
         env:
           EVAL_ID: ${{ needs.plan.outputs.eval_id }}
         run: |
           set -euo pipefail
           aws s3 sync "s3://$BUCKET/runs/$EVAL_ID/" "results/$EVAL_ID/"
           npx tsx bugboss-evals/sim/cli.ts report --dir "results/$EVAL_ID" --out report.md
+
+      # One comparison per case. A side that failed still wrote a result
+      # (sim/replay-side.ts), so pairs line up; a case whose tasks wrote
+      # nothing at all is reported as such rather than dropped.
+      - name: Judge and report Tier 2
+        if: needs.plan.outputs.tier == 'replay'
+        env:
+          EVAL_ID: ${{ needs.plan.outputs.eval_id }}
+          PLAN: ${{ needs.plan.outputs.plan }}
+        run: |
+          set -euo pipefail
+          aws s3 sync --only-show-errors "s3://$BUCKET/runs/$EVAL_ID/" "results/$EVAL_ID/"
+          aa=()
+          if [ "$(echo "$PLAN" | jq -r .mode)" = "aa" ]; then
+            aa=(--aa)
+          fi
+          echo "## BugBoss Tier 2 eval" > report.md
+          for case_id in $(echo "$PLAN" | jq -r '.cases[]'); do
+            args=()
+            checkpoint=""
+            for side in baseline candidate; do
+              for run_id in $(echo "$PLAN" | jq -r --arg c "$case_id" --arg s "$side" \
+                '.runs[] | select(.case == $c and .side == $s) | .runId'); do
+                if [ -f "results/$EVAL_ID/$run_id/result.json" ]; then
+                  args+=("--$side" "results/$EVAL_ID/$run_id/result.json")
+                fi
+                if [ -z "$checkpoint" ] && [ -f "results/$EVAL_ID/$run_id/checkpoint.jsonl" ]; then
+                  checkpoint="results/$EVAL_ID/$run_id/checkpoint.jsonl"
+                fi
+              done
+            done
+            if [ -n "$checkpoint" ]; then
+              args+=("--checkpoint" "$checkpoint")
+            fi
+            {
+              echo
+              echo "### $case_id"
+              echo
+            } >> report.md
+            if ! npx tsx bugboss-evals/replay/cli.ts compare \
+              --case "bugboss-evals/replay/cases/$case_id.json" "${args[@]}" "${aa[@]}" \
+              --region "$AWS_REGION" --out "report-$case_id.md" > /dev/null 2> "error-$case_id.txt"; then
+              {
+                echo "Not compared:"
+                echo
+                cat "error-$case_id.txt"
+              } >> report.md
+              continue
+            fi
+            cat "report-$case_id.md" >> report.md
+          done
 
       - name: Post the report
         env:

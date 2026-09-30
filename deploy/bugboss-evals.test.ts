@@ -11,6 +11,7 @@ import {
   INSTANCE_VCPU,
   MODEL_ROLE_ARN,
   OPS_MAIN_SUBJECT,
+  PROD_SESSIONS_ARN,
   RUNNER_CPU,
   RUNNER_MEMORY_RESERVATION_MIB,
   WORKFLOW_FILE,
@@ -116,5 +117,30 @@ describe("the eval repository's lifecycle", () => {
       const patterns: string[] = ("tagPatternList" in rule.selection ? rule.selection.tagPatternList : undefined) ?? [];
       assert.ok(!patterns.some((pattern) => "runner".startsWith(pattern.replace("*", ""))), JSON.stringify(rule));
     }
+  });
+});
+
+describe("Tier 2's reads", () => {
+  const grants = (policy: ReturnType<typeof runnerTaskPolicy>, action: string) =>
+    policy.Statement.filter((statement) => statement.Action.includes(action)).flatMap((statement) => statement.Resource);
+
+  // The runner reads the recorded sessions; the workflow never does, and
+  // the grant reaches no other prefix of the prod bucket.
+  it("lets the runner read prod incident sessions, and nothing else of that bucket", () => {
+    assert.equal(PROD_SESSIONS_ARN, "arn:aws:s3:::bugboss-prod/sessions/incident/*");
+    const prod = grants(runnerTaskPolicy("arn:log"), "s3:GetObject").filter((arn) => arn.startsWith("arn:aws:s3:::bugboss-prod"));
+    assert.deepEqual(prod, [PROD_SESSIONS_ARN]);
+    const statement = runnerTaskPolicy("arn:log").Statement.find((s) => s.Resource.includes(PROD_SESSIONS_ARN));
+    assert.deepEqual(statement?.Action, ["s3:GetObject"]);
+  });
+
+  it("lets the runner read variant tarballs and the workflow upload them", () => {
+    assert.ok(grants(runnerTaskPolicy("arn:log"), "s3:GetObject").includes("arn:aws:s3:::goodparty-bugboss-evals/*"));
+    const workflow = workflowPolicy({ taskRoleArn: "arn:task", executionRoleArn: "arn:exec" });
+    assert.ok(grants(workflow, "s3:PutObject").includes("arn:aws:s3:::goodparty-bugboss-evals/*"));
+    assert.ok(
+      !workflow.Statement.flatMap((s) => s.Resource).some((arn) => arn.startsWith("arn:aws:s3:::bugboss-prod")),
+      "the workflow never reads prod sessions",
+    );
   });
 });

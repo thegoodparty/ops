@@ -68,6 +68,11 @@ const BEDROCK_RESOURCES = [
 const ECR_REPOSITORY_ARN = `arn:aws:ecr:${REGION}:${ACCOUNT_ID}:repository/${ECR_REPOSITORY}`;
 const RESULTS_BUCKET_ARN = `arn:aws:s3:::${RESULTS_BUCKET}`;
 
+// Tier 2 resumes real incidents from their recorded Pi sessions. The runner
+// reads one, cuts it at the PR, and hands the replay container only the cut;
+// nothing that runs variant code gets this grant or the object.
+export const PROD_SESSIONS_ARN = "arn:aws:s3:::bugboss-prod/sessions/incident/*";
+
 export const ECR_PULL_ACTIONS = [
   "ecr:BatchCheckLayerAvailability",
   "ecr:BatchGetImage",
@@ -161,6 +166,12 @@ export const runnerTaskPolicy = (logGroupArn: string): PolicyDocument => ({
       Resource: [ECR_REPOSITORY_ARN],
     },
     ...resultsReadWrite,
+    {
+      Sid: "ReplayCheckpoints",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [PROD_SESSIONS_ARN],
+    },
     {
       Sid: "Logs",
       Effect: "Allow",
@@ -304,9 +315,10 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
     restrictPublicBuckets: true,
   });
 
-  // Run results expire; seed bundles under omni/ do not, because a missing
-  // one fails every run of that scenario until somebody uploads it by hand
-  // (`cli.ts seed-bundle --upload`).
+  // Run results and Tier 2 variant tarballs expire; seed bundles under omni/
+  // and replay/ do not, because a missing one fails every run of that
+  // scenario or case until somebody uploads it by hand (`cli.ts seed-bundle
+  // --upload`, `cli.ts replay-bundle --upload`).
   new aws.s3.BucketLifecycleConfiguration("bugbossEvalsBucketLifecycle", {
     bucket: bucket.id,
     rules: [
@@ -315,6 +327,12 @@ export const createBugBossEvals = (config: BugBossEvalsConfig) => {
         status: "Enabled",
         filter: { prefix: "runs/" },
         expiration: { days: 90 },
+      },
+      {
+        id: "expire-variants",
+        status: "Enabled",
+        filter: { prefix: "variants/" },
+        expiration: { days: 14 },
       },
       {
         id: "abort-incomplete-uploads",
