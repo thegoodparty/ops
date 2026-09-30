@@ -947,10 +947,18 @@ export const runScenario = async (spec: RunSpec): Promise<RunResult> => {
         // prod task.
         await compose(["restart", "bugboss"]);
         await compose(["restart", "postgres"]);
+        // A refire sent before BugBoss is listening again is refused by the
+        // gateway, which would end the run on the harness's own restart.
+        await waitFor("bugboss after the chaos restart", async () => (await client.call("/bugboss/health")).ok, 180_000);
       }
       const refire = scenario.alert.refireEverySeconds;
       if (refire > 0 && telemetry.state === "fault" && now - lastFire >= refire * 1000) {
-        lastFire = await fire();
+        // Only the first alert must land. A refused refire is BugBoss's
+        // outcome to record, not a reason for the harness to stop watching.
+        lastFire = await fire().catch((error: Error) => {
+          log("refire_refused", { error: error.message });
+          return now;
+        });
       }
     }
     return await finish();
