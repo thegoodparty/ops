@@ -45,13 +45,12 @@ export = async () => {
   const playwrightReports = createPlaywrightReportsBucket();
 
   // Referenced, not created: this account's GitHub OIDC provider already
-  // exists (gp-marketing's clickup-bot-ci-invoker-prod role proves it) and
-  // already trusts this account's repos.
-  const githubOidcProvider = await aws.iam.getOpenIdConnectProvider({
-    url: "https://token.actions.githubusercontent.com",
-  });
+  // exists. A constant ARN, not a getOpenIdConnectProvider lookup - the PR
+  // preview role lacks iam:ListOpenIDConnectProviders, and ci-roles/policies.ts
+  // already hardcodes this same ARN.
   const sitemaps = createSitemapsBucket({
-    oidcProviderArn: githubOidcProvider.arn,
+    oidcProviderArn:
+      "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
   });
 
   createIdentityCenter();
