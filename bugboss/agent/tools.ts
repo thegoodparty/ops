@@ -12,9 +12,19 @@
 // person needs to hear it and how.
 
 import { execFile } from "node:child_process";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { makeAlarm, makeLog } from "../logging";
 import type { BossInboxKind, Directive } from "../types";
+import {
+  CONDITION_TYPES,
+  conditionKey,
+  conditionProblem,
+  createConditionCheck,
+  type ConditionArgs,
+  type ConditionCheck,
+  REVIEW_SETTLE_SECONDS,
+  type GitHubReadPort,
+} from "./conditions";
 
 const log = makeLog("agent-tools");
 const alarm = makeAlarm("agent-tools");
@@ -124,12 +134,14 @@ export interface ProbeResult {
 
 export type Probe = (command: string, timeoutMs: number) => Promise<ProbeResult>;
 
-export const shellProbe: Probe = (command, timeoutMs) =>
+// The checkout, when there is one. Incident 94 lost a 900s wait to a check
+// script that ran `gh` without `--repo` and got "not a git repository".
+export const shellProbeIn = (cwd?: string): Probe => (command, timeoutMs) =>
   new Promise((resolve) => {
     execFile(
       "/bin/sh",
       ["-c", command],
-      { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" },
+      { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: "utf8", ...(cwd ? { cwd } : {}) },
       (error, stdout, stderr) => {
         const output = `${stdout ?? ""}${stderr ?? ""}`;
         const code =
@@ -142,6 +154,8 @@ export const shellProbe: Probe = (command, timeoutMs) =>
       },
     );
   });
+
+export const shellProbe: Probe = shellProbeIn();
 
 const wait = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve) => {
@@ -441,6 +455,35 @@ const release = async (
   }
 };
 
+export const waitDoneMessage = (waitingFor: string, output: string): string =>
+  [
+    `Done: ${waitingFor}. The thing I was waiting on a person for has happened, and I am carrying on.`,
+    "",
+    "What the check saw:",
+    "```",
+    probeOutput(output),
+    "```",
+  ].join("\n");
+
+/**
+ * The close for a wait on a person. The Boss told someone this incident needs
+ * them, and dropping the marker alone tells nobody it no longer does: incident
+ * 90's thread said it needed a person for 1h40m after the merge the wait had
+ * seen within a minute. Sent by code because the model, handed the result,
+ * moves on to the next step and does not think to say so. A failure costs the
+ * message, not the result of a wait that just succeeded.
+ */
+const closeAsk = async (
+  heartbeat: HeartbeatDeps,
+  args: { key: string; waitingFor: string; output: string },
+): Promise<void> => {
+  try {
+    await heartbeat.boss.tellBoss("message", waitDoneMessage(args.waitingFor, args.output));
+  } catch (error: unknown) {
+    alarm("wait_done_undelivered", { command: args.key, error: String(error) });
+  }
+};
+
 export interface MonitorDeps {
   probe?: Probe;
   sleep?: (ms: number) => Promise<void>;
@@ -452,10 +495,14 @@ export interface MonitorDeps {
   /** The current wait's interrupt, read when a call starts. */
   waitSignal?: () => AbortSignal;
   maxBlockSeconds?: number;
+  /** What the typed conditions read. Absent means only `command` can be waited on. */
+  github?: GitHubReadPort;
+  /** Where a command runs: the checkout, so a check script can use git and relative paths. */
+  cwd?: string;
+  settleSeconds?: number;
 }
 
-export interface MonitorArgs {
-  command: string;
+export interface MonitorArgs extends ConditionArgs {
   intervalSeconds: number;
   timeoutSeconds: number;
   description: string;
@@ -483,6 +530,8 @@ export interface MonitorResult {
    * to pass this rather than the original or the wait never ends.
    */
   remainingSeconds?: number;
+  /** On a capped review wait, the `since` that resumes it without missing one. */
+  since?: string;
 }
 
 /**
@@ -500,7 +549,7 @@ export const runMonitor = async (
   args: MonitorArgs,
   deps: MonitorDeps = {},
 ): Promise<MonitorResult> => {
-  const probe = deps.probe ?? shellProbe;
+  const probe = deps.probe ?? (deps.cwd ? shellProbeIn(deps.cwd) : shellProbe);
   const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
   const now = deps.now ?? Date.now;
   const probeTimeoutMs =
@@ -523,8 +572,9 @@ export const runMonitor = async (
   // costs one turn and the model reissues the call; swallowing it would start
   // a day-long wait with no marker, which is the silent no-heartbeat
   // behaviour this exists to end, with nothing in the agent's view saying so.
+  const key = conditionKey(args);
   let marker = heartbeat
-    ? await heartbeat.marker.recordWait(args.command, args.waitingFor?.trim() || null)
+    ? await heartbeat.marker.recordWait(key, args.waitingFor?.trim() || null)
     : null;
 
   // Measured from when the wait began, not from this process start, which is
@@ -539,27 +589,53 @@ export const runMonitor = async (
   const capAt = now() + (deps.maxBlockSeconds ?? MAX_BLOCK_SECONDS) * 1000;
   const deadline = Math.min(requestedDeadline, capAt);
 
+  const typed = (args.condition ?? "command") !== "command";
+  const github = deps.github;
+  if (typed && !github) throw new Error(`${args.condition} needs GitHub access, which this monitor was built without`);
+  const check: ConditionCheck = typed && github
+    ? createConditionCheck(args, {
+        github,
+        now,
+        sinceMs: startedAt,
+        settleSeconds: deps.settleSeconds,
+      })
+    : async () => {
+        const result = await probe(args.command ?? "", probeTimeoutMs);
+        return { done: result.code === 0, output: result.output };
+      };
+  const since =
+    args.condition === "pr_review" && !marker
+      ? (args.since ?? new Date(startedAt).toISOString())
+      : undefined;
+
   let last = "";
   for (;;) {
-    const result = await probe(args.command, probeTimeoutMs);
-    last = result.output;
-    if (result.code === 0) {
-      if (heartbeat) await release(heartbeat, args.command);
+    const state = await check();
+    last = state.output;
+    const expired = deps.signal?.aborted || now() >= deadline;
+    // A review that landed and is still settling has happened, so the
+    // deadline ends it as met rather than throwing the verdict away.
+    if (state.done || (expired && state.met && !deps.signal?.aborted)) {
+      if (heartbeat) {
+        await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, output: last });
+        await release(heartbeat, key);
+      }
       return { output: last, timedOut: false, capped: false };
     }
-    if (deps.signal?.aborted || now() >= deadline) {
+    if (expired) {
       const capped = !deps.signal?.aborted && capAt < requestedDeadline;
       // A capped wait is not over, so the marker stays: the re-armed call
       // resumes its clock and its heartbeat ladder instead of starting both
       // again, which at a 55-minute cap would mean the first reminder at one
       // hour never came.
-      if (heartbeat && !capped) await release(heartbeat, args.command);
+      if (heartbeat && !capped) await release(heartbeat, key);
       return capped && !heartbeat
         ? {
             output: last,
             timedOut: false,
             capped,
             remainingSeconds: Math.ceil((requestedDeadline - now()) / 1000),
+            ...(since ? { since } : {}),
           }
         : { output: last, timedOut: !capped, capped };
     }
@@ -591,7 +667,7 @@ export const runMonitor = async (
           marker = await heartbeat.marker.recordPing();
         } catch (error: unknown) {
           alarm("wait_heartbeat_record_failed", {
-            command: args.command,
+            command: key,
             error: String(error),
           });
           await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
@@ -619,7 +695,7 @@ export const runMonitor = async (
             }),
           );
           log("wait_escalated", {
-            command: args.command,
+            command: key,
             pings: marker.pings,
             waitedMs,
           });
@@ -629,7 +705,7 @@ export const runMonitor = async (
           // only reporter: a reminder nobody received looks, from outside,
           // exactly like a wait that has not reached its next rung.
           alarm("wait_escalation_undelivered", {
-            command: args.command,
+            command: key,
             pings: marker.pings,
             waitedMs,
             error: String(error),
@@ -868,29 +944,47 @@ const INTERRUPTED =
   "The Boss spoke: its message reaches you next. If none does, call get_incident before you do anything else.";
 
 const MONITOR_DESCRIPTION = [
-  "Block until a shell command exits 0, then return its output whole. Use it for",
-  "every wait: a merge, a deploy, a migration, an alert going quiet. Never poll",
-  "with bash in a loop. It costs one turn. One call blocks for at most",
-  `${MAX_BLOCK_SECONDS} seconds (55 minutes), inside the one-hour prompt cache, and`,
-  "returns saying so if `timeoutSeconds` asked for longer. If you still need to",
-  "wait, call it again the way the result tells you to.",
+  "Block until something is true, then return what it found. Use it for every",
+  "wait. It costs one turn however long it blocks, and no model call happens",
+  "until the condition fires, it times out, or the Boss speaks. Never poll from",
+  "bash: no `gh pr checks --watch`, no `gh run watch`, no loops, no `sleep`.",
+  "",
+  "Say what you are waiting for with `condition`. Each one is checked in code",
+  "and ends on a failure as well as a success, so pick the one closest to the",
+  "cause: the release run, not prod.",
+  "- pr_checks (`pr`): every check on the PR head finished, or one failed.",
+  "  Returns the result and the failing checks with links.",
+  "- pr_review (`pr`, `reviewer`, `since`): a new review, or a",
+  "  delegate-reviewer state comment, after `since` (default: when the wait",
+  `  began). It keeps watching ${REVIEW_SETTLE_SECONDS / 60} minutes after the first, because`,
+  "  delegate-reviewer can post APPROVED and then COMMENTED on the same commit.",
+  "  Returns every review whole with its inline comments; the last one stands.",
+  "  Pass reviewer: \"delegate-reviewer\" to wait for delegate only.",
+  "- pr_closed (`pr`): merged or closed. Returns the merge commit.",
+  "- workflow_run (`repo`, `sha`, `workflow`): that commit's run finished, or",
+  "  failed. For a deploy in omni, workflow: \"release\" and the merge commit.",
+  "  Returns each run's conclusion and the failed jobs and steps.",
+  "- command (`command`): anything else. A read-only shell command, run in the",
+  "  checkout; exit 0 ends the wait. Make it exit 0 on failure too, and print",
+  "  what you will need, so the result answers the question.",
+  "`pr` is a PR URL or thegoodparty/omni#123.",
+  "",
+  `One call blocks for at most ${MAX_BLOCK_SECONDS} seconds (55 minutes), inside the`,
+  "one-hour prompt cache, and returns saying so if `timeoutSeconds` asked for",
+  "longer. If you still need to wait, call it again the way the result says.",
   "",
   "`waitingFor` is what people see on the incident board: one short plain",
   "sentence, no shell, e.g. \"someone to merge omni#2189 or #2195\" or \"the",
   "deploy of #2234 to finish\".",
   "",
-  "THE COMMAND MUST BE A READ-ONLY CHECK. A restart replays this call and runs",
-  "the command again, so a side effect happens twice. `gh pr merge` here is a bug.",
+  "A command MUST BE A READ-ONLY CHECK. A restart replays this call and runs",
+  "it again, so a side effect happens twice. `gh pr merge` here is a bug.",
   "",
   "Set `awaitingHuman` when a person must act for the wait to end: what they must",
   "do, with the link. The Boss is then told once the wait passes an hour inside",
   "working hours, and again on a doubling gap up to a day. The incident stays",
   "yours. Leave it unset for a deploy, a migration, npm ci or an alert going quiet.",
-  "",
-  "THE COMMAND MUST STILL DETECT WHAT THE PERSON WAS ASKED TO DO, or the wait only",
-  "ends when somebody tells you, which is slow and often never. A merge is",
-  "`gh pr view <url> --json state,mergedAt`, a flag flip is a read of the flag, a",
-  "restart is the health check.",
+  "The condition must still detect that they did it: a merge is pr_closed.",
 ].join("\n");
 
 const MESSAGE_BOSS_DESCRIPTION = [
@@ -917,14 +1011,35 @@ export const createMonitorTool = async (
 ): Promise<ToolDefinition> => {
   const { Type } = await import("typebox");
   const parameters = Type.Object({
-    command: Type.String({
-      description: "Read-only shell command. Exit 0 means the wait is over.",
-    }),
+    condition: Type.Optional(
+      Type.Union(CONDITION_TYPES.map((type) => Type.Literal(type)), {
+        description: "What ends the wait. Default command.",
+      }),
+    ),
+    command: Type.Optional(
+      Type.String({
+        description: "For condition command: a read-only shell command. Exit 0 means the wait is over.",
+      }),
+    ),
+    pr: Type.Optional(
+      Type.String({ description: "For pr_checks, pr_review, pr_closed: the PR URL, or thegoodparty/omni#123." }),
+    ),
+    reviewer: Type.Optional(
+      Type.String({ description: "For pr_review: only this login, or part of it, e.g. delegate-reviewer." }),
+    ),
+    since: Type.Optional(
+      Type.String({ description: "For pr_review: ISO time; count reviews after it. Default: when the wait began." }),
+    ),
+    repo: Type.Optional(Type.String({ description: "For workflow_run: owner/name, e.g. thegoodparty/omni." })),
+    sha: Type.Optional(Type.String({ description: "For workflow_run: the commit the workflow runs on." })),
+    workflow: Type.Optional(
+      Type.String({ description: "For workflow_run: the workflow name or file, e.g. release. Default: every workflow on the commit." }),
+    ),
     intervalSeconds: Type.Number({
-      description: "Seconds between attempts. 30 for a deploy, 300 for a quiet signal.",
+      description: "Seconds between checks. 30 for a deploy, 60 for a PR, 300 for a quiet signal.",
     }),
     timeoutSeconds: Type.Number({
-      description: `Give up after this long and return the last output. One call returns after at most ${MAX_BLOCK_SECONDS}s; call again to keep waiting.`,
+      description: `Give up after this long and return the last result. One call returns after at most ${MAX_BLOCK_SECONDS}s; call again to keep waiting.`,
     }),
     description: Type.String({
       description: "What you are waiting for, in one line.",
@@ -936,7 +1051,7 @@ export const createMonitorTool = async (
     awaitingHuman: Type.Optional(
       Type.String({
         description:
-          "Only when a person must act for this wait to end: what they must do, with the link. The command must still detect that they did it.",
+          "Only when a person must act for this wait to end: what they must do, with the link. The condition must still detect that they did it.",
       }),
     ),
   });
@@ -948,28 +1063,75 @@ export const createMonitorTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MonitorArgs;
+      const problem = conditionProblem(args);
+      if (problem) {
+        return {
+          content: [{ type: "text", text: `Rejected, nothing was waited for: ${problem}` }],
+          details: { timedOut: false, rejected: true },
+        };
+      }
       const interrupt = deps.waitSignal?.();
       const result = await runMonitor(args, {
         ...deps,
         signal: eitherSignal(signal, deps.signal, interrupt),
       });
+      const again = [
+        ...(result.remainingSeconds === undefined ? [] : [`timeoutSeconds: ${result.remainingSeconds}, which is what is left of your wait`]),
+        ...(result.since === undefined ? [] : [`since: "${result.since}", so a review that lands in between is not missed`]),
+      ];
       const header = interrupt?.aborted && result.timedOut
         ? `STOPPED WAITING for: ${args.description} (interrupted). ${INTERRUPTED}`
         : result.capped
           ? `STILL WAITING for: ${args.description}. This call was capped at ${MAX_BLOCK_SECONDS}s of the ${args.timeoutSeconds}s you asked for, so the prompt cache stays warm. Nothing has timed out. ${
-              result.remainingSeconds === undefined
-                ? "If you still need to wait, call monitor again with the same arguments."
-                : `If you still need to wait, call monitor again with timeoutSeconds: ${result.remainingSeconds}, which is what is left of your wait.`
+              again.length
+                ? `If you still need to wait, call monitor again with ${again.join(", and ")}.`
+                : "If you still need to wait, call monitor again with the same arguments."
             }`
           : result.timedOut
             ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
             : `Condition met: ${args.description}`;
       return {
         content: [{ type: "text", text: `${header}\n\n${result.output}` }],
-        details: { timedOut: result.timedOut, command: args.command },
+        details: { timedOut: result.timedOut, command: conditionKey(args) },
       };
     },
   } as ToolDefinition;
+};
+
+/** Past this, a `sleep` in bash is a wait, not a pause for GitHub to catch up. */
+export const BASH_SLEEP_LIMIT_SECONDS = 10;
+
+const SLEEP_UNITS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3600, d: 86_400 };
+
+/**
+ * Why a bash command is a wait that belongs in monitor, or null.
+ *
+ * Matches the two shapes that cannot be anything but waiting, so it never
+ * refuses real work: a `sleep` longer than a few seconds, and gh's own
+ * watchers. A bash wait holds the turn blind and wakes to re-read the whole
+ * context for one poll; the fleet spent 479 turns and $198 that way in a week.
+ */
+export const pollingRefusal = (command: string): string | null => {
+  const sleeps = [...command.matchAll(/\bsleep\s+(\d+(?:\.\d+)?)([smhd]?)\b/g)].map(
+    (match) => Number(match[1]) * (SLEEP_UNITS[match[2]] ?? 1),
+  );
+  const longest = Math.max(0, ...sleeps);
+  const watcher =
+    /\bgh\s+run\s+watch\b/.test(command) ||
+    (/\bgh\s+pr\s+checks\b/.test(command) && /--watch\b/.test(command));
+  if (!watcher && longest <= BASH_SLEEP_LIMIT_SECONDS) return null;
+  return [
+    `Refused, nothing ran: this bash call waits (${watcher ? "a gh watcher" : `sleep ${longest}s`}). Waiting from bash holds a turn blind and then re-reads your whole context to poll once.`,
+    "Wait with monitor instead: condition pr_checks for a PR's CI, pr_review for a verdict, pr_closed for a merge, workflow_run for a commit's release or deploy, and command for anything else. No model call happens until it fires.",
+  ].join(" ");
+};
+
+export const pollingGuardExtension = (pi: ExtensionAPI): void => {
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return;
+    const reason = pollingRefusal(String((event.input as { command?: unknown }).command ?? ""));
+    return reason ? { block: true, reason } : undefined;
+  });
 };
 
 export const createMessageBossTool = async (

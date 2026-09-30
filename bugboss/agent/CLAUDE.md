@@ -213,6 +213,45 @@ agent passes that; passing the original again would restart the clock every
 call and the wait would never end. A capped `message_boss` keeps its
 question marker, so calling again with the same message does not re-ask.
 
+**Waits are typed, and code decides when they end.** `monitor` takes a
+`condition` (`conditions.ts`): `pr_checks` (the `statusCheckRollup` that `gh
+pr checks` reads, so non-Actions checks count), `pr_review` (reviews and the
+`<!-- delegate-reviewer-state -->` comment after `since`), `pr_closed`,
+`workflow_run` (a commit's runs, or one named workflow), and `command` for
+the rest. Before them, every agent wrote its own check script: bash turns
+probing `gh` output to get the jq right, a script that exited 0 with nothing
+in it, and another bash turn to fetch what the wait had seen. Across the
+fleet that was 479 poll turns, 16% of turns and 36% of cost. Three rules the
+conditions hold to:
+
+- **A failure ends the wait.** A check that exits 0 only on success cannot
+  tell a failed run from a running one: incident 80 watched prod for 1h51m
+  after its release run had failed. `pr_checks` and `workflow_run` stop at
+  the first failure. `workflow_run` ignores `schedule` and `workflow_run`
+  events unless a workflow is named, because the default branch's head
+  carries dozens of cancelled gpbot-ci-drive runs that are not its pipeline.
+- **A review wait settles for `REVIEW_SETTLE_SECONDS` after the first one.**
+  delegate-reviewer can post APPROVED and then COMMENTED on the same commit,
+  so the result carries every review in the window, oldest first, whole, with
+  inline comments. A capped review wait with no marker returns the `since` to
+  resume from.
+- **Arguments GitHub rejects end the wait at once** (401, 404, GraphQL
+  errors); a 5xx or a network failure is waited through.
+
+A `command` runs in the checkout: incident 94 lost a 900s wait to a script
+that called `gh` outside a git repository.
+
+**A wait on a person closes its ask.** When a wait with `awaitingHuman` fires,
+the harness tells the Boss it is done (`waitDoneMessage`) before dropping the
+marker. Dropping the marker told nobody: incident 90's thread said it needed
+a person for 1h40m after the merge the wait had seen within a minute.
+
+**bash refuses to wait** (`pollingGuardExtension`, a pi `tool_call` hook): a
+`sleep` over `BASH_SLEEP_LIMIT_SECONDS`, `gh run watch`, and `gh pr checks
+--watch`. Those shapes are nothing but waiting, so the guard never blocks
+real work; everything subtler (a one-off `gh pr checks`) is left to the
+prompt and the tool description.
+
 **A Boss message is a user message, and it ends a wait.** The Boss writes it
 to `pending_directive` from another process, so `createDirectiveWatcher`
 (`run.ts`) polls every ten seconds and delivers each `boss_message` with
@@ -237,6 +276,10 @@ prices the wait honestly and says what to do with it — refresh impact, record
 timeline events, draft the post-mortem — because the cost lands whether or not the agent
 came out of the wait with anything.
 
+- `monitor(condition?, command?, pr?, …)` — `condition` defaults to
+  `command`, so a call recorded before conditions existed replays unchanged.
+  A typed wait's marker is keyed on `conditionKey`, the condition and what it
+  watches, the way a command wait is keyed on its command.
 - `monitor(command, …)` — **the command must be read-only.** On a container
   restart the session holds a tool call with no result, so the tool runs
   again; an action would be performed twice.
@@ -253,8 +296,8 @@ came out of the wait with anything.
   pattern-matched `gh pr` would stop reporting the day somebody wrote the same
   check differently.
 
-  The `command` has to **observe the thing itself** — `gh pr view --json
-  state,mergedAt`, a flag read, a health check — not park until somebody says
+  The condition has to **observe the thing itself** — `pr_closed`, a flag
+  read, a health check — not park until somebody says
   they did it. Being told is the fallback. That is instruction (`prompt.ts`,
   the tool description) rather than a validator: what a command observes is
   not readable from its text, and this codebase does not pattern-match

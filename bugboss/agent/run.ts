@@ -44,11 +44,13 @@ import {
 } from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
+import { createGitHubReadPort } from "./conditions";
 import {
   bossMessageText,
   createMessageBossTool,
   createMonitorTool,
   createWaitInterrupt,
+  pollingGuardExtension,
   renderDirectives,
   type BossInboxPort,
   type DirectivePeek,
@@ -1528,6 +1530,8 @@ const launch = async (args: {
     await createMonitorTool({
       signal: wrapUpAbort.signal,
       waitSignal: waits.signal,
+      cwd: paths.checkout,
+      github: createGitHubReadPort({ token: () => process.env.GITHUB_TOKEN }),
       heartbeat: {
         marker: api,
         boss: api,
@@ -1821,6 +1825,7 @@ const launch = async (args: {
       sessionSyncExtension(sync, onSyncFailure),
       turnBudget.extension,
       stages.extension,
+      pollingGuardExtension,
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
       // every thinking block is signed against.
