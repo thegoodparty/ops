@@ -218,7 +218,8 @@ twice, and the un-park is the half that actually recovers the incident.
 `postNotice` is optional on the deps because the unit tests and the E2E run
 without Slack, but a prod composition root that passes nothing makes this
 notice silent, so its absence alarms (`stale_notice_undeliverable`) rather
-than passing. So does an incident with no thread to post into.
+than passing. So does an incident with no thread to post into, but that
+check is the poster's, in `../index.ts`, not the dispatcher's.
 
 ## The circuit breaker
 
