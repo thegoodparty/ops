@@ -425,8 +425,8 @@ session, its next turn came back with no text and no tool call, and nothing
 was posted or logged. So a run that ends empty **without** `stay_silent` is a
 failure: `incident_run_silent_unchosen` alarms with the thread and the
 trigger, the person who spoke gets the failure reply, and the run does not
-settle, so its inbox rows stay unseen and the watermark stays put. A close or
-merge posts its own notice; when that is the whole answer the Boss still has
+settle, so its inbox rows stay unseen and the watermark stays put. A close, merge
+or page posts its own notice; when that is the whole answer the Boss still has
 to say so with `stay_silent`.
 
 An untagged follow-up in a non-incident thread the Boss already talks in
