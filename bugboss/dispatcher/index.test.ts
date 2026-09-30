@@ -1751,6 +1751,32 @@ describe("the spawned environment", () => {
     cleanup();
   });
 
+  it("hands the child the alert slugs of its incident's signals, and no one else's", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+    insertIncident(sqlite, "i2", { status: "CLOSED" });
+    const signal = sqlite.prepare(
+      `INSERT INTO signal (id, source, sourceId, kind, title, body, labels, openedAt, incidentId)
+       VALUES (?, 'grafana', ?, 'alert', 't', 'b', ?, ?, ?)`,
+    );
+    signal.run("s1", "f1", JSON.stringify({ alert_slug: "route-errors-win" }), T0, "i1");
+    signal.run("s2", "f2", JSON.stringify({ alert_slug: "high-cpu" }), T0, "i1");
+    signal.run("s3", "f3", JSON.stringify({ alert_slug: "high-cpu" }), T0, "i1");
+    signal.run("s4", "f4", JSON.stringify({}), T0, "i1");
+    signal.run("s5", "f5", JSON.stringify({ alert_slug: "someone-elses" }), T0, "i2");
+
+    const held = heldSpawn();
+    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor }));
+    await d.tick();
+
+    assert.equal(held.contexts[0].env.BUGBOSS_ALERT_SLUGS, '["high-cpu","route-errors-win"]');
+
+    held.releaseAll();
+    await d.drain();
+    cleanup();
+  });
+
   it("is what child_process actually gets, with nothing inherited", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();

@@ -822,6 +822,12 @@ export class Dispatcher {
 
     const token = this.mintToken(row.id);
     const deadlineAt = now + this.config.agentTimeoutSeconds * 1000;
+    const alertSlugs = this.db
+      .query<{ slug: string }>(
+        "SELECT DISTINCT json_extract(labels, '$.alert_slug') AS slug FROM signal WHERE incidentId = ? AND json_extract(labels, '$.alert_slug') IS NOT NULL ORDER BY slug",
+        [row.id],
+      )
+      .map((r) => String(r.slug));
 
     const env = buildChildEnv({
       base: this.childBaseEnv,
@@ -832,6 +838,7 @@ export class Dispatcher {
       deadlineAt,
       maxTurns: this.config.agentMaxTurns,
       attempt,
+      alertSlugs,
     });
     // The child resolves AWS through the container credential provider, so
     // the allowlist in env.ts has to carry that path. Dropping a name from
