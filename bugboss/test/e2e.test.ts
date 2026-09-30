@@ -1768,6 +1768,35 @@ test("an untagged follow-up in a Boss conversation thread reaches the Boss", asy
   assert.equal(fakeModel.intents.length, 0, "intents drained");
 });
 
+/**
+ * Delegate's catch: an untagged follow-up may be two people talking under a
+ * Boss answer. Asked "report or question?" of them, or given an apology for a
+ * silence the Boss chose, is a reply nobody wanted.
+ */
+test("an untagged follow-up the Boss chooses to ignore gets no reply at all", async () => {
+  fakeModel.intents.push({ intent: "question" });
+  await boss.slackEvent({
+    type: "app_mention",
+    channel: "C0TEST",
+    user: "U-swain",
+    text: "<@B0BOSS> what is open right now",
+    ts: "2150.1",
+  });
+  const postsBefore = fakeSlack.posts.length;
+  const asked = fakeSlackAgent.asked.length;
+
+  fakeModel.intents.push({ intent: "unclear" });
+  fakeSlackAgent.script = async (req) => {
+    assert.equal(req.allowSilence, true, "premise: an untagged follow-up may be silent");
+    await bossTool(req, "stay_silent", { reason: "two people deciding where to eat" });
+    return "";
+  };
+  await deliver(threaded("2150.2", "2150.1", "want to grab lunch after this?"));
+  await until(() => fakeSlackAgent.asked.length > asked, "the Boss to read the follow-up");
+
+  assert.equal(fakeSlack.posts.length, postsBefore, "no clarifying question and no apology");
+});
+
 test("the same words in a thread the Boss has never spoken in stay ignored", async () => {
   const asked = fakeSlackAgent.asked.length;
   const reactions = fakeSlack.reactions.length;
