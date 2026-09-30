@@ -439,7 +439,7 @@ describe("thread headers", () => {
 
     assert.equal(sweep.edits.length, 1);
     assert.equal(sweep.edits[0].ts, "400.0");
-    assert.match(sweep.edits[0].text, /^\*Incident 1 · Investigating\*/);
+    assert.match(sweep.edits[0].text, /^\*Incident 1 · INVESTIGATING\*/);
     assert.ok(
       sweep.edits[0].text.endsWith("*Incident 1 opened*\nmemory above 90%"),
       sweep.edits[0].text,
@@ -487,7 +487,7 @@ describe("thread headers", () => {
     await after.sweep();
 
     assert.equal(after.edits.length, 1);
-    assert.match(after.edits[0].text, /Fixing/);
+    assert.match(after.edits[0].text, /FIXING/);
   });
 
   test("follow the summary", async () => {
@@ -588,7 +588,7 @@ describe("thread headers", () => {
     const closing = harness(easternAt(9) + 30_000);
     await closing.sweep();
     assert.equal(closing.edits.length, 1);
-    assert.match(closing.edits[0].text, /Closed/);
+    assert.match(closing.edits[0].text, /CLOSED/);
     assert.match(closing.edits[0].text, /this incident is over/);
     assert.ok(
       closing.edits[0].text.endsWith("*Incident 1 opened*"),

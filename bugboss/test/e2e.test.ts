@@ -1106,6 +1106,7 @@ test("an agent's message sent before its thread opened reaches the Boss once it 
   let shown = "";
   fakeSlackAgent.script = async (req) => {
     shown = req.input;
+    await bossTool(req, "stay_silent", { reason: "the agent's message is context for me, not news for the thread" });
     return "";
   };
   await bossClientFor(incidentId, boss.mintToken(incidentId)).tellBoss("message", said);
@@ -1952,6 +1953,7 @@ test("an agent's question is answered by the Boss, and the agent's wait ends on 
     premise.settled = settled;
     premise.input = req.input;
     await bossTool(req, "message_agent", { incidentId: id, text: answer });
+    await bossTool(req, "stay_silent", { reason: "the answer went to the agent; the thread needs nothing more" });
     return "";
   };
 
@@ -2013,6 +2015,7 @@ test("the Boss closing an incident posts the same closed notice an agent's close
     "the alert was a test rule somebody forgot to delete, and it has been deleted";
   fakeSlackAgent.script = async (req) => {
     await bossTool(req, "close_incident", { incidentId: id, reason });
+    await bossTool(req, "stay_silent", { reason: "the closed notice already says it" });
     return "";
   };
   await boss.slackEvent(replyIn(thread, "that alert was a leftover test rule, I deleted it"));
@@ -2059,10 +2062,11 @@ test("a message that arrives while the Boss is mid-run is read, not dropped", as
     release = resolve;
   });
   let running = false;
-  fakeSlackAgent.script = async () => {
+  fakeSlackAgent.script = async (req) => {
     running = true;
     await gate;
     running = false;
+    await bossTool(req, "stay_silent", { reason: "nothing here is for me" });
     return "";
   };
 
@@ -2120,6 +2124,7 @@ test("an agent's escalation wakes the Boss, and the Boss's page reaches the rota
       incidentId: id,
       reason: "Somebody with Stripe dashboard access needs to confirm the refund fix before it ships.",
     });
+    await bossTool(req, "stay_silent", { reason: "the page is the message" });
     return "";
   };
   await bossClientFor(id, boss.mintToken(id)).tellBoss("escalation", brief);
@@ -2437,6 +2442,7 @@ test("an agent's escalation reaches the Boss, not the thread, and leaves the inc
   let shown = "";
   fakeSlackAgent.script = async (req) => {
     shown = req.input;
+    await bossTool(req, "stay_silent", { reason: "the escalation is handled by the page, not a reply" });
     return "";
   };
   const before = fakeSlack.posts.length;
@@ -2604,6 +2610,7 @@ test("a parked incident is left alone, and the Boss telling its agent something 
         incidentId: row.id,
         text: "The credential rotation is done; Ada did it at 10:40.",
       });
+      await bossTool(req, "stay_silent", { reason: "the answer went to the agent; the thread needs nothing more" });
       return "";
     };
     await parked.slackEvent(replyIn(row.slackThreadTs!, "rotation is done"));
@@ -3316,7 +3323,7 @@ test("a thread carries a header above the message that opened it", async () => {
   const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
   assert.ok(edit, JSON.stringify(fakeSlack.edits));
   assert.match(edit.text, /Board header errors on the briefings route/);
-  assert.match(edit.text, /Investigating/);
+  assert.match(edit.text, /INVESTIGATING/);
   // Swain's constraint: nothing is removed from the original message except
   // the status and the title, both of which are added above it.
   assert.ok(edit.text.endsWith(opening.text), edit.text);
@@ -3349,7 +3356,7 @@ test("the header follows the incident and is not rewritten when it has not moved
 
   const edit = fakeSlack.edits.find((e) => e.ts === threadTs);
   assert.ok(edit, "a status change reaches the header");
-  assert.match(edit.text, /Fixing/);
+  assert.match(edit.text, /FIXING/);
 });
 
 /**

@@ -986,6 +986,11 @@ export const createBugBoss = async (
       incidentChannel: config.slackChannelId,
     },
     closeIncident: (args) => closeIncidentByBoss({ db, slack: threads }, args),
+    // The status card's one model-written sentence. The intent read's model,
+    // because it is the knob that already moves a small bounded call to a
+    // cheaper model (BUGBOSS_INTENT_MODEL_ID) without a deploy.
+    summaryModel: options.intentModel ?? options.model,
+    now,
   });
 
   /**
