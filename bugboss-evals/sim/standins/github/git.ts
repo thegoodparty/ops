@@ -273,6 +273,19 @@ export const checkout = async (dir: string, sha: string, dest: string): Promise<
   await git(["-C", dir, "worktree", "add", "--quiet", "--detach", "--force", dest, sha]);
 };
 
+/**
+ * A standalone checkout of one commit for visible CI, as actions/checkout
+ * makes. CI runs as a user who cannot read the bare repository, so a
+ * worktree, whose git dir lives inside it, would break every git command CI
+ * runs.
+ */
+export const ciCheckout = async (dir: string, sha: string, dest: string): Promise<void> => {
+  await rm(dest, { recursive: true, force: true });
+  await git(["init", "--quiet", "--initial-branch", PROTECTED_BRANCH, dest]);
+  await git(["-C", dest, "fetch", "--quiet", "--depth", "1", `file://${dir}`, sha]);
+  await git(["-C", dest, "-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+};
+
 export const removeCheckout = async (dir: string, dest: string): Promise<void> => {
   try {
     await git(["-C", dir, "worktree", "remove", "--force", dest]);

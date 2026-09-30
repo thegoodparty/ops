@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import type { Server } from "node:http";
 import { createServer } from "node:net";
 import type { AddressInfo } from "node:net";
@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
-import { startServers } from "./server";
+import { ciEnvFrom, configFromEnv, startServers } from "./server";
 import type { GitHubStandin } from "./standin";
 import type { State } from "./state";
 
@@ -55,6 +55,9 @@ const ghAvailable = (): string | null => {
 
 const skip = ghAvailable();
 
+/** Only root can drop CI to another user, and only Linux has /proc to probe. */
+const ciUserSkip = process.getuid?.() === 0 && process.platform === "linux" ? false : "CI runs as another user only when the stand-in is root on Linux";
+
 const freePort = (): Promise<number> =>
   new Promise((resolve) => {
     const s = createServer();
@@ -81,6 +84,9 @@ interface World {
   controlToken: string;
   hookLog: string;
   envDump: string;
+  /** Where the CI probe writes; the one place in `dir` CI's user may write. */
+  ciOut: string;
+  probe: string;
   botToken: string;
   /** The agent's environment, as BugBoss's child would have it. */
   env: Record<string, string>;
@@ -103,13 +109,40 @@ const commit = (cwd: string, file: string, content: string, message: string, env
 
 const setup = async (over: Record<string, string> = {}): Promise<World> => {
   const dir = mkdtempSync(join(tmpdir(), "gh-standin-test-"));
+  // CI's user has to reach its probe and its output here, and nothing else.
+  chmodSync(dir, 0o755);
   const { ca, cert, key } = makeCert(dir);
+  chmodSync(key, 0o600);
+  chmodSync(join(dir, "ca.key"), 0o600);
   const port = 443;
   const controlPort = await freePort();
   const host = "localhost";
   const web = `https://${host}`;
   const hookLog = join(dir, "hook.log");
-  const envDump = join(dir, "ci-env.txt");
+  const ciOut = join(dir, "ci-out");
+  mkdirSync(ciOut);
+  chmodSync(ciOut, 0o777);
+  const envDump = join(ciOut, "ci-env.txt");
+  const dataDir = join(dir, "data");
+  // Each line names something CI could read or write that it must not.
+  const probeFile = join(dir, "ci-probe.sh");
+  writeFileSync(
+    probeFile,
+    [
+      "#!/bin/sh",
+      `env > ${envDump}`,
+      `id -u > ${ciOut}/uid`,
+      `git rev-parse HEAD > ${ciOut}/head`,
+      `for f in ${key} ${dataDir}/repos ${dataDir}/scratch /proc/${process.pid}/environ; do`,
+      `  { if [ -d "$f" ]; then ls "$f"; else cat "$f"; fi; } > /dev/null 2>&1 && echo "read $f"`,
+      "done > " + `${ciOut}/reached`,
+      `touch ${dataDir}/scratch/ci-was-here 2>/dev/null && echo "wrote scratch" >> ${ciOut}/reached`,
+      "true",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  const probe = `sh ${probeFile}`;
   const home = join(dir, "home");
   const hook = join(dir, "deploy-hook.sh");
   writeFileSync(hook, `#!/bin/sh\ntest -d "$2" && echo "$1 $2" >> ${hookLog}\n`, { mode: 0o755 });
@@ -141,9 +174,9 @@ const setup = async (over: Record<string, string> = {}): Promise<World> => {
     TLS_CERT_FILE: cert,
     TLS_KEY_FILE: key,
     GITHUB_PUBLIC_URL: web,
-    GITHUB_DATA_DIR: join(dir, "data"),
+    GITHUB_DATA_DIR: dataDir,
     GITHUB_STANDIN_HUMANS: JSON.stringify({ [PERSONA_TOKEN]: "oncall-human" }),
-    CI_VISIBLE: JSON.stringify([`env > ${envDump}`, "sh check.sh"]),
+    CI_VISIBLE: JSON.stringify([probe, "sh check.sh"]),
     DEPLOY_HOOK_COMMAND: hook,
     SOME_SECRET: "must-not-reach-ci",
     ...over,
@@ -195,6 +228,8 @@ const setup = async (over: Record<string, string> = {}): Promise<World> => {
     controlToken,
     hookLog,
     envDump,
+    ciOut,
+    probe,
     botToken,
     env,
   };
@@ -288,6 +323,12 @@ describe("the GitHub stand-in under the real gh", { skip: skip ?? false }, () =>
     assert.match(dumped, /^CI=true$/m);
   });
 
+  test("CI runs as a user who cannot read the stand-in's secrets or its data", { skip: ciUserSkip }, () => {
+    assert.equal(readFileSync(join(w.ciOut, "uid"), "utf8").trim(), "65534");
+    assert.equal(readFileSync(join(w.ciOut, "reached"), "utf8"), "");
+    assert.match(readFileSync(join(w.ciOut, "head"), "utf8"), /^[0-9a-f]{40}\n$/, "git works in CI's own checkout");
+  });
+
   test("gh pr checks reports the failure, and gh run view --log-failed shows why", async () => {
     const checks = await gh(w, ["pr", "checks", "1"]);
     assert.notEqual(checks.code, 0, "failing checks exit non-zero");
@@ -321,7 +362,7 @@ describe("the GitHub stand-in under the real gh", { skip: skip ?? false }, () =>
     assert.equal((pr.files as unknown[]).length, 1);
     const rollup = pr.statusCheckRollup as { name: string; conclusion: string; workflowName: string }[];
     assert.deepEqual(rollup.map((c) => [c.name, c.conclusion, c.workflowName]).sort(), [
-      [`env > ${w.envDump}`, "SUCCESS", "ci"],
+      [w.probe, "SUCCESS", "ci"],
       ["sh check.sh", "FAILURE", "ci"],
     ]);
 
@@ -560,7 +601,6 @@ describe("the reviewer and scripted CI", { skip: skip ?? false }, () => {
 
 describe("configuration", () => {
   test("CI never sees the control token or anything else not named for it", async () => {
-    const { ciEnvFrom } = await import("./server");
     assert.deepEqual(
       ciEnvFrom({
         PATH: "/bin",
@@ -583,7 +623,6 @@ describe("configuration", () => {
   });
 
   test("a CI with nothing to run is refused rather than green for everything", async () => {
-    const { configFromEnv } = await import("./server");
     assert.throws(() => configFromEnv({ GITHUB_DATA_DIR: "/tmp/x" }), /CI_VISIBLE is required/);
     assert.throws(() => configFromEnv({ CI_VISIBLE: "npm test" }), /not valid JSON/);
     assert.equal(configFromEnv({ CI_MODE: "scripted", GITHUB_DATA_DIR: "/tmp/x" }).ciMode, "scripted");

@@ -362,6 +362,22 @@ describe("what a transition looks like in Slack", () => {
     assert.ok(text.includes("• Does the RCA explain the signals?"), text);
   });
 
+  test("a pull request on BUGBOSS_GITHUB_URL's host is linked by its number, and github.com is the default", () => {
+    const render = (prUrl: string) => renderEvent({ type: "pr_needs_merge", incidentId: "inc-1", prUrl });
+    const saved = process.env.BUGBOSS_GITHUB_URL;
+    try {
+      delete process.env.BUGBOSS_GITHUB_URL;
+      assert.ok(render("https://github.com/thegoodparty/omni/pull/2").includes("<https://github.com/thegoodparty/omni/pull/2|thegoodparty/omni#2>"));
+      assert.ok(render("https://github/thegoodparty/omni/pull/3").includes("<https://github/thegoodparty/omni/pull/3>"));
+
+      process.env.BUGBOSS_GITHUB_URL = "https://github";
+      assert.ok(render("https://github/thegoodparty/omni/pull/3").includes("<https://github/thegoodparty/omni/pull/3|thegoodparty/omni#3>"));
+    } finally {
+      if (saved === undefined) delete process.env.BUGBOSS_GITHUB_URL;
+      else process.env.BUGBOSS_GITHUB_URL = saved;
+    }
+  });
+
   test("a url that is not a GitHub pull request still links", () => {
     assert.ok(
       renderEvent({

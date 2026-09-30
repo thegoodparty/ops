@@ -12,14 +12,16 @@
 // nothing lands on `main` except through a merge, a merge needs green visible
 // CI and a human approval on the head, and the bot's token can never merge.
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, rm } from "node:fs/promises";
+import { chmodSync, mkdirSync } from "node:fs";
+import { chmod, mkdir, rm } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 
 import {
   checkout,
+  ciCheckout,
   commitInfo,
   commitsBetween,
   createBareRepo,
@@ -64,6 +66,12 @@ export interface StandinConfig {
   ciTimeoutSeconds: number;
   /** The only environment CI commands and the deploy hook run with. */
   ciEnv: Record<string, string>;
+  /**
+   * The user visible CI runs as. CI runs the agent's code, so it must not be
+   * the stand-in's own user, whose environment and files hold the tokens.
+   * Unset runs it as this process's user, which is only for tests off Linux.
+   */
+  ciUid?: number;
   deployHookCommand: string | null;
   reviewerLogin: string;
   requestChangesOnce: boolean;
@@ -98,6 +106,19 @@ export const createGitHubStandin = (config: StandinConfig) => {
   const iso = (): string => now().toISOString();
   const web = config.publicUrl.replace(/\/$/, "");
   const api = `${web}/api/v3`;
+
+  // CI may pass through the data dir to its own checkout under ci/ and reach
+  // nothing else: the bare repos and the push logs in scratch/ are what branch
+  // protection rests on, and a CI that could write them could land on main.
+  const ciRoot = join(config.dataDir, "ci");
+  const ciHome = join(ciRoot, "home");
+  mkdirSync(ciRoot, { recursive: true });
+  chmodSync(config.dataDir, 0o711);
+  chmodSync(ciRoot, 0o711);
+  for (const name of ["repos", "scratch", "deploys"]) {
+    mkdirSync(join(config.dataDir, name), { recursive: true });
+    chmodSync(join(config.dataDir, name), 0o700);
+  }
 
   let state: State = emptyState({ mode: config.ciMode, verdicts: [], used: 0 });
   /** Minted installation tokens. Kept out of `state`: they are credentials. */
@@ -501,7 +522,8 @@ export const createGitHubStandin = (config: StandinConfig) => {
     new Promise((resolve) => {
       const child = spawn("bash", ["-c", command], {
         cwd,
-        env: config.ciEnv,
+        env: config.ciUid === undefined ? config.ciEnv : { ...config.ciEnv, HOME: ciHome },
+        ...(config.ciUid === undefined ? {} : { uid: config.ciUid, gid: config.ciUid }),
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -580,8 +602,19 @@ export const createGitHubStandin = (config: StandinConfig) => {
       await afterCi(repo, run);
       return;
     }
-    const dir = join(config.dataDir, "ci", String(run.id));
-    await checkout(repo.dir, headSha, dir);
+    const dir = join(ciRoot, String(run.id));
+    await ciCheckout(repo.dir, headSha, dir);
+    if (config.ciUid !== undefined) {
+      const owner = `${config.ciUid}:${config.ciUid}`;
+      const made = await mkdir(ciHome, { recursive: true });
+      await chmod(ciHome, 0o700);
+      // The home keeps npm's cache between runs, so it is handed over once
+      // rather than walked on every run.
+      const paths = made === undefined ? [dir] : [dir, ciHome];
+      await new Promise<void>((resolve, reject) =>
+        execFile("chown", ["-R", owner, ...paths], (err) => (err ? reject(err) : resolve())),
+      );
+    }
     try {
       for (const job of run.jobs) {
         if (job.status === "completed") continue;
@@ -597,7 +630,7 @@ export const createGitHubStandin = (config: StandinConfig) => {
         setJob(job, "completed", conclusion);
       }
     } finally {
-      await removeCheckout(repo.dir, dir);
+      await rm(dir, { recursive: true, force: true });
     }
     if (!done(run)) finishRun(run);
     await afterCi(repo, run);
@@ -1943,6 +1976,7 @@ export const createGitHubStandin = (config: StandinConfig) => {
     for (const run of state.workflowRuns) if (run.status !== "completed") cancelRun(run);
     await idle();
     await rm(join(config.dataDir, "repos"), { recursive: true, force: true });
+    await mkdir(join(config.dataDir, "repos"), { mode: 0o700 });
     state = emptyState({ mode: config.ciMode, verdicts: [], used: 0 });
     appTokens = new Set();
   };

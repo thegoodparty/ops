@@ -1,7 +1,7 @@
 # One image for every piece of the sim we wrote: the stand-ins, the proxy,
 # the telemetry emitter, the persona, the checker, and the fan-out runner.
-# node:22-alpine and alpine's github-cli match the BugBoss image, so the gh
-# the stand-in's tests drive is the gh BugBoss runs.
+# The gh the stand-in's tests drive is the one pinned in bugboss/Dockerfile,
+# built by standins/github/test-in-image.sh; the gh here is only a tool.
 #
 # build-base and python3 stay: the checker and visible CI run `npm ci` on
 # omni, which compiles native modules. docker-cli and its compose plugin are

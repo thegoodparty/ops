@@ -26,6 +26,8 @@
 //   CI_MODE                     run | scripted
 //   CI_VISIBLE                  JSON array of shell commands, one job each
 //   CI_TIMEOUT_SECONDS          per command (3600)
+//   CI_UID                      uid (and gid) visible CI runs as when this
+//                               process is root (65534, nobody)
 //   DEPLOY_HOOK_COMMAND         run as `<cmd> <mergeSha> <checkoutPath>`
 //   REVIEWER_LOGIN              the delegate bot (delegate-reviewer[bot])
 //   REVIEWER_REQUEST_CHANGES_ONCE  "true" makes its first verdict request changes
@@ -74,6 +76,12 @@ const parseJson = <T>(name: string, raw: string | undefined, fallback: T): T => 
   }
 };
 
+const ciUidFrom = (raw: string | undefined): number => {
+  const uid = Number(raw ?? 65534);
+  if (!Number.isInteger(uid) || uid <= 0) throw new Error(`CI_UID must be a uid other than root's, got ${raw}`);
+  return uid;
+};
+
 export const configFromEnv = (env: NodeJS.ProcessEnv): StandinConfig => {
   const ciMode = env.CI_MODE ?? "run";
   if (ciMode !== "run" && ciMode !== "scripted") throw new Error(`CI_MODE must be run or scripted, got ${ciMode}`);
@@ -94,6 +102,7 @@ export const configFromEnv = (env: NodeJS.ProcessEnv): StandinConfig => {
     ciVisible,
     ciTimeoutSeconds: Number(env.CI_TIMEOUT_SECONDS ?? 3600),
     ciEnv: ciEnvFrom(env),
+    ciUid: process.getuid?.() === 0 ? ciUidFrom(env.CI_UID) : undefined,
     deployHookCommand: env.DEPLOY_HOOK_COMMAND || null,
     reviewerLogin: env.REVIEWER_LOGIN ?? "delegate-reviewer[bot]",
     requestChangesOnce: env.REVIEWER_REQUEST_CHANGES_ONCE === "true",

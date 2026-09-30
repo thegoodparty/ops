@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM node:22-alpine AS tools
 
 # git, gh and npm are the agent's hands: it clones omni, reads code, opens a
 # PR. aws is how it reads CloudWatch and ECS events to debug a deploy, which
@@ -9,8 +9,16 @@ FROM node:22-alpine
 # postgresql-client is how an agent answers "is the test database up" for
 # itself, with `pg_isready -d $OMNI_TEST_POSTGRES_URL`, rather than inferring
 # it from a vitest stack trace. omni's harness brings its own driver.
-RUN apk add --no-cache git curl github-cli bash aws-cli jq ripgrep uv \
+#
+# gh is pinned because the evals' GitHub stand-in answers exactly what this gh
+# sends, and bugboss-evals/sim/standins/github/test-in-image.sh proves it
+# against this stage. Bump the pin and rerun that script together. When the
+# base image moves to an Alpine that no longer carries it, this fails to build
+# rather than shipping an untested gh.
+RUN apk add --no-cache git curl github-cli=2.97.0-r1 bash aws-cli jq ripgrep uv \
   postgresql-client
+
+FROM tools
 
 WORKDIR /app
 
