@@ -376,8 +376,8 @@ CREATE TABLE IF NOT EXISTS incident_thread (
   header            TEXT,
   -- The signal that opened the incident, as the header links it. Resolved
   -- once and kept, because a Slack report's permalink is an API call.
-  -- `originLabel` NULL means not resolved yet; '' means there was nothing
-  -- to link. `originUrl` NULL is a source with no link to give.
+  -- `originLabel` NULL means not resolved yet, including an incident with
+  -- no signal so far. `originUrl` NULL is a source with no link to give.
   originLabel       TEXT,
   originUrl         TEXT
 );

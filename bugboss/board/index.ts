@@ -223,30 +223,40 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
     if (!row.slackThreadTs) continue;
 
     let origin: SignalOriginRef | null =
-      row.originLabel === null || row.originLabel === ""
-        ? null
-        : { label: row.originLabel, url: row.originUrl };
+      row.originLabel === null ? null : { label: row.originLabel, url: row.originUrl };
     if (row.originLabel === null) {
       // The same cap as the edits, for the same reason: the first sweep
       // after this ships resolves every thread at once, and a Slack
       // report's link is an API call.
+      // An incident with no signal costs no API call, so it does not count:
+      // asked again every tick, it would otherwise starve the rows after it.
       if (resolved >= MAX_HEADER_UPDATES_PER_TICK) continue;
-      resolved += 1;
       try {
         origin = await deps.origin(row.incidentId);
       } catch (err) {
+        resolved += 1;
         alarm("header_origin_failed", { incidentId: row.incidentId, error: String(err) });
         continue;
       }
+      if (origin !== null) resolved += 1;
+      // No signal yet is not final: one may still be attached, so the row
+      // is made (the header write below needs it) and the origin is left
+      // for the next tick to ask again.
       const found = origin;
       await deps.db.withWrite((w: Database.Database) => {
+        if (found === null) {
+          w.prepare(
+            "INSERT INTO incident_thread (incidentId, opening) VALUES (?, '') ON CONFLICT(incidentId) DO NOTHING",
+          ).run(row.incidentId);
+          return;
+        }
         w.prepare(
           `INSERT INTO incident_thread (incidentId, opening, originLabel, originUrl)
            VALUES (?, '', ?, ?)
            ON CONFLICT(incidentId) DO UPDATE SET
              originLabel = excluded.originLabel,
              originUrl = excluded.originUrl`,
-        ).run(row.incidentId, found?.label ?? "", found?.url ?? null);
+        ).run(row.incidentId, found.label, found.url ?? null);
       });
     }
 

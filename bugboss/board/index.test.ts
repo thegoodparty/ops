@@ -924,12 +924,26 @@ describe("thread headers", () => {
     assert.match(edits.at(-1) ?? "", /\|original report>$/);
   });
 
+  test("an incident with no signal yet gets its link once one is attached", async () => {
+    await seed("1");
+    await openThread("1", "400.0");
+    const first = harness(easternAt(9));
+    await first.sweep();
+    assert.equal(first.edits[0].text.split("\n").length, 2, "premise: no signal, so no link line");
+
+    await grafanaSignal("1");
+    const later = harness(easternAt(9) + 30_000);
+    await later.sweep();
+    assert.equal(later.edits.length, 1);
+    assert.equal(later.edits[0].text.split("\n")[2], `<${GENERATOR}|original alert>`);
+  });
+
   test("a tick that has used up its edits still resolves origins for the rows after them", async () => {
     for (let i = 1; i <= MAX_HEADER_UPDATES_PER_TICK; i++) {
       await seed(String(i));
       await openThread(String(i), `${i}00.0`);
       await db.withWrite((d) => {
-        d.prepare("UPDATE incident_thread SET originLabel = '' WHERE incidentId = ?").run(String(i));
+        d.prepare("UPDATE incident_thread SET originLabel = 'original alert' WHERE incidentId = ?").run(String(i));
       });
     }
     const late = String(MAX_HEADER_UPDATES_PER_TICK + 1);

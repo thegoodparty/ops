@@ -315,11 +315,12 @@ export class SlackRelay {
       // the opening would later have the header sweep write it over the
       // winner's -- chat.update replaces a message whole.
       if (linked === "linked") {
-        // An origin with no url may be a permalink lookup that failed, so
-        // it is left for the sweep to resolve rather than kept as final.
+        // An origin with no url may be a permalink lookup that failed, and
+        // no origin may be a signal not attached yet, so both are left for
+        // the sweep to resolve rather than kept as final.
         await this.recordOpening(event.incidentId, parts[0], {
           header: parts[0],
-          origin: event.origin && !event.origin.url ? undefined : event.origin,
+          origin: event.origin?.url ? event.origin : undefined,
         });
       }
       if (linked === "unwritable") {
@@ -500,17 +501,15 @@ export class SlackRelay {
   private async recordOpening(
     incidentId: string,
     text: string,
-    record: { header: string | null; origin: SignalOriginRef | null | undefined },
+    record: { header: string | null; origin: SignalOriginRef | undefined },
   ): Promise<void> {
-    const originLabel =
-      record.origin === undefined ? null : (record.origin?.label ?? "");
     try {
       await this.db.withWrite((d) => {
         d.prepare(
           `INSERT OR IGNORE INTO incident_thread
              (incidentId, opening, header, originLabel, originUrl)
            VALUES (?, ?, ?, ?, ?)`,
-        ).run(incidentId, text, record.header, originLabel, record.origin?.url ?? null);
+        ).run(incidentId, text, record.header, record.origin?.label ?? null, record.origin?.url ?? null);
       });
     } catch (err) {
       alarm("thread_opening_unrecorded", {
