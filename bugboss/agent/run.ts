@@ -5,13 +5,19 @@
 // from it is reached through a dynamic import. Types are imported normally and
 // cost nothing at runtime.
 
-import { createInstallationToken, gitHubAppFromEnv } from "../github";
+import { createInstallationToken, gitHubAppFromEnv, gitHubEndpoints } from "../github";
+import { gitHubTokenEnv } from "../dispatcher/env";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import type { ExtensionAPI, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  InlineExtension,
+  ModelRuntime,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type {
   Directive,
   IncidentMatch,
@@ -306,12 +312,31 @@ const exec = (command: string, args: string[], cwd?: string): Promise<string> =>
  *
  * A credential helper reads the environment at the moment git asks, so it
  * always presents the current token and never persists one.
+ *
+ * Keyed on the host omni is cloned from, which is github.com in production
+ * and the stand-in in the eval harness. git scopes a helper by scheme, host
+ * and port, so a helper keyed on github.com is never asked for another host.
  */
-export const configureGitCredentials = async (): Promise<void> => {
+export const gitCredentialKey = (repoUrl: string): string => {
+  let origin = "https://github.com";
+  try {
+    const url = new URL(repoUrl);
+    // Only https carries a password, and anything else -- a local path in a
+    // test, an ssh remote -- keeps the key production has always had.
+    if (url.protocol === "https:") origin = url.origin;
+  } catch {
+    // Not a URL. Same answer as a remote that is not https.
+  }
+  return `credential.${origin}.helper`;
+};
+
+export const configureGitCredentials = async (
+  repoUrl: string = DEFAULT_OMNI_REPO,
+): Promise<void> => {
   await exec("git", [
     "config",
     "--global",
-    "credential.https://github.com.helper",
+    gitCredentialKey(repoUrl),
     `!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f`,
   ]);
   // Without an identity git refuses to commit, and the failure arrives after
@@ -785,9 +810,20 @@ export interface RunIncidentAgentOptions {
    */
   attempt?: number;
   grafana?: { url: string; token: string; command?: string; args?: string[] };
+  /**
+   * `BUGBOSS_GITHUB_URL`: where `rerun_ci` sends its two calls. Absent in
+   * production, which is github.com.
+   */
+  githubUrl?: string;
   store?: SessionStore & NotesStore;
   api?: BossClient;
   skipClone?: boolean;
+  /**
+   * Pi extensions loaded after BugBoss's own, so they observe the run rather
+   * than shape it. Nothing in production passes any; the eval harness's phase
+   * replay uses them to watch and bound a resumed run from outside it.
+   */
+  extensions?: InlineExtension[];
 }
 
 /**
@@ -877,6 +913,7 @@ export const agentOptionsFromEnv = (
     maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : INCIDENT_AGENT_MAX_TURNS,
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
+    ...(env.BUGBOSS_GITHUB_URL ? { githubUrl: env.BUGBOSS_GITHUB_URL } : {}),
     ...(grafanaToken
       ? {
           grafana: {
@@ -1380,7 +1417,12 @@ const launch = async (args: {
     // credentials are refreshed in place every twenty minutes, and an incident
     // outlives the one held here at launch.
     await createRerunCiTool({
-      github: createGitHubRunsPort({ token: () => process.env.GITHUB_TOKEN }),
+      github: createGitHubRunsPort({
+        token: () => process.env.GITHUB_TOKEN,
+        ...(options.githubUrl
+          ? { baseUrl: gitHubEndpoints(options.githubUrl).apiUrl }
+          : {}),
+      }),
       boss: api,
     }),
   ];
@@ -1755,6 +1797,7 @@ const launch = async (args: {
       prefixDriftExtension((message) =>
         console.warn(`[bugboss ${options.incidentId}] ${message}`),
       ),
+      ...(options.extensions ?? []),
     ],
   });
   await resourceLoader.reload();
@@ -1845,7 +1888,7 @@ const launch = async (args: {
  * the way that shows up is `gh` refusing to push a branch the agent has
  * already built and committed.
  */
-const keepGitHubTokenFresh = async (): Promise<void> => {
+const keepGitHubTokenFresh = async (options: RunIncidentAgentOptions): Promise<void> => {
   const app = gitHubAppFromEnv(process.env);
   if (!app) {
     console.log(
@@ -1857,12 +1900,11 @@ const keepGitHubTokenFresh = async (): Promise<void> => {
     );
     return;
   }
-  const mint = createInstallationToken(app);
+  const mint = createInstallationToken(app, gitHubEndpoints(options.githubUrl));
   const refresh = async () => {
     try {
       const token = await mint();
-      process.env.GITHUB_TOKEN = token;
-      process.env.GH_TOKEN = token;
+      Object.assign(process.env, gitHubTokenEnv(token, process.env));
     } catch (error: unknown) {
       // Deliberately not fatal. The previous token is good for the rest of
       // its hour, and an investigation that cannot open a PR is still worth
@@ -1880,12 +1922,12 @@ const keepGitHubTokenFresh = async (): Promise<void> => {
   await refresh();
   setInterval(() => void refresh(), 20 * 60 * 1000).unref();
   // After the first token exists, so the helper never presents an empty one.
-  await configureGitCredentials();
+  await configureGitCredentials(options.omniRepoUrl);
 };
 
 if (require.main === module) {
   const bootOptions = agentOptionsFromEnv(process.env);
-  keepGitHubTokenFresh()
+  keepGitHubTokenFresh(bootOptions)
     .then(() => runIncidentAgent(bootOptions))
     .then(
     (result) => {
