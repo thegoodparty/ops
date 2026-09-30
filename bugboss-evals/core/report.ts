@@ -1,3 +1,11 @@
+import {
+  median as medianOf,
+  MIN_POWERED_CASES,
+  pct,
+  type Comparison,
+  type DeltaSummary,
+  type Section,
+} from "./aggregate";
 import { measure, PHASES, type ColdCause, type Scorecard } from "./metrics";
 import {
   calibrate,
@@ -351,5 +359,129 @@ export const renderReport = (
     }
     push("");
   }
+  return lines.join("\n");
+};
+
+// ---------------------------------------------------------------------------
+// A/B comparison, for both tiers
+// ---------------------------------------------------------------------------
+
+const money = (v: number | undefined) =>
+  v === undefined ? "-" : `${v < 0 ? "-" : ""}$${Math.abs(v).toFixed(2)}`;
+const signedMoney = (v: number | undefined) =>
+  v === undefined ? "-" : `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(2)}`;
+const secs = (v: number | undefined) => {
+  if (v === undefined) return "-";
+  const abs = Math.abs(v);
+  const text = abs >= 3600 ? `${(abs / 3600).toFixed(1)}h` : abs >= 60 ? `${Math.round(abs / 60)}m` : `${Math.round(abs)}s`;
+  return v < 0 ? `-${text}` : text;
+};
+const signedSecs = (v: number | undefined) =>
+  v === undefined ? "-" : `${v >= 0 ? "+" : ""}${secs(v)}`;
+const pValue = (p: number | undefined) => (p === undefined ? "-" : p.toFixed(3));
+
+/**
+ * A table cell cannot hold a raw pipe or newline. Whitespace is collapsed and
+ * pipes escaped; nothing is cut, so a long rationale makes a wide cell.
+ */
+const tableCell = (text: string) =>
+  text.split(/\s+/).filter(Boolean).join(" ").replace(/\|/g, "\\|");
+
+const deltaRow = (label: string, d: DeltaSummary, fmt: (v: number | undefined) => string, signedFmt: (v: number | undefined) => string) =>
+  `| ${label} | ${fmt(d.medianBaseline)} | ${fmt(d.medianCandidate)} | ${signedFmt(d.medianDelta)} | ${d.lower} lower / ${d.equal} equal / ${d.higher} higher | ${pValue(d.signTestP)} | ${d.verdict} |`;
+
+const sectionLines = (s: Section): string[] => [
+  `Quality: **${s.quality.verdict}**. ${s.quality.explanation}`,
+  "",
+  "| Measure | Baseline median | Candidate median | Median delta | Pairs | Sign test p | Verdict |",
+  "| --- | --- | --- | --- | --- | --- | --- |",
+  deltaRow("Cost", s.cost, money, signedMoney),
+  deltaRow("Wall clock", s.wallClock, secs, signedSecs),
+  "",
+  `Run endings, baseline: ${Object.entries(s.statuses.baseline).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(", ") || "none"}. Candidate: ${Object.entries(s.statuses.candidate).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(", ") || "none"}.`,
+];
+
+export const renderComparison = (args: {
+  comparison: Comparison;
+  tier: "Tier 1" | "Tier 2";
+  baselineRef: string;
+  candidateRef: string;
+  judgeModel?: string;
+}): string => {
+  const { comparison: c } = args;
+  const lines: string[] = [
+    `# BugBoss eval, ${args.tier}: ${c.aa ? "A/A calibration" : "A/B comparison"}`,
+    "",
+  ];
+  if (c.aa) {
+    const cost = c.overall.cost.deltas.map(Math.abs);
+    const wall = c.overall.wallClock.deltas.map(Math.abs);
+    lines.push(
+      "Both sides ran the same ref, so every difference below is run-to-run noise. Treat a later A/B difference smaller than this spread as noise.",
+      "",
+      `- Cost: median absolute pair difference ${money(medianOf(cost))}, largest ${money(cost.length ? Math.max(...cost) : undefined)}.`,
+      `- Wall clock: median absolute pair difference ${secs(medianOf(wall))}, largest ${secs(wall.length ? Math.max(...wall) : undefined)}.`,
+      `- Judge flip rate: ${pct(c.overall.quality.flipRate)}.`,
+      "",
+    );
+  } else {
+    lines.push(
+      c.ship.passes
+        ? "**Ship rule: passes.** No gate regressed and quality is not significantly worse. The cost and wall-clock deltas below are for the owner to weigh."
+        : `**Ship rule: fails.** ${c.ship.reasons.join("; ")}.`,
+      "",
+    );
+  }
+  lines.push(
+    `## Overall (${c.pairs.length} pairs)`,
+    "",
+    ...sectionLines(c.overall),
+    "",
+    "## Gate regressions",
+    "",
+    ...(c.regressions.length === 0
+      ? ["None. No gate that passed in every baseline rep of a scenario failed in a candidate rep."]
+      : [
+          "A gate that passed in every baseline rep of a scenario and failed in any candidate rep. Each one blocks.",
+          "",
+          "| Scenario | Gate | Baseline reps (all passed) | Candidate reps that failed |",
+          "| --- | --- | --- | --- |",
+          ...c.regressions.map((r) => `| ${r.scenarioId} | ${r.gate} | ${r.baselineReps} | ${r.failedReps.join(", ")} |`),
+        ]),
+    "",
+    "## By scenario",
+    "",
+    "Read these as well as the total: a change that helps two scenarios and breaks one can hide in a tally.",
+    "",
+  );
+  for (const [id, s] of Object.entries(c.byScenario)) {
+    lines.push(`### ${id}`, "", ...sectionLines(s), "");
+  }
+  lines.push(
+    "## Per pair",
+    "",
+    "| Pair | Scenario | Rep | Baseline | Candidate | Cost delta | Wall-clock delta | Verdict | Why |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ...c.pairs.map((p) => {
+      const v = p.verdict;
+      const verdict = !v ? "not judged" : v.excluded ? "excluded" : v.flipped ? "unstable" : v.winner === "tie" ? "tie" : `${v.winner} ${v.margin}`;
+      const why = !v ? "" : v.excluded ?? v.rationale;
+      const d = (field: "costUsd" | "wallClockSeconds") =>
+        typeof p.baseline[field] === "number" && typeof p.candidate[field] === "number"
+          ? (p.candidate[field] as number) - (p.baseline[field] as number)
+          : undefined;
+      return `| ${p.pairId} | ${p.scenarioId} | ${p.rep} | ${p.baseline.status} | ${p.candidate.status} | ${signedMoney(d("costUsd"))} | ${signedSecs(d("wallClockSeconds"))} | ${verdict} | ${tableCell(why)} |`;
+    }),
+    "",
+    "## How this was run",
+    "",
+    `- Baseline: \`${args.baselineRef}\`. Candidate: \`${args.candidateRef}\`.`,
+    ...(args.judgeModel ? [`- Judge model: \`${args.judgeModel}\`. Judge spend: ${money(c.overall.quality.judgeCostUsd)}.`] : []),
+    "- Every pair is judged twice with the outputs swapped. A pair whose verdict reverses is unstable and excluded from scoring; above 20% unstable the quality result is inconclusive.",
+    "- Before judging, identifiers, timestamps and every line stating a run's cost, tokens, turns or duration are removed from both sides. Nothing is cut for length; a pair too large for the judge is excluded and listed above.",
+    `- No quality, cost or wall-clock direction is claimed below ${MIN_POWERED_CASES} decided pairs. Wall-clock differences under about 20% are noise until an A/A run shows the real spread.`,
+    "- Cost is the model proxy's count for the agent under test. Persona, judge and Boss triage spend are not in it.",
+    "",
+  );
   return lines.join("\n");
 };
