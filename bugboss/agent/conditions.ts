@@ -360,6 +360,7 @@ const prChecks = (ref: PrRef, github: GitHubReadPort): ConditionCheck => async (
   const [owner, name] = ref.repo.split("/");
   const nodes: RollupNode[] = [];
   let head = "";
+  let state = "OPEN";
   let after: string | null = null;
   for (;;) {
     const result: GitHubResult<RollupData> = await github.graphql<RollupData>(ROLLUP_QUERY, {
@@ -372,6 +373,7 @@ const prChecks = (ref: PrRef, github: GitHubReadPort): ConditionCheck => async (
     const pull: NonNullable<RollupData["repository"]>["pullRequest"] = result.data.repository?.pullRequest ?? null;
     if (!pull) return { done: true, failed: true, output: `COULD NOT READ ${ref.label}: no such pull request. Nothing was waited for; fix the arguments.` };
     head = pull.headRefOid;
+    state = pull.state;
     const contexts: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: RollupNode[] } | undefined =
       pull.commits.nodes[0]?.commit.statusCheckRollup?.contexts;
     nodes.push(...(contexts?.nodes ?? []));
@@ -380,7 +382,10 @@ const prChecks = (ref: PrRef, github: GitHubReadPort): ConditionCheck => async (
   }
 
   if (!nodes.length) {
-    return { done: false, output: `No checks have started on ${ref.label} at ${short(head)} yet.` };
+    // An open PR's checks may not have started yet; a closed one's never will.
+    return state === "OPEN"
+      ? { done: false, output: `No checks have started on ${ref.label} at ${short(head)} yet.` }
+      : { done: true, output: `RESULT: NO CHECKS. ${ref.label} is ${state} and has no checks at ${short(head)}, so there is nothing left to wait for.` };
   }
   const by = (bucket: Bucket) => nodes.filter((node) => checkBucket(node) === bucket);
   const failed = by("fail");

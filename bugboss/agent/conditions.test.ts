@@ -112,7 +112,7 @@ const fakeGitHub = (onCheck: (check: number) => void = () => {}) => {
         repository: {
           pullRequest: {
             headRefOid: world.pull.head.sha,
-            state: "OPEN",
+            state: world.pull.state === "closed" ? (world.pull.merged ? "MERGED" : "CLOSED") : "OPEN",
             commits: {
               nodes: [
                 {
@@ -703,4 +703,20 @@ test("a GraphQL request says it is JSON", async () => {
   }) as typeof fetch;
   await createGitHubReadPort({ token: () => "t", fetchImpl }).graphql("query { viewer { login } }", {});
   assert.equal(contentType, "application/json");
+});
+
+test("pr_checks on a PR that closed with no checks ends instead of waiting out its timeout", async () => {
+  const clock = fakeClock();
+  const github = fakeGitHub((check) => {
+    if (check === 3) Object.assign(github.world.pull, { state: "closed", merged: true });
+  });
+
+  const result = await runMonitor(
+    { ...base, condition: "pr_checks", pr: "omni#2262" },
+    { github: github.port, sleep: clock.sleep, now: clock.now },
+  );
+
+  assert.equal(github.checks(), 3, "waited while open, ended once merged");
+  assert.equal(result.timedOut, false);
+  assert.match(result.output, /^RESULT: NO CHECKS\. omni#2262 is MERGED/);
 });
