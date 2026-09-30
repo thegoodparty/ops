@@ -107,6 +107,12 @@ describe("run configuration", () => {
     assert.equal(env.AWS_ENDPOINT_URL_BEDROCK_RUNTIME, "https://proxy:8443");
   });
 
+  test("the incident model is set only when a run names one", () => {
+    assert.equal(bugbossEnv({ secrets: makeSecrets(), grafanaToken: "t" }).BUGBOSS_MODEL_ID, undefined);
+    const env = bugbossEnv({ secrets: makeSecrets(), grafanaToken: "t", incidentModelId: "us.anthropic.claude-sonnet-5" });
+    assert.equal(env.BUGBOSS_MODEL_ID, "us.anthropic.claude-sonnet-5");
+  });
+
   test("the certificate names every stand-in and chains to the run's CA", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sim-tls-"));
     try {

@@ -31,6 +31,7 @@ const USAGE = `Usage: npx tsx bugboss-evals/sim/cli.ts <command> [options]
   run      --scenario <id> (--ref <git ref> | --image <tag>) [--rep 1] [--side baseline]
            [--sim-image <tag>] [--run-id <id>] [--out <dir|s3://...>]
            [--omni-bundle <path|s3://...|auto>] [--omni-dir <omni checkout>]
+           [--model <bedrock model id>]   (the incident agent's BUGBOSS_MODEL_ID)
            [--zero-spend]      (no model credentials anywhere: every model call
                                 fails, so the run exercises the stack for $0)
   compare  --baseline <ref> --candidate <ref> [--scenarios a,b] [--reps 3]
@@ -288,6 +289,7 @@ const runOne = async (args: Args, simImage?: string): Promise<RunResult & { side
     runId,
     workRoot: defaults.workRoot,
     omniBundle: await resolveBundle(args, scenario.omni.baseSha),
+    ...(typeof args.model === "string" ? { incidentModelId: args.model } : {}),
     modelCredentials:
       args["zero-spend"] === true
         ? "none"

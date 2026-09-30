@@ -107,6 +107,11 @@ export interface RunSpec {
    * and writes the session where only those two containers can read it.
    */
   modelCredentials: ModelCredentials;
+  /**
+   * The incident agent's model, as BUGBOSS_MODEL_ID. A variant knob that
+   * needs no new image; unset, BugBoss uses its own default.
+   */
+  incidentModelId?: string;
   pollSeconds?: number;
   log?: (event: string, fields?: Record<string, string | number | boolean | null>) => void;
   /**
@@ -354,7 +359,9 @@ export const agentHomeFiles = (secrets: RunSecrets): Record<string, string> => (
 export const bugbossEnv = (args: {
   secrets: RunSecrets;
   grafanaToken: string;
+  incidentModelId?: string;
 }): Record<string, string> => ({
+  ...(args.incidentModelId ? { BUGBOSS_MODEL_ID: args.incidentModelId } : {}),
   PORT: "3000",
   BUGBOSS_LOOPBACK_PORT: "8080",
   BUGBOSS_BUCKET: BUCKET,
@@ -875,7 +882,7 @@ export const runScenario = async (spec: RunSpec): Promise<RunResult> => {
       headers: admin,
       body: JSON.stringify({ name: "bugboss" }),
     });
-    writeFileSync(join(runDir, "bugboss.env"), dotenv(bugbossEnv({ secrets, grafanaToken: token.key })));
+    writeFileSync(join(runDir, "bugboss.env"), dotenv(bugbossEnv({ secrets, grafanaToken: token.key, incidentModelId: spec.incidentModelId })));
 
     await compose(["up", "-d", "bugboss", "postgres"]);
     await waitFor("bugboss", async () => (await client.call("/bugboss/health")).ok, 180_000);
