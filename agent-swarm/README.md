@@ -87,15 +87,11 @@ Three things only a person can do. Do them first, in any order.
    existing `dev-alerts` contact point, so both systems see every alert and each
    fails independently. Follow [grafana/ADD-INTEGRATION.md](./grafana/ADD-INTEGRATION.md).
 3. **Fill in the secret.** The `AGENT_SWARM` secret already exists with an
-   Anthropic key, a GitHub token and the bridge's Grafana secrets generated. Patch
-   in the three Slack values from step 1:
+   Anthropic key, a GitHub token and the bridge's Grafana secrets generated. Add
+   the three Slack values from step 1:
 
 ```bash
-aws secretsmanager get-secret-value --secret-id AGENT_SWARM --region us-west-2 \
-  --query SecretString --output text | python3 -m json.tool > /tmp/swarm.json
-# edit /tmp/swarm.json: SWARM_INCIDENT_CHANNEL, SLACK_BOT_TOKEN, SLACK_APP_TOKEN
-aws secretsmanager put-secret-value --secret-id AGENT_SWARM --region us-west-2 \
-  --secret-string file:///tmp/swarm.json && rm /tmp/swarm.json
+./set-slack-credentials.sh      # prompts with input hidden, prints only lengths
 ```
 
 ## Deploying

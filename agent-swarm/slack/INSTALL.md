@@ -49,7 +49,7 @@ the `C...` segment at the end of the URL. This is `SWARM_INCIDENT_CHANNEL`.
 `chat:write.public` is in the manifest, so the bot can post without an invite,
 but an invite is what lets it read replies and notices. Invite it.
 
-## 5. Hand the three values over
+## 5. Put the three values in the secret
 
 | Value | Prefix | Where |
 | --- | --- | --- |
@@ -58,7 +58,15 @@ but an invite is what lets it read replies and notices. Invite it.
 | `SWARM_INCIDENT_CHANNEL` | `C` | step 4 |
 
 These go into the `AGENT_SWARM` secret in Secrets Manager, never into `.env` on
-disk and never into a commit.
+disk and never into a commit. Run the helper and paste them in when it asks:
+
+```bash
+cd agent-swarm && ./set-slack-credentials.sh
+```
+
+It prompts with input hidden, so a token never reaches your shell history or the
+process list, and it prints back only lengths. Then `./deploy.sh` renders them
+onto the host.
 
 ## Renaming
 
