@@ -150,7 +150,10 @@ git fetch -q origin && git checkout -q -B main origin/main
 `,
   );
   chmodSync(hook, 0o755);
-  writeFileSync(join(home, ".gitconfig"), `[core]\n\thooksPath = ${join(home, "hooks")}\n`);
+  // The empty helper clears any the system config names (the macOS keychain,
+  // on a Mac), for the Boss and every agent under this HOME. BugBoss adds its
+  // own helper for github.com after it.
+  writeFileSync(join(home, ".gitconfig"), `[core]\n\thooksPath = ${join(home, "hooks")}\n[credential]\n\thelper =\n`);
 };
 
 const startPostgres = (runId: string): { url: string; stop: () => void } => {
@@ -242,8 +245,8 @@ const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: s
   const dir = join(spec.root, "deploy");
   const token = readFileSync(spec.tokenFile, "utf8").trim();
   const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
-  if ((await exec("git", ["-c", auth, "clone", "-q", "--filter=blob:none", "--no-checkout", SANDBOX_URL, dir])) !== 0) return false;
-  if ((await exec("git", ["-C", dir, "-c", auth, "checkout", "-q", sha])) !== 0) return false;
+  if ((await exec("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--filter=blob:none", "--no-checkout", SANDBOX_URL, dir])) !== 0) return false;
+  if ((await exec("git", ["-C", dir, "-c", "credential.helper=", "-c", auth, "checkout", "-q", sha])) !== 0) return false;
   await shareWith(spec.runAs, dir);
   for (const [step, timeout] of [
     [check.setup, 1800],
