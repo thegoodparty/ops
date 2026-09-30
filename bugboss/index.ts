@@ -57,6 +57,7 @@ import {
   SLACK_AGENT_BUDGET_MS,
   SlackAgent,
   slackSessionPrefix,
+  STAY_SILENT_TOOL,
   type ObjectStore,
   type SlackAgentModel,
   type SlackClient,
@@ -613,6 +614,7 @@ export const createSlackAgentModel = (
       else if (reply.text) answer = reply.text;
       if (reply.toolCalls.length === 0) break;
 
+      let staySilent = false;
       for (const call of reply.toolCalls) {
         const tool = req.tools.find((t) => t.name === call.name);
         messages.push({
@@ -623,6 +625,26 @@ export const createSlackAgentModel = (
             ? await tool.run(call.input)
             : `Unknown tool ${call.name}.`,
         });
+        if (call.name === STAY_SILENT_TOOL) staySilent = true;
+      }
+
+      // Terminal: calling stay_silent ends the run right here, before
+      // another model request goes out. A close_incident or merge_incidents
+      // in the same turn already ran above -- its effect is real -- but
+      // nothing further is read from the model. Production once called
+      // stay_silent, then took one more turn anyway, which is how the
+      // literal text "(silpersisted)" reached a thread after the Boss had
+      // already chosen silence: the turn that produced it never should have
+      // run.
+      if (staySilent) {
+        if (reply.text) {
+          log("slack_agent_stay_silent_text_discarded", {
+            sessionKey: req.sessionKey,
+            text: reply.text,
+          });
+        }
+        answer = "";
+        break;
       }
       exhausted = turn === req.maxTurns - 1;
     }

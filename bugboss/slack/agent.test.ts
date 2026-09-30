@@ -35,6 +35,7 @@ import {
   createMemoryThreadLock,
   incidentSessionPrefix,
   slackSessionPrefix,
+  STAY_SILENT_TOOL,
   type ObjectStore,
   type OpenIncident,
   type SlackAgentModel,
@@ -1358,6 +1359,123 @@ describe("a run that may stay silent", () => {
       runRequest([countingTool([])], 3),
     );
     assert.equal(result.text, "Let me look at the incident first.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/** A tool the harness executes but never asks anything about, so it can stand in for close_incident, message_agent, or any other write tool called alongside stay_silent. */
+const spyTool = (name: string, calls: unknown[]) => ({
+  name,
+  description: "test tool",
+  inputSchema: { type: "object" } as Record<string, unknown>,
+  run: (input: Record<string, unknown>) => {
+    calls.push(input);
+    return Promise.resolve(`${name} ran`);
+  },
+});
+
+const staySilentTool = (reasons: string[]) => ({
+  name: STAY_SILENT_TOOL,
+  description: "test stay_silent",
+  inputSchema: { type: "object" } as Record<string, unknown>,
+  run: (input: Record<string, unknown>) => {
+    reasons.push(String(input.reason));
+    return Promise.resolve(
+      "Silence recorded. The run ends here; anything else you write in this turn is discarded, not posted.",
+    );
+  },
+});
+
+describe("stay_silent is terminal", () => {
+  test("a tool called in the same turn still runs, and nothing more is requested once stay_silent is called", async () => {
+    const { store } = memoryStore();
+    const closeCalls: unknown[] = [];
+    const reasons: string[] = [];
+    let completions = 0;
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
+      complete: () => {
+        completions++;
+        return Promise.resolve({
+          text: "",
+          toolCalls: [
+            { id: "call-close", name: "close_incident", input: { reason: "evidence" } },
+            { id: "call-silent", name: STAY_SILENT_TOOL, input: { reason: "the closed notice already says it" } },
+          ],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply);
+      },
+    };
+
+    const result = await createSlackAgentModel(model, store).run({
+      ...runRequest([spyTool("close_incident", closeCalls), staySilentTool(reasons)], 5),
+      allowSilence: true,
+    });
+
+    assert.equal(completions, 1, "stay_silent ends the run before a second request goes out");
+    assert.equal(closeCalls.length, 1, "close_incident, called in the same turn, still ran");
+    assert.deepEqual(reasons, ["the closed notice already says it"]);
+    assert.equal(result.text, "", "nothing is posted once silence is chosen");
+  });
+
+  test("discards text written in the same turn as stay_silent, and logs the discard", async () => {
+    const { store } = memoryStore();
+    const reasons: string[] = [];
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
+      complete: () =>
+        Promise.resolve({
+          text: "Here is an answer anyway.",
+          toolCalls: [
+            { id: "call-silent", name: STAY_SILENT_TOOL, input: { reason: "two people talking to each other" } },
+          ],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply),
+    };
+
+    let answer = "";
+    const lines = await captureLogs(async () => {
+      const result = await createSlackAgentModel(model, store).run({
+        ...runRequest([staySilentTool(reasons)], 5),
+        allowSilence: true,
+      });
+      answer = result.text;
+    });
+
+    assert.equal(answer, "", "the narration written alongside the tool call is never posted");
+    assert.deepEqual(reasons, ["two people talking to each other"]);
+    assert.ok(
+      lines.some((l) => l.includes("slack_agent_stay_silent_text_discarded")),
+      "the discard is logged",
+    );
+  });
+
+  test("does not exhaust the budget or run a wrap-up when stay_silent is called on the final turn", async () => {
+    const { store } = memoryStore();
+    const reasons: string[] = [];
+    let completions = 0;
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
+      complete: () => {
+        completions++;
+        return Promise.resolve({
+          text: "",
+          toolCalls: [{ id: "call-silent", name: STAY_SILENT_TOOL, input: { reason: "nothing here is for me" } }],
+          usage: emptyModelUsage(),
+        } satisfies ModelReply);
+      },
+    };
+
+    const lines = await captureLogs(async () => {
+      await createSlackAgentModel(model, store).run({
+        ...runRequest([staySilentTool(reasons)], 1),
+        allowSilence: true,
+      });
+    });
+
+    assert.equal(completions, 1, "the single turn the budget allowed, and nothing after it");
+    assert.ok(!lines.some((l) => l.includes("slack_agent_turns_exhausted")));
   });
 });
 
