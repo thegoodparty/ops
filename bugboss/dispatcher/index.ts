@@ -68,6 +68,9 @@ export const RESUME_NOTICE_SECONDS = 300;
  */
 export const PARK_COOLDOWN_SECONDS = 3600;
 
+/** How long a resume waits on the session read before measuring without it. */
+export const SESSION_READ_TIMEOUT_MS = 5000;
+
 /**
  * How long an incident may go with nothing at all happening to it.
  *
@@ -1089,18 +1092,27 @@ export class Dispatcher {
    * Human rows are left out on purpose. A reply in the thread says a person
    * was there, not that the agent was.
    *
-   * An open wait marker is stronger than any timestamp. Both are deleted when
-   * the wait ends, so one still standing means the agent was inside that wait
-   * when it was killed, and a wait writes nothing while it blocks: its
+   * An open wait marker can be stronger than any timestamp. Both are deleted
+   * when the wait ends, and a wait writes nothing while it blocks, so its
    * question can be an hour old on an agent that was alive until the
-   * restart. So it counts as alive up to when this process started.
+   * restart. It counts as alive up to when this process started, but only
+   * when the wait is the last thing the agent did: a marker older than the
+   * session's last entry is an orphan from a wait a SIGKILL interrupted
+   * earlier, and the agent has since moved on, so it proves nothing.
    */
   private lastAliveAt = async (row: EligibleRow): Promise<number> => {
-    const waiting = this.db.get<{ open: number }>(
-      `SELECT (EXISTS(SELECT 1 FROM pending_question WHERE incidentId = ?)
-            OR EXISTS(SELECT 1 FROM pending_wait WHERE incidentId = ?)) AS open`,
-      [row.id, row.id],
-    )?.open === 1;
+    const markerAt =
+      this.db.get<{ at: number | null }>(
+        // SQLite's two-argument MAX is NULL if either side is, so each side is
+        // zeroed and a result of zero means no marker at all.
+        `SELECT NULLIF(MAX(
+           COALESCE((SELECT askedAt FROM pending_question
+                      WHERE incidentId = ?), 0),
+           COALESCE((SELECT MAX(startedAt, COALESCE(lastPingAt, 0))
+                      FROM pending_wait WHERE incidentId = ?), 0)
+         ), 0) AS at`,
+        [row.id, row.id],
+      )?.at ?? null;
     const recorded =
       this.db.get<{ at: number }>(
         `SELECT MAX(
@@ -1119,7 +1131,18 @@ export class Dispatcher {
     let session: number | null = null;
     if (this.lastSessionEventAt && row.sessionRef) {
       try {
-        session = await this.lastSessionEventAt(row.sessionRef);
+        // Bounded because ticks are serialized: a GetObject that never
+        // settles would stop every relaunch behind it.
+        let timer: NodeJS.Timeout | undefined;
+        session = await Promise.race([
+          this.lastSessionEventAt(row.sessionRef),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`session read took over ${SESSION_READ_TIMEOUT_MS}ms`)),
+              SESSION_READ_TIMEOUT_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(timer));
       } catch (err: unknown) {
         alarm("resume_session_read_failed", {
           incidentId: row.id,
@@ -1133,7 +1156,11 @@ export class Dispatcher {
     return Math.max(
       recorded,
       session ?? 0,
-      waiting ? this.bootedAt : 0,
+      // No session, no way to tell a live wait from an orphan, and hiding a
+      // real gap is worse than announcing a false one the alarm above explains.
+      markerAt !== null && session !== null && markerAt >= session
+        ? this.bootedAt
+        : 0,
       row.lastStartedAt ?? row.firstSignalAt,
     );
   };
