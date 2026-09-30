@@ -45,6 +45,7 @@ import {
   tsAfter,
   type SlackMessage,
 } from "./agent";
+import { GH_TIMEOUT_MS } from "./gh";
 
 const BOT = "U0BUGBOSS";
 const ALERT_CHANNEL = "C0ALERTS";
@@ -105,6 +106,7 @@ const refuseOpen = () => Promise.reject(new Error("no report expected in this te
 const toolExtras = () => ({
   silence: { allowed: true, reason: null as string | null },
   openIncident: refuseOpen,
+  gh: null,
   reporter: null,
   status: {
     summarise: () => Promise.reject(new Error("no summary expected in this test")),
@@ -514,6 +516,7 @@ describe("prefix binding", () => {
         "merge_incidents",
         "stop_agent",
         "page_rotation",
+        "gh",
       ],
       "order is part of the prefix, and the write tools come after the reads",
     );
@@ -532,6 +535,7 @@ describe("prefix binding", () => {
     const { store } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -563,6 +567,7 @@ describe("an untagged follow-up in a thread the Boss is already in", () => {
     const agent = new SlackAgent({
       summaryModel: noSummaryModel,
       openIncident: refuseOpen,
+      gh: null,
       db,
       store,
       slack: slack.client,
@@ -621,6 +626,7 @@ describe("the per-thread lock", () => {
     const { store } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -652,6 +658,7 @@ describe("the per-thread lock", () => {
     let calls = 0;
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -681,6 +688,7 @@ describe("the per-thread lock", () => {
     const { store } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -712,6 +720,7 @@ describe("session persistence", () => {
     const { store, objects } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -868,6 +877,7 @@ describe("session persistence", () => {
     const { store } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store: { ...store, put: () => Promise.reject(new Error("s3 500")) },
@@ -890,6 +900,7 @@ describe("session persistence", () => {
     const posts: string[] = [];
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -933,6 +944,7 @@ describe("when the answer itself fails", () => {
     const posts: { channel?: string; text: string }[] = [];
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -972,6 +984,7 @@ describe("when the answer itself fails", () => {
     const posts: { channel?: string; text: string }[] = [];
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -1635,6 +1648,7 @@ describe("the turn budget", () => {
     const leases: number[] = [];
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -1655,7 +1669,7 @@ describe("the turn budget", () => {
 
     assert.equal(
       leases[0],
-      (SLACK_AGENT_MAX_TURNS + 1) * SLACK_AGENT_BUDGET_MS,
+      (SLACK_AGENT_MAX_TURNS + 1) * SLACK_AGENT_BUDGET_MS + SLACK_AGENT_MAX_TURNS * GH_TIMEOUT_MS,
       "a lease shorter than the run lets a second mention corrupt the session",
     );
   });
@@ -1666,6 +1680,7 @@ describe("the turn budget", () => {
     const { store } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -1784,6 +1799,7 @@ describe("what a question cost", () => {
     const slack = fakeSlack();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -2203,6 +2219,7 @@ describe("the Boss in an incident thread", () => {
     const { store, objects } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,
@@ -2314,6 +2331,7 @@ describe("the Boss in an incident thread", () => {
     slack.state.replies = [opening];
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
@@ -2336,6 +2354,7 @@ describe("the Boss in an incident thread", () => {
     slack.state.replies = [opening];
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
@@ -2589,6 +2608,7 @@ describe("the Boss's write tools", () => {
       const slack = fakeSlack();
       const agent = new SlackAgent({
         openIncident: refuseOpen,
+        gh: null,
         summaryModel: noSummaryModel,
         db,
         store: memoryStore().store,
@@ -2624,6 +2644,7 @@ describe("open_incident", () => {
   const agentWith = (open: OpenIncident, model: SlackAgentModel) =>
     new SlackAgent({
       openIncident: open,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
@@ -2672,6 +2693,7 @@ describe("open_incident", () => {
       store: memoryStore().store,
       ...toolExtras(),
       openIncident: open,
+      gh: null,
       reporter: null,
       commands: commandDeps(),
     }).find((t) => t.name === "open_incident")!;
@@ -2689,6 +2711,7 @@ describe("open_incident", () => {
     const { store } = memoryStore();
     const agent = new SlackAgent({
       openIncident: refuseOpen,
+      gh: null,
       summaryModel: noSummaryModel,
       db,
       store,

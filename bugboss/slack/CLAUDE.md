@@ -483,6 +483,29 @@ evidence anybody can check. The prompt carries the rest: never change state
 without evidence it can cite, and an agent asking for a close is a request to
 check rather than a reason to act.
 
+**It reads GitHub itself.** `gh` (`slack/gh.ts`) is appended last, after
+the write tools. It runs the `gh` binary with the argv the model supplies,
+through `execFile` with no shell, on the App installation token an incident
+agent gets -- same permissions, same repositories, minted and re-minted by
+`createInstallationToken` in the composition root and shared with the
+closing report's PR-state reader. It exists because the Boss, asked in
+incident 94's thread who made omni#2265, said it had no GitHub access and
+asked for the link to be pasted.
+
+| Bound | Why |
+| --- | --- |
+| no shell, argv only | a `;` or `|` in an argument stays a literal argument |
+| env built, not inherited | the child sees `GH_TOKEN`, `GH_REPO=thegoodparty/omni` and its own `GH_CONFIG_DIR`, none of the Boss's other secrets |
+| `auth`, `alias`, `extension`, `config` refused | `gh auth token` prints the token into a transcript one answer from Slack; an alias or extension runs a program that could read this process's environment |
+| the token scrubbed from output | nothing gh prints carries it back |
+| `GH_TIMEOUT_MS` per call | counted into `SLACK_AGENT_LOCK_TTL_MS` |
+| `MAX_GH_OUTPUT_CHARS`, a **refusal** | past it nothing is shown and the model is told to ask for `--json` fields, `--jq`, `--limit`; never the first part of the output |
+
+Anything `gh` changes on GitHub -- a comment, a review, a close, a merge, a
+re-run -- is a state change under the same prompt rule as the write tools:
+only when a person asked or there is evidence to cite, and the Boss says what
+it did. Branch protection, not the prompt, is what keeps a merge honest.
+
 `page_rotation` exists because `toMrkdwn` strips `<!subteam^…>` out of model
 prose, which is right -- a model that can page the rotation by typing it is
 how a rotation gets muted -- and the Boss still has to be able to reach

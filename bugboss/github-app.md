@@ -23,8 +23,17 @@ can account for.
 Credentials, and nothing else. BugBoss receives no GitHub webhooks — the
 ingress handles Grafana, Slack and humans ([`ingress/`](./ingress/)) and there
 is no GitHub route — so the App subscribes to no events and has no webhook URL
-that matters. All it does is mint installation tokens that the incident agent
-uses as `GITHUB_TOKEN` and `GH_TOKEN`.
+that matters. All it does is mint installation tokens, for two holders:
+
+- **The incident agent**, as `GITHUB_TOKEN` and `GH_TOKEN` for `gh` and `git`.
+- **The Boss**, in the composition root: one token source, shared by the
+  closing report's PR-state reader and the Boss's `gh` tool
+  ([`slack/gh.ts`](./slack/gh.ts)), which runs `gh` with that token for
+  whatever the model asks of GitHub. The token is not scoped down for it:
+  the Boss gets what an agent gets, so "who made this PR" is something it
+  looks up rather than asks a person to paste. `gh auth`, `alias`,
+  `extension` and `config` are refused in code, because they print the
+  token or run another program; see [`slack/CLAUDE.md`](./slack/CLAUDE.md).
 
 The agent gets the App's *credentials* rather than a token minted at launch,
 because an installation token lasts an hour and an incident can run for a day.
@@ -44,7 +53,7 @@ names the missing permission rather than quietly falling back to asking.
 | --- | --- | --- |
 | `metadata` | read | Mandatory for every App. Nothing calls it directly. |
 | `contents` | write | The agent pushes its fix branch. `git push` through the credential helper configured in `agent/run.ts`. |
-| `pull_requests` | write | `gh pr create`, `gh pr comment` (including the bare `delegate review` that fires the reviewer), and reading review state. Driven by the ship-pr skill the prompt points the agent at. |
+| `pull_requests` | write | `gh pr create`, `gh pr comment` (including the bare `delegate review` that fires the reviewer), and reading review state. Driven by the ship-pr skill the prompt points the agent at. The Boss's `gh` reads PRs, their files and reviews with it. |
 | `actions` | **write** (requested) | Reading workflow runs and jobs to tell whether a PR is green (`gh run list`, `gh run view`) needs only `read`. Re-running a run's failed jobs — `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`, via [`agent/rerun.ts`](./agent/rerun.ts) — needs `write`. |
 | `deployments` | read | Granted, with no caller in this repo. Kept because a read permission nobody uses is cheaper to leave than to remove and rediscover; drop it the next time anyone is in the settings page anyway. |
 
@@ -56,6 +65,17 @@ failure of initiative. See [`agent/rerun.ts`](./agent/rerun.ts) for why the
 capability is bounded in code rather than handed over whole — an agent that can
 re-run will otherwise re-run every time it sees red, which is retry-as-a-fix
 with a bigger budget.
+
+## What it does not have, and what that costs the Boss
+
+Neither is requested. Both are the next widening if the Boss needs them.
+
+- **No `checks`.** A check run is invisible to the App, so `gh pr checks` and
+  the `statusCheckRollup` field of `gh pr view --json` fail or come back
+  empty. CI is read through workflow runs instead (`gh run list --branch`,
+  `gh run view`), which `actions` covers.
+- **No `issues`.** Pull requests are covered by `pull_requests`; an issue in
+  a private repository is not, and `gh issue view` there answers 404.
 
 ## What it deliberately does not have
 
