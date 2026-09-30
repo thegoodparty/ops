@@ -636,7 +636,7 @@ export const createSlackAgentModel = (
       // literal text "(silpersisted)" reached a thread after the Boss had
       // already chosen silence: the turn that produced it never should have
       // run.
-      if (staySilent) {
+      if (staySilent && req.allowSilence) {
         if (reply.text) {
           log("slack_agent_stay_silent_text_discarded", {
             sessionKey: req.sessionKey,

@@ -238,6 +238,7 @@ export const STAY_SILENT_TOOL = "stay_silent";
  * `stay_silent` and read by the run once the model is done.
  */
 export interface SilenceChoice {
+  allowed: boolean;
   reason: string | null;
 }
 
@@ -609,6 +610,9 @@ export const buildTools = ({
       },
       run: (input) => {
         const reason = String(input.reason ?? "").trim();
+        if (!silence.allowed) {
+          return Promise.resolve("Refused: this message tags you, so it is always answered. Write your reply.");
+        }
         if (!reason) {
           return Promise.resolve("Refused: say why nothing here is for you. Nothing was recorded.");
         }
@@ -1240,7 +1244,7 @@ export class SlackAgent {
         [incidentId],
       );
 
-      const silence: SilenceChoice = { reason: null };
+      const silence: SilenceChoice = { allowed: true, reason: null };
       // The newest person in this run is who a report is filed for. A run
       // woken by the agent alone has nobody to attribute one to.
       const latest = humans.at(-1);
@@ -1442,7 +1446,7 @@ export class SlackAgent {
       // two people talking under a Boss answer, so there, as in an incident
       // thread, silence is allowed -- but only chosen with stay_silent.
       const allowSilence = mention.tagged === false;
-      const silence: SilenceChoice = { reason: null };
+      const silence: SilenceChoice = { allowed: allowSilence, reason: null };
       const tools = this.tools(silence, {
         user: mention.user,
         channel: mention.channel,

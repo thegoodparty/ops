@@ -103,7 +103,7 @@ const noSummaryModel = {
 const refuseOpen = () => Promise.reject(new Error("no report expected in this test"));
 
 const toolExtras = () => ({
-  silence: { reason: null as string | null },
+  silence: { allowed: true, reason: null as string | null },
   openIncident: refuseOpen,
   reporter: null,
   status: {
@@ -1449,6 +1449,38 @@ describe("stay_silent is terminal", () => {
       lines.some((l) => l.includes("slack_agent_stay_silent_text_discarded")),
       "the discard is logged",
     );
+  });
+
+  test("on a run that must answer, stay_silent ends nothing and the answer already written is posted", async () => {
+    const { store } = memoryStore();
+    let completions = 0;
+    const model: SizedModelClient = {
+      contextWindow: TEST_CONTEXT_WINDOW,
+      complete: () => {
+        completions++;
+        return Promise.resolve(
+          completions === 1
+            ? ({
+                text: "Incident 94 is fixed; the PR merged an hour ago.",
+                toolCalls: [{ id: "call-silent", name: STAY_SILENT_TOOL, input: { reason: "nothing more to add" } }],
+                usage: emptyModelUsage(),
+              } satisfies ModelReply)
+            : ({ text: "", toolCalls: [], usage: emptyModelUsage() } satisfies ModelReply),
+        );
+      },
+    };
+    const refusing = {
+      ...staySilentTool([]),
+      run: () => Promise.resolve("Refused: this message tags you, so it is always answered. Write your reply."),
+    };
+
+    const result = await createSlackAgentModel(model, store).run({
+      ...runRequest([refusing], 5),
+      allowSilence: false,
+    });
+
+    assert.equal(completions, 2, "the refusal went back to the model instead of ending the run");
+    assert.equal(result.text, "Incident 94 is fixed; the PR merged an hour ago.");
   });
 
   test("does not exhaust the budget or run a wrap-up when stay_silent is called on the final turn", async () => {
