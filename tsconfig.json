@@ -6,7 +6,8 @@
     "deploy/**/*.ts",
     "deploy-org/**/*.ts",
     "deploy-workbench/**/*.ts",
-    "bugboss/**/*.ts"
+    "bugboss/**/*.ts",
+    "bugboss-evals/**/*.ts"
   ],
   "compilerOptions": {
     "target": "ES2022",
@@ -18,5 +19,8 @@
     "outDir": "dist",
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
-  }
+  },
+  "exclude": [
+    "bugboss-evals/scenarios/*/check/**"
+  ]
 }
