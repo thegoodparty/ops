@@ -3,6 +3,7 @@ import * as aws from "@pulumi/aws";
 import { createWorker } from "./components/worker";
 import { createWebhookLambda } from "./components/webhooks";
 import { createPlaywrightReportsBucket } from "./components/playwright-reports";
+import { createSitemapsBucket } from "./components/sitemaps";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createBugBoss } from "./components/bugboss";
@@ -43,6 +44,16 @@ export = async () => {
 
   const playwrightReports = createPlaywrightReportsBucket();
 
+  // Referenced, not created: this account's GitHub OIDC provider already
+  // exists (gp-marketing's clickup-bot-ci-invoker-prod role proves it) and
+  // already trusts this account's repos.
+  const githubOidcProvider = await aws.iam.getOpenIdConnectProvider({
+    url: "https://token.actions.githubusercontent.com",
+  });
+  const sitemaps = createSitemapsBucket({
+    oidcProviderArn: githubOidcProvider.arn,
+  });
+
   createIdentityCenter();
   createCiRoles();
 
@@ -65,6 +76,8 @@ export = async () => {
     clusterName: worker.cluster.name,
     logGroupName: worker.logGroup.name,
     playwrightReportsBucket: playwrightReports.bucket.bucket,
+    sitemapsBucket: sitemaps.bucket.bucket,
+    sitemapsPublisherRoleArn: sitemaps.publisherRole.arn,
     bugbossUrl: bugboss?.url,
   };
 };
