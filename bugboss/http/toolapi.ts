@@ -478,14 +478,13 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       return c.json({ error: "body was not JSON" }, 400);
     }
     if (!command.trim()) return c.json({ error: "command is empty" }, 400);
-    if (!waitingFor) return c.json({ error: "waitingFor is empty" }, 400);
 
     const row = await deps.db.withWrite((w) => {
       w.prepare(
         `INSERT INTO pending_wait (incidentId, command, waitingFor, startedAt, pings, lastPingAt)
          VALUES (?, ?, ?, ?, 0, NULL)
          ON CONFLICT(incidentId) DO UPDATE SET
-           waitingFor = excluded.waitingFor,
+           waitingFor = COALESCE(excluded.waitingFor, pending_wait.waitingFor),
            startedAt = CASE WHEN pending_wait.command = excluded.command
              THEN pending_wait.startedAt ELSE excluded.startedAt END,
            pings = CASE WHEN pending_wait.command = excluded.command
@@ -493,7 +492,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
            lastPingAt = CASE WHEN pending_wait.command = excluded.command
              THEN pending_wait.lastPingAt ELSE NULL END,
            command = excluded.command`,
-      ).run(caller.incidentId, command, waitingFor, now());
+      ).run(caller.incidentId, command, waitingFor || null, now());
       return w
         .prepare(
           "SELECT command, startedAt, pings, lastPingAt FROM pending_wait WHERE incidentId = ?",

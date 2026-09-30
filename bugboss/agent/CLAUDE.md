@@ -205,8 +205,9 @@ came out of the wait with anything.
   again; an action would be performed twice.
 - `monitor(…, waitingFor)` — required: one plain sentence for the incident
   board and status card ("someone to merge omni#2189"). They show it in place
-  of the command, which is shell and never shown. An empty one is refused
-  before anything runs.
+  of the command, which is shell and never shown. Required by the schema
+  only: a restart replays calls recorded before it existed, so a missing one
+  runs anyway and the board says "a check the agent is running".
 - `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
   what the wait is on, and the harness tells the Boss when they do not turn
   up. Unset, the wait is silent, which is right for a deploy, a migration or

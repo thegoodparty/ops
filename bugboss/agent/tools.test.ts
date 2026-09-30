@@ -346,7 +346,7 @@ const heartbeatHarness = (args: {
   const events: string[] = [];
   const told: { kind: BossInboxKind; text: string; at: string; pingsWhenTold: number | null }[] = [];
   let recordWaitCalls = 0;
-  const labels: string[] = [];
+  const labels: (string | null)[] = [];
   let pingCalls = 0;
   let clears = 0;
 
@@ -1531,7 +1531,7 @@ test("message_boss honours the harness deadline alongside pi's signal", async ()
   assert.equal(harness.escalations().length, 0, "the deadline is its own escalation path");
 });
 
-test("monitor refuses a wait with no waitingFor, before it runs anything", async () => {
+test("a replayed monitor call from before waitingFor existed still resumes", async () => {
   let probes = 0;
   const tool = await createMonitorTool({
     probe: async () => {
@@ -1539,15 +1539,17 @@ test("monitor refuses a wait with no waitingFor, before it runs anything", async
       return { code: 0, output: "" };
     },
   });
-  for (const waitingFor of ["", "   "]) {
-    const out = await tool.execute(
-      "c1",
-      { command: "true", intervalSeconds: 1, timeoutSeconds: 1, description: "x", waitingFor } as never,
-      new AbortController().signal,
-      undefined,
-      {} as never,
-    );
-    assert.match(toolText(out), /^Rejected: waitingFor is empty/);
-  }
-  assert.equal(probes, 0, "a refused wait runs no command");
+  assert.ok(
+    (tool.parameters as { required?: string[] }).required?.includes("waitingFor"),
+    "the premise: the model is required to give one",
+  );
+  const out = await tool.execute(
+    "c1",
+    { command: "true", intervalSeconds: 1, timeoutSeconds: 1, description: "x" } as never,
+    new AbortController().signal,
+    undefined,
+    {} as never,
+  );
+  assert.doesNotMatch(toolText(out), /^Rejected/);
+  assert.equal(probes, 1, "the recorded wait ran its check");
 });

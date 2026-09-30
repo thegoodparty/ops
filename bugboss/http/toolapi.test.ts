@@ -497,13 +497,22 @@ test("a wait keeps the agent's label, and a replay can reword it without restart
   await authed("/pending-wait", { method: "DELETE" });
 });
 
-test("a wait with no label is refused", async () => {
+test("a wait replayed from before the label existed is kept, and keeps any label it had", async () => {
   const res = await startWait("gh pr view 2189", "  ");
-  assert.equal(res.status, 400);
-  assert.equal(
-    db.get("SELECT 1 FROM pending_wait WHERE incidentId = ?", [INCIDENT]),
-    undefined,
+  assert.equal(res.status, 200, "a replayed wait must resume, so it is not refused");
+  assert.deepEqual(
+    db.get("SELECT waitingFor FROM pending_wait WHERE incidentId = ?", [INCIDENT]),
+    { waitingFor: null },
+    "no label, which the board renders as the fallback",
   );
+  await startWait("gh pr view 2189", "someone to merge omni#2189");
+  await startWait("gh pr view 2189", "");
+  assert.deepEqual(
+    db.get("SELECT waitingFor FROM pending_wait WHERE incidentId = ?", [INCIDENT]),
+    { waitingFor: "someone to merge omni#2189" },
+    "a later unlabelled replay does not erase a label",
+  );
+  await authed("/pending-wait", { method: "DELETE" });
 });
 
 test("counting a nudge against no wait is an error, not a new wait", async () => {

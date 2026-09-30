@@ -333,7 +333,7 @@ export interface WaitMarkerPort {
    * what stops that stale marker from silencing the next wait's first
    * reminder.
    */
-  recordWait(command: string, waitingFor: string): Promise<PendingWait>;
+  recordWait(command: string, waitingFor: string | null): Promise<PendingWait>;
   recordPing(): Promise<PendingWait>;
   clearWait(): Promise<void>;
 }
@@ -417,8 +417,12 @@ export interface MonitorArgs {
   intervalSeconds: number;
   timeoutSeconds: number;
   description: string;
-  /** What the board and the status card say is being waited for. */
-  waitingFor: string;
+  /**
+   * What the board and the status card say is being waited for. Required of
+   * the model by the schema, and still optional here: a restart replays a
+   * call recorded before the argument existed, and that wait must resume.
+   */
+  waitingFor?: string;
   /**
    * What a person has to do for this wait to end. Set only when one does: it
    * is what turns the heartbeat on.
@@ -470,7 +474,7 @@ export const runMonitor = async (
   // a day-long wait with no marker, which is the silent no-heartbeat
   // behaviour this exists to end, with nothing in the agent's view saying so.
   let marker = heartbeat
-    ? await heartbeat.marker.recordWait(args.command, args.waitingFor)
+    ? await heartbeat.marker.recordWait(args.command, args.waitingFor?.trim() || null)
     : null;
 
   // Measured from when the wait began, not from this process start, which is
@@ -857,17 +861,6 @@ export const createMonitorTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MonitorArgs;
-      if (!String(args.waitingFor ?? "").trim()) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Rejected: waitingFor is empty. Say in one short plain sentence what you are waiting for, for the incident board. Nothing was run.",
-            },
-          ],
-          details: { rejected: true, command: args.command },
-        };
-      }
       const result = await runMonitor(args, {
         ...deps,
         signal: eitherSignal(signal, deps.signal),
