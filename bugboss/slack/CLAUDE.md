@@ -410,6 +410,15 @@ labelled as the agent's and saying which one it is blocked on, and are marked
 seen after the run -- so a run that died before answering leaves them for the
 next one.
 
+**A mention outside an incident reads the thread above it, once.** The first
+`@bugboss` in a thread somebody else started is handed every message before
+it, other bots' posts included, because "log an incident for this" under a
+report means that report. The same holds when an old session expired: the
+Boss reads the thread again, its own earlier posts marked as its own, so it
+does not redo what it already did. A mention that starts its own thread has
+nothing above it and fetches nothing. A resume reads only what people said
+since the watermark.
+
 **It never drops a trigger.** A message that arrives while the thread's run
 is in flight marks the thread dirty rather than being told the Boss is busy,
 and the holder runs again before it lets go: while the thread is dirty, and
