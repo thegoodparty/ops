@@ -193,6 +193,19 @@ matter how long they wait. That is what keeps a multi-day incident from
 saturating context on polling, and it is why the prompt forbids polling with
 bash in a loop.
 
+**Both end on a word from the Boss.** Each poll peeks the directive queue, and
+a `boss_message`, `stop` or `merged` ends the wait with the condition unmet.
+The Boss's message is consumed there, because that result is what delivers
+it; everything else stays queued for a Boss tool to drain.
+
+**A Boss message rides on every tool result, not only the Boss tools'.**
+`directiveDeliveryExtension` (`run.ts`) peeks after each tool call and appends
+any `boss_message` to that result. Only the Boss tools drain the queue, and an
+agent writing a fix or watching CI calls none of them for minutes: incident
+94's agent ran ten bash and monitor calls past a redirection and read it only
+when a deploy restarted it. `stop` and `merged` are left for a Boss tool,
+whose result is the one that can end the run on them.
+
 **One turn is not one bill, and the prompt used to say it was.** A block that
 outlives the prompt cache pays a full cache write on the turn after it, which
 on a nine-hour incident was 41% of what that incident cost. So the prompt

@@ -1553,3 +1553,109 @@ test("a replayed monitor call from before waitingFor existed still resumes", asy
   assert.doesNotMatch(toolText(out), /^Rejected/);
   assert.equal(probes, 1, "the recorded wait ran its check");
 });
+
+// ---------------------------------------------------------------------------
+// monitor hears the Boss
+// ---------------------------------------------------------------------------
+
+/**
+ * A directive queue that only shows an entry once the clock reaches its time
+ * and only loses one to `consumeDirective`, the way the loopback API behaves.
+ */
+const directiveFeed = (now: () => number, feed: { at: number; directive: Directive }[]) => {
+  const consumed = new Set<number>();
+  const entries = feed.map((entry, index) => ({ id: index + 1, ...entry }));
+  return {
+    consumed,
+    api: {
+      peekDirectives: async (): Promise<PendingDirective[]> =>
+        entries
+          .filter((entry) => entry.at <= now() && !consumed.has(entry.id))
+          .map(({ id, directive }) => ({ id, directive })),
+      consumeDirective: async (id: number) => {
+        consumed.add(id);
+      },
+    },
+  };
+};
+
+test("a Boss message ends a merge wait instead of sitting behind it (incident 94)", async () => {
+  const clock = fakeClock();
+  const start = clock.now();
+  const harness = heartbeatHarness({ now: clock.now });
+  const redirect =
+    "Scope correction from a person in the thread: your fix silences the alert, not the bug the candidate hit.";
+  const feed = directiveFeed(clock.now, [
+    { at: start + 8 * 60_000, directive: { type: "boss_message", text: redirect, at: start + 8 * 60_000 } },
+    { at: start + 8 * 60_000, directive: { type: "new_signals", count: 1, summary: "another 502" } },
+  ]);
+
+  const result = await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      heartbeat: harness.deps,
+      directives: feed.api,
+    },
+  );
+
+  assert.equal(result.timedOut, false);
+  assert.equal(result.bossMessage, redirect);
+  assert.ok(clock.now() - start < 10 * 60_000, "the wait ended on the message, not the day");
+  assert.deepEqual([...feed.consumed], [1], "the answer is consumed, the rest stays queued");
+  assert.deepEqual(result.directives?.map((directive) => directive.type), ["new_signals"]);
+  assert.equal(harness.marker(), null, "the board no longer says it is waiting on a merge");
+});
+
+test("the monitor tool puts the Boss's words in front of the model and ends on stop", async () => {
+  const clock = fakeClock();
+  const feed = directiveFeed(clock.now, [
+    { at: 0, directive: { type: "boss_message", text: "answer the three questions first", at: 0 } },
+    { at: 0, directive: { type: "stop", reason: "closed by a person" } },
+  ]);
+  const tool = await createMonitorTool({
+    probe: stalled,
+    sleep: clock.sleep,
+    now: clock.now,
+    directives: feed.api,
+  });
+
+  const out = (await tool.execute(
+    "call-1",
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 },
+    undefined,
+    undefined,
+    undefined as never,
+  )) as { content: { type: string; text?: string }[]; terminate?: boolean };
+
+  const text = toolText(out);
+  assert.match(text, /^STOPPED WAITING for: the PR to be merged/);
+  assert.match(text, /The Boss said: answer the three questions first/);
+  assert.match(text, /STOP: closed by a person/);
+  assert.equal(out.terminate, true);
+});
+
+test("a failed directive read costs the check, not the wait", async () => {
+  const clock = fakeClock();
+  let reads = 0;
+  const result = await runMonitor(
+    { command: "check", intervalSeconds: 60, timeoutSeconds: 180, description: "quiet", waitingFor: "quiet" },
+    {
+      probe: stalled,
+      sleep: clock.sleep,
+      now: clock.now,
+      directives: {
+        peekDirectives: async () => {
+          reads += 1;
+          throw new Error("the Boss said 503");
+        },
+        consumeDirective: async () => {},
+      },
+    },
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.ok(reads > 1, "it kept waiting and kept looking");
+});

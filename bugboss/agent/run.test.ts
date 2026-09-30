@@ -15,6 +15,7 @@ import {
   createBossClient,
   createBossTools,
   createTurnBudget,
+  directiveDeliveryExtension,
   INCIDENT_AGENT_MAX_TURNS,
   DEFAULT_TIMEOUT_SECONDS,
   MODEL_BINDING_MISMATCH,
@@ -1175,4 +1176,67 @@ test("the turn budget reaches the agent from the environment the dispatcher buil
       `BUGBOSS_MAX_TURNS=${JSON.stringify(value)} must fall back, not bind`,
     );
   }
+});
+
+test("a Boss message rides on a bash result, and a stop waits for a Boss tool (incident 94)", async () => {
+  const queue = [
+    { id: 1, directive: { type: "boss_message" as const, text: "the fix hides the bug; re-scope before shipping", at: 1 } },
+    { id: 2, directive: { type: "stop" as const, reason: "closed" } },
+  ];
+  const consumed: number[] = [];
+  const failures: unknown[] = [];
+  const handlers: Record<string, (...args: unknown[]) => unknown> = {};
+  const pi = {
+    on: (event: string, handler: (...args: unknown[]) => unknown) => {
+      handlers[event] = handler;
+      return () => {};
+    },
+  } as never;
+
+  directiveDeliveryExtension(
+    {
+      peekDirectives: async () => queue.filter((entry) => !consumed.includes(entry.id)),
+      consumeDirective: async (id) => {
+        consumed.push(id);
+      },
+    },
+    (error) => failures.push(error),
+  )(pi);
+
+  const bash = { type: "tool_result", toolName: "bash", content: [{ type: "text", text: "pass: 36" }] };
+  const first = (await handlers.tool_result(bash, {})) as { content: { type: string; text: string }[] };
+  assert.equal(first.content[0].text, "pass: 36", "the tool's own output is untouched");
+  assert.match(first.content.at(-1)?.text ?? "", /FROM THE BOSS: the fix hides the bug; re-scope before shipping/);
+  assert.doesNotMatch(first.content.at(-1)?.text ?? "", /STOP/);
+  assert.deepEqual(consumed, [1]);
+
+  assert.equal(await handlers.tool_result(bash, {}), undefined, "delivered once");
+  assert.deepEqual(failures, []);
+});
+
+test("a failed directive read leaves the tool result as it was", async () => {
+  const failures: unknown[] = [];
+  const handlers: Record<string, (...args: unknown[]) => unknown> = {};
+  const pi = {
+    on: (event: string, handler: (...args: unknown[]) => unknown) => {
+      handlers[event] = handler;
+      return () => {};
+    },
+  } as never;
+  directiveDeliveryExtension(
+    {
+      peekDirectives: async () => {
+        throw new Error("the Boss said 503");
+      },
+      consumeDirective: async () => {},
+    },
+    (error) => failures.push(error),
+  )(pi);
+
+  const result = await handlers.tool_result(
+    { type: "tool_result", toolName: "bash", content: [{ type: "text", text: "ok" }] },
+    {},
+  );
+  assert.equal(result, undefined);
+  assert.equal(failures.length, 1);
 });

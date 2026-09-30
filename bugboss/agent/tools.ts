@@ -410,6 +410,12 @@ export interface MonitorDeps {
   signal?: AbortSignal;
   /** Absent means no wait is ever reported, whatever the model asks for. */
   heartbeat?: HeartbeatDeps;
+  /**
+   * Where a word from the Boss is seen mid-wait. Absent means a wait only ends
+   * on its own condition, which is how a redirection sat unread behind a
+   * merge wait on incident 94.
+   */
+  directives?: DirectivePeek;
 }
 
 export interface MonitorArgs {
@@ -433,6 +439,12 @@ export interface MonitorArgs {
 export interface MonitorResult {
   output: string;
   timedOut: boolean;
+  /** What the Boss said that ended the wait early. Absent when nothing did. */
+  bossMessage?: string | null;
+  /** Everything else the poll saw. The caller renders these. */
+  directives?: Directive[];
+  /** A `stop` or a `merged` arrived: the incident is no longer the agent's. */
+  terminate?: boolean;
 }
 
 /**
@@ -496,6 +508,47 @@ export const runMonitor = async (
     if (deps.signal?.aborted || now() >= deadline) {
       if (heartbeat) await release(heartbeat, args.command);
       return { output: last, timedOut: true };
+    }
+
+    // A person's word only reaches an agent through the Boss, so a wait that
+    // cannot hear it is a wait nobody can redirect. The answer is consumed
+    // here because this call's result is what delivers it; everything else
+    // stays queued for the next Boss tool to drain.
+    if (deps.directives) {
+      let entries: PendingDirective[] = [];
+      try {
+        entries = await deps.directives.peekDirectives();
+      } catch (error: unknown) {
+        alarm("monitor_directive_peek_failed", {
+          command: args.command,
+          error: String(error),
+        });
+      }
+      const answers = entries.filter((entry) => bossMessageText(entry.directive) !== null);
+      const terminate = entries.some(
+        (entry) =>
+          entry.directive.type === "stop" || entry.directive.type === "merged",
+      );
+      if (answers.length || terminate) {
+        if (heartbeat) await release(heartbeat, args.command);
+        for (const answer of answers) await deps.directives.consumeDirective(answer.id);
+        log("monitor_interrupted", {
+          command: args.command,
+          answers: answers.length,
+          terminate,
+        });
+        return {
+          output: last,
+          timedOut: false,
+          bossMessage: answers.length
+            ? answers.map((entry) => bossMessageText(entry.directive)).join("\n\n")
+            : null,
+          directives: entries
+            .filter((entry) => !answers.includes(entry))
+            .map((entry) => entry.directive),
+          terminate,
+        };
+      }
     }
 
     if (heartbeat && marker) {
@@ -865,12 +918,22 @@ export const createMonitorTool = async (
         ...deps,
         signal: eitherSignal(signal, deps.signal),
       });
+      const interrupted = result.bossMessage !== undefined;
       const header = result.timedOut
         ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
-        : `Condition met: ${args.description}`;
+        : interrupted
+          ? `STOPPED WAITING for: ${args.description}. The condition is not met; the Boss spoke, so act on that first.`
+          : `Condition met: ${args.description}`;
+      const said = result.bossMessage ? `\n\nThe Boss said: ${result.bossMessage}` : "";
       return {
-        content: [{ type: "text", text: `${header}\n\n${result.output}` }],
-        details: { timedOut: result.timedOut, command: args.command },
+        content: [
+          {
+            type: "text",
+            text: `${header}${said}\n\n${result.output}${renderDirectives(result.directives ?? [])}`,
+          },
+        ],
+        details: { timedOut: result.timedOut, command: args.command, interrupted },
+        terminate: result.terminate === true,
       };
     },
   } as ToolDefinition;

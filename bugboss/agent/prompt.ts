@@ -101,10 +101,12 @@ call goes nowhere: nobody reads it, not the Boss and not a person. One run
 wrote 56,000 characters of it. Think in your reasoning, act through tools, and
 put anything somebody should know into message_boss.
 
-get_incident re-reads the incident and returns pending directives. Every tool
-response carries a directives array: that is how you hear from the Boss, learn
-that your incident was merged into another, or that new signals arrived. Read
-them on every call and act on them immediately.
+get_incident re-reads the incident and returns pending directives. Every Boss
+tool response carries a directives array: that is how you learn that your
+incident was merged into another, or that new signals arrived. A message from
+the Boss can arrive on any tool result, and it ends a monitor wait early. It is
+usually a person redirecting you: act on it before you carry on with your
+plan.
 
 get_incident also takes another incident's id, and reads any of them. Nothing
 is walled off from you: you can see what the incident beside yours is, what
