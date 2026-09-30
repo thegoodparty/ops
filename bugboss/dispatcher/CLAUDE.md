@@ -215,6 +215,11 @@ marker commits **before** the post, on the precedent `report/index.ts` sets:
 a container that dies between the two stays quiet rather than saying it
 twice, and the un-park is the half that actually recovers the incident.
 
+`postNotice` is optional on the deps because the unit tests and the E2E run
+without Slack, but a prod composition root that passes nothing makes this
+notice silent, so its absence alarms (`stale_notice_undeliverable`) rather
+than passing. So does an incident with no thread to post into.
+
 ## The circuit breaker
 
 `maxConcurrentAgents` is a circuit breaker, not a scheduler. Hitting it
@@ -237,19 +242,20 @@ A launch whose environment carries no credential path at all alarms:
 without it the agent loses Bedrock, and that surfaces a turn later as a model
 call failing with nothing pointing back at the environment.
 
-## A resume is announced, not silent
+## A resume tells the agent and alarms, and posts nothing
 
-Relaunch was always automatic: an incident in an agent status gets a new
-child on the next tick, whatever killed the last one. What was
-missing is that nobody was told. A thread whose last message is *"the PR is
-waiting on a human merge"* stays true after the agent dies, so the silence
-reads as patience.
+Relaunch is automatic: an incident in an agent status gets a new child on
+the next tick, whatever killed the last one. Every resume after a gap of at
+least a tick gives the agent a `resumed_after` directive, because the agent
+is the one that has to re-check what moved. A gap longer than
+`RESUME_ALARM_SECONDS` also raises `agent_resumed_after_gap`, which is how an
+operator learns agents are dying. A shorter one only logs `agent_resumed`.
 
-A gap longer than `RESUME_NOTICE_SECONDS` alarms **and** posts to the thread.
-Shorter than that is a deploy putting everything back within a tick or two,
-and saying so each time would teach people to skip the message that matters.
-The agent is still told either way -- that is the `resumed_after` directive,
-and it is the one that has to re-check what moved.
+Nothing is posted to the thread. The post asked nothing of anyone: the
+relaunch had already happened and the agent had already been told. It also
+fired on ordinary deploys. ECS stops the old task before the new one starts,
+so a deploy gap runs about eight minutes from the agent's last activity,
+which is over the threshold, and the notice became noise on every merge.
 
 **The gap runs from the agent's last activity, never from its launch.** When
 this process watched the exit, the exit time is exact. After a container
@@ -268,11 +274,6 @@ session could not be read, since nothing then tells the two apart. The session r
 would stop every relaunch. Launch is only the floor. Measuring from
 launch told every thread on every deploy that an agent working minutes
 earlier had been gone for hours, and to disregard its last message.
-
-`postNotice` is optional on the deps because the unit tests and the E2E run
-without Slack, but a prod composition root that passes nothing makes the one
-event this exists to surface silent again, so its absence alarms rather than
-passing.
 
 ## Exit codes
 
