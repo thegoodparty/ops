@@ -83,16 +83,18 @@ export const contains = async (sandbox: Sandbox, base: string, head: string): Pr
 
 export type CheckState = "green" | "pending" | "red";
 
-/** Every check run on the commit, which is the whole of the sandbox's CI. */
+/**
+ * The sandbox's CI is its Actions workflow runs on the commit. Read through
+ * the Actions API because the App holds no `checks` permission.
+ */
 export const checks = async (sandbox: Sandbox, sha: string): Promise<CheckState> => {
-  const { check_runs } = await sandbox.call<{
-    check_runs: Array<{ status: string; conclusion: string | null }>;
-  }>(`/commits/${sha}/check-runs?per_page=100`);
-  if (check_runs.length === 0) return "pending";
-  if (check_runs.some((run) => run.status !== "completed")) return "pending";
-  return check_runs.every((run) => ["success", "skipped", "neutral"].includes(run.conclusion ?? ""))
-    ? "green"
-    : "red";
+  const { workflow_runs } = await sandbox.call<{
+    workflow_runs: Array<{ status: string; conclusion: string | null; event: string; created_at: string }>;
+  }>(`/actions/runs?head_sha=${sha}&per_page=100`);
+  // A PR edit re-triggers CI and cancels the run before it; only the newest counts.
+  const latest = workflow_runs.filter((run) => run.event === "pull_request").sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+  if (!latest || latest.status !== "completed") return "pending";
+  return latest.conclusion === "success" ? "green" : "red";
 };
 
 // ------------------------------------------------------------------ seeding
