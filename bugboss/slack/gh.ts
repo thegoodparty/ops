@@ -112,7 +112,7 @@ export const buildGhTool = (gh: GhExec | null): SlackAgentTool => ({
   description: [
     "Run the GitHub CLI, `gh`, as BugBoss's GitHub App -- the same access an incident agent has. Pass the arguments as an array, without the leading `gh`; there is no shell, so no pipes, redirects or quoting.",
     `The default repository is ${DEFAULT_GH_REPO}; pass --repo owner/name for any other.`,
-    "Examples: [\"pr\",\"view\",\"2265\",\"--json\",\"title,author,state,createdAt,mergedAt,headRefName,body,files,reviews\"], [\"pr\",\"list\",\"--search\",\"alert grouping\",\"--state\",\"all\",\"--limit\",\"10\",\"--json\",\"number,title,author,state\"], [\"run\",\"list\",\"--branch\",\"feat/x\",\"--limit\",\"5\"] for CI -- the App cannot read check runs, so `pr checks` and statusCheckRollup fail or come back empty; workflow runs are how CI is read.",
+    "Examples: [\"pr\",\"view\",\"2265\",\"--json\",\"title,author,state,createdAt,mergedAt,headRefName,body,files,reviews\"], [\"pr\",\"list\",\"--search\",\"alert grouping\",\"--state\",\"all\",\"--limit\",\"10\",\"--json\",\"number,title,author,state\"], [\"pr\",\"checks\",\"2265\"] or [\"run\",\"list\",\"--branch\",\"feat/x\",\"--limit\",\"5\"] for CI.",
     `At most ${MAX_GH_OUTPUT_CHARS} characters come back; a call that prints more is refused whole, not cut, so ask for specific --json fields rather than everything.`,
     "auth, alias, extension and config are refused.",
   ].join(" "),
