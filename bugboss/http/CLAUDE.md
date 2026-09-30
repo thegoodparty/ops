@@ -77,6 +77,10 @@ directives it has not read.
 `POST /incidents/:id/boss-inbox` is the only way anything an agent writes
 leaves it for a person, and nothing on the loopback app posts to Slack. It
 commits the row, then calls `wakeBoss`, so a Boss run started by the wake
-always finds it. `GET /incidents/:id/boss-inbox/escalations` counts the
+always finds it. An escalation marked `ownBrief` is the agent's own `escalate`
+and also calls `noteEscalated`, because a real child reaches this route with
+no dispatcher in the call, and without it the deadline posts a placeholder
+brief over the agent's. The harness's rungs while it waits are not marked.
+`GET /incidents/:id/boss-inbox/escalations` counts the
 escalations already sent, which is what the unanswered-question ladder
 reads its gap from across a restart.

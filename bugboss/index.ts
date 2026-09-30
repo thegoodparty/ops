@@ -996,6 +996,19 @@ export const createBugBoss = async (
               : null,
           });
           opened++;
+          // An agent can write to the Boss before its incident has a thread,
+          // and the wake for that row found nowhere to answer. Now there is.
+          const unseen = db.get(
+            "SELECT 1 FROM boss_inbox WHERE incidentId = ? AND seenAt IS NULL LIMIT 1",
+            [row.id],
+          );
+          if (unseen) {
+            void slackAgent
+              .handleIncident({ incidentId: row.id, trigger: { kind: "inbox" } })
+              .catch((err: unknown) =>
+                alarm("boss_wake_failed", { incidentId: row.id, error: String(err) }),
+              );
+          }
         } catch (err) {
           alarm("open_post_failed", { incidentId: row.id, error: String(err) });
         }

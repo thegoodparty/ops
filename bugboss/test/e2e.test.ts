@@ -1088,6 +1088,34 @@ test("a thread that failed to open is opened on the next pass", async () => {
   assert.ok(threadOf(incidentId), "a refused post costs a delay, not the thread");
 });
 
+/**
+ * An agent can write to the Boss before its incident has a thread, and the
+ * wake for that row has nowhere to answer. Opening the thread is what gives
+ * it one, so opening it is what wakes the Boss.
+ */
+test("an agent's message sent before its thread opened reaches the Boss once it opens", async () => {
+  fakeSlack.failNextPost = true;
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "slack is down" });
+  await boss.ingest("grafana", grafanaBody("fp-61", "threadless-errors"));
+  const incidentId = incidentOf("fp-61")!;
+  assert.equal(threadOf(incidentId), null, "the premise: no thread yet");
+
+  const said = "The webhook secret rotated at 09:10 and every failure starts then.";
+  const askedBefore = fakeSlackAgent.asked.length;
+  let shown = "";
+  fakeSlackAgent.script = async (req) => {
+    shown = req.input;
+    return "";
+  };
+  await bossClientFor(incidentId, boss.mintToken(incidentId)).tellBoss("message", said);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fakeSlackAgent.asked.length, askedBefore, "and the wake found no thread to run in");
+
+  assert.ok((await boss.ensureIncidentThreads()) >= 1);
+  await until(() => shown !== "", "the Boss to run once the thread opened");
+  assert.ok(shown.includes(said), "on the row that was waiting for it");
+});
+
 // --- Slack cannot hold anything open ---------------------------------------
 
 test("a Slack call that never answers is bounded, not silently queued", async () => {

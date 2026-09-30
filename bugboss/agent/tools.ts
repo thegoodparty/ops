@@ -160,7 +160,12 @@ const eitherSignal = (
  * woken; whether anybody is told, who, and in what words is its decision.
  */
 export interface BossInboxPort {
-  tellBoss(kind: BossInboxKind, text: string): Promise<void>;
+  /**
+   * `ownBrief` marks the agent's own escalation, as opposed to one the
+   * harness sends while it waits, so the dispatcher's deadline does not post
+   * a placeholder brief over it.
+   */
+  tellBoss(kind: BossInboxKind, text: string, options?: { ownBrief?: boolean }): Promise<void>;
   /**
    * The escalations already sent up for this incident since `since`. Read
    * back from the inbox itself, so the ladder on an unanswered question

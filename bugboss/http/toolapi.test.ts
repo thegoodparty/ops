@@ -253,17 +253,25 @@ test("the Boss is woken only once the row it is woken for is committed", async (
   assert.equal(wakes[0].unseen[0].seenAt, null);
 });
 
-test("an escalation tells the dispatcher, and nothing else sent up does", async () => {
+test("the agent's own escalation brief tells the dispatcher, and nothing else sent up does", async () => {
   await clearInbox();
   escalationsNoted.length = 0;
 
   for (const kind of ["message", "question"]) {
-    assert.equal((await sendToBoss({ kind, text: `a ${kind}` })).status, 200);
+    assert.equal((await sendToBoss({ kind, text: `a ${kind}`, ownBrief: true })).status, 200);
   }
-  assert.deepEqual(escalationsNoted, [], "the premise: a message or question is not one");
+  assert.equal(
+    (await sendToBoss({ kind: "escalation", text: "still waiting on a person, 2h" })).status,
+    200,
+  );
+  assert.deepEqual(
+    escalationsNoted,
+    [],
+    "the premise: a message, a question and a harness rung are not the agent's brief",
+  );
 
   assert.equal(
-    (await sendToBoss({ kind: "escalation", text: "needs a person" })).status,
+    (await sendToBoss({ kind: "escalation", text: "needs a person", ownBrief: true })).status,
     200,
   );
   assert.deepEqual(escalationsNoted, [INCIDENT]);

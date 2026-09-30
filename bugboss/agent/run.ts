@@ -413,8 +413,12 @@ export const createBossClient = (args: {
     recordWait: (command) => call<PendingWait>("POST", "/pending-wait", { command }),
     recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
     clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
-    tellBoss: (kind, text) =>
-      call<{ id: number }>("POST", "/boss-inbox", { kind, text }).then(() => undefined),
+    tellBoss: (kind, text, options) =>
+      call<{ id: number }>("POST", "/boss-inbox", {
+        kind,
+        text,
+        ownBrief: options?.ownBrief === true,
+      }).then(() => undefined),
     escalationsSince: (since) =>
       call<{ count: number; lastAt: number | null }>(
         "GET",
@@ -643,10 +647,21 @@ export const createBossTools = async (args: {
       }),
       execute: async (_id: string, params: unknown) => {
         const { reason, brief } = params as { reason: string; brief: string };
-        await args.boss.tellBoss("escalation", `${reason}\n\n${brief}`);
+        await args.boss.tellBoss("escalation", `${reason}\n\n${brief}`, { ownBrief: true });
+        // The inbox route drains nothing, and a stop or merge waiting behind
+        // this call has to end the run on this turn like any other tool's.
+        const { directives = [] } = await args.api.getIncident();
         return {
-          content: [{ type: "text" as const, text: "ok: the Boss has your escalation and brief." }],
+          content: [
+            {
+              type: "text" as const,
+              text: `ok: the Boss has your escalation and brief.${renderDirectives(directives)}`,
+            },
+          ],
           details: undefined,
+          terminate: directives.some(
+            (directive) => directive.type === "stop" || directive.type === "merged",
+          ),
         };
       },
     },
