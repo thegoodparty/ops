@@ -1,8 +1,8 @@
-import type { Transcript, Turn } from "./transcript";
+import type { Trace, Ttl, Turn } from "./trace";
 
-export type Ttl = "5m" | "1h";
+export type { Ttl };
 
-/** Dollars per token, derived from the transcripts' own cost fields. */
+/** Dollars per token, by token class. */
 export interface Rates {
   input: number;
   output: number;
@@ -10,6 +10,40 @@ export interface Rates {
   cacheWrite5m: number;
   cacheWrite1h: number;
 }
+
+const perMillion = (rates: Rates): Rates => ({
+  input: rates.input / 1e6,
+  output: rates.output / 1e6,
+  cacheRead: rates.cacheRead / 1e6,
+  cacheWrite5m: rates.cacheWrite5m / 1e6,
+  cacheWrite1h: rates.cacheWrite1h / 1e6,
+});
+
+/**
+ * The eval's own price table, per model, in dollars per million tokens. It is
+ * not read from Pi's catalog, so a trace from any source prices the same way.
+ * The values were derived from the per-turn `cost` fields of the 20 incident
+ * transcripts on 2026-09-29, every turn matching to 0.00%; `deriveRates`
+ * re-derives them from whatever corpus is loaded, and the report shows any
+ * drift from this table.
+ */
+export const PRICE_TABLE: Record<string, Rates> = {
+  "us.anthropic.claude-opus-5": perMillion({
+    input: 5.5,
+    output: 27.5,
+    cacheRead: 0.55,
+    cacheWrite5m: 6.875,
+    cacheWrite1h: 11,
+  }),
+};
+
+export const ratesFor = (model: string): Rates => {
+  const rates = PRICE_TABLE[model];
+  if (!rates) {
+    throw new Error(`no price for model ${JSON.stringify(model)} in PRICE_TABLE`);
+  }
+  return rates;
+};
 
 export interface RateDerivation {
   rates: Rates;
@@ -28,23 +62,10 @@ export interface Tokens {
   writeTtl: Ttl;
 }
 
-/**
- * Runs before about 02:35 UTC 2026-09-29 went through the Converse path, whose
- * effective cache TTL was five minutes. The `api` field names the path, and
- * the timestamp is the fallback for a turn that does not carry it.
- */
-export const INVOKE_MODEL_CUTOVER = Date.parse("2026-09-29T02:35:00Z");
-
-export const ttlOf = (turn: Turn): Ttl => {
-  if (turn.api.includes("converse")) return "5m";
-  if (turn.api.includes("invoke")) return "1h";
-  return turn.startedAt < INVOKE_MODEL_CUTOVER ? "5m" : "1h";
-};
-
 export const ttlMs = (ttl: Ttl): number =>
   ttl === "5m" ? 5 * 60_000 : 60 * 60_000;
 
-export const deriveRates = (transcripts: Transcript[]): RateDerivation => {
+export const deriveRates = (transcripts: Trace[]): RateDerivation => {
   const sums: Record<keyof Rates, { tokens: number; usd: number }> = {
     input: { tokens: 0, usd: 0 },
     output: { tokens: 0, usd: 0 },
@@ -130,7 +151,7 @@ export const recordedTokens = (turn: Turn): Tokens => ({
   output: turn.usage.output,
   cacheRead: turn.usage.cacheRead,
   cacheWrite: turn.usage.cacheWrite,
-  writeTtl: turn.usage.cacheWrite1h > 0 ? "1h" : ttlOf(turn),
+  writeTtl: turn.cacheTtl,
 });
 
 export const contextTokens = (tokens: Tokens): number =>

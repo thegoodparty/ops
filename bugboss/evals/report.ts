@@ -7,8 +7,8 @@ import {
   type Calibration,
   type ToolUse,
 } from "./prefix";
-import { deriveRates, type RateDerivation, type Rates } from "./price";
-import type { Transcript } from "./transcript";
+import { deriveRates, ratesFor, type RateDerivation, type Rates } from "./price";
+import type { Trace } from "./trace";
 import {
   frozenUsd,
   keepAlive,
@@ -98,7 +98,7 @@ const minutes = (ms: number) =>
   ms >= 3_600_000 ? `${(ms / 3_600_000).toFixed(1)}h` : `${Math.round(ms / 60_000)}m`;
 
 export const prefixTokensFor = (
-  transcript: Transcript,
+  transcript: Trace,
   tools: ToolUse,
   scenario: PrefixScenario,
 ): { docs: number; tools: number; total: number } => {
@@ -112,7 +112,7 @@ export const prefixTokensFor = (
 };
 
 export const levers = (
-  transcripts: Transcript[],
+  transcripts: Trace[],
   rates: Rates,
   options: ReportOptions,
 ): Lever[] => {
@@ -121,7 +121,7 @@ export const levers = (
     name: string,
     outcomeCanChange: boolean,
     variant: (
-      transcript: Transcript,
+      transcript: Trace,
       scenario: "low" | "central" | "high",
     ) => ReturnType<typeof todayWorld>,
   ): Lever => ({
@@ -180,11 +180,15 @@ const rangeOf = (runs: LeverRun[]) => {
 };
 
 export const renderReport = (
-  transcripts: Transcript[],
+  transcripts: Trace[],
   options?: Partial<ReportOptions>,
 ): string => {
   const derivation: RateDerivation = deriveRates(transcripts);
-  const { rates } = derivation;
+  const models = [...new Set(transcripts.map((t) => t.model))];
+  if (models.length !== 1) {
+    throw new Error(`one model per report, got ${models.join(", ")}`);
+  }
+  const rates = ratesFor(models[0]);
   const calibration = calibrate(transcripts);
   const opts = { ...defaultOptions(calibration), ...options };
   const cards: Scorecard[] = transcripts.map((t) => measure(t, rates));
@@ -230,10 +234,12 @@ export const renderReport = (
     "",
     "## Assumptions",
     "",
-    "### Rates, derived from the transcripts' own cost fields",
+    `### Rates for ${models[0]}`,
     "",
-    "| Category | Rate | Tokens behind it |",
-    "| --- | --- | --- |",
+    "From the eval's own price table (\`price.ts\`), checked against rates re-derived from this corpus's per-turn cost fields.",
+    "",
+    "| Category | Table rate | Derived from corpus | Tokens behind it |",
+    "| --- | --- | --- | --- |",
     ...(
       [
         ["Input", "input"],
@@ -244,10 +250,10 @@ export const renderReport = (
       ] as const
     ).map(
       ([label, key]) =>
-        `| ${label} | ${perM(rates[key])} | ${derivation.tokens[key].toLocaleString("en-US")} |`,
+        `| ${label} | ${perM(rates[key])} | ${derivation.tokens[key] ? perM(derivation.rates[key]) : "-"} | ${derivation.tokens[key].toLocaleString("en-US")} |`,
     ),
     "",
-    `Largest single-turn deviation from these rates: ${(derivation.maxDeviation * 100).toFixed(2)}%. Re-pricing every recorded turn with them gives ${usd(repriced)} against ${usd(recorded)} recorded.`,
+    `Largest single-turn deviation from the derived rates: ${(derivation.maxDeviation * 100).toFixed(2)}%. Re-pricing every recorded turn with the table gives ${usd(repriced)} against ${usd(recorded)} recorded.`,
     "",
     "### Keep-alive",
     "",

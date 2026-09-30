@@ -2,12 +2,11 @@ import {
   priceTokens,
   recordedTokens,
   ttlMs,
-  ttlOf,
   type PricedTokens,
   type Rates,
   type Ttl,
 } from "./price";
-import { contextOf, isBilled, type Transcript, type Turn } from "./transcript";
+import { contextOf, isBilled, type Trace, type Turn } from "./trace";
 
 export type Phase = "investigate" | "fix" | "post_pr";
 
@@ -47,7 +46,7 @@ const opensPr = (turn: Turn) =>
       ),
   );
 
-export const milestones = (transcript: Transcript): Milestones => ({
+export const milestones = (transcript: Trace): Milestones => ({
   rootCauseTurn:
     transcript.turns.find((turn) => accepted(turn, "report_root_cause"))
       ?.index ?? null,
@@ -91,7 +90,7 @@ export interface TurnContext {
  * happened in between: how long, whether the process was relaunched, and
  * whether a block_binding crash loop sat in that gap.
  */
-export const billedTurns = (transcript: Transcript): TurnContext[] => {
+export const billedTurns = (transcript: Trace): TurnContext[] => {
   const out: TurnContext[] = [];
   let previous: Turn | null = null;
   for (const turn of transcript.turns) {
@@ -110,7 +109,7 @@ export const billedTurns = (transcript: Transcript): TurnContext[] => {
           (other) =>
             other.startedAt >= since &&
             other.startedAt <= turn.startedAt &&
-            (other.errorMessage ?? "").includes(BLOCK_BINDING),
+            (other.error ?? "").includes(BLOCK_BINDING),
         ));
     out.push({
       turn,
@@ -133,7 +132,7 @@ export const coldCause = (entry: TurnContext): ColdCause => {
   if (entry.previous === null) return "session_start";
   if (entry.crashLoopBefore) return "relaunch_after_crash_loop";
   if (entry.relaunched) return "relaunch";
-  if (entry.gapMs > ttlMs(ttlOf(entry.turn))) {
+  if (entry.gapMs > ttlMs(entry.turn.cacheTtl)) {
     return entry.previous.toolCalls.some((call) => WAIT_TOOLS.has(call.name))
       ? "wait_over_ttl"
       : "slow_tool_over_ttl";
@@ -142,7 +141,7 @@ export const coldCause = (entry: TurnContext): ColdCause => {
 };
 
 export const coldStarts = (
-  transcript: Transcript,
+  transcript: Trace,
   rates: Rates,
 ): ColdStart[] =>
   billedTurns(transcript)
@@ -151,7 +150,7 @@ export const coldStarts = (
       turn: entry.turn.index,
       cause: coldCause(entry),
       gapMs: entry.gapMs,
-      ttl: ttlOf(entry.turn),
+      ttl: entry.turn.cacheTtl,
       writeTokens: entry.turn.usage.cacheWrite,
       writeUsd: priceTokens(recordedTokens(entry.turn), rates).cacheWrite,
       afterTools: entry.previous?.toolCalls.map((call) => call.name) ?? [],
@@ -180,7 +179,7 @@ export interface DuplicateGroup {
  * The same tool with the same canonical arguments, called more than once in a
  * run. Polling tools are left out: calling them again is their purpose.
  */
-export const duplicateCalls = (transcript: Transcript): DuplicateGroup[] => {
+export const duplicateCalls = (transcript: Trace): DuplicateGroup[] => {
   const seen = new Map<string, DuplicateGroup>();
   for (const turn of transcript.turns) {
     for (const call of turn.toolCalls) {
@@ -209,7 +208,7 @@ export interface Refusals {
   usd: number;
 }
 
-export const refusals = (transcript: Transcript, rates: Rates): Refusals => {
+export const refusals = (transcript: Trace, rates: Rates): Refusals => {
   const byTool: Record<string, number> = {};
   const streaks = new Map<string, number[]>();
   const loops: RefusalLoop[] = [];
@@ -258,7 +257,7 @@ export interface Harness {
   crashLoopRelaunchTurns: number[];
 }
 
-export const harness = (transcript: Transcript, rates: Rates): Harness => {
+export const harness = (transcript: Trace, rates: Rates): Harness => {
   const loopTurns = billedTurns(transcript).filter(
     (entry) => entry.crashLoopBefore && isCold(entry.turn),
   );
@@ -266,7 +265,7 @@ export const harness = (transcript: Transcript, rates: Rates): Harness => {
     errorTurns: transcript.turns.filter((turn) => turn.stopReason === "error")
       .length,
     blockBindingTurns: transcript.turns.filter((turn) =>
-      (turn.errorMessage ?? "").includes(BLOCK_BINDING),
+      (turn.error ?? "").includes(BLOCK_BINDING),
     ).length,
     crashLoopRelaunchUsd: loopTurns.reduce(
       (sum, entry) =>
@@ -288,7 +287,7 @@ export interface ContextProfile {
 }
 
 export const contextProfile = (
-  transcript: Transcript,
+  transcript: Trace,
   marks: Milestones,
 ): ContextProfile => {
   const billed = transcript.turns.filter(isBilled);
@@ -351,7 +350,7 @@ export interface Scorecard {
   ttls: Record<Ttl, number>;
 }
 
-export const measure = (transcript: Transcript, rates: Rates): Scorecard => {
+export const measure = (transcript: Trace, rates: Rates): Scorecard => {
   const marks = milestones(transcript);
   const byPhase: Scorecard["byPhase"] = {
     investigate: { usd: 0, turns: 0 },
@@ -366,7 +365,7 @@ export const measure = (transcript: Transcript, rates: Rates): Scorecard => {
     const phase = byPhase[phaseOf(turn.index, marks)];
     phase.usd += priced.total;
     phase.turns += 1;
-    if (isBilled(turn)) ttls[ttlOf(turn)] += 1;
+    if (isBilled(turn)) ttls[turn.cacheTtl] += 1;
   }
   const exits: Record<string, number> = {};
   for (const exit of transcript.exits) {

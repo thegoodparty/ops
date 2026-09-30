@@ -1,4 +1,4 @@
-import { parseTranscript } from "./transcript";
+import { parsePiSession } from "./adapters/pi-session";
 
 /**
  * Tiny synthetic Pi session transcripts for the evals tests. Real transcripts
@@ -166,7 +166,7 @@ export const fixture = (options?: {
  * crash, then goes cold with no gap at all.
  */
 export const postPrRun = () =>
-  parseTranscript(
+  parsePiSession(
     "a",
     fixture()
       .launch(0)

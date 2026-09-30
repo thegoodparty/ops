@@ -1,4 +1,4 @@
-import { contextOf, isBilled, type Transcript } from "./transcript";
+import { contextOf, isBilled, type Trace } from "./trace";
 
 export interface EmbeddedDoc {
   path: string;
@@ -60,7 +60,7 @@ export interface ToolUse {
   unmeasured: string[];
 }
 
-export const grafanaToolUse = (transcripts: Transcript[]): ToolUse => {
+export const grafanaToolUse = (transcripts: Trace[]): ToolUse => {
   const newest = [...transcripts].sort((a, b) => b.startedAt - a.startedAt)[0];
   const offered = (newest?.toolNames ?? [])
     .filter((name) => name.startsWith(GRAFANA_PREFIX))
@@ -102,7 +102,7 @@ export interface Calibration {
  * written on that turn is then the system prompt plus the kickoff message,
  * which measures characters per token on our own prompt.
  */
-export const calibrate = (transcripts: Transcript[]): Calibration => {
+export const calibrate = (transcripts: Trace[]): Calibration => {
   const charsPerToken: number[] = [];
   const toolBlockTokens: number[] = [];
   for (const transcript of transcripts) {

@@ -1,67 +1,31 @@
 import { readFile } from "node:fs/promises";
 
-export interface Usage {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cacheWrite1h: number;
-  cost: {
-    input: number;
-    output: number;
-    cacheRead: number;
-    cacheWrite: number;
-    total: number;
-  };
-}
+import {
+  isRefusal,
+  type Trace,
+  type Ttl,
+  type Turn,
+  type Usage,
+} from "../trace";
 
-export interface ToolCall {
-  id: string;
-  name: string;
-  args: Record<string, unknown>;
-}
+/**
+ * Reads Pi's session.jsonl into a Trace. Everything Pi-specific about the
+ * format stays in this file.
+ */
 
-export interface ToolResult {
-  toolCallId: string;
-  toolName: string;
-  text: string;
-  isError: boolean;
-  /**
-   * Our tools refuse a call by returning text that starts `error:` with
-   * `isError: false`, so a check keyed on `isError` alone misses every one.
-   */
-  refused: boolean;
-}
+/**
+ * Runs before about 02:35 UTC 2026-09-29 went through the Converse path, whose
+ * effective cache TTL was five minutes; after it, InvokeModel, which honours
+ * the 1h TTL. Pi records the path in `api`, and the timestamp is the fallback
+ * for a turn that does not carry it.
+ */
+export const INVOKE_MODEL_CUTOVER = Date.parse("2026-09-29T02:35:00Z");
 
-export interface Turn {
-  index: number;
-  entryId: string;
-  startedAt: number;
-  api: string;
-  stopReason: string;
-  errorMessage: string | null;
-  usage: Usage;
-  toolCalls: ToolCall[];
-  results: ToolResult[];
-  launch: number;
-}
-
-export interface Exit {
-  at: number;
-  reason: string;
-  error: string | null;
-  launch: number;
-}
-
-export interface Transcript {
-  id: string;
-  startedAt: number;
-  systemPrompt: string;
-  toolNames: string[];
-  turns: Turn[];
-  exits: Exit[];
-  launches: number;
-}
+export const cacheTtlOf = (api: string, startedAt: number): Ttl => {
+  if (api.includes("converse")) return "5m";
+  if (api.includes("invoke")) return "1h";
+  return startedAt < INVOKE_MODEL_CUTOVER ? "5m" : "1h";
+};
 
 type Json = Record<string, unknown>;
 
@@ -94,18 +58,16 @@ const resultText = (content: unknown): string =>
         .join("\n")
     : "";
 
-export const isRefusal = (text: string, isError: boolean): boolean =>
-  isError || text.trimStart().startsWith("error:");
-
-export const parseTranscript = (id: string, jsonl: string): Transcript => {
+export const parsePiSession = (id: string, jsonl: string): Trace => {
   const entries = jsonl
     .split("\n")
     .filter((line) => line.trim() !== "")
     .map((line) => JSON.parse(line) as Json);
 
-  const transcript: Transcript = {
+  const transcript: Trace = {
     id,
     startedAt: 0,
+    model: "",
     systemPrompt: "",
     toolNames: [],
     turns: [],
@@ -123,6 +85,11 @@ export const parseTranscript = (id: string, jsonl: string): Transcript => {
       const data = entry.data as Json;
       transcript.systemPrompt = String(data.systemPrompt ?? "");
       transcript.toolNames = (data.toolNames as string[]) ?? [];
+      if (typeof data.modelId === "string") transcript.model = data.modelId;
+      continue;
+    }
+    if (entry.type === "model_change" && typeof entry.modelId === "string") {
+      transcript.model ||= entry.modelId;
       continue;
     }
     if (entry.type === "custom" && entry.customType === "bugboss_exit") {
@@ -143,15 +110,22 @@ export const parseTranscript = (id: string, jsonl: string): Transcript => {
     }
     if (message.role === "assistant") {
       const content = (message.content as Json[]) ?? [];
+      const startedAt =
+        num(message.timestamp) || Date.parse(String(entry.timestamp));
+      const usage = parseUsage(message.usage);
       const turn: Turn = {
         index: transcript.turns.length + 1,
-        entryId: String(entry.id),
-        startedAt: num(message.timestamp) || Date.parse(String(entry.timestamp)),
-        api: String(message.api ?? ""),
+        id: String(entry.id),
+        startedAt,
+        model: String(message.model ?? transcript.model),
+        cacheTtl:
+          usage.cacheWrite1h > 0
+            ? "1h"
+            : cacheTtlOf(String(message.api ?? ""), startedAt),
         stopReason: String(message.stopReason ?? ""),
-        errorMessage:
+        error:
           typeof message.errorMessage === "string" ? message.errorMessage : null,
-        usage: parseUsage(message.usage),
+        usage,
         toolCalls: content
           .filter((part) => part.type === "toolCall")
           .map((part) => ({
@@ -182,13 +156,8 @@ export const parseTranscript = (id: string, jsonl: string): Transcript => {
   return transcript;
 };
 
-export const readTranscript = async (
+export const readPiSession = async (
   path: string,
   id = path.replace(/^.*\//, "").replace(/\.jsonl$/, ""),
-): Promise<Transcript> => parseTranscript(id, await readFile(path, "utf8"));
+): Promise<Trace> => parsePiSession(id, await readFile(path, "utf8"));
 
-export const contextOf = (usage: Usage): number =>
-  usage.input + usage.cacheRead + usage.cacheWrite;
-
-/** A turn the provider billed. Error turns in the crash loop bill nothing. */
-export const isBilled = (turn: Turn): boolean => contextOf(turn.usage) > 0;

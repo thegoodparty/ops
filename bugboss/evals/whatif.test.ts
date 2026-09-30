@@ -5,11 +5,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { main } from "./cli";
-import { fixture, postPrRun, RATES_PER_M } from "./fixtures";
+import { fixture, postPrRun } from "./fixtures";
 import { billedTurns, coldCause, isCold, milestones } from "./metrics";
-import { contextTokens, deriveRates, type Rates } from "./price";
+import { contextTokens, deriveRates, ratesFor, type Rates } from "./price";
 import { renderReport } from "./report";
-import { parseTranscript } from "./transcript";
+import { parsePiSession } from "./adapters/pi-session";
 import {
   keepAlive,
   phaseReset,
@@ -20,19 +20,13 @@ import {
   type PhaseReset,
 } from "./whatif";
 
-const RATES: Rates = {
-  input: RATES_PER_M.input / 1e6,
-  output: RATES_PER_M.output / 1e6,
-  cacheRead: RATES_PER_M.cacheRead / 1e6,
-  cacheWrite5m: RATES_PER_M.cacheWrite5m / 1e6,
-  cacheWrite1h: RATES_PER_M.cacheWrite1h / 1e6,
-};
+const RATES: Rates = ratesFor("us.anthropic.claude-opus-5");
 
 const close = (actual: number, expected: number) =>
   assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} !== ${expected}`);
 
 test("today's world turns a 5m-TTL miss inside an hour warm and writes at the 1h rate", () => {
-  const run = parseTranscript(
+  const run = parsePiSession(
     "t",
     fixture()
       .launch(0)
@@ -125,7 +119,7 @@ test("prefix trim takes the tokens from the read on warm turns and the write on 
 });
 
 const resetRun = () =>
-  parseTranscript(
+  parsePiSession(
     "r",
     fixture()
       .launch(0)
@@ -188,7 +182,7 @@ test("a gated reset skips a milestone whose context is under the gate", () => {
 });
 
 test("a run that never reaches a milestone is priced the same with a reset", () => {
-  const run = parseTranscript(
+  const run = parsePiSession(
     "n",
     fixture()
       .launch(0)

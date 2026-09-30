@@ -10,12 +10,11 @@ import {
   priceTokens,
   recordedTokens,
   ttlMs,
-  ttlOf,
   type PricedTokens,
   type Rates,
   type Tokens,
 } from "./price";
-import { contextOf, isBilled, type Transcript } from "./transcript";
+import { contextOf, isBilled, type Trace } from "./trace";
 
 /**
  * One priced world: a token count for every recorded turn (zero for turns
@@ -38,7 +37,7 @@ const EMPTY: Tokens = {
 
 const cached = (tokens: Tokens) => tokens.cacheRead + tokens.cacheWrite;
 
-const byIndex = (transcript: Transcript) => {
+const byIndex = (transcript: Trace) => {
   const map = new Map<number, TurnContext>();
   for (const entry of billedTurns(transcript)) map.set(entry.turn.index, entry);
   return map;
@@ -52,7 +51,7 @@ const byIndex = (transcript: Transcript) => {
  * frozen: that loop is fixed, and its cost is reported on its own rather than
  * credited to any lever.
  */
-export const todayWorld = (transcript: Transcript): World => {
+export const todayWorld = (transcript: Trace): World => {
   const entries = byIndex(transcript);
   const turns = transcript.turns.map((turn) =>
     isBilled(turn) ? { ...recordedTokens(turn), writeTtl: "1h" as const } : EMPTY,
@@ -62,7 +61,7 @@ export const todayWorld = (transcript: Transcript): World => {
     const slot = index - 1;
     if (entry.crashLoopBefore && isCold(entry.turn)) frozen[slot] = true;
     if (
-      ttlOf(entry.turn) === "5m" &&
+      entry.turn.cacheTtl === "5m" &&
       isCold(entry.turn) &&
       entry.previous !== null &&
       !entry.relaunched &&
@@ -96,7 +95,7 @@ export interface KeepAlive {
  * relaunch gap gets no pings: no process is alive to send them.
  */
 export const keepAlive = (
-  transcript: Transcript,
+  transcript: Trace,
   base: World,
   policy: KeepAlive,
 ): World => {
@@ -175,7 +174,7 @@ export interface PhaseReset {
  * cold write of the new session, and some re-orientation turns.
  */
 export const phaseReset = (
-  transcript: Transcript,
+  transcript: Trace,
   base: World,
   policy: PhaseReset,
 ): World => {

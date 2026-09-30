@@ -14,8 +14,9 @@ import {
   phaseOf,
   refusals,
 } from "./metrics";
-import { deriveRates } from "./price";
-import { parseTranscript } from "./transcript";
+import { deriveRates, PRICE_TABLE, ratesFor } from "./price";
+import type { Trace } from "./trace";
+import { parsePiSession } from "./adapters/pi-session";
 
 test("a result that starts error: is a refusal even though isError is false", () => {
   const run = postPrRun();
@@ -37,7 +38,7 @@ test("the parser links results to calls and counts launches and exits", () => {
 test("rates come back out of the transcripts' own cost fields", () => {
   const { rates } = deriveRates([
     postPrRun(),
-    parseTranscript(
+    parsePiSession(
       "b",
       fixture()
         .launch(0)
@@ -80,7 +81,7 @@ test("cold starts are attributed to what happened in the gap", () => {
 
 test("the TTL follows the request path: 10 minutes is over TTL on Converse only", () => {
   const build = (api: "bedrock-invoke-model" | "bedrock-converse-stream") =>
-    parseTranscript(
+    parsePiSession(
       api,
       fixture()
         .launch(0)
@@ -108,7 +109,7 @@ test("refusals of one tool in a row form a loop even with other tools between", 
 });
 
 test("duplicates ignore key order and leave polling tools out", () => {
-  const run = parseTranscript(
+  const run = parsePiSession(
     "d",
     fixture()
       .launch(0)
@@ -146,4 +147,44 @@ test("crash-loop turns are counted as harness, not as agent cost", () => {
   const card = measure(run, rates);
   assert.equal(card.exits["turn_error (block_binding)"], 1);
   assert.ok(Math.abs(card.recordedUsd - card.repricedUsd) < 1e-9);
+});
+
+test("the eval's price table matches the rates the transcripts' cost fields imply", () => {
+  const { rates } = deriveRates([postPrRun()]);
+  const table = ratesFor("us.anthropic.claude-opus-5");
+  assert.ok(Math.abs(rates.cacheRead - table.cacheRead) < 1e-15);
+  assert.ok(Math.abs(rates.cacheWrite1h - table.cacheWrite1h) < 1e-15);
+  assert.ok(Math.abs(rates.output - table.output) < 1e-15);
+  assert.equal(Object.keys(PRICE_TABLE).length, 1);
+  assert.throws(() => ratesFor("some-other-model"), /no price/);
+});
+
+test("measure runs on a trace built without the Pi adapter", () => {
+  const usage = (read: number, write: number) => ({
+    input: 2,
+    output: 100,
+    cacheRead: read,
+    cacheWrite: write,
+    cacheWrite1h: write,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  });
+  const trace: Trace = {
+    id: "proxy",
+    startedAt: 0,
+    model: "us.anthropic.claude-opus-5",
+    systemPrompt: "",
+    toolNames: [],
+    exits: [],
+    launches: 1,
+    turns: [
+      { index: 1, id: "r1", startedAt: 0, model: "us.anthropic.claude-opus-5", cacheTtl: "1h", stopReason: "toolUse", error: null, usage: usage(0, 70_000), toolCalls: [{ id: "c1", name: "monitor", args: {} }], results: [{ toolCallId: "c1", toolName: "monitor", text: "ok", isError: false, refused: false }], launch: 0 },
+      { index: 2, id: "r2", startedAt: 2 * 3_600_000, model: "us.anthropic.claude-opus-5", cacheTtl: "1h", stopReason: "toolUse", error: null, usage: usage(0, 71_000), toolCalls: [], results: [], launch: 0 },
+    ],
+  };
+  const card = measure(trace, ratesFor(trace.model));
+  assert.deepEqual(
+    card.cold.map((cold) => cold.cause),
+    ["session_start", "wait_over_ttl"],
+  );
+  assert.ok(card.repricedUsd > 0);
 });

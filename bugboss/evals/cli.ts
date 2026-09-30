@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { renderReport } from "./report";
-import { parseTranscript, readTranscript, type Transcript } from "./transcript";
+import { parsePiSession, readPiSession } from "./adapters/pi-session";
+import type { Trace } from "./trace";
 
 const USAGE = `Usage: npx tsx bugboss/evals/cli.ts [--out report.md] [--focus 2,3,5] <source>...
 
@@ -16,7 +17,7 @@ eval "$(aws configure export-credentials --format env)" first.`;
 
 const DEFAULT_BUCKET = "bugboss-prod";
 
-const fromS3 = async (client: S3Client, source: string): Promise<Transcript> => {
+const fromS3 = async (client: S3Client, source: string): Promise<Trace> => {
   const url = source.startsWith("s3://")
     ? source
     : `s3://${DEFAULT_BUCKET}/sessions/incident/${source.slice(3)}/session.jsonl`;
@@ -29,18 +30,18 @@ const fromS3 = async (client: S3Client, source: string): Promise<Transcript> => 
   const id = source.startsWith("s3:") && !source.startsWith("s3://")
     ? source.slice(3)
     : key[key.length - 2] ?? url;
-  return parseTranscript(id, body);
+  return parsePiSession(id, body);
 };
 
-const fromPath = async (path: string): Promise<Transcript[]> => {
+const fromPath = async (path: string): Promise<Trace[]> => {
   if ((await stat(path)).isDirectory()) {
     const names = (await readdir(path)).filter((name) => name.endsWith(".jsonl"));
-    return Promise.all(names.map((name) => readTranscript(join(path, name))));
+    return Promise.all(names.map((name) => readPiSession(join(path, name))));
   }
-  return [await readTranscript(path)];
+  return [await readPiSession(path)];
 };
 
-const byId = (a: Transcript, b: Transcript) => {
+const byId = (a: Trace, b: Trace) => {
   const [x, y] = [Number(a.id), Number(b.id)];
   return Number.isNaN(x) || Number.isNaN(y) ? a.id.localeCompare(b.id) : x - y;
 };
