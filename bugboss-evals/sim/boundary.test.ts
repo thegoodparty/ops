@@ -200,6 +200,11 @@ describe("egress lockdown", { skip: dockerAvailable ? false : "docker is not ava
         maxBuffer: 1 << 26,
       }).catch(() => undefined);
     }
+    // Verdaccio wrote the npm cache as its own uid, which this user cannot
+    // unlink on Linux, so the files go from inside a container.
+    await run("docker", ["run", "--rm", "--user", "0", "-v", `${workRoot}:/w`, "--entrypoint", "rm", "verdaccio/verdaccio:6.1.2", "-rf", "/w/_cache"], {
+      maxBuffer: 1 << 26,
+    }).catch(() => undefined);
     rmSync(workRoot, { recursive: true, force: true });
   });
 
