@@ -238,6 +238,7 @@ export const STAY_SILENT_TOOL = "stay_silent";
  * `stay_silent` and read by the run once the model is done.
  */
 export interface SilenceChoice {
+  allowed: boolean;
   reason: string | null;
 }
 
@@ -595,13 +596,13 @@ export const buildTools = ({
     {
       name: STAY_SILENT_TOOL,
       description:
-        "Post nothing in reply. Only in an incident thread or for an untagged message in a thread you are already in, and only for a message that is not for you -- people talking to each other. A message that tags you is always answered. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. Calling this ends the run: nothing more is read from you, whether or not you write anything else in this turn.",
+        "Post nothing in reply. Only in an incident thread or for an untagged message in a thread you are already in, and only when there is nothing for you to say: the message is not for you -- people talking to each other -- or a notice you just caused (a close, a merge, a page) is already the whole answer. A message that tags you is always answered. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. Calling this ends the run: nothing more is read from you, whether or not you write anything else in this turn.",
       inputSchema: {
         type: "object",
         properties: {
           reason: {
             type: "string",
-            description: "Why nothing here is for you, in one sentence.",
+            description: "Why there is nothing for you to say, in one sentence.",
           },
         },
         required: ["reason"],
@@ -609,6 +610,9 @@ export const buildTools = ({
       },
       run: (input) => {
         const reason = String(input.reason ?? "").trim();
+        if (!silence.allowed) {
+          return Promise.resolve("Refused: this message tags you, so it is always answered. Write your reply.");
+        }
         if (!reason) {
           return Promise.resolve("Refused: say why nothing here is for you. Nothing was recorded.");
         }
@@ -1240,7 +1244,7 @@ export class SlackAgent {
         [incidentId],
       );
 
-      const silence: SilenceChoice = { reason: null };
+      const silence: SilenceChoice = { allowed: true, reason: null };
       // The newest person in this run is who a report is filed for. A run
       // woken by the agent alone has nobody to attribute one to.
       const latest = humans.at(-1);
@@ -1442,7 +1446,7 @@ export class SlackAgent {
       // two people talking under a Boss answer, so there, as in an incident
       // thread, silence is allowed -- but only chosen with stay_silent.
       const allowSilence = mention.tagged === false;
-      const silence: SilenceChoice = { reason: null };
+      const silence: SilenceChoice = { allowed: allowSilence, reason: null };
       const tools = this.tools(silence, {
         user: mention.user,
         channel: mention.channel,
