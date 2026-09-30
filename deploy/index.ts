@@ -6,6 +6,7 @@ import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createBugBoss } from "./components/bugboss";
+import { createBugBossEvals } from "./components/bugboss-evals";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -60,11 +61,19 @@ export = async () => {
       })
     : undefined;
 
+  // Not gated on an image the way BugBoss is: the task definition names the
+  // mutable `runner` tag, which bugboss-eval.yml pushes before every eval, and
+  // nothing runs until that workflow starts a task.
+  const bugbossEvals = createBugBossEvals({ subnetIds: vpcSubnetIds.public });
+
   return {
     webhookUrl: webhook.url,
     clusterName: worker.cluster.name,
     logGroupName: worker.logGroup.name,
     playwrightReportsBucket: playwrightReports.bucket.bucket,
     bugbossUrl: bugboss?.url,
+    bugbossEvalsCluster: bugbossEvals.cluster.name,
+    bugbossEvalsTaskFamily: bugbossEvals.taskDefinition.family,
+    bugbossEvalsBucket: bugbossEvals.bucket.bucket,
   };
 };
