@@ -1,27 +1,15 @@
-// Rendering the closing report. Pure: data in, two strings out.
+// Rendering the closing report. Pure: data in, one Markdown string out, which
+// `pdf.ts` lays out as the PDF attached to the close notice.
 //
-// Two texts leave here and they are prepared for different readers, which is
-// the whole reason they are separate functions:
-//
-// - `renderReportDocument` is a Markdown file. Nothing is escaped, because
-//   nothing in Markdown is an entity that can swallow the rest of a document
-//   the way Slack's `<...>` swallows the rest of a message. A quoted log line
-//   containing `<`, `&` or `*` renders as itself or as emphasis; either way
-//   the reader still gets every byte after it. The one exception is a table
-//   cell, where an unescaped `|` silently starts a new column -- so `cell()`
-//   is the only escaping in this file, and it is applied nowhere else.
-//
-// - `renderThreadSummary` is mrkdwn, and goes out through `slack/format.ts`
-//   under the rules that file documents. Model prose reaching it -- the root
-//   cause line -- goes through `toMrkdwn`; every value is interpolated with
-//   the `mrkdwn` tag, which escapes it.
-//
-// Putting the escaping decision in one comment at the top of one file is
-// deliberate. The same root cause string goes down both paths, and a reader
-// working out which rules apply where is a reader about to get it wrong.
+// Nothing is escaped, because nothing in Markdown is an entity that can
+// swallow the rest of a document the way Slack's `<...>` swallows the rest of
+// a message. A quoted log line containing `<`, `&` or `*` renders as itself
+// or as emphasis; either way the reader still gets every byte after it. The
+// one exception is a table cell, where an unescaped `|` silently starts a new
+// column -- so `cell()` is the only escaping in this file, and it is applied
+// nowhere else.
 
 import type { Incident, RecurrenceAnalysis, RecurrenceCategory } from "../types";
-import { mrkdwn, raw, toMrkdwn } from "../slack/format";
 
 // ---------------------------------------------------------------------------
 // What a report is made of
@@ -521,7 +509,7 @@ const recurrence = (data: ReportData): string[] => {
 };
 
 /**
- * The whole report, as a Markdown file.
+ * The whole report, as Markdown.
  *
  * Ordered for someone who opens it once: the numbers first, then the cause,
  * then the write-up, then the evidence trail underneath. Nobody scrolls to a
@@ -563,84 +551,5 @@ export const renderReportDocument = (data: ReportData): string => {
     ...signalTable(data),
     ...actionTable(data),
     ...runTable(data, metrics),
-  ].join("\n");
-};
-
-// ---------------------------------------------------------------------------
-// The thread summary
-// ---------------------------------------------------------------------------
-
-/**
- * What goes in the thread beside the file.
- *
- * The thread has to read on a phone without opening anything, which is the
- * standard the rest of the incident thread already holds itself to. So this
- * is the numbers a person scanning the channel wants and one line of cause,
- * and everything else is in the file.
- */
-export const renderThreadSummary = (
-  data: ReportData,
-  note: string | null = null,
-): string => {
-  const { incident, run } = data;
-  const metrics = reportMetrics(data);
-
-  const facts = [
-    incident.usersImpacted === null
-      ? "impact not measured"
-      : `${count(incident.usersImpacted)} users impacted`,
-    interval(metrics.timeToDetectMs, {
-      measured: (length) => `detected in ${length}`,
-      absent: "time to detect not recorded",
-      backwards: () =>
-        "detection time inconsistent (impact recorded as starting after the signal)",
-      implausible: () =>
-        "detection time not usable (impact and the signal too far apart to be one incident)",
-    }),
-    interval(metrics.timeToResolveMs, {
-      measured: (length) => `resolved in ${length}`,
-      absent: "time to resolve not recorded",
-      backwards: () => "resolve time inconsistent (resolved before the signal)",
-      implausible: () =>
-        "resolve time not usable (the signal and the resolution too far apart to be one incident)",
-    }),
-  ].join(" · ");
-
-  const work = [
-    `${count(data.signals.length)} signal${data.signals.length === 1 ? "" : "s"}`,
-    ...(data.mergedIn.length > 0 ? [`${count(data.mergedIn.length)} merged in`] : []),
-    `${count(data.prs.length)} PR${data.prs.length === 1 ? "" : "s"}${
-      metrics.prsMerged > 0 ? ` (${metrics.prsMerged} merged)` : ""
-    }`,
-    `${count(run.attempts)} agent launch${run.attempts === 1 ? "" : "es"}`,
-  ].join(" · ");
-
-  const priced =
-    run.estimatedCostUsd === null || run.estimatedCostUsd === 0
-      ? ""
-      : ` (est. ${dollars(run.estimatedCostUsd)})`;
-  const spend = [
-    `${compact(metrics.totalTokens)} tokens`,
-    ...(run.turns === null ? [] : [`${count(run.turns)} turns`]),
-    `on ${run.modelId ?? "an unrecorded model"}${priced}`,
-  ].join(" · ");
-
-  // The whole cause. Two cuts used to sit here: 300 characters, and before
-  // that only the first line. Both are the one thing a summary must not do
-  // -- a cause that reads as a finished sentence and stops before the clause
-  // naming what broke is worse than no cause at all, and a reader cannot
-  // tell a short cause from a cut one. Past one message this splits, because
-  // the whole summary already goes out through `splitForSlack`.
-  const cause = incident.rootCause
-    ? toMrkdwn(incident.rootCause.trim())
-    : "No root cause was recorded.";
-
-  return [
-    mrkdwn`*Incident ${incident.id} — closing report*`,
-    mrkdwn`${raw(cause)}`,
-    mrkdwn`• ${facts}`,
-    mrkdwn`• ${work}`,
-    mrkdwn`• ${spend}`,
-    ...(note ? [mrkdwn`_${note}_`] : []),
   ].join("\n");
 };

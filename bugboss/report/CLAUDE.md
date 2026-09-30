@@ -1,8 +1,8 @@
 # report
 
 The document an incident ends with: every metric the system already holds,
-the post-mortem, and what the agent spent, in one file in the incident
-thread.
+the post-mortem, and what the agent spent, in one PDF attached to the notice
+that says the incident closed.
 
 ## It fires at CLOSED, not at RESOLVED
 
@@ -16,62 +16,55 @@ So resolution keeps the short post it already had ("resolved, here is the
 evidence, here is what shipped") and the document goes out at close. One
 incident, two moments, two different things worth saying.
 
-## Publishing is a notification, never part of the transition
+## A close is one message
 
-By the time anything here runs, `reportAnalysis` has committed and the agent
-has exited. There is no state to roll back and nothing useful to retry into,
-so **every failure below degrades and alarms** rather than propagating. A
-failed upload posts the whole report as thread text instead; a thread that
-will not take the text alarms and stops. The incident is closed either way.
+The close notice is the file's `initial_comment` on
+`files.completeUploadExternal`, so notice and report arrive together.
 
-## Why it runs after the agent, not inside the tool call
+Both close paths send it from the transition itself: `reportAnalysis` and
+`closeIncidentByBoss` call `announceClose` once their write has committed. It
+does not wait on the agent exiting or on any later model turn. The notice is
+derived from the row (`closeNoticeFor`), so a sweep that publishes for a
+container that died mid-close says exactly what the close would have.
+
+Publishing never undoes the close. Every failure is recorded, alarmed and
+retried; none propagates.
+
+## Tokens are as of the close
 
 The tokens the report quotes reach the incident row from `rollUpUsage`, which
-reads the session file **after the child exits**. At the moment
-`report_analysis` returns, the row still holds the previous launch's numbers —
-or zero for a first launch. So the composition root publishes from the launch's
-`finally`, after roll-up, and `publishPendingReports` sweeps up the incidents
-whose container died in between. Nothing relaunches an agent on a `CLOSED`
-incident, so without that sweep a badly-timed restart loses the report for
-good.
+reads the session file. The session syncs to S3 at the end of each turn, so
+`announceClose` rolls up first and gets everything but the turn that called
+`report_analysis` and any after it. The row catches up when the run exits;
+the report does not. That gap is the price of the close being one message
+sent at the moment it happens.
 
-The sweep waits out `REPORT_SWEEP_GRACE_MS` before touching anything, because
-an incident that closed seconds ago still has roll-up in flight and a report
-published ahead of it would quote zero tokens.
+## Claimed before it uploads, retried when it fails
 
-## Published once, marked before it posts
+The claim is an `incident_action` row (`report_published`), written **before**
+the upload in one guarded `INSERT`, because two publishers race (the close and
+the sweep) and a container that dies mid-upload must stay quiet rather than
+attach the file twice.
 
-The marker is an `incident_action` row (`report_published`), written **before**
-the upload, in one guarded `INSERT`, because a container that dies mid-post
-must stay quiet rather than post twice on the way back up. Two publishers do race
-in normal operation (the launch's `finally` and the tick's sweep), and the
-write queue plus the `NOT EXISTS` predicate inside the statement is what
-orders them.
+A failed attempt writes a `report_upload_failed` row and, in the same
+transaction, hands the claim back:
 
-Read and **rendered** before the claim, both for the same reason. The claim is
-durable and the sweep will not revisit an incident carrying one, so anything
-able to throw has to throw while the report can still be published later.
-Rendering is where hostile row data lands -- an on-call list that is not a
-list -- and the cost of doing it early is a wasted render when two publishers
-race, against a report lost for good. This is the failure that would not show
-up in the run that caused it: the marker persists, the next container sees it,
-and nothing is ever posted.
+- **The first failure** posts the close notice alone, with one line saying the
+  report is attaching shortly. The close is never silent because Slack would
+  not take a file.
+- **The sweep** (`publishPendingReports`, on the dispatcher tick) retries
+  `REPORT_UPLOAD_RETRY_MS` after the last failure. A retry that succeeds posts
+  the file on its own, with no comment, because the notice already went out.
+- **After `REPORT_UPLOAD_ATTEMPTS`** the claim is kept, `upload_abandoned`
+  alarms, and the thread gets one line saying the report is saved with the
+  incident. The attempt limit is also what bounds a row that cannot be
+  rendered: reading and rendering failures count as attempts.
 
-The claim is handed **back** in exactly one case: the thread took nothing at
-all. Then the marker asserts a report that does not exist, and it is the marker
-that stops the sweep ever returning -- so leaving it would lose the report for
-good. A retry cannot duplicate what never landed: re-posting can at worst
-say it twice, not posting cannot be recovered from at all. A *partial* post keeps its claim, and
-that is the case the ordering was always right about -- half a report somebody
-can read beats a duplicate they have to reconcile.
-
-A row this code cannot render is the other bounded case. Rendering is pure, so
-it fails identically on every tick, and the sweep takes the ten oldest
-unpublished closes -- ten rows like that and no report publishes again, with a
-pair of alarms repeating every thirty seconds as the only sign. So it is
-retried for `REPORT_GIVE_UP_MS` in case something repairs the row, and after
-that answered instead of repeated: the thread is told the report could not be
-written, which is the one thing a repeating alarm never does.
+The one failure that keeps its claim at once is `UploadOutcomeUnknownError`:
+`files.completeUploadExternal` failed without an answer, so the file may
+already be in the thread. Retrying it is how one report is attached twice, so
+it alarms `upload_outcome_unknown` and stops. A container that dies mid-attempt
+leaves the same state, a claim with no outcome, and gets the same answer.
 
 It is a row rather than a column because `db/schema.sql` runs as
 `CREATE TABLE IF NOT EXISTS` over a restored snapshot with no migration
@@ -88,8 +81,8 @@ both and names which is which: the token table is the record, and the dollar
 line is what **Pi** priced the run at as it ran, read back out of the same
 session file and labelled `Estimated cost`.
 
-The label is load-bearing, not manners. The figure reaches a Slack summary
-and a document a person reads months later, and an unhedged number is quoted
+The label is load-bearing, not manners. The figure reaches a document a
+person reads months later, and an unhedged number is quoted
 back as though somebody had seen a bill. `estimatedCostUsd` is named that on
 `ReportRun` for the same reason.
 
@@ -116,58 +109,42 @@ set -- least of all for the one that says the defect is in BugBoss.
 An answer whose JSON will not load leaves the section in place saying so. A
 section that quietly vanished would read as an incident that never recurred.
 
-## Two texts, two escaping rules
+## The document is Markdown, then a PDF
 
-This is the trap, and it is why rendering is one file with the rule at the top
-of it. The same root cause string goes down both paths:
+`render.ts` writes Markdown and escapes nothing. No Markdown construct swallows
+the rest of a document the way Slack's `<…>` swallows the rest of a message,
+so a quoted log line renders as itself. The single exception is a table cell,
+where a raw `|` silently opens a column and a newline silently ends the row —
+`cell()` is the only escaping in the file.
 
-- **The document is Markdown.** Nothing is escaped. No Markdown construct
-  swallows the rest of a file the way Slack's `<…>` swallows the rest of a
-  message, so a quoted log line renders as itself. The single exception is a
-  table cell, where a raw `|` silently opens a column and a newline silently
-  ends the row — `cell()` is the only escaping in the file.
-- **The thread summary is mrkdwn**, and goes out under the rules in
-  `slack/CLAUDE.md`: values through the `mrkdwn` tag, model prose through
-  `toMrkdwn`.
+`pdf.ts` lays that Markdown out as the PDF: headings, lists, code blocks and
+real tables with a header row, wrapped and paginated, never cut. It is
+pdfkit with the PDF standard fonts, parsed by marked's lexer: pure JS, no
+headless browser, no font file to ship into the Alpine image. The standard
+fonts only encode WinAnsi, and pdfkit draws the wrong glyph for anything
+outside it without an error, so `encodable` spells arrows and symbols in ASCII,
+strips accents it cannot draw, and prints a visible `?` for anything else.
+Both PDF dates are pinned, so the same Markdown gives the same bytes and the
+tests compare against a pinned hash.
 
-On the degraded path the document is posted through `postProse`, which is the
-Markdown-to-mrkdwn conversion plus the length split — so the headings and
-tables that read correctly in the file still read correctly in the thread.
+The notice beside it is mrkdwn, built by `toolapi/announce.ts` under the rules
+in `slack/CLAUDE.md`. It skips the Slack client every other post goes through,
+so the composition root runs it through the incident-reference pass itself.
 
 ## The thread is short; the document is complete
 
-Every other path into an incident thread is capped at `THREAD_PROSE_CHARS` and
-refuses a longer post (`slack/CLAUDE.md`). This document is the one thing
-exempt, and the exemption is structural rather than a bigger number: the report
-does not go out as thread text at all, it goes out as a file, so the thread
-stays short by the long version being somewhere else. `report_analysis`'s
-`postmortem` is therefore the one model field with no cap on it.
+Every path into an incident thread is capped at `THREAD_PROSE_CHARS` and
+refuses a longer post (`slack/CLAUDE.md`). This document is exempt by never
+being thread text: it is a file, so the thread stays short by the long
+version being somewhere else. `report_analysis`'s `postmortem` is therefore
+the one model field with no cap on it.
 
-The degraded path is the single case where the document does land in the thread
-as text, and it posts through `postDocument` — which does nothing `postProse`
-does not, and exists so that one exemption is a name at a call site rather than
-the absence of a check.
+## Why a PDF
 
-The thread summary beside the file is the numbers a person scanning the
-channel wants and one line of cause. The line is the cause's first line,
-whole — it used to be cut at 300 characters on top of that, and a cause that
-reads as a finished sentence and stops before the clause naming what broke is
-worse than no cause at all. Length was never the problem it solved: the
-summary already goes out through `splitForSlack`.
-
-## Why a Markdown file
-
-Slack previews it inline, indexes the text for search, and leaves it
-downloadable, and it costs one scope. A canvas renders more richly but is a
-larger API surface with nothing to download; a PDF means a rendering
-dependency in a container that has none and is not searchable in Slack; a long
-message is the thing this replaces — mrkdwn has no headings and no tables, and
-thread posts are deliberately short because the reader is on a phone.
-
-The summary rides along as the file's own message, so the thread still reads
-without opening anything.
+Slack previews it inline on a phone, keeps it downloadable, and it renders
+the tables and headings mrkdwn has no way to express. It costs one scope.
 
 **`files:write` is the scope**, it is in `slack-app-manifest.yaml`, and like
 every scope there it does nothing until somebody reinstalls the app. Until
-then the upload throws `missing_scope`, which alarms and posts the report
-inline.
+then the completion answers `missing_scope`: the notice goes out alone, the
+retries fail, and `upload_abandoned` alarms.

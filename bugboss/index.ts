@@ -266,13 +266,8 @@ export interface CreateBugBossOptions {
   s3?: S3Client;
   /** Overrides the default harness the Slack agent runs on. */
   slackAgentModel?: SlackAgentModel;
-  /**
-   * Uploads the closing report into an incident thread. Absent means the
-   * report is posted as text instead, which is the fallback and not a
-   * failure: a workspace where `files:write` was never granted still gets
-   * every word of it.
-   */
-  fileUploader?: FileUploader;
+  /** Attaches the closing report to the close notice in an incident thread. */
+  fileUploader: FileUploader;
   /**
    * Looks up what became of the PRs an agent opened, for the closing report.
    * Absent leaves every PR rendered as "state not known".
@@ -355,7 +350,7 @@ export interface BugBoss {
   sweepOrphans(): Promise<number>;
   /** Open a Slack thread for any incident still without one. */
   ensureIncidentThreads(): Promise<number>;
-  /** Post the closing report for any incident that closed without one. */
+  /** Attach the closing report for any closed incident still without it. */
   sweepReports(): Promise<number>;
   /** One pass of the status board: headers, the morning post, the all-clear. */
   sweepBoard(): Promise<unknown>;
@@ -796,24 +791,22 @@ export const createBugBoss = async (
    * It goes outside the deadline wrapper, so a permalink lookup it makes is
    * itself bounded and never eats the budget of the post it is preparing.
    */
-  const slack = withIncidentReferences(
-    deadlined,
-    createIncidentReferences({
-      threads: {
-        incidentForThread: (threadTs) =>
-          db.get<{ id: string }>(
-            "SELECT id FROM incident WHERE slackThreadTs = ?",
-            [threadTs],
-          )?.id ?? null,
-        threadOf: (incidentId) =>
-          db.get<{ slackThreadTs: string | null }>(
-            "SELECT slackThreadTs FROM incident WHERE id = ?",
-            [incidentId],
-          )?.slackThreadTs ?? null,
-      },
-      permalink: (messageTs) => deadlined.permalink(messageTs),
-    }),
-  );
+  const incidentRefs = createIncidentReferences({
+    threads: {
+      incidentForThread: (threadTs) =>
+        db.get<{ id: string }>(
+          "SELECT id FROM incident WHERE slackThreadTs = ?",
+          [threadTs],
+        )?.id ?? null,
+      threadOf: (incidentId) =>
+        db.get<{ slackThreadTs: string | null }>(
+          "SELECT slackThreadTs FROM incident WHERE id = ?",
+          [incidentId],
+        )?.slackThreadTs ?? null,
+    },
+    permalink: (messageTs) => deadlined.permalink(messageTs),
+  });
+  const slack = withIncidentReferences(deadlined, incidentRefs);
 
   // Said once, at boot, rather than every thirty seconds by the sweep that
   // skips them. `chat.update` replaces a message whole and the only way to
@@ -932,7 +925,8 @@ export const createBugBoss = async (
       rotationGroupId: secrets.slackRotationGroupId ?? null,
       incidentChannel: config.slackChannelId,
     },
-    closeIncident: (args) => closeIncidentByBoss({ db, slack: threads }, args),
+    closeIncident: (args) =>
+      closeIncidentByBoss({ db, slack: threads, announceClose }, args),
   });
 
   /**
@@ -1139,6 +1133,7 @@ export const createBugBoss = async (
       correlator,
       slack: threads,
       evidence,
+      announceClose,
     });
 
     return {
@@ -1663,15 +1658,8 @@ export const createBugBoss = async (
       // file rather than from anything the agent reports: a killed agent
       // never gets to report, and the file is on disk either way. So the
       // numbers survive exactly the runs you most want them for.
-      //
-      // The closing report follows the roll-up rather than running beside
-      // it, because the tokens it quotes are the ones roll-up just wrote.
-      // It is a no-op unless this launch was the one that closed the
-      // incident.
       void noteRunOutcome(ctx.incidentId, sessionRef);
-      void rollUpUsage(ctx.incidentId, sessionRef).then(() =>
-        publishReport(ctx.incidentId),
-      );
+      void rollUpUsage(ctx.incidentId, sessionRef);
     });
   };
 
@@ -1827,20 +1815,39 @@ export const createBugBoss = async (
     sessions: store,
     post: (threadTs, text) => slack.post(threadTs, text),
     channel: config.slackChannelId,
-    uploader: options.fileUploader,
+    // The close notice rides on the file as its comment, so it reaches Slack
+    // without passing the client every other message goes through.
+    uploader: {
+      upload: async (file) =>
+        options.fileUploader.upload({
+          ...file,
+          comment:
+            file.comment === null
+              ? null
+              : await incidentRefs.render(file.comment, file.threadTs),
+        }),
+    },
     prStates: options.prStates,
     now,
   };
 
   /**
-   * After the agent exits and after its usage is on the row, because the
-   * report quotes both. Never awaited by the dispatcher and never able to
-   * fail a launch: the transition it reports on committed long ago.
+   * The close's one message, sent by the close itself rather than by
+   * anything that runs after the agent: the notice with the report attached.
+   *
+   * Usage is rolled up first, from the session file as far as it has synced.
+   * The turn that called report_analysis and any after it are not in it yet,
+   * so the report's token figures are as of the close; the row catches up
+   * when the run exits. Never throws: the close has already committed.
    */
-  const publishReport = (incidentId: string): Promise<unknown> =>
-    publishIncidentReport(reportDeps, incidentId).catch((err: unknown) =>
-      alarm("report_publish_failed", { incidentId, error: String(err) }),
-    );
+  const announceClose = async (incidentId: string): Promise<void> => {
+    try {
+      await rollUpUsage(incidentId, incidentSessionKey(incidentId));
+      await publishIncidentReport(reportDeps, incidentId);
+    } catch (err: unknown) {
+      alarm("report_publish_failed", { incidentId, error: String(err) });
+    }
+  };
 
   const sweepReports = (): Promise<number> => publishPendingReports(reportDeps);
 
@@ -2517,8 +2524,8 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
     slack: createSlackClient(secrets.slackBotToken, config.slackChannelId),
     // The closing report uploads as a file. Same token as every other post,
     // but the `files:write` scope it needs is granted only when somebody
-    // reinstalls the app -- until then the upload throws and the report goes
-    // out inline, which is exactly what should happen.
+    // reinstalls the app -- until then the close notice goes out alone and
+    // the retries end in an alarm.
     fileUploader: createSlackFileUploader(secrets.slackBotToken),
     // Only when the App is configured. The Boss otherwise never mints a
     // GitHub token of its own; this is the one thing it asks GitHub for, and

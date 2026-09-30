@@ -53,12 +53,12 @@ oauth_config:
       ## uncalled even though this scope would cover the first of them.
       - reactions:write
       ## files.getUploadURLExternal and files.completeUploadExternal, for the
-      ## closing report BugBoss posts into an incident thread as a Markdown
-      ## file when the incident reaches CLOSED. (files.upload is deprecated;
-      ## the two-call external flow is what replaced it, and both calls sit
+      ## closing report BugBoss attaches, as a PDF, to the close notice when
+      ## an incident reaches CLOSED. (files.upload is deprecated; the
+      ## two-call external flow is what replaced it, and both calls sit
       ## behind this one scope.) Without it the upload fails with
-      ## missing_scope and the report is posted as thread text instead --
-      ## nothing is lost, it is just longer to read.
+      ## missing_scope: the notice goes out alone, the retries fail, and
+      ## upload_abandoned alarms. The report stays saved with the incident.
       - files:write
       ## Granted on the installed app already (docs/bugboss-todo.md), and
       ## listed here because this file is what a reinstall applies -- leaving

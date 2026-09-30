@@ -190,11 +190,8 @@ An agent's `escalate` and `message_boss` are not on the list. Both land in
 thread.
 
 **The thread is short; the document is complete.** The post-mortem is the
-exemption because it does not go to the thread as text — it leaves as the
-closing report, a Markdown file (`report/CLAUDE.md`). The one place the
-document does reach the thread is the degraded path when the upload fails, and
-that call is `postDocument` rather than `postProse` so the exemption is a name
-somebody can grep for instead of a check somebody forgot.
+exemption because it never goes to the thread as text — it leaves as the
+closing report, a PDF attached to the close notice (`report/CLAUDE.md`).
 
 ## Incident references are rendered by code, on the way out
 
@@ -217,12 +214,15 @@ out, put into one shape. Determinism is the point of it.
 **The seam is the client, and it has to be.** There is no single place above
 it where outbound text is composed: `relay.ts` splits and posts for itself,
 `agent.ts` goes through `postProse`, `toolapi/index.ts` and
-`toolapi/announce.ts` each run their own `splitForSlack` loop, `report/` uses
-`postDocument`, `http/toolapi.ts` does two of those, and the composition root
-posts directly in three more places. A pass on some of them would be the same
+`toolapi/announce.ts` each run their own `splitForSlack` loop, `http/toolapi.ts`
+does two of those, and the composition root posts directly in three more
+places. A pass on some of them would be the same
 inconsistency with a new cause, which is worse than the old one because it
 looks fixed. So `withIncidentReferences` wraps the `SlackClient` itself,
 outside the deadline wrapper, and a surface added later gets it by default.
+The close notice is the one message that reaches Slack another way, as the
+comment on the closing report's upload, so the composition root runs it
+through the same pass before handing it to the uploader.
 
 Three things bound it:
 

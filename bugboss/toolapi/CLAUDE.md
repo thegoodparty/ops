@@ -174,7 +174,8 @@ that is both blocked and needs somebody calls both.
 `closeIncidentByBoss` is the Boss's close, from any open status, and it lives
 beside `reportAnalysis` so the two cannot drift: one guarded `UPDATE`, the
 same `closeOpenSignals` and `indexIncident` in the same write, a `stop` for
-the agent, and the same `closedNotice` headline in the thread.
+the agent, and the same `closedNotice` headline in the thread, sent through
+`announceClose` as the comment on the closing report.
 
 A CLOSED row must carry `resolvedAt` and `postmortem`, and that CHECK cannot
 change on a live table. An incident closed from FIXING has neither, so both

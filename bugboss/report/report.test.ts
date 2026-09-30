@@ -12,11 +12,13 @@ import {
   publishPendingReports,
   readReportData,
   renderReportDocument,
-  renderThreadSummary,
   reportMetrics,
   REPORT_PUBLISHED_ACTION,
-  REPORT_GIVE_UP_MS,
   REPORT_SWEEP_GRACE_MS,
+  REPORT_UPLOAD_ATTEMPTS,
+  REPORT_UPLOAD_FAILED_ACTION,
+  REPORT_UPLOAD_RETRY_MS,
+  UploadOutcomeUnknownError,
   type ReportDeps,
   type ReportUpload,
 } from "./index";
@@ -101,6 +103,7 @@ const deps = (overrides: Partial<ReportDeps> = {}): ReportDeps => ({
     return { ts: `ts-${posts.length}` };
   },
   channel: "C-INCIDENTS",
+  renderPdf: async (markdown) => Buffer.from(markdown, "utf8"),
   uploader: {
     upload: async (file) => {
       if (uploadFails) throw new Error("slack: missing_scope");
@@ -223,6 +226,7 @@ const markers = (incidentId: string): number =>
   )[0].n;
 
 describe("the report assembles from a real incident row", () => {
+
   it("carries the metrics, the post-mortem and the run's cost", async () => {
     await seed("inc-1");
 
@@ -331,27 +335,6 @@ describe("the report assembles from a real incident row", () => {
     );
   });
 
-  it("puts the whole cause in the thread summary, every line of it", async () => {
-    // Two cuts used to sit here: 300 characters, and before that only the
-    // first line. Both leave a reader with a sentence that reads as
-    // finished, and no way to know there was more -- and "the rest is in
-    // the file" is not an answer, because the summary is what somebody
-    // scanning the channel actually reads. It splits past one message.
-    const line =
-      `The pool was sized for the old traffic shape, ${"x".repeat(600)}, ` +
-      "and the write path saturated it first.";
-    const rest = "The read path had its own pool and never saturated.";
-    await seed("inc-16", { rootCause: `${line}\n\n${rest}` });
-
-    const data = await readReportData(deps(), "inc-16");
-    assert.ok(data);
-    const summary = renderThreadSummary(data);
-
-    assert.ok(summary.includes("the write path saturated it first."));
-    assert.ok(summary.includes(rest), "the lines after the first are there too");
-    assert.doesNotMatch(summary, /\u2026/);
-  });
-
   it("puts the whole signal headline at the top of the report", async () => {
     const rest = "and the write path saturated first";
     await seed("inc-17", { signalTitle: `Route errors detected\n${rest}` });
@@ -368,7 +351,7 @@ describe("the report assembles from a real incident row", () => {
     assert.ok(headline.includes(rest), "a headline with a second line keeps it");
   });
 
-  it("escapes the thread summary but not the document", async () => {
+  it("does not escape the document", async () => {
     await seed("inc-4", {
       rootCause: "A `<script>` tag & an ampersand reached the log line.",
     });
@@ -377,30 +360,51 @@ describe("the report assembles from a real incident row", () => {
     assert.ok(data);
     // The document is Markdown: nothing there can swallow the rest of a file.
     assert.match(renderReportDocument(data), /`<script>` tag & an ampersand/);
-    // Slack reads `<...>` as an entity, so the same string has to be escaped.
-    const summary = renderThreadSummary(data);
-    assert.match(summary, /&lt;script&gt;/);
-    assert.doesNotMatch(summary, /[^&]&[^agl]/);
   });
 });
 
 describe("publishing", () => {
-  it("uploads the document and posts a summary beside it", async () => {
+
+  it("attaches the report to the close notice, as one message", async () => {
     await seed("inc-5");
 
     assert.equal(await publishIncidentReport(deps(), "inc-5"), "published");
     assert.equal(uploads.length, 1);
     assert.equal(uploads[0].channel, "C-INCIDENTS");
     assert.equal(uploads[0].threadTs, "thread-1");
-    assert.equal(uploads[0].filename, "incident-inc-5.md");
-    assert.match(uploads[0].content, /^# Incident inc-5/);
-    // The summary rides on the file's own message, so the thread reads
-    // without opening anything and there is no second post to scroll past.
-    assert.match(uploads[0].comment, /\*Incident inc-5 — closing report\*/);
-    assert.match(uploads[0].comment, /1,240 users impacted/);
-    assert.match(uploads[0].comment, /106\.2k tokens/);
-    assert.match(uploads[0].comment, /us\.anthropic\.claude-opus-5/);
-    assert.equal(posts.length, 0, "a successful upload posts nothing separately");
+    assert.equal(uploads[0].filename, "incident-inc-5.pdf");
+    assert.match(uploads[0].content.toString(), /^# Incident inc-5/);
+    assert.equal(
+      uploads[0].comment,
+      "*Incident inc-5 closed*\n_1240 users impacted · post-mortem written._",
+    );
+    assert.equal(posts.length, 0, "nothing posted beside the file");
+  });
+
+  it("uploads a real PDF when nothing stands in for the renderer", async () => {
+    await seed("inc-5b");
+
+    assert.equal(
+      await publishIncidentReport(deps({ renderPdf: undefined }), "inc-5b"),
+      "published",
+    );
+    assert.equal(uploads[0].content.subarray(0, 5).toString(), "%PDF-");
+  });
+
+  it("says the Boss closed it when the Boss did", async () => {
+    await seed("inc-5c");
+    await db.withWrite((w) => {
+      w.prepare(
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES ('inc-5c', 'boss', NULL, 'close', 'a duplicate of incident 4', ?)`,
+      ).run(NOW - 60_000);
+    });
+
+    await publishIncidentReport(deps(), "inc-5c");
+    assert.equal(
+      uploads[0].comment,
+      "*Incident inc-5c closed*\n_Closed by BugBoss:_ a duplicate of incident 4",
+    );
   });
 
   it("refuses to publish an incident that has not closed", async () => {
@@ -413,22 +417,53 @@ describe("publishing", () => {
   });
 });
 
-describe("a failed upload degrades instead of breaking the close", () => {
-  it("posts the whole report into the thread and says why", async () => {
-    await seed("inc-7");
-    uploadFails = true;
+/** The shape `AbortSignal.timeout` rejects with, which is what incident 10 hit. */
+const timedOut = (): Error => {
+  const err = new Error("The operation was aborted due to timeout");
+  err.name = "TimeoutError";
+  return err;
+};
 
-    assert.equal(await publishIncidentReport(deps(), "inc-7"), "degraded");
-    assert.equal(uploads.length, 0);
-    assert.ok(posts.length >= 2, "summary plus the report itself");
-    assert.match(posts[0].text, /\*Incident inc-7 — closing report\*/);
-    assert.match(posts[0].text, /could not be uploaded/);
-    const body = posts.map((p) => p.text).join("\n");
-    assert.match(body, /The pool saturated/, "the post-mortem still reached the thread");
-    // Slack renders mrkdwn, so the document's Markdown headings are converted
-    // on this path even though the file itself keeps them.
-    assert.doesNotMatch(body, /^## Post-mortem$/m);
-    assert.match(body, /\*Post-mortem\*/);
+const failures = (incidentId: string): number =>
+  db.query<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM incident_action WHERE incidentId = ? AND action = ?",
+    [incidentId, REPORT_UPLOAD_FAILED_ACTION],
+  )[0].n;
+
+describe("a failed upload is retried, never dumped into the thread", () => {
+
+  it("posts the close notice alone at close, not the report body", async () => {
+    await seed("inc-7");
+    const attempted: ReportUpload[] = [];
+
+    const outcome = await publishIncidentReport(
+      deps({
+        uploader: {
+          upload: async (file) => {
+            attempted.push(file);
+            throw timedOut();
+          },
+        },
+      }),
+      "inc-7",
+    );
+
+    // The premise: the upload was really attempted, with a document that
+    // carries the post-mortem. Without it, a thread with no post-mortem in it
+    // would prove nothing.
+    assert.equal(attempted.length, 1);
+    assert.match(attempted[0].content.toString(), /The pool saturated/);
+
+    assert.equal(outcome, "retrying");
+    assert.equal(posts.length, 1, "one notice, and nothing else");
+    assert.doesNotMatch(posts[0].text, /The pool saturated/);
+    assert.doesNotMatch(posts[0].text, /Five whys/);
+    assert.equal(
+      posts[0].text,
+      "*Incident inc-7 closed*\n_1240 users impacted · post-mortem written._\n_The closing report is attaching shortly._",
+    );
+    assert.equal(markers("inc-7"), 0, "the claim is handed back so the sweep retries");
+    assert.equal(failures("inc-7"), 1);
     assert.equal(
       db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'inc-7'")
         ?.status,
@@ -437,73 +472,122 @@ describe("a failed upload degrades instead of breaking the close", () => {
     );
   });
 
-  it("degrades the same way when no uploader is configured at all", async () => {
-    await seed("inc-8");
+  it("uploads on a later sweep, once, as the normal file in the thread", async () => {
+    await seed("inc-7b", { closedAt: NOW - 60_000 });
+    uploadFails = true;
+    assert.equal(await publishIncidentReport(deps(), "inc-7b"), "retrying");
+    assert.equal(posts.length, 1);
 
-    const outcome = await publishIncidentReport(
-      deps({ uploader: undefined }),
-      "inc-8",
-    );
-    assert.equal(outcome, "degraded");
-    assert.match(posts[0].text, /no file upload configured/);
+    uploadFails = false;
+    // Inside the retry spacing nothing happens, so a failing Slack is not
+    // hammered once a tick.
+    const soon = NOW + 60_000;
+    assert.equal(await publishPendingReports(deps({ now: () => soon })), 0);
+    assert.equal(uploads.length, 0);
+
+    const later = NOW + REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS;
+    assert.equal(await publishPendingReports(deps({ now: () => later })), 1);
+    assert.equal(uploads.length, 1);
+    assert.equal(uploads[0].threadTs, "thread-1");
+    assert.match(uploads[0].content.toString(), /The pool saturated/);
+    assert.equal(uploads[0].comment, null, "the notice already went out; the file posts on its own");
+    assert.equal(posts.length, 1, "no second notice beside the file");
+    assert.equal(markers("inc-7b"), 1);
+
+    const muchLater = later + 10 * REPORT_UPLOAD_RETRY_MS;
+    assert.equal(await publishPendingReports(deps({ now: () => muchLater })), 0);
+    assert.equal(uploads.length, 1, "attached once");
   });
 
-  it("hands the claim back when the thread took nothing at all", async () => {
-    await seed("inc-9");
-    uploadFails = true;
+  it("does not attach twice when the last step's answer never came back", async () => {
+    // The file can land and the completion's answer still be lost -- a
+    // timeout on files.completeUploadExternal, or a container that dies right
+    // after it. A retry then attaches a second copy, so an attempt whose
+    // outcome is unknown keeps its claim, the same as a crash mid-attempt.
+    await seed("inc-7c", { closedAt: NOW - REPORT_SWEEP_GRACE_MS - 1_000 });
+    let attached = 0;
+    const uploader = {
+      upload: async () => {
+        attached++;
+        throw new UploadOutcomeUnknownError(String(timedOut()));
+      },
+    };
 
-    const outcome = await publishIncidentReport(
-      deps({
-        post: async () => {
-          throw new Error("slack: ratelimited");
-        },
-      }),
-      "inc-9",
-    );
+    assert.equal(await publishIncidentReport(deps({ uploader }), "inc-7c"), "skipped");
+    assert.equal(markers("inc-7c"), 1);
+    assert.equal(posts.length, 0, "a notice saying it failed could be false");
 
-    assert.equal(outcome, "skipped");
-    // The claim is what stops the sweep ever coming back, so leaving it
-    // standing here would lose the report for good -- nothing relaunches an
-    // agent on a CLOSED incident. Nothing landed, so a retry cannot post a
-    // second copy: re-posting can at worst say it twice, not posting cannot
-    // be recovered from at all.
-    assert.equal(markers("inc-9"), 0);
-    assert.equal(
-      db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'inc-9'")
-        ?.status,
-      "CLOSED",
-      "and the transition is still untouched",
-    );
+    for (const step of [1, 2, 3]) {
+      const at = NOW + step * (REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS);
+      await publishPendingReports(deps({ uploader, now: () => at }));
+      await publishIncidentReport(deps({ uploader, now: () => at }), "inc-7c");
+    }
+    assert.equal(attached, 1, "the replays never reached Slack");
+    assert.equal(posts.length, 0);
   });
 
-  it("keeps the claim when the thread took part of it", async () => {
-    await seed("inc-9b");
+  it("does not attach twice when the container dies after the claim", async () => {
+    await seed("inc-7d", { closedAt: NOW - REPORT_SWEEP_GRACE_MS - 1_000 });
+    // The claim is written and the process never gets to record an outcome.
+    await db.withWrite((w) => {
+      w.prepare(
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES ('inc-7d', 'boss', NULL, ?, 'claimed', ?)`,
+      ).run(REPORT_PUBLISHED_ACTION, NOW - 1_000);
+    });
+
+    const later = NOW + REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS;
+    assert.equal(await publishPendingReports(deps({ now: () => later })), 0);
+    assert.equal(await publishIncidentReport(deps({ now: () => later }), "inc-7d"), "skipped");
+    assert.equal(uploads.length, 0);
+    assert.equal(posts.length, 0);
+  });
+
+  it("stops and alarms once its attempts are used up", async () => {
+    await seed("inc-7e", { closedAt: NOW - 60_000 });
     uploadFails = true;
+    const alarms: string[] = [];
+    const realError = console.error;
+    console.error = (line: unknown) => {
+      alarms.push(String(line));
+    };
+    try {
+      assert.equal(await publishIncidentReport(deps(), "inc-7e"), "retrying");
+      let at = NOW;
+      for (let attempt = 2; attempt < REPORT_UPLOAD_ATTEMPTS; attempt++) {
+        at += REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS;
+        const when = at;
+        assert.equal(await publishPendingReports(deps({ now: () => when })), 0);
+      }
+      at += REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS;
+      const last = at;
+      assert.equal(await publishPendingReports(deps({ now: () => last })), 1);
 
-    // The summary posts, the document underneath it does not. This is the
-    // case the old ordering was right about: a retry would append a second
-    // copy of a report a reader can already see half of, and half a report
-    // somebody can read beats a duplicate they have to reconcile.
-    let posted = 0;
-    const outcome = await publishIncidentReport(
-      deps({
-        post: async (threadTs, text) => {
-          posted++;
-          if (posted > 1) throw new Error("slack: ratelimited");
-          posts.push({ threadTs, text });
-          return { ts: "ts-1" };
-        },
-      }),
-      "inc-9b",
-    );
+      assert.equal(failures("inc-7e"), REPORT_UPLOAD_ATTEMPTS);
+      assert.equal(markers("inc-7e"), 1, "the claim stands, so nothing loops");
+      assert.ok(
+        alarms.some((line) => line.includes('"event":"upload_abandoned"')),
+        "exhaustion alarms",
+      );
 
-    assert.equal(outcome, "skipped");
-    assert.equal(posted, 2, "it got past the summary and failed on the document");
-    assert.equal(markers("inc-9b"), 1, "so the claim stands and nothing retries");
+      const afterwards = last + 100 * REPORT_UPLOAD_RETRY_MS;
+      assert.equal(await publishPendingReports(deps({ now: () => afterwards })), 0);
+      assert.equal(failures("inc-7e"), REPORT_UPLOAD_ATTEMPTS, "and never tries again");
+    } finally {
+      console.error = realError;
+    }
+
+    assert.equal(posts.length, 2, "the first notice and the last, nothing between");
+    assert.match(posts[1].text, /could not be attached/);
+    assert.match(posts[1].text, /saved with the incident/);
+    for (const post of posts) {
+      assert.doesNotMatch(post.text, /The pool saturated/);
+    }
   });
 });
 
 describe("a resumed or restarted container does not post it twice", () => {
+
   it("publishes once however many times it is asked", async () => {
     await seed("inc-10");
 
@@ -528,6 +612,7 @@ describe("a resumed or restarted container does not post it twice", () => {
 });
 
 describe("the sweep catches a close whose container died", () => {
+
   it("publishes a closed incident that never got a report", async () => {
     await seed("inc-12", { closedAt: NOW - REPORT_SWEEP_GRACE_MS - 1_000 });
 
@@ -567,6 +652,7 @@ const glanceRow = async (incidentId: string, label: string): Promise<string> => 
 };
 
 describe("an interval whose two times disagree is named, not erased", () => {
+
   it("names the gap when impact is recorded as starting after the signal", async () => {
     // Both timestamps exist and they contradict each other: impact is on
     // record as beginning after we were already alerted. That is a fact about
@@ -588,18 +674,6 @@ describe("an interval whose two times disagree is named, not erased", () => {
     assert.doesNotMatch(row, /not known/);
     // A raw pipe would open a third column and shift every row under it.
     assert.equal((row.match(/(?<!\\)\|/g) ?? []).length, 3);
-  });
-
-  it("carries the inconsistency into the thread summary too", async () => {
-    await seed("inc-17", { impactStartedAt: OPENED + 12 * 60_000 });
-
-    const data = await readReportData(deps(), "inc-17");
-    assert.ok(data);
-    const summary = renderThreadSummary(data);
-    assert.match(summary, /detection time inconsistent/);
-    // Most people only ever read the thread. Told the number was never
-    // captured, they go looking for a writer that is in fact working.
-    assert.doesNotMatch(summary, /time to detect not recorded/);
   });
 
   it("says something different for a time never recorded than for a backwards one", async () => {
@@ -624,9 +698,6 @@ describe("an interval whose two times disagree is named, not erased", () => {
       "| Time to resolve | not usable — the incident is recorded as resolved 5m before its first signal arrived, so one of the two times is wrong |",
     );
 
-    const data = await readReportData(deps(), "inc-20");
-    assert.ok(data);
-    assert.match(renderThreadSummary(data), /resolve time inconsistent/);
   });
 
   it("names a close time that lands before the first signal", async () => {
@@ -644,6 +715,7 @@ describe("an interval whose two times disagree is named, not erased", () => {
 });
 
 describe("duration prints the length it was handed", () => {
+
   it("keeps the sign on a negative rather than swallowing it", () => {
     // Deciding what a backwards interval means is `interval`'s job, so in
     // principle nothing reaches here with a negative. The point of printing
@@ -661,6 +733,7 @@ describe("duration prints the length it was handed", () => {
 });
 
 describe("the report survives GitHub being unreachable", () => {
+
   it("publishes the whole report when the PR reader throws", async () => {
     await seed("inc-22");
 
@@ -680,9 +753,9 @@ describe("the report survives GitHub being unreachable", () => {
     // post-mortem and the spend for one column nobody was blocked on.
     assert.equal(outcome, "published");
     assert.equal(uploads.length, 1);
-    assert.match(uploads[0].content, /^# Incident inc-22/);
-    assert.match(uploads[0].content, /pull\/42 — state not known/);
-    assert.match(uploads[0].content, /\| Pull requests \| 1 \(0 merged\) \|/);
+    assert.match(uploads[0].content.toString(), /^# Incident inc-22/);
+    assert.match(uploads[0].content.toString(), /pull\/42 — state not known/);
+    assert.match(uploads[0].content.toString(), /\| Pull requests \| 1 \(0 merged\) \|/);
   });
 
   it("reflects a state the reader does answer with", async () => {
@@ -702,9 +775,6 @@ describe("the report survives GitHub being unreachable", () => {
     const doc = renderReportDocument(data);
     assert.match(doc, /pull\/42 — merged/);
     assert.match(doc, /\| Pull requests \| 1 \(1 merged\) \|/);
-    // The merged count is in the thread too, because "did the fix land" is
-    // the question people scanning the channel are actually asking.
-    assert.match(renderThreadSummary(data), /1 PR \(1 merged\)/);
   });
 
   it("answers for the urls it was told about and says so for the rest", async () => {
@@ -739,6 +809,7 @@ describe("the report survives GitHub being unreachable", () => {
 });
 
 describe("an incident that came back explains itself", () => {
+
   it("carries the recorded answer, in words rather than as a slug", async () => {
     // The whole value of the recurrence answer is that it was written at
     // close and, before this, read back by nobody.
@@ -836,64 +907,40 @@ describe("an incident that came back explains itself", () => {
   });
 });
 
-describe("a report that cannot be rendered is not a report that is lost", () => {
-  it("leaves no claim behind, so a later attempt still publishes", async () => {
-    // The claim is durable and the sweep will not revisit an incident that
-    // carries one, so the order of render and claim decides whether a bad row
-    // costs one attempt or the report itself. This is the failure that does
-    // not show up in the run that causes it: the marker persists, and the
-    // next container comes up, sees it, and stays quiet forever.
-    //
+describe("a report that cannot be rendered is not a close that goes unsaid", () => {
+  it("still says the incident closed, and attaches the report once the row is readable", async () => {
     // `rotationAtOpen` holds JSON written by another module. Valid JSON that
     // is not a list is the cheapest way to reach a throw inside rendering.
-    await seed("inc-40");
+    await seed("inc-40", { closedAt: NOW - 60_000 });
     await db.withWrite((w) => {
       w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-40'").run();
     });
 
-    assert.equal(await publishIncidentReport(deps(), "inc-40"), "skipped");
+    assert.equal(await publishIncidentReport(deps(), "inc-40"), "retrying");
     assert.equal(uploads.length, 0);
-    assert.equal(posts.length, 0, "nothing half-posted either");
-    assert.equal(markers("inc-40"), 0, "and nothing durable to suppress a retry");
+    assert.equal(posts.length, 1);
+    assert.match(posts[0].text, /^\*Incident inc-40 closed\*/);
+    assert.match(posts[0].text, /attaching shortly/);
+    assert.equal(markers("inc-40"), 0, "nothing durable to suppress a retry");
 
-    // The sweep would pick it up again on the next tick, and once the row is
-    // readable the report goes out in full.
     await db.withWrite((w) => {
       w.prepare(
         `UPDATE incident SET rotationAtOpen = '["U-ONCALL"]' WHERE id = 'inc-40'`,
       ).run();
     });
 
-    assert.equal(await publishIncidentReport(deps(), "inc-40"), "published");
+    const later = NOW + REPORT_SWEEP_GRACE_MS + REPORT_UPLOAD_RETRY_MS;
+    assert.equal(await publishPendingReports(deps({ now: () => later })), 1);
     assert.equal(uploads.length, 1);
-    assert.match(uploads[0].content, /\| On call at open \| U-ONCALL \|/);
+    assert.match(uploads[0].content.toString(), /\| On call at open \| U-ONCALL \|/);
+    assert.equal(uploads[0].comment, null);
+    assert.equal(posts.length, 1);
     assert.equal(markers("inc-40"), 1);
-  });
-
-  it("a failed upload leaves the incident closed and the claim standing", async () => {
-    // The degraded path is the one that persists a marker without a file, so
-    // what matters is that nothing else was disturbed: the transition is
-    // untouched and the next resume reads a CLOSED incident with a report
-    // already accounted for, rather than re-posting one.
-    await seed("inc-41");
-    uploadFails = true;
-
-    assert.equal(await publishIncidentReport(deps(), "inc-41"), "degraded");
-    assert.equal(markers("inc-41"), 1);
-    assert.equal(
-      db.get<{ status: string }>("SELECT status FROM incident WHERE id = 'inc-41'")
-        ?.status,
-      "CLOSED",
-    );
-
-    // A second pass -- a restart, or the sweep -- reads that marker and stops.
-    const before = posts.length;
-    assert.equal(await publishIncidentReport(deps(), "inc-41"), "skipped");
-    assert.equal(posts.length, before, "no second copy in the thread");
   });
 });
 
 describe("an interval too wide to be one incident is named, not printed", () => {
+
   it("refuses a detect time computed from a seconds epoch", async () => {
     // `impactStartedAt` is validated as a positive integer and documented as
     // epoch millis, so a model handing back seconds passes validation clean.
@@ -941,23 +988,6 @@ describe("an interval too wide to be one incident is named, not printed", () => 
     assert.notEqual(absent, backwards);
   });
 
-  it("carries the implausible case into the thread summary too", async () => {
-    await seed("inc-54", { impactStartedAt: Math.round(OPENED / 1000) });
-
-    const data = await readReportData(deps(), "inc-54");
-    assert.ok(data);
-    const summary = renderThreadSummary(data);
-    assert.match(summary, /detection time not usable/);
-    // Most people only ever read the thread, so "detected in 20337d" there
-    // is the same wrong number with the wider audience.
-    assert.doesNotMatch(summary, /detected in/);
-    assert.doesNotMatch(summary, /\d+d \d+h/);
-    // Not the backwards wording either. These two times are in order; it is
-    // the distance between them that is impossible, and someone told they
-    // are out of order goes looking at the wrong thing.
-    assert.doesNotMatch(summary, /detection time inconsistent/);
-  });
-
   it("still measures an incident that genuinely ran for weeks", async () => {
     // The ceiling has to sit well above anything real, or it turns a slow
     // incident into a fabricated data error -- the same failure pointing the
@@ -987,6 +1017,7 @@ describe("an interval too wide to be one incident is named, not printed", () => 
 });
 
 describe("duration tells a short length from no length", () => {
+
   it("reads a gap under a second as one rather than rounding it away", () => {
     // "0s" is not a smaller number than "<1s", it is a different claim: it
     // says the two moments coincide. The caller that cannot afford that is
@@ -1013,6 +1044,7 @@ describe("duration tells a short length from no length", () => {
 });
 
 describe("interval decides what a difference means before anyone prints it", () => {
+
   it("sends a difference that is not a number to the absent sentence", () => {
     // `duration` answers "unknown" for a NaN, which is the bare word this
     // file exists to argue against: it tells the reader nothing about which
@@ -1039,63 +1071,5 @@ describe("interval decides what a difference means before anyone prints it", () 
     });
     assert.match(said, /not usable/);
     assert.notEqual(said, "absent");
-  });
-});
-
-describe("a row that can never be rendered stops being retried", () => {
-  it("answers in the thread once retrying has stopped being useful", async () => {
-    // Rendering is pure, so a row it cannot read fails identically on every
-    // tick -- and the sweep takes the ten oldest unpublished closes, so ten
-    // rows like this and no report publishes again, with a pair of alarms
-    // every thirty seconds as the only sign. After the window it is answered
-    // instead of repeated, which is the one thing a repeating alarm never
-    // does.
-    await seed("inc-42", { closedAt: NOW - REPORT_GIVE_UP_MS - 60_000 });
-    await db.withWrite((w) => {
-      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-42'").run();
-    });
-
-    assert.equal(await publishIncidentReport(deps(), "inc-42"), "degraded");
-    assert.equal(uploads.length, 0, "there was no document to upload");
-    assert.equal(posts.length, 1, "one line, not a partial report");
-    assert.match(posts[0].text, /could not be written/);
-    assert.match(posts[0].text, /inc-42/);
-    assert.equal(markers("inc-42"), 1, "claimed, so it stops coming round");
-
-    // And it stays stopped.
-    assert.equal(await publishIncidentReport(deps(), "inc-42"), "skipped");
-    assert.equal(posts.length, 1);
-  });
-
-  it("keeps retrying inside the window, in case the row is repaired", async () => {
-    await seed("inc-43", { closedAt: NOW - 60_000 });
-    await db.withWrite((w) => {
-      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-43'").run();
-    });
-
-    assert.equal(await publishIncidentReport(deps(), "inc-43"), "skipped");
-    assert.equal(posts.length, 0, "nothing said yet; it may still come good");
-    assert.equal(markers("inc-43"), 0, "and nothing durable to suppress the retry");
-  });
-
-  it("gives up without a thread to give up into, and says so rather than looping", async () => {
-    // A thread that will not take even the one line leaves the claim off, so
-    // the sweep is free to try again -- the same rule the degraded path uses.
-    await seed("inc-44", { closedAt: NOW - REPORT_GIVE_UP_MS - 60_000 });
-    await db.withWrite((w) => {
-      w.prepare("UPDATE incident SET rotationAtOpen = '{}' WHERE id = 'inc-44'").run();
-    });
-
-    const outcome = await publishIncidentReport(
-      deps({
-        post: async () => {
-          throw new Error("slack: channel_not_found");
-        },
-      }),
-      "inc-44",
-    );
-
-    assert.equal(outcome, "skipped");
-    assert.equal(markers("inc-44"), 0);
   });
 });

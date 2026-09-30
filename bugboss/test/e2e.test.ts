@@ -32,7 +32,7 @@ import type { SlackAgentRun } from "../slack/agent";
 import type { SlackEvent } from "../slack/relay";
 import { emptyModelUsage } from "../model";
 import type { ModelReply, ModelRequest, ModelUsage } from "../triage";
-import type { ReportUpload } from "../report";
+import { readReportData, renderReportDocument, renderReportPdf, type ReportUpload } from "../report";
 import type { BugBossConfig, TriageDecision } from "../types";
 
 type QueuedDecision = TriageDecision & { recurrenceOf?: string };
@@ -340,20 +340,44 @@ test("a Grafana alert becomes a resolved, written-up incident", async () => {
   assert.ok(incident.postmortem, "a post-mortem is required to reach CLOSED");
   assert.ok(incident.resolvedAt, "resolvedAt must be set before CLOSED");
 
-  // The report is published off the launch, after usage roll-up, so it is
-  // still in flight when dispatchOnce returns.
   await until(() => fakeUploader.files.length === 1, "the closing report");
   const [report] = fakeUploader.files;
+  const threadTs = report.threadTs;
+  const id = boss.db.get<{ id: string }>("SELECT id FROM incident WHERE status = 'CLOSED'")!.id;
+  // A close is one message: the notice, with the report attached to it.
+  // Before this, the same close posted the notice, a separate summary, and on
+  // a failed upload the whole report in four parts.
+  const closeMessages = [
+    ...fakeSlack.posts.filter(
+      (p) => p.threadTs === threadTs && /closed\*|closing report/.test(p.text),
+    ),
+    ...fakeUploader.files,
+  ];
+  assert.equal(closeMessages.length, 1, JSON.stringify(closeMessages.map((m) => ("text" in m ? m.text : m.comment))));
+  assert.match(report.comment ?? "", new RegExp(`\\*Incident ${id} closed\\*`));
   assert.equal(report.threadTs, fakeSlack.posts[0].threadTs ?? "ts-1");
-  assert.match(report.content, /^# Incident /);
-  assert.match(report.content, /## Post-mortem/);
-  assert.match(report.content, /Bad column in the upgrade webhook\./);
-  assert.match(report.content, /\| Users impacted \| 3 \|/);
-  assert.match(report.content, /pull\/9999/);
+  assert.equal(report.filename, `incident-${id}.pdf`);
+  // The PDF is deterministic, so the file can be checked against the report
+  // this incident's row renders to, and the row's report checked for content.
+  const data = await readReportData(
+    {
+      db: boss.db,
+      sessions: { get: async () => null },
+      post: fakeSlack.post.bind(fakeSlack),
+      channel: "C0TEST",
+      uploader: fakeUploader,
+    },
+    id,
+  );
+  const document = renderReportDocument(data!);
+  assert.ok(report.content.equals(await renderReportPdf(document)));
+  assert.match(document, /## Post-mortem/);
+  assert.match(document, /Bad column in the upgrade webhook\./);
+  assert.match(document, /\| Users impacted \| 3 \|/);
+  assert.match(document, /pull\/9999/);
   // This fake agent never wrote a session file, so there is nothing to bill
   // it from. The report says that rather than printing a free run.
-  assert.match(report.content, /\| Turns \| not recorded \|/);
-  assert.match(report.comment, /closing report/);
+  assert.match(document, /\| Turns \| not recorded \|/);
 });
 
 test("a second alert for the same cause attaches rather than opening", async () => {
@@ -1245,6 +1269,7 @@ test("a delivery that cannot be written answers a failure, not ok", async () => 
     config: config(join(dir, "halted.db")),
     model: fakeModel,
     slack: fakeSlack,
+    fileUploader: fakeUploader,
     spawnAgent: fakeAgent,
     s3: refusing,
     insecureTestVerifiers: { grafana: () => {} },
@@ -1870,17 +1895,24 @@ test("the Boss closing an incident posts the same closed notice an agent's close
       ?.status,
     "CLOSED",
   );
-  const notice = fakeSlack.posts.filter((p) => p.threadTs === thread).at(-1)!;
-  assert.equal(notice.text.split("\n")[0], `*Incident ${id} closed*`);
+  const closeFile = fakeUploader.files.find((f) => f.threadTs === thread);
+  assert.ok(closeFile, "the close is one message, the notice with the report attached");
+  const notice = closeFile.comment ?? "";
+  assert.equal(notice.split("\n")[0], `*Incident ${id} closed*`);
+  assert.match(notice, /_Closed by BugBoss:_ the alert was a test rule/);
+  assert.ok(
+    fakeSlack.posts.every((p) => !(p.threadTs === thread && /closed\*/.test(p.text))),
+    "and nothing beside it says so again",
+  );
 
   // The agent's close from the first test in this file, for the same line.
-  const agentClose = fakeSlack.posts.find(
-    (p) => p.threadTs !== thread && /^\*Incident \d+ closed\*\n/.test(p.text),
+  const agentClose = fakeUploader.files.find(
+    (f) => f.threadTs !== thread && /^\*Incident \d+ closed\*\n/.test(f.comment ?? ""),
   );
   assert.ok(agentClose, "an agent's close is on record to compare against");
   assert.equal(
-    notice.text.split("\n")[0].replace(id, "N"),
-    agentClose.text.split("\n")[0].replace(/\d+/, "N"),
+    notice.split("\n")[0].replace(id, "N"),
+    (agentClose.comment ?? "").split("\n")[0].replace(/\d+/, "N"),
     "one headline, whoever closed it",
   );
   assert.deepEqual(
@@ -2329,6 +2361,7 @@ test("neither a reply nor an escalation can strand an incident", async () => {
     config: config(join(dir, "stranding.db")),
     model: fakeModel,
     slack: fakeSlack,
+    fileUploader: fakeUploader,
     // Asks for a person and stops, which is what an agent out of ideas does.
     spawnAgent: async (tools: AgentSpawnContext) => {
       await tools.escalate({
@@ -2405,6 +2438,7 @@ test("a parked incident is left alone, and the Boss telling its agent something 
     config: config(join(dir, "parked.db")),
     model: fakeModel,
     slack: fakeSlack,
+    fileUploader: fakeUploader,
     // Out of road for now: says so, parks itself, exits.
     spawnAgent: async (tools: AgentSpawnContext) => {
       await tools.escalate({

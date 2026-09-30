@@ -16,6 +16,19 @@ import { makeAlarm } from "../logging";
 
 const alarm = makeAlarm("toolapi");
 
+/**
+ * The line every close posts, whoever closed it. A close reads one way in the
+ * thread whether an agent wrote the post-mortem or the Boss ended it.
+ */
+export const closedNotice = (incidentId: string, detail: string): string =>
+  `${mrkdwn`*Incident ${incidentId} closed*`}\n${detail}`;
+
+export const agentClosedDetail = (usersImpacted: number | null): string =>
+  mrkdwn`_${usersImpacted ?? "Unknown"} users impacted · post-mortem written._`;
+
+export const bossClosedDetail = (reason: string): string =>
+  `_Closed by BugBoss:_ ${toMrkdwn(reason)}`;
+
 /** The write half of Slack a merge announcement needs. */
 export interface AnnouncePoster {
   post(threadTs: string | null, text: string): Promise<{ ts: string }>;
