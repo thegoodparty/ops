@@ -275,6 +275,13 @@ export type InboundRoute =
       ts: string;
       user: string;
       text: string;
+      /**
+       * False for an untagged follow-up in a Boss thread. Nobody addressed
+       * that one to the Boss by name, so it may be two people talking, and
+       * the Boss may choose to say nothing; a tagged mention is always
+       * answered.
+       */
+      tagged: boolean;
     };
 
 export const mentionsBot = (text: string, botUserId: string): boolean =>
@@ -432,20 +439,20 @@ export class SlackRelay {
     const threadTs = event.thread_ts ?? null;
     if (!threadTs) {
       return mentioned
-        ? { kind: "slack_agent", channel, threadTs: ts, ts, user, text }
+        ? { kind: "slack_agent", channel, threadTs: ts, ts, user, text, tagged: true }
         : ignore("channel chatter, not addressed to us");
     }
 
     const incident = this.incidentForThread(threadTs);
     if (!incident) {
-      if (mentioned) return { kind: "slack_agent", channel, threadTs, ts, user, text };
+      if (mentioned) return { kind: "slack_agent", channel, threadTs, ts, user, text, tagged: true };
       // A follow-up under a Boss answer, untagged. It is the Boss's exactly
       // as a tagged one would be: people reply to whoever answered them, and
       // "Can you close incident 2?" was lost here for want of an @. Decided
       // by what the Boss has done in this thread, never by what was said.
       if (await this.isBossThread(channel, threadTs)) {
         log("boss_thread_followup", { channel, threadTs, ts });
-        return { kind: "slack_agent", channel, threadTs, ts, user, text };
+        return { kind: "slack_agent", channel, threadTs, ts, user, text, tagged: false };
       }
       return ignore("thread is not an incident thread");
     }

@@ -2208,6 +2208,7 @@ export const createBugBoss = async (
         ts: route.ts,
         user: route.user,
         text: route.text,
+        tagged: route.tagged,
       });
 
     // Before the read, so a follow-up typed while this one is still being
@@ -2253,6 +2254,12 @@ export const createBugBoss = async (
         named: read.combineIds,
       });
     }
+
+    // An untagged follow-up nobody could classify is most often not for the
+    // Boss at all. Asking "is this a report or a question?" of two people
+    // talking would be a reply nobody wanted, so the Boss reads it in the
+    // thread's context and may choose to stay silent.
+    if (!route.tagged && !read.fellBack) return ask();
 
     log("mention_unclear", { user: route.user, ts: route.ts, fellBack: read.fellBack });
     await sayInThread(
