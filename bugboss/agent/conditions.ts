@@ -57,6 +57,8 @@ export interface ConditionState {
    * reaches its deadline in this state ends as met, not timed out.
    */
   met?: boolean;
+  /** Nothing was observed: GitHub refused the arguments. Ends the wait, and is not the condition. */
+  failed?: boolean;
 }
 
 export type ConditionCheck = () => Promise<ConditionState>;
@@ -99,7 +101,10 @@ export const createGitHubReadPort = (deps: {
     const token = deps.token();
     if (!token) return { ok: false, status: 401, message: NO_TOKEN, acceptedPermissions: null };
     try {
-      const response = await http(url, { ...init, headers: headers(token) });
+      const response = await http(url, {
+        ...init,
+        headers: init.body ? { ...headers(token), "content-type": "application/json" } : headers(token),
+      });
       const text = await response.text();
       if (!response.ok) {
         return {
@@ -237,7 +242,7 @@ const fatal = (status: number): boolean => status === 401 || status === 404 || s
 const unreadable = (what: string, result: { status: number; message: string; acceptedPermissions: string | null }): ConditionState => {
   const needs = result.acceptedPermissions ? ` GitHub says this needs: ${result.acceptedPermissions}.` : "";
   return fatal(result.status)
-    ? { done: true, output: `COULD NOT READ ${what}: ${result.message} (HTTP ${result.status}).${needs} Nothing was waited for; fix the arguments.` }
+    ? { done: true, failed: true, output: `COULD NOT READ ${what}: ${result.message} (HTTP ${result.status}).${needs} Nothing was waited for; fix the arguments.` }
     : { done: false, output: `could not read ${what} this time: ${result.message}. Still waiting.` };
 };
 
@@ -365,7 +370,7 @@ const prChecks = (ref: PrRef, github: GitHubReadPort): ConditionCheck => async (
     });
     if (!result.ok) return unreadable(`the checks on ${ref.label}`, result);
     const pull: NonNullable<RollupData["repository"]>["pullRequest"] = result.data.repository?.pullRequest ?? null;
-    if (!pull) return { done: true, output: `COULD NOT READ ${ref.label}: no such pull request. Nothing was waited for; fix the arguments.` };
+    if (!pull) return { done: true, failed: true, output: `COULD NOT READ ${ref.label}: no such pull request. Nothing was waited for; fix the arguments.` };
     head = pull.headRefOid;
     const contexts: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: RollupNode[] } | undefined =
       pull.commits.nodes[0]?.commit.statusCheckRollup?.contexts;

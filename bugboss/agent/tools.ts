@@ -532,6 +532,8 @@ export interface MonitorResult {
   remainingSeconds?: number;
   /** On a capped review wait, the `since` that resumes it without missing one. */
   since?: string;
+  /** GitHub refused the arguments; nothing was observed. */
+  failed?: boolean;
 }
 
 /**
@@ -615,6 +617,10 @@ export const runMonitor = async (
     const expired = deps.signal?.aborted || now() >= deadline;
     // A review that landed and is still settling has happened, so the
     // deadline ends it as met rather than throwing the verdict away.
+    if (state.failed) {
+      if (heartbeat) await release(heartbeat, key);
+      return { output: last, timedOut: false, capped: false, failed: true };
+    }
     if (state.done || (expired && state.met && !deps.signal?.aborted)) {
       if (heartbeat) {
         await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, output: last });
@@ -1087,7 +1093,9 @@ export const createMonitorTool = async (
                 ? `If you still need to wait, call monitor again with ${again.join(", and ")}.`
                 : "If you still need to wait, call monitor again with the same arguments."
             }`
-          : result.timedOut
+          : result.failed
+            ? `CHECK FAILED, the wait is over and nothing was observed: ${args.description}`
+            : result.timedOut
             ? `TIMED OUT after ${args.timeoutSeconds}s waiting for: ${args.description}`
             : `Condition met: ${args.description}`;
       return {

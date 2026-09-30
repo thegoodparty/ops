@@ -656,3 +656,51 @@ test("the bash guard refuses only what can be nothing but a wait", () => {
     assert.equal(pollingRefusal(command), null, command);
   }
 });
+
+test("a PR GitHub cannot find ends a person-wait without telling the Boss it is done", async () => {
+  const clock = fakeClock();
+  const told: string[] = [];
+  let cleared = false;
+  const port: GitHubReadPort = {
+    get: async () => ({ ok: false, status: 404, message: "Not Found", acceptedPermissions: null }),
+    getAll: async () => ({ ok: true, data: [] }),
+    graphql: async () => ({ ok: true, data: {} as never }),
+  };
+  const tool = await createMonitorTool({
+    github: port,
+    sleep: clock.sleep,
+    now: clock.now,
+    heartbeat: {
+      marker: {
+        recordWait: async (command) => ({ command, startedAt: clock.now(), pings: 0, lastPingAt: null }),
+        recordPing: async () => assert.fail("no reminder"),
+        clearWait: async () => {
+          cleared = true;
+        },
+      },
+      boss: { tellBoss: async (_kind, text) => void told.push(text), escalationsSince: async () => ({ count: 0, lastAt: null }) },
+    },
+  });
+  const out = (await tool.execute(
+    "c1",
+    { ...base, condition: "pr_closed", pr: "omni#99999", awaitingHuman: "Merge it" } as never,
+    undefined,
+    undefined,
+    {} as never,
+  )) as { content: { text: string }[] };
+
+  assert.deepEqual(told, [], "nothing happened, so nobody is told it is done");
+  assert.equal(cleared, true);
+  assert.match(out.content[0].text, /^CHECK FAILED/);
+  assert.doesNotMatch(out.content[0].text, /Condition met/);
+});
+
+test("a GraphQL request says it is JSON", async () => {
+  let contentType: string | undefined;
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    contentType = (init.headers as Record<string, string>)["content-type"];
+    return new Response(JSON.stringify({ data: {} }), { status: 200 });
+  }) as typeof fetch;
+  await createGitHubReadPort({ token: () => "t", fetchImpl }).graphql("query { viewer { login } }", {});
+  assert.equal(contentType, "application/json");
+});
