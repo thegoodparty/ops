@@ -1,0 +1,8 @@
+# Nothing is scraped: every sample arrives by remote write, run with
+# --web.enable-remote-write-receiver.
+global:
+  evaluation_interval: 1m
+
+storage:
+  tsdb:
+    out_of_order_time_window: 2d
