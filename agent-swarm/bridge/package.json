@@ -1,0 +1,14 @@
+{
+  "name": "agent-swarm-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Turns Grafana alert deliveries into agent-swarm incidents: verifies the delivery, dedups on fingerprint, numbers incidents, and creates one task per new alert.",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  }
+}

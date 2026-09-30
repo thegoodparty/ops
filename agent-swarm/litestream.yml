@@ -1,0 +1,28 @@
+# The entire incident record — every incident:<n> KV entry, every task, every
+# agent profile — lives in this one SQLite file. If the instance is replaced
+# without a replica, all of it is gone. Litestream streams the WAL to S3 so the
+# record survives the host.
+#
+# No access keys here on purpose. Litestream's config accepts them, but it also
+# falls back to the AWS SDK credential chain, and this host already has an
+# instance profile with read/write on the bucket. A key written into a config
+# file is a long-lived credential on disk that someone has to rotate; the
+# instance role is neither.
+#
+# This is an assumption, not a documented guarantee, so it is checked rather
+# than trusted: the deploy verifies replication after first boot by looking for
+# a successful snapshot in the bucket. If Litestream turns out not to consult
+# IMDS, the fix is to add access-key-id / secret-access-key here and pass
+# LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY through the compose
+# service — and that failure is loud, because Litestream refuses to start
+# without usable credentials rather than running un-replicated.
+dbs:
+  - path: /app/data/agent-swarm-db.sqlite
+    replicas:
+      - type: s3
+        bucket: agent-swarm-prod
+        path: litestream
+        region: us-west-2
+        snapshot-interval: 3600s
+        retention: 720h
+addr: ":9090"

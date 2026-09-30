@@ -1,0 +1,284 @@
+# Docker Compose for the GoodParty agent-swarm host.
+#
+# One EC2 host (m7i.2xlarge, Amazon Linux 2023) runs the whole system: a
+# control-plane API, a lead agent that commands incidents, two coder agents that
+# work them in parallel, a Litestream sidecar that replicates the incident
+# database to S3, and a bridge that turns Grafana alerts into incident tasks.
+# Slack is the human interface. Agents and the API only ever poll outbound, so
+# the only host ports are 3013 and 3014 — both behind the AWS ALB.
+#
+# Deploy by hand on the host:  docker compose --env-file .env up -d
+#
+# Deliberately absent: minio, minio-init, agent-fs, and caddy.
+#   - agent-fs is optional; with AGENT_FS_API_URL unset the API falls back to
+#     the local filesystem (see skills/agent-swarm/references/components.md).
+#   - minio exists only to back agent-fs.
+#   - the ALB terminates TLS, so there is no caddy and no `--profile tls` block.
+# Three fewer stateful services is the point of this deployment.
+#
+# Pin both swarm images to one release. A blank AGENT_SWARM_VERSION tracks
+# `latest`, which upstream rebuilds on every commit to main. Migrations are
+# forward-only, so re-pinning to an older tag is not a rollback — back up
+# /var/lib/agent-swarm/api-data before changing the version.
+# Releases: https://github.com/desplega-ai/agent-swarm/releases
+
+# Each agent keeps its identity on its own personal volume. Explicit IDs remain
+# supported for existing installs; removing an override reuses the persisted ID.
+x-agent-entrypoint: &agent-entrypoint
+  - /bin/sh
+  - -ec
+  - |
+    ID_FILE="/workspace/personal/.agent-id"
+    if [ -n "$${AGENT_ID:-}" ]; then
+      printf '%s\n' "$$AGENT_ID" > "$$ID_FILE"
+    elif [ -s "$$ID_FILE" ]; then
+      AGENT_ID=$$(cat "$$ID_FILE")
+    else
+      AGENT_ID=$$(cat /proc/sys/kernel/random/uuid)
+      printf '%s\n' "$$AGENT_ID" > "$$ID_FILE"
+    fi
+    export AGENT_ID
+    exec /docker-entrypoint.sh "$$@"
+  - --
+
+services:
+  api:
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.158.0}"
+    pull_policy: always
+    stop_grace_period: 60s
+    # Independent per-container cgroup pids ceiling (containment), separate from
+    # the sandboxed-script rlimit budget (JAVASCRIPT_RUNTIME_SANDBOX_MAX_PROCS).
+    # Upstream sizes 1024 at ~2x realistic worst-case legitimate load while
+    # staying 4x tighter than the 4096 `ulimit -u` ceiling, so it holds even
+    # when a runaway script resets its own rlimits. See upstream
+    # docker-compose.example.yml for the full arithmetic.
+    pids_limit: 1024
+
+    environment:
+      - API_KEY=${API_KEY}
+      # Preferred alias for stored/agent auth.
+      - AGENT_SWARM_API_KEY=${AGENT_SWARM_API_KEY:-}
+      # Explicit rather than auto-generated beside the database. Litestream
+      # replicates the database but not that file, so a restore would bring back
+      # rows nobody could decrypt. Held in Secrets Manager, the key travels with
+      # the secret instead of with the host.
+      - SECRETS_ENCRYPTION_KEY=${SECRETS_ENCRYPTION_KEY}
+      - HARNESS_PROVIDER=${HARNESS_PROVIDER:-pi}
+      # Enables session summaries and memory rating on the control plane. No
+      # OpenRouter or AWS credentials are wired: pi resolves the native
+      # Anthropic provider from this key alone.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Optional embeddings for semantic memory search. Without a key the API
+      # falls back to full-text search, which is the accepted trade-off here.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MEMORY_RATERS=${MEMORY_RATERS:-implicit-citation,explicit-self}
+      # The API reaches its own MCP surface over the compose network.
+      - MCP_BASE_URL=http://api:3013
+      - APP_URL=${APP_URL}
+      - PUBLIC_MCP_BASE_URL=${PUBLIC_MCP_BASE_URL}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      # Agents shell out to the AWS CLI while investigating. Without a region
+      # every aws call fails, and the host has no profile to fall back on.
+      - AWS_DEFAULT_REGION=us-west-2
+      # Socket Mode is outbound-only, so there is no public request URL and no
+      # signing secret to set.
+      - SLACK_DISABLE=false
+      - SLACK_MODE=socket
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      # Not SLACK_CHANNEL_ID: agent-swarm reads no variable by that name. This is
+      # where the swarm reports its own failures (queue stalls, OAuth keepalive,
+      # a preflight that could not run), which is what stops a dead deployment
+      # from looking exactly like a quiet one.
+      - SLACK_ALERTS_CHANNEL=${SWARM_INCIDENT_CHANNEL}
+      # Our convention, not an agent-swarm setting: the incident channel ID. The
+      # lead reads it from the environment because its prompt names the channel,
+      # and a bot needs an ID rather than a name to post into one.
+      - SWARM_INCIDENT_CHANNEL=${SWARM_INCIDENT_CHANNEL}
+
+    ports:
+      - "3013:3013"
+
+    volumes:
+      # Mount ONLY the data directory. Mounting `/app` shadows the image's
+      # `migrations/` (and package.json, extensions/, scripts-runtime/, …) at
+      # whatever version first populated the mount, while the compiled binary
+      # keeps upgrading — so the API queries schema no migration ever created.
+      # `/app/data` holds the SQLite database and its auto-generated
+      # `.encryption-key`.
+      - /var/lib/agent-swarm/api-data:/app/data
+      # The only directory both this container and every agent have. The closing
+      # post-mortem is uploaded by `slack-upload-file`, which runs HERE, and it
+      # resolves a relative path from /workspace — so a file the lead wrote to
+      # /workspace/shared/<agent>/ only resolves if the API mounts the same
+      # directory. Without this the report cannot be uploaded, and the failure is
+      # quiet, which is the one shape of failure this system exists to avoid.
+      - /var/lib/agent-swarm/shared:/workspace/shared
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:3013/health || wget -q --spider http://localhost:3013/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    restart: unless-stopped
+
+  litestream:
+    image: litestream/litestream:0.3.13
+    command: ["replicate", "-config", "/etc/litestream.yml"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      # No keys are passed: credentials come from the instance profile through
+      # the SDK chain. litestream.yml carries the reasoning, and the deploy
+      # verifies replication rather than assuming it worked.
+      - AWS_REGION=us-west-2
+    volumes:
+      # Same data directory as the API: read the WAL, write only to S3.
+      - /var/lib/agent-swarm/api-data:/app/data
+      - ./litestream.yml:/etc/litestream.yml:ro
+    restart: unless-stopped
+
+  lead:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.158.0}"
+    entrypoint: *agent-entrypoint
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      - HARNESS_PROVIDER=${HARNESS_PROVIDER:-pi}
+      - MODEL_OVERRIDE=${MODEL_OVERRIDE:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - API_KEY=${API_KEY}
+      - "AGENT_ID=${LEAD_AGENT_ID:-}"
+      # The incident commander. Only this agent gets the custom prompt.
+      - AGENT_ROLE=lead
+      - TEMPLATE_ID=official/lead
+      - SYSTEM_PROMPT_FILE=/etc/agent-swarm/incident-commander.md
+      # Same network, so the service name resolves.
+      - MCP_BASE_URL=http://api:3013
+      - MEMORY_RATERS=${MEMORY_RATERS:-implicit-citation,explicit-self}
+      - AWS_DEFAULT_REGION=us-west-2
+      # Read-only log access, so an investigation carries evidence rather than a
+      # guess. The token reaches no write path in Grafana.
+      - GRAFANA_URL=${GRAFANA_URL}
+      - GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+      - LOKI_DATASOURCE_UID=${LOKI_DATASOURCE_UID}
+      - SWARM_INCIDENT_CHANNEL=${SWARM_INCIDENT_CHANNEL}
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+
+    volumes:
+      - /var/lib/agent-swarm/logs:/logs
+      - /var/lib/agent-swarm/shared:/workspace/shared
+      - /var/lib/agent-swarm/personal/lead:/workspace/personal
+      - ./incident-commander.md:/etc/agent-swarm/incident-commander.md:ro
+
+    restart: unless-stopped
+
+  coder-1:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.158.0}"
+    entrypoint: *agent-entrypoint
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      - HARNESS_PROVIDER=${HARNESS_PROVIDER:-pi}
+      - MODEL_OVERRIDE=${MODEL_OVERRIDE:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - API_KEY=${API_KEY}
+      - "AGENT_ID=${CODER_1_AGENT_ID:-}"
+      - AGENT_ROLE=worker
+      - TEMPLATE_ID=official/coder
+      - MCP_BASE_URL=http://api:3013
+      - MEMORY_RATERS=${MEMORY_RATERS:-implicit-citation,explicit-self}
+      - AWS_DEFAULT_REGION=us-west-2
+      - GRAFANA_URL=${GRAFANA_URL}
+      - GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+      - LOKI_DATASOURCE_UID=${LOKI_DATASOURCE_UID}
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+
+    volumes:
+      - /var/lib/agent-swarm/logs:/logs
+      - /var/lib/agent-swarm/shared:/workspace/shared
+      - /var/lib/agent-swarm/personal/coder-1:/workspace/personal
+
+    restart: unless-stopped
+
+  coder-2:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.158.0}"
+    entrypoint: *agent-entrypoint
+    pull_policy: always
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+
+    environment:
+      - HARNESS_PROVIDER=${HARNESS_PROVIDER:-pi}
+      - MODEL_OVERRIDE=${MODEL_OVERRIDE:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - API_KEY=${API_KEY}
+      - "AGENT_ID=${CODER_2_AGENT_ID:-}"
+      - AGENT_ROLE=worker
+      - TEMPLATE_ID=official/coder
+      - MCP_BASE_URL=http://api:3013
+      - MEMORY_RATERS=${MEMORY_RATERS:-implicit-citation,explicit-self}
+      - AWS_DEFAULT_REGION=us-west-2
+      - GRAFANA_URL=${GRAFANA_URL}
+      - GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+      - LOKI_DATASOURCE_UID=${LOKI_DATASOURCE_UID}
+      - YOLO=true
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_EMAIL=${GITHUB_EMAIL:-}
+      - GITHUB_NAME=${GITHUB_NAME:-}
+
+    volumes:
+      - /var/lib/agent-swarm/logs:/logs
+      - /var/lib/agent-swarm/shared:/workspace/shared
+      - /var/lib/agent-swarm/personal/coder-2:/workspace/personal
+
+    restart: unless-stopped
+
+  bridge:
+    build: ./bridge
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      - PORT=3014
+      # The bridge creates incident tasks through the API, so it authenticates
+      # as a control-plane client.
+      - API_KEY=${API_KEY}
+      - AGENT_SWARM_API_KEY=${AGENT_SWARM_API_KEY:-}
+      - AGENT_SWARM_API_URL=http://api:3013
+      # Matches the Grafana webhook contact point: the secret verifies the
+      # payload, the password authenticates the request.
+      - GRAFANA_WEBHOOK_SECRET=${GRAFANA_WEBHOOK_SECRET}
+      - GRAFANA_BASIC_AUTH_PASSWORD=${GRAFANA_BASIC_AUTH_PASSWORD}
+    volumes:
+      # The seen-set and the incident counter. Without a mount these live in the
+      # container's writable layer, so recreating the bridge forgets every
+      # fingerprint and restarts numbering at 1, which reads as brand new
+      # incidents for alerts that are already being worked.
+      - /var/lib/agent-swarm/bridge:/state
+    ports:
+      - "3014:3014"
+    restart: unless-stopped

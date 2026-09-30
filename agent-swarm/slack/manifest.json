@@ -1,0 +1,91 @@
+{
+  "display_information": {
+    "name": "Agent Swarm",
+    "description": "GoodParty incident swarm, alongside BugBoss",
+    "background_color": "#a86d07",
+    "long_description": "A second incident system, running alongside BugBoss on its own host. It triages Grafana alerts into incidents, works them with a swarm of agents, and reports in Slack."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "Agent Swarm",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/agent-swarm-status",
+        "description": "Check status of available agents",
+        "should_escape": false
+      },
+      {
+        "command": "/agent-swarm-help",
+        "description": "Show help for using the Agent Swarm bot",
+        "should_escape": false
+      }
+    ],
+    "agent_view": {
+      "agent_description": "Manage an agent-swarm",
+      "suggested_prompts": []
+    },
+    "rich_previews": {
+      "is_active": true,
+      "entity_types": [
+        "slack#/entities/file",
+        "slack#/entities/task",
+        "slack#/entities/item",
+        "slack#/entities/content_item"
+      ]
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "assistant:write",
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "chat:write.customize",
+        "chat:write.public",
+        "commands",
+        "files:read",
+        "files:write",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
+        "reactions:write",
+        "users:read"
+      ]
+    },
+    "pkce_enabled": false
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "entity_details_requested",
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim",
+        "assistant_thread_started"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false,
+    "is_mcp_enabled": true
+  }
+}
