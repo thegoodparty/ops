@@ -1532,7 +1532,10 @@ describe("Dispatcher.tick", () => {
   describe("after a restart kills an agent inside a blocking wait", () => {
     const ASKED_AGO_MS = 3_000_000;
 
-    const restartDuring = async (marker: "question" | "wait" | null) => {
+    const restartDuring = async (
+      marker: "question" | "wait" | null,
+      sessionAt = T0 - ASKED_AGO_MS - 5_000,
+    ) => {
       const { db, sqlite, cleanup } = makeDb();
       const { toolApiFor } = makeTools();
       insertIncident(sqlite, "i1", {
@@ -1573,7 +1576,7 @@ describe("Dispatcher.tick", () => {
           postNotice: async (_id, text) => {
             notices.push(text);
           },
-          lastSessionEventAt: async () => T0 - ASKED_AGO_MS,
+          lastSessionEventAt: async () => sessionAt,
         }),
       );
       clock = T0 + 45_000;
@@ -1603,6 +1606,49 @@ describe("Dispatcher.tick", () => {
         assert.deepEqual(directives, [{ type: "resumed_after", seconds: 45 }], marker);
       }
     });
+
+    // A SIGKILL mid-wait leaves its marker behind, and a resumed agent that
+    // never re-enters that wait leaves it there. Its later turns are newer
+    // than the marker, which is how an orphan is told from a live wait.
+    it("an orphaned marker older than the session proves nothing", async () => {
+      const { notices, directives } = await restartDuring(
+        "question",
+        T0 - ASKED_AGO_MS + 600_000,
+      );
+      assert.equal(notices.length, 1);
+      assert.deepEqual(directives, [
+        { type: "resumed_after", seconds: (ASKED_AGO_MS - 600_000 + 45_000) / 1000 },
+      ]);
+    });
+  });
+
+  it("does not let a session read that never settles hold up the tick", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", {
+      attempts: 1,
+      sessionRef: "sessions/incident/i1/session.jsonl",
+      lastStartedAt: T0 - 600_000,
+    });
+
+    const held = heldSpawn();
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        lastSessionEventAt: () => new Promise<number | null>(() => {}),
+      }),
+    );
+    const alarms = await captureAlarms(async () => {
+      const result = await d.tick();
+      assert.deepEqual(result.started.map((a) => a.incidentId), ["i1"]);
+    });
+    assert.ok(alarms.includes("resume_session_read_failed"));
+
+    held.releaseAll();
+    await d.drain();
+    cleanup();
   });
 
   it("falls back to the database when the session cannot be read", async () => {

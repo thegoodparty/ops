@@ -255,8 +255,12 @@ turn, via `lastSessionEventAt`) and what the agent's blocking tools write
 while a turn is still open: `boss_inbox`, agent `incident_action`,
 `pending_question`, `pending_wait`. An open `pending_question` or
 `pending_wait` row goes further: both are deleted when the wait ends, so one
-still standing means the agent was blocked inside it when it was killed, and
-it counts as alive up to this process's start. Launch is only the floor. Measuring from
+still standing and newer than the session's last entry means the agent was
+blocked inside it when it was killed, and it counts as alive up to this
+process's start. One older than the session is an orphan from an earlier
+interrupted wait and counts for nothing. The session read is bounded by
+`SESSION_READ_TIMEOUT_MS`, because ticks are serialized and a hung read
+would stop every relaunch. Launch is only the floor. Measuring from
 launch told every thread on every deploy that an agent working minutes
 earlier had been gone for hours, and to disregard its last message.
 
