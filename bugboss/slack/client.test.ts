@@ -3,8 +3,13 @@ import { describe, test } from "node:test";
 
 import axios, { type AxiosResponse, type InternalAxiosRequestConfig } from "axios";
 
-import { createCachingLinker, createSlackClient, createSlackFileUploader } from "./client";
-import type { ReportUpload } from "../report";
+import {
+  byteUploadTimeoutMs,
+  createCachingLinker,
+  createSlackClient,
+  createSlackFileUploader,
+} from "./client";
+import { UploadOutcomeUnknownError, type ReportUpload } from "../report";
 
 const INCIDENTS = "C0DEVALERTS";
 const ELSEWHERE = "C0RANDOM";
@@ -324,7 +329,7 @@ const A_FILE: ReportUpload = {
   threadTs: "100.000200",
   filename: "inc-1.md",
   title: "inc-1 post-mortem",
-  content: "the document",
+  content: Buffer.from("the document", "utf8"),
   comment: "post-mortem attached",
 };
 
@@ -335,6 +340,9 @@ const drive = async (
     upload?: () => Promise<Response>;
     /** A status the API answers with, for the retry question. */
     apiStatus?: number;
+    /** What files.completeUploadExternal answers with, alone. */
+    complete?: { ok: boolean; error?: string };
+    completeStatus?: number;
   } = {},
 ): Promise<UploadRun> => {
   const api: ApiCall[] = [];
@@ -351,14 +359,18 @@ const drive = async (
       params: new URLSearchParams(String(config.data ?? "")),
       timeout: config.timeout ?? 0,
     });
+    const completing = method === "files.completeUploadExternal";
     const data: Ticket =
       method === "files.getUploadURLExternal"
         ? (options.ticket ?? { ok: true, upload_url: SIGNED_URL, file_id: "F0DOC" })
-        : { ok: true };
+        : completing && options.complete
+          ? options.complete
+          : { ok: true };
+    const status = (completing ? options.completeStatus : undefined) ?? options.apiStatus;
     return Promise.resolve({
       data,
-      status: options.apiStatus ?? 200,
-      statusText: options.apiStatus ? "Server Error" : "OK",
+      status: status ?? 200,
+      statusText: status ? "Server Error" : "OK",
       headers: {},
       config,
       // `buildResult` reads this to spot the one method that answers with a
@@ -374,7 +386,7 @@ const drive = async (
       method: init?.method ?? "GET",
       signal,
       abortedAtCall: signal !== null && signal.aborted,
-      bytes: Buffer.isBuffer(init?.body) ? init.body.byteLength : -1,
+      bytes: init?.body instanceof Uint8Array ? init.body.byteLength : -1,
     });
     return options.upload ? options.upload() : new Response("OK", { status: 200 });
   }) as typeof fetch;
@@ -410,8 +422,8 @@ describe("an upload is bounded, or it is not an upload", () => {
     assert.equal(post.method, "POST");
     // The signal is the whole point of this test. Deleting it is a one-line
     // change that nothing else in the suite would notice, and it puts the
-    // report sweep back to waiting for as long as somebody else's host cares
-    // to hold the socket -- which is strictly worse than the inline fallback.
+    // close back to waiting for as long as somebody else's host cares to
+    // hold the socket, with the incident's close notice waiting behind it.
     assert.ok(post.signal instanceof AbortSignal, "the POST has no timeout");
     assert.equal(post.abortedAtCall, false, "a dead signal means it never went");
     // The two API calls either side are bounded too, and by the same number.
@@ -434,10 +446,11 @@ describe("an upload is bounded, or it is not an upload", () => {
     });
 
     assert.equal(run.error?.name, "TimeoutError");
+    assert.ok(!(run.error instanceof UploadOutcomeUnknownError), "nothing was shared");
     assert.equal(run.posts.length, 1, "the POST was attempted");
     // Completing an upload whose bytes never arrived is the one outcome worse
     // than failing: Slack publishes a file the reader cannot open, and the
-    // inline fallback never runs because nothing threw.
+    // retry never runs because nothing threw.
     assert.deepEqual(methods(run), ["files.getUploadURLExternal"]);
   });
 
@@ -471,20 +484,14 @@ describe("an upload is bounded, or it is not an upload", () => {
     }
   });
 
-  test("the length promised is bytes, not characters", async () => {
-    // A post-mortem quoting a log line is rarely pure ASCII, and Slack
-    // rejects the completion when the promised length does not match what
-    // arrived -- so a character count fails only on the documents that
-    // contain the interesting part.
-    const content = "rate rose 4% — timeouts on /café 🎉";
+  test("the length promised is the length sent", async () => {
+    // Slack rejects the completion when the promised length does not match
+    // what arrived, and a PDF is bytes that no character count describes.
+    const content = Buffer.from([0x25, 0x50, 0x44, 0x46, 0xe2, 0x80, 0x94, 0x00, 0xff]);
     const run = await drive({ ...A_FILE, content });
 
     const promised = Number(paramsFor(run, "files.getUploadURLExternal").get("length"));
-    assert.equal(promised, Buffer.byteLength(content, "utf8"));
-    assert.ok(
-      promised > content.length,
-      `${promised} vs ${content.length}: the fixture has no multi-byte characters`,
-    );
+    assert.equal(promised, content.byteLength);
     assert.equal(run.posts[0]?.bytes, promised, "what was sent is what was promised");
     assert.equal(run.error, null);
   });
@@ -515,15 +522,12 @@ describe("an upload is bounded, or it is not an upload", () => {
   });
 });
 
-describe("the upload does not retry its way past the tick it has", () => {
+describe("the upload does not retry on its own", () => {
   test("a retryable failure is attempted once, not five times over five minutes", async () => {
-    // This is the bound that is easy to get wrong because every individual
-    // request still looks bounded. The SDK's default policy spreads five
-    // attempts over five minutes, which is ten dispatcher ticks of the report
-    // sweep held open -- against a documented guarantee that a Slack which
-    // will not take the file degrades to thread text on the tick that noticed
-    // the close. Retrying also buys nothing here: the other side of this
-    // failure is the same report, in the thread, as text.
+    // The SDK's default policy spreads five attempts over five minutes while
+    // every individual request still looks bounded. The report sweep already
+    // retries the whole upload later, with a limit and an alarm, so a second
+    // retry loop underneath it only hides how long an attempt really took.
     const run = await drive(A_FILE, { apiStatus: 500 });
 
     assert.ok(run.error, "a 500 from Slack fails the upload");
@@ -533,21 +537,56 @@ describe("the upload does not retry its way past the tick it has", () => {
       "one attempt, and nothing downstream of it",
     );
     assert.deepEqual(run.posts, [], "no POST to a signed url it never received");
+    assert.ok(
+      !(run.error instanceof UploadOutcomeUnknownError),
+      "nothing was shared, so a retry is safe",
+    );
   });
 
-  test("every API call carries the same per-call bound", async () => {
-    // Zero is the SDK default and means unbounded. With retries off, the
-    // per-call bound is the whole story: three steps at 8s is 24s of worst
-    // case, inside the 30s tick.
+  test("both API calls keep the eight-second bound", async () => {
     const run = await drive(A_FILE);
 
-    const bounds = [...new Set(run.api.map((call) => call.timeout))];
-    assert.equal(bounds.length, 1, `mixed bounds: ${bounds.join(", ")}`);
-    assert.ok(bounds[0] > 0, "an unbounded WebClient call is the defect");
-    assert.ok(
-      run.api.length * bounds[0] < 30_000,
-      `${run.api.length} calls at ${bounds[0]}ms must fit one 30s tick`,
-    );
+    assert.deepEqual(methods(run), [
+      "files.getUploadURLExternal",
+      "files.completeUploadExternal",
+    ]);
+    for (const call of run.api) assert.equal(call.timeout, 8_000, call.method);
+  });
+});
+
+describe("the byte upload's bound grows with the file", () => {
+  test("a floor above the eight seconds incident 10 timed out on", () => {
+    assert.equal(byteUploadTimeoutMs(0), 20_000);
+    assert.ok(byteUploadTimeoutMs(4 * 1024) > 8_000);
+  });
+
+  test("more bytes, more time", () => {
+    assert.equal(byteUploadTimeoutMs(1024 * 1024), 20_000 + 1024 * 10);
+    assert.ok(byteUploadTimeoutMs(2 * 1024 * 1024) > byteUploadTimeoutMs(1024 * 1024));
+  });
+
+  test("and a ceiling, however large", () => {
+    assert.equal(byteUploadTimeoutMs(10 * 1024 * 1024), 60_000);
+    assert.equal(byteUploadTimeoutMs(1024 * 1024 * 1024), 60_000);
+  });
+});
+
+describe("a completion that may have landed says so", () => {
+  test("Slack answering no is a plain failure: nothing was shared", async () => {
+    const run = await drive(A_FILE, { complete: { ok: false, error: "missing_scope" } });
+
+    assert.match(String(run.error?.message), /missing_scope/);
+    assert.ok(!(run.error instanceof UploadOutcomeUnknownError));
+  });
+
+  test("no answer at all is an unknown outcome, because the file may be in the thread", async () => {
+    const run = await drive(A_FILE, { completeStatus: 502 });
+
+    assert.ok(run.error instanceof UploadOutcomeUnknownError, String(run.error));
+    assert.deepEqual(methods(run), [
+      "files.getUploadURLExternal",
+      "files.completeUploadExternal",
+    ]);
   });
 });
 

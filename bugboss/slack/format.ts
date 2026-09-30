@@ -306,11 +306,9 @@ export const MAX_MESSAGE_CHARS = 3000;
  * make it shorter.
  *
  * **This is the thread's budget and only the thread's**, and it is a budget
- * on text somebody is in a position to rewrite. The closing report is a file
- * and is deliberately exempt: the thread is short, the document is complete.
- * The exemption is `postDocument` below -- a different function rather than
- * a bigger number -- so the long thing is a call site you can grep for
- * rather than a check somebody forgot.
+ * on text somebody is in a position to rewrite. The closing report is exempt
+ * by never being thread text: it is a PDF attached to the close notice. The
+ * thread is short, the document is complete.
  */
 export const THREAD_PROSE_CHARS = 1200;
 
@@ -469,26 +467,8 @@ export const splitForSlack = (
  * returned because that is the message the rest hang off.
  *
  * A split is not a failure, but it is a thing that happened to somebody's
- * post-mortem, so it is said out loud rather than inferred from the channel.
+ * post, so it is said out loud rather than inferred from the channel.
  */
-/**
- * Post text that is exempt from `THREAD_PROSE_CHARS`, and say so by name.
- *
- * It does nothing `postProse` does not. It exists so the exemption is a name
- * at a call site instead of the absence of a check: a new caller of this is
- * a decision somebody has to defend in review, and a new caller of
- * `postProse` is not.
- *
- * One caller: the closing report, when it could not be uploaded as a file
- * and the thread is the only place left for it. The thread is short and the
- * document is complete.
- */
-export const postDocument = (
-  post: (text: string) => Promise<{ ts: string }>,
-  text: string,
-  context: Record<string, unknown> = {},
-): Promise<{ ts: string }> => postProse(post, text, { ...context, document: true });
-
 export const postProse = async (
   post: (text: string) => Promise<{ ts: string }>,
   text: string,

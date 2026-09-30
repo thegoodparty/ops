@@ -48,7 +48,13 @@ import {
   type IncidentRow,
   type SignalRow,
 } from "./assign";
-import { createAnnouncer, type AnnouncePoster } from "./announce";
+import {
+  agentClosedDetail,
+  bossClosedDetail,
+  closedNotice,
+  createAnnouncer,
+  type AnnouncePoster,
+} from "./announce";
 import { verifyAgentToken } from "./token";
 import {
   bullets,
@@ -153,6 +159,12 @@ export interface ToolApiDeps {
   correlator: Correlator;
   slack: ThreadPoster;
   evidence: EvidenceStore;
+  /**
+   * The close's one message: the notice with the closing report attached.
+   * Never throws; a report that will not go out is retried by the report
+   * sweep. Absent, the notice is posted alone as text.
+   */
+  announceClose?: (incidentId: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,13 +196,6 @@ const closeOpenSignals = (
     "UPDATE signal SET closedAt = ? WHERE incidentId = ? AND closedAt IS NULL",
   ).run(at, incidentId);
 };
-
-/**
- * The line every close posts, whoever closed it. A close reads one way in the
- * thread whether an agent wrote the post-mortem or the Boss ended it.
- */
-const closedNotice = (incidentId: string, detail: string): string =>
-  `${mrkdwn`*Incident ${incidentId} closed*`}\n${detail}`;
 
 const placeholders = (n: number) => new Array(n).fill("?").join(",");
 
@@ -877,9 +882,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
 
   // No budget on `postmortem`, deliberately, and this is the one transition
   // where that is true. It is not posted as thread text -- it becomes the
-  // closing report, a Markdown file in the thread -- so the thread stays
+  // closing report, a PDF attached to the close notice -- so the thread stays
   // short by the document being somewhere else rather than by the write-up
-  // being shorter. The thread post below is the Boss's own one-liner.
+  // being shorter.
   const reportAnalysis: ToolApi["reportAnalysis"] = (args) =>
     call("reportAnalysis", async (incidentId) => {
       const incident = readIncident(incidentId);
@@ -918,13 +923,11 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       });
       if (!applied) return raced(incidentId, "reportAnalysis");
 
-      await notify(
-        incident,
-        closedNotice(
-          incidentId,
-          mrkdwn`_${args.usersImpacted} users impacted · post-mortem written._`,
-        ),
-      );
+      if (deps.announceClose) {
+        await deps.announceClose(incidentId);
+      } else {
+        await notify(incident, closedNotice(incidentId, agentClosedDetail(args.usersImpacted)));
+      }
 
       // A recurrence closes on a second answer the first incident never had
       // to give, and that answer is the only thing here that can change the
@@ -1221,7 +1224,11 @@ const BOSS_CLOSABLE: readonly IncidentStatus[] = [
  * incident keeps the resolution time and evidence its agent recorded.
  */
 export const closeIncidentByBoss = async (
-  deps: { db: Db; slack: AnnouncePoster },
+  deps: {
+    db: Db;
+    slack: AnnouncePoster;
+    announceClose?: (incidentId: string) => Promise<void>;
+  },
   args: { incidentId: string; reason: string },
 ): Promise<{ ok: true; from: IncidentStatus } | { ok: false; error: string }> => {
   const { db, slack } = deps;
@@ -1276,12 +1283,15 @@ export const closeIncidentByBoss = async (
   }
 
   log("boss_closed", { incidentId, from: outcome.from });
+  if (deps.announceClose) {
+    await deps.announceClose(incidentId);
+    return outcome;
+  }
   const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [incidentId]);
   if (row) {
-    const incident = rowToIncident(row);
     await createAnnouncer({ db, slack }).notify(
-      incident,
-      closedNotice(incidentId, `_Closed by BugBoss:_ ${toMrkdwn(reason)}`),
+      rowToIncident(row),
+      closedNotice(incidentId, bossClosedDetail(reason)),
     );
   }
   return outcome;

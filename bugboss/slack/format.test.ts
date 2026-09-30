@@ -10,7 +10,6 @@ import {
   link,
   mrkdwn,
   overThreadBudget,
-  postDocument,
   postProse,
   raw,
   splitForSlack,
@@ -385,59 +384,5 @@ describe("the thread's budget", () => {
       THREAD_PROSE_CHARS < MAX_MESSAGE_CHARS,
       `${THREAD_PROSE_CHARS} vs ${MAX_MESSAGE_CHARS}`,
     );
-  });
-});
-
-describe("postDocument", () => {
-  const recorder = () => {
-    const sent: string[] = [];
-    let n = 0;
-    return {
-      sent,
-      post: async (text: string) => {
-        sent.push(text);
-        n += 1;
-        return { ts: `ts-${n}` };
-      },
-    };
-  };
-
-  const document = Array.from(
-    { length: 400 },
-    (_, i) => `- finding ${i} ${"x".repeat(20)}`,
-  ).join("\n");
-
-  test("the exemption is a name, not a second way of posting", async () => {
-    // If these two ever render differently, the closing report in the thread
-    // stops being the same text as every other post and starts being a path
-    // nothing else exercises.
-    const viaDocument = recorder();
-    const viaProse = recorder();
-
-    const documentResult = await postDocument(viaDocument.post, document);
-    const proseResult = await postProse(viaProse.post, document);
-
-    assert.deepEqual(viaDocument.sent, viaProse.sent);
-    assert.deepEqual(documentResult, proseResult);
-  });
-
-  test("a document many times the thread budget arrives whole", async () => {
-    const slack = recorder();
-    assert.ok(
-      document.length > THREAD_PROSE_CHARS * 5,
-      `${document.length} chars is not a document`,
-    );
-
-    const result = await postDocument(slack.post, document);
-
-    assert.ok(slack.sent.length > 1, `expected a split, got ${slack.sent.length}`);
-    assert.deepEqual(result, { ts: "ts-1" });
-    // The tail is the part a truncating bound would take, and the part a
-    // reader of a post-mortem most needs.
-    assert.ok(slack.sent.join("").includes("• finding 399"));
-    assert.ok(slack.sent.join("").includes("• finding 0 "));
-    for (const part of slack.sent) {
-      assert.ok(part.length <= MAX_MESSAGE_CHARS, `${part.length} chars`);
-    }
   });
 });

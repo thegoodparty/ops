@@ -1,35 +1,29 @@
 // The closing report: everything the system learned about one incident, in a
-// single document, posted into its thread when the incident closes.
+// single PDF, attached to the notice that says the incident closed. One
+// message, not a notice and a report beside it.
 //
 // It fires at CLOSED and not at RESOLVED, because the post-mortem does not
 // exist before then -- `report_analysis` is what writes it, and the schema
 // carries a CHECK saying a CLOSED row has one. Resolution keeps the short
 // post it already had.
 //
-// Publishing is a notification, never part of the transition. `reportAnalysis`
-// has already committed and the agent has already exited by the time anything
-// here runs, so every failure below degrades and alarms rather than
-// propagating: there is no state left to roll back and nothing useful to
-// retry into.
-//
-// Ordering is why this is not called from the tool API. The run's tokens
-// reach the incident row from `rollUpUsage`, which reads the session file
-// *after* the child exits -- so at the moment `report_analysis` returns, the
-// row still holds the previous launch's numbers, or zero. The composition
-// root calls this once roll-up has finished, and a sweep catches the
-// incidents whose container died in between.
+// Publishing is part of the close, called by the transition itself, but it
+// is never able to undo it: the close has committed before anything here
+// runs, so every failure below is recorded, alarmed and retried by the sweep
+// rather than propagated.
 
 import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
 import { sumSessionUsage } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
-import { mrkdwn, postDocument, splitForSlack } from "../slack/format";
+import { mrkdwn } from "../slack/format";
+import { agentClosedDetail, bossClosedDetail, closedNotice } from "../toolapi/announce";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
 import type { RecurrenceAnalysis } from "../types";
+import { renderReportPdf } from "./pdf";
 import {
   renderReportDocument,
-  renderThreadSummary,
   type ReportAction,
   type ReportData,
   type ReportPr,
@@ -37,26 +31,50 @@ import {
 } from "./render";
 
 export * from "./render";
+export * from "./pdf";
 
 const log = makeLog("report");
 
 const alarm = makeAlarm("report");
 
 /**
- * The durable marker that this incident's report has gone out, written as an
+ * The claim on publishing this incident's report, written as an
  * `incident_action` row rather than a new column: the DDL runs as CREATE
  * TABLE IF NOT EXISTS over a restored snapshot with no migration runner, so a
  * column added to a live table would never exist in production. This table
- * already is the ledger of what happened to an incident, and the Boss
- * publishing the report is one of those things.
+ * already is the ledger of what happened to an incident.
+ *
+ * Standing, it means the report went out, or an attempt is in flight, or one
+ * ended in a way nobody can tell apart from success. All three keep every
+ * publisher away.
  */
 export const REPORT_PUBLISHED_ACTION = "report_published";
 
+/** One attempt that failed and put nothing in the thread. Counted. */
+export const REPORT_UPLOAD_FAILED_ACTION = "report_upload_failed";
+
 /**
- * How long after closing the sweep will pick an incident up. The fast path
- * claims within a second or two of the agent exiting, so anything still
- * unclaimed after this lost its container between the transition and the
- * publish.
+ * The close notice went out on its own, after a failed attempt. Without this
+ * row the next attempt carries the notice as the file's comment, so a notice
+ * Slack refused is re-sent rather than lost.
+ */
+export const REPORT_NOTICE_POSTED_ACTION = "report_notice_posted";
+
+/**
+ * Attempts before the report is given up on, the one at close included. With
+ * the retry spacing below that is about twenty minutes of Slack being unable
+ * to take the file, which is weather that has lasted long enough for a
+ * person to look.
+ */
+export const REPORT_UPLOAD_ATTEMPTS = 4;
+
+/** How long after a failed attempt the sweep tries again. */
+export const REPORT_UPLOAD_RETRY_MS = 5 * 60 * 1000;
+
+/**
+ * How long after closing the sweep will pick an incident up. The close
+ * publishes within a second or two of the transition, so anything still
+ * unclaimed after this lost its container in between.
  */
 export const REPORT_SWEEP_GRACE_MS = 5 * 60 * 1000;
 
@@ -64,18 +82,16 @@ export const REPORT_SWEEP_GRACE_MS = 5 * 60 * 1000;
 const REPORT_SWEEP_LIMIT = 10;
 
 /**
- * How long a report that cannot be built keeps being retried before the
- * thread gets a line instead.
- *
- * Retrying is right for weather and wrong for a row this code cannot read.
- * The sweep takes the ten oldest unpublished closes, so an incident that
- * fails deterministically holds a slot in that queue on every tick forever --
- * ten of them and no report publishes again, with two alarms repeating every
- * thirty seconds as the only sign. An hour is long enough for a transient
- * cause to clear or for somebody to repair the row, and short enough that
- * giving up is still same-day.
+ * An upload whose last step failed without an answer. Slack may already have
+ * put the file in the thread, so this attempt keeps its claim: retrying it is
+ * how one report is attached twice.
  */
-export const REPORT_GIVE_UP_MS = 60 * 60 * 1000;
+export class UploadOutcomeUnknownError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UploadOutcomeUnknownError";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Collaborators
@@ -86,17 +102,19 @@ export interface ReportUpload {
   threadTs: string | null;
   filename: string;
   title: string;
-  /** The Markdown document. Bytes, not mrkdwn. */
-  content: string;
-  /** Posted as the file's message, in mrkdwn. */
-  comment: string;
+  /** The PDF. */
+  content: Buffer;
+  /**
+   * The file's message, in mrkdwn: the close notice, so notice and report
+   * arrive as one message. Null on a retry, whose notice already went out.
+   */
+  comment: string | null;
 }
 
 /**
  * Slack's external upload flow, which is three calls and no SDK sugar worth
  * depending on. Injected so the whole of this module is testable without a
- * workspace, and optional at the composition root so a deployment without the
- * scope degrades to text rather than losing the report.
+ * workspace.
  */
 export interface FileUploader {
   upload(file: ReportUpload): Promise<void>;
@@ -117,8 +135,17 @@ export interface ReportDeps {
   post(threadTs: string | null, text: string): Promise<{ ts: string }>;
   /** The channel incident threads live in, which the upload has to name. */
   channel: string;
-  uploader?: FileUploader;
+  uploader: FileUploader;
   prStates?: PrStateReader;
+  /** Defaults to the real PDF. Tests read the Markdown instead. */
+  renderPdf?: (markdown: string) => Promise<Buffer>;
+  /**
+   * Writes the run's tokens onto the row from its session file, before the
+   * report reads them. Every publisher needs it, the sweep included: a
+   * container that died mid-close may never have rolled up at all, and zero
+   * tokens reads as a free run. Never throws.
+   */
+  rollUpUsage?: (incidentId: string) => Promise<void>;
   now?: () => number;
 }
 
@@ -167,9 +194,14 @@ export const readReportData = async (
 
   const actions: ReportAction[] = deps.db.query<ActionRow>(
     `SELECT actorKind, actorId, action, reason, at FROM incident_action
-       WHERE incidentId = ? AND action <> ?
+       WHERE incidentId = ? AND action NOT IN (?, ?, ?)
        ORDER BY at, id`,
-    [incidentId, REPORT_PUBLISHED_ACTION],
+    [
+      incidentId,
+      REPORT_PUBLISHED_ACTION,
+      REPORT_UPLOAD_FAILED_ACTION,
+      REPORT_NOTICE_POSTED_ACTION,
+    ],
   );
 
   // Tokens and modelId are the record and come off the row. Turns and the
@@ -197,10 +229,10 @@ export const readReportData = async (
   // JSON will not load is a worse report, not a reason to withhold one.
   //
   // Every field is checked rather than cast, because the cast is the
-  // dangerous version: rendering runs *after* the publish is claimed, so a
-  // `why` that turned out to be missing would throw with the marker already
-  // durable -- the one shape of failure that loses a report for good. A row
-  // that is not an answer is treated exactly like one that will not parse.
+  // dangerous version: a `why` that turned out to be missing would throw in
+  // rendering on every attempt, and the report would be abandoned rather
+  // than published with the section saying so. A row that is not an answer
+  // is treated exactly like one that will not parse.
   let recurrence: RecurrenceAnalysis | null = null;
   if (incident.recurrenceAnalysis) {
     try {
@@ -259,26 +291,45 @@ export const readReportData = async (
 // Publishing
 // ---------------------------------------------------------------------------
 
-export type PublishOutcome = "published" | "degraded" | "skipped";
+export type PublishOutcome = "published" | "retrying" | "abandoned" | "skipped";
 
 /**
- * Claim the right to publish, as one statement.
+ * The close notice, derived from the row rather than handed in, so the sweep
+ * that publishes for a container that died mid-close says exactly what the
+ * close itself would have.
+ */
+export const closeNoticeFor = (data: ReportData): string => {
+  const bossClose = data.actions.find(
+    (action) => action.actorKind === "boss" && action.action === "close",
+  );
+  return closedNotice(
+    data.incident.id,
+    bossClose
+      ? bossClosedDetail(bossClose.reason ?? "")
+      : agentClosedDetail(data.incident.usersImpacted),
+  );
+};
+
+/**
+ * Claim the right to publish, as one statement, and learn in the same
+ * transaction whether the close notice has already gone out on its own.
  *
  * Guarded in the INSERT rather than by a read before it, like every other
- * transition here: two publishers can race -- the fast path after an agent
- * exits and the sweep -- and the write queue is the only thing that orders
- * them. The marker is durable *before* the message exists, so a container
- * that dies mid-post stays quiet rather than saying it twice. A resumed agent cannot re-enter
- * this at all, since `reportAnalysis` will not run twice against a CLOSED
- * row, but the container restarts on every merge to ops main and the sweep
- * runs on every tick.
+ * transition here: two publishers can race -- the close and the sweep -- and
+ * the write queue is the only thing that orders them. The claim is durable
+ * *before* the upload starts, so a container that dies mid-upload stays quiet
+ * rather than attaching the file twice.
  */
-const claim = (db: Db, incidentId: string, at: number): Promise<boolean> =>
+const claim = (
+  db: Db,
+  incidentId: string,
+  at: number,
+): Promise<{ claimed: boolean; failures: number; noticePosted: boolean }> =>
   db.withWrite((w: Database.Database) => {
     const res = w
       .prepare(
         `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
-         SELECT ?, 'boss', NULL, ?, 'closing report posted to the incident thread', ?
+         SELECT ?, 'boss', NULL, ?, 'closing report attached to the incident thread', ?
           WHERE EXISTS (SELECT 1 FROM incident WHERE id = ? AND status = 'CLOSED')
             AND NOT EXISTS (
               SELECT 1 FROM incident_action WHERE incidentId = ? AND action = ?
@@ -292,33 +343,74 @@ const claim = (db: Db, incidentId: string, at: number): Promise<boolean> =>
         incidentId,
         REPORT_PUBLISHED_ACTION,
       );
-    return res.changes > 0;
+    const count = (action: string): number =>
+      (
+        w
+          .prepare(
+            "SELECT COUNT(*) AS n FROM incident_action WHERE incidentId = ? AND action = ?",
+          )
+          .get(incidentId, action) as { n: number }
+      ).n;
+    return {
+      claimed: res.changes > 0,
+      failures: count(REPORT_UPLOAD_FAILED_ACTION),
+      noticePosted: count(REPORT_NOTICE_POSTED_ACTION) > 0,
+    };
   });
 
 /**
- * Hand the claim back, for the one case that earns it: nothing reached the
- * thread, so the marker says a report was posted that was not, and the sweep
- * should come round again.
- *
- * Deliberately not done after a partial post. A report has no way to tell
- * which of its parts landed, so the choice here is between half a report
- * somebody can see and a duplicate they have to reconcile. Half wins.
+ * Written after the post rather than before it. A crash in between repeats
+ * the notice on the next attempt, and a repeated line is the lesser failure
+ * next to a close nobody was told about.
  */
-const release = (db: Db, incidentId: string): Promise<void> =>
+const recordNotice = (db: Db, incidentId: string, at: number): Promise<void> =>
   db
     .withWrite((w: Database.Database) => {
       w.prepare(
-        "DELETE FROM incident_action WHERE incidentId = ? AND action = ?",
-      ).run(incidentId, REPORT_PUBLISHED_ACTION);
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES (?, 'boss', NULL, ?, 'close notice posted without the report', ?)`,
+      ).run(incidentId, REPORT_NOTICE_POSTED_ACTION, at);
     })
     .then(() => undefined);
 
 /**
- * Post the report into the incident thread, once.
+ * Record a failed attempt and, unless that was the last one, hand the claim
+ * back so the sweep comes round again. One transaction, so a crash leaves
+ * either the claim or the failure, never a released claim with no count.
+ */
+const recordFailure = (
+  db: Db,
+  incidentId: string,
+  error: string,
+  at: number,
+): Promise<number> =>
+  db.withWrite((w: Database.Database) => {
+    w.prepare(
+      `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+       VALUES (?, 'boss', NULL, ?, ?, ?)`,
+    ).run(incidentId, REPORT_UPLOAD_FAILED_ACTION, error, at);
+    const failed = w
+      .prepare(
+        "SELECT COUNT(*) AS n FROM incident_action WHERE incidentId = ? AND action = ?",
+      )
+      .get(incidentId, REPORT_UPLOAD_FAILED_ACTION) as { n: number };
+    if (failed.n < REPORT_UPLOAD_ATTEMPTS) {
+      w.prepare(
+        "DELETE FROM incident_action WHERE incidentId = ? AND action = ?",
+      ).run(incidentId, REPORT_PUBLISHED_ACTION);
+    }
+    return failed.n;
+  });
+
+/**
+ * Attach the report to the incident thread, once.
  *
- * Returns what happened rather than throwing. The caller is a `finally`
- * handler and a timer; neither has anything to do with a failure except log
- * it, and this module has already done that.
+ * Until the close notice has reached the thread, every attempt carries it as
+ * the file's message, so a close is one message. If an attempt fails, the
+ * notice goes out alone with a line saying the report follows, and a later
+ * attempt attaches the file on its own. Returns what happened rather than throwing: the callers are the close
+ * and a timer, and neither has anything to do with a failure except log it,
+ * which this module has already done.
  */
 export const publishIncidentReport = async (
   deps: ReportDeps,
@@ -326,141 +418,105 @@ export const publishIncidentReport = async (
 ): Promise<PublishOutcome> => {
   const now = deps.now ?? Date.now;
 
-  // Read before claiming, so the only work left inside the claim is posting.
-  // Two publishers racing both read; one of them then loses the INSERT and
-  // stops, which costs a wasted S3 get rather than a lost report.
-  let data: ReportData | null;
+  const { claimed, failures, noticePosted } = await claim(deps.db, incidentId, now());
+  if (!claimed) {
+    log("publish_skipped", { incidentId, reason: "not closed, or already claimed" });
+    return "skipped";
+  }
+  const noticeDue = !noticePosted;
+  log("publish_claimed", { incidentId, attempt: failures + 1 });
+
+  let data: ReportData | null = null;
   try {
+    await deps.rollUpUsage?.(incidentId);
     data = await readReportData(deps, incidentId);
-  } catch (err) {
-    alarm("assemble_failed", { incidentId, error: String(err) });
-    return "skipped";
-  }
-  if (!data) {
-    alarm("assemble_failed", { incidentId, error: "no such incident" });
-    return "skipped";
-  }
-  if (data.incident.status !== "CLOSED") {
-    log("publish_skipped", { incidentId, reason: "not closed", status: data.incident.status });
-    return "skipped";
-  }
-
-  // Rendered before the claim, for the same reason the read is. The claim is
-  // durable and the sweep will not revisit an incident that carries it, so
-  // anything able to throw has to throw while the report can still be
-  // published later. Rendering is where hostile row data lands -- an
-  // on-call list that is not a list, a metric that is not a number -- and
-  // the cost of doing it early is a wasted render when two publishers race,
-  // against a report lost for good.
-  let document: string;
-  let summary: string;
-  try {
-    document = renderReportDocument(data);
-    summary = renderThreadSummary(data);
-  } catch (err) {
-    // Rendering is a pure function of the row, so this fails again on every
-    // tick for as long as the row is what it is. Retried for an hour in case
-    // something repairs it, and after that answered rather than repeated: the
-    // thread is told the report is missing, which is the one thing a
-    // repeating alarm never does.
-    const stuck = data.incident.closedAt !== null &&
-      now() - data.incident.closedAt > REPORT_GIVE_UP_MS;
-    alarm("render_failed", { incidentId, error: String(err), givingUp: stuck });
-    if (!stuck) return "skipped";
-    if (!(await claim(deps.db, incidentId, now()))) return "skipped";
-    try {
-      await deps.post(
-        data.incident.slackThreadTs,
-        mrkdwn`*Incident ${incidentId} is closed, but its closing report could not be written.*\n_Everything the incident recorded is intact; it is the report that failed._`,
-      );
-      return "degraded";
-    } catch (postErr) {
-      await release(deps.db, incidentId);
-      alarm("publish_failed", { incidentId, error: String(postErr) });
-      return "skipped";
-    }
-  }
-
-  if (!(await claim(deps.db, incidentId, now()))) {
-    log("publish_skipped", { incidentId, reason: "already published" });
-    return "skipped";
-  }
-  log("publish_claimed", { incidentId });
-
-  const threadTs = data.incident.slackThreadTs;
-
-  const degrade = async (note: string): Promise<PublishOutcome> => {
-    // Counted because it decides whether the claim was earned. A thread that
-    // took nothing at all leaves a marker asserting a report exists when none
-    // does, and that marker is what stops the sweep ever trying again.
-    let landed = 0;
-    try {
-      // The summary is already mrkdwn, built by the `mrkdwn` tag; the
-      // document is raw Markdown and needs converting. Two texts, two paths,
-      // which is the split slack/format.ts draws.
-      for (const part of splitForSlack(renderThreadSummary(data, note))) {
-        await deps.post(threadTs, part);
-        landed++;
-      }
-      // postDocument, not postProse: this is the one text exempt from the
-      // thread's length budget, and the exemption is supposed to be a name
-      // somebody can grep for.
-      await postDocument((text) => deps.post(threadTs, text), document, { incidentId });
-      return "degraded";
-    } catch (err) {
-      if (landed === 0) await release(deps.db, incidentId);
-      alarm("publish_failed", {
-        incidentId,
-        error: String(err),
-        landed,
-        retryable: landed === 0,
-      });
-      return "skipped";
-    }
-  };
-
-  if (!deps.uploader) {
-    // Config, not a failure: a deployment with no file uploader wired still
-    // gets the whole report, in the thread.
-    log("publish_without_upload", { incidentId });
-    return degrade("Posted inline: BugBoss has no file upload configured.");
-  }
-
-  try {
+    if (!data) throw new Error("no such incident");
+    const pdf = await (deps.renderPdf ?? renderReportPdf)(renderReportDocument(data));
     await deps.uploader.upload({
       channel: deps.channel,
-      threadTs,
-      filename: `incident-${data.incident.id}.md`,
+      threadTs: data.incident.slackThreadTs,
+      filename: `incident-${data.incident.id}.pdf`,
       title: `Incident ${data.incident.id} — closing report`,
-      content: document,
-      comment: summary,
+      content: pdf,
+      comment: noticeDue ? closeNoticeFor(data) : null,
     });
     log("published", {
       incidentId,
-      chars: document.length,
+      bytes: pdf.byteLength,
+      attempt: failures + 1,
       signals: data.signals.length,
       prs: data.prs.length,
     });
     return "published";
   } catch (err) {
-    // Nobody asked for this failure and it is invisible otherwise: the
-    // likeliest cause is `files:write` missing because the app was never
-    // reinstalled after the scope was added, and a swallowed missing_scope
-    // looks exactly like a BugBoss that is working.
-    alarm("upload_failed", { incidentId, error: String(err) });
-    return degrade("The report file could not be uploaded, so it is posted here instead.");
+    if (err instanceof UploadOutcomeUnknownError) {
+      // The file may be in the thread. A second copy is the one outcome this
+      // cannot take back, so the claim stands and a person gets told.
+      alarm("upload_outcome_unknown", { incidentId, error: String(err) });
+      return "skipped";
+    }
+
+    // Reading and rendering fail here too, and are retried with the upload:
+    // an unreadable row can be repaired, and the attempt limit bounds the
+    // one that cannot.
+    const attempts = await recordFailure(deps.db, incidentId, String(err), now());
+    // The likeliest persistent cause is `files:write` missing because the
+    // app was never reinstalled after the scope was added, and a swallowed
+    // missing_scope looks exactly like a BugBoss that is working.
+    alarm("upload_failed", {
+      incidentId,
+      error: String(err),
+      attempt: attempts,
+      of: REPORT_UPLOAD_ATTEMPTS,
+    });
+    const threadTs = data?.incident.slackThreadTs ?? readThreadTs(deps.db, incidentId);
+    const say = async (text: string): Promise<boolean> => {
+      try {
+        await deps.post(threadTs, text);
+        return true;
+      } catch (postErr) {
+        alarm("notice_failed", { incidentId, error: String(postErr) });
+        return false;
+      }
+    };
+    // The notice rides with the last word on the report, whichever that is,
+    // so a close is never announced in two posts when one would do.
+    const withNotice = async (line: string): Promise<void> => {
+      if (!noticeDue) {
+        await say(line);
+        return;
+      }
+      const text = data ? `${closeNoticeFor(data)}\n${line}` : closedNotice(incidentId, line);
+      if (await say(text)) await recordNotice(deps.db, incidentId, now());
+    };
+
+    if (attempts < REPORT_UPLOAD_ATTEMPTS) {
+      if (noticeDue) await withNotice("_The closing report is attaching shortly._");
+      return "retrying";
+    }
+
+    alarm("upload_abandoned", { incidentId, attempts, error: String(err) });
+    await withNotice(
+      mrkdwn`_The closing report for Incident ${incidentId} could not be attached after ${attempts} attempts. It is saved with the incident._`,
+    );
+    return "abandoned";
   }
 };
 
+const readThreadTs = (db: Db, incidentId: string): string | null =>
+  db.get<{ slackThreadTs: string | null }>(
+    "SELECT slackThreadTs FROM incident WHERE id = ?",
+    [incidentId],
+  )?.slackThreadTs ?? null;
+
 /**
- * Publish anything that closed and never got a report.
+ * Publish anything that closed and has no report in its thread yet.
  *
- * The fast path runs in the `finally` of an agent launch, which a container
- * replaced mid-close never reaches -- and nothing relaunches an agent on a
- * CLOSED incident, so without this the report would be lost for good. The
- * grace period keeps it off the fast path's heels: an incident that closed
- * seconds ago still has usage roll-up in flight, and a report published ahead
- * of that would quote zero tokens.
+ * Two kinds of incident land here. One whose container was replaced between
+ * the close and its publish: nothing relaunches an agent on a CLOSED
+ * incident, so without this the close would never be announced at all. And
+ * one whose upload failed, which waits out the retry spacing so a Slack that
+ * will not take the file is not asked again on every tick.
  */
 export const publishPendingReports = async (
   deps: ReportDeps,
@@ -473,16 +529,26 @@ export const publishPendingReports = async (
           SELECT 1 FROM incident_action a
            WHERE a.incidentId = incident.id AND a.action = ?
         )
+        AND NOT EXISTS (
+          SELECT 1 FROM incident_action f
+           WHERE f.incidentId = incident.id AND f.action = ? AND f.at > ?
+        )
       ORDER BY closedAt
       LIMIT ?`,
-    [now() - REPORT_SWEEP_GRACE_MS, REPORT_PUBLISHED_ACTION, REPORT_SWEEP_LIMIT],
+    [
+      now() - REPORT_SWEEP_GRACE_MS,
+      REPORT_PUBLISHED_ACTION,
+      REPORT_UPLOAD_FAILED_ACTION,
+      now() - REPORT_UPLOAD_RETRY_MS,
+      REPORT_SWEEP_LIMIT,
+    ],
   );
 
-  let published = 0;
+  let settled = 0;
   for (const row of due) {
     const outcome = await publishIncidentReport(deps, row.id);
-    if (outcome !== "skipped") published++;
+    if (outcome === "published" || outcome === "abandoned") settled++;
   }
-  if (published > 0) log("sweep_published", { incidents: published });
-  return published;
+  if (settled > 0) log("sweep_published", { incidents: settled });
+  return settled;
 };

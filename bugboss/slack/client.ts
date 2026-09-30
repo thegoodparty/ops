@@ -14,11 +14,11 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { retryPolicies, WebClient } from "@slack/web-api";
+import { ErrorCode, retryPolicies, WebClient } from "@slack/web-api";
 
 import { makeAlarm } from "../logging";
 import type { ObjectStore, SlackClient, SlackMessage } from "./agent";
-import type { FileUploader } from "../report";
+import { UploadOutcomeUnknownError, type FileUploader } from "../report";
 
 /**
  * Error level, because the thing it reports is a tenfold rise in Slack calls
@@ -38,19 +38,33 @@ const alarm = makeAlarm("slack-client");
 const REPLIES_PAGE_LIMIT = 200;
 
 /**
- * One call in the upload flow, and there are three of them.
+ * The two Slack API calls in the upload flow, each.
  *
- * The guarantee this serves is about the whole flow, not one request: a
- * Slack that will not take the file degrades to thread text on the tick that
- * noticed the close, and the dispatcher tick is 30 seconds. A per-request
- * bound only delivers that if the requests cannot repeat, which is why the
- * retry policy below is what it is -- 8s x 3 steps is 24s of worst case,
- * inside the tick, and nothing about that arithmetic survives a retry.
- *
- * Eight seconds is what a Loki read gets. The body here is a post-mortem,
- * measured in kilobytes, so it does not need more.
+ * With retries off (below) this bound is the whole of what either call can
+ * cost. Eight seconds is what a Loki read gets, and both calls carry a few
+ * hundred bytes of JSON, so they do not need more.
  */
 const UPLOAD_CALL_TIMEOUT_MS = 8_000;
+
+/**
+ * The bound on the POST of the file's bytes to the signed url, which is the
+ * step incident 10 timed out on at eight seconds with a report of a few
+ * kilobytes. So it is not bandwidth that runs a small upload long but the
+ * fixed cost of Slack's file host accepting it, and the floor is set well
+ * above the eight seconds that failed. On top of that, 10ms per KiB is room
+ * for a link as slow as 100 KiB/s, and the ceiling stops one pathological
+ * upload holding the report's claim for more than a minute: past it, a
+ * later sweep's fresh attempt is worth more than more waiting.
+ */
+const BYTE_UPLOAD_FLOOR_MS = 20_000;
+const BYTE_UPLOAD_MS_PER_KIB = 10;
+const BYTE_UPLOAD_CEILING_MS = 60_000;
+
+export const byteUploadTimeoutMs = (bytes: number): number =>
+  Math.min(
+    BYTE_UPLOAD_CEILING_MS,
+    BYTE_UPLOAD_FLOOR_MS + Math.ceil(bytes / 1024) * BYTE_UPLOAD_MS_PER_KIB,
+  );
 
 /**
  * A link to one message. Slack builds a permalink out of the workspace
@@ -245,49 +259,58 @@ export const createSlackClient = (
  *
  * `files:write` is the scope, and it does nothing until somebody reinstalls
  * the app. Until then `files.completeUploadExternal` answers `missing_scope`,
- * which is a throw here and an alarm plus an inline post in `report/`.
+ * which is a throw here and a retried, then abandoned, report in `report/`.
  */
 export const createSlackFileUploader = (token: string): FileUploader => {
   const web = new WebClient(token, {
     // No retries, deliberately, and this is the one WebClient here without
-    // them. The SDK's default spreads five attempts over five minutes, which
-    // is ten dispatcher ticks spent holding the report sweep open while every
-    // individual request still looks bounded -- and it buys nothing, because
-    // the thing on the other side of a failure here is not a lost report. It
-    // is the same report, in the thread, as text. Waiting minutes to avoid
-    // that is the wrong way round.
+    // them. The SDK's default spreads five attempts over five minutes while
+    // every individual request still looks bounded, and `report/` already
+    // retries the whole upload on a later sweep, with a limit and an alarm.
+    // Two retry loops stacked is how a bound stops meaning anything.
     retryConfig: { retries: 0 },
     timeout: UPLOAD_CALL_TIMEOUT_MS,
   });
   return {
     upload: async (file) => {
-      // Byte length, not character count: Slack rejects the completion when
-      // the length it was promised does not match what arrived, and a
-      // post-mortem quoting a log line is rarely pure ASCII.
-      const body = Buffer.from(file.content, "utf8");
       const ticket = await web.files.getUploadURLExternal({
         filename: file.filename,
-        length: body.byteLength,
+        length: file.content.byteLength,
       });
       if (!ticket.upload_url || !ticket.file_id) {
         throw new Error("files.getUploadURLExternal returned no upload url");
       }
       const uploaded = await fetch(ticket.upload_url, {
         method: "POST",
-        body,
-        signal: AbortSignal.timeout(UPLOAD_CALL_TIMEOUT_MS),
+        body: new Uint8Array(file.content),
+        signal: AbortSignal.timeout(byteUploadTimeoutMs(file.content.byteLength)),
       });
       if (!uploaded.ok) {
         throw new Error(
           `file upload rejected: ${uploaded.status} ${uploaded.statusText}`,
         );
       }
-      await web.files.completeUploadExternal({
-        files: [{ id: ticket.file_id, title: file.title }],
-        channel_id: file.channel,
-        thread_ts: file.threadTs ?? undefined,
-        initial_comment: file.comment,
-      });
+      try {
+        await web.files.completeUploadExternal({
+          files: [{ id: ticket.file_id, title: file.title }],
+          channel_id: file.channel,
+          thread_ts: file.threadTs ?? undefined,
+          initial_comment: file.comment ?? undefined,
+        });
+      } catch (err) {
+        // Slack answering no is an answer: nothing was shared. Anything else
+        // -- a timeout, a dropped socket, a 5xx -- can arrive after Slack has
+        // already put the file in the thread, and retrying that posts it
+        // twice. The caller has to be able to tell the two apart.
+        const code = (err as { code?: string }).code;
+        if (
+          code === ErrorCode.PlatformError ||
+          code === ErrorCode.RateLimitedError
+        ) {
+          throw err;
+        }
+        throw new UploadOutcomeUnknownError(String(err));
+      }
     },
   };
 };
