@@ -39,6 +39,7 @@ import {
   renderHeader,
   type BoardRow,
 } from "../slack/board";
+import { STATUS_FACTS_SQL } from "../slack/status";
 
 const log = makeLog("board");
 
@@ -66,7 +67,7 @@ export const ALL_CLEAR_SETTLE_MS = 10 * 60 * 1000;
 const OPEN_LIST = OPEN_STATUSES.map((s) => `'${s}'`).join(",");
 
 /**
- * Every open incident, with the three fields a row is made of. One query:
+ * Every open incident, with the facts a row is made of. One query:
  * the board is read on every tick, and a read per incident is how a query
  * that runs twice a minute grows with the size of the corpus.
  */
@@ -74,14 +75,7 @@ export const openBoard = (db: {
   query<T>(sql: string, params?: unknown[]): T[];
 }): BoardRow[] =>
   db.query<BoardRow>(
-    `SELECT i.id AS incidentId,
-            i.status AS status,
-            i.summary AS summary,
-            (SELECT title FROM signal WHERE incidentId = i.id
-              ORDER BY openedAt, id LIMIT 1) AS firstSignalTitle,
-            (SELECT waitingFor FROM incident_wait WHERE incidentId = i.id)
-              AS waitingFor
-       FROM incident i
+    `${STATUS_FACTS_SQL}
       WHERE i.status IN (${OPEN_LIST})
       ORDER BY CAST(i.id AS INTEGER)`,
   );
@@ -209,17 +203,11 @@ interface HeaderRow extends BoardRow {
  */
 const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
   const candidates = deps.db.query<HeaderRow>(
-    `SELECT i.id AS incidentId,
-            i.status AS status,
-            i.summary AS summary,
-            i.slackThreadTs AS slackThreadTs,
-            t.header AS header,
-            (SELECT title FROM signal WHERE incidentId = i.id
-              ORDER BY openedAt, id LIMIT 1) AS firstSignalTitle,
-            (SELECT waitingFor FROM incident_wait WHERE incidentId = i.id)
-              AS waitingFor
-       FROM incident_thread t JOIN incident i ON i.id = t.incidentId
-      ORDER BY CAST(i.id AS INTEGER)`,
+    `SELECT f.*, i.slackThreadTs AS slackThreadTs, t.header AS header
+       FROM (${STATUS_FACTS_SQL}) f
+       JOIN incident i ON i.id = f.incidentId
+       JOIN incident_thread t ON t.incidentId = f.incidentId
+      ORDER BY CAST(f.incidentId AS INTEGER)`,
   );
 
   let written = 0;

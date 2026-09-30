@@ -49,10 +49,26 @@ export interface RelayConfig {
   rotationGroupId: string | null;
 }
 
+/**
+ * Whether the Boss already has a conversation in a thread outside any
+ * incident. The same predicate ingress is given, so the two layers cannot
+ * disagree about whether an untagged follow-up is the Boss's.
+ */
+export type BossThreadCheck = (
+  channel: string,
+  threadTs: string,
+) => boolean | Promise<boolean>;
+
 export interface RelayDeps {
   db: Db;
   slack: SlackPoster;
   config: RelayConfig;
+  /**
+   * Required: an untagged follow-up under a Boss answer is dropped without
+   * it, and an optional seam nobody wires is a fix that exists only in the
+   * source.
+   */
+  isBossThread: BossThreadCheck;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,11 +295,13 @@ export class SlackRelay {
   private readonly db: Db;
   private readonly slack: SlackPoster;
   private readonly cfg: RelayConfig;
+  private readonly isBossThread: BossThreadCheck;
 
   constructor(deps: RelayDeps) {
     this.db = deps.db;
     this.slack = deps.slack;
     this.cfg = deps.config;
+    this.isBossThread = deps.isBossThread;
   }
 
   /**
@@ -424,9 +442,16 @@ export class SlackRelay {
 
     const incident = this.incidentForThread(threadTs);
     if (!incident) {
-      return mentioned
-        ? { kind: "slack_agent", channel, threadTs, ts, user, text }
-        : ignore("thread is not an incident thread");
+      if (mentioned) return { kind: "slack_agent", channel, threadTs, ts, user, text };
+      // A follow-up under a Boss answer, untagged. It is the Boss's exactly
+      // as a tagged one would be: people reply to whoever answered them, and
+      // "Can you close incident 2?" was lost here for want of an @. Decided
+      // by what the Boss has done in this thread, never by what was said.
+      if (await this.isBossThread(channel, threadTs)) {
+        log("boss_thread_followup", { channel, threadTs, ts });
+        return { kind: "slack_agent", channel, threadTs, ts, user, text };
+      }
+      return ignore("thread is not an incident thread");
     }
 
     // Recorded before the Boss reads it. The thread is the record, so a

@@ -205,6 +205,53 @@ test("an untagged reply in an incident thread is not ignored", async () => {
   }
 });
 
+/**
+ * An untagged follow-up under a Boss answer is addressed to the Boss, and has
+ * to be visible here or it gets no :eyes: while the relay answers it. Which
+ * thread it is in decides that, never what it says.
+ */
+test("an untagged reply in a Boss conversation thread is not ignored", async () => {
+  const followUp = event({
+    type: "message",
+    text: "Can you close incident 2?",
+    thread_ts: "1764000000.000001",
+    ts: "1764000000.000200",
+  });
+
+  const blind = await classifySlackEvent(request(followUp), config);
+  assert.equal(blind.kind, "ignored", "premise: without the check it is chatter");
+
+  const seen: string[][] = [];
+  const bossThread = { ...config, isBossThread: (c: string, ts: string) => {
+    seen.push([c, ts]);
+    return ts === "1764000000.000001";
+  } };
+  assert.equal((await classifySlackEvent(request(followUp), bossThread)).kind, "boss_thread_reply");
+  assert.deepEqual(seen, [["C0BUGS", "1764000000.000001"]]);
+
+  const elsewhere = event({
+    type: "message",
+    text: "Can you close incident 2?",
+    thread_ts: "1764000000.000009",
+    ts: "1764000000.000300",
+  });
+  assert.equal(
+    (await classifySlackEvent(request(elsewhere), bossThread)).kind,
+    "ignored",
+    "the same words in another thread are nobody's",
+  );
+
+  const topLevel = event({ type: "message", text: "Can you close incident 2?" });
+  assert.equal((await classifySlackEvent(request(topLevel), bossThread)).kind, "ignored");
+
+  const tagged = event({ thread_ts: "1764000000.000001", ts: "1764000000.000400" });
+  assert.equal(
+    (await classifySlackEvent(request(tagged), bossThread)).kind,
+    "mention",
+    "a tagged message keeps its own kind",
+  );
+});
+
 test("a tagged reply in an incident thread is that incident's, not a new question", async () => {
   const result = await classifySlackEvent(
     request(

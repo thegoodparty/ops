@@ -124,6 +124,7 @@ beforeEach(async () => {
     db,
     slack,
     config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+  isBossThread: () => false,
   });
 });
 
@@ -224,6 +225,7 @@ describe("the mention policy", () => {
       db,
       slack: solo,
       config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: null },
+    isBossThread: () => false,
     });
     await seedIncident("inc-1");
     await r.emit(ordinary[0]);
@@ -657,6 +659,59 @@ describe("inbound", () => {
     );
   });
 
+  /**
+   * "Can you close incident 2?", untagged, under a Boss answer that began
+   * with a channel-level mention. It was dropped here as chatter. The route
+   * turns on whether the Boss has a conversation in that thread, and the
+   * predicate is handed the thread and never the text.
+   */
+  test("an untagged follow-up in a Boss conversation thread goes to the Boss", async () => {
+    const asked: string[][] = [];
+    const followUp = {
+      type: "message",
+      channel: CHANNEL,
+      user: "U0HUMAN",
+      text: "Can you close incident 2?",
+      ts: "1800.2",
+      thread_ts: "1800.1",
+    };
+
+    const blind = new SlackRelay({
+      db,
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: () => false,
+    });
+    assert.equal((await blind.handle(followUp)).kind, "ignore", "premise: dropped without the check");
+
+    const routed = new SlackRelay({
+      db,
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: (...args: string[]) => {
+        asked.push(args);
+        return Promise.resolve(args[1] === "1800.1");
+      },
+    });
+    const route = await routed.handle(followUp);
+    assert.equal(route.kind, "slack_agent");
+    if (route.kind !== "slack_agent") return;
+    assert.equal(route.threadTs, "1800.1", "answered in the same thread");
+    assert.equal(route.text, "Can you close incident 2?");
+    assert.deepEqual(asked, [[CHANNEL, "1800.1"]], "decided from the thread alone");
+
+    assert.equal(
+      (await routed.handle({ ...followUp, ts: "1900.2", thread_ts: "1900.1" })).kind,
+      "ignore",
+      "the same words in another thread are chatter",
+    );
+    assert.equal(
+      (await routed.handle({ ...followUp, ts: "1800.3", thread_ts: undefined })).kind,
+      "ignore",
+      "top-level chatter never asks the thread check",
+    );
+  });
+
   test("a threaded mention arriving twice is only handled once", async () => {
     const thread = await openThread("inc-1");
     const shared = {
@@ -713,6 +768,7 @@ describe("a broken thread link", () => {
       db: writeFailingDb(),
       slack,
       config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+    isBossThread: () => false,
     });
 
     const errors = await captureErrors(() =>

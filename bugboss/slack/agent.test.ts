@@ -91,9 +91,29 @@ const memoryStore = () => {
   return { store, objects };
 };
 
+/** The status card's summary call, for runs that never ask for a card. */
+const noSummaryModel = {
+  complete: () => Promise.reject(new Error("no summary expected in this test")),
+};
+
+const toolExtras = () => ({
+  silence: { reason: null as string | null },
+  status: {
+    summarise: () => Promise.reject(new Error("no summary expected in this test")),
+    cache: new Map<string, { position: number; text: string }>(),
+    now: Date.now,
+  },
+});
+
 const fakeModel = () => {
   const runs: SlackAgentRun[] = [];
-  const state = { reply: "answered", hold: false, gates: [] as (() => void)[] };
+  const state = {
+    reply: "answered",
+    hold: false,
+    gates: [] as (() => void)[],
+    /** When set, the run calls stay_silent with this reason, as a model would. */
+    silence: null as string | null,
+  };
   return {
     runs,
     state,
@@ -104,6 +124,11 @@ const fakeModel = () => {
     model: {
       run: async (req: SlackAgentRun) => {
         runs.push(req);
+        if (state.silence !== null) {
+          const tool = req.tools.find((t) => t.name === "stay_silent");
+          if (!tool) throw new Error("the Boss has no stay_silent tool");
+          await tool.run({ reason: state.silence });
+        }
         if (state.hold) {
           await new Promise<void>((resolve) => {
             state.gates.push(resolve);
@@ -226,7 +251,7 @@ describe("SQL access is read-only", () => {
 
   test("the tool refuses a write and leaves the row alone", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, commands: commandDeps() });
+    const [, query] = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
     const out = await query.run({ sql: "DELETE FROM incident" });
 
     assert.match(out, /^Rejected: /);
@@ -240,7 +265,7 @@ describe("SQL access is read-only", () => {
   // shared guard accepts actually runs.
   test("a refusal carries the shared guard's reason in this surface's shape", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, commands: commandDeps() });
+    const [, query] = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
 
     assert.equal(
       await query.run({ sql: "SELECT 1; DROP TABLE incident" }),
@@ -259,7 +284,7 @@ describe("SQL access is read-only", () => {
 
   test("a read the guard accepts runs, semicolon and quoted keywords included", async () => {
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, commands: commandDeps() });
+    const [, query] = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
 
     assert.match(await query.run({ sql: "SELECT id FROM incident;" }), /inc-1/);
     assert.equal(
@@ -287,7 +312,7 @@ describe("SQL access is read-only", () => {
     });
 
     const { store } = memoryStore();
-    const tool = buildTools({ db, store, commands: commandDeps() }).find((t) => t.name === "get_incident");
+    const tool = buildTools({ db, store, ...toolExtras(), commands: commandDeps() }).find((t) => t.name === "get_incident");
     assert.ok(tool);
     const out = await tool.run({ incidentId: "inc-wide" });
 
@@ -306,7 +331,7 @@ describe("SQL access is read-only", () => {
     });
 
     const { store } = memoryStore();
-    const [, query] = buildTools({ db, store, commands: commandDeps() });
+    const [, query] = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
     const out = await query.run({ sql: "SELECT * FROM signal" });
 
     assert.equal(out.split("\n").length, MAX_SQL_ROWS + 1, "rows are capped");
@@ -327,7 +352,7 @@ describe("SQL access is read-only", () => {
 describe("search_incidents on the Slack agent", () => {
   const searchTool = () => {
     const { store } = memoryStore();
-    const tool = buildTools({ db, store, commands: commandDeps() }).find(
+    const tool = buildTools({ db, store, ...toolExtras(), commands: commandDeps() }).find(
       (t) => t.name === "search_incidents",
     );
     assert.ok(tool, "the Slack agent can reach the search triage has");
@@ -433,7 +458,7 @@ describe("prefix binding", () => {
   test("the tool specs are byte-identical across builds and database states", async () => {
     const specs = () =>
       JSON.stringify(
-        buildTools({ db, store: memoryStore().store, commands: commandDeps() }).map(
+        buildTools({ db, store: memoryStore().store, ...toolExtras(), commands: commandDeps() }).map(
           ({ name, description, inputSchema }) => ({ name, description, inputSchema }),
         ),
       );
@@ -447,13 +472,15 @@ describe("prefix binding", () => {
 
     assert.equal(specs(), before);
     assert.deepEqual(
-      buildTools({ db, store: memoryStore().store, commands: commandDeps() }).map((t) => t.name),
+      buildTools({ db, store: memoryStore().store, ...toolExtras(), commands: commandDeps() }).map((t) => t.name),
       [
         "get_incident",
         "query_incidents",
         "read_agent_session",
         "search_incidents",
         "incident_board",
+        "incident_status",
+        "stay_silent",
         "message_agent",
         "close_incident",
         "merge_incidents",
@@ -476,6 +503,7 @@ describe("prefix binding", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -519,6 +547,7 @@ describe("the per-thread lock", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -548,6 +577,7 @@ describe("the per-thread lock", () => {
     const { store } = memoryStore();
     let calls = 0;
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -575,6 +605,7 @@ describe("the per-thread lock", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -604,6 +635,7 @@ describe("session persistence", () => {
     const slack = fakeSlack();
     const { store, objects } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -713,6 +745,7 @@ describe("session persistence", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store: { ...store, put: () => Promise.reject(new Error("s3 500")) },
       slack: slack.client,
@@ -733,6 +766,7 @@ describe("session persistence", () => {
     const { store } = memoryStore();
     const posts: string[] = [];
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: {
@@ -774,6 +808,7 @@ describe("when the answer itself fails", () => {
     const { store } = memoryStore();
     const posts: { channel?: string; text: string }[] = [];
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: {
@@ -811,6 +846,7 @@ describe("when the answer itself fails", () => {
     const { store } = memoryStore();
     const posts: { channel?: string; text: string }[] = [];
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: {
@@ -842,22 +878,26 @@ describe("when the answer itself fails", () => {
 });
 
 describe("reading another agent's session", () => {
-  test("it finds the archived session under the incident prefix", async () => {
+  test("it finds the archived session under the incident prefix, and counts turns", async () => {
     const { store, objects } = memoryStore();
+    const said = (text: string) =>
+      JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text }] } });
     objects.set(
       "sessions/incident/inc-1/session.jsonl",
-      ["{\"role\":\"user\"}", "{\"role\":\"assistant\"}", "{\"role\":\"tool\"}"].join("\n"),
+      [said("first look"), said("second look"), said("third look")].join("\n"),
     );
-    const [, , read] = buildTools({ db, store, commands: commandDeps() });
+    const [, , read] = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
 
-    const out = await read.run({ incidentId: "inc-1", tailLines: 2 });
-    assert.match(out, /3 entries, last 2/);
-    assert.doesNotMatch(out, /"role":"user"/);
+    const out = await read.run({ incidentId: "inc-1", turns: 2 });
+    assert.match(out, /3 turns, last 2/);
+    assert.match(out, /third look/);
+    assert.doesNotMatch(out, /first look/);
+    assert.doesNotMatch(out, /"role":/, "a rendering, not the JSONL");
   });
 
   test("a missing session says so rather than inventing one", async () => {
     const { store } = memoryStore();
-    const [, , read] = buildTools({ db, store, commands: commandDeps() });
+    const [, , read] = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
     const out = await read.run({ incidentId: "inc-404" });
     assert.match(out, /No session under sessions\/incident\/inc-404\//);
   });
@@ -888,7 +928,7 @@ describe("the Slack agent hands back no links of its own", () => {
 
   test("get_incident reports the thread ts, never a url", async () => {
     await withThread("inc-1", "400.0");
-    const [get] = buildTools({ db, store: memoryStore().store, commands: commandDeps() });
+    const [get] = buildTools({ db, store: memoryStore().store, ...toolExtras(), commands: commandDeps() });
 
     const out = await get.run({ incidentId: "inc-1" });
 
@@ -899,7 +939,7 @@ describe("the Slack agent hands back no links of its own", () => {
 
   test("query_incidents does not decorate a row that names a thread", async () => {
     await withThread("inc-1", "400.0");
-    const [, query] = buildTools({ db, store: memoryStore().store, commands: commandDeps() });
+    const [, query] = buildTools({ db, store: memoryStore().store, ...toolExtras(), commands: commandDeps() });
 
     const out = await query.run({
       sql: "SELECT id, slackThreadTs FROM incident WHERE slackThreadTs IS NOT NULL",
@@ -1319,6 +1359,7 @@ describe("the turn budget", () => {
     const { store } = memoryStore();
     const leases: number[] = [];
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -1348,6 +1389,7 @@ describe("the turn budget", () => {
     const slack = fakeSlack();
     const { store } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -1371,9 +1413,14 @@ describe("asking the right tool", () => {
     assert.match(SLACK_AGENT_SYSTEM, /WHERE i\.status IN \('INVESTIGATING','FIXING'\)/);
   });
 
-  test("the prompt says what an on-call answer contains", () => {
-    assert.match(SLACK_AGENT_SYSTEM, /blocked on a person/i);
-    assert.match(SLACK_AGENT_SYSTEM, /needs nothing from them/i);
+  // Status used to be composed by the model, and came out a different shape
+  // every time it was asked. It is rendered by code now, so what the prompt
+  // has to carry is that the card is pasted, not rewritten.
+  test("the prompt sends status questions to the rendered card and the board, verbatim", () => {
+    assert.match(SLACK_AGENT_SYSTEM, /call incident_status and post the card exactly as it comes back/);
+    assert.match(SLACK_AGENT_SYSTEM, /at most one sentence of your own/);
+    assert.match(SLACK_AGENT_SYSTEM, /Never rewrite, reorder, reformat or summarise the card/);
+    assert.match(SLACK_AGENT_SYSTEM, /"what needs me\?" is incident_board, pasted as it comes back/);
     assert.match(SLACK_AGENT_SYSTEM, /About 200 words/);
     assert.match(SLACK_AGENT_SYSTEM, /Plain terms/);
   });
@@ -1459,6 +1506,7 @@ describe("what a question cost", () => {
     const { store } = memoryStore();
     const slack = fakeSlack();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -1488,7 +1536,7 @@ describe("read_agent_session", () => {
   const readSession = async (lines: string[]) => {
     const { store, objects } = memoryStore();
     objects.set(sessionKeyFor("inc-1"), lines.join("\n"));
-    const tools = buildTools({ db, store, commands: commandDeps() });
+    const tools = buildTools({ db, store, ...toolExtras(), commands: commandDeps() });
     const tool = tools.find((t) => t.name === "read_agent_session");
     assert.ok(tool);
     return tool.run({ incidentId: "inc-1" });
@@ -1502,17 +1550,19 @@ describe("read_agent_session", () => {
     assert.match(out, /was killed after 1 turns/);
   });
 
-  // The reader used to cut its own answer at 24,000 characters, which meant
-  // the entries a reader asked for by number were the entries most likely
-  // to be missing. `tailLines` is the bound now, and it counts entries.
-  test("the tail comes back whole, however wide the entries are", async () => {
+  // The reader used to cut its own answer at 24,000 characters, and then
+  // handed back raw JSONL lines instead, sixty of which were 199,928
+  // characters in prod. The bound is a count of turns now, and nothing is cut.
+  test("the tail is the turns asked for, bounded by count rather than width", async () => {
     const out = await readSession(
-      Array.from({ length: 20_000 }, (_, i) => turn(`${i} ${"x".repeat(500)}`)),
+      Array.from({ length: 20_000 }, (_, i) => turn(`turn number ${i} checked the deploy`)),
     );
 
     assert.match(out, /was killed after 20000 turns/);
-    assert.ok(out.includes("19999 "), "the last entry is there");
-    assert.ok(out.includes("19920 "), "and so are the eighty asked for");
+    assert.match(out, /20000 turns, last 15/);
+    assert.ok(out.includes("turn number 19999 checked the deploy"), "the last turn is there, whole");
+    assert.ok(out.includes("turn number 19985 checked the deploy"), "and so are the fifteen asked for");
+    assert.ok(!out.includes("turn number 19984 "), "and nothing before them");
     assert.ok(!out.includes("truncated"));
   });
 
@@ -1874,6 +1924,7 @@ describe("the Boss in an incident thread", () => {
     const slack = fakeSlack();
     const { store, objects } = memoryStore();
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store,
       slack: slack.client,
@@ -1983,6 +2034,7 @@ describe("the Boss in an incident thread", () => {
     const slack = fakeSlack();
     slack.state.replies = [opening];
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
       slack: slack.client,
@@ -2003,6 +2055,7 @@ describe("the Boss in an incident thread", () => {
     const slack = fakeSlack();
     slack.state.replies = [opening];
     const agent = new SlackAgent({
+      summaryModel: noSummaryModel,
       db,
       store: memoryStore().store,
       slack: slack.client,
@@ -2016,16 +2069,21 @@ describe("the Boss in an incident thread", () => {
     assert.equal(slack.posts[0].threadTs, THREAD);
   });
 
-  test("an empty answer posts nothing, and that is not a failure", async () => {
+  test("a chosen silence posts nothing, and logs why at info", async () => {
     await seed();
     const { model, slack, agent } = build();
     slack.state.replies = [opening];
     model.state.reply = "";
+    model.state.silence = "two people are talking to each other";
     const lines = await captureLogs(() =>
       agent.handleIncident({ incidentId: "7", trigger: human("500.000300", "@dana can you look at this?") }),
     );
     assert.equal(model.runs.length, 1, "premise: the Boss did read it");
     assert.equal(slack.posts.length, 0);
+    const chose = lines.find((l) => l.includes('"stay_silent"'));
+    assert.ok(chose, "the silence is logged");
+    assert.match(chose, /two people are talking to each other/);
+    assert.match(chose, /"level":"info"/);
     assert.ok(lines.some((l) => l.includes("incident_answered") && l.includes('"spoke":false')));
   });
 
@@ -2118,7 +2176,7 @@ describe("the Boss in an incident thread", () => {
 
 describe("the Boss's write tools", () => {
   const tool = (name: string, over: Partial<BossCommandDeps> = {}) => {
-    const found = buildTools({ db, store: memoryStore().store, commands: commandDeps(over) }).find(
+    const found = buildTools({ db, store: memoryStore().store, ...toolExtras(), commands: commandDeps(over) }).find(
       (t) => t.name === name,
     );
     assert.ok(found, name);
@@ -2249,6 +2307,7 @@ describe("the Boss's write tools", () => {
       const model = fakeModel();
       const slack = fakeSlack();
       const agent = new SlackAgent({
+        summaryModel: noSummaryModel,
         db,
         store: memoryStore().store,
         slack: slack.client,
