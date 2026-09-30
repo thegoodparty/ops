@@ -117,6 +117,13 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   escalates every tick — the hot loop `park` exists for, named in its own
   doc comment in `types.ts`. Announcing is what a person sees; parking is
   what makes it stop.
+- **A launch that starts spent makes no model request.** `turn_end` fires
+  only after a turn is paid for, and the first turn of a relaunch rewrites
+  the whole restored context: incident 80 came back at 266 of 200 turns and
+  spent $4.04 on one `get_incident`. So `promptWithinBudget` runs the same
+  hand-off before the first prompt when the restored count is already at the
+  cap. The dispatcher cannot make this call itself: it never reads the
+  session file the count lives in.
 - **The agent escalating itself wins the announcement.** The steer asks for
   exactly that and the model can answer on its very last grace turn, which
   ends the same `turn_end` the cap fires on. The budget watches
@@ -192,6 +199,19 @@ post-mortem. Those are records, not conversation.
 matter how long they wait. That is what keeps a multi-day incident from
 saturating context on polling, and it is why the prompt forbids polling with
 bash in a loop.
+
+**One call blocks for at most `MAX_BLOCK_SECONDS` (3300s).** That is under
+the one-hour prompt cache TTL, so a wake is a warm read rather than a rewrite
+of the whole context. Incident 80 asked `monitor` for 2h and 4h and paid
+$5.25 in cold rewrites for the two wakes. A longer request is clamped, not
+refused: the result says the call was capped and nothing timed out, and the
+agent calls again. A capped `monitor` keeps its wait marker, so the re-armed
+call resumes the original clock and heartbeat ladder (without that, the first
+reminder at one hour would never land). A capped wait with no marker has
+nothing to resume, so its result names the `timeoutSeconds` left and the
+agent passes that; passing the original again would restart the clock every
+call and the wait would never end. A capped `message_boss` keeps its
+question marker, so calling again with the same message does not re-ask.
 
 **A Boss message is a user message, and it ends a wait.** The Boss writes it
 to `pending_directive` from another process, so `createDirectiveWatcher`
