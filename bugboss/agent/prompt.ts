@@ -152,7 +152,8 @@ whole context is written again from scratch. That was 41% of the bill on a
 nine-hour incident. Waiting less does not win it back — how long you wait is
 set by what you are waiting for — so the waste is arriving at the far end
 having learned nothing. The command you give it must be a read-only check,
-because a container restart replays the call and runs it again.
+because a container restart replays the call and runs it again. waitingFor is
+what people read on the incident board, so it is plain words, never shell.
 
 **When a person is what you are waiting for, say so in awaitingHuman.** A
 merge, a flag, a restart someone else has to do. Write what they have to do and
@@ -253,7 +254,8 @@ for it only when you actually need to build or test:
       command: "test -f ${input.npmCiDoneMarker} && echo ready || { test -f ${input.npmCiFailedMarker} && cat ${input.npmCiFailedMarker} && exit 0; exit 1; }",
       intervalSeconds: 15,
       timeoutSeconds: 900,
-      description: "npm ci to finish"
+      description: "npm ci to finish",
+      waitingFor: "npm ci to finish"
     )
 
 Branch off main, commit, and push with the gh CLI. The token in your
@@ -334,15 +336,18 @@ const MONITOR_EXAMPLES = (input: PromptInput): string => `## Waiting, concretely
     monitor("gh pr view <url> --json state -q .state | grep -qE 'MERGED|CLOSED'",
             intervalSeconds: 60, timeoutSeconds: 86400,
             description: "the PR to be merged",
+            waitingFor: "someone to merge omni#<n>",
             awaitingHuman: "Merge <url>. Checks are green and it is approved; I cannot merge.")
 
     monitor("gh run list --commit <sha> --json conclusion -q '.[0].conclusion' | grep -q success",
             intervalSeconds: 30, timeoutSeconds: 3600,
-            description: "the release train to finish deploying <sha>")
+            description: "the release train to finish deploying <sha>",
+            waitingFor: "the deploy of <sha> to finish")
 
     monitor("test -f ${input.npmCiDoneMarker}",
             intervalSeconds: 15, timeoutSeconds: 900,
-            description: "npm ci")
+            description: "npm ci",
+            waitingFor: "npm ci to finish")
 
 A quiet signal is the same shape: a read-only query that exits non-zero while
 the bad thing is still happening and 0 once it has stopped for long enough to

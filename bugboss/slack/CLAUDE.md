@@ -85,7 +85,7 @@ A reply here has to stay visible at ingress: `classifySlackEvent` keeps an
 threads the route used to be "tagged or dropped", so a person replying to the
 Boss the way people reply to anyone — without an `@` — was talking to nobody.
 A thread where the Boss already has a conversation (a `boss_thread` row,
-recorded by `answerMention` and `sayInThread` in the composition root, or a
+recorded by `answerMention` in the composition root, or a
 persisted session `state.json` under `slackSessionPrefix`) routes an untagged
 reply to `slack_agent`, exactly as a tagged one in that thread. Ingress calls
 it `boss_thread_reply` so it keeps its :eyes:. Both layers take the one
@@ -107,9 +107,8 @@ it is working on something it will never answer.
 
 Since ingress stopped reading words (see "The human boundary" in
 `docs/architecture.md`), the kinds left are what a signature, an event
-envelope and a thread id can answer. `mention` earns one — covering a report
-and a question alike, because telling those apart is a model call further in
-— and so does `incident_reply`, any reply in a thread BugBoss owns, which is
+envelope and a thread id can answer. `mention` earns one, bare or not,
+because what it asks for is the Boss's to read — and so does `incident_reply`, any reply in a thread BugBoss owns, which is
 how a person talks to the Boss about an incident, and `boss_thread_reply`, an
 untagged follow-up in a thread where the Boss already has a conversation. The invariant that keeps the two layers honest, tested in
 `test/e2e.test.ts`: **nothing the relay acts on may be `ignored` at ingress.**
@@ -279,7 +278,7 @@ is facts, so it is rendered in `slack/status.ts` and the Boss pastes it.
 | --- | --- |
 | lifecycle | `incident.status`, every state in order with the current one in bold caps; MERGED names the survivor; PARKED when an `incident_wait` has `liftsOnReply = 0` |
 | the few-word title | `incident.summary`, falling back to the first signal's title |
-| waiting on | `incident_wait.waitingFor`, `pending_question`, `pending_wait` and unread inbox questions, or "nobody" |
+| waiting on | `incident_wait.waitingFor`, `pending_question`, `pending_wait.waitingFor` and unread inbox questions, or "nobody"; a parked incident is the one sentence "a person to decide what happens next; the turn budget is spent" and nothing else |
 | now | the one model-written line; see below |
 | impact, PR, spend | `usersImpacted`, `prUrls`, and `describeSpend` over the session, with its estimate wording |
 
@@ -291,13 +290,19 @@ disagree:
   in the morning, is a list of them, and each thread's header is the same
   words on two lines (`slack/board.ts` delegates to `slack/status.ts`).
 
+**A monitor wait shows the agent's `waitingFor`, never its command.** The
+command is a shell line, and the board once printed one verbatim as what an
+incident was waiting on. `STATUS_FACTS_SQL` does not read `pending_wait.command`
+at all. A wait recorded before `monitor` asked for a label shows "a check the
+agent is running".
+
 **The one-line forms carry no clock.** A header is rewritten whenever its
 text changes, so "asked 12 min ago" in it would rewrite every thread's header
 every minute against a Tier 3 budget. Only the card shows ages.
 
 **Exactly one line is written by a model.** "Now" is a direct bounded call
-(`createStatusSummariser`, on the intent-read model so
-`BUGBOSS_INTENT_MODEL_ID` can move it somewhere cheaper) over the agent's
+(`createStatusSummariser`, on `intentModel` so `BUGBOSS_INTENT_MODEL_ID` can
+move it somewhere cheaper) over the agent's
 last `STATUS_SUMMARY_TURNS` rendered turns. It is cached per incident at a
 **session position**, the number of entries in the session, so asking twice
 about an agent that has not moved costs one call. A failed call renders
@@ -348,80 +353,32 @@ gets **no header** — the one answer that cannot delete somebody's alert text.
 
 ## Nothing here reads the words a person chose
 
-Two readers of inbound human text, and both are models:
+One reader of inbound human text, and it is the Boss. In an incident thread
+it has the incident, the thread and its inbox in front of it; on a mention
+anywhere else it has the mention and what was said in that thread since it
+last answered. There is no classifier in front of it.
 
-- **In an incident thread**, the Boss itself, with the incident, the thread
-  and its inbox in front of it. There is no separate classifier.
-- **On a mention anywhere else**, `intent.ts`: whether somebody is reporting
-  something broken, asking a question, or asking for two incidents to be
-  combined.
+There used to be two. The mention path first ran a string matcher on the
+first word, then a model call that knew three labels: report, question,
+combine. A request to act fit none, so "Can you close incident 2?" was
+answered "Which is it?". The Boss reads which a message is and does it: a
+report goes through `open_incident`, a request to close, merge or stop goes
+through its write tools, and a question gets an answer.
 
-The mention read used to be a string matcher on the first word — `report`,
-`bug` or `broken` — so `@bugboss Pro upgrades are failing` was answered as a
-question and opened nothing. A magic phrase nobody can discover is not an
-interface. Every outcome of the read is said out loud: an ambiguous read asks
-which it was, and a failed model call says the call failed. Silence is what
-the old matcher did, and silence is indistinguishable from the bot not reading
-you.
+`buildInput` frames a mention as `<@user> says: …`, never `asks:`, so the
+framing does not presuppose a question.
+
+### `open_incident`
+
+Files a report through `reportAccepted` in the composition root, the same
+human-signal ingest every report takes. The model supplies only the text. The
+reporter is the person whose message started the run, off the signed Slack
+event: the mention's user, or in an incident thread the newest person in the
+run. A run only an agent's inbox started has nobody to attribute a report to,
+so the tool refuses. The mention's ts is the dedup key, so a retry of the
+same call in the same run files nothing new.
 
 The relay records and routes; it does not decide what a message meant.
-
-### The mention read is advisory
-
-Same split as `triage/`: the model reads the sentence, the code keeps the
-invariants. The only read that writes is a combine, and three code-side checks
-bound it: every id must appear literally in what the person typed, both must
-name incidents that can still take signals, and which of the two survives is
-`assign`'s rule rather than anything said in the message. It writes under the
-`human` actor, with the Slack user id off the verified event, never out of the
-text.
-
-The message is fenced in a `<MESSAGE untrusted="true">` block with the rule
-stated in the system prompt, the same framing triage puts around an alert
-body. That is worth having and is not what the containment rests on.
-
-### Cost, latency and the failure path
-
-One bounded call per mention: a few hundred tokens in, a label or two out, no
-tools and no database access. It runs on the same `ModelClient` triage uses;
-`BUGBOSS_INTENT_MODEL_ID` moves it to a smaller model without a deploy.
-
-It runs **off the Slack ack**, in the `settled` promise, next to the Slack
-agent. That costs a report its durability before the ack: what makes a mention
-a report is the model call, and recording every mention as a signal first
-would open an incident for every question. A report typed into the window
-between the ack and the read is lost with a 200 already sent. This container
-restarts on every merge to ops `main`, so that window is real, and closing it
-properly means a durable inbox rather than a different place to put the call.
-
-A failed call answers `unclear`, alarms with the module's fallback rate
-(`triage/health.ts`), and posts a line saying the read failed rather than that
-the message was ambiguous. Those are two different sentences on purpose.
-
-### Combining two incidents from a mention
-
-Somebody says "82 and 79 are the same bug, merge them" at the bot and it
-happens. An agent may only re-partition its own incident, so before this the
-one legal move left to an agent being asked was to open a *third* incident.
-From inside an incident thread the same request is the Boss's to act on, with
-`merge_incidents`, which calls the same `assign` and `announceMerge` pair.
-
-`combineIncidents` in the composition root runs it. Out in the channel
-nothing supplies a second side, so both have to be named, and every way a pair
-fails to form asks which incidents rather than dropping the message. A
-hallucinated id and a real request look the same from inside, and the cost of
-asking on a misread is one line.
-
-Everything it checks, it checks **inside the write**: both incidents still
-exist, both can still take signals, and which signals move. The write queue
-serializes behind a synchronous S3 PUT, so a list read beforehand could drag
-signals out of a third incident a correlation merge moved them to in the gap.
-
-It does not choose a direction: the more established incident survives, and a
-person who asks for the other direction gets this one and is told so. What
-follows is the same pair of messages correlation leaves — the absorbed thread
-closed out with a permalink to the survivor, and the survivor told where the
-signals came from.
 
 ## The commander is the only interface
 
@@ -488,7 +445,7 @@ the tools array is part of the cache prefix:
 | --- | --- |
 | `message_agent` | pushes a `boss_message` directive, which ends a blocked agent's wait and lifts a wait on a person |
 | `close_incident` | the tool API's Boss close, which posts the same closed notice an agent's close does |
-| `merge_incidents` | `assign` then `announceMerge`, the pair `combineIncidents` uses; the older incident survives whichever way round it was asked |
+| `merge_incidents` | `assign` then `announceMerge`, inside one write; the older incident survives whichever way round it was asked |
 | `stop_agent` | pushes a `stop` directive; the dispatcher starts a fresh run on its next tick |
 | `page_rotation` | posts the rotation mention into the thread through code |
 

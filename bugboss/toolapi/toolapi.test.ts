@@ -675,7 +675,7 @@ describe("park", () => {
     const id = await openIncident(["sig-a"]);
 
     const res = await toolsFor(id).park({
-      waitingFor: "a person, after the 200-turn budget ran out",
+      waitingFor: "a person to decide what happens next; the 200-turn budget is spent",
       liftsOnReply: false,
     });
 
@@ -721,7 +721,7 @@ describe("park", () => {
     assert.equal(waitRow(id)?.liftsOnReply, 1);
 
     await tools.park({
-      waitingFor: "a person, after the 200-turn budget ran out",
+      waitingFor: "a person to decide what happens next; the 200-turn budget is spent",
       liftsOnReply: false,
     });
 

@@ -171,9 +171,9 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
         const into = establishedOf(from, to);
         const absorb = into === from ? to : from;
 
-        // Statuses and signals are read inside the write, the same as
-        // combineIncidents: a correlation merge landing between a read and
-        // this assign would otherwise have its signals dragged back out.
+        // Statuses and signals are read inside the write: a correlation
+        // merge landing between a read and this assign would otherwise have
+        // its signals dragged back out.
         let outcome:
           | { kind: "refused"; why: string }
           | { kind: "assigned"; result: AssignResult };

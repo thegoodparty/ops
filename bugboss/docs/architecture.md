@@ -108,9 +108,8 @@ An agent that concludes its partition is wrong cannot consolidate — that is
 what keeps a compromised one to a single record. It asks instead, through
 `propose_merge`: the Boss compares the two on the judgement it already uses
 after a root cause, and `assign` decides which record survives. A person asks
-the Boss in an incident thread, which merges with `merge_incidents`, or asks
-at the bot in the channel, which `slack/intent.ts` reads and the composition
-root applies as `human`.
+the Boss, in an incident thread or at the bot anywhere else, and it merges
+with `merge_incidents`.
 
 ## Reads are not contained
 
@@ -252,12 +251,10 @@ State-change notices are not conversation. Opened, root cause, resolved,
 closed and merged posts are emitted by code on the transition, whether the
 agent or the Boss caused it.
 
-A mention outside any incident thread is read by a bounded model call
-(`slack/intent.ts`) which answers whether somebody is reporting something
-broken, asking a question, or asking for two incidents to be combined. It is
-advisory, on the same split as triage: the model reads the sentence, the code
-holds the invariants, an ambiguous read asks, and a failed call says the read
-failed. The read runs off the Slack ack, beside the Boss, for the reason the
+A mention outside any incident thread goes to the Boss too, bare or not. It
+reads whether somebody is reporting something broken (it files that with
+`open_incident`), asking a question, or asking it to act, and nothing reads
+the message before it does. It runs off the Slack ack, for the reason the
 webhook acknowledges before it works.
 
 ## The agent boundary

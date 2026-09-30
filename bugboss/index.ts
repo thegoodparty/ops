@@ -62,7 +62,7 @@ import {
   type SlackClient,
 } from "./slack/agent";
 import { createSlackAck } from "./slack/ack";
-import { mrkdwn, raw, userMention } from "./slack/format";
+import { mrkdwn, raw } from "./slack/format";
 import {
   createRotationReader,
   createS3ObjectStore,
@@ -79,22 +79,15 @@ import { boardOnRequest, sweepBoard } from "./board";
 import {
   SlackRelay,
   mentionPrefix,
-  stripBotMention,
   type InboundRoute,
   type SlackEvent,
 } from "./slack/relay";
-import { readMentionIntent, type IntentDeps } from "./slack/intent";
 import {
   applyAssign,
   assign,
   AssignError,
   closeIncidentByBoss,
-  createAnnouncer,
   createToolApi,
-  establishedOf,
-  getIncidentRow,
-  getSignalsFor,
-  logAssign,
   mintAgentToken,
   type AssignResult,
   type Correlator,
@@ -254,10 +247,9 @@ export interface CreateBugBossOptions {
    */
   model: SizedModelClient;
   /**
-   * Reads what an inbound Slack message means. Defaults to `model`, because
-   * this is the same shape of bounded call triage makes and the prompt is a
-   * few hundred tokens; a smaller model belongs here the moment one is
-   * subscribed, which is what BUGBOSS_INTENT_MODEL_ID is for.
+   * The Boss's small bounded calls outside its own loop, today the status
+   * card's summary line. Defaults to `model`; a smaller model belongs here the
+   * moment one is subscribed, which is what BUGBOSS_INTENT_MODEL_ID is for.
    */
   intentModel?: ModelClient;
   slack: BossSlackClient;
@@ -443,7 +435,7 @@ export const createMemoryS3 = (): S3Client => {
  *
  * Memoized because `ModelRuntime.create` reads auth and the model catalog off
  * disk and may refresh it over the network, and the Boss builds two clients
- * at boot -- the triage model and, when one is named, a separate intent
+ * at boot -- the triage model and, when one is named, a separate small
  * model. Two runtimes would do that work twice and wrap the same builtin
  * provider twice for no gain. `registerBedrockRouting` is idempotent per
  * runtime, so sharing one is also what keeps the router single-layered.
@@ -986,20 +978,16 @@ export const createBugBoss = async (
       incidentChannel: config.slackChannelId,
     },
     closeIncident: (args) => closeIncidentByBoss({ db, slack: threads }, args),
-    // The status card's one model-written sentence. The intent read's model,
-    // because it is the knob that already moves a small bounded call to a
-    // cheaper model (BUGBOSS_INTENT_MODEL_ID) without a deploy.
+    // The same executor a report always went through; only who decides a
+    // message is a report has moved, from a classifier to the Boss.
+    openIncident: async (report) =>
+      (await reportAccepted({ ...report, reportedAt: now() })).settled,
+    // The status card's one model-written sentence, on the knob that moves a
+    // small bounded call to a cheaper model (BUGBOSS_INTENT_MODEL_ID) without
+    // a deploy.
     summaryModel: options.intentModel ?? options.model,
     now,
   });
-
-  /**
-   * Reads what an inbound message means, for every interface a person talks
-   * to. One bounded call per message, off the Slack ack, on the same model
-   * seam triage uses -- a few hundred tokens in and a label out, so the bill
-   * is set by how much people type rather than by how many alerts fire.
-   */
-  const intent: IntentDeps = { model: options.intentModel ?? options.model };
 
   // The relay's, so the two pings are spelled one way and carry the same
   // trailing space.
@@ -1184,10 +1172,6 @@ export const createBugBoss = async (
     permalink: (messageTs) => slack.permalink(messageTs),
     openThreads: ensureIncidentThreads,
   };
-
-  // The same two messages the tool API leaves behind when correlation merges.
-  // A person's merge is the same event and has to read as one.
-  const announce = createAnnouncer({ db, slack: threads });
 
   const toolApiFor = (incidentId: string, token?: string): ToolApi => {
     const api = createToolApi({
@@ -1596,11 +1580,11 @@ export const createBugBoss = async (
   };
 
   /**
-   * A mention somebody meant as a report. It has no ingress channel of its
-   * own: what makes it a report is a model call rather than anything the
-   * webhook body says, so the signal is built here and placed through the
-   * human adapter, which is also what Signal.source already points the orphan
-   * sweep at.
+   * A mention the Boss read as a report, filed through its open_incident
+   * tool. It has no ingress channel of its own: what makes it a report is the
+   * Boss's reading rather than anything the webhook body says, so the signal
+   * is built here and placed through the human adapter, which is also what
+   * Signal.source already points the orphan sweep at.
    */
   const reportAccepted = (report: HumanReport): Promise<AcceptedIngest> =>
     acceptSignals([humanSignal(report)], ingress.get(HUMAN_SOURCE));
@@ -2015,260 +1999,28 @@ export const createBugBoss = async (
   // Inbound Slack
   // -------------------------------------------------------------------------
 
-  const sayInThread = (
-    channel: string,
-    threadTs: string,
-    text: string,
-  ): Promise<void> =>
-    slack
-      .post(threadTs, text, channel)
-      // Whatever the Boss says in a thread, the reply to it is for the Boss.
-      .then(() => recordBossThread(channel, threadTs))
-      .catch((err: unknown) =>
-        alarm("intent_reply_failed", { channel, threadTs, error: String(err) }),
-      );
-
-  /** The statuses an incident can still take signals in. Mirrors assign. */
-  const COMBINABLE: readonly IncidentStatus[] = ["INVESTIGATING", "FIXING"];
-
   /**
-   * Somebody has asked, in a mention, for two incidents to be made one. This
-   * is where that becomes a thing that happened.
-   *
-   * It exists at all because the alternative was a refusal. An agent may
-   * only re-partition its own incident, so when a person asked one for a
-   * merge, its single legal move was to open a *third* incident. Agent
-   * containment is untouched and should stay that way; an agent asks through
-   * proposeMerge, the Boss merges from an incident thread, and a mention
-   * lands here.
-   *
-   * Three things bound it, none of them a reading of the sentence:
-   *
-   *   - Every id must appear literally in what they typed. A model that
-   *     invents a plausible number is dropped here, not obeyed.
-   *   - Both must be incidents that can still take signals, re-read after
-   *     the model call rather than trusted from the route.
-   *   - Which of the two survives is not theirs to pick and is not read out
-   *     of the message. `assign` holds that rule.
-   */
-  const combineIncidents = async (args: {
-    channel: string;
-    threadTs: string;
-    user: string;
-    /** What they typed, with the bot mention stripped. */
-    said: string;
-    /** The ids the read came back with, unvalidated. */
-    named: string[];
-  }): Promise<void> => {
-    const say = (text: string) => sayInThread(args.channel, args.threadTs, text);
-    const decline = (why: string, note: string) => {
-      log("combine_declined", { named: args.named, why });
-      return say(mrkdwn`${raw(userMention(args.user))} ${raw(note)}`);
-    };
-
-    // Not the model's word for it. An id it read out of the message is in
-    // the message; an id it did not is a number it made up, and acting on
-    // one combines two incidents nobody asked about. Digits first, so the
-    // boundary match below cannot be handed a pattern.
-    const ids = [...new Set(args.named)].filter(
-      (id) =>
-        /^\d+$/.test(id) && new RegExp(`(^|\\D)${id}(\\D|$)`).test(args.said),
-    );
-    if (ids.length !== args.named.length) {
-      log("combine_ids_dropped", { named: args.named, kept: ids });
-    }
-
-    // Out in the channel there is no thread to supply a second side, so two
-    // is the whole ask.
-    const pair = ids.length >= 2 ? ids.slice(0, 2) : null;
-
-    // Never silent. The reasons a pair cannot be formed are all invisible to
-    // them -- the model named an incident that is not in their sentence, or
-    // named one thing -- and the cost of saying something on a misread is
-    // one line in a thread.
-    if (!pair) {
-      log("combine_incomplete", { named: args.named, kept: ids });
-      return decline(
-        "could not make a pair",
-        "which two incidents? Name both and I will combine them.",
-      );
-    }
-
-    // The rule, applied before anything moves, so what gets said matches
-    // what gets written. Not negotiable from the message: a person asking
-    // for the merge the other way round still gets this one, and is told.
-    // Both ids come from the message, so this needs no database.
-    const into = establishedOf(pair[0], pair[1]);
-    const absorb = into === pair[0] ? pair[1] : pair[0];
-
-    // Which signals move is resolved inside the write, not before it. The
-    // same reason every transition here puts its predicate in the statement:
-    // the write queue serializes behind a synchronous S3 PUT, so the gap
-    // between reading a list of ids and assigning them is hundreds of
-    // milliseconds of other people's writes. A correlation merge landing in
-    // that gap moves those signals to a third incident, and a list read
-    // beforehand would then drag them out of it -- a human-actor assign has
-    // no containment to stop that, so it would be a silent cross-incident
-    // steal. `applyMerge` in the tool API reads its signals the same way.
-    //
-    // Both statuses are checked in here for the same reason, and only here.
-    // The route was built when the message arrived and this runs after a
-    // model call, so either incident can have resolved or merged away since
-    // -- and a second copy of the check outside the transaction would be a
-    // duplicate that no test can distinguish from this one.
-    let outcome:
-      | { kind: "unknown"; id: string }
-      | { kind: "shut"; id: string; status: IncidentStatus }
-      | { kind: "empty" }
-      | { kind: "assigned"; result: AssignResult };
-    try {
-      outcome = await db.withWrite((w: Database.Database) => {
-        for (const id of pair) {
-          const row = getIncidentRow(w, id);
-          if (!row) return { kind: "unknown" as const, id };
-          if (!COMBINABLE.includes(row.status)) {
-            return { kind: "shut" as const, id, status: row.status };
-          }
-        }
-        const signalIds = getSignalsFor(w, absorb).map((signal) => signal.id);
-        if (signalIds.length === 0) return { kind: "empty" as const };
-        return {
-          kind: "assigned" as const,
-          result: assign(
-            w,
-            { signalIds, target: into, reason: args.said },
-            { kind: "human", slackUserId: args.user },
-          ),
-        };
-      });
-    } catch (err) {
-      alarm("combine_failed", {
-        pair,
-        error: String(err),
-      });
-      await say(
-        mrkdwn`${raw(userMention(args.user))} I could not combine these two -- ${err instanceof AssignError ? String((err as Error).message) : "the write failed and the error is in the BugBoss logs"}.`,
-      );
-      return;
-    }
-
-    if (outcome.kind === "unknown") {
-      return decline(
-        `unknown incident ${outcome.id}`,
-        `there is no incident ${outcome.id}, so I have left these alone.`,
-      );
-    }
-    if (outcome.kind === "shut") {
-      return decline(
-        `incident ${outcome.id} is ${outcome.status}`,
-        `incident ${outcome.id} is ${outcome.status} and is not taking signals, so these cannot be combined. A signal arriving after a resolution is a recurrence rather than the same incident.`,
-      );
-    }
-    if (outcome.kind === "empty") {
-      return decline(
-        "nothing to move",
-        `incident ${absorb} has no signals left to move, so there is nothing to combine.`,
-      );
-    }
-    const result = outcome.result;
-    logAssign(result);
-
-    // Their answer goes first, and announce's closing message last, because
-    // one of the two threads announce writes into can be this one -- and
-    // "this is the last message in this thread" has to be true when it is
-    // read.
-    //
-    // Which is also why this says nothing about a thread ending. Two
-    // messages both claiming to be the end is worse than one: the first is
-    // false by the time it is read, and the one that carries the link to
-    // where everything moved is the one that has to be believed.
-    await say(
-      [
-        mrkdwn`${raw(userMention(args.user))} Done -- incident ${absorb} is now part of incident ${into}.`,
-        mrkdwn`_Incident ${into} is the older record, so it stays the incident of record and keeps its thread._`,
-      ].join("\n"),
-    );
-    await announce.announceMerge(result);
-  };
-
-  /**
-   * An @bugboss mention outside any incident thread: somebody reporting
-   * something broken, or somebody asking a question. This used to turn on
-   * whether the first word was "report", "bug" or "broken", which is a magic
-   * phrase nobody can discover -- "@bugboss Pro upgrades are failing" was
-   * answered as a question and opened nothing.
+   * An @bugboss mention outside any incident thread. It goes to the Boss
+   * whole, bare or not: whether it is a report, a question or a request to
+   * act is the Boss's to read, and it opens an incident through open_incident
+   * when it is a report. A classifier in front of it once answered "Can you
+   * close incident 2?" with "is that a report or a question?".
    */
   const answerMention = async (
     route: Extract<InboundRoute, { kind: "slack_agent" }>,
   ): Promise<void> => {
-    const ask = () =>
-      slackAgent.handle({
-        channel: route.channel,
-        threadTs: route.threadTs,
-        ts: route.ts,
-        user: route.user,
-        text: route.text,
-        tagged: route.tagged,
-      });
-
-    // Before the read, so a follow-up typed while this one is still being
+    // Before the run, so a follow-up typed while this one is still being
     // answered already reaches the Boss. A top-level mention's thread is the
     // mention's own ts, which is where the answer goes.
     await recordBossThread(route.channel, route.threadTs);
-
-    const said = stripBotMention(route.text, secrets.slackBotUserId ?? "");
-    // A bare @bugboss is somebody about to type. There is no sentence to
-    // read, and a report built from it would open an incident with an empty
-    // body, so it goes to the agent that can ask what they want.
-    if (!said) return ask();
-
-    const read = await readMentionIntent(intent, { text: said });
-
-    if (read.intent === "bug_report") {
-      const accepted = await reportAccepted({
-        text: said,
-        // The verified Slack identity, never a field the body carried.
-        reportedBy: route.user,
-        channel: route.channel,
-        threadTs: route.threadTs === route.ts ? null : route.threadTs,
-        messageTs: route.ts,
-        reportedAt: now(),
-      });
-      await accepted.settled;
-      return;
-    }
-
-    if (read.intent === "question") return ask();
-
-    // The surface that used to answer this with "I cannot". A mention is
-    // not in an incident thread, so nothing supplies a second id and both
-    // have to be named -- but the request is the same request, and it runs
-    // through the same executor rather than a second implementation that
-    // drifts from it.
-    if (read.intent === "combine") {
-      return combineIncidents({
-        channel: route.channel,
-        threadTs: route.threadTs,
-        user: route.user,
-        said,
-        named: read.combineIds,
-      });
-    }
-
-    // An untagged follow-up nobody could classify is most often not for the
-    // Boss at all. Asking "is this a report or a question?" of two people
-    // talking would be a reply nobody wanted, so the Boss reads it in the
-    // thread's context and may choose to stay silent.
-    if (!route.tagged && !read.fellBack) return ask();
-
-    log("mention_unclear", { user: route.user, ts: route.ts, fellBack: read.fellBack });
-    await sayInThread(
-      route.channel,
-      route.threadTs,
-      read.fellBack
-        ? mrkdwn`${raw(userMention(route.user))} I could not read that one -- the call that works out what a message means failed, and the error is in the BugBoss logs. Try me again.`
-        : mrkdwn`${raw(userMention(route.user))} I could not tell whether that is something broken you want me to put an agent on, or a question. Which is it?`,
-    );
+    await slackAgent.handle({
+      channel: route.channel,
+      threadTs: route.threadTs,
+      ts: route.ts,
+      user: route.user,
+      text: route.text,
+      tagged: route.tagged,
+    });
   };
 
   const slackEventAccepted = async (

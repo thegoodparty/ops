@@ -1033,7 +1033,7 @@ test("an exhausted run parks on a wait a reply cannot lift", () => {
   });
 
   assert.equal(park.liftsOnReply, false);
-  assert.match(park.waitingFor, /200-turn budget for this incident ran out/);
+  assert.equal(park.waitingFor, "a person to decide what happens next; the 200-turn budget is spent");
 });
 
 test("the brief does not promise that replying will continue the work", () => {

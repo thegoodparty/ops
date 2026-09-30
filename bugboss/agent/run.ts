@@ -410,7 +410,8 @@ export const createBossClient = (args: {
     recordPending: (message) =>
       call<PendingQuestion>("POST", "/pending-question", { message }),
     clearPending: () => call<void>("DELETE", "/pending-question").then(() => undefined),
-    recordWait: (command) => call<PendingWait>("POST", "/pending-wait", { command }),
+    recordWait: (command, waitingFor) =>
+      call<PendingWait>("POST", "/pending-wait", { command, waitingFor }),
     recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
     clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
     tellBoss: (kind, text, options) =>
@@ -1124,7 +1125,7 @@ export const shouldAnnounceExhaustion = (state: TurnBudgetState): boolean =>
 export const turnBudgetPark = (
   state: TurnBudgetState,
 ): { waitingFor: string; liftsOnReply: boolean } => ({
-  waitingFor: `a person, after the ${state.max}-turn budget for this incident ran out`,
+  waitingFor: `a person to decide what happens next; the ${state.max}-turn budget is spent`,
   liftsOnReply: false,
 });
 

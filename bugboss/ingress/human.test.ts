@@ -178,7 +178,7 @@ test("parsing a delivery as a human one is refused rather than accepted", async 
 test("the registry is keyed by source name", () => {
   const registry = createIngress({ grafana: { secret: "s" } });
   // Slack is not an ingress channel: a report arrives as a mention and what
-  // makes it a report is a model call, not anything a body can be parsed for.
+  // makes it a report is the Boss's reading, not anything a body can be parsed for.
   assert.deepEqual(registry.list().sort(), ["grafana", "human"]);
   assert.equal(registry.has("grafana"), true);
   assert.equal(registry.has("sentry"), false);
