@@ -1,7 +1,7 @@
 # slack
 
-Outbound transitions into an incident thread, inbound replies back to the
-agent, and a read-only agent that answers questions about incidents.
+Outbound transitions into an incident thread, and the Boss's incident
+commander, which every person in a thread and every agent talks to.
 
 ## The thread is the record
 
@@ -633,13 +633,72 @@ agent with a merge in mind calls `propose_merge` rather than posting a
 choice, so the case is hard to reach — but it is still a difference, and
 closing it means a model call on every press.
 
-## The Slack agent is read-only, deliberately
+## The commander is the only interface
 
-`prepareQuery` in `triage/sql.ts` enforces it — one guard for both surfaces,
-rather than the two that used to disagree about what a read was. It answers
-questions about incidents; it cannot merge, close, stop or restart anything.
-Everything a person changes, they change by replying in the thread the agent
-is reading.
+`slack/agent.ts`. Every message in an incident thread, tagged or not, runs
+`handleIncident({ incidentId, trigger })` with `trigger` either the person's
+message or `{ kind: "inbox" }`, which is how an agent's `message_boss` or
+escalation arrives. Agents never read the thread, so a person is never talking
+to one: they talk to the Boss, and the Boss decides what the agent hears.
+`handle(mention)` is the other entry point, for an `@bugboss` anywhere else.
+
+**The incident is always given.** A run is told which incident the thread is,
+its status and its title, and what is in the thread -- **BugBoss posts
+included**. The opening alert, the root cause, the resolution and the merge
+notices are the incident's record, and a Boss that could see only the humans
+answered "what is this about" without the one message that says. A fresh
+session reads the whole thread; a resume reads everything since the
+watermark except the Boss's own replies, which are already in its session.
+Those come from the same bot user as the notices it does need, so they are
+told apart by ts: `state.json` keeps the ts of each reply posted after the
+watermark. The agent's unseen `boss_inbox` rows ride in the same input,
+labelled as the agent's and saying which one it is blocked on, and are marked
+seen after the run -- so a run that died before answering leaves them for the
+next one.
+
+**It never drops a trigger.** A message that arrives while the thread's run
+is in flight marks the thread dirty rather than being told the Boss is busy,
+and the holder runs again before it lets go: while the thread is dirty, and
+while unseen inbox rows exist. Dirty is set before the lock is tried and read
+after it is released, so a message in any gap between the two is picked up by
+one run or the other. The lock is held for one run at a time, never across
+the follow-ups, because its TTL is derived from one run's budget. The
+triggering message is also queued in memory, since a message posted a moment
+ago is not guaranteed to be in the fetch yet. A run with nothing new since the
+last one does not call the model.
+
+**Silence is an answer.** Two people talking to each other are not talking to
+the Boss. A run that ends without writing anything posts nothing, and the
+harness is told so (`allowSilence`), so it hands back empty rather than an
+apology. This is not a magic string: empty means nothing to say.
+
+**It can change state, on evidence.** The write tools are in
+`boss/commands.ts`, appended after the read tools in a fixed order because
+the tools array is part of the cache prefix:
+
+| Tool | What code does with the ask |
+| --- | --- |
+| `message_agent` | pushes a `boss_message` directive, which ends a blocked agent's wait and lifts a wait on a person |
+| `close_incident` | the tool API's Boss close, which posts the same closed notice an agent's close does |
+| `merge_incidents` | `assign` then `announceMerge`, the pair `combineIncidents` uses; the older incident survives whichever way round it was asked |
+| `stop_agent` | pushes a `stop` directive; the dispatcher starts a fresh run on its next tick |
+| `page_rotation` | posts the rotation mention into the thread through code |
+
+Each takes an incident and a reason. A close, merge or stop refuses a reason
+under forty characters, because the reason is what the record keeps of why
+state changed without a person doing it, and a one-word verdict is not
+evidence anybody can check. The prompt carries the rest: never change state
+without evidence it can cite, and an agent asking for a close is a request to
+check rather than a reason to act.
+
+`page_rotation` exists because `toMrkdwn` strips `<!subteam^…>` out of model
+prose, which is right -- a model that can page the rotation by typing it is
+how a rotation gets muted -- and the Boss still has to be able to reach
+people. So the mention is composed by code, and a mention typed into an
+answer still posts as literal text.
+
+`prepareQuery` in `triage/sql.ts` still guards `query_incidents`, one guard
+for both surfaces. The write tools do not go through it: they never take SQL.
 
 `search_incidents` is the same tool triage calls, adapted to this surface's
 tool shape. Its three answers have to stay three: matches, `0 matches` for a
@@ -648,18 +707,21 @@ reached the index. A search that never ran, reported as nothing found, tells
 somebody asking "have we seen this before" that the problem is new.
 
 What a run spent comes back from the harness beside the answer and lands on
-the `answered` log line. The wrap-up call and a call that failed are both in
-it: the run that cost the most is the one that answered least.
+the `answered` or `incident_answered` log line. The wrap-up call and a call
+that failed are both in it: the run that cost the most is the one that
+answered least.
 
 Its failures must not die in the channel that failed: the in-thread apology
 is tried first, and if that throws it is logged distinctly and re-posted to
 `alertChannel`. Both use the same token and API, so the likely causes — a
 revoked token, the bot removed, exhausted rate-limit retries — fail both
-identically.
+identically. An incident run a person triggered gets the same apology; one
+only an agent triggered alarms and leaves its inbox rows unseen, since nobody
+in the thread is waiting on it.
 
-`alertChannel` and `rotationGroupId` are **required**, not optional. An
-optional field nobody sets is a fix that exists in the source and not in
-production, which had already happened three times here.
+`alertChannel`, `rotationGroupId` and `incidentChannel` are **required**, not
+optional. An optional field nobody sets is a fix that exists in the source and
+not in production, which had already happened three times here.
 
 ## The Slack agent compacts; it does not narrow its results
 
@@ -717,16 +779,18 @@ reason the incident agent's prompt is written that way.
 The widest reasonable one is "tell me about everything": a query across the
 open incidents, then depth on the few that need it, then the answer. Twelve
 did not cover eleven incidents. What bounds this is how long somebody will
-sit in a thread waiting, not the bill — this surface is read-only and runs
-on the same model triage does, nowhere near what an incident agent costs.
+sit in a thread waiting, not the bill — this surface runs on the same model
+triage does, nowhere near what an incident agent costs.
 
 **The thread lock is derived from that budget, not chosen.** A lock that
-expires mid-run is not a lock: the next mention takes the thread and two runs
+expires mid-run is not a lock: the next message takes the thread and two runs
 write one transcript key. `SLACK_AGENT_LOCK_TTL_MS` is every turn plus the
 wrap-up, each spending its whole call budget, so raising the turns raises the
-lease with it. Long is the safe direction — `handle` releases in a `finally`,
-so the lease only ever covers a run that never settles, and telling the next
-person the thread is busy beats corrupting the session they are asking about.
+lease with it. Long is the safe direction — both entry points release in a
+`finally`, so the lease only ever covers a run that never settles, and a
+message waiting behind a dead run beats corrupting the session it is about.
+A channel mention that finds the lock held is still told the Boss is busy; an
+incident thread never is.
 
 **Exhaustion no longer throws the run's work away.** Everything it read is
 still on the transcript, so the harness (`createSlackAgentModel`, in

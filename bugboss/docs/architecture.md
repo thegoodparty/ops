@@ -125,19 +125,20 @@ not the caller's, and every write goes to that one record.
 
 ## Two agents
 
-One thing here writes state: the incident agent (`agent/`), a Pi session in a
-child process. Everything else that reaches a model is the Boss -- triage,
-root-cause correlation, the inbound-language read and the Slack question box
--- and all of it is read-only against the incident corpus. They share one
-request path (`bedrock/client.ts`), one read-only toolset (`triage/sql.ts`)
-and one usage accumulator.
+The incident agent (`agent/`) is a Pi session in a child process that works
+one incident. Everything else that reaches a model is the Boss -- triage,
+root-cause correlation, the inbound-language read and the incident commander
+in `slack/agent.ts`. They share one request path (`bedrock/client.ts`), one
+read-only query guard (`triage/sql.ts`) and one usage accumulator.
 
-Every Boss capability is an answer-tool schema plus read-only lookup tools,
-with code deciding what happens to the answer, which is what makes "the model
-proposes; the rules decide" structural rather than remembered. The numbered
-steps below are stages of one pipeline, not separate agents; the only place
-the count matters is that a free-form tool on a Boss path would collapse the
-distinction.
+The commander is the only interface between people and agents: people talk
+to it in incident threads, agents send it what they need from people, and it
+relays, answers, closes, merges, stops and pages. Every Boss write is an ask
+from the model and a decision made by code -- an answer-tool schema, or a
+write tool that takes an incident and a reason and runs the same guarded
+transition an agent's call does -- which is what makes "the model proposes;
+the rules decide" structural rather than remembered. The numbered steps below
+are stages of one pipeline, not separate agents.
 
 ## The path an alert takes
 
@@ -435,7 +436,7 @@ deleting is not the way back.
 | `dispatcher/` | Launch, deadlines, escalation, parking, the stale sweep, the circuit breaker |
 | `agent/` | The incident agent: Pi session, tools, prompt, resume |
 | `bedrock/` | The Pi provider over Bedrock `InvokeModel`, and the Boss's client on it |
-| `slack/` | Outbound relay, inbound intent, the read-only Slack agent, and how outbound text is rendered |
+| `slack/` | Outbound relay, inbound intent, the incident commander, and how outbound text is rendered |
 | `board/` | When the status board says anything: headers, the morning post, the all-clear |
 | `report/` | The closing report: assemble, render, publish once |
 | `http/` | Public routes and the loopback tool API |
