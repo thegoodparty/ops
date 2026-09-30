@@ -13,6 +13,10 @@ have their own, and the larger subsystems under `bugboss/` have theirs.
 
 - `bugboss/` — Incident agents that work Grafana alerts end to end. See
   [`bugboss/CLAUDE.md`](./bugboss/CLAUDE.md)
+- `bugboss-evals/` — Black-box evals for BugBoss: Tier 1 runs a whole
+  incident against stand-ins (`sim/`, which must never import `bugboss/`),
+  Tier 2 replays the after-PR phase (`replay/`). Entry point
+  `bugboss-evals/sim/cli.ts`
 - `delegate/` — AI agent framework powered by Claude Agent SDK
 - `scripts/` — Operational automation scripts, run via `npm run script <name>`
 - `utils/` — Shared utilities (Grafana log search, People API client)
