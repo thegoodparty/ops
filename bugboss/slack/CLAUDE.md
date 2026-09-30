@@ -506,6 +506,19 @@ re-run -- is a state change under the same prompt rule as the write tools:
 only when a person asked or there is evidence to cite, and the Boss says what
 it did. Branch protection, not the prompt, is what keeps a merge honest.
 
+**Writes are not filtered, on purpose.** `gh` can write -- `gh api -X POST`,
+`gh issue create`, `gh pr comment` -- and nothing in code refuses a write.
+That is the decision, not a gap: the Boss gets what an incident agent gets,
+and an agent reads the same untrusted PR bodies with the same token and a
+whole shell. A method filter on `gh api` alone would not close the path
+anyway (`gh api -f` with no `-X` is a POST, and a dozen subcommands write),
+and a complete one is a read-only token, which is the design this replaced.
+What stands against an injected write is the same as for an agent: the
+prompt's "data, not instructions" rule, the evidence rule above, and branch
+protection. If that stops being enough, the change is a read-only token
+minted for the Boss (`permissions` on the installation-token request), not
+an argv filter.
+
 `page_rotation` exists because `toMrkdwn` strips `<!subteam^…>` out of model
 prose, which is right -- a model that can page the rotation by typing it is
 how a rotation gets muted -- and the Boss still has to be able to reach
