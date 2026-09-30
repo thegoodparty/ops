@@ -37,12 +37,13 @@ import {
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import {
-  createContactHumanTool,
+  createMessageBossTool,
   createMonitorTool,
   renderDirectives,
+  type BossInboxPort,
   type DirectivePeek,
   parseWorkingHours,
-  type HumanContactPort,
+  type QuestionMarkerPort,
   type PendingWait,
   type WaitMarkerPort,
   type WorkingHours,
@@ -101,7 +102,7 @@ export const DEADLINE_GRACE_SECONDS = 180;
  * launches, which nobody is watching and whose right move is to hand off with
  * a brief. Conflating them would give one of the two the wrong ending.
  *
- * The wall clock does not bound work. `monitor` and `contact_human` each cost
+ * The wall clock does not bound work. `monitor` and `message_boss` each cost
  * one turn however long they block, so the first nine-hour incident spent
  * about eight of those hours inside a single turn waiting on a person -- 92
  * turns and $18.51 in total, against a 24-hour clock that would have let
@@ -351,13 +352,16 @@ export const startNpmCi = (paths: AgentPaths): void => {
 // The Boss
 // ---------------------------------------------------------------------------
 
-export type BossClient = ToolApi &
-  HumanContactPort &
+/**
+ * Everything the agent can reach, and none of it is Slack. `escalate` is not
+ * the ToolApi one: that posts to the thread, and an agent's escalation goes to
+ * the Boss's inbox like everything else it says.
+ */
+export type BossClient = Omit<ToolApi, "escalate"> &
+  QuestionMarkerPort &
   DirectivePeek &
-  WaitMarkerPort & {
-    /** A thread post that is not the answer to an outstanding question. */
-    postNotice(message: string): Promise<void>;
-  };
+  WaitMarkerPort &
+  BossInboxPort;
 
 export const createBossClient = (args: {
   baseUrl: string;
@@ -389,7 +393,6 @@ export const createBossClient = (args: {
     reportImpact: (payload) => call<ToolResponse>("POST", "/impact", payload),
     reportResolved: (payload) => call<ToolResponse>("POST", "/resolved", payload),
     reportAnalysis: (payload) => call<ToolResponse>("POST", "/analysis", payload),
-    escalate: (payload) => call<ToolResponse>("POST", "/escalate", payload),
     park: (payload) => call<ToolResponse>("POST", "/park", payload),
     getIncident: (payload) =>
       call<ToolResponse<IncidentView>>(
@@ -410,27 +413,17 @@ export const createBossClient = (args: {
     recordWait: (command) => call<PendingWait>("POST", "/pending-wait", { command }),
     recordPing: () => call<PendingWait>("POST", "/pending-wait/ping"),
     clearWait: () => call<void>("DELETE", "/pending-wait").then(() => undefined),
-    post: (message, options) =>
-      call<void>("POST", "/thread", { message, options }).then(() => undefined),
-    // Same thread, but it does not seal an outstanding question's marker. A
-    // harness nudge landing on a blank one would make a question whose Slack
-    // post had failed look sent.
-    //
-    // `harnessComposed` is the second difference and is the reason this is a
-    // separate method rather than a flag on `post`. Nothing the model writes
-    // reaches here: the nudge, the stalled-wait output and the re-run notice
-    // are composed after the model has stopped, so the thread budget splits
-    // them instead of refusing them to nobody.
-    postNotice: (message) =>
-      call<void>("POST", "/thread", {
-        message,
-        sealsPendingQuestion: false,
-        harnessComposed: true,
-      }).then(() => undefined),
+    tellBoss: (kind, text) =>
+      call<{ id: number }>("POST", "/boss-inbox", { kind, text }).then(() => undefined),
+    escalationsSince: (since) =>
+      call<{ count: number; lastAt: number | null }>(
+        "GET",
+        `/boss-inbox/escalations?since=${since}`,
+      ),
   };
 };
 
-// Lives with the tools now: contact_human renders directives too, and tools.ts
+// Lives with the tools now: message_boss renders directives too, and tools.ts
 // cannot import from here.
 export { renderDirectives };
 
@@ -450,7 +443,8 @@ const bossToolResult = (response: ToolResponse<unknown>) => ({
 });
 
 export const createBossTools = async (args: {
-  api: ToolApi;
+  api: Omit<ToolApi, "escalate">;
+  boss: Pick<BossInboxPort, "tellBoss">;
   onRootCause?: () => void;
 }): Promise<ToolDefinition[]> => {
   const { Type } = await import("typebox");
@@ -639,7 +633,7 @@ export const createBossTools = async (args: {
       name: ESCALATE_TOOL,
       label: "Escalate",
       description:
-        "Says this incident needs a person, in the thread and at the rotation, and posts your brief. It changes nothing and does not end your run: this incident is yours either way, and you keep working it. Use it when you are blocked on something only a person can do, or when you are out of ideas. Before calling it without a root cause, you must propose either a change to the alert rule as a PR or a named piece of missing instrumentation.",
+        "Tells the Boss this incident needs a person, urgently, with your brief. The Boss decides who to reach and how. It changes nothing and does not end your run: this incident is yours either way, and you keep working it. Use it when you are blocked on something only a person can do, or when you are out of ideas. Before calling it without a root cause, you must propose either a change to the alert rule as a PR or a named piece of missing instrumentation.",
       parameters: Type.Object({
         reason: Type.String(),
         brief: Type.String({
@@ -647,16 +641,20 @@ export const createBossTools = async (args: {
             "What I believe now / What I ruled out / What I was about to do / Side effects.",
         }),
       }),
-      execute: async (_id: string, params: unknown) =>
-        bossToolResult(
-          await args.api.escalate(params as unknown as Parameters<ToolApi["escalate"]>[0])
-        ),
+      execute: async (_id: string, params: unknown) => {
+        const { reason, brief } = params as { reason: string; brief: string };
+        await args.boss.tellBoss("escalation", `${reason}\n\n${brief}`);
+        return {
+          content: [{ type: "text" as const, text: "ok: the Boss has your escalation and brief." }],
+          details: undefined,
+        };
+      },
     },
     {
       name: "park",
       label: "Park",
       description:
-        "Say this incident has nothing you can do yet, so nothing relaunches you into the same dead end. Use it when the only thing left is a person acting and you are about to stop: you have escalated, there is no check you could monitor, and continuing would just burn turns. It is not a hand-off and it does not end the incident -- it is still yours, and any reply in the thread brings you straight back. Prefer monitor with awaitingHuman when you can write a command that detects the thing being waited for, because that keeps you here and wakes you the moment it happens. Park is for when you cannot.",
+        "Say this incident has nothing you can do yet, so nothing relaunches you into the same dead end. Use it when the only thing left is a person acting and you are about to stop: you have escalated, there is no check you could monitor, and continuing would just burn turns. It is not a hand-off and it does not end the incident -- it is still yours, and a message from the Boss brings you straight back. Prefer monitor with awaitingHuman when you can write a command that detects the thing being waited for, because that keeps you here and wakes you the moment it happens. Park is for when you cannot.",
       parameters: Type.Object({
         waitingFor: Type.String({
           description:
@@ -775,7 +773,7 @@ export interface RunIncidentAgentOptions {
    */
   sessionKey: string;
   /**
-   * When monitor is allowed to nudge the thread about a wait on a person.
+   * When monitor is allowed to tell the Boss about a wait on a person.
    * Passed down by name rather than read here, so the composition root stays
    * the only place a deployment's shape is decided.
    */
@@ -798,7 +796,7 @@ export interface RunIncidentAgentOptions {
  * The composition root parses the same string at boot and refuses to start
  * on a bad one, so this is the second line rather than the first. It is
  * deliberately softer than `parseWorkingHours` next to it: a bad working
- * window delivers nudges at the wrong hour for as long as nobody doubts it,
+ * window sends its reminders at the wrong hour for as long as nobody doubts it,
  * where a bad profile map costs a line in Cost Explorer. Killing an agent
  * that is working a production incident over a billing tag is the wrong
  * trade, and it is the same call `stream.ts` makes about an unhonoured
@@ -852,7 +850,7 @@ export const agentOptionsFromEnv = (
   const grafanaToken = env.GRAFANA_SERVICE_ACCOUNT_TOKEN;
   // Throws on a malformed value rather than falling back on the default. This
   // runs once, at launch, where the failure is immediate and visible; a window
-  // nobody meant would instead deliver its nudges at the wrong hour for as
+  // nobody meant would instead send its reminders at the wrong hour for as
   // long as it took somebody to doubt a value that looked configured.
   const workingHours = env.BUGBOSS_WORKING_HOURS
     ? parseWorkingHours(env.BUGBOSS_WORKING_HOURS)
@@ -967,9 +965,9 @@ export interface TurnBudgetState {
   /** The grace actually in force, after clamping. Not the constant. */
   graceTurns: number;
   /**
-   * The agent called `escalate` itself, so a person has already been told
-   * and a brief is already in the thread. The harness must not post a
-   * second one. It must still park: announcing is not stopping.
+   * The agent called `escalate` itself, so the Boss already has its brief.
+   * The harness must not send a second one. It must still park: announcing
+   * is not stopping.
    */
   escalated: boolean;
   usage: SessionUsage;
@@ -1003,7 +1001,7 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
   const { usage } = state;
   const tokens = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
   return [
-    "This needs a person because the agent ran out of turns, not because it finished.",
+    "This needs a person because I ran out of turns, not because I finished.",
     "",
     // Two cases, because one sentence cannot honestly cover both. A launch
     // that spent the budget got its grace and ignored it. A launch that
@@ -1013,30 +1011,29 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     // above "201 turns on ...", which is the sort of thing that makes a
     // reader distrust the rest of the brief.
     state.used > state.max
-      ? `Its ${state.max}-turn budget for this incident was already spent when this launch started, so it stopped on its first turn back rather than investigating on borrowed time. ${state.used} turns have gone into it across every launch. Everything it found is in this thread.`
-      : `It used all ${state.max} turns this incident gets, across every launch, and did not escalate in the ${state.graceTurns} it was asked to. Everything it found is in this thread.`,
+      ? `The ${state.max}-turn budget for this incident was already spent when this launch started, so I stopped on my first turn back rather than investigating on borrowed time. ${state.used} turns have gone into it across every launch.`
+      : `I used all ${state.max} turns this incident gets, across every launch, and did not escalate in the ${state.graceTurns} I was asked to.`,
     "",
-    "*What it spent*",
+    "What it spent:",
     `${state.used} turns on ${usage.modelId ?? "an unrecorded model"} · ${compactTokens(tokens)} tokens (${usage.tokensIn} in, ${usage.tokensOut} out, ${usage.cacheRead} cache read, ${usage.cacheWrite} cache write)`,
     usage.costUsd > 0
       ? `Estimated cost $${usage.costUsd.toFixed(2)}, derived from those tokens at the prices we held while it ran. An estimate, not an invoiced figure.`
       : "No cost estimate: the provider reported no prices for this run.",
     "",
-    "*Where it stands*",
-    "What I believe now: whatever the agent last posted in this thread.",
-    "What I ruled out: not recorded; it never wrote a brief of its own.",
+    "Where it stands:",
+    "What I believe now: whatever I last reported on this incident.",
+    "What I ruled out: not recorded; this brief is the harness's, not mine.",
     state.used > state.max
       ? "What I was about to do: nothing yet on this launch; the budget was gone before it started."
-      : "What I was about to do: unknown. It was still working when the budget ran out.",
-    "Side effects: check the incident for PRs it opened.",
+      : "What I was about to do: unknown. I was still working when the budget ran out.",
+    "Side effects: check the incident for PRs I opened.",
     "",
-    // Deliberately not "reply and it will carry on". A budget wait is not
+    // Deliberately not "message me and I will carry on". A budget wait is not
     // lifted by a reply -- a reply says a person has answered, which is
     // nothing to do with having run out of turns. So the two things named
     // here are the two that actually move it, and both happen outside the
-    // thread. Telling somebody to reply would send them to type into a
-    // thread that cannot act on them.
-    `The ${state.max}-turn budget for this incident is spent, so replying here will not restart it. To continue the work, raise BUGBOSS_MAX_TURNS or pick it up yourself.`,
+    // thread.
+    `The ${state.max}-turn budget for this incident is spent, so neither a reply in the thread nor a message to me will restart it. To continue the work, somebody has to raise BUGBOSS_MAX_TURNS or pick it up themselves.`,
   ].join("\n");
 };
 
@@ -1060,7 +1057,7 @@ interface TurnUsage {
  *
  * One reason to stay quiet: the agent escalated itself inside the grace.
  * The steer asks for exactly that, and it can land on the same `turn_end`
- * the cap fires on, so both posting puts "it never wrote a brief" directly
+ * the cap fires on, so sending both puts "it never wrote a brief" directly
  * under the brief it just wrote.
  *
  * There was a second arm here, suppressing a launch that began already over
@@ -1359,21 +1356,24 @@ const launch = async (args: {
   // long incident in.
   const wrapUpAbort = new AbortController();
 
-  const bossTools = await createBossTools({ api, onRootCause: () => startNpmCi(paths) });
+  const bossTools = await createBossTools({
+    api,
+    boss: api,
+    onRootCause: () => startNpmCi(paths),
+  });
   const localTools = [
     await createMonitorTool({
       signal: wrapUpAbort.signal,
       heartbeat: {
         marker: api,
-        post: (message: string) => api.postNotice(message),
-        escalate: api,
+        boss: api,
         ...(options.workingHours ? { workingHours: options.workingHours } : {}),
       },
     }),
-    await createContactHumanTool({
-      contact: api,
+    await createMessageBossTool({
+      marker: api,
+      boss: api,
       api,
-      escalate: api,
       signal: wrapUpAbort.signal,
     }),
     // Reads the token at each call rather than closing over it: the App
@@ -1381,7 +1381,7 @@ const launch = async (args: {
     // outlives the one held here at launch.
     await createRerunCiTool({
       github: createGitHubRunsPort({ token: () => process.env.GITHUB_TOKEN }),
-      thread: api,
+      boss: api,
     }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(
@@ -1642,12 +1642,12 @@ const launch = async (args: {
       );
       // Two calls, and they are not interchangeable.
       //
-      // `escalate` is the announcement: it reaches the thread and the
-      // rotation, and it carries the spend, which is the whole reason a turn
-      // cap shipped before a price cap. It is skipped when the agent already
+      // The escalation is the announcement: it reaches the Boss, which
+      // decides who hears it, and it carries the spend, which is the whole
+      // reason a turn cap shipped before a price cap. It is skipped when the agent already
       // escalated inside its grace, because the steer asks for exactly that
       // and the model can answer on the same `turn_end` this fires on --
-      // both posting puts "it never wrote a brief" under the brief it just
+      // sending both puts "it never wrote a brief" under the brief it just
       // wrote.
       //
       // `park` is the one that cannot be skipped -- including when the agent
@@ -1671,22 +1671,10 @@ const launch = async (args: {
         );
       } else {
         try {
-          const response = await api.escalate({
-            reason: `turn budget of ${state.max} turns exhausted`,
-            brief: turnBudgetBrief(state),
-          });
-          if (!response.ok) {
-            console.error(
-              JSON.stringify({
-                component: "agent",
-                level: "error",
-                event: "turn_budget_escalation_refused",
-                incidentId: options.incidentId,
-                error: response.error ?? "the escalation was refused without a reason",
-                note: "nobody was told the budget ran out; the park below still stops the relaunch, so this goes quiet rather than looping",
-              }),
-            );
-          }
+          await api.tellBoss(
+            "escalation",
+            `turn budget of ${state.max} turns exhausted\n\n${turnBudgetBrief(state)}`,
+          );
         } catch (err: unknown) {
           console.error(
             JSON.stringify({

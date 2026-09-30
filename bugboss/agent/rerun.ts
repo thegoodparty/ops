@@ -33,10 +33,10 @@
 //      re-run, repeat" runs out. Process-scoped, and a restart hands it back —
 //      but every run already re-run is still at attempt 2 and still refused,
 //      so what a restart buys is only the runs it has not touched.
-//   3. The thread hears about it. The notice is posted by this tool, not by
-//      the model deciding to mention it, and it carries the agent's own
-//      reasoning so a human reading the thread can say "that is not a flake,
-//      that is your change".
+//   3. The Boss hears about it. The notice is sent by this tool, not by the
+//      model deciding to mention it, and it carries the agent's own reasoning
+//      so somebody the Boss shows it to can say "that is not a flake, that is
+//      your change".
 //
 // What is *not* here: a fence. The agent runs a real shell, so `gh run rerun`
 // remains reachable the way `gh pr merge` does, and the control on merging is
@@ -46,18 +46,12 @@
 // `CLAUDE.md` in this directory before widening it.
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { BossInboxPort } from "./tools";
 
 export const RERUN_TOOL_NAME = "rerun_ci";
 
 /** One suspicion confirmed, not a pull request ground to green. */
 export const MAX_RERUNS_PER_INCIDENT = 3;
-
-/**
- * The suspicion is posted to Slack, where the reader is on a phone. Same
- * reasoning as `CONTACT_HUMAN_MESSAGE_LIMIT`, and a separate number because
- * they answer to different readers and will drift apart.
- */
-export const RERUN_SUSPICION_LIMIT = 700;
 
 /** Anchored, because the value is interpolated into an api.github.com path. */
 const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -100,23 +94,6 @@ export interface GitHubRunsPort {
   rerunFailedJobs(repo: string, runId: number): Promise<GitHubResult<null>>;
 }
 
-/**
- * Deliberately not `HumanContactPort.post`, and for the same reason
- * `HeartbeatDeps.post` is its own thing: that one seals an outstanding
- * question's marker with the ts of whatever posts next, which is right for
- * the ask and wrong for a notice the model did not write.
- *
- * `contact_human` records its marker before it posts, so a Slack failure
- * between the two leaves a marker with a blank `messageTs` -- the one state
- * that tells the next attempt to post the question again. A re-run notice
- * going through the sealing route fills that blank in with its own ts, the
- * question then looks sent, and the agent waits out its whole timeout on
- * something nobody was ever asked.
- */
-export interface ThreadPort {
-  postNotice(message: string): Promise<void>;
-}
-
 export interface RerunArgs {
   repo: string;
   runId: number;
@@ -130,9 +107,9 @@ export interface RerunResult {
   started: boolean;
   /** Set when GitHub was asked and said no. Carries GitHub's own words. */
   error: string | null;
-  /** What the thread was told, or was meant to be told. */
+  /** What the Boss was told, or was meant to be told. */
   notice: string;
-  /** Set when the re-run started and the thread never heard about it. */
+  /** Set when the re-run started and the Boss never heard about it. */
   postError: string | null;
 }
 
@@ -263,7 +240,7 @@ export const githubRefusalText = (
       "BugBoss's GitHub App does not hold it — it has `actions: read`, which is enough",
       "to watch a job fail and not enough to act on it.",
       "",
-      "Do not quietly work around this. Ask a human with contact_human AND say in the",
+      "Do not quietly work around this. Ask the Boss with message_boss AND say in the",
       `ask that the BugBoss GitHub App is missing \`${acceptedPermissions}\` for ${endpoint},`,
       "so somebody grants it instead of clicking around it again next incident.",
     ].join("\n");
@@ -288,31 +265,11 @@ export const githubRefusalText = (
       "`gh run list --commit <sha> --json databaseId`, and remember the run id is not",
       "the job id. Or the run has aged out. Or BugBoss's GitHub App cannot see",
       `${repo} at all: GitHub answers 404 rather than 403 for a private repository an`,
-      "installation is not on. If you believe the id is right, say so when you ask a",
-      "human, and name the App.",
+      "installation is not on. If you believe the id is right, say so when you ask the",
+      "Boss, and name the App.",
     ].join("\n");
   }
   return `GitHub refused with ${status || "a transport error"}: ${message}`;
-};
-
-/**
- * `toMrkdwn` passes a `<…>` entity through byte for byte, so a `<`, `>` or `|`
- * inside the workflow name would end the link early and swallow the rest of
- * the line. The name comes from our own workflow files rather than from
- * telemetry, so this is belt and braces — but a silently mangled post is
- * exactly the failure this system is built not to have.
- */
-/**
- * The name goes in whole. It used to be cut at 80 characters, to keep the
- * notice under `THREAD_PROSE_CHARS` alongside a suspicion already limited
- * to 700 -- an arithmetic in which a name GitHub gave us was the term that
- * gave way, because it was the only one with nobody to refuse to. The
- * notice goes out on the harness path now (`postNotice`), so a long one
- * splits rather than being refused, and the arithmetic is gone with it.
- */
-const linkLabel = (name: string): string => {
-  const clean = name.replace(/[<>|]/g, " ").replace(/\s+/g, " ").trim();
-  return clean || "the workflow run";
 };
 
 export const rerunNotice = (
@@ -321,7 +278,7 @@ export const rerunNotice = (
   suspicion: string,
 ): string =>
   [
-    `*Re-running the failed jobs in ${repo} <${run.html_url}|${linkLabel(run.name)}>.*`,
+    `I am re-running the failed jobs in ${repo}, workflow run "${run.name}" (${run.html_url}).`,
     "",
     suspicion.trim(),
     "",
@@ -343,14 +300,12 @@ export const runRerunFailedJobs = async (
   args: RerunArgs,
   deps: {
     github: GitHubRunsPort;
-    thread: ThreadPort;
+    boss: Pick<BossInboxPort, "tellBoss">;
     attempted: Set<string>;
     maxReruns?: number;
-    suspicionLimit?: number;
   },
 ): Promise<RerunResult> => {
   const max = deps.maxReruns ?? MAX_RERUNS_PER_INCIDENT;
-  const limit = deps.suspicionLimit ?? RERUN_SUSPICION_LIMIT;
   const refuse = (reason: string): RerunResult => ({
     refused: reason,
     started: false,
@@ -372,15 +327,9 @@ export const runRerunFailedJobs = async (
   const suspicion = args.suspicion?.trim() ?? "";
   if (!suspicion) {
     return refuse(
-      "suspicion is required: name the job that failed and say what makes you think it is the environment rather than your change. It is posted to the incident thread, because a re-run nobody can see is a re-run nobody can disagree with.",
+      "suspicion is required: name the job that failed and say what makes you think it is the environment rather than your change. It goes to the Boss, because a re-run nobody can see is a re-run nobody can disagree with.",
     );
   }
-  if (suspicion.length > limit) {
-    return refuse(
-      `suspicion is ${suspicion.length} characters and the limit is ${limit}. It is a line or two in a Slack thread, not the analysis — keep which job, which failure, and why it looks environmental.`,
-    );
-  }
-
   const key = `${args.repo}#${args.runId}`;
   if (!deps.attempted.has(key) && deps.attempted.size >= max) {
     return refuse(
@@ -426,7 +375,7 @@ export const runRerunFailedJobs = async (
     run.data.conclusion === "action_required"
   ) {
     return refuse(
-      `run ${args.runId} is waiting on a human to approve it (status ${run.data.status}, conclusion ${run.data.conclusion ?? "none"}). That is what a fork pull request from a first-time contributor or an environment protection rule does, and re-running does not clear it — approval is a different button that BugBoss does not hold. Ask for the approval with contact_human, and say which run.`,
+      `run ${args.runId} is waiting on a human to approve it (status ${run.data.status}, conclusion ${run.data.conclusion ?? "none"}). That is what a fork pull request from a first-time contributor or an environment protection rule does, and re-running does not clear it — approval is a different button that BugBoss does not hold. Ask the Boss for the approval with message_boss, and say which run.`,
     );
   }
   if (run.data.status !== "completed") {
@@ -458,18 +407,17 @@ export const runRerunFailedJobs = async (
   }
   deps.attempted.add(key);
 
-  // Posted after the re-run rather than before it, which is the opposite of
-  // what `contact_human` does with its marker, for a reason that only applies
-  // here: until the permission is granted every call ends in a 403, and a
-  // notice posted first would announce a re-run that never happened, over and
-  // over, in the thread a human is reading. A post that fails afterwards is
-  // recoverable and loud — the tool result hands the agent the exact text and
-  // tells it to post it — where a thread full of announcements for re-runs
-  // that did not happen is neither.
+  // Sent after the re-run rather than before it, which is the opposite of
+  // what `message_boss` does with its question, for a reason that only
+  // applies here: until the permission is granted every call ends in a 403,
+  // and a notice sent first would announce a re-run that never happened, over
+  // and over. A send that fails afterwards is recoverable and loud — the tool
+  // result hands the agent the exact text and tells it to send it — where a
+  // stream of announcements for re-runs that did not happen is neither.
   const notice = rerunNotice(args.repo, run.data, suspicion);
   let postError: string | null = null;
   try {
-    await deps.thread.postNotice(notice);
+    await deps.boss.tellBoss("message", notice);
   } catch (err) {
     postError = String(err);
   }
@@ -478,9 +426,9 @@ export const runRerunFailedJobs = async (
 
 const RERUN_DESCRIPTION = [
   "Re-run the failed jobs in one GitHub Actions workflow run, once, to confirm",
-  "that a failure is environmental rather than yours. It posts your reasoning to",
-  "the incident thread before it reports back, so a human can tell you that the",
-  "failure is your change.",
+  "that a failure is environmental rather than yours. It sends your reasoning to",
+  "the Boss before it reports back, so somebody can tell you that the failure is",
+  "your change.",
   "",
   "THIS IS NOT A WAY TO GET A PULL REQUEST GREEN. Read the failure first. A test",
   "that names something you touched is your change, and a second attempt at it",
@@ -500,7 +448,7 @@ const RERUN_DESCRIPTION = [
 
 export const createRerunCiTool = async (deps: {
   github: GitHubRunsPort;
-  thread: ThreadPort;
+  boss: Pick<BossInboxPort, "tellBoss">;
 }): Promise<ToolDefinition> => {
   const { Type } = await import("typebox");
   // One ledger for the life of the process, which is one incident.
@@ -514,7 +462,7 @@ export const createRerunCiTool = async (deps: {
       description: "The workflow run id (databaseId), not the job id and not the check name.",
     }),
     suspicion: Type.String({
-      description: `Which job failed and why you believe it is the environment rather than your change. Posted to the incident thread. mrkdwn, at most ${RERUN_SUSPICION_LIMIT} characters.`,
+      description: "Which job failed and why you believe it is the environment rather than your change. Sent to the Boss.",
     }),
   });
 
@@ -527,7 +475,7 @@ export const createRerunCiTool = async (deps: {
       const args = params as unknown as RerunArgs;
       const result = await runRerunFailedJobs(args, {
         github: deps.github,
-        thread: deps.thread,
+        boss: deps.boss,
         attempted,
       });
       const text = result.refused
@@ -538,12 +486,12 @@ export const createRerunCiTool = async (deps: {
             ? [
                 `Re-running the failed jobs in run ${args.runId}. This is the one attempt you get on it.`,
                 "",
-                `The thread was NOT told: posting failed with ${result.postError}. Post this yourself now, before you wait for the result:`,
+                `The Boss was NOT told: sending failed with ${result.postError}. Send this yourself with message_boss now, before you wait for the result:`,
                 "",
                 result.notice,
               ].join("\n")
             : [
-                `Re-running the failed jobs in run ${args.runId}, and the thread has been told why.`,
+                `Re-running the failed jobs in run ${args.runId}, and the Boss has been told why.`,
                 "",
                 "This is the one attempt you get on this run. If the same job fails again,",
                 "that is a finding to report rather than something to re-run. If it goes",

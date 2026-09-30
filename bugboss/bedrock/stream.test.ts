@@ -478,6 +478,46 @@ test("a partial downgrade is reported, not written off as good enough", async ()
   ]);
 });
 
+test("message_delta's cache write total never re-triggers the retention check", async () => {
+  // message_delta carries the write total and nothing else -- no
+  // cache_creation split -- so checking it there reads every turn as an
+  // unconfirmable downgrade. The check belongs on message_start, which
+  // carries the split; message_delta's usage must still land in output.usage.
+  const output = newOutput();
+  const reports: CacheRetentionReport[] = [];
+  await consumeAnthropicStream({
+    events: (async function* () {
+      yield {
+        type: "message_start",
+        message: {
+          id: "msg_5",
+          usage: {
+            input_tokens: 2,
+            cache_creation_input_tokens: 26618,
+            cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 26618 },
+          },
+        },
+      };
+      yield {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 5, cache_creation_input_tokens: 26618 },
+      };
+      yield { type: "message_stop" };
+    })(),
+    output,
+    push: () => {},
+    applyCost: () => {},
+    parseJson: () => ({}),
+    cacheRetention: "long",
+    onUnhonouredCacheRetention: (report) => reports.push(report),
+  });
+
+  assert.deepEqual(reports, []);
+  assert.equal(output.usage.output, 5);
+  assert.equal(output.usage.cacheWrite, 26618);
+});
+
 test("the bedrock metrics backstop never reports a downgrade", async () => {
   // `amazon-bedrock-invocationMetrics` carries no cache_creation split by
   // construction, so a check here would fire on every stream that fell back to

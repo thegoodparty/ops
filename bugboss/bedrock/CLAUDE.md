@@ -191,7 +191,7 @@ invisibly.
 
 ## The cache is written with a 1h ttl
 
-`monitor` and `contact_human` each cost one turn however long they block.
+`monitor` and `message_boss` each cost one turn however long they block.
 That is what keeps a multi-day incident from saturating context, and it is
 also what guarantees a cache miss on a 5-minute cache, because a tool that
 blocks for ten minutes resumes into a dead prefix and rebuilds all ~190k
@@ -231,10 +231,17 @@ retention nobody asked for. An *absent* split is reported too, because
 `calculateCost` reads a missing 1h share as zero and would bill a 1h write at
 the 5m rate.
 
-One path is deliberately exempt. The `message_stop` backstop synthesizes usage
-from `amazon-bedrock-invocationMetrics`, which carry no split by construction,
-so checking it would report a fault on every stream that fell back to it and
-never on a real downgrade.
+The check runs on `message_start`, because that is the event that carries the
+split. `message_delta` carries only the write total -- never
+`cache_creation` -- so holding it to the same check reads an absent split as
+an unconfirmable downgrade on every turn, not just a real one.
+
+Two paths are deliberately exempt for that reason. `message_delta` is one:
+its usage still lands in `output.usage`, but with no retention arguments, so
+no check runs against it. The `message_stop` backstop is the other -- it
+synthesizes usage from `amazon-bedrock-invocationMetrics`, which carry no
+split by construction, so checking it would report a fault on every stream
+that fell back to it and never on a real downgrade.
 
 Deliberately a loud log and not a throw. This is a billing fault, and
 crashing an agent that is working a production incident over one would be the
@@ -243,7 +250,7 @@ wrong trade.
 ### What it does not fix
 
 A gap longer than an hour is beyond any ttl. Incident 1's last miss followed
-a 28,809s `contact_human` timeout that expired with no reply. That case wants
+a 28,809s wait on a person that expired with no reply. That case wants
 a keep-alive or a shorter default timeout, not a longer cache.
 
 ## Traps when changing this directory

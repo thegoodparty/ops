@@ -1,6 +1,7 @@
-// The loopback routes that are not ToolApi: the outstanding-question marker,
-// the wait marker monitor keeps while it is blocked on a person, and the
-// non-draining directive read contact_human polls.
+// The loopback routes that are not ToolApi: the Boss's inbox, the
+// outstanding-question marker, the wait marker monitor keeps while it is
+// blocked on a person, and the non-draining directive read message_boss
+// polls.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -8,34 +9,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
+import Database from "better-sqlite3";
+
+import { unseenByBoss } from "../boss/inbox";
 import { Db } from "../db";
 import { createMemoryS3 } from "../index";
 import { mintAgentToken } from "../toolapi";
-import { THREAD_PROSE_CHARS } from "../slack/format";
-import type { Directive, ToolApi } from "../types";
-import {
-  CHOICE_ACTION_PREFIX,
-  CHOICE_BLOCK_ID,
-  MAX_CHOICE_OPTIONS,
-  type SlackBlock,
-} from "../slack/blocks";
+import type { BossInboxItem, Directive, ToolApi } from "../types";
 import { createToolApiRoutes } from "./toolapi";
 
 const SECRET = "test-secret";
 const INCIDENT = "inc-7";
+const OTHER = "inc-8";
 
 let dir: string;
 let db: Db;
 let app: ReturnType<typeof createToolApiRoutes>;
 let clock = 1_000_000;
 let reached = 0;
-const threadPosts: string[] = [];
-const choicePosts: { text: string; blocks: readonly SlackBlock[] }[] = [];
+let dbPath: string;
+const wakes: { incidentId: string; unseen: BossInboxItem[] }[] = [];
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "bugboss-http-"));
+  dbPath = join(dir, "test.db");
   db = await Db.open({
-    path: join(dir, "test.db"),
+    path: dbPath,
     bucket: "bugboss-test",
     key: "db/test.db",
     s3: createMemoryS3(),
@@ -44,6 +43,9 @@ before(async () => {
     w.prepare(
       "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
     ).run(INCIDENT, clock);
+    w.prepare(
+      "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
+    ).run(OTHER, clock);
   });
 
   app = createToolApiRoutes({
@@ -55,20 +57,13 @@ before(async () => {
         reportRootCause: async (args: unknown) => ({ ok: true, data: args, directives: [] }),
       } as unknown as ToolApi;
     },
-    slack: {
-      post: async (_threadTs: string | null, text: string) => {
-        threadPosts.push(text);
-        return { ts: "ts-1" };
-      },
-      postChoice: async (
-        _threadTs: string | null,
-        text: string,
-        blocks: readonly SlackBlock[],
-      ) => {
-        threadPosts.push(text);
-        choicePosts.push({ text, blocks });
-        return { ts: `ts-choice-${choicePosts.length}` };
-      },
+    wakeBoss: (incidentId) => {
+      const reader = new Database(dbPath, { readonly: true });
+      try {
+        wakes.push({ incidentId, unseen: unseenByBoss(reader, incidentId) });
+      } finally {
+        reader.close();
+      }
     },
     now: () => clock,
   });
@@ -116,14 +111,16 @@ test("a replayed question keeps its watermark, a different one gets a new one", 
   };
   assert.equal(different.message, "Should I roll back the deploy?");
   assert.equal(different.askedAt, 3_000_000);
-  assert.equal(
-    db.get<{ messageTs: string }>(
-      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-      [INCIDENT],
-    )?.messageTs,
-    "",
-    "the new question has no posted message yet",
-  );
+  assert.deepEqual(Object.keys(different).sort(), ["askedAt", "message"]);
+
+  const read = (await (await authed("/pending-question")).json()) as Record<
+    string,
+    unknown
+  >;
+  assert.deepEqual(read, {
+    message: "Should I roll back the deploy?",
+    askedAt: 3_000_000,
+  });
 
   await authed("/pending-question", { method: "DELETE" });
 });
@@ -210,197 +207,171 @@ test("the directive read is scoped by the token like every other route", async (
   assert.equal(crossed.status, 403);
 });
 
-test("what the agent writes is converted for Slack and never truncated", async () => {
-  const before = threadPosts.length;
-  await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({
-      message: "## Found it\n- **the cache**, log says `near <Set-Cookie>`",
-    }),
-  });
-  const posted = threadPosts[before];
-  assert.ok(posted.includes("*Found it*"), posted);
-  assert.ok(posted.includes("• *the cache*"), posted);
-  assert.ok(posted.includes("`near &lt;Set-Cookie&gt;`"), posted);
+const tokenFor = (incidentId: string) =>
+  `Bearer ${mintAgentToken(SECRET, { incidentId, attempt: 1 }, 3600)}`;
 
-  // Inside the thread budget, but escaping multiplies it past what one
-  // message holds. Still a split and still the whole tail: the budget is
-  // about what a person will read, and conversion happening to need two
-  // messages is not the model writing too much.
-  const expands = Array.from(
-    { length: 34 },
-    (_, i) => `- ruled out ${i} ${"&".repeat(18)}`,
-  ).join("\n");
-  assert.ok(expands.length <= THREAD_PROSE_CHARS, "the premise: inside the budget");
-  const res = await authed("/thread", {
+const sendToBoss = (body: unknown, incidentId = INCIDENT) =>
+  app.request(`/incidents/${incidentId}/boss-inbox`, {
     method: "POST",
-    body: JSON.stringify({ message: expands }),
-  });
-  assert.equal(res.status, 200);
-  const parts = threadPosts.slice(before + 1);
-  assert.ok(parts.length > 1, `expected a split, got ${parts.length}`);
-  assert.ok(parts.join("").includes("ruled out 33"), "the tail is not dropped");
-
-  await authed("/pending-question", { method: "DELETE" });
-});
-
-test("a post past the thread budget is refused, not split into two long ones", async () => {
-  // Every post to a thread arrives through here -- the ask, the evidence
-  // under it, the rerun notice, the wait heartbeat -- so this is where the
-  // budget is a budget rather than a rule one of four callers follows.
-  const before = threadPosts.length;
-  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
-  const res = await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: long }),
+    headers: {
+      "content-type": "application/json",
+      authorization: tokenFor(incidentId),
+    },
+    body: typeof body === "string" ? body : JSON.stringify(body),
   });
 
-  assert.equal(res.status, 400);
-  const body = (await res.json()) as { error: string };
-  assert.match(body.error, /message is \d+ characters/);
-  assert.match(body.error, new RegExp(String(THREAD_PROSE_CHARS)));
-  // A refusal nobody can act on is a dead end, so it says where the long
-  // version goes instead of only that this one is too long.
-  assert.match(body.error, /post-mortem/);
-  assert.equal(
-    threadPosts.length,
-    before,
-    "refused before posting, so there is no half-delivered write-up",
+const inboxOf = (incidentId: string) =>
+  db.query<BossInboxItem>(
+    "SELECT id, incidentId, kind, text, createdAt, seenAt FROM boss_inbox WHERE incidentId = ? ORDER BY id",
+    [incidentId],
   );
-});
 
-test("a harness-composed post is split, because there is nobody to refuse it to", async () => {
-  // The other half of the same rule. The budget is a refusal, and a refusal
-  // only means anything where somebody can rewrite the text -- a wait nudge
-  // and a re-run notice are composed after the model has stopped, so
-  // refusing one drops it. That is what used to force a 400-character cut
-  // through the middle of the check's output.
-  const before = threadPosts.length;
-  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
-
-  const res = await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({
-      message: long,
-      sealsPendingQuestion: false,
-      harnessComposed: true,
-    }),
+const clearInbox = () =>
+  db.withWrite((w) => {
+    w.prepare("DELETE FROM boss_inbox").run();
   });
 
+test("the Boss is woken only once the row it is woken for is committed", async () => {
+  await clearInbox();
+  wakes.length = 0;
+
+  const res = await sendToBoss({ kind: "question", text: "Can someone merge the PR?" });
   assert.equal(res.status, 200);
-  const posted = threadPosts.slice(before).join("\n");
-  assert.ok(threadPosts.length > before + 1, "it went out as more than one post");
-  // Whole, across the parts. Nothing is missing and nothing says it is.
-  assert.ok(posted.includes("ruled out 0"));
-  assert.ok(posted.includes("ruled out 399"));
-  assert.doesNotMatch(posted, /truncat|elided/);
-});
+  const { id } = (await res.json()) as { id: number };
 
-test("a model post cannot buy the harness exemption by asking for it", async () => {
-  // This side of the socket does not trust the child. The flag is set by
-  // `postNotice`, which is the harness's own client method; nothing the
-  // model calls reaches it. This is the check that would notice if that
-  // ever stopped being true from the wire's point of view.
-  const before = threadPosts.length;
-  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
-
-  const res = await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: long, harnessComposed: "yes" }),
-  });
-
-  assert.equal(res.status, 400, "anything but a literal true is not the exemption");
-  assert.equal(threadPosts.length, before);
-});
-
-test("the marker says whether the question was actually posted", async () => {
-  clock = 4_000_000;
-  await (await ask("Is the rollback safe?")).json();
-
-  const recorded = (await (await authed("/pending-question")).json()) as {
-    messageTs: string;
-  };
-  assert.equal(recorded.messageTs, "", "recorded, not yet posted");
-
-  await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: "Is the rollback safe?" }),
-  });
-  const posted = (await (await authed("/pending-question")).json()) as {
-    messageTs: string;
-  };
-  assert.equal(posted.messageTs, "ts-1");
-
-  await authed("/pending-question", { method: "DELETE" });
-});
-
-test("a question with options posts buttons, and the marker points at them", async () => {
-  clock = 4_100_000;
-  await (await ask("Roll back, or wait for the next deploy?")).json();
-
-  const before = choicePosts.length;
-  const res = await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({
-      message: "Roll back, or wait for the next deploy?",
-      options: ["Roll back", "Wait for the next deploy"],
-    }),
-  });
-  assert.equal(res.status, 200);
-  assert.equal(choicePosts.length, before + 1, "one message, with blocks");
-
-  const posted = choicePosts.at(-1)!;
-  const actions = posted.blocks.find((block) => block.type === "actions");
-  assert.ok(actions && actions.type === "actions");
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].incidentId, INCIDENT);
   assert.deepEqual(
-    actions.elements.map((element) => element.value),
-    ["Roll back", "Wait for the next deploy"],
+    wakes[0].unseen.map((row) => ({ id: row.id, kind: row.kind, text: row.text })),
+    [{ id, kind: "question", text: "Can someone merge the PR?" }],
+    "a separate connection already sees the row when the wake fires",
   );
-  assert.ok(actions.elements.every((e) => e.action_id.startsWith(CHOICE_ACTION_PREFIX)));
-  assert.equal(actions.block_id, CHOICE_BLOCK_ID);
-  assert.ok(posted.text.includes("1. Roll back"), "the fallback is answerable as text");
-
-  // A press comes back quoting the message the buttons are on, and the marker
-  // is what the relay matches it against.
-  const marker = (await (await authed("/pending-question")).json()) as {
-    messageTs: string;
-  };
-  assert.equal(marker.messageTs, `ts-choice-${choicePosts.length}`);
-
-  await authed("/pending-question", { method: "DELETE" });
+  assert.equal(wakes[0].unseen[0].seenAt, null);
 });
 
-test("a question with no options still posts as plain prose", async () => {
-  const before = choicePosts.length;
-  await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: "What changed in the last hour?" }),
-  });
-  assert.equal(choicePosts.length, before, "no blocks where none were asked for");
-  assert.equal(threadPosts.at(-1), "What changed in the last hour?");
+test("text reaches the inbox whole, with no length limit", async () => {
+  await clearInbox();
+  wakes.length = 0;
+  const long = Array.from({ length: 400 }, (_, i) => `- ruled out ${i}`).join("\n");
+  assert.ok(long.length > 4_000, "the premise: longer than any Slack budget");
+
+  const res = await sendToBoss({ kind: "message", text: long });
+  assert.equal(res.status, 200);
+  assert.equal(inboxOf(INCIDENT)[0].text, long);
 });
 
-test("the boundary refuses options the tool would have caught, and posts nothing", async () => {
-  const before = threadPosts.length;
-  const tooMany = Array.from({ length: MAX_CHOICE_OPTIONS + 1 }, (_, i) => `o${i}`);
+test("a rejected body writes nothing and wakes nobody", async () => {
+  await clearInbox();
+  wakes.length = 0;
 
-  const many = await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: "Pick one", options: tooMany }),
-  });
-  assert.equal(many.status, 400);
+  for (const [body, why] of [
+    [{ kind: "shout", text: "hello" }, "a kind the Boss does not know"],
+    [{ kind: "message", text: "" }, "empty text"],
+    [{ kind: "message", text: "   \n " }, "whitespace-only text"],
+    [{ kind: "message" }, "missing text"],
+    ["not json", "a body that is not JSON"],
+  ] as const) {
+    const res = await sendToBoss(body);
+    assert.equal(res.status, 400, why);
+    assert.ok(((await res.json()) as { error: string }).error, why);
+  }
 
-  const wrongType = await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: "Pick one", options: [1, 2] }),
-  });
-  assert.equal(wrongType.status, 400);
-  assert.match(
-    ((await wrongType.json()) as { error: string }).error,
-    /array of strings/,
+  assert.equal(inboxOf(INCIDENT).length, 0);
+  assert.equal(wakes.length, 0);
+});
+
+test("an unknown incident is a 404, not a row the Boss can never act on", async () => {
+  wakes.length = 0;
+  const res = await sendToBoss({ kind: "message", text: "hello" }, "inc-missing");
+  assert.equal(res.status, 404);
+  assert.equal(inboxOf("inc-missing").length, 0);
+  assert.equal(wakes.length, 0);
+});
+
+test("a token for one incident cannot write to another's inbox", async () => {
+  await clearInbox();
+  wakes.length = 0;
+  assert.ok(
+    db.get("SELECT id FROM incident WHERE id = ?", [OTHER]),
+    "the premise: the target incident exists, so only the token stops the write",
   );
 
-  assert.equal(threadPosts.length, before, "a refused question is never posted");
+  const crossed = await app.request(`/incidents/${OTHER}/boss-inbox`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: tokenFor(INCIDENT),
+    },
+    body: JSON.stringify({ kind: "escalation", text: "wake up" }),
+  });
+  assert.equal(crossed.status, 403);
+
+  const anonymous = await app.request(`/incidents/${INCIDENT}/boss-inbox`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ kind: "message", text: "hello" }),
+  });
+  assert.equal(anonymous.status, 401);
+
+  assert.equal(inboxOf(OTHER).length, 0);
+  assert.equal(inboxOf(INCIDENT).length, 0);
+  assert.equal(wakes.length, 0);
+});
+
+test("escalations are counted for this incident only, and only since the moment asked", async () => {
+  await clearInbox();
+  await db.withWrite((w) => {
+    const insert = w.prepare(
+      "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES (?, ?, ?, ?)",
+    );
+    insert.run(INCIDENT, "escalation", "first", 1_000);
+    insert.run(INCIDENT, "escalation", "second", 2_000);
+    insert.run(INCIDENT, "escalation", "third", 3_000);
+    insert.run(INCIDENT, "question", "not an escalation", 5_000);
+    insert.run(INCIDENT, "message", "not an escalation", 6_000);
+    insert.run(OTHER, "escalation", "someone else's", 7_000);
+  });
+
+  const escalations = async (since?: number) =>
+    (await (
+      await authed(
+        since === undefined
+          ? "/boss-inbox/escalations"
+          : `/boss-inbox/escalations?since=${since}`,
+      )
+    ).json()) as { count: number; lastAt: number | null };
+
+  assert.deepEqual(await escalations(), { count: 3, lastAt: 3_000 });
+  assert.deepEqual(await escalations(0), { count: 3, lastAt: 3_000 });
+  assert.deepEqual(
+    await escalations(2_000),
+    { count: 2, lastAt: 3_000 },
+    "since is inclusive",
+  );
+  assert.deepEqual(await escalations(3_001), { count: 0, lastAt: null });
+
+  const bad = await authed("/boss-inbox/escalations?since=yesterday");
+  assert.equal(bad.status, 400);
+});
+
+test("an escalation sent through the route is one the count sees", async () => {
+  await clearInbox();
+  const since = Date.now();
+  await sendToBoss({ kind: "escalation", text: "still no answer" });
+  await sendToBoss({ kind: "question", text: "is anyone there?" });
+
+  const counted = (await (
+    await authed(`/boss-inbox/escalations?since=${since}`)
+  ).json()) as { count: number; lastAt: number | null };
+  assert.equal(counted.count, 1);
+  assert.ok(counted.lastAt !== null && counted.lastAt >= since);
+});
+
+test("the escalation count is scoped by the token", async () => {
+  const crossed = await app.request(`/incidents/${OTHER}/boss-inbox/escalations`, {
+    headers: { authorization: tokenFor(INCIDENT) },
+  });
+  assert.equal(crossed.status, 403);
 });
 
 test("model arguments are validated before they reach a tool", async () => {
@@ -496,47 +467,4 @@ test("counting a nudge against no wait is an error, not a new wait", async () =>
     undefined,
     "a missing marker is not invented at the moment of the fault",
   );
-});
-
-test("a harness notice does not seal a question whose post never landed", async () => {
-  clock = 7_000_000;
-  await ask("Can someone merge the PR?");
-  assert.equal(
-    db.get<{ messageTs: string }>(
-      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-      [INCIDENT],
-    )?.messageTs,
-    "",
-  );
-
-  await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({
-      message: "Still waiting on someone: the PR to be merged",
-      sealsPendingQuestion: false,
-    }),
-  });
-  assert.equal(
-    db.get<{ messageTs: string }>(
-      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-      [INCIDENT],
-    )?.messageTs,
-    "",
-    "the nudge is not the question, so it does not make the question look sent",
-  );
-
-  // The ask itself still does.
-  await authed("/thread", {
-    method: "POST",
-    body: JSON.stringify({ message: "Can someone merge the PR?" }),
-  });
-  assert.equal(
-    db.get<{ messageTs: string }>(
-      "SELECT messageTs FROM pending_question WHERE incidentId = ?",
-      [INCIDENT],
-    )?.messageTs,
-    "ts-1",
-  );
-
-  await authed("/pending-question", { method: "DELETE" });
 });

@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import { THREAD_PROSE_CHARS } from "../slack/format";
-import {
-  CONTACT_HUMAN_MESSAGE_LIMIT,
-  CONTACT_HUMAN_MIN_WAIT_SECONDS,
-} from "./tools";
+import { MESSAGE_BOSS_MIN_WAIT_SECONDS } from "./tools";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,7 +29,7 @@ const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
   ],
   alertDefinitions: [{ path: "a/alerts.types.ts", content: "export type KnownCause = {}" }],
   shipPrSkill: "# ship-pr\nOpen the PR, drive delegate to Approved.",
-  toolNames: ["read", "bash", "monitor", "contact_human"],
+  toolNames: ["read", "bash", "monitor", "message_boss"],
   npmCiDoneMarker: "/work/inc-42/npm-ci.done",
   npmCiFailedMarker: "/work/inc-42/npm-ci.failed",
   ...overrides,
@@ -50,7 +47,7 @@ test("input ordering cannot move a byte of the prompt", () => {
   const ordered = composeSystemPrompt(input());
   const shuffled = composeSystemPrompt(
     input({
-      toolNames: ["monitor", "read", "contact_human", "bash"],
+      toolNames: ["monitor", "read", "message_boss", "bash"],
       observabilityDocs: [
         { path: "packages/gp-api/docs/observability.md", content: "route alerts are per-controller" },
         { path: "docs/observability.md", content: "Loki uid grafanacloud-logs" },
@@ -94,8 +91,8 @@ test("the load-bearing rules are all in there", () => {
 test("the prompt names the difference between asking and escalating", () => {
   const prompt = composeSystemPrompt(input());
 
-  assert.match(prompt, /I am still working, and I need one fact from you/);
-  assert.match(prompt, /somebody needs to look at this/);
+  assert.match(prompt, /message_boss\*\* tells the Boss something/);
+  assert.match(prompt, /somebody needs to look at this, urgently/);
   // The prompt has to say that escalating changes nothing, or a model that
   // reads only the prompt believes it can put an incident down.
   assert.match(prompt, /this one is yours until it closes/);
@@ -105,19 +102,22 @@ test("the prompt names the difference between asking and escalating", () => {
   assert.match(prompt, /relaunches you into the same dead end/);
   // The harness enforces this one; the prompt has to say so, or a model that
   // reads only the prompt believes an unanswered question is survivable.
-  assert.match(prompt, /is escalated by the harness/);
-  assert.match(prompt, new RegExp(`${CONTACT_HUMAN_MIN_WAIT_SECONDS} seconds is raised to it`));
+  assert.match(prompt, /is escalated to the Boss by the harness/);
+  assert.match(prompt, new RegExp(`${MESSAGE_BOSS_MIN_WAIT_SECONDS} seconds is raised to it`));
 });
 
-test("the prompt gives the report a budget, a shape and an example", () => {
+test("the agent talks only to the Boss and is told not to narrate", () => {
   const prompt = composeSystemPrompt(input());
 
-  assert.match(prompt, /## What a human reads/);
-  assert.match(prompt, new RegExp(`capped at ${CONTACT_HUMAN_MESSAGE_LIMIT} characters`));
-  assert.match(prompt, /Length is not a quality signal/);
-  assert.match(prompt, /posted as its own follow-up message below the ask/);
-  // An example changes model behaviour where an adjective does not.
-  assert.match(prompt, /\*What I need:\*/);
+  assert.match(prompt, /## You talk to the Boss, and only the Boss/);
+  assert.match(prompt, /You never talk to people and you never read what they write/);
+  assert.match(prompt, /FROM THE BOSS/);
+  // One run wrote 56k characters of prose between tool calls that nobody
+  // ever saw. The prompt is the only thing that can stop the next one.
+  assert.match(prompt, /\*\*Do not narrate between tool calls\.\*\*/);
+  assert.match(prompt, /nobody reads it, not the Boss and not a person/);
+  assert.doesNotMatch(prompt, /contact_human/);
+  assert.doesNotMatch(prompt, /\bnudge/);
 });
 
 test("the agent is told its notes are a record to keep, not scratch to tidy", () => {
@@ -198,10 +198,11 @@ test("alert definitions stay inside their budget", async () => {
 test("the agent is told to write mrkdwn, not Markdown", () => {
   const prompt = composeSystemPrompt(input());
 
-  assert.ok(prompt.includes("## Writing to Slack"));
-  // Everything the agent writes is posted verbatim, so the rules it needs are
-  // the ones Markdown gets wrong: bold, links, headings, and the escaping it
-  // must not attempt by hand.
+  assert.ok(prompt.includes("## What reaches Slack"));
+  // The root cause, the resolution evidence and the post-mortem are posted
+  // verbatim, so the rules they need are the ones Markdown gets wrong: bold,
+  // links, headings, and the escaping it must not attempt by hand.
+  assert.match(prompt, /your root cause, your resolution evidence and your\s+post-mortem/);
   assert.ok(prompt.includes("not **bold**"));
   assert.ok(prompt.includes("<https://example.com|label>"));
   assert.ok(prompt.includes("There are no headings and no tables."));
@@ -235,7 +236,7 @@ test("the prompt does not tell the agent that a long wait is free", () => {
   assert.match(prompt, /outlives the prompt cache/);
   // And the correction has to leave the agent with something to do, or it
   // reads as "wait less", which the measurements say is not a lever.
-  assert.match(prompt, /report_impact so the number in the thread is current/);
+  assert.match(prompt, /report_impact so the number is current/);
   assert.match(prompt, /worse than waiting/);
 });
 
@@ -261,31 +262,13 @@ test("the prompt does not understate how far the GitHub token reaches", () => {
   assert.match(prompt, /every repository in the thegoodparty/);
 });
 
-test("the thread cap is stated as a refusal, not a split", () => {
+test("the thread cap on resolution evidence is a refusal, and the post-mortem has none", () => {
   const prompt = composeSystemPrompt(input());
 
-  assert.match(prompt, /The thread is short; the document is complete/);
-  assert.match(prompt, new RegExp(`capped at ${THREAD_PROSE_CHARS} characters`));
-  // A model told the ceiling is a split writes long and lets the harness cut
-  // it. The refusal is the whole behaviour change, so the prompt says it.
-  assert.match(prompt, /refused: not truncated, not split across two\s+messages/);
-  assert.match(prompt, new RegExp(`tighter still, ${CONTACT_HUMAN_MESSAGE_LIMIT}\\s+characters`));
-  assert.doesNotMatch(prompt, /under about 3000 characters/);
-});
-
-test("the post-mortem is the one thing the prompt exempts from the cap", () => {
-  const prompt = composeSystemPrompt(input());
-
-  assert.match(prompt, /post-mortem is the single exception and it has no cap at all/);
+  assert.match(prompt, new RegExp(`capped at\\s+${THREAD_PROSE_CHARS} characters`));
+  assert.match(prompt, /a longer one is refused and\s+handed back/);
+  assert.match(prompt, /The post-mortem has no cap\s+at all/);
   assert.match(prompt, /becomes a file attached to the thread/);
-  assert.match(prompt, /Nothing here is asking you to write less/);
-  assert.match(prompt, /no cap is the post-mortem, which becomes the closing report/);
-  // `details` goes out through the thread route, so the old "no budget at
-  // all" reading of it is now a refused call the model did not expect.
-  assert.match(
-    prompt,
-    new RegExp(`its own\\s+${THREAD_PROSE_CHARS}-character budget rather than no budget at all`),
-  );
 });
 
 test("the prompt asks for behaviour over symbols, with a worked pair", () => {
