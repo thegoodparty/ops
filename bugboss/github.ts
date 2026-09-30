@@ -9,6 +9,8 @@
 // @octokit/auth-app caches and refreshes on its own, so the agent re-mints
 // only when the current token is close to expiry.
 
+import { readFile } from "node:fs/promises";
+
 import { createAppAuth } from "@octokit/auth-app";
 
 import { makeAlarm, makeLog } from "./logging";
@@ -67,6 +69,18 @@ export const createInstallationToken = (
     installationId: config.installationId,
   });
   return async () => (await auth({ type: "installation" })).token;
+};
+
+/**
+ * `BUGBOSS_GITHUB_TOKEN_FILE`: a token somebody else keeps fresh, read on each
+ * use, instead of the App's own credentials. Unset in production. The eval
+ * harness sets it so the BugBoss under test holds a token scoped to its
+ * sandbox repository and never the App's private key.
+ */
+export const tokenFromFile = (path: string): (() => Promise<string>) => async () => {
+  const token = (await readFile(path, "utf8")).trim();
+  if (!token) throw new Error(`${path} holds no GitHub token`);
+  return token;
 };
 
 // ---------------------------------------------------------------------------
