@@ -1,0 +1,55 @@
+{
+  "receiver": "bugboss",
+  "status": "firing",
+  "orgId": 1,
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "[Shared] Route errors detected",
+        "alert_slug": "route-errors-shared",
+        "environment": "prod",
+        "grafana_folder": "PROD Alerts (provisioned via gp-api)",
+        "request_endpoint": "POST /v1/payments/events"
+      },
+      "annotations": {
+        "summary": "[PROD] [Shared] Route errors detected `POST /v1/payments/events`",
+        "description": "[PROD] `POST /v1/payments/events` returned unexpected error responses, or no status at all, in the 60 seconds ending 30 seconds before this check (status ≥ 400 excluding 400/401/403/404/409/498, or null).\n\nThe rule reads 30 seconds behind real time so that log lines reaching Loki a few seconds late are still counted, which means this page arrives up to 30 seconds later than the error would otherwise allow.\n\n<http://grafana:3000/explore?schemaVersion=1&panes=%7B%22a%22%3A%7B%22datasource%22%3A%22grafanacloud-logs%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22uid%22%3A%22grafanacloud-logs%22%7D%2C%22expr%22%3A%22%7Bservice_name%3D%5C%22gp-api%5C%22%2C%20deployment_environment_name%3D%5C%22prod%5C%22%7D%20%7C%3D%20%5C%22POST%20%2Fv1%2Fpayments%2Fevents%5C%22%20%7C%20json%20%7C%20request_endpoint%20%3D%20%5C%22POST%20%2Fv1%2Fpayments%2Fevents%5C%22%20%7C%20exception_type%20%21%3D%20%5C%22%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-1h%22%2C%22to%22%3A%22now%22%7D%7D%7D|Open this route's error lines> to read the exception each failing request logged (type, message, stack trace) before deciding what to fix. *View in Grafana* shows only the count that fired.\n\nA **null** status means gp-api never wrote one: the request was killed in flight, usually by the gateway’s ~120s idle timeout. Only those running longer than 30 seconds are counted — a shorter one is the caller hanging up, which is not a fault and is far more common. Check `responseTimeMs` on those lines; a cluster at ~120,000ms is the timeout, not the handler.\n\n@serve-bugs @win-bugs"
+      },
+      "startsAt": "2026-01-01T00:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://grafana:3000/alerting/grafana/evalpaymentsroute01/view?orgId=1",
+      "fingerprint": "b7d40e19c2a85f31",
+      "silenceURL": "http://grafana:3000/alerting/silence/new?alertmanager=grafana&matcher=__alert_rule_uid__%3Devalpaymentsroute01&matcher=alert_slug%3Droute-errors-shared&matcher=environment%3Dprod&matcher=request_endpoint%3DPOST%20%2Fv1%2Fpayments%2Fevents&orgId=1",
+      "dashboardURL": "",
+      "panelURL": "",
+      "values": {
+        "B": 1,
+        "C": 1
+      },
+      "valueString": "[ var='B' labels={} value=1 ], [ var='C' labels={} value=1 ]"
+    }
+  ],
+  "groupLabels": {
+    "alert_slug": "route-errors-shared",
+    "request_endpoint": "POST /v1/payments/events"
+  },
+  "commonLabels": {
+    "alertname": "[Shared] Route errors detected",
+    "alert_slug": "route-errors-shared",
+    "environment": "prod",
+    "grafana_folder": "PROD Alerts (provisioned via gp-api)",
+    "request_endpoint": "POST /v1/payments/events"
+  },
+  "commonAnnotations": {
+    "summary": "[PROD] [Shared] Route errors detected `POST /v1/payments/events`",
+    "description": "[PROD] `POST /v1/payments/events` returned unexpected error responses, or no status at all, in the 60 seconds ending 30 seconds before this check (status ≥ 400 excluding 400/401/403/404/409/498, or null).\n\nThe rule reads 30 seconds behind real time so that log lines reaching Loki a few seconds late are still counted, which means this page arrives up to 30 seconds later than the error would otherwise allow.\n\n<http://grafana:3000/explore?schemaVersion=1&panes=%7B%22a%22%3A%7B%22datasource%22%3A%22grafanacloud-logs%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22uid%22%3A%22grafanacloud-logs%22%7D%2C%22expr%22%3A%22%7Bservice_name%3D%5C%22gp-api%5C%22%2C%20deployment_environment_name%3D%5C%22prod%5C%22%7D%20%7C%3D%20%5C%22POST%20%2Fv1%2Fpayments%2Fevents%5C%22%20%7C%20json%20%7C%20request_endpoint%20%3D%20%5C%22POST%20%2Fv1%2Fpayments%2Fevents%5C%22%20%7C%20exception_type%20%21%3D%20%5C%22%5C%22%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-1h%22%2C%22to%22%3A%22now%22%7D%7D%7D|Open this route's error lines> to read the exception each failing request logged (type, message, stack trace) before deciding what to fix. *View in Grafana* shows only the count that fired.\n\nA **null** status means gp-api never wrote one: the request was killed in flight, usually by the gateway’s ~120s idle timeout. Only those running longer than 30 seconds are counted — a shorter one is the caller hanging up, which is not a fault and is far more common. Check `responseTimeMs` on those lines; a cluster at ~120,000ms is the timeout, not the handler.\n\n@serve-bugs @win-bugs"
+  },
+  "externalURL": "http://grafana:3000/",
+  "version": "1",
+  "groupKey": "{}:{alert_slug=\"route-errors-shared\",request_endpoint=\"POST /v1/payments/events\"}",
+  "truncatedAlerts": 0,
+  "title": "[FIRING:1] route-errors-shared (POST /v1/payments/events)",
+  "state": "alerting",
+  "message": "**Firing**\n\n[PROD] [Shared] Route errors detected `POST /v1/payments/events`"
+}
