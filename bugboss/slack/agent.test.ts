@@ -953,6 +953,7 @@ const runRequest = (
   fresh: true,
   input: "<@U0HUMAN> asks: what is the state of the various incidents?",
   maxTurns,
+  allowSilence: false,
 });
 
 describe("a run that uses its whole budget", () => {
