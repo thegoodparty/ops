@@ -88,7 +88,7 @@ const run = (
 };
 
 for (const id of ids) {
-  const { scenario, dir } = loadScenario(join(SCENARIOS, id, "scenario.json"));
+  const { scenario, dir } = loadScenario(id);
   const cases = [
     { sha: scenario.omni.baseSha, expect: 1, label: "fails at baseSha" },
     { sha: scenario.omni.provingFixSha, expect: 0, label: "passes at provingFixSha" },
@@ -101,7 +101,7 @@ for (const id of ids) {
         const { dir: omniDir, fresh } = worktree(c.sha);
         try {
           const stem = join(ROOT, `${id}-${c.sha.slice(0, 12)}`);
-          if (fresh && scenario.check.setup) {
+          if (fresh) {
             const setup = run(dir, scenario.check.setup, c.sha, omniDir, 1800, `${stem}-setup.log`);
             assert.equal(setup.status, 0, `setup failed, see ${stem}-setup.log`);
             writeFileSync(join(omniDir, ".bugboss-setup-done"), "");
