@@ -2041,6 +2041,7 @@ export const createBugBoss = async (
       ts: route.ts,
       user: route.user,
       text: route.text,
+      tagged: route.tagged,
     });
   };
 

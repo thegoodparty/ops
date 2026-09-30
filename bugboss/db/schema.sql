@@ -323,6 +323,16 @@ CREATE TABLE IF NOT EXISTS boss_inbox (
 CREATE INDEX IF NOT EXISTS boss_inbox_unseen_idx
   ON boss_inbox (incidentId, seenAt);
 
+-- Slack messages outside an incident thread that have been handed to the
+-- Boss. The insert is what collapses a Slack retry of the same message, the
+-- way thread_reply does for incident threads.
+CREATE TABLE IF NOT EXISTS boss_message_seen (
+  channel           TEXT NOT NULL,
+  ts                TEXT NOT NULL,
+  receivedAt        INTEGER NOT NULL,
+  PRIMARY KEY (channel, ts)
+);
+
 -- Directives waiting for an agent to pick up on its next call.
 CREATE TABLE IF NOT EXISTS pending_directive (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,

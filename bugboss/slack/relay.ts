@@ -275,6 +275,13 @@ export type InboundRoute =
       ts: string;
       user: string;
       text: string;
+      /**
+       * False for an untagged follow-up in a Boss thread. Nobody addressed
+       * that one to the Boss by name, so it may be two people talking, and
+       * the Boss may choose to say nothing; a tagged mention is always
+       * answered.
+       */
+      tagged: boolean;
     };
 
 export const mentionsBot = (text: string, botUserId: string): boolean =>
@@ -431,21 +438,25 @@ export class SlackRelay {
 
     const threadTs = event.thread_ts ?? null;
     if (!threadTs) {
-      return mentioned
-        ? { kind: "slack_agent", channel, threadTs: ts, ts, user, text }
-        : ignore("channel chatter, not addressed to us");
+      if (!mentioned) return ignore("channel chatter, not addressed to us");
+      if (!(await this.recordBossMessage(channel, ts))) return ignore("duplicate delivery");
+      return { kind: "slack_agent", channel, threadTs: ts, ts, user, text, tagged: true };
     }
 
     const incident = this.incidentForThread(threadTs);
     if (!incident) {
-      if (mentioned) return { kind: "slack_agent", channel, threadTs, ts, user, text };
+      if (mentioned) {
+        if (!(await this.recordBossMessage(channel, ts))) return ignore("duplicate delivery");
+        return { kind: "slack_agent", channel, threadTs, ts, user, text, tagged: true };
+      }
       // A follow-up under a Boss answer, untagged. It is the Boss's exactly
       // as a tagged one would be: people reply to whoever answered them, and
       // "Can you close incident 2?" was lost here for want of an @. Decided
       // by what the Boss has done in this thread, never by what was said.
       if (await this.isBossThread(channel, threadTs)) {
+        if (!(await this.recordBossMessage(channel, ts))) return ignore("duplicate delivery");
         log("boss_thread_followup", { channel, threadTs, ts });
-        return { kind: "slack_agent", channel, threadTs, ts, user, text };
+        return { kind: "slack_agent", channel, threadTs, ts, user, text, tagged: false };
       }
       return ignore("thread is not an incident thread");
     }
@@ -583,6 +594,24 @@ export class SlackRelay {
           msg.ts,
           Date.now(),
         );
+      return res.changes > 0;
+    });
+  }
+
+  /**
+   * False when Slack redelivered a message the Boss has already been handed.
+   * Keyed on (channel, ts) for the same reason recordReply is: Slack retries
+   * any delivery it did not see answered in three seconds, and a second run
+   * of the Boss on one message either answers twice or trips the thread lock
+   * into a "still working" reply nobody asked for.
+   */
+  private async recordBossMessage(channel: string, ts: string): Promise<boolean> {
+    return this.db.withWrite((d) => {
+      const res = d
+        .prepare(
+          "INSERT OR IGNORE INTO boss_message_seen (channel, ts, receivedAt) VALUES (?, ?, ?)",
+        )
+        .run(channel, ts, Date.now());
       return res.changes > 0;
     });
   }

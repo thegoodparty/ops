@@ -429,6 +429,14 @@ settle, so its inbox rows stay unseen and the watermark stays put. A close or
 merge posts its own notice; when that is the whole answer the Boss still has
 to say so with `stay_silent`.
 
+An untagged follow-up in a non-incident thread the Boss already talks in
+gets the same rule, because it may be two people talking under a Boss
+answer: `handle` runs it with silence allowed, `stay_silent` posts nothing,
+and an empty run without it alarms (`followup_run_silent_unchosen`) and
+posts the failure reply. An intent read of `unclear` on one goes to the Boss
+rather than asking "report or question?". A tagged mention is always
+answered.
+
 **Calling `stay_silent` is terminal.** The turn loop (`createSlackAgentModel`
 in `../index.ts`) ends the run the instant that tool is called: no further
 model request goes out, and any text the same turn also wrote is discarded

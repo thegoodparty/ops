@@ -696,6 +696,37 @@ describe("inbound", () => {
     );
   });
 
+  /**
+   * Slack retries any delivery it did not see answered in three seconds. On
+   * the three routes that end at the Boss outside an incident thread, the
+   * retry used to be handed over a second time: the Boss either answered
+   * twice or the thread lock turned the second run into a "still working"
+   * reply nobody asked for.
+   */
+  test("a Slack retry of a message for the Boss reaches the Boss once", async () => {
+    const routed = new SlackRelay({
+      db,
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: (_channel: string, threadTs: string) => Promise.resolve(threadTs === "2400.1"),
+    });
+    const deliveries = [
+      { type: "app_mention", channel: CHANNEL, user: "U0HUMAN", text: `<@${BOT}> what is open?`, ts: "2300.1" },
+      { type: "app_mention", channel: CHANNEL, user: "U0HUMAN", text: `<@${BOT}> and now?`, ts: "2300.2", thread_ts: "2300.1" },
+      { type: "message", channel: CHANNEL, user: "U0HUMAN", text: "can you close incident 2?", ts: "2400.2", thread_ts: "2400.1" },
+    ];
+    for (const event of deliveries) {
+      const first = await routed.handle(event);
+      assert.equal(first.kind, "slack_agent", `premise: ${event.ts} is the Boss's on first delivery`);
+      const retry = await routed.handle(event);
+      assert.equal(retry.kind, "ignore", `${event.ts}: the retry is not handed to the Boss again`);
+    }
+    assert.equal(
+      db.query("SELECT ts FROM boss_message_seen WHERE ts IN ('2300.1','2300.2','2400.2')").length,
+      3,
+    );
+  });
+
   test("a threaded mention arriving twice is only handled once", async () => {
     const thread = await openThread("inc-1");
     const shared = {
