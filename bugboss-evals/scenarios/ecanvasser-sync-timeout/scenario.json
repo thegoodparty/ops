@@ -1,0 +1,47 @@
+{
+  "id": "ecanvasser-sync-timeout",
+  "sourceIncident": 2,
+  "omni": {
+    "baseSha": "33e207e312e587e99fe63b08dce7ed25fe9e2574",
+    "provingFixSha": "4d86389fb5492d9b6fbd18fbe15248c24f5fd236"
+  },
+  "alert": {
+    "file": "alert.json",
+    "refireEverySeconds": 600
+  },
+  "telemetry": {
+    "generator": "telemetry.ts",
+    "backfillHoursBefore": 6
+  },
+  "ci": [
+    "npm run test -w packages/gp-api -- src/vendors/ecanvasserIntegration",
+    "npm run lint -w packages/gp-api"
+  ],
+  "check": {
+    "setup": "check/setup.sh",
+    "command": "check/run.sh",
+    "timeoutSeconds": 420
+  },
+  "human": {
+    "facts": [
+      {
+        "when": "ecanvasser|sync|door",
+        "say": "The eCanvasser integration syncs door-knocking data for candidates. Users sometimes say the sync is slow. I don't know why."
+      },
+      {
+        "when": "load balancer|idle|timeout|gateway|120",
+        "say": "The load balancer drops idle connections at about two minutes."
+      },
+      {
+        "when": "what do you think|root cause|any idea|theory|suspect",
+        "say": "I haven't looked. What did you find?"
+      },
+      {
+        "when": "confirm|verify|check in prod|production",
+        "say": "I don't have time to check prod myself. Please check the logs."
+      }
+    ]
+  },
+  "wallClockSeconds": 14400,
+  "reference": "reference.md"
+}
