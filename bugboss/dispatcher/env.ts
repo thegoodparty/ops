@@ -48,11 +48,17 @@ export interface ChildEnvInput {
  * How the AWS SDK finds the task role inside a container. On Fargate only the
  * relative URI is ever set; the other two are how the same provider is fed
  * outside it, and they cost nothing to carry.
+ *
+ * `AWS_PROFILE` is the one path that is not the container provider. Production
+ * never sets it. The eval harness does, pointing at fake keys in a mounted
+ * credentials file, and Pi's Bedrock provider will not start without one of
+ * these names in its environment even when the SDK could resolve a file.
  */
 export const AWS_CREDENTIAL_PATH_VARS = [
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+  "AWS_PROFILE",
 ] as const;
 
 export const CHILD_BASE_ENV_NAMES = [

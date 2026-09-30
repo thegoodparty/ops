@@ -29,6 +29,7 @@ import { createGitHubRunsPort } from "./agent/rerun";
 import {
   CHILD_BASE_ENV_NAMES,
   gitHubTokenEnv,
+  hasAwsCredentialPath,
   pickBaseEnv,
   pickEndpointEnv,
 } from "./dispatcher/env";
@@ -296,6 +297,7 @@ describe("the child's environment", () => {
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_PROFILE",
       ],
     );
     assert.deepEqual(pickBaseEnv({ ...PROD_ENV, BUGBOSS_GITHUB_URL: STANDIN }), {
@@ -303,6 +305,13 @@ describe("the child's environment", () => {
       HOME: PROD_ENV.HOME,
       AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: PROD_ENV.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI,
     });
+  });
+
+  test("a sim parent's AWS_PROFILE reaches the child and counts as a credential path", () => {
+    const env = pickBaseEnv({ ...PROD_ENV, AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: undefined, AWS_PROFILE: "default" });
+    assert.equal(env.AWS_PROFILE, "default");
+    assert.ok(hasAwsCredentialPath(env));
+    assert.equal("AWS_PROFILE" in pickBaseEnv(PROD_ENV), false);
   });
 
   test("a sim parent hands over its endpoints, its trust, and GH_HOST", () => {
