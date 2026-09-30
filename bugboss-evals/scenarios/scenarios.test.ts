@@ -3,8 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { loadScenario } from "../core/scenario";
-import type { AwsData } from "../sim/standins/aws-data";
+import { loadScenario, SCENARIO_IDS } from "../core/scenario";
 import type { TelemetryBatch, TelemetryGenerator } from "../sim/telemetry/types";
 
 // Fast, always-on checks over every scenario directory. The slow proof that
@@ -15,6 +14,10 @@ const SCENARIOS = __dirname;
 const ids = readdirSync(SCENARIOS).filter((id) =>
   existsSync(join(SCENARIOS, id, "scenario.json")),
 );
+
+test("every scenario directory is in the comparison, and nothing else is", () => {
+  assert.deepEqual([...ids].sort(), [...SCENARIO_IDS].sort());
+});
 
 const HOUR = 3_600_000;
 const ALERT_AT = Date.UTC(2026, 0, 1, 12);
@@ -45,28 +48,25 @@ const byteCount = (batch: TelemetryBatch) =>
   JSON.stringify(batch).length;
 
 for (const id of ids) {
-  const { scenario, dir } = loadScenario(join(SCENARIOS, id, "scenario.json"));
+  const { scenario, dir } = loadScenario(id);
 
   test(`${id}: scenario.json is valid and names files that exist`, () => {
     assert.equal(scenario.id, id, "the id matches the directory name");
     for (const file of [
       scenario.alert.file,
       scenario.telemetry.generator,
-      scenario.aws.data,
       scenario.check.command,
-      scenario.persona.file,
+      scenario.check.setup,
       scenario.reference,
-      ...(scenario.check.setup ? [scenario.check.setup] : []),
     ]) {
       assert.ok(existsSync(join(dir, file)), `${file} exists`);
     }
     assert.notEqual(scenario.omni.baseSha, scenario.omni.provingFixSha);
-    const [lo, hi] = scenario.persona.replyDelaySeconds;
-    assert.ok(lo <= hi, "reply delay range is ordered");
+    for (const fact of scenario.human.facts) new RegExp(fact.when, "i");
   });
 
   test(`${id}: the hidden check is never shown to the agent's CI`, () => {
-    for (const command of scenario.ci.visible) {
+    for (const command of scenario.ci) {
       assert.doesNotMatch(command, /check\//, "visible CI does not run the hidden check");
     }
     assert.match(scenario.check.command, /^check\//);
@@ -84,26 +84,6 @@ for (const id of ids) {
       assert.ok(alert.annotations?.summary);
       assert.ok(!Number.isNaN(Date.parse(alert.startsAt)));
     }
-  });
-
-  test(`${id}: aws.json has the AwsData shape`, () => {
-    const data = JSON.parse(readFileSync(join(dir, scenario.aws.data), "utf8")) as AwsData;
-    assert.ok(Array.isArray(data.cloudwatch));
-    for (const series of data.cloudwatch) {
-      assert.ok(series.namespace && series.metricName && series.unit);
-      assert.equal(typeof series.dimensions, "object");
-      for (const point of series.datapoints) {
-        // Offsets in ms from the alert, never absolute: the stand-in shifts
-        // them onto the run's clock, as the telemetry loader does for logs.
-        assert.ok(Number.isInteger(point.ts) && point.ts <= 0, "datapoint ts is an offset before the alert");
-        assert.equal(typeof point.value, "number");
-      }
-    }
-    assert.ok(data.ecs.clusters.length > 0);
-    for (const service of data.ecs.services) {
-      assert.ok(data.ecs.clusters.includes(service.cluster), `${service.name}'s cluster is listed`);
-    }
-    assert.ok(Array.isArray(data.secretsManager.names));
   });
 
   test(`${id}: nothing in the scenario looks copied from production`, () => {
