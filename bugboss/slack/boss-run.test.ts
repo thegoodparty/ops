@@ -27,6 +27,9 @@ import {
   type SlackMessage,
 } from "./agent";
 
+/** The report ingest. Nothing here reads as a report. */
+const refuseOpen = () => Promise.reject(new Error("no report expected in this test"));
+
 const BOT = "U0BUGBOSS";
 const CHANNEL = "C0INCIDENTS";
 const ALERT = "C0ALERTS";
@@ -207,6 +210,7 @@ const build = (model: SizedModelClient, summary?: SizedModelClient) => {
     },
   };
   const agent = new SlackAgent({
+    openIncident: refuseOpen,
     db,
     store,
     slack: slack.client,

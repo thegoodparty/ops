@@ -40,8 +40,8 @@ Slack refuses then loses the link rather than the sentence. The relay's
 ## Ingress does not read what a message says
 
 Slack is **not** an adapter. A person reports something by mentioning
-`@bugboss`, and whether that mention is a report or a question is a model
-call the composition root makes off the ack (`slack/intent.ts`), not
+`@bugboss`, and whether that mention is a report is the Boss's to read, off
+the ack. When it is, the Boss files it with `open_incident`. It is not
 something a body can be parsed for.
 
 This used to be a verb: the first word had to be `report`, `bug` or `broken`.
