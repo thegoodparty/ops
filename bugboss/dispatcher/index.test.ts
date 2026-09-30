@@ -1526,6 +1526,85 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  // A blocking wait writes nothing while it blocks. An agent an hour into a
+  // question to the Boss, or a wait on a person, looks idle by every
+  // timestamp, and a deploy killing it is still just a deploy.
+  describe("after a restart kills an agent inside a blocking wait", () => {
+    const ASKED_AGO_MS = 3_000_000;
+
+    const restartDuring = async (marker: "question" | "wait" | null) => {
+      const { db, sqlite, cleanup } = makeDb();
+      const { toolApiFor } = makeTools();
+      insertIncident(sqlite, "i1", {
+        attempts: 1,
+        sessionRef: "sessions/incident/i1/session.jsonl",
+        lastStartedAt: T0 - 16_200_000,
+      });
+      sqlite
+        .prepare(
+          "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES ('i1', 'question', 'Can I merge #12?', ?)",
+        )
+        .run(T0 - ASKED_AGO_MS);
+      if (marker === "question") {
+        sqlite
+          .prepare(
+            "INSERT INTO pending_question (incidentId, messageTs, askedAt, message) VALUES ('i1', '', ?, 'Can I merge #12?')",
+          )
+          .run(T0 - ASKED_AGO_MS);
+      }
+      if (marker === "wait") {
+        sqlite
+          .prepare(
+            "INSERT INTO pending_wait (incidentId, command, startedAt, pings, lastPingAt) VALUES ('i1', 'gh pr view 12', ?, 0, NULL)",
+          )
+          .run(T0 - ASKED_AGO_MS);
+      }
+
+      // The process boots at T0 and its first tick runs a tick later.
+      let clock = T0;
+      const notices: string[] = [];
+      const held = heldSpawn();
+      const d = createDispatcher(
+        deps({
+          db,
+          spawn: held.spawn,
+          toolApiFor,
+          now: () => clock,
+          postNotice: async (_id, text) => {
+            notices.push(text);
+          },
+          lastSessionEventAt: async () => T0 - ASKED_AGO_MS,
+        }),
+      );
+      clock = T0 + 45_000;
+      const alarms = await captureAlarms(async () => {
+        await d.tick();
+      });
+      const directives = db
+        .query<{ payload: string }>("SELECT payload FROM pending_directive")
+        .map((r) => JSON.parse(r.payload));
+
+      held.releaseAll();
+      await d.drain();
+      cleanup();
+      return { notices, alarms, directives };
+    };
+
+    it("without an open marker, the last timestamp alone reads as an hour gone", async () => {
+      const { notices } = await restartDuring(null);
+      assert.equal(notices.length, 1);
+    });
+
+    it("an open question or wait means it was alive until the restart", async () => {
+      for (const marker of ["question", "wait"] as const) {
+        const { notices, alarms, directives } = await restartDuring(marker);
+        assert.deepEqual(notices, [], marker);
+        assert.ok(!alarms.includes("agent_resumed_after_gap"), marker);
+        assert.deepEqual(directives, [{ type: "resumed_after", seconds: 45 }], marker);
+      }
+    });
+  });
+
   it("falls back to the database when the session cannot be read", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
@@ -1536,9 +1615,9 @@ describe("Dispatcher.tick", () => {
     });
     sqlite
       .prepare(
-        "INSERT INTO pending_wait (incidentId, command, startedAt, pings, lastPingAt) VALUES ('i1', 'gh pr view 1', ?, 2, ?)",
+        "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES ('i1', 'message', 'PR is up', ?)",
       )
-      .run(T0 - 10_000_000, T0 - 120_000);
+      .run(T0 - 120_000);
 
     const notices: string[] = [];
     const held = heldSpawn();

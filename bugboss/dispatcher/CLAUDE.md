@@ -253,7 +253,10 @@ restart it did not: a deploy kills every child with no exit record. The clock
 is then the newest of the session's last entry timestamp (synced after every
 turn, via `lastSessionEventAt`) and what the agent's blocking tools write
 while a turn is still open: `boss_inbox`, agent `incident_action`,
-`pending_question`, `pending_wait`. Launch is only the floor. Measuring from
+`pending_question`, `pending_wait`. An open `pending_question` or
+`pending_wait` row goes further: both are deleted when the wait ends, so one
+still standing means the agent was blocked inside it when it was killed, and
+it counts as alive up to this process's start. Launch is only the floor. Measuring from
 launch told every thread on every deploy that an agent working minutes
 earlier had been gone for hours, and to disregard its last message.
 

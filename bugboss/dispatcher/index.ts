@@ -417,6 +417,8 @@ export class Dispatcher {
   private readonly parkCooldownMs: number;
   private readonly staleAfterSeconds: number;
   private readonly now: () => number;
+  /** When this process began dispatching, the nearest clock to the last restart. */
+  private readonly bootedAt: number;
 
   /** The live side of the comparison. In-process, so it is simply true. */
   private readonly running = new Map<string, Entry>();
@@ -465,6 +467,7 @@ export class Dispatcher {
     this.staleAfterSeconds =
       deps.config.staleAfterSeconds ?? STALE_AFTER_SECONDS;
     this.now = deps.now ?? Date.now;
+    this.bootedAt = this.now();
   }
 
   start = (): void => {
@@ -1085,8 +1088,19 @@ export class Dispatcher {
    *
    * Human rows are left out on purpose. A reply in the thread says a person
    * was there, not that the agent was.
+   *
+   * An open wait marker is stronger than any timestamp. Both are deleted when
+   * the wait ends, so one still standing means the agent was inside that wait
+   * when it was killed, and a wait writes nothing while it blocks: its
+   * question can be an hour old on an agent that was alive until the
+   * restart. So it counts as alive up to when this process started.
    */
   private lastAliveAt = async (row: EligibleRow): Promise<number> => {
+    const waiting = this.db.get<{ open: number }>(
+      `SELECT (EXISTS(SELECT 1 FROM pending_question WHERE incidentId = ?)
+            OR EXISTS(SELECT 1 FROM pending_wait WHERE incidentId = ?)) AS open`,
+      [row.id, row.id],
+    )?.open === 1;
     const recorded =
       this.db.get<{ at: number }>(
         `SELECT MAX(
@@ -1119,6 +1133,7 @@ export class Dispatcher {
     return Math.max(
       recorded,
       session ?? 0,
+      waiting ? this.bootedAt : 0,
       row.lastStartedAt ?? row.firstSignalAt,
     );
   };
