@@ -53,7 +53,10 @@ alert = {
     "startsAt": now,
     "endsAt": "0001-01-01T00:00:00Z",
     "generatorURL": "https://goodparty.grafana.net/alerting/list",
-    "fingerprint": uuid.uuid5(uuid.NAMESPACE_URL, "agent-swarm-smoke-test").hex[:16],
+    # Unique per run, so each smoke test opens its own incident. A fixed one is
+    # treated as a duplicate delivery inside the bridge's dedup window, which is
+    # correct behaviour and useless for testing.
+    "fingerprint": uuid.uuid4().hex[:16],
 }
 print(json.dumps([{
     "status": "firing",

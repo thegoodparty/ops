@@ -320,25 +320,45 @@ const handleGrafana = async (req, res) => {
 
   const summary = { accepted: [], duplicates: [], dropped: [], failed: [] }
 
+  // Grafana posts a top-level ARRAY of alert *groups*, each nesting the alerts
+  // that fired for it. Walking that array as if it were a list of alerts never
+  // sees a per-alert fingerprint and never splits a group, so one delivery
+  // carrying three alerts became one incident, keyed on a hash of the labels the
+  // three happened to share.
+  //
+  // Accept both shapes: an entry that carries its own `alerts` is a group,
+  // otherwise the entry is the alert. The group travels with each alert because
+  // that is where its common labels and annotations live.
+  const units = []
   for (const entry of alerts) {
     if (typeof entry !== 'object' || entry === null) continue
-    const alert = entry
+    const members = Array.isArray(entry.alerts) && entry.alerts.length > 0 ? entry.alerts : [entry]
+    for (const member of members) {
+      if (typeof member !== 'object' || member === null) continue
+      units.push({ alert: member, group: entry })
+    }
+  }
+
+  for (const { alert, group } of units) {
     const labels = {
       ...mapping(root.groupLabels),
+      ...mapping(group.groupLabels),
       ...mapping(root.commonLabels),
+      ...mapping(group.commonLabels),
       ...mapping(alert.labels),
     }
     const annotations = {
       ...mapping(root.commonAnnotations),
+      ...mapping(group.commonAnnotations),
       ...mapping(alert.annotations),
     }
     const fingerprint = fingerprintFor(alert, labels, annotations)
-    const status = lower(alert.status) ?? lower(root.status) ?? 'firing'
+    const status = lower(alert.status) ?? lower(group.status) ?? lower(root.status) ?? 'firing'
 
     // A resolved notification is dropped outright. An alert that stopped firing
     // does not mean the thing it was about is fixed; it means the symptom went
     // away, and only an agent closes an incident on evidence it went and got.
-    if (deliveryResolved || status === 'resolved') {
+    if (deliveryResolved || lower(group.status) === 'resolved' || status === 'resolved') {
       summary.dropped.push(fingerprint)
       log('dropped', { fingerprint, reason: 'resolved' })
       continue
@@ -371,7 +391,7 @@ const handleGrafana = async (req, res) => {
 
     const incident = state.nextIncident
     const task = {
-      task: renderTask(incident, alert, root, fingerprint),
+      task: renderTask(incident, alert, group, fingerprint),
       source: 'api',
       tags: [INCIDENT_TAG, `${INCIDENT_TAG}:${incident}`, 'alert'],
       priority: priorityFor(labels.severity),

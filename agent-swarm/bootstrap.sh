@@ -142,7 +142,10 @@ docker buildx version >/dev/null 2>&1 || die "the docker buildx plugin is missin
 docker compose pull
 
 log "Starting the stack"
-docker compose up -d
+# --build, because the bridge is built from source that arrived in this tarball.
+# Plain `up -d` reuses an image that already exists, so a change to the bridge
+# would deploy, report success, and keep running the previous code.
+docker compose up -d --build
 
 log "Running services"
 docker compose ps
