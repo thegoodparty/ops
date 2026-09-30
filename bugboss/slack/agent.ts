@@ -1437,7 +1437,9 @@ export class SlackAgent {
       // chatter that arrived while it was away.
       // A first mention in a thread somebody else started is usually about
       // what was said above it: "log an incident for this" under a report.
-      // Without the thread the Boss is answering a pointer to nothing.
+      // Without the thread the Boss is answering a pointer to nothing. A
+      // session that expired is fresh too, so its own earlier posts come
+      // with it, or it would redo what it already did.
       const missed =
         fresh || !prior
           ? mention.threadTs === mention.ts
@@ -1595,8 +1597,7 @@ export class SlackAgent {
           tsAfter(m.ts, lastSeenTs) &&
           m.ts !== mention.ts &&
           tsAfter(mention.ts, m.ts) &&
-          (withBots || !m.botId) &&
-          m.user !== this.cfg.botUserId,
+          (withBots || (!m.botId && m.user !== this.cfg.botUserId)),
       );
     } catch (err) {
       // A throttled or failed fetch costs context, not the answer.
@@ -1612,11 +1613,11 @@ export class SlackAgent {
       : `<@${mention.user}> tagged you and wrote nothing else.`;
     if (missed.length === 0) return line;
     const transcript = missed
-      .map((m) => `<@${m.user ?? "unknown"}>: ${m.text}`)
+      .map((m) => `${m.user === this.cfg.botUserId ? "You (BugBoss)" : `<@${m.user ?? "unknown"}>`}: ${m.text}`)
       .join("\n");
     return [
       firstTime
-        ? `Said in this thread before you were tagged (${missed.length} message(s)):`
+        ? `Earlier in this thread, before this message (${missed.length} message(s)); anything marked as yours you already posted, in a session you no longer have:`
         : `Said in this thread since you last answered (${missed.length} message(s)):`,
       transcript,
       "",
