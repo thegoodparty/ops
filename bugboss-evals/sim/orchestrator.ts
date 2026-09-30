@@ -12,6 +12,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -33,6 +34,39 @@ import { evaluateGates, type GateInputs, type GateResult } from "./gates";
  */
 
 const run = promisify(execFile);
+
+/**
+ * Every docker, compose and git call the harness makes on the host runs with
+ * no credential helper. A person's docker config commonly names the macOS
+ * keychain as its credsStore, and Apple's git names it as a credential helper,
+ * so without this each pull and each run asks the keychain, over and over.
+ * The images are public, so nothing needs a stored credential. The context,
+ * CLI plugins and buildx state are linked from the real config so compose and
+ * the daemon the person uses keep working. Set at import, before any call.
+ */
+export const isolateHostTools = (env: NodeJS.ProcessEnv = process.env): void => {
+  if (env.BUGBOSS_EVALS_DOCKER_CONFIG_ISOLATED === "1") return;
+  const real = env.DOCKER_CONFIG ?? join(homedir(), ".docker");
+  const dir = mkdtempSync(join(tmpdir(), "bugboss-evals-docker-"));
+  let currentContext: string | undefined;
+  try {
+    currentContext = (JSON.parse(readFileSync(join(real, "config.json"), "utf8")) as { currentContext?: string }).currentContext;
+  } catch {
+    currentContext = undefined;
+  }
+  writeFileSync(join(dir, "config.json"), JSON.stringify(currentContext ? { currentContext } : {}));
+  for (const name of ["contexts", "cli-plugins", "buildx"]) {
+    if (existsSync(join(real, name))) symlinkSync(join(real, name), join(dir, name));
+  }
+  env.DOCKER_CONFIG = dir;
+  env.BUGBOSS_EVALS_DOCKER_CONFIG_ISOLATED = "1";
+  env.GIT_CONFIG_COUNT = "1";
+  env.GIT_CONFIG_KEY_0 = "credential.helper";
+  env.GIT_CONFIG_VALUE_0 = "";
+  env.GIT_TERMINAL_PROMPT = "0";
+};
+
+isolateHostTools();
 
 export const SIM_DIR = __dirname;
 export const OPS_ROOT = resolve(__dirname, "..", "..");

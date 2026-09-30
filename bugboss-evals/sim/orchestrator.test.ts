@@ -11,6 +11,7 @@ import {
   alertBody,
   bugbossEnv,
   closedBy,
+  isolateHostTools,
   closingSummaryCause,
   dotenv,
   endCondition,
@@ -299,5 +300,21 @@ describe("the root cause the judge reads", () => {
     assert.equal(outputs.rootCauseSource, "heuristic");
     assert.equal(outputs.rootCause, "The root cause is the pool.");
     assert.equal(outputsFor(inputs, state([]), "/nonexistent").rootCauseSource, null);
+  });
+});
+
+describe("host tools", () => {
+  test("docker and git on the host never reach a credential helper", () => {
+    const home = mkdtempSync(join(tmpdir(), "docker-home-"));
+    writeFileSync(join(home, "config.json"), JSON.stringify({ credsStore: "osxkeychain", currentContext: "orbstack" }));
+    mkdirSync(join(home, "contexts"));
+    const env: NodeJS.ProcessEnv = { DOCKER_CONFIG: home };
+    isolateHostTools(env);
+    assert.notEqual(env.DOCKER_CONFIG, home);
+    assert.deepEqual(JSON.parse(readFileSync(join(env.DOCKER_CONFIG!, "config.json"), "utf8")), { currentContext: "orbstack" });
+    assert.ok(existsSync(join(env.DOCKER_CONFIG!, "contexts")), "the context the person uses still resolves");
+    assert.equal(env.GIT_CONFIG_KEY_0, "credential.helper");
+    assert.equal(env.GIT_CONFIG_VALUE_0, "");
+    rmSync(home, { recursive: true, force: true });
   });
 });
