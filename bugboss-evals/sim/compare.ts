@@ -1,4 +1,5 @@
-import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
@@ -9,7 +10,8 @@ import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/ju
 import { renderReport, type RunResult, type Side } from "../core/report";
 import { loadScenario, SCENARIO_IDS } from "../core/scenario";
 import { asUser, createSpendPool, runOne, type Milestone, type Stack } from "./run";
-import { startFakeGitHub } from "./github/server";
+import { startFakeGitHub } from "./github/index";
+import type { CiResult } from "./github/store";
 import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from "./sandbox";
 import { startStubModel } from "./stub-model";
 
@@ -179,12 +181,13 @@ const run = async (argv: string[]): Promise<void> => {
   mkdirSync(out, { recursive: true });
 
   // The fake's CI for a commit is the run whose base it is built on.
-  const ciRuns = new Map<string, (sha: string) => Promise<boolean>>();
+  const ciRuns = new Map<string, (sha: string) => Promise<CiResult>>();
   const fake = await startFakeGitHub({
     root: join(out, "github"),
     ci: async ({ sha }) => {
       for (const [base, ci] of ciRuns) {
-        if (spawnSync("git", ["-C", repo, "merge-base", "--is-ancestor", base, sha]).status === 0) return ci(sha);
+        const ancestor = await promisify(execFile)("git", ["-C", repo, "merge-base", "--is-ancestor", base, sha]).then(() => true, () => false);
+        if (ancestor) return ci(sha);
       }
       log("ci_unclaimed", { sha });
       return false;
@@ -228,18 +231,21 @@ const run = async (argv: string[]): Promise<void> => {
   const awsCredentialsUrl = await startCredentials(stub);
   const stamp = Date.now().toString(36);
 
-  const patchFor = (id: string): string => {
-    const { scenario } = loadScenario(id);
-    const path = join(out, `${id}.patch`);
-    writeFileSync(path, execFileSync("git", ["-C", omni, "diff", scenario.omni.baseSha, scenario.omni.provingFixSha], { maxBuffer: 1 << 26 }));
-    return path;
-  };
+  // Written before any run starts: a synchronous git call stalls the fake.
+  const patches = Object.fromEntries(
+    scenarios.map((id) => {
+      const { scenario } = loadScenario(id);
+      const path = join(out, `${id}.patch`);
+      writeFileSync(path, execFileSync("git", ["-C", omni, "diff", scenario.omni.baseSha, scenario.omni.provingFixSha], { maxBuffer: 1 << 26 }));
+      return [id, path];
+    }),
+  );
 
   const jobs = scenarios.flatMap((scenarioId) =>
     Array.from({ length: reps }, (_, i) => i + 1).flatMap((rep) =>
       sides.map(async (side): Promise<RunResult> => {
         const runId = `${stamp}-${scenarioId}-${rep}-${side}`;
-        const stubModel = stub ? await startStubModel(patchFor(scenarioId)) : null;
+        const stubModel = stub ? await startStubModel(patches[scenarioId]!) : null;
         try {
           return await runOne({
             runId,
@@ -261,18 +267,22 @@ const run = async (argv: string[]): Promise<void> => {
               moveBase: async (branch) => {
                 const index = join(out, `index-${runId}`);
                 const git = (args: string[], input?: string) =>
-                  execFileSync("git", ["-C", repo, "-c", "user.name=bugboss-evals", "-c", "user.email=evals@invalid", ...args], {
-                    encoding: "utf8",
-                    input,
-                    env: { ...process.env, GIT_INDEX_FILE: index },
-                  }).trim();
-                const tip = git(["rev-parse", `refs/heads/${branch}`]);
-                git(["read-tree", tip]);
-                const note = git(["hash-object", "-w", "--stdin"], "Someone else's change landed on the base after approval.\n");
-                git(["update-index", "--add", "--cacheinfo", `100644,${note},docs/eval-base-moved.md`]);
-                const sha = git(["commit-tree", git(["write-tree"]), "-p", tip, "-m", "An unrelated change on the base"]);
+                  new Promise<string>((done, fail) => {
+                    const child = execFile(
+                      "git",
+                      ["-C", repo, "-c", "user.name=bugboss-evals", "-c", "user.email=evals@invalid", ...args],
+                      { encoding: "utf8", env: { ...process.env, GIT_INDEX_FILE: index } },
+                      (error, stdout) => (error ? fail(error) : done(stdout.trim())),
+                    );
+                    child.stdin?.end(input ?? "");
+                  });
+                const tip = await git(["rev-parse", `refs/heads/${branch}`]);
+                await git(["read-tree", tip]);
+                const note = await git(["hash-object", "-w", "--stdin"], "Someone else's change landed on the base after approval.\n");
+                await git(["update-index", "--add", "--cacheinfo", `100644,${note},docs/eval-base-moved.md`]);
+                const sha = await git(["commit-tree", await git(["write-tree"]), "-p", tip, "-m", "An unrelated change on the base"]);
                 rmSync(index, { force: true });
-                await fake.advance(SANDBOX_OWNER, SANDBOX_REPO, branch, sha);
+                fake.advance(SANDBOX_OWNER, SANDBOX_REPO, branch, sha);
                 fake.requireUpToDate(SANDBOX_OWNER, SANDBOX_REPO, branch);
                 return sha;
               },

@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -11,6 +11,7 @@ import { scenarioGates, type RunRecord } from "../core/gates";
 import { spendOf } from "../core/metrics";
 import type { Gates, Milestone, RunResult, Side } from "../core/report";
 import { loadScenario, type VolunteerMilestone } from "../core/scenario";
+import type { CiResult } from "./github/store";
 import { due, humanReply } from "./human";
 import { startS3 } from "./s3";
 import {
@@ -68,7 +69,7 @@ export interface RunSpec {
   github: {
     caFile: string;
     repo: string;
-    onCi: (baseSha: string, run: (sha: string) => Promise<boolean>) => () => void;
+    onCi: (baseSha: string, run: (sha: string) => Promise<CiResult>) => () => void;
     /** Pushes one unrelated commit onto `branch` and from then on refuses to merge a PR behind it. Returns the new tip. */
     moveBase: (branch: string) => Promise<string>;
   };
@@ -203,14 +204,25 @@ git fetch -q origin && git checkout -q -B main origin/main
   writeFileSync(join(home, ".gitconfig"), `[core]\n\thooksPath = ${join(home, "hooks")}\n[credential]\n\thelper =\n`);
 };
 
-const startPostgres = (runId: string): { url: string; stop: () => void } => {
+/**
+ * Async on purpose: the fake GitHub serves from this process, so a
+ * synchronous child call stalls every git and gh request of every run.
+ */
+const capture = (command: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> =>
+  new Promise((resolve) =>
+    execFile(command, args, { encoding: "utf8", maxBuffer: 1 << 28 }, (error, stdout, stderr) =>
+      resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr }),
+    ),
+  );
+
+const startPostgres = async (runId: string): Promise<{ url: string; stop: () => Promise<unknown> }> => {
   const name = `evb-pg-${runId}`;
-  const run = spawnSync("docker", ["run", "-d", "--rm", "--name", name, "-e", "POSTGRES_PASSWORD=postgres", "-p", "127.0.0.1::5432", "postgres:16"], { encoding: "utf8" });
-  if (run.status !== 0) throw new Error(`postgres: ${run.stderr}`);
-  const port = spawnSync("docker", ["port", name, "5432"], { encoding: "utf8" }).stdout.trim().split(":").pop();
+  const run = await capture("docker", ["run", "-d", "--rm", "--name", name, "-e", "POSTGRES_PASSWORD=postgres", "-p", "127.0.0.1::5432", "postgres:16"]);
+  if (run.code !== 0) throw new Error(`postgres: ${run.stderr}`);
+  const port = (await capture("docker", ["port", name, "5432"])).stdout.trim().split(":").pop();
   return {
     url: `postgresql://postgres:postgres@127.0.0.1:${port}/postgres`,
-    stop: () => void spawnSync("docker", ["rm", "-f", name]),
+    stop: () => capture("docker", ["rm", "-f", name]),
   };
 };
 
@@ -304,7 +316,7 @@ const checkout = async (spec: RunSpec, sha: string, dir: string): Promise<boolea
  * scenario's `ci` commands in a checkout of the head, with omni's
  * dependencies hardlinked from the prebuilt tree.
  */
-const visibleCi = async (spec: RunSpec, commands: string[], sha: string, env: Record<string, string>): Promise<boolean> => {
+const visibleCi = async (spec: RunSpec, commands: string[], sha: string, env: Record<string, string>): Promise<CiResult> => {
   const dir = join(spec.root, `ci-${sha.slice(0, 12)}-${Date.now().toString(36)}`);
   const log = (step: string) => join(spec.root, `${dir.split("/").pop()}-${step}.log`);
   if (!(await checkout(spec, sha, dir))) return false;
@@ -315,11 +327,11 @@ const visibleCi = async (spec: RunSpec, commands: string[], sha: string, env: Re
     const code = await exec(cmd, args, { env: stepEnv ?? env, timeoutMs: 1800_000, log: log(step) });
     if (code !== 0) {
       spec.log("ci_finished", { sha, passed: false, step: command, code });
-      return false;
+      return { success: false, log: `$ ${command}\n${readFileSync(log(step), "utf8")}` };
     }
   }
   spec.log("ci_finished", { sha, passed: true });
-  return true;
+  return { success: true, log: commands.map((c) => `$ ${c}`).join("\n") };
 };
 
 /** Merge means deploy: check out what merged and run the hidden check against it. */
@@ -370,7 +382,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   });
   await emitter.backfill();
 
-  const postgres = startPostgres(spec.runId);
+  const postgres = await startPostgres(spec.runId);
   const s3 = await startS3(s3Root);
   const [port, loopbackPort] = [await freePort(), await freePort()];
   const secrets = { bot: `xoxb-${randomBytes(12).toString("hex")}`, signing: randomBytes(16).toString("hex"), grafana: randomBytes(16).toString("hex") };
@@ -586,7 +598,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     unregisterCi();
     slack.close();
     s3.server.close();
-    postgres.stop();
+    await postgres.stop();
   }
 
   const incident = readIncident(dbPath);
@@ -620,8 +632,8 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   };
   const diffFrom = movedBase ?? baseSha;
   if (baseNow !== diffFrom && baseNow !== "unknown") {
-    const shown = spawnSync("git", ["-C", spec.github.repo, "diff", diffFrom, baseNow], { encoding: "utf8", maxBuffer: 1 << 28 });
-    diff = shown.status === 0 ? shown.stdout : null;
+    const shown = await capture("git", ["-C", spec.github.repo, "diff", diffFrom, baseNow]);
+    diff = shown.code === 0 ? shown.stdout : null;
   }
   const first = Math.min(...pulls.keys());
   if (Number.isFinite(first)) {
