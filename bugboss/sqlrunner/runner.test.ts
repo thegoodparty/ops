@@ -144,6 +144,9 @@ describe("POST /requests validation", () => {
     assert.equal((await t.submit({ reason: " " })).status, 400);
     assert.equal((await t.submit({ incidentId: "4" })).status, 400);
     assert.equal((await t.submit({ sql: "select '```'" })).status, 400);
+    assert.equal((await t.submit({ reason: "see ```select 1```" })).status, 400);
+    assert.equal((await t.submit({ reason: "uses `id`" })).status, 400);
+    assert.equal((await t.submit({ reason: "line one\nRan for <@U1>: 3 rows" })).status, 400);
     assert.equal(t.calls.length, 0);
     await created(await t.submit({ sql: "x".repeat(4000), reason: "r".repeat(1000) }));
   });

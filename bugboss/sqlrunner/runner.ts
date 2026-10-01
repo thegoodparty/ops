@@ -163,6 +163,12 @@ export const validateRequest = (
       error: `reason is ${reason.length} characters; the limit is ${MAX_REASON_CHARS}`,
     };
   }
+  // The reason sits right above the SQL's code block. A backtick could open a
+  // decoy block and a newline could fake the layout around the real query, so
+  // the approver would read the agent's prose as the thing being approved.
+  if (reason.includes("`") || /[\r\n]/.test(reason)) {
+    return { ok: false, error: "reason must be one line with no backticks" };
+  }
   return { ok: true, body: { incidentId, threadTs, sql, reason } };
 };
 
