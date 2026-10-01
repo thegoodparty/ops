@@ -350,6 +350,6 @@ export const buildGrantTurnsTool = (db: Db): SlackAgentTool => ({
     });
     if (!outcome.granted) return `Rejected: ${outcome.why}.`;
     log("turns_granted", { incidentId, turns, total: outcome.total });
-    return `Granted ${turns} turns to incident ${incidentId} (${outcome.total} granted in total, on top of the configured budget). If its agent is parked on a spent budget, it resumes on the next tick and the thread is told, so do not announce it. If there is work for it, send it with message_agent.`;
+    return `Granted ${turns} turns to incident ${incidentId} (${outcome.total} granted in total, on top of the configured budget). If its agent is parked on a spent budget and the new total covers the turns it has used, it resumes on the next tick and the dispatcher tells the thread. If it has used more than the new total, it stays parked and nothing is posted, so a grant that does not resume it needs to be larger. If there is work for it, send it with message_agent.`;
   },
 });

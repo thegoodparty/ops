@@ -95,8 +95,8 @@ export const budgetRaisedNotice = (max: number, used: number): string =>
   `The turn budget was raised to ${max}, so the agent is resuming with ${max - used} turns left.`;
 
 /** What the thread is told when a Boss grant resumes a spent incident. */
-export const turnsGrantedNotice = (granted: number, left: number): string =>
-  `Granted ${granted} more turns; the agent is resuming with ${left} left.`;
+export const turnsGrantedNotice = (max: number, used: number): string =>
+  `Granted more turns; the agent is resuming with ${max - used} left of ${max}.`;
 
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
@@ -994,7 +994,7 @@ export class Dispatcher {
       }
       const notice =
         row.grantedTurns > 0
-          ? turnsGrantedNotice(row.grantedTurns, max - used)
+          ? turnsGrantedNotice(max, used)
           : budgetRaisedNotice(max, used);
       await this.postNotice(row.id, notice).catch((err: unknown) =>
         alarm("budget_notice_failed", { incidentId: row.id, error: String(err) }),

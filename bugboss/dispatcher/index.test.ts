@@ -2815,7 +2815,7 @@ describe("Dispatcher raised turn budget", () => {
 
     assert.equal(waits(made.db, "i1"), 0);
     assert.deepEqual(launches[0], { incidentId: "i1", maxTurns: "350" }, "the child gets budget + grant");
-    assert.deepEqual(posts, ["Granted 50 more turns; the agent is resuming with 50 left."]);
+    assert.deepEqual(posts, ["Granted more turns; the agent is resuming with 50 left of 350."]);
     made.cleanup();
   });
 

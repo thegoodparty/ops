@@ -224,8 +224,9 @@ stays held. Lift and marker commit before the post, as with the sweep.
 `turns_granted` action; it posts nothing. The lift compares used turns with
 `agentMaxTurns + grantedTurns`, and the grant total is part of the held-wait
 key, so a wait held as spent is read again once a grant moves it. When the
-incident has a grant the notice is "Granted N more turns; the agent is
-resuming with M left." instead, N being its total grant.
+incident has a grant the notice is "Granted more turns; the agent is
+resuming with M left of N." instead. It names no grant size: grants sum,
+and the wait does not record which of them it is being lifted by.
 
 The marker is itself activity, and that is the whole trick. The clock reads
 `incident_action`, so writing the marker resets the clock the sweep reads.
