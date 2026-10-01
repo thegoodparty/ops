@@ -27,31 +27,49 @@ export type BedrockModel = {
   id: string;
   /**
    * What the sandbox actually selects, which is not always the same thing. A
-   * `us.` geo inference profile for most of these, the bare model id for the
-   * two deliberately kept in one region, and for Claude Sonnet 5.5 the
-   * `global.` profile, which is the only inference profile AWS offers for it.
+   * `us.` geo inference profile for most of these, and the bare model id for
+   * the two deliberately kept in one region.
    */
   invokeId: string;
   /** True when `invokeId` is a cross-region inference profile. */
   crossRegion: boolean;
+  /**
+   * Extra inference profiles to permit alongside `invokeId`, and only for as
+   * long as a profile change is rolling out.
+   *
+   * A profile change moves `invokeId` from one profile to another on the same
+   * foundation model, so unlike a model replacement there is no new `id` to
+   * add and no agreement to create: only the IAM resource moves. Dropping the
+   * old profile's ARN in the same change that adds the new one would take
+   * access away from every `gp-pi` image still selecting the old profile,
+   * which is the mid-session AccessDenied the three-merge order exists to
+   * avoid. So the old profile stays here until `gp-pi` has shipped the switch,
+   * and is removed in a follow-up. An entry that keeps one is a permanent
+   * second profile, which is a data-residency decision rather than a
+   * transition. See `docs/workbench-account.md`, "Changing a model's
+   * inference profile".
+   */
+  transitionalInvokeIds?: string[];
   note?: string;
 };
 
 export const WORKBENCH_MODELS: BedrockModel[] = [
   {
-    // The one entry that leaves the US. `GetFoundationModelAvailability`
-    // aside, the check here is the public model card: for every other
-    // cross-region model it lists a `us.` geo inference profile, and for this
-    // one the Geo column is `N/A` in every commercial region, leaving
-    // `global.anthropic.claude-sonnet-5-5` as the only profile. That profile
-    // routes by capacity anywhere in the world, not among US regions, so
-    // enabling this model is a data-residency decision rather than a list
-    // entry. See `docs/workbench-account.md` under "Adding a Bedrock model
-    // later".
+    // Sonnet 5.5's profile, not its model, changed on 2026-10-01: AWS added
+    // `us.anthropic.claude-sonnet-5-5`, a geo profile that keeps data in US
+    // and Canadian regions, where the model card had listed In-Region and Geo
+    // as unsupported when the model was added on 2026-09-28. The account's
+    // convention is to stay in the United States, so the sandbox moves to the
+    // geo profile and off `global.anthropic.claude-sonnet-5-5`, which routes
+    // by capacity anywhere in the world. The global profile stays permitted
+    // through `transitionalInvokeIds` until `gp-pi` has shipped the same
+    // switch, then comes out. See `docs/workbench-account.md` under "Changing
+    // a model's inference profile".
     id: "anthropic.claude-sonnet-5-5",
-    invokeId: "global.anthropic.claude-sonnet-5-5",
+    invokeId: "us.anthropic.claude-sonnet-5-5",
     crossRegion: true,
-    note: "global-only: no In-Region or Geo inference profile is offered in any commercial region, so this routes outside US geography unlike every other cross-region model here",
+    transitionalInvokeIds: ["global.anthropic.claude-sonnet-5-5"],
+    note: "the US geo profile was added after launch, replacing the global-only profile this entry was created with; it keeps data in US and Canadian regions",
   },
   {
     id: "anthropic.claude-opus-5-5",
@@ -107,6 +125,11 @@ export const bedrockInvokeResources = (
 ): string[] => [
   ...WORKBENCH_MODELS.filter((m) => m.crossRegion).map(
     (m) => `arn:aws:bedrock:*:${accountId}:inference-profile/${m.invokeId}`
+  ),
+  ...WORKBENCH_MODELS.flatMap((m) =>
+    (m.transitionalInvokeIds ?? []).map(
+      (id) => `arn:aws:bedrock:*:${accountId}:inference-profile/${id}`
+    )
   ),
   ...WORKBENCH_MODELS.map(
     (m) => `arn:aws:bedrock:*::foundation-model/${m.id}`

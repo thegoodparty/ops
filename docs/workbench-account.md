@@ -370,13 +370,15 @@ Facts discovered during implementation go here as they are learned:
 - **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
   list imported by both the IAM policy that permits them and the script that
   subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5-5`,
-  `xai.grok-4.6`, `openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`,
-  `moonshotai.kimi-k3`, plus `zai.glm-5` and
-  `deepseek.v3.2` kept region-pinned by choice. One entry is neither a geo
-  profile nor region-pinned: `anthropic.claude-sonnet-5-5` is offered only as
-  `global.anthropic.claude-sonnet-5-5`, the one model here that routes
-  outside US geography. See "Claude Sonnet 5.5 and the `global.` profile"
-  under "Adding a Bedrock model later".
+  `anthropic.claude-sonnet-5-5`, `xai.grok-4.6`, `openai.gpt-5.6-sol`,
+  `openai.gpt-5.6-terra` and `moonshotai.kimi-k3`, plus `zai.glm-5` and
+  `deepseek.v3.2` kept region-pinned by choice. Sonnet 5.5 was the one
+  exception — it launched with only a `global.` profile, which routes outside
+  US geography — until AWS added `us.anthropic.claude-sonnet-5-5` on
+  2026-10-01. The entry moved to the geo profile; the `global.` ARN stays
+  permitted through a transition until `gp-pi` ships the same switch. See
+  "Changing a model's inference profile" under "Adding a Bedrock model
+  later".
 - **The Anthropic first-time-use form is assumed already submitted.** It is
   required once per account or once at the organization's management account,
   and a submission at the root is inherited by every account in the
@@ -1390,35 +1392,54 @@ apart. For Opus 5.5 on 2026-09-23 the refusal named `bedrock:InvokeModel` on
 which is the IAM gate rather than the subscription, exactly as expected from a
 model that is not yet in the list.
 
-### Claude Sonnet 5.5 and the `global.` profile
+### Changing a model's inference profile
 
-Sonnet 5.5, added 2026-09-28, is the first entry here that is not a `us.` geo
-profile. Its model card lists `In-Region` and `Geo` as unsupported in every
-commercial region and offers only `global.anthropic.claude-sonnet-5-5`, so the
-global id is the only way to invoke it. The difference is not cosmetic: a geo
-profile routes among US regions, and a global profile routes by capacity
-anywhere in the world. Enabling this model is therefore a data-residency
-decision, and it is recorded here rather than left to be inferred from the
-diff.
+Sonnet 5.5 was the first entry here that was not a `us.` geo profile, and the
+only one ever. Its model card at launch, on 2026-09-28, listed `In-Region` and
+`Geo` as unsupported in every commercial region and offered only
+`global.anthropic.claude-sonnet-5-5`. A geo profile routes among US regions; a
+global profile routes by capacity anywhere in the world, so enabling the model
+was a data-residency decision rather than a list edit. The account's convention
+is to stay in the United States — every other cross-region model is a `us.`
+profile and the SCP's region deny was written around that posture — but nothing
+in AWS enforces it: the region statement exempts `bedrock` wholesale, because
+the `us.` profiles need that too, and no policy distinguishes a `global.`
+profile from a `us.` one. The line is held by this file, so the decision on
+2026-09-28, on request, was to allow the exception: the model was wanted and
+global was the only profile AWS offered for it.
 
-The account's convention is to stay in the United States. Every other
-cross-region model in the list is a `us.` profile and the SCP's region deny
-was written around that posture, and `docs/design.md` in `gp-pi` calls the
-`global.` pricing table a saving "not to take quietly". What makes this an
-open choice rather than an automatic no is that nothing in AWS enforces the
-convention: the region statement exempts `bedrock` wholesale, because the
-`us.` profiles need that too, and no policy distinguishes a `global.` profile
-from a `us.` one. The line is held by this file, so an exception to it has to
-be a decision rather than a discovery.
+That changed on 2026-10-01, when AWS added `us.anthropic.claude-sonnet-5-5`
+(and an `eu.` sibling). The model card now lists both under Geo, and the US
+profile "keeps data within US and Canada regions". With a US profile available
+the exception no longer has a reason to stand, so the entry moved to it:
+`invokeId` is `us.anthropic.claude-sonnet-5-5`, and `gp-pi` offers it as
+`Claude Sonnet 5.5 (US)` with the Geo pricing table's 2.2 in, 11 out, 2.75 for
+a five minute cache write and 0.22 cache read. The `global.` figures the entry
+carried before — 2, 10, 2.5, 0.2 — are the Global Cross-region Inference
+table, about 10% cheaper, and would understate spend on the geo profile.
 
-The decision on 2026-09-28, on request, is to allow it: the model is wanted
-and the only profile AWS offers for it is global. Two things follow for
-whoever revisits this. Removing the entry is the same one-line change as any
-other removal, but through the normal order — `gp-pi` stops offering the
-model first, then this list drops it — so nobody is left with a picker entry
-that fails with AccessDenied. And if the exception should not stand, the
-model is the thing to remove rather than the `global.` mechanism, which no
-other entry uses.
+A profile change is not a model change, and the difference matters to the
+order. The foundation-model `id` is unchanged, so the agreement already exists
+and `scripts/enable-bedrock-models.ts` has nothing to create. Only the IAM
+resource moves: `bedrockInvokeResources()` names the inference profile ARN,
+and a request for a profile the policy does not name is refused. Dropping the
+`global.` ARN in the same change that adds `us.` would therefore take access
+away from every `gp-pi` image still selecting global — the same mid-session
+AccessDenied the three-merge order exists to prevent, just with one fewer
+moving part. The old profile stays permitted through `transitionalInvokeIds`
+on the entry until `gp-pi` has shipped the switch, and is removed in a
+follow-up. That is the model-replacement shape with the subscription step taken
+out:
+
+1. `ops` switches `invokeId` to `us.` and lists `global.` in
+   `transitionalInvokeIds`, so both profiles are permitted.
+2. `gp-pi` switches its entry to the `us.` id.
+3. `ops` removes `transitionalInvokeIds`, once nothing offers the global
+   profile any more.
+
+An entry that keeps a `transitionalInvokeIds` is a permanent second profile,
+which is the data-residency decision above rather than a transition; empty it
+in the follow-up.
 
 ### What a model costs the policy
 
@@ -1432,7 +1453,11 @@ that asks people to check numbers. Re-measured on 2026-09-28 after the
 invocation-logging and `cloudwatch:GenerateQuery` changes, those same 14 ARNs
 compose to 3729, and Sonnet 5.5's two bring it to 16 ARNs and 3881 bytes.
 Retiring Sonnet 5 on 2026-09-28, once 5.5 had replaced it in `gp-pi`, brought
-that back to 14 ARNs at 3737. So there is room for roughly forty more models
+that back to 14 ARNs at 3737. That is the count while Sonnet 5.5's entry has no
+`transitionalInvokeIds`. Moving it to the US profile puts a fifteenth ARN in the
+policy — the `global.` profile, still permitted for old `gp-pi` images — and the
+follow-up that clears the field takes it back to 14. So there is room for
+roughly forty more models
 before the
 limit is the thing to think about, which is worth knowing mainly so nobody trims
 the list to save space.
