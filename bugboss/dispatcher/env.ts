@@ -60,15 +60,17 @@ export const AWS_CREDENTIAL_PATH_VARS = [
 ] as const;
 
 /**
- * Where a child clones from, works, reads its GitHub token and sends its AWS
- * calls. Production sets none of them, so a production child gets nothing
- * from here. The eval harness sets them all: without them the agent would be
+ * Where a child clones from, works, reads its GitHub token, which CA it
+ * trusts, how long a review wait settles, and where it sends its AWS calls.
+ * Production sets none of them, so a production child gets nothing from here. The eval harness sets them all: without them the agent would be
  * the one process in the run still pointed at omni and real S3.
  */
 export const CHILD_EVAL_ENV_NAMES = [
   "BUGBOSS_OMNI_REPO",
   "BUGBOSS_WORK_ROOT",
   "BUGBOSS_GITHUB_TOKEN_FILE",
+  "BUGBOSS_REVIEW_SETTLE_SECONDS",
+  "NODE_EXTRA_CA_CERTS",
 ] as const;
 
 const AWS_ENDPOINT = /^AWS_ENDPOINT_URL(_[A-Z0-9_]+)?$/;

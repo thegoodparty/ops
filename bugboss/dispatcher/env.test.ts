@@ -118,6 +118,8 @@ describe("pickBaseEnv", () => {
       BUGBOSS_OMNI_REPO: "https://github.com/o/sandbox.git",
       BUGBOSS_WORK_ROOT: "/tmp/run/work",
       BUGBOSS_GITHUB_TOKEN_FILE: "/tmp/run/token",
+      BUGBOSS_REVIEW_SETTLE_SECONDS: "5",
+      NODE_EXTRA_CA_CERTS: "/tmp/run/ca.pem",
       AWS_ENDPOINT_URL_S3: "http://127.0.0.1:9000",
       AWS_ENDPOINT_URLS: "not an endpoint",
       GITHUB_APP_PRIVATE_KEY: "-----BEGIN",
@@ -128,6 +130,8 @@ describe("pickBaseEnv", () => {
       BUGBOSS_OMNI_REPO: "https://github.com/o/sandbox.git",
       BUGBOSS_WORK_ROOT: "/tmp/run/work",
       BUGBOSS_GITHUB_TOKEN_FILE: "/tmp/run/token",
+      BUGBOSS_REVIEW_SETTLE_SECONDS: "5",
+      NODE_EXTRA_CA_CERTS: "/tmp/run/ca.pem",
       AWS_ENDPOINT_URL_S3: "http://127.0.0.1:9000",
     });
   });

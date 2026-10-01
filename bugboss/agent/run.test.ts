@@ -468,6 +468,20 @@ test("the dispatcher's environment is the whole launch contract", () => {
   });
 });
 
+test("a review settle override reaches the options, and an unset or bad one leaves the default", () => {
+  const base = {
+    BUGBOSS_INCIDENT_ID: "inc-7",
+    BUGBOSS_S3_BUCKET: "b",
+    BUGBOSS_SESSION_REF: "sessions/incident/inc-7/session.jsonl",
+  };
+
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_REVIEW_SETTLE_SECONDS: "5" }).reviewSettleSeconds, 5);
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_REVIEW_SETTLE_SECONDS: "0" }).reviewSettleSeconds, 0);
+  assert.equal(agentOptionsFromEnv(base).reviewSettleSeconds, undefined);
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_REVIEW_SETTLE_SECONDS: "" }).reviewSettleSeconds, undefined);
+  assert.equal(agentOptionsFromEnv({ ...base, BUGBOSS_REVIEW_SETTLE_SECONDS: "soon" }).reviewSettleSeconds, undefined);
+});
+
 test("the alert slugs reach the options, and a bad list costs only the list", () => {
   const base = {
     BUGBOSS_INCIDENT_ID: "inc-7",

@@ -972,6 +972,8 @@ export interface RunIncidentAgentOptions {
   grafana?: { url: string; token: string; command?: string; args?: string[] };
   /** From `BUGBOSS_ALERT_SLUGS`: which rules fired, so the prompt carries them. */
   alertSlugs?: string[];
+  /** From `BUGBOSS_REVIEW_SETTLE_SECONDS`. Unset means `REVIEW_SETTLE_SECONDS`. */
+  reviewSettleSeconds?: number;
   store?: SessionStore;
   api?: BossClient;
   skipClone?: boolean;
@@ -1065,6 +1067,7 @@ export const agentOptionsFromEnv = (
   // finite and hand every agent a budget of nothing.
   const maxTurns = Number(env.BUGBOSS_MAX_TURNS);
   const alertSlugs = readAlertSlugs(env.BUGBOSS_ALERT_SLUGS);
+  const reviewSettleSeconds = env.BUGBOSS_REVIEW_SETTLE_SECONDS ? Number(env.BUGBOSS_REVIEW_SETTLE_SECONDS) : Number.NaN;
 
   return {
     incidentId,
@@ -1083,6 +1086,7 @@ export const agentOptionsFromEnv = (
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
     ...(alertSlugs.length ? { alertSlugs } : {}),
+    ...(Number.isFinite(reviewSettleSeconds) && reviewSettleSeconds >= 0 ? { reviewSettleSeconds } : {}),
     ...(grafanaToken
       ? {
           grafana: {
@@ -1672,6 +1676,7 @@ const launch = async (args: {
       waitSignal: waits.signal,
       cwd: paths.checkout,
       github: createGitHubReadPort({ token: () => process.env.GITHUB_TOKEN }),
+      ...(options.reviewSettleSeconds === undefined ? {} : { settleSeconds: options.reviewSettleSeconds }),
       heartbeat: {
         marker: api,
         boss: api,
