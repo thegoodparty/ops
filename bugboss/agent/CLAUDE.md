@@ -13,7 +13,8 @@ control.
 In AWS it runs on the Boss's own identity, resolved through the container
 credential provider, which refreshes itself for as long as the run lasts.
 Nothing inside the container separates the two, so what limits an agent is
-what the task can reach at all — no database, no release path.
+what the task can reach at all — no database, no release path. The one
+database read it has goes through a person: `request_sql_query`, below.
 
 GitHub is different. It gets the App's **credentials**, not a token minted for
 it, and re-mints every twenty minutes. Installation tokens last an hour and an incident can
@@ -359,6 +360,27 @@ forbids it; that is advice, not a control. If a reviewer wants this closed,
 the only real answer is a second, narrower token for the agent's shell, which
 is a bigger change than this one.
 
+## Production SQL goes through a person and a sidecar
+
+`request_sql_query` (`sql.ts`) runs one SELECT against gp-api's production
+reader, and the agent never holds the password. The tool calls the loopback
+API (`POST /incidents/:id/sql-requests`), the Boss adds the incident's own
+thread and forwards to the `sqlrunner` sidecar, and the sidecar checks the
+thread with Slack, asks for approval in it and runs the query once a person
+on the rotation approves. The agent has a shell and the Boss's secrets, so none of that can
+live on this side.
+
+- **It is a blocking tool**, like `monitor`: one turn, capped at
+  `MAX_BLOCK_SECONDS`, polled every `SQL_POLL_SECONDS`, and ended by a Boss
+  message through `createWaitInterrupt`. A wait that ends unsettled returns
+  the `requestId`, and calling again with it resumes rather than asking twice.
+- **The sidecar's refusals arrive verbatim**, status and body, so the client
+  method returns `{status, text}` instead of throwing like `call`.
+- **A 404 means the sidecar restarted.** It holds requests in memory, so the
+  agent is told to ask again. Any other unreadable answer ends the wait too;
+  retrying a sidecar that is down would alarm on every poll.
+- **Rows come back whole.** The 200-row cap is in the sidecar's SQL, not here.
+
 ## An unanswered question gets loud, and the wait continues
 
 Both tools that reach a person leave the incident exactly where it was.
@@ -493,7 +515,9 @@ phone screen, and each one caused retry loops in the runs that hit it.
 
 What the agent writes that does reach Slack is posted by `toolapi` on a
 transition, and that is where the thread budget lives: resolution evidence
-is refused past `THREAD_PROSE_CHARS`, and the post-mortem has no cap.
+is refused past `THREAD_PROSE_CHARS`, and the post-mortem has no character
+cap; only its `practiceChanges` section has a word range, and it refuses
+rather than cuts.
 
 The Slack agent has compaction too — `compactTranscript` in `slack/agent.ts`,
 wired into the loop in the composition root — so what is left on that surface
@@ -501,9 +525,10 @@ bounds *rows and entries*, never widths.
 
 ## What reaches Slack is mrkdwn
 
-The root cause, the resolution evidence and the post-mortem are posted as the
-agent wrote them, so the prompt carries the mrkdwn contract ("What reaches
-Slack" in `prompt.ts`) for those three and nothing else. The model is told
+The root cause and the resolution evidence are posted as the agent wrote
+them, so the prompt carries the mrkdwn contract ("What reaches Slack" in
+`prompt.ts`) for those two and nothing else. The post-mortem only reaches the
+PDF, which reads Markdown, so the prompt asks for Markdown there. The model is told
 **not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at the
 boundary, and a model that pre-escapes would post `&amp;amp;`.
 
@@ -647,9 +672,10 @@ event so a replayed call after a restart records nothing twice.
 
 It exists because of compaction. The first error scrolls out of the context
 long before the closer writes the post-mortem, so the closer reads the
-timeline from `get_incident` instead of rebuilding it, and the closing
-report prints it as "Recorded timeline" under the post-mortem. The prompt
-asks for events on the turn they are learned, not at the end.
+timeline from `get_incident` instead of rebuilding it. Its post-mortem
+timeline rows name events by `recordedEventId`, and the report merges the two
+into one table with the recorded times (`report/CLAUDE.md`). The prompt asks
+for events on the turn they are learned, not at the end.
 
 **The model is pinned in the session.** On resume it resolves from the
 stored prefix, not from env — Bedrock does not restore it, and the SSM

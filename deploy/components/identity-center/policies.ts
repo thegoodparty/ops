@@ -8,20 +8,49 @@ import { bedrockInvokeResources } from "../../../utils/bedrock-models";
 
 type PolicyValue = string | string[];
 
+/**
+ * A statement names either `Action` or `NotAction`, never both and never
+ * neither. AWS rejects the pair in one statement, and a statement with neither
+ * matches nothing while reading as though it matches something. Modelled as a
+ * union so both mistakes are a compile error rather than a policy nobody
+ * notices is inert.
+ */
+type ActionExpression =
+  | { Action: PolicyValue; NotAction?: never }
+  | { NotAction: PolicyValue; Action?: never };
+
 export type PolicyStatement = {
   Sid?: string;
   Effect: "Allow" | "Deny";
-  Action: PolicyValue;
   Resource?: PolicyValue;
-  NotAction?: PolicyValue;
   NotResource?: PolicyValue;
   Condition?: Record<string, Record<string, PolicyValue>>;
-};
+} & ActionExpression;
 
 export type PolicyDocument = {
   Version: "2012-10-17";
   Statement: PolicyStatement[];
 };
+
+/**
+ * Every IAM service prefix that serves Bedrock models.
+ *
+ * One list, read by both the exclusion on the tag-conditioned grants in
+ * `engineerAccess` and the read allow that follows it, because two copies would
+ * drift and the failure mode is a service quietly reachable again. `bedrock`
+ * is the foundation-model service. `bedrock-agentcore`, `bedrock-mantle` and
+ * `bedrock-websearch` are separate namespaces AWS has added since, each with
+ * its own prefix, so `bedrock:*` alone does not cover them. A new Bedrock-family
+ * prefix has to be added here; the test in
+ * `deploy/identity-center-engineer.test.ts` pins the list so a change is visible
+ * in review, though nothing can detect a prefix AWS adds later.
+ */
+const BEDROCK_SERVICE_PREFIXES = [
+  "bedrock",
+  "bedrock-agentcore",
+  "bedrock-mantle",
+  "bedrock-websearch",
+] as const;
 
 export const engineerAccess: PolicyDocument = {
   Version: "2012-10-17",
@@ -39,7 +68,14 @@ export const engineerAccess: PolicyDocument = {
     {
       Sid: "DevResourceOperations",
       Effect: "Allow",
-      Action: ["*"],
+      // NotAction rather than Action: ["*"], so this blanket grant does not
+      // reach the Bedrock family. Their invoke and create actions list
+      // `aws:RequestTag` among their condition keys, so the tag conditions
+      // below would otherwise match them. Reads are granted explicitly by
+      // ReadBedrockCatalog; every other action in those services is left
+      // denied. See that statement for why the exclusion lives here rather
+      // than in a Deny.
+      NotAction: BEDROCK_SERVICE_PREFIXES.map((prefix) => `${prefix}:*`),
       Resource: "*",
       Condition: {
         StringEquals: {
@@ -50,7 +86,9 @@ export const engineerAccess: PolicyDocument = {
     {
       Sid: "DevResourceCreation",
       Effect: "Allow",
-      Action: ["*"],
+      // Excludes the Bedrock family for the same reason as
+      // DevResourceOperations above.
+      NotAction: BEDROCK_SERVICE_PREFIXES.map((prefix) => `${prefix}:*`),
       Resource: "*",
       Condition: {
         StringEquals: {
@@ -76,9 +114,43 @@ export const engineerAccess: PolicyDocument = {
       },
     },
     {
-      Sid: "InvokeBedrockModels",
+      // Read-only Bedrock, enforced as an allowlist rather than a Deny.
+      //
+      // This set used to carry `bedrock:*`, which is how a laptop `pi` running
+      // under the `EngineerAccess` profile invoked Claude Opus 4.6 and caused
+      // Bedrock to subscribe the model in the management account on first use.
+      // Bedrock enables every model by default and subscribes in the
+      // background on invocation, so AWS's guidance is that the control is a
+      // Deny or a scoped Allow on the invocation, not withholding a
+      // subscription. The subscription mechanics are in
+      // `docs/workbench-account.md` under "Adding a Bedrock model later".
+      //
+      // The obvious shape is a single Deny with `NotAction` over the read
+      // actions, and it is wrong. IAM evaluates `NotAction` across every
+      // service: with `Resource: "*"` and no condition it denies S3, SQS,
+      // Transcribe and everything else this set exists for. No condition key
+      // scopes a statement to one service, so the exclusion has to live on the
+      // Allow side. The Bedrock-family prefixes are named out of the two
+      // tag-conditioned blanket grants above, and only these reads are allowed
+      // back. Those grants need the exclusion because the invoke and create
+      // actions list `aws:RequestTag` among their condition keys, so
+      // `Action: ["*"]` reaches them. An action added later is then denied by
+      // default rather than admitted until someone remembers this file.
+      //
+      // The management account is where production runs and is not the place
+      // for human Bedrock traffic. That is the workbench account, through
+      // `WorkbenchAccess`, which names its models and is the intended path;
+      // `AdministratorAccess` keeps invocation as the break-glass exception.
+      //
+      // Reads are also granted by the `ReadOnlyAccess` managed policy this set
+      // carries; naming them here makes the intent explicit and keeps the
+      // grant from depending on a policy AWS can widen or narrow.
+      Sid: "ReadBedrockCatalog",
       Effect: "Allow",
-      Action: ["bedrock:*"],
+      Action: BEDROCK_SERVICE_PREFIXES.flatMap((prefix) => [
+        `${prefix}:Get*`,
+        `${prefix}:List*`,
+      ]),
       Resource: "*",
     },
     {
@@ -260,6 +332,31 @@ export const workbenchAccess: PolicyDocument = {
         "logs:StopQuery",
       ],
       Resource: "*",
+    },
+    // Brave Search, for `gp-pi`'s always-on `web_search` tool. One secret and
+    // one read-only action, and the only secretsmanager or ssm permission this
+    // set has. The container reads it with the same SSO session that invokes
+    // Bedrock, so there is no second credential to distribute.
+    //
+    // The suffix is wildcarded rather than named because the secret is created
+    // outside Pulumi, and the grant lives in a different stack from the secret,
+    // so there is no Output to read. That also survives a delete-and-recreate
+    // rotation. The name is a seam with `gp-websearch.ts` in the `gp-pi` repo:
+    // renaming it on either side without the other is an AccessDenied at the
+    // first search, not a load-time error. Recorded in
+    // `docs/workbench-account.md`.
+    //
+    // Worth reading twice: this is the first thing in this account that is
+    // worth reading at all, which the account was designed not to hold. It is
+    // shared by every engineer's sandbox, so a prompt-injected agent can take
+    // it. The scope is one secret and one read; the key is
+    // revocable in Brave, and it is dedicated to `gp-pi` rather than the key
+    // the product uses.
+    {
+      Sid: "ReadBraveSearchKey",
+      Effect: "Allow",
+      Action: ["secretsmanager:GetSecretValue"],
+      Resource: `arn:aws:secretsmanager:us-west-2:${WORKBENCH_ACCOUNT_ID}:secret:gp-pi/brave-search-??????`,
     },
   ],
 };

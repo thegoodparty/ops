@@ -48,10 +48,19 @@ oauth_config:
       ## The app_mention event, which is how @bugboss reaches it.
       - app_mentions:read
       ## reactions.add, for the :eyes: BugBoss puts on a message the moment
-      ## it takes it, before the work that answers it. The reaction is never
-      ## removed or read back, so reactions.remove and reactions:read stay
-      ## uncalled even though this scope would cover the first of them.
+      ## it takes it, before the work that answers it. That reaction is never
+      ## removed or read back, so reactions.remove stays uncalled even though
+      ## this scope covers it.
       - reactions:write
+      ## reactions.get, so the SQL runner sidecar can confirm that a person
+      ## on the rotation approved a query by reacting to the runner's own
+      ## message. Approval is a reaction rather than a button on purpose: the
+      ## incident agent can read the signing secret, so it could forge an
+      ## interactivity payload, but it cannot react as anyone but the bot,
+      ## and the runner ignores the bot. The thread is read with
+      ## conversations.replies (channels:history) and the rotation with
+      ## usergroups.users.list (usergroups:read), both already granted.
+      - reactions:read
       ## files.getUploadURLExternal and files.completeUploadExternal, for the
       ## closing report BugBoss attaches, as a PDF, to the close notice when
       ## an incident reaches CLOSED. (files.upload is deprecated; the

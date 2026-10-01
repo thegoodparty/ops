@@ -18,6 +18,7 @@ import {
 } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { createSqlQueryTool } from "./sql";
 import { createBossTools } from "./run";
 import { createMessageBossTool, createMonitorTool } from "./tools";
 import { TEST_DB_ENV_VAR } from "../testdb";
@@ -131,7 +132,7 @@ test("the agent is told to record the timeline as it happens, and why", () => {
   assert.match(prompt, /taken from the evidence\nrather than from when you noticed/);
   // The closer reads the table, so the agent has to know the post-mortem is
   // built from it rather than from a context that has been summarised.
-  assert.match(prompt, /build its timeline from the `timeline` get_incident returns/);
+  assert.match(prompt, /give each timeline row the recordedEventId of the event it\s+describes/);
   assert.doesNotMatch(prompt, /notes/);
 });
 
@@ -352,7 +353,9 @@ test("the safety rules stay in the prompt, not one read away", () => {
 // measured on this prompt) while it pasted documents in. Raising these bounds
 // makes every turn of every incident dearer; do it deliberately.
 const MAX_SYSTEM_PROMPT_CHARS = 42_000;
-const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 58_000;
+// Raised from 58,000 when the SQL sidecar's tool and prompt section (#207)
+// landed; main's build was failing, so the overrun went unseen.
+const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 60_000;
 
 test("the composed prefix stays under its bound", async () => {
   const pi = await import("@earendil-works/pi-coding-agent");
@@ -363,6 +366,7 @@ test("the composed prefix stays under its bound", async () => {
     await createMonitorTool({ signal }),
     await createMessageBossTool({ marker: stub, boss: stub, api: stub, signal }),
     await createRerunCiTool({ github: createGitHubRunsPort({ token: () => undefined }), boss: stub }),
+    await createSqlQueryTool({ port: stub, signal }),
     ...[
       pi.createBashToolDefinition,
       pi.createEditToolDefinition,
@@ -407,10 +411,16 @@ test("the agent is told to write mrkdwn, not Markdown", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.ok(prompt.includes("## What reaches Slack"));
-  // The root cause, the resolution evidence and the post-mortem are posted
-  // verbatim, so the rules they need are the ones Markdown gets wrong: bold,
-  // links, headings, and the escaping it must not attempt by hand.
-  assert.match(prompt, /your root cause, your resolution evidence and your\s+post-mortem/);
+  // The root cause and the resolution evidence are posted verbatim, so the
+  // rules they need are the ones Markdown gets wrong: bold, links, headings,
+  // and the escaping it must not attempt by hand. The post-mortem goes to the
+  // PDF, which reads Markdown.
+  assert.match(prompt, /your root cause and your resolution evidence\./);
+  assert.match(prompt, /\*\*The post-mortem is not Slack text\.\*\* Every rule above is for the root cause\s+and the resolution evidence only/);
+  assert.ok(
+    prompt.indexOf("The post-mortem is not Slack text") > prompt.indexOf("There are no headings and no tables."),
+    "the exception comes after the mrkdwn rules it overrides",
+  );
   assert.ok(prompt.includes("not **bold**"));
   assert.ok(prompt.includes("<https://example.com|label>"));
   assert.ok(prompt.includes("There are no headings and no tables."));
@@ -470,13 +480,13 @@ test("the prompt does not understate how far the GitHub token reaches", () => {
   assert.match(prompt, /every repository in the thegoodparty/);
 });
 
-test("the thread cap on resolution evidence is a refusal, and the post-mortem has none", () => {
+test("the thread cap on resolution evidence is a refusal, and the post-mortem has no character cap", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.match(prompt, new RegExp(`capped at\\s+${THREAD_PROSE_CHARS} characters`));
   assert.match(prompt, /a longer one is refused and\s+handed back/);
-  assert.match(prompt, /The post-mortem has no cap\s+at all/);
-  assert.match(prompt, /becomes a file attached to the thread/);
+  assert.match(prompt, /It has no character\s+cap/);
+  assert.match(prompt, /it is a file attached to the thread/);
 });
 
 test("the prompt asks for behaviour over symbols, with a worked pair", () => {

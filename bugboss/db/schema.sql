@@ -111,6 +111,11 @@ CREATE TABLE IF NOT EXISTS incident (
   -- the table exists.
   recurrenceAnalysis TEXT,
 
+  -- The post-mortem as the fields report_analysis takes, JSON. The report
+  -- renders it in a fixed order; postmortem holds the same content as
+  -- Markdown for every other reader. Null on rows closed before it existed.
+  postmortemSections TEXT,
+
   -- Cross-field constraints, which are the difference between an invariant
   -- and a comment. Every one of these was reachable at some point today: a
   -- resurrected MERGED row, a RESOLVED incident whose evidence lived only in

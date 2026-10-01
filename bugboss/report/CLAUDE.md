@@ -143,8 +143,10 @@ so the composition root runs it through the incident-reference pass itself.
 Every path into an incident thread is capped at `THREAD_PROSE_CHARS` and
 refuses a longer post (`slack/CLAUDE.md`). This document is exempt by never
 being thread text: it is a file, so the thread stays short by the long
-version being somewhere else. `report_analysis`'s `postmortem` is therefore
-the one model field with no cap on it.
+version being somewhere else. `report_analysis`'s sections are therefore
+the model fields with no character cap on them. The one length rule is
+`practiceChanges`, refused outside about 100-300 words with "keep it to about
+200 words"; nothing is ever cut.
 
 ## Why a PDF
 
@@ -156,10 +158,48 @@ every scope there it does nothing until somebody reinstalls the app. Until
 then the completion answers `missing_scope`: the notice goes out alone, the
 retries fail, and `upload_abandoned` alarms.
 
-## The recorded timeline is the agent's, printed as it recorded it
+## The post-mortem is sections, rendered by code
 
-`incident_timeline_event` rows go under the post-mortem as "Recorded
-timeline", oldest first by when each thing happened. The post-mortem is the
-closer's account and this is the evidence it was written from, so the two
-stay side by side rather than merged. Both close paths get it: the rows are
-read at publish time, not carried by `report_analysis`.
+Free-form post-mortems carried the same facts in a different shape every
+time: headings in Slack mrkdwn or Markdown, the timeline as a table or as
+bullets, "prevention" meaning practice change in one and a to-do list in the
+next. So `report_analysis` takes fields, not a blob, and `render.ts` lays them
+out in one order:
+
+1. **At a glance**: the agent's two or three sentences, then the metrics table.
+2. **Timeline**: one Markdown table (below).
+3. **User impact**, then the measured count and its query.
+4. **Root cause**, with "Why it came back" under it on a recurrence.
+5. **Five whys**: exactly five why/because pairs.
+6. **Resolution actions taken**: the agent's list, then the resolution
+   evidence and each PR's state from GitHub.
+7. **Preventing similar issues: changes to how we build**: `practiceChanges`,
+   about 200 words on development practice (tests, review gates, alert
+   design, architecture) that would stop *similar* issues. It is not a list
+   of follow-up tasks: a closed incident has none. The heading and the field
+   name say so on purpose.
+8. **Agent run**: code only. Model, launches and restarts, turns, wall clock
+   (first to last session entry, parked time included), tokens by class, and
+   the labelled estimate. Signals and what people did follow as appendices.
+
+`postmortem.ts` checks the fields and refuses an empty section with a sentence
+naming it and what to write. The sections are stored as JSON in
+`incident.postmortemSections`, and `incident.postmortem` gets the same content
+rendered as Markdown, because search, the next agent's prior incident and the
+Slack agent all read that column as prose.
+
+**Old rows are not rewritten.** An incident closed before the sections
+existed, or closed by the Boss, has no `postmortemSections` and renders the
+old layout with its `postmortem` as written. Sections that will not parse
+alarm `postmortem_sections_unreadable` and fall back the same way.
+
+## One timeline, recorded times first
+
+A post-mortem timeline row either names an `incident_timeline_event` by
+`recordedEventId` or carries `at` in UTC. A row that names an event, has its
+time to the second, or cites the same evidence within five minutes of it, is
+that event: it prints the recorded time, because that was written when it
+happened, in the agent's words. Recorded events no row describes are added
+in their own words, so nothing recorded drops out. Both close paths read the
+rows at publish time; a Boss-closed incident prints them as "Recorded
+timeline" under its free-form post-mortem, as before.

@@ -51,6 +51,7 @@ import {
   type CheckoutOutcome,
 } from "./workspace";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
+import { createSqlQueryTool, type SidecarReply, type SqlRequestPort } from "./sql";
 import { createGitHubReadPort } from "./conditions";
 import {
   bossMessageText,
@@ -357,7 +358,8 @@ export type BossClient = Omit<ToolApi, "escalate"> &
   DirectivePeek &
   WaitMarkerPort &
   BossInboxPort &
-  TimelinePeek;
+  TimelinePeek &
+  SqlRequestPort;
 
 /**
  * The timeline without the drain. The stage compaction reads it between
@@ -390,6 +392,17 @@ export const createBossClient = (args: {
       throw new Error(`Boss ${method} ${path} failed: ${response.status} ${text}`);
     }
     return (text ? JSON.parse(text) : {}) as T;
+  };
+
+  // Status and body, never thrown: the SQL sidecar's refusals are its own
+  // words, and `call` would turn every one into a harness failure.
+  const reply = async (method: string, path: string, body?: unknown): Promise<SidecarReply> => {
+    const response = await http(`${base}${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, text: await response.text() };
   };
 
   return {
@@ -433,6 +446,9 @@ export const createBossClient = (args: {
         "GET",
         `/boss-inbox/escalations?since=${since}`,
       ),
+    createSqlRequest: (payload) => reply("POST", "/sql-requests", payload),
+    getSqlRequest: (requestId) =>
+      reply("GET", `/sql-requests/${encodeURIComponent(requestId)}`),
   };
 };
 
@@ -601,9 +617,29 @@ export const createBossTools = async (args: {
       name: "report_analysis",
       label: "Report analysis",
       description:
-        "RESOLVED -> CLOSED, your last act. Markdown post-mortem: summary, timeline (built from get_incident's timeline), humans involved, impact, root cause with five whys, owned prevention items. On a recurrence, `recurrence` is required.",
+        "RESOLVED -> CLOSED, your last act. The post-mortem as sections; code renders them in a fixed order and adds the agent run. No headings of your own. On a recurrence, `recurrence` is required.",
       parameters: Type.Object({
-        postmortem: Type.String(),
+        atAGlance: Type.String({ description: "2-3 sentences: what broke, who it hurt, that it is fixed." }),
+        timeline: Type.Array(
+          Type.Object({
+            at: Type.Optional(Type.String({ description: "ISO 8601 UTC, e.g. 2026-10-01T02:14:30Z." })),
+            event: Type.String(),
+            evidenceUrl: Type.Optional(Type.String()),
+            recordedEventId: Type.Optional(
+              Type.Number({ description: "get_incident timeline id this row describes; its time wins." }),
+            ),
+          }),
+        ),
+        userImpact: Type.String(),
+        rootCause: Type.String(),
+        fiveWhys: Type.Array(Type.Object({ why: Type.String(), because: Type.String() }), {
+          description: "Exactly five.",
+        }),
+        resolutionActions: Type.Array(Type.String(), { description: "Done, not planned." }),
+        practiceChanges: Type.String({
+          description:
+            "About 200 words: development-practice changes that would prevent similar issues. Not follow-up work on this one.",
+        }),
         usersImpacted: Type.Number(),
         impactQuery: Type.String(),
         recurrence: Type.Optional(
@@ -1600,6 +1636,11 @@ const launch = async (args: {
     await createRerunCiTool({
       github: createGitHubRunsPort({ token: () => process.env.GITHUB_TOKEN }),
       boss: api,
+    }),
+    await createSqlQueryTool({
+      port: api,
+      signal: wrapUpAbort.signal,
+      waitSignal: waits.signal,
     }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(

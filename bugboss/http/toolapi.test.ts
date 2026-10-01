@@ -559,3 +559,213 @@ test("a timeline event is validated before it reaches the tool API", async () =>
   assert.equal(((await bad.json()) as { ok: boolean }).ok, false);
   assert.equal(reached, before);
 });
+
+// --- request_sql_query: the Boss names the thread and forwards -------------
+
+const SQL_INCIDENT = "41";
+const THREADLESS = "43";
+
+interface SidecarCall {
+  method: string;
+  url: string;
+  body: unknown;
+}
+
+const sqlApp = async (options: {
+  sqlRunnerUrl?: string;
+  sidecar?: (call: SidecarCall) => Response | Promise<Response>;
+}) => {
+  await seedSqlIncidents();
+  const calls: SidecarCall[] = [];
+  const routes = createToolApiRoutes({
+    db,
+    tokenSecret: SECRET,
+    toolApiFor: () => ({}) as ToolApi,
+    wakeBoss: () => {},
+    noteEscalated: () => {},
+    sqlRunnerUrl: options.sqlRunnerUrl,
+    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+      const call = {
+        method: init?.method ?? "GET",
+        url: String(input),
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      };
+      calls.push(call);
+      if (!options.sidecar) throw new Error("connect ECONNREFUSED 127.0.0.1:8790");
+      return options.sidecar(call);
+    }) as typeof fetch,
+    now: () => clock,
+  });
+  const as = (incidentId: string) => async (path: string, init: RequestInit = {}) =>
+    routes.request(`/incidents/${incidentId}${path}`, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mintAgentToken(SECRET, { incidentId, attempt: 1 }, 3600)}`,
+      },
+    });
+  return { calls, as };
+};
+
+const alarmsDuring = async <T>(run: () => Promise<T>): Promise<{ result: T; alarms: string[] }> => {
+  const alarms: string[] = [];
+  const real = console.error;
+  console.error = (line: string) => alarms.push(line);
+  try {
+    return { result: await run(), alarms };
+  } finally {
+    console.error = real;
+  }
+};
+
+const askSql = (body: unknown = { sql: "select id from campaign", reason: "which campaign" }) => ({
+  method: "POST",
+  body: JSON.stringify(body),
+});
+
+// Inserted on first use rather than in a second `before`, which node:test
+// does not order after the one that opens the database.
+let sqlIncidents: Promise<void> | null = null;
+const seedSqlIncidents = (): Promise<void> =>
+  (sqlIncidents ??= db.withWrite((w) => {
+    w.prepare(
+      "INSERT INTO incident (id, status, firstSignalAt, slackThreadTs) VALUES (?, 'INVESTIGATING', ?, ?)",
+    ).run(SQL_INCIDENT, clock, "1727700000.000100");
+    w.prepare(
+      "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
+    ).run(THREADLESS, clock);
+  }));
+
+test("a SQL request goes to the sidecar with the incident's own thread, not one the agent names", async () => {
+  const { calls, as } = await sqlApp({
+    sqlRunnerUrl: "http://127.0.0.1:8790/",
+    sidecar: () => Response.json({ requestId: "4b6f" }, { status: 201 }),
+  });
+
+  const res = await as(SQL_INCIDENT)(
+    "/sql-requests",
+    askSql({ sql: "select 1", reason: "check", threadTs: "1.2", incidentId: 99 }),
+  );
+
+  assert.equal(res.status, 201);
+  assert.deepEqual(await res.json(), { requestId: "4b6f" });
+  assert.deepEqual(calls, [
+    {
+      method: "POST",
+      url: "http://127.0.0.1:8790/requests",
+      body: { incidentId: 41, threadTs: "1727700000.000100", sql: "select 1", reason: "check" },
+    },
+  ]);
+});
+
+test("the sidecar's refusals reach the agent verbatim, status and all", async () => {
+  for (const [status, error] of [
+    [400, "drop the semicolon"],
+    [409, "incident 41 already has a pending request"],
+    [503, "rotation group not configured"],
+  ] as const) {
+    const { as } = await sqlApp({
+      sqlRunnerUrl: "http://127.0.0.1:8790",
+      sidecar: () => Response.json({ error }, { status }),
+    });
+    const { result: res, alarms } = await alarmsDuring(() =>
+      as(SQL_INCIDENT)("/sql-requests", askSql()),
+    );
+    assert.equal(res.status, status);
+    assert.deepEqual(await res.json(), { error });
+    // A refusal the sidecar meant is not a fault; a 5xx is.
+    assert.equal(alarms.some((line) => /sql_runner_error/.test(line)), status >= 500);
+  }
+});
+
+test("a SQL request with nowhere to ask is refused out loud, and the sidecar is never called", async () => {
+  const unset = await sqlApp({ sidecar: () => Response.json({ requestId: "x" }, { status: 201 }) });
+  const noUrl = await alarmsDuring(() => unset.as(SQL_INCIDENT)("/sql-requests", askSql()));
+  assert.equal(noUrl.result.status, 503);
+  assert.match(((await noUrl.result.json()) as { error: string }).error, /BUGBOSS_SQL_RUNNER_URL/);
+  assert.equal(noUrl.alarms.filter((line) => /sql_runner_unconfigured/.test(line)).length, 1);
+  assert.equal(unset.calls.length, 0);
+
+  const threadless = await sqlApp({
+    sqlRunnerUrl: "http://127.0.0.1:8790",
+    sidecar: () => Response.json({ requestId: "x" }, { status: 201 }),
+  });
+  const noThread = await alarmsDuring(() => threadless.as(THREADLESS)("/sql-requests", askSql()));
+  assert.equal(noThread.result.status, 409);
+  assert.match(((await noThread.result.json()) as { error: string }).error, /no Slack thread/);
+  assert.equal(noThread.alarms.filter((line) => /sql_request_no_thread/.test(line)).length, 1);
+  assert.equal(threadless.calls.length, 0);
+});
+
+test("an unreachable sidecar is an error the agent can read and an alarm somebody can", async () => {
+  const { as } = await sqlApp({ sqlRunnerUrl: "http://127.0.0.1:8790" });
+
+  const create = await alarmsDuring(() => as(SQL_INCIDENT)("/sql-requests", askSql()));
+  assert.equal(create.result.status, 502);
+  assert.match(((await create.result.json()) as { error: string }).error, /ECONNREFUSED/);
+  assert.equal(create.alarms.filter((line) => /sql_runner_unreachable/.test(line)).length, 1);
+
+  const read = await alarmsDuring(() => as(SQL_INCIDENT)("/sql-requests/4b6f"));
+  assert.equal(read.result.status, 502);
+  assert.equal(read.alarms.filter((line) => /sql_runner_unreachable/.test(line)).length, 1);
+});
+
+test("reading a SQL request proxies the sidecar's answer, a 404 included", async () => {
+  const done = {
+    requestId: "4b6f",
+    status: "done",
+    decidedBy: "U01",
+    columns: ["id"],
+    rows: [{ id: 1 }],
+    rowCount: 1,
+  };
+  const { calls, as } = await sqlApp({
+    sqlRunnerUrl: "http://127.0.0.1:8790",
+    sidecar: (call) =>
+      call.url.endsWith("/requests/4b6f")
+        ? Response.json(done)
+        : Response.json({ error: "not found" }, { status: 404 }),
+  });
+
+  const found = await as(SQL_INCIDENT)("/sql-requests/4b6f");
+  assert.equal(found.status, 200);
+  assert.deepEqual(await found.json(), done);
+
+  const lost = await alarmsDuring(() => as(SQL_INCIDENT)("/sql-requests/gone"));
+  assert.equal(lost.result.status, 404);
+  assert.deepEqual(lost.alarms, [], "a lost request is the sidecar restarting, not a fault");
+  assert.deepEqual(
+    calls.map((call) => [call.method, call.url]),
+    [
+      ["GET", "http://127.0.0.1:8790/requests/4b6f"],
+      ["GET", "http://127.0.0.1:8790/requests/gone"],
+    ],
+  );
+});
+
+test("a request id cannot move the sidecar path", async () => {
+  const { calls, as } = await sqlApp({
+    sqlRunnerUrl: "http://127.0.0.1:8790",
+    sidecar: () => Response.json({}),
+  });
+  const res = await as(SQL_INCIDENT)(`/sql-requests/${encodeURIComponent("../health")}`);
+  assert.equal(res.status, 400);
+  assert.equal(calls.length, 0);
+});
+
+test("the SQL routes are scoped by the token like every other route", async () => {
+  const { calls, as } = await sqlApp({
+    sqlRunnerUrl: "http://127.0.0.1:8790",
+    sidecar: () => Response.json({ requestId: "x" }, { status: 201 }),
+  });
+  const res = await app.request(`/incidents/${SQL_INCIDENT}/sql-requests`, {
+    ...askSql(),
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${mintAgentToken(SECRET, { incidentId: THREADLESS, attempt: 1 }, 3600)}`,
+    },
+  });
+  assert.equal(res.status, 403);
+  assert.equal((await as(SQL_INCIDENT)("/sql-requests", { method: "POST", body: "nope" })).status, 400);
+  assert.equal(calls.length, 0);
+});

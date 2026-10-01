@@ -21,6 +21,8 @@ import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
 import { indexIncident, searchIncidents, UnsearchableQuery } from "../db/search";
+import { pickSections, postmortemProblem } from "../report/postmortem";
+import { renderPostmortem } from "../report/render";
 import type {
   Directive,
   Evidence,
@@ -899,11 +901,12 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       : null;
   };
 
-  // No budget on `postmortem`, deliberately, and this is the one transition
-  // where that is true. It is not posted as thread text -- it becomes the
-  // closing report, a PDF attached to the close notice -- so the thread stays
-  // short by the document being somewhere else rather than by the write-up
-  // being shorter.
+  // No character budget on the post-mortem, deliberately, and this is the one
+  // transition where that is true. It is not posted as thread text -- it
+  // becomes the closing report, a PDF attached to the close notice -- so the
+  // thread stays short by the document being somewhere else rather than by
+  // the write-up being shorter. The one length rule is practiceChanges' word
+  // range, and it refuses rather than cuts.
   const reportAnalysis: ToolApi["reportAnalysis"] = (args) =>
     call("reportAnalysis", async (incidentId) => {
       const incident = readIncident(incidentId);
@@ -915,6 +918,11 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const gap = recurrenceGap(incident, args.recurrence);
       if (gap) return reject(gap);
 
+      const recorded = readTimelineEvents(db, incidentId);
+      const problem = postmortemProblem(args, recorded);
+      if (problem) return reject(problem);
+      const sections = pickSections(args);
+
       const applied = await db.withWrite((w) => {
         const at = Date.now();
         const taken = w
@@ -922,12 +930,14 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
             // The status guard is what holds this transition, so a MERGED
             // row cannot be resurrected through here.
             `UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = ?,
-               usersImpacted = ?, impactQuery = ?, recurrenceAnalysis = ?
+               postmortemSections = ?, usersImpacted = ?, impactQuery = ?,
+               recurrenceAnalysis = ?
              WHERE id = ? AND status = 'RESOLVED'`,
           )
           .run(
             at,
-            args.postmortem,
+            renderPostmortem(sections, recorded),
+            JSON.stringify(sections),
             args.usersImpacted,
             args.impactQuery,
             args.recurrence ? JSON.stringify(args.recurrence) : null,
@@ -989,6 +999,14 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       if (!Number.isFinite(args.occurredAt) || args.occurredAt <= 0) {
         return reject(
           "occurredAt must be epoch millis of when it happened; if you cannot point at a time, use the time of the evidence you have",
+        );
+      }
+      // The report prints recorded times over the post-mortem's, so a time
+      // ahead of now is a wrong time printed as fact. Incident 98 recorded
+      // its merge a day after it was recorded.
+      if (args.occurredAt > Date.now() + 60_000) {
+        return reject(
+          `occurredAt ${new Date(args.occurredAt).toISOString()} is in the future; take the time from the evidence (the merge commit, the log line, the release run), in epoch millis`,
         );
       }
       if (!readIncident(incidentId)) return reject(`unknown incident: ${incidentId}`);

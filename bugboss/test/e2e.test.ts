@@ -35,6 +35,7 @@ import { emptyModelUsage } from "../model";
 import type { ModelReply, ModelRequest, ModelUsage } from "../triage";
 import { readReportData, renderReportDocument, renderReportPdf, type ReportUpload } from "../report";
 import type { BugBossConfig, TriageDecision } from "../types";
+import { SECTIONS } from "../report/postmortem.fixture";
 
 type QueuedDecision = TriageDecision & { recurrenceOf?: string };
 
@@ -176,7 +177,7 @@ const fakeAgent = async (tools: AgentSpawnContext) => {
     evidence: "two clean runs through the flow after deploy",
   });
   await tools.reportAnalysis({
-    postmortem: "# Summary\nBad column in the upgrade webhook.",
+    ...SECTIONS,
     usersImpacted: 3,
     impactQuery: '{service_name="gp-api"} |= "pro_upgrade"',
   });
@@ -375,8 +376,8 @@ test("a Grafana alert becomes a resolved, written-up incident", async () => {
   );
   const document = renderReportDocument(data!);
   assert.ok(report.content.equals(await renderReportPdf(document)));
-  assert.match(document, /## Post-mortem/);
-  assert.match(document, /Bad column in the upgrade webhook\./);
+  assert.match(document, /## Five whys/);
+  assert.match(document, /## Preventing similar issues/);
   assert.match(document, /\| Users impacted \| 3 \|/);
   assert.match(document, /pull\/9999/);
   // This fake agent never wrote a session file, so there is nothing to bill
@@ -1299,6 +1300,15 @@ test("the prod-critical allowlist can be delivered in the secret blob", () => {
   // One of exactly three things the design says earns an @, and there is no
   // other way to deliver it: the task definition does not set this.
   assert.deepEqual(cfg.prodCriticalSlugs, ["pro-upgrade-errors", "checkout-5xx"]);
+});
+
+test("the SQL runner's address is read once, at the composition root", () => {
+  const base = { BUGBOSS_BUCKET: "bugboss-prod", BUGBOSS_SLACK_CHANNEL_ID: "C0PROD" };
+  assert.equal(
+    bossConfigFromEnv({ ...base, BUGBOSS_SQL_RUNNER_URL: "http://127.0.0.1:8790" }).sqlRunnerUrl,
+    "http://127.0.0.1:8790",
+  );
+  assert.equal(bossConfigFromEnv(base).sqlRunnerUrl, undefined);
 });
 
 // --- the test database says something, whatever state it is in -------------
