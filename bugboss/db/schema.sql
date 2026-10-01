@@ -201,10 +201,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS signal_open_source_idx
 -- startsAt, which is what tells a redelivery of one firing (same startsAt,
 -- ignored by the key) from a new one. The first firing is the signal's
 -- openedAt and has no row here.
+--
+-- announcedAt is set in the transaction that tells the agent, not the one
+-- that records the firing, so a process that dies between the two leaves a
+-- row a Grafana retry still announces. Set as well when there was no live
+-- incident to tell, which is a decision rather than a gap.
 CREATE TABLE IF NOT EXISTS signal_firing (
   signalId          TEXT NOT NULL REFERENCES signal(id),
   startedAt         INTEGER NOT NULL,
   receivedAt        INTEGER NOT NULL,
+  announcedAt       INTEGER,
   PRIMARY KEY (signalId, startedAt)
 );
 

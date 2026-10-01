@@ -1230,8 +1230,11 @@ export const createBugBoss = async (
     incidentId: string | null;
     /** False when this delivery has nothing left to decide. */
     needsPlacement: boolean;
-    /** An open signal that fired again, recorded in `signal_firing`. */
-    refired: boolean;
+    /**
+     * The start of a later firing of this open signal that is recorded in
+     * `signal_firing` and not announced yet, or null.
+     */
+    refiredAt: number | null;
   }
 
   const recordSignal = async (signal: RawSignal): Promise<RecordedSignal> => {
@@ -1251,18 +1254,25 @@ export const createBugBoss = async (
         // new firing; every redelivery of one firing repeats its startsAt.
         // A human report's openedAt is when it reached us, so the same
         // message retried would read as new, and its id is the message
-        // anyway. The key is what makes two deliveries of one refire one row.
+        // anyway. The key is what makes two deliveries of one refire one row;
+        // announcedAt is what lets a retry finish one that never got told.
         const startedAt = Date.parse(signal.labels[`${META_PREFIX}starts_at`] ?? "");
-        const refired =
-          signal.source === GRAFANA_SOURCE &&
-          Number.isFinite(startedAt) &&
-          startedAt > exists.openedAt &&
-          w
-            .prepare(
-              "INSERT OR IGNORE INTO signal_firing (signalId, startedAt, receivedAt) VALUES (?, ?, ?)",
-            )
-            .run(exists.id, startedAt, now()).changes === 1;
-        return { ...exists, fresh: false, refired };
+        if (
+          signal.source !== GRAFANA_SOURCE ||
+          !Number.isFinite(startedAt) ||
+          startedAt <= exists.openedAt
+        ) {
+          return { ...exists, fresh: false, refiredAt: null };
+        }
+        w.prepare(
+          "INSERT OR IGNORE INTO signal_firing (signalId, startedAt, receivedAt) VALUES (?, ?, ?)",
+        ).run(exists.id, startedAt, now());
+        const unannounced = w
+          .prepare(
+            "SELECT 1 FROM signal_firing WHERE signalId = ? AND startedAt = ? AND announcedAt IS NULL",
+          )
+          .get(exists.id, startedAt);
+        return { ...exists, fresh: false, refiredAt: unannounced ? startedAt : null };
       }
 
       const max = w
@@ -1286,7 +1296,7 @@ export const createBugBoss = async (
         signal.reportedBy,
         signal.openedAt,
       );
-      return { id, incidentId: null, explained: 0, fresh: true, refired: false };
+      return { id, incidentId: null, explained: 0, fresh: true, refiredAt: null };
     });
 
     // A re-delivery of a signal that never reached an incident is the last
@@ -1301,7 +1311,7 @@ export const createBugBoss = async (
       id: row.id,
       incidentId: row.incidentId,
       needsPlacement,
-      refired: row.refired,
+      refiredAt: row.refiredAt,
     };
   };
 
@@ -1311,19 +1321,29 @@ export const createBugBoss = async (
    * fails costs the thread a line, not the agent the news. A signal that is
    * open but not on a live incident is left as it was: nothing is working
    * it to tell, and placement or the orphan sweep owns it.
+   *
+   * Claiming announcedAt and pushing the directive are one transaction, so
+   * two deliveries racing for the same firing tell the agent once.
    */
   const announceRefire = async (
     row: RecordedSignal,
     signal: RawSignal,
+    startedAt: number,
   ): Promise<boolean> => {
     const incidentId = row.incidentId;
     if (!incidentId) return false;
-    const startedAt = Date.parse(signal.labels[`${META_PREFIX}starts_at`] ?? "");
     const title = db.get<{ title: string }>(
       "SELECT title FROM signal WHERE id = ?",
       [row.id],
     )?.title ?? signal.title;
     const told = await db.withWrite((w: Database.Database) => {
+      const claimed = w
+        .prepare(
+          `UPDATE signal_firing SET announcedAt = ?
+             WHERE signalId = ? AND startedAt = ? AND announcedAt IS NULL`,
+        )
+        .run(now(), row.id, startedAt).changes === 1;
+      if (!claimed) return false;
       const live = w
         .prepare(
           "SELECT 1 FROM incident WHERE id = ? AND status IN ('INVESTIGATING', 'FIXING')",
@@ -1598,9 +1618,9 @@ export const createBugBoss = async (
           const { signal, row } = recorded[i];
           if (!row.needsPlacement) {
             let refired = false;
-            if (row.refired) {
+            if (row.refiredAt !== null) {
               try {
-                refired = await announceRefire(row, signal);
+                refired = await announceRefire(row, signal, row.refiredAt);
               } catch (err) {
                 alarm("refire_failed", {
                   signalId: row.id,
