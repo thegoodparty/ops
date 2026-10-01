@@ -497,7 +497,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   } finally {
     // Give the Boss a moment to roll the session up, then stop everything.
     await sleep(5000);
-    await deploying;
+    await (deploying as Promise<void> | null)?.catch((e: unknown) => spec.log("deploy_failed", { error: String(e) }));
     if (boss.pid) {
       try {
         process.kill(-boss.pid, "SIGTERM");
@@ -513,7 +513,14 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const incident = readIncident(dbPath);
   const merged = [...pulls.entries()].filter(([, p]) => p.mergedGreen !== null);
   // A run stopped early may never have rolled its session up to S3.
-  const rolledUp = sessionsUnder(s3Root).map((path) => parsePiSession(path, readFileSync(path, "utf8")));
+  const rolledUp = sessionsUnder(s3Root).flatMap((path) => {
+    try {
+      return [parsePiSession(path, readFileSync(path, "utf8"))];
+    } catch (e: unknown) {
+      spec.log("session_unreadable", { path, error: String(e) });
+      return [];
+    }
+  });
   const traces = rolledUp.length ? rolledUp : liveTraces(work);
   const lifecycle = until === "closed";
   let gates: Gates = {
