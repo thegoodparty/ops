@@ -53,8 +53,8 @@ tick. The grace test pins its clocks to literals for the same reason.
 ## The turn budget is the child's, and this is only the courier
 
 `BUGBOSS_MAX_TURNS` goes down in `buildChildEnv` beside the deadline and
-nothing here acts on it. That is deliberate: the count lives in the restored
-session file, which the dispatcher never reads, and the escalation has to
+nothing here enforces it. That is deliberate: the count lives in the restored
+session file, which the dispatcher reads only to resume a raised budget (below), and the escalation has to
 carry what the run spent — which the incident row only has as of the last
 tick's `rollUpUsage`, not as of the turn that spent the budget. So the child owns both halves. It counts, it escalates with live
 numbers, and it calls `park` so this does not relaunch it into the same
@@ -199,10 +199,20 @@ Boss message, and it costs a full agent launch each time round.
 Announcing is unconditional, though, because the failure on the other side is
 a permanent park nobody is watching. **Being told is not the same as being
 relaunched**: the thread notice for a held incident names the two things that
-actually move it, raising `BUGBOSS_MAX_TURNS` or taking the work over, and
+actually move it, raising the turn budget or taking the work over, and
 deliberately does not invite a reply, which is what the agent's own closing
-brief already promised. Nothing lifts such a wait automatically, so clearing
-one after the budget is raised is still a manual step.
+brief already promised.
+
+**Raising the budget lifts the wait on the next boot.** `liftRaisedBudgets`
+runs once per process, on the first tick and before the eligibility read: for
+each open incident with a budget wait, it reads the used turns off the synced
+session (`sessionTurns`) and, when they are under `agentMaxTurns`, deletes the
+wait, writes a `turn_budget_raised` action, then posts "The turn budget was
+raised to N, so the agent is resuming with M turns left." Once per process
+because the budget is a constant or an env var, so only a restart changes it.
+The used turns come from the session rather than the wait's text because a
+launch can overrun its budget, and a wait the new number still does not cover
+stays held. Lift and marker commit before the post, as with the sweep.
 
 The marker is itself activity, and that is the whole trick. The clock reads
 `incident_action`, so writing the marker resets the clock the sweep reads.

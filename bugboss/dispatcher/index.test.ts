@@ -2548,7 +2548,7 @@ describe("staleNotice", () => {
     const held = staleNotice(86_400, "held");
     assert.match(held, /still waiting/);
     assert.match(held, /turn budget for this incident is spent/);
-    assert.match(held, /BUGBOSS_MAX_TURNS/);
+    assert.match(held, /Raising the turn budget, which resumes it on the next deploy/);
     // The agent's closing brief already said replying will not restart it.
     // A nudge inviting one a day later would make that brief a lie.
     assert.equal(/\breply\b|\breplying\b/i.test(held), false, held);
@@ -2620,6 +2620,133 @@ describe("Dispatcher workspace sweep", () => {
     assert.ok(await trashEmptied(root));
 
     rmSync(root, { recursive: true, force: true });
+    cleanup();
+  });
+});
+
+describe("Dispatcher raised turn budget", () => {
+  const budgetWait = (sqlite: Database.Database, id: string, max: number) =>
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait
+           (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES (?, ?, NULL, 0, ?)`,
+      )
+      .run(id, `a person to decide what happens next; the ${max}-turn budget is spent`, T0 - 1000);
+
+  const waits = (db: DispatcherDb, id: string) =>
+    db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id]).length;
+
+  const setup = (turns: Record<string, number>) => {
+    const made = makeDb();
+    const { toolApiFor } = makeTools();
+    const launched: string[] = [];
+    const posts: { incidentId: string; text: string }[] = [];
+    const d = createDispatcher(
+      deps({
+        db: made.db,
+        config: config({ agentMaxTurns: 300 }),
+        spawn: async (ctx) => {
+          launched.push(ctx.incidentId);
+        },
+        toolApiFor,
+        postNotice: async (incidentId, text) => {
+          posts.push({ incidentId, text });
+        },
+        sessionTurns: async (ref) => turns[ref] ?? null,
+      }),
+    );
+    return { ...made, d, launched, posts };
+  };
+
+  it("lifts a wait parked on a 200 budget once the max is 300, and says so once", async () => {
+    const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 200 });
+    insertIncident(sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    budgetWait(sqlite, "i1", 200);
+
+    await (await d.tick()).settled;
+    await (await d.tick()).settled;
+
+    assert.equal(waits(db, "i1"), 0);
+    assert.ok(launched.includes("i1"), "the incident is runnable again");
+    assert.deepEqual(posts, [
+      {
+        incidentId: "i1",
+        text: "The turn budget was raised to 300, so the agent is resuming with 100 turns left.",
+      },
+    ]);
+    assert.equal(
+      db.query(
+        "SELECT id FROM incident_action WHERE incidentId = 'i1' AND action = 'turn_budget_raised'",
+      ).length,
+      1,
+    );
+    cleanup();
+  });
+
+  it("records the lift before posting, so a failed post loses nothing", async () => {
+    const made = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(made.sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    budgetWait(made.sqlite, "i1", 200);
+    let waitAtPost = -1;
+    const d = createDispatcher(
+      deps({
+        db: made.db,
+        config: config({ agentMaxTurns: 300 }),
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async () => {
+          waitAtPost = waits(made.db, "i1");
+          throw new Error("slack down");
+        },
+        sessionTurns: async () => 270,
+      }),
+    );
+
+    const alarms = await captureAlarms(async () => {
+      await (await d.tick()).settled;
+    });
+
+    assert.equal(waitAtPost, 0, "the wait was gone before the post was attempted");
+    assert.ok(alarms.includes("budget_notice_failed"));
+    made.cleanup();
+  });
+
+  it("holds a spent wait whose used turns still reach the max", async () => {
+    const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 300, "s/i2": 320 });
+    insertIncident(sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    insertIncident(sqlite, "i2", { status: "INVESTIGATING", sessionRef: "s/i2" });
+    budgetWait(sqlite, "i1", 300);
+    budgetWait(sqlite, "i2", 200);
+
+    await (await d.tick()).settled;
+
+    assert.equal(waits(db, "i1"), 1);
+    assert.equal(waits(db, "i2"), 1);
+    assert.deepEqual(launched, []);
+    assert.deepEqual(posts, []);
+    cleanup();
+  });
+
+  it("leaves closed incidents and waits on anything else alone", async () => {
+    const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 200, "s/i2": 10 });
+    insertIncident(sqlite, "i1", { status: "CLOSED", sessionRef: "s/i1" });
+    insertIncident(sqlite, "i2", { status: "FIXING", sessionRef: "s/i2" });
+    budgetWait(sqlite, "i1", 200);
+    sqlite
+      .prepare(
+        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+         VALUES ('i2', 'a person to approve the PR', NULL, 0, ?)`,
+      )
+      .run(T0 - 1000);
+
+    await (await d.tick()).settled;
+
+    assert.equal(waits(db, "i1"), 1);
+    assert.equal(waits(db, "i2"), 1);
+    assert.deepEqual(launched, []);
+    assert.deepEqual(posts, []);
     cleanup();
   });
 });

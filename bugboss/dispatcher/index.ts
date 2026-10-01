@@ -87,6 +87,13 @@ export const STALE_AFTER_SECONDS = 86_400;
  */
 export const STALE_SWEPT_ACTION = "stale_swept";
 
+/** The `incident_action` written when a raised turn budget lifts a budget wait. */
+export const BUDGET_RAISED_ACTION = "turn_budget_raised";
+
+/** What the thread is told when a raised budget resumes a spent incident. */
+export const budgetRaisedNotice = (max: number, used: number): string =>
+  `The turn budget was raised to ${max}, so the agent is resuming with ${max - used} turns left.`;
+
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
   tickSeconds: 30,
@@ -131,6 +138,13 @@ export interface DispatcherDeps {
    * gap falls back to what the database recorded.
    */
   lastSessionEventAt?: (sessionRef: string) => Promise<number | null>;
+  /**
+   * Turns an incident's synced session has spent, or null when there is no
+   * session. Read at boot for incidents parked on a spent turn budget, to
+   * learn whether a raised budget gives them turns back. Absent, nothing
+   * lifts such a wait.
+   */
+  sessionTurns?: (sessionRef: string) => Promise<number | null>;
   /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
   childBaseEnv?: Record<string, string | undefined>;
   /**
@@ -381,7 +395,7 @@ export const staleNotice = (
     outcome === "unparked"
       ? "It was waiting on somebody and nobody came back, so it is no longer waiting: an agent will pick it up again and carry on from where it stopped."
       : outcome === "held"
-        ? "It is still waiting, and this notice does not change that: the turn budget for this incident is spent, and time passing does not add turns. Raising BUGBOSS_MAX_TURNS or picking the work up yourself are the two things that move it."
+        ? "It is still waiting, and this notice does not change that: the turn budget for this incident is spent, and time passing does not add turns. Raising the turn budget, which resumes it on the next deploy, or picking the work up yourself are the two things that move it."
         : "An agent still has it and will pick it up again; quiet this long usually means something is stuck rather than in progress.",
   ].join(" ");
 };
@@ -411,6 +425,9 @@ export class Dispatcher {
   private readonly childBaseEnv: Record<string, string | undefined>;
   private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
   private readonly lastSessionEventAt: ((sessionRef: string) => Promise<number | null>) | null;
+  private readonly sessionTurns: ((sessionRef: string) => Promise<number | null>) | null;
+  /** Budget waits are checked once per process: only a deploy changes the budget. */
+  private budgetsChecked = false;
   private readonly fastFailureMs: number;
   private readonly maxLaunches: number;
   private readonly parkCooldownMs: number;
@@ -464,6 +481,7 @@ export class Dispatcher {
     this.childBaseEnv = deps.childBaseEnv ?? {};
     this.postNotice = deps.postNotice ?? null;
     this.lastSessionEventAt = deps.lastSessionEventAt ?? null;
+    this.sessionTurns = deps.sessionTurns ?? null;
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
@@ -555,6 +573,11 @@ export class Dispatcher {
     // Before the launch loop, so a workspace is out of the way before
     // anything could start into it.
     await this.sweepWorkspaces();
+    // Before the eligibility read, so an incident it lifts launches this tick.
+    if (!this.budgetsChecked) {
+      this.budgetsChecked = true;
+      await this.liftRaisedBudgets(now);
+    }
 
     const eligible = this.db.query<EligibleRow>(ELIGIBLE_SQL, [now]);
     const started: RunningAgent[] = [];
@@ -861,6 +884,80 @@ export class Dispatcher {
       );
     }
     return swept;
+  };
+
+  /**
+   * Resume incidents parked on a turn budget that has since been raised.
+   *
+   * A budget wait is the one park nothing else lifts: not a reply, not the
+   * cooldown, not the stale sweep. That is right while the budget stands, and
+   * wrong once it rises above what the incident spent, because then it has
+   * turns again and the park is holding back work it could do. The budget is
+   * a constant or an environment variable, so it only changes on a restart,
+   * and once per process is enough.
+   *
+   * Turns are read from the session, not from the wait's text, because a
+   * launch can overrun the budget it parked on (incident 80 sat at 270 of
+   * 200), and a wait the new budget still does not cover must stay held.
+   *
+   * Lift and marker commit before the post, so a failed post never leaves a
+   * notice for a lift that did not happen. The delete is guarded on the wait
+   * it read, so a wait rewritten in between is left alone.
+   */
+  private liftRaisedBudgets = async (now: number): Promise<void> => {
+    if (!this.sessionTurns) return;
+    const max = this.config.agentMaxTurns;
+    const rows = this.db.query<{ id: string; sessionRef: string | null; startedAt: number }>(
+      `SELECT i.id AS id, i.sessionRef AS sessionRef, w.startedAt AS startedAt
+       FROM incident i
+       JOIN incident_wait w ON w.incidentId = i.id
+       WHERE i.status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
+         AND w.liftsOnReply = 0
+         AND w.waitingFor LIKE '%-turn budget%'`,
+    );
+    for (const row of rows) {
+      if (this.running.has(row.id) || !row.sessionRef) continue;
+      let used: number | null;
+      try {
+        used = await this.sessionTurns(row.sessionRef);
+      } catch (err) {
+        alarm("budget_check_failed", { incidentId: row.id, error: String(err) });
+        continue;
+      }
+      if (used === null || used >= max) continue;
+
+      const lifted = await this.db.withWrite((db) => {
+        const deleted = db
+          .prepare(
+            "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 0 AND startedAt = ?",
+          )
+          .run(row.id, row.startedAt);
+        if (deleted.changes !== 1) return false;
+        db.prepare(
+          `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+           VALUES (?, 'boss', NULL, ?, ?, ?)`,
+        ).run(
+          row.id,
+          BUDGET_RAISED_ACTION,
+          `turn budget raised to ${max} with ${used} turns used`,
+          now,
+        );
+        return true;
+      });
+      if (!lifted) continue;
+
+      log("turn_budget_raised", { incidentId: row.id, used, max });
+      if (!this.postNotice) {
+        alarm("budget_notice_undeliverable", {
+          incidentId: row.id,
+          note: "no thread poster is wired in, so nobody watching this incident was told it resumed",
+        });
+        continue;
+      }
+      await this.postNotice(row.id, budgetRaisedNotice(max, used)).catch((err: unknown) =>
+        alarm("budget_notice_failed", { incidentId: row.id, error: String(err) }),
+      );
+    }
   };
 
   private launch = async (row: EligibleRow, now: number): Promise<Entry> => {

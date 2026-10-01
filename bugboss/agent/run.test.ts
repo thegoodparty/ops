@@ -1037,7 +1037,7 @@ test("the brief does not promise that replying will continue the work", () => {
     usage: { ...emptySessionUsage(), turns: 200 },
   });
 
-  assert.match(brief, /raise BUGBOSS_MAX_TURNS or pick it up themselves/);
+  assert.match(brief, /raise the turn budget, which resumes it on the next deploy, or pick it up themselves/);
   assert.match(brief, /neither a reply in the thread nor a message to me will restart it/);
   assert.doesNotMatch(
     brief,
@@ -1128,6 +1128,30 @@ test("a relaunch with the budget spent makes no model request and still parks", 
   const brief = turnBudgetBrief(exhausted[0]);
   assert.match(brief, /already spent when this launch started, so I stopped before taking a turn/);
   assert.match(brief, /nothing yet on this launch/);
+});
+
+test("the incident agent's turn budget is 300", () => {
+  assert.equal(INCIDENT_AGENT_MAX_TURNS, 300);
+});
+
+test("a relaunch at 250 of 300 turns makes a model request", async () => {
+  // Incidents parked at 200 resume once the budget is 300, and the first
+  // launch back must work rather than stop on the old number.
+  const budget = createTurnBudget({
+    prior: { ...emptySessionUsage(), turns: 250 },
+    maxTurns: INCIDENT_AGENT_MAX_TURNS,
+    graceTurns: TURN_BUDGET_GRACE_TURNS,
+    onGrace: () => assert.fail("250 of 300 is outside the grace"),
+    onExhausted: () => assert.fail("250 of 300 is not spent"),
+  });
+  let requests = 0;
+
+  await promptWithinBudget(budget, async () => {
+    requests += 1;
+  });
+
+  assert.equal(requests, 1);
+  assert.equal(budget.exhausted(), false);
 });
 
 test("a budget spent to the turn at launch is spent, not one turn short", async () => {
