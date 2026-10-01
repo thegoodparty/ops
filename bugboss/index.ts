@@ -2065,9 +2065,6 @@ export const createBugBoss = async (
       ...(process.env.BUGBOSS_GOAL_MODEL_ID
         ? { BUGBOSS_GOAL_MODEL_ID: process.env.BUGBOSS_GOAL_MODEL_ID }
         : {}),
-      ...(process.env.BUGBOSS_STAGE_TURNS
-        ? { BUGBOSS_STAGE_TURNS: process.env.BUGBOSS_STAGE_TURNS }
-        : {}),
       ...(config.inferenceProfiles
         ? { BUGBOSS_INFERENCE_PROFILES: config.inferenceProfiles }
         : {}),

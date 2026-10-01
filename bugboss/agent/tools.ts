@@ -500,22 +500,7 @@ export interface MonitorDeps {
   /** Where a command runs: the checkout, so a check script can use git and relative paths. */
   cwd?: string;
   settleSeconds?: number;
-  /**
-   * The stage-goal check before a person is asked to merge. Null lets the
-   * wait start; a string is returned instead of waiting.
-   */
-  checkIn?: MergeCheckIn;
 }
-
-/**
- * `known` says the ask is structurally a merge -- a wait on a person to close
- * a PR -- so a check-in already met at this stage covers it, and a re-armed
- * wait every 55 minutes is not judged again.
- */
-export type MergeCheckIn = (
-  ask: string,
-  options?: { known?: boolean },
-) => Promise<{ text: string; stop: boolean } | null>;
 
 export interface MonitorArgs extends ConditionArgs {
   intervalSeconds: number;
@@ -781,6 +766,9 @@ export interface DirectivePeek {
   peekDirectives(): Promise<PendingDirective[]>;
   consumeDirective(id: number): Promise<void>;
 }
+
+/** The stage-goal check before a person is asked to merge. Null lets the message go out. */
+export type MergeCheckIn = (ask: string) => Promise<string | null>;
 
 export interface MessageBossDeps {
   marker: QuestionMarkerPort;
@@ -1093,19 +1081,6 @@ export const createMonitorTool = async (
           details: { timedOut: false, rejected: true },
         };
       }
-      if (deps.checkIn && args.condition === "pr_closed" && args.awaitingHuman) {
-        const blocked = await deps.checkIn(
-          `The agent is about to wait for a person to merge ${args.pr}. What it asks of them: ${args.awaitingHuman}`,
-          { known: true },
-        );
-        if (blocked) {
-          return {
-            content: [{ type: "text", text: `Not waiting, and nobody was asked. ${blocked.text}` }],
-            details: { timedOut: false, rejected: true },
-            terminate: blocked.stop,
-          };
-        }
-      }
       const interrupt = deps.waitSignal?.();
       const result = await runMonitor(args, {
         ...deps,
@@ -1210,9 +1185,8 @@ export const createMessageBossTool = async (
             );
         if (blocked) {
           return {
-            content: [{ type: "text", text: `Not sent to the Boss. ${blocked.text}` }],
+            content: [{ type: "text", text: `Not sent to the Boss. ${blocked}` }],
             details: { timedOut: false },
-            terminate: blocked.stop,
           };
         }
       }

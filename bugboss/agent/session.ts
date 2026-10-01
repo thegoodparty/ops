@@ -430,12 +430,6 @@ export type ExitReason =
    * passed.
    */
   | "turns_exhausted"
-  /**
-   * A stage goal stopped the run: its turn bound ran out, the agent stopped
-   * making progress on it, or it was judged impossible. The Boss was told
-   * and the incident parked until a person answers.
-   */
-  | "goal_parked"
   /** Pi reported an error on the last turn. */
   | "turn_error"
   /** SIGTERM or SIGINT reached the child before it was done. */
@@ -460,7 +454,6 @@ export const isStoredExit = (value: unknown): value is StoredExit => {
     "completed",
     "timed_out",
     "turns_exhausted",
-    "goal_parked",
     "turn_error",
     "signal",
   ];

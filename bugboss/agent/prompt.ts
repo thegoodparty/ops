@@ -699,7 +699,7 @@ question in front of you, when it is in front of you.
 
 const GATES = `## How your gates are judged
 
-A model judges gates, merge asks and stops on your transcript alone:
+A model judges your gates and merge asks on your transcript alone:
 surface the evidence first.
 
 Root cause:

@@ -7,24 +7,9 @@ import { describe, test } from "node:test";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 
 import { createPiModelClient } from "../bedrock/client";
-import type {
-  GoalContext,
-  IncidentStatus,
-  TimelineEvent,
-  ToolApi,
-  ToolResponse,
-} from "../types";
-import {
-  createGoalEvaluator,
-  createStageGoals,
-  goalStopExtension,
-  GOAL_MESSAGE_TYPE,
-  GOALS,
-  parseStageTurns,
-  stageFor,
-  type GoalStage,
-} from "./goals";
-import { createBossTools, exitCodeFor, startWithinBudget } from "./run";
+import type { GoalContext, IncidentStatus, TimelineEvent, ToolApi, ToolResponse } from "../types";
+import { createGoalEvaluator, createStageGoals, GOALS } from "./goals";
+import { createBossTools, startWithinBudget } from "./run";
 import { sumSessionUsage } from "./session";
 import { createMessageBossTool } from "./tools";
 
@@ -50,17 +35,14 @@ const MERGED: TimelineEvent = {
 /**
  * A real Pi session with two stand-in models: the agent, scripted turn by
  * turn, and the evaluator, a function of what it is shown. Everything between
- * them -- the tool calls, the gate, the stop hook, the steered reason landing
- * in the agent's next request -- is the production code.
+ * them -- the tool calls, the gate, the reason landing in the agent's next
+ * request -- is the production code.
  */
 const runGoals = async (args: {
   status?: IncidentStatus;
   timeline?: TimelineEvent[];
-  bounds?: Record<GoalStage, number>;
   /** What the stand-in `run_query` tool returns, in call order. */
   queries?: string[];
-  /** How many report_root_cause calls the tool API refuses first. */
-  rootCauseRefusals?: number;
   judge: (body: string) => Verdict;
   turns: (kit: typeof import("@earendil-works/pi-ai")) => unknown[];
 }) => {
@@ -105,7 +87,6 @@ const runGoals = async (args: {
     reportRootCause: 0,
     reportResolved: 0,
     reportAnalysis: 0,
-    park: [] as { waitingFor: string; liftsOnReply?: boolean }[],
     told: [] as { kind: string; text: string }[],
     verdicts: [] as { gate: string; verdict: string; reason: string }[],
   };
@@ -114,9 +95,6 @@ const runGoals = async (args: {
   const api = {
     reportRootCause: async () => {
       calls.reportRootCause += 1;
-      if (calls.reportRootCause <= (args.rootCauseRefusals ?? 0)) {
-        return { ok: false, error: "the incident moved", directives: [] } as ToolResponse<never>;
-      }
       return ok();
     },
     reportResolved: async () => {
@@ -125,10 +103,6 @@ const runGoals = async (args: {
     },
     reportAnalysis: async () => {
       calls.reportAnalysis += 1;
-      return ok();
-    },
-    park: async (park: { waitingFor: string; liftsOnReply?: boolean }) => {
-      calls.park.push(park);
       return ok();
     },
     getIncident: async () => ok({ signals: [SIGNAL] }),
@@ -152,7 +126,6 @@ const runGoals = async (args: {
     timeline: args.timeline ?? [],
   };
 
-  let live: import("@earendil-works/pi-coding-agent").AgentSession | null = null;
   let manager: import("@earendil-works/pi-coding-agent").SessionManager | null = null;
   const logs: { event: string; fields: Record<string, unknown> }[] = [];
   const goals = createStageGoals({
@@ -165,16 +138,9 @@ const runGoals = async (args: {
     recordVerdict: async (verdict) => {
       calls.verdicts.push(verdict);
     },
-    tellBoss: (text) => tellBoss("escalation", text),
-    park: (park) => api.park(park),
-    pendingQuestion: async () => null,
+    escalate: (reason, brief) => tellBoss("escalation", `${reason}\n\n${brief}`),
     session: () => manager,
     toMessages: (messages) => pi.convertToLlm(messages as Parameters<typeof pi.convertToLlm>[0]),
-    abort: async () => {
-      await live?.abort();
-    },
-    wrappingUp: () => false,
-    ...(args.bounds ? { bounds: args.bounds } : {}),
     log: (event, fields) => logs.push({ event, fields }),
     alarm: (event, fields) => logs.push({ event, fields }),
   });
@@ -195,9 +161,6 @@ const runGoals = async (args: {
       api,
       boss: { tellBoss: (kind, text) => tellBoss(kind, text) },
       goals,
-      onTimelineEvent: (kind) => {
-        if (kind === "fix_merged") goals.merged();
-      },
     })),
     await createMessageBossTool({
       marker: {
@@ -224,7 +187,6 @@ const runGoals = async (args: {
     noPromptTemplates: true,
     systemPromptOverride: () => "You are a test agent.",
     appendSystemPromptOverride: () => [],
-    extensionFactories: [goals.extension, goalStopExtension(goals)],
   });
   await resourceLoader.reload();
 
@@ -239,12 +201,9 @@ const runGoals = async (args: {
     settingsManager: settings,
     sessionManager: manager,
   });
-  live = session;
 
-  goals.start(context);
   await startWithinBudget({
     budget: { stopIfSpent: async () => false },
-    goals,
     stages: { resume: async () => {} },
     session,
     message: "Incident 94 is yours.",
@@ -274,7 +233,7 @@ const sections = (body: string) => {
   return {
     gate: text.slice(at("# The goal: "), at("# What the agent is doing now")),
     attempt: text.slice(at("# What the agent is doing now"), at("# The incident record")),
-    transcript: text.slice(at("# The agent's conversation in this stage")),
+    transcript: text.slice(at("# The agent's conversation since its last compaction")),
   };
 };
 
@@ -305,53 +264,64 @@ describe("stage goals, through a real Pi session", () => {
 
     assert.equal(run.calls.reportRootCause, 1, "the transition ran once, on the met verdict");
     assert.match(run.agentRequests[1], /NOT MET, nothing changed: Nothing shows what happened to a user/);
+    assert.match(
+      run.agentRequests[1],
+      /comprehensive picture of what went wrong for an actual human user/,
+      "the goal text comes back with the reason",
+    );
     assert.deepEqual(
       run.calls.verdicts.filter((v) => v.gate === "root_cause").map((v) => v.verdict),
       ["not_met", "met"],
       "every verdict reaches the timeline",
     );
-    assert.equal(run.goals.stage(), "fixing");
     assert.match(run.evaluatorBodies[0], /POST \/v1\/payments\/events returned 5xx/, "the evaluator sees the signals");
     assert.match(run.evaluatorBodies[0], /that 502 is what paged/, "and the claim it is judging, whole");
   });
 
-  test("resolved is rejected without a post-deploy replay, then without follow-ups done", async () => {
+  test("resolved is rejected until the deploy, the replay, the repairs and the follow-ups are all shown", async () => {
+    const evidence = [
+      ["release run 1187 succeeded on merge commit 4f2a", "No release run is shown succeeding for the merge commit of omni#2265."],
+      ["Replay against deployed sha 4f2a", "No replay of the impacted users' path against the deployed commit."],
+      ["Refunded 3 charges in Stripe", "The 3 charged candidates are not shown refunded."],
+      ["release run 1188 succeeded on omni#2270", "Follow-up omni#2270 is not shown merged and deployed."],
+    ];
     const run = await runGoals({
       status: "FIXING",
       timeline: [MERGED],
-      queries: [
-        "Replay against deployed sha 4f2a: a draft with a bit.ly link is refused before checkout; no charge.",
-        "Follow-up omni#2270 (pre-payment gate for MMS) merged at 21:02; release run 1188 succeeded on its merge commit.",
-      ],
-      judge: (body) =>
-        !sections(body).transcript.includes("Replay against deployed")
-          ? verdict("not_met", "No replay of the impacted users' path against the deployed commit.")
-          : !sections(body).transcript.includes("release run 1188 succeeded")
-            ? verdict("not_met", "Follow-up omni#2270 is not shown merged and deployed.")
-            : verdict("met", "Replay and follow-up shown."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(
-          fauxToolCall("report_resolved", { prUrls: ["https://github.com/thegoodparty/omni/pull/2265"], evidence: "the alert has been quiet for an hour" }),
-        ),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "replay" })),
-        fauxAssistantMessage(
-          fauxToolCall("report_resolved", { prUrls: ["https://github.com/thegoodparty/omni/pull/2265"], evidence: "replayed" }),
-        ),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "follow-up" })),
-        fauxAssistantMessage(
-          fauxToolCall("report_resolved", { prUrls: ["https://github.com/thegoodparty/omni/pull/2265"], evidence: "replayed, follow-up shipped" }),
-        ),
-        fauxAssistantMessage("done"),
-      ],
+      queries: evidence.map(([shown]) => shown),
+      judge: (body) => {
+        const missing = evidence.find(([shown]) => !sections(body).transcript.includes(shown));
+        return missing
+          ? verdict("not_met", missing[1])
+          : verdict("met", "Deploy, replay, repairs and follow-up all shown.");
+      },
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => {
+        const resolve = (text: string) =>
+          fauxAssistantMessage(
+            fauxToolCall("report_resolved", { prUrls: ["https://github.com/thegoodparty/omni/pull/2265"], evidence: text }),
+          );
+        return [
+          resolve("the alert has been quiet for an hour"),
+          ...evidence.flatMap(([shown]) => [
+            fauxAssistantMessage(fauxToolCall("run_query", { query: shown })),
+            resolve(`shown: ${shown}`),
+          ]),
+          fauxAssistantMessage("done"),
+        ];
+      },
     });
 
-    assert.equal(run.calls.reportResolved, 1);
-    assert.match(run.agentRequests[1], /No replay of the impacted users' path/);
-    assert.match(run.agentRequests[3], /Follow-up omni#2270 is not shown merged and deployed/);
-    assert.equal(run.goals.stage(), "closing");
+    assert.equal(run.calls.reportResolved, 1, "only the last attempt ran the transition");
+    evidence.forEach(([, reason], i) => {
+      assert.ok(run.agentRequests[1 + 2 * i].includes(reason), `refused for: ${reason}`);
+    });
+    assert.deepEqual(
+      run.calls.verdicts.map((v) => v.verdict),
+      ["not_met", "not_met", "not_met", "not_met", "met"],
+    );
   });
 
-  test("closing is rejected while the post-mortem leaves follow-up work on this incident", async () => {
+  test("closing is rejected while the post-mortem lists follow-up work on this incident, and accepts practice-level prevention", async () => {
     const sections_ = (resolutionActions: string[]) => ({
       atAGlance: "Candidates were charged for sends that never went out. Fixed.",
       timeline: [{ at: "2026-09-30T19:02:11Z", event: "first refused send" }],
@@ -384,8 +354,6 @@ describe("stage goals, through a real Pi session", () => {
     assert.equal(run.calls.reportAnalysis, 1);
     assert.match(run.agentRequests[1], /follow-up work on this incident; ship it/);
     assert.match(run.evaluatorBodies[1], /test pattern for every paid flow/, "practice-level prevention reaches the evaluator and passes");
-    assert.equal(run.goals.stage(), null, "a closed incident has no stage, so its last message is not judged");
-    assert.equal(run.evaluatorBodies.length, 2, "and no stop was evaluated after it");
   });
 
   test("the merge check-in holds the ask while delegate's last verdict is not approve", async () => {
@@ -393,9 +361,7 @@ describe("stage goals, through a real Pi session", () => {
       status: "FIXING",
       queries: ["delegate-reviewer on 9c1e: request changes", "delegate-reviewer on 3b7d: APPROVED; checks green"],
       judge: (body) =>
-        !sections(body).gate.includes("Before asking a person to merge")
-          ? verdict("not_met", "Wait for the merge.")
-          : sections(body).transcript.includes("APPROVED")
+        sections(body).transcript.includes("APPROVED")
           ? verdict("met", "Approved on the head commit, CI green.")
           : verdict("not_met", "delegate-reviewer's last verdict on the head commit is request changes."),
       turns: ({ fauxAssistantMessage, fauxToolCall }) => [
@@ -403,7 +369,7 @@ describe("stage goals, through a real Pi session", () => {
         fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
         fauxAssistantMessage(fauxToolCall("run_query", { query: "reviews again" })),
         fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
-        fauxAssistantMessage(fauxToolCall("park", { waitingFor: "a merge of omni#2265" })),
+        fauxAssistantMessage("done"),
       ],
     });
 
@@ -416,253 +382,50 @@ describe("stage goals, through a real Pi session", () => {
     );
   });
 
-  test("a stop attempt with the goal not met continues the run with the reason", async () => {
+  test("a message that asks nobody to merge goes out, and records no verdict", async () => {
     const run = await runGoals({
-      queries: ["2 candidates charged with no send"],
-      judge: (body) =>
-        !sections(body).gate.includes("report_root_cause")
-          ? verdict("not_met", "Now fix it.")
-          : sections(body).transcript.includes("candidates charged")
-          ? verdict("met", "User harm shown.")
-          : verdict("not_met", "You have not shown who was harmed; query for charges with no send."),
+      status: "FIXING",
+      judge: () => verdict("not_applicable", "A status update, not a merge ask."),
       turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage("I think the 502 is the bug and I am done."),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "charged with no send" })),
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "charged before the send was checked", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("root cause reported"),
+        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Root cause found; writing the fix now." })),
+        fauxAssistantMessage("done"),
       ],
     });
 
-    assert.match(run.agentRequests[1], /Do not stop yet: the goal for this stage is not met\. You have not shown who was harmed/);
-    assert.ok(run.raw.includes(GOAL_MESSAGE_TYPE), "the reason is in the session, so a restart keeps it");
-    assert.equal(run.calls.reportRootCause, 1);
-    assert.equal(run.goals.stage(), "fixing");
+    assert.equal(run.evaluatorBodies.length, 1, "premise: the evaluator was asked");
+    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 1);
+    assert.equal(run.calls.verdicts.length, 0);
   });
 
-  test("park is a stop attempt too, and is refused while the goal is not met", async () => {
-    const run = await runGoals({
-      judge: () => verdict("not_met", "Nothing is waiting on a person; keep investigating."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("park", { waitingFor: "someone to look" })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "q" })),
-        fauxAssistantMessage(fauxToolCall("escalate", { reason: "stuck", brief: "b" })),
-      ],
-      bounds: { investigating: 3, fixing: 60, verifying: 40, closing: 20 },
-    });
-    assert.match(run.agentRequests[1], /Not parked\. Do not stop yet/);
-  });
-
-  test("impossible escalates to the Boss and parks", async () => {
+  test("impossible escalates through escalate, and the agent keeps working", async () => {
     const run = await runGoals({
       judge: () => verdict("impossible", "Only Stripe support can say which charges were refunded; a person has to ask them."),
       turns: ({ fauxAssistantMessage, fauxToolCall }) => [
         fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("should not run"),
+        fauxAssistantMessage("still here"),
       ],
     });
 
-    assert.equal(run.calls.reportRootCause, 0);
+    assert.equal(run.calls.reportRootCause, 0, "the transition did not run");
     assert.equal(run.calls.told.length, 1);
     assert.equal(run.calls.told[0].kind, "escalation");
     assert.match(run.calls.told[0].text, /Only Stripe support can say/);
-    assert.deepEqual(run.calls.park.map((p) => p.liftsOnReply), [true], "a reply is exactly what should restart it");
-    assert.equal(run.agentRequests.length, 1, "the gate ended the run");
-    assert.ok(run.goals.handedOff());
+    assert.match(run.agentRequests[1], /IMPOSSIBLE, nothing changed: Only Stripe support.*The Boss has it as an escalation/s);
+    assert.deepEqual(run.calls.verdicts.map((v) => v.verdict), ["impossible"]);
   });
 
-  test("the stage's turn bound escalates with the last reason and stops the run", async () => {
+  test("an evaluator that fails passes the gate, with an alarm", async () => {
     const run = await runGoals({
-      bounds: { investigating: 3, fixing: 60, verifying: 40, closing: 20 },
-      judge: () => verdict("not_met", "No user harm shown yet."),
+      judge: () => ({ verdict: "maybe", reason: "" }),
       turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "the 502", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "a" })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "b" })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "c" })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "d" })),
-      ],
-    });
-
-    assert.equal(run.agentRequests.length, 3, "nothing after the third turn");
-    assert.equal(run.calls.told.length, 1);
-    assert.match(run.calls.told[0].text, /investigating stage has used its 3 turns/);
-    assert.match(run.calls.told[0].text, /No user harm shown yet/, "with the last not-met reason");
-    assert.equal(run.calls.park.length, 1);
-    assert.equal(
-      exitCodeFor({ sessionFile: undefined, restored: false, timedOut: false, turnsExhausted: false, goalParked: true, error: run.error }),
-      0,
-      "a bound doing its job is not an agent failure",
-    );
-  });
-
-  test("repeated stops with no work between them hand off instead of looping", async () => {
-    const run = await runGoals({
-      judge: () => verdict("not_met", "Show user harm."),
-      turns: ({ fauxAssistantMessage }) => [
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("still done"),
-        fauxAssistantMessage("really done"),
-        fauxAssistantMessage("never reached"),
-      ],
-    });
-
-    assert.equal(run.agentRequests.length, 3);
-    assert.equal(run.calls.told.length, 1);
-    assert.match(run.calls.told[0].text, /3 times in a row/);
-    assert.equal(run.calls.park.length, 1);
-  });
-
-  test("a met stop is told to record it, and never counts toward the hand-off", async () => {
-    let n = 0;
-    const run = await runGoals({
-      judge: () => {
-        n += 1;
-        return n <= 2 ? verdict("not_met", "Show user harm.") : verdict("met", "Harm shown.");
-      },
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
         fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "q" })),
+        fauxAssistantMessage("done"),
       ],
     });
 
-    assert.match(run.agentRequests[3], /judged met: record it with report_root_cause/);
     assert.equal(run.calls.reportRootCause, 1);
-    assert.equal(run.calls.told.length, 0, "nobody was told it fell short");
-  });
-
-  test("a met gate the tool API refuses still counts as progress", async () => {
-    let n = 0;
-    const run = await runGoals({
-      rootCauseRefusals: 1,
-      judge: () => {
-        n += 1;
-        // Not a verdict after the fourth, so the fifth stop is let through
-        // unjudged and the run ends there.
-        return n === 3
-          ? verdict("met", "Harm shown.")
-          : n <= 4
-            ? verdict("not_met", "Show user harm.")
-            : verdict("unparseable", "x");
-      },
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-      ],
-    });
-
-    assert.equal(run.calls.reportRootCause, 1, "the evaluator passed it and the tool API refused it");
-    assert.equal(run.calls.told.length, 0, "the not-met after it is the first of a new streak, not the third");
-  });
-
-  test("a met stop breaks a not-met streak", async () => {
-    let n = 0;
-    const run = await runGoals({
-      judge: () => {
-        n += 1;
-        return n === 3
-          ? verdict("met", "Harm shown.")
-          : n <= 4
-            ? verdict("not_met", "Show user harm.")
-            : verdict("unparseable", "x");
-      },
-      turns: ({ fauxAssistantMessage }) => [
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-      ],
-    });
-
-    assert.deepEqual(
-      run.calls.verdicts.slice(0, 4).map((v) => v.verdict),
-      ["not_met", "not_met", "met", "not_met"],
-      "premise: two refused stops, a met stop, then a refused stop",
-    );
-    assert.ok(
-      !run.calls.told.some((told) => /in a row/.test(told.text)),
-      "the not-met after the met stop is the first of a new streak, not the third",
-    );
-  });
-
-  test("a passed merge check-in breaks a not-met streak, even inside one turn", async () => {
-    let judged = 0;
-    const run = await runGoals({
-      status: "FIXING",
-      // Not a verdict after the park's, so later stops are let through and
-      // the only hand-off that could happen is the one under test.
-      judge: (body) =>
-        ++judged > 4
-          ? verdict("unparseable", "x")
-          : sections(body).gate.includes("Before asking a person to merge")
-            ? verdict("met", "Approved and green.")
-            : verdict("not_met", "Wait for the merge."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage("done"),
-        fauxAssistantMessage("done"),
-        // The check-in passes, then the park in the same batch is refused:
-        // one not-met after a pass, not the third of a streak.
-        fauxAssistantMessage([
-          fauxToolCall("message_boss", { message: "Please merge omni#2265." }),
-          fauxToolCall("park", { waitingFor: "the merge" }),
-        ]),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "q" })),
-      ],
-    });
-
-    assert.deepEqual(
-      run.calls.verdicts.slice(0, 4).map((v) => [v.gate, v.verdict]),
-      [
-        ["resolved", "not_met"],
-        ["resolved", "not_met"],
-        ["merge_check_in", "met"],
-        ["resolved", "not_met"],
-      ],
-      "two refused stops, a passed check-in, then the refused park",
-    );
-    assert.ok(
-      !run.calls.told.some((told) => /in a row/.test(told.text)),
-      "no hand-off for a streak the passed check-in broke",
-    );
-    assert.equal(run.calls.park.length, 0);
-  });
-
-  test("an impossible merge check-in ends the run as well as parking it", async () => {
-    const run = await runGoals({
-      status: "FIXING",
-      judge: () => verdict("impossible", "The fix needs a Stripe dashboard setting only a person can change."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please merge omni#2265." })),
-        fauxAssistantMessage(fauxToolCall("report_resolved", { prUrls: [], evidence: "x" })),
-      ],
-    });
-
-    assert.equal(run.agentRequests.length, 1, "nothing ran after the hand-off");
-    assert.equal(run.calls.reportResolved, 0);
-    assert.equal(run.calls.park.length, 1);
-    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 0);
-  });
-
-  test("refused parks are not progress, so three of them hand off", async () => {
-    const run = await runGoals({
-      judge: () => verdict("not_met", "Nothing is waiting on a person."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("park", { waitingFor: "a" })),
-        fauxAssistantMessage(fauxToolCall("park", { waitingFor: "b" })),
-        fauxAssistantMessage(fauxToolCall("park", { waitingFor: "c" })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "never" })),
-      ],
-    });
-
-    assert.equal(run.agentRequests.length, 3);
-    assert.equal(run.calls.told.length, 1);
-    assert.match(run.calls.told[0].text, /3 times in a row/);
+    assert.ok(run.logs.some((log) => log.event === "goal_unjudged"));
+    assert.deepEqual(run.calls.verdicts.map((v) => v.verdict), ["unjudged"]);
   });
 
   test("the evaluator's tokens count in the incident's usage, and not as turns", async () => {
@@ -684,124 +447,37 @@ describe("stage goals, through a real Pi session", () => {
   });
 });
 
-test("a stage whose marker cannot be written is anchored at the branch's newest entry", async () => {
-  const branch: { type: string; id: string; customType?: string; data?: unknown; message?: { role?: string } }[] = [];
-  // Shaped like Pi's: every branch entry projects, custom ones with no messages.
-  const said: Record<string, string> = { e1: "investigation evidence", e2: "the gate call", e3: "fixing work" };
-  const projection = () => {
-    const entries = branch.map((entry) => ({
-      sourceEntry: entry,
-      messages: said[entry.id] ? [{ role: "user", content: said[entry.id], timestamp: 0 }] : [],
-    }));
-    return { entries, messages: entries.flatMap((entry) => entry.messages) };
-  };
-  let failWrites = false;
-  const session = {
-    getBranch: () => branch,
-    buildSessionProjection: projection,
-    appendCustomEntry: (customType: string, data?: unknown) => {
-      if (failWrites) throw new Error("disk full");
-      const id = `c${branch.length}`;
-      branch.push({ type: "custom", id, customType, data });
-      return id;
+test("a transcript over the evaluator's window drops its oldest messages whole and says how many", async () => {
+  let body = "";
+  const evaluate = createGoalEvaluator({
+    client: {
+      complete: async (request) => {
+        body = JSON.stringify(request.messages);
+        return { text: '{"verdict": "met", "reason": "ok"}', usage: null } as never;
+      },
     },
-  };
-  const seen: string[][] = [];
-  const goals = createStageGoals({
-    evaluate: async (input) => {
-      seen.push(input.transcript.map((message) => String(message.content)));
-      return { judgement: "met", reason: "ok", usage: null };
-    },
-    context: async () => ({
+    contextWindow: 9_000,
+    maxTokens: 100,
+    estimateTokens: () => 1_000,
+  });
+  const message = (text: string) => ({ role: "user" as const, content: text, timestamp: 0 });
+  await evaluate({
+    gate: "root_cause",
+    goal: GOALS.root_cause,
+    attempt: "attempt",
+    context: {
       incident: { id: "1", status: "INVESTIGATING", rootCause: null, usersImpacted: null, impactQuery: null, prUrls: [], resolvedEvidence: null },
       signals: [],
       timeline: [],
-    }),
-    recordVerdict: async () => {},
-    tellBoss: async () => {},
-    park: async () => ({ ok: true, directives: [] }),
-    pendingQuestion: async () => null,
-    session: () => session,
-    toMessages: (messages) => messages as never,
-    abort: async () => {},
-    wrappingUp: () => false,
-    log: () => {},
-    alarm: () => {},
+    },
+    transcript: Array.from({ length: 10 }, (_, i) => message(`message-${i}`)),
   });
-  const handlers: Record<string, (event: unknown) => Promise<unknown>> = {};
-  goals.extension({ on: (name: string, handler: (event: unknown) => Promise<unknown>) => (handlers[name] = handler) } as never);
 
-  goals.start({ incident: { status: "INVESTIGATING" } as GoalContext["incident"], timeline: [] });
-  branch.push({ type: "message", id: "e1" }, { type: "message", id: "e2" });
-  await goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] }));
-  failWrites = true;
-  await handlers.turn_end({ message: { content: [] } });
-  branch.push({ type: "message", id: "e3" });
-  await goals.gate("resolved", "attempt", async () => ({ ok: true, directives: [] }));
-
-  assert.deepEqual(seen[1], ["fixing work"], "only the new stage, not the investigation and not the whole session");
-});
-
-const handOffGoals = (options: { tellFails?: boolean; parkFails?: boolean; writeFails?: boolean }) => {
-  const told: string[] = [];
-  let failing = false;
-  const branch: { type: string; id: string; customType?: string; data?: unknown }[] = [];
-  const session = {
-    getBranch: () => branch,
-    buildSessionProjection: () => ({ entries: branch.map((entry) => ({ sourceEntry: entry, messages: [] })), messages: [] }),
-    appendCustomEntry: (customType: string, data?: unknown) => {
-      if (failing) throw new Error("disk full");
-      const id = `c${branch.length}`;
-      branch.push({ type: "custom", id, customType, data });
-      return id;
-    },
-  };
-  const goals = createStageGoals({
-    evaluate: async () => ({ judgement: "impossible", reason: "needs a person", usage: null }),
-    context: async () => ({
-      incident: { id: "1", status: "INVESTIGATING", rootCause: null, usersImpacted: null, impactQuery: null, prUrls: [], resolvedEvidence: null },
-      signals: [],
-      timeline: [],
-    }),
-    recordVerdict: async () => {},
-    tellBoss: async (text) => {
-      if (options.tellFails) throw new Error("slack down");
-      told.push(text);
-    },
-    park: async () => {
-      if (options.parkFails) throw new Error("db down");
-      return { ok: true, directives: [] };
-    },
-    pendingQuestion: async () => null,
-    session: () => session as never,
-    toMessages: (messages) => messages as never,
-    abort: async () => {},
-    wrappingUp: () => false,
-    log: () => {},
-    alarm: () => {},
-  });
-  goals.start({ incident: { status: "INVESTIGATING" } as GoalContext["incident"], timeline: [] });
-  failing = Boolean(options.writeFails);
-  return { goals, told };
-};
-
-test("a hand-off where neither the Boss nor the park was reached is not a clean hand-off", async () => {
-  const { goals, told } = handOffGoals({ tellFails: true, parkFails: true });
-  await goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] }));
-  assert.equal(told.length, 0, "premise: nobody was told");
-  assert.equal(goals.handedOff(), false);
-
-  const reached = handOffGoals({ parkFails: true });
-  await reached.goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] }));
-  assert.equal(reached.told.length, 1);
-  assert.equal(reached.goals.handedOff(), true, "the Boss was told, so the hand-off happened");
-});
-
-test("a hand-off that cannot record its restart tells nobody, so the next launch tells them once", async () => {
-  const { goals, told } = handOffGoals({ writeFails: true });
-  await goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] })).catch(() => {});
-  assert.equal(told.length, 0);
-  assert.equal(goals.handedOff(), false);
+  const shown = Array.from({ length: 10 }, (_, i) => body.includes(`message-${i}`));
+  const dropped = shown.indexOf(true);
+  assert.ok(dropped > 0, "premise: something was dropped");
+  assert.ok(shown.slice(dropped).every(Boolean), "only the oldest, whole");
+  assert.ok(body.includes(`(${dropped} earlier messages are not shown, for size.`));
 });
 
 test("the closing goal rejects undone work on this incident, not practice-level prevention", () => {
@@ -809,24 +485,4 @@ test("the closing goal rejects undone work on this incident, not practice-level 
   assert.match(GOALS.analysis, /development practice in general .* are wanted, not follow-up work/);
   assert.match(GOALS.resolved, /follow-up or prevention work for this incident has been fully completed/);
   assert.match(GOALS.resolved, /changes to how we build" ideas are not work for this incident/);
-});
-
-test("the stage comes from the status, and FIXING splits at the merge", () => {
-  assert.equal(stageFor("INVESTIGATING", []), "investigating");
-  assert.equal(stageFor("FIXING", []), "fixing");
-  assert.equal(stageFor("FIXING", [MERGED]), "verifying");
-  assert.equal(stageFor("RESOLVED", []), "closing");
-  assert.equal(stageFor("CLOSED", []), null);
-});
-
-test("stage turns are configurable, and a bad value keeps the defaults", () => {
-  assert.deepEqual(parseStageTurns("10,20,30,40"), { investigating: 10, fixing: 20, verifying: 30, closing: 40 });
-  const logs: string[] = [];
-  assert.deepEqual(parseStageTurns("10,20", (event) => logs.push(event)), {
-    investigating: 60,
-    fixing: 60,
-    verifying: 40,
-    closing: 20,
-  });
-  assert.deepEqual(logs, ["stage_turns_unreadable"]);
 });
