@@ -321,16 +321,26 @@ interface UsageFields {
  * - `{ type: "usage" | "compaction", usage }` -- out-of-band calls that are
  *   billed but are not turns, such as the summarization compaction runs.
  *
+ * - `{ type: "custom", customType: GOAL_VERDICT_ENTRY_TYPE, data: { usage } }`
+ *   -- a stage-goal evaluation, made on a different and cheaper model. Its
+ *   tokens count here and its model does not: the row carries one `modelId`,
+ *   and it has to stay the agent's.
+ *
  * A message entry never carries top-level `usage`, so reading the nested one
  * first and falling back cannot double count.
  */
 interface SessionUsageLine {
   type?: string;
+  customType?: string;
+  data?: { usage?: UsageFields };
   usage?: UsageFields;
   model?: string;
   modelId?: string;
   message?: { role?: string; model?: string; usage?: UsageFields };
 }
+
+/** One stage-goal verdict, with what the evaluation spent. */
+export const GOAL_VERDICT_ENTRY_TYPE = "bugboss_goal_verdict";
 
 /**
  * Sum a session file's usage. Totals are absolute over the whole file, which
@@ -366,7 +376,12 @@ export const sumSessionUsage = (contents: string): SessionUsage => {
       total.turns += 1;
     }
 
-    const usage = entry.message?.usage ?? entry.usage;
+    const usage =
+      entry.message?.usage ??
+      entry.usage ??
+      (entry.type === "custom" && entry.customType === GOAL_VERDICT_ENTRY_TYPE
+        ? entry.data?.usage
+        : undefined);
     if (usage) {
       total.tokensIn += usage.input ?? 0;
       total.tokensOut += usage.output ?? 0;
@@ -415,6 +430,12 @@ export type ExitReason =
    * passed.
    */
   | "turns_exhausted"
+  /**
+   * A stage goal stopped the run: its turn bound ran out, the agent stopped
+   * making progress on it, or it was judged impossible. The Boss was told
+   * and the incident parked until a person answers.
+   */
+  | "goal_parked"
   /** Pi reported an error on the last turn. */
   | "turn_error"
   /** SIGTERM or SIGINT reached the child before it was done. */
@@ -439,6 +460,7 @@ export const isStoredExit = (value: unknown): value is StoredExit => {
     "completed",
     "timed_out",
     "turns_exhausted",
+    "goal_parked",
     "turn_error",
     "signal",
   ];

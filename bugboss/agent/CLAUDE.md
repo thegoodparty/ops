@@ -583,7 +583,8 @@ every turn re-read everything the agent had ever seen, and cache reads of
 history were half of what the fleet spent. Incidents 80, 86 and 94 hit the
 turn cap carrying an investigation they had finished hours earlier.
 
-- **Three transitions, all tool calls.** `report_root_cause` succeeding
+- **Three transitions, all tool calls.** `report_root_cause` succeeding,
+  which now means its stage goal was judged met first (see "Stage goals"),
   (`root_cause`), and `track_incident_timeline_event` recording `fix_pr_opened`
   (`fix_opened`) or `fix_merged` (`fix_merged`). The tools report them through
   `onRootCause` / `onTimelineEvent`; nothing reads what the agent wrote.
@@ -619,6 +620,65 @@ turn cap carrying an investigation they had finished hours earlier.
 
 The replay of incidents 94 and 86 at these three transitions came to about
 43% less spend on the two ($31 of $73.50), nearly all of it cache reads.
+
+## Stage goals
+
+The agent never decides it is done. A separate model, Haiku 4.5 on Bedrock
+(`DEFAULT_GOAL_MODEL_ID`, overridden by `BUGBOSS_GOAL_MODEL_ID`), reads the
+goal for the gate in front of it and the stage's transcript and returns met,
+not met or impossible with a reason. It is Claude Code's `/goal` pattern;
+`goals.ts` holds the goal text, the evaluator and the stage state.
+
+Why: incident 94's root cause explained the 502 that paged and not the
+candidates charged for sends that never went out, and incident 80 closed with
+its prevention written up as follow-up work. Both gates checked arguments, not
+outcomes.
+
+- **Where it runs.** `report_root_cause`, `report_resolved` and
+  `report_analysis` (only a met verdict runs the transition, so stage
+  compaction rests on a verified gate); the merge check-in, on every
+  `message_boss` and on a `monitor` for `pr_closed` with `awaitingHuman`; and
+  every attempt to stop: a run ending on a turn with no tool call
+  (`agent_before_settle`), and `park`. A not-met stop steers the reason back as
+  a custom message and the run continues. A pending question to the Boss
+  defers a stop's evaluation, as an active wait defers `/goal`'s.
+- **Which messages ask for a merge is the evaluator's call.** It answers
+  `not_applicable` for a message that asks nobody to merge. No code reads the
+  message's words. A resumed `message_boss` wait is not judged again, and a
+  met check-in covers later `pr_closed` waits in the same stage, so the 55
+  minute re-arm costs nothing.
+- **Impossible, a stage's turn bound, and the no-progress guard all hand
+  off:** an escalation to the Boss with the last reason, then `park` with
+  `liftsOnReply: true`, because a person's answer is exactly what should
+  restart it. A `bugboss_goal_stage` entry with `restart: true` gives the
+  stage a fresh allowance for when they do. Bounds are 60/60/40/20 turns for
+  investigating, fixing, verifying (FIXING after `fix_merged`) and closing,
+  `BUGBOSS_STAGE_TURNS` to change them. The guard fires after three
+  consecutive not-met verdicts with no non-gate tool call between them.
+- **Inside the overall budget, never on top of it.** Its extension runs after
+  the turn budget's and skips once the deadline or the budget has asked for
+  the brief, so one turn is announced once. `startWithinBudget` checks a spent
+  stage before the first request, like `promptWithinBudget`. The hand-off
+  exits 0 (`goal_parked`), as turn exhaustion does.
+- **What it reads.** The goal, the attempt (a gate's arguments whole), the
+  incident record and timeline through the non-draining
+  `GET /incidents/:id/goal-context`, and the agent's projected context since
+  the stage began, after the latest compaction summary. Nothing is cut by
+  character count. A stage that outgrows the evaluator's window leaves out its
+  oldest messages whole and says how many.
+- **Every verdict is recorded twice.** As a `goal_verdict` timeline row
+  (`POST /incidents/:id/goal-verdict`, kept out of `TIMELINE_EVENT_KINDS` so
+  the agent cannot record one, and filtered out of stage compaction prompts),
+  and as a `bugboss_goal_verdict` session entry carrying its usage, which
+  `sumSessionUsage` adds to the incident's tokens but not its turns or its
+  `modelId`. The closing report therefore prices those tokens at the agent's
+  rates, which overstates them about fivefold; they are a small share of the
+  total.
+- **An evaluator that fails passes the gate**, with a `goal_unjudged` alarm.
+  A gate held shut by an outage would stop every incident at once.
+- **Running incidents.** Their stored prompt has no goal section, so they
+  meet goals first as a refusal, which carries the goal text. Their stage
+  count starts at their first launch on this code.
 
 ## The transcript keeps everything compaction summarised
 

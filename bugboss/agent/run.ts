@@ -15,20 +15,23 @@ import type {
   AgentSession,
   ExtensionAPI,
   ModelRuntime,
+  SessionManager,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type {
   Directive,
+  GoalContext,
   IncidentMatch,
   IncidentView,
   MergeOutcomeView,
+  RecordedTimelineKind,
   TimelineEvent,
-  TimelineEventKind,
   ToolApi,
   ToolResponse,
 } from "../types";
-import { TIMELINE_EVENT_KINDS } from "../types";
+import { GOAL_VERDICT_KIND, TIMELINE_EVENT_KINDS } from "../types";
 import {
+  DEFAULT_GOAL_MODEL_ID,
   DEFAULT_MODEL_ID,
   invokeModelIdFor,
   parseInferenceProfiles,
@@ -36,6 +39,7 @@ import {
   type InferenceProfiles,
 } from "../bedrock";
 import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
+import { createPiModelClient } from "../bedrock/client";
 import {
   connectMcpToolset,
   GRAFANA_MCP_ARGS,
@@ -69,6 +73,15 @@ import {
   type PendingDirective,
   type PendingQuestion,
 } from "./tools";
+import {
+  createGoalEvaluator,
+  createStageGoals,
+  goalStopExtension,
+  parseStageTurns,
+  type GoalStage,
+  type StageGate,
+  type StageGoals,
+} from "./goals";
 import {
   createPiSummarizer,
   createStageCompaction,
@@ -357,7 +370,8 @@ export type BossClient = Omit<ToolApi, "escalate"> &
   DirectivePeek &
   WaitMarkerPort &
   BossInboxPort &
-  TimelinePeek;
+  TimelinePeek &
+  GoalPort;
 
 /**
  * The timeline without the drain. The stage compaction reads it between
@@ -366,6 +380,12 @@ export type BossClient = Omit<ToolApi, "escalate"> &
  */
 export interface TimelinePeek {
   timelineEvents(): Promise<TimelineEvent[]>;
+}
+
+/** What the stage-goal evaluator reads and writes, none of it draining directives. */
+export interface GoalPort {
+  goalContext(): Promise<GoalContext>;
+  recordGoalVerdict(verdict: { gate: string; verdict: string; reason: string }): Promise<TimelineEvent>;
 }
 
 export const createBossClient = (args: {
@@ -411,6 +431,8 @@ export const createBossClient = (args: {
     trackTimelineEvent: (payload) =>
       call<ToolResponse<TimelineEvent>>("POST", "/timeline", payload),
     timelineEvents: () => call<TimelineEvent[]>("GET", "/timeline"),
+    goalContext: () => call<GoalContext>("GET", "/goal-context"),
+    recordGoalVerdict: (verdict) => call<TimelineEvent>("POST", "/goal-verdict", verdict),
     peekDirectives: () => call<PendingDirective[]>("GET", "/directives"),
     consumeDirective: (id) =>
       call<void>("DELETE", `/directives/${id}`).then(() => undefined),
@@ -459,9 +481,29 @@ export const createBossTools = async (args: {
   api: Omit<ToolApi, "escalate">;
   boss: Pick<BossInboxPort, "tellBoss">;
   onRootCause?: () => void;
-  onTimelineEvent?: (kind: TimelineEventKind) => void;
+  onTimelineEvent?: (kind: RecordedTimelineKind) => void;
+  /** Absent, every gate runs unjudged, as it did before stage goals. */
+  goals?: Pick<StageGoals, "gate" | "stopAttempt" | "markParked">;
 }): Promise<ToolDefinition[]> => {
   const { Type } = await import("typebox");
+
+  // The gate's own arguments go to the evaluator whole: they are the claim it
+  // is judging.
+  const judged = async (
+    gate: StageGate,
+    tool: string,
+    params: unknown,
+    run: () => Promise<ToolResponse>,
+  ) => {
+    if (!args.goals) return bossToolResult(await run());
+    const result = await args.goals.gate(
+      gate,
+      `The agent called ${tool} with:\n${JSON.stringify(params, null, 2)}`,
+      run,
+    );
+    const rendered = bossToolResult(result.response);
+    return result.stop ? { ...rendered, terminate: true } : rendered;
+  };
 
   const tools: ToolDefinition[] = [
     {
@@ -526,13 +568,14 @@ export const createBossTools = async (args: {
           }),
         ),
       }),
-      execute: async (_id: string, params: unknown) => {
-        const response = await args.api.reportRootCause(
-          params as unknown as Parameters<ToolApi["reportRootCause"]>[0],
-        );
-        if (response.ok) args.onRootCause?.();
-        return bossToolResult(response);
-      },
+      execute: async (_id: string, params: unknown) =>
+        judged("root_cause", "report_root_cause", params, async () => {
+          const response = await args.api.reportRootCause(
+            params as unknown as Parameters<ToolApi["reportRootCause"]>[0],
+          );
+          if (response.ok) args.onRootCause?.();
+          return response;
+        }),
     },
     {
       name: "search_incidents",
@@ -591,10 +634,8 @@ export const createBossTools = async (args: {
         evidence: Type.String({ description: "What you observed stop happening, and how." }),
       }),
       execute: async (_id: string, params: unknown) =>
-        bossToolResult(
-          await args.api.reportResolved(
-            params as unknown as Parameters<ToolApi["reportResolved"]>[0],
-          )
+        judged("resolved", "report_resolved", params, () =>
+          args.api.reportResolved(params as unknown as Parameters<ToolApi["reportResolved"]>[0]),
         ),
     },
     {
@@ -656,10 +697,8 @@ export const createBossTools = async (args: {
         ),
       }),
       execute: async (_id: string, params: unknown) =>
-        bossToolResult(
-          await args.api.reportAnalysis(
-            params as unknown as Parameters<ToolApi["reportAnalysis"]>[0],
-          )
+        judged("analysis", "report_analysis", params, () =>
+          args.api.reportAnalysis(params as unknown as Parameters<ToolApi["reportAnalysis"]>[0]),
         ),
     },
     {
@@ -743,10 +782,30 @@ export const createBossTools = async (args: {
           }),
         ),
       }),
-      execute: async (_id: string, params: unknown) =>
-        bossToolResult(
-          await args.api.park(params as unknown as Parameters<ToolApi["park"]>[0])
-        ),
+      execute: async (_id: string, params: unknown) => {
+        const { waitingFor } = params as { waitingFor: string };
+        const decision = args.goals
+          ? await args.goals.stopAttempt(`The agent called park, waiting for: ${waitingFor}`, {
+              fromTool: true,
+            })
+          : ({ kind: "allow" } as const);
+        if (decision.kind === "continue") {
+          return {
+            content: [{ type: "text" as const, text: `Not parked. ${decision.text}` }],
+            details: undefined,
+          };
+        }
+        if (decision.kind === "stopped") {
+          return {
+            content: [{ type: "text" as const, text: decision.text }],
+            details: undefined,
+            terminate: true,
+          };
+        }
+        const response = await args.api.park(params as unknown as Parameters<ToolApi["park"]>[0]);
+        if (response.ok) args.goals?.markParked();
+        return bossToolResult(response);
+      },
     },
   ] as unknown as ToolDefinition[];
 
@@ -894,6 +953,10 @@ export interface RunIncidentAgentOptions {
   timeoutSeconds?: number;
   /** Turns this incident gets in total. Defaults to `INCIDENT_AGENT_MAX_TURNS`. */
   maxTurns?: number;
+  /** The stage-goal evaluator's model. Defaults to `DEFAULT_GOAL_MODEL_ID`. */
+  goalModelId?: string;
+  /** Turns per stage before the Boss is told its goal is not met. */
+  stageTurns?: Record<GoalStage, number>;
   awsRegion?: string;
   /**
    * The S3 key for the session, from the dispatcher's sessionRef. Required
@@ -1023,6 +1086,10 @@ export const agentOptionsFromEnv = (
     sessionKey,
     timeoutSeconds,
     maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : INCIDENT_AGENT_MAX_TURNS,
+    goalModelId: env.BUGBOSS_GOAL_MODEL_ID || DEFAULT_GOAL_MODEL_ID,
+    stageTurns: parseStageTurns(env.BUGBOSS_STAGE_TURNS, (event, fields) =>
+      console.error(JSON.stringify({ component: "agent", level: "error", event, ...fields })),
+    ),
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
     ...(alertSlugs.length ? { alertSlugs } : {}),
@@ -1043,6 +1110,8 @@ export interface RunIncidentAgentResult {
   timedOut: boolean;
   /** The incident's turn budget ran out and the run was stopped on it. */
   turnsExhausted: boolean;
+  /** A stage goal handed the incident to the Boss and parked it. */
+  goalParked?: boolean;
   /** Pi's message for the last failed or aborted turn. Null on a clean end. */
   error: string | null;
 }
@@ -1060,7 +1129,7 @@ export interface RunIncidentAgentResult {
  * is already with a human by then; nothing is waiting on the exit code.
  */
 export const exitCodeFor = (result: RunIncidentAgentResult): number =>
-  result.turnsExhausted ? 0 : result.error ? 1 : 0;
+  result.turnsExhausted || result.goalParked ? 0 : result.error ? 1 : 0;
 
 export const sessionSyncFailedMessage = (streak: number): string =>
   `Your session has failed to save ${streak} times in a row. Nothing you have done since is durable: if this container restarts you will start over from nothing. Stop investigating and call escalate now, with a brief covering what you believe, what you ruled out and what you were about to do.`;
@@ -1093,6 +1162,7 @@ export const kickoffMessage = (incidentId: string): string =>
 export const exitRecordFor = (args: {
   timedOut: boolean;
   turnsExhausted: boolean;
+  goalParked?: boolean;
   error: string | null;
   attempt: number | null;
   at: number;
@@ -1106,7 +1176,9 @@ export const exitRecordFor = (args: {
     ? "timed_out"
     : args.turnsExhausted
       ? "turns_exhausted"
-      : args.error
+      : args.goalParked
+        ? "goal_parked"
+        : args.error
         ? "turn_error"
         : "completed",
   at: args.at,
@@ -1401,11 +1473,14 @@ export const promptWithinBudget = async (
  */
 export const startWithinBudget = async (args: {
   budget: Pick<TurnBudget, "stopIfSpent">;
+  /** A stage's turns spent by a launch that died before handing off. */
+  goals?: Pick<StageGoals, "stopIfSpent">;
   stages: Pick<StageCompaction, "resume">;
   session: Pick<AgentSession, "compact" | "sessionManager" | "prompt">;
   message: string;
 }): Promise<void> =>
   promptWithinBudget(args.budget, async () => {
+    if (await args.goals?.stopIfSpent()) return;
     await args.stages.resume(args.session);
     await args.session.prompt(args.message);
   });
@@ -1569,7 +1644,10 @@ const launch = async (args: {
     settings,
     reserveTokens: reserveTokensFor(model),
     contextWindow: model.contextWindow,
-    timeline: () => api.timelineEvents(),
+    // Verdicts are the harness's bookkeeping; a summary that reproduced them
+    // verbatim would carry every one forward into every later stage.
+    timeline: async () =>
+      (await api.timelineEvents()).filter((event) => event.kind !== GOAL_VERDICT_KIND),
     summarize: createPiSummarizer({
       compact: pi.compact,
       modelRuntime,
@@ -1583,6 +1661,20 @@ const launch = async (args: {
       ),
   });
 
+  // Assigned once it is opened, below; nothing reads it before a turn runs.
+  let goalSession: SessionManager | null = null;
+  const goals = await createGoals({
+    options,
+    api,
+    modelRuntime,
+    pi,
+    session: () => goalSession,
+    abort: async () => {
+      await live?.abort().catch(() => {});
+    },
+    wrappingUp: () => wrapUpAbort.signal.aborted,
+  });
+
   const bossTools = await createBossTools({
     api,
     boss: api,
@@ -1593,10 +1685,13 @@ const launch = async (args: {
     onTimelineEvent: (kind) => {
       const stage = STAGE_FOR_TIMELINE_KIND[kind];
       if (stage) stages.request(stage);
+      if (kind === "fix_merged") goals?.merged();
     },
+    ...(goals ? { goals } : {}),
   });
   const localTools = [
     await createMonitorTool({
+      ...(goals ? { checkIn: goals.checkIn } : {}),
       signal: wrapUpAbort.signal,
       waitSignal: waits.signal,
       cwd: paths.checkout,
@@ -1608,6 +1703,7 @@ const launch = async (args: {
       },
     }),
     await createMessageBossTool({
+      ...(goals ? { checkIn: goals.checkIn } : {}),
       marker: api,
       boss: api,
       api,
@@ -1656,6 +1752,7 @@ const launch = async (args: {
   const sessionManager = restored
     ? pi.SessionManager.open(paths.sessionFile, paths.sessionDir, paths.checkout)
     : pi.SessionManager.create(paths.checkout, paths.sessionDir, { id: options.incidentId });
+  goalSession = sessionManager;
 
   const sync = createSessionSync({
     store,
@@ -1896,6 +1993,9 @@ const launch = async (args: {
       stages.extension,
       sessionSyncExtension(sync, onSyncFailure),
       turnBudget.extension,
+      // After the budget, so a turn that spends both is announced once, by
+      // the budget, which is the harder stop.
+      ...(goals ? [goals.extension, goalStopExtension(goals)] : []),
       pollingGuardExtension,
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
@@ -1958,10 +2058,29 @@ const launch = async (args: {
   });
   const directiveWatch = setInterval(() => void watchDirectives(), DIRECTIVE_POLL_MS);
 
+  if (goals) {
+    try {
+      goals.start(await api.goalContext());
+    } catch (err: unknown) {
+      // No stage means no stop is judged and no stage is bounded; the gates
+      // still are, since they read the record fresh.
+      console.error(
+        JSON.stringify({
+          component: "agent",
+          level: "error",
+          event: "goal_stage_unknown",
+          incidentId: options.incidentId,
+          error: String(err),
+        }),
+      );
+    }
+  }
+
   let error: string | null = null;
   try {
     await startWithinBudget({
       budget: turnBudget,
+      ...(goals ? { goals } : {}),
       stages,
       session,
       message: restored
@@ -1982,6 +2101,7 @@ const launch = async (args: {
       exitRecordFor({
         timedOut,
         turnsExhausted: turnBudget.exhausted(),
+        goalParked: goals?.handedOff() ?? false,
         error,
         attempt,
         at: Date.now(),
@@ -1998,8 +2118,59 @@ const launch = async (args: {
     restored,
     timedOut,
     turnsExhausted: turnBudget.exhausted(),
+    goalParked: goals?.handedOff() ?? false,
     error,
   };
+};
+
+/**
+ * The evaluator and the stage state, or none. A goal model the catalog does
+ * not know costs the run its goals, never the run: the gates fall back to
+ * what they did before, and the alarm says so.
+ */
+const createGoals = async (args: {
+  options: RunIncidentAgentOptions;
+  api: BossClient;
+  modelRuntime: ModelRuntime;
+  pi: typeof import("@earendil-works/pi-coding-agent");
+  session: () => SessionManager | null;
+  abort: () => Promise<void>;
+  wrappingUp: () => boolean;
+}): Promise<StageGoals | null> => {
+  const incidentId = args.options.incidentId;
+  const emit = (level: "info" | "error") => (event: string, fields: Record<string, unknown>) =>
+    (level === "error" ? console.error : console.log)(
+      JSON.stringify({ component: "agent", level, event, incidentId, ...fields }),
+    );
+  const modelId = args.options.goalModelId ?? DEFAULT_GOAL_MODEL_ID;
+  let model: Awaited<ReturnType<typeof resolveBedrockModel>>;
+  try {
+    model = await resolveBedrockModel({ id: modelId });
+    assertBedrockInvokeModelRouting(args.modelRuntime, model);
+  } catch (err: unknown) {
+    emit("error")("goal_model_unavailable", { modelId, error: String(err) });
+    return null;
+  }
+  return createStageGoals({
+    evaluate: createGoalEvaluator({
+      client: createPiModelClient({ runtime: args.modelRuntime, model }),
+      contextWindow: model.contextWindow,
+      estimateTokens: (message) => args.pi.estimateTokens(message),
+    }),
+    context: () => args.api.goalContext(),
+    recordVerdict: (verdict) => args.api.recordGoalVerdict(verdict),
+    tellBoss: (text) => args.api.tellBoss("escalation", text),
+    park: (park) => args.api.park(park),
+    pendingQuestion: () => args.api.getPending(),
+    session: args.session,
+    toMessages: (messages) =>
+      args.pi.convertToLlm(messages as Parameters<typeof args.pi.convertToLlm>[0]),
+    abort: args.abort,
+    wrappingUp: args.wrappingUp,
+    ...(args.options.stageTurns ? { bounds: args.options.stageTurns } : {}),
+    log: emit("info"),
+    alarm: emit("error"),
+  });
 };
 
 /**

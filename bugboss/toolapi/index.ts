@@ -26,6 +26,7 @@ import { renderPostmortem } from "../report/render";
 import type {
   Directive,
   Evidence,
+  GoalContext,
   Incident,
   IncidentStatus,
   IncidentMatch,
@@ -40,7 +41,7 @@ import type {
   ToolApi,
   ToolResponse,
 } from "../types";
-import { TIMELINE_EVENT_KINDS } from "../types";
+import { GOAL_VERDICT_KIND, TIMELINE_EVENT_KINDS } from "../types";
 import {
   assign,
   getIncidentRow,
@@ -219,6 +220,60 @@ export const readTimelineEvents = (
        ORDER BY occurredAt, id`,
     [incidentId],
   );
+
+/** The stage-goal evaluator's read. Null for an incident that does not exist. */
+export const readGoalContext = (
+  db: Pick<Db, "query" | "get">,
+  incidentId: string,
+): GoalContext | null => {
+  const row = db.get<IncidentRow>("SELECT * FROM incident WHERE id = ?", [incidentId]);
+  if (!row) return null;
+  const incident = rowToIncident(row);
+  return {
+    incident: {
+      id: incident.id,
+      status: incident.status,
+      rootCause: incident.rootCause,
+      usersImpacted: incident.usersImpacted,
+      impactQuery: incident.impactQuery,
+      prUrls: incident.prUrls,
+      resolvedEvidence: incident.resolvedEvidence,
+    },
+    signals: db
+      .query<SignalRow>("SELECT * FROM signal WHERE incidentId = ? ORDER BY openedAt, id", [
+        incidentId,
+      ])
+      .map(rowToSignal)
+      .map(({ id, kind, source, title, body }) => ({ id, kind, source, title, body })),
+    timeline: readTimelineEvents(db, incidentId),
+  };
+};
+
+/**
+ * One stage-goal verdict, as a timeline row the Boss, the status card, the
+ * closing report and evals read like any other. Recorded when it was made,
+ * since the verdict is the event.
+ */
+export const recordGoalVerdict = (
+  db: Pick<Db, "withWrite">,
+  incidentId: string,
+  verdict: { gate: string; verdict: string; reason: string },
+  now = Date.now(),
+): Promise<TimelineEvent> => {
+  const summary = `${verdict.gate} ${verdict.verdict}: ${verdict.reason}`;
+  return db.withWrite((w): TimelineEvent => {
+    const id = Number(
+      w
+        .prepare(
+          `INSERT INTO incident_timeline_event
+             (incidentId, kind, occurredAt, recordedAt, summary, evidenceUrl)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(incidentId, GOAL_VERDICT_KIND, now, now, summary).lastInsertRowid,
+    );
+    return { id, kind: GOAL_VERDICT_KIND, occurredAt: now, recordedAt: now, summary, evidenceUrl: null };
+  });
+};
 
 export const createToolApi = (deps: ToolApiDeps): ToolApi => {
   const { db, correlator, slack, evidence } = deps;

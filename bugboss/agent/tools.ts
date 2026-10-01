@@ -500,7 +500,22 @@ export interface MonitorDeps {
   /** Where a command runs: the checkout, so a check script can use git and relative paths. */
   cwd?: string;
   settleSeconds?: number;
+  /**
+   * The stage-goal check before a person is asked to merge. Null lets the
+   * wait start; a string is returned instead of waiting.
+   */
+  checkIn?: MergeCheckIn;
 }
+
+/**
+ * `known` says the ask is structurally a merge -- a wait on a person to close
+ * a PR -- so a check-in already met at this stage covers it, and a re-armed
+ * wait every 55 minutes is not judged again.
+ */
+export type MergeCheckIn = (
+  ask: string,
+  options?: { known?: boolean },
+) => Promise<{ text: string; stop: boolean } | null>;
 
 export interface MonitorArgs extends ConditionArgs {
   intervalSeconds: number;
@@ -780,6 +795,8 @@ export interface MessageBossDeps {
   /** The current wait's interrupt, read when a call starts. */
   waitSignal?: () => AbortSignal;
   maxBlockSeconds?: number;
+  /** Judges whether this message asks for a merge, and if so whether it is ready. */
+  checkIn?: MergeCheckIn;
 }
 
 export interface MessageBossArgs {
@@ -1076,6 +1093,19 @@ export const createMonitorTool = async (
           details: { timedOut: false, rejected: true },
         };
       }
+      if (deps.checkIn && args.condition === "pr_closed" && args.awaitingHuman) {
+        const blocked = await deps.checkIn(
+          `The agent is about to wait for a person to merge ${args.pr}. What it asks of them: ${args.awaitingHuman}`,
+          { known: true },
+        );
+        if (blocked) {
+          return {
+            content: [{ type: "text", text: `Not waiting, and nobody was asked. ${blocked.text}` }],
+            details: { timedOut: false, rejected: true },
+            terminate: blocked.stop,
+          };
+        }
+      }
       const interrupt = deps.waitSignal?.();
       const result = await runMonitor(args, {
         ...deps,
@@ -1170,6 +1200,22 @@ export const createMessageBossTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MessageBossArgs;
+      if (deps.checkIn) {
+        // A question already asked is a resumed wait, not a new ask.
+        const resuming = args.wait && (await deps.marker.getPending())?.message === args.message;
+        const blocked = resuming
+          ? null
+          : await deps.checkIn(
+              `The agent is sending the Boss this message${args.wait ? " and waiting for the answer" : ""}:\n${args.message}`,
+            );
+        if (blocked) {
+          return {
+            content: [{ type: "text", text: `Not sent to the Boss. ${blocked.text}` }],
+            details: { timedOut: false },
+            terminate: blocked.stop,
+          };
+        }
+      }
       const interrupt = deps.waitSignal?.();
       const result = await runMessageBoss(args, {
         ...deps,

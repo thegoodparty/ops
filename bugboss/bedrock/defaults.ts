@@ -20,3 +20,11 @@
  * that quietly stops appearing.
  */
 export const DEFAULT_MODEL_ID = "us.anthropic.claude-opus-5";
+
+/**
+ * The stage-goal evaluator's model, overridden by `BUGBOSS_GOAL_MODEL_ID`.
+ * Small and fast on purpose, as Claude Code's /goal evaluator is: it reads a
+ * goal and one stage of transcript and answers with a verdict, at every gate
+ * and every attempt to stop.
+ */
+export const DEFAULT_GOAL_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0";

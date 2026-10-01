@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { THREAD_PROSE_CHARS } from "../slack/format";
 import { MAX_BLOCK_SECONDS, MESSAGE_BOSS_MIN_WAIT_SECONDS } from "./tools";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { GOALS } from "./goals";
 import { TEST_DB_ENV_VAR } from "../testdb";
 
 /**
@@ -688,6 +689,28 @@ question in front of you, when it is in front of you.
 - \`CLAUDE.md\` at the root, then the nearest \`AGENTS.md\` to the code you are
   changing: the conventions a pull request here is reviewed against.`;
 
+const GATES = `## How your gates are judged
+
+A separate evaluator judges report_root_cause, report_resolved,
+report_analysis and any ask to merge against the goals below before anything
+moves, and judges stopping or parking against your stage's goal. It has no
+tools and reads only your transcript and the incident record, so put the
+evidence in your own tool calls first: the query and its output, the test run,
+the release run, the replay. A refusal names what is missing; do that and call
+again.
+
+Root cause:
+${GOALS.root_cause}
+
+Before asking anyone to merge:
+${GOALS.merge_check_in}
+
+Resolved:
+${GOALS.resolved}
+
+Closed:
+${GOALS.analysis}`;
+
 export const composeSystemPrompt = (input: PromptInput): string => {
   const tools = [...input.toolNames].sort();
   const alerts = [...input.firedAlerts].sort(bySlug);
@@ -701,6 +724,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     CHECKOUT(input),
     TESTS(input),
     TIMELINE,
+    GATES,
     MONITOR_EXAMPLES(input),
     SHIP_PR,
     REPORTING,

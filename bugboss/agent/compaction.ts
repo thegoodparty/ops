@@ -46,7 +46,7 @@ import type {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
-import type { TimelineEvent, TimelineEventKind } from "../types";
+import type { RecordedTimelineKind, TimelineEvent } from "../types";
 
 export type CompactionStage = "root_cause" | "fix_opened" | "fix_merged";
 
@@ -58,7 +58,7 @@ export type CompactionStage = "root_cause" | "fix_opened" | "fix_merged";
 export const STAGE_COMPACTION_MIN_TOKENS = 50_000;
 
 /** The timeline events that are stage transitions. The rest only record. */
-export const STAGE_FOR_TIMELINE_KIND: Partial<Record<TimelineEventKind, CompactionStage>> = {
+export const STAGE_FOR_TIMELINE_KIND: Partial<Record<RecordedTimelineKind, CompactionStage>> = {
   fix_pr_opened: "fix_opened",
   fix_merged: "fix_merged",
 };

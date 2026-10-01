@@ -23,7 +23,12 @@ import { z } from "zod";
 
 import { recordForBoss } from "../boss/inbox";
 import type { Db } from "../db";
-import { readTimelineEvents, verifyAgentToken } from "../toolapi";
+import {
+  readGoalContext,
+  readTimelineEvents,
+  recordGoalVerdict,
+  verifyAgentToken,
+} from "../toolapi";
 import { TIMELINE_EVENT_KINDS } from "../types";
 import type { Directive, ToolApi, WakeBoss } from "../types";
 
@@ -139,6 +144,12 @@ const BODIES = {
   }),
   none: z.object({}),
 };
+
+const GOAL_VERDICT_BODY = z.object({
+  gate: z.enum(["root_cause", "merge_check_in", "resolved", "analysis"]),
+  verdict: z.enum(["met", "not_met", "impossible", "not_applicable", "unjudged"]),
+  reason: z.string().min(1),
+});
 
 const describeIssues = (error: z.ZodError): string =>
   error.issues
@@ -307,6 +318,25 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     const caller = authorize(c);
     if (caller instanceof Response) return caller;
     return c.json(readTimelineEvents(deps.db, caller.incidentId));
+  });
+
+  /** Read-only, for the stage-goal evaluator, for the same reason as above. */
+  app.get("/incidents/:id/goal-context", (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    const context = readGoalContext(deps.db, caller.incidentId);
+    if (!context) return c.json({ error: `unknown incident: ${caller.incidentId}` }, 404);
+    return c.json(context);
+  });
+
+  app.post("/incidents/:id/goal-verdict", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    const parsed = GOAL_VERDICT_BODY.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) {
+      return c.json({ error: `invalid arguments: ${describeIssues(parsed.error)}` }, 400);
+    }
+    return c.json(await recordGoalVerdict(deps.db, caller.incidentId, parsed.data));
   });
 
   // -------------------------------------------------------------------------

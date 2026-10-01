@@ -352,7 +352,10 @@ test("the safety rules stay in the prompt, not one read away", () => {
 // measured on this prompt) while it pasted documents in. Raising these bounds
 // makes every turn of every incident dearer; do it deliberately.
 const MAX_SYSTEM_PROMPT_CHARS = 42_000;
-const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 58_000;
+// Raised from 58,000 for the stage goals: an evaluator the agent cannot see
+// rejects evidence the agent did not know to surface, and every refusal is a
+// turn. ~2,400 characters on every turn buys fewer of those.
+const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 60_000;
 
 test("the composed prefix stays under its bound", async () => {
   const pi = await import("@earendil-works/pi-coding-agent");

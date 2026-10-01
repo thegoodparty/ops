@@ -294,6 +294,11 @@ through nothing, and two reads:
 | `escalate` | None. Hands the Boss the brief as an `escalation`; the Boss decides who to reach. The agent keeps the incident and keeps working |
 | `park` | None. Stops the relaunch until a Boss message, the cooldown or the stale sweep; the agent keeps the incident. A park with `liftsOnReply: false` is out of turns rather than waiting on news, so none of the three lift it and the sweep only announces it |
 
+The three gates (`report_root_cause`, `report_resolved`, `report_analysis`)
+and a merge ask do not take the agent's word for it. A separate model judges
+each against its stage goal first, and only a met verdict runs the
+transition. See "Stage goals" in `agent/CLAUDE.md`.
+
 `escalate` and `park` answer different questions, and neither is a hand-off,
 because there is nothing to hand to. Escalating says a person is needed;
 parking says stop relaunching until something changes. Parking is the one
