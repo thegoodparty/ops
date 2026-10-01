@@ -691,18 +691,13 @@ question in front of you, when it is in front of you.
 
 const GATES = `## How your gates are judged
 
-A separate evaluator judges report_root_cause, report_resolved,
-report_analysis and any ask to merge against the goals below before anything
-moves, and judges stopping or parking against your stage's goal. It has no
-tools and reads only your transcript and the incident record, so put the
-evidence in your own tool calls first: the query and its output, the test run,
-the release run, the replay. A refusal names what is missing; do that and call
-again.
+A model judges gates, merge asks and stops on your transcript alone:
+surface the evidence first.
 
 Root cause:
 ${GOALS.root_cause}
 
-Before asking anyone to merge:
+Merge ask:
 ${GOALS.merge_check_in}
 
 Resolved:
