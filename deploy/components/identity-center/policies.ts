@@ -261,6 +261,31 @@ export const workbenchAccess: PolicyDocument = {
       ],
       Resource: "*",
     },
+    // Brave Search, for `gp-pi`'s always-on `web_search` tool. One secret and
+    // one read-only action, and the only secretsmanager or ssm permission this
+    // set has. The container reads it with the same SSO session that invokes
+    // Bedrock, so there is no second credential to distribute.
+    //
+    // The suffix is wildcarded rather than named because the secret is created
+    // outside Pulumi, and the grant lives in a different stack from the secret,
+    // so there is no Output to read. That also survives a delete-and-recreate
+    // rotation. The name is a seam with `gp-websearch.ts` in the `gp-pi` repo:
+    // renaming it on either side without the other is an AccessDenied at the
+    // first search, not a load-time error. Recorded in
+    // `docs/workbench-account.md`.
+    //
+    // Worth reading twice: this is the first thing in this account that is
+    // worth reading at all, which the account was designed not to hold. It is
+    // shared by every engineer's sandbox, so a prompt-injected agent can take
+    // it. The scope is one secret and one read; the key is
+    // revocable in Brave, and it is dedicated to `gp-pi` rather than the key
+    // the product uses.
+    {
+      Sid: "ReadBraveSearchKey",
+      Effect: "Allow",
+      Action: ["secretsmanager:GetSecretValue"],
+      Resource: `arn:aws:secretsmanager:us-west-2:${WORKBENCH_ACCOUNT_ID}:secret:gp-pi/brave-search-??????`,
+    },
   ],
 };
 
