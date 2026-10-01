@@ -19,7 +19,8 @@ test("BugBoss's own S3 client, configured only by AWS_ENDPOINT_URL_S3, round-tri
     AWS_REGION: "us-west-2",
   });
   try {
-    const s3 = new S3Client({});
+    // Explicit, so a profile in the developer's own environment cannot win.
+    const s3 = new S3Client({ credentials: { accessKeyId: "fake", secretAccessKey: "fake" } });
     await s3.send(new PutObjectCommand({ Bucket: "b", Key: "sessions/inc-1.jsonl", Body: "line\n" }));
     assert.equal(readFileSync(join(root, "b", "sessions", "inc-1.jsonl"), "utf8"), "line\n");
     const got = await s3.send(new GetObjectCommand({ Bucket: "b", Key: "sessions/inc-1.jsonl" }));

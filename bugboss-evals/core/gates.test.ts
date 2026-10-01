@@ -70,6 +70,7 @@ test("a merge is noticed only by a thread post, a header change and a turn insid
   });
   assert.deepEqual(scenarioGates(gates, missed), { said: false, cleared: false, woke: false, moved: false });
   assert.deepEqual(scenarioGates(gates, { ...noticed, mergedAt: null }), { said: false, cleared: false, woke: false, moved: false });
+  assert.deepEqual(scenarioGates(gates, { ...noticed, mergedAt: null }, true), { said: null, cleared: null, woke: null, moved: null });
 });
 
 test("the harm checks read the calls in order, the cause's first sentence and the first PR", () => {
