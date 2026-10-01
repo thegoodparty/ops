@@ -353,7 +353,9 @@ test("the safety rules stay in the prompt, not one read away", () => {
 // measured on this prompt) while it pasted documents in. Raising these bounds
 // makes every turn of every incident dearer; do it deliberately.
 const MAX_SYSTEM_PROMPT_CHARS = 42_000;
-const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 58_000;
+// Raised from 58,000 when the SQL sidecar's tool and prompt section (#207)
+// landed; main's build was failing, so the overrun went unseen.
+const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 60_000;
 
 test("the composed prefix stays under its bound", async () => {
   const pi = await import("@earendil-works/pi-coding-agent");
