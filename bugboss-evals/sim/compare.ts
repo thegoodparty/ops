@@ -160,7 +160,7 @@ const prebuild = async (dir: string, npmCache: string, runAs: string | undefined
   if (existsSync(join(dir, "node_modules"))) return true;
   const home = join(dir, "..", `${dir.split("/").pop()}-home`);
   mkdirSync(home, { recursive: true });
-  execFileSync("chmod", ["-R", "a+rwX", dir, home, npmCache]);
+  if (runAs) execFileSync("chmod", ["-R", "a+rwX", dir, home, npmCache]);
   const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, npm_config_cache: npmCache };
   const { command, args, env: stepEnv } = asUser(runAs, "bash", [SETUP_OMNI, dir], env);
   const ok = await new Promise<boolean>((resolve) =>
