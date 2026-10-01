@@ -742,6 +742,68 @@ test("a stage whose marker cannot be written is anchored at the branch's newest 
   assert.deepEqual(seen[1], ["fixing work"], "only the new stage, not the investigation and not the whole session");
 });
 
+const handOffGoals = (options: { tellFails?: boolean; parkFails?: boolean; writeFails?: boolean }) => {
+  const told: string[] = [];
+  let failing = false;
+  const branch: { type: string; id: string; customType?: string; data?: unknown }[] = [];
+  const session = {
+    getBranch: () => branch,
+    buildSessionProjection: () => ({ entries: branch.map((entry) => ({ sourceEntry: entry, messages: [] })), messages: [] }),
+    appendCustomEntry: (customType: string, data?: unknown) => {
+      if (failing) throw new Error("disk full");
+      const id = `c${branch.length}`;
+      branch.push({ type: "custom", id, customType, data });
+      return id;
+    },
+  };
+  const goals = createStageGoals({
+    evaluate: async () => ({ judgement: "impossible", reason: "needs a person", usage: null }),
+    context: async () => ({
+      incident: { id: "1", status: "INVESTIGATING", rootCause: null, usersImpacted: null, impactQuery: null, prUrls: [], resolvedEvidence: null },
+      signals: [],
+      timeline: [],
+    }),
+    recordVerdict: async () => {},
+    tellBoss: async (text) => {
+      if (options.tellFails) throw new Error("slack down");
+      told.push(text);
+    },
+    park: async () => {
+      if (options.parkFails) throw new Error("db down");
+      return { ok: true, directives: [] };
+    },
+    pendingQuestion: async () => null,
+    session: () => session as never,
+    toMessages: (messages) => messages as never,
+    abort: async () => {},
+    wrappingUp: () => false,
+    log: () => {},
+    alarm: () => {},
+  });
+  goals.start({ incident: { status: "INVESTIGATING" } as GoalContext["incident"], timeline: [] });
+  failing = Boolean(options.writeFails);
+  return { goals, told };
+};
+
+test("a hand-off where neither the Boss nor the park was reached is not a clean hand-off", async () => {
+  const { goals, told } = handOffGoals({ tellFails: true, parkFails: true });
+  await goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] }));
+  assert.equal(told.length, 0, "premise: nobody was told");
+  assert.equal(goals.handedOff(), false);
+
+  const reached = handOffGoals({ parkFails: true });
+  await reached.goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] }));
+  assert.equal(reached.told.length, 1);
+  assert.equal(reached.goals.handedOff(), true, "the Boss was told, so the hand-off happened");
+});
+
+test("a hand-off that cannot record its restart tells nobody, so the next launch tells them once", async () => {
+  const { goals, told } = handOffGoals({ writeFails: true });
+  await goals.gate("root_cause", "attempt", async () => ({ ok: true, directives: [] })).catch(() => {});
+  assert.equal(told.length, 0);
+  assert.equal(goals.handedOff(), false);
+});
+
 test("the closing goal rejects undone work on this incident, not practice-level prevention", () => {
   assert.match(GOALS.analysis, /no follow-up work on this incident/);
   assert.match(GOALS.analysis, /development practice in general .* are wanted, not follow-up work/);

@@ -465,9 +465,14 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
 
   /** Tell the Boss, park until a person answers, and restart the stage's count for when they do. */
   const handOff = async (text: string): Promise<void> => {
-    handedOff = true;
+    // The restart marker goes first and is not swallowed: a launch that cannot
+    // record it has told nobody, so the next launch hands off once rather than
+    // twice.
+    deps.session()?.appendCustomEntry(GOAL_STAGE_ENTRY_TYPE, { stage, restart: true });
+    let told = false;
     try {
       await deps.tellBoss(text);
+      told = true;
     } catch (err: unknown) {
       deps.alarm("goal_escalation_failed", { stage, error: String(err) });
     }
@@ -481,11 +486,9 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
     } catch (err: unknown) {
       deps.alarm("goal_park_failed", { stage, error: String(err) });
     }
-    try {
-      deps.session()?.appendCustomEntry(GOAL_STAGE_ENTRY_TYPE, { stage, restart: true });
-    } catch (err: unknown) {
-      deps.alarm("goal_stage_unrecorded", { stage, error: String(err) });
-    }
+    // Handed off only if somebody was told or the incident is parked; with
+    // neither, the run must not exit as a clean hand-off.
+    handedOff = told || parked;
   };
 
   const goalFooter = (gate: Gate): string => `The goal (${GATE_TITLE[gate]}):\n${GOALS[gate]}`;
