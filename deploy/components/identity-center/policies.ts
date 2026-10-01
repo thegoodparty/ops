@@ -32,6 +32,26 @@ export type PolicyDocument = {
   Statement: PolicyStatement[];
 };
 
+/**
+ * Every IAM service prefix that serves Bedrock models.
+ *
+ * One list, read by both the exclusion on the tag-conditioned grants in
+ * `engineerAccess` and the read allow that follows it, because two copies would
+ * drift and the failure mode is a service quietly reachable again. `bedrock`
+ * is the foundation-model service. `bedrock-agentcore`, `bedrock-mantle` and
+ * `bedrock-websearch` are separate namespaces AWS has added since, each with
+ * its own prefix, so `bedrock:*` alone does not cover them. A new Bedrock-family
+ * prefix has to be added here; the test in
+ * `deploy/identity-center-engineer.test.ts` pins the list so a change is visible
+ * in review, though nothing can detect a prefix AWS adds later.
+ */
+const BEDROCK_SERVICE_PREFIXES = [
+  "bedrock",
+  "bedrock-agentcore",
+  "bedrock-mantle",
+  "bedrock-websearch",
+] as const;
+
 export const engineerAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -49,13 +69,13 @@ export const engineerAccess: PolicyDocument = {
       Sid: "DevResourceOperations",
       Effect: "Allow",
       // NotAction rather than Action: ["*"], so this blanket grant does not
-      // reach Bedrock. `bedrock:InvokeModel` lists `aws:RequestTag` among its
-      // condition keys, so the tag conditions below would otherwise match it
-      // and let an engineer invoke a model. Bedrock reads are granted
-      // explicitly by ReadBedrockCatalog; every other Bedrock action is left
+      // reach the Bedrock family. Their invoke and create actions list
+      // `aws:RequestTag` among their condition keys, so the tag conditions
+      // below would otherwise match them. Reads are granted explicitly by
+      // ReadBedrockCatalog; every other action in those services is left
       // denied. See that statement for why the exclusion lives here rather
       // than in a Deny.
-      NotAction: ["bedrock:*"],
+      NotAction: BEDROCK_SERVICE_PREFIXES.map((prefix) => `${prefix}:*`),
       Resource: "*",
       Condition: {
         StringEquals: {
@@ -66,8 +86,9 @@ export const engineerAccess: PolicyDocument = {
     {
       Sid: "DevResourceCreation",
       Effect: "Allow",
-      // Excludes Bedrock for the same reason as DevResourceOperations above.
-      NotAction: ["bedrock:*"],
+      // Excludes the Bedrock family for the same reason as
+      // DevResourceOperations above.
+      NotAction: BEDROCK_SERVICE_PREFIXES.map((prefix) => `${prefix}:*`),
       Resource: "*",
       Condition: {
         StringEquals: {
@@ -104,17 +125,17 @@ export const engineerAccess: PolicyDocument = {
       // subscription. The subscription mechanics are in
       // `docs/workbench-account.md` under "Adding a Bedrock model later".
       //
-      // The obvious shape is a single Deny with `NotAction: ["bedrock:Get*",
-      // "bedrock:List*"]`, and it is wrong. IAM evaluates `NotAction` across
-      // every service: with `Resource: "*"` and no condition it denies S3,
-      // SQS, Transcribe and everything else this set exists for. No condition
-      // key scopes a statement to one service, so the exclusion has to live on
-      // the Allow side. Bedrock is named out of the two tag-conditioned
-      // blanket grants above, and only these reads are allowed back. Those
-      // grants need the exclusion because `bedrock:InvokeModel` lists
-      // `aws:RequestTag` among its condition keys, so `Action: ["*"]` reaches
-      // it. A Bedrock action added later is then denied by default rather than
-      // admitted until someone remembers this file.
+      // The obvious shape is a single Deny with `NotAction` over the read
+      // actions, and it is wrong. IAM evaluates `NotAction` across every
+      // service: with `Resource: "*"` and no condition it denies S3, SQS,
+      // Transcribe and everything else this set exists for. No condition key
+      // scopes a statement to one service, so the exclusion has to live on the
+      // Allow side. The Bedrock-family prefixes are named out of the two
+      // tag-conditioned blanket grants above, and only these reads are allowed
+      // back. Those grants need the exclusion because the invoke and create
+      // actions list `aws:RequestTag` among their condition keys, so
+      // `Action: ["*"]` reaches them. An action added later is then denied by
+      // default rather than admitted until someone remembers this file.
       //
       // The management account is where production runs and is not the place
       // for human Bedrock traffic. That is the workbench account, through
@@ -126,7 +147,10 @@ export const engineerAccess: PolicyDocument = {
       // grant from depending on a policy AWS can widen or narrow.
       Sid: "ReadBedrockCatalog",
       Effect: "Allow",
-      Action: ["bedrock:Get*", "bedrock:List*"],
+      Action: BEDROCK_SERVICE_PREFIXES.flatMap((prefix) => [
+        `${prefix}:Get*`,
+        `${prefix}:List*`,
+      ]),
       Resource: "*",
     },
     {
