@@ -72,6 +72,7 @@ import {
 import {
   createPiSummarizer,
   createStageCompaction,
+  type StageCompaction,
   STAGE_FOR_TIMELINE_KIND,
 } from "./compaction";
 import {
@@ -1373,6 +1374,22 @@ export const promptWithinBudget = async (
   await prompt();
 };
 
+/**
+ * The start of a launch: the budget check, then the compaction a previous
+ * process armed and did not run, then the first request. Compacting first
+ * makes the relaunch's cold cache write a summary rather than the history.
+ */
+export const startWithinBudget = async (args: {
+  budget: Pick<TurnBudget, "stopIfSpent">;
+  stages: Pick<StageCompaction, "resume">;
+  session: Pick<AgentSession, "compact" | "sessionManager" | "prompt">;
+  message: string;
+}): Promise<void> =>
+  promptWithinBudget(args.budget, async () => {
+    await args.stages.resume(args.session);
+    await args.session.prompt(args.message);
+  });
+
 export const deadlineMessage = (graceSeconds: number): string =>
   `Your wall-clock deadline has expired. Stop investigating. Within the next ${graceSeconds} seconds, call escalate with a brief: what you believe now, what you ruled out, what you were about to do, and any side effects. If you have no root cause, your brief must still propose a change to the alert rule or name the instrumentation that is missing.`;
 
@@ -1854,9 +1871,11 @@ const launch = async (args: {
     systemPromptOverride: () => prefix.systemPrompt,
     appendSystemPromptOverride: () => [],
     extensionFactories: [
+      // Ahead of the sync, so the stage it records at turn_end is in the
+      // upload that turn_end makes.
+      stages.extension,
       sessionSyncExtension(sync, onSyncFailure),
       turnBudget.extension,
-      stages.extension,
       pollingGuardExtension,
       // The prompt is forced rather than rebuilt, so a doc that changed in the
       // checkout between containers cannot move a single byte of the prefix
@@ -1921,13 +1940,14 @@ const launch = async (args: {
 
   let error: string | null = null;
   try {
-    await promptWithinBudget(turnBudget, () =>
-      session.prompt(
-        restored
-          ? resumeMessage(checkout, existsSync(paths.npmCiFailed))
-          : kickoffMessage(options.incidentId),
-      ),
-    );
+    await startWithinBudget({
+      budget: turnBudget,
+      stages,
+      session,
+      message: restored
+        ? resumeMessage(checkout, existsSync(paths.npmCiFailed))
+        : kickoffMessage(options.incidentId),
+    });
   } finally {
     clearTimeout(deadline);
     clearTimeout(hardStop);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { copyFileSync } from "node:fs";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,10 +11,11 @@ import type { TimelineEvent, ToolApi, ToolResponse } from "../types";
 import {
   createPiSummarizer,
   createStageCompaction,
+  pendingStageOf,
   STAGE_FOR_TIMELINE_KIND,
   stageCompactionInstructions,
 } from "./compaction";
-import { createBossTools } from "./run";
+import { createBossTools, startWithinBudget } from "./run";
 
 const TIMELINE: TimelineEvent[] = [
   {
@@ -41,6 +43,14 @@ const runSession = async (args: {
   keepRecentTokens: number;
   minTokens?: number;
   bigResult?: string;
+  /** A session file to relaunch over, as a restarted process would. */
+  open?: string;
+  budgetSpent?: boolean;
+  /**
+   * Copy the session file at the first turn_end that leaves a stage armed:
+   * the upload a process killed before Pi's between-turn check leaves behind.
+   */
+  snapshotWhenArmed?: boolean;
   turns: (kit: typeof import("@earendil-works/pi-ai")) => unknown[];
 }) => {
   const pi = await import("@earendil-works/pi-coding-agent");
@@ -59,13 +69,16 @@ const runSession = async (args: {
   const model = faux.getModel();
 
   const summaryPrompts: string[] = [];
+  const requests: { kind: "summary" | "turn"; context: string }[] = [];
   const scripted = args.turns(kit);
   faux.setResponses(
     Array.from({ length: scripted.length * 3 }, () => (context: TranscriptContext) => {
       if (JSON.stringify(context).includes("context summarization assistant")) {
         summaryPrompts.push(text(context));
+        requests.push({ kind: "summary", context: text(context) });
         return kit.fauxAssistantMessage(`## Goal\nsummary ${summaryPrompts.length}`);
       }
+      requests.push({ kind: "turn", context: text(context) });
       const next = scripted.shift();
       return (next ?? kit.fauxAssistantMessage("done")) as ReturnType<
         typeof kit.fauxAssistantMessage
@@ -116,6 +129,7 @@ const runSession = async (args: {
     },
   });
 
+  let snapshot: string | null = null;
   const resourceLoader = new pi.DefaultResourceLoader({
     cwd: dir,
     agentDir: join(dir, "agent"),
@@ -125,11 +139,25 @@ const runSession = async (args: {
     noPromptTemplates: true,
     systemPromptOverride: () => "You are a test agent.",
     appendSystemPromptOverride: () => [],
-    extensionFactories: [stages.extension],
+    extensionFactories: [
+      stages.extension,
+      (extension) => {
+        extension.on("turn_end", (_event, ctx) => {
+          if (!args.snapshotWhenArmed || snapshot) return;
+          if (!pendingStageOf(ctx.sessionManager.getBranch())) return;
+          const file = ctx.sessionManager.getSessionFile();
+          assert.ok(file);
+          snapshot = join(dir, "killed.jsonl");
+          copyFileSync(file, snapshot);
+        });
+      },
+    ],
   });
   await resourceLoader.reload();
 
-  const sessionManager = pi.SessionManager.create(dir, join(dir, "sessions"), { id: "inc-1" });
+  const sessionManager = args.open
+    ? pi.SessionManager.open(args.open, join(dir, "sessions"), dir)
+    : pi.SessionManager.create(dir, join(dir, "sessions"), { id: "inc-1" });
   const { session } = await pi.createAgentSession({
     cwd: dir,
     model,
@@ -142,7 +170,12 @@ const runSession = async (args: {
   });
   live = session;
 
-  await session.prompt("Incident inc-1 is yours.");
+  await startWithinBudget({
+    budget: { stopIfSpent: async () => args.budgetSpent ?? false },
+    stages,
+    session,
+    message: args.open ? "You were restarted. Carry on." : "Incident inc-1 is yours.",
+  });
   const error = session.state.errorMessage ?? null;
   session.dispose();
 
@@ -153,9 +186,12 @@ const runSession = async (args: {
     .split("\n")
     .map((line) => JSON.parse(line) as { type: string; id?: string; details?: { stage?: string } });
   return {
+    file,
+    snapshot,
     entries,
     compactions: entries.filter((entry) => entry.type === "compaction"),
     summaryPrompts,
+    requests,
     logs,
     error,
     reserveAfter: settings.getCompactionReserveTokens(model),
@@ -298,6 +334,108 @@ describe("stage compaction, through a real Pi session", () => {
     assert.equal(run.compactions.length, 1, "the backstop compacted");
     assert.equal(run.compactions[0].details?.stage, undefined);
     assert.doesNotMatch(run.summaryPrompts[0], /Additional focus/);
+  });
+});
+
+const readEntries = async (file: string) =>
+  (await readFile(file, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Parameters<typeof pendingStageOf>[0][number]);
+
+const reportRootCause = ({ fauxAssistantMessage, fauxToolCall }: typeof import("@earendil-works/pi-ai")) => [
+  fauxAssistantMessage(fauxToolCall("get_incident", {})),
+  fauxAssistantMessage(
+    fauxToolCall("report_root_cause", { cause: "a missing index", explainedSignalIds: ["s1"] }),
+  ),
+  fauxAssistantMessage("done"),
+];
+
+describe("stage compaction across a restart", () => {
+  test("a restart right after report_root_cause compacts on resume, before the first request", async () => {
+    const first = await runSession({ ...roomy, snapshotWhenArmed: true, turns: reportRootCause });
+    assert.ok(first.snapshot, "the process was killed with the stage armed");
+    const killed = await readEntries(first.snapshot);
+    assert.equal(killed.filter((entry) => entry.type === "compaction").length, 0);
+    assert.equal(pendingStageOf(killed), "root_cause");
+
+    const resumed = await runSession({
+      ...roomy,
+      open: first.snapshot,
+      turns: ({ fauxAssistantMessage }) => [fauxAssistantMessage("done")],
+    });
+
+    assert.equal(resumed.error, null);
+    assert.deepEqual(
+      resumed.requests.map((request) => request.kind),
+      ["summary", "turn"],
+      "the summary is the first request, and the turn after it",
+    );
+    assert.match(resumed.summaryPrompts[0], /moved from investigating to fixing/);
+    assert.match(resumed.summaryPrompts[0], /first 502 on POST \/v1\/outreach/);
+    assert.match(resumed.requests[1].context, /summary 1/, "the first turn is sent the summary");
+    assert.deepEqual(resumed.compactions.map((entry) => entry.details?.stage), ["root_cause"]);
+    assert.equal(pendingStageOf(await readEntries(resumed.file)), null, "the marker is cleared");
+  });
+
+  test("a restart after the compaction ran does not compact again", async () => {
+    const first = await runSession({ ...roomy, turns: reportRootCause });
+    assert.deepEqual(first.compactions.map((entry) => entry.details?.stage), ["root_cause"]);
+
+    const resumed = await runSession({
+      ...roomy,
+      open: first.file,
+      turns: ({ fauxAssistantMessage }) => [fauxAssistantMessage("done")],
+    });
+
+    assert.deepEqual(resumed.requests.map((request) => request.kind), ["turn"]);
+    assert.equal(resumed.compactions.length, 1, "only the compaction from before the restart");
+  });
+
+  test("a resume with the budget spent neither compacts nor calls the model", async () => {
+    const first = await runSession({ ...roomy, snapshotWhenArmed: true, turns: reportRootCause });
+    assert.ok(first.snapshot);
+
+    const resumed = await runSession({
+      ...roomy,
+      open: first.snapshot,
+      budgetSpent: true,
+      turns: ({ fauxAssistantMessage }) => [fauxAssistantMessage("done")],
+    });
+
+    assert.deepEqual(resumed.requests, []);
+    assert.equal(resumed.compactions.length, 0);
+    assert.equal(pendingStageOf(await readEntries(resumed.file)), "root_cause", "still owed next launch");
+  });
+
+  test("two transitions before the restart compact once, for the later stage", async () => {
+    const first = await runSession({
+      ...roomy,
+      snapshotWhenArmed: true,
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("get_incident", {})),
+        fauxAssistantMessage([
+          fauxToolCall("report_root_cause", { cause: "a missing index", explainedSignalIds: ["s1"] }),
+          fauxToolCall("track_incident_timeline_event", {
+            kind: "fix_pr_opened",
+            occurredAt: Date.parse("2026-09-30T19:40:14Z"),
+            summary: "opened omni#2260",
+          }),
+        ]),
+        fauxAssistantMessage("done"),
+      ],
+    });
+    assert.ok(first.snapshot);
+
+    const resumed = await runSession({
+      ...roomy,
+      open: first.snapshot,
+      turns: ({ fauxAssistantMessage }) => [fauxAssistantMessage("done")],
+    });
+
+    assert.deepEqual(resumed.requests.map((request) => request.kind), ["summary", "turn"]);
+    assert.match(resumed.summaryPrompts[0], /fix pull request for this incident has just been opened/);
+    assert.deepEqual(resumed.compactions.map((entry) => entry.details?.stage), ["fix_opened"]);
   });
 });
 
