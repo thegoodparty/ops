@@ -549,6 +549,9 @@ export const createBossTools = async (args: {
     },
     {
       name: "report_root_cause",
+      // A judged call runs in order with the rest of its batch, so the
+      // evaluator never races another verdict in the same turn.
+      executionMode: "sequential",
       label: "Report root cause",
       description:
         "INVESTIGATING -> FIXING. State the cause and list exactly the signals it accounts for; unexplained signals are split into their own incident. Starts npm ci in the background.",
@@ -626,6 +629,7 @@ export const createBossTools = async (args: {
     },
     {
       name: "report_resolved",
+      executionMode: "sequential",
       label: "Report resolved",
       description:
         "FIXING -> RESOLVED. Only after you have observed the harm stop: a user who repeats exactly what the affected user did is not harmed. Evidence is what you observed, not what you believe the fix does; a quiet alert is not evidence on its own.",
@@ -640,6 +644,7 @@ export const createBossTools = async (args: {
     },
     {
       name: "report_analysis",
+      executionMode: "sequential",
       label: "Report analysis",
       description:
         "RESOLVED -> CLOSED, your last act. The post-mortem as sections; code renders them in a fixed order and adds the agent run. No headings of your own. On a recurrence, `recurrence` is required.",
@@ -767,6 +772,7 @@ export const createBossTools = async (args: {
     },
     {
       name: "park",
+      executionMode: "sequential",
       label: "Park",
       description:
         "Say there is nothing you can do until a person acts, so nothing relaunches you into the same dead end. Not a hand-off: the incident stays yours and a Boss message brings you back. Prefer monitor with awaitingHuman whenever a command can detect the thing; park is for when none can.",

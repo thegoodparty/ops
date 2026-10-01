@@ -351,35 +351,39 @@ describe("stage goals, through a real Pi session", () => {
     assert.equal(run.goals.stage(), "closing");
   });
 
-  test("closing is rejected while the post-mortem lists follow-up work", async () => {
+  test("closing is rejected while the post-mortem leaves follow-up work on this incident", async () => {
+    const sections_ = (resolutionActions: string[]) => ({
+      atAGlance: "Candidates were charged for sends that never went out. Fixed.",
+      timeline: [{ at: "2026-09-30T19:02:11Z", event: "first refused send" }],
+      userImpact: "3 candidates charged $634.10 with no send.",
+      rootCause: "We took the money before asking Peerly whether the message was sendable.",
+      fiveWhys: Array.from({ length: 5 }, (_, i) => ({ why: `why ${i}`, because: `because ${i}` })),
+      resolutionActions,
+      practiceChanges:
+        "Check a send is deliverable before any payment step, as a test pattern for every paid flow.",
+      usersImpacted: 3,
+      impactQuery: "select ...",
+    });
     const run = await runGoals({
       status: "RESOLVED",
       judge: (body) =>
-        sections(body).attempt.includes("Follow-up items")
-          ? verdict("not_met", "The post-mortem lists follow-up items; ship them or escalate them as a decision.")
-          : verdict("met", "Timeline, impact and cause match; no follow-up work."),
+        sections(body).attempt.includes("Follow-up:")
+          ? verdict("not_met", "A resolution action is follow-up work on this incident; ship it or escalate it as a decision.")
+          : verdict("met", "Timeline, impact and cause match; no follow-up work on this incident."),
       turns: ({ fauxAssistantMessage, fauxToolCall }) => [
         fauxAssistantMessage(
-          fauxToolCall("report_analysis", {
-            postmortem: "## Summary\nCharged for sends.\n## Follow-up items\n- add a pre-payment gate",
-            usersImpacted: 3,
-            impactQuery: "select ...",
-          }),
+          fauxToolCall("report_analysis", sections_(["Refunded the 3 candidates", "Follow-up: add the pre-payment gate"])),
         ),
         fauxAssistantMessage(
-          fauxToolCall("report_analysis", {
-            postmortem:
-              "## Summary\nCharged for sends.\n## Prevention\n- pre-payment gate shipped in omni#2270\n## How we might prevent recurrences of similar issues by changes to our development practices\nCheck a send is deliverable before any payment step, as a test pattern for every paid flow.",
-            usersImpacted: 3,
-            impactQuery: "select ...",
-          }),
+          fauxToolCall("report_analysis", sections_(["Refunded the 3 candidates", "Shipped the pre-payment gate in omni#2270"])),
         ),
         fauxAssistantMessage("closed"),
       ],
     });
 
     assert.equal(run.calls.reportAnalysis, 1);
-    assert.match(run.agentRequests[1], /lists follow-up items/);
+    assert.match(run.agentRequests[1], /follow-up work on this incident; ship it/);
+    assert.match(run.evaluatorBodies[1], /test pattern for every paid flow/, "practice-level prevention reaches the evaluator and passes");
     assert.equal(run.goals.stage(), null, "a closed incident has no stage, so its last message is not judged");
     assert.equal(run.evaluatorBodies.length, 2, "and no stop was evaluated after it");
   });

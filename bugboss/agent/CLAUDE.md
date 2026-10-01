@@ -674,6 +674,10 @@ outcomes.
   `modelId`. The closing report therefore prices those tokens at the agent's
   rates, which overstates them about fivefold; they are a small share of the
   total.
+- **Judged tools run in order.** The three gates and `park` are
+  `executionMode: "sequential"`, which makes Pi run their whole batch one call
+  at a time, so two verdicts in one turn never race over the no-progress
+  count. It is not part of the tools array the model sees.
 - **An evaluator that fails passes the gate**, with a `goal_unjudged` alarm.
   A gate held shut by an outage would stop every incident at once.
 - **Running incidents.** Their stored prompt has no goal section, so they
