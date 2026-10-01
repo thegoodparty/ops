@@ -83,6 +83,7 @@ interface SideSummary {
   gateCells: Record<keyof Gates, string>;
   spend: Spend;
   meanUsd: number | null;
+  meanTurns: number | null;
   meanWall: number | null;
 }
 
@@ -97,6 +98,7 @@ const summarise = (runs: RunResult[]): SideSummary => {
     gateCells,
     spend: runs.reduce((sum, r) => addSpend(sum, r.spend), ZERO_SPEND),
     meanUsd: mean(runs.map((r) => r.spend.usd)),
+    meanTurns: mean(runs.map((r) => r.spend.turns)),
     meanWall: walls.length ? mean(walls) : null,
   };
 };
@@ -158,7 +160,7 @@ export const renderReport = (args: {
     const base = summarise(pick(scenario, "baseline"));
     const cand = summarise(pick(scenario, "candidate"));
     const cell = (s: SideSummary) =>
-      `${s.gatesPassed}/${s.runs} | ${s.meanUsd === null ? "–" : usd(s.meanUsd)} | ${minutes(s.meanWall)}`;
+      `${s.gatesPassed}/${s.runs} | ${s.meanTurns === null ? "–" : Math.round(s.meanTurns)} | ${s.meanUsd === null ? "–" : usd(s.meanUsd)} | ${minutes(s.meanWall)}`;
     return `| ${label} | ${cell(base)} | ${cell(cand)} | ${verdictLine(verdictsFor(scenario))} |`;
   };
 
@@ -167,10 +169,12 @@ export const renderReport = (args: {
     return `| ${side} | ${(Object.keys(GATE_NAMES) as (keyof Gates)[]).map((g) => s.gateCells[g]).join(" | ")} |`;
   });
 
-  const spendTable = (["baseline", "candidate"] as Side[]).map((side) => {
-    const s = summarise(pick(null, side)).spend;
-    return `| ${side} | ${tokens(s.input)} | ${tokens(s.output)} | ${tokens(s.cacheRead)} | ${tokens(s.cacheWrite)} | ${s.turns} | ${usd(s.usd)} |`;
-  });
+  const spendTable = [...scenarios, null].flatMap((scenario) =>
+    (["baseline", "candidate"] as Side[]).map((side) => {
+      const s = summarise(pick(scenario, side)).spend;
+      return `| ${scenario ?? "**Total**"} | ${side} | ${tokens(s.input)} | ${tokens(s.output)} | ${tokens(s.cacheRead)} | ${tokens(s.cacheWrite)} | ${s.turns} | ${usd(s.usd)} |`;
+    }),
+  );
 
   const scenarioGateRows = scenarios.flatMap((scenario) => {
     const ids = [...new Set(args.runs.filter((r) => r.scenario === scenario).flatMap((r) => Object.keys(r.scenarioGates ?? {})))];
@@ -189,12 +193,12 @@ export const renderReport = (args: {
   return [
     "## BugBoss eval (advisory)",
     "",
-    `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, mean estimated cost per run (priced from tokens), and mean time from alert to ${milestone}. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
+    `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, then per run the mean model turns, estimated cost (priced from tokens) and time from alert to ${milestone}. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
     "",
     `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
     "",
-    "| Scenario | Baseline gates | cost | wall | Candidate gates | cost | wall | Quality W-L-T |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| Scenario | Baseline gates | turns | cost | wall | Candidate gates | turns | cost | wall | Quality W-L-T |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ...scenarios.map((s) => row(s, s)),
     row("**Total**", null),
     "",
@@ -209,8 +213,8 @@ export const renderReport = (args: {
     ...(scenarioGateRows.length
       ? ["| Scenario | Scenario gate | Baseline | Candidate |", "| --- | --- | --- | --- |", ...scenarioGateRows, ""]
       : []),
-    "| Side | Input | Output | Cache read | Cache write | Turns | Cost (est.) |",
-    "| --- | --- | --- | --- | --- | --- | --- |",
+    "| Scenario | Side | Input | Output | Cache read | Cache write | Turns | Cost (est.) |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ...spendTable,
     "",
     `Judge: ${usd(args.judgeUsd)}. Cost covers the incident agents' sessions only; the Boss's own calls are not in a transcript.`,

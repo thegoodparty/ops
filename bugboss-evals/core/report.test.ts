@@ -57,8 +57,10 @@ test("the report has a row per scenario and a total, and names the runs that fai
   });
   assert.match(text, /Tier: \*\*full\*\*, each run stopping at close/);
   assert.match(text, /Estimated spend: \$37\.00 of the \$200\.00 cap\./);
-  assert.match(text, /\| a \| 1\/1 \| \$10\.00 \| 60m \| 0\/1 \| \$8\.00 \| – \| 0-1-0 \|/);
-  assert.match(text, /\| \*\*Total\*\* \| 2\/2 \| \$10\.00 \| 60m \| 1\/2 \| \$8\.00 \| 60m \| 1-1-0 \|/);
+  assert.match(text, /\| a \| 1\/1 \| 40 \| \$10\.00 \| 60m \| 0\/1 \| 40 \| \$8\.00 \| – \| 0-1-0 \|/);
+  assert.match(text, /\| \*\*Total\*\* \| 2\/2 \| 40 \| \$10\.00 \| 60m \| 1\/2 \| 40 \| \$8\.00 \| 60m \| 1-1-0 \|/);
+  assert.match(text, /\| a \| candidate \| 0 \| 0 \| 0 \| 0 \| 40 \| \$8\.00 \|/);
+  assert.match(text, /\| \*\*Total\*\* \| baseline \| 0 \| 0 \| 0 \| 0 \| 80 \| \$20\.00 \|/);
   assert.match(text, /- a rep 1 candidate: ended wall_clock; closed$/m);
   assert.match(text, /\| b \| merge-noticed \| 0\/1 \| 1\/1 \|/);
   assert.match(text, /Quality: no material change \(mean \+0\.00 on -2\.\.\+2\)/);
@@ -84,8 +86,8 @@ test("a fast-tier run's merge gates read n/a, and runs stopped at the cap are co
     capUsd: 40,
   });
   assert.match(text, /each run stopping at PR opened/);
-  assert.match(text, /mean time from alert to PR opened/);
-  assert.match(text, /\| a \| 1\/1 \| \$10\.00 \| 10m \| 1\/1 \| \$8\.00 \| – \|/);
+  assert.match(text, /time from alert to PR opened/);
+  assert.match(text, /\| a \| 1\/1 \| 40 \| \$10\.00 \| 10m \| 1\/1 \| 40 \| \$8\.00 \| – \|/);
   assert.match(text, /\| baseline \| n\/a \| n\/a \| n\/a \| 1\/1 \|/);
   assert.match(text, /\| a \| thread-told \| n\/a \| n\/a \|/);
   assert.match(text, /\| a \| cause \| 1\/1 \| 1\/1 \|/);
