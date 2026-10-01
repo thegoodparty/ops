@@ -1,10 +1,18 @@
 # bugboss-evals
 
 Tells whether a BugBoss change, a model change included, made it better or
-worse. Comment `bugboss eval` on an open ops PR: main's BugBoss and the PR's
-run every scenario three times each, and one advisory table comes back on the
-PR. Nothing gates on it. `bugboss eval stub` runs the same pipeline once with
-the scripted model, at zero model spend.
+worse. Comment on an open ops PR and main's BugBoss and the PR's run every
+scenario, and one advisory table comes back on the PR. Nothing gates on it.
+
+| Comment | Runs | Each run stops at | Spend cap |
+| --- | --- | --- | --- |
+| `bugboss eval` | 1 rep per scenario, 6 pairs | the PR opening | $40 |
+| `bugboss eval full` | 3 reps per scenario | the close | $200 |
+| `bugboss eval stub` | 1 rep, scripted model | the close | $0 |
+
+One rep of six scenarios is six pairs, the fewest the sign test can call.
+Each matrix job holds an even share of the cap, and every run in it stops,
+ending `spend_cap`, once their live sessions price at 90% of that share.
 
 ## What a run is
 
@@ -38,8 +46,12 @@ to end. The harness (`sim/run.ts`) is everything outside it:
   denied. S3 (its snapshot and session files) is `sim/s3.ts`, on disk.
 - **Postgres** for omni's tests is one container per run, as
   `OMNI_TEST_POSTGRES_URL`.
-- **npm** reads one cache per job, warmed from each scenario's lockfile
-  before the runs start; every run's HOME links `.npm` to it.
+- **npm and omni's dependencies.** Once per base, before the runs start, an
+  omni tree is installed and built as the run-as user through
+  `scenarios/_lib/setup-omni.sh`. That warms one npm cache, which every run's
+  HOME links `.npm` to, and the hidden check hardlinks the tree's
+  `node_modules` when the lockfile is unchanged. The workflow caches both by
+  base sha.
 
 The BugBoss options this needs are all unset in production:
 `BUGBOSS_GITHUB_TOKEN_FILE`, `SLACK_API_URL`, `BUGBOSS_OMNI_REPO`,
@@ -50,7 +62,8 @@ The BugBoss options this needs are all unset in production:
 Per scenario and in total, per side: gates passed (closed, fix check passes
 after merge, CI green at every merge, nothing pushed to main), mean estimated
 cost (priced from tokens; BugBoss stores tokens, never dollars) and mean time
-from alert to close. A scenario can add its own gates (`gates` in
+from alert to the tier's milestone. On the fast tier, gates about a merge
+read n/a. The table also gives the tier and the spend against the cap. A scenario can add its own gates (`gates` in
 `scenario.json`, `core/gates.ts`): checks over the thread, the incident's
 statuses and root cause, the first PR's files and the agent's tool calls,
 such as "the thread heard the merge within fifteen minutes". They get their
@@ -77,9 +90,13 @@ In CI: the `bugboss eval` comment. It needs the `bugboss-eval` environment
 
 Every PR touching BugBoss or the evals runs `bugboss-evals-ci.yml`, which
 holds no secrets: it proves each changed scenario's hidden check against omni
-(public), and runs the harness `--offline` against the stub, with a local
-bare repository as the sandbox, up to the root cause. The GitHub leg is
-proven only by `bugboss eval stub`, once the trusted parts are on main.
+(public), and runs the harness `--offline` against the stub for every
+scenario, with a local bare repository as the sandbox, up to the root cause.
+The GitHub leg is proven only by `bugboss eval stub`, once the trusted parts
+are on main: the only sandbox credential is the org-wide App's key, which
+branch code never holds. A second App installed only on the sandbox would
+make its key safe as a repository secret, and PR CI could then run the whole
+lifecycle.
 
 `--until root_cause|pr_opened|closed` stops each run at a milestone; `closed`,
 the default, is the whole lifecycle.

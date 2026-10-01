@@ -1,6 +1,6 @@
 # Zero-spend evidence on every PR that touches BugBoss or its evals: each
 # scenario's hidden check is proved against omni, and the harness runs one
-# offline pair end to end with the scripted model.
+# offline pair per scenario with the scripted model, up to the root cause.
 #
 # pull_request runs the PR's own code, so this workflow holds no secrets, no
 # environment and no AWS role. omni is public and needs no token. Offline
@@ -66,6 +66,8 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       # Blobless: full history for both shas, blobs only for what is checked out.
       - run: git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
+      # A proving fix may live only on a pull request's ref, so every scenario sha is fetched by name.
+      - run: git -C /tmp/omni fetch -q --filter=blob:none origin $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
       # prove.test.ts runs zero tests, and passes, for an id with no directory.
       - run: test -f "bugboss-evals/scenarios/${{ matrix.scenario }}/scenario.json"
       - run: npx tsx --test bugboss-evals/scenarios/prove.test.ts
@@ -82,6 +84,16 @@ jobs:
   offline:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - ecanvasser-sync-timeout
+          - users-read-invalid-zip
+          - p2p-phone-list-late-cap
+          - missed-merge
+          - alert-vs-user-harm
+          - alert-vs-user-harm-paid-alert
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,6 +108,8 @@ jobs:
       - name: Free disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - run: git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
+      # A proving fix may live only on a pull request's ref, so every scenario sha is fetched by name.
+      - run: git -C /tmp/omni fetch -q --filter=blob:none origin $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
       # Both sides are this PR: until the harness's BugBoss options are on
       # main, main's BugBoss cannot run against a stand-in at all.
       - name: Run
@@ -108,7 +122,7 @@ jobs:
         run: |
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
             --offline --stub /tmp/omni --baseline HEAD --candidate HEAD \
-            --scenarios users-read-invalid-zip --reps 1 --out /tmp/evals
+            --scenarios "${{ matrix.scenario }}" --reps 1 --out /tmp/evals
       - name: Every run reached a root cause
         run: |
           test -f /tmp/evals/results.json
@@ -117,7 +131,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: offline
+          name: offline-${{ matrix.scenario }}
           path: |
             /tmp/evals/results.json
             /tmp/evals/runs/*/result.json
