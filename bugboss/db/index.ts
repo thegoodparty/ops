@@ -327,23 +327,27 @@ export class Db {
       // every write behind this one.
       const delays = halt ? [] : this.timing.retryDelaysMs;
       let lastErr: unknown;
-      for (let attempt = 0; attempt <= delays.length; attempt++) {
+      let landed = false;
+      for (let attempt = 0; attempt <= delays.length && !landed; attempt++) {
         if (attempt > 0) await new Promise((r) => setTimeout(r, delays[attempt - 1]));
         try {
           await this.put(body);
-          this.write.exec("COMMIT");
+          landed = true;
           if (attempt > 0) log("snapshot_retry_succeeded", { attempt: attempt + 1 });
-          if (halt) {
-            this.halted = null;
-            log("writes_resumed", { haltedForMs: this.now() - halt.since });
-          }
-          return result;
         } catch (err) {
           lastErr = err;
           log("snapshot_attempt_failed", { attempt: attempt + 1, error: String(err) });
         }
       }
-      this.write.exec("ROLLBACK");
+      if (landed) {
+        this.write.exec("COMMIT");
+        if (halt) {
+          this.halted = null;
+          log("writes_resumed", { haltedForMs: this.now() - halt.since });
+        }
+        return result;
+      }
+      if (this.write.inTransaction) this.write.exec("ROLLBACK");
 
       if (halt) {
         halt.error = String(lastErr);

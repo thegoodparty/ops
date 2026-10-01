@@ -2665,6 +2665,39 @@ describe("Dispatcher escalations while writes fail", () => {
     cleanup();
   });
 
+  it("keeps its count when the park fails, so the escalation goes out once writes return", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let halted = false;
+    let launches = 0;
+    const d = createDispatcher(
+      deps({
+        db: refusing(db, () => halted),
+        spawn: async () => {
+          launches += 1;
+          throw new Error("agent exited 1");
+        },
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+      }),
+    );
+
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    halted = true;
+    await captureAlarms(async () => {
+      await d.tick().then((r) => r.settled).catch(() => undefined);
+    });
+    halted = false;
+    const recovered = await d.tick();
+
+    assert.equal(launches, 3, "no relaunch spent rebuilding a count it already had");
+    assert.deepEqual(recovered.escalated, ["i1"]);
+    assert.equal(escalations.length, 1);
+    cleanup();
+  });
+
   it("parks before it posts a crash loop", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { escalations } = makeTools();

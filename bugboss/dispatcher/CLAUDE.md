@@ -90,7 +90,8 @@ informational for the same reason.
 
 Hitting either ceiling **parks** and then escalates, and the park is what
 stops the relaunching *and* the re-deciding. The park commits first: a park
-that cannot be written posts nothing (`*_escalation_unrecorded`), and a post
+that cannot be written posts nothing (`*_escalation_unrecorded`) and keeps
+its count, so the ceiling is met again on the next tick, and a post
 that fails takes the park back so the incident relaunches. Posting first is
 what turned the 2026-10-01 write halt into an escalation and a rotation page
 every two minutes for incident 93: every launch write failed, every third tick

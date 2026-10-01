@@ -589,11 +589,14 @@ export class Dispatcher {
         // for as long as writes fail: on 2026-10-01 a halted database
         // reposted this escalation, and paged the rotation, every two minutes
         // for five hours. A park that cannot be written says nothing.
+        // Put back, so the ceiling is met again next tick rather than after
+        // another full set of crashes.
         if (!(await this.park(row.id, reason, now))) {
+          this.fastFailures.set(row.id, failures);
           alarm("crash_loop_escalation_unrecorded", {
             incidentId: row.id,
             failures,
-            note: "the park could not be written, so the escalation was not posted; it relaunches instead",
+            note: "the park could not be written, so the escalation was not posted; it is tried again next tick",
           });
           continue;
         }
@@ -628,10 +631,11 @@ export class Dispatcher {
         this.launches.delete(row.id);
         const reason = `${launches} launches on this incident without finishing one`;
         if (!(await this.park(row.id, reason, now))) {
+          this.launches.set(row.id, launches);
           alarm("stalled_escalation_unrecorded", {
             incidentId: row.id,
             launches,
-            note: "the park could not be written, so the escalation was not posted; it relaunches instead",
+            note: "the park could not be written, so the escalation was not posted; it is tried again next tick",
           });
           continue;
         }
