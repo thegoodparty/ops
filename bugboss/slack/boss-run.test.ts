@@ -481,3 +481,56 @@ describe("incident_status through the real harness", () => {
     assert.ok(lines.some((l) => l.includes("status_summary_failed") && l.includes('"level":"error"')));
   });
 });
+
+describe("incident 80, replayed: code work for an agent out of turns", () => {
+  const REBASE = "rebase it now";
+
+  // A stand-in for the model: it reaches for the tools the prompt names when
+  // they are on offer, and otherwise does what the Boss did in prod, which
+  // was to tell the person it could not.
+  const standIn = () => {
+    const calls: string[] = [];
+    const model: SizedModelClient = {
+      contextWindow: 1_000_000,
+      complete: (request) => {
+        const offered = new Set(request.tools.map((t) => t.name));
+        const done = new Set(
+          request.messages.flatMap((m) => (m.role === "assistant" ? m.toolCalls.map((c) => c.name) : [])),
+        );
+        const call = (name: string, input: Record<string, unknown>): Promise<ModelReply> => {
+          calls.push(name);
+          return Promise.resolve({ text: "", toolCalls: [{ id: `c-${calls.length}`, name, input }], usage: emptyModelUsage() });
+        };
+        if (offered.has("grant_turns") && !done.has("grant_turns")) {
+          return call("grant_turns", {
+            incidentId: "2",
+            turns: 50,
+            reason: "Swain asked for a rebase in the thread and the agent is parked with its turn budget spent.",
+          });
+        }
+        if (offered.has("grant_turns") && !done.has("message_agent")) {
+          return call("message_agent", { incidentId: "2", text: "Swain asked you to rebase your PR onto main now." });
+        }
+        const text = done.has("message_agent")
+          ? "Gave incident 2 50 more turns and asked its agent to rebase."
+          : "I can't rebase: I have no checkout, and the agent is out of turns.";
+        return Promise.resolve({ text, toolCalls: [], usage: emptyModelUsage() });
+      },
+    };
+    return { model, calls };
+  };
+
+  test("the Boss grants turns and briefs the agent rather than handing the work back", async () => {
+    const { model, calls } = standIn();
+    const { agent } = build(model);
+
+    await captureLogs(() =>
+      agent.handleIncident({ incidentId: "2", trigger: { ...human, text: REBASE, ts: "900.000900" } }),
+    );
+
+    assert.deepEqual(calls, ["grant_turns", "message_agent"]);
+    assert.equal(db.get<{ grantedTurns: number }>("SELECT grantedTurns FROM incident WHERE id = '2'")?.grantedTurns, 50);
+    const [directive] = db.query<{ payload: string }>("SELECT payload FROM pending_directive WHERE incidentId = '2'");
+    assert.match(directive.payload, /"type":"boss_message".*rebase/);
+  });
+});

@@ -94,6 +94,10 @@ export const BUDGET_RAISED_ACTION = "turn_budget_raised";
 export const budgetRaisedNotice = (max: number, used: number): string =>
   `The turn budget was raised to ${max}, so the agent is resuming with ${max - used} turns left.`;
 
+/** What the thread is told when a Boss grant resumes a spent incident. */
+export const turnsGrantedNotice = (max: number, used: number): string =>
+  `Granted more turns; the agent is resuming with ${max - used} left of ${max}.`;
+
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
   tickSeconds: 30,
@@ -198,6 +202,7 @@ interface EligibleRow {
   attempts: number;
   lastStartedAt: number | null;
   firstSignalAt: number;
+  grantedTurns: number;
 }
 
 /**
@@ -218,7 +223,7 @@ const AGENT_STATUSES: readonly IncidentStatus[] = [
 const ELIGIBLE_SQL = `
   SELECT i.id AS id, i.status AS status, i.sessionRef AS sessionRef,
          i.attempts AS attempts, i.lastStartedAt AS lastStartedAt,
-         i.firstSignalAt AS firstSignalAt
+         i.firstSignalAt AS firstSignalAt, i.grantedTurns AS grantedTurns
   FROM incident i
   LEFT JOIN incident_wait w ON w.incidentId = i.id
   WHERE i.status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
@@ -888,15 +893,16 @@ export class Dispatcher {
   };
 
   /**
-   * Resume incidents parked on a turn budget that has since been raised.
+   * Resume incidents parked on a turn budget that has since been raised,
+   * by a new configured max or by a Boss `grant_turns` on that incident.
    *
    * A budget wait is the one park nothing else lifts: not a reply, not the
    * cooldown, not the stale sweep. That is right while the budget stands, and
    * wrong once it rises above what the incident spent, because then it has
    * turns again and the park is holding back work it could do. The budget is
-   * a constant or an environment variable, so it only changes on a restart:
-   * a wait found still spent is not read again in this process, and a read
-   * that failed or timed out is retried on the next tick.
+   * a constant or an environment variable plus the incident's grants, so a
+   * wait found still spent is not read again until a grant moves it, and a
+   * read that failed or timed out is retried on the next tick.
    *
    * Turns are read from the session, not from the wait's text, because a
    * launch can overrun the budget it parked on (incident 80 sat at 270 of
@@ -908,9 +914,14 @@ export class Dispatcher {
    */
   private liftRaisedBudgets = async (now: number): Promise<void> => {
     if (!this.sessionTurns) return;
-    const max = this.config.agentMaxTurns;
-    const rows = this.db.query<{ id: string; sessionRef: string | null; startedAt: number }>(
-      `SELECT i.id AS id, i.sessionRef AS sessionRef, w.startedAt AS startedAt
+    const rows = this.db.query<{
+      id: string;
+      sessionRef: string | null;
+      startedAt: number;
+      grantedTurns: number;
+    }>(
+      `SELECT i.id AS id, i.sessionRef AS sessionRef, w.startedAt AS startedAt,
+              i.grantedTurns AS grantedTurns
        FROM incident i
        JOIN incident_wait w ON w.incidentId = i.id
        WHERE i.status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
@@ -918,7 +929,8 @@ export class Dispatcher {
          AND w.waitingFor LIKE '%-turn budget%'`,
     );
     for (const row of rows) {
-      const key = `${row.id}:${row.startedAt}`;
+      const max = this.config.agentMaxTurns + row.grantedTurns;
+      const key = `${row.id}:${row.startedAt}:${row.grantedTurns}`;
       if (this.running.has(row.id) || this.budgetsHeld.has(key)) continue;
       if (!row.sessionRef) {
         this.budgetsHeld.add(key);
@@ -972,7 +984,7 @@ export class Dispatcher {
       }
       if (!lifted) continue;
 
-      log("turn_budget_raised", { incidentId: row.id, used, max });
+      log("turn_budget_raised", { incidentId: row.id, used, max, granted: row.grantedTurns });
       if (!this.postNotice) {
         alarm("budget_notice_undeliverable", {
           incidentId: row.id,
@@ -980,7 +992,11 @@ export class Dispatcher {
         });
         continue;
       }
-      await this.postNotice(row.id, budgetRaisedNotice(max, used)).catch((err: unknown) =>
+      const notice =
+        row.grantedTurns > 0
+          ? turnsGrantedNotice(max, used)
+          : budgetRaisedNotice(max, used);
+      await this.postNotice(row.id, notice).catch((err: unknown) =>
         alarm("budget_notice_failed", { incidentId: row.id, error: String(err) }),
       );
     }
@@ -1013,7 +1029,7 @@ export class Dispatcher {
       token,
       sessionRef: row.sessionRef,
       deadlineAt,
-      maxTurns: this.config.agentMaxTurns,
+      maxTurns: this.config.agentMaxTurns + row.grantedTurns,
       attempt,
       alertSlugs,
     });

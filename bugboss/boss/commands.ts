@@ -286,3 +286,70 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
     },
   ];
 };
+
+/** The most one grant_turns call can add. */
+export const MAX_GRANT_TURNS = 200;
+
+/** The `incident_action` a grant writes. */
+export const TURNS_GRANTED_ACTION = "turns_granted";
+
+/**
+ * Its own export rather than one more entry in `buildCommandTools`, because
+ * it is appended after `gh` in the Boss's tool list: the tools array is part
+ * of the cached prefix, and an entry in the middle would move every one
+ * after it.
+ *
+ * The grant only writes. The dispatcher reads it on its next tick, lifts a
+ * spent-budget wait the new total covers, and posts the thread notice after
+ * the lift commits, so a notice never claims a resume that did not happen.
+ */
+export const buildGrantTurnsTool = (db: Db): SlackAgentTool => ({
+  name: "grant_turns",
+  description:
+    `Give an incident's agent more turns, on top of its configured budget, when a person asks or you can cite the evidence that the work is worth it. An agent parked because its turn budget is spent resumes on the dispatcher's next tick, and the thread is told; tell the agent what to do with message_agent as well. Between 1 and ${MAX_GRANT_TURNS} turns per call. A run already in progress keeps the budget it launched with; the grant counts from its next launch.`,
+  inputSchema: {
+    type: "object",
+    properties: {
+      incidentId: { type: "string", description: "The incident whose agent gets the turns." },
+      turns: { type: "integer", description: `How many turns to add, 1 to ${MAX_GRANT_TURNS}.` },
+      reason: {
+        type: "string",
+        description: "Who asked, or the evidence the work needs the turns. Kept as the record.",
+      },
+    },
+    required: ["incidentId", "turns", "reason"],
+    additionalProperties: false,
+  },
+  run: async (input) => {
+    const incidentId = str(input.incidentId);
+    const turns = input.turns;
+    if (typeof turns !== "number" || !Number.isInteger(turns) || turns < 1 || turns > MAX_GRANT_TURNS) {
+      return `Rejected: turns must be a whole number from 1 to ${MAX_GRANT_TURNS}. Nothing was granted.`;
+    }
+    const reason = str(input.reason).trim();
+    const short = shortReason("grant_turns", reason);
+    if (short) return `Rejected: ${short}`;
+    const outcome = await db.withWrite((w: Database.Database) => {
+      const row = getIncidentRow(w, incidentId);
+      if (!row) return { granted: false as const, why: `there is no incident ${incidentId}` };
+      if (!AGENT_STATUSES.includes(row.status)) {
+        return {
+          granted: false as const,
+          why: `incident ${incidentId} is ${row.status}, so no agent is working it to use the turns`,
+        };
+      }
+      w.prepare("UPDATE incident SET grantedTurns = grantedTurns + ? WHERE id = ?").run(turns, incidentId);
+      w.prepare(
+        `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+         VALUES (?, 'boss', NULL, ?, ?, ?)`,
+      ).run(incidentId, TURNS_GRANTED_ACTION, `${turns} turns: ${reason}`, Date.now());
+      const total = w
+        .prepare("SELECT grantedTurns FROM incident WHERE id = ?")
+        .get(incidentId) as { grantedTurns: number };
+      return { granted: true as const, total: total.grantedTurns };
+    });
+    if (!outcome.granted) return `Rejected: ${outcome.why}.`;
+    log("turns_granted", { incidentId, turns, total: outcome.total });
+    return `Granted ${turns} turns to incident ${incidentId} (${outcome.total} granted in total, on top of the configured budget). If its agent is parked on a spent budget and the new total covers the turns it has used, it resumes on the next tick and the dispatcher tells the thread. If it has used more than the new total, it stays parked and nothing is posted, so a grant that does not resume it needs to be larger. If there is work for it, send it with message_agent.`;
+  },
+});
