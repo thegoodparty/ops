@@ -225,6 +225,7 @@ export interface BugBossSecrets {
   triageModelId?: string;
   intentModelId?: string;
   agentModelId?: string;
+  goalModelId?: string;
   awsRegion?: string;
 }
 
@@ -2066,9 +2067,7 @@ export const createBugBoss = async (
         ? { [TEST_DB_ENV_VAR]: config.testDatabase.url }
         : {}),
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
-      ...(process.env.BUGBOSS_GOAL_MODEL_ID
-        ? { BUGBOSS_GOAL_MODEL_ID: process.env.BUGBOSS_GOAL_MODEL_ID }
-        : {}),
+      ...(secrets.goalModelId ? { BUGBOSS_GOAL_MODEL_ID: secrets.goalModelId } : {}),
       ...(config.inferenceProfiles
         ? { BUGBOSS_INFERENCE_PROFILES: config.inferenceProfiles }
         : {}),
@@ -2319,6 +2318,7 @@ const readSecrets = (env: NodeJS.ProcessEnv): BugBossSecrets => ({
   triageModelId: env.BUGBOSS_TRIAGE_MODEL_ID,
   intentModelId: env.BUGBOSS_INTENT_MODEL_ID,
   agentModelId: env.BUGBOSS_MODEL_ID,
+  goalModelId: env.BUGBOSS_GOAL_MODEL_ID,
   awsRegion: env.AWS_REGION ?? env.AWS_DEFAULT_REGION,
 });
 

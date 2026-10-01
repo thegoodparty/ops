@@ -262,7 +262,7 @@ export interface StageGoalsDeps {
   evaluate: GoalEvaluator;
   /** The non-draining read. */
   context: () => Promise<GoalContext>;
-  recordVerdict: (verdict: { gate: Gate; verdict: Judgement; reason: string }) => Promise<unknown>;
+  recordVerdict: (verdict: { gate: Gate; verdict: Verdict; reason: string }) => Promise<unknown>;
   /** The escalate tool's own path to the Boss. */
   escalate: (reason: string, brief: string) => Promise<void>;
   session: () => GoalSession | null;
@@ -320,7 +320,9 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
       // the old behaviour wearing the new one's name.
       deps.alarm("goal_unjudged", { gate, reason: evaluation.reason });
     }
-    if (evaluation.judgement !== "not_applicable") {
+    // Unjudged is an outage, not a verdict: the alarm carries it, and the
+    // evaluator must not read it back as an earlier judgement.
+    if (evaluation.judgement !== "not_applicable" && evaluation.judgement !== "unjudged") {
       try {
         await deps.recordVerdict({ gate, verdict: evaluation.judgement, reason: evaluation.reason });
       } catch (err: unknown) {

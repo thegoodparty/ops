@@ -662,7 +662,9 @@ outcomes.
 - **The three gates.** `report_root_cause`, `report_resolved` and
   `report_analysis` run their transition only on a met verdict, so stage
   compaction rests on a verified gate. Not met returns the reason and the goal
-  text as the tool result, and the agent keeps working.
+  text as the tool result, and the agent keeps working. A refused gate or
+  merge ask still delivers the Boss's queued directives, so a stop is not
+  held behind a retry.
 - **The merge check-in.** Every `message_boss` is judged first. The evaluator
   decides whether the message asks for a merge: `not_applicable` lets it
   through, and no code reads the message's words. Not met blocks the message
@@ -670,8 +672,9 @@ outcomes.
 - **Impossible escalates.** The reason goes to the Boss as an `escalation`,
   the same path the `escalate` tool uses. Nothing changes and the agent keeps
   working; the overall turn budget bounds a stuck agent.
-- **An evaluator that fails passes the gate**, with a `goal_unjudged` alarm.
-  A gate held shut by an outage would stop every incident at once.
+- **An evaluator that fails passes the gate**, with a `goal_unjudged` alarm
+  and no timeline row. A gate held shut by an outage would stop every
+  incident at once.
 - **What it reads.** The goal, the attempt (a gate's arguments whole), the
   incident record and timeline through the non-draining
   `GET /incidents/:id/goal-context`, and the agent's projected context: the

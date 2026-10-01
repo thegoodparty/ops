@@ -7,7 +7,7 @@ import { describe, test } from "node:test";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 
 import { createPiModelClient } from "../bedrock/client";
-import type { GoalContext, IncidentStatus, TimelineEvent, ToolApi, ToolResponse } from "../types";
+import type { Directive, GoalContext, IncidentStatus, TimelineEvent, ToolApi, ToolResponse } from "../types";
 import { createGoalEvaluator, createStageGoals, GOALS } from "./goals";
 import { createBossTools, startWithinBudget } from "./run";
 import { sumSessionUsage } from "./session";
@@ -43,6 +43,8 @@ const runGoals = async (args: {
   timeline?: TimelineEvent[];
   /** What the stand-in `run_query` tool returns, in call order. */
   queries?: string[];
+  /** Directives the Boss has queued, drained by the first get_incident. */
+  directives?: Directive[];
   judge: (body: string) => Verdict;
   turns: (kit: typeof import("@earendil-works/pi-ai")) => unknown[];
 }) => {
@@ -90,6 +92,7 @@ const runGoals = async (args: {
     told: [] as { kind: string; text: string }[],
     verdicts: [] as { gate: string; verdict: string; reason: string }[],
   };
+  const queued = [...(args.directives ?? [])];
   const ok = (data?: unknown): ToolResponse<never> =>
     ({ ok: true, directives: [], ...(data === undefined ? {} : { data }) }) as ToolResponse<never>;
   const api = {
@@ -105,7 +108,10 @@ const runGoals = async (args: {
       calls.reportAnalysis += 1;
       return ok();
     },
-    getIncident: async () => ok({ signals: [SIGNAL] }),
+    getIncident: async () => {
+      const directives = queued.splice(0);
+      return { ...ok({ signals: [SIGNAL] }), directives };
+    },
     trackTimelineEvent: async (event: { kind: TimelineEvent["kind"] }) => ok({ ...event, id: 9 }),
   } as unknown as ToolApi;
   const tellBoss = async (kind: string, text: string) => {
@@ -414,6 +420,20 @@ describe("stage goals, through a real Pi session", () => {
     assert.deepEqual(run.calls.verdicts.map((v) => v.verdict), ["impossible"]);
   });
 
+  test("a refused gate still delivers a stop the Boss queued", async () => {
+    const run = await runGoals({
+      directives: [{ type: "stop", reason: "a person took it" }],
+      judge: () => verdict("not_met", "No user harm shown."),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
+        fauxAssistantMessage("should not run"),
+      ],
+    });
+
+    assert.equal(run.calls.reportRootCause, 0, "premise: the gate was refused");
+    assert.equal(run.agentRequests.length, 1, "the stop ended the run on the refused call");
+  });
+
   test("an evaluator that fails passes the gate, with an alarm", async () => {
     const run = await runGoals({
       judge: () => ({ verdict: "maybe", reason: "" }),
@@ -425,7 +445,7 @@ describe("stage goals, through a real Pi session", () => {
 
     assert.equal(run.calls.reportRootCause, 1);
     assert.ok(run.logs.some((log) => log.event === "goal_unjudged"));
-    assert.deepEqual(run.calls.verdicts.map((v) => v.verdict), ["unjudged"]);
+    assert.equal(run.calls.verdicts.length, 0, "an outage is not a verdict on the timeline");
   });
 
   test("the evaluator's tokens count in the incident's usage, and not as turns", async () => {

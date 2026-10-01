@@ -1206,7 +1206,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           evidence: loaded,
           priorIncident: readPriorIncident(incident.recurrenceOf),
           absorbed: readAbsorbed(incidentId),
-          timeline: readTimelineEvents(db, incidentId),
+          // Verdicts are the harness's, and not events the post-mortem matches.
+          timeline: readTimelineEvents(db, incidentId).filter((event) => event.kind !== GOAL_VERDICT_KIND),
         },
       };
     });

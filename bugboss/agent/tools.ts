@@ -1184,9 +1184,11 @@ export const createMessageBossTool = async (
               `The agent is sending the Boss this message${args.wait ? " and waiting for the answer" : ""}:\n${args.message}`,
             );
         if (blocked) {
+          const directives = (await deps.api.peekDirectives()).map((entry) => entry.directive);
           return {
-            content: [{ type: "text", text: `Not sent to the Boss. ${blocked}` }],
+            content: [{ type: "text", text: `Not sent to the Boss. ${blocked}${renderDirectives(directives)}` }],
             details: { timedOut: false },
+            terminate: directives.some((directive) => directive.type === "stop" || directive.type === "merged"),
           };
         }
       }

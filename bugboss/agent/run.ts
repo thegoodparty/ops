@@ -515,9 +515,20 @@ export const createBossTools = async (args: {
     run: () => Promise<ToolResponse>,
   ) => {
     if (!args.goals) return bossToolResult(await run());
-    return bossToolResult(
-      await args.goals.gate(gate, `The agent called ${tool} with:\n${JSON.stringify(params, null, 2)}`, run),
+    let ran = false;
+    const response = await args.goals.gate(
+      gate,
+      `The agent called ${tool} with:\n${JSON.stringify(params, null, 2)}`,
+      () => {
+        ran = true;
+        return run();
+      },
     );
+    if (ran) return bossToolResult(response);
+    // A refused gate never reached the tool API, so it drained nothing; a
+    // stop or merge must still reach the agent on this call.
+    const { directives = [] } = await args.api.getIncident();
+    return bossToolResult({ ...response, directives });
   };
 
   const tools: ToolDefinition[] = [

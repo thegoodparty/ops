@@ -159,7 +159,7 @@ const BODIES = {
 
 const GOAL_VERDICT_BODY = z.object({
   gate: z.enum(["root_cause", "merge_check_in", "resolved", "analysis"]),
-  verdict: z.enum(["met", "not_met", "impossible", "not_applicable", "unjudged"]),
+  verdict: z.enum(["met", "not_met", "impossible"]),
   reason: z.string().min(1),
 });
 
