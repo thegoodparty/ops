@@ -340,7 +340,26 @@ export class Db {
         }
       }
       if (landed) {
-        this.write.exec("COMMIT");
+        try {
+          this.write.exec("COMMIT");
+        } catch (commitErr) {
+          // A connection left inside the transaction refuses every later
+          // BEGIN. S3 now holds a write local does not, so the state as it
+          // stands goes back up to put the two level again.
+          if (this.write.inTransaction) this.write.exec("ROLLBACK");
+          const relevelled = await this.put(this.write.serialize()).then(
+            () => true,
+            () => false,
+          );
+          alarm("commit_failed_after_put", {
+            error: String(commitErr),
+            relevelled,
+            note: relevelled
+              ? "rolled back locally and S3 re-uploaded to match"
+              : "rolled back locally, but S3 still holds the write; a restart would restore it",
+          });
+          throw commitErr;
+        }
         if (halt) {
           this.halted = null;
           log("writes_resumed", { haltedForMs: this.now() - halt.since });

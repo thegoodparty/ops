@@ -880,6 +880,39 @@ describe("a snapshot PUT that fails", () => {
     }
   });
 
+  it("rolls back and keeps writing when the commit after a landed PUT fails", async () => {
+    const { s3, state } = flakyS3();
+    const db = await Db.open({ path: join(dir, "commit.db"), bucket: "b", key: "k", s3, snapshotTiming: timing });
+    try {
+      const conn = (db as unknown as { write: Database.Database }).write;
+      const exec = conn.exec.bind(conn);
+      let failCommit = true;
+      conn.exec = ((sql: string) => {
+        if (sql === "COMMIT" && failCommit) {
+          failCommit = false;
+          throw new Error("disk I/O error");
+        }
+        return exec(sql);
+      }) as typeof conn.exec;
+
+      const alarms = await captureAlarms(() => insert(db, "uncommitted").catch(() => undefined));
+      assert.ok(alarms.includes("commit_failed_after_put"));
+      await insert(db, "next");
+
+      assert.deepEqual(db.query("SELECT id FROM incident"), [{ id: "next" }]);
+      const landed = join(dir, "commit-landed.db");
+      writeFileSync(landed, state.landed!);
+      const copy = new Database(landed, { readonly: true });
+      try {
+        assert.deepEqual(copy.prepare("SELECT id FROM incident").all(), [{ id: "next" }]);
+      } finally {
+        copy.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   it("gives up on a PUT that never answers instead of holding the write queue", async () => {
     let attempts = 0;
     const s3 = {
