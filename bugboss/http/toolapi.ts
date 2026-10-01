@@ -14,9 +14,10 @@
 // has to watch for an answer without draining, which no ToolApi call can do,
 // so the directive read lives here too. And everything an agent says to a
 // person arrives at the Boss's inbox through here: no route on this app posts
-// to Slack.
+// to Slack. The last two forward request_sql_query to the SQL sidecar, which
+// posts its own approval request; the Boss only names the thread.
 
-import { makeLog } from "../logging";
+import { makeAlarm, makeLog } from "../logging";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { z } from "zod";
@@ -28,6 +29,7 @@ import { TIMELINE_EVENT_KINDS } from "../types";
 import type { Directive, ToolApi, WakeBoss } from "../types";
 
 const log = makeLog("boss-http");
+const alarm = makeAlarm("boss-http");
 
 export interface ToolApiHttpDeps {
   db: Db;
@@ -44,6 +46,16 @@ export interface ToolApiHttpDeps {
    * route with no dispatcher in the call.
    */
   noteEscalated: (incidentId: string) => void;
+  /**
+   * The SQL sidecar (`bugboss/sqlrunner`), from BUGBOSS_SQL_RUNNER_URL. It
+   * holds the database password and asks a person in the incident thread
+   * before it runs anything; this side only names the thread. Unset leaves
+   * request_sql_query in the agent's tool list answering with an error and an
+   * alarm, so the prompt prefix does not change with configuration.
+   */
+  sqlRunnerUrl?: string;
+  /** Reaches the sidecar. Tests inject a fake one. */
+  fetchImpl?: typeof fetch;
   now?: () => number;
 }
 
@@ -584,6 +596,135 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
       );
     });
     return c.body(null, 204);
+  });
+
+  // -------------------------------------------------------------------------
+  // request_sql_query: forwarded to the SQL sidecar
+  // -------------------------------------------------------------------------
+
+  const sqlRunner = deps.sqlRunnerUrl?.replace(/\/$/, "");
+  const sidecarFetch = deps.fetchImpl ?? fetch;
+
+  /**
+   * The sidecar's answer goes back verbatim, status and body, because it is
+   * the side that decides: a semicolon, a second pending request, a missing
+   * rotation group are its refusals to word, and the agent reads them as
+   * they were written. Everything that stops the call before the sidecar
+   * answers alarms as well as erroring. An agent told "try again later" with
+   * nobody else told is how a capability stays broken for weeks.
+   */
+  const forwardToSqlRunner = async (
+    c: Context,
+    incidentId: string,
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+  ): Promise<Response> => {
+    if (!sqlRunner) {
+      alarm("sql_runner_unconfigured", { incidentId });
+      return c.json(
+        { error: "the SQL runner is not configured on this Boss (BUGBOSS_SQL_RUNNER_URL is unset); nothing was asked" },
+        503,
+      );
+    }
+
+    let response: Response;
+    try {
+      response = await sidecarFetch(`${sqlRunner}${path}`, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (err) {
+      alarm("sql_runner_unreachable", { incidentId, path, error: String(err) });
+      return c.json(
+        { error: `the SQL runner could not be reached: ${String(err)}` },
+        502,
+      );
+    }
+
+    const text = await response.text();
+    if (response.status >= 500) {
+      alarm("sql_runner_error", { incidentId, path, status: response.status, body: text });
+    } else if (!response.ok) {
+      log("sql_runner_refused", { incidentId, path, status: response.status });
+    }
+    return new Response(text, {
+      status: response.status,
+      headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
+    });
+  };
+
+  /**
+   * The Boss adds the thread, and that is all it adds. The approval is a
+   * reaction on the sidecar's own message in the incident thread, so the
+   * thread has to come from the incident row rather than from the agent: an
+   * agent that named its own thread could ask for approval somewhere nobody
+   * on the rotation is looking.
+   */
+  app.post("/incidents/:id/sql-requests", async (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "body was not JSON" }, 400);
+    }
+    // Shape only. What a query may contain is the sidecar's to refuse, so its
+    // wording is the only one the agent ever reads about it.
+    const parsed = z.object({ sql: z.string(), reason: z.string() }).safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: describeIssues(parsed.error) }, 400);
+    }
+
+    // The sidecar's contract takes an integer, and every production id is
+    // one (`MAX(id)+1`). Anything else is a row nothing here should exist for.
+    const incidentId = Number(caller.incidentId);
+    if (!Number.isSafeInteger(incidentId)) {
+      alarm("sql_request_bad_incident_id", { incidentId: caller.incidentId });
+      return c.json({ error: `incident ${caller.incidentId} has no integer id; nothing was asked` }, 500);
+    }
+
+    const row = deps.db.get<{ slackThreadTs: string | null }>(
+      "SELECT slackThreadTs FROM incident WHERE id = ?",
+      [caller.incidentId],
+    );
+    if (!row) {
+      alarm("sql_request_unknown_incident", { incidentId: caller.incidentId });
+      return c.json({ error: `unknown incident ${caller.incidentId}; nothing was asked` }, 404);
+    }
+    if (!row.slackThreadTs) {
+      alarm("sql_request_no_thread", { incidentId: caller.incidentId });
+      return c.json(
+        {
+          error: `incident ${caller.incidentId} has no Slack thread yet, so there is nowhere to ask for approval; nothing was asked`,
+        },
+        409,
+      );
+    }
+
+    return forwardToSqlRunner(c, caller.incidentId, "POST", "/requests", {
+      incidentId,
+      threadTs: row.slackThreadTs,
+      sql: parsed.data.sql,
+      reason: parsed.data.reason,
+    });
+  });
+
+  // Not checked against the caller's incident: the sidecar's answer does not
+  // say whose request it was, and the id is a random UUID only its creator
+  // was handed. Reads are not contained here anyway (toolapi/CLAUDE.md).
+  app.get("/incidents/:id/sql-requests/:requestId", (c) => {
+    const caller = authorize(c);
+    if (caller instanceof Response) return caller;
+    const requestId = c.req.param("requestId");
+    // It goes into the sidecar's path, so nothing in it may move the path.
+    if (!/^[A-Za-z0-9-]+$/.test(requestId)) {
+      return c.json({ error: "requestId is not a request id" }, 400);
+    }
+    return forwardToSqlRunner(c, caller.incidentId, "GET", `/requests/${requestId}`);
   });
 
   return app;

@@ -22,6 +22,7 @@ This file is what you need before editing anything here.
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
 | What the GitHub App may do, and why | [`github-app.md`](./github-app.md) |
 | The Postgres agents run omni's tests against | [`testdb/CLAUDE.md`](./testdb/CLAUDE.md) |
+| The human-approved read-only query against gp-api prod | [`sqlrunner/CLAUDE.md`](./sqlrunner/CLAUDE.md) |
 
 `index.ts` is the composition root — the only place real services are
 named. `types.ts` is the contract everything else is built against.
@@ -99,6 +100,12 @@ An entity check — "does this text contain `<@U…>`", "is this thread an
 incident's" — is not a language interface. Those decide where a message is
 routed, never what it meant.
 
+The one deliberate exception is approving a SQL query: a person on the
+rotation reacts to the SQL runner's own message, and code reads the reaction.
+What is being approved is the exact stored query, byte for byte, and a model
+between the person and that decision could be steered by the
+attacker-writable text the agent reads. `sqlrunner/CLAUDE.md` has the rest.
+
 **Anything a reader sees the same way twice is rendered once, in code.** An
 incident reference, a status-board row, a thread's header and an incident's
 status card are all formatting, and formatting asked for in a prompt is followed
@@ -144,8 +151,11 @@ predicate in the `UPDATE` and reject on `changes === 0`.
 **The agent is untrusted, and the container is what bounds it.** An agent
 reads attacker-writable log lines for a living, and it runs as a child of the
 Boss with the Boss's own credentials — there is no fence inside the task.
-What holds is outside it: this container reaches no database and no release
-path, and its GitHub App cannot merge. The loopback API is how an agent moves
+What holds is outside it: the container holds no database credential and
+no release path, and its GitHub App cannot merge. It can reach the gp-api
+prod reader over the network, but only the `sqlrunner` sidecar holds the
+read-only credential, in a container the agent cannot read, and it runs a
+query only after a rotation member reacts on the sidecar's own message. The loopback API is how an agent moves
 incident state, with a per-launch token scoped to one incident so concurrent
 agents cannot reach each other's work.
 

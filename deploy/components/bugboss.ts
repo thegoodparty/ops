@@ -42,11 +42,18 @@ export const AGENT_UID = 1001;
 // is OOM-killed, nothing restarts a non-essential container, and every agent
 // loses its test database at once. So size the memory so the connection
 // ceiling is always what gives first.
+//
+// The SQL runner follows the same rule for memory: the task grows a GB and
+// the runner takes it. Its CPU comes out of BugBoss's share, which costs
+// nothing, because a share is only a floor under contention and the runner
+// is idle unless a person has just approved a query.
 export const TASK_CPU = 4096;
-export const TASK_MEMORY = 19456;
+export const TASK_MEMORY = 20480;
 export const POSTGRES_CPU = 512;
 export const POSTGRES_MEMORY = 3072;
-export const BUGBOSS_CPU = 3584;
+export const SQL_RUNNER_CPU = 256;
+export const SQL_RUNNER_MEMORY = 1024;
+export const BUGBOSS_CPU = 3328;
 export const BUGBOSS_MEMORY = 16384;
 
 // Matches omni's own harness (packages/gp-api/src/test-postgres.ts) so an
@@ -88,6 +95,26 @@ const POSTGRES_PORT = 5432;
  * reads it, rather than the two agreeing by inspection.
  */
 export const TEST_DB_URL = `postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}`;
+
+// The SQL runner sidecar, which runs a read-only query against gp-api prod
+// once a person on the rotation has approved it in Slack. See
+// bugboss/sqlrunner/CLAUDE.md for the approval mechanism; what lives here is
+// the part of its trust boundary that only IaC can draw.
+export const SQL_RUNNER_PORT = 8790;
+export const SQL_RUNNER_URL = `http://127.0.0.1:${SQL_RUNNER_PORT}`;
+export const SQL_RUNNER_LOG_GROUP = "/bugboss/sql-runner";
+export const READONLY_DB_PASSWORD_PARAMETER_ARN = `arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/gp-api-prod/readonly-password`;
+const READONLY_DB_HOST =
+  "gp-api-db-prod.cluster-ro-cmb1uukjsfbe.us-west-2.rds.amazonaws.com";
+const READONLY_DB_NAME = "gpdb";
+const READONLY_DB_USER = "readonly_user";
+
+// gp-api prod's Aurora security group. No Pulumi stack declares it -- it is
+// managed by hand, and its rules carry hand-written descriptions -- so it is
+// named by id like the VPC above, and the rule below is a standalone resource
+// rather than an inline block. An inline `ingress` would make this stack the
+// owner of the group's whole rule set and delete every rule it did not write.
+const GP_API_PROD_DB_SECURITY_GROUP_ID = "sg-03783e4adbbee87dc";
 
 // `Environment: infra` is a protection, not a label. The EngineerAccess SSO
 // permission set grants every engineer `Action: ["*"]` on anything tagged
@@ -188,6 +215,17 @@ export const createBugBoss = (config: BugBossConfig) => {
     tags: TAGS,
   });
 
+  // Its own group, and deliberately outside every prefix the task role's
+  // ApplicationLogContent statement allows. It is the record of what ran
+  // against prod and who approved it, and a Postgres error can quote row
+  // values. An agent gets rows only through a request a person approved, so
+  // it reads neither.
+  const sqlRunnerLogGroup = new aws.cloudwatch.LogGroup("bugbossSqlRunnerLogGroup", {
+    name: SQL_RUNNER_LOG_GROUP,
+    retentionInDays: 30,
+    tags: TAGS,
+  });
+
   // Looked up, never declared. The secret is created and populated by hand,
   // so declaring it here would fail the whole stack update on the first apply
   // with ResourceExistsException, and owning the container would tie rotating
@@ -236,6 +274,20 @@ export const createBugBoss = (config: BugBossConfig) => {
     egress: [
       { protocol: "-1", fromPort: 0, toPort: 0, cidrBlocks: ["0.0.0.0/0"] },
     ],
+    tags: TAGS,
+  });
+
+  // The one network path from this task to a production database. What
+  // bounds it is the credential, not the network: only the SQL runner holds
+  // one, and it runs nothing a person has not approved. The agent can open a
+  // socket to this port, and gets an authentication failure.
+  new aws.vpc.SecurityGroupIngressRule("bugbossSqlRunnerToGpApiDb", {
+    securityGroupId: GP_API_PROD_DB_SECURITY_GROUP_ID,
+    referencedSecurityGroupId: serviceSecurityGroup.id,
+    ipProtocol: "tcp",
+    fromPort: 5432,
+    toPort: 5432,
+    description: "bugboss sql runner sidecar (read-only, human-approved)",
     tags: TAGS,
   });
 
@@ -417,6 +469,18 @@ export const createBugBoss = (config: BugBossConfig) => {
               Action: ["secretsmanager:GetSecretValue"],
               Resource: [secret.arn],
             },
+            // What ECS calls to inject an SSM `secrets` entry into a
+            // container at launch. This role is the only thing that ever
+            // holds the read-only password; the task role never does. The
+            // parameter is encrypted with the AWS-managed SSM key, whose key
+            // policy already lets SSM decrypt for any principal in the
+            // account, so no kms:Decrypt is needed.
+            {
+              Sid: "SqlRunnerReadonlyPassword",
+              Effect: "Allow",
+              Action: ["ssm:GetParameters"],
+              Resource: [READONLY_DB_PASSWORD_PARAMETER_ARN],
+            },
           ],
         }),
       },
@@ -561,6 +625,21 @@ export const createBugBoss = (config: BugBossConfig) => {
               ],
               Resource: ["*"],
             },
+            // The agent runs with this role and has a shell. Nothing above
+            // allows either of these today; the deny is so that a future,
+            // broader Allow -- `/gp-api-prod/*`, `logs:*` on `*` -- cannot hand
+            // an agent the password the SQL runner exists to keep from it, or
+            // the runner's logs, without someone deleting this first.
+            {
+              Sid: "NeverTheSqlRunnersCredentialOrLogs",
+              Effect: "Deny",
+              Action: ["ssm:GetParameter*", "logs:*"],
+              Resource: [
+                READONLY_DB_PASSWORD_PARAMETER_ARN,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${SQL_RUNNER_LOG_GROUP}`,
+                `arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${SQL_RUNNER_LOG_GROUP}:*`,
+              ],
+            },
           ],
         }),
       },
@@ -682,6 +761,11 @@ export const createBugBoss = (config: BugBossConfig) => {
           // Postgres instead of trying to start one; bugboss/testdb refuses
           // anything but loopback here and alarms at boot if nothing answers.
           { name: TEST_DB_ENV_VAR, value: TEST_DB_URL },
+          // The SQL runner sidecar below. The Boss forwards an agent's
+          // request_sql_query here. An agent can reach this port as easily as
+          // the Boss can, and that is fine: the runner trusts no caller, only
+          // a reaction it confirms with Slack itself.
+          { name: "BUGBOSS_SQL_RUNNER_URL", value: SQL_RUNNER_URL },
           // A map, keyed by the logical model id the agent is configured
           // with. An entry that matches nothing costs a run its line in Cost
           // Explorer and nothing else, which is what a retune to a model
@@ -771,6 +855,54 @@ export const createBugBoss = (config: BugBossConfig) => {
             "awslogs-group": logGroup.name,
             "awslogs-region": REGION,
             "awslogs-stream-prefix": "postgres",
+          },
+        },
+      },
+      // Runs a read-only SQL query against gp-api prod, once a person on the
+      // rotation has approved it with a reaction on the runner's own Slack
+      // message. A separate container because a container is the smallest
+      // thing in a task with its own environment: the agent can read
+      // everything the Boss's process holds, and it cannot read this one's.
+      //
+      // So the password is injected here, by the execution role, and nowhere
+      // else. No mountPoints: sharing the work volume would give the agent a
+      // filesystem this process can see. Logs go to a group the task role is
+      // denied.
+      //
+      // NOT essential, for the postgres sidecar's reason: BugBoss must boot
+      // and work alerts whether or not this is up.
+      {
+        name: "sqlrunner",
+        image: config.imageUri,
+        cpu: SQL_RUNNER_CPU,
+        memory: SQL_RUNNER_MEMORY,
+        essential: false,
+        command: ["node", "dist/bugboss/sqlrunner/main.js"],
+        environment: [
+          { name: "SQL_RUNNER_PORT", value: String(SQL_RUNNER_PORT) },
+          { name: "GP_API_READONLY_DB_HOST", value: READONLY_DB_HOST },
+          { name: "GP_API_READONLY_DB_NAME", value: READONLY_DB_NAME },
+          { name: "GP_API_READONLY_DB_USER", value: READONLY_DB_USER },
+        ],
+        // BUGBOSS_SECRETS for the Slack bot token, which it uses only to post
+        // the request and to ask Slack who reacted.
+        secrets: [
+          { name: "BUGBOSS_SECRETS", valueFrom: secret.arn },
+          {
+            name: "GP_API_READONLY_DB_PASSWORD",
+            valueFrom: READONLY_DB_PASSWORD_PARAMETER_ARN,
+          },
+        ],
+        // No portMappings, as with postgres: the Boss reaches it on loopback
+        // through the shared namespace, and publishing it would put a
+        // query-runner on the task ENI, which has a public IP. The runner
+        // also binds 127.0.0.1 itself.
+        logConfiguration: {
+          logDriver: "awslogs",
+          options: {
+            "awslogs-group": sqlRunnerLogGroup.name,
+            "awslogs-region": REGION,
+            "awslogs-stream-prefix": "sqlrunner",
           },
         },
       },

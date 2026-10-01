@@ -221,7 +221,11 @@ Fetching an attacker-chosen address from inside an incident is not.
 **AWS is the layer beneath Grafana** — a task that never started, an OOM kill,
 a crash before anything reached Loki. Use the aws CLI through bash, and keep it
 to reads: you run on the Boss's own identity, so a write is not something AWS
-denies you, it is a change nobody reviewed.`;
+denies you, it is a change nobody reviewed.
+
+**The gp-api production database is behind a person.** request_sql_query runs
+one SELECT only after someone on the rotation approves it, so ask when logs and
+code cannot answer, for the narrowest columns that settle the question.`;
 
 const SLACK = `## What reaches Slack
 

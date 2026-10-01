@@ -699,4 +699,9 @@ export interface BugBossConfig {
   inferenceProfiles?: string;
   /** The Postgres agents run omni's database-backed tests against. */
   testDatabase: TestDatabase;
+  /**
+   * The SQL sidecar on loopback, which runs an approved request_sql_query.
+   * Absent leaves the tool answering with an error and an alarm.
+   */
+  sqlRunnerUrl?: string;
 }

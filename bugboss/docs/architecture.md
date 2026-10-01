@@ -237,7 +237,9 @@ fixes, opens a PR, waits for a merge and a deploy, and writes a post-mortem.
 ## The human boundary
 
 Everything a person says to BugBoss is a sentence, not a command. There is no
-slash command, no button and no phrase to learn.
+slash command, no button and no phrase to learn. The one thing a person does
+that is not a sentence is approve an agent's SQL query with a reaction, and
+that is deliberate; see "Querying gp-api prod".
 
 **The Boss is the only interface between people and incident agents.** Every
 message in an incident thread, tagged or not, goes to the Boss with the
@@ -267,10 +269,13 @@ too. There is no privilege boundary inside the container — a child can read
 the parent's own environment — so anything claimed at that line would be a
 claim rather than a control.
 
-The boundary that is real is the task. This container holds no database
-credentials, no deploy role and no merge rights. Its AWS identity reads logs,
-metrics and ECS state, calls Bedrock, and writes its own bucket; it cannot
-reach RDS, the release path, or any secret but its own. The GitHub App opens
+The boundary that is real is the task. The agent's container holds no
+database credentials, no deploy role and no merge rights. Its AWS identity
+reads logs, metrics and ECS state, calls Bedrock, and writes its own bucket;
+it cannot reach the release path or any secret but its own. The task can open
+a connection to gp-api prod's database reader, but the only credential for it
+is in the SQL runner sidecar, which the agent cannot read (see "Querying
+gp-api prod"). The GitHub App opens
 pull requests and cannot merge one, enforced by branch protection on `main`
 rather than by the prompt. So every effect an agent can have on the platform
 arrives as a pull request a human approves.
@@ -375,6 +380,55 @@ replaces the task, so nothing accumulates across deploys.
 This does not replace CI, and the prompt says so. CI is still what has to be
 green at the approval SHA; what it cannot give an agent is the short loop.
 
+## Querying gp-api prod
+
+Some incidents can only be confirmed in the data: how many users a bug
+reached, whether a backfill landed. The agent cannot hold a prod credential,
+because it reads attacker-writable text, has a shell and unrestricted egress,
+and can read everything the Boss's process holds. So a query runs in another
+container, and only once a person has approved it.
+
+**Layout.** `sqlrunner` is a third container in the task, from the same image
+(`node dist/bugboss/sqlrunner/main.js`). It listens on `127.0.0.1:8790` with
+no port mapping, so only the task's own loopback reaches it. It shares the
+network namespace and nothing else: not the PID namespace, not the work
+volume, not the environment.
+
+**The flow.**
+
+1. The agent calls `request_sql_query(sql, reason)` on the loopback tool API.
+2. The Boss adds the incident's thread and forwards it to the runner.
+3. The runner posts the exact SQL in that thread and waits.
+4. A member of the rotation group reacts to approve or refuse. The runner
+   polls `reactions.get`, ignores the bot user and anyone not in the
+   rotation, and re-reads the message before running.
+5. It runs the query in a `READ ONLY` transaction with a statement timeout,
+   as `readonly_user` on the reader endpoint, with a row and size cap. It
+   edits the outcome into its message, and the agent collects the rows by
+   polling through the Boss.
+
+**The trust boundary.**
+
+- The password is the SSM parameter `/gp-api-prod/readonly-password`,
+  injected into the `sqlrunner` container alone by the execution role at
+  launch. The task role, which the agent runs as, has an explicit deny on it.
+- Approval is a reaction rather than a button. The agent can read the
+  signing secret, so it could forge an interactivity payload; it can only
+  react as the bot, and the bot does not count. The runner asks Slack who
+  reacted, so nothing the agent sends it can stand in for a person.
+- The agent holds the bot token, so it could edit the runner's message to
+  show a harmless query over the stored one. The runner refuses to run if the
+  message was edited, deleted, or no longer shows what it stored.
+- The runner logs to `/bugboss/sql-runner`, outside every log prefix the
+  task role reads, and the task role is explicitly denied it too.
+- A security group rule opens the database's port 5432 to this task's
+  security group and nothing wider.
+
+**What it does not protect against.** Once rows are returned to the agent
+they are the agent's, and its egress is open, so an approval is an approval
+to let those rows out. And a person can approve a bad query: the runner
+enforces read-only and the caps, not judgement about what is being read.
+
 ## Durability
 
 **SQLite, mirrored to S3 synchronously.** Every write goes through
@@ -421,6 +475,7 @@ those rows, and the closing report prints them.
 | `http/` | Public routes and the loopback tool API |
 | `db/` | SQLite, and the S3 mirror |
 | `testdb/` | The test Postgres URL, its guard and its boot probe |
+| `sqlrunner/` | The sidecar that runs a human-approved read-only query against gp-api prod |
 | `index.ts` | The composition root. The only place real services are named |
 
 `types.ts` is the contract every module is built against. `model.ts` is the
