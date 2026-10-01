@@ -187,7 +187,7 @@ beforeEach(async () => {
 });
 
 const CLOSE_ASK = "Can we close this alert? I've since removed this alert completely.";
-const human = { kind: "human" as const, user: "U0SWAIN", text: CLOSE_ASK, ts: "900.000500" };
+const human = { kind: "human" as const, user: "U0SWAIN", text: CLOSE_ASK, ts: "900.000500", tagged: false };
 
 /** The prod model's failure, as a rule: fed a result this wide, it answers with nothing. */
 const CHOKES_AT = 100_000;
@@ -479,5 +479,88 @@ describe("incident_status through the real harness", () => {
     assert.match(cards[0], new RegExp(`\\*Now:\\* ${SUMMARY_UNAVAILABLE}\\n`));
     assert.doesNotMatch(cards[0], /Turn \d|"role"|const rule/);
     assert.ok(lines.some((l) => l.includes("status_summary_failed") && l.includes('"level":"error"')));
+  });
+});
+
+// Prod, 2026-10-01: in incident 100's thread Swain asked "<@BugBoss> what's
+// the status here?", and the Boss stayed silent because the tag was "another
+// user (U0C46PE9LN7), not me" -- its own id, raw, in a run that allowed
+// silence for every message.
+describe("incident 100, replayed", () => {
+  const STATUS_ASK = `<@${BOT}|BugBoss> what's the status here?`;
+  const CHAT = "I think it's the deploy from this morning";
+
+  /** What the prod model did: read the tag as somebody else's and choose silence. Refused, it answers. */
+  const incidentHundredModel = () => {
+    const requests: ModelRequest[] = [];
+    const reply = (text: string, name?: string, input: Record<string, unknown> = {}): ModelReply => ({
+      text,
+      toolCalls: name ? [{ id: `call-${requests.length}`, name, input }] : [],
+      usage: emptyModelUsage(),
+    });
+    const model: SizedModelClient = {
+      contextWindow: 1_000_000,
+      complete: (request) => {
+        requests.push(request);
+        const refused = request.messages.some((m) => m.role === "toolResult" && /^Refused: this message tags you/.test(m.text));
+        if (refused) return Promise.resolve(reply("Incident 100's agent is investigating; its last step was a tool call."));
+        return Promise.resolve(
+          reply("", "stay_silent", { reason: "The message tags another user, not me, and is a question directed at that person." }),
+        );
+      },
+    };
+    return { model, requests };
+  };
+
+  const run = async (text: string, tagged: boolean) => {
+    await db.withWrite((d) => {
+      d.prepare(
+        `INSERT INTO incident (id, status, firstSignalAt, slackThreadTs, summary, prUrls)
+         VALUES ('100', 'INVESTIGATING', 1, ?, 'Checkout latency', '[]')`,
+      ).run("1790869000.000100");
+    });
+    const { store } = memoryStore();
+    const slack = fakeSlack();
+    const ts = "1790869358.078479";
+    slack.replies.push(
+      { user: BOT, botId: "B0BUGBOSS", text: "*Incident 100 opened*", ts: "1790869000.000100" },
+      { user: "U0SWAIN", botId: null, text, ts },
+    );
+    const { model, requests } = incidentHundredModel();
+    const agent = new SlackAgent({
+      openIncident: refuseOpen,
+      gh: null,
+      db,
+      store,
+      slack: slack.client,
+      model: createSlackAgentModel(model, store),
+      summaryModel: model,
+      config: { botUserId: BOT, alertChannel: ALERT, rotationGroupId: null, incidentChannel: CHANNEL },
+      closeIncident: () => Promise.reject(new Error("no close expected")),
+    });
+    const lines = await captureLogs(() =>
+      agent.handleIncident({ incidentId: "100", trigger: { kind: "human", user: "U0SWAIN", text, ts, tagged } }),
+    );
+    const input = requests[0].messages.find((m) => m.role === "user")?.text ?? "";
+    return { posts: slack.posts, lines, input, requests };
+  };
+
+  test("a tagged status question shows the Boss it is the one asked, and is answered", async () => {
+    const { posts, lines, input } = await run(STATUS_ASK, true);
+
+    assert.match(input, /<@U0SWAIN>: @BugBoss \(you\) what's the status here\?/);
+    assert.ok(!input.includes(`<@${BOT}`), "the Boss's own id never reaches it raw");
+    assert.ok(!lines.some((l) => l.includes('"event":"stay_silent"')), "silence was not recorded");
+    assert.equal(posts.length, 1);
+    assert.match(posts[0].text, /Incident 100's agent is investigating/);
+  });
+
+  test("an untagged message between people in the thread may still be silent", async () => {
+    const { posts, lines, input } = await run(CHAT, false);
+
+    assert.match(input, /I think it's the deploy from this morning/);
+    assert.equal(posts.length, 0);
+    assert.ok(lines.some((l) => l.includes('"event":"stay_silent"')));
+    assert.ok(!lines.some((l) => l.includes('"level":"error"')), lines.join("\n"));
   });
 });
