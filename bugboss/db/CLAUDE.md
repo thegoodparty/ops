@@ -15,15 +15,42 @@ It does three things that all matter:
 Never pass an async function to it. better-sqlite3's transactions are
 synchronous only, and an async callback would commit early.
 
-## A failed PUT halts writes
+## A failed PUT halts writes, and the halt lifts itself
 
-Permanently, and on purpose. A process that keeps committing locally while
-S3 falls behind is worse than one that stops, because the divergence stays
-invisible until a restart loses it.
+The invariant is that S3 is never more than one failed write behind local, and
+no write resolves until a snapshot holding it is in S3. A process that keeps
+committing locally while S3 falls behind is worse than one that stops, because
+the divergence stays invisible until a restart loses it.
 
-The consequence is worth knowing: after one halt, every ingest, every
-transition and every escalation throws. That is the correct behaviour and
-also a total outage, so the halt is an `alarm`, not a log.
+How that is kept without a permanent outage:
+
+1. **Every PUT has a deadline** (`SNAPSHOT_TIMING.putTimeoutMs`, 20s). The SDK
+   sets none, so a stalled socket held the write queue until its signature was
+   older than the 15 minutes S3 accepts (`RequestTimeTooSkewed`, 2026-10-01).
+2. **A failed PUT is retried twice inside the same write**, each a new
+   `PutObjectCommand` and a new `send`, so each is signed when it is sent. A
+   retry that lands means the write resolves normally.
+3. **Only then does it halt**, with an `alarm` (`snapshot_failed_halting_writes`).
+   While halted no transaction runs: each write first retries a snapshot of the
+   whole current state, on a backoff from 5s to 60s, and between retries it
+   throws `writes halted` without a PUT. The first snapshot that lands clears
+   the halt (`writes_resumed`) and S3 is level with local again.
+4. **A halt older than 5 minutes alarms again**, once (`writes_still_halted`).
+
+The write whose PUT failed is committed locally, and its error says so:
+`committedLocally(err)` is true for it and for nothing else. The recovery
+snapshot makes it durable. Callers that retry are already idempotent for this
+case (see `linkThread` in `slack/relay.ts`).
+
+**A halt means nothing may be said that a write would record.** Every
+announcer that a tick drives commits its marker before it posts, and posts
+nothing when the write throws. The 2026-10-01 halt reposted the crash-loop
+escalation and the morning board every tick for five hours, because each
+posted first and recorded after. The one exception is a marker that
+`committedLocally`: the next tick reads it, so posting on it says the thing
+once. The trade-off, accepted: a restart before the halt lifts restores S3,
+which lacks that marker, so that one notice can go out a second time. See
+`board/CLAUDE.md` and `dispatcher/CLAUDE.md`.
 
 ## Two connections
 

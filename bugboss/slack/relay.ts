@@ -302,6 +302,12 @@ export class SlackRelay {
         return open;
       }
 
+      // A write has to land before the post, because the link written after
+      // it is what stops the thread sweep opening this thread again. With the
+      // database refusing writes, posting first opened a new top-level thread
+      // for this incident, and pinged the rotation, on every tick. The empty
+      // write records nothing; it throws when the link would.
+      await this.db.withWrite(() => undefined);
       const parts = splitForSlack(body);
       const { ts } = await this.slack.post(null, parts[0], this.cfg.channelId);
       // The rest go into the thread this post just started, which is why they

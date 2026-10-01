@@ -1023,11 +1023,25 @@ describe("thread headers", () => {
       d.prepare("UPDATE incident SET summary = 'moved on' WHERE id = '1'").run();
     });
 
-    // Reads work; every write is refused, the way a halted Db behaves.
+    // Reads work, and so does the board's own record; every write the
+    // header sweep makes is refused, so the sweep throws outright.
     const halted = {
       query: (sql: string, params?: unknown[]) => db.query(sql, params),
       get: (sql: string, params?: unknown[]) => db.get(sql, params),
-      withWrite: () => Promise.reject(new Error("writes halted: snapshot PUT failed")),
+      withWrite: (fn: Parameters<Db["withWrite"]>[0]) =>
+        db.withWrite((d) => {
+          const prepare = d.prepare.bind(d);
+          return fn(
+            Object.assign(Object.create(d), {
+              prepare: (sql: string) => {
+                if (sql.includes("incident_thread")) {
+                  throw new Error("writes halted: snapshot PUT failed");
+                }
+                return prepare(sql);
+              },
+            }),
+          );
+        }),
     } as unknown as Db;
 
     const posts: string[] = [];
@@ -1108,4 +1122,137 @@ describe("a monitor wait on the board and the card", () => {
     assert.match(card("82"), /\*Waiting on:\* a check the agent is running/);
     assert.ok(!boardOnRequest(db).includes("gh pr view"));
   });
+});
+
+describe("the board while writes fail", () => {
+  const refusing = {
+    query: (sql: string, params?: unknown[]) => db.query(sql, params),
+    get: (sql: string, params?: unknown[]) => db.get(sql, params),
+    withWrite: () => Promise.reject(new Error("writes halted: RequestTimeTooSkewed")),
+  } as unknown as Db;
+
+  const sweepWith = (store: Db, at: number, post: (text: string) => Promise<{ ts: string }>) =>
+    sweepBoard({
+      db: store,
+      post,
+      update: () => Promise.resolve(),
+      origin,
+      channel: CHANNEL,
+      now: () => at,
+    });
+
+  // #dev-alerts on 2026-10-01: the morning board went out, the marker after
+  // it failed, and the next tick saw the same unmarked day.
+  test("a halted database posts no morning board, however many ticks pass", async () => {
+    await seed("1");
+    await harness(easternAt(6)).sweep();
+
+    const posts: string[] = [];
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      for (let tick = 0; tick < 20; tick++) {
+        await sweepWith(refusing, easternAt(7) + tick * 30_000, (text) => {
+          posts.push(text);
+          return Promise.resolve({ ts: "x" });
+        }).catch(() => undefined);
+      }
+    } finally {
+      console.error = quiet;
+    }
+
+    assert.equal(posts.length, 0);
+  });
+
+  test("a halted database posts no all-clear either", async () => {
+    await harness(easternAt(6)).sweep();
+    await seed("1");
+    await harness(easternAt(6) + 1).sweep();
+    await close("1");
+    await harness(easternAt(6) + 2).sweep();
+
+    const posts: string[] = [];
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      for (let tick = 0; tick < 20; tick++) {
+        await sweepWith(refusing, easternAt(6) + 3_600_000 + tick * 30_000, (text) => {
+          posts.push(text);
+          return Promise.resolve({ ts: "x" });
+        }).catch(() => undefined);
+      }
+    } finally {
+      console.error = quiet;
+    }
+
+    assert.equal(posts.length, 0);
+  });
+
+  test("a marker that committed locally still posts, and only once", async () => {
+    await seed("1");
+    await harness(easternAt(6)).sweep();
+
+    // The first failing write: committed here, upload refused.
+    const uploadRefused = {
+      query: (sql: string, params?: unknown[]) => db.query(sql, params),
+      get: (sql: string, params?: unknown[]) => db.get(sql, params),
+      withWrite: async (fn: Parameters<Db["withWrite"]>[0]) => {
+        await db.withWrite(fn);
+        throw Object.assign(new Error("RequestTimeTooSkewed"), { committedLocally: true });
+      },
+    } as unknown as Db;
+
+    const posts: string[] = [];
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      for (let tick = 0; tick < 5; tick++) {
+        await sweepWith(uploadRefused, easternAt(7) + tick * 30_000, (text) => {
+          posts.push(text);
+          return Promise.resolve({ ts: "x" });
+        }).catch(() => undefined);
+      }
+    } finally {
+      console.error = quiet;
+    }
+
+    assert.equal(posts.length, 1);
+  });
+
+  test("the all-clear is marked before it goes out", async () => {
+    await harness(easternAt(6)).sweep();
+    await seed("1");
+    await harness(easternAt(6) + 1).sweep();
+    await close("1");
+    await harness(easternAt(6) + 2).sweep();
+
+    const markedAtPost: number[] = [];
+    await sweepWith(db, easternAt(6) + 3_600_000, (text) => {
+      markedAtPost.push(
+        db.get<{ clearAnnounced: number }>("SELECT clearAnnounced FROM board_state WHERE id = 1")!
+          .clearAnnounced,
+      );
+      return Promise.resolve({ ts: text });
+    });
+
+    assert.deepEqual(markedAtPost, [1]);
+  });
+
+  test("the day is marked before the board goes out", async () => {
+    await seed("1");
+    await harness(easternAt(6)).sweep();
+
+    const markedAtPost: (string | null)[] = [];
+    await sweepWith(db, easternAt(7), (text) => {
+      markedAtPost.push(
+        db.get<{ dailyOn: string | null }>("SELECT dailyOn FROM board_state WHERE id = 1")!.dailyOn,
+      );
+      assert.match(text, /1 open/);
+      return Promise.resolve({ ts: "x" });
+    });
+
+    assert.deepEqual(markedAtPost, [dateIn(BOARD_TIME_ZONE, easternAt(7))]);
+  });
+
+
 });

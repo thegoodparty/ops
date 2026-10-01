@@ -28,7 +28,7 @@
 
 import type Database from "better-sqlite3";
 
-import type { Db } from "../db";
+import { committedLocally, type Db } from "../db";
 import type { SignalOriginRef } from "../ingress/link";
 import type { IncidentStatus } from "../types";
 import { makeAlarm, makeLog } from "../logging";
@@ -301,13 +301,22 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
 };
 
 /**
+ * A marker that committed locally and failed only its upload still counts:
+ * the next tick reads it, and the halt's recovery upload carries it to S3.
+ */
+const recorded = (write: Promise<void>): Promise<void> =>
+  write.catch((err: unknown) => {
+    if (!committedLocally(err)) throw err;
+  });
+
+/**
  * One tick's worth of board.
  *
- * Posts before it records, everywhere. A post that lands and a write that
- * fails re-posts on the next tick, which is noise; a write that lands and a
- * post that fails is a morning with no board and nothing saying so. The
- * first failure mode also only happens when `withWrite` has halted, at
- * which point nothing in this process is working anyway.
+ * Records before it posts, everywhere. The marker is what stops the next tick
+ * deciding the same thing again, so a post ahead of it repeats for as long as
+ * writes fail: on 2026-10-01 a halted database reposted the morning board
+ * dozens of times. A write that fails posts nothing. A post that fails is
+ * an alarm and a morning without a board, which is the cheaper of the two.
  */
 export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
   const now = (deps.now ?? Date.now)();
@@ -357,16 +366,25 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
     // A quiet morning gets no message. Swain's call, and the reason is that
     // a daily all-clear is a post people learn to skim, which is how the one
     // that matters gets skimmed too.
+    // Marked either way, and first. The day's slot is used up at the first
+    // tick past the hour, so an incident opening at two in the afternoon
+    // starts a thread rather than a board nobody asked for.
+    await recorded(
+      deps.db.withWrite((w: Database.Database) => {
+        w.prepare("UPDATE board_state SET dailyOn = ? WHERE id = 1").run(today);
+      }),
+    );
     if (rows.length > 0) {
-      await deps.post(renderBoard("Open incidents", rows));
-      postedDaily = true;
+      try {
+        await deps.post(renderBoard("Open incidents", rows));
+        postedDaily = true;
+      } catch (err) {
+        alarm("daily_board_post_failed", {
+          error: String(err),
+          note: "the day is already marked, so this morning's board was not posted",
+        });
+      }
     }
-    // Marked either way. The day's slot is used up at the first tick past
-    // the hour, so an incident opening at two in the afternoon starts a
-    // thread rather than a board nobody asked for.
-    await deps.db.withWrite((w: Database.Database) => {
-      w.prepare("UPDATE board_state SET dailyOn = ? WHERE id = 1").run(today);
-    });
   }
 
   let postedAllClear = false;
@@ -383,11 +401,20 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
       w.prepare("UPDATE board_state SET emptySince = ? WHERE id = 1").run(now);
     });
   } else if (state.clearAnnounced === 0 && now - state.emptySince >= settleMs) {
-    await deps.post(ALL_CLEAR);
-    postedAllClear = true;
-    await deps.db.withWrite((w: Database.Database) => {
-      w.prepare("UPDATE board_state SET clearAnnounced = 1 WHERE id = 1").run();
-    });
+    await recorded(
+      deps.db.withWrite((w: Database.Database) => {
+        w.prepare("UPDATE board_state SET clearAnnounced = 1 WHERE id = 1").run();
+      }),
+    );
+    try {
+      await deps.post(ALL_CLEAR);
+      postedAllClear = true;
+    } catch (err) {
+      alarm("all_clear_post_failed", {
+        error: String(err),
+        note: "already marked, so this all-clear was not posted",
+      });
+    }
   }
 
   if (postedDaily || postedAllClear || headers > 0) {
