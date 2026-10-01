@@ -8,15 +8,24 @@ import { bedrockInvokeResources } from "../../../utils/bedrock-models";
 
 type PolicyValue = string | string[];
 
+/**
+ * A statement names either `Action` or `NotAction`, never both and never
+ * neither. AWS rejects the pair in one statement, and a statement with neither
+ * matches nothing while reading as though it matches something. Modelled as a
+ * union so both mistakes are a compile error rather than a policy nobody
+ * notices is inert.
+ */
+type ActionExpression =
+  | { Action: PolicyValue; NotAction?: never }
+  | { NotAction: PolicyValue; Action?: never };
+
 export type PolicyStatement = {
   Sid?: string;
   Effect: "Allow" | "Deny";
-  Action: PolicyValue;
   Resource?: PolicyValue;
-  NotAction?: PolicyValue;
   NotResource?: PolicyValue;
   Condition?: Record<string, Record<string, PolicyValue>>;
-};
+} & ActionExpression;
 
 export type PolicyDocument = {
   Version: "2012-10-17";
@@ -76,9 +85,45 @@ export const engineerAccess: PolicyDocument = {
       },
     },
     {
-      Sid: "InvokeBedrockModels",
-      Effect: "Allow",
-      Action: ["bedrock:*"],
+      // Read-only Bedrock, and read-only deliberately rather than by simply
+      // not granting it. This set used to carry `bedrock:*`, which is how a
+      // laptop `pi` running under the `EngineerAccess` profile invoked Claude
+      // Opus 4.6 and caused Bedrock to subscribe the model in the management
+      // account on first use. Bedrock enables every model by default and
+      // subscribes in the background on invocation, so AWS's own guidance is
+      // that the control is a Deny or a scoped Allow on the invocation, not
+      // withholding a subscription. The subscription mechanics are in
+      // `docs/workbench-account.md` under "Adding a Bedrock model later".
+      //
+      // The management account is where production runs and is not the place
+      // for human Bedrock traffic. That is the workbench account, through
+      // `WorkbenchAccess`, which names its models and is the intended path;
+      // `AdministratorAccess` keeps invocation as the break-glass exception.
+      //
+      // A Deny rather than merely removing the Allow, because this document
+      // also carries two `Action: ["*"]` statements conditioned on request and
+      // resource tags. Bedrock mutations such as
+      // `CreateProvisionedModelThroughput` and `CreateModelInvocationJob`
+      // accept request tags, so a request tagged `Environment=dev` would
+      // otherwise reach them the same way `organizations:CreateAccount` was
+      // reachable before `adminReservedActions` existed. The Deny holds as
+      // those Allows drift.
+      //
+      // `NotAction` rather than an enumerated invoke list, matching the region
+      // deny in `deploy-org/policies.ts`: the thing worth reviewing is the read
+      // allowlist, not the growing set of Bedrock actions. Reads are left to
+      // the `ReadOnlyAccess` managed policy this set already carries, which is
+      // why no Allow is added here. Accepted collateral: this also denies the
+      // few non-generating runtime calls `ReadOnlyAccess` grants, such as
+      // `CountTokens` and `AgenticRetrieveStream`, which nothing uses through
+      // this set.
+      //
+      // Deliberately here and not in `adminReservedActions`: that document is
+      // composed into `workbenchAccess` too, where Bedrock invocation is the
+      // entire point of the account.
+      Sid: "DenyBedrockNonRead",
+      Effect: "Deny",
+      NotAction: ["bedrock:Get*", "bedrock:List*"],
       Resource: "*",
     },
     {
