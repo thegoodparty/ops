@@ -349,7 +349,14 @@ export class Db {
           // A connection left inside the transaction refuses every later
           // BEGIN. S3 now holds a write local does not, so the state as it
           // stands goes back up to put the two level again.
-          if (this.write.inTransaction) this.write.exec("ROLLBACK");
+          try {
+            if (this.write.inTransaction) this.write.exec("ROLLBACK");
+          } catch (rollbackErr) {
+            alarm("rollback_failed_after_commit_failure", {
+              commitError: String(commitErr),
+              rollbackError: String(rollbackErr),
+            });
+          }
           const relevelled = await this.put(this.write.serialize()).then(
             () => true,
             () => false,
@@ -359,8 +366,20 @@ export class Db {
             relevelled,
             note: relevelled
               ? "rolled back locally and S3 re-uploaded to match"
-              : "rolled back locally, but S3 still holds the write; a restart would restore it",
+              : "rolled back locally, but S3 still holds the write; writes halt until an upload of the local state lands",
           });
+          // Halted, the next write that lands uploads the local state, which
+          // is what re-levels S3.
+          if (!relevelled) {
+            const now = this.now();
+            this.halted = {
+              error: String(commitErr),
+              since: now,
+              nextRetryAt: now + this.timing.haltRetryMs,
+              retryMs: this.timing.haltRetryMs,
+              alarmedPersisting: false,
+            };
+          }
           throw commitErr;
         }
         if (halt) {
