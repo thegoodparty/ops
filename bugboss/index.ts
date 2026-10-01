@@ -135,7 +135,7 @@ import {
   sessionKeyFor,
   sumSessionUsage,
 } from "./agent/session";
-import { INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
+import { DEFAULT_WORK_ROOT, INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
 import { createInstallationToken, createPrStateReader } from "./github";
 import { createGhExec, type GhExec } from "./slack/gh";
@@ -2012,6 +2012,9 @@ export const createBugBoss = async (
     db,
     config: config.dispatcher,
     spawn,
+    // The child always works under the default, since BUGBOSS_WORK_ROOT is
+    // not in the environment it is given, so this is the same directory.
+    workRoot: DEFAULT_WORK_ROOT,
     toolApiFor,
     mintToken,
     // The dispatcher has no Slack of its own and the tool API cannot say

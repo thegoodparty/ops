@@ -281,3 +281,16 @@ A child that exits non-zero or dies to a signal **rejects**. The dispatcher
 returns early when it did the killing itself, so its own deadline SIGKILL
 does not also report `agent_failed` under a name pointing at the wrong
 component.
+
+## Workspaces are deleted here
+
+Each tick, before launching, `sweepWorkspaces` moves `/work/<id>` into
+`/work/.trash` when the incident's row is CLOSED or MERGED and it has no live
+child, then deletes the trash in the background (a 5 GB tree is slow to
+delete on EFS, and one delete runs at a time). The first tick after boot is
+therefore also the sweep of whatever the last task left.
+
+A directory with **no row** is kept and logged once as
+`workspace_without_incident`. The database is restored from an S3 snapshot at
+boot, and a restore that came back short would otherwise delete every live
+workspace at once.

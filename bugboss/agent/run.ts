@@ -7,9 +7,9 @@
 
 import { createInstallationToken, gitHubAppFromEnv } from "../github";
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import type {
   AgentSession,
@@ -43,6 +43,13 @@ import {
   type McpToolset,
 } from "./mcp";
 import { composeSystemPrompt, loadPromptContext } from "./prompt";
+import {
+  lockfileHash,
+  npmCiNeeded,
+  npmCiPidRecord,
+  prepareCheckout,
+  type CheckoutOutcome,
+} from "./workspace";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import { createGitHubReadPort } from "./conditions";
 import {
@@ -214,6 +221,7 @@ export interface AgentPaths {
   npmCiLog: string;
   npmCiDone: string;
   npmCiFailed: string;
+  npmCiPid: string;
 }
 
 export const computePaths = (workRoot: string, incidentId: string): AgentPaths => {
@@ -228,6 +236,7 @@ export const computePaths = (workRoot: string, incidentId: string): AgentPaths =
     npmCiLog: join(workDir, "npm-ci.log"),
     npmCiDone: join(workDir, "npm-ci.done"),
     npmCiFailed: join(workDir, "npm-ci.failed"),
+    npmCiPid: join(workDir, "npm-ci.pid"),
   };
 };
 
@@ -316,26 +325,20 @@ export const configureGitCredentials = async (): Promise<void> => {
   ]);
 };
 
-/**
- * A partial clone, not a shallow one: investigation is half git history, and
- * `--depth 1` is blind to it. Blobs are fetched on demand.
- */
-export const cloneOmni = async (repoUrl: string, dest: string): Promise<void> => {
-  if (existsSync(join(dest, ".git"))) return;
-  await mkdir(dirname(dest), { recursive: true });
-  await exec("git", ["clone", "--filter=blob:none", repoUrl, dest]);
-};
-
-export const npmCiCommand = (paths: AgentPaths): string =>
-  `npm ci > ${paths.npmCiLog} 2>&1 && touch ${paths.npmCiDone} || cp ${paths.npmCiLog} ${paths.npmCiFailed}`;
+// The done marker holds the lockfile hash it installed, so a relaunch can
+// tell node_modules it may keep from node_modules that no longer matches.
+export const npmCiCommand = (paths: AgentPaths, lockHash: string): string =>
+  `npm ci > ${paths.npmCiLog} 2>&1 && echo ${lockHash} > ${paths.npmCiDone} || cp ${paths.npmCiLog} ${paths.npmCiFailed}`;
 
 export const startNpmCi = (paths: AgentPaths): void => {
-  if (existsSync(paths.npmCiDone) || existsSync(paths.npmCiFailed)) return;
-  const child = spawn("/bin/sh", ["-c", npmCiCommand(paths)], {
+  if (!npmCiNeeded(paths)) return;
+  rmSync(paths.npmCiDone, { force: true });
+  const child = spawn("/bin/sh", ["-c", npmCiCommand(paths, lockfileHash(paths.checkout))], {
     cwd: paths.checkout,
     detached: true,
     stdio: "ignore",
   });
+  if (child.pid) writeFileSync(paths.npmCiPid, npmCiPidRecord(child.pid));
   child.unref();
 };
 
@@ -1041,8 +1044,19 @@ export const exitCodeFor = (result: RunIncidentAgentResult): number =>
 export const sessionSyncFailedMessage = (streak: number): string =>
   `Your session has failed to save ${streak} times in a row. Nothing you have done since is durable: if this container restarts you will start over from nothing. Stop investigating and call escalate now, with a brief covering what you believe, what you ruled out and what you were about to do.`;
 
-export const resumeMessage = (): string =>
-  "You were restarted. Time passed while you were down, and pull requests merge, deploys ship, alerts stop and people fix things by hand in that time. Call get_incident first: its resumed_after directive says how long. Re-run only the checks that matter for what you were in the middle of, then continue.";
+export const resumeMessage = (checkout: CheckoutOutcome, npmCiFailed: boolean): string =>
+  [
+    "You were restarted. Time passed while you were down, and pull requests merge, deploys ship, alerts stop and people fix things by hand in that time. Call get_incident first: its resumed_after directive says how long. Re-run only the checks that matter for what you were in the middle of, then continue.",
+    checkout === "cloned"
+      ? "Your workspace was not kept, so the checkout is a fresh clone of main: branches you had not pushed and uncommitted changes are gone, and there are no node_modules until you run npm ci."
+      : "Your workspace was kept: the checkout is on the branch you left it on with your uncommitted changes, node_modules is kept unless package-lock.json changed, and an npm ci the restart interrupted has been started again. There is no need to re-clone or reinstall.",
+    ...(checkout === "reused_unfetched"
+      ? ["Fetching origin failed at relaunch, so origin is as stale as when you stopped. Run git fetch before you trust anything about the remote."]
+      : []),
+    ...(checkout !== "cloned" && npmCiFailed
+      ? ["npm ci failed in this workspace before the restart and was not run again. Its log is in the failed marker; run npm ci yourself once you know why."]
+      : []),
+  ].join(" ");
 
 export const kickoffMessage = (incidentId: string): string =>
   `Incident ${incidentId} is yours. Call get_incident to read the signals and the evidence that was prefetched for you, then work it to a conclusion.`;
@@ -1377,9 +1391,13 @@ export const runIncidentAgent = async (
     });
 
   await mkdir(paths.sessionDir, { recursive: true });
-  if (!options.skipClone) {
-    await cloneOmni(options.omniRepoUrl ?? DEFAULT_OMNI_REPO, paths.checkout);
-  }
+  const checkout: CheckoutOutcome = options.skipClone
+    ? "reused"
+    : await prepareCheckout(options.omniRepoUrl ?? DEFAULT_OMNI_REPO, paths.checkout);
+  // A log means an install was started in this workspace before, and the task
+  // it ran in may have died mid-way. Picking it up here is what stops a
+  // FIXING agent waiting on a done marker that nothing is going to write.
+  if (checkout !== "cloned" && existsSync(paths.npmCiLog)) startNpmCi(paths);
   const restored = await restoreSessionFile({ store, key, sessionFile: paths.sessionFile });
   // The turn budget is over the incident, not over this process, so a launch
   // starts from what the restored transcript already spent. Read here rather
@@ -1452,6 +1470,7 @@ export const runIncidentAgent = async (
       modelRuntime,
       mcp,
       restored,
+      checkout,
       storedPrefix: pinned.storedPrefix,
       priorUsage,
     });
@@ -1471,11 +1490,24 @@ const launch = async (args: {
   modelRuntime: ModelRuntime;
   mcp: McpToolset[];
   restored: boolean;
+  checkout: CheckoutOutcome;
   storedPrefix: StoredPrefix | null;
   priorUsage: SessionUsage;
 }): Promise<RunIncidentAgentResult> => {
-  const { options, paths, store, key, api, pi, model, modelRuntime, mcp, restored, storedPrefix } =
-    args;
+  const {
+    options,
+    paths,
+    store,
+    key,
+    api,
+    pi,
+    model,
+    modelRuntime,
+    mcp,
+    restored,
+    checkout,
+    storedPrefix,
+  } = args;
 
   // Aborted when either soft bound fires -- the wall-clock deadline or the
   // turn budget -- so a tool parked in a 24h wait returns and the turn can
@@ -1890,7 +1922,11 @@ const launch = async (args: {
   let error: string | null = null;
   try {
     await promptWithinBudget(turnBudget, () =>
-      session.prompt(restored ? resumeMessage() : kickoffMessage(options.incidentId)),
+      session.prompt(
+        restored
+          ? resumeMessage(checkout, existsSync(paths.npmCiFailed))
+          : kickoffMessage(options.incidentId),
+      ),
     );
   } finally {
     clearTimeout(deadline);

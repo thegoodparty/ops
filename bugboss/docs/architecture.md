@@ -229,7 +229,8 @@ that cannot answer escalates, which leaves a recurrence nobody can explain
 open with somebody told it needs them.
 
 **5. The agent** (`agent/`) runs Pi against Bedrock in the same container.
-It gets a fresh `git clone --filter=blob:none` of omni, the Grafana MCP
+It gets its own `git clone --filter=blob:none` of omni on an EFS volume that
+survives a restart, the Grafana MCP
 toolset, and a scoped token for the Boss's loopback API. It investigates,
 fixes, opens a PR, waits for a merge and a deploy, and writes a post-mortem.
 
@@ -392,7 +393,10 @@ system prompt, the tools array and every earlier message — and does not
 expire.
 
 Every merge to ops `main` restarts this container, so resume is the normal
-path, not the exceptional one.
+path, not the exceptional one. That is why the agents' workspaces
+(`/work/<id>`: the checkout, node_modules, uncommitted edits) are on EFS
+rather than the task's disk, and deleted by the dispatcher only once the
+incident is CLOSED or MERGED. See `agent/CLAUDE.md`.
 
 **The story of the incident lives in its timeline, not in the context.**
 The agent records key moments with `track_incident_timeline_event` as they

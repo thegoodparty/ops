@@ -29,6 +29,7 @@ import {
   PREFIX_DRIFT_DIAGNOSTIC,
   prefixDriftExtension,
   renderDirectives,
+  resumeMessage,
   reserveTokensFor,
   signalExitCode,
   shouldAnnounceExhaustion,
@@ -76,10 +77,10 @@ test("the compaction reserve leaves room for a maximum response", async () => {
 });
 
 test("npm ci records both outcomes so monitor can see either", () => {
-  const command = npmCiCommand(computePaths("/work", "inc-7"));
+  const command = npmCiCommand(computePaths("/work", "inc-7"), "abc123");
 
   assert.match(command, /^npm ci/);
-  assert.match(command, /touch \/work\/inc-7\/npm-ci\.done/);
+  assert.match(command, /echo abc123 > \/work\/inc-7\/npm-ci\.done/);
   assert.match(command, /\/work\/inc-7\/npm-ci\.failed/);
 });
 
@@ -1479,4 +1480,14 @@ test("a Boss message the watcher took ends a message_boss wait with the interrup
   assert.deepEqual(queue.consumed, [1]);
   assert.equal(pending, null, "the question no longer looks outstanding");
   assert.ok(polls <= 3, `ended within a poll, took ${polls - 2}`);
+});
+
+test("a resumed agent is told whether its workspace survived, so it neither re-checks nor trusts a lost one", () => {
+  assert.match(resumeMessage("reused", false), /Your workspace was kept/);
+  assert.doesNotMatch(resumeMessage("reused", false), /failed/);
+  assert.match(resumeMessage("cloned", false), /Your workspace was not kept/);
+  assert.match(resumeMessage("cloned", false), /uncommitted changes are gone/);
+  // What the relaunch could not do is said, not papered over by "kept".
+  assert.match(resumeMessage("reused_unfetched", false), /Fetching origin failed/);
+  assert.match(resumeMessage("reused", true), /npm ci failed in this workspace/);
 });

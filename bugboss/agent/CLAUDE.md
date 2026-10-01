@@ -1,7 +1,7 @@
 # agent
 
 The incident agent: a Pi session running in a child process, against
-Bedrock, with a fresh checkout of omni.
+Bedrock, with its own checkout of omni that outlives a restart.
 
 ## What it is allowed to do
 
@@ -644,6 +644,40 @@ asks for events on the turn they are learned, not at the end.
 stored prefix, not from env — Bedrock does not restore it, and the SSM
 mapping retunes without a deploy. Replaying against a different model
 rejects every thinking block, and `drop_block` is deliberately quiet.
+
+## The workspace survives a restart
+
+`/work/<id>` (the checkout, its node_modules, the npm ci markers and the
+session directory) is on an EFS volume mounted at `/work`
+(`deploy/components/bugboss.ts`), because every ops deploy replaces the task
+and its ephemeral disk. Before that, every deploy re-cloned omni for every
+open incident and lost uncommitted edits: incident 86 redid 29 turns.
+`workspace.ts` is what uses it:
+
+- **A relaunch keeps the checkout.** `prepareCheckout` only fetches when
+  `.git` exists, and clears every stale `*.lock` a killed git command left. It clones into
+  `omni.partial` and renames, so a task killed mid-clone never leaves a
+  `.git` that looks whole.
+- **node_modules is kept while the lockfile is.** The done marker holds the
+  `package-lock.json` hash it installed. A relaunch into a workspace that ever
+  started `npm ci` calls `startNpmCi`, which reinstalls only on a different
+  hash or an install the restart interrupted. `npm-ci.pid` (boot id and pid)
+  stops a second install over one still running from an earlier launch in
+  the same task.
+- **The resume message says which it was.** `resumeMessage` tells the agent
+  its workspace was kept, or that it is a fresh clone, and names what the
+  relaunch could not do: a fetch that failed, or an npm ci that had failed
+  before and was not rerun.
+- **The dispatcher deletes it** once the incident is CLOSED or MERGED and no
+  agent is running. See `dispatcher/CLAUDE.md`.
+
+One agent per incident is still what makes this safe: the dispatcher's
+`running` map within a task, and the service's stop-then-start deploy
+across tasks. Nothing on the volume locks against a second writer.
+
+The volume is not backed up. The session transcript in S3 and the incident's
+timeline are still the only record guaranteed to survive; a lost volume only
+costs a re-clone.
 
 ## Exit
 
