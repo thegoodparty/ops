@@ -426,8 +426,12 @@ export class Dispatcher {
   private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
   private readonly lastSessionEventAt: ((sessionRef: string) => Promise<number | null>) | null;
   private readonly sessionTurns: ((sessionRef: string) => Promise<number | null>) | null;
-  /** Budget waits are checked once per process: only a deploy changes the budget. */
-  private budgetsChecked = false;
+  /**
+   * Budget waits already read and found still spent, keyed by incident and
+   * wait start. Only a deploy changes the budget, so each is read once per
+   * process; a read that failed is not in here and is tried again next tick.
+   */
+  private readonly budgetsHeld = new Set<string>();
   private readonly fastFailureMs: number;
   private readonly maxLaunches: number;
   private readonly parkCooldownMs: number;
@@ -574,10 +578,7 @@ export class Dispatcher {
     // anything could start into it.
     await this.sweepWorkspaces();
     // Before the eligibility read, so an incident it lifts launches this tick.
-    if (!this.budgetsChecked) {
-      this.budgetsChecked = true;
-      await this.liftRaisedBudgets(now);
-    }
+    await this.liftRaisedBudgets(now);
 
     const eligible = this.db.query<EligibleRow>(ELIGIBLE_SQL, [now]);
     const started: RunningAgent[] = [];
@@ -893,8 +894,9 @@ export class Dispatcher {
    * cooldown, not the stale sweep. That is right while the budget stands, and
    * wrong once it rises above what the incident spent, because then it has
    * turns again and the park is holding back work it could do. The budget is
-   * a constant or an environment variable, so it only changes on a restart,
-   * and once per process is enough.
+   * a constant or an environment variable, so it only changes on a restart:
+   * a wait found still spent is not read again in this process, and a read
+   * that failed or timed out is retried on the next tick.
    *
    * Turns are read from the session, not from the wait's text, because a
    * launch can overrun the budget it parked on (incident 80 sat at 270 of
@@ -916,34 +918,58 @@ export class Dispatcher {
          AND w.waitingFor LIKE '%-turn budget%'`,
     );
     for (const row of rows) {
-      if (this.running.has(row.id) || !row.sessionRef) continue;
+      const key = `${row.id}:${row.startedAt}`;
+      if (this.running.has(row.id) || this.budgetsHeld.has(key)) continue;
+      if (!row.sessionRef) {
+        this.budgetsHeld.add(key);
+        continue;
+      }
       let used: number | null;
+      let timer: NodeJS.Timeout | undefined;
       try {
-        used = await this.sessionTurns(row.sessionRef);
+        used = await Promise.race([
+          this.sessionTurns(row.sessionRef),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`session read took over ${SESSION_READ_TIMEOUT_MS}ms`)),
+              SESSION_READ_TIMEOUT_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(timer));
       } catch (err) {
         alarm("budget_check_failed", { incidentId: row.id, error: String(err) });
         continue;
       }
-      if (used === null || used >= max) continue;
+      if (used === null || used >= max) {
+        this.budgetsHeld.add(key);
+        continue;
+      }
 
-      const lifted = await this.db.withWrite((db) => {
-        const deleted = db
-          .prepare(
-            "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 0 AND startedAt = ?",
-          )
-          .run(row.id, row.startedAt);
-        if (deleted.changes !== 1) return false;
-        db.prepare(
-          `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
-           VALUES (?, 'boss', NULL, ?, ?, ?)`,
-        ).run(
-          row.id,
-          BUDGET_RAISED_ACTION,
-          `turn budget raised to ${max} with ${used} turns used`,
-          now,
-        );
-        return true;
-      });
+      const usedTurns = used;
+      let lifted: boolean;
+      try {
+        lifted = await this.db.withWrite((db) => {
+          const deleted = db
+            .prepare(
+              "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 0 AND startedAt = ?",
+            )
+            .run(row.id, row.startedAt);
+          if (deleted.changes !== 1) return false;
+          db.prepare(
+            `INSERT INTO incident_action (incidentId, actorKind, actorId, action, reason, at)
+             VALUES (?, 'boss', NULL, ?, ?, ?)`,
+          ).run(
+            row.id,
+            BUDGET_RAISED_ACTION,
+            `turn budget raised to ${max} with ${usedTurns} turns used`,
+            now,
+          );
+          return true;
+        });
+      } catch (err) {
+        alarm("budget_lift_failed", { incidentId: row.id, error: String(err) });
+        continue;
+      }
       if (!lifted) continue;
 
       log("turn_budget_raised", { incidentId: row.id, used, max });

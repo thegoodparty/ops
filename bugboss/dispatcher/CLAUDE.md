@@ -204,12 +204,14 @@ deliberately does not invite a reply, which is what the agent's own closing
 brief already promised.
 
 **Raising the budget lifts the wait on the next boot.** `liftRaisedBudgets`
-runs once per process, on the first tick and before the eligibility read: for
+runs every tick before the eligibility read, and reads each wait at most once
+per process unless the read fails or passes `SESSION_READ_TIMEOUT_MS`: for
 each open incident with a budget wait, it reads the used turns off the synced
 session (`sessionTurns`) and, when they are under `agentMaxTurns`, deletes the
 wait, writes a `turn_budget_raised` action, then posts "The turn budget was
-raised to N, so the agent is resuming with M turns left." Once per process
-because the budget is a constant or an env var, so only a restart changes it.
+raised to N, so the agent is resuming with M turns left." A wait found still
+spent is not read again until the next restart, because the budget is a
+constant or an env var and only a restart changes it.
 The used turns come from the session rather than the wait's text because a
 launch can overrun its budget, and a wait the new number still does not cover
 stays held. Lift and marker commit before the post, as with the sweep.

@@ -2729,6 +2729,50 @@ describe("Dispatcher raised turn budget", () => {
     cleanup();
   });
 
+  it("retries a failed session read on the next tick, and reads a held wait once", async () => {
+    const made = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(made.sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    insertIncident(made.sqlite, "i2", { status: "FIXING", sessionRef: "s/i2" });
+    budgetWait(made.sqlite, "i1", 200);
+    budgetWait(made.sqlite, "i2", 300);
+    const reads: string[] = [];
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db: made.db,
+        config: config({ agentMaxTurns: 300 }),
+        spawn: async () => {},
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+        sessionTurns: async (ref) => {
+          reads.push(ref);
+          if (ref === "s/i1" && reads.filter((r) => r === ref).length === 1) {
+            throw new Error("s3 blip");
+          }
+          return ref === "s/i1" ? 200 : 300;
+        },
+      }),
+    );
+
+    const alarms = await captureAlarms(async () => {
+      await (await d.tick()).settled;
+    });
+    assert.ok(alarms.includes("budget_check_failed"));
+    assert.equal(waits(made.db, "i1"), 1);
+
+    await (await d.tick()).settled;
+    await (await d.tick()).settled;
+
+    assert.equal(waits(made.db, "i1"), 0, "the second read lifted it");
+    assert.equal(waits(made.db, "i2"), 1);
+    assert.equal(reads.filter((r) => r === "s/i2").length, 1, "a held wait is not read every tick");
+    assert.equal(posts.length, 1);
+    made.cleanup();
+  });
+
   it("leaves closed incidents and waits on anything else alone", async () => {
     const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 200, "s/i2": 10 });
     insertIncident(sqlite, "i1", { status: "CLOSED", sessionRef: "s/i1" });
