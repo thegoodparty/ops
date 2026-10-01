@@ -1,0 +1,86 @@
+{
+  "id": "merge-behind",
+  "sourceIncident": 87,
+  "omni": {
+    "baseSha": "00c3d470fdf037e4ba4086e6edf9fa1a80299588",
+    "provingFixSha": "67356ec7cd27753200580deef312c5d6f28397de"
+  },
+  "alert": {
+    "file": "alert.json",
+    "refireEverySeconds": 600
+  },
+  "telemetry": {
+    "generator": "telemetry.ts",
+    "backfillHoursBefore": 6
+  },
+  "ci": [
+    "npm run test -w packages/gp-api -- deploy/components/alerting",
+    "npm run lint -w packages/gp-api"
+  ],
+  "check": {
+    "setup": "check/setup.sh",
+    "command": "check/run.sh",
+    "timeoutSeconds": 900
+  },
+  "human": {
+    "facts": [
+      {
+        "when": "memory|restart|oom|dashboard",
+        "say": "gp-api memory looks normal on the dashboard to me. I haven't restarted anything."
+      },
+      {
+        "when": "grafana|quer|evaluat|datasource|other (pages|alerts)|together|several",
+        "say": "Several unrelated pages arrived within a few minutes of each other. I don't know why."
+      },
+      {
+        "when": "merge|review|approv",
+        "say": "I merge approved, green PRs when I see them."
+      },
+      {
+        "when": "what do you think|root cause|any idea|theory|suspect",
+        "say": "I haven't looked. What did you find?"
+      },
+      {
+        "when": "confirm|verify|check in prod|production",
+        "say": "I don't have time to check prod myself. Please check the logs."
+      }
+    ],
+    "merge": {
+      "after": "green",
+      "delaySeconds": 0
+    },
+    "volunteer": [
+      {
+        "at": "merge_refused",
+        "say": "{pr} is approved and green, merging is just a click, stop pinging."
+      }
+    ]
+  },
+  "world": {
+    "baseMovesAfter": "approved"
+  },
+  "wallClockSeconds": 10800,
+  "reference": "reference.md",
+  "gates": [
+    {
+      "id": "merge-heard",
+      "kind": "thread_after_merge",
+      "pattern": "merged|landed|deployed|deploying|verif",
+      "withinSeconds": 600
+    },
+    {
+      "id": "branch-updated",
+      "kind": "agent_says",
+      "tools": [
+        "bash"
+      ],
+      "pattern": "git\\b[^\"]*\\b(rebase|pull|merge)\\b(?!-)[^\"]*\\borigin[/ ]main|update-branch"
+    },
+    {
+      "id": "named-behind",
+      "kind": "says_after_volunteer",
+      "after": "merge_refused",
+      "pattern": "behind|out[- ]of[- ]date|not up[- ]to[- ]date|update[sd]? (the|its) branch|rebas|mergeab|merge (was|is) (refused|blocked)"
+    }
+  ]
+}
