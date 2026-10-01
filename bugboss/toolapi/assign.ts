@@ -135,8 +135,9 @@ export const pushDirective = (
   // The Boss is the only thing a person's word reaches an agent through, so
   // its message is what wakes a parked incident. A reply in the thread no
   // longer can: it goes to the Boss, and relaunching an agent that has
-  // nothing new to read costs a launch for chatter.
-  if (directive.type === "boss_message") {
+  // nothing new to read costs a launch for chatter. An alert firing again is
+  // news of the same weight, and the agent has something new to read.
+  if (directive.type === "boss_message" || directive.type === "signal_refired") {
     db.prepare(
       "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1",
     ).run(incidentId);

@@ -1371,6 +1371,37 @@ test("a Boss message mid-wait ends the wait within a poll and reaches the model 
   assert.equal(wait.waits.signal().aborted, false, "the next wait starts clean");
 });
 
+test("an alert firing again mid-wait ends the wait and reaches the model as a user message", async () => {
+  const queue = directiveQueue();
+  const steered: string[] = [];
+  const wait = await mergeWait(async (count) => {
+    if (count !== 2) return;
+    queue.push({
+      type: "signal_refired",
+      signalId: "sig-88",
+      title: "[PROD] resend-cv-pin errors",
+      startedAt: Date.parse("2026-09-30T20:56:40.000Z"),
+    });
+    await watch();
+  });
+  const watch = createDirectiveWatcher({
+    api: queue.api,
+    steer: async (text) => steered.push(text),
+    interruptWait: wait.waits.interrupt,
+    onFailure: (error) => assert.fail(String(error)),
+  });
+
+  const out = await wait.run();
+
+  assert.match(out.content[0].text, /\(interrupted\)/);
+  assert.equal(steered.length, 1);
+  assert.match(
+    steered[0],
+    /^ALERT FIRED AGAIN: sig-88 \(\[PROD\] resend-cv-pin errors\) started firing again at 2026-09-30T20:56:40.000Z/,
+  );
+  assert.deepEqual(queue.consumed, [1], "delivered by the steer, so not again by a tool");
+});
+
 test("a stop mid-wait ends the wait and stays queued for the Boss tool that ends the run", async () => {
   const queue = directiveQueue();
   const steered: string[] = [];

@@ -338,7 +338,7 @@ that ever misses the prompt cache, which is why the prefix is written with a
 
 There is no push channel and an agent is never addressable. Directives ride
 back on responses to calls the agent was already making — `stop`, `merged`,
-`new_signals`, `boss_message`, `resumed_after`.
+`new_signals`, `boss_message`, `resumed_after`, `signal_refired`.
 
 `new_signals` names the incidents that were emptied into this one, when that
 is how the signals arrived. Without it a merge reaches the surviving agent as

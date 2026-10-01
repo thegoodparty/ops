@@ -62,6 +62,7 @@ import {
   createMonitorTool,
   createWaitInterrupt,
   pollingGuardExtension,
+  refiredLine,
   renderDirectives,
   type BossInboxPort,
   type DirectivePeek,
@@ -885,6 +886,9 @@ export const DIRECTIVE_POLL_MS = 10_000;
  * bash and monitor calls past a redirection, told the Boss its fix was ready,
  * and read it only when a deploy restarted it.
  *
+ * An alert on the incident firing again is steered the same way: an agent
+ * waiting on CI or a deploy is exactly the one that needs to hear it now.
+ *
  * Consumed after the steer, because the steered message is then in the
  * session and a restart keeps it. `stop` and `merged` only interrupt: they
  * stay queued so the next Boss tool drains them and ends the run, which only
@@ -910,6 +914,14 @@ export const createDirectiveWatcher = (args: {
         if (text !== null) {
           if (!steered.has(entry.id)) {
             await args.steer(`The Boss says: ${text}`);
+            steered.add(entry.id);
+            args.interruptWait();
+          }
+          await args.api.consumeDirective(entry.id);
+          handled.add(entry.id);
+        } else if (entry.directive.type === "signal_refired") {
+          if (!steered.has(entry.id)) {
+            await args.steer(refiredLine(entry.directive));
             steered.add(entry.id);
             args.interruptWait();
           }

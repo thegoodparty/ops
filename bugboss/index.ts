@@ -32,7 +32,9 @@ import {
   createLokiQuery,
   humanSignal,
   signalOrigin,
+  GRAFANA_SOURCE,
   HUMAN_SOURCE,
+  META_PREFIX,
   SLUG_LABEL,
   type GrafanaVerifier,
   type LokiQuery,
@@ -95,6 +97,7 @@ import {
   type EvidenceStore,
   type ThreadPoster,
 } from "./toolapi";
+import { pushDirective } from "./toolapi/assign";
 import {
   publishIncidentReport,
   publishPendingReports,
@@ -294,6 +297,7 @@ export type PlacedAction =
   | "attach"
   | "suppress"
   | "duplicate"
+  | "refired"
   | "failed";
 
 export interface PlacedSignal {
@@ -1226,6 +1230,8 @@ export const createBugBoss = async (
     incidentId: string | null;
     /** False when this delivery has nothing left to decide. */
     needsPlacement: boolean;
+    /** An open signal that fired again, recorded in `signal_firing`. */
+    refired: boolean;
   }
 
   const recordSignal = async (signal: RawSignal): Promise<RecordedSignal> => {
@@ -1234,13 +1240,30 @@ export const createBugBoss = async (
     const row = await db.withWrite((w: Database.Database) => {
       const exists = w
         .prepare(
-          `SELECT id, incidentId, explained FROM signal
+          `SELECT id, incidentId, explained, openedAt FROM signal
              WHERE source = ? AND sourceId = ? AND closedAt IS NULL`,
         )
         .get(signal.source, signal.sourceId) as
-        | { id: string; incidentId: string | null; explained: number }
+        | { id: string; incidentId: string | null; explained: number; openedAt: number }
         | undefined;
-      if (exists) return { ...exists, fresh: false };
+      if (exists) {
+        // Only Grafana says when a firing began, and only a later start is a
+        // new firing; every redelivery of one firing repeats its startsAt.
+        // A human report's openedAt is when it reached us, so the same
+        // message retried would read as new, and its id is the message
+        // anyway. The key is what makes two deliveries of one refire one row.
+        const startedAt = Date.parse(signal.labels[`${META_PREFIX}starts_at`] ?? "");
+        const refired =
+          signal.source === GRAFANA_SOURCE &&
+          Number.isFinite(startedAt) &&
+          startedAt > exists.openedAt &&
+          w
+            .prepare(
+              "INSERT OR IGNORE INTO signal_firing (signalId, startedAt, receivedAt) VALUES (?, ?, ?)",
+            )
+            .run(exists.id, startedAt, now()).changes === 1;
+        return { ...exists, fresh: false, refired };
+      }
 
       const max = w
         .prepare(
@@ -1263,7 +1286,7 @@ export const createBugBoss = async (
         signal.reportedBy,
         signal.openedAt,
       );
-      return { id, incidentId: null, explained: 0, fresh: true };
+      return { id, incidentId: null, explained: 0, fresh: true, refired: false };
     });
 
     // A re-delivery of a signal that never reached an incident is the last
@@ -1274,7 +1297,64 @@ export const createBugBoss = async (
       !placing.has(row.id) &&
       (row.fresh || (row.incidentId === null && row.explained === 0));
     if (needsPlacement) placing.add(row.id);
-    return { id: row.id, incidentId: row.incidentId, needsPlacement };
+    return {
+      id: row.id,
+      incidentId: row.incidentId,
+      needsPlacement,
+      refired: row.refired,
+    };
+  };
+
+  /**
+   * An open signal on a live incident fired again. The agent is told first,
+   * because the directive is durable and the Slack post is not; a post that
+   * fails costs the thread a line, not the agent the news. A signal that is
+   * open but not on a live incident is left as it was: nothing is working
+   * it to tell, and placement or the orphan sweep owns it.
+   */
+  const announceRefire = async (
+    row: RecordedSignal,
+    signal: RawSignal,
+  ): Promise<boolean> => {
+    const incidentId = row.incidentId;
+    if (!incidentId) return false;
+    const startedAt = Date.parse(signal.labels[`${META_PREFIX}starts_at`] ?? "");
+    const title = db.get<{ title: string }>(
+      "SELECT title FROM signal WHERE id = ?",
+      [row.id],
+    )?.title ?? signal.title;
+    const told = await db.withWrite((w: Database.Database) => {
+      const live = w
+        .prepare(
+          "SELECT 1 FROM incident WHERE id = ? AND status IN ('INVESTIGATING', 'FIXING')",
+        )
+        .get(incidentId);
+      if (!live) return false;
+      pushDirective(w, incidentId, {
+        type: "signal_refired",
+        signalId: row.id,
+        title,
+        startedAt,
+      });
+      return true;
+    });
+    if (!told) return false;
+    const origin = await signalOrigin(
+      { source: signal.source, labels: signal.labels },
+      deadlined,
+    );
+    await relay
+      .emit({
+        type: "signal_refired",
+        incidentId,
+        title,
+        startedAt,
+        url: origin.url,
+      })
+      .catch((err: unknown) =>
+        alarm("refire_post_failed", { incidentId, signalId: row.id, error: String(err) }),
+      );
+    return true;
   };
 
   /**
@@ -1517,16 +1597,29 @@ export const createBugBoss = async (
         for (let i = next++; i < recorded.length; i = next++) {
           const { signal, row } = recorded[i];
           if (!row.needsPlacement) {
-            log("duplicate_signal", {
+            let refired = false;
+            if (row.refired) {
+              try {
+                refired = await announceRefire(row, signal);
+              } catch (err) {
+                alarm("refire_failed", {
+                  signalId: row.id,
+                  incidentId: row.incidentId,
+                  error: String(err),
+                });
+              }
+            }
+            log(refired ? "signal_refired" : "duplicate_signal", {
               signalId: row.id,
+              incidentId: row.incidentId,
               source: signal.source,
               sourceId: signal.sourceId,
             });
             placed[i] = {
               signalId: row.id,
               incidentId: row.incidentId,
-              action: "duplicate",
-              reason: "already ingested",
+              action: refired ? "refired" : "duplicate",
+              reason: refired ? "fired again on its open incident" : "already ingested",
             };
             continue;
           }

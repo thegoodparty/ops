@@ -192,6 +192,22 @@ CREATE TABLE IF NOT EXISTS signal (
 CREATE UNIQUE INDEX IF NOT EXISTS signal_open_source_idx
   ON signal (source, sourceId) WHERE closedAt IS NULL;
 
+-- Every later firing of a signal that was still open when it fired again.
+--
+-- A Grafana fingerprint is the same for every firing of an alert instance,
+-- so a route that recovered and broke again hours later arrives as the open
+-- signal it already is. Without this, that firing was answered "duplicate"
+-- and reached neither the thread nor the agent. The key is the firing's own
+-- startsAt, which is what tells a redelivery of one firing (same startsAt,
+-- ignored by the key) from a new one. The first firing is the signal's
+-- openedAt and has no row here.
+CREATE TABLE IF NOT EXISTS signal_firing (
+  signalId          TEXT NOT NULL REFERENCES signal(id),
+  startedAt         INTEGER NOT NULL,
+  receivedAt        INTEGER NOT NULL,
+  PRIMARY KEY (signalId, startedAt)
+);
+
 -- The open list, which is the only query the control plane itself makes often.
 CREATE INDEX IF NOT EXISTS incident_status_idx ON incident (status);
 CREATE INDEX IF NOT EXISTS signal_incident_idx ON signal (incidentId);
