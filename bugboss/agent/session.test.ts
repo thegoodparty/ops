@@ -517,3 +517,18 @@ test("a session PUT that never answers fails the sync instead of freezing turn_e
     clearInterval(keepAlive);
   }
 });
+
+test("a session GET whose body stalls after the headers still fails within the deadline", { timeout: 5000 }, async () => {
+  const client = {
+    send: async () => ({ Body: { transformToByteArray: () => new Promise(() => {}) } }),
+  };
+  const store = createS3SessionStore("bugboss-test", "us-west-2", { client, timeoutMs: 50 });
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    const started = Date.now();
+    await assert.rejects(store.get("sessions/incident/100/session.jsonl"));
+    assert.ok(Date.now() - started < 1000);
+  } finally {
+    clearInterval(keepAlive);
+  }
+});

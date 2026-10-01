@@ -76,11 +76,18 @@ export const createS3SessionStore = (
         client(),
       ]);
       try {
+        // One deadline for the headers and the body: send() resolves on
+        // headers, and a body that stalls after them is the same hang.
+        const abortSignal = AbortSignal.timeout(timeoutMs);
+        const expired = new Promise<never>((_, reject) => {
+          abortSignal.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+        });
+        expired.catch(() => {});
         const res = await s3.send(
           new GetObjectCommand({ Bucket: bucket, Key: key }),
-          { abortSignal: AbortSignal.timeout(timeoutMs) },
+          { abortSignal },
         );
-        const bytes = await res.Body?.transformToByteArray();
+        const bytes = await Promise.race([res.Body?.transformToByteArray(), expired]);
         return bytes ? Buffer.from(bytes) : null;
       } catch (err) {
         const name = (err as { name?: string }).name;
