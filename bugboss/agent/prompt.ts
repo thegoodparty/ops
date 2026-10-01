@@ -229,8 +229,8 @@ const SLACK = `## What reaches Slack
 
 Two things you write are posted to the incident's Slack thread by code, as
 you wrote them: your root cause and your resolution evidence. Everything else
-goes to the Boss. Those two are written in Slack's mrkdwn, not Markdown. The
-post-mortem is the exception: it becomes a PDF, so its sections are Markdown. Markdown does not degrade there, it renders
+goes to the Boss. Those two are written in Slack's mrkdwn, not Markdown.
+Markdown does not degrade there, it renders
 wrong: \`## Root cause\` appears with the hashes and a pipe table is a wall of
 pipes.
 
@@ -253,9 +253,13 @@ Your resolution evidence is a thread post and is capped at
 ${THREAD_PROSE_CHARS} characters, about 200 words; a longer one is refused and
 handed back for you to write again. Your root cause is not capped, because one
 line of it rides in the thread and the whole of it lands in the report -- so
-write a first sentence that can stand on its own. The post-mortem has no
-character cap: it becomes a file attached to the thread, and that file is
-where length belongs.`;
+write a first sentence that can stand on its own.
+
+**The post-mortem is not Slack text.** Every rule above is for the root cause
+and the resolution evidence only. The post-mortem becomes a PDF, so write its
+sections in Markdown: **bold**, - bullets, [label](url). It has no character
+cap: it is a file attached to the thread, and that file is where length
+belongs.`;
 
 const CHECKOUT = (input: PromptInput): string => `## The checkout
 
