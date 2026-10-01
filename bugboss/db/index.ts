@@ -50,6 +50,9 @@ export const LATE_COLUMNS: LateColumn[] = [
   // column and the thread header's. Nullable: an incident that has not been
   // given one falls back to its first signal's title.
   { table: "incident", column: "summary", type: "TEXT" },
+  // The structured post-mortem. Nullable: every incident closed before it
+  // existed keeps its free-form `postmortem` and renders that.
+  { table: "incident", column: "postmortemSections", type: "TEXT" },
   // Triage's own spend, per signal. The full declaration including
   // `NOT NULL DEFAULT 0`, not a bare `INTEGER`, and the difference is not
   // cosmetic: `ALTER TABLE ADD COLUMN x INTEGER` leaves the column nullable
