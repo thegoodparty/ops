@@ -1221,6 +1221,30 @@ describe("the board while writes fail", () => {
     assert.equal(retry.posts.length, 1, "retried rather than lost");
   });
 
+  test("a board whose post and undo both fail says so instead of throwing", async () => {
+    await seed("1");
+    await harness(easternAt(6)).sweep();
+
+    let writes = 0;
+    const flaky = {
+      query: (sql: string, params?: unknown[]) => db.query(sql, params),
+      get: (sql: string, params?: unknown[]) => db.get(sql, params),
+      withWrite: (fn: Parameters<Db["withWrite"]>[0]) =>
+        writes++ === 0 ? db.withWrite(fn) : Promise.reject(new Error("writes halted")),
+    } as unknown as Db;
+
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (line: unknown) => errors.push(String(line));
+    try {
+      await sweepWith(flaky, easternAt(7), () => Promise.reject(new Error("slack is down")));
+    } finally {
+      console.error = original;
+    }
+
+    assert.ok(errors.some((line) => line.includes("daily_board_post_failed") && line.includes("undoError")));
+  });
+
   test("the all-clear is marked before it goes out, and unmarked when it fails", async () => {
     await harness(easternAt(6)).sweep();
     await seed("1");

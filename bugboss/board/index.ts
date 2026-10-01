@@ -369,10 +369,18 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
         await deps.post(renderBoard("Open incidents", rows));
         postedDaily = true;
       } catch (err) {
-        alarm("daily_board_post_failed", { error: String(err), note: "the day is unmarked again, so the next tick retries" });
-        await deps.db.withWrite((w: Database.Database) => {
-          w.prepare("UPDATE board_state SET dailyOn = ? WHERE id = 1").run(state.dailyOn);
-        });
+        try {
+          await deps.db.withWrite((w: Database.Database) => {
+            w.prepare("UPDATE board_state SET dailyOn = ? WHERE id = 1").run(state.dailyOn);
+          });
+          alarm("daily_board_post_failed", { error: String(err), note: "the day is unmarked again, so the next tick retries" });
+        } catch (undoErr) {
+          alarm("daily_board_post_failed", {
+            error: String(err),
+            undoError: String(undoErr),
+            note: "the day stays marked, so this morning's board is lost",
+          });
+        }
       }
     }
   }
@@ -398,10 +406,18 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
       await deps.post(ALL_CLEAR);
       postedAllClear = true;
     } catch (err) {
-      alarm("all_clear_post_failed", { error: String(err), note: "unmarked again, so the next tick retries" });
-      await deps.db.withWrite((w: Database.Database) => {
-        w.prepare("UPDATE board_state SET clearAnnounced = 0 WHERE id = 1").run();
-      });
+      try {
+        await deps.db.withWrite((w: Database.Database) => {
+          w.prepare("UPDATE board_state SET clearAnnounced = 0 WHERE id = 1").run();
+        });
+        alarm("all_clear_post_failed", { error: String(err), note: "unmarked again, so the next tick retries" });
+      } catch (undoErr) {
+        alarm("all_clear_post_failed", {
+          error: String(err),
+          undoError: String(undoErr),
+          note: "it stays marked, so this all-clear is lost",
+        });
+      }
     }
   }
 
