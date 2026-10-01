@@ -9,6 +9,8 @@ import {
   BUGBOSS_MEMORY,
   POSTGRES_CPU,
   POSTGRES_MEMORY,
+  SQL_RUNNER_CPU,
+  SQL_RUNNER_MEMORY,
   TASK_CPU,
   TASK_MEMORY,
   TEST_DB_URL,
@@ -21,17 +23,13 @@ import { resolveTestDatabase, TEST_DB_ENV_VAR } from "../bugboss/testdb";
 // that can be wrong by a typo.
 describe("the BugBoss task's container sizing", () => {
   it("does not promise more memory than the task has", () => {
-    assert.ok(
-      BUGBOSS_MEMORY + POSTGRES_MEMORY <= TASK_MEMORY,
-      `containers ask for ${BUGBOSS_MEMORY + POSTGRES_MEMORY} MiB of ${TASK_MEMORY}`,
-    );
+    const total = BUGBOSS_MEMORY + POSTGRES_MEMORY + SQL_RUNNER_MEMORY;
+    assert.ok(total <= TASK_MEMORY, `containers ask for ${total} MiB of ${TASK_MEMORY}`);
   });
 
   it("does not promise more cpu than the task has", () => {
-    assert.ok(
-      BUGBOSS_CPU + POSTGRES_CPU <= TASK_CPU,
-      `containers ask for ${BUGBOSS_CPU + POSTGRES_CPU} units of ${TASK_CPU}`,
-    );
+    const total = BUGBOSS_CPU + POSTGRES_CPU + SQL_RUNNER_CPU;
+    assert.ok(total <= TASK_CPU, `containers ask for ${total} units of ${TASK_CPU}`);
   });
 
   // Fargate rejects a task definition whose cpu/memory pair is not one it

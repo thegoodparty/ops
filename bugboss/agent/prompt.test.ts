@@ -18,6 +18,7 @@ import {
 } from "./prompt";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { createSqlQueryTool } from "./sql";
 import { createBossTools } from "./run";
 import { createMessageBossTool, createMonitorTool } from "./tools";
 import { TEST_DB_ENV_VAR } from "../testdb";
@@ -363,6 +364,7 @@ test("the composed prefix stays under its bound", async () => {
     await createMonitorTool({ signal }),
     await createMessageBossTool({ marker: stub, boss: stub, api: stub, signal }),
     await createRerunCiTool({ github: createGitHubRunsPort({ token: () => undefined }), boss: stub }),
+    await createSqlQueryTool({ port: stub, signal }),
     ...[
       pi.createBashToolDefinition,
       pi.createEditToolDefinition,

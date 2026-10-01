@@ -2193,6 +2193,7 @@ export const createBugBoss = async (
     now,
     wakeBoss,
     noteEscalated: dispatcher.noteEscalated,
+    sqlRunnerUrl: config.sqlRunnerUrl,
   });
 
   let servers: BugBossServers | null = null;
@@ -2366,6 +2367,7 @@ export const bossConfigFromEnv = (env: NodeJS.ProcessEnv): BugBossConfig => {
         }
       : {}),
     testDatabase: resolveTestDatabase(env),
+    ...(env.BUGBOSS_SQL_RUNNER_URL ? { sqlRunnerUrl: env.BUGBOSS_SQL_RUNNER_URL } : {}),
   };
 };
 
