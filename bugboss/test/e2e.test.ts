@@ -1302,6 +1302,15 @@ test("the prod-critical allowlist can be delivered in the secret blob", () => {
   assert.deepEqual(cfg.prodCriticalSlugs, ["pro-upgrade-errors", "checkout-5xx"]);
 });
 
+test("the SQL runner's address is read once, at the composition root", () => {
+  const base = { BUGBOSS_BUCKET: "bugboss-prod", BUGBOSS_SLACK_CHANNEL_ID: "C0PROD" };
+  assert.equal(
+    bossConfigFromEnv({ ...base, BUGBOSS_SQL_RUNNER_URL: "http://127.0.0.1:8790" }).sqlRunnerUrl,
+    "http://127.0.0.1:8790",
+  );
+  assert.equal(bossConfigFromEnv(base).sqlRunnerUrl, undefined);
+});
+
 // --- the test database says something, whatever state it is in -------------
 
 const captureConsole = async (

@@ -224,14 +224,18 @@ Fetching an attacker-chosen address from inside an incident is not.
 **AWS is the layer beneath Grafana** — a task that never started, an OOM kill,
 a crash before anything reached Loki. Use the aws CLI through bash, and keep it
 to reads: you run on the Boss's own identity, so a write is not something AWS
-denies you, it is a change nobody reviewed.`;
+denies you, it is a change nobody reviewed.
+
+**The gp-api production database is behind a person.** request_sql_query runs
+one SELECT only after someone on the rotation approves it, so ask when logs and
+code cannot answer, for the narrowest columns that settle the question.`;
 
 const SLACK = `## What reaches Slack
 
-Three things you write are posted to the incident's Slack thread by code, as
-you wrote them: your root cause, your resolution evidence and your
-post-mortem. Everything else goes to the Boss. Those three are written in
-Slack's mrkdwn, not Markdown. Markdown does not degrade there, it renders
+Two things you write are posted to the incident's Slack thread by code, as
+you wrote them: your root cause and your resolution evidence. Everything else
+goes to the Boss. Those two are written in Slack's mrkdwn, not Markdown.
+Markdown does not degrade there, it renders
 wrong: \`## Root cause\` appears with the hashes and a pipe table is a wall of
 pipes.
 
@@ -254,9 +258,13 @@ Your resolution evidence is a thread post and is capped at
 ${THREAD_PROSE_CHARS} characters, about 200 words; a longer one is refused and
 handed back for you to write again. Your root cause is not capped, because one
 line of it rides in the thread and the whole of it lands in the report -- so
-write a first sentence that can stand on its own. The post-mortem has no
-character cap: it becomes a file attached to the thread, and that file is
-where length belongs.`;
+write a first sentence that can stand on its own.
+
+**The post-mortem is not Slack text.** Every rule above is for the root cause
+and the resolution evidence only. The post-mortem becomes a PDF, so write its
+sections in Markdown: **bold**, - bullets, [label](url). It has no character
+cap: it is a file attached to the thread, and that file is where length
+belongs.`;
 
 const CHECKOUT = (input: PromptInput): string => `## The checkout
 

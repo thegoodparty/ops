@@ -69,7 +69,7 @@ export const GOALS: Record<Gate, string> = {
     "- Every proposed code change is merged and fully promoted to production: the transcript shows the release run for each merge commit succeeding, and any separate infra deploy.",
     "- With the deployed code, another user taking the same actions as the impacted users would not be harmed: shown by a test or a replay of the impacted users' path against the deployed commit, with its output.",
     "- Every user whose state needed repairing directly (a SQL migration, a manual Stripe refund) has been repaired, each shown in the transcript.",
-    "- All follow-up work on this incident is complete: merged and deployed to prod.",
+    "- Any follow-up or prevention work for this incident has been fully completed (merged and deployed to prod). The post-mortem's \"Preventing similar issues: changes to how we build\" ideas are not work for this incident.",
   ].join("\n"),
   analysis: [
     "- The post-mortem's timeline matches the recorded timeline events, with times, and its impact matches the reported impact.",
@@ -670,6 +670,8 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
           await handOff(text);
           return { kind: "stopped", text: `Handed to the Boss and parked: ${text}` };
         }
+      } else {
+        noProgress = 0;
       }
       return {
         kind: "continue",

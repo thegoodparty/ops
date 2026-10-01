@@ -55,6 +55,7 @@ import {
   type CheckoutOutcome,
 } from "./workspace";
 import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
+import { createSqlQueryTool, type SidecarReply, type SqlRequestPort } from "./sql";
 import { createGitHubReadPort } from "./conditions";
 import {
   bossMessageText,
@@ -371,7 +372,8 @@ export type BossClient = Omit<ToolApi, "escalate"> &
   WaitMarkerPort &
   BossInboxPort &
   TimelinePeek &
-  GoalPort;
+  GoalPort &
+  SqlRequestPort;
 
 /**
  * The timeline without the drain. The stage compaction reads it between
@@ -410,6 +412,17 @@ export const createBossClient = (args: {
       throw new Error(`Boss ${method} ${path} failed: ${response.status} ${text}`);
     }
     return (text ? JSON.parse(text) : {}) as T;
+  };
+
+  // Status and body, never thrown: the SQL sidecar's refusals are its own
+  // words, and `call` would turn every one into a harness failure.
+  const reply = async (method: string, path: string, body?: unknown): Promise<SidecarReply> => {
+    const response = await http(`${base}${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, text: await response.text() };
   };
 
   return {
@@ -455,6 +468,9 @@ export const createBossClient = (args: {
         "GET",
         `/boss-inbox/escalations?since=${since}`,
       ),
+    createSqlRequest: (payload) => reply("POST", "/sql-requests", payload),
+    getSqlRequest: (requestId) =>
+      reply("GET", `/sql-requests/${encodeURIComponent(requestId)}`),
   };
 };
 
@@ -1722,6 +1738,11 @@ const launch = async (args: {
     await createRerunCiTool({
       github: createGitHubRunsPort({ token: () => process.env.GITHUB_TOKEN }),
       boss: api,
+    }),
+    await createSqlQueryTool({
+      port: api,
+      signal: wrapUpAbort.signal,
+      waitSignal: waits.signal,
     }),
   ];
   const customTools = [...bossTools, ...localTools, ...mcp.flatMap((set) => set.tools)].sort(

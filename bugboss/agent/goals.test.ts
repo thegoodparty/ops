@@ -560,6 +560,37 @@ describe("stage goals, through a real Pi session", () => {
     assert.equal(run.calls.told.length, 0, "the not-met after it is the first of a new streak, not the third");
   });
 
+  test("a met stop breaks a not-met streak", async () => {
+    let n = 0;
+    const run = await runGoals({
+      judge: () => {
+        n += 1;
+        return n === 3
+          ? verdict("met", "Harm shown.")
+          : n <= 4
+            ? verdict("not_met", "Show user harm.")
+            : verdict("unparseable", "x");
+      },
+      turns: ({ fauxAssistantMessage }) => [
+        fauxAssistantMessage("done"),
+        fauxAssistantMessage("done"),
+        fauxAssistantMessage("done"),
+        fauxAssistantMessage("done"),
+        fauxAssistantMessage("done"),
+      ],
+    });
+
+    assert.deepEqual(
+      run.calls.verdicts.slice(0, 4).map((v) => v.verdict),
+      ["not_met", "not_met", "met", "not_met"],
+      "premise: two refused stops, a met stop, then a refused stop",
+    );
+    assert.ok(
+      !run.calls.told.some((told) => /in a row/.test(told.text)),
+      "the not-met after the met stop is the first of a new streak, not the third",
+    );
+  });
+
   test("a passed merge check-in breaks a not-met streak, even inside one turn", async () => {
     let judged = 0;
     const run = await runGoals({
@@ -714,7 +745,8 @@ test("a stage whose marker cannot be written is anchored at the branch's newest 
 test("the closing goal rejects undone work on this incident, not practice-level prevention", () => {
   assert.match(GOALS.analysis, /no follow-up work on this incident/);
   assert.match(GOALS.analysis, /development practice in general .* are wanted, not follow-up work/);
-  assert.match(GOALS.resolved, /follow-up work on this incident is complete/);
+  assert.match(GOALS.resolved, /follow-up or prevention work for this incident has been fully completed/);
+  assert.match(GOALS.resolved, /changes to how we build" ideas are not work for this incident/);
 });
 
 test("the stage comes from the status, and FIXING splits at the merge", () => {
