@@ -560,6 +560,15 @@ test("a timeline event is validated before it reaches the tool API", async () =>
   assert.equal(reached, before);
 });
 
+test("the timeline route takes the harness's goal_verdict kind", async () => {
+  const before = reached;
+  await authed("/timeline", {
+    method: "POST",
+    body: JSON.stringify({ kind: "goal_verdict", occurredAt: 5, summary: "root_cause met: shown" }),
+  });
+  assert.equal(reached, before + 1, "it reached the tool API");
+});
+
 // --- request_sql_query: the Boss names the thread and forwards -------------
 
 const SQL_INCIDENT = "41";

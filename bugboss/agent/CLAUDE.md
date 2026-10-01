@@ -608,7 +608,8 @@ every turn re-read everything the agent had ever seen, and cache reads of
 history were half of what the fleet spent. Incidents 80, 86 and 94 hit the
 turn cap carrying an investigation they had finished hours earlier.
 
-- **Three transitions, all tool calls.** `report_root_cause` succeeding
+- **Three transitions, all tool calls.** `report_root_cause` succeeding,
+  which now means its stage goal was judged met first (see "Stage goals"),
   (`root_cause`), and `track_incident_timeline_event` recording `fix_pr_opened`
   (`fix_opened`) or `fix_merged` (`fix_merged`). The tools report them through
   `onRootCause` / `onTimelineEvent`; nothing reads what the agent wrote.
@@ -644,6 +645,52 @@ turn cap carrying an investigation they had finished hours earlier.
 
 The replay of incidents 94 and 86 at these three transitions came to about
 43% less spend on the two ($31 of $73.50), nearly all of it cache reads.
+
+## Stage goals
+
+The agent never decides a gate is passed. A separate model, Haiku 4.5 on
+Bedrock (`DEFAULT_GOAL_MODEL_ID`, overridden by `BUGBOSS_GOAL_MODEL_ID`),
+reads the goal for the gate and the transcript and returns met, not met or
+impossible with a reason. It is Claude Code's `/goal` pattern; `goals.ts`
+holds the goal text and the evaluator.
+
+Why: incident 94's root cause explained the 502 that paged and not the
+candidates charged for sends that never went out, and incident 80 closed with
+its prevention written up as follow-up work. Both gates checked arguments, not
+outcomes.
+
+- **The three gates.** `report_root_cause`, `report_resolved` and
+  `report_analysis` run their transition only on a met verdict, so stage
+  compaction rests on a verified gate. Not met returns the reason and the goal
+  text as the tool result, and the agent keeps working. A refused gate or
+  merge ask still delivers the Boss's queued directives, so a stop is not
+  held behind a retry.
+- **The merge check-in.** Every `message_boss` is judged first. The evaluator
+  decides whether the message asks for a merge: `not_applicable` lets it
+  through, and no code reads the message's words. Not met blocks the message
+  with the reason. A resumed `message_boss` wait is not judged again.
+- **Impossible escalates.** The reason goes to the Boss as an `escalation`,
+  the same path the `escalate` tool uses. Nothing changes and the agent keeps
+  working; the overall turn budget bounds a stuck agent.
+- **An evaluator that fails passes the gate**, with a `goal_unjudged` alarm
+  and no timeline row. A gate held shut by an outage would stop every
+  incident at once.
+- **What it reads.** The goal, the attempt (a gate's arguments whole), the
+  incident and signals from `getIncident`, the timeline from the
+  non-draining `GET /incidents/:id/timeline`, and the agent's projected
+  context: the latest compaction summary and everything after. Nothing is cut
+  by character count. A transcript that outgrows the evaluator's window
+  leaves out its oldest messages whole and says how many.
+- **No routes of its own.** `getIncident` drains directives, and so does the
+  verdict write, so `goalApi` (`run.ts`) hands what they drained back to the
+  judged tool, which delivers it like any other tool result.
+- **Every verdict is recorded twice.** As a `goal_verdict` row written by
+  `goalApi` through the timeline route, and as a `bugboss_goal_verdict`
+  session entry carrying its usage, which `sumSessionUsage` adds to the
+  incident's tokens but not its turns or its `modelId`. The agent's
+  `track_incident_timeline_event` tool refuses `goal_verdict`; `getIncident`,
+  stage compaction, the post-mortem and the closing report leave the rows
+  out, and the evaluator reads them back as earlier verdicts.
 
 ## The transcript keeps everything compaction summarised
 

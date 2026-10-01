@@ -25,7 +25,7 @@ import { z } from "zod";
 import { recordForBoss } from "../boss/inbox";
 import type { Db } from "../db";
 import { readTimelineEvents, verifyAgentToken } from "../toolapi";
-import { TIMELINE_EVENT_KINDS } from "../types";
+import { GOAL_VERDICT_KIND, TIMELINE_EVENT_KINDS } from "../types";
 import type { Directive, ToolApi, WakeBoss } from "../types";
 
 const log = makeLog("boss-http");
@@ -139,7 +139,7 @@ const BODIES = {
     text: z.string().min(1),
   }),
   timeline: z.object({
-    kind: z.enum(TIMELINE_EVENT_KINDS),
+    kind: z.enum([...TIMELINE_EVENT_KINDS, GOAL_VERDICT_KIND]),
     occurredAt: z.number().int().positive(),
     summary: z.string().trim().min(1),
     evidenceUrl: z.url().optional(),

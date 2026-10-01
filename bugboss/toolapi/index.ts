@@ -36,11 +36,10 @@ import type {
   Signal,
   SignalView,
   TimelineEvent,
-  TimelineEventKind,
   ToolApi,
   ToolResponse,
 } from "../types";
-import { TIMELINE_EVENT_KINDS } from "../types";
+import { GOAL_VERDICT_KIND, TIMELINE_EVENT_KINDS } from "../types";
 import {
   assign,
   getIncidentRow,
@@ -918,7 +917,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const gap = recurrenceGap(incident, args.recurrence);
       if (gap) return reject(gap);
 
-      const recorded = readTimelineEvents(db, incidentId);
+      const recorded = readTimelineEvents(db, incidentId).filter((event) => event.kind !== GOAL_VERDICT_KIND);
       const problem = postmortemProblem(args, recorded);
       if (problem) return reject(problem);
       const sections = pickSections(args);
@@ -991,7 +990,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
    */
   const trackTimelineEvent: ToolApi["trackTimelineEvent"] = (args) =>
     call<TimelineEvent>("trackTimelineEvent", async (incidentId) => {
-      if (!(TIMELINE_EVENT_KINDS as readonly string[]).includes(args.kind)) {
+      if (!([...TIMELINE_EVENT_KINDS, GOAL_VERDICT_KIND] as readonly string[]).includes(args.kind)) {
         return reject(
           `unknown timeline event kind ${args.kind}; use one of ${TIMELINE_EVENT_KINDS.join(", ")}`,
         );
@@ -1011,7 +1010,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       }
       if (!readIncident(incidentId)) return reject(`unknown incident: ${incidentId}`);
 
-      const kind = args.kind as TimelineEventKind;
+      const kind = args.kind;
       const evidenceUrl = args.evidenceUrl ?? null;
       const event = await db.withWrite((w): TimelineEvent => {
         const existing = w
@@ -1151,7 +1150,8 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
           evidence: loaded,
           priorIncident: readPriorIncident(incident.recurrenceOf),
           absorbed: readAbsorbed(incidentId),
-          timeline: readTimelineEvents(db, incidentId),
+          // Verdicts are the harness's, and not events the post-mortem matches.
+          timeline: readTimelineEvents(db, incidentId).filter((event) => event.kind !== GOAL_VERDICT_KIND),
         },
       };
     });

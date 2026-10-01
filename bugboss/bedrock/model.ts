@@ -11,7 +11,7 @@ import type { Model, ModelCost } from "@earendil-works/pi-ai";
 
 import { BEDROCK_INVOKE_MODEL_API, type BedrockInvokeModelApi } from "./options";
 
-export { DEFAULT_MODEL_ID } from "./defaults";
+export { DEFAULT_GOAL_MODEL_ID, DEFAULT_MODEL_ID } from "./defaults";
 
 export type BedrockInvokeModelModel = Model<BedrockInvokeModelApi>;
 

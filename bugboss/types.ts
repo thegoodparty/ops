@@ -398,7 +398,8 @@ export interface ToolApi {
    * forward, so they are the part of the story that survives the context.
    */
   trackTimelineEvent(args: {
-    kind: TimelineEventKind;
+    /** `goal_verdict` only from the harness: the agent's tool accepts `TIMELINE_EVENT_KINDS`. */
+    kind: RecordedTimelineKind;
     /** Epoch millis of when it happened, from the evidence. */
     occurredAt: number;
     summary: string;
@@ -581,9 +582,19 @@ export const TIMELINE_EVENT_KINDS = [
 
 export type TimelineEventKind = (typeof TIMELINE_EVENT_KINDS)[number];
 
+/**
+ * A stage-goal verdict, written by the harness through the same timeline
+ * route rather than by the agent. Kept out of `TIMELINE_EVENT_KINDS` because
+ * that list is the agent's tool schema, and a kind the agent may not record
+ * has no place in it.
+ */
+export const GOAL_VERDICT_KIND = "goal_verdict";
+
+export type RecordedTimelineKind = TimelineEventKind | typeof GOAL_VERDICT_KIND;
+
 export interface TimelineEvent {
   id: number;
-  kind: TimelineEventKind;
+  kind: RecordedTimelineKind;
   occurredAt: number;
   recordedAt: number;
   summary: string;

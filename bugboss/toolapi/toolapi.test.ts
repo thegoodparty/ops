@@ -18,6 +18,7 @@ import { applyAssign } from "./assign";
 import {
   closeIncidentByBoss,
   createToolApi,
+  readTimelineEvents,
   type CorrelationMerge,
   type MergeVerdict,
 } from "./index";
@@ -279,6 +280,7 @@ describe("the status progression", () => {
       "https://github.com/thegoodparty/omni/pull/9999",
     ]);
 
+    await tools.trackTimelineEvent({ kind: "goal_verdict", occurredAt: Date.now() - 1_000, summary: "analysis met: harness bookkeeping" });
     const closed = await tools.reportAnalysis({
       ...SECTIONS,
       usersImpacted: 11,
@@ -288,6 +290,7 @@ describe("the status progression", () => {
     assert.equal(incidentRow(id)?.status, "CLOSED");
     assert.ok(incidentRow(id)?.closedAt);
     assert.match(incidentRow(id)?.postmortem ?? "", /## Five whys/);
+    assert.doesNotMatch(incidentRow(id)?.postmortem ?? "", /harness bookkeeping/, "a goal verdict is not a post-mortem event");
   });
 
   it("rejects every transition taken out of order", async () => {
@@ -1448,6 +1451,19 @@ describe("the timeline", () => {
 
     assert.equal(replay.data?.id, first.data?.id);
     assert.equal(((await tools.getIncident()).data as IncidentView).timeline.length, 1);
+  });
+
+  it("records the harness's goal verdicts, and leaves them out of the agent's view", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    const verdict = await tools.trackTimelineEvent({ kind: "goal_verdict", occurredAt: 1_000, summary: "root_cause met: shown" });
+    await tools.trackTimelineEvent({ kind: "first_error", occurredAt: 500, summary: "first 502" });
+
+    assert.equal(verdict.ok, true, verdict.error);
+    assert.deepEqual(readTimelineEvents(db, id).map((event) => event.kind), ["first_error", "goal_verdict"]);
+    assert.deepEqual(((await tools.getIncident()).data as IncidentView).timeline.map((event) => event.kind), ["first_error"]);
   });
 
   it("refuses a kind it does not know and a time that is not one", async () => {

@@ -15,6 +15,7 @@ import type {
   AgentSession,
   ExtensionAPI,
   ModelRuntime,
+  SessionManager,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type {
@@ -22,13 +23,14 @@ import type {
   IncidentMatch,
   IncidentView,
   MergeOutcomeView,
+  RecordedTimelineKind,
   TimelineEvent,
-  TimelineEventKind,
   ToolApi,
   ToolResponse,
 } from "../types";
-import { TIMELINE_EVENT_KINDS } from "../types";
+import { GOAL_VERDICT_KIND, TIMELINE_EVENT_KINDS } from "../types";
 import {
+  DEFAULT_GOAL_MODEL_ID,
   DEFAULT_MODEL_ID,
   invokeModelIdFor,
   parseInferenceProfiles,
@@ -36,6 +38,7 @@ import {
   type InferenceProfiles,
 } from "../bedrock";
 import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "../bedrock/runtime";
+import { createPiModelClient } from "../bedrock/client";
 import {
   connectMcpToolset,
   GRAFANA_MCP_ARGS,
@@ -70,6 +73,13 @@ import {
   type PendingDirective,
   type PendingQuestion,
 } from "./tools";
+import {
+  createGoalEvaluator,
+  createStageGoals,
+  type StageGate,
+  type StageGoals,
+  type StageGoalsDeps,
+} from "./goals";
 import {
   createPiSummarizer,
   createStageCompaction,
@@ -481,9 +491,25 @@ export const createBossTools = async (args: {
   api: Omit<ToolApi, "escalate">;
   boss: Pick<BossInboxPort, "tellBoss">;
   onRootCause?: () => void;
-  onTimelineEvent?: (kind: TimelineEventKind) => void;
+  onTimelineEvent?: (kind: RecordedTimelineKind) => void;
+  /** Absent, every gate runs unjudged, as it did before stage goals. */
+  goals?: Pick<StageGoals, "gate">;
 }): Promise<ToolDefinition[]> => {
   const { Type } = await import("typebox");
+
+  // The gate's own arguments go to the evaluator whole: they are the claim it
+  // is judging.
+  const judged = async (
+    gate: StageGate,
+    tool: string,
+    params: unknown,
+    run: () => Promise<ToolResponse>,
+  ) => {
+    if (!args.goals) return bossToolResult(await run());
+    return bossToolResult(
+      await args.goals.gate(gate, `The agent called ${tool} with:\n${JSON.stringify(params, null, 2)}`, run),
+    );
+  };
 
   const tools: ToolDefinition[] = [
     {
@@ -548,13 +574,14 @@ export const createBossTools = async (args: {
           }),
         ),
       }),
-      execute: async (_id: string, params: unknown) => {
-        const response = await args.api.reportRootCause(
-          params as unknown as Parameters<ToolApi["reportRootCause"]>[0],
-        );
-        if (response.ok) args.onRootCause?.();
-        return bossToolResult(response);
-      },
+      execute: async (_id: string, params: unknown) =>
+        judged("root_cause", "report_root_cause", params, async () => {
+          const response = await args.api.reportRootCause(
+            params as unknown as Parameters<ToolApi["reportRootCause"]>[0],
+          );
+          if (response.ok) args.onRootCause?.();
+          return response;
+        }),
     },
     {
       name: "search_incidents",
@@ -613,10 +640,8 @@ export const createBossTools = async (args: {
         evidence: Type.String({ description: "What you observed stop happening, and how." }),
       }),
       execute: async (_id: string, params: unknown) =>
-        bossToolResult(
-          await args.api.reportResolved(
-            params as unknown as Parameters<ToolApi["reportResolved"]>[0],
-          )
+        judged("resolved", "report_resolved", params, () =>
+          args.api.reportResolved(params as unknown as Parameters<ToolApi["reportResolved"]>[0]),
         ),
     },
     {
@@ -678,10 +703,8 @@ export const createBossTools = async (args: {
         ),
       }),
       execute: async (_id: string, params: unknown) =>
-        bossToolResult(
-          await args.api.reportAnalysis(
-            params as unknown as Parameters<ToolApi["reportAnalysis"]>[0],
-          )
+        judged("analysis", "report_analysis", params, () =>
+          args.api.reportAnalysis(params as unknown as Parameters<ToolApi["reportAnalysis"]>[0]),
         ),
     },
     {
@@ -741,6 +764,15 @@ export const createBossTools = async (args: {
         ),
       }),
       execute: async (_id: string, params: unknown) => {
+        // The route also takes the harness's goal_verdict; the agent may not.
+        const { kind } = params as { kind: string };
+        if (!(TIMELINE_EVENT_KINDS as readonly string[]).includes(kind)) {
+          return bossToolResult({
+            ok: false,
+            error: `unknown timeline event kind ${kind}; use one of ${TIMELINE_EVENT_KINDS.join(", ")}`,
+            directives: [],
+          });
+        }
         const response = await args.api.trackTimelineEvent(
           params as unknown as Parameters<ToolApi["trackTimelineEvent"]>[0],
         );
@@ -916,6 +948,8 @@ export interface RunIncidentAgentOptions {
   timeoutSeconds?: number;
   /** Turns this incident gets in total. Defaults to `INCIDENT_AGENT_MAX_TURNS`. */
   maxTurns?: number;
+  /** The stage-goal evaluator's model. Defaults to `DEFAULT_GOAL_MODEL_ID`. */
+  goalModelId?: string;
   awsRegion?: string;
   /**
    * The S3 key for the session, from the dispatcher's sessionRef. Required
@@ -1045,6 +1079,7 @@ export const agentOptionsFromEnv = (
     sessionKey,
     timeoutSeconds,
     maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : INCIDENT_AGENT_MAX_TURNS,
+    goalModelId: env.BUGBOSS_GOAL_MODEL_ID || DEFAULT_GOAL_MODEL_ID,
     ...(Number.isFinite(attempt) && attempt > 0 ? { attempt } : {}),
     ...(workingHours ? { workingHours } : {}),
     ...(alertSlugs.length ? { alertSlugs } : {}),
@@ -1591,7 +1626,10 @@ const launch = async (args: {
     settings,
     reserveTokens: reserveTokensFor(model),
     contextWindow: model.contextWindow,
-    timeline: () => api.timelineEvents(),
+    // Verdicts are the harness's bookkeeping; a summary that reproduced them
+    // verbatim would carry every one forward into every later stage.
+    timeline: async () =>
+      (await api.timelineEvents()).filter((event) => event.kind !== GOAL_VERDICT_KIND),
     summarize: createPiSummarizer({
       compact: pi.compact,
       modelRuntime,
@@ -1605,6 +1643,16 @@ const launch = async (args: {
       ),
   });
 
+  // Assigned once it is opened, below; nothing reads it before a turn runs.
+  let goalSession: SessionManager | null = null;
+  const goals = await createGoals({
+    options,
+    api,
+    modelRuntime,
+    pi,
+    session: () => goalSession,
+  });
+
   const bossTools = await createBossTools({
     api,
     boss: api,
@@ -1616,6 +1664,7 @@ const launch = async (args: {
       const stage = STAGE_FOR_TIMELINE_KIND[kind];
       if (stage) stages.request(stage);
     },
+    ...(goals ? { goals } : {}),
   });
   const localTools = [
     await createMonitorTool({
@@ -1630,6 +1679,7 @@ const launch = async (args: {
       },
     }),
     await createMessageBossTool({
+      ...(goals ? { checkIn: goals.checkIn } : {}),
       marker: api,
       boss: api,
       api,
@@ -1683,6 +1733,7 @@ const launch = async (args: {
   const sessionManager = restored
     ? pi.SessionManager.open(paths.sessionFile, paths.sessionDir, paths.checkout)
     : pi.SessionManager.create(paths.checkout, paths.sessionDir, { id: options.incidentId });
+  goalSession = sessionManager;
 
   const sync = createSessionSync({
     store,
@@ -2027,6 +2078,91 @@ const launch = async (args: {
     turnsExhausted: turnBudget.exhausted(),
     error,
   };
+};
+
+/**
+ * The evaluator's reads and writes, through routes that already exist. No
+ * route reads the incident without draining, so it reads it the way the
+ * agent does and hands the drained directives to the tool it judged; the
+ * timeline comes from the non-draining peek, verdicts and all. A verdict is a
+ * `goal_verdict` row through the timeline route, which only this code
+ * writes: the agent's tool refuses the kind.
+ */
+export const goalApi = (
+  api: Pick<BossClient, "getIncident" | "timelineEvents" | "trackTimelineEvent" | "tellBoss">,
+  alarm: (event: string, fields: Record<string, unknown>) => void,
+): Pick<StageGoalsDeps, "context" | "recordVerdict" | "escalate"> => ({
+  context: async () => {
+    const view = await api.getIncident();
+    const directives = view.directives ?? [];
+    if (!view.ok || !view.data) return { context: null, error: view.error ?? "no data", directives };
+    let timeline: TimelineEvent[];
+    try {
+      timeline = await api.timelineEvents();
+    } catch (err: unknown) {
+      return { context: null, error: `the timeline could not be read: ${String(err)}`, directives };
+    }
+    const { incident, signals } = view.data;
+    return {
+      context: {
+        incident,
+        signals: signals.map(({ id, kind, source, title, body }) => ({ id, kind, source, title, body })),
+        timeline,
+      },
+      directives,
+    };
+  },
+  recordVerdict: async (verdict) => {
+    const response = await api.trackTimelineEvent({
+      kind: GOAL_VERDICT_KIND,
+      occurredAt: Date.now(),
+      summary: `${verdict.gate} ${verdict.verdict}: ${verdict.reason}`,
+    });
+    if (!response.ok) alarm("goal_verdict_timeline_failed", { gate: verdict.gate, error: response.error });
+    return response.directives ?? [];
+  },
+  escalate: (reason, brief) => api.tellBoss("escalation", `${reason}\n\n${brief}`),
+});
+
+/**
+ * The stage-goal evaluator, or none. A goal model the catalog does
+ * not know costs the run its goals, never the run: the gates fall back to
+ * what they did before, and the alarm says so.
+ */
+const createGoals = async (args: {
+  options: RunIncidentAgentOptions;
+  api: BossClient;
+  modelRuntime: ModelRuntime;
+  pi: typeof import("@earendil-works/pi-coding-agent");
+  session: () => SessionManager | null;
+}): Promise<StageGoals | null> => {
+  const incidentId = args.options.incidentId;
+  const emit = (level: "info" | "error") => (event: string, fields: Record<string, unknown>) =>
+    (level === "error" ? console.error : console.log)(
+      JSON.stringify({ component: "agent", level, event, incidentId, ...fields }),
+    );
+  const modelId = args.options.goalModelId ?? DEFAULT_GOAL_MODEL_ID;
+  let model: Awaited<ReturnType<typeof resolveBedrockModel>>;
+  try {
+    model = await resolveBedrockModel({ id: modelId });
+    assertBedrockInvokeModelRouting(args.modelRuntime, model);
+  } catch (err: unknown) {
+    emit("error")("goal_model_unavailable", { modelId, error: String(err) });
+    return null;
+  }
+  return createStageGoals({
+    evaluate: createGoalEvaluator({
+      client: createPiModelClient({ runtime: args.modelRuntime, model }),
+      contextWindow: model.contextWindow,
+      estimateTokens: (message) => args.pi.estimateTokens(message),
+    }),
+    ...goalApi(args.api, emit("error")),
+    session: args.session,
+    toMessages: (messages) =>
+      args.pi.convertToLlm(messages as Parameters<typeof args.pi.convertToLlm>[0]),
+    log: emit("info"),
+    alarm: emit("error"),
+  });
 };
 
 /**

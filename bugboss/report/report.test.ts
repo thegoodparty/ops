@@ -281,11 +281,12 @@ describe("the report assembles from a real incident row", () => {
       );
       insert.run("fix_merged", OPENED + 3_000_000, OPENED + 3_000_000, "omni#42 merged", "https://github.com/thegoodparty/omni/pull/42");
       insert.run("first_error", OPENED - 600_000, OPENED + 60_000, "first 502 | on outreach", null);
+      insert.run("goal_verdict", OPENED + 100_000, OPENED + 100_000, "root_cause met: shown", null);
     });
 
     const data = await readReportData(deps(), "inc-30");
     assert.ok(data);
-    assert.deepEqual(data.timeline.map((event) => event.kind), ["first_error", "fix_merged"]);
+    assert.deepEqual(data.timeline.map((event) => event.kind), ["first_error", "fix_merged"], "goal verdicts are not moments in the incident");
 
     const doc = renderReportDocument(data);
     assert.match(doc, /## Recorded timeline/);

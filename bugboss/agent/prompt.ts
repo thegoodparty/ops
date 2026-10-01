@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { THREAD_PROSE_CHARS } from "../slack/format";
 import { MAX_BLOCK_SECONDS, MESSAGE_BOSS_MIN_WAIT_SECONDS } from "./tools";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
+import { GOALS } from "./goals";
 import { TEST_DB_ENV_VAR } from "../testdb";
 
 /**
@@ -696,6 +697,23 @@ question in front of you, when it is in front of you.
 - \`CLAUDE.md\` at the root, then the nearest \`AGENTS.md\` to the code you are
   changing: the conventions a pull request here is reviewed against.`;
 
+const GATES = `## How your gates are judged
+
+A model judges your gates and merge asks on your transcript alone:
+surface the evidence first.
+
+Root cause:
+${GOALS.root_cause}
+
+Merge ask:
+${GOALS.merge_check_in}
+
+Resolved:
+${GOALS.resolved}
+
+Closed:
+${GOALS.analysis}`;
+
 export const composeSystemPrompt = (input: PromptInput): string => {
   const tools = [...input.toolNames].sort();
   const alerts = [...input.firedAlerts].sort(bySlug);
@@ -709,6 +727,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
     CHECKOUT(input),
     TESTS(input),
     TIMELINE,
+    GATES,
     MONITOR_EXAMPLES(input),
     SHIP_PR,
     REPORTING,
