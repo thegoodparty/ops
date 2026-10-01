@@ -1149,6 +1149,33 @@ test("a refire recorded before a crash is announced by Grafana's retry", async (
   assert.equal(firings(first.signalId!), 1);
 });
 
+test("a refire that lands during the first placement is announced once it is placed", async () => {
+  let refire: Promise<unknown> | null = null;
+  fakeModel.beforeDecide = async () => {
+    refire = boss.ingest(
+      "grafana",
+      grafanaBody("fp-refire-f", "refire-mid-placement-errors", "firing", LATER_FIRING),
+    );
+    await until(
+      () =>
+        boss.db.get("SELECT 1 FROM signal_firing WHERE startedAt = ?", [
+          Date.parse(LATER_FIRING),
+        ]) !== undefined,
+      "the refire to be recorded",
+    );
+  };
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
+  const [first] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-f", "refire-mid-placement-errors", "firing", FIRST_FIRING),
+  );
+  await refire;
+  const incidentId = first.incidentId!;
+
+  assert.equal(refireThread(incidentId).length, 1);
+  assert.equal(refireDirectives(incidentId).length, 1);
+});
+
 test("a resolved notification for an open signal posts nothing", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
   const [first] = await boss.ingest(

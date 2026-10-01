@@ -124,7 +124,11 @@ open on its incident. What tells a new firing from a redelivery is
 `recordSignal` writes a later `startsAt` to `signal_firing`, keyed on
 (signal, startsAt), so a retried refire is one row. `announcedAt` is claimed
 in the transaction that tells the agent, so a crash after recording leaves a
-firing Grafana's retry still announces. When the signal's
+firing Grafana's retry still announces. A refire that lands while the
+signal's first placement is running is announced once placement attaches it.
+A wait parked on an exhausted budget (`liftsOnReply = 0`) is not lifted: a
+relaunch would exhaust and escalate again, so the directive waits in the
+queue and the thread line reaches the people that incident is waiting on. When the signal's
 incident is INVESTIGATING or FIXING, the agent gets a `signal_refired`
 directive (steered into a live run, and it lifts a wait that lifts on a Boss
 message) and the thread gets one line with the alert's link. Anything else
