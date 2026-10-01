@@ -195,7 +195,7 @@ has an author to refuse it to:
 | a dispatcher escalation brief (crash loop, launch cap, deadline) | `THREAD_PROSE_CHARS`, through the tool API's `escalate` |
 | the Boss's own answer (`slack/agent.ts`) | its prompt's "about 200 words"; `postProse` splits it, nothing refuses it |
 | code-composed notices: `report_root_cause`'s split and merge notices, impact changes, closed notices, the dispatcher's stale notices | none; code writes them |
-| `report_analysis`'s post-mortem | **none** |
+| `report_analysis`'s post-mortem | **none** by characters; `practiceChanges` is refused outside about 100-300 words |
 
 An agent's `escalate` and `message_boss` are not on the list. Both land in
 `boss_inbox` (`boss/inbox.ts`), and the Boss decides what of them reaches the

@@ -9,7 +9,14 @@
 // column -- so `cell()` is the only escaping in this file, and it is applied
 // nowhere else.
 
-import type { Incident, RecurrenceAnalysis, RecurrenceCategory, TimelineEvent } from "../types";
+import type {
+  Incident,
+  PostmortemSections,
+  RecurrenceAnalysis,
+  RecurrenceCategory,
+  TimelineEvent,
+} from "../types";
+import { mergeTimeline } from "./postmortem";
 
 // ---------------------------------------------------------------------------
 // What a report is made of
@@ -64,6 +71,11 @@ export interface ReportRun {
   attempts: number;
   turns: number | null;
   /**
+   * First to last entry in the session file: how long the agent was on the
+   * incident, parked time included. Null when the file is gone.
+   */
+  sessionSpanMs: number | null;
+  /**
    * Those tokens at the Bedrock catalog's rates, each class at its own rate,
    * computed when the report is built. An estimate, and named one: nothing
    * here ever sees an invoice.
@@ -102,6 +114,12 @@ export interface ReportData {
    * rather than a reason not to publish one.
    */
   recurrence: RecurrenceAnalysis | null;
+  /**
+   * The structured post-mortem. Null for an incident closed before it
+   * existed, or by the Boss, and for one whose stored sections will not
+   * load; those render `incident.postmortem` as written.
+   */
+  postmortem: PostmortemSections | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +347,7 @@ export const reportMetrics = (data: ReportData): ReportMetrics => {
 // The document
 // ---------------------------------------------------------------------------
 
-const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
+const glanceTable = (data: ReportData, metrics: ReportMetrics): string[] => {
   const { incident } = data;
   const sources = [...new Set(data.signals.map((signal) => signal.source))];
   const rows: [string, string][] = [
@@ -394,8 +412,6 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
     ["Recurrence of", incident.recurrenceOf ?? "—"],
   ];
   return [
-    "## At a glance",
-    "",
     "| | |",
     "| --- | --- |",
     ...rows.map(([label, value]) => `| ${cell(label)} | ${cell(value)} |`),
@@ -403,10 +419,16 @@ const glance = (data: ReportData, metrics: ReportMetrics): string[] => {
   ];
 };
 
-const signalTable = (data: ReportData): string[] => {
+const glance = (data: ReportData, metrics: ReportMetrics): string[] => [
+  "## At a glance",
+  "",
+  ...glanceTable(data, metrics),
+];
+
+const signalTable = (data: ReportData, heading = "Signals"): string[] => {
   if (data.signals.length === 0) return [];
   return [
-    "## Signals",
+    `## ${heading}`,
     "",
     "| Source | Kind | Title | Opened | Closed | Explained |",
     "| --- | --- | --- | --- | --- | --- |",
@@ -451,10 +473,10 @@ const timelineTable = (data: ReportData): string[] => {
   ];
 };
 
-const actionTable = (data: ReportData): string[] => {
+const actionTable = (data: ReportData, heading = "What people did"): string[] => {
   if (data.actions.length === 0) return [];
   return [
-    "## What people did",
+    `## ${heading}`,
     "",
     "| When | Who | What | Why |",
     "| --- | --- | --- | --- |",
@@ -499,8 +521,19 @@ const runTable = (data: ReportData, metrics: ReportMetrics): string[] => {
   const { run } = data;
   const rows: [string, string][] = [
     ["Model", run.modelId ?? "not recorded"],
-    ["Launches", count(run.attempts)],
+    [
+      "Launches",
+      run.attempts > 1
+        ? `${count(run.attempts)} (${count(run.attempts - 1)} ${run.attempts === 2 ? "restart" : "restarts"})`
+        : count(run.attempts),
+    ],
     ["Turns", run.turns === null ? "not recorded" : count(run.turns)],
+    [
+      "Wall clock",
+      run.sessionSpanMs === null
+        ? "not recorded"
+        : `${duration(run.sessionSpanMs)}, first to last turn, parked time included`,
+    ],
     ["Input tokens", count(run.tokensIn)],
     ["Output tokens", count(run.tokensOut)],
     ["Cache read", count(run.cacheRead)],
@@ -544,12 +577,12 @@ const resolution = (data: ReportData): string[] => {
  * hold, and what was done about that -- and because a recurrence is the most
  * important fact about an incident that has one.
  */
-const recurrence = (data: ReportData): string[] => {
+const recurrence = (data: ReportData, heading = "## Why it came back"): string[] => {
   const { incident } = data;
   if (!incident.recurrenceOf) return [];
   if (!data.recurrence) {
     return [
-      "## Why it came back",
+      heading,
       "",
       `A recurrence of ${incident.id === incident.recurrenceOf ? "itself" : incident.recurrenceOf}. The answer recorded at close could not be read back, so it is missing here rather than wrong.`,
       "",
@@ -557,7 +590,7 @@ const recurrence = (data: ReportData): string[] => {
   }
   const { category, why, remedy } = data.recurrence;
   return [
-    "## Why it came back",
+    heading,
     "",
     `A recurrence of ${incident.recurrenceOf}: ${RECURRENCE_REASON[category] ?? category}.`,
     "",
@@ -569,6 +602,154 @@ const recurrence = (data: ReportData): string[] => {
     "",
     remedy.trim(),
     "",
+  ];
+};
+
+// ---------------------------------------------------------------------------
+// The structured post-mortem
+// ---------------------------------------------------------------------------
+
+/**
+ * The post-mortem's sections, in the order every report uses. The prevention
+ * heading says what the section is for, because it is the one most easily
+ * mistaken for a list of follow-up tasks: it is about how we build, and work
+ * left on this incident does not belong in a closed incident's report.
+ */
+export const POSTMORTEM_HEADINGS = {
+  atAGlance: "At a glance",
+  timeline: "Timeline",
+  userImpact: "User impact",
+  rootCause: "Root cause",
+  fiveWhys: "Five whys",
+  resolutionActions: "Resolution actions taken",
+  practiceChanges: "Preventing similar issues: changes to how we build",
+  agentRun: "Agent run",
+} as const;
+
+const prose = (body: string): string[] => [nest(body.trim()), ""];
+
+const mergedTimelineTable = (
+  sections: PostmortemSections,
+  recorded: readonly TimelineEvent[],
+): string[] => [
+  "| When | What | Evidence |",
+  "| --- | --- | --- |",
+  ...mergeTimeline(sections.timeline, recorded).map((row) =>
+    [
+      "",
+      Number.isFinite(row.at) ? timestamp(row.at) : "time not recorded",
+      cell(row.event),
+      cell(row.evidenceUrl ?? "—"),
+      "",
+    ].join(" | ").trim(),
+  ),
+  "",
+];
+
+const fiveWhysList = (sections: PostmortemSections): string[] => [
+  ...sections.fiveWhys.map(
+    (step, i) => `${i + 1}. **${step.why.trim().replace(/\s+/g, " ")}** ${step.because.trim().replace(/\s+/g, " ")}`,
+  ),
+  "",
+];
+
+const actionsList = (sections: PostmortemSections): string[] => [
+  ...sections.resolutionActions.map((action) => `- ${action.trim().replace(/\s+/g, " ")}`),
+  "",
+];
+
+/**
+ * The post-mortem as the Markdown stored in `incident.postmortem`, for every
+ * reader that is not the report: search, the next agent's prior incident, the
+ * Slack agent. Same sections, same order, without the measured tables only
+ * the report carries.
+ */
+export const renderPostmortem = (
+  sections: PostmortemSections,
+  recorded: readonly TimelineEvent[],
+): string =>
+  [
+    `## ${POSTMORTEM_HEADINGS.atAGlance}`,
+    "",
+    ...prose(sections.atAGlance),
+    `## ${POSTMORTEM_HEADINGS.timeline}`,
+    "",
+    ...mergedTimelineTable(sections, recorded),
+    `## ${POSTMORTEM_HEADINGS.userImpact}`,
+    "",
+    ...prose(sections.userImpact),
+    `## ${POSTMORTEM_HEADINGS.rootCause}`,
+    "",
+    ...prose(sections.rootCause),
+    `## ${POSTMORTEM_HEADINGS.fiveWhys}`,
+    "",
+    ...fiveWhysList(sections),
+    `## ${POSTMORTEM_HEADINGS.resolutionActions}`,
+    "",
+    ...actionsList(sections),
+    `## ${POSTMORTEM_HEADINGS.practiceChanges}`,
+    "",
+    ...prose(sections.practiceChanges),
+  ]
+    .join("\n")
+    .trimEnd();
+
+/**
+ * The report for an incident closed on structured sections: the seven
+ * sections in their fixed order, each the agent's words followed by what the
+ * system measured for it, then the evidence tables as appendices.
+ */
+const structuredDocument = (
+  data: ReportData,
+  sections: PostmortemSections,
+  metrics: ReportMetrics,
+): string[] => {
+  const { incident } = data;
+  const evidence: string[] = [];
+  if (incident.resolvedEvidence) {
+    evidence.push(`**What showed it stopped:** ${incident.resolvedEvidence.trim()}`, "");
+  }
+  if (data.prs.length > 0) {
+    evidence.push(...data.prs.map((pr) => `- ${pr.url} — ${prLabel(pr)}`), "");
+  }
+  const run = runTable(data, metrics);
+  return [
+    `## ${POSTMORTEM_HEADINGS.atAGlance}`,
+    "",
+    ...prose(sections.atAGlance),
+    ...glanceTable(data, metrics),
+    `## ${POSTMORTEM_HEADINGS.timeline}`,
+    "",
+    ...mergedTimelineTable(sections, data.timeline),
+    `## ${POSTMORTEM_HEADINGS.userImpact}`,
+    "",
+    ...prose(sections.userImpact),
+    ...(incident.usersImpacted === null
+      ? []
+      : [
+          `**${count(incident.usersImpacted)} ${incident.usersImpacted === 1 ? "user" : "users"} impacted.**`,
+          "",
+          ...(incident.impactQuery
+            ? ["Measured by:", "", "```", incident.impactQuery.trim(), "```", ""]
+            : ["No query was recorded for this number.", ""]),
+        ]),
+    `## ${POSTMORTEM_HEADINGS.rootCause}`,
+    "",
+    ...prose(sections.rootCause),
+    ...recurrence(data, "### Why it came back"),
+    `## ${POSTMORTEM_HEADINGS.fiveWhys}`,
+    "",
+    ...fiveWhysList(sections),
+    `## ${POSTMORTEM_HEADINGS.resolutionActions}`,
+    "",
+    ...actionsList(sections),
+    ...evidence,
+    `## ${POSTMORTEM_HEADINGS.practiceChanges}`,
+    "",
+    ...prose(sections.practiceChanges),
+    ...run,
+    ...signalTable(data, "Appendix: signals"),
+    ...actionTable(data, "Appendix: what people did"),
   ];
 };
 
@@ -588,13 +769,20 @@ export const renderReportDocument = (data: ReportData): string => {
   // when this *is* the file.
   const headline = data.signals[0]?.title ?? "No signal recorded";
 
-  return [
+  const header = [
     `# Incident ${incident.id}`,
     "",
     headline.trim(),
     "",
     `Closed ${incident.closedAt === null ? "at an unrecorded time" : timestamp(incident.closedAt)} · written by BugBoss.`,
     "",
+  ];
+  if (data.postmortem) {
+    return [...header, ...structuredDocument(data, data.postmortem, metrics)].join("\n");
+  }
+
+  return [
+    ...header,
     ...glance(data, metrics),
     ...section("Root cause", incident.rootCause ?? ""),
     ...recurrence(data),

@@ -23,6 +23,7 @@ import {
   type ReportUpload,
 } from "./index";
 import { duration, interval } from "./render";
+import { PRACTICE_CHANGES, SECTIONS } from "./postmortem.fixture";
 
 const fakeS3 = () => {
   const objects = new Map<string, Buffer>();
@@ -1214,5 +1215,117 @@ describe("interval decides what a difference means before anyone prints it", () 
     });
     assert.match(said, /not usable/);
     assert.notEqual(said, "absent");
+  });
+});
+
+describe("a structured post-mortem renders in one fixed order", () => {
+  const SECTION_ORDER = [
+    "## At a glance",
+    "## Timeline",
+    "## User impact",
+    "## Root cause",
+    "## Five whys",
+    "## Resolution actions taken",
+    "## Preventing similar issues: changes to how we build",
+    "## Agent run",
+  ];
+
+  const seedStructured = async (id: string) => {
+    await seed(id);
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET postmortemSections = ? WHERE id = ?").run(
+        JSON.stringify({
+          ...SECTIONS,
+          timeline: [
+            { recordedEventId: 1, at: "2026-10-01T03:05:00Z", event: "Cause confirmed from a trace." },
+            ...SECTIONS.timeline.filter((row) => !row.event.startsWith("Cause confirmed")),
+          ],
+        }),
+        id,
+      );
+      const insert = w.prepare(
+        `INSERT INTO incident_timeline_event (id, incidentId, kind, occurredAt, recordedAt, summary, evidenceUrl)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insert.run(1, id, "root_cause_found", Date.UTC(2026, 9, 1, 3, 0, 0), Date.UTC(2026, 9, 1, 3, 1, 0), "Root cause found", null);
+      insert.run(2, id, "fix_verified", Date.UTC(2026, 9, 1, 7, 45, 2), Date.UTC(2026, 9, 1, 7, 50, 0), "Recorded only: 18 saves succeed", "https://grafana.example/explore");
+    });
+    s3.objects.set(
+      `sessions/incident/${id}/session.jsonl`,
+      Buffer.from(
+        [
+          JSON.stringify({ type: "session", timestamp: "2026-10-01T02:20:00.000Z" }),
+          ...SESSION.split("\n"),
+          JSON.stringify({ type: "custom", timestamp: "2026-10-01T07:52:00.000Z" }),
+        ].join("\n"),
+        "utf8",
+      ),
+    );
+  };
+
+  it("has the seven sections in order, then the evidence as appendices", async () => {
+    await seedStructured("inc-s");
+    const doc = renderReportDocument((await readReportData(deps(), "inc-s"))!);
+
+    const at = SECTION_ORDER.map((heading) => doc.indexOf(`\n${heading}\n`));
+    assert.ok(at.every((i) => i >= 0), `missing: ${SECTION_ORDER.filter((_, i) => at[i] < 0).join(", ")}`);
+    assert.deepEqual([...at].sort((a, b) => a - b), at, "sections out of order");
+    assert.ok(doc.indexOf("\n## Appendix: signals\n") > at.at(-1)!);
+    assert.doesNotMatch(doc, /\n## Post-mortem\n/, "no free-form block beside the sections");
+  });
+
+  it("renders the timeline as a table, recorded times winning and recorded events kept", async () => {
+    await seedStructured("inc-s");
+    const doc = renderReportDocument((await readReportData(deps(), "inc-s"))!);
+    const timeline = doc.slice(doc.indexOf("\n## Timeline\n"), doc.indexOf("\n## User impact\n"));
+
+    assert.match(timeline, /\| When \| What \| Evidence \|\n\| --- \| --- \| --- \|/);
+    assert.match(timeline, /\| 2026-10-01 03:00:00 UTC \| Cause confirmed from a trace\. \| — \|/);
+    assert.doesNotMatch(timeline, /03:05:00/, "the agent's time loses to the recorded one");
+    assert.match(timeline, /\| 2026-10-01 07:45:02 UTC \| A real batch of 18 saves, 17 concurrent, all succeed\. \| https:\/\/grafana\.example\/explore \|/);
+    assert.doesNotMatch(timeline, /Recorded only/, "one row per moment");
+    assert.doesNotMatch(doc, /## Recorded timeline/);
+  });
+
+  it("writes the agent run from what BugBoss recorded, the dollars labelled an estimate", async () => {
+    await seedStructured("inc-s");
+    const doc = renderReportDocument((await readReportData(deps(), "inc-s"))!);
+    const run = doc.slice(doc.indexOf("\n## Agent run\n"), doc.indexOf("\n## Appendix"));
+
+    assert.match(run, /\| Model \| us\.anthropic\.claude-opus-5 \|/);
+    assert.match(run, /\| Launches \| 2 \(1 restart\) \|/);
+    assert.match(run, /\| Turns \| 2 \|/);
+    assert.match(run, /\| Wall clock \| 5h 32m, first to last turn, parked time included \|/);
+    assert.match(run, /\| Cache write \(1h\) \| 1,500 \|/);
+    assert.match(run, /\*\*Estimated cost: \$0\.12\.\*\* An estimate, not a bill/);
+  });
+
+  it("adds what the system measured under the agent's words", async () => {
+    await seedStructured("inc-s");
+    const doc = renderReportDocument((await readReportData(deps(), "inc-s"))!);
+
+    assert.match(doc, /## User impact\n\nOne candidate saw 7 door-knocking list saves fail[^\n]*\n\n\*\*1,240 users impacted\.\*\*/);
+    assert.match(doc, /## Resolution actions taken\n\n- omni#2290 moves[^\n]*\n- Deployed[^\n]*\n\n\*\*What showed it stopped:\*\* Errors stopped at 11:02/);
+    assert.match(doc, /- https:\/\/github\.com\/thegoodparty\/omni\/pull\/42 — state not known/);
+    assert.ok(doc.includes(PRACTICE_CHANGES), "prevention whole, never cut");
+  });
+
+  it("keeps rendering a free-form post-mortem from before the sections existed", async () => {
+    await seed("inc-old", { postmortem: "*Summary*\n\nThe pool saturated.\n\n*Prevention*\n\n• Raise it." });
+    const data = (await readReportData(deps(), "inc-old"))!;
+    assert.equal(data.postmortem, null);
+    const doc = renderReportDocument(data);
+
+    assert.match(doc, /## Post-mortem\n\n\*Summary\*\n\nThe pool saturated\.\n\n\*Prevention\*\n\n• Raise it\./);
+    assert.doesNotMatch(doc, /## Resolution actions taken/);
+  });
+
+  it("falls back to the stored Markdown when the sections will not load", async () => {
+    await seed("inc-bad", { postmortem: "## At a glance\n\nStill readable." });
+    await db.withWrite((w) =>
+      w.prepare("UPDATE incident SET postmortemSections = '{not json' WHERE id = 'inc-bad'").run(),
+    );
+    const doc = renderReportDocument((await readReportData(deps(), "inc-bad"))!);
+    assert.match(doc, /Still readable\./);
   });
 });

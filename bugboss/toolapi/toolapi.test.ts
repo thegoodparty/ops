@@ -25,6 +25,7 @@ import jwt from "jsonwebtoken";
 
 import { mintAgentToken, verifyAgentToken } from "./token";
 import { THREAD_PROSE_CHARS } from "../slack/format";
+import { SECTIONS } from "../report/postmortem.fixture";
 
 const SECRET = "test-secret-not-a-real-one";
 
@@ -279,14 +280,14 @@ describe("the status progression", () => {
     ]);
 
     const closed = await tools.reportAnalysis({
-      postmortem: "# Summary\nBad column in the upgrade webhook.",
+      ...SECTIONS,
       usersImpacted: 11,
       impactQuery: '{service_name="gp-api"} |= "pro_upgrade"',
     });
     assert.equal(closed.ok, true, closed.error);
     assert.equal(incidentRow(id)?.status, "CLOSED");
     assert.ok(incidentRow(id)?.closedAt);
-    assert.match(incidentRow(id)?.postmortem ?? "", /Bad column/);
+    assert.match(incidentRow(id)?.postmortem ?? "", /## Five whys/);
   });
 
   it("rejects every transition taken out of order", async () => {
@@ -301,7 +302,7 @@ describe("the status progression", () => {
     await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
 
     const analysisTooEarly = await tools.reportAnalysis({
-      postmortem: "p",
+      ...SECTIONS,
       usersImpacted: 1,
       impactQuery: "q",
     });
@@ -323,7 +324,7 @@ describe("the status progression", () => {
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
     await tools.reportResolved({ prUrls: [], evidence: "quiet" });
-    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    await tools.reportAnalysis({ ...SECTIONS, usersImpacted: 1, impactQuery: "q" });
 
     const after = await tools.reportImpact({ usersImpacted: 99, query: "q" });
     assert.equal(after.ok, false);
@@ -629,7 +630,7 @@ describe("invariant 2: resolution closes the signals it claims to have fixed", (
     });
 
     const res = await tools.reportAnalysis({
-      postmortem: "p",
+      ...SECTIONS,
       usersImpacted: 1,
       impactQuery: "q",
     });
@@ -740,7 +741,7 @@ describe("park", () => {
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
     await tools.reportResolved({ prUrls: [], evidence: "quiet" });
-    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    await tools.reportAnalysis({ ...SECTIONS, usersImpacted: 1, impactQuery: "q" });
 
     const res = await tools.park({ waitingFor: "somebody" });
 
@@ -1267,7 +1268,7 @@ describe("escalate", () => {
     assert.equal(resolved.ok, true, resolved.error);
     assert.equal(incidentRow(id)?.status, "RESOLVED");
     const analysis = await tools.reportAnalysis({
-      postmortem: "p",
+      ...SECTIONS,
       usersImpacted: 1,
       impactQuery: "q",
     });
@@ -1281,7 +1282,7 @@ describe("escalate", () => {
     const tools = toolsFor(id);
     await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
     await tools.reportResolved({ prUrls: [], evidence: "quiet" });
-    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    await tools.reportAnalysis({ ...SECTIONS, usersImpacted: 1, impactQuery: "q" });
     const before = posts.length;
 
     const res = await tools.escalate({ reason: "have a look", brief: "b" });
@@ -2016,7 +2017,7 @@ describe("a recurrence closes on a second question", () => {
       evidence: "zero matching lines for 90 minutes after the deploy",
     });
     await firstTools.reportAnalysis({
-      postmortem: "## Summary\nthe pool was too small",
+      ...SECTIONS,
       usersImpacted: 3,
       impactQuery: "q",
     });
@@ -2069,7 +2070,7 @@ describe("a recurrence closes on a second question", () => {
     });
 
     const closed = await tools.reportAnalysis({
-      postmortem: "## Summary\nsized the pool again",
+      ...SECTIONS,
       usersImpacted: 4,
       impactQuery: "q",
     });
@@ -2091,7 +2092,7 @@ describe("a recurrence closes on a second question", () => {
     });
 
     const closed = await tools.reportAnalysis({
-      postmortem: "## Summary\nagain",
+      ...SECTIONS,
       usersImpacted: 4,
       impactQuery: "q",
       recurrence: {
@@ -2113,7 +2114,7 @@ describe("a recurrence closes on a second question", () => {
     });
 
     const closed = await tools.reportAnalysis({
-      postmortem: "## Summary\nsized the pool on both paths",
+      ...SECTIONS,
       usersImpacted: 4,
       impactQuery: "q",
       recurrence: {
@@ -2146,7 +2147,7 @@ describe("a recurrence closes on a second question", () => {
     });
 
     await tools.reportAnalysis({
-      postmortem: "## Summary\nsized the pool",
+      ...SECTIONS,
       usersImpacted: 4,
       impactQuery: "q",
       recurrence: {
@@ -2184,7 +2185,7 @@ describe("a recurrence closes on a second question", () => {
     });
 
     const closed = await tools.reportAnalysis({
-      postmortem: "## Summary\nfine",
+      ...SECTIONS,
       usersImpacted: 1,
       impactQuery: "q",
     });
@@ -2485,7 +2486,7 @@ describe("the Boss closing an incident", () => {
     await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
     await goesQuiet("sig-a");
     await tools.reportResolved({ prUrls: [], evidence: "clean for an hour" });
-    await tools.reportAnalysis({ postmortem: "p", usersImpacted: 1, impactQuery: "q" });
+    await tools.reportAnalysis({ ...SECTIONS, usersImpacted: 1, impactQuery: "q" });
     const agentHeadline = (postsIn(id).at(-1) ?? "").split("\n")[0];
 
     await seed("sig-b");
@@ -2536,5 +2537,85 @@ describe("the Boss closing an incident", () => {
     const bare = await closeIncidentByBoss({ db, slack }, { incidentId: open, reason: "  " });
     assert.equal(bare.ok, false);
     assert.equal(incidentRow(open)?.status, "INVESTIGATING");
+  });
+});
+
+describe("report_analysis takes the post-mortem as sections", () => {
+  const resolvedIncident = async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+    await tools.reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
+    await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+    return { id, tools };
+  };
+  const sectionsOf = (id: string) =>
+    db.get<{ postmortemSections: string | null }>(
+      "SELECT postmortemSections FROM incident WHERE id = ?",
+      [id],
+    )?.postmortemSections ?? null;
+
+  it("stores the sections and the same content as Markdown for every other reader", async () => {
+    const { id, tools } = await resolvedIncident();
+    const closed = await tools.reportAnalysis({ ...SECTIONS, usersImpacted: 1, impactQuery: "q" });
+    assert.equal(closed.ok, true, closed.error);
+
+    assert.deepEqual(JSON.parse(sectionsOf(id)!), SECTIONS);
+    const md = incidentRow(id)?.postmortem ?? "";
+    assert.match(md, /^## At a glance\n/);
+    assert.match(md, /## Timeline\n\n\| When \| What \| Evidence \|/);
+    assert.ok(md.includes(SECTIONS.practiceChanges));
+  });
+
+  it("refuses an empty section, says what to write, and leaves the incident open", async () => {
+    const { id, tools } = await resolvedIncident();
+    const res = await tools.reportAnalysis({ ...SECTIONS, userImpact: " ", usersImpacted: 1, impactQuery: "q" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /userImpact is empty: say what users experienced and how many/);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+    assert.equal(sectionsOf(id), null);
+  });
+
+  it("refuses an overlong prevention section rather than cutting it", async () => {
+    const { id, tools } = await resolvedIncident();
+    const long = Array.from({ length: 400 }, (_, i) => `word${i}`).join(" ");
+    const res = await tools.reportAnalysis({ ...SECTIONS, practiceChanges: long, usersImpacted: 1, impactQuery: "q" });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /practiceChanges is 400 words; keep it to about 200 words\./);
+    assert.equal(incidentRow(id)?.status, "RESOLVED");
+    assert.equal(incidentRow(id)?.postmortem, null, "nothing stored, so nothing shortened");
+  });
+
+  it("prints a recorded event's time over the agent's", async () => {
+    const { id, tools } = await resolvedIncident();
+    const tracked = await tools.trackTimelineEvent({
+      kind: "first_error",
+      occurredAt: Date.UTC(2026, 9, 1, 2, 14, 30),
+      summary: "first refusal",
+    });
+    assert.equal(tracked.ok, true, tracked.error);
+    const eventId = (tracked.data as { id: number }).id;
+
+    const closed = await tools.reportAnalysis({
+      ...SECTIONS,
+      timeline: [{ recordedEventId: eventId, at: "2026-10-01T02:20:00Z", event: "First save refused." }],
+      usersImpacted: 1,
+      impactQuery: "q",
+    });
+    assert.equal(closed.ok, true, closed.error);
+    assert.match(incidentRow(id)?.postmortem ?? "", /\| 2026-10-01 02:14:30 UTC \| First save refused\. \|/);
+  });
+
+  it("refuses a recorded time in the future, since the report prints it over the agent's", async () => {
+    const { tools } = await resolvedIncident();
+    const res = await tools.trackTimelineEvent({
+      kind: "fix_merged",
+      occurredAt: Date.now() + 86_400_000,
+      summary: "merged",
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /is in the future; take the time from the evidence/);
   });
 });

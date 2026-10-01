@@ -290,7 +290,7 @@ through nothing, and two reads:
 | `report_root_cause` | `INVESTIGATING → FIXING`. Triggers correlation, splits the unexplained |
 | `report_impact` | Repeatable; impact grows during an incident |
 | `report_resolved` | `FIXING → RESOLVED`, with evidence |
-| `report_analysis` | `RESOLVED → CLOSED`, terminal |
+| `report_analysis` | `RESOLVED → CLOSED`, terminal. Takes the post-mortem as sections that code renders in a fixed order (`report/CLAUDE.md`) |
 | `escalate` | None. Hands the Boss the brief as an `escalation`; the Boss decides who to reach. The agent keeps the incident and keeps working |
 | `park` | None. Stops the relaunch until a Boss message, the cooldown or the stale sweep; the agent keeps the incident. A park with `liftsOnReply: false` is out of turns rather than waiting on news, so none of the three lift it and the sweep only announces it |
 
@@ -402,8 +402,8 @@ incident is CLOSED or MERGED. See `agent/CLAUDE.md`.
 The agent records key moments with `track_incident_timeline_event` as they
 happen -- first error, impact confirmed, root cause, fix opened, merged,
 deployed, verified -- into `incident_timeline_event`. Its context is
-summarised at each stage, so the closer builds the post-mortem timeline from
-those rows, and the closing report prints them.
+summarised at each stage, so the closer's timeline rows name those events
+by id, and the report prints one timeline with the recorded times.
 
 ## Layout
 

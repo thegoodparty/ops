@@ -21,8 +21,9 @@ import { makeAlarm, makeLog } from "../logging";
 import { mrkdwn } from "../slack/format";
 import { agentClosedDetail, bossClosedDetail, closedNotice } from "../toolapi/announce";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
-import type { RecurrenceAnalysis, TimelineEvent } from "../types";
+import type { PostmortemSections, RecurrenceAnalysis, TimelineEvent } from "../types";
 import { renderReportPdf } from "./pdf";
+import { parsePostmortemSections } from "./postmortem";
 import {
   renderReportDocument,
   type ReportAction,
@@ -32,6 +33,7 @@ import {
 } from "./render";
 
 export * from "./render";
+export * from "./postmortem";
 export * from "./pdf";
 
 const log = makeLog("report");
@@ -218,10 +220,28 @@ export const readReportData = async (
   // session file, so they are simply missing once it ages out -- the honest
   // shape, rather than a zero that reads as a run with no turns.
   let turns: number | null = null;
+  let sessionSpanMs: number | null = null;
   if (incident.sessionRef) {
     try {
       const contents = await deps.sessions.get(incident.sessionRef);
-      if (contents) turns = sumSessionUsage(contents).turns;
+      if (contents) {
+        turns = sumSessionUsage(contents).turns;
+        let first: number | null = null;
+        let last: number | null = null;
+        for (const line of contents.split("\n")) {
+          let entry: { timestamp?: unknown };
+          try {
+            entry = JSON.parse(line) as typeof entry;
+          } catch {
+            continue;
+          }
+          const at = typeof entry?.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
+          if (!Number.isFinite(at)) continue;
+          if (first === null || at < first) first = at;
+          if (last === null || at > last) last = at;
+        }
+        if (first !== null && last !== null) sessionSpanMs = last - first;
+      }
     } catch (err) {
       // A missing turn count is a worse report, not a worse incident.
       alarm("session_read_failed", { incidentId, error: String(err) });
@@ -259,6 +279,14 @@ export const readReportData = async (
     } catch (err) {
       alarm("recurrence_unreadable", { incidentId, error: String(err) });
     }
+  }
+
+  // Unreadable sections fall back to `postmortem`, which holds the same
+  // content as Markdown: a worse report, never a missing one.
+  let postmortem: PostmortemSections | null = null;
+  if (incident.postmortemSections) {
+    postmortem = parsePostmortemSections(incident.postmortemSections);
+    if (!postmortem) alarm("postmortem_sections_unreadable", { incidentId });
   }
 
   // Dollars are derived here, on read, from the tokens and the catalog's
@@ -309,6 +337,7 @@ export const readReportData = async (
     timeline,
     prs: incident.prUrls.map((url) => ({ url, state: states[url] ?? null })),
     recurrence,
+    postmortem,
     run: {
       modelId: incident.modelId,
       tokensIn: incident.tokensIn,
@@ -318,6 +347,7 @@ export const readReportData = async (
       cacheWrite1h: incident.cacheWrite1h,
       attempts: incident.attempts,
       turns,
+      sessionSpanMs,
       estimatedCostUsd: ownCost !== null && ownCost > 0 ? ownCost : null,
       mergedInCostUsd,
       mergedInPriced,
