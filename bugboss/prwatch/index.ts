@@ -83,7 +83,7 @@ export const recommendationIn = (body: string | null, state?: string): Recommend
 };
 
 export interface ReviewNode {
-  author: { login: string } | null;
+  author: { __typename?: string; login: string } | null;
   state: string;
   body: string | null;
   submittedAt: string | null;
@@ -92,13 +92,19 @@ export interface ReviewNode {
 }
 
 export interface CommentNode {
-  author: { login: string } | null;
+  author: { __typename?: string; login: string } | null;
   body: string | null;
   updatedAt: string;
   url: string;
 }
 
-const isDelegate = (login: string | undefined): boolean => (login ?? "").toLowerCase().startsWith("delegate-reviewer");
+/**
+ * The App's own account and nothing that merely resembles it. GraphQL names a
+ * Bot without the `[bot]` suffix REST adds, so the type is what tells it from
+ * a user who registered the same login.
+ */
+const isDelegate = (author: { __typename?: string; login: string } | null): boolean =>
+  author?.__typename === "Bot" && author.login === "delegate-reviewer";
 
 /**
  * delegate's verdict on the head commit, newest first. A review counts only
@@ -113,13 +119,13 @@ export const latestDelegateVerdict = (args: {
 }): DelegateVerdict | null => {
   const verdicts: DelegateVerdict[] = [];
   for (const review of args.reviews) {
-    if (!isDelegate(review.author?.login) || review.commit?.oid !== args.head || !review.submittedAt) continue;
+    if (!isDelegate(review.author) || review.commit?.oid !== args.head || !review.submittedAt) continue;
     const recommendation = recommendationIn(review.body, review.state);
     if (recommendation) verdicts.push({ recommendation, sha: args.head, at: review.submittedAt, url: review.url });
   }
   const headAt = args.headCommittedAt ? Date.parse(args.headCommittedAt) : 0;
   for (const comment of args.comments) {
-    if (!isDelegate(comment.author?.login)) continue;
+    if (!isDelegate(comment.author)) continue;
     if (!(comment.body ?? "").trimStart().startsWith(DELEGATE_STATE_MARKER)) continue;
     if (Date.parse(comment.updatedAt) < headAt) continue;
     const recommendation = recommendationIn(comment.body);
@@ -244,7 +250,7 @@ export interface PrWatcher {
    * closed and the thread has been told, which is when the agent's own "done"
    * would only repeat it.
    */
-  coversWaitDone(incidentId: string, text: string): Promise<boolean>;
+  coversWaitDone(incidentId: string, text: string, waitStartedAt: number): Promise<boolean>;
 }
 
 type Transition =
@@ -342,8 +348,10 @@ export const createPrWatcher = (deps: PrWatcherDeps): PrWatcher => {
           now(),
         );
         // The agent saw it itself; telling it again would only steer it back
-        // over ground it has already covered.
-        if (!options.fromAgent) {
+        // over ground it has already covered. A park lifts either way.
+        if (options.fromAgent) {
+          w.prepare("DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1").run(row.incidentId);
+        } else {
           pushDirective(w, row.incidentId, {
             type: "boss_message",
             text: kind === "merged" ? mergedDirective(ref, pr) : closedDirective(ref, pr),
@@ -387,14 +395,18 @@ export const createPrWatcher = (deps: PrWatcherDeps): PrWatcher => {
     log("pr_transition_announced", { incidentId, pr: ref.label, kind: transition.kind, posted });
   };
 
-  const check = async (rows: WatchRow[], options: { fromAgent: boolean }): Promise<number> => {
+  const check = async (
+    rows: WatchRow[],
+    options: { fromAgent: boolean },
+    alreadyRead?: Map<string, PrObservation>,
+  ): Promise<number> => {
     if (!rows.length) return 0;
     const refs = new Map<string, PrRef>();
     for (const row of rows) {
       const ref = parsePr(`${row.repo}#${row.number}`);
       if (ref) refs.set(refKey(ref), ref);
     }
-    const seen = await deps.reader.read([...refs.values()]);
+    const seen = alreadyRead ?? (await deps.reader.read([...refs.values()]));
     let posted = 0;
     for (const row of rows) {
       const ref = refs.get(refKey(row));
@@ -432,21 +444,35 @@ export const createPrWatcher = (deps: PrWatcherDeps): PrWatcher => {
     return running;
   };
 
-  const coversWaitDone: PrWatcher["coversWaitDone"] = async (incidentId, text) => {
+  const coversWaitDone: PrWatcher["coversWaitDone"] = async (incidentId, text, waitStartedAt) => {
     const refs = prRefsIn(text);
     if (!refs.length) return false;
+    // Read before recording anything. A row written for a read that then
+    // failed would be found by the next sweep as a PR somebody waits on, and
+    // announced with a directive to an agent that has already seen it.
+    let seen: Map<string, PrObservation>;
+    try {
+      seen = await deps.reader.read(refs);
+    } catch (error: unknown) {
+      log("wait_done_pr_read_failed", { incidentId, error: String(error) });
+      return false;
+    }
     await record(refs.map((ref) => ({ incidentId, ref })));
-    const rows = watchedRows("p.incidentId = ?", [incidentId]).filter((row) =>
-      refs.some((ref) => refKey(ref) === refKey(row)),
+    const rows = watchedRows("p.incidentId = ?", [incidentId]).filter(
+      (row) => row.announcedAt === null && refs.some((ref) => refKey(ref) === refKey(row)),
     );
-    await check(rows.filter((row) => row.announcedAt === null), { fromAgent: true });
-    return refs.every(
-      (ref) =>
-        (db.get<{ announcedAt: number | null }>(
+    await check(rows, { fromAgent: true }, seen);
+    // Only an announcement made while this wait was open covers it. A later
+    // wait that merely names a PR merged days ago -- its deploy, a restart --
+    // is news of its own.
+    return refs.every((ref) => {
+      const at =
+        db.get<{ announcedAt: number | null }>(
           "SELECT announcedAt FROM pr_watch WHERE incidentId = ? AND repo = ? AND number = ?",
           [incidentId, ref.repo, ref.number],
-        )?.announcedAt ?? null) !== null,
-    );
+        )?.announcedAt ?? null;
+      return at !== null && at >= waitStartedAt;
+    });
   };
 
   return {

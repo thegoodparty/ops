@@ -187,7 +187,9 @@ Two rules keep it to one notice per transition:
 - An agent's wait on a person ends with a "done" to the Boss carrying what it
   waited on (`waitDone`). The inbox route asks the watcher about the PRs it
   names, which reads them right then, so whoever saw it first, the thread
-  hears it once and the Boss is not handed the same news.
+  hears it once and the Boss is not handed the same news. Only an
+  announcement made after that wait began covers it: a later wait that names
+  the same PR, its deploy say, is news of its own.
 
 A PR first seen already merged is history unless a wait on a person still
 names it. Without that rule, the deploy that shipped this would have announced

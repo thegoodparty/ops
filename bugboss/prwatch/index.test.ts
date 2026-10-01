@@ -283,7 +283,7 @@ test("the GraphQL reader asks for every PR in one request and reads delegate's v
         commits: { nodes: [{ commit: { oid: "abc", committedDate: "2026-09-29T21:00:00Z" } }] },
         reviews: {
           nodes: [
-            { author: { login: "delegate-reviewer" }, state: "APPROVED", body: "**Recommendation: approve**", submittedAt: "2026-09-29T21:58:34Z", url: "r1", commit: { oid: "abc" } },
+            { author: { __typename: "Bot", login: "delegate-reviewer" }, state: "APPROVED", body: "**Recommendation: approve**", submittedAt: "2026-09-29T21:58:34Z", url: "r1", commit: { oid: "abc" } },
           ],
         },
         comments: { nodes: [] },
@@ -325,7 +325,7 @@ const routes = (w: ReturnType<typeof watcher>, wakes: string[]) =>
   });
 
 /** What `closeAsk` sends when incident 84's merge wait passes. */
-const agentDone = (app: ReturnType<typeof routes>, incidentId: string) =>
+const agentDone = (app: ReturnType<typeof routes>, incidentId: string, waitStartedAt = clock - 600_000) =>
   app.request(`/incidents/${incidentId}/boss-inbox`, {
     method: "POST",
     headers: {
@@ -340,6 +340,7 @@ const agentDone = (app: ReturnType<typeof routes>, incidentId: string) =>
         "someone to merge omni#2231",
         `Merge ${PR_2231} -- approved, 37 checks green, I cannot merge.`,
       ].join("\n"),
+      waitStartedAt,
     }),
   });
 
@@ -393,6 +394,54 @@ test("a wait that ended on something other than a merged PR still reaches the Bo
   assert.deepEqual(wakes, ["84"]);
 });
 
+test("a later wait that names a PR announced before it began still reaches the Boss", async () => {
+  await seedIncident("84", "1.1");
+  await seedMergeWait("84");
+  const w = watcher();
+  const wakes: string[] = [];
+  const app = routes(w, wakes);
+  await tick(w);
+  world.set("thegoodparty/omni#2231", merged());
+  await tick(w);
+  assert.equal(posts.length, 1);
+
+  clock += 3_600_000;
+  await agentDone(app, "84", clock - 60_000);
+  assert.deepEqual(wakes, ["84"], "the deploy wait's own done is news");
+  assert.equal(posts.length, 1);
+});
+
+test("an agent that saw the merge itself still has its park lifted", async () => {
+  await seedIncident("84", "1.1");
+  await seedMergeWait("84");
+  await db.withWrite((w) => {
+    w.prepare(
+      "INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt) VALUES ('84', 'someone to merge omni#2231', NULL, 1, 1)",
+    ).run();
+  });
+  const w = watcher();
+  const app = routes(w, []);
+  await tick(w);
+  world.set("thegoodparty/omni#2231", merged());
+  await agentDone(app, "84");
+  assert.equal(posts.length, 1);
+  assert.equal(db.get("SELECT 1 FROM incident_wait WHERE incidentId = '84'"), undefined);
+});
+
+test("a GitHub read that fails during an agent's done records nothing and lets the message through", async () => {
+  await seedIncident("84", "1.1");
+  const failing = createPrWatcher({
+    db,
+    reader: { read: async () => { throw new Error("GitHub GraphQL answered 502"); } },
+    slack,
+    now: () => clock,
+  });
+  const wakes: string[] = [];
+  await agentDone(routes(failing, wakes), "84");
+  assert.deepEqual(wakes, ["84"]);
+  assert.equal(db.get("SELECT 1 FROM pr_watch WHERE incidentId = '84'"), undefined);
+});
+
 // ---------------------------------------------------------------------------
 // Pure parts
 // ---------------------------------------------------------------------------
@@ -413,7 +462,7 @@ test("a recommendation is read from the body, and APPROVED means approve", () =>
 
 test("a delegate review on an older head is not the verdict", () => {
   const review = (oid: string, state: string, body: string, at: string): ReviewNode => ({
-    author: { login: "delegate-reviewer" },
+    author: { __typename: "Bot", login: "delegate-reviewer" },
     state,
     body,
     submittedAt: at,
@@ -426,7 +475,9 @@ test("a delegate review on an older head is not the verdict", () => {
     reviews: [
       review("old", "APPROVED", "**Recommendation: approve**", "2026-09-30T09:00:00Z"),
       review("new", "COMMENTED", "**Recommendation: request changes**", "2026-09-30T11:00:00Z"),
-      { ...review("new", "APPROVED", "**Recommendation: approve**", "2026-09-30T12:00:00Z"), author: { login: "swain" } },
+      { ...review("new", "APPROVED", "**Recommendation: approve**", "2026-09-30T12:00:00Z"), author: { __typename: "User", login: "swain" } },
+      { ...review("new", "APPROVED", "**Recommendation: approve**", "2026-09-30T12:01:00Z"), author: { __typename: "User", login: "delegate-reviewer" } },
+      { ...review("new", "APPROVED", "**Recommendation: approve**", "2026-09-30T12:02:00Z"), author: { __typename: "Bot", login: "delegate-reviewer-evil" } },
     ],
     comments: [],
   });

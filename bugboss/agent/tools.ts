@@ -229,6 +229,8 @@ export interface BossInboxPort {
        * thread they merged or closed, this message is kept and not repeated.
        */
       waitDone?: string;
+      /** When that wait began, so a PR announced before it does not cover it. */
+      waitStartedAt?: number;
     },
   ): Promise<void>;
   /**
@@ -487,11 +489,12 @@ export const waitDoneMessage = (waitingFor: string, output: string): string =>
  */
 const closeAsk = async (
   heartbeat: HeartbeatDeps,
-  args: { key: string; waitingFor: string; ask: string; output: string },
+  args: { key: string; waitingFor: string; ask: string; startedAt: number; output: string },
 ): Promise<void> => {
   try {
     await heartbeat.boss.tellBoss("message", waitDoneMessage(args.waitingFor, args.output), {
       waitDone: [args.key, args.waitingFor, args.ask].join("\n"),
+      waitStartedAt: args.startedAt,
     });
   } catch (error: unknown) {
     alarm("wait_done_undelivered", { command: args.key, error: String(error) });
@@ -637,7 +640,7 @@ export const runMonitor = async (
     }
     if (state.done || (expired && state.met && !deps.signal?.aborted)) {
       if (heartbeat) {
-        await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, ask, output: last });
+        await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, ask, startedAt, output: last });
         await release(heartbeat, key);
       }
       return { output: last, timedOut: false, capped: false };

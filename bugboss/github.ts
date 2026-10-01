@@ -184,8 +184,8 @@ const PR_WATCH_FIELDS = `url state mergedAt closedAt
   mergeCommit { oid }
   headRefOid
   commits(last: 1) { nodes { commit { oid committedDate } } }
-  reviews(last: 30) { nodes { author { login } state body submittedAt url commit { oid } } }
-  comments(last: 50) { nodes { author { login } body updatedAt url } }`;
+  reviews(last: 30) { nodes { author { __typename login } state body submittedAt url commit { oid } } }
+  comments(last: 50) { nodes { author { __typename login } body updatedAt url } }`;
 
 const PR_WATCH_TIMEOUT_MS = 15_000;
 

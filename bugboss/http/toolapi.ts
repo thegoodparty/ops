@@ -330,6 +330,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
         text: z.string().trim().min(1),
         ownBrief: z.boolean().optional(),
         waitDone: z.string().optional(),
+        waitStartedAt: z.number().optional(),
       })
       .safeParse(raw);
     if (!parsed.success) {
@@ -351,7 +352,11 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     let covered = false;
     if (parsed.data.kind === "message" && parsed.data.waitDone && deps.prWatch) {
       try {
-        covered = await deps.prWatch.coversWaitDone(caller.incidentId, parsed.data.waitDone);
+        covered = await deps.prWatch.coversWaitDone(
+          caller.incidentId,
+          parsed.data.waitDone,
+          parsed.data.waitStartedAt ?? 0,
+        );
       } catch (error: unknown) {
         log("wait_done_pr_read_failed", { incidentId: caller.incidentId, error: String(error) });
       }
