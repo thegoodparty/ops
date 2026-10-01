@@ -3,6 +3,7 @@
 
 import { ErrorCode, retryPolicies, WebClient } from "@slack/web-api";
 
+import { DEADLINES } from "../deadline";
 import type { Reaction, SqlRunnerSlack } from "./runner";
 
 const isSlackError = (err: unknown, code: string): boolean => {
@@ -15,10 +16,11 @@ export const createSqlRunnerSlack = (token: string): SqlRunnerSlack => {
   // line that never lands, is worse than a slow one.
   const writer = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    timeout: DEADLINES.slackRequest,
   });
   // Reads do not retry. The poll comes round again in five seconds, and an
   // SDK parked on a 429 for minutes would hold every other request's poll.
-  const reader = new WebClient(token, { retryConfig: { retries: 0 } });
+  const reader = new WebClient(token, { retryConfig: { retries: 0 }, timeout: DEADLINES.slackRequest });
 
   return {
     post: async (channel, threadTs, text) => {

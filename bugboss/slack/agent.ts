@@ -42,6 +42,7 @@ import type { ModelClient, ModelTurn } from "../model";
 import { buildGhTool, GH_TIMEOUT_MS, type GhExec } from "./gh";
 import { buildReadSlackLinkTool } from "./link";
 import { renderSessionTurns } from "./session-view";
+import { answerTags } from "./tags";
 import {
   forModelToPaste,
   oneLine,
@@ -1354,6 +1355,7 @@ export class SlackAgent {
         for (const part of splitForSlack(toMrkdwn(text))) {
           posted.push((await this.slack.post(threadTs, part, channel)).ts);
         }
+        await this.markAnswered(channel, shown.map((m) => m.ts));
       }
 
       // Seen once the run that read them is over, so a run that died before
@@ -1567,6 +1569,7 @@ export class SlackAgent {
         text,
         { thread: lockKey },
       );
+      await this.markAnswered(mention.channel, [mention.ts, ...missed.map((m) => m.ts)]);
 
       // The answer is already posted. A failed state write costs the next
       // resume its watermark; it must not turn an answer into an apology.
@@ -1589,6 +1592,19 @@ export class SlackAgent {
       await this.reportFailure(mention, err);
     } finally {
       await this.lock.release(lockKey);
+    }
+  }
+
+  /**
+   * After the answer is posted, never before. A failed mark costs a false
+   * `tag_unanswered`, which is the side to be wrong on; it must not turn a
+   * posted answer into a failed run.
+   */
+  private async markAnswered(channel: string, read: string[]): Promise<void> {
+    try {
+      await answerTags(this.db, channel, read, Date.now());
+    } catch (err) {
+      alarm("tag_answer_unrecorded", { channel, error: String(err) });
     }
   }
 

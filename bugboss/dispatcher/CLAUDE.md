@@ -331,3 +331,21 @@ A directory with **no row** is kept and logged once as
 `workspace_without_incident`. The database is restored from an S3 snapshot at
 boot, and a restore that came back short would otherwise delete every live
 workspace at once.
+
+## Silence is an alarm, not a transition
+
+`watchSilence` runs every tick over the live children and raises
+`agent_silent` (incidentId, minutes) when one has written no session entry
+for `AGENT_SILENT_SECONDS` (10 minutes). It reads the **local** session file
+through `agentActivity` (`createActivityReader` in `agent/session.ts`), not
+the S3 copy: S3 is only synced at turn end, so it cannot tell a `monitor`
+call in progress from a hung model call or a hung turn-end PUT, which are
+the stalls this exists for. A `monitor` call still open in the newest turn,
+or a row in `incident_wait`, `pending_wait` or `pending_question`, is the
+agent choosing to wait, and is skipped. The launch time is the floor, so a
+resumed session is not silent on the strength of the last run's entries.
+
+One silence is one alarm: `silentAlarmedAt` holds the activity it fired for,
+and only a newer entry re-arms it. It is in memory because a restart is a
+new child with a new launch time. It posts nothing and kills nothing; the
+deadline still ends a run that never comes back.

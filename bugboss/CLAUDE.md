@@ -87,6 +87,17 @@ working week. Use `alarm` for a failure nobody asked for and `log` for a
 thing that happened, including a transition a module refused on purpose. An
 alarm that fires during normal operation teaches people to ignore alarms.
 
+**Every outbound call has a deadline.** Node's `fetch`, the AWS SDK and the
+Slack SDK all default to none, and a call that never answers freezes its caller
+with nothing thrown, which is the silent failure above in its purest form. On
+2026-10-01 an S3 snapshot PUT and a Bedrock stream each did exactly that. Take
+the budget from `deadline.ts` (`deadline("name")` for a signal,
+`DEADLINES.name` for a `WebClient`'s `timeout`), and race an SDK body read with
+`beforeDeadline`, because `send()` resolves on the headers. `deadline.test.ts`
+scans every `fetch`, AWS `send` and `WebClient` here and fails on one without a
+bound; a site already bounded its own way goes on its allowlist, with the bound
+it carries.
+
 **Every interface a person talks to is natural language.** Nothing here
 decides what somebody wants by matching their words against a list. One thing
 did — the bug-report verb — and it was a magic phrase nobody could discover

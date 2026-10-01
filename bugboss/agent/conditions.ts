@@ -12,6 +12,7 @@
 // Every condition that can fail fires on the failure. Waiting on a pipeline
 // means waiting for its answer, and "failed" is an answer.
 
+import { deadline } from "../deadline";
 import { githubMessage, type GitHubResult } from "./rerun";
 
 export const DELEGATE_STATE_MARKER = "<!-- delegate-reviewer-state -->";
@@ -103,6 +104,7 @@ export const createGitHubReadPort = (deps: {
     try {
       const response = await http(url, {
         ...init,
+        signal: deadline("github"),
         headers: init.body ? { ...headers(token), "content-type": "application/json" } : headers(token),
       });
       const text = await response.text();

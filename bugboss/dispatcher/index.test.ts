@@ -3094,3 +3094,115 @@ describe("Dispatcher escalations while writes fail", () => {
     cleanup();
   });
 });
+
+describe("Dispatcher agent_silent", () => {
+  const silentAlarms = async (fn: () => Promise<void>): Promise<{ incidentId: string; minutes: number; level: string }[]> => {
+    const original = console.error;
+    const found: { incidentId: string; minutes: number; level: string }[] = [];
+    console.error = (line: unknown) => {
+      try {
+        const parsed = JSON.parse(String(line)) as { event?: string; incidentId: string; minutes: number; level: string };
+        if (parsed.event === "agent_silent") found.push(parsed);
+      } catch {
+        original(line);
+      }
+    };
+    try {
+      await fn();
+    } finally {
+      console.error = original;
+    }
+    return found;
+  };
+
+  const setup = (activity: { lastEntryAt: number | null; inMonitor: boolean } | null) => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+    const held = heldSpawn();
+    let clock = T0;
+    const state = { activity };
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: held.spawn,
+        toolApiFor,
+        config: config({ agentTimeoutSeconds: 86_400 }),
+        now: () => clock,
+        agentActivity: async () => state.activity,
+      }),
+    );
+    const at = async (ms: number) => {
+      clock = T0 + ms;
+      await d.tick();
+    };
+    return { sqlite, state, at, done: () => { held.releaseAll(); cleanup(); } };
+  };
+
+  it("fires once, with the incident and the minutes, when a running agent writes nothing for over ten minutes", async () => {
+    const s = setup({ lastEntryAt: T0 + 60_000, inMonitor: false });
+    const alarms = await silentAlarms(async () => {
+      await s.at(0);
+      await s.at(10 * 60_000);
+      await s.at(12 * 60_000);
+      await s.at(20 * 60_000);
+      await s.at(40 * 60_000);
+    });
+    assert.equal(alarms.length, 1, "one silence is one alarm, however many ticks it lasts");
+    assert.equal(alarms[0].incidentId, "i1");
+    assert.equal(alarms[0].minutes, 11);
+    assert.equal(alarms[0].level, "error");
+    s.done();
+  });
+
+  it("stays quiet while the agent keeps writing", async () => {
+    const s = setup({ lastEntryAt: T0, inMonitor: false });
+    const alarms = await silentAlarms(async () => {
+      for (let minute = 0; minute <= 60; minute += 5) {
+        s.state.activity = { lastEntryAt: T0 + minute * 60_000 - 30_000, inMonitor: false };
+        await s.at(minute * 60_000);
+      }
+    });
+    assert.deepEqual(alarms, []);
+    s.done();
+  });
+
+  it("fires again for a second silence after the agent came back", async () => {
+    const s = setup({ lastEntryAt: T0, inMonitor: false });
+    const alarms = await silentAlarms(async () => {
+      await s.at(0);
+      await s.at(11 * 60_000);
+      s.state.activity = { lastEntryAt: T0 + 12 * 60_000, inMonitor: false };
+      await s.at(13 * 60_000);
+      await s.at(23 * 60_000);
+      await s.at(30 * 60_000);
+    });
+    assert.equal(alarms.length, 2);
+    s.done();
+  });
+
+  it("does not count a monitor call or a wait on a person as silence", async () => {
+    const s = setup({ lastEntryAt: T0, inMonitor: true });
+    const alarms = await silentAlarms(async () => {
+      await s.at(0);
+      await s.at(30 * 60_000);
+      s.state.activity = { lastEntryAt: T0, inMonitor: false };
+      s.sqlite
+        .prepare("INSERT INTO pending_wait (incidentId, command, startedAt) VALUES ('i1', 'gh pr view', ?)")
+        .run(T0);
+      await s.at(60 * 60_000);
+    });
+    assert.deepEqual(alarms, []);
+    s.done();
+  });
+
+  it("measures a resumed run from its launch, not from the last run's final entry", async () => {
+    const s = setup({ lastEntryAt: T0 - 3 * 3_600_000, inMonitor: false });
+    const alarms = await silentAlarms(async () => {
+      await s.at(0);
+      await s.at(5 * 60_000);
+    });
+    assert.deepEqual(alarms, []);
+    s.done();
+  });
+});

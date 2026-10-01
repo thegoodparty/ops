@@ -17,6 +17,7 @@
 // to Slack. The last two forward request_sql_query to the SQL sidecar, which
 // posts its own approval request; the Boss only names the thread.
 
+import { deadline } from "../deadline";
 import { makeAlarm, makeLog } from "../logging";
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -650,6 +651,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
         method,
         headers: { "content-type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
+        signal: deadline("sqlRunner"),
       });
     } catch (err) {
       alarm("sql_runner_unreachable", { incidentId, path, error: String(err) });

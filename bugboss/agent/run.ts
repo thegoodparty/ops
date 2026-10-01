@@ -5,6 +5,7 @@
 // from it is reached through a dynamic import. Types are imported normally and
 // cost nothing at runtime.
 
+import { deadline } from "../deadline";
 import { createInstallationToken, gitHubAppFromEnv } from "../github";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
@@ -402,6 +403,7 @@ export const createBossClient = (args: {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: deadline("toolApi"),
     });
     const text = await response.text();
     if (!response.ok) {
@@ -417,6 +419,7 @@ export const createBossClient = (args: {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: deadline("toolApi"),
     });
     return { status: response.status, text: await response.text() };
   };

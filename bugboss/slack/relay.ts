@@ -13,6 +13,7 @@ import type { SignalOriginRef } from "../ingress/link";
 import { makeAlarm, makeLog } from "../logging";
 import { bullets, link, mrkdwn, raw, splitForSlack, toMrkdwn } from "./format";
 import { lifecycleSteps, renderThreadHeader } from "./status";
+import { recordTag } from "./tags";
 
 const log = makeLog("slack-relay");
 
@@ -443,14 +444,14 @@ export class SlackRelay {
     const threadTs = event.thread_ts ?? null;
     if (!threadTs) {
       if (!mentioned) return ignore("channel chatter, not addressed to us");
-      if (!(await this.recordBossMessage(channel, ts))) return ignore("duplicate delivery");
+      if (!(await this.recordBossMessage(channel, ts, ts))) return ignore("duplicate delivery");
       return { kind: "slack_agent", channel, threadTs: ts, ts, user, text, tagged: true };
     }
 
     const incident = this.incidentForThread(threadTs);
     if (!incident) {
       if (mentioned) {
-        if (!(await this.recordBossMessage(channel, ts))) return ignore("duplicate delivery");
+        if (!(await this.recordBossMessage(channel, ts, threadTs))) return ignore("duplicate delivery");
         return { kind: "slack_agent", channel, threadTs, ts, user, text, tagged: true };
       }
       // A follow-up under a Boss answer, untagged. It is the Boss's exactly
@@ -458,7 +459,7 @@ export class SlackRelay {
       // "Can you close incident 2?" was lost here for want of an @. Decided
       // by what the Boss has done in this thread, never by what was said.
       if (await this.isBossThread(channel, threadTs)) {
-        if (!(await this.recordBossMessage(channel, ts))) return ignore("duplicate delivery");
+        if (!(await this.recordBossMessage(channel, ts, null))) return ignore("duplicate delivery");
         log("boss_thread_followup", { channel, threadTs, ts });
         return { kind: "slack_agent", channel, threadTs, ts, user, text, tagged: false };
       }
@@ -474,7 +475,7 @@ export class SlackRelay {
       user,
       text,
       ts,
-    });
+    }, mentioned ? threadTs : null);
     if (!inserted) return ignore("duplicate delivery");
 
     log("reply_recorded", { incidentId: incident.id, ts, mentioned });
@@ -590,8 +591,10 @@ export class SlackRelay {
   private async recordReply(
     incidentId: string,
     msg: { channel: string; user: string; text: string; ts: string },
+    taggedIn: string | null,
   ): Promise<boolean> {
     return this.db.withWrite((d) => {
+      if (taggedIn) recordTag(d, { channel: msg.channel, threadTs: taggedIn, ts: msg.ts }, Date.now());
       const res = d
         .prepare(
           `INSERT OR IGNORE INTO thread_reply
@@ -617,8 +620,9 @@ export class SlackRelay {
    * of the Boss on one message either answers twice or trips the thread lock
    * into a "still working" reply nobody asked for.
    */
-  private async recordBossMessage(channel: string, ts: string): Promise<boolean> {
+  private async recordBossMessage(channel: string, ts: string, taggedIn: string | null): Promise<boolean> {
     return this.db.withWrite((d) => {
+      if (taggedIn) recordTag(d, { channel, threadTs: taggedIn, ts }, Date.now());
       const res = d
         .prepare(
           "INSERT OR IGNORE INTO boss_message_seen (channel, ts, receivedAt) VALUES (?, ?, ?)",

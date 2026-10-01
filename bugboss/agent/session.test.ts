@@ -7,6 +7,8 @@ import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import {
+  createActivityReader,
+  sessionActivity,
   EXIT_ENTRY_TYPE,
   PROMPT_ENTRY_TYPE,
   createS3SessionStore,
@@ -531,4 +533,53 @@ test("a session GET whose body stalls after the headers still fails within the d
   } finally {
     clearInterval(keepAlive);
   }
+});
+
+const line = (entry: Record<string, unknown>): string => JSON.stringify(entry);
+const assistantCalling = (at: string, ...calls: [string, string][]) =>
+  line({
+    type: "message",
+    timestamp: at,
+    message: { role: "assistant", content: calls.map(([id, name]) => ({ type: "toolCall", id, name })) },
+  });
+const resultFor = (at: string, id: string) =>
+  line({ type: "message", timestamp: at, message: { role: "toolResult", toolCallId: id } });
+
+test("sessionActivity: an unanswered monitor call in the newest turn is a wait", () => {
+  const contents = [
+    assistantCalling("2026-10-01T15:00:00.000Z", ["a", "bash"]),
+    resultFor("2026-10-01T15:00:05.000Z", "a"),
+    assistantCalling("2026-10-01T15:01:00.000Z", ["b", "monitor"]),
+  ].join("\n");
+  assert.deepEqual(sessionActivity(contents), {
+    lastEntryAt: Date.parse("2026-10-01T15:01:00.000Z"),
+    inMonitor: true,
+  });
+});
+
+test("sessionActivity: an answered monitor, or one a killed run left behind, is not a wait", () => {
+  const answered = [
+    assistantCalling("2026-10-01T15:01:00.000Z", ["b", "monitor"]),
+    resultFor("2026-10-01T15:20:00.000Z", "b"),
+  ].join("\n");
+  assert.equal(sessionActivity(answered).inMonitor, false);
+
+  const orphaned = [
+    assistantCalling("2026-10-01T15:01:00.000Z", ["b", "monitor"]),
+    assistantCalling("2026-10-01T16:00:00.000Z", ["c", "bash"]),
+  ].join("\n");
+  assert.equal(sessionActivity(orphaned).inMonitor, false);
+});
+
+test("createActivityReader: reads the newest session file and null for a missing directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bugboss-activity-"));
+  const read = createActivityReader();
+  assert.equal(await read(join(dir, "absent")), null);
+  await writeFile(join(dir, "s.jsonl"), assistantCalling("2026-10-01T15:01:00.000Z", ["b", "monitor"]));
+  assert.equal((await read(dir))?.inMonitor, true);
+  await writeFile(
+    join(dir, "s.jsonl"),
+    [assistantCalling("2026-10-01T15:01:00.000Z", ["b", "monitor"]), resultFor("2026-10-01T15:30:00.000Z", "b")].join("\n"),
+  );
+  assert.deepEqual(await read(dir), { lastEntryAt: Date.parse("2026-10-01T15:30:00.000Z"), inMonitor: false });
 });

@@ -27,6 +27,7 @@ import { emptyTrash, sweepWorkspaces } from "../agent/workspace";
 import { buildChildEnv, hasAwsCredentialPath } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
 import { committedLocally, writesHalted } from "../db";
+import type { AgentActivity } from "../agent/session";
 import { makeAlarm, makeLog } from "../logging";
 
 export * from "./env";
@@ -68,6 +69,14 @@ export const RESUME_ALARM_SECONDS = 300;
  * dispatcher parks an incident are all "not now".
  */
 export const PARK_COOLDOWN_SECONDS = 3600;
+
+/**
+ * How long a running agent may go without writing a session entry before it
+ * counts as silent. Incident 100's agent stopped mid-turn for over an hour on
+ * a hung call and nothing noticed but a person; a healthy turn writes well
+ * inside this, and a monitor wait or a wait on a person is excluded.
+ */
+export const AGENT_SILENT_SECONDS = 600;
 
 /** How long a resume waits on the session read before measuring without it. */
 export const SESSION_READ_TIMEOUT_MS = 5000;
@@ -150,6 +159,14 @@ export interface DispatcherDeps {
    * lifts such a wait.
    */
   sessionTurns?: (sessionRef: string) => Promise<number | null>;
+  /**
+   * What a live agent's local session says: when it last wrote anything, and
+   * whether it is inside a monitor call. Absent, as in the tests that run no
+   * real child, nothing watches for silence.
+   */
+  agentActivity?: (incidentId: string) => Promise<AgentActivity | null>;
+  /** Defaults to AGENT_SILENT_SECONDS. */
+  silentAfterSeconds?: number;
   /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
   childBaseEnv?: Record<string, string | undefined>;
   /**
@@ -315,6 +332,15 @@ interface Entry {
    * spoke, and a restart is a new child that will write its own brief.
    */
   escalated: boolean;
+  /**
+   * The last activity `agent_silent` already fired for, so one silence is
+   * one alarm. A new entry moves the activity past it, and the next silence
+   * fires again. In memory because a restart is a new child with a new
+   * launch time, so it is a different silence anyway.
+   */
+  silentAlarmedAt: number | null;
+  /** The activity read failed and said so; one alarm per run, not per tick. */
+  activityReadFailed: boolean;
   done: Promise<void>;
 }
 
@@ -432,6 +458,8 @@ export class Dispatcher {
   private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
   private readonly lastSessionEventAt: ((sessionRef: string) => Promise<number | null>) | null;
   private readonly sessionTurns: ((sessionRef: string) => Promise<number | null>) | null;
+  private readonly agentActivity: ((incidentId: string) => Promise<AgentActivity | null>) | null;
+  private readonly silentAfterMs: number;
   /**
    * Budget waits already read and found still spent, keyed by incident and
    * wait start. Only a deploy changes the budget, so each is read once per
@@ -499,6 +527,8 @@ export class Dispatcher {
     this.postNotice = deps.postNotice ?? null;
     this.lastSessionEventAt = deps.lastSessionEventAt ?? null;
     this.sessionTurns = deps.sessionTurns ?? null;
+    this.agentActivity = deps.agentActivity ?? null;
+    this.silentAfterMs = (deps.silentAfterSeconds ?? AGENT_SILENT_SECONDS) * 1000;
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
@@ -587,6 +617,7 @@ export class Dispatcher {
   private runTick = async (): Promise<TickResult> => {
     const now = this.now();
     const expired = await this.enforceDeadlines(now);
+    await this.watchSilence(now);
     // Before the launch loop, so a workspace is out of the way before
     // anything could start into it.
     await this.sweepWorkspaces();
@@ -1090,6 +1121,8 @@ export class Dispatcher {
       proc: null,
       killed: false,
       escalated: false,
+      silentAlarmedAt: null,
+      activityReadFailed: false,
       done: Promise.resolve(),
     };
     this.running.set(row.id, entry);
@@ -1186,6 +1219,51 @@ export class Dispatcher {
       });
 
     return entry;
+  };
+
+  /**
+   * Alarm on a running agent that has written nothing for too long. Not a
+   * transition and not a post: the agent may yet come back, and the deadline
+   * is what ends it. What this adds is that somebody hears about it in
+   * minutes rather than a day.
+   *
+   * A monitor call and a wait on a person are the agent choosing to be quiet,
+   * so neither is silence. The launch time is the floor, because a resumed
+   * session's newest entry is from the run before.
+   */
+  private watchSilence = async (now: number): Promise<void> => {
+    if (!this.agentActivity) return;
+    for (const entry of [...this.running.values()]) {
+      if (entry.killed) continue;
+      const waiting = this.db.get<{ waiting: number }>(
+        `SELECT (EXISTS (SELECT 1 FROM incident_wait WHERE incidentId = ?)
+              OR EXISTS (SELECT 1 FROM pending_wait WHERE incidentId = ?)
+              OR EXISTS (SELECT 1 FROM pending_question WHERE incidentId = ?)) AS waiting`,
+        [entry.incidentId, entry.incidentId, entry.incidentId],
+      );
+      if (waiting?.waiting) continue;
+      let activity: AgentActivity | null;
+      try {
+        activity = await this.agentActivity(entry.incidentId);
+      } catch (err) {
+        if (!entry.activityReadFailed) {
+          entry.activityReadFailed = true;
+          alarm("agent_activity_read_failed", { incidentId: entry.incidentId, error: String(err) });
+        }
+        continue;
+      }
+      if (activity?.inMonitor) continue;
+      const lastAt = Math.max(entry.startedAt, activity?.lastEntryAt ?? 0);
+      if (now - lastAt <= this.silentAfterMs || entry.silentAlarmedAt === lastAt) continue;
+      entry.silentAlarmedAt = lastAt;
+      alarm("agent_silent", {
+        incidentId: entry.incidentId,
+        minutes: Math.floor((now - lastAt) / 60_000),
+        pid: entry.pid,
+        attempt: entry.attempt,
+        note: "a running agent has written nothing to its session for this long and is not in a monitor wait or a wait on a person",
+      });
+    }
   };
 
   private enforceDeadlines = async (

@@ -721,3 +721,16 @@ mass status change cannot burst against the posts that are notifications.
 Each edit goes through the same ten-second deadline, so a Slack refusing
 edits costs the sweep a tick rather than the process. `board/CLAUDE.md` has
 the rest.
+
+## A tag that goes unanswered alarms
+
+A tagged message is always answered, and `slack/tags.ts` is what notices
+when it was not. The relay writes a `boss_tag` row in the same transaction
+that records the message, so a Slack retry is one tag. The Boss marks the
+tags its run read once its answer is posted (`markAnswered`), and only
+those, so a tag that arrived mid-run is still owed. The composition root's
+sweep raises `tag_unanswered` (channel, thread, ts) for a row unanswered
+after `TAG_ANSWER_SECONDS`, writing `alarmedAt` before it alarms, so each
+message alarms once across ticks and restarts. Nothing is posted: a person
+who got no answer does not need a second message from the thing that failed
+to answer, and the alarm reaches Grafana either way.

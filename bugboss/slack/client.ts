@@ -16,6 +16,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { ErrorCode, retryPolicies, WebClient } from "@slack/web-api";
 
+import { beforeDeadline, deadline, DEADLINES } from "../deadline";
 import { makeAlarm } from "../logging";
 import type { ObjectStore, SlackClient, SlackMessage } from "./agent";
 import { UploadOutcomeUnknownError, type FileUploader } from "../report";
@@ -178,6 +179,7 @@ export const createSlackClient = (
   // minutes rather than half an hour.
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    timeout: DEADLINES.slackRequest,
   });
   const linker = createCachingLinker(
     {
@@ -339,10 +341,12 @@ export const createS3ObjectStore = (
   return {
     get: async (key) => {
       try {
+        const signal = deadline("slackStore");
         const res = await s3.send(
           new GetObjectCommand({ Bucket: bucket, Key: key }),
+          { abortSignal: signal },
         );
-        return (await res.Body?.transformToString()) ?? null;
+        return res.Body ? await beforeDeadline(signal, res.Body.transformToString()) : null;
       } catch (err) {
         if (missing(err)) return null;
         throw err;
@@ -351,6 +355,7 @@ export const createS3ObjectStore = (
     put: async (key, body) => {
       await s3.send(
         new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }),
+        { abortSignal: deadline("slackStore") },
       );
     },
     list: async (prefix) => {
@@ -363,6 +368,7 @@ export const createS3ObjectStore = (
             Prefix: prefix,
             ContinuationToken: token,
           }),
+          { abortSignal: deadline("slackStore") },
         );
         for (const obj of res.Contents ?? []) {
           if (obj.Key) keys.push(obj.Key);
@@ -394,6 +400,7 @@ export const createRotationReader = (
 ): (() => Promise<string[] | null>) => {
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    timeout: DEADLINES.slackRequest,
   });
   let cached: { at: number; members: string[] } | null = null;
 

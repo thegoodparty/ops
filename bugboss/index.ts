@@ -77,6 +77,7 @@ import {
   withIncidentReferences,
 } from "./slack/incidents";
 import { boardOnRequest, sweepBoard } from "./board";
+import { sweepUnansweredTags } from "./slack/tags";
 import {
   SlackRelay,
   mentionPrefix,
@@ -130,12 +131,13 @@ import {
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { attachedSignalIds } from "./triage/sql";
 import {
+  createActivityReader,
   lastSessionEventAt,
   readSessionOutcome,
   sessionKeyFor,
   sumSessionUsage,
 } from "./agent/session";
-import { DEFAULT_WORK_ROOT, INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
+import { computePaths, DEFAULT_WORK_ROOT, INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
 import { createInstallationToken, createPrStateReader } from "./github";
 import { createGhExec, type GhExec } from "./slack/gh";
@@ -2009,6 +2011,7 @@ export const createBugBoss = async (
       now,
     });
 
+  const readActivity = createActivityReader();
   const dispatcher = createDispatcher({
     db,
     config: config.dispatcher,
@@ -2047,6 +2050,11 @@ export const createBugBoss = async (
       const raw = await store.get(sessionRef);
       return raw ? lastSessionEventAt(raw) : null;
     },
+    // The local file, not the S3 copy: S3 is synced at turn end, so it cannot
+    // tell a monitor call in progress from a stall, and a stalled turn-end PUT
+    // is one of the stalls this exists to catch.
+    agentActivity: (incidentId) =>
+      readActivity(computePaths(DEFAULT_WORK_ROOT, incidentId).sessionDir),
     sessionTurns: async (sessionRef) => {
       const raw = await store.get(sessionRef);
       return raw ? sumSessionUsage(raw).turns : null;
@@ -2237,6 +2245,7 @@ export const createBugBoss = async (
       // replaced between the close and its report is the one case where the
       // report has no other way out.
       background("report_sweep", sweepReports);
+      background("tag_sweep", () => sweepUnansweredTags(db, now()));
     }, config.dispatcher.tickSeconds * 1000);
     resolutionTimer.unref();
     log("started", { env: config.env, bucket: config.s3Bucket });

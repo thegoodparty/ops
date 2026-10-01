@@ -5,6 +5,7 @@
 // they share a process, and a write does not return until S3 has it. When an
 // agent's reportRootCause returns, the transition is durable.
 
+import { beforeDeadline, deadline, DEADLINES } from "../deadline";
 import { makeAlarm, makeLog } from "../logging";
 import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -205,7 +206,7 @@ export interface SnapshotTiming {
 }
 
 export const SNAPSHOT_TIMING: SnapshotTiming = {
-  putTimeoutMs: 20_000,
+  putTimeoutMs: DEADLINES.dbSnapshotPut,
   retryDelaysMs: [500, 2_000],
   haltRetryMs: 5_000,
   haltRetryMaxMs: 60_000,
@@ -264,10 +265,12 @@ export class Db {
   static async open(cfg: DbConfig): Promise<Db> {
     const s3 = cfg.s3 ?? new S3Client({});
     try {
+      const signal = deadline("dbRestore");
       const res = await s3.send(
         new GetObjectCommand({ Bucket: cfg.bucket, Key: cfg.key }),
+        { abortSignal: signal },
       );
-      const bytes = await res.Body!.transformToByteArray();
+      const bytes = await beforeDeadline(signal, res.Body!.transformToByteArray());
       const { writeFileSync } = await import("node:fs");
       writeFileSync(cfg.path, bytes);
       log("restored_snapshot", { bytes: bytes.length });
@@ -409,7 +412,7 @@ export class Db {
           Key: this.cfg.key,
           Body: readFileSync(snapshot),
         }),
-        { abortSignal: AbortSignal.timeout(this.timing.putTimeoutMs) },
+        { abortSignal: deadline("dbSnapshotPut", this.timing.putTimeoutMs) },
       );
     } finally {
       try {

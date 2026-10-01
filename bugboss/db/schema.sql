@@ -343,6 +343,23 @@ CREATE TABLE IF NOT EXISTS boss_message_seen (
   PRIMARY KEY (channel, ts)
 );
 
+-- Every message that tagged the Boss, until the Boss answers it. A tag is
+-- always answered, so one still unanswered five minutes on is a fault the
+-- sweep alarms on as tag_unanswered; alarmedAt is written before the alarm
+-- so a restart or the next tick does not raise it twice.
+CREATE TABLE IF NOT EXISTS boss_tag (
+  channel           TEXT NOT NULL,
+  ts                TEXT NOT NULL,
+  threadTs          TEXT NOT NULL,
+  taggedAt          INTEGER NOT NULL,
+  answeredAt        INTEGER,
+  alarmedAt         INTEGER,
+  PRIMARY KEY (channel, ts)
+);
+
+CREATE INDEX IF NOT EXISTS boss_tag_open_idx
+  ON boss_tag (answeredAt, alarmedAt);
+
 -- Directives waiting for an agent to pick up on its next call.
 CREATE TABLE IF NOT EXISTS pending_directive (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,

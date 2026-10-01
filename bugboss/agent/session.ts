@@ -16,9 +16,10 @@
 // replaced -- everything between the previous compaction's `firstKeptEntryId`
 // (or the start) and this one's is what the summary stands for, verbatim.
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { MONITOR_TOOL_NAME } from "./tools";
 
 export interface SessionStore {
   get(key: string): Promise<Buffer | null>;
@@ -570,6 +571,97 @@ export const lastSessionEventAt = (contents: string): number | null => {
     if (Number.isFinite(at) && (latest === null || at > latest)) latest = at;
   }
   return latest;
+};
+
+/**
+ * What a live agent's local session says about whether it is working: the
+ * newest stamp, and whether it is sitting in a `monitor` call that has not
+ * returned. A monitor wait is the agent choosing to be quiet, so the
+ * dispatcher's silence check has to tell it apart from a stall.
+ *
+ * Only the newest assistant message's tool calls count as open. A call a
+ * killed run never answered stays unanswered in the file forever, and reading
+ * it as a wait would hide every silence after the resume.
+ */
+export interface AgentActivity {
+  lastEntryAt: number | null;
+  inMonitor: boolean;
+}
+
+interface ActivityLine {
+  timestamp?: string;
+  type?: string;
+  message?: {
+    role?: string;
+    toolCallId?: string;
+    content?: string | { type?: string; id?: string; name?: string }[];
+  };
+}
+
+export const sessionActivity = (contents: string): AgentActivity => {
+  let lastEntryAt: number | null = null;
+  let open = new Map<string, string>();
+  for (const line of contents.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry: ActivityLine;
+    try {
+      entry = JSON.parse(trimmed) as ActivityLine;
+    } catch {
+      continue;
+    }
+    if (typeof entry.timestamp === "string") {
+      const at = Date.parse(entry.timestamp);
+      if (Number.isFinite(at) && (lastEntryAt === null || at > lastEntryAt)) lastEntryAt = at;
+    }
+    if (entry.type !== "message") continue;
+    if (entry.message?.role === "assistant") {
+      open = new Map();
+      const content = entry.message.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part.type === "toolCall" && part.id && part.name) open.set(part.id, part.name);
+        }
+      }
+    } else if (entry.message?.role === "toolResult" && entry.message.toolCallId) {
+      open.delete(entry.message.toolCallId);
+    }
+  }
+  return { lastEntryAt, inMonitor: [...open.values()].includes(MONITOR_TOOL_NAME) };
+};
+
+/**
+ * The live agent's activity read from its local session directory, which the
+ * Boss shares with the child. Pi names a new session file itself, so the
+ * newest `.jsonl` there is the one being written. Re-parsed only when the
+ * file changed, because the dispatcher asks every tick for every live agent.
+ */
+export const createActivityReader = () => {
+  const seen = new Map<string, { file: string; mtimeMs: number; size: number; activity: AgentActivity }>();
+  return async (sessionDir: string): Promise<AgentActivity | null> => {
+    let names: string[];
+    try {
+      names = await readdir(sessionDir);
+    } catch (err) {
+      if ((err as { code?: string }).code === "ENOENT") return null;
+      throw err;
+    }
+    let newest: { file: string; mtimeMs: number; size: number } | null = null;
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const file = join(sessionDir, name);
+      const info = await stat(file);
+      if (!newest || info.mtimeMs > newest.mtimeMs) newest = { file, mtimeMs: info.mtimeMs, size: info.size };
+    }
+    if (!newest) return null;
+    const cached = seen.get(sessionDir);
+    if (cached && cached.file === newest.file && cached.mtimeMs === newest.mtimeMs && cached.size === newest.size) {
+      return cached.activity;
+    }
+    const activity = sessionActivity(await readFile(newest.file, "utf8"));
+    seen.set(sessionDir, { ...newest, activity });
+    return activity;
+  };
 };
 
 /** One line for a log or a thread, so the wording is not written twice. */

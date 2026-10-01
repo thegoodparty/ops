@@ -45,6 +45,7 @@
 // discipline attached, plus a prompt rule, and that honest gap. Read
 // `CLAUDE.md` in this directory before widening it.
 
+import { deadline } from "../deadline";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { BossInboxPort } from "./tools";
 
@@ -172,6 +173,7 @@ export const createGitHubRunsPort = (deps: {
       const response = await http(`${base}${path}`, {
         method,
         headers: githubHeaders(token),
+        signal: deadline("github"),
       });
       const text = await response.text();
       if (!response.ok) {
