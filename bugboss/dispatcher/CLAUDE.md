@@ -97,11 +97,16 @@ what turned the 2026-10-01 write halt into an escalation and a rotation page
 every two minutes for incident 93: every launch write failed, every third tick
 met the crash-loop ceiling, and the park after the post failed too. The
 deadline escalation has nothing to record, since `entry.killed` already makes
-it once per run, so it is gated on an empty write instead. Without it the same escalation
-goes to the thread every thirty seconds for as long as the incident stays
-open. Unlike the counters it is in the database, so the stop outlives a
-restart, and it is lifted by the cooldown, a Boss message or the stale sweep
-rather than by a deploy.
+it once per run, so it is gated on an empty write instead. A deadline held
+back by that gate is owed, in memory, and posted on the first tick a write
+lands. Without the park the same escalation goes to the thread every thirty
+seconds for as long as the incident stays open. Unlike the counters it is in
+the database, so the stop outlives a restart, and it is lifted by the
+cooldown, a Boss message or the stale sweep rather than by a deploy.
+
+A launch the database refused (`writesHalted`) is not counted as a fast
+failure. Counted, a halt of three ticks met the crash-loop ceiling on every
+open incident and paged the rotation for each once writes returned.
 
 **The counter is cleared at the ceiling either way**, and which thing replaces
 it is the only difference between the two arms. A told escalation keeps

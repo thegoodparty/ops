@@ -229,6 +229,10 @@ interface Halt {
 export const committedLocally = (err: unknown): boolean =>
   (err as { committedLocally?: boolean } | null)?.committedLocally === true;
 
+/** True for any write refused because S3 is not taking snapshots. */
+export const writesHalted = (err: unknown): boolean =>
+  (err as { writesHalted?: boolean } | null)?.writesHalted === true;
+
 export class Db {
   private readonly write: Database.Database;
   /** Separate connection, opened read-only. Agents query through this one. */
@@ -342,6 +346,7 @@ export class Db {
       });
       throw Object.assign(lastErr instanceof Error ? lastErr : new Error(String(lastErr)), {
         committedLocally: true,
+        writesHalted: true,
       });
     });
 
@@ -368,7 +373,7 @@ export class Db {
         note: "every write in this process is refusing; S3 has not taken a snapshot since the halt",
       });
     }
-    if (now < halt.nextRetryAt) throw new Error(`writes halted: ${halt.error}`);
+    if (now < halt.nextRetryAt) throw Object.assign(new Error(`writes halted: ${halt.error}`), { writesHalted: true });
 
     try {
       await this.putSnapshot();
@@ -376,7 +381,7 @@ export class Db {
       halt.error = String(err);
       halt.retryMs = Math.min(halt.retryMs * 2, this.timing.haltRetryMaxMs);
       halt.nextRetryAt = this.now() + halt.retryMs;
-      throw new Error(`writes halted: ${halt.error}`);
+      throw Object.assign(new Error(`writes halted: ${halt.error}`), { writesHalted: true });
     }
     this.halted = null;
     log("writes_resumed", { haltedForMs: this.now() - halt.since });

@@ -2802,7 +2802,9 @@ describe("Dispatcher escalations while writes fail", () => {
     get: (sql, params) => db.get(sql, params),
     withWrite: (fn) =>
       failing()
-        ? Promise.reject(new Error("writes halted: RequestTimeTooSkewed"))
+        ? Promise.reject(
+            Object.assign(new Error("writes halted: RequestTimeTooSkewed"), { writesHalted: true }),
+          )
         : db.withWrite(fn),
   });
 
@@ -3034,6 +3036,14 @@ describe("Dispatcher escalations while writes fail", () => {
 
     assert.equal(escalations.length, 0);
     assert.ok(alarms.includes("deadline_escalation_unrecorded"));
+
+    // Owed, not dropped: the first tick a write lands posts it, once.
+    halted = false;
+    await d.tick();
+    await d.tick();
+    assert.equal(escalations.length, 1);
+    assert.match(escalations[0].reason, /deadline/);
+    releases.forEach((r) => r());
     await d.drain();
     cleanup();
   });

@@ -26,7 +26,7 @@ import { DEADLINE_GRACE_SECONDS, INCIDENT_AGENT_MAX_TURNS } from "../agent/run";
 import { emptyTrash, sweepWorkspaces } from "../agent/workspace";
 import { buildChildEnv, hasAwsCredentialPath } from "./env";
 import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
-import { committedLocally } from "../db";
+import { committedLocally, writesHalted } from "../db";
 import { makeAlarm, makeLog } from "../logging";
 
 export * from "./env";
@@ -474,6 +474,13 @@ export class Dispatcher {
    */
   private readonly launches = new Map<string, number>();
 
+  /**
+   * Deadline escalations a failing write held back, by incident. In memory,
+   * like the run they describe: the kill already happened, and this is only
+   * the post still owed for it. Retried at the top of every tick.
+   */
+  private readonly owedDeadlines = new Map<string, { reason: string; brief: string }>();
+
   private timer: NodeJS.Timeout | null = null;
 
   constructor(deps: DispatcherDeps) {
@@ -692,6 +699,13 @@ export class Dispatcher {
       try {
         entry = await this.launch(row, now);
       } catch (err) {
+        // A launch the database refused is not the agent crashing. Counted,
+        // a halt of three ticks met the crash-loop ceiling on every open
+        // incident, and the rotation was paged for each once writes came back.
+        if (writesHalted(err)) {
+          log("launch_deferred", { incidentId: row.id, error: String(err) });
+          continue;
+        }
         const failures = (this.fastFailures.get(row.id) ?? 0) + 1;
         this.fastFailures.set(row.id, failures);
         alarm("launch_failed", {
@@ -1163,6 +1177,15 @@ export class Dispatcher {
   ): Promise<{ killed: string[]; escalated: string[] }> => {
     const killed: string[] = [];
     const escalated: string[] = [];
+    for (const [incidentId, owed] of [...this.owedDeadlines]) {
+      try {
+        await this.db.withWrite(() => undefined);
+      } catch {
+        break;
+      }
+      this.owedDeadlines.delete(incidentId);
+      if (await this.escalate(incidentId, owed.reason, owed.brief)) escalated.push(incidentId);
+    }
     for (const entry of [...this.running.values()]) {
       if (entry.killed || now < entry.killAt) continue;
       entry.killed = true;
@@ -1194,21 +1217,20 @@ export class Dispatcher {
       // already makes it once per run. The empty write is a gate instead:
       // it lands only when the database can, so a halted one posts nothing,
       // which is the rule every other dispatcher escalation keeps.
+      const reason = `wall-clock deadline of ${this.config.agentTimeoutSeconds}s expired`;
+      const brief = deadlineBrief(entry, ranSeconds);
       try {
         await this.db.withWrite(() => undefined);
       } catch (err) {
+        this.owedDeadlines.set(entry.incidentId, { reason, brief });
         alarm("deadline_escalation_unrecorded", {
           incidentId: entry.incidentId,
           error: String(err),
-          note: "writes are failing, so the deadline escalation was not posted",
+          note: "writes are failing, so the deadline escalation waits; it is posted on the first tick a write lands",
         });
         continue;
       }
-      const ok = await this.escalate(
-        entry.incidentId,
-        `wall-clock deadline of ${this.config.agentTimeoutSeconds}s expired`,
-        deadlineBrief(entry, ranSeconds),
-      );
+      const ok = await this.escalate(entry.incidentId, reason, brief);
       if (ok) escalated.push(entry.incidentId);
     }
     return { killed, escalated };
