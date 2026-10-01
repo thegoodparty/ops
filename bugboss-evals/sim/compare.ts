@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -146,11 +146,18 @@ const git = (args: string[], cwd?: string) =>
  * node_modules. Skipped when the workflow's cache restored it. False when the
  * build failed, and the checks then install for themselves.
  */
+/**
+ * Opens paths to the run-as user. What that user already wrote is shared,
+ * since it writes with umask 0, and is not ours to chmod: those failures are
+ * expected and ignored.
+ */
+const share = (...paths: string[]): void => void spawnSync("chmod", ["-R", "a+rwX", ...paths], { stdio: "ignore" });
+
 const prebuild = async (dir: string, npmCache: string, runAs: string | undefined): Promise<boolean> => {
   if (existsSync(join(dir, "node_modules"))) return true;
   const home = join(dir, "..", `${dir.split("/").pop()}-home`);
   mkdirSync(home, { recursive: true });
-  if (runAs) execFileSync("chmod", ["-R", "a+rwX", dir, home, npmCache]);
+  if (runAs) share(dir, home, npmCache);
   const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, npm_config_cache: npmCache };
   const { command, args, env: stepEnv } = asUser(runAs, "bash", [SETUP_OMNI, dir], env);
   const ok = await new Promise<boolean>((resolve) =>
@@ -227,7 +234,7 @@ const run = async (argv: string[]): Promise<void> => {
     candidate: buildRef(candidateRef, out),
   };
   await warming;
-  execFileSync("chmod", ["-R", "a+rwX", npmCache]);
+  share(npmCache);
   const stack = await startStack();
   const awsCredentialsUrl = await startCredentials(stub);
   const stamp = Date.now().toString(36);
