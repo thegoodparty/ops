@@ -263,7 +263,17 @@ const run = async (argv: string[]): Promise<void> => {
       }),
     ),
   );
-  const runs = await Promise.all(jobs);
+  // One run that throws must not cost the job every other run's result.
+  const runs = (
+    await Promise.all(
+      jobs.map((job) =>
+        job.catch((e: unknown) => {
+          log("run_threw", { error: e instanceof Error ? e.stack : String(e) });
+          return null;
+        }),
+      ),
+    )
+  ).filter((r): r is RunResult => r !== null);
 
   if (stubOmni) {
     const judgeStub = await startStubModel("/dev/null");
