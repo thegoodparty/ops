@@ -6,6 +6,7 @@ import {
   githubActionsPulumiDeployTrust,
   githubActionsPulumiPlan,
   githubActionsPulumiPlanTrust,
+  githubActionsJudgeSweepTrust,
   githubActionsPulumiPreview,
   githubActionsPulumiPreviewTrust,
   githubActionsWorkbenchDeploy,
@@ -17,6 +18,20 @@ const ACCOUNT_ID = "333022194791";
 const DEPLOY_ROLE_NAME = "github-actions-pulumi-deploy";
 const DEPLOY_POLICY_ARN = `arn:aws:iam::${ACCOUNT_ID}:policy/GitHubActionsPulumiDeployPolicy`;
 const READ_ONLY_ACCESS_ARN = "arn:aws:iam::aws:policy/ReadOnlyAccess";
+
+// Written by omni, not here: packages/gp-ai/infrastructure/modules/
+// universal-judge-sweep-policy, instantiated at environments/dev/ and applied
+// by omni's release train. The grant and the role that holds it are owned by
+// different repos on purpose — what the judge may touch is a fact about the
+// judge's buckets and queue, which live in omni's terraform, while who may
+// assume anything in this account is a fact about CI identity, which lives
+// here. The ARN is the seam.
+//
+// `-dev` is in the name because the policy exists in dev only, which is a
+// property of the judge rather than of this role: the Fargate side refuses a
+// judge dispatch outside dev in two places, so a prod twin would be a grant
+// nothing can use.
+const JUDGE_SWEEP_POLICY_ARN = `arn:aws:iam::${ACCOUNT_ID}:policy/UniversalJudgeSweep-dev`;
 const ADMINISTRATOR_ACCESS_ARN = "arn:aws:iam::aws:policy/AdministratorAccess";
 
 /**
@@ -197,6 +212,31 @@ export const createCiRoles = () => {
     policyArn: READ_ONLY_ACCESS_ARN,
   });
 
+  // The Universal Judge's sweep role, assumed by thegoodparty/omni's
+  // judge.yml. See githubActionsJudgeSweepTrust for who may assume it and why
+  // it is pinned to one workflow file on main.
+  //
+  // No inline document at all, unlike every role above. Its whole grant is the
+  // attachment, because the resources it names — two S3 buckets and a queue —
+  // are omni's and are described where they are created. Duplicating them here
+  // would mean the prefix a judge may stage under is written in two repos, and
+  // the one that drifts would be this one.
+  //
+  // No protect. Nothing depends on it until judge.yml names it, and an
+  // unreachable test harness is a safe thing to leave easy to correct.
+  const judgeSweepRole = new aws.iam.Role("githubActionsJudgeSweep", {
+    name: "github-actions-judge-sweep",
+    description:
+      "Universal Judge background sweeps from judge.yml on main in thegoodparty/omni. Dev only.",
+    assumeRolePolicy: JSON.stringify(githubActionsJudgeSweepTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicyAttachment("githubActionsJudgeSweepAttachment", {
+    role: judgeSweepRole.name,
+    policyArn: JUDGE_SWEEP_POLICY_ARN,
+  });
+
   return {
     deployRole,
     deployPolicy,
@@ -204,5 +244,6 @@ export const createCiRoles = () => {
     workbenchDeployRole,
     previewRole,
     planRole,
+    judgeSweepRole,
   };
 };

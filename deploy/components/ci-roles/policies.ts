@@ -956,6 +956,70 @@ const TF_STATE_READABLE = [
   `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
 ];
 
+// The Universal Judge's background sweep, in thegoodparty/omni.
+//
+// WHY A ROLE OF ITS OWN rather than three more statements on the deploy role.
+// The judge drives agents: it stages an override config in S3 and sends a
+// dispatch message that makes a PMF experiment run. That is a test harness,
+// and a test harness holding `github-actions-pulumi-deploy` —
+// AdministratorAccess in this account — is the grant nobody writes
+// deliberately and everybody inherits by reusing the convenient role. What it
+// may touch lives in omni's own terraform as `UniversalJudgeSweep-dev`,
+// attached in ci-roles.ts, and amounts to: staging under `_judge/` in one
+// bucket, reading its own `_judge-` runs in another, SendMessage on one queue.
+//
+// PINNED TO ONE WORKFLOW FILE, unlike the plan role below. `sub` is per-ref,
+// not per-workflow, so the subject alone would admit every workflow in omni
+// that runs on main. `job_workflow_ref` closes that, the way it does for the
+// ops statement on the deploy role.
+//
+// WHY THE SUBJECT IS main AND NOT `pull_request`, which is the surprising
+// half. A sweep is always *about* a pull request but never *runs on* one.
+// Both entry points are default-branch events: a `/judge` comment is
+// `issue_comment`, which GitHub only ever fires from the default branch, and
+// the other is `workflow_dispatch`. Neither produces a `pull_request` subject,
+// and judge.yml carries no `pull_request` trigger on purpose — a sweep costs
+// money, so it is asked for rather than fired by opening a PR. The PR being
+// judged arrives as an input; its head is fetched as data and never becomes
+// the ref the job runs as.
+//
+// So the ref in the subject is the ref the workflow file came from, and
+// requiring main is what makes the `job_workflow_ref` pin mean anything. The
+// callers reach judge.yml by relative path (`./.github/workflows/judge.yml`),
+// which GitHub resolves from the CALLER'S ref — the resolved-from-the-default-
+// branch behaviour applies only to the `org/repo/...@ref` form. A dispatch
+// launched from a feature branch would therefore present that branch in both
+// claims at once and satisfy any document written around it. Requiring main on
+// both is what keeps the code holding this role code that was reviewed and
+// merged.
+//
+// The cost of that is one real constraint, stated here so it is not
+// rediscovered as a bug: a sweep dispatched from a branch gets AccessDenied.
+// Dispatch from main — the branch picker chooses which judge.yml runs, not
+// which PR is judged, and the PR is the `pr_number` input.
+export const githubActionsJudgeSweepTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": [
+            "repo:thegoodparty/omni:ref:refs/heads/main",
+          ],
+          "token.actions.githubusercontent.com:job_workflow_ref":
+            "thegoodparty/omni/.github/workflows/judge.yml@refs/heads/main",
+        },
+      },
+    },
+  ],
+};
+
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
