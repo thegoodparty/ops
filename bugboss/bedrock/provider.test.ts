@@ -372,7 +372,11 @@ test("the region option and an abort signal reach the client", async () => {
     .result();
 
   assert.equal(seen[0].region, "us-west-2");
-  assert.equal(seen[0].signal, controller.signal);
+  // Combined with the idle watchdog's own signal, so the caller's abort has
+  // to arrive through it rather than be the same object.
+  assert.equal(seen[0].signal?.aborted, false);
+  controller.abort();
+  assert.equal(seen[0].signal?.aborted, true);
 });
 
 test("registering claims the new id and leaves the builtin converse id alone", async () => {
@@ -552,4 +556,95 @@ test("priceTokens refuses tiered rates rather than misprice summed tokens", () =
       ),
     /tiered/,
   );
+});
+
+const captureAlarms = () => {
+  const lines: Record<string, unknown>[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => {
+    if (typeof line === "string" && line.startsWith("{")) lines.push(JSON.parse(line));
+  };
+  return { lines, restore: () => (console.error = original) };
+};
+
+const ask = async (invoke: BedrockInvoke, idleTimeoutMs: number) => {
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  const provider = await createBedrockInvokeModelProvider({
+    invoke,
+    idleTimeoutMs,
+    incidentId: "100",
+  });
+  const pi = await import("@earendil-works/pi-ai");
+  const started = Date.now();
+  const message = await provider
+    .stream(model, pi.normalizeContext({ messages: [{ role: "user", content: "status?", timestamp: 0 }] }))
+    .result();
+  return { message, elapsed: Date.now() - started, pi };
+};
+
+const never = () => new Promise<never>(() => {});
+
+test("a stream that goes silent mid-turn is abandoned within the idle bound", { timeout: 5000 }, async () => {
+  const alarms = captureAlarms();
+  try {
+    const { message, elapsed, pi } = await ask(
+      async () => ({
+        $metadata: { httpStatusCode: 200 },
+        body: (async function* () {
+          yield { chunk: { bytes: encoder.encode(JSON.stringify(silentThinkingTurn[0])) } };
+          await never();
+        })(),
+      }),
+      100,
+    );
+
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage ?? "", /timed out/);
+    assert.ok(pi.isRetryableAssistantError(message), "a stall has to reach Pi's retry path");
+    assert.ok(elapsed < 1000, `took ${elapsed}ms`);
+    const stall = alarms.lines.find((line) => line.event === "model_call_stalled");
+    assert.equal(stall?.incidentId, "100");
+    assert.equal(stall?.level, "error");
+    assert.ok(typeof stall?.elapsedMs === "number" && stall.elapsedMs >= 100);
+  } finally {
+    alarms.restore();
+  }
+});
+
+test("a request that never answers at all is abandoned within the idle bound", { timeout: 5000 }, async () => {
+  const alarms = captureAlarms();
+  try {
+    const { message, elapsed } = await ask(never, 100);
+
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage ?? "", /timed out/);
+    assert.ok(elapsed < 1000, `took ${elapsed}ms`);
+    assert.ok(alarms.lines.some((line) => line.event === "model_call_stalled"));
+  } finally {
+    alarms.restore();
+  }
+});
+
+test("a slow stream that keeps sending is not abandoned", { timeout: 5000 }, async () => {
+  const alarms = captureAlarms();
+  try {
+    const { message, elapsed } = await ask(
+      async () => ({
+        $metadata: { httpStatusCode: 200 },
+        body: (async function* () {
+          for (const event of silentThinkingTurn) {
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            yield { chunk: { bytes: encoder.encode(JSON.stringify(event)) } };
+          }
+        })(),
+      }),
+      150,
+    );
+
+    assert.equal(message.stopReason, "stop");
+    assert.ok(elapsed > 150, `a whole call longer than the bound is the point; took ${elapsed}ms`);
+    assert.ok(!alarms.lines.some((line) => line.event === "model_call_stalled"));
+  } finally {
+    alarms.restore();
+  }
 });

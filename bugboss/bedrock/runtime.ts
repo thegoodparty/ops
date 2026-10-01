@@ -110,6 +110,8 @@ export const registerBedrockRouting = async ({
   runtime,
   invoke,
   invokeModelIdFor,
+  idleTimeoutMs,
+  incidentId,
 }: RegisterBedrockRoutingOptions): Promise<Provider> => {
   const builtin = runtime.getProvider(BEDROCK_PROVIDER_ID);
   if (!builtin) {
@@ -126,6 +128,8 @@ export const registerBedrockRouting = async ({
   const invokeModel = await registerBedrockInvokeModelProvider({
     invoke,
     invokeModelIdFor,
+    idleTimeoutMs,
+    incidentId,
   });
   const provider = routeBedrockProvider(builtin, invokeModel);
   runtime.registerNativeProvider(provider);

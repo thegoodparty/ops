@@ -186,8 +186,29 @@ distinctly when the environment disagrees.
 ## No retries here
 
 There is no backoff anywhere in this module, deliberately: Pi owns the
-retry loop, and a second layer underneath it would multiply attempts
+retry loop, including for a stalled call, and a second layer underneath it would multiply attempts
 invisibly.
+
+## A call that stops sending is abandoned after five idle minutes
+
+Nothing else bounds a model call. The SDK client sets no request or socket
+timeout, and the agent's own deadline is a day out, so a stream that stops
+sending without closing held incident 100's agent silent for over an hour
+with no turn, no error and no exit.
+
+`MODEL_IDLE_TIMEOUT_MS` is reset on every response chunk, including the
+response itself, and when it lapses the request is aborted and the read in
+flight is raced, not awaited, because aborting is not proof the SDK unblocks
+a read already waiting on a socket. The turn ends as `stopReason: "error"`
+with "timed out" in its message, which is what Pi's
+`isRetryableAssistantError` matches: Pi retries it, and a run that keeps
+stalling exits into the dispatcher's relaunch. `model_call_stalled` is the
+alarm, with `incidentId` on agent calls and null on the Boss's.
+
+Idle, not total: a healthy call that thinks for minutes keeps sending. Across
+3,788 production turns the slowest whole call took 316s and the next 126s,
+and an idle gap is always shorter than the call it sits in. Both the agent
+and the Boss's bounded calls come through this provider, so both are covered.
 
 ## The cache is written with a 1h ttl
 
