@@ -37,6 +37,12 @@ export const PRICE_TABLE: Record<string, Rates> = {
     cacheWrite5m: 2.75,
     cacheWrite1h: 4.4,
   }),
+  // Anthropic API ids, for a runtime that bypasses Bedrock. List prices as
+  // published 2026-09-25: cache writes are 1.25x (5m) and 2x (1h) of input.
+  "claude-opus-5": perMillion({ input: 5, output: 25, cacheRead: 0.5, cacheWrite5m: 6.25, cacheWrite1h: 10 }),
+  "claude-opus-5-5": perMillion({ input: 4, output: 20, cacheRead: 0.2, cacheWrite5m: 5, cacheWrite1h: 8 }),
+  "claude-sonnet-5": perMillion({ input: 2, output: 10, cacheRead: 0.2, cacheWrite5m: 2.5, cacheWrite1h: 4 }),
+  "claude-sonnet-5-5": perMillion({ input: 2, output: 10, cacheRead: 0.2, cacheWrite5m: 2.5, cacheWrite1h: 4 }),
 };
 
 /** Bedrock ARNs and inference-profile ids both end in the catalog id. */

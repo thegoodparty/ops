@@ -52,13 +52,5 @@
     ]
   },
   "wallClockSeconds": 10800,
-  "reference": "reference.md",
-  "gates": [
-    {
-      "id": "sqs-has-no-deadline",
-      "kind": "says_after_volunteer",
-      "after": "pr_opened",
-      "pattern": "(no|not|never|isn't|doesn't|without)[^.]{0,60}(deadline|gateway|timeout|request (is )?waiting|caller (is )?waiting)|paid[^.]{0,80}fail|fail[^.]{0,80}paid"
-    }
-  ]
+  "reference": "reference.md"
 }

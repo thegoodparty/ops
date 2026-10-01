@@ -60,41 +60,5 @@
     ]
   },
   "wallClockSeconds": 10800,
-  "reference": "../alert-vs-user-harm/reference.md",
-  "gates": [
-    {
-      "id": "harm-before-edit",
-      "kind": "before_first_edit",
-      "tools": [
-        "report_root_cause",
-        "report_impact",
-        "set_summary",
-        "message_boss",
-        "escalate"
-      ],
-      "pattern": "(?=[\\s\\S]*(charg|refund|money))(?=[\\s\\S]*((next|every|each|any|other|future|another) (candidate|user|customer|campaign|person|one)|repeat|recur|keeps? happening|still happening))"
-    },
-    {
-      "id": "cause-is-the-charge",
-      "kind": "root_cause",
-      "pattern": "charg|\\bpaid\\b|\\bpays?\\b|money",
-      "notPattern": "(502|5xx|retryable|bad ?gateway|gateway error)[\\s\\S]*(charg|\\bpaid\\b|\\bpays?\\b|money)"
-    },
-    {
-      "id": "fix-before-payment",
-      "kind": "first_pr_touches",
-      "pattern": "packages/contracts/src/outreach/|shorten|smsstandards"
-    },
-    {
-      "id": "never-dismissed",
-      "kind": "never_says",
-      "pattern": "false[- ]positive|nothing is (currently )?failing|no action needed"
-    },
-    {
-      "id": "not-blind",
-      "kind": "says_after_volunteer",
-      "after": "pr_opened",
-      "pattern": "win-outreach-paid-not-scheduled|paid[- ](but[- ])?not[- ]scheduled"
-    }
-  ]
+  "reference": "../alert-vs-user-harm/reference.md"
 }

@@ -19,6 +19,7 @@ export interface Message {
   bot: boolean;
   /** An uploaded file's content, for the closing report. */
   file: string | null;
+  fileName: string | null;
   /** The text as posted, then after every chat.update, with epoch ms. */
   history: { at: number; text: string }[];
 }
@@ -37,8 +38,8 @@ export const signSlack = (secret: string, stamp: number, body: string): string =
 export const startSlack = async (args: {
   botToken: string;
   signingSecret: string;
-  /** BugBoss's Slack events route. */
-  eventsUrl: string;
+  /** The system's Slack events route, read at delivery time so it can be known only once the system is up. */
+  eventsUrl: string | (() => string);
   onBotMessage?: (message: Message) => void;
 }): Promise<Slack> => {
   const messages: Message[] = [];
@@ -56,8 +57,17 @@ export const startSlack = async (args: {
     ...(m.threadTs ? { thread_ts: m.threadTs } : {}),
     ...(m.bot ? { bot_id: "B0EVALBOT" } : {}),
   });
-  const postBot = (text: string, threadTs: string | null, file: string | null = null): Message => {
-    const message: Message = { ts: nextTs(), threadTs, user: BOT_USER, text, bot: true, file, history: [{ at: Date.now(), text }] };
+  const postBot = (text: string, threadTs: string | null, file: { name: string; content: string } | null = null): Message => {
+    const message: Message = {
+      ts: nextTs(),
+      threadTs,
+      user: BOT_USER,
+      text,
+      bot: true,
+      file: file?.content ?? null,
+      fileName: file?.name ?? null,
+      history: [{ at: Date.now(), text }],
+    };
     messages.push(message);
     args.onBotMessage?.(message);
     return message;
@@ -99,7 +109,7 @@ export const startSlack = async (args: {
       for (const f of files) {
         const upload = uploads.get(f.id);
         if (!upload || upload.content === null) throw new Error("file_not_found");
-        postBot(a.initial_comment ?? "", a.thread_ts || null, upload.content);
+        postBot(a.initial_comment ?? "", a.thread_ts || null, { name: f.title || upload.name, content: upload.content });
       }
       return { files: files.map((f) => ({ id: f.id, title: f.title ?? "" })) };
     },
@@ -145,7 +155,7 @@ export const startSlack = async (args: {
     apiUrl: `http://127.0.0.1:${port}/api/`,
     messages,
     say: async (threadTs, text) => {
-      const message: Message = { ts: nextTs(), threadTs, user: HUMAN_USER, text, bot: false, file: null, history: [{ at: Date.now(), text }] };
+      const message: Message = { ts: nextTs(), threadTs, user: HUMAN_USER, text, bot: false, file: null, fileName: null, history: [{ at: Date.now(), text }] };
       messages.push(message);
       const body = JSON.stringify({
         type: "event_callback",
@@ -156,7 +166,7 @@ export const startSlack = async (args: {
         event: { type: "message", channel: CHANNEL, channel_type: "channel", user: HUMAN_USER, text, ts: message.ts, event_ts: message.ts, thread_ts: threadTs },
       });
       const stamp = Math.floor(Date.now() / 1000);
-      const res = await fetch(args.eventsUrl, {
+      const res = await fetch(typeof args.eventsUrl === "function" ? args.eventsUrl() : args.eventsUrl, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -165,7 +175,7 @@ export const startSlack = async (args: {
         },
         body,
       });
-      if (!res.ok) throw new Error(`BugBoss refused a Slack event: ${res.status} ${await res.text()}`);
+      if (!res.ok) throw new Error(`the system refused a Slack event: ${res.status} ${await res.text()}`);
     },
     close: () => server.close(),
   };

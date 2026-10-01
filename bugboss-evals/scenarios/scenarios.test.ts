@@ -73,13 +73,13 @@ for (const id of ids) {
     assert.match(scenario.check.command, /^(\.\.\/[a-z0-9-]+\/)?check\//);
   });
 
-  test(`${id}: alert.json is a firing Grafana delivery BugBoss can ingest`, () => {
+  test(`${id}: alert.json is a firing Grafana webhook delivery`, () => {
     const body = JSON.parse(readFileSync(join(dir, scenario.alert.file), "utf8"));
     assert.equal(body.status, "firing");
     assert.ok(Array.isArray(body.alerts) && body.alerts.length > 0);
     for (const alert of body.alerts) {
       assert.equal(alert.status, "firing");
-      assert.ok(alert.fingerprint, "a fingerprint is BugBoss's dedup key");
+      assert.ok(alert.fingerprint, "Grafana's fingerprint is the dedup key");
       assert.ok(alert.labels?.alertname && alert.labels?.alert_slug);
       assert.equal(alert.labels.environment, "prod");
       assert.ok(alert.annotations?.summary);

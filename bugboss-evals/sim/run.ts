@@ -1,18 +1,18 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
-import Database from "better-sqlite3";
-
-import { parsePiSession } from "../core/adapters/pi-session";
-import { scenarioGates, type RunRecord } from "../core/gates";
-import { spendOf } from "../core/metrics";
+import type { Activity, ActivityEvent } from "../core/activity";
+import { tracesFromProxyLog } from "../core/adapters/proxy-log";
+import { spendOf, ZERO_SPEND } from "../core/metrics";
 import type { Gates, Milestone, RunResult, Side } from "../core/report";
 import { loadScenario, type VolunteerMilestone } from "../core/scenario";
 import type { CiResult } from "./github/store";
 import { due, humanReply } from "./human";
+import { modelProxyEnv, startModelProxy, type ModelProxy } from "./model-proxy";
+import type { Runtime, RuntimeBuild, RuntimeLaunch } from "./runtimes/types";
 import { startS3 } from "./s3";
 import {
   checks,
@@ -22,6 +22,7 @@ import {
   refSha,
   runBase,
   SANDBOX_URL,
+  type CheckState,
   type Pull,
   type Sandbox,
 } from "./sandbox";
@@ -30,11 +31,12 @@ import { loadGenerator, pushBatch } from "./telemetry/load";
 import { createEmitter } from "./telemetry/run";
 
 /**
- * One run, black box: a BugBoss built from one ref, one scenario, its own
- * Grafana org, S3, Slack, Postgres and sandbox base. The harness plays the
- * on-call human and the reviewer, runs the sandbox's CI, merges when it is
- * green, runs the hidden check on what merged, and flips the telemetry
- * healthy when it passes.
+ * One run, black box: one runtime built from one ref, one scenario, its own
+ * Grafana org, S3, Slack, Postgres, model proxy and sandbox base. The harness
+ * plays the on-call human and the reviewer, runs the sandbox's CI, merges when
+ * it is green, runs the hidden check on what merged, and flips the telemetry
+ * healthy when it passes. Everything it observes of the system is what the
+ * world saw, recorded as the run's activity for the judge.
  */
 
 const SETUP_OMNI = join(__dirname, "..", "scenarios", "_lib", "setup-omni.sh");
@@ -55,11 +57,12 @@ export interface RunSpec {
   rep: number;
   side: Side;
   ref: string;
-  /** A checkout of `ref` with `dist/` built. */
-  bugbossDir: string;
+  runtime: Runtime;
+  /** `runtime.build(ref)`, done once per side. */
+  build: RuntimeBuild;
   root: string;
   stack: Stack;
-  /** The file BugBoss reads its GitHub token from. The fake takes any token. */
+  /** The file the system reads its GitHub token from. The fake takes any token. */
   tokenFile: string;
   /**
    * The fake github.com: the CA it serves with, the sandbox's bare repository
@@ -75,9 +78,10 @@ export interface RunSpec {
   };
   /** A container credential endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI). */
   awsCredentialsUrl: string;
-  /** Set only for the zero-spend proof. */
+  awsRegion?: string;
+  /** Set only for the zero-spend proof: the system talks to the scripted model directly and no proxy counts anything. */
   stubModelUrl?: string;
-  /** Run BugBoss, the sandbox's CI and the hidden check as this user, which holds no secrets. */
+  /** Run the system, the sandbox's CI and the hidden check as this user, which holds no secrets. */
   runAs?: string;
   /** Where a run stops. `closed` is the whole lifecycle. */
   until?: Milestone;
@@ -211,8 +215,8 @@ git fetch -q origin && git checkout -q -B main origin/main
   );
   chmodSync(hook, 0o755);
   // The empty helper clears any the system config names (the macOS keychain,
-  // on a Mac), for the Boss and every agent under this HOME. BugBoss adds its
-  // own helper for github.com after it.
+  // on a Mac), for everything the system runs under this HOME. The system
+  // adds its own helper for github.com after it.
   writeFileSync(join(home, ".gitconfig"), `[core]\n\thooksPath = ${join(home, "hooks")}\n[credential]\n\thelper =\n`);
 };
 
@@ -241,7 +245,7 @@ const startPostgres = async (runId: string): Promise<{ url: string; stop: () => 
 const sendAlert = async (url: string, secret: string, body: unknown): Promise<void> => {
   const raw = JSON.stringify(body);
   const stamp = String(Math.floor(Date.now() / 1000));
-  const res = await fetch(`${url}/grafana`, {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -251,55 +255,10 @@ const sendAlert = async (url: string, secret: string, body: unknown): Promise<vo
     },
     body: raw,
   });
-  if (!res.ok) throw new Error(`BugBoss refused the alert: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`the system refused the alert: ${res.status} ${await res.text()}`);
 };
 
 const MAX_HUMAN_REPLIES = 20;
-
-interface IncidentRow {
-  id: string;
-  status: string;
-  rootCause: string | null;
-  postmortem: string | null;
-  closedAt: number | null;
-}
-
-const readIncident = (dbPath: string): IncidentRow | null => {
-  if (!existsSync(dbPath)) return null;
-  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-  try {
-    return (
-      (db
-        .prepare("SELECT id, status, rootCause, postmortem, closedAt FROM incident WHERE mergedInto IS NULL ORDER BY firstSignalAt LIMIT 1")
-        .get() as IncidentRow | undefined) ?? null
-    );
-  } catch {
-    return null;
-  } finally {
-    db.close();
-  }
-};
-
-const sessionsUnder = (dir: string): string[] =>
-  existsSync(dir)
-    ? readdirSync(dir).flatMap((name) => {
-        const path = join(dir, name);
-        return statSync(path).isDirectory() ? sessionsUnder(path) : path.endsWith(".jsonl") ? [path] : [];
-      })
-    : [];
-
-/** The agents' sessions as they are being written, under each incident's `session/` directory. A half-written last line is left for the next read. */
-const liveTraces = (work: string) =>
-  sessionsUnder(work)
-    .filter((path) => path.includes("/session/"))
-    .flatMap((path) => {
-      const text = readFileSync(path, "utf8");
-      try {
-        return [parsePiSession(path, text.slice(0, text.lastIndexOf("\n") + 1))];
-      } catch {
-        return [];
-      }
-    });
 
 const exec = (command: string, args: string[], options: { env?: Record<string, string>; timeoutMs?: number; log?: string } = {}): Promise<number | null> =>
   new Promise((resolve) => {
@@ -373,8 +332,8 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const home = join(spec.root, "home");
   const work = join(spec.root, "work");
   const s3Root = join(spec.root, "s3");
-  const dbPath = join(spec.root, "bugboss.db");
-  for (const d of [home, work, s3Root]) mkdirSync(d, { recursive: true });
+  const stateDir = join(spec.root, "state");
+  for (const d of [home, work, s3Root, stateDir]) mkdirSync(d, { recursive: true });
   writeHome(home, spec.runId, spec.npmCache);
 
   const sandbox = createSandbox();
@@ -394,50 +353,40 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   });
   await emitter.backfill();
 
+  // What the world saw, in order. The judge reads this and nothing else of the run.
+  const events: ActivityEvent[] = [];
+  const record = (event: ActivityEvent): void => void events.push(event);
+
   const postgres = await startPostgres(spec.runId);
   const s3 = await startS3(s3Root);
-  const [port, loopbackPort] = [await freePort(), await freePort()];
+  const [port, spare] = [await freePort(), await freePort()];
   const secrets = { bot: `xoxb-${randomBytes(12).toString("hex")}`, signing: randomBytes(16).toString("hex"), grafana: randomBytes(16).toString("hex") };
 
-  const bossUrl = `http://127.0.0.1:${port}`;
+  let launched: RuntimeLaunch | null = null;
   const questions: Message[] = [];
   const slack = await startSlack({
     botToken: secrets.bot,
     signingSecret: secrets.signing,
-    eventsUrl: `${bossUrl}/slack`,
+    eventsUrl: () => {
+      if (!launched?.slackEventsUrl) throw new Error("the runtime takes no Slack events over HTTP");
+      return launched.slackEventsUrl;
+    },
     onBotMessage: (m) => {
       if (m.text.includes("?")) questions.push(m);
     },
   });
+
+  const region = spec.awsRegion ?? "us-west-2";
+  const proxy: ModelProxy | null = spec.stubModelUrl
+    ? null
+    : await startModelProxy({ upstream: spec.runtime.modelUpstream, region, logPath: join(spec.root, "proxy.jsonl") });
 
   await shareWith(spec.runAs, spec.root);
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: home,
     LANG: "C.UTF-8",
-    PORT: String(port),
-    BUGBOSS_LOOPBACK_PORT: String(loopbackPort),
-    BUGBOSS_BUCKET: "bugboss-eval",
-    BUGBOSS_DB_PATH: dbPath,
-    BUGBOSS_SLACK_CHANNEL_ID: CHANNEL,
-    BUGBOSS_TICK_SECONDS: "10",
-    BUGBOSS_OMNI_REPO: SANDBOX_URL,
-    BUGBOSS_WORK_ROOT: work,
-    BUGBOSS_GITHUB_TOKEN_FILE: spec.tokenFile,
-    BUGBOSS_REVIEW_SETTLE_SECONDS: "5",
-    NODE_EXTRA_CA_CERTS: spec.github.caFile,
-    SLACK_BOT_TOKEN: secrets.bot,
-    SLACK_SIGNING_SECRET: secrets.signing,
-    SLACK_BOT_USER_ID: BOT_USER,
-    SLACK_API_URL: slack.apiUrl,
-    GRAFANA_URL: spec.stack.grafanaUrl,
-    GRAFANA_SERVICE_ACCOUNT_TOKEN: grafanaToken,
-    GRAFANA_WEBHOOK_SECRET: secrets.grafana,
-    AWS_REGION: "us-west-2",
-    AWS_CONTAINER_CREDENTIALS_FULL_URI: spec.awsCredentialsUrl,
-    AWS_ENDPOINT_URL_S3: s3.url,
-    OMNI_TEST_POSTGRES_URL: postgres.url,
-    ...(spec.stubModelUrl ? { AWS_ENDPOINT_URL_BEDROCK_RUNTIME: spec.stubModelUrl } : {}),
+    ...(proxy ? modelProxyEnv(proxy, spec.runtime.modelUpstream) : { AWS_ENDPOINT_URL_BEDROCK_RUNTIME: spec.stubModelUrl! }),
   };
 
   const checkEnv: Record<string, string> = {
@@ -449,21 +398,26 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   // gp-api's eslint runs out of the default 2 GB heap.
   const unregisterCi = spec.github.onCi(baseSha, (sha) => visibleCi(spec, scenario.ci, sha, { ...checkEnv, NODE_OPTIONS: "--max-old-space-size=6144" }));
 
-  const launch = asUser(spec.runAs, "node", [join(spec.bugbossDir, "dist", "bugboss", "index.js")], env);
-  const logFd = join(spec.root, "bugboss.log");
-  writeFileSync(logFd, "");
-  const boss: ChildProcess = spawn(launch.command, launch.args, {
-    env: launch.env ?? process.env,
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
+  launched = await spec.runtime.launch({
+    build: spec.build,
+    env,
+    ports: { http: port, spare: [spare] },
+    workRoot: work,
+    world: {
+      slack: { apiUrl: slack.apiUrl, botToken: secrets.bot, signingSecret: secrets.signing, botUserId: BOT_USER, channel: CHANNEL },
+      grafana: { url: spec.stack.grafanaUrl, serviceAccountToken: grafanaToken, webhookSecret: secrets.grafana },
+      github: { repoUrl: SANDBOX_URL, tokenFile: spec.tokenFile, caFile: spec.github.caFile },
+      aws: { region, credentialsUrl: spec.awsCredentialsUrl, s3Url: s3.url },
+      postgresUrl: postgres.url,
+      stateDir,
+    },
+    ...(spec.runAs ? { runAs: spec.runAs } : {}),
   });
-  const append = (chunk: Buffer) => writeFileSync(logFd, chunk, { flag: "a" });
-  boss.stdout?.on("data", append);
-  boss.stderr?.on("data", append);
+  const system = launched;
   let exited: string | null = null;
-  boss.on("exit", (code, signal) => (exited = `BugBoss exited ${code ?? signal}`));
+  system.child.on("exit", (code, signal) => (exited = `the system exited ${code ?? signal}`));
 
-  const pulls = new Map<number, { reviewedSha: string | null; reviewAsks: number; mergedGreen: boolean | null }>();
+  const pulls = new Map<number, PullState>();
   let fixed: boolean | null = null;
   let deploying: Promise<void> | null = null;
   let latestMerge: string | null = null;
@@ -476,6 +430,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, checkEnv)
       .then((passed) => {
         fixed = passed;
+        record({ at: Date.now(), kind: "check_result", passed });
         spec.log("deployed", { sha, fixed });
         emitter.setState(passed ? "healthy" : "fault");
       })
@@ -488,22 +443,20 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   let closedAt: number | null = null;
   const said = new Set<string>();
   let replies = 0;
+  let prOpenedAt: number | null = null;
   let mergedAt: number | null = null;
-  let milestoneAt: number | null = null;
   let mergeAskedAt: number | null = null;
-  const statuses: RunRecord["statuses"] = [];
   const reached = new Set<VolunteerMilestone>();
   const volunteeredSaid = new Set<string>();
-  const volunteered: RunRecord["volunteered"] = [];
   let movedBase: string | null = null;
   const deadline = alertAt + Math.min(scenario.wallClockSeconds, spec.maxRunSeconds ?? Infinity) * 1000;
   let lastAlert = 0;
 
   try {
     for (let i = 0; ; i++) {
-      if (i > 60) throw new Error("BugBoss never answered /health");
+      if (i > 60) throw new Error("the system never answered its health check");
       if (exited) throw new Error(exited);
-      if (await fetch(`${bossUrl}/health`).then((r) => r.ok, () => false)) break;
+      if (await fetch(system.healthUrl).then((r) => r.ok, () => false)) break;
       await sleep(2000);
     }
     const alertBody = JSON.parse(readFileSync(join(scenarioDir, scenario.alert.file), "utf8"));
@@ -517,15 +470,17 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       }
       await emitter.tick();
       if (fixed !== true && Date.now() - lastAlert >= scenario.alert.refireEverySeconds * 1000) {
-        await sendAlert(bossUrl, secrets.grafana, alertBody).catch((e: unknown) => spec.log("alert_failed", { error: String(e) }));
+        const refire = lastAlert !== 0;
+        await sendAlert(system.alertUrl, secrets.grafana, alertBody).then(
+          () => record({ at: Date.now(), kind: "alert_fired", refire }),
+          (e: unknown) => spec.log("alert_failed", { error: String(e) }),
+        );
         lastAlert = Date.now();
       }
 
       // Everything the world does to the run this tick: the on-call human in
       // Slack, the reviewer and the merging human on GitHub, the scenario's
       // world events, then the human's volunteered lines.
-      const seen = readIncident(dbPath);
-      if (seen?.rootCause) reached.add("root_cause");
       for (const question of questions.splice(0)) {
         if (replies >= MAX_HUMAN_REPLIES) break;
         replies += 1;
@@ -543,6 +498,11 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         baseSha,
         pulls,
         mayMerge,
+        record,
+        onOpened: () => {
+          reached.add("pr_opened");
+          prOpenedAt ??= Date.now();
+        },
         onApproved: () => reached.add("approved"),
         onMergeRefused: () => reached.add("merge_refused"),
         onMerged: (sha) => {
@@ -552,7 +512,6 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
           deploy();
         },
       }).catch((e: unknown) => spec.log("github_step_failed", { error: String(e) }));
-      if (pulls.size > 0) reached.add("pr_opened");
       if (scenario.world?.baseMovesAfter && reached.has(scenario.world.baseMovesAfter) && movedBase === null) {
         movedBase = await spec.github.moveBase(runBase(spec.runId));
         spec.log("base_moved", { sha: movedBase });
@@ -561,33 +520,25 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       if (thread) {
         for (const line of due(scenario.human.volunteer, reached, volunteeredSaid, pulls.size ? Math.min(...pulls.keys()) : null)) {
           await slack.say(thread.ts, line.say).catch((e: unknown) => spec.log("human_volunteer_failed", { error: String(e) }));
-          volunteered.push({ at: Date.now(), milestone: line.milestone, say: line.say });
         }
       }
 
-      if (spec.spend) {
-        spec.spend.record(spec.runId, spendOf(liveTraces(work)).usd);
+      if (spec.spend && proxy) {
+        spec.spend.record(spec.runId, proxy.spentUsd());
         if (spec.spend.exhausted()) {
           end = "spend_cap";
           break;
         }
       }
 
-      const incident = readIncident(dbPath);
-      if (incident && statuses.at(-1)?.status !== incident.status) statuses.push({ at: Date.now(), status: incident.status });
-      if (incident?.status === "CLOSED") {
+      if (await system.closed()) {
         end = "closed";
-        closedAt = incident.closedAt;
-        break;
-      }
-      if (until === "root_cause" && incident?.rootCause) {
-        end = "root_cause";
-        milestoneAt = Date.now();
+        closedAt = Date.now();
+        record({ at: closedAt, kind: "closed" });
         break;
       }
       if (until === "pr_opened" && pulls.size > 0) {
         end = "pr_opened";
-        milestoneAt = Date.now();
         break;
       }
       await sleep(5_000);
@@ -595,14 +546,14 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   } catch (error: unknown) {
     end = `error: ${error instanceof Error ? error.message : String(error)}`;
   } finally {
-    // Give the Boss a moment to roll the session up, then stop everything.
+    // Give the system a moment to finish what it was writing, then stop everything.
     await sleep(5000);
     while (deploying as Promise<void> | null) {
       await (deploying as Promise<void> | null)?.catch((e: unknown) => spec.log("deploy_failed", { error: String(e) }));
     }
-    if (boss.pid) {
+    if (system.child.pid) {
       try {
-        process.kill(-boss.pid, "SIGTERM");
+        process.kill(-system.child.pid, "SIGTERM");
       } catch {
         // Already gone.
       }
@@ -611,59 +562,52 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     slack.close();
     s3.server.close();
     await postgres.stop();
+    await proxy?.close();
   }
 
-  const incident = readIncident(dbPath);
   const merged = [...pulls.entries()].filter(([, p]) => p.mergedGreen !== null);
-  // A run stopped early may never have rolled its session up to S3.
-  const rolledUp = sessionsUnder(s3Root).flatMap((path) => {
-    try {
-      return [parsePiSession(path, readFileSync(path, "utf8"))];
-    } catch (e: unknown) {
-      spec.log("session_unreadable", { path, error: String(e) });
-      return [];
-    }
-  });
-  const traces = rolledUp.length ? rolledUp : liveTraces(work);
   const lifecycle = until === "closed";
-  let gates: Gates = {
-    closed: lifecycle ? incident?.status === "CLOSED" : null,
-    fixed: lifecycle ? fixed === true : null,
-    mergedGreen: lifecycle ? merged.every(([, p]) => p.mergedGreen === true) : null,
-    noPushToMain: true,
-  };
-  let diff: string | null = null;
-  let firstPrFiles: string[] | null = null;
   const baseNow = await refSha(sandbox, runBase(spec.runId)).catch(() => "unknown");
   const mergeCommits = await Promise.all(merged.map(async ([n]) => (await sandbox.call<Pull>(`/pulls/${n}`)).merge_commit_sha));
-  gates = {
-    ...gates,
+  const gates: Gates = {
+    closed: lifecycle ? end === "closed" : null,
+    fixed: lifecycle ? fixed === true : null,
+    mergedGreen: lifecycle ? merged.every(([, p]) => p.mergedGreen === true) : null,
     noPushToMain:
       (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
       (baseNow === baseSha || baseNow === movedBase || mergeCommits.includes(baseNow)),
   };
-  const diffFrom = movedBase ?? baseSha;
-  if (baseNow !== diffFrom && baseNow !== "unknown") {
-    const shown = await capture("git", ["-C", spec.github.repo, "diff", diffFrom, baseNow]);
-    diff = shown.code === 0 ? shown.stdout : null;
-  }
-  const first = Math.min(...pulls.keys());
-  if (Number.isFinite(first)) {
-    firstPrFiles = await sandbox
-      .call<Array<{ filename: string }>>(`/pulls/${first}/files?per_page=100`)
-      .then((files) => files.map((f) => f.filename), () => null);
-  }
-  const record: RunRecord = {
-    mergedAt,
-    statuses,
-    rootCause: incident?.rootCause ?? null,
-    firstPrFiles,
-    volunteered,
-    slack: slack.messages.map((m) => ({ at: m.history[0]?.at ?? 0, ts: m.ts, threadTs: m.threadTs, text: m.text, bot: m.bot, history: m.history })),
-    traces,
-  };
 
-  const reachedAt = lifecycle ? closedAt : milestoneAt;
+  // The fix as the judge sees it: base to merge when something merged, else
+  // base to the first pull request's head, else nothing.
+  const diffFrom = movedBase ?? baseSha;
+  let diffTo: string | null = baseNow !== diffFrom && baseNow !== "unknown" ? baseNow : null;
+  if (diffTo === null && pulls.size > 0) {
+    const first = Math.min(...pulls.keys());
+    diffTo = await sandbox.call<Pull>(`/pulls/${first}`).then((p) => p.head.sha, () => null);
+  }
+  let diff = "";
+  if (diffTo) {
+    const shown = await capture("git", ["-C", spec.github.repo, "diff", diffFrom, diffTo]);
+    diff = shown.code === 0 ? shown.stdout : "";
+  }
+
+  for (const m of slack.messages) {
+    const posted = m.history[0]?.at ?? alertAt;
+    if (!m.bot) {
+      record({ at: posted, kind: "slack_human", ts: m.ts, threadTs: m.threadTs, text: m.history[0]?.text ?? m.text });
+      continue;
+    }
+    if (m.file !== null) record({ at: posted, kind: "slack_file", ts: m.ts, name: m.fileName ?? "file", text: m.file });
+    if (m.file === null || (m.history[0]?.text ?? "").trim() !== "") {
+      record({ at: posted, kind: "slack_post", ts: m.ts, threadTs: m.threadTs, text: m.history[0]?.text ?? m.text });
+    }
+    for (const edit of m.history.slice(1)) record({ at: edit.at, kind: "slack_update", ts: m.ts, text: edit.text });
+  }
+  const activity: Activity = { alertAt, events: [...events].sort((a, b) => a.at - b.at) };
+
+  const traces = proxy ? await tracesFromProxyLog(join(spec.root, "proxy.jsonl")).catch((e: unknown) => (spec.log("proxy_log_unreadable", { error: String(e) }), [])) : [];
+  const seconds = (at: number | null) => (at === null ? null : Math.round((at - alertAt) / 1000));
   const result: RunResult = {
     runId: spec.runId,
     scenario: scenario.id,
@@ -673,11 +617,11 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     until,
     end,
     gates,
-    scenarioGates: scenarioGates(scenario.gates, record, !lifecycle),
-    spend: spendOf(traces),
-    wallClockSeconds: reachedAt ? Math.round((reachedAt - alertAt) / 1000) : null,
-    output: { rootCause: incident?.rootCause ?? null, diff, postmortem: incident?.postmortem ?? null },
+    spend: traces.length ? spendOf(traces) : ZERO_SPEND,
+    wallClock: { prOpened: seconds(prOpenedAt), merged: seconds(mergedAt), closed: seconds(closedAt) },
   };
+  writeFileSync(join(spec.root, "activity.json"), JSON.stringify(activity, null, 2));
+  writeFileSync(join(spec.root, "diff.patch"), diff);
   writeFileSync(join(spec.root, "result.json"), JSON.stringify(result, null, 2));
   writeFileSync(join(spec.root, "slack.json"), JSON.stringify(slack.messages, null, 2));
   spec.log("run_finished", { runId: spec.runId, end, gates });
@@ -686,41 +630,63 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
 
 const REVIEW_BODY = "Approved.\n\nRecommendation: approve";
 
+interface PullState {
+  reviewedSha: string | null;
+  reviewAsks: number;
+  mergedGreen: boolean | null;
+  /** The latest CI conclusion recorded per head, so each run's result lands in the activity once. */
+  ciRecorded: Map<string, CheckState>;
+}
+
+const pullFiles = (sandbox: Sandbox, number: number): Promise<string[]> =>
+  sandbox.call<Array<{ filename: string }>>(`/pulls/${number}/files?per_page=100`).then((files) => files.map((f) => f.filename), () => []);
+
 /**
  * The reviewer and the human's merge. A PR opened against main that carries
  * this run's base is moved onto the run's own branch; every new head, and
  * every `delegate review` ask, gets an approving review; an approved PR whose
- * checks are green at its head is merged, which is the deploy.
+ * checks are green at its head is merged, which is the deploy. Everything
+ * seen here is recorded as the run's activity.
  */
 const driveGitHub = async (args: {
   sandbox: Sandbox;
   spec: RunSpec;
   baseSha: string;
-  pulls: Map<number, { reviewedSha: string | null; reviewAsks: number; mergedGreen: boolean | null }>;
+  pulls: Map<number, PullState>;
   /** False while the scripted human is not yet merging. */
   mayMerge: boolean;
+  record: (event: ActivityEvent) => void;
+  onOpened: () => void;
   onApproved: () => void;
   /** GitHub said no to the human's merge: the PR is behind its base. */
   onMergeRefused: () => void;
   onMerged: (sha: string) => void;
 }): Promise<void> => {
-  const { sandbox, spec, baseSha, pulls } = args;
-  const open = await sandbox.call<Pull[]>("/pulls?state=open&per_page=100");
+  const { sandbox, spec, baseSha, pulls, record } = args;
+  const open = await sandbox.call<Array<Pull & { title: string }>>("/pulls?state=open&per_page=100");
   for (const pull of open) {
     if (pulls.has(pull.number) || (pull.base.ref !== "main" && pull.base.ref !== runBase(spec.runId))) continue;
     if (!(await contains(sandbox, baseSha, pull.head.sha))) continue;
     if (pull.base.ref === "main") {
       await sandbox.call(`/pulls/${pull.number}`, { method: "PATCH", body: { base: runBase(spec.runId) } });
     }
-    pulls.set(pull.number, { reviewedSha: null, reviewAsks: 0, mergedGreen: null });
+    pulls.set(pull.number, { reviewedSha: null, reviewAsks: 0, mergedGreen: null, ciRecorded: new Map() });
+    record({ at: Date.now(), kind: "pr_opened", number: pull.number, title: pull.title, files: await pullFiles(sandbox, pull.number) });
+    args.onOpened();
     spec.log("pr_claimed", { number: pull.number });
   }
   for (const [number, state] of pulls) {
     if (state.mergedGreen !== null) continue;
     const pull = await sandbox.call<Pull>(`/pulls/${number}`);
+    const ci = await checks(sandbox, pull.head.sha);
+    if (ci !== "pending" && state.ciRecorded.get(pull.head.sha) !== ci) {
+      state.ciRecorded.set(pull.head.sha, ci);
+      record({ at: Date.now(), kind: "ci_run", number, conclusion: ci === "green" ? "success" : "failure" });
+    }
     if (pull.merged_at) {
       // Merged by something other than the harness.
-      state.mergedGreen = (await checks(sandbox, pull.head.sha)) === "green";
+      state.mergedGreen = ci === "green";
+      record({ at: Date.now(), kind: "merged", number });
       args.onMerged(pull.merge_commit_sha ?? pull.head.sha);
       continue;
     }
@@ -728,27 +694,33 @@ const driveGitHub = async (args: {
     const comments = await sandbox.call<Array<{ body: string }>>(`/issues/${number}/comments?per_page=100`);
     const asks = comments.filter((c) => c.body.trim() === "delegate review").length;
     if (state.reviewedSha !== pull.head.sha || asks > state.reviewAsks) {
+      if (state.reviewedSha !== null && state.reviewedSha !== pull.head.sha) {
+        record({ at: Date.now(), kind: "pr_head_pushed", number, files: await pullFiles(sandbox, number) });
+      }
       await sandbox.call(`/pulls/${number}/reviews`, {
         method: "POST",
         body: { commit_id: pull.head.sha, event: "COMMENT", body: REVIEW_BODY },
       });
+      record({ at: Date.now(), kind: "review", number, state: "approved", body: REVIEW_BODY });
       state.reviewedSha = pull.head.sha;
       state.reviewAsks = asks;
       args.onApproved();
       continue;
     }
-    if (!args.mayMerge || (await checks(sandbox, pull.head.sha)) !== "green") continue;
+    if (!args.mayMerge || ci !== "green") continue;
     const merged = await sandbox
       .call<{ sha: string }>(`/pulls/${number}/merge`, { method: "PUT", body: { sha: pull.head.sha, merge_method: "merge" } })
       .catch((e: unknown) => {
         if (!/: 405 /.test(String(e))) throw e;
         spec.log("merge_refused", { number, error: String(e) });
+        record({ at: Date.now(), kind: "merge_refused", number, reason: "the pull request is behind its base branch" });
         args.onMergeRefused();
         return null;
       });
     if (!merged) continue;
     state.mergedGreen = true;
     spec.log("pr_merged", { number, sha: merged.sha });
+    record({ at: Date.now(), kind: "merged", number });
     args.onMerged(merged.sha);
   }
 };

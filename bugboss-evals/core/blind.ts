@@ -1,14 +1,14 @@
 /**
- * Removes what would tell the judge which variant produced an output, or how
- * efficiently. BugBoss's closing report prints the run's tokens, turns and an
- * estimated cost, and its summary line says how long the incident took; left
- * in, any of those tells the judge which side was cheaper or faster, and the
- * quality verdict stops being independent of the cost measure.
+ * Removes what would tell the judge which variant produced a run, or how
+ * efficiently. A system's closing post may print the run's tokens, turns and
+ * an estimated cost, and a summary line may say how long the incident took;
+ * left in, any of those tells the judge which side was cheaper or faster, and
+ * the quality verdict stops being independent of the cost measure.
  *
- * Two kinds of text, two treatments. Prose (the root cause and the
- * post-mortem) loses whole lines and whole sections that talk about the run
- * itself. A diff loses nothing but identifiers, because dropping a line of
- * code changes what the judge thinks the fix was.
+ * Two kinds of text, two treatments. Prose (anything said in Slack or
+ * uploaded to the thread) loses whole lines and whole sections that talk
+ * about the run itself. A diff loses nothing but identifiers, because
+ * dropping a line of code changes what the judge thinks the fix was.
  *
  * Nothing here cuts by length. A line is removed for what it says, never for
  * how long it is.
@@ -75,7 +75,11 @@ const SUBSTITUTIONS: Array<[RegExp, string]> = [
   [/\b(us\.|global\.|eu\.)?anthropic\.[\w.:-]+/g, "<model>"],
   [/\bclaude-[a-z0-9][\w.-]*/gi, "<model>"],
   [/\brefs\/heads\/[\w./-]+/g, "<branch>"],
-  [/\bbugboss\/[\w./-]+/g, "<branch>"],
+  // Branch names, by the shapes agents and people give them: `<owner>/<kind>-…`
+  // or `<kind>/<name>`. File paths and URLs are left alone, because a path
+  // in a message or a diff header is evidence the judge needs.
+  [/(?<![\w./-])[a-z][\w-]*\/(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)[\w./-]*/gi, "<branch>"],
+  [/(?<![\w./-])(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)\/[\w][\w./-]*/gi, "<branch>"],
   [/\/pull\/\d+/g, "/pull/<n>"],
   [/\bPR\s+#?\d+\b/g, "PR <n>"],
   [/(^|[^\w&])#\d+\b/g, "$1#<n>"],
@@ -103,22 +107,24 @@ const dropRunProse = (text: string): { text: string; dropped: number } => {
   let dropped = 0;
   let skippingLevel: number | null = null;
   for (const line of text.split("\n")) {
-    const heading = /^(#{1,6})\s/.exec(line);
+    // A timeline quotes every message line, so headings arrive as `> ## Cost`.
+    const bare = line.replace(/^(?:>\s?)+/, "");
+    const heading = /^(#{1,6})\s/.exec(bare);
     if (skippingLevel !== null) {
       if (heading && heading[1].length <= skippingLevel) {
         skippingLevel = null;
       } else {
-        if (line.trim() !== "") dropped += 1;
+        if (bare.trim() !== "") dropped += 1;
         continue;
       }
     }
-    const section = RUN_SECTION.exec(line);
+    const section = RUN_SECTION.exec(bare);
     if (section) {
       skippingLevel = section[1].length;
       dropped += 1;
       continue;
     }
-    if (RUN_LINE.some((pattern) => pattern.test(line))) {
+    if (RUN_LINE.some((pattern) => pattern.test(bare))) {
       dropped += 1;
       continue;
     }
@@ -138,33 +144,24 @@ export const blind = (text: string, kind: TextKind, options: BlindOptions = {}):
   return { text: substitute(kept, identifying), droppedLines: dropped };
 };
 
-/** What one side of a pair produced, before or after blinding. */
-export interface IncidentOutput {
-  /** As the agent reported it. Null when the run never reported one. */
-  rootCause: string | null;
-  /** From the scenario's base commit to the merge commit. Null when nothing merged. */
+/** What one side of a pair looks like to the judge, before or after blinding. */
+export interface SideOutput {
+  /** The rendered activity timeline (core/activity.ts): every Slack message, GitHub event, the check and the close. */
+  timeline: string;
+  /** From the scenario's base commit to the merge commit, or to the first pull request's head when nothing merged. Null when no pull request was opened. */
   diff: string | null;
-  /** The closing report file. Null when the incident never closed. */
-  postmortem: string | null;
 }
 
-export const blindOutput = (
-  output: IncidentOutput,
+export const blindSide = (
+  side: SideOutput,
   options: BlindOptions = {},
-): { output: IncidentOutput; droppedLines: number } => {
-  let droppedLines = 0;
-  const prose = (value: string | null) => {
-    if (value === null) return null;
-    const result = blind(value, "prose", options);
-    droppedLines += result.droppedLines;
-    return result.text;
-  };
+): { output: SideOutput; droppedLines: number } => {
+  const timeline = blind(side.timeline, "prose", options);
   return {
     output: {
-      rootCause: prose(output.rootCause),
-      diff: output.diff === null ? null : blind(output.diff, "diff", options).text,
-      postmortem: prose(output.postmortem),
+      timeline: timeline.text,
+      diff: side.diff === null ? null : blind(side.diff, "diff", options).text,
     },
-    droppedLines,
+    droppedLines: timeline.droppedLines,
   };
 };

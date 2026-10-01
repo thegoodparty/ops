@@ -1,4 +1,3 @@
-import type { IncidentOutput } from "./blind";
 import type { CaseVerdict } from "./judge";
 import { addSpend, ZERO_SPEND, type Spend } from "./metrics";
 
@@ -9,7 +8,7 @@ export type Milestone = "root_cause" | "pr_opened" | "closed";
 
 /** Null is not applicable: the run's tier stops before a merge. */
 export interface Gates {
-  /** The incident reached CLOSED. */
+  /** The incident was closed. */
   closed: boolean | null;
   /** The hidden check passed on what was merged. */
   fixed: boolean | null;
@@ -39,12 +38,15 @@ export interface RunResult {
   /** How the run ended: `closed`, `root_cause`, `pr_opened`, `wall_clock`, `spend_cap`, or `error: …`. */
   end: string;
   gates: Gates;
-  /** The scenario's own gates (core/gates.ts), by id. */
-  scenarioGates: Record<string, boolean | null>;
   spend: Spend;
-  /** From the alert to the tier's milestone. Null when it never got there. */
-  wallClockSeconds: number | null;
-  output: IncidentOutput;
+  /** Seconds from the alert to each milestone. Null when the run never got there. */
+  wallClock: WallClock;
+}
+
+export interface WallClock {
+  prOpened: number | null;
+  merged: number | null;
+  closed: number | null;
 }
 
 /**
@@ -84,14 +86,21 @@ interface SideSummary {
   spend: Spend;
   meanUsd: number | null;
   meanTurns: number | null;
-  meanWall: number | null;
+  meanWall: Record<keyof WallClock, number | null>;
 }
+
+const WALL_NAMES: Record<keyof WallClock, string> = { prOpened: "to PR", merged: "to merge", closed: "to close" };
 
 const summarise = (runs: RunResult[]): SideSummary => {
   const gateCells = Object.fromEntries(
     (Object.keys(GATE_NAMES) as (keyof Gates)[]).map((g) => [g, ratio(runs.map((r) => r.gates[g]))]),
   ) as Record<keyof Gates, string>;
-  const walls = runs.map((r) => r.wallClockSeconds).filter((w): w is number => w !== null);
+  const meanWall = Object.fromEntries(
+    (Object.keys(WALL_NAMES) as (keyof WallClock)[]).map((k) => {
+      const reached = runs.map((r) => r.wallClock[k]).filter((w): w is number => w !== null);
+      return [k, reached.length ? mean(reached) : null];
+    }),
+  ) as Record<keyof WallClock, number | null>;
   return {
     runs: runs.length,
     gatesPassed: runs.filter((r) => gatesPass(r.gates)).length,
@@ -99,7 +108,7 @@ const summarise = (runs: RunResult[]): SideSummary => {
     spend: runs.reduce((sum, r) => addSpend(sum, r.spend), ZERO_SPEND),
     meanUsd: mean(runs.map((r) => r.spend.usd)),
     meanTurns: mean(runs.map((r) => r.spend.turns)),
-    meanWall: walls.length ? mean(walls) : null,
+    meanWall,
   };
 };
 
@@ -160,7 +169,7 @@ export const renderReport = (args: {
     const base = summarise(pick(scenario, "baseline"));
     const cand = summarise(pick(scenario, "candidate"));
     const cell = (s: SideSummary) =>
-      `${s.gatesPassed}/${s.runs} | ${s.meanTurns === null ? "–" : Math.round(s.meanTurns)} | ${s.meanUsd === null ? "–" : usd(s.meanUsd)} | ${minutes(s.meanWall)}`;
+      `${s.gatesPassed}/${s.runs} | ${s.meanTurns === null ? "–" : Math.round(s.meanTurns)} | ${s.meanUsd === null ? "–" : usd(s.meanUsd)} | ${minutes(s.meanWall.prOpened)} | ${minutes(s.meanWall.merged)} | ${minutes(s.meanWall.closed)}`;
     return `| ${label} | ${cell(base)} | ${cell(cand)} | ${verdictLine(verdictsFor(scenario))} |`;
   };
 
@@ -176,14 +185,6 @@ export const renderReport = (args: {
     }),
   );
 
-  const scenarioGateRows = scenarios.flatMap((scenario) => {
-    const ids = [...new Set(args.runs.filter((r) => r.scenario === scenario).flatMap((r) => Object.keys(r.scenarioGates ?? {})))];
-    return ids.map((id) => {
-      const cell = (side: Side) => ratio(pick(scenario, side).map((r) => r.scenarioGates?.[id]));
-      return `| ${scenario} | ${id} | ${cell("baseline")} | ${cell("candidate")} |`;
-    });
-  });
-
   const failures = args.runs.filter((r) => !gatesPass(r.gates));
   const excluded = args.verdicts.filter((v) => v.excluded !== null);
   const unpriced = [...new Set(args.runs.flatMap((r) => r.spend.unpriced))];
@@ -191,16 +192,16 @@ export const renderReport = (args: {
   const capped = args.runs.filter((r) => r.end === "spend_cap").length;
 
   return [
-    "## BugBoss eval (advisory)",
+    "## Incident eval (advisory)",
     "",
-    `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, then per run the mean model turns, estimated cost (priced from tokens) and time from alert to ${milestone}. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
+    `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed (closed, fix check, CI green at merge, no push to main), then per run the mean model turns, estimated cost (priced from tokens at the provider boundary) and minutes from the alert to the PR, the merge and the close. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge shown each side's full Slack thread, GitHub events and fix diff.`,
     "",
     args.tier === "stub"
       ? "No Bedrock spend: a scripted model answered every call. The costs below price its token counts as if the configured model had."
       : `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
     "",
-    "| Scenario | Baseline gates | turns | cost | wall | Candidate gates | turns | cost | wall | Quality W-L-T |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| Scenario | Baseline gates | turns | cost | to PR | to merge | to close | Candidate gates | turns | cost | to PR | to merge | to close | Quality W-L-T |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ...scenarios.map((s) => row(s, s)),
     row("**Total**", null),
     "",
@@ -212,14 +213,11 @@ export const renderReport = (args: {
     `| --- |${" --- |".repeat(Object.keys(GATE_NAMES).length)}`,
     ...gateTable,
     "",
-    ...(scenarioGateRows.length
-      ? ["| Scenario | Scenario gate | Baseline | Candidate |", "| --- | --- | --- | --- |", ...scenarioGateRows, ""]
-      : []),
     "| Scenario | Side | Input | Output | Cache read | Cache write | Turns | Cost (est.) |",
     "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ...spendTable,
     "",
-    `Judge: ${usd(args.judgeUsd)}. Cost covers the incident agents' sessions only; the Boss's own calls are not in a transcript.`,
+    `Judge: ${usd(args.judgeUsd)}.`,
     ...(unpriced.length ? [`Unpriced models (not in the price table): ${unpriced.join(", ")}.`] : []),
     ...(failures.length
       ? [

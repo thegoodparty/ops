@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { blind, blindOutput } from "./blind";
+import { renderTimeline } from "./activity";
+import { blind, blindSide } from "./blind";
 
-// Shaped like the closing report BugBoss uploads (report/render.ts): a summary
+// Shaped like a closing report a system might upload to the thread: a summary
 // line with tokens, turns and an estimated cost, and an "Agent run" section.
 const POSTMORTEM = [
   "# Incident 83 postmortem",
@@ -87,14 +88,61 @@ test("a diff loses no lines, only identifiers", () => {
   assert.match(text, /#<n>/);
 });
 
-test("blindOutput keeps an absent part absent and counts dropped lines", () => {
-  const { output, droppedLines } = blindOutput({
-    rootCause: "Pool exhaustion. 40 turns in.",
-    diff: null,
-    postmortem: null,
-  });
+test("branch names of either common shape are replaced; file paths are not", () => {
+  const { text } = blind(
+    "Opened fix/users-zip-read from bugboss/incident-83-pool; see packages/gp-api/src/users/users.schema.ts and a/src/pool.ts",
+    "prose",
+  );
+  assert.ok(!text.includes("fix/users-zip-read"));
+  assert.ok(!text.includes("bugboss/incident-83-pool"));
+  assert.match(text, /Opened <branch> from <branch>/);
+  assert.match(text, /packages\/gp-api\/src\/users\/users\.schema\.ts/);
+  assert.match(text, /a\/src\/pool\.ts/);
+});
+
+test("a rendered timeline keeps every message and loses only identifiers and run statements", () => {
+  const T0 = Date.UTC(2026, 0, 1, 12);
+  const timeline = renderTimeline(
+    {
+      alertAt: T0,
+      events: [
+        { at: T0, kind: "alert_fired", refire: false },
+        { at: T0 + 120_000, kind: "slack_post", ts: "1790871995.216999", threadTs: null, text: "Incident 83: P2024 on election-api\nInvestigating. Root cause suspected in the 25-connection pool." },
+        { at: T0 + 600_000, kind: "slack_human", ts: "1790872595.000001", threadTs: "1790871995.216999", text: "It works now, you can resolve it." },
+        { at: T0 + 660_000, kind: "slack_post", ts: "1790872655.000002", threadTs: "1790871995.216999", text: "Which environment was that on? Prod still shows the error at 2026-09-28T14:02:11Z." },
+        { at: T0 + 2_400_000, kind: "pr_opened", number: 2213, title: "Cap the officeholder read", files: ["packages/election-api/src/officeholders.ts"] },
+        { at: T0 + 3_000_000, kind: "merged", number: 2213 },
+        { at: T0 + 3_100_000, kind: "slack_file", ts: "1790875095.000003", name: "postmortem.md", text: POSTMORTEM },
+        { at: T0 + 3_200_000, kind: "closed" },
+      ],
+    },
+    (s) => s,
+  );
+  const { output, droppedLines } = blindSide({ timeline, diff: "index 3f9a2c1d..9b8e7f6a 100644\n+const limit = 50" });
+  const text = output.timeline;
+  for (const kept of [
+    "Investigating. Root cause suspected in the 25-connection pool.",
+    "It works now, you can resolve it.",
+    "Which environment was that on? Prod still shows the error at <time>.",
+    "Cap the officeholder read",
+    "packages/election-api/src/officeholders.ts",
+    "Add a row cap",
+    "Incident closed",
+  ]) {
+    assert.ok(text.includes(kept), `lost: ${kept}\n${text}`);
+  }
+  for (const gone of ["2213", "3f9a2c1d7e", "bugboss/incident-83-pool", "2026-09-28", "$22.52", "124 turns", "1790871995"]) {
+    assert.ok(!text.includes(gone), `still contains ${gone}`);
+  }
+  assert.match(text, /Pull request #<n> opened/);
+  assert.match(text, /\*\*\+02:00\*\*/);
+  assert.ok(droppedLines >= 8);
+  assert.match(output.diff ?? "", /index <sha>\.\.<sha>/);
+  assert.match(output.diff ?? "", /\+const limit = 50/);
+});
+
+test("blindSide keeps an absent diff absent", () => {
+  const { output, droppedLines } = blindSide({ timeline: "**+00:00** Alert fired\n", diff: null });
   assert.equal(output.diff, null);
-  assert.equal(output.postmortem, null);
-  assert.equal(output.rootCause, "");
-  assert.equal(droppedLines, 1);
+  assert.equal(droppedLines, 0);
 });

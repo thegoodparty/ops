@@ -1,9 +1,9 @@
 /**
  * The neutral shape every eval measure is written against: model requests
  * with their usage, the tool calls each one made and the results that came
- * back, and timestamps. Nothing here is specific to Pi. An adapter turns a
- * recorded source into a Trace: `adapters/pi-session.ts` reads Pi's
- * session.jsonl, and a model-proxy log would be another adapter.
+ * back, and timestamps. Nothing here is specific to any harness. An adapter
+ * turns a recorded source into a Trace: `adapters/proxy-log.ts` reads the
+ * model proxy's log, which sees every request whatever sent it.
  */
 
 export type Ttl = "5m" | "1h";

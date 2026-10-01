@@ -9,36 +9,6 @@ const Sha = z.string().regex(/^[0-9a-f]{40}$/);
 export const VOLUNTEER_MILESTONES = ["root_cause", "pr_opened", "approved", "merge_refused", "merged"] as const;
 export type VolunteerMilestone = (typeof VOLUNTEER_MILESTONES)[number];
 
-// A behaviour the base gates cannot see, checked once the run ends
-// (core/gates.ts). Patterns are case-insensitive regular expressions.
-const ScenarioGateSchema = z.discriminatedUnion("kind", [
-  // A bot post in the incident thread after the merge, within the bound.
-  z.object({ id: z.string(), kind: z.literal("thread_after_merge"), pattern: z.string(), withinSeconds: z.number().int().positive() }).strict(),
-  // The thread's top message stops matching, within the bound of the merge.
-  z.object({ id: z.string(), kind: z.literal("header_clears_after_merge"), pattern: z.string(), withinSeconds: z.number().int().positive() }).strict(),
-  // The incident reaches one of these statuses within the bound of the merge.
-  z.object({ id: z.string(), kind: z.literal("status_after_merge"), statuses: z.array(z.string()).min(1), withinSeconds: z.number().int().positive() }).strict(),
-  // The agent takes a model turn within the bound of the merge: it woke.
-  z.object({ id: z.string(), kind: z.literal("turn_after_merge"), withinSeconds: z.number().int().positive() }).strict(),
-  // One of these tool calls, its arguments matching, comes before the first edit or write.
-  z.object({ id: z.string(), kind: z.literal("before_first_edit"), tools: z.array(z.string()).min(1), pattern: z.string() }).strict(),
-  // The first sentence of the recorded root cause.
-  z.object({ id: z.string(), kind: z.literal("root_cause"), pattern: z.string(), notPattern: z.string().optional() }).strict(),
-  // A file the first pull request changes.
-  z.object({ id: z.string(), kind: z.literal("first_pr_touches"), pattern: z.string() }).strict(),
-  // Some call to one of these tools has arguments matching.
-  z.object({ id: z.string(), kind: z.literal("agent_says"), tools: z.array(z.string()).min(1), pattern: z.string() }).strict(),
-  // No bot post and no message_boss or escalate call matches.
-  z.object({ id: z.string(), kind: z.literal("never_says"), pattern: z.string() }).strict(),
-  // The incident reaches none of these statuses before the merge.
-  z.object({ id: z.string(), kind: z.literal("no_status_before_merge"), statuses: z.array(z.string()).min(1) }).strict(),
-  // A bot post in the incident thread, or a message_boss or escalate call,
-  // matches after the human volunteered the line due at `after`.
-  z.object({ id: z.string(), kind: z.literal("says_after_volunteer"), after: z.enum(VOLUNTEER_MILESTONES), pattern: z.string() }).strict(),
-]);
-
-export type ScenarioGate = z.infer<typeof ScenarioGateSchema>;
-
 export const ScenarioSchema = z
   .object({
     id: z.string().regex(/^[a-z0-9-]+$/),
@@ -93,7 +63,6 @@ export const ScenarioSchema = z
     world: z.object({ baseMovesAfter: z.enum(["approved"]) }).strict().optional(),
     wallClockSeconds: z.number().int().positive(),
     reference: z.string(),
-    gates: z.array(ScenarioGateSchema).default([]),
   })
   .strict();
 

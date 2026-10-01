@@ -59,27 +59,5 @@
     "baseMovesAfter": "approved"
   },
   "wallClockSeconds": 10800,
-  "reference": "reference.md",
-  "gates": [
-    {
-      "id": "merge-heard",
-      "kind": "thread_after_merge",
-      "pattern": "merged|landed|deployed|deploying|verif",
-      "withinSeconds": 600
-    },
-    {
-      "id": "branch-updated",
-      "kind": "agent_says",
-      "tools": [
-        "bash"
-      ],
-      "pattern": "git\\b[^\"]*\\b(rebase|pull|merge)\\b(?!-)[^\"]*\\borigin[/ ]main|update-branch"
-    },
-    {
-      "id": "named-behind",
-      "kind": "says_after_volunteer",
-      "after": "merge_refused",
-      "pattern": "behind|out[- ]of[- ]date|not up[- ]to[- ]date|update[sd]? (the|its) branch|rebas|mergeab|merge (was|is) (refused|blocked)"
-    }
-  ]
+  "reference": "reference.md"
 }

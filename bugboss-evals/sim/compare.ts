@@ -1,17 +1,21 @@
 import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
 
+import { ActivitySchema, renderTimeline } from "../core/activity";
+import type { SideOutput } from "../core/blind";
 import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
 import { renderReport, type RunResult, type Side } from "../core/report";
 import { loadScenario, SCENARIO_IDS } from "../core/scenario";
 import { asUser, createSpendPool, runOne, type Milestone, type Stack } from "./run";
 import { startFakeGitHub } from "./github/index";
 import type { CiResult } from "./github/store";
+import { bugboss } from "./runtimes/bugboss";
+import type { Runtime } from "./runtimes/types";
 import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from "./sandbox";
 import { startStubModel } from "./stub-model";
 
@@ -21,22 +25,22 @@ import { startStubModel } from "./stub-model";
  * `report`: one or more results.json into the table posted on the PR.
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
- *     --omni /tmp/omni --out /tmp/evals [--scenarios a,b] [--reps 3] [--stub] [--run-as user] \
- *     [--until root_cause|pr_opened|closed] [--spend-cap-usd 6.67]
+ *     --omni /tmp/omni --out /tmp/evals [--runtime bugboss] [--scenarios a,b] [--reps 3] [--stub] \
+ *     [--run-as user] [--until pr_opened|closed] [--spend-cap-usd 6.67]
  *
- * `--omni` is a clone holding every scenario's shas, which seeds the fake
- * GitHub's sandbox. `--stub` swaps Bedrock for the scripted model. GitHub is
+ * `--runtime` names the system under test (`sim/runtimes/`); both refs are
+ * built by it. `--omni` is a clone holding every scenario's shas, which seeds
+ * the fake GitHub's sandbox. `--stub` swaps Bedrock for the scripted model. GitHub is
  * always the fake, so the machine must map github.com and api.github.com to
  * 127.0.0.1 and let Node bind 443 (see the workflows); the harness trusts the
  * fake's CA itself, through sudo.
  *
  * `--spend-cap-usd` is this process's share of the comparison's cap: every
- * run stops, ending `spend_cap`, once their live sessions together price at
+ * run stops, ending `spend_cap`, once their model proxies together price at
  * 90% of it.
  *   npx tsx bugboss-evals/sim/compare.ts report --baseline main --candidate pr out1/results.json …
  */
 
-const OPS_ROOT = resolve(__dirname, "..", "..");
 const STACK_DIR = join(__dirname, "stack");
 const SETUP_OMNI = join(__dirname, "..", "scenarios", "_lib", "setup-omni.sh");
 
@@ -48,21 +52,8 @@ const flag = (argv: string[], name: string): string | undefined => {
   return i === -1 ? undefined : argv[i + 1];
 };
 
-/** BugBoss from its own commit, built as production builds it. */
-const buildRef = (ref: string, out: string): { dir: string; sha: string } => {
-  const sha = execFileSync("git", ["-C", OPS_ROOT, "rev-parse", `${ref}^{commit}`], { encoding: "utf8" }).trim();
-  const dir = join(out, "build", sha.slice(0, 12));
-  if (!existsSync(join(dir, "dist", "bugboss", "index.js"))) {
-    if (!existsSync(dir)) execFileSync("git", ["-C", OPS_ROOT, "worktree", "add", "--detach", dir, sha], { stdio: "inherit" });
-    execFileSync("npm", ["ci", "--no-audit", "--no-fund"], { cwd: dir, stdio: "inherit" });
-    execFileSync("npx", ["tsc", "-p", "."], { cwd: dir, stdio: "inherit" });
-    copyFileSync(join(dir, "bugboss", "db", "schema.sql"), join(dir, "dist", "bugboss", "db", "schema.sql"));
-  }
-  return { dir, sha };
-};
-
 /**
- * The container credential endpoint BugBoss and its agents resolve AWS
+ * The container credential endpoint the system under test resolves AWS
  * through. It serves this process's own credentials, which in CI are the
  * Bedrock-only OIDC role, so every other AWS call is denied. With --stub it
  * serves fake ones.
@@ -170,9 +161,14 @@ const prebuild = async (dir: string, npmCache: string, runAs: string | undefined
   return ok;
 };
 
+const RUNTIMES: Record<string, Runtime> = { bugboss };
+
 const run = async (argv: string[]): Promise<void> => {
   isolateFromKeychain();
   const out = resolve(flag(argv, "out") ?? "bugboss-evals-out");
+  const runtimeId = flag(argv, "runtime") ?? "bugboss";
+  const runtime = RUNTIMES[runtimeId];
+  if (!runtime) throw new Error(`--runtime must be one of ${Object.keys(RUNTIMES).join(", ")}`);
   const omni = resolve(flag(argv, "omni") ?? "");
   const baselineRef = flag(argv, "baseline") ?? "origin/main";
   const candidateRef = flag(argv, "candidate") ?? "HEAD";
@@ -230,8 +226,8 @@ const run = async (argv: string[]): Promise<void> => {
   );
 
   const builds = {
-    baseline: buildRef(baselineRef, out),
-    candidate: buildRef(candidateRef, out),
+    baseline: await runtime.build(baselineRef, out),
+    candidate: await runtime.build(candidateRef, out),
   };
   await warming;
   share(npmCache);
@@ -261,7 +257,8 @@ const run = async (argv: string[]): Promise<void> => {
             rep,
             side,
             ref: side === "baseline" ? baselineRef : candidateRef,
-            bugbossDir: builds[side].dir,
+            runtime,
+            build: builds[side],
             root: join(out, "runs", runId),
             stack,
             tokenFile,
@@ -337,6 +334,14 @@ const run = async (argv: string[]): Promise<void> => {
     });
   }
   const model = createBedrockJudgeModel({ region: "us-west-2" });
+  // What the judge sees of a run: the activity the harness recorded, rendered
+  // whole, and the fix diff. judgePair blinds both.
+  const sideOutput = (run: RunResult): SideOutput => {
+    const dir = join(out, "runs", run.runId);
+    const activity = ActivitySchema.parse(JSON.parse(readFileSync(join(dir, "activity.json"), "utf8")));
+    const diff = existsSync(join(dir, "diff.patch")) ? readFileSync(join(dir, "diff.patch"), "utf8") : "";
+    return { timeline: renderTimeline(activity, (s) => s), diff: diff.trim() === "" ? null : diff };
+  };
   const verdicts: CaseVerdict[] = [];
   for (const scenarioId of scenarios) {
     const { scenario, dir } = loadScenario(scenarioId);
@@ -352,15 +357,19 @@ const run = async (argv: string[]): Promise<void> => {
         await judgePair({
           pairId: `${scenarioId}/${rep}`,
           context,
-          baseline: baseline.output,
-          candidate: candidate.output,
+          baseline: sideOutput(baseline),
+          candidate: sideOutput(candidate),
           model,
-          blinding: { identifying: [baselineRef, candidateRef, builds.baseline.sha, builds.candidate.sha, baseline.runId, candidate.runId] },
+          blinding: {
+            identifying: [baselineRef, candidateRef, builds.baseline.sha, builds.candidate.sha, baseline.runId, candidate.runId].filter(
+              (s): s is string => typeof s === "string",
+            ),
+          },
         }),
       );
     }
   }
-  writeFileSync(join(out, "results.json"), JSON.stringify({ baselineRef, candidateRef, spendCapUsd: capUsd, runs, verdicts }, null, 2));
+  writeFileSync(join(out, "results.json"), JSON.stringify({ runtime: runtime.id, baselineRef, candidateRef, spendCapUsd: capUsd, runs, verdicts }, null, 2));
   log("results_written", { path: join(out, "results.json") });
 };
 

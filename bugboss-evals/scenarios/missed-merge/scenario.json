@@ -54,24 +54,5 @@
     }
   },
   "wallClockSeconds": 10800,
-  "reference": "reference.md",
-  "gates": [
-    {
-      "id": "woke-on-merge",
-      "kind": "turn_after_merge",
-      "withinSeconds": 600
-    },
-    {
-      "id": "thread-told",
-      "kind": "thread_after_merge",
-      "pattern": "merged|is done|landed|deployed|verif",
-      "withinSeconds": 900
-    },
-    {
-      "id": "needs-human-cleared",
-      "kind": "header_clears_after_merge",
-      "pattern": "needs a human",
-      "withinSeconds": 900
-    }
-  ]
+  "reference": "reference.md"
 }

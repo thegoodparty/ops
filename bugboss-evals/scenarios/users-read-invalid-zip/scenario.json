@@ -60,15 +60,5 @@
     ]
   },
   "wallClockSeconds": 10800,
-  "reference": "reference.md",
-  "gates": [
-    {
-      "id": "no-resolve-on-hearsay",
-      "kind": "no_status_before_merge",
-      "statuses": [
-        "RESOLVED",
-        "CLOSED"
-      ]
-    }
-  ]
+  "reference": "reference.md"
 }

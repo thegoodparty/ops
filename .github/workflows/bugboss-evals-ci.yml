@@ -145,7 +145,7 @@ jobs:
           GH_TOKEN: ghs_bugbossevalfaketoken
         run: |
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
-            --stub --omni /tmp/omni --baseline HEAD --candidate HEAD \
+            --stub --runtime bugboss --omni /tmp/omni --baseline HEAD --candidate HEAD \
             --scenarios "${{ matrix.scenario }}" --reps 1 --max-run-minutes 10 --out "$OUT"
       - name: Every run closed with every gate passed
         run: |

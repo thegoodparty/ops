@@ -21,10 +21,8 @@ const run = (scenario: string, rep: number, side: Side, over: Partial<RunResult>
   until: "closed",
   end: "closed",
   gates: { closed: true, fixed: true, mergedGreen: true, noPushToMain: true },
-  scenarioGates: {},
   spend: { ...ZERO_SPEND, usd: side === "baseline" ? 10 : 8, turns: 40, unpriced: [] },
-  wallClockSeconds: 3600,
-  output: { rootCause: "x", diff: "y", postmortem: "z" },
+  wallClock: { prOpened: 1200, merged: 2400, closed: 3600 },
   ...over,
 });
 
@@ -46,9 +44,9 @@ test("the report has a row per scenario and a total, and names the runs that fai
     candidateRef: "pr",
     runs: [
       run("a", 1, "baseline"),
-      run("a", 1, "candidate", { end: "wall_clock", wallClockSeconds: null, gates: { closed: false, fixed: null, mergedGreen: true, noPushToMain: true } }),
-      run("b", 1, "baseline", { scenarioGates: { "merge-noticed": false } }),
-      run("b", 1, "candidate", { scenarioGates: { "merge-noticed": true } }),
+      run("a", 1, "candidate", { end: "wall_clock", wallClock: { prOpened: 1200, merged: null, closed: null }, gates: { closed: false, fixed: null, mergedGreen: true, noPushToMain: true } }),
+      run("b", 1, "baseline"),
+      run("b", 1, "candidate"),
     ],
     verdicts: [verdict("a/1", "baseline"), verdict("b/1", "candidate")],
     judgeUsd: 1,
@@ -57,12 +55,13 @@ test("the report has a row per scenario and a total, and names the runs that fai
   });
   assert.match(text, /Tier: \*\*full\*\*, each run stopping at close/);
   assert.match(text, /Estimated spend: \$37\.00 of the \$200\.00 cap\./);
-  assert.match(text, /\| a \| 1\/1 \| 40 \| \$10\.00 \| 60m \| 0\/1 \| 40 \| \$8\.00 \| – \| 0-1-0 \|/);
-  assert.match(text, /\| \*\*Total\*\* \| 2\/2 \| 40 \| \$10\.00 \| 60m \| 1\/2 \| 40 \| \$8\.00 \| 60m \| 1-1-0 \|/);
+  assert.match(text, /## Incident eval/);
+  assert.match(text, /\| a \| 1\/1 \| 40 \| \$10\.00 \| 20m \| 40m \| 60m \| 0\/1 \| 40 \| \$8\.00 \| 20m \| – \| – \| 0-1-0 \|/);
+  assert.match(text, /\| \*\*Total\*\* \| 2\/2 \| 40 \| \$10\.00 \| 20m \| 40m \| 60m \| 1\/2 \| 40 \| \$8\.00 \| 20m \| 40m \| 60m \| 1-1-0 \|/);
   assert.match(text, /\| a \| candidate \| 0 \| 0 \| 0 \| 0 \| 40 \| \$8\.00 \|/);
   assert.match(text, /\| \*\*Total\*\* \| baseline \| 0 \| 0 \| 0 \| 0 \| 80 \| \$20\.00 \|/);
   assert.match(text, /- a rep 1 candidate: ended wall_clock; closed$/m);
-  assert.match(text, /\| b \| merge-noticed \| 0\/1 \| 1\/1 \|/);
+  assert.doesNotMatch(text, /Scenario gate|BugBoss|the Boss/);
   assert.match(text, /Quality: no material change \(mean \+0\.00 on -2\.\.\+2\)/);
 });
 
@@ -72,25 +71,21 @@ test("a fast-tier run's merge gates read n/a, and runs stopped at the cap are co
       until: "pr_opened",
       end: "pr_opened",
       gates: { closed: null, fixed: null, mergedGreen: null, noPushToMain: true },
-      scenarioGates: { "thread-told": null, cause: true },
-      wallClockSeconds: 600,
+      wallClock: { prOpened: 600, merged: null, closed: null },
       ...over,
     });
   const text = renderReport({
     baselineRef: "main",
     candidateRef: "pr",
-    runs: [fast("baseline"), fast("candidate", { end: "spend_cap", wallClockSeconds: null })],
+    runs: [fast("baseline"), fast("candidate", { end: "spend_cap", wallClock: { prOpened: null, merged: null, closed: null } })],
     verdicts: [],
     judgeUsd: 0,
     tier: "fast",
     capUsd: 40,
   });
   assert.match(text, /each run stopping at PR opened/);
-  assert.match(text, /time from alert to PR opened/);
-  assert.match(text, /\| a \| 1\/1 \| 40 \| \$10\.00 \| 10m \| 1\/1 \| 40 \| \$8\.00 \| – \|/);
+  assert.match(text, /\| a \| 1\/1 \| 40 \| \$10\.00 \| 10m \| – \| – \| 1\/1 \| 40 \| \$8\.00 \| – \| – \| – \|/);
   assert.match(text, /\| baseline \| n\/a \| n\/a \| n\/a \| 1\/1 \|/);
-  assert.match(text, /\| a \| thread-told \| n\/a \| n\/a \|/);
-  assert.match(text, /\| a \| cause \| 1\/1 \| 1\/1 \|/);
   assert.match(text, /of the \$40\.00 cap\. 1 runs stopped at the cap\./);
 });
 

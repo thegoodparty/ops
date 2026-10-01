@@ -142,7 +142,7 @@ jobs:
               ;;
           esac
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
-            --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
+            --runtime bugboss --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
             --scenarios "${{ matrix.scenario }}" "${mode[@]}" \
             --omni /tmp/omni --out "$OUT" --run-as bugboss-eval
       - if: always()

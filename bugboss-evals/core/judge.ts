@@ -7,21 +7,27 @@
  * swapped, a verdict that reverses under the swap is unstable and excluded,
  * and two passes that agree on direction keep the weaker margin.
  *
- * Changed from it: both outputs are blinded first (`blind.ts`), and nothing is
+ * Changed from it: both sides are blinded first (`blind.ts`), and nothing is
  * truncated. Universal judge cut each side at 60,000 characters; here a pair
  * that does not fit the judge's context is refused and reported, because a
- * post-mortem missing its second half is a different post-mortem.
+ * thread missing its second half is a different thread.
  *
- * The model is reached through `JudgeModel`, not through bugboss/: the judge
- * has to keep working when BugBoss's own request path is the thing a variant
- * changed.
+ * What the judge sees of a side is its external activity: the rendered
+ * timeline (`activity.ts`) of every Slack message, GitHub event, the deploy
+ * check and the close, plus the fix diff. Never a transcript, a tool call or
+ * an incident row, so two systems built nothing alike are compared on the
+ * same terms.
+ *
+ * The model is reached through `JudgeModel`, not through the system under
+ * test: the judge has to keep working when that system's own request path is
+ * the thing a variant changed.
  */
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { blindOutput, type BlindOptions, type IncidentOutput } from "./blind";
+import { blindSide, type BlindOptions, type SideOutput } from "./blind";
 import { priceTokens, ratesFor } from "./price";
 
 export const RUBRIC_DIR = join(__dirname, "rubrics");
@@ -160,23 +166,25 @@ export const createBedrockJudgeModel = (args: {
 export const loadRubric = (name = "incident", dir = RUBRIC_DIR): string =>
   readFileSync(join(dir, `${name}.md`), "utf8");
 
-/** The context both outputs were produced from. Identical for both sides. */
+/** The context both sides worked from. Identical for both. */
 export interface JudgeContext {
   /** The Grafana webhook body that opened the incident. */
   alert: unknown;
   /**
-   * The vetted root cause, `reference.md`. Never the real fix diff. Null when
-   * no human-vetted reference exists for the incident; the judge is told so
-   * and the verdict records it.
+   * The vetted account of the incident, `reference.md`: the mechanism, what
+   * the mitigation and the systemic fix should each have been, and which of
+   * the human's lines were wrong. Never the real fix diff. Null when no
+   * human-vetted reference exists; the judge is told so and the verdict
+   * records it.
    */
   reference: string | null;
 }
 
 export const NO_REFERENCE =
-  "No vetted reference exists for this incident. Compare the two outputs against each other and against the evidence each one cites.";
+  "No vetted reference exists for this incident. Compare the two sides against each other and against the evidence each one cites.";
 
 /**
- * A fence longer than any backtick run in the text, so a diff or post-mortem
+ * A fence longer than any backtick run in the text, so a diff or a message
  * that contains a fenced block cannot close ours early.
  */
 const fenced = (text: string, lang = ""): string => {
@@ -190,21 +198,16 @@ const part = (title: string, value: string | null, lang = ""): string[] =>
     ? [`### ${title}`, "", "(none produced)", ""]
     : [`### ${title}`, "", fenced(value, lang), ""];
 
-const renderOutput = (label: string, output: IncidentOutput): string[] => [
+const renderSide = (label: string, side: SideOutput): string[] => [
   `## ${label}`,
   "",
-  ...part("Root cause", output.rootCause),
-  ...part("Fix diff", output.diff, "diff"),
-  ...part("Post-mortem", output.postmortem),
+  ...part("What happened, as the on-call human and GitHub saw it", side.timeline),
+  ...part("Fix diff", side.diff, "diff"),
 ];
 
-export const buildPrompt = (
-  context: JudgeContext,
-  first: IncidentOutput,
-  second: IncidentOutput,
-): string =>
+export const buildPrompt = (context: JudgeContext, first: SideOutput, second: SideOutput): string =>
   [
-    "Two variants of the same incident agent handled the same incident. Compare how each handled it using the rubric and record your verdict.",
+    "Two systems handled the same production incident. For each you see everything the on-call human and GitHub saw, in order, and the code change. Compare how each handled it using the rubric and record your verdict.",
     "",
     "## The alert that opened the incident",
     "",
@@ -214,11 +217,11 @@ export const buildPrompt = (
     ),
     "",
     ...(context.reference === null
-      ? ["## Reference root cause", "", NO_REFERENCE]
-      : ["## Reference root cause, vetted by a human", "", fenced(context.reference)]),
+      ? ["## Reference", "", NO_REFERENCE]
+      : ["## Reference, vetted by a human", "", fenced(context.reference)]),
     "",
-    ...renderOutput("Output 1", first),
-    ...renderOutput("Output 2", second),
+    ...renderSide("Output 1", first),
+    ...renderSide("Output 2", second),
     "Call record_verdict exactly once.",
   ].join("\n");
 
@@ -244,7 +247,7 @@ export interface CaseVerdict {
    */
   excluded: string | null;
   judgeCostUsd: number;
-  /** Prose lines blinding removed, both sides and both passes counted once. */
+  /** Timeline lines blinding removed, both sides counted once. */
   blindedLines: number;
 }
 
@@ -255,8 +258,8 @@ const judgeOnce = async (args: {
   modelId: string;
   rubric: string;
   context: JudgeContext;
-  first: IncidentOutput;
-  second: IncidentOutput;
+  first: SideOutput;
+  second: SideOutput;
   firstRole: VariantRole;
   secondRole: VariantRole;
 }): Promise<SingleJudgement> => {
@@ -343,8 +346,8 @@ export const reconcile = (
 export const judgePair = async (args: {
   pairId: string;
   context: JudgeContext;
-  baseline: IncidentOutput;
-  candidate: IncidentOutput;
+  baseline: SideOutput;
+  candidate: SideOutput;
   model: JudgeModel;
   /** For pricing the judge's own calls through the eval's price table. */
   modelId?: string;
@@ -353,8 +356,8 @@ export const judgePair = async (args: {
 }): Promise<CaseVerdict> => {
   const modelId = args.modelId ?? DEFAULT_JUDGE_MODEL;
   const rubric = args.rubric ?? loadRubric();
-  const baseline = blindOutput(args.baseline, args.blinding);
-  const candidate = blindOutput(args.candidate, args.blinding);
+  const baseline = blindSide(args.baseline, args.blinding);
+  const candidate = blindSide(args.candidate, args.blinding);
   const blindedLines = baseline.droppedLines + candidate.droppedLines;
   const orders = [baselineFirst(args.pairId), !baselineFirst(args.pairId)];
 

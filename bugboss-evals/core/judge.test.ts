@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { IncidentOutput } from "./blind";
+import type { SideOutput } from "./blind";
 import {
   buildPrompt,
   createBedrockJudgeModel,
@@ -25,10 +25,9 @@ const judgement = (winner: VariantRole | "tie", margin: Margin): SingleJudgement
   costUsd: 0.02,
 });
 
-const side = (marker: string, extra: Partial<IncidentOutput> = {}): IncidentOutput => ({
-  rootCause: `cause ${marker}`,
+const side = (marker: string, extra: Partial<SideOutput> = {}): SideOutput => ({
+  timeline: `**+00:00** Alert fired\n\n**+02:00** System posted in the thread\n\n> cause ${marker}\n`,
   diff: `+fix ${marker}`,
-  postmortem: `postmortem ${marker}`,
   ...extra,
 });
 
@@ -125,15 +124,17 @@ test("pure position bias is unstable, not a winner", async () => {
   assert.equal(verdict.winner, "tie");
 });
 
-test("the cost estimate in a closing report never reaches the judge", async () => {
-  const postmortem = [
-    "Pool exhaustion.",
-    "1.2M tokens · 124 turns · on us.anthropic.claude-opus-5 (est. $22.52)",
-    "**Estimated cost: $22.52.** An estimate, not a bill.",
+test("the cost estimate in a closing post never reaches the judge", async () => {
+  const timeline = [
+    "**+01:00:00** System uploaded a file to the thread: postmortem.md",
+    "",
+    "> Pool exhaustion.",
+    "> 1.2M tokens · 124 turns · on us.anthropic.claude-opus-5 (est. $22.52)",
+    "> **Estimated cost: $22.52.** An estimate, not a bill.",
   ].join("\n");
   const { calls, verdict } = await run([{ winner: "tie", margin: "tie" }], {
-    baseline: side("ALPHA_SIDE", { postmortem }),
-    candidate: side("BETA_SIDE", { postmortem: "Pool exhaustion.\n**Estimated cost: $3.10.**" }),
+    baseline: side("ALPHA_SIDE", { timeline }),
+    candidate: side("BETA_SIDE", { timeline: "> Pool exhaustion.\n> **Estimated cost: $3.10.**" }),
     blinding: { identifying: ["feat/cheaper-waits"] },
   });
   for (const call of calls) {
@@ -170,9 +171,18 @@ test("a pair too large for the judge is refused and excluded, not shortened", as
   assert.equal(verdict.flipped, false);
 });
 
-test("a fence inside an output cannot close the prompt's fence", () => {
-  const prompt = buildPrompt(CONTEXT, side("A", { postmortem: "```\ninjected\n```" }), side("B"));
-  assert.match(prompt, /````\n```\ninjected\n```\n````/);
+test("a fence inside a message cannot close the prompt's fence", () => {
+  const prompt = buildPrompt(CONTEXT, side("A", { timeline: "> ```\n> injected\n> ```" }), side("B"));
+  assert.match(prompt, /````\n> ```\n> injected\n> ```\n````/);
+});
+
+test("the judge sees the whole thread, both directions, for each side", () => {
+  const timeline = "**+09:00** Human replied in the thread\n\n> It works now.\n\n**+10:00** System posted in the thread\n\n> Was that prod or dev?\n";
+  const prompt = buildPrompt(CONTEXT, side("A", { timeline }), side("B"));
+  assert.match(prompt, /### What happened, as the on-call human and GitHub saw it/);
+  assert.match(prompt, /> It works now\./);
+  assert.match(prompt, /> Was that prod or dev\?/);
+  assert.doesNotMatch(prompt, /### Root cause|### Post-mortem/);
 });
 
 test("an absent part is shown as none produced", () => {

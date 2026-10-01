@@ -1,8 +1,15 @@
 # bugboss-evals
 
-Tells whether a BugBoss change, a model change included, made it better or
-worse. Comment on an open ops PR and main's BugBoss and the PR's run every
-scenario, and one advisory table comes back on the PR. Nothing gates on it.
+Tells whether a change to the incident system, a model change included, made
+it better or worse. Comment on an open ops PR and main's system and the PR's
+run every scenario, and one advisory table comes back on the PR. Nothing
+gates on it.
+
+The system under test is a black box. The harness reaches it only through
+the alert webhook, Slack, GitHub, the telemetry stack and the model provider,
+and it scores only what came back out through those same surfaces. So two
+systems built nothing alike, one agent or a swarm or a state machine, are
+measured on the same terms.
 
 | Comment | Runs | Each run stops at | Spend cap |
 | --- | --- | --- | --- |
@@ -63,6 +70,13 @@ to end. The harness (`sim/run.ts`) is everything outside it:
 - **AWS.** BugBoss resolves credentials from a local container-credential
   endpoint serving the workflow's Bedrock-only role, so every other call is
   denied. S3 (its snapshot and session files) is `sim/s3.ts`, on disk.
+- **The model** is reached through a counting proxy (`sim/model-proxy/`).
+  The system is pointed at it with `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` for
+  Bedrock or `ANTHROPIC_BASE_URL` for the Anthropic API. The proxy forwards
+  every request, logs its model, usage and assembled response, and keeps the
+  running spend that the cap reads. It is the only place turns and cost come
+  from: nothing reads a transcript, a session file or the system's own
+  accounting.
 - **Postgres** for omni's tests is one container per run, as
   `OMNI_TEST_POSTGRES_URL`.
 - **npm and omni's dependencies.** Once per base, before the runs start, an
@@ -72,26 +86,72 @@ to end. The harness (`sim/run.ts`) is everything outside it:
   `node_modules` when the lockfile is unchanged. The workflow caches both by
   base sha.
 
-The BugBoss options this needs are all unset in production:
+## What a run leaves behind
+
+Everything the world saw of the run, in order, as `activity.json` in the
+run's output directory (`core/activity.ts`): each alert delivery, every Slack
+message in both directions with its edits, every file uploaded to the thread,
+each pull request opened and updated, CI results, reviews, a refused merge, the
+merge, whether the hidden check passed on what deployed, and the close. Every
+message is kept whole; nothing is cut by length. Alongside it, `diff.patch`
+from the scenario's base to the merge commit (or the first pull request's
+head when nothing merged) and the proxy's request log.
+
+That is the whole record. There is no transcript, tool call or incident row
+in it, because the judge must not be able to tell how a side was built.
+
+## What the table says
+
+Per scenario and in total, per side:
+
+- **Gates**, from the fake GitHub and the close: closed, the hidden check
+  passed on what merged, CI green at every merge, nothing pushed to main. On
+  the fast tier the merge gates read n/a.
+- **Turns and estimated cost**, from the proxy log priced by `core/price.ts`.
+- **Minutes from the alert** to the pull request, the merge and the close.
+
+Then quality: the candidate's wins-losses-ties from `core/judge.ts`, blind
+(`core/blind.ts`), order-swapped, judged twice, with a sign test. For each
+pair the judge sees the alert, the scenario's `reference.md`, and for each
+side the rendered timeline and the fix diff. It answers, per side: was every
+transition communicated in Slack and promptly; was the root cause right; did
+the mitigation and the systemic fix resolve it; how did it handle the human,
+including the lines `reference.md` marks as wrong; then which side handled
+the incident better (`core/rubrics/incident.md`). Blinding replaces refs,
+shas, pull request numbers, branches and timestamps inside messages, and drops
+any line that states the run's own cost, tokens, turns or duration. Tokens by
+class, per scenario and side, are in the details.
+
+## Runtimes
+
+The system under test sits behind `sim/runtimes/types.ts`: `build(ref)` makes
+it from a git ref, `launch({ build, env, ports, workRoot, world })` starts it
+against this run's fakes and returns where it listens for its health check,
+the Grafana webhook and Slack events, plus `closed()`. `world` carries the
+values of the run's world (the Slack sim, the Grafana org and its token, the
+sandbox and its token file and CA, the credential endpoint, S3, Postgres, a
+state directory), and each runtime maps them onto its own configuration.
+`env` carries only PATH, HOME, LANG and the model proxy's endpoint. run.ts
+knows nothing else about what it launched; `--runtime` on `compare.ts` picks
+one.
+
+`bugboss` (`sim/runtimes/bugboss.ts`) is the only implementation. Its
+`closed()` reads BugBoss's SQLite incident row, and that is the one read of
+the system's insides left in the harness; the incident service, once it
+exists, is what every runtime will have to tell about a close, and the read
+goes with it. Everything else about a run comes from Slack, GitHub, the hidden
+check and the proxy.
+
+The BugBoss options the adapter sets are all unset in production:
 `BUGBOSS_GITHUB_TOKEN_FILE`, `SLACK_API_URL`, `BUGBOSS_OMNI_REPO`,
 `BUGBOSS_WORK_ROOT`, `AWS_ENDPOINT_URL_*` and `BUGBOSS_REVIEW_SETTLE_SECONDS`
 (5 here, so an approval does not hold a review wait for five minutes).
 
-## What the table says
-
-Per scenario and in total, per side: gates passed (closed, fix check passes
-after merge, CI green at every merge, nothing pushed to main), mean model
-turns, mean estimated cost (priced from tokens; BugBoss stores tokens, never
-dollars) and mean time from alert to the tier's milestone. On the fast tier, gates about a merge
-read n/a. The table also gives the tier and the spend against the cap. A scenario can add its own gates (`gates` in
-`scenario.json`, `core/gates.ts`): checks over the thread, the incident's
-statuses and root cause, the first PR's files and the agent's tool calls,
-such as "the thread heard the merge within fifteen minutes". They get their
-own table. Quality is the candidate's wins-losses-ties
-from `core/judge.ts`: blind (`core/blind.ts`), order-swapped, over each pair's
-root cause, fix diff and post-mortem, with a sign test. Tokens by class, per
-scenario and side, are in the details. Cost is priced from `core/price.ts` over the agents' session
-transcripts; the Boss's own calls are not in a transcript and are not counted.
+The Slack sim speaks HTTP mode: it delivers events as signed Events API
+callbacks to `slackEventsUrl`. A runtime that only takes Slack over Socket
+Mode needs a Socket Mode face on `sim/slack.ts`, which is not built. On the
+stub tier the system talks to the scripted model directly and no proxy sits
+in front of it, so stub runs report zero spend.
 
 ## Trust
 
@@ -109,6 +169,11 @@ also runs `bugboss-evals-ci.yml`, which holds no secrets: it proves each
 changed scenario's hidden check against omni (public), and runs every
 scenario's whole lifecycle against the stub, both sides the PR's BugBoss,
 asserting each run closed with every gate passed.
+
+`reference.md` is what the judge compares against. Beyond the vetted
+mechanism it should say what the immediate mitigation and the systemic fix
+should each have been, and name which of `human.volunteer` and `human.facts`
+lines were wrong, so the judge can score how the side answered them.
 
 `--until root_cause|pr_opened|closed` stops each run at a milestone; `closed`,
 the default, is the whole lifecycle.
