@@ -9,8 +9,8 @@ import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 // own. Assert on the composed document, which is the one that reaches IAM.
 const composed = withAdminReserved(workbenchAccess);
 
-const actionsOf = (s: (typeof composed.Statement)[number]) =>
-  Array.isArray(s.Action) ? s.Action : [s.Action];
+const actionsOf = (s: (typeof composed.Statement)[number]): string[] =>
+  Array.isArray(s.Action) ? s.Action : s.Action ? [s.Action] : [];
 
 describe("WorkbenchAccess", () => {
   // The set is the entire session for an engineer's sandbox, and the account is
