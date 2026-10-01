@@ -1337,6 +1337,12 @@ export const createBugBoss = async (
       [row.id],
     )?.title ?? signal.title;
     const told = await db.withWrite((w: Database.Database) => {
+      const live = w
+        .prepare(
+          "SELECT 1 FROM incident WHERE id = ? AND status IN ('INVESTIGATING', 'FIXING')",
+        )
+        .get(incidentId);
+      if (!live) return false;
       const claimed = w
         .prepare(
           `UPDATE signal_firing SET announcedAt = ?
@@ -1344,12 +1350,6 @@ export const createBugBoss = async (
         )
         .run(now(), row.id, startedAt).changes === 1;
       if (!claimed) return false;
-      const live = w
-        .prepare(
-          "SELECT 1 FROM incident WHERE id = ? AND status IN ('INVESTIGATING', 'FIXING')",
-        )
-        .get(incidentId);
-      if (!live) return false;
       pushDirective(w, incidentId, {
         type: "signal_refired",
         signalId: row.id,
@@ -1645,6 +1645,29 @@ export const createBugBoss = async (
           }
           try {
             placed[i] = await placeRecorded(row.id, signal, adapter);
+            // A refire that arrived while this placement was running found no
+            // incident to tell, and Grafana has its 200. This is the last
+            // point anything knows to announce it.
+            const incidentId = placed[i].incidentId;
+            if (incidentId) {
+              const pending = db.query<{ startedAt: number }>(
+                "SELECT startedAt FROM signal_firing WHERE signalId = ? AND announcedAt IS NULL ORDER BY startedAt",
+                [row.id],
+              );
+              for (const firing of pending) {
+                await announceRefire(
+                  { ...row, incidentId },
+                  signal,
+                  firing.startedAt,
+                ).catch((err: unknown) =>
+                  alarm("refire_failed", {
+                    signalId: row.id,
+                    incidentId,
+                    error: String(err),
+                  }),
+                );
+              }
+            }
           } catch (err) {
             alarm("place_failed", {
               signalId: row.id,
