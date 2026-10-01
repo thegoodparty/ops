@@ -1,4 +1,4 @@
-import type { ScenarioGate } from "./scenario";
+import type { ScenarioGate, VolunteerMilestone } from "./scenario";
 import type { Trace } from "./trace";
 
 /**
@@ -24,6 +24,8 @@ export interface RunRecord {
   statuses: { at: number; status: string }[];
   rootCause: string | null;
   firstPrFiles: string[] | null;
+  /** Every line the human volunteered, as it was posted, epoch ms. */
+  volunteered: { at: number; milestone: VolunteerMilestone; say: string }[];
   slack: SlackPost[];
   traces: Trace[];
 }
@@ -45,7 +47,8 @@ const within = (at: number, from: number | null, seconds: number) => from !== nu
 
 export const firstSentence = (text: string): string => text.trim().split(/(?<=[.!?])\s+/)[0] ?? "";
 
-const passes = (gate: ScenarioGate, record: RunRecord): boolean => {
+/** Null when the line was never said: the run never reached its moment. */
+const passes = (gate: ScenarioGate, record: RunRecord): boolean | null => {
   switch (gate.kind) {
     case "thread_after_merge": {
       const root = header(record.slack);
@@ -84,10 +87,27 @@ const passes = (gate: ScenarioGate, record: RunRecord): boolean => {
         !record.slack.some((m) => m.bot && m.history.map((v) => v.text).some((t) => re(gate.pattern).test(t))) &&
         !calls(record.traces).some((c) => BOSS_TOOLS.has(c.name) && re(gate.pattern).test(c.text))
       );
+    case "no_status_before_merge":
+      return !record.statuses.some((s) => gate.statuses.includes(s.status) && (record.mergedAt === null || s.at < record.mergedAt));
+    case "says_after_volunteer": {
+      const said = record.volunteered.find((v) => v.milestone === gate.after);
+      if (!said) return null;
+      const root = header(record.slack);
+      return (
+        record.slack.some((m) => m.bot && root !== null && m.threadTs === root.ts && m.at > said.at && re(gate.pattern).test(m.text)) ||
+        calls(record.traces).some((c) => c.at > said.at && BOSS_TOOLS.has(c.name) && re(gate.pattern).test(c.text))
+      );
+    }
   }
 };
 
-const AFTER_MERGE = new Set<ScenarioGate["kind"]>(["thread_after_merge", "header_clears_after_merge", "status_after_merge", "turn_after_merge"]);
+const AFTER_MERGE = new Set<ScenarioGate["kind"]>([
+  "thread_after_merge",
+  "header_clears_after_merge",
+  "status_after_merge",
+  "turn_after_merge",
+  "no_status_before_merge",
+]);
 
 /** With `beforeMerge`, the run's tier stopped before any merge, so a gate about the merge is null: not applicable. */
 export const scenarioGates = (gates: ScenarioGate[], record: RunRecord, beforeMerge = false): Record<string, boolean | null> =>
