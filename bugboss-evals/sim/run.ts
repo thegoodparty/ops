@@ -30,9 +30,12 @@ import { createEmitter } from "./telemetry/run";
 /**
  * One run, black box: a BugBoss built from one ref, one scenario, its own
  * Grafana org, S3, Slack, Postgres and sandbox base. The harness plays the
- * on-call human and the reviewer, merges when CI is green, runs the hidden
- * check on what merged, and flips the telemetry healthy when it passes.
+ * on-call human and the reviewer, runs the sandbox's CI, merges when it is
+ * green, runs the hidden check on what merged, and flips the telemetry
+ * healthy when it passes.
  */
+
+const SETUP_OMNI = join(__dirname, "..", "scenarios", "_lib", "setup-omni.sh");
 
 export interface Stack {
   grafanaUrl: string;
@@ -54,18 +57,20 @@ export interface RunSpec {
   bugbossDir: string;
   root: string;
   stack: Stack;
+  /** The file BugBoss reads its GitHub token from. The fake takes any token. */
   tokenFile: string;
+  /**
+   * The fake github.com: the CA it serves with, the sandbox's bare repository
+   * on disk, and `onCi`, which hands the fake this run's CI for every commit
+   * on top of `baseSha`. It returns the unregister.
+   */
+  github: { caFile: string; repo: string; onCi: (baseSha: string, run: (sha: string) => Promise<boolean>) => () => void };
   /** A container credential endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI). */
   awsCredentialsUrl: string;
   /** Set only for the zero-spend proof. */
   stubModelUrl?: string;
-  /** Run BugBoss and the hidden check as this user, which holds no secrets. */
+  /** Run BugBoss, the sandbox's CI and the hidden check as this user, which holds no secrets. */
   runAs?: string;
-  /**
-   * No GitHub: the sandbox is a local bare repository holding the scenario's
-   * base, and the run ends at the root cause, since no PR can open.
-   */
-  offline?: { repo: string; baseSha: string };
   /** Where a run stops. `closed` is the whole lifecycle. */
   until?: Milestone;
   /** A shared npm cache, warmed once, every run's HOME points at. */
@@ -110,8 +115,8 @@ const freePort = (): Promise<number> =>
   });
 
 /**
- * With `runAs`, the command runs as a user that holds nothing: not the App
- * key, not the workflow's token, not the runner's sudo. umask 0 so the
+ * With `runAs`, the command runs as a user that holds nothing: not the
+ * workflow's token, not the AWS role, not the runner's sudo. umask 0 so the
  * harness, as the runner, can still read and write what it leaves behind.
  */
 export const asUser = (runAs: string | undefined, command: string, args: string[], env: Record<string, string>) =>
@@ -288,14 +293,41 @@ const exec = (command: string, args: string[], options: { env?: Record<string, s
     });
   });
 
-/** Merge means deploy: clone what merged and run the hidden check against it. */
+/** A checkout of `sha` from the sandbox's repository on disk, for the run-as user. */
+const checkout = async (spec: RunSpec, sha: string, dir: string): Promise<boolean> => {
+  if ((await exec("git", ["clone", "-q", "--no-checkout", spec.github.repo, dir])) !== 0) return false;
+  if ((await exec("git", ["-C", dir, "checkout", "-q", sha])) !== 0) return false;
+  await shareWith(spec.runAs, dir);
+  return true;
+};
+
+/**
+ * The sandbox's visible CI, which the fake runs for every new PR head: the
+ * scenario's `ci` commands in a checkout of the head, with omni's
+ * dependencies hardlinked from the prebuilt tree.
+ */
+const visibleCi = async (spec: RunSpec, commands: string[], sha: string, env: Record<string, string>): Promise<boolean> => {
+  const dir = join(spec.root, `ci-${sha.slice(0, 12)}-${Date.now().toString(36)}`);
+  const log = (step: string) => join(spec.root, `${dir.split("/").pop()}-${step}.log`);
+  if (!(await checkout(spec, sha, dir))) return false;
+  spec.log("ci_started", { sha });
+  const steps = [["setup", `bash ${SETUP_OMNI} .`], ...commands.map((command, i) => [String(i + 1), command])];
+  for (const [step, command] of steps) {
+    const { command: cmd, args, env: stepEnv } = asUser(spec.runAs, "bash", ["-c", `cd ${dir} && ${command}`], env);
+    const code = await exec(cmd, args, { env: stepEnv ?? env, timeoutMs: 1800_000, log: log(step) });
+    if (code !== 0) {
+      spec.log("ci_finished", { sha, passed: false, step: command, code });
+      return false;
+    }
+  }
+  spec.log("ci_finished", { sha, passed: true });
+  return true;
+};
+
+/** Merge means deploy: check out what merged and run the hidden check against it. */
 const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: string; command: string; timeoutSeconds: number }, sha: string, env: Record<string, string>): Promise<boolean> => {
   const dir = join(spec.root, `deploy-${sha.slice(0, 12)}`);
-  const token = readFileSync(spec.tokenFile, "utf8").trim();
-  const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
-  if ((await exec("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--filter=blob:none", "--no-checkout", SANDBOX_URL, dir])) !== 0) return false;
-  if ((await exec("git", ["-C", dir, "-c", "credential.helper=", "-c", auth, "checkout", "-q", sha])) !== 0) return false;
-  await shareWith(spec.runAs, dir);
+  if (!(await checkout(spec, sha, dir))) return false;
   for (const [step, timeout] of [
     [check.setup, 1800],
     [check.command, check.timeoutSeconds],
@@ -323,12 +355,10 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   for (const d of [home, work, s3Root]) mkdirSync(d, { recursive: true });
   writeHome(home, spec.runId, spec.npmCache);
 
-  const offline = spec.offline;
-  const sandbox: Sandbox | null = offline ? null : createSandbox(() => readFileSync(spec.tokenFile, "utf8").trim());
-  const mainAtStart = sandbox ? await refSha(sandbox, "main") : null;
-  const baseSha = sandbox ? await createRunBase(sandbox, scenario.id, spec.runId) : offline!.baseSha;
-  if (offline) spawnSync("git", ["-C", offline.repo, "update-ref", `refs/heads/${runBase(spec.runId)}`, baseSha]);
-  const until: Milestone = offline ? "root_cause" : (spec.until ?? "closed");
+  const sandbox = createSandbox();
+  const mainAtStart = await refSha(sandbox, "main");
+  const baseSha = await createRunBase(sandbox, scenario.id, spec.runId);
+  const until: Milestone = spec.until ?? "closed";
   const grafanaToken = await grafanaOrg(spec.stack, spec.runId);
 
   const generator = await loadGenerator(scenarioDir, scenario.telemetry.generator);
@@ -369,9 +399,11 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     BUGBOSS_DB_PATH: dbPath,
     BUGBOSS_SLACK_CHANNEL_ID: CHANNEL,
     BUGBOSS_TICK_SECONDS: "10",
-    BUGBOSS_OMNI_REPO: offline ? offline.repo : SANDBOX_URL,
+    BUGBOSS_OMNI_REPO: SANDBOX_URL,
     BUGBOSS_WORK_ROOT: work,
     BUGBOSS_GITHUB_TOKEN_FILE: spec.tokenFile,
+    BUGBOSS_REVIEW_SETTLE_SECONDS: "5",
+    NODE_EXTRA_CA_CERTS: spec.github.caFile,
     SLACK_BOT_TOKEN: secrets.bot,
     SLACK_SIGNING_SECRET: secrets.signing,
     SLACK_BOT_USER_ID: BOT_USER,
@@ -385,6 +417,15 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     OMNI_TEST_POSTGRES_URL: postgres.url,
     ...(spec.stubModelUrl ? { AWS_ENDPOINT_URL_BEDROCK_RUNTIME: spec.stubModelUrl } : {}),
   };
+
+  const checkEnv: Record<string, string> = {
+    PATH: env.PATH,
+    HOME: home,
+    OMNI_TEST_POSTGRES_URL: postgres.url,
+    ...(spec.prebuilt ? { OMNI_PREBUILT: spec.prebuilt } : {}),
+  };
+  // gp-api's eslint runs out of the default 2 GB heap.
+  const unregisterCi = spec.github.onCi(baseSha, (sha) => visibleCi(spec, scenario.ci, sha, { ...checkEnv, NODE_OPTIONS: "--max-old-space-size=6144" }));
 
   const launch = asUser(spec.runAs, "node", [join(spec.bugbossDir, "dist", "bugboss", "index.js")], env);
   const logFd = join(spec.root, "bugboss.log");
@@ -410,12 +451,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     const sha = latestMerge;
     if (deploying || !sha) return;
     spec.log("deploying", { sha });
-    deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, {
-      PATH: env.PATH,
-      HOME: home,
-      OMNI_TEST_POSTGRES_URL: postgres.url,
-      ...(spec.prebuilt ? { OMNI_PREBUILT: spec.prebuilt } : {}),
-    })
+    deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, checkEnv)
       .then((passed) => {
         fixed = passed;
         spec.log("deployed", { sha, fixed });
@@ -459,6 +495,8 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         lastAlert = Date.now();
       }
 
+      // Everything the world does to the run this tick: the on-call human in
+      // Slack, then the reviewer and the merging human on GitHub.
       for (const question of questions.splice(0)) {
         if (replies >= MAX_HUMAN_REPLIES) break;
         replies += 1;
@@ -466,13 +504,11 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
           .say(question.threadTs ?? question.ts, humanReply(question.text, scenario.human.facts, said))
           .catch((e: unknown) => spec.log("human_reply_failed", { error: String(e) }));
       }
-
       if (mergeAskedAt === null && slack.messages.some((m) => m.bot && /\bmerg/i.test(m.text))) mergeAskedAt = Date.now();
       const mayMerge =
         scenario.human.merge.after === "green" ||
         (mergeAskedAt !== null && Date.now() >= mergeAskedAt + scenario.human.merge.delaySeconds * 1000);
-
-      if (sandbox) await driveGitHub({ sandbox, spec, baseSha, pulls, mayMerge, onMerged: (sha) => {
+      await driveGitHub({ sandbox, spec, baseSha, pulls, mayMerge, onMerged: (sha) => {
         mergedAt ??= Date.now();
         latestMerge = sha;
         deploy();
@@ -503,7 +539,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         milestoneAt = Date.now();
         break;
       }
-      await sleep(15_000);
+      await sleep(5_000);
     }
   } catch (error: unknown) {
     end = `error: ${error instanceof Error ? error.message : String(error)}`;
@@ -520,6 +556,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         // Already gone.
       }
     }
+    unregisterCi();
     slack.close();
     s3.server.close();
     postgres.stop();
@@ -546,27 +583,23 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   };
   let diff: string | null = null;
   let firstPrFiles: string[] | null = null;
-  if (sandbox) {
-    const baseNow = await refSha(sandbox, runBase(spec.runId)).catch(() => "unknown");
-    const mergeCommits = await Promise.all(merged.map(async ([n]) => (await sandbox.call<Pull>(`/pulls/${n}`)).merge_commit_sha));
-    gates = {
-      ...gates,
-      noPushToMain:
-        (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
-        (baseNow === baseSha || mergeCommits.includes(baseNow)),
-    };
-    diff =
-      baseNow !== baseSha && baseNow !== "unknown"
-        ? await fetch(`https://api.github.com/repos/thegoodparty/bugboss-eval-sandbox/compare/${baseSha}...${baseNow}`, {
-            headers: { accept: "application/vnd.github.diff", authorization: `Bearer ${readFileSync(spec.tokenFile, "utf8").trim()}` },
-          }).then((r) => (r.ok ? r.text() : null))
-        : null;
-    const first = Math.min(...pulls.keys());
-    if (Number.isFinite(first)) {
-      firstPrFiles = await sandbox
-        .call<Array<{ filename: string }>>(`/pulls/${first}/files?per_page=100`)
-        .then((files) => files.map((f) => f.filename), () => null);
-    }
+  const baseNow = await refSha(sandbox, runBase(spec.runId)).catch(() => "unknown");
+  const mergeCommits = await Promise.all(merged.map(async ([n]) => (await sandbox.call<Pull>(`/pulls/${n}`)).merge_commit_sha));
+  gates = {
+    ...gates,
+    noPushToMain:
+      (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
+      (baseNow === baseSha || mergeCommits.includes(baseNow)),
+  };
+  if (baseNow !== baseSha && baseNow !== "unknown") {
+    const shown = spawnSync("git", ["-C", spec.github.repo, "diff", baseSha, baseNow], { encoding: "utf8", maxBuffer: 1 << 28 });
+    diff = shown.status === 0 ? shown.stdout : null;
+  }
+  const first = Math.min(...pulls.keys());
+  if (Number.isFinite(first)) {
+    firstPrFiles = await sandbox
+      .call<Array<{ filename: string }>>(`/pulls/${first}/files?per_page=100`)
+      .then((files) => files.map((f) => f.filename), () => null);
   }
   const record: RunRecord = {
     mergedAt,

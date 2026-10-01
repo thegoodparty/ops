@@ -1,26 +1,30 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadScenario, SCENARIO_IDS, type Scenario } from "../core/scenario";
-import { SANDBOX_OWNER, SANDBOX_REPO } from "./token";
+import { loadScenario, SCENARIO_IDS } from "../core/scenario";
 
 /**
- * The sandbox repository and everything the harness asks of it.
+ * The sandbox repository, served by the fake github.com (`./github/`), and
+ * everything the harness asks of it.
  *
- * Layout: `scenario/<id>` is the scenario's omni base plus one commit that
- * swaps omni's workflows for a CI running the scenario's visible checks.
- * Every run gets its own `eval/<run>/main`, one empty commit on top of that,
- * so its pull request can be told apart from the others. `main` is the oldest
- * base with omni's workflows removed: it exists only because omni's ship-pr
- * skill opens every PR with `--base main`, and GitHub refuses a PR between
- * branches with no history in common. The harness moves each PR onto its
- * run's own base the moment it appears.
+ * Layout: `main` is one empty commit. `scenario/<id>` is a snapshot of the
+ * scenario's omni base, as one commit on main, with omni's workflows removed
+ * and ship-pr pointed at the sandbox. Every run gets its own
+ * `eval/<run>/main`, one empty commit on top of that, so its pull request can
+ * be told apart from the others. main exists only because omni's ship-pr
+ * opens every PR with `--base main`; the harness moves each PR onto its run's
+ * own base the moment it appears.
  */
 
+export const SANDBOX_OWNER = "thegoodparty";
+export const SANDBOX_REPO = "bugboss-eval-sandbox";
 export const SANDBOX_URL = `https://github.com/${SANDBOX_OWNER}/${SANDBOX_REPO}.git`;
 const API = `https://api.github.com/repos/${SANDBOX_OWNER}/${SANDBOX_REPO}`;
+
+/** The fake accepts any token; BugBoss still reads one from a file. */
+export const FAKE_TOKEN = "ghs_bugbossevalfaketoken";
 
 export const scenarioBranch = (id: string) => `scenario/${id}`;
 export const runBase = (runId: string) => `eval/${runId}/main`;
@@ -31,13 +35,13 @@ export interface Sandbox {
   call: <T = Json>(path: string, init?: { method?: string; body?: unknown }) => Promise<T>;
 }
 
-export const createSandbox = (token: () => string): Sandbox => ({
+export const createSandbox = (): Sandbox => ({
   call: async <T,>(path: string, init: { method?: string; body?: unknown } = {}) => {
     const res = await fetch(`${API}${path}`, {
       method: init.method ?? "GET",
       headers: {
         accept: "application/vnd.github+json",
-        authorization: `Bearer ${token()}`,
+        authorization: `Bearer ${FAKE_TOKEN}`,
         "x-github-api-version": "2022-11-28",
       },
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
@@ -83,10 +87,7 @@ export const contains = async (sandbox: Sandbox, base: string, head: string): Pr
 
 export type CheckState = "green" | "pending" | "red";
 
-/**
- * The sandbox's CI is its Actions workflow runs on the commit. Read through
- * the Actions API because the App holds no `checks` permission.
- */
+/** The sandbox's CI is the fake's Actions runs on the commit, which the harness's `ci` callback decides. */
 export const checks = async (sandbox: Sandbox, sha: string): Promise<CheckState> => {
   const { workflow_runs } = await sandbox.call<{
     workflow_runs: Array<{ status: string; conclusion: string | null; event: string; created_at: string }>;
@@ -99,51 +100,14 @@ export const checks = async (sandbox: Sandbox, sha: string): Promise<CheckState>
 
 // ------------------------------------------------------------------ seeding
 
-// Fixed dates make every seed commit reproducible, so re-seeding pushes
-// nothing new: the sandbox refuses force-pushes, to main and to anything.
-const SEED_DATE = "2026-09-30T00:00:00Z";
-
-const git = (cwd: string, args: string[], input?: string): string =>
-  execFileSync("git", args, {
-    cwd,
-    encoding: "utf8",
-    input,
-    maxBuffer: 1 << 26,
-    env: { ...process.env, GIT_AUTHOR_DATE: SEED_DATE, GIT_COMMITTER_DATE: SEED_DATE },
-  }).trim();
-
-export const ciWorkflow = (scenario: Scenario): string => `name: CI
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, edited]
-concurrency:
-  group: ci-\${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-jobs:
-  checks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
-        options: --health-cmd pg_isready --health-interval 5s --health-retries 20
-    env:
-      OMNI_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
-      # gp-api's eslint runs out of the default 2 GB heap.
-      NODE_OPTIONS: --max-old-space-size=6144
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      - run: npm ci --no-audit --no-fund
-      - run: npm run build -w packages/contracts
-      - run: if [ -f packages/nest-common/package.json ]; then npm run build -w packages/nest-common; fi
-      - run: npm run generate -w packages/gp-api
-${scenario.ci.map((command) => `      - run: ${command}\n`).join("")}`;
+const SEED_ENV = {
+  GIT_AUTHOR_NAME: "bugboss-evals",
+  GIT_AUTHOR_EMAIL: "bugboss@goodparty.org",
+  GIT_AUTHOR_DATE: "2026-09-30T00:00:00Z",
+  GIT_COMMITTER_NAME: "bugboss-evals",
+  GIT_COMMITTER_EMAIL: "bugboss@goodparty.org",
+  GIT_COMMITTER_DATE: "2026-09-30T00:00:00Z",
+};
 
 const APP_BOT = "bugboss-gp[bot]";
 
@@ -157,56 +121,40 @@ export const patchShipPr = (text: string): string =>
     .replaceAll("thegoodparty/omni", `${SANDBOX_OWNER}/${SANDBOX_REPO}`)
     .replaceAll("delegate-reviewer[bot]", APP_BOT);
 
+const SHIP_PR = ".claude/skills/ship-pr/SKILL.md";
+
 /**
- * One-time setup, run by a person with push access over SSH (a workflow file
- * cannot be pushed by the App, which holds no `workflows` permission):
- *
- *   npx tsx bugboss-evals/sim/sandbox.ts seed ~/Repos/thegoodparty/omni
- *
- * Changing an existing scenario's seed commit needs `--force`, with the
- * sandbox's rulesets disabled for the push, because they refuse force-pushes.
+ * Every scenario's base into the sandbox at `remote`, a path on disk. Each is
+ * a snapshot, not omni's history: the omni clone holds only those commits, and
+ * a clone of the sandbox stays one tree deep. Everything is written through a
+ * scratch index, so the omni clone's checkout is never touched.
  */
-export const seed = (omniDir: string, force = false, remote = `git@github.com:${SANDBOX_OWNER}/${SANDBOX_REPO}.git`): void => {
-  const work = mkdtempSync(join(tmpdir(), "sandbox-seed-"));
+export const seed = (omniDir: string, remote: string): void => {
+  const scratch = mkdtempSync(join(tmpdir(), "sandbox-seed-"));
+  const git = (args: string[], input?: string, trim = true): string => {
+    const out = execFileSync("git", ["-C", omniDir, ...args], {
+      encoding: "utf8",
+      input,
+      maxBuffer: 1 << 26,
+      env: { ...process.env, ...SEED_ENV, GIT_INDEX_FILE: join(scratch, "index") },
+    });
+    return trim ? out.trim() : out;
+  };
   try {
-    git(work, ["init", "-q"]);
-    git(work, ["config", "user.name", "bugboss-evals"]);
-    git(work, ["config", "user.email", "bugboss@goodparty.org"]);
-    const scenarios = SCENARIO_IDS.map((id) => loadScenario(id).scenario);
-    const bases = scenarios.map((s) => s.omni.baseSha);
-    git(work, ["fetch", "-q", "--no-tags", omniDir, ...bases]);
-    const oldest = git(work, ["merge-base", "--octopus", ...bases]);
-
-    const commitOn = (base: string, message: string, edit: () => void): string => {
-      git(work, ["checkout", "-q", "--detach", base]);
-      git(work, ["rm", "-rq", "--ignore-unmatch", ".github/workflows"]);
-      edit();
-      git(work, ["add", "-A"]);
-      git(work, ["commit", "-q", "-m", message]);
-      return git(work, ["rev-parse", "HEAD"]);
-    };
-
-    const refs = [`${commitOn(oldest, "Remove omni's workflows from the eval sandbox", () => undefined)}:refs/heads/main`];
-    for (const scenario of scenarios) {
-      const sha = commitOn(scenario.omni.baseSha, `Eval sandbox CI for ${scenario.id}`, () => {
-        execFileSync("mkdir", ["-p", join(work, ".github", "workflows")]);
-        writeFileSync(join(work, ".github", "workflows", "ci.yml"), ciWorkflow(scenario));
-        const skill = join(work, ".claude", "skills", "ship-pr", "SKILL.md");
-        writeFileSync(skill, patchShipPr(readFileSync(skill, "utf8")));
-      });
-      refs.push(`${sha}:refs/heads/${scenarioBranch(scenario.id)}`);
+    const main = git(["commit-tree", git(["mktree"], ""), "-m", "Eval sandbox"]);
+    const refs = [`${main}:refs/heads/main`];
+    for (const id of SCENARIO_IDS) {
+      const base = loadScenario(id).scenario.omni.baseSha;
+      git(["read-tree", base]);
+      const workflows = git(["ls-files", "--", ".github/workflows"]).split("\n").filter(Boolean);
+      if (workflows.length) git(["update-index", "--force-remove", "--", ...workflows]);
+      const skill = git(["hash-object", "-w", "--stdin"], patchShipPr(git(["show", `${base}:${SHIP_PR}`], undefined, false)));
+      git(["update-index", "--cacheinfo", `100644,${skill},${SHIP_PR}`]);
+      const sha = git(["commit-tree", git(["write-tree"]), "-p", main, "-m", `${id}: omni ${base}`]);
+      refs.push(`${sha}:refs/heads/${scenarioBranch(id)}`);
     }
-    execFileSync("git", ["push", ...(force ? ["--force"] : []), remote, ...refs], { cwd: work, stdio: "inherit" });
+    git(["push", "-q", remote, ...refs]);
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
   }
 };
-
-if (require.main === module) {
-  const [command, omniDir, force] = process.argv.slice(2);
-  if (command !== "seed" || !omniDir) {
-    console.error("usage: sandbox.ts seed <omni checkout>");
-    process.exit(2);
-  }
-  seed(omniDir, force === "--force");
-}

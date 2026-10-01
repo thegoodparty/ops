@@ -1,14 +1,16 @@
-import { execFile, execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { getCACertificates, setDefaultCACertificates } from "node:tls";
 
 import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
 import { renderReport, type RunResult, type Side } from "../core/report";
 import { loadScenario, SCENARIO_IDS } from "../core/scenario";
 import { asUser, createSpendPool, runOne, type Milestone, type Stack } from "./run";
-import { scenarioBranch, SANDBOX_URL } from "./sandbox";
+import { startFakeGitHub } from "./github/server";
+import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from "./sandbox";
 import { startStubModel } from "./stub-model";
 
 /**
@@ -17,17 +19,18 @@ import { startStubModel } from "./stub-model";
  * `report`: one or more results.json into the table posted on the PR.
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
- *     --token-file /tmp/token --out /tmp/evals [--scenarios a,b] [--reps 3] [--stub <omni>] [--run-as user] \
- *     [--until root_cause|pr_opened|closed] [--offline] [--spend-cap-usd 6.67]
+ *     --omni /tmp/omni --out /tmp/evals [--scenarios a,b] [--reps 3] [--stub] [--run-as user] \
+ *     [--until root_cause|pr_opened|closed] [--spend-cap-usd 6.67]
+ *
+ * `--omni` is a clone holding every scenario's shas, which seeds the fake
+ * GitHub's sandbox. `--stub` swaps Bedrock for the scripted model. GitHub is
+ * always the fake, so the machine must map github.com and api.github.com to
+ * 127.0.0.1 and let Node bind 443 (see the workflows); the harness trusts the
+ * fake's CA itself, through sudo.
  *
  * `--spend-cap-usd` is this process's share of the comparison's cap: every
  * run stops, ending `spend_cap`, once their live sessions together price at
  * 90% of it.
- *
- * `--offline` needs `--stub`: no GitHub and no token, the sandbox a local
- * bare repository with the scenario's base as one commit, each run ending at
- * the root cause. It proves everything up to the PR at zero spend and with no
- * credential at all, which is what a pull request's CI can hold.
  *   npx tsx bugboss-evals/sim/compare.ts report --baseline main --candidate pr out1/results.json …
  */
 
@@ -134,24 +137,6 @@ export const isolateFromKeychain = (): void => {
 const git = (args: string[], cwd?: string) =>
   execFileSync("git", ["-c", "user.name=bugboss-evals", "-c", "user.email=evals@invalid", ...args], { cwd, encoding: "utf8", maxBuffer: 1 << 26 }).trim();
 
-/** The scenario's base as a one-commit bare repository, for `--offline`. */
-const offlineRepo = (omni: string, id: string, out: string): { repo: string; baseSha: string } => {
-  const { scenario } = loadScenario(id);
-  const snap = join(out, "offline", id, "base");
-  const repo = join(out, "offline", id, "sandbox.git");
-  if (!existsSync(repo)) {
-    git(["-C", omni, "worktree", "add", "-q", "--detach", snap, scenario.omni.baseSha]);
-    rmSync(join(snap, ".git"));
-    git(["-C", omni, "worktree", "prune"]);
-    git(["init", "-q", "-b", "main"], snap);
-    git(["add", "-A"], snap);
-    git(["commit", "-q", "-m", `${id} base`], snap);
-    git(["init", "-q", "--bare", repo]);
-    git(["push", "-q", repo, "HEAD:refs/heads/main"], snap);
-  }
-  return { repo, baseSha: git(["rev-parse", "HEAD"], snap) };
-};
-
 /**
  * An omni tree at one base with its dependencies installed and built, as the
  * run-as user, through the hidden check's own setup. It warms the one npm
@@ -179,23 +164,42 @@ const prebuild = async (dir: string, npmCache: string, runAs: string | undefined
 const run = async (argv: string[]): Promise<void> => {
   isolateFromKeychain();
   const out = resolve(flag(argv, "out") ?? "bugboss-evals-out");
-  const offline = argv.includes("--offline");
-  const tokenFile = offline ? join(out, "no-token") : resolve(flag(argv, "token-file") ?? "");
+  const omni = resolve(flag(argv, "omni") ?? "");
   const baselineRef = flag(argv, "baseline") ?? "origin/main";
   const candidateRef = flag(argv, "candidate") ?? "HEAD";
   const scenarios = flag(argv, "scenarios")?.split(",") ?? SCENARIO_IDS;
   const reps = Number(flag(argv, "reps") ?? 3);
-  const stubOmni = flag(argv, "stub");
+  const stub = argv.includes("--stub");
   const runAs = flag(argv, "run-as");
   const sides = (flag(argv, "sides")?.split(",") ?? ["baseline", "candidate"]) as Side[];
   const until = flag(argv, "until") as Milestone | undefined;
   const capUsd = flag(argv, "spend-cap-usd") === undefined ? null : Number(flag(argv, "spend-cap-usd"));
   const spend = capUsd === null ? undefined : createSpendPool(capUsd);
-  if (offline && !stubOmni) throw new Error("--offline runs only against the stub: pass --stub <omni>");
-  if (!offline && !existsSync(tokenFile)) throw new Error("--token-file must name the file the trusted minter keeps fresh");
+  if (!existsSync(join(omni, ".git"))) throw new Error("--omni must name a clone holding every scenario's shas");
   mkdirSync(out, { recursive: true });
-  const offlineRepos = offline ? Object.fromEntries(scenarios.map((id) => [id, offlineRepo(stubOmni!, id, out)])) : {};
-  if (offline) writeFileSync(tokenFile, "offline\n");
+
+  // The fake's CI for a commit is the run whose base it is built on.
+  const ciRuns = new Map<string, (sha: string) => Promise<boolean>>();
+  const fake = await startFakeGitHub({
+    root: join(out, "github"),
+    ci: async ({ sha }) => {
+      for (const [base, ci] of ciRuns) {
+        if (spawnSync("git", ["-C", repo, "merge-base", "--is-ancestor", base, sha]).status === 0) return ci(sha);
+      }
+      log("ci_unclaimed", { sha });
+      return false;
+    },
+  });
+  const repo = fake.bareRepo(SANDBOX_OWNER, SANDBOX_REPO);
+  seed(omni, repo);
+  // Node reads NODE_EXTRA_CA_CERTS only at startup, and the CA is made just
+  // now, so this process adds it in place. git and gh read the system store.
+  setDefaultCACertificates([...getCACertificates("default"), readFileSync(fake.caFile, "utf8")]);
+  execFileSync("sudo", ["cp", fake.caFile, "/usr/local/share/ca-certificates/bugboss-eval-github.crt"]);
+  execFileSync("sudo", ["update-ca-certificates"], { stdio: "ignore" });
+  chmodSync(fake.caFile, 0o644);
+  const tokenFile = join(out, "github-token");
+  writeFileSync(tokenFile, `${FAKE_TOKEN}\n`, { mode: 0o644 });
 
   const npmCache = join(out, "npm-cache");
   mkdirSync(npmCache, { recursive: true });
@@ -204,12 +208,10 @@ const run = async (argv: string[]): Promise<void> => {
   const warming = Promise.all(
     [...new Set(scenarios.map(baseOf))].map(async (sha) => {
       const id = scenarios.find((s) => baseOf(s) === sha)!;
-      const dir = offline ? join(out, "offline", id, "base") : join(out, "prebuilt", sha);
-      if (!offline && !existsSync(join(dir, "package-lock.json"))) {
-        const token = readFileSync(tokenFile, "utf8").trim();
-        const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+      const dir = join(out, "prebuilt", sha);
+      if (!existsSync(join(dir, "package-lock.json"))) {
         await new Promise<void>((resolve) =>
-          execFile("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--depth", "1", "--branch", scenarioBranch(id), SANDBOX_URL, dir], () => resolve()),
+          execFile("git", ["clone", "-q", "--depth", "1", "--branch", scenarioBranch(id), `file://${repo}`, dir], () => resolve()),
         );
       }
       if (existsSync(join(dir, "package-lock.json")) && (await prebuild(dir, npmCache, runAs))) prebuilt[sha] = dir;
@@ -223,13 +225,13 @@ const run = async (argv: string[]): Promise<void> => {
   await warming;
   execFileSync("chmod", ["-R", "a+rwX", npmCache]);
   const stack = await startStack();
-  const awsCredentialsUrl = await startCredentials(Boolean(stubOmni));
+  const awsCredentialsUrl = await startCredentials(stub);
   const stamp = Date.now().toString(36);
 
   const patchFor = (id: string): string => {
     const { scenario } = loadScenario(id);
     const path = join(out, `${id}.patch`);
-    writeFileSync(path, execFileSync("git", ["-C", stubOmni!, "diff", scenario.omni.baseSha, scenario.omni.provingFixSha], { maxBuffer: 1 << 26 }));
+    writeFileSync(path, execFileSync("git", ["-C", omni, "diff", scenario.omni.baseSha, scenario.omni.provingFixSha], { maxBuffer: 1 << 26 }));
     return path;
   };
 
@@ -237,7 +239,7 @@ const run = async (argv: string[]): Promise<void> => {
     Array.from({ length: reps }, (_, i) => i + 1).flatMap((rep) =>
       sides.map(async (side): Promise<RunResult> => {
         const runId = `${stamp}-${scenarioId}-${rep}-${side}`;
-        const stub = stubOmni ? await startStubModel(patchFor(scenarioId)) : null;
+        const stubModel = stub ? await startStubModel(patchFor(scenarioId)) : null;
         try {
           return await runOne({
             runId,
@@ -249,19 +251,26 @@ const run = async (argv: string[]): Promise<void> => {
             root: join(out, "runs", runId),
             stack,
             tokenFile,
+            github: {
+              caFile: fake.caFile,
+              repo,
+              onCi: (base, ci) => {
+                ciRuns.set(base, ci);
+                return () => void ciRuns.delete(base);
+              },
+            },
             awsCredentialsUrl,
             npmCache,
             ...(prebuilt[baseOf(scenarioId)] ? { prebuilt: prebuilt[baseOf(scenarioId)] } : {}),
             ...(spend ? { spend } : {}),
-            ...(offline ? { offline: offlineRepos[scenarioId] } : {}),
             ...(until ? { until } : {}),
-            ...(stub ? { stubModelUrl: stub.url } : {}),
+            ...(stubModel ? { stubModelUrl: stubModel.url } : {}),
             ...(runAs ? { runAs } : {}),
             seed: rep,
             log: (event, fields) => log(event, { runId, ...fields }),
           });
         } finally {
-          stub?.server.close();
+          stubModel?.server.close();
         }
       }),
     ),
@@ -277,8 +286,9 @@ const run = async (argv: string[]): Promise<void> => {
       ),
     )
   ).filter((r): r is RunResult => r !== null);
+  await fake.close();
 
-  if (stubOmni) {
+  if (stub) {
     const judgeStub = await startStubModel("/dev/null");
     Object.assign(process.env, {
       AWS_ENDPOINT_URL_BEDROCK_RUNTIME: judgeStub.url,

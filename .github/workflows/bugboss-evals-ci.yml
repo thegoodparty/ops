@@ -1,10 +1,11 @@
 # Zero-spend evidence on every PR that touches BugBoss or its evals: each
 # scenario's hidden check is proved against omni, and the harness runs one
-# offline pair per scenario with the scripted model, up to the root cause.
+# pair per scenario with the scripted model through the whole lifecycle (PR,
+# CI, review, merge, hidden check, close) against a fake github.com.
 #
 # pull_request runs the PR's own code, so this workflow holds no secrets, no
-# environment and no AWS role. omni is public and needs no token. Offline
-# means no GitHub: the sandbox is a local bare repo. See bugboss-evals/CLAUDE.md.
+# environment and no AWS role. omni is public and needs no token, and the
+# fake GitHub takes any. See bugboss-evals/CLAUDE.md.
 name: BugBoss evals CI
 
 on:
@@ -61,9 +62,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - run: nohup sudo rm -rf /usr/share/dotnet > /dev/null 2>&1 &
       - run: npm ci --no-audit --no-fund
-      - name: Free disk
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       # Blobless: full history for both shas, blobs only for what is checked out.
       - run: git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
       # A proving fix may live only on a pull request's ref, so every scenario sha is fetched by name.
@@ -81,9 +81,9 @@ jobs:
           path: /tmp/bugboss-evals-omni/*.log
           if-no-files-found: ignore
 
-  offline:
+  lifecycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -94,47 +94,71 @@ jobs:
           - missed-merge
           - alert-vs-user-harm
           - alert-vs-user-harm-paid-alert
+    env:
+      OUT: /tmp/evals/out
     steps:
       - uses: actions/checkout@v4
         with:
           # compare.ts builds each ref in a git worktree of this checkout.
           fetch-depth: 0
           persist-credentials: false
+      # In the background: nothing here needs the space before the runs do.
+      - run: nohup sudo rm -rf /usr/share/dotnet > /dev/null 2>&1 &
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v6
       - run: npm ci --no-audit --no-fund
-      - name: Free disk
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - run: git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
-      # A proving fix may live only on a pull request's ref, so every scenario sha is fetched by name.
-      - run: git -C /tmp/omni fetch -q --filter=blob:none origin $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
-      # Both sides are this PR: until the harness's BugBoss options are on
-      # main, main's BugBoss cannot run against a stand-in at all.
+      # Every scenario sha, one commit deep: the sandbox is seeded with
+      # snapshots and the stub diffs base against fix, so no history is needed.
+      - run: |
+          git init -q /tmp/omni
+          git -C /tmp/omni fetch -q --depth 1 --no-tags https://github.com/thegoodparty/omni.git $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
+      - id: base
+        run: echo "sha=$(jq -r .omni.baseSha bugboss-evals/scenarios/${{ matrix.scenario }}/scenario.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.OUT }}/prebuilt/${{ steps.base.outputs.sha }}
+            ${{ env.OUT }}/npm-cache
+          key: bugboss-eval-omni-${{ steps.base.outputs.sha }}
+      - run: |
+          GRAFANA_ADMIN_PASSWORD=unused docker compose -f bugboss-evals/sim/stack/stack.yml pull -q
+          docker pull -q postgres:16
+      # The fake GitHub's GraphQL is the subset gh 2.96.0 sends.
+      - run: |
+          curl -fsSL -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.deb
+          sudo dpkg -i /tmp/gh.deb > /dev/null
+          gh --version
+      # Last, once nothing else needs the real GitHub: from here github.com is
+      # the harness's fake, on 443, which Node may bind unprivileged.
+      - run: |
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
+          echo "127.0.0.1 github.com api.github.com" | sudo tee -a /etc/hosts
       - name: Run
         # The judge's Bedrock client points at a stub but still signs, so it
-        # needs some credentials to resolve. These are not real.
+        # needs some credentials to resolve. None of these are real.
         env:
           AWS_ACCESS_KEY_ID: AKIAEVALFAKE
           AWS_SECRET_ACCESS_KEY: fake
           AWS_REGION: us-west-2
+          GH_TOKEN: ghs_bugbossevalfaketoken
         run: |
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
-            --offline --stub /tmp/omni --baseline HEAD --candidate HEAD \
-            --scenarios "${{ matrix.scenario }}" --reps 1 --out /tmp/evals
-      - name: Every run reached a root cause
+            --stub --omni /tmp/omni --baseline HEAD --candidate HEAD \
+            --scenarios "${{ matrix.scenario }}" --reps 1 --out "$OUT"
+      - name: Every run closed with every gate passed
         run: |
-          test -f /tmp/evals/results.json
-          jq -r '.runs[] | "\(.scenario) rep \(.rep) \(.side): \(.end)"' /tmp/evals/results.json
-          jq -e '(.runs | length) > 0 and all(.runs[]; .end == "root_cause")' /tmp/evals/results.json > /dev/null
+          npx tsx bugboss-evals/sim/compare.ts report --tier stub --baseline HEAD --candidate HEAD "$OUT/results.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          jq -r '.runs[] | "\(.scenario) rep \(.rep) \(.side): \(.end) \(.gates)"' "$OUT/results.json"
+          jq -e '(.runs | length) == 2 and all(.runs[]; .end == "closed" and ([.gates[]] | all(. == true)))' "$OUT/results.json" > /dev/null
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: offline-${{ matrix.scenario }}
+          name: lifecycle-${{ matrix.scenario }}
           path: |
-            /tmp/evals/results.json
-            /tmp/evals/runs/*/result.json
-            /tmp/evals/runs/*/bugboss.log
-            /tmp/evals/runs/*/slack.json
+            ${{ env.OUT }}/results.json
+            ${{ env.OUT }}/runs/*/result.json
+            ${{ env.OUT }}/runs/*/*.log
+            ${{ env.OUT }}/runs/*/slack.json
           if-no-files-found: warn

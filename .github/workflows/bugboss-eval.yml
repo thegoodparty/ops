@@ -6,9 +6,9 @@
 #                        no Bedrock: it proves the pipeline, not the change
 #
 # issue_comment runs this file, and the harness, from main, so a PR cannot
-# change how it is measured. The PR's BugBoss runs as an unprivileged user
-# with a token scoped to the sandbox repo; the App key stays with the trusted
-# minter. See bugboss-evals/CLAUDE.md.
+# change how it is measured. The PR's BugBoss runs as an unprivileged user.
+# GitHub is a fake on the runner, so no GitHub credential is involved. See
+# bugboss-evals/CLAUDE.md.
 name: BugBoss eval
 
 on:
@@ -52,7 +52,6 @@ jobs:
 
   eval:
     needs: gate
-    environment: bugboss-eval
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
@@ -70,26 +69,27 @@ jobs:
           - missed-merge
           - alert-vs-user-harm
           - alert-vs-user-harm-paid-alert
+    env:
+      OUT: /tmp/bugboss-eval/out
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
+      - run: nohup sudo rm -rf /usr/share/dotnet > /dev/null 2>&1 &
       - run: git fetch --no-tags origin "pull/${{ github.event.issue.number }}/head"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v6
       - run: npm ci --no-audit --no-fund
-      - name: Free disk
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      # The stub applies each scenario's proving fix, and a fix may live only
-      # on a pull request's ref, so every scenario sha is fetched by name.
-      - if: needs.gate.outputs.tier == 'stub'
-        run: |
-          git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
-          git -C /tmp/omni fetch -q --filter=blob:none origin $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
+      # Every scenario sha by name, one commit deep: a proving fix may live
+      # only on a pull request's ref. The sandbox is seeded from these
+      # snapshots, and the stub diffs base against fix.
+      - run: |
+          git init -q /tmp/omni
+          git -C /tmp/omni fetch -q --depth 1 --no-tags https://github.com/thegoodparty/omni.git $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
       - id: base
         run: echo "sha=$(jq -r .omni.baseSha bugboss-evals/scenarios/${{ matrix.scenario }}/scenario.json)" >> "$GITHUB_OUTPUT"
       # omni's dependencies at the scenario's base, built once and kept across
@@ -97,8 +97,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            /tmp/bugboss-eval/out/prebuilt/${{ steps.base.outputs.sha }}
-            /tmp/bugboss-eval/out/npm-cache
+            ${{ env.OUT }}/prebuilt/${{ steps.base.outputs.sha }}
+            ${{ env.OUT }}/npm-cache
           key: bugboss-eval-omni-${{ steps.base.outputs.sha }}
       - if: needs.gate.outputs.tier != 'stub'
         uses: aws-actions/configure-aws-credentials@v4
@@ -107,21 +107,27 @@ jobs:
           role-duration-seconds: 21600
           aws-region: us-west-2
       - name: Create the user BugBoss runs as
-        run: sudo useradd --create-home bugboss-eval
-      - name: Mint sandbox-scoped GitHub tokens
-        env:
-          GITHUB_APP_ID: ${{ secrets.BUGBOSS_GP_APP_ID }}
-          GITHUB_APP_INSTALLATION_ID: ${{ secrets.BUGBOSS_GP_INSTALLATION_ID }}
-          GITHUB_APP_PRIVATE_KEY: ${{ secrets.BUGBOSS_GP_PRIVATE_KEY }}
         run: |
+          sudo useradd --create-home bugboss-eval
           mkdir -p /tmp/bugboss-eval && chmod 755 /tmp/bugboss-eval
-          nohup npx tsx bugboss-evals/sim/token.ts /tmp/bugboss-eval/github-token > /tmp/bugboss-eval/minter.log 2>&1 &
-          for i in $(seq 60); do [ -s /tmp/bugboss-eval/github-token ] && exit 0; sleep 2; done
-          cat /tmp/bugboss-eval/minter.log; exit 1
+      - run: |
+          GRAFANA_ADMIN_PASSWORD=unused docker compose -f bugboss-evals/sim/stack/stack.yml pull -q
+          docker pull -q postgres:16
+      # The fake GitHub's GraphQL is the subset gh 2.96.0 sends.
+      - run: |
+          curl -fsSL -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.deb
+          sudo dpkg -i /tmp/gh.deb > /dev/null
+          gh --version
+      # Last, once nothing else needs the real GitHub: from here github.com is
+      # the harness's fake, on 443, which Node may bind unprivileged.
+      - run: |
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
+          echo "127.0.0.1 github.com api.github.com" | sudo tee -a /etc/hosts
       - name: Run
         env:
           TIER: ${{ needs.gate.outputs.tier }}
           JOBS: ${{ strategy.job-total }}
+          GH_TOKEN: ghs_bugbossevalfaketoken
         run: |
           # Each job holds its even share of the comparison's cap.
           share() { awk -v cap="$1" -v jobs="$JOBS" 'BEGIN { printf "%.2f", cap / jobs }'; }
@@ -129,7 +135,7 @@ jobs:
             fast) mode=(--reps 1 --until pr_opened --spend-cap-usd "$(share 40)") ;;
             full) mode=(--reps 3 --spend-cap-usd "$(share 200)") ;;
             stub)
-              mode=(--reps 1 --stub /tmp/omni)
+              mode=(--reps 1 --stub)
               # With no role assumed, the judge's stubbed Bedrock client still
               # signs and needs some credentials to resolve. These are not real.
               export AWS_ACCESS_KEY_ID=AKIAEVALFAKE AWS_SECRET_ACCESS_KEY=fake AWS_REGION=us-west-2
@@ -138,17 +144,17 @@ jobs:
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
             --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
             --scenarios "${{ matrix.scenario }}" "${mode[@]}" \
-            --token-file /tmp/bugboss-eval/github-token --out /tmp/bugboss-eval/out --run-as bugboss-eval
+            --omni /tmp/omni --out "$OUT" --run-as bugboss-eval
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.scenario }}
           path: |
-            /tmp/bugboss-eval/out/results.json
-            /tmp/bugboss-eval/out/runs/*/result.json
-            /tmp/bugboss-eval/out/runs/*/bugboss.log
-            /tmp/bugboss-eval/out/runs/*/slack.json
-            /tmp/bugboss-eval/out/runs/*/s3/**/*.jsonl
+            ${{ env.OUT }}/results.json
+            ${{ env.OUT }}/runs/*/result.json
+            ${{ env.OUT }}/runs/*/*.log
+            ${{ env.OUT }}/runs/*/slack.json
+            ${{ env.OUT }}/runs/*/s3/**/*.jsonl
           if-no-files-found: warn
 
   report:
