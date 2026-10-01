@@ -108,6 +108,7 @@ const toolExtras = () => ({
   openIncident: refuseOpen,
   gh: null,
   reporter: null,
+  slack: { replies: () => Promise.reject(new Error("no Slack read expected in this test")) },
   status: {
     summarise: () => Promise.reject(new Error("no summary expected in this test")),
     cache: new Map<string, { position: number; text: string }>(),
@@ -234,6 +235,7 @@ beforeEach(async () => {
     d.prepare("DELETE FROM incident_wait").run();
     d.prepare("DELETE FROM signal").run();
     d.prepare("DELETE FROM incident_thread").run();
+    d.prepare("DELETE FROM incident_action").run();
     d.prepare("DELETE FROM incident").run();
     d.prepare(
       "INSERT INTO incident (id, status, firstSignalAt) VALUES ('inc-1','INVESTIGATING',1)",
@@ -517,6 +519,8 @@ describe("prefix binding", () => {
         "stop_agent",
         "page_rotation",
         "gh",
+        "read_slack_link",
+        "grant_turns",
       ],
       "order is part of the prefix, and the write tools come after the reads",
     );
@@ -2508,6 +2512,42 @@ describe("the Boss's write tools", () => {
     const out = await tool("message_agent").run({ incidentId: "c1", text: "hello" });
     assert.match(out, /^Rejected: incident c1 is CLOSED/);
     assert.equal(directives("c1").length, 0);
+  });
+
+  const granted = (incidentId: string): number | undefined =>
+    db.get<{ grantedTurns: number }>("SELECT grantedTurns FROM incident WHERE id = ?", [incidentId])?.grantedTurns;
+
+  test("grant_turns adds to the incident's grant and records why", async () => {
+    const grant = tool("grant_turns");
+    assert.match(await grant.run({ incidentId: "inc-1", turns: 40, reason: EVIDENCE }), /^Granted 40 turns/);
+    assert.match(await grant.run({ incidentId: "inc-1", turns: 10, reason: EVIDENCE }), /50 granted in total/);
+    assert.equal(granted("inc-1"), 50);
+    assert.equal(
+      db.query("SELECT id FROM incident_action WHERE incidentId = 'inc-1' AND action = 'turns_granted'").length,
+      2,
+    );
+  });
+
+  test("grant_turns refuses a count out of range, and a reason that is not evidence", async () => {
+    const grant = tool("grant_turns");
+    for (const turns of [0, -5, 201, 2.5, "50"]) {
+      assert.match(await grant.run({ incidentId: "inc-1", turns, reason: EVIDENCE }), /^Rejected: turns must be/, String(turns));
+    }
+    assert.match(await grant.run({ incidentId: "inc-1", turns: 50, reason: "asked" }), /^Rejected: grant_turns needs a reason/);
+    assert.equal(granted("inc-1"), 0);
+  });
+
+  test("grant_turns refuses a closed incident", async () => {
+    await db.withWrite((d) => {
+      d.prepare(
+        "INSERT INTO incident (id, status, firstSignalAt, resolvedAt, closedAt, postmortem) VALUES ('c1','CLOSED',1,2,3,'pm')",
+      ).run();
+    });
+    assert.match(
+      await tool("grant_turns").run({ incidentId: "c1", turns: 50, reason: EVIDENCE }),
+      /^Rejected: incident c1 is CLOSED/,
+    );
+    assert.equal(granted("c1"), 0);
   });
 
   test("close_incident goes through the tool API's close and refuses a reason that is not evidence", async () => {

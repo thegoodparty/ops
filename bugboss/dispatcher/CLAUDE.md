@@ -53,7 +53,10 @@ tick. The grace test pins its clocks to literals for the same reason.
 ## The turn budget is the child's, and this is only the courier
 
 `BUGBOSS_MAX_TURNS` goes down in `buildChildEnv` beside the deadline and
-nothing here enforces it. That is deliberate: the count lives in the restored
+nothing here enforces it. Its value is the incident's effective budget,
+`agentMaxTurns` plus the incident's `grantedTurns` (see "A grant" below), so
+the child's own checks, `promptWithinBudget` included, count against the
+granted number. That is deliberate: the count lives in the restored
 session file, which the dispatcher reads only to resume a raised budget (below), and the escalation has to
 carry what the run spent — which the incident row only has as of the last
 tick's `rollUpUsage`, not as of the turn that spent the budget. So the child owns both halves. It counts, it escalates with live
@@ -215,6 +218,14 @@ constant or an env var and only a restart changes it.
 The used turns come from the session rather than the wait's text because a
 launch can overrun its budget, and a wait the new number still does not cover
 stays held. Lift and marker commit before the post, as with the sweep.
+
+**A grant lifts it on the next tick.** The Boss's `grant_turns`
+(`boss/commands.ts`) adds to `incident.grantedTurns` and writes a
+`turns_granted` action; it posts nothing. The lift compares used turns with
+`agentMaxTurns + grantedTurns`, and the grant total is part of the held-wait
+key, so a wait held as spent is read again once a grant moves it. When the
+incident has a grant the notice is "Granted N more turns; the agent is
+resuming with M left." instead, N being its total grant.
 
 The marker is itself activity, and that is the whole trick. The clock reads
 `incident_action`, so writing the marker resets the clock the sweep reads.

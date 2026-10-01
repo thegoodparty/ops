@@ -233,11 +233,22 @@ export const createSlackClient = (
         // Every page leads with the thread's parent, so it is keyed out.
         for (const m of res.messages ?? []) {
           const ts = String(m.ts ?? "");
+          // Sent on most messages, and absent from the SDK's type.
+          const sent = m as {
+            user_profile?: { display_name?: string; real_name?: string };
+            username?: string;
+          };
           byTs.set(ts, {
             user: m.user ?? null,
             botId: m.bot_id ?? null,
             text: m.text ?? "",
             ts,
+            name:
+              sent.user_profile?.display_name ||
+              sent.user_profile?.real_name ||
+              m.bot_profile?.name ||
+              sent.username ||
+              null,
           });
         }
         cursor = res.response_metadata?.next_cursor || undefined;

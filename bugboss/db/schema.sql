@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS incident (
   -- failures instead, so an interrupted agent is not mistaken for a crashing
   -- one: every merge to main restarts this container.
   attempts          INTEGER NOT NULL DEFAULT 0,
+  -- Turns the Boss has granted this incident on top of the configured
+  -- budget, summed over every grant_turns call. The agent's budget is the
+  -- configured max plus this, so a grant outlives a restart the way spent
+  -- turns do.
+  grantedTurns      INTEGER NOT NULL DEFAULT 0,
   modelId           TEXT,
   -- Tokens, never dollars. Bedrock returns these; a price is arithmetic we do
   -- against a table that goes stale the day AWS changes a rate, and a stored

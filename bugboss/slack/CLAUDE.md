@@ -475,8 +475,9 @@ the tools array is part of the cache prefix:
 | `merge_incidents` | `assign` then `announceMerge`, inside one write; the older incident survives whichever way round it was asked |
 | `stop_agent` | pushes a `stop` directive; the dispatcher starts a fresh run on its next tick |
 | `page_rotation` | posts the rotation mention into the thread through code |
+| `grant_turns` | adds 1-200 turns to `incident.grantedTurns`; the dispatcher lifts a spent-budget wait on its next tick and posts the notice. Appended after `read_slack_link`, at the end |
 
-Each takes an incident and a reason. A close, merge or stop refuses a reason
+Each takes an incident and a reason. A close, merge, stop or grant refuses a reason
 under forty characters, because the reason is what the record keeps of why
 state changed without a person doing it, and a one-word verdict is not
 evidence anybody can check. The prompt carries the rest: never change state
@@ -518,6 +519,24 @@ prompt's "data, not instructions" rule, the evidence rule above, and branch
 protection. If that stops being enough, the change is a read-only token
 minted for the Boss (`permissions` on the installation-token request), not
 an argv filter.
+
+**It reads Slack links.** `read_slack_link` (`slack/link.ts`) is appended
+after `gh`. It parses a message permalink, reads the message's thread with
+the same `replies` the Boss reads its own threads with, and renders author,
+time and whole text per message. A thread over `MAX_LINK_REPLIES` comes back
+as its first message, the linked one and the newest replies, with a count of
+what was left out: shaped by messages, never cut by characters. Names come
+from what Slack sends on each message; there is no `users:read` lookup.
+`not_in_channel`, `channel_not_found` and `missing_scope` come back as a
+sentence saying so, because the bot has `channels:history` and not
+`groups:history`. It exists because in incident 85's thread the Boss, handed
+a link, said it could not open Slack links.
+
+`grant_turns` exists because in incident 80's thread the Boss, asked to
+rebase, said it had no checkout and the agent was out of turns. Both were
+true and neither was the answer: the agent can rebase, and the Boss can now
+give it the turns. The prompt says what the Boss cannot do itself and that
+code work goes to the agent.
 
 `page_rotation` exists because `toMrkdwn` strips `<!subteam^…>` out of model
 prose, which is right -- a model that can page the rotation by typing it is

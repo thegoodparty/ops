@@ -18,6 +18,8 @@ import {
   type DispatcherDeps,
 } from "./index";
 import { createChildProcessSpawn, type AgentSpawnContext, type SpawnAgent } from "./spawn";
+import { buildGrantTurnsTool } from "../boss/commands";
+import type { Db } from "../db";
 
 const T0 = 1_700_000_000_000;
 
@@ -2770,6 +2772,50 @@ describe("Dispatcher raised turn budget", () => {
     assert.equal(waits(made.db, "i2"), 1);
     assert.equal(reads.filter((r) => r === "s/i2").length, 1, "a held wait is not read every tick");
     assert.equal(posts.length, 1);
+    made.cleanup();
+  });
+
+  it("resumes a spent incident on the tick after a grant, with the granted budget, and says so once", async () => {
+    const made = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(made.sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    budgetWait(made.sqlite, "i1", 300);
+    const launches: { incidentId: string; maxTurns: string }[] = [];
+    const posts: string[] = [];
+    const d = createDispatcher(
+      deps({
+        db: made.db,
+        config: config({ agentMaxTurns: 300 }),
+        spawn: async (ctx) => {
+          launches.push({ incidentId: ctx.incidentId, maxTurns: ctx.env.BUGBOSS_MAX_TURNS });
+        },
+        toolApiFor,
+        postNotice: async (_id, text) => {
+          posts.push(text);
+        },
+        sessionTurns: async () => 300,
+      }),
+    );
+
+    await (await d.tick()).settled;
+    assert.deepEqual(launches, [], "premise: spent at 300 of 300, it is held");
+
+    const grant = buildGrantTurnsTool(made.db as unknown as Db);
+    assert.match(
+      await grant.run({
+        incidentId: "i1",
+        turns: 50,
+        reason: "Swain asked in the thread for the agent to rebase its PR onto main now.",
+      }),
+      /^Granted 50 turns/,
+    );
+
+    await (await d.tick()).settled;
+    await (await d.tick()).settled;
+
+    assert.equal(waits(made.db, "i1"), 0);
+    assert.deepEqual(launches[0], { incidentId: "i1", maxTurns: "350" }, "the child gets budget + grant");
+    assert.deepEqual(posts, ["Granted 50 more turns; the agent is resuming with 50 left."]);
     made.cleanup();
   });
 
