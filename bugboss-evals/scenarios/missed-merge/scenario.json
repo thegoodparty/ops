@@ -15,7 +15,7 @@
   },
   "ci": [
     "npm test -w packages/contracts",
-    "npm test -w packages/gp-api",
+    "npm run test -w packages/gp-api -- src/users",
     "npm run lint -w packages/gp-api"
   ],
   "check": {

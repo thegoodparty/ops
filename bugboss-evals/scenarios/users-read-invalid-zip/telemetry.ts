@@ -19,6 +19,11 @@ import type {
 // shape (only some searches fail, the same search can fail repeatedly, every
 // failure names a data.N.zip issue) is the same.
 //
+// Dev runs the same admin console against a different dataset that holds no
+// bad zip, so its GET /v1/users always answers 200. A search someone runs "to
+// check the fix" lands there as often as not, and only the
+// deployment_environment_name label tells the two apart.
+//
 // Events are generated per minute from (seed, minute), so a live window cut
 // at any boundary returns exactly the lines a longer window would, and the
 // two sides of a pair see the same world.
@@ -26,6 +31,7 @@ import type {
 const MINUTE = 60_000;
 
 const INSTANCES = ["ip-10-20-1-11.sim.internal", "ip-10-20-2-37.sim.internal"];
+const DEV_INSTANCES = ["ip-10-30-1-08.sim.internal"];
 
 const SEARCH_NAMES = [
   "Avery",
@@ -56,6 +62,7 @@ const OTHER_ROUTES: { endpoint: string; url: string; perMinute: number }[] = [
 ];
 
 const ADMIN_CALLS_PER_MINUTE = 1 / 3;
+const DEV_ADMIN_CALLS_PER_MINUTE = 1 / 6;
 const FAULT_SHARE = 0.2;
 
 const mulberry32 = (a: number) => () => {
@@ -89,15 +96,13 @@ const poisson = (rnd: () => number, mean: number) => {
   return k;
 };
 
-const labels = (instance: string) => ({
-  service_name: "gp-api",
-  deployment_environment_name: "prod",
-  service_instance_id: instance,
-});
-
 const line = (ts: number, instance: string, body: Record<string, unknown>): LogLine => ({
   ts,
-  labels: labels(instance),
+  labels: {
+    service_name: "gp-api",
+    deployment_environment_name: DEV_INSTANCES.includes(instance) ? "dev" : "prod",
+    service_instance_id: instance,
+  },
   line: JSON.stringify(body),
 });
 
@@ -115,8 +120,9 @@ const request = (
   endpoint: string,
   url: string,
   fail: { index: number } | null,
+  instances = INSTANCES,
 ) => {
-  const instance = INSTANCES[Math.floor(rnd() * INSTANCES.length)];
+  const instance = instances[Math.floor(rnd() * instances.length)];
   const requestId = uuid(rnd);
   const req = { method: endpoint.split(" ")[0], endpoint, url };
   out.push(line(ts, instance, { level: 30, msg: "Request received", requestId, request: req }));
@@ -188,6 +194,13 @@ const minuteEvents = (seed: number, minute: number, state: "fault" | "healthy") 
     const hit = rnd() < FAULT_SHARE;
     const index = Math.floor(rnd() * 20);
     request(out, rnd, ts, "GET /v1/users", url, state === "fault" && hit ? { index } : null);
+  }
+  // Its own stream of draws, so dev traffic never shifts what prod shows.
+  const dev = bucketRng(seed ^ 0x5eed, minute);
+  for (let i = poisson(dev, DEV_ADMIN_CALLS_PER_MINUTE); i > 0; i--) {
+    const ts = start + Math.floor(dev() * MINUTE);
+    const name = SEARCH_NAMES[Math.floor(dev() * SEARCH_NAMES.length)];
+    request(out, dev, ts, "GET /v1/users", `/v1/users?limit=20&offset=0&firstName=${name}`, null, DEV_INSTANCES);
   }
   return out;
 };
