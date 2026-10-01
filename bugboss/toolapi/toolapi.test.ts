@@ -18,6 +18,7 @@ import { applyAssign } from "./assign";
 import {
   closeIncidentByBoss,
   createToolApi,
+  readTimelineEvents,
   type CorrelationMerge,
   type MergeVerdict,
 } from "./index";
@@ -1448,6 +1449,19 @@ describe("the timeline", () => {
 
     assert.equal(replay.data?.id, first.data?.id);
     assert.equal(((await tools.getIncident()).data as IncidentView).timeline.length, 1);
+  });
+
+  it("records the harness's goal verdicts, and leaves them out of the agent's view", async () => {
+    await seed("sig-a");
+    const id = await openIncident(["sig-a"]);
+    const tools = toolsFor(id);
+
+    const verdict = await tools.trackTimelineEvent({ kind: "goal_verdict", occurredAt: 1_000, summary: "root_cause met: shown" });
+    await tools.trackTimelineEvent({ kind: "first_error", occurredAt: 500, summary: "first 502" });
+
+    assert.equal(verdict.ok, true, verdict.error);
+    assert.deepEqual(readTimelineEvents(db, id).map((event) => event.kind), ["first_error", "goal_verdict"]);
+    assert.deepEqual(((await tools.getIncident()).data as IncidentView).timeline.map((event) => event.kind), ["first_error"]);
   });
 
   it("refuses a kind it does not know and a time that is not one", async () => {

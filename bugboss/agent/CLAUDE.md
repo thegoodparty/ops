@@ -676,17 +676,21 @@ outcomes.
   and no timeline row. A gate held shut by an outage would stop every
   incident at once.
 - **What it reads.** The goal, the attempt (a gate's arguments whole), the
-  incident record and timeline through the non-draining
-  `GET /incidents/:id/goal-context`, and the agent's projected context: the
-  latest compaction summary and everything after. Nothing is cut by character
-  count. A transcript that outgrows the evaluator's window leaves out its
-  oldest messages whole and says how many.
-- **Every verdict is recorded twice.** As a `goal_verdict` timeline row
-  (`POST /incidents/:id/goal-verdict`, kept out of `TIMELINE_EVENT_KINDS` so
-  the agent cannot record one, and filtered out of stage compaction prompts),
-  and as a `bugboss_goal_verdict` session entry carrying its usage, which
-  `sumSessionUsage` adds to the incident's tokens but not its turns or its
-  `modelId`.
+  incident and signals from `getIncident`, the timeline from the
+  non-draining `GET /incidents/:id/timeline`, and the agent's projected
+  context: the latest compaction summary and everything after. Nothing is cut
+  by character count. A transcript that outgrows the evaluator's window
+  leaves out its oldest messages whole and says how many.
+- **No routes of its own.** `getIncident` drains directives, and so does the
+  verdict write, so `goalApi` (`run.ts`) hands what they drained back to the
+  judged tool, which delivers it like any other tool result.
+- **Every verdict is recorded twice.** As a `goal_verdict` row written by
+  `goalApi` through the timeline route, and as a `bugboss_goal_verdict`
+  session entry carrying its usage, which `sumSessionUsage` adds to the
+  incident's tokens but not its turns or its `modelId`. The agent's
+  `track_incident_timeline_event` tool refuses `goal_verdict`; `getIncident`
+  and stage compaction leave the rows out, and the evaluator reads them back
+  as earlier verdicts.
 
 ## The transcript keeps everything compaction summarised
 

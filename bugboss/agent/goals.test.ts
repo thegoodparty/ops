@@ -7,9 +7,9 @@ import { describe, test } from "node:test";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 
 import { createPiModelClient } from "../bedrock/client";
-import type { Directive, GoalContext, IncidentStatus, TimelineEvent, ToolApi, ToolResponse } from "../types";
+import type { Directive, IncidentStatus, TimelineEvent, ToolApi, ToolResponse } from "../types";
 import { createGoalEvaluator, createStageGoals, GOALS } from "./goals";
-import { createBossTools, startWithinBudget } from "./run";
+import { createBossTools, goalApi, startWithinBudget, type BossClient } from "./run";
 import { sumSessionUsage } from "./session";
 import { createMessageBossTool } from "./tools";
 
@@ -93,8 +93,19 @@ const runGoals = async (args: {
     verdicts: [] as { gate: string; verdict: string; reason: string }[],
   };
   const queued = [...(args.directives ?? [])];
+  // Every tool API call drains, as the real one does.
   const ok = (data?: unknown): ToolResponse<never> =>
-    ({ ok: true, directives: [], ...(data === undefined ? {} : { data }) }) as ToolResponse<never>;
+    ({ ok: true, directives: queued.splice(0), ...(data === undefined ? {} : { data }) }) as ToolResponse<never>;
+  const incident = {
+    id: "94",
+    status: args.status ?? "INVESTIGATING",
+    rootCause: null,
+    usersImpacted: null,
+    impactQuery: null,
+    prUrls: [],
+    resolvedEvidence: null,
+  };
+  const timeline: TimelineEvent[] = [...(args.timeline ?? [])];
   const api = {
     reportRootCause: async () => {
       calls.reportRootCause += 1;
@@ -108,28 +119,20 @@ const runGoals = async (args: {
       calls.reportAnalysis += 1;
       return ok();
     },
-    getIncident: async () => {
-      const directives = queued.splice(0);
-      return { ...ok({ signals: [SIGNAL] }), directives };
+    getIncident: async () => ok({ incident, signals: [SIGNAL] }),
+    trackTimelineEvent: async (event: Omit<TimelineEvent, "id" | "recordedAt">) => {
+      const row = { ...event, id: timeline.length + 1, recordedAt: event.occurredAt, evidenceUrl: null };
+      timeline.push(row);
+      const verdict = /^(\S+) (\S+): (.*)$/s.exec(event.summary);
+      if (event.kind === "goal_verdict" && verdict) {
+        calls.verdicts.push({ gate: verdict[1], verdict: verdict[2], reason: verdict[3] });
+      }
+      return ok(row);
     },
-    trackTimelineEvent: async (event: { kind: TimelineEvent["kind"] }) => ok({ ...event, id: 9 }),
-  } as unknown as ToolApi;
+    timelineEvents: async () => [...timeline],
+  } as unknown as ToolApi & Pick<BossClient, "timelineEvents">;
   const tellBoss = async (kind: string, text: string) => {
     calls.told.push({ kind, text });
-  };
-
-  const context: GoalContext = {
-    incident: {
-      id: "94",
-      status: args.status ?? "INVESTIGATING",
-      rootCause: null,
-      usersImpacted: null,
-      impactQuery: null,
-      prUrls: [],
-      resolvedEvidence: null,
-    },
-    signals: [SIGNAL],
-    timeline: args.timeline ?? [],
   };
 
   let manager: import("@earendil-works/pi-coding-agent").SessionManager | null = null;
@@ -140,11 +143,7 @@ const runGoals = async (args: {
       contextWindow: evaluatorModel.contextWindow,
       estimateTokens: (message) => pi.estimateTokens(message),
     }),
-    context: async () => context,
-    recordVerdict: async (verdict) => {
-      calls.verdicts.push(verdict);
-    },
-    escalate: (reason, brief) => tellBoss("escalation", `${reason}\n\n${brief}`),
+    ...goalApi({ ...api, tellBoss: (kind, text) => tellBoss(kind, text) }, (event, fields) => logs.push({ event, fields })),
     session: () => manager,
     toMessages: (messages) => pi.convertToLlm(messages as Parameters<typeof pi.convertToLlm>[0]),
     log: (event, fields) => logs.push({ event, fields }),
@@ -403,6 +402,36 @@ describe("stage goals, through a real Pi session", () => {
     assert.equal(run.calls.verdicts.length, 0);
   });
 
+  test("an evaluator that fails on a merge check-in lets the ask out, with an alarm", async () => {
+    const run = await runGoals({
+      status: "FIXING",
+      judge: () => ({ verdict: "maybe", reason: "" }),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
+        fauxAssistantMessage("done"),
+      ],
+    });
+
+    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 1, "the ask went out");
+    assert.ok(run.logs.some((log) => log.event === "goal_unjudged"));
+    assert.equal(run.calls.verdicts.length, 0);
+  });
+
+  test("a merge check-in delivers a stop it drained instead of sending the ask", async () => {
+    const run = await runGoals({
+      status: "FIXING",
+      directives: [{ type: "stop", reason: "a person took it" }],
+      judge: () => verdict("met", "Approved and green."),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
+        fauxAssistantMessage("should not run"),
+      ],
+    });
+
+    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 0);
+    assert.equal(run.agentRequests.length, 1, "the stop ended the run");
+  });
+
   test("impossible escalates through escalate, and the agent keeps working", async () => {
     const run = await runGoals({
       judge: () => verdict("impossible", "Only Stripe support can say which charges were refunded; a person has to ask them."),
@@ -432,6 +461,26 @@ describe("stage goals, through a real Pi session", () => {
 
     assert.equal(run.calls.reportRootCause, 0, "premise: the gate was refused");
     assert.equal(run.agentRequests.length, 1, "the stop ended the run on the refused call");
+  });
+
+  test("the agent's timeline tool cannot record a verdict", async () => {
+    const run = await runGoals({
+      judge: () => verdict("met", "ok"),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(
+          fauxToolCall("track_incident_timeline_event", {
+            kind: "goal_verdict",
+            occurredAt: Date.now(),
+            summary: "root_cause met: trust me",
+          }),
+        ),
+        fauxAssistantMessage("done"),
+      ],
+    });
+
+    assert.equal(run.calls.verdicts.length, 0);
+    assert.match(run.agentRequests[1], /goal_verdict/);
+    assert.doesNotMatch(run.agentRequests[1], /"ok\b/);
   });
 
   test("an evaluator that fails passes the gate, with an alarm", async () => {

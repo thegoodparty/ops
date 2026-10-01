@@ -560,35 +560,13 @@ test("a timeline event is validated before it reaches the tool API", async () =>
   assert.equal(reached, before);
 });
 
-test("a goal verdict lands in the timeline, and the evaluator's read drains nothing", async () => {
-  const recorded = await authed("/goal-verdict", {
+test("the timeline route takes the harness's goal_verdict kind", async () => {
+  const before = reached;
+  await authed("/timeline", {
     method: "POST",
-    body: JSON.stringify({
-      gate: "root_cause",
-      verdict: "not_met",
-      reason: "nothing shows what happened to a user",
-    }),
+    body: JSON.stringify({ kind: "goal_verdict", occurredAt: 5, summary: "root_cause met: shown" }),
   });
-  assert.equal(recorded.status, 200);
-
-  const context = (await (await authed("/goal-context")).json()) as {
-    incident: { status: string };
-    timeline: { kind: string; summary: string }[];
-  };
-  assert.equal(context.incident.status, "INVESTIGATING");
-  const verdict = context.timeline.find((event) => event.kind === "goal_verdict");
-  assert.equal(verdict?.summary, "root_cause not_met: nothing shows what happened to a user");
-  const queued = db.query<{ n: number }>(
-    "SELECT COUNT(*) AS n FROM pending_directive WHERE incidentId = ?",
-    [INCIDENT],
-  )[0].n;
-  assert.ok(queued >= 1, "reading the goal context drains nothing");
-
-  const bad = await authed("/goal-verdict", {
-    method: "POST",
-    body: JSON.stringify({ gate: "vibes", verdict: "met", reason: "x" }),
-  });
-  assert.equal(bad.status, 400);
+  assert.equal(reached, before + 1, "it reached the tool API");
 });
 
 // --- request_sql_query: the Boss names the thread and forwards -------------

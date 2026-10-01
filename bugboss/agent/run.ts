@@ -20,7 +20,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type {
   Directive,
-  GoalContext,
   IncidentMatch,
   IncidentView,
   MergeOutcomeView,
@@ -79,6 +78,7 @@ import {
   createStageGoals,
   type StageGate,
   type StageGoals,
+  type StageGoalsDeps,
 } from "./goals";
 import {
   createPiSummarizer,
@@ -375,7 +375,6 @@ export type BossClient = Omit<ToolApi, "escalate"> &
   WaitMarkerPort &
   BossInboxPort &
   TimelinePeek &
-  GoalPort &
   SqlRequestPort;
 
 /**
@@ -385,12 +384,6 @@ export type BossClient = Omit<ToolApi, "escalate"> &
  */
 export interface TimelinePeek {
   timelineEvents(): Promise<TimelineEvent[]>;
-}
-
-/** What the stage-goal evaluator reads and writes, none of it draining directives. */
-export interface GoalPort {
-  goalContext(): Promise<GoalContext>;
-  recordGoalVerdict(verdict: { gate: string; verdict: string; reason: string }): Promise<TimelineEvent>;
 }
 
 export const createBossClient = (args: {
@@ -447,8 +440,6 @@ export const createBossClient = (args: {
     trackTimelineEvent: (payload) =>
       call<ToolResponse<TimelineEvent>>("POST", "/timeline", payload),
     timelineEvents: () => call<TimelineEvent[]>("GET", "/timeline"),
-    goalContext: () => call<GoalContext>("GET", "/goal-context"),
-    recordGoalVerdict: (verdict) => call<TimelineEvent>("POST", "/goal-verdict", verdict),
     peekDirectives: () => call<PendingDirective[]>("GET", "/directives"),
     consumeDirective: (id) =>
       call<void>("DELETE", `/directives/${id}`).then(() => undefined),
@@ -515,20 +506,9 @@ export const createBossTools = async (args: {
     run: () => Promise<ToolResponse>,
   ) => {
     if (!args.goals) return bossToolResult(await run());
-    let ran = false;
-    const response = await args.goals.gate(
-      gate,
-      `The agent called ${tool} with:\n${JSON.stringify(params, null, 2)}`,
-      () => {
-        ran = true;
-        return run();
-      },
+    return bossToolResult(
+      await args.goals.gate(gate, `The agent called ${tool} with:\n${JSON.stringify(params, null, 2)}`, run),
     );
-    if (ran) return bossToolResult(response);
-    // A refused gate never reached the tool API, so it drained nothing; a
-    // stop or merge must still reach the agent on this call.
-    const { directives = [] } = await args.api.getIncident();
-    return bossToolResult({ ...response, directives });
   };
 
   const tools: ToolDefinition[] = [
@@ -784,6 +764,15 @@ export const createBossTools = async (args: {
         ),
       }),
       execute: async (_id: string, params: unknown) => {
+        // The route also takes the harness's goal_verdict; the agent may not.
+        const { kind } = params as { kind: string };
+        if (!(TIMELINE_EVENT_KINDS as readonly string[]).includes(kind)) {
+          return bossToolResult({
+            ok: false,
+            error: `unknown timeline event kind ${kind}; use one of ${TIMELINE_EVENT_KINDS.join(", ")}`,
+            directives: [],
+          });
+        }
         const response = await args.api.trackTimelineEvent(
           params as unknown as Parameters<ToolApi["trackTimelineEvent"]>[0],
         );
@@ -2092,6 +2081,45 @@ const launch = async (args: {
 };
 
 /**
+ * The evaluator's reads and writes, through routes that already exist. No
+ * route reads the incident without draining, so it reads it the way the
+ * agent does and hands the drained directives to the tool it judged; the
+ * timeline comes from the non-draining peek, verdicts and all. A verdict is a
+ * `goal_verdict` row through the timeline route, which only this code
+ * writes: the agent's tool refuses the kind.
+ */
+export const goalApi = (
+  api: Pick<BossClient, "getIncident" | "timelineEvents" | "trackTimelineEvent" | "tellBoss">,
+  alarm: (event: string, fields: Record<string, unknown>) => void,
+): Pick<StageGoalsDeps, "context" | "recordVerdict" | "escalate"> => ({
+  context: async () => {
+    const [view, timeline] = await Promise.all([api.getIncident(), api.timelineEvents()]);
+    if (!view.ok || !view.data) {
+      return { context: null, error: view.error ?? "no data", directives: view.directives ?? [] };
+    }
+    const { incident, signals } = view.data;
+    return {
+      context: {
+        incident,
+        signals: signals.map(({ id, kind, source, title, body }) => ({ id, kind, source, title, body })),
+        timeline,
+      },
+      directives: view.directives ?? [],
+    };
+  },
+  recordVerdict: async (verdict) => {
+    const response = await api.trackTimelineEvent({
+      kind: GOAL_VERDICT_KIND,
+      occurredAt: Date.now(),
+      summary: `${verdict.gate} ${verdict.verdict}: ${verdict.reason}`,
+    });
+    if (!response.ok) alarm("goal_verdict_timeline_failed", { gate: verdict.gate, error: response.error });
+    return response.directives ?? [];
+  },
+  escalate: (reason, brief) => api.tellBoss("escalation", `${reason}\n\n${brief}`),
+});
+
+/**
  * The stage-goal evaluator, or none. A goal model the catalog does
  * not know costs the run its goals, never the run: the gates fall back to
  * what they did before, and the alarm says so.
@@ -2123,9 +2151,7 @@ const createGoals = async (args: {
       contextWindow: model.contextWindow,
       estimateTokens: (message) => args.pi.estimateTokens(message),
     }),
-    context: () => args.api.goalContext(),
-    recordVerdict: (verdict) => args.api.recordGoalVerdict(verdict),
-    escalate: (reason, brief) => args.api.tellBoss("escalation", `${reason}\n\n${brief}`),
+    ...goalApi(args.api, emit("error")),
     session: args.session,
     toMessages: (messages) =>
       args.pi.convertToLlm(messages as Parameters<typeof args.pi.convertToLlm>[0]),

@@ -767,8 +767,11 @@ export interface DirectivePeek {
   consumeDirective(id: number): Promise<void>;
 }
 
-/** The stage-goal check before a person is asked to merge. Null lets the message go out. */
-export type MergeCheckIn = (ask: string) => Promise<string | null>;
+/**
+ * The stage-goal check before a person is asked to merge. A null `blocked`
+ * lets the message go out. `directives` were drained by the check's reads.
+ */
+export type MergeCheckIn = (ask: string) => Promise<{ blocked: string | null; directives: Directive[] }>;
 
 export interface MessageBossDeps {
   marker: QuestionMarkerPort;
@@ -1175,20 +1178,22 @@ export const createMessageBossTool = async (
     parameters,
     execute: async (_toolCallId, params, signal) => {
       const args = params as unknown as MessageBossArgs;
+      let drained: Directive[] = [];
       if (deps.checkIn) {
         // A question already asked is a resumed wait, not a new ask.
         const resuming = args.wait && (await deps.marker.getPending())?.message === args.message;
-        const blocked = resuming
-          ? null
+        const check = resuming
+          ? { blocked: null, directives: [] }
           : await deps.checkIn(
               `The agent is sending the Boss this message${args.wait ? " and waiting for the answer" : ""}:\n${args.message}`,
             );
-        if (blocked) {
-          const directives = (await deps.api.peekDirectives()).map((entry) => entry.directive);
+        drained = check.directives;
+        const stopped = drained.some((directive) => directive.type === "stop" || directive.type === "merged");
+        if (check.blocked || stopped) {
           return {
-            content: [{ type: "text", text: `Not sent to the Boss. ${blocked}${renderDirectives(directives)}` }],
+            content: [{ type: "text", text: `Not sent to the Boss. ${check.blocked ?? ""}${renderDirectives(drained)}` }],
             details: { timedOut: false },
-            terminate: directives.some((directive) => directive.type === "stop" || directive.type === "merged"),
+            terminate: stopped,
           };
         }
       }
@@ -1210,7 +1215,7 @@ export const createMessageBossTool = async (
             : "The wait ended on a directive rather than an answer.";
       return {
         content: [
-          { type: "text", text: `${text}${renderDirectives(result.directives)}` },
+          { type: "text", text: `${text}${renderDirectives([...drained, ...result.directives])}` },
         ],
         details: { timedOut: result.timedOut },
         terminate: result.terminate,

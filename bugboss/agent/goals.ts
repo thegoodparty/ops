@@ -21,9 +21,19 @@ import { z } from "zod";
 
 import { ModelRequestFailed, type ModelClient, type ModelUsage } from "../model";
 import { GOAL_VERDICT_KIND } from "../types";
-import type { GoalContext, ToolResponse } from "../types";
+import type { Directive, Incident, SignalView, TimelineEvent, ToolResponse } from "../types";
 import { renderTimeline } from "./compaction";
 import { GOAL_VERDICT_ENTRY_TYPE } from "./session";
+
+/** What the evaluator reads about an incident. */
+export interface GoalContext {
+  incident: Pick<
+    Incident,
+    "id" | "status" | "rootCause" | "usersImpacted" | "impactQuery" | "prUrls" | "resolvedEvidence"
+  >;
+  signals: Pick<SignalView, "id" | "kind" | "source" | "title" | "body">[];
+  timeline: TimelineEvent[];
+}
 
 export type StageGate = "root_cause" | "resolved" | "analysis";
 export type Gate = StageGate | "merge_check_in";
@@ -260,9 +270,12 @@ export interface GoalSession {
 
 export interface StageGoalsDeps {
   evaluate: GoalEvaluator;
-  /** The non-draining read. */
-  context: () => Promise<GoalContext>;
-  recordVerdict: (verdict: { gate: Gate; verdict: Verdict; reason: string }) => Promise<unknown>;
+  /**
+   * Both go through tool API calls that drain the Boss's directives, so both
+   * hand back what they drained, and the tool that was judged delivers it.
+   */
+  context: () => Promise<{ context: GoalContext | null; error?: string; directives: Directive[] }>;
+  recordVerdict: (verdict: { gate: Gate; verdict: Verdict; reason: string }) => Promise<Directive[]>;
   /** The escalate tool's own path to the Boss. */
   escalate: (reason: string, brief: string) => Promise<void>;
   session: () => GoalSession | null;
@@ -290,16 +303,15 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
     return session ? deps.toMessages(session.buildSessionProjection().messages) : [];
   };
 
-  const judge = async (gate: Gate, attempt: string): Promise<Evaluation> => {
+  const judge = async (gate: Gate, attempt: string): Promise<Evaluation & { directives: Directive[] }> => {
+    const directives: Directive[] = [];
     let evaluation: Evaluation;
     try {
-      evaluation = await deps.evaluate({
-        gate,
-        goal: GOALS[gate],
-        attempt,
-        context: await deps.context(),
-        transcript: transcript(),
-      });
+      const read = await deps.context();
+      directives.push(...read.directives);
+      evaluation = read.context
+        ? await deps.evaluate({ gate, goal: GOALS[gate], attempt, context: read.context, transcript: transcript() })
+        : { judgement: "unjudged", reason: `the incident could not be read: ${read.error}`, usage: null };
     } catch (err: unknown) {
       evaluation = { judgement: "unjudged", reason: `the goal could not be judged: ${String(err)}`, usage: null };
     }
@@ -324,12 +336,14 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
     // evaluator must not read it back as an earlier judgement.
     if (evaluation.judgement !== "not_applicable" && evaluation.judgement !== "unjudged") {
       try {
-        await deps.recordVerdict({ gate, verdict: evaluation.judgement, reason: evaluation.reason });
+        directives.push(
+          ...(await deps.recordVerdict({ gate, verdict: evaluation.judgement, reason: evaluation.reason })),
+        );
       } catch (err: unknown) {
         deps.alarm("goal_verdict_timeline_failed", { gate, error: String(err) });
       }
     }
-    return evaluation;
+    return { ...evaluation, directives };
   };
 
   const goalFooter = (gate: Gate): string => `The goal (${GATE_TITLE[gate]}):\n${GOALS[gate]}`;
@@ -362,7 +376,7 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
             "",
             `Keep working, surface the evidence, then call ${GATE_TOOL[gate]} again.`,
           ].join("\n"),
-          directives: [],
+          directives: evaluation.directives,
         };
       }
       if (evaluation.judgement === "impossible") {
@@ -370,32 +384,35 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
         return {
           ok: false,
           error: `IMPOSSIBLE, nothing changed: ${evaluation.reason}\n\n${told} Keep working the incident while a person decides.`,
-          directives: [],
+          directives: evaluation.directives,
         };
       }
-      return run();
+      const response = await run();
+      return { ...response, directives: [...evaluation.directives, ...(response.directives ?? [])] };
     },
 
     /**
-     * The check before a person is asked to merge. Null when the message may
-     * go out; otherwise what the tool returns instead of sending it.
+     * The check before a person is asked to merge. `blocked` is null when the
+     * message may go out; otherwise what the tool returns instead of sending it.
      */
-    checkIn: async (ask: string): Promise<string | null> => {
+    checkIn: async (ask: string): Promise<{ blocked: string | null; directives: Directive[] }> => {
       const evaluation = await judge("merge_check_in", ask);
+      const { directives } = evaluation;
       if (evaluation.judgement === "not_met") {
-        return [
+        const blocked = [
           `NOT MET, nothing changed: ${evaluation.reason}`,
           "",
           goalFooter("merge_check_in"),
           "",
           "The ask was not sent. Keep working, surface the evidence, then ask again.",
         ].join("\n");
+        return { blocked, directives };
       }
       if (evaluation.judgement === "impossible") {
         const told = await escalate("merge_check_in", evaluation.reason);
-        return `IMPOSSIBLE, the ask was not sent: ${evaluation.reason}\n\n${told}`;
+        return { blocked: `IMPOSSIBLE, the ask was not sent: ${evaluation.reason}\n\n${told}`, directives };
       }
-      return null;
+      return { blocked: null, directives };
     },
   };
 };
