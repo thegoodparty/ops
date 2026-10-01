@@ -603,6 +603,17 @@ turn cap carrying an investigation they had finished hours earlier.
   non-draining `GET /incidents/:id/timeline`. A failed read or a failed
   summary logs and falls back to Pi's default summary; the context still
   shrinks, it just loses the stage's focus.
+- **An armed stage survives a restart.** Arming is process memory, and every
+  ops deploy restarts every agent, so the turn that arms also appends a
+  `bugboss_stage_compaction` custom entry (`{ stage }`) to the session file.
+  `stages.extension` runs ahead of the session sync so that entry is in the
+  same turn_end upload. On launch, `startWithinBudget` checks the turn budget,
+  then `stages.resume` compacts for the stage if the last stage entry on the
+  branch has no `compaction` entry after it, then sends the first prompt. A
+  spent budget does neither. Compacting first makes the relaunch's cold cache
+  write a summary rather than the history. The compaction entry clears the
+  marker; `{ stage: null }` clears it when Pi found nothing to compact or the
+  resume compaction failed.
 
 The replay of incidents 94 and 86 at these three transitions came to about
 43% less spend on the two ($31 of $73.50), nearly all of it cache reads.

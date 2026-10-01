@@ -27,6 +27,13 @@
 //
 // The backstop is untouched: when nothing is armed the hook returns nothing
 // and Pi summarises with its default prompt at the usual threshold.
+//
+// Arming lasts only as long as the process, and a deploy restarts every
+// agent, so the armed stage is also written to the session as a custom entry.
+// A relaunch that finds one with no compaction after it compacts for that
+// stage before its first request. That timing is cheap: the first request of
+// a relaunch rewrites the whole context into the cache anyway, and this makes
+// what it rewrites the summary.
 
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
@@ -35,6 +42,7 @@ import type {
   ExtensionAPI,
   ModelRuntime,
   SessionBeforeCompactEvent,
+  SessionEntry,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
@@ -115,6 +123,24 @@ export const stageCompactionInstructions = (
       : "No timeline events have been recorded yet. Under a `## Timeline` heading, list the key moments visible in the conversation with their times, and say they still need recording with track_incident_timeline_event.",
   ].join("\n");
 
+/**
+ * The custom entry that records an armed stage. `{ stage: null }` clears one
+ * that will not be compacted for; a `compaction` entry after it clears it too.
+ */
+export const STAGE_ENTRY_TYPE = "bugboss_stage_compaction";
+
+/** The stage the session still owes a compaction for, if any. */
+export const pendingStageOf = (entries: SessionEntry[]): CompactionStage | null => {
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    if (entry.type === "compaction") return null;
+    if (entry.type === "custom" && entry.customType === STAGE_ENTRY_TYPE) {
+      return (entry.data as { stage?: CompactionStage | null } | undefined)?.stage ?? null;
+    }
+  }
+  return null;
+};
+
 export interface StageCompactionSettings {
   applyOverrides(overrides: { compaction: { reserveTokens: number } }): void;
 }
@@ -123,6 +149,11 @@ export interface StageCompaction {
   /** Called by the tool whose success is the transition. */
   request: (stage: CompactionStage) => void;
   extension: (pi: ExtensionAPI) => void;
+  /**
+   * Compacts for a stage a previous process armed and did not get to. Called
+   * once at launch, before the first request, while the session is idle.
+   */
+  resume: (session: Pick<AgentSession, "compact" | "sessionManager">) => Promise<void>;
 }
 
 type Preparation = SessionBeforeCompactEvent["preparation"];
@@ -184,6 +215,7 @@ export const createStageCompaction = (args: {
         }
         armed = stage;
         args.settings.applyOverrides({ compaction: { reserveTokens: args.contextWindow } });
+        pi.appendEntry(STAGE_ENTRY_TYPE, { stage });
         args.log("stage_compaction_armed", { stage, tokens });
       });
 
@@ -193,6 +225,7 @@ export const createStageCompaction = (args: {
         if (!armed) return;
         args.log("stage_compaction_not_run", { stage: armed });
         disarm();
+        pi.appendEntry(STAGE_ENTRY_TYPE, { stage: null });
       });
 
       pi.on("session_before_compact", async (event) => {
@@ -232,6 +265,21 @@ export const createStageCompaction = (args: {
           return undefined;
         }
       });
+    },
+    resume: async (session) => {
+      const stage = pendingStageOf(session.sessionManager.getBranch());
+      if (!stage) return;
+      args.log("stage_compaction_resumed", { stage });
+      armed = stage;
+      try {
+        await session.compact();
+      } catch (err: unknown) {
+        // Cleared rather than left for the next launch: a compaction that
+        // failed here fails the same way there, and the backstop remains.
+        disarm();
+        session.sessionManager.appendCustomEntry(STAGE_ENTRY_TYPE, { stage: null });
+        args.log("stage_compaction_resume_failed", { stage, error: String(err) });
+      }
     },
   };
 };
