@@ -195,7 +195,9 @@ export const renderReport = (args: {
     "",
     `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, then per run the mean model turns, estimated cost (priced from tokens) and time from alert to ${milestone}. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
     "",
-    `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
+    args.tier === "stub"
+      ? "No Bedrock spend: a scripted model answered every call. The costs below price its token counts as if the configured model had."
+      : `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
     "",
     "| Scenario | Baseline gates | turns | cost | wall | Candidate gates | turns | cost | wall | Quality W-L-T |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",

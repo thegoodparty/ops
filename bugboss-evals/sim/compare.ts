@@ -275,6 +275,9 @@ const run = async (argv: string[]): Promise<void> => {
                       { encoding: "utf8", env: { ...process.env, GIT_INDEX_FILE: index } },
                       (error, stdout) => (error ? fail(error) : done(stdout.trim())),
                     );
+                    // git exits before reading stdin it never asked for; a
+                    // write into that closed pipe must not kill the harness.
+                    child.stdin?.on("error", () => undefined);
                     child.stdin?.end(input ?? "");
                   });
                 const tip = await git(["rev-parse", `refs/heads/${branch}`]);
