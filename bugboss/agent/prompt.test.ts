@@ -407,10 +407,16 @@ test("the agent is told to write mrkdwn, not Markdown", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.ok(prompt.includes("## What reaches Slack"));
-  // The root cause, the resolution evidence and the post-mortem are posted
-  // verbatim, so the rules they need are the ones Markdown gets wrong: bold,
-  // links, headings, and the escaping it must not attempt by hand.
-  assert.match(prompt, /your root cause, your resolution evidence and your\s+post-mortem/);
+  // The root cause and the resolution evidence are posted verbatim, so the
+  // rules they need are the ones Markdown gets wrong: bold, links, headings,
+  // and the escaping it must not attempt by hand. The post-mortem goes to the
+  // PDF, which reads Markdown.
+  assert.match(prompt, /your root cause and your resolution evidence\./);
+  assert.match(prompt, /\*\*The post-mortem is not Slack text\.\*\* Every rule above is for the root cause\s+and the resolution evidence only/);
+  assert.ok(
+    prompt.indexOf("The post-mortem is not Slack text") > prompt.indexOf("There are no headings and no tables."),
+    "the exception comes after the mrkdwn rules it overrides",
+  );
   assert.ok(prompt.includes("not **bold**"));
   assert.ok(prompt.includes("<https://example.com|label>"));
   assert.ok(prompt.includes("There are no headings and no tables."));
@@ -475,8 +481,8 @@ test("the thread cap on resolution evidence is a refusal, and the post-mortem ha
 
   assert.match(prompt, new RegExp(`capped at\\s+${THREAD_PROSE_CHARS} characters`));
   assert.match(prompt, /a longer one is refused and\s+handed back/);
-  assert.match(prompt, /The post-mortem has no\s+character cap/);
-  assert.match(prompt, /becomes a file attached to the thread/);
+  assert.match(prompt, /It has no character\s+cap/);
+  assert.match(prompt, /it is a file attached to the thread/);
 });
 
 test("the prompt asks for behaviour over symbols, with a worked pair", () => {
