@@ -188,6 +188,22 @@ describe("decisions", () => {
     assert.match(update.args[2] as string, /Ran for <@U_ONCALL>: 1 rows returned to the agent\.$/);
   });
 
+  it("keeps an approved request pending when the re-read fails, and runs it on the next tick", async () => {
+    const t = setup();
+    const id = await created(await t.submit({}));
+    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    const reply = t.slack.reply;
+    t.slack.reply = async () => {
+      throw new Error("ratelimited");
+    };
+    await t.runner.tick();
+    assert.equal((await t.status(id)).status, "pending");
+    assert.equal(t.executed.length, 0);
+    t.slack.reply = reply;
+    await t.runner.tick();
+    assert.equal((await t.status(id)).status, "done");
+  });
+
   it("lets a refusal win over an approval", async () => {
     const t = setup();
     const id = await created(await t.submit({}));

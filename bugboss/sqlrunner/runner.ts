@@ -235,7 +235,6 @@ export const createSqlRunner = (config: SqlRunnerConfig) => {
   };
 
   const run = async (req: SqlRequest, approver: string) => {
-    req.status = "running";
     req.decidedBy = approver;
     log("request_approved", { requestId: req.requestId, incidentId: req.incidentId, decidedBy: approver });
 
@@ -255,6 +254,10 @@ export const createSqlRunner = (config: SqlRunnerConfig) => {
       });
       return;
     }
+
+    // Only now, after the re-read: a 429 on that read must leave the request
+    // pending so the next tick retries it, not fail an approved query.
+    req.status = "running";
 
     let result: QueryResult;
     try {
