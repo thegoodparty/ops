@@ -46,6 +46,7 @@ const runGoals = async (args: {
   /** Directives the Boss has queued, drained by the first get_incident. */
   directives?: Directive[];
   timelineFails?: boolean;
+  escalationFails?: boolean;
   judge: (body: string) => Verdict;
   turns: (kit: typeof import("@earendil-works/pi-ai")) => unknown[];
 }) => {
@@ -136,6 +137,7 @@ const runGoals = async (args: {
     },
   } as unknown as ToolApi & Pick<BossClient, "timelineEvents">;
   const tellBoss = async (kind: string, text: string) => {
+    if (kind === "escalation" && args.escalationFails) throw new Error("inbox down");
     calls.told.push({ kind, text });
   };
 
@@ -465,6 +467,38 @@ describe("stage goals, through a real Pi session", () => {
 
     assert.equal(run.calls.reportRootCause, 0, "premise: the gate was refused");
     assert.equal(run.agentRequests.length, 1, "the stop ended the run on the refused call");
+  });
+
+  test("an impossible verdict whose escalation fails tells the agent to escalate itself, with an alarm", async () => {
+    const run = await runGoals({
+      escalationFails: true,
+      judge: () => verdict("impossible", "Only a person can decide this."),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
+        fauxAssistantMessage("still here"),
+      ],
+    });
+
+    assert.equal(run.calls.reportRootCause, 0);
+    assert.match(run.agentRequests[1], /The escalation to the Boss failed; call escalate yourself/);
+    assert.ok(run.logs.some((log) => log.event === "goal_escalation_failed"));
+  });
+
+  test("an impossible merge check-in escalates and holds the ask", async () => {
+    const run = await runGoals({
+      status: "FIXING",
+      judge: () => verdict("impossible", "The fix needs a Stripe dashboard setting only a person can change."),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
+        fauxAssistantMessage("still here"),
+      ],
+    });
+
+    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 0, "the ask did not go out");
+    assert.equal(run.calls.told.filter((told) => told.kind === "escalation").length, 1);
+    assert.match(run.calls.told[0].text, /Stripe dashboard setting/);
+    assert.match(run.agentRequests[1], /Not sent to the Boss\. IMPOSSIBLE, the ask was not sent/);
+    assert.deepEqual(run.calls.verdicts.map((v) => [v.gate, v.verdict]), [["merge_check_in", "impossible"]]);
   });
 
   test("the agent's timeline tool cannot record a verdict", async () => {
