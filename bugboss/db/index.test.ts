@@ -845,6 +845,7 @@ describe("a snapshot PUT that fails", () => {
     try {
       const first = await captureAlarms(() => insert(db, "lost-put").catch(() => undefined));
       assert.ok(first.includes("snapshot_failed_halting_writes"), "an alarm on the first failure");
+      assert.deepEqual(db.query("SELECT id FROM incident"), [], "rolled back, so the throw is the truth");
 
       // Inside the backoff: refused without another PUT, and nothing committed.
       const puts = state.puts;
@@ -861,7 +862,7 @@ describe("a snapshot PUT that fails", () => {
       await insert(db, "after");
 
       const ids = db.query<{ id: string }>("SELECT id FROM incident ORDER BY id").map((r) => r.id);
-      assert.deepEqual(ids, ["after", "lost-put"], "nothing committed while halted");
+      assert.deepEqual(ids, ["after"], "nothing a caller was told failed is there");
 
       const landed = join(dir, "landed.db");
       writeFileSync(landed, state.landed!);
@@ -870,7 +871,7 @@ describe("a snapshot PUT that fails", () => {
         const inS3 = (copy.prepare("SELECT id FROM incident ORDER BY id").all() as { id: string }[]).map(
           (r) => r.id,
         );
-        assert.deepEqual(inS3, ["after", "lost-put"], "S3 is level with local again");
+        assert.deepEqual(inS3, ["after"], "S3 and local agree");
       } finally {
         copy.close();
       }

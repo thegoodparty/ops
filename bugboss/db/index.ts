@@ -6,7 +6,7 @@
 // agent's reportRootCause returns, the transition is durable.
 
 import { makeAlarm, makeLog } from "../logging";
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -282,38 +282,75 @@ export class Db {
   }
 
   /**
-   * The only way to write. Runs fn in a transaction, snapshots, and does not
-   * resolve until S3 has the snapshot.
+   * The only way to write. Runs fn in a transaction, uploads the database as
+   * that transaction leaves it, and commits only once S3 has it. Local is
+   * never ahead of S3: a write whose upload fails is rolled back, so a caller
+   * told it failed is telling the truth, and a marker that throws is a
+   * marker nobody will find on the next tick.
    *
-   * A PUT that keeps failing halts writes rather than continuing. A process
-   * that keeps committing locally while S3 falls behind is worse than one
-   * that stops, because the divergence stays invisible until a restart loses
-   * it. The halt lifts itself: a halted Db retries the snapshot of its whole
-   * current state before the next write it is asked for, on a backoff, and
-   * resumes once one lands. Until then no new transaction runs, so S3 is
-   * never more than the failed write behind.
+   * An upload that keeps failing halts writes, which here is a circuit
+   * breaker rather than a guard against divergence, since there is none to
+   * guard against. While halted a write is refused without an upload until
+   * the backoff allows one more try, and the first upload that lands lifts
+   * the halt.
    */
   async withWrite<T>(fn: (db: Database.Database) => T): Promise<T> {
     const run = this.queue.then(async () => {
-      if (this.halted) await this.retryHalted();
-
-      const result = this.write.transaction(fn)(this.write);
-
-      let lastErr: unknown;
-      for (let attempt = 0; attempt <= this.timing.retryDelaysMs.length; attempt++) {
-        if (attempt > 0) {
-          await new Promise((r) => setTimeout(r, this.timing.retryDelaysMs[attempt - 1]));
+      const halt = this.halted;
+      if (halt) {
+        const now = this.now();
+        if (!halt.alarmedPersisting && now - halt.since >= this.timing.haltAlarmMs) {
+          halt.alarmedPersisting = true;
+          alarm("writes_still_halted", {
+            haltedForMs: now - halt.since,
+            error: halt.error,
+            note: "every write in this process is refusing; S3 has not taken an upload since the halt",
+          });
         }
+        if (now < halt.nextRetryAt) throw new Error(`writes halted: ${halt.error}`);
+      }
+
+      this.write.exec("BEGIN IMMEDIATE");
+      let result: T;
+      try {
+        result = fn(this.write);
+      } catch (err) {
+        if (this.write.inTransaction) this.write.exec("ROLLBACK");
+        throw err;
+      }
+      // `serialize` reads through this connection, so it holds the
+      // uncommitted transaction, and the read connection still sees the
+      // state before it.
+      const body = this.write.serialize();
+
+      // One try while halted, so a refusing S3 does not hold the queue for
+      // every write behind this one.
+      const delays = halt ? [] : this.timing.retryDelaysMs;
+      let lastErr: unknown;
+      for (let attempt = 0; attempt <= delays.length; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, delays[attempt - 1]));
         try {
-          await this.putSnapshot();
+          await this.put(body);
+          this.write.exec("COMMIT");
           if (attempt > 0) log("snapshot_retry_succeeded", { attempt: attempt + 1 });
+          if (halt) {
+            this.halted = null;
+            log("writes_resumed", { haltedForMs: this.now() - halt.since });
+          }
           return result;
         } catch (err) {
           lastErr = err;
           log("snapshot_attempt_failed", { attempt: attempt + 1, error: String(err) });
         }
       }
+      this.write.exec("ROLLBACK");
 
+      if (halt) {
+        halt.error = String(lastErr);
+        halt.retryMs = Math.min(halt.retryMs * 2, this.timing.haltRetryMaxMs);
+        halt.nextRetryAt = this.now() + halt.retryMs;
+        throw new Error(`writes halted: ${halt.error}`);
+      }
       const now = this.now();
       this.halted = {
         error: String(lastErr),
@@ -324,8 +361,8 @@ export class Db {
       };
       alarm("snapshot_failed_halting_writes", {
         error: String(lastErr),
-        attempts: this.timing.retryDelaysMs.length + 1,
-        note: "writes refuse until a snapshot of the current state reaches S3; retried on the next write, with backoff",
+        attempts: delays.length + 1,
+        note: "the write was rolled back; writes refuse until an upload lands, tried again on the next write after a backoff",
       });
       throw lastErr;
     });
@@ -337,66 +374,16 @@ export class Db {
   }
 
   /**
-   * Throws while S3 still will not take a snapshot, and clears the halt once
-   * it does. What it uploads is the current state, which already holds the
-   * write whose PUT failed, so a success brings S3 level with local before
-   * anything new commits.
+   * One upload. A new command and a new SDK call every time, so every
+   * attempt is signed when it is sent. The deadline is what stops a stalled
+   * socket holding the write queue until its signature is too old for S3 to
+   * accept.
    */
-  private retryHalted = async (): Promise<void> => {
-    const halt = this.halted!;
-    const now = this.now();
-    if (!halt.alarmedPersisting && now - halt.since >= this.timing.haltAlarmMs) {
-      halt.alarmedPersisting = true;
-      alarm("writes_still_halted", {
-        haltedForMs: now - halt.since,
-        error: halt.error,
-        note: "every write in this process is refusing; S3 has not taken a snapshot since the halt",
-      });
-    }
-    if (now < halt.nextRetryAt) throw new Error(`writes halted: ${halt.error}`);
-
-    try {
-      await this.putSnapshot();
-    } catch (err) {
-      halt.error = String(err);
-      halt.retryMs = Math.min(halt.retryMs * 2, this.timing.haltRetryMaxMs);
-      halt.nextRetryAt = this.now() + halt.retryMs;
-      throw new Error(`writes halted: ${halt.error}`);
-    }
-    this.halted = null;
-    log("writes_resumed", { haltedForMs: this.now() - halt.since });
-  };
-
-  /**
-   * One snapshot, one PUT. A new command and a new SDK call every time, so
-   * every attempt is signed when it is sent. The deadline is what stops a
-   * stalled socket holding the write queue until its signature is too old
-   * for S3 to accept.
-   */
-  private putSnapshot = async (): Promise<void> => {
-    const snapshot = `${this.cfg.path}.snapshot`;
-    try {
-      unlinkSync(snapshot);
-    } catch {
-      // First write, or already cleaned up.
-    }
-    this.write.exec(`VACUUM INTO '${snapshot}'`);
-    try {
-      await this.s3.send(
-        new PutObjectCommand({
-          Bucket: this.cfg.bucket,
-          Key: this.cfg.key,
-          Body: readFileSync(snapshot),
-        }),
-        { abortSignal: AbortSignal.timeout(this.timing.putTimeoutMs) },
-      );
-    } finally {
-      try {
-        unlinkSync(snapshot);
-      } catch {
-        // Nothing to clean up.
-      }
-    }
+  private put = async (body: Buffer): Promise<void> => {
+    await this.s3.send(
+      new PutObjectCommand({ Bucket: this.cfg.bucket, Key: this.cfg.key, Body: body }),
+      { abortSignal: AbortSignal.timeout(this.timing.putTimeoutMs) },
+    );
   };
 
   /** Read-only. This is what triage and the Slack agent query through. */

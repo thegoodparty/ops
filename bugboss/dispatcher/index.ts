@@ -1114,7 +1114,13 @@ export class Dispatcher {
     if (!AGENT_STATUSES.includes(row.status)) return false;
 
     try {
-      await this.toolApiFor(incidentId).escalate({ reason, brief });
+      // A refusal is an answer, not a throw: the tool API rejects with ok
+      // false when the post failed, and that is nobody told.
+      const response = await this.toolApiFor(incidentId).escalate({ reason, brief });
+      if (!response.ok) {
+        alarm("escalation_failed", { incidentId, reason, error: response.error });
+        return false;
+      }
       log("escalated", { incidentId, reason });
       return true;
     } catch (err) {

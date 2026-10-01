@@ -2711,7 +2711,8 @@ describe("Dispatcher escalations while writes fail", () => {
         parkedAtPost.push(
           db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [incidentId]) !== undefined,
         );
-        throw new Error("slack is down");
+        // What the tool API answers when its post fails: a refusal, not a throw.
+        return { ok: false, error: "could not post the escalation", directives: [] };
       },
     });
 

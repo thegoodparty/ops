@@ -15,31 +15,29 @@ It does three things that all matter:
 Never pass an async function to it. better-sqlite3's transactions are
 synchronous only, and an async callback would commit early.
 
-## A failed PUT halts writes, and the halt lifts itself
+## A write commits only once S3 has it
 
-The invariant is that S3 is never more than one failed write behind local, and
-no write resolves until a snapshot holding it is in S3. A process that keeps
-committing locally while S3 falls behind is worse than one that stops, because
-the divergence stays invisible until a restart loses it.
+`withWrite` opens the transaction, runs `fn`, uploads `serialize()` of the
+connection (which includes the uncommitted transaction), and commits only when
+the PUT succeeds. A PUT that fails rolls the transaction back. So local is
+never ahead of S3, and a caller told its write failed is told the truth. That
+matters to every marker below: a marker write that throws left nothing behind
+for the next tick to trip over. The read connection sees a write only once it
+has committed, which is once it is durable.
 
-How that is kept without a permanent outage:
+How a failing S3 is handled:
 
 1. **Every PUT has a deadline** (`SNAPSHOT_TIMING.putTimeoutMs`, 20s). The SDK
    sets none, so a stalled socket held the write queue until its signature was
    older than the 15 minutes S3 accepts (`RequestTimeTooSkewed`, 2026-10-01).
 2. **A failed PUT is retried twice inside the same write**, each a new
-   `PutObjectCommand` and a new `send`, so each is signed when it is sent. A
-   retry that lands means the write resolves normally.
-3. **Only then does it halt**, with an `alarm` (`snapshot_failed_halting_writes`).
-   While halted no transaction runs: each write first retries a snapshot of the
-   whole current state, on a backoff from 5s to 60s, and between retries it
-   throws `writes halted` without a PUT. The first snapshot that lands clears
-   the halt (`writes_resumed`) and S3 is level with local again.
+   `PutObjectCommand` and a new `send`, so each is signed when it is sent.
+3. **Then writes halt**, with an `alarm` (`snapshot_failed_halting_writes`).
+   The halt is a circuit breaker, not a guard against divergence, since there
+   is none. While halted a write throws `writes halted` without a PUT until a
+   backoff (5s doubling to 60s) allows one try. The first PUT that lands lifts
+   the halt (`writes_resumed`).
 4. **A halt older than 5 minutes alarms again**, once (`writes_still_halted`).
-
-The write whose PUT failed is committed locally and its caller was told it
-failed. The recovery snapshot makes it durable anyway. Callers that retry are
-already idempotent for exactly this case (see `linkThread` in `slack/relay.ts`).
 
 **A halt means nothing may be said that a write would record.** Every
 announcer that a tick drives commits its marker before it posts, and posts

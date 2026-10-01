@@ -1857,14 +1857,20 @@ test("a thread known only by its persisted session state still counts", async ()
 // --- a reply reaches the Boss, and cannot take the incident away -----------
 
 /** A reply in an incident's thread, as Slack delivers it. */
-const replyIn = (threadTs: string, text: string, user = "U-swain") => ({
-  type: "message",
-  channel: "C0TEST",
-  user,
-  text,
-  ts: `${Date.now() / 1000}`,
-  thread_ts: threadTs,
-});
+// Strictly increasing. Two replies inside one millisecond would otherwise
+// share a ts, and the relay drops the second as Slack retrying the first.
+let lastReplyMs = 0;
+const replyIn = (threadTs: string, text: string, user = "U-swain") => {
+  lastReplyMs = Math.max(Date.now(), lastReplyMs + 1);
+  return {
+    type: "message",
+    channel: "C0TEST",
+    user,
+    text,
+    ts: `${lastReplyMs / 1000}`,
+    thread_ts: threadTs,
+  };
+};
 
 /**
  * What a person saying "I have this" does now. It used to write

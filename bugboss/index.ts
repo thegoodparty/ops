@@ -369,7 +369,7 @@ export interface BugBoss {
 
 /**
  * A whole-object S3 in memory, so a caller that passes no client still gets
- * the real write path: VACUUM INTO, a PUT that must succeed before withWrite
+ * the real write path: a PUT that must succeed before withWrite commits and
  * resolves, and evidence that loads back out.
  */
 export const createMemoryS3 = (): S3Client => {
