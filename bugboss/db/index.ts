@@ -374,10 +374,10 @@ export class Db {
             const now = this.now();
             this.halted = {
               error: String(commitErr),
-              since: now,
+              since: halt ? halt.since : now,
               nextRetryAt: now + this.timing.haltRetryMs,
               retryMs: this.timing.haltRetryMs,
-              alarmedPersisting: false,
+              alarmedPersisting: halt ? halt.alarmedPersisting : false,
             };
           }
           throw commitErr;
