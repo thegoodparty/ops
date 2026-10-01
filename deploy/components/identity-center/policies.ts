@@ -48,7 +48,14 @@ export const engineerAccess: PolicyDocument = {
     {
       Sid: "DevResourceOperations",
       Effect: "Allow",
-      Action: ["*"],
+      // NotAction rather than Action: ["*"], so this blanket grant does not
+      // reach Bedrock. `bedrock:InvokeModel` lists `aws:RequestTag` among its
+      // condition keys, so the tag conditions below would otherwise match it
+      // and let an engineer invoke a model. Bedrock reads are granted
+      // explicitly by ReadBedrockCatalog; every other Bedrock action is left
+      // denied. See that statement for why the exclusion lives here rather
+      // than in a Deny.
+      NotAction: ["bedrock:*"],
       Resource: "*",
       Condition: {
         StringEquals: {
@@ -59,7 +66,8 @@ export const engineerAccess: PolicyDocument = {
     {
       Sid: "DevResourceCreation",
       Effect: "Allow",
-      Action: ["*"],
+      // Excludes Bedrock for the same reason as DevResourceOperations above.
+      NotAction: ["bedrock:*"],
       Resource: "*",
       Condition: {
         StringEquals: {
@@ -85,45 +93,40 @@ export const engineerAccess: PolicyDocument = {
       },
     },
     {
-      // Read-only Bedrock, and read-only deliberately rather than by simply
-      // not granting it. This set used to carry `bedrock:*`, which is how a
-      // laptop `pi` running under the `EngineerAccess` profile invoked Claude
-      // Opus 4.6 and caused Bedrock to subscribe the model in the management
-      // account on first use. Bedrock enables every model by default and
-      // subscribes in the background on invocation, so AWS's own guidance is
-      // that the control is a Deny or a scoped Allow on the invocation, not
-      // withholding a subscription. The subscription mechanics are in
+      // Read-only Bedrock, enforced as an allowlist rather than a Deny.
+      //
+      // This set used to carry `bedrock:*`, which is how a laptop `pi` running
+      // under the `EngineerAccess` profile invoked Claude Opus 4.6 and caused
+      // Bedrock to subscribe the model in the management account on first use.
+      // Bedrock enables every model by default and subscribes in the
+      // background on invocation, so AWS's guidance is that the control is a
+      // Deny or a scoped Allow on the invocation, not withholding a
+      // subscription. The subscription mechanics are in
       // `docs/workbench-account.md` under "Adding a Bedrock model later".
+      //
+      // The obvious shape is a single Deny with `NotAction: ["bedrock:Get*",
+      // "bedrock:List*"]`, and it is wrong. IAM evaluates `NotAction` across
+      // every service: with `Resource: "*"` and no condition it denies S3,
+      // SQS, Transcribe and everything else this set exists for. No condition
+      // key scopes a statement to one service, so the exclusion has to live on
+      // the Allow side. Bedrock is named out of the two tag-conditioned
+      // blanket grants above, and only these reads are allowed back. Those
+      // grants need the exclusion because `bedrock:InvokeModel` lists
+      // `aws:RequestTag` among its condition keys, so `Action: ["*"]` reaches
+      // it. A Bedrock action added later is then denied by default rather than
+      // admitted until someone remembers this file.
       //
       // The management account is where production runs and is not the place
       // for human Bedrock traffic. That is the workbench account, through
       // `WorkbenchAccess`, which names its models and is the intended path;
       // `AdministratorAccess` keeps invocation as the break-glass exception.
       //
-      // A Deny rather than merely removing the Allow, because this document
-      // also carries two `Action: ["*"]` statements conditioned on request and
-      // resource tags. Bedrock mutations such as
-      // `CreateProvisionedModelThroughput` and `CreateModelInvocationJob`
-      // accept request tags, so a request tagged `Environment=dev` would
-      // otherwise reach them the same way `organizations:CreateAccount` was
-      // reachable before `adminReservedActions` existed. The Deny holds as
-      // those Allows drift.
-      //
-      // `NotAction` rather than an enumerated invoke list, matching the region
-      // deny in `deploy-org/policies.ts`: the thing worth reviewing is the read
-      // allowlist, not the growing set of Bedrock actions. Reads are left to
-      // the `ReadOnlyAccess` managed policy this set already carries, which is
-      // why no Allow is added here. Accepted collateral: this also denies the
-      // few non-generating runtime calls `ReadOnlyAccess` grants, such as
-      // `CountTokens` and `AgenticRetrieveStream`, which nothing uses through
-      // this set.
-      //
-      // Deliberately here and not in `adminReservedActions`: that document is
-      // composed into `workbenchAccess` too, where Bedrock invocation is the
-      // entire point of the account.
-      Sid: "DenyBedrockNonRead",
-      Effect: "Deny",
-      NotAction: ["bedrock:Get*", "bedrock:List*"],
+      // Reads are also granted by the `ReadOnlyAccess` managed policy this set
+      // carries; naming them here makes the intent explicit and keeps the
+      // grant from depending on a policy AWS can widen or narrow.
+      Sid: "ReadBedrockCatalog",
+      Effect: "Allow",
+      Action: ["bedrock:Get*", "bedrock:List*"],
       Resource: "*",
     },
     {

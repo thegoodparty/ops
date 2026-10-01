@@ -8,34 +8,48 @@ import { engineerAccess } from "./components/identity-center/policies";
 // own. Assert on the composed document, which is the one that reaches IAM.
 const composed = withAdminReserved(engineerAccess);
 
+const asList = (value: unknown): string[] =>
+  value === undefined
+    ? []
+    : Array.isArray(value)
+      ? (value as string[])
+      : [value as string];
+
 describe("EngineerAccess", () => {
-  // The control that stops a laptop `pi` running under this profile invoking a
-  // model and causing Bedrock to subscribe it in the management account. A read
-  // allowlist expressed as `NotAction`, so a Bedrock action added later is
-  // denied by default rather than admitted until someone remembers this file.
-  it("denies every Bedrock action that is not a read", () => {
-    const deny = composed.Statement.find(
-      (s) => s.Sid === "DenyBedrockNonRead"
+  // The grant that stops a laptop `pi` running under this profile invoking a
+  // model and causing Bedrock to subscribe it in the management account.
+  it("allows Bedrock reads and nothing else", () => {
+    const allow = composed.Statement.find(
+      (s) => s.Sid === "ReadBedrockCatalog"
     );
-    assert.ok(deny, "no DenyBedrockNonRead statement");
-    assert.equal(deny.Effect, "Deny");
-    assert.equal(deny.Resource, "*");
-    assert.deepEqual(deny.NotAction, ["bedrock:Get*", "bedrock:List*"]);
+    assert.ok(allow, "no ReadBedrockCatalog statement");
+    assert.equal(allow.Effect, "Allow");
+    assert.deepEqual(asList(allow.Action), ["bedrock:Get*", "bedrock:List*"]);
   });
 
-  // Belt and braces with the Deny above: an explicit Allow for an invocation
-  // would be dead code today, but it reads as intent and is the shape a
-  // regression takes.
+  // The two tag-conditioned blanket grants would otherwise reach Bedrock,
+  // because `bedrock:InvokeModel` lists `aws:RequestTag` among its condition
+  // keys. Excluding Bedrock from them is what makes the read grant above the
+  // only Bedrock path. A Deny with `NotAction` is the obvious alternative and
+  // is wrong: `NotAction` is evaluated across every service, so it would deny
+  // S3, SQS, Transcribe and the rest of the set too.
+  it("excludes Bedrock from both tag-conditioned blanket grants", () => {
+    for (const sid of ["DevResourceOperations", "DevResourceCreation"]) {
+      const statement = composed.Statement.find((s) => s.Sid === sid);
+      assert.ok(statement, `no ${sid} statement`);
+      assert.equal(statement.Effect, "Allow");
+      assert.deepEqual(asList(statement.NotAction), ["bedrock:*"]);
+      assert.equal(statement.Action, undefined, `${sid} still names Action`);
+    }
+  });
+
+  // A regression can also take the shape of a new explicit invoke Allow, which
+  // the exclusions above would not catch.
   it("names no Bedrock invocation in an Allow", () => {
     const forbidden = /^bedrock:(Invoke|Converse|StartAsync)/;
     for (const statement of composed.Statement) {
       if (statement.Effect !== "Allow") continue;
-      const actions = Array.isArray(statement.Action)
-        ? statement.Action
-        : statement.Action
-          ? [statement.Action]
-          : [];
-      for (const action of actions) {
+      for (const action of asList(statement.Action)) {
         assert.equal(
           forbidden.test(action),
           false,
