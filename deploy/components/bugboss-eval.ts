@@ -5,13 +5,13 @@ const REGION = "us-west-2";
 
 /**
  * The only thing in AWS BugBoss evals touch. `.github/workflows/bugboss-eval.yml`
- * assumes this role through GitHub's OIDC provider, from the `bugboss-eval`
- * environment, which only `main` may deploy to. It can invoke Bedrock models
+ * assumes this role through GitHub's OIDC provider. issue_comment runs that
+ * file from main, so the subject is main's ref. It can invoke Bedrock models
  * and nothing else, so the BugBoss under test, which resolves AWS through it,
  * is denied every other call.
  */
 export const BUGBOSS_EVAL_ROLE_NAME = "github-actions-bugboss-eval";
-export const BUGBOSS_EVAL_SUBJECT = "repo:thegoodparty/ops:environment:bugboss-eval";
+export const BUGBOSS_EVAL_SUBJECT = "repo:thegoodparty/ops:ref:refs/heads/main";
 
 export const bugbossEvalTrust = {
   Version: "2012-10-17",

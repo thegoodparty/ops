@@ -12,7 +12,7 @@ test("the eval role invokes Bedrock models and nothing else", () => {
 });
 
 test("only the main-only bugboss-eval environment can assume it", () => {
-  assert.equal(BUGBOSS_EVAL_SUBJECT, "repo:thegoodparty/ops:environment:bugboss-eval");
+  assert.equal(BUGBOSS_EVAL_SUBJECT, "repo:thegoodparty/ops:ref:refs/heads/main");
   const [statement] = bugbossEvalTrust.Statement;
   assert.equal(statement.Condition.StringEquals["token.actions.githubusercontent.com:sub"], BUGBOSS_EVAL_SUBJECT);
   assert.equal(statement.Condition.StringEquals["token.actions.githubusercontent.com:aud"], "sts.amazonaws.com");
