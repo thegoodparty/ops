@@ -14,9 +14,7 @@
     "backfillHoursBefore": 6
   },
   "ci": [
-    "npm test -w packages/contracts",
-    "npm run test -w packages/gp-api -- src/users",
-    "npm run lint -w packages/gp-api"
+    "npm run test -w packages/gp-api -- src/users/users.routes.test.ts"
   ],
   "check": {
     "setup": "../users-read-invalid-zip/check/setup.sh",

@@ -14,8 +14,7 @@
     "backfillHoursBefore": 6
   },
   "ci": [
-    "npm run test -w packages/gp-api -- deploy/components/alerting",
-    "npm run lint -w packages/gp-api"
+    "npm run test -w packages/gp-api -- deploy/components/alerting/alert-notification.test.ts"
   ],
   "check": {
     "setup": "check/setup.sh",

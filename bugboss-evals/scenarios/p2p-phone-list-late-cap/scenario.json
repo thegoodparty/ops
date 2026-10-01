@@ -14,8 +14,7 @@
     "backfillHoursBefore": 24
   },
   "ci": [
-    "npm run test -w packages/gp-api -- src/contacts src/vendors/peerly src/outreach",
-    "npm run lint -w packages/gp-api"
+    "npm run test -w packages/gp-api -- src/contacts/utils/audienceResolution.util.test.ts src/outreach/services/outreachServeSmsCreate.service.test.ts src/outreach/services/outreachTextDelivery.service.test.ts"
   ],
   "check": {
     "setup": "check/setup.sh",

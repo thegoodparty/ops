@@ -81,6 +81,8 @@ export interface RunSpec {
   runAs?: string;
   /** Where a run stops. `closed` is the whole lifecycle. */
   until?: Milestone;
+  /** Ends the run sooner than the scenario's own wall clock: PR CI's bound, so a broken run fails in minutes. */
+  maxRunSeconds?: number;
   /** A shared npm cache, warmed once, every run's HOME points at. */
   npmCache?: string;
   /** An omni tree at the scenario's base with its dependencies built, which the hidden check copies from. */
@@ -113,14 +115,24 @@ export const createSpendPool = (capUsd: number, stopAt = 0.9): SpendPool => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const freePort = (): Promise<number> =>
-  new Promise((resolve, reject) => {
-    const server = createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      server.close(() => (address && typeof address !== "string" ? resolve(address.port) : reject(new Error("no port"))));
+// Both sides of a pair ask at once, and the OS can hand both the same port
+// between one's close and the other's listen.
+const handedOut = new Set<number>();
+const freePort = async (): Promise<number> => {
+  for (;;) {
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = createServer();
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        server.close(() => (address && typeof address !== "string" ? resolve(address.port) : reject(new Error("no port"))));
+      });
     });
-  });
+    if (!handedOut.has(port)) {
+      handedOut.add(port);
+      return port;
+    }
+  }
+};
 
 /**
  * With `runAs`, the command runs as a user that holds nothing: not the
@@ -484,7 +496,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const volunteeredSaid = new Set<string>();
   const volunteered: RunRecord["volunteered"] = [];
   let movedBase: string | null = null;
-  const deadline = alertAt + scenario.wallClockSeconds * 1000;
+  const deadline = alertAt + Math.min(scenario.wallClockSeconds, spec.maxRunSeconds ?? Infinity) * 1000;
   let lastAlert = 0;
 
   try {

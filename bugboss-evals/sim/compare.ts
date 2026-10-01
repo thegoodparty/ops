@@ -175,6 +175,7 @@ const run = async (argv: string[]): Promise<void> => {
   const runAs = flag(argv, "run-as");
   const sides = (flag(argv, "sides")?.split(",") ?? ["baseline", "candidate"]) as Side[];
   const until = flag(argv, "until") as Milestone | undefined;
+  const maxRunMinutes = flag(argv, "max-run-minutes");
   const capUsd = flag(argv, "spend-cap-usd") === undefined ? null : Number(flag(argv, "spend-cap-usd"));
   const spend = capUsd === null ? undefined : createSpendPool(capUsd);
   if (!existsSync(join(omni, ".git"))) throw new Error("--omni must name a clone holding every scenario's shas");
@@ -292,6 +293,7 @@ const run = async (argv: string[]): Promise<void> => {
             ...(prebuilt[baseOf(scenarioId)] ? { prebuilt: prebuilt[baseOf(scenarioId)] } : {}),
             ...(spend ? { spend } : {}),
             ...(until ? { until } : {}),
+            ...(maxRunMinutes ? { maxRunSeconds: Number(maxRunMinutes) * 60 } : {}),
             ...(stubModel ? { stubModelUrl: stubModel.url } : {}),
             ...(runAs ? { runAs } : {}),
             seed: rep,

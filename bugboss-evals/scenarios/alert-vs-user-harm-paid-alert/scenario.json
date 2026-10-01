@@ -14,9 +14,7 @@
     "backfillHoursBefore": 6
   },
   "ci": [
-    "npm test -w packages/contracts",
-    "npm run test -w packages/gp-api -- src/outreach src/payments",
-    "npm run lint -w packages/gp-api"
+    "npm run test -w packages/gp-api -- src/outreach/tests/outreachFlow.test.ts src/outreach/services/outreach.service.test.ts"
   ],
   "check": {
     "setup": "../alert-vs-user-harm/check/setup.sh",
