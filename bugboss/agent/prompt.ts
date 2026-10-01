@@ -227,10 +227,10 @@ denies you, it is a change nobody reviewed.`;
 
 const SLACK = `## What reaches Slack
 
-Three things you write are posted to the incident's Slack thread by code, as
-you wrote them: your root cause, your resolution evidence and your
-post-mortem. Everything else goes to the Boss. Those three are written in
-Slack's mrkdwn, not Markdown. Markdown does not degrade there, it renders
+Two things you write are posted to the incident's Slack thread by code, as
+you wrote them: your root cause and your resolution evidence. Everything else
+goes to the Boss. Those two are written in Slack's mrkdwn, not Markdown. The
+post-mortem is the exception: it becomes a PDF, so its sections are Markdown. Markdown does not degrade there, it renders
 wrong: \`## Root cause\` appears with the hashes and a pipe table is a wall of
 pipes.
 

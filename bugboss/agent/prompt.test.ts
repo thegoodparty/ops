@@ -407,10 +407,12 @@ test("the agent is told to write mrkdwn, not Markdown", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.ok(prompt.includes("## What reaches Slack"));
-  // The root cause, the resolution evidence and the post-mortem are posted
-  // verbatim, so the rules they need are the ones Markdown gets wrong: bold,
-  // links, headings, and the escaping it must not attempt by hand.
-  assert.match(prompt, /your root cause, your resolution evidence and your\s+post-mortem/);
+  // The root cause and the resolution evidence are posted verbatim, so the
+  // rules they need are the ones Markdown gets wrong: bold, links, headings,
+  // and the escaping it must not attempt by hand. The post-mortem goes to the
+  // PDF, which reads Markdown.
+  assert.match(prompt, /your root cause and your resolution evidence\./);
+  assert.match(prompt, /post-mortem is the exception: it becomes a PDF, so its sections are Markdown/);
   assert.ok(prompt.includes("not **bold**"));
   assert.ok(prompt.includes("<https://example.com|label>"));
   assert.ok(prompt.includes("There are no headings and no tables."));
