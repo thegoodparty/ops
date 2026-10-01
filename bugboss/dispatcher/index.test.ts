@@ -2623,3 +2623,166 @@ describe("Dispatcher workspace sweep", () => {
     cleanup();
   });
 });
+
+describe("Dispatcher escalations while writes fail", () => {
+  // Reads work and every write throws, which is what a halted Db does.
+  const refusing = (db: DispatcherDb, failing: () => boolean): DispatcherDb => ({
+    query: (sql, params) => db.query(sql, params),
+    get: (sql, params) => db.get(sql, params),
+    withWrite: (fn) =>
+      failing()
+        ? Promise.reject(new Error("writes halted: RequestTimeTooSkewed"))
+        : db.withWrite(fn),
+  });
+
+  // Incident 93 on 2026-10-01. Every launch write failed, so every launch
+  // was a fast failure, so every third tick met the crash-loop ceiling and
+  // posted, and the park after the post failed, so nothing stopped the next
+  // round. Two minutes apart, for five hours.
+  it("replays the incident 93 storm and posts nothing", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "93", { sessionRef: "s-1" });
+
+    const d = createDispatcher(
+      deps({
+        db: refusing(db, () => true),
+        spawn: async () => {
+          throw new Error("unreachable: the launch write fails first");
+        },
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+      }),
+    );
+
+    await captureAlarms(async () => {
+      for (let tick = 0; tick < 40; tick += 1) {
+        await d.tick().then((r) => r.settled).catch(() => undefined);
+      }
+    });
+
+    assert.equal(escalations.length, 0, "a park that cannot be written posts nothing");
+    cleanup();
+  });
+
+  it("parks before it posts a crash loop", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    const parkedAtPost: boolean[] = [];
+    const toolApiFor = (incidentId: string): ToolApi => ({
+      ...makeTools().toolApiFor(incidentId),
+      escalate: async ({ reason, brief }) => {
+        parkedAtPost.push(
+          db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [incidentId]) !== undefined,
+        );
+        escalations.push({ incidentId, reason, brief });
+        return { ok: true, directives: [] };
+      },
+    });
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: async () => {
+          throw new Error("agent exited 1");
+        },
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+      }),
+    );
+    for (let i = 0; i < 4; i += 1) await (await d.tick()).settled;
+
+    assert.deepEqual(parkedAtPost, [true], "the park was committed when the post went out");
+    cleanup();
+  });
+
+  it("parks before it posts a launch ceiling, and takes the park back when the post fails", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let clock = T0;
+    const releases: (() => void)[] = [];
+    const parkedAtPost: boolean[] = [];
+    const toolApiFor = (incidentId: string): ToolApi => ({
+      ...makeTools().toolApiFor(incidentId),
+      escalate: async () => {
+        parkedAtPost.push(
+          db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [incidentId]) !== undefined,
+        );
+        throw new Error("slack is down");
+      },
+    });
+
+    const d = createDispatcher(
+      deps({
+        db,
+        spawn: () => new Promise<void>((resolve) => releases.push(resolve)),
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+        fastFailureSeconds: 60,
+        maxLaunches: 3,
+        now: () => clock,
+      }),
+    );
+
+    const alarms = await captureAlarms(async () => {
+      for (let i = 0; i < 3; i += 1) {
+        await d.tick();
+        clock += 61_000;
+        releases.forEach((r) => r());
+        await d.drain();
+      }
+      await d.tick();
+    });
+
+    assert.deepEqual(parkedAtPost, [true]);
+    assert.equal(
+      db.get("SELECT 1 FROM incident_wait WHERE incidentId = 'i1'"),
+      undefined,
+      "nobody was told, so it relaunches rather than sitting parked",
+    );
+    assert.ok(alarms.includes("stalled_escalation_failed"));
+    releases.forEach((r) => r());
+    await d.drain();
+    cleanup();
+  });
+
+  it("does not post a deadline escalation while writes fail", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let clock = T0;
+    let halted = false;
+    const releases: (() => void)[] = [];
+    const d = createDispatcher(
+      deps({
+        db: refusing(db, () => halted),
+        spawn: (ctx) => {
+          ctx.register({ pid: 1, kill: () => releases.forEach((r) => r()) });
+          return new Promise<void>((resolve) => releases.push(resolve));
+        },
+        toolApiFor,
+        config: config({ agentTimeoutSeconds: 60 }),
+        now: () => clock,
+      }),
+    );
+
+    await d.tick();
+    halted = true;
+    clock = T0 + 60_000 + (DEADLINE_GRACE_SECONDS + 1) * 1000;
+    const alarms = await captureAlarms(async () => {
+      for (let tick = 0; tick < 5; tick += 1) {
+        await d.tick().catch(() => undefined);
+        clock += 30_000;
+      }
+    });
+
+    assert.equal(escalations.length, 0);
+    assert.ok(alarms.includes("deadline_escalation_unrecorded"));
+    await d.drain();
+    cleanup();
+  });
+});

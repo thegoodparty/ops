@@ -18,6 +18,12 @@ and fragmenting forever. That post is a one-line notice and the transition
 goes under it in the thread, because the header sweep rewrites the
 top-level message whole on its next tick.
 
+The thread sweep opens a thread for every open incident with no
+`slackThreadTs`, every tick, so `opened` makes an empty write before it posts.
+With the database refusing writes, the link after the post can never land and
+each tick would open another top-level thread and ping the rotation. The empty
+write throws first and nothing is posted.
+
 A merge or a split leaves two threads that have to point at each other, and a
 thread is only findable by its permalink. `chat.getPermalink` builds one from
 the workspace domain, which is why it is an API call rather than string

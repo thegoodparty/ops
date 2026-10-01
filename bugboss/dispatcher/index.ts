@@ -571,16 +571,6 @@ export class Dispatcher {
 
       const failures = this.fastFailures.get(row.id) ?? 0;
       if (failures >= this.config.maxAttempts) {
-        const ok = await this.escalate(
-          row.id,
-          `${failures} consecutive launches died within ${this.fastFailureMs / 1000}s`,
-          crashLoopBrief(row, failures, this.fastFailureMs / 1000),
-        );
-        // A told escalation stops the relaunching; an untold one must fall
-        // back to it. Keeping the counter at the ceiling with nothing else
-        // changed retried the same failing escalation every tick for as long
-        // as the incident stayed open, which never resolved and never said so.
-        //
         // The counter goes either way, because past this point it can only be
         // wrong. The park the told path falls back to *expires*: leaving the
         // count at the ceiling means the cooldown lifts the wait into a
@@ -593,14 +583,33 @@ export class Dispatcher {
         // refills this from real launches and escalates again, which is a
         // page that has earned itself.
         this.fastFailures.delete(row.id);
+        const reason = `${failures} launches in a row died within ${this.fastFailureMs / 1000}s`;
+        // Park first and committed, then the post. The park is what stops
+        // the next tick deciding this again, so a post ahead of it repeats
+        // for as long as writes fail: on 2026-10-01 a halted database
+        // reposted this escalation, and paged the rotation, every two minutes
+        // for five hours. A park that cannot be written says nothing.
+        if (!(await this.park(row.id, reason, now))) {
+          alarm("crash_loop_escalation_unrecorded", {
+            incidentId: row.id,
+            failures,
+            note: "the park could not be written, so the escalation was not posted; it relaunches instead",
+          });
+          continue;
+        }
+        const ok = await this.escalate(
+          row.id,
+          `${failures} consecutive launches died within ${this.fastFailureMs / 1000}s`,
+          crashLoopBrief(row, failures, this.fastFailureMs / 1000),
+        );
+        // A told escalation stops the relaunching; an untold one must fall
+        // back to it, so the park comes off again. Keeping it, or the counter
+        // at the ceiling, retried the same failing escalation for as long as
+        // the incident stayed open, which never resolved and never said so.
         if (ok) {
-          await this.park(
-            row.id,
-            `${failures} launches in a row died within ${this.fastFailureMs / 1000}s`,
-            now,
-          );
           escalated.push(row.id);
         } else {
+          await this.unpark(row.id);
           alarm("crash_loop_escalation_failed", {
             incidentId: row.id,
             failures,
@@ -612,23 +621,25 @@ export class Dispatcher {
 
       const launches = this.launches.get(row.id) ?? 0;
       if (launches >= this.maxLaunches) {
-        const ok = await this.escalate(
-          row.id,
-          `${launches} launches on this incident without finishing one`,
-          stalledBrief(row, launches),
-        );
         // Same rule as fastFailures above, and the same expiring park, so
         // the same clear: a count left at the ceiling turns the cooldown into
-        // an hourly page instead of the retry it promises.
+        // an hourly page instead of the retry it promises. Park before the
+        // post, for the same reason too.
         this.launches.delete(row.id);
+        const reason = `${launches} launches on this incident without finishing one`;
+        if (!(await this.park(row.id, reason, now))) {
+          alarm("stalled_escalation_unrecorded", {
+            incidentId: row.id,
+            launches,
+            note: "the park could not be written, so the escalation was not posted; it relaunches instead",
+          });
+          continue;
+        }
+        const ok = await this.escalate(row.id, reason, stalledBrief(row, launches));
         if (ok) {
-          await this.park(
-            row.id,
-            `${launches} launches on this incident without finishing one`,
-            now,
-          );
           escalated.push(row.id);
         } else {
+          await this.unpark(row.id);
           alarm("stalled_escalation_failed", {
             incidentId: row.id,
             launches,
@@ -1049,6 +1060,20 @@ export class Dispatcher {
         continue;
       }
 
+      // Nothing here records the escalation, since `entry.killed` above
+      // already makes it once per run. The empty write is a gate instead:
+      // it lands only when the database can, so a halted one posts nothing,
+      // which is the rule every other dispatcher escalation keeps.
+      try {
+        await this.db.withWrite(() => undefined);
+      } catch (err) {
+        alarm("deadline_escalation_unrecorded", {
+          incidentId: entry.incidentId,
+          error: String(err),
+          note: "writes are failing, so the deadline escalation was not posted",
+        });
+        continue;
+      }
       const ok = await this.escalate(
         entry.incidentId,
         `wall-clock deadline of ${this.config.agentTimeoutSeconds}s expired`,
@@ -1117,6 +1142,36 @@ export class Dispatcher {
     incidentId: string,
     waitingFor: string,
     now: number,
+  ): Promise<boolean> => {
+    try {
+      await this.writePark(incidentId, waitingFor, now);
+    } catch (err) {
+      alarm("park_failed", { incidentId, error: String(err) });
+      return false;
+    }
+    log("parked", { incidentId, waitingFor, wakeAt: now + this.parkCooldownMs });
+    return true;
+  };
+
+  /** Takes back a park whose escalation never reached anyone. */
+  private unpark = async (incidentId: string): Promise<void> => {
+    try {
+      await this.db.withWrite((db) => {
+        db.prepare("DELETE FROM incident_wait WHERE incidentId = ?").run(incidentId);
+      });
+    } catch (err) {
+      alarm("unpark_failed", {
+        incidentId,
+        error: String(err),
+        note: "parked with nobody told; the cooldown, a reply or the stale sweep lifts it",
+      });
+    }
+  };
+
+  private writePark = async (
+    incidentId: string,
+    waitingFor: string,
+    now: number,
   ): Promise<void> => {
     await this.db.withWrite((db) => {
       db.prepare(
@@ -1135,7 +1190,6 @@ export class Dispatcher {
            startedAt = excluded.startedAt`,
       ).run(incidentId, waitingFor, now + this.parkCooldownMs, now);
     });
-    log("parked", { incidentId, waitingFor, wakeAt: now + this.parkCooldownMs });
   };
 
   /**

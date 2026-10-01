@@ -117,8 +117,14 @@ the morning board or the all-clear — those are the two things here that
 
 ## Order inside a sweep
 
-Posts happen before the writes that record them. A post that lands and a
-write that fails re-posts on the next tick, which is noise; a write that
-lands and a post that fails is a morning with no board and nothing saying so.
-The first case also only arises once `withWrite` has halted, at which point
-nothing in this process is working anyway.
+The marker commits before the post: `dailyOn` before the morning board,
+`clearAnnounced` before the all-clear. A write that throws posts nothing. A
+post that fails puts the marker back and alarms, so the next tick tries again
+rather than losing the morning.
+
+It used to be the other way round, on the reasoning that a failed write only
+happens once `withWrite` has halted, when nothing works anyway. On 2026-10-01
+the database halted for five hours and the morning board went to #dev-alerts
+dozens of times, because every tick saw the same unmarked day. Headers are
+still edit-then-record: `chat.update` replaces one message, so a repeat costs
+nothing.

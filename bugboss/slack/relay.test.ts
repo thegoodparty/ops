@@ -74,12 +74,18 @@ const seedIncident = (id: string, status = "INVESTIGATING") =>
   });
 
 /** Reads hit the real database; every write fails the way a halted Db does. */
-const writeFailingDb = (): Db =>
-  ({
+/** Lets the first `landing` writes through, then refuses every one after. */
+const writeFailingDb = (landing = 0): Db => {
+  let writes = 0;
+  return {
     get: (sql: string, params: unknown[] = []) => db.get(sql, params),
     query: (sql: string, params: unknown[] = []) => db.query(sql, params),
-    withWrite: () => Promise.reject(new Error("writes halted: s3 unreachable")),
-  }) as unknown as Db;
+    withWrite: (fn: Parameters<Db["withWrite"]>[0]) =>
+      writes++ < landing
+        ? db.withWrite(fn)
+        : Promise.reject(new Error("writes halted: s3 unreachable")),
+  } as unknown as Db;
+};
 
 /** The error log is the one notice that does not go through Slack. */
 const captureErrors = async (fn: () => Promise<unknown>): Promise<string[]> => {
@@ -725,8 +731,9 @@ describe("a broken thread link", () => {
 
   test("a link write that keeps failing is announced, not just logged", async () => {
     await seedIncident("inc-1");
+    // The gate write before the opener lands; the link after it does not.
     const halted = new SlackRelay({
-      db: writeFailingDb(),
+      db: writeFailingDb(1),
       slack,
       config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
     isBossThread: () => false,
@@ -748,6 +755,26 @@ describe("a broken thread link", () => {
       errors.some((line) => line.includes("thread_link_write_failed")),
       "and the write failure reaches the error log",
     );
+  });
+
+  test("a database refusing writes opens no thread, however often it is asked", async () => {
+    await seedIncident("inc-1");
+    const halted = new SlackRelay({
+      db: writeFailingDb(),
+      slack,
+      config: { channelId: CHANNEL, botUserId: BOT, rotationGroupId: ROTATION },
+      isBossThread: () => false,
+    });
+
+    // The thread sweep asks once a tick for every open incident without a
+    // thread, and a link that cannot be written leaves it without one.
+    for (let tick = 0; tick < 10; tick++) {
+      await halted
+        .emit({ type: "opened", incidentId: "inc-1", title: "t", origin: null })
+        .catch(() => undefined);
+    }
+
+    assert.equal(slack.posts.length, 0, "a post ahead of the link would repeat every tick");
   });
 
   test("a transition with no thread pings the rotation instead of drifting loose", async () => {

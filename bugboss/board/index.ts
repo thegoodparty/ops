@@ -303,11 +303,12 @@ const sweepHeaders = async (deps: BoardDeps): Promise<number> => {
 /**
  * One tick's worth of board.
  *
- * Posts before it records, everywhere. A post that lands and a write that
- * fails re-posts on the next tick, which is noise; a write that lands and a
- * post that fails is a morning with no board and nothing saying so. The
- * first failure mode also only happens when `withWrite` has halted, at
- * which point nothing in this process is working anyway.
+ * Records before it posts, everywhere. The marker is what stops the next tick
+ * deciding the same thing again, so a post ahead of it repeats for as long as
+ * writes fail: on 2026-10-01 a halted database reposted the morning board
+ * dozens of times. A write that fails posts nothing. A post that fails puts
+ * the marker back, so the next tick tries again rather than the morning
+ * going without a board and nothing saying so.
  */
 export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
   const now = (deps.now ?? Date.now)();
@@ -357,16 +358,23 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
     // A quiet morning gets no message. Swain's call, and the reason is that
     // a daily all-clear is a post people learn to skim, which is how the one
     // that matters gets skimmed too.
-    if (rows.length > 0) {
-      await deps.post(renderBoard("Open incidents", rows));
-      postedDaily = true;
-    }
-    // Marked either way. The day's slot is used up at the first tick past
-    // the hour, so an incident opening at two in the afternoon starts a
-    // thread rather than a board nobody asked for.
+    // Marked either way, and first. The day's slot is used up at the first
+    // tick past the hour, so an incident opening at two in the afternoon
+    // starts a thread rather than a board nobody asked for.
     await deps.db.withWrite((w: Database.Database) => {
       w.prepare("UPDATE board_state SET dailyOn = ? WHERE id = 1").run(today);
     });
+    if (rows.length > 0) {
+      try {
+        await deps.post(renderBoard("Open incidents", rows));
+        postedDaily = true;
+      } catch (err) {
+        alarm("daily_board_post_failed", { error: String(err), note: "the day is unmarked again, so the next tick retries" });
+        await deps.db.withWrite((w: Database.Database) => {
+          w.prepare("UPDATE board_state SET dailyOn = ? WHERE id = 1").run(state.dailyOn);
+        });
+      }
+    }
   }
 
   let postedAllClear = false;
@@ -383,11 +391,18 @@ export const sweepBoard = async (deps: BoardDeps): Promise<BoardSweep> => {
       w.prepare("UPDATE board_state SET emptySince = ? WHERE id = 1").run(now);
     });
   } else if (state.clearAnnounced === 0 && now - state.emptySince >= settleMs) {
-    await deps.post(ALL_CLEAR);
-    postedAllClear = true;
     await deps.db.withWrite((w: Database.Database) => {
       w.prepare("UPDATE board_state SET clearAnnounced = 1 WHERE id = 1").run();
     });
+    try {
+      await deps.post(ALL_CLEAR);
+      postedAllClear = true;
+    } catch (err) {
+      alarm("all_clear_post_failed", { error: String(err), note: "unmarked again, so the next tick retries" });
+      await deps.db.withWrite((w: Database.Database) => {
+        w.prepare("UPDATE board_state SET clearAnnounced = 0 WHERE id = 1").run();
+      });
+    }
   }
 
   if (postedDaily || postedAllClear || headers > 0) {
