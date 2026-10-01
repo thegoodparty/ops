@@ -69,6 +69,21 @@ export const createSqlRunnerSlack = (token: string): SqlRunnerSlack => {
       return { text: found.text ?? "", edited: found.edited !== undefined };
     },
 
+    // Given a reply's ts, conversations.replies still answers with the
+    // thread's parent first, which is how a reply passed off as a thread
+    // shows up: the parent's ts is not the one asked about.
+    threadParent: async (channel, threadTs) => {
+      try {
+        const res = await reader.conversations.replies({ channel, ts: threadTs, limit: 1 });
+        const parent = res.messages?.[0];
+        if (!parent?.ts) return null;
+        return { ts: parent.ts, user: parent.user ?? null, text: parent.text ?? "" };
+      } catch (err) {
+        if (isSlackError(err, "thread_not_found") || isSlackError(err, "message_not_found")) return null;
+        throw err;
+      }
+    },
+
     rotationMembers: async (usergroupId) => {
       const res = await reader.usergroups.users.list({ usergroup: usergroupId });
       return (res.users ?? []).filter((u): u is string => typeof u === "string");

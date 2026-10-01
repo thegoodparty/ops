@@ -365,9 +365,9 @@ is a bigger change than this one.
 `request_sql_query` (`sql.ts`) runs one SELECT against gp-api's production
 reader, and the agent never holds the password. The tool calls the loopback
 API (`POST /incidents/:id/sql-requests`), the Boss adds the incident's own
-thread and forwards to the `sqlrunner` sidecar, and the sidecar asks for
-approval in that thread and runs the query once a person on the rotation
-approves. The agent has a shell and the Boss's secrets, so none of that can
+thread and forwards to the `sqlrunner` sidecar, and the sidecar checks the
+thread with Slack, asks for approval in it and runs the query once a person
+on the rotation approves. The agent has a shell and the Boss's secrets, so none of that can
 live on this side.
 
 - **It is a blocking tool**, like `monitor`: one turn, capped at

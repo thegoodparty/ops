@@ -398,10 +398,14 @@ volume, not the environment.
 
 1. The agent calls `request_sql_query(sql, reason)` on the loopback tool API.
 2. The Boss adds the incident's thread and forwards it to the runner.
-3. The runner posts the exact SQL in that thread and waits.
+3. The runner checks with Slack that the thread is a top-level message the
+   bot posted, headed with that incident's number, then posts the exact SQL
+   in it and waits. The agent can call the runner directly, so step 2 is
+   not what keeps a request in its own incident's thread; this check is.
 4. A member of the rotation group reacts to approve or refuse. The runner
-   polls `reactions.get`, ignores the bot user and anyone not in the
-   rotation, and re-reads the message before running.
+   polls `reactions.get`, ignores anyone not in the rotation, fails the
+   request if the bot itself has reacted, and re-reads the message before
+   running.
 5. It runs the query in a `READ ONLY` transaction with a statement timeout,
    as `readonly_user` on the reader endpoint, with a row and size cap. It
    edits the outcome into its message, and the agent collects the rows by
@@ -418,7 +422,15 @@ volume, not the environment.
   reacted, so nothing the agent sends it can stand in for a person.
 - The agent holds the bot token, so it could edit the runner's message to
   show a harmless query over the stored one. The runner refuses to run if the
-  message was edited, deleted, or no longer shows what it stored.
+  message was edited, deleted, or no longer shows what it stored. It also
+  refuses SQL a person could read differently from what runs: anything but
+  printable ASCII (bidi controls and zero-width characters can show one query
+  and run another), more than 40 lines, a line over 200 characters, or two
+  blank lines in a row (which push the end of a query below Slack's "Show
+  more").
+- The same token lets the agent react as the bot. A ▶️ already on the
+  message makes approving a click on an existing pill, so any reaction from
+  the bot fails the request.
 - The runner logs to `/bugboss/sql-runner`, outside every log prefix the
   task role reads, and the task role is explicitly denied it too.
 - A security group rule opens the database's port 5432 to this task's

@@ -5,8 +5,9 @@ agent, after a person in the on-call rotation approves it in Slack. Its own
 container ("sqlrunner") in the BugBoss task, same image, entry point
 `main.ts`, listening on `127.0.0.1:8790`.
 
-The agent never calls it. Its `request_sql_query` tool goes through the
-Boss's loopback tool API, which adds the incident's thread and forwards here.
+The agent's `request_sql_query` tool goes through the Boss's loopback tool
+API, which adds the incident's thread and forwards here. The agent can also
+call this port directly, so nothing a caller sends is taken on trust.
 
 - `runner.ts`: the state machine and the HTTP routes. Every decision.
 - `slack.ts`, `execute.ts`: the Slack and Postgres wiring it is handed.
@@ -26,7 +27,25 @@ be given it.
 **Approval is a reaction, not a button.** A button click arrives as a signed
 request, and the agent can sign one. A reaction is read back from Slack with
 `reactions.get`, and the only user the agent's token can react as is the bot,
-which is excluded. Only members of the rotation user group count.
+which is excluded. Only members of the rotation user group count. Nothing of
+ours ever reacts to the message, so a reaction from the bot is the agent
+seeding a pill for a person to click, and it fails the request.
+
+**The thread is checked with Slack, not taken from the caller.** The Boss
+names the incident's thread, but the agent can skip the Boss and name any
+incident and any thread. Before posting, the runner reads the thread's
+top-level message and refuses unless it is that exact message (not a reply),
+the bot posted it, and its first line names the same incident number. This
+stops an agent from asking "Incident 812 wants to run a query" under
+incident 812 so the approver judges it against the wrong incident. It does
+not stop the agent posting a fake top-level header with the bot token; that
+would be a new, visible message in the channel.
+
+**What the approver reads is what runs.** The SQL must be printable ASCII
+(bidi controls and zero-width characters can show one query and run
+another), at most 40 lines of at most 200 characters, with no two blank
+lines in a row, so nothing hides below Slack's "Show more". The reason must
+be printable ASCII on one line. The message states the query's line count.
 
 **The message is re-read before it runs.** The agent can `chat.update` our
 message, so a person could approve SQL that is not what we stored. Before
@@ -67,6 +86,9 @@ what other incidents asked for or got back.
 - `conversations.replies` always returns the thread's parent first, so
   `limit: 1` never returns the reply. `slack.ts` pins `oldest`/`latest` to
   our ts and finds the reply by ts.
+- Given a reply's ts, `conversations.replies` still returns the thread's
+  parent first, so `threadParent` comparing the parent's ts with the one
+  asked about is what catches a reply passed off as a thread.
 - Read calls do not retry: a 429 skips one 10s poll rather than parking the
   loop inside the SDK. Writes retry for up to five minutes.
 - Five pending requests polled every 10s is 30 `reactions.get` a minute,

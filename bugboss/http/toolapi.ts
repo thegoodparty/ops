@@ -656,11 +656,10 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
   };
 
   /**
-   * The Boss adds the thread, and that is all it adds. The approval is a
-   * reaction on the sidecar's own message in the incident thread, so the
-   * thread has to come from the incident row rather than from the agent: an
-   * agent that named its own thread could ask for approval somewhere nobody
-   * on the rotation is looking.
+   * The Boss adds the thread, and that is all it adds. It is a convenience,
+   * not a check: the agent can reach the sidecar on loopback directly and
+   * name any incident and thread it likes, so the sidecar confirms with Slack
+   * that the thread is this incident's before it posts anything.
    */
   app.post("/incidents/:id/sql-requests", async (c) => {
     const caller = authorize(c);

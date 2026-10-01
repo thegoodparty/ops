@@ -1,10 +1,10 @@
 // request_sql_query: one read-only SELECT against gp-api's production
 // database, run only after a person on the rotation approves it.
 //
-// The agent never reaches the database or the sidecar that holds its
-// password. The tool calls the Boss's loopback API, the Boss names the
-// incident's thread and forwards to the sidecar, and the sidecar asks for
-// approval with a message of its own and reads the reaction back from Slack.
+// The agent never reaches the database or the sidecar's password. The tool
+// calls the Boss's loopback API, the Boss names the incident's thread and
+// forwards to the sidecar, and the sidecar checks that thread with Slack, asks
+// for approval with a message of its own and reads the reaction back.
 // Everything here is the waiting: it is a blocking tool like monitor, costs one
 // turn however long the person takes, and is cut short by a Boss message the
 // same way.
@@ -218,7 +218,9 @@ export const renderSqlOutcome = (outcome: SqlQueryOutcome): string => {
 const DESCRIPTION = [
   "Run ONE read-only SELECT on the gp-api PRODUCTION database (reader), once a",
   "person on the rotation approves it in the incident thread. Wrapped as a",
-  "subquery: 200 rows max, 30s timeout, no semicolons. Schema: the Prisma models",
+  "subquery: 200 rows max, 30s timeout, no semicolons, printable ASCII, 40 lines",
+  "of 200 chars, no double blank lines. Never react to the approval message.",
+  "Schema: the Prisma models",
   "under packages/gp-api/prisma/schema/ in your checkout (mind @@map). Rows",
   "come back to you only, never to Slack. Select the narrowest columns you need,",
   "never secrets or personal data you do not need.",

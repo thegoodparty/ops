@@ -21,6 +21,8 @@ const log = makeLog("sqlrunner");
 const alarm = makeAlarm("sqlrunner");
 
 export const MAX_SQL_CHARS = 4000;
+export const MAX_SQL_LINES = 40;
+export const MAX_SQL_LINE_CHARS = 200;
 export const MAX_REASON_CHARS = 1000;
 export const ROW_CAP = 200;
 export const MAX_RESULT_CHARS = 100_000;
@@ -49,9 +51,17 @@ export interface PostedReply {
   edited: boolean;
 }
 
+export interface ThreadParent {
+  ts: string;
+  /** The poster's user id; a bot's own posts carry its bot user id. */
+  user: string | null;
+  text: string;
+}
+
 /**
- * The four Slack reads and two writes the runner makes. Every one of them is
- * on our own message in an incident thread; nothing here reads anything else.
+ * The five Slack reads and two writes the runner makes. Every one of them is
+ * on an incident thread's top-level message or on our own message in that
+ * thread; nothing here reads anything else.
  */
 export interface SqlRunnerSlack {
   /** chat.postMessage in a thread. Returns the message ts and the text as Slack stored it. */
@@ -70,6 +80,12 @@ export interface SqlRunnerSlack {
     ts: string,
   ): Promise<PostedReply | null>;
   rotationMembers(usergroupId: string): Promise<string[]>;
+  /**
+   * The top-level message of the thread `threadTs` belongs to, or null when
+   * there is no such message. Its `ts` differs from `threadTs` when
+   * `threadTs` names a reply rather than a thread.
+   */
+  threadParent(channel: string, threadTs: string): Promise<ThreadParent | null>;
 }
 
 export interface QueryResult {
@@ -143,6 +159,27 @@ export const validateRequest = (
       error: `sql is ${sql.length} characters; the limit is ${MAX_SQL_CHARS}`,
     };
   }
+  // What the approver reads has to be what Postgres runs. Bidi controls and
+  // zero-width characters can show one query and run another, so the SQL is
+  // printable ASCII. Slack folds a long message behind "Show more", so the
+  // query is short enough to read whole, with no blank stretch to hide the
+  // end of it below.
+  if (!/^[\x20-\x7E\n\t]*$/.test(sql)) {
+    return {
+      ok: false,
+      error: "sql must be printable ASCII (newlines and tabs allowed); write any other character as a U&'\\XXXX' escape",
+    };
+  }
+  const lines = sql.split("\n");
+  if (lines.length > MAX_SQL_LINES) {
+    return { ok: false, error: `sql is ${lines.length} lines; the limit is ${MAX_SQL_LINES}` };
+  }
+  if (lines.some((l) => l.length > MAX_SQL_LINE_CHARS)) {
+    return { ok: false, error: `every sql line must be at most ${MAX_SQL_LINE_CHARS} characters; break the long ones` };
+  }
+  if (lines.some((l, i) => i > 0 && l.trim() === "" && lines[i - 1].trim() === "")) {
+    return { ok: false, error: "sql must not contain two blank lines in a row" };
+  }
   if (sql.includes(";")) {
     return {
       ok: false,
@@ -169,12 +206,21 @@ export const validateRequest = (
   if (reason.includes("`") || /[\r\n]/.test(reason)) {
     return { ok: false, error: "reason must be one line with no backticks" };
   }
+  if (!/^[\x20-\x7E]*$/.test(reason)) {
+    return { ok: false, error: "reason must be printable ASCII" };
+  }
   return { ok: true, body: { incidentId, threadTs, sql, reason } };
+};
+
+const lineCount = (sql: string): string => {
+  const n = sql.split("\n").length;
+  return n === 1 ? "1 line" : `${n} lines`;
 };
 
 export const renderRequest = (body: Body): string =>
   mrkdwn`*Incident ${body.incidentId} wants to run a query.*
 Reason: ${body.reason}
+The query is ${lineCount(body.sql)}; read all of it before reacting.
 ${raw("```")}
 ${body.sql}
 ${raw("```")}
@@ -307,6 +353,17 @@ export const createSqlRunner = (config: SqlRunnerConfig) => {
       });
       return;
     }
+    // Nothing of ours ever reacts to this message, so a reaction from the bot
+    // is the agent, which holds the bot token. A ▶️ already there turns
+    // approving into a click on someone else's pill.
+    const seeded = reactions.filter((r) => r.users.includes(config.botUserId)).map((r) => r.name);
+    if (seeded.length > 0) {
+      alarm("approval_message_tampered", { requestId: req.requestId, incidentId: req.incidentId, reason: "bot_reaction", reactions: seeded });
+      await finish(req, "failed", "Failed: the bot reacted to this message, which nothing legitimate does, so nothing ran.", {
+        error: "the approval message carries a reaction from the bot itself; nothing ran. Ask again and do not react to it.",
+      });
+      return;
+    }
     const counted = (name: string) =>
       (reactions.find((r) => r.name === name)?.users ?? []).filter(
         (u) => u !== config.botUserId && members.has(u),
@@ -408,6 +465,37 @@ export const createSqlRunner = (config: SqlRunnerConfig) => {
       status: "pending",
     };
     requests.set(req.requestId, req);
+
+    // Whoever calls this names the incident and the thread, and the agent can
+    // call it as easily as the Boss can, so neither is taken on trust. The
+    // thread has to be a top-level message the bot posted, headed with this
+    // incident's number. Otherwise an agent could post "Incident 812 wants to
+    // run a query" under incident 812, and the approver would judge it
+    // against the wrong incident.
+    let parent: ThreadParent | null;
+    try {
+      parent = await config.slack.threadParent(config.channelId, body.threadTs);
+    } catch (err) {
+      requests.delete(req.requestId);
+      alarm("thread_read_failed", { incidentId: body.incidentId, error: errorMessage(err) });
+      return c.json({ error: `could not read the incident thread from Slack: ${errorMessage(err)}` }, 502);
+    }
+    const headedBy = parent ? /Incident (\d+)(?!\d)/.exec(parent.text.split("\n")[0]) : null;
+    const wrongThread =
+      parent === null
+        ? "there is no message at that threadTs"
+        : parent.ts !== body.threadTs
+          ? "threadTs is a reply, not the top of a thread"
+          : parent.user !== config.botUserId
+            ? "the thread was not started by BugBoss"
+            : headedBy?.[1] !== String(body.incidentId)
+              ? `the thread is not headed with incident ${body.incidentId}`
+              : null;
+    if (wrongThread) {
+      requests.delete(req.requestId);
+      alarm("request_wrong_thread", { incidentId: body.incidentId, threadTs: body.threadTs, reason: wrongThread });
+      return c.json({ error: `${wrongThread}; nothing was asked` }, 403);
+    }
 
     const text = renderRequest(body);
     try {

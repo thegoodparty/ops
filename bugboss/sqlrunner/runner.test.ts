@@ -11,6 +11,7 @@ import {
   type QueryResult,
   type Reaction,
   type SqlRunnerSlack,
+  type ThreadParent,
 } from "./runner";
 
 const CHANNEL = "C_INCIDENTS";
@@ -21,10 +22,16 @@ const GROUP = "S_ROTATION";
 const THREAD = "1700000000.000100";
 const SECRET = "jane.doe@example.com";
 
+const threadFor = (incidentId: number) =>
+  incidentId === 4 ? THREAD : `1700000000.${String(incidentId).padStart(6, "0")}`;
+const header = (incidentId: number) =>
+  `*Incident ${incidentId}* · checkout is failing\n*Status*: *Investigating* → Fixing → Resolved → Closed`;
+
 const fakeSlack = () => {
   const calls: { method: string; args: unknown[] }[] = [];
   const messages = new Map<string, { text: string; edited: boolean }>();
   const reactions = new Map<string, Reaction[]>();
+  const parents = new Map<string, ThreadParent | null>();
   let rotation = [ONCALL];
   let rotationReads = 0;
   let seq = 0;
@@ -54,11 +61,13 @@ const fakeSlack = () => {
       rotationReads++;
       return rotation;
     },
+    threadParent: async (_channel, threadTs) => parents.get(threadTs) ?? null,
   };
   return {
     slack,
     calls,
     messages,
+    parents,
     react: (ts: string, name: string, users: string[]) => {
       const list = reactions.get(ts) ?? [];
       list.push({ name, users });
@@ -89,18 +98,25 @@ const setup = (opts: { result?: QueryResult | Error; rotationGroupId?: string | 
     rotationGroupId: opts.rotationGroupId === undefined ? GROUP : opts.rotationGroupId,
     now: () => clock,
   });
-  const submit = (body: Record<string, unknown>) =>
-    runner.app.request("/requests", {
+  const submit = (body: Record<string, unknown>) => {
+    const incidentId = body.incidentId ?? 4;
+    const threadTs =
+      body.threadTs ?? (typeof incidentId === "number" ? threadFor(incidentId) : THREAD);
+    if (typeof incidentId === "number" && !fake.parents.has(threadTs as string)) {
+      fake.parents.set(threadTs as string, { ts: threadTs as string, user: BOT, text: header(incidentId) });
+    }
+    return runner.app.request("/requests", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        incidentId: 4,
-        threadTs: THREAD,
+        incidentId,
+        threadTs,
         sql: "select email from users where id = 1",
         reason: "check the user's email",
         ...body,
       }),
     });
+  };
   const status = async (id: string) =>
     (await (await runner.app.request(`/requests/${id}`)).json()) as Record<string, unknown>;
   const lastPostTs = () => {
@@ -138,7 +154,7 @@ describe("POST /requests validation", () => {
 
   it("refuses sql and reasons over their limits, and accepts them at the limit", async () => {
     const t = setup();
-    assert.equal((await t.submit({ sql: "x".repeat(4001) })).status, 400);
+    assert.equal((await t.submit({ sql: Array.from({ length: 21 }, () => "x".repeat(199)).join("\n") })).status, 400);
     assert.equal((await t.submit({ reason: "r".repeat(1001) })).status, 400);
     assert.equal((await t.submit({ sql: "", reason: "r" })).status, 400);
     assert.equal((await t.submit({ reason: " " })).status, 400);
@@ -148,7 +164,31 @@ describe("POST /requests validation", () => {
     assert.equal((await t.submit({ reason: "uses `id`" })).status, 400);
     assert.equal((await t.submit({ reason: "line one\nRan for <@U1>: 3 rows" })).status, 400);
     assert.equal(t.calls.length, 0);
-    await created(await t.submit({ sql: "x".repeat(4000), reason: "r".repeat(1000) }));
+    await created(
+      await t.submit({ sql: [...Array.from({ length: 19 }, () => "x".repeat(199)), "x".repeat(200)].join("\n"), reason: "r".repeat(1000) }),
+    );
+  });
+
+  it("refuses sql the approver could read differently from what runs", async () => {
+    const t = setup();
+    const refused = [
+      "select id from campaign where slug = 'a\u202E' or true --'",
+      "select id\u200B from campaign",
+      "select 'José'",
+      "select 1\r\nfrom campaign",
+      Array.from({ length: 41 }, () => "select 1").join("\n"),
+      `select '${"x".repeat(200)}'`,
+      "select id from campaign\n\n\nunion select email from users",
+      "select id from campaign\n  \n\t\nunion select email from users",
+    ];
+    for (const sql of refused) {
+      assert.equal((await t.submit({ sql })).status, 400, JSON.stringify(sql));
+    }
+    assert.equal((await t.submit({ reason: "check the user\u202E email" })).status, 400);
+    assert.equal(t.calls.length, 0);
+    await created(
+      await t.submit({ sql: Array.from({ length: 40 }, (_, i) => (i % 2 ? "" : "\tselect 1")).join("\n") }),
+    );
   });
 
   it("answers 503 and posts nothing when no rotation group is configured", async () => {
@@ -161,12 +201,13 @@ describe("POST /requests validation", () => {
 describe("the posted message", () => {
   it("carries the whole SQL, escaped, in a code block, in the incident thread", async () => {
     const t = setup();
-    const sql = `select * from users where a < 5 and b > 2 and c = '&' ${"x".repeat(3500)}`;
+    const sql = `select * from users where a < 5 and b > 2 and c = '&'\n${"x".repeat(190)}`;
     await created(await t.submit({ sql, reason: "<!channel> look" }));
     const [channel, thread, text] = t.calls[0].args as string[];
     assert.equal(channel, CHANNEL);
     assert.equal(thread, THREAD);
-    assert.ok(text.includes("```\nselect * from users where a &lt; 5 and b &gt; 2 and c = '&amp;' " + "x".repeat(3500) + "\n```"));
+    assert.ok(text.includes("```\nselect * from users where a &lt; 5 and b &gt; 2 and c = '&amp;'\n" + "x".repeat(190) + "\n```"));
+    assert.ok(text.includes("The query is 2 lines; read all of it before reacting."));
     assert.ok(text.includes("&lt;!channel&gt; look"));
     assert.ok(text.includes("Incident 4"));
     assert.ok(text.includes("React with :arrow_forward: to run it or :x: to refuse. Only the on-call rotation counts."));
@@ -215,13 +256,13 @@ describe("decisions", () => {
     assert.match(t.calls.find((c) => c.method === "update")!.args[2] as string, /Refused by <@U_ONCALL>\.$/);
   });
 
-  it("ignores the bot's own reaction even if the bot is in the rotation", async () => {
+  it("never runs on the bot's own reaction, even if the bot is in the rotation", async () => {
     const t = setup();
     t.setRotation([ONCALL, BOT]);
     const id = await created(await t.submit({}));
     t.react(t.lastPostTs(), "arrow_forward", [BOT]);
     await t.runner.tick();
-    assert.equal((await t.status(id)).status, "pending");
+    assert.equal((await t.status(id)).status, "failed");
     assert.equal(t.executed.length, 0);
   });
 
@@ -385,5 +426,71 @@ describe("rows never reach Slack", () => {
       assert.ok(t.calls.some((c) => c.method === "update"));
       assert.ok(!JSON.stringify(t.calls).includes(SECRET));
     }
+  });
+});
+
+describe("the thread a request names", () => {
+  const refusedWith = async (res: Response, pattern: RegExp) => {
+    assert.equal(res.status, 403);
+    assert.match(((await res.json()) as { error: string }).error, pattern);
+  };
+
+  it("posts only under the top of a thread the bot started for that incident", async () => {
+    const t = setup();
+    t.parents.set("1700000009.000001", null);
+    await refusedWith(await t.submit({ threadTs: "1700000009.000001" }), /no message/);
+
+    t.parents.set("1700000009.000002", { ts: THREAD, user: BOT, text: header(4) });
+    await refusedWith(await t.submit({ threadTs: "1700000009.000002" }), /a reply/);
+
+    t.parents.set("1700000009.000003", { ts: "1700000009.000003", user: OTHER, text: header(4) });
+    await refusedWith(await t.submit({ threadTs: "1700000009.000003" }), /not started by BugBoss/);
+
+    t.parents.set(THREAD, { ts: THREAD, user: BOT, text: header(4) });
+    await refusedWith(await t.submit({ incidentId: 812, threadTs: THREAD }), /not headed with incident 812/);
+    t.parents.set("1700000009.000004", { ts: "1700000009.000004", user: BOT, text: header(41) });
+    await refusedWith(await t.submit({ threadTs: "1700000009.000004" }), /not headed with incident 4/);
+
+    assert.equal(t.calls.filter((c) => c.method === "post").length, 0);
+    await created(await t.submit({}));
+  });
+
+  it("accepts a thread the Boss recovered with a rotation ping in front", async () => {
+    const t = setup();
+    t.parents.set(THREAD, { ts: THREAD, user: BOT, text: "<!subteam^S_ROTATION> *Incident 4 has no Slack thread*" });
+    await created(await t.submit({}));
+  });
+
+  it("frees the slot and answers 502 when the thread cannot be read", async () => {
+    const t = setup();
+    t.slack.threadParent = async () => {
+      throw new Error("ratelimited");
+    };
+    assert.equal((await t.submit({})).status, 502);
+    t.slack.threadParent = async (_c, ts) => ({ ts, user: BOT, text: header(4) });
+    await created(await t.submit({}));
+  });
+});
+
+describe("a reaction from the bot itself", () => {
+  it("fails the request even when a rotation member approved too", async () => {
+    const t = setup();
+    const id = await created(await t.submit({}));
+    t.react(t.lastPostTs(), "arrow_forward", [BOT, ONCALL]);
+    await t.runner.tick();
+    const s = await t.status(id);
+    assert.equal(s.status, "failed");
+    assert.match(s.error as string, /reaction from the bot/);
+    assert.deepEqual(t.executed, []);
+  });
+
+  it("fails on any bot reaction, not only the approve one", async () => {
+    const t = setup();
+    const id = await created(await t.submit({}));
+    t.react(t.lastPostTs(), "eyes", [BOT]);
+    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    await t.runner.tick();
+    assert.equal((await t.status(id)).status, "failed");
+    assert.deepEqual(t.executed, []);
   });
 });
