@@ -11,7 +11,7 @@ import type { Db } from "../db";
 import type { SlackReactor } from "./ack";
 import type { SlackLinker } from "./client";
 import type { SlackPoster } from "./relay";
-import { mentionPrefix, stripBotMention } from "./relay";
+import { botMentionPattern, mentionPrefix, mentionsBot, stripBotMention } from "./relay";
 import {
   channelLink,
   link,
@@ -612,7 +612,7 @@ export const buildTools = ({
     {
       name: STAY_SILENT_TOOL,
       description:
-        "Post nothing in reply. Only in an incident thread or for an untagged message in a thread you are already in, and only when there is nothing for you to say: the message is not for you -- people talking to each other -- or a notice you just caused (a close, a merge, a page) is already the whole answer. A message that tags you is always answered. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. Calling this ends the run: nothing more is read from you, whether or not you write anything else in this turn.",
+        "Post nothing in reply. Never for a message that tags you (shown as @BugBoss (you)): that is always answered, in an incident thread or anywhere else. Otherwise only for an untagged message with nothing in it for you: people talking to each other, or a notice you just caused (a close, a merge, a page) that is already the whole answer. Give the reason. This is the only way to post nothing: a run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. Calling this ends the run: nothing more is read from you, whether or not you write anything else in this turn.",
       inputSchema: {
         type: "object",
         properties: {
@@ -718,7 +718,7 @@ export const SLACK_AGENT_SYSTEM = [
   "- A request to change something -- close, merge, stop: do it if you can cite the evidence, and say what you did. If you cannot, say what you would need to see. \"See my message in that thread\" means read that incident's thread_reply rows.",
   "- Never ask whether a message is a report or a question. Decide, and if you truly cannot tell what they want, ask about the thing itself.",
   "- A question about the status of an incident -- where it is, what its agent is doing, what it is waiting on, what it has cost: call incident_status and post the card exactly as it comes back, plus at most one sentence of your own after it, only if it says something the card does not. Never rewrite, reorder, reformat or summarise the card.",
-  "- People talking to each other, or anything else not meant for you: call stay_silent with the reason, then end your run without writing anything. Silence has to be chosen. A run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. A request made of you is never met with silence: do it, or say what you would need to do it.",
+  "- People talking to each other, or anything else not meant for you: call stay_silent with the reason, then end your run without writing anything. Silence has to be chosen. A run that ends with no reply and no stay_silent is treated as a failure, and the thread is told you could not answer. A request made of you, or any message that tags you (shown as @BugBoss (you)), is never met with silence: do it, or say what you would need to do it.",
   "",
   "Something from an incident's agent:",
   "- A message: context. Tell the thread only what a person there needs to know.",
@@ -1080,7 +1080,14 @@ interface ThreadState {
 
 /** Why the Boss is running in an incident thread. */
 export type IncidentTrigger =
-  | { kind: "human"; user: string; text: string; ts: string }
+  | {
+      kind: "human";
+      user: string;
+      text: string;
+      ts: string;
+      /** True when the message tags the Boss: that run answers, never stays silent. */
+      tagged: boolean;
+    }
   | { kind: "inbox" };
 
 interface IncidentContext {
@@ -1277,7 +1284,23 @@ export class SlackAgent {
         [incidentId],
       );
 
-      const silence: SilenceChoice = { allowed: true, reason: null };
+      // Two people talking to each other in the thread may get silence. A
+      // message that tags the Boss is a question to it, and incident 100's
+      // "what's the status here?" went unanswered when it was not. A tag the
+      // thread shows past the watermark counts too: a run that failed before
+      // answering one leaves it there, and the retry may be woken by the inbox.
+      const unanswered = prior?.lastSeenTs;
+      const tagged =
+        humans.some((h) => h.tagged) ||
+        shown.some(
+          (m) =>
+            !m.botId &&
+            m.user !== this.cfg.botUserId &&
+            (unanswered === undefined || tsAfter(m.ts, unanswered)) &&
+            mentionsBot(m.text, this.cfg.botUserId),
+        );
+      const allowSilence = !tagged;
+      const silence: SilenceChoice = { allowed: allowSilence, reason: null };
       // The newest person in this run is who a report is filed for. A run
       // woken by the agent alone has nobody to attribute one to.
       const latest = humans.at(-1);
@@ -1289,9 +1312,9 @@ export class SlackAgent {
         tools: this.tools(silence, reporter),
         sessionKey,
         fresh,
-        input: this.buildIncidentInput(incident, fresh, shown, inbox, question),
+        input: this.buildIncidentInput(incident, fresh, shown, inbox, question, tagged),
         maxTurns: this.cfg.maxTurns ?? SLACK_AGENT_MAX_TURNS,
-        allowSilence: true,
+        allowSilence,
       });
 
       // Silence has to be chosen. Empty text used to be read as a deliberate
@@ -1404,6 +1427,7 @@ export class SlackAgent {
     shown: SlackMessage[],
     inbox: BossInboxItem[],
     question: { askedAt: number; message: string } | undefined,
+    tagged: boolean,
   ): string {
     const lines = [
       `This is the thread of incident ${incident.id}. Status: ${incident.status}. Title: ${incident.title ?? "none yet"}.`,
@@ -1427,7 +1451,11 @@ export class SlackAgent {
           ? `The thread so far, oldest first (${shown.length} message(s)):`
           : `Said in the thread since you last looked (${shown.length} message(s)):`,
       );
-      for (const m of shown) lines.push(`${this.author(m)}: ${m.text}`);
+      // Raw, the Boss's own tag is an id it does not know is its own: it read
+      // incident 100's tag as a question for somebody else.
+      for (const m of shown) {
+        lines.push(`${this.author(m)}: ${m.text.replace(botMentionPattern(this.cfg.botUserId), "@BugBoss (you)")}`);
+      }
     }
     if (inbox.length > 0) {
       lines.push("", `From incident ${incident.id}'s agent, not seen by you before (${inbox.length}):`);
@@ -1441,7 +1469,12 @@ export class SlackAgent {
         lines.push(`[${label}] ${row.text}`);
       }
     }
-    lines.push("", "Reply in the thread only if something here is for you.");
+    lines.push(
+      "",
+      tagged
+        ? "A message here tags you, so answer it."
+        : "Reply in the thread only if something here is for you.",
+    );
     return lines.join("\n");
   }
 

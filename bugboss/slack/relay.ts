@@ -245,6 +245,8 @@ export type InboundRoute =
       ts: string;
       user: string;
       text: string;
+      /** True when the message tags the Boss, which is then always answered. */
+      tagged: boolean;
     }
   | {
       kind: "slack_agent";
@@ -262,11 +264,15 @@ export type InboundRoute =
       tagged: boolean;
     };
 
+// Slack writes a mention as `<@ID>`, or `<@ID|name>` when the client keeps
+// the name it showed. Incident 100's status question came in the second form.
+export const botMentionPattern = (botUserId: string): RegExp => new RegExp(`<@${botUserId}(\\|[^>]*)?>`, "g");
+
 export const mentionsBot = (text: string, botUserId: string): boolean =>
-  text.includes(`<@${botUserId}>`);
+  botMentionPattern(botUserId).test(text);
 
 export const stripBotMention = (text: string, botUserId: string): string =>
-  text.replaceAll(`<@${botUserId}>`, "").replace(/\s+/g, " ").trim();
+  text.replace(botMentionPattern(botUserId), "").replace(/\s+/g, " ").trim();
 
 const ignore = (reason: string): InboundRoute => ({ kind: "ignore", reason });
 
@@ -480,6 +486,7 @@ export class SlackRelay {
       ts,
       user,
       text,
+      tagged: mentioned,
     };
   }
 

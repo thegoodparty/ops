@@ -2235,7 +2235,7 @@ describe("the Boss in an incident thread", () => {
     return { model, slack, store, objects, agent };
   };
 
-  const human = (ts: string, text: string) => ({ kind: "human" as const, user: "U0HUMAN", text, ts });
+  const human = (ts: string, text: string) => ({ kind: "human" as const, user: "U0HUMAN", text, ts, tagged: false });
 
   const opening: SlackMessage = {
     user: BOT,
@@ -2663,7 +2663,7 @@ describe("the Boss's write tools", () => {
       d.prepare("UPDATE incident SET slackThreadTs = '800.1' WHERE id = 'inc-1'").run();
     });
     model.state.reply = `<!subteam^${ROTATION}> wake up`;
-    await agent.handleIncident({ incidentId: "inc-1", trigger: { kind: "human", user: "U0HUMAN", text: "x", ts: "800.2" } });
+    await agent.handleIncident({ incidentId: "inc-1", trigger: { kind: "human", user: "U0HUMAN", text: "x", ts: "800.2", tagged: false } });
     assert.equal(slack.posts.length, 1);
     assert.ok(!slack.posts[0].text.startsWith("<!subteam^"), slack.posts[0].text);
   });

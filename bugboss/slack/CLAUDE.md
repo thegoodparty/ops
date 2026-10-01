@@ -441,6 +441,14 @@ not talking to the Boss, and it says nothing by calling `stay_silent` with a
 reason, which is logged at info. The harness is still told silence is
 allowed (`allowSilence`), so it hands back empty rather than an apology.
 
+A message that tags the Boss is never met with silence, in an incident
+thread or anywhere. The relay marks an `incident_reply` `tagged`, and a run
+with a tagged trigger, or a tag the thread shows past the last watermark (a
+failed run's leftover, retried by an inbox wake), has `allowSilence: false`,
+so `stay_silent` is refused. The Boss's own `<@ID>` or `<@ID|name>` is rendered as
+`@BugBoss (you)` in the incident-thread input: raw, incident 100's Boss read
+its own id as somebody else and stayed silent on "what's the status here?".
+
 Empty text alone used to be read as that choice, and that is how a request
 to close incident 2 vanished: the Boss read 199,928 characters of raw
 session, its next turn came back with no text and no tool call, and nothing

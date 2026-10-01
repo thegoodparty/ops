@@ -486,6 +486,7 @@ describe("inbound", () => {
     assert.equal(route.kind, "incident_reply");
     if (route.kind !== "incident_reply") return;
     assert.equal(route.incidentId, "inc-1");
+    assert.equal(route.tagged, false);
     const replies = db.query<{ text: string; slackUserId: string }>(
       "SELECT text, slackUserId FROM thread_reply WHERE incidentId = 'inc-1'",
     );
@@ -523,7 +524,7 @@ describe("inbound", () => {
     );
   });
 
-  test("a tagged reply routes exactly as an untagged one does", async () => {
+  test("a tagged reply routes as an untagged one does, marked tagged so it is always answered", async () => {
     const thread = await openThread("inc-1");
     const route = await relay.handle({
       type: "app_mention",
@@ -542,7 +543,23 @@ describe("inbound", () => {
       ts: "1700.2",
       user: "U0HUMAN",
       text: `<@${BOT}> stop, this is expected`,
+      tagged: true,
     });
+  });
+
+  // Incident 100: the tag came as `<@ID|BugBoss>`. As a plain message it has
+  // to read as the duplicate of its app_mention, or the untagged copy is the
+  // one recorded and the tag is lost.
+  test("a tag that carries the name is still a tag", async () => {
+    const thread = await openThread("inc-1");
+    const text = `<@${BOT}|BugBoss> what's the status here?`;
+    const plain = await relay.handle({ type: "message", channel: CHANNEL, user: "U0HUMAN", text, ts: "1700.3", thread_ts: thread });
+    assert.deepEqual(plain, { kind: "ignore", reason: "duplicate of app_mention" });
+
+    const route = await relay.handle({ type: "app_mention", channel: CHANNEL, user: "U0HUMAN", text, ts: "1700.3", thread_ts: thread });
+    assert.equal(route.kind, "incident_reply");
+    if (route.kind !== "incident_reply") return;
+    assert.equal(route.tagged, true);
   });
 
   test("a channel-level mention opens a new Slack agent thread on itself", async () => {

@@ -2151,6 +2151,7 @@ export const createBugBoss = async (
             user: route.user,
             text: route.text,
             ts: route.ts,
+            tagged: route.tagged,
           },
         }),
       };
