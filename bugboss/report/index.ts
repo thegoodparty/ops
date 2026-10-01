@@ -16,6 +16,7 @@ import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
 import { sumSessionUsage } from "../agent/session";
+import { catalogRatesFor, priceTokens, type TokenCounts } from "../bedrock/model";
 import { makeAlarm, makeLog } from "../logging";
 import { mrkdwn } from "../slack/format";
 import { agentClosedDetail, bossClosedDetail, closedNotice } from "../toolapi/announce";
@@ -186,11 +187,12 @@ export const readReportData = async (
       explained: signal.explained === 1,
     }));
 
-  const mergedIn = deps.db
-    .query<{ id: string }>("SELECT id FROM incident WHERE mergedInto = ? ORDER BY id", [
-      incidentId,
-    ])
-    .map((merged) => merged.id);
+  const merged = deps.db.query<TokenCounts & { id: string; modelId: string | null }>(
+    `SELECT id, modelId, tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h
+       FROM incident WHERE mergedInto = ? ORDER BY id`,
+    [incidentId],
+  );
+  const mergedIn = merged.map((m) => m.id);
 
   const actions: ReportAction[] = deps.db.query<ActionRow>(
     `SELECT actorKind, actorId, action, reason, at FROM incident_action
@@ -211,20 +213,15 @@ export const readReportData = async (
     [incidentId],
   );
 
-  // Tokens and modelId are the record and come off the row. Turns and the
-  // estimated price are read back out of the same session file rollUpUsage
-  // summed, so they are simply missing once it ages out -- which is the
-  // honest shape, rather than a zero that reads as a free run.
+  // Tokens and modelId come off the row, which rollUpUsage keeps current;
+  // the price is derived from them below. Turns are read back out of the
+  // session file, so they are simply missing once it ages out -- the honest
+  // shape, rather than a zero that reads as a run with no turns.
   let turns: number | null = null;
-  let estimatedCostUsd: number | null = null;
   if (incident.sessionRef) {
     try {
       const contents = await deps.sessions.get(incident.sessionRef);
-      if (contents) {
-        const usage = sumSessionUsage(contents);
-        turns = usage.turns;
-        estimatedCostUsd = usage.costUsd > 0 ? usage.costUsd : null;
-      }
+      if (contents) turns = sumSessionUsage(contents).turns;
     } catch (err) {
       // A missing turn count is a worse report, not a worse incident.
       alarm("session_read_failed", { incidentId, error: String(err) });
@@ -264,6 +261,37 @@ export const readReportData = async (
     }
   }
 
+  // Dollars are derived here, on read, from the tokens and the catalog's
+  // rates, and never stored: the tokens are the record. Null rather than
+  // zero when the model has no rates or pricing refuses, so a missing price
+  // never reads as a free run.
+  const estimate = async (
+    modelId: string | null,
+    tokens: TokenCounts,
+  ): Promise<number | null> => {
+    if (!modelId) return null;
+    const rates = await catalogRatesFor(modelId);
+    if (!rates) return null;
+    try {
+      return priceTokens(rates, tokens);
+    } catch (err) {
+      alarm("usage_unpriced", { incidentId, modelId, error: String(err) });
+      return null;
+    }
+  };
+  const ownCost = await estimate(incident.modelId, incident);
+  let mergedInCostUsd = 0;
+  const mergedInPriced: string[] = [];
+  const mergedInUnpriced: string[] = [];
+  for (const m of merged) {
+    const cost = await estimate(m.modelId, m);
+    if (cost === null) mergedInUnpriced.push(m.id);
+    else if (cost > 0) {
+      mergedInPriced.push(m.id);
+      mergedInCostUsd += cost;
+    }
+  }
+
   let states: Record<string, ReportPr["state"]> = {};
   if (deps.prStates && incident.prUrls.length > 0) {
     try {
@@ -290,7 +318,10 @@ export const readReportData = async (
       cacheWrite1h: incident.cacheWrite1h,
       attempts: incident.attempts,
       turns,
-      estimatedCostUsd,
+      estimatedCostUsd: ownCost !== null && ownCost > 0 ? ownCost : null,
+      mergedInCostUsd,
+      mergedInPriced,
+      mergedInUnpriced,
     },
   };
 };

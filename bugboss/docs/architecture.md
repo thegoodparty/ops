@@ -511,15 +511,25 @@ of the window, which on Opus 5's 1,000,000 left 50,000 tokens of headroom in
 front of a response that can be 128,000.
 
 **Tokens are facts; dollars are arithmetic.** Bedrock returns token counts.
-A price is something we compute locally against Pi's hardcoded per-model
-table, and the day AWS moves a rate that table goes stale with nothing in a
-stored dollar figure that could ever say so. So the incident row records
-`tokensIn`, `tokensOut`, `cacheRead`, `cacheWrite` and the 1h share of that
-write -- which is carried separately because it prices at 2x base input
-where the rest is 1.25x, and every run here asks for the long cache. There
-is no cost column. A dollar figure is derived where it is shown and called
-an **estimate** in the closing report, in Slack and in
-`read_agent_session`, because that is what it is.
+A price is something we compute locally against Pi's per-model table, and the
+day AWS moves a rate that table goes stale with nothing in a stored dollar
+figure that could ever say so. So the incident row records `tokensIn`,
+`tokensOut`, `cacheRead`, `cacheWrite` and the 1h share of that write --
+carried separately because it prices at 2x base input where the rest is
+1.25x -- and there is no cost column. A dollar figure is derived where it is
+shown, from those tokens and Pi's Bedrock catalog rates for `modelId`
+(`priceTokens` in `bedrock/model.ts`), and called an **estimate** in the
+closing report, in Slack and in `read_agent_session`.
+
+`rollUpUsage` keeps the tokens current. It sums the incident's session file
+and writes absolute totals, never increments, so a re-read cannot double
+count: after every child exits, on every tick for the agents that are
+running, and over every row at boot. The boot pass is the one that matters
+most, because every deploy kills the children along with the `.finally` that
+would have rolled them up. A total below the stored one is never written:
+the file only grows, so a smaller one is a stale read. A merged incident
+keeps its own tokens on its own row; the closing report prices the merged-in
+rows and adds them to the incident that absorbed them.
 
 The one way to check the estimate is an **application inference profile**: a
 tagged wrapper the agent is invoked through, since Bedrock puts no

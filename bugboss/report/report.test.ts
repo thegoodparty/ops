@@ -234,7 +234,10 @@ describe("the report assembles from a real incident row", () => {
     assert.ok(data);
     assert.equal(data.run.modelId, "us.anthropic.claude-opus-5");
     assert.equal(data.run.turns, 2, "turns come from the session file, not the row");
-    assert.equal(data.run.estimatedCostUsd, 3.76);
+    // 3,000 in at $5.50/M, 1,200 out at $27.50/M, 100,000 read at $0.55/M,
+    // 500 5m writes at $6.875/M and 1,500 1h writes at $11/M. Priced from the
+    // row's tokens; the session file's own cost figures are not read.
+    assert.equal(data.run.estimatedCostUsd, 0.1244375);
     assert.equal(data.run.cacheWrite1h, 1500, "the 1h split is the record, not the price");
     assert.equal(data.prs.length, 1);
     assert.equal(data.prs[0].state, null, "no PR reader wired, so state is not known");
@@ -256,7 +259,7 @@ describe("the report assembles from a real incident row", () => {
     // The 1h share prices at 2x base input where the rest is 1.25x, so a
     // re-pricing that cannot see it is wrong by most of that gap.
     assert.match(doc, /\| Cache write \(1h\) \| 1,500 \|/);
-    assert.match(doc, /Estimated cost: \$3\.76\./);
+    assert.match(doc, /Estimated cost: \$0\.12\./);
     assert.match(doc, /An estimate, not a bill/);
     assert.doesNotMatch(
       doc,
@@ -297,11 +300,61 @@ describe("the report assembles from a real incident row", () => {
     assert.doesNotMatch(renderReportDocument(data), /Recorded timeline/);
   });
 
+  it("adds what the incidents merged into it spent on their own agents", async () => {
+    await seed("inc-7");
+    await seed("inc-8", { status: "INVESTIGATING", closedAt: null, postmortem: null });
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET status = 'MERGED', mergedInto = 'inc-7' WHERE id = 'inc-8'").run();
+    });
+
+    const data = await readReportData(deps(), "inc-7");
+    assert.ok(data);
+    assert.equal(data.run.estimatedCostUsd, 0.1244375, "its own spend stays its own");
+    assert.equal(data.run.mergedInCostUsd, 0.1244375, "priced from the merged row's own tokens");
+
+    const doc = renderReportDocument(data);
+    assert.match(doc, /Estimated cost: \$0\.12\./);
+    assert.match(doc, /merged into this one \(inc-8\) spent an estimated further \$0\.12 .*\$0\.25 in all/);
+
+    await seed("inc-9", { status: "INVESTIGATING", closedAt: null, postmortem: null });
+    await db.withWrite((w) => {
+      w.prepare(
+        "UPDATE incident SET status = 'MERGED', mergedInto = 'inc-7', modelId = NULL WHERE id = 'inc-9'",
+      ).run();
+    });
+    const partialMerged = renderReportDocument((await readReportData(deps(), "inc-7"))!);
+    assert.match(partialMerged, /incident inc-9 has no estimate/);
+    assert.doesNotMatch(partialMerged, /in all/, "a sum missing a merged incident is never the total");
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET mergedInto = NULL, status = 'INVESTIGATING' WHERE id = 'inc-9'").run();
+    });
+
+    await seed("inc-10", { status: "INVESTIGATING", closedAt: null, postmortem: null });
+    await db.withWrite((w) => {
+      w.prepare(
+        `UPDATE incident SET status = 'MERGED', mergedInto = 'inc-7', tokensIn = 0, tokensOut = 0,
+           cacheRead = 0, cacheWrite = 0, cacheWrite1h = 0 WHERE id = 'inc-10'`,
+      ).run();
+    });
+    const withIdle = renderReportDocument((await readReportData(deps(), "inc-7"))!);
+    assert.match(withIdle, /merged into this one \(inc-8\) spent/, "an idle merged incident is not listed as spending");
+    assert.doesNotMatch(withIdle, /inc-10 has no estimate/, "spending nothing is not a missing price");
+    assert.match(withIdle, /\$0\.25 in all/);
+    await db.withWrite((w) => {
+      w.prepare("UPDATE incident SET modelId = NULL WHERE id = 'inc-7'").run();
+    });
+    const unpriced = await readReportData(deps(), "inc-7");
+    assert.ok(unpriced);
+    const partial = renderReportDocument(unpriced);
+    assert.match(partial, /has no estimate, so there is no total/);
+    assert.doesNotMatch(partial, /in all/, "merged spend alone is never presented as the total");
+  });
+
   it("says so rather than inventing a number it does not have", async () => {
     await seed("inc-2", { sessionRef: null });
     await db.withWrite((w) => {
       w.prepare(
-        "UPDATE incident SET impactStartedAt = NULL, usersImpacted = NULL WHERE id = 'inc-2'",
+        "UPDATE incident SET impactStartedAt = NULL, usersImpacted = NULL, modelId = NULL WHERE id = 'inc-2'",
       ).run();
     });
 

@@ -55,9 +55,8 @@ tick. The grace test pins its clocks to literals for the same reason.
 `BUGBOSS_MAX_TURNS` goes down in `buildChildEnv` beside the deadline and
 nothing here acts on it. That is deliberate: the count lives in the restored
 session file, which the dispatcher never reads, and the escalation has to
-carry what the run spent — which the incident row does not have yet, because
-`rollUpUsage` runs after the child exits and after this has already
-escalated. So the child owns both halves. It counts, it escalates with live
+carry what the run spent — which the incident row only has as of the last
+tick's `rollUpUsage`, not as of the turn that spent the budget. So the child owns both halves. It counts, it escalates with live
 numbers, and it calls `park` so this does not relaunch it into the same
 exhausted budget. See `agent/CLAUDE.md`.
 

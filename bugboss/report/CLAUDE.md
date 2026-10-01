@@ -80,11 +80,13 @@ incident.
 ## Tokens are the record; the dollar line is an estimate and says so
 
 Bedrock returns tokens. A price is arithmetic we do locally against a table
-that goes stale silently when a rate moves, so there is no cost column and
-nothing here holds a price list (`docs/architecture.md`). The report prints
-both and names which is which: the token table is the record, and the dollar
-line is what **Pi** priced the run at as it ran, read back out of the same
-session file and labelled `Estimated cost`.
+that goes stale silently when a rate moves, so there is no cost column
+(`docs/architecture.md`). The report prints both and names which is which:
+the token table is the record, and the dollar line is those tokens priced at
+the Bedrock catalog's rates when the report is built (`priceTokens`),
+labelled `Estimated cost`. When incidents were merged into this one, their
+rows' tokens are priced the same way and added on a line of their own, so a
+merge does not make their agents' spend disappear.
 
 The label is load-bearing, not manners. The figure reaches a document a
 person reads months later, and an unhedged number is quoted

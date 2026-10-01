@@ -48,10 +48,10 @@ export interface ReportAction {
 
 /**
  * What the agent spent. Tokens and `modelId` are the record and come off the
- * incident row, which `rollUpUsage` writes from the session file after the
- * child exits. `turns` and `estimatedCostUsd` come from that same file read
- * once more at publish time, so they are null when it has aged out from
- * under the lifecycle rule while the row's tokens survive.
+ * incident row, which `rollUpUsage` keeps current from the session file; the
+ * dollar figures are priced from them at read time. `turns` comes from that
+ * same file read once more at publish time, so it is null when the file has
+ * aged out from under the lifecycle rule while the row survives.
  */
 export interface ReportRun {
   modelId: string | null;
@@ -64,12 +64,25 @@ export interface ReportRun {
   attempts: number;
   turns: number | null;
   /**
-   * Pi's own arithmetic over those tokens at the prices it held while the run
-   * was happening. An estimate, and named one: nothing here ever sees an
-   * invoice, and Pi's price table is a hardcoded per-model list that goes
-   * stale the day AWS moves a rate.
+   * Those tokens at the Bedrock catalog's rates, each class at its own rate,
+   * computed when the report is built. An estimate, and named one: nothing
+   * here ever sees an invoice.
    */
   estimatedCostUsd: number | null;
+  /**
+   * What the incidents merged into this one spent on their own agents before
+   * they were merged, priced the same way from their rows' tokens. Added
+   * here so a merge does not make that spend disappear.
+   */
+  mergedInCostUsd: number;
+  /**
+   * Merged-in incidents with no estimate: no model id, or no catalog rates
+   * for it. Named so a partial sum is never presented as the whole.
+   */
+  mergedInUnpriced: string[];
+  /** Merged-in incidents whose agents spent something, priced. A merged
+   * incident that spent nothing is in neither list. */
+  mergedInPriced: string[];
 }
 
 export interface ReportData {
@@ -459,6 +472,29 @@ const actionTable = (data: ReportData): string[] => {
   ];
 };
 
+const mergedSpend = (data: ReportData): string[] => {
+  const { run } = data;
+  const priced = run.mergedInPriced;
+  if (priced.length === 0 && run.mergedInUnpriced.length === 0) return [];
+  const parts: string[] = [];
+  if (priced.length > 0) {
+    parts.push(
+      `The incidents merged into this one (${priced.join(", ")}) spent an estimated further ${dollars(run.mergedInCostUsd)} on their own agents.`,
+    );
+  }
+  if (run.mergedInUnpriced.length > 0) {
+    parts.push(
+      `Merged-in ${run.mergedInUnpriced.length === 1 ? "incident" : "incidents"} ${run.mergedInUnpriced.join(", ")} ${run.mergedInUnpriced.length === 1 ? "has" : "have"} no estimate, because the model has no rates in the catalog.`,
+    );
+  }
+  parts.push(
+    run.estimatedCostUsd === null || run.mergedInUnpriced.length > 0
+      ? "Part of this spend has no estimate, so there is no total."
+      : `**${dollars(run.estimatedCostUsd + run.mergedInCostUsd)} in all.**`,
+  );
+  return [parts.join(" "), ""];
+};
+
 const runTable = (data: ReportData, metrics: ReportMetrics): string[] => {
   const { run } = data;
   const rows: [string, string][] = [
@@ -480,9 +516,10 @@ const runTable = (data: ReportData, metrics: ReportMetrics): string[] => {
     ...rows.map(([label, value]) => `| ${cell(label)} | ${cell(value)} |`),
     "",
     run.estimatedCostUsd === null || run.estimatedCostUsd === 0
-      ? "Tokens and the model id are the record here. Prices move, so a stored dollar figure would be a guess frozen at write time, while these two re-price correctly whenever someone asks."
-      : `**Estimated cost: ${dollars(run.estimatedCostUsd)}.** An estimate, not a bill — it is arithmetic over the tokens above at the prices we held while this ran, and nothing here ever sees an invoice. Tokens and the model id are the record, because they re-price correctly after a rate change and a stored dollar figure would not.`,
+      ? "Tokens and the model id are the record here. No estimate is shown: the model has no rates in the catalog, or nothing was spent."
+      : `**Estimated cost: ${dollars(run.estimatedCostUsd)}.** An estimate, not a bill — it is the tokens above at the Bedrock catalog's current rates, and nothing here ever sees an invoice. Tokens and the model id are the record, because they re-price correctly after a rate change and a stored dollar figure would not.`,
     "",
+    ...mergedSpend(data),
   ];
 };
 
