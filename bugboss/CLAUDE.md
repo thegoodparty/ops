@@ -18,6 +18,7 @@ This file is what you need before editing anything here.
 | Threads, relay, the Slack agent | [`slack/CLAUDE.md`](./slack/CLAUDE.md) |
 | The status board, the morning post, the all-clear | [`board/CLAUDE.md`](./board/CLAUDE.md) |
 | The closing report an incident ends with | [`report/CLAUDE.md`](./report/CLAUDE.md) |
+| Noticing an incident's PR merge, close or review verdict | "PRs are watched in code" below, and `prwatch/index.ts` |
 | Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
 | The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
 | What the GitHub App may do, and why | [`github-app.md`](./github-app.md) |
@@ -157,6 +158,40 @@ per run, read from GitHub's own `run_attempt`; a budget across the incident;
 and a notice sent to the Boss by the tool rather than by the model
 remembering to mention it. What the App holds and what it deliberately does
 not is [`github-app.md`](./github-app.md).
+
+## PRs are watched in code
+
+An agent watching its own PR is not enough: it can be parked, dead,
+restarting, out of budget, or simply not say so. Incident 84's agent saw the
+merge three minutes after it happened and nothing reached the thread; incident
+90's thread said it needed a person for 1h40m after the merge.
+
+So `prwatch/` watches every PR an open incident owns -- `prUrls`, the agent's
+`fix_pr_opened` and `fix_merged` timeline events, and any PR a wait on a person
+names -- once a minute on the composition root's sweep interval, in **one
+GraphQL request for all of them** (one point of the App's 5,000 an hour).
+`pr_watch` is its memory, so a restart does not announce anything twice.
+
+On a merge or a close it commits first, then posts a code-composed notice
+through the announcer, records an `incident_action`, deletes the `pending_wait`
+that named the PR (the header's "Needs a human to merge" line), and pushes a
+`boss_message`, which lifts a park and steers a live agent. A delegate verdict
+on the head is announced once it has stood for `REVIEW_SETTLE_SECONDS`, because
+delegate can approve and then request changes minutes later.
+
+Two rules keep it to one notice per transition:
+
+- The announcement is claimed in the statement: `UPDATE pr_watch ... WHERE
+  announcedAt IS NULL`, and only the write that changed a row posts. The
+  sweep and an agent's wait can both see one merge; only one of them wins.
+- An agent's wait on a person ends with a "done" to the Boss carrying what it
+  waited on (`waitDone`). The inbox route asks the watcher about the PRs it
+  names, which reads them right then, so whoever saw it first, the thread
+  hears it once and the Boss is not handed the same news.
+
+A PR first seen already merged is history unless a wait on a person still
+names it. Without that rule, the deploy that shipped this would have announced
+every PR every open incident had ever shipped.
 
 ## Schema changes
 

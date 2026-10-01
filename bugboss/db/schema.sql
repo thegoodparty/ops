@@ -448,3 +448,27 @@ CREATE TABLE IF NOT EXISTS boss_thread (
   since             INTEGER NOT NULL,
   PRIMARY KEY (channel, threadTs)
 );
+
+-- A pull request an open incident is waiting on, and what was last seen of
+-- it on GitHub. `prwatch/` writes it; it is the whole memory of what has
+-- already been announced, so a restart -- every merge to ops main is one --
+-- does not say a merge twice.
+--
+-- `state` NULL means not read yet. `announcedAt` is set by the one write
+-- that wins the right to tell the thread about a merge or a close, whether
+-- the sweep or an agent's own wait saw it first; NULL beside a terminal
+-- state is a PR that was already merged when it was first seen, which is
+-- history rather than news. `verdict` and `verdictSha` are the last settled
+-- delegate-reviewer verdict announced, or the one standing when watching
+-- began.
+CREATE TABLE IF NOT EXISTS pr_watch (
+  incidentId        TEXT NOT NULL REFERENCES incident(id),
+  repo              TEXT NOT NULL,
+  number            INTEGER NOT NULL,
+  state             TEXT,
+  verdict           TEXT,
+  verdictSha        TEXT,
+  firstSeenAt       INTEGER NOT NULL,
+  announcedAt       INTEGER,
+  PRIMARY KEY (incidentId, repo, number)
+);

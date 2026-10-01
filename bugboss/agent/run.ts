@@ -427,6 +427,7 @@ export const createBossClient = (args: {
         kind,
         text,
         ownBrief: options?.ownBrief === true,
+        ...(options?.waitDone ? { waitDone: options.waitDone } : {}),
       }).then(() => undefined),
     escalationsSince: (since) =>
       call<{ count: number; lastAt: number | null }>(

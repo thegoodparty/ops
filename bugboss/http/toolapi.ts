@@ -21,8 +21,9 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { z } from "zod";
 
-import { recordForBoss } from "../boss/inbox";
+import { markSeenByBoss, recordForBoss } from "../boss/inbox";
 import type { Db } from "../db";
+import type { PrWatcher } from "../prwatch";
 import { readTimelineEvents, verifyAgentToken } from "../toolapi";
 import { TIMELINE_EVENT_KINDS } from "../types";
 import type { Directive, ToolApi, WakeBoss } from "../types";
@@ -44,6 +45,12 @@ export interface ToolApiHttpDeps {
    * route with no dispatcher in the call.
    */
   noteEscalated: (incidentId: string) => void;
+  /**
+   * Whether the PRs a finished wait names have already been announced as
+   * merged or closed. Absent when the GitHub App is not configured, and then
+   * every message reaches the Boss.
+   */
+  prWatch?: Pick<PrWatcher, "coversWaitDone">;
   now?: () => number;
 }
 
@@ -322,6 +329,7 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
         kind: z.enum(["message", "question", "escalation"]),
         text: z.string().trim().min(1),
         ownBrief: z.boolean().optional(),
+        waitDone: z.string().optional(),
       })
       .safeParse(raw);
     if (!parsed.success) {
@@ -334,13 +342,34 @@ export const createToolApiRoutes = (deps: ToolApiHttpDeps): Hono => {
     );
     if (!exists) return c.json({ error: "unknown incident" }, 404);
 
-    const id = await deps.db.withWrite((w) =>
-      recordForBoss(w, {
+    // A wait on a PR merging ended. The PR watcher reads it now and tells the
+    // thread itself if nobody has yet, so the Boss being handed the agent's
+    // "done" as well would say the same merge twice. The row is still kept,
+    // as read, so the record of what the agent said is whole. A GitHub read
+    // that fails lets the message through: being told twice is the cheaper
+    // mistake.
+    let covered = false;
+    if (parsed.data.kind === "message" && parsed.data.waitDone && deps.prWatch) {
+      try {
+        covered = await deps.prWatch.coversWaitDone(caller.incidentId, parsed.data.waitDone);
+      } catch (error: unknown) {
+        log("wait_done_pr_read_failed", { incidentId: caller.incidentId, error: String(error) });
+      }
+    }
+
+    const id = await deps.db.withWrite((w) => {
+      const recorded = recordForBoss(w, {
         incidentId: caller.incidentId,
         kind: parsed.data.kind,
         text: parsed.data.text,
-      }),
-    );
+      });
+      if (covered) markSeenByBoss(w, [recorded]);
+      return recorded;
+    });
+    if (covered) {
+      log("wait_done_already_announced", { incidentId: caller.incidentId, id });
+      return c.json({ id });
+    }
     log("boss_inbox_recorded", {
       incidentId: caller.incidentId,
       kind: parsed.data.kind,

@@ -137,7 +137,8 @@ import {
 } from "./agent/session";
 import { DEFAULT_WORK_ROOT, INCIDENT_AGENT_MAX_TURNS } from "./agent/run";
 import { parseInferenceProfiles } from "./bedrock/model";
-import { createInstallationToken, createPrStateReader } from "./github";
+import { createInstallationToken, createPrStateReader, createPrWatchReader } from "./github";
+import { createPrWatcher, type PrWatchReader } from "./prwatch";
 import { createGhExec, type GhExec } from "./slack/gh";
 import { makeAlarm, makeLog } from "./logging";
 import type {
@@ -268,6 +269,12 @@ export interface CreateBugBossOptions {
    * Absent leaves every PR rendered as "state not known".
    */
   prStates?: PrStateReader;
+  /**
+   * Reads the PRs open incidents are waiting on, for the PR watcher. Absent
+   * means nothing watches them, and an agent's own wait is the only thing
+   * that notices a merge.
+   */
+  prWatch?: PrWatchReader;
   /**
    * The Boss's `gh`, on the App's installation token. Null when the App is
    * not configured: the tool still exists, so the prompt prefix does not
@@ -2186,6 +2193,15 @@ export const createBugBoss = async (
     acknowledgeSlack: createSlackAck(slack),
     slackConfig: slackIngress,
   });
+  // Rides the resolution interval like the board, at its own one-minute
+  // cadence, and remembers what it announced in `pr_watch`.
+  const prWatcher = options.prWatch
+    ? createPrWatcher({ db, reader: options.prWatch, slack: threads, now })
+    : null;
+  if (!prWatcher) {
+    log("pr_watch_disabled", { note: "no GitHub App, so only an agent's own wait notices a PR merge" });
+  }
+
   const loopbackApp = createToolApiRoutes({
     db,
     tokenSecret,
@@ -2193,6 +2209,7 @@ export const createBugBoss = async (
     now,
     wakeBoss,
     noteEscalated: dispatcher.noteEscalated,
+    ...(prWatcher ? { prWatch: prWatcher } : {}),
   });
 
   let servers: BugBossServers | null = null;
@@ -2229,6 +2246,7 @@ export const createBugBoss = async (
       // replaced between the close and its report is the one case where the
       // report has no other way out.
       background("report_sweep", sweepReports);
+      if (prWatcher) background("pr_watch", prWatcher.sweep);
     }, config.dispatcher.tickSeconds * 1000);
     resolutionTimer.unref();
     log("started", { env: config.env, bucket: config.s3Bucket });
@@ -2465,6 +2483,7 @@ export const bugBossFromEnv = async (): Promise<BugBoss> => {
     // report. One token source for both, cached and re-minted before expiry
     // by @octokit/auth-app, the same way an incident agent's is.
     prStates: githubToken ? createPrStateReader(githubToken) : undefined,
+    prWatch: githubToken ? createPrWatchReader(githubToken) : undefined,
     gh: githubToken ? createGhExec({ token: githubToken }) : null,
     // The merged env, not process.env: Loki's credentials come from the
     // secret blob, and settingsEnv builds a new object rather than mutating

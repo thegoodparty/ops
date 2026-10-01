@@ -547,6 +547,19 @@ identically. An incident run a person triggered gets the same apology; one
 only an agent triggered alarms and leaves its inbox rows unseen, since nobody
 in the thread is waiting on it.
 
+**A PR merge is not the Boss's to announce.** The PR watcher
+(`prwatch/`) posts merges, closes and delegate verdicts on an incident's PRs in
+code and tells the agent. An agent's own "done" for a wait on a merge reaches
+the inbox already marked seen when the watcher has told the thread, so the Boss
+never sees it and cannot say it twice. The prompt says the rest: do not repeat
+those notices, and do not relay one to the agent as news.
+
+**"Why didn't you catch it?" is answered from the record.** Incident 84's Boss
+answered it with "I don't poll GitHub continuously" without reading the
+agent's session, which had seen the merge within three minutes. The prompt
+sends the Boss to `read_agent_session` and the incident's timeline and thread
+first, and forbids describing a design or a schedule it has not read.
+
 `alertChannel`, `rotationGroupId` and `incidentChannel` are **required**, not
 optional. An optional field nobody sets is a fix that exists in the source and
 not in production, which had already happened three times here.

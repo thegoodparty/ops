@@ -218,7 +218,19 @@ export interface BossInboxPort {
    * harness sends while it waits, so the dispatcher's deadline does not post
    * a placeholder brief over it.
    */
-  tellBoss(kind: BossInboxKind, text: string, options?: { ownBrief?: boolean }): Promise<void>;
+  tellBoss(
+    kind: BossInboxKind,
+    text: string,
+    options?: {
+      ownBrief?: boolean;
+      /**
+       * What the wait that just ended was on: its key, its label and the ask.
+       * The Boss reads the PRs it names, and when it has already told the
+       * thread they merged or closed, this message is kept and not repeated.
+       */
+      waitDone?: string;
+    },
+  ): Promise<void>;
   /**
    * The escalations already sent up for this incident since `since`. Read
    * back from the inbox itself, so the ladder on an unanswered question
@@ -475,10 +487,12 @@ export const waitDoneMessage = (waitingFor: string, output: string): string =>
  */
 const closeAsk = async (
   heartbeat: HeartbeatDeps,
-  args: { key: string; waitingFor: string; output: string },
+  args: { key: string; waitingFor: string; ask: string; output: string },
 ): Promise<void> => {
   try {
-    await heartbeat.boss.tellBoss("message", waitDoneMessage(args.waitingFor, args.output));
+    await heartbeat.boss.tellBoss("message", waitDoneMessage(args.waitingFor, args.output), {
+      waitDone: [args.key, args.waitingFor, args.ask].join("\n"),
+    });
   } catch (error: unknown) {
     alarm("wait_done_undelivered", { command: args.key, error: String(error) });
   }
@@ -623,7 +637,7 @@ export const runMonitor = async (
     }
     if (state.done || (expired && state.met && !deps.signal?.aborted)) {
       if (heartbeat) {
-        await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, output: last });
+        await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, ask, output: last });
         await release(heartbeat, key);
       }
       return { output: last, timedOut: false, capped: false };

@@ -13,6 +13,14 @@ import { createAppAuth } from "@octokit/auth-app";
 
 import { makeAlarm, makeLog } from "./logging";
 
+import {
+  latestDelegateVerdict,
+  refKey,
+  type CommentNode,
+  type PrObservation,
+  type PrWatchReader,
+  type ReviewNode,
+} from "./prwatch";
 import type { PrStateReader, ReportPr } from "./report";
 
 const alarm = makeAlarm("github");
@@ -163,6 +171,102 @@ export const createPrStateReader = (
         }
       }),
     );
+    return found;
+  },
+});
+
+// ---------------------------------------------------------------------------
+// The PR watcher's one read
+// ---------------------------------------------------------------------------
+
+const PR_WATCH_FIELDS = `url state mergedAt closedAt
+  mergedBy { login }
+  mergeCommit { oid }
+  headRefOid
+  commits(last: 1) { nodes { commit { oid committedDate } } }
+  reviews(last: 30) { nodes { author { login } state body submittedAt url commit { oid } } }
+  comments(last: 50) { nodes { author { login } body updatedAt url } }`;
+
+const PR_WATCH_TIMEOUT_MS = 15_000;
+
+interface WatchedPullNode {
+  url: string;
+  state: "OPEN" | "MERGED" | "CLOSED";
+  mergedAt: string | null;
+  closedAt: string | null;
+  mergedBy: { login: string } | null;
+  mergeCommit: { oid: string } | null;
+  headRefOid: string;
+  commits: { nodes: { commit: { oid: string; committedDate: string } }[] };
+  reviews: { nodes: ReviewNode[] };
+  comments: { nodes: CommentNode[] };
+}
+
+/**
+ * One GraphQL request for every watched PR, each under its own alias. One
+ * request costs one point of the 5,000 an hour, however many PRs it names,
+ * where REST would be three calls a PR. The repo and number are parsed by
+ * `parsePr` before they get here, so they are safe to put in the query as
+ * literals; a PR GitHub cannot find comes back as an error on its alias and
+ * is left out, without costing the others their answer.
+ */
+export const createPrWatchReader = (
+  installationToken: () => Promise<string>,
+  fetchImpl: typeof fetch = fetch,
+): PrWatchReader => ({
+  read: async (refs) => {
+    const found = new Map<string, PrObservation>();
+    if (!refs.length) return found;
+    const query = `query {\n${refs
+      .map((ref, index) => {
+        const [owner, name] = ref.repo.split("/");
+        return `  pr${index}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${ref.number}) { ${PR_WATCH_FIELDS} } }`;
+      })
+      .join("\n")}\n}`;
+    const token = await installationToken();
+    const res = await fetchImpl("https://api.github.com/graphql", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "user-agent": "bugboss",
+      },
+      body: JSON.stringify({ query }),
+      signal: AbortSignal.timeout(PR_WATCH_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      throw Object.assign(new Error(`GitHub GraphQL answered ${res.status}: ${await res.text()}`), {
+        status: res.status,
+      });
+    }
+    const body = (await res.json()) as {
+      data?: Record<string, { pullRequest: WatchedPullNode | null } | null> | null;
+      errors?: { message: string; path?: (string | number)[] }[];
+    };
+    if (body.errors?.length) {
+      log("pr_watch_partial", { errors: body.errors.map((error) => `${error.path?.join(".") ?? ""}: ${error.message}`) });
+    }
+    if (!body.data) throw new Error(`GitHub GraphQL returned no data: ${JSON.stringify(body.errors ?? [])}`);
+    refs.forEach((ref, index) => {
+      const pull = body.data?.[`pr${index}`]?.pullRequest;
+      if (!pull) return;
+      const head = pull.commits.nodes[0]?.commit;
+      found.set(refKey(ref), {
+        state: pull.state,
+        url: pull.url,
+        mergedAt: pull.mergedAt,
+        closedAt: pull.closedAt,
+        mergedBy: pull.mergedBy?.login ?? null,
+        mergeCommit: pull.mergeCommit?.oid ?? null,
+        head: pull.headRefOid,
+        verdict: latestDelegateVerdict({
+          head: pull.headRefOid,
+          headCommittedAt: head?.oid === pull.headRefOid ? head.committedDate : null,
+          reviews: pull.reviews.nodes,
+          comments: pull.comments.nodes,
+        }),
+      });
+    });
     return found;
   },
 });

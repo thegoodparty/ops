@@ -349,20 +349,27 @@ const heartbeatHarness = (args: {
 }) => {
   let marker: PendingWait | null = args.existing ?? null;
   const events: string[] = [];
-  const told: { kind: BossInboxKind; text: string; at: string; pingsWhenTold: number | null }[] = [];
+  const told: {
+    kind: BossInboxKind;
+    text: string;
+    at: string;
+    pingsWhenTold: number | null;
+    waitDone?: string;
+  }[] = [];
   let recordWaitCalls = 0;
   const labels: (string | null)[] = [];
   let pingCalls = 0;
   let clears = 0;
 
   const boss: BossInboxPort = {
-    tellBoss: async (kind, text) => {
+    tellBoss: async (kind, text, options) => {
       events.push(`tellBoss:${kind}`);
       told.push({
         kind,
         text,
         at: new Date(args.now()).toISOString(),
         pingsWhenTold: marker?.pings ?? null,
+        ...(options?.waitDone ? { waitDone: options.waitDone } : {}),
       });
       if (args.tellFails) throw new Error("the Boss said 503");
     },
@@ -459,6 +466,18 @@ test("a wait on a person tells the Boss once it has gone an hour inside working 
   // changed since the ask.
   assert.ok(text.includes('{"state":"OPEN"}'));
   assert.equal(harness.clears(), 1, "the timeout drops the marker");
+});
+
+test("the done for a wait on a person names what it waited on, so the PR watcher can tell it already said so", async () => {
+  const clock = clockAt("2026-09-28T15:00:00Z");
+  const harness = heartbeatHarness({ now: clock.now });
+  await runMonitor(
+    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 600 },
+    { probe: async () => ({ code: 0, output: "MERGED" }), sleep: clock.sleep, now: clock.now, heartbeat: harness.deps },
+  );
+  assert.equal(harness.told.length, 1);
+  assert.equal(harness.told[0].kind, "message");
+  assert.equal(harness.told[0].waitDone, [PR_WAIT.command, PR_WAIT.waitingFor, PR_WAIT.awaitingHuman].join("\n"));
 });
 
 test("the heartbeat has only the Boss to tell", () => {
