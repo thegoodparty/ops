@@ -688,9 +688,9 @@ outcomes.
   `goalApi` through the timeline route, and as a `bugboss_goal_verdict`
   session entry carrying its usage, which `sumSessionUsage` adds to the
   incident's tokens but not its turns or its `modelId`. The agent's
-  `track_incident_timeline_event` tool refuses `goal_verdict`; `getIncident`
-  and stage compaction leave the rows out, and the evaluator reads them back
-  as earlier verdicts.
+  `track_incident_timeline_event` tool refuses `goal_verdict`; `getIncident`,
+  stage compaction, the post-mortem and the closing report leave the rows
+  out, and the evaluator reads them back as earlier verdicts.
 
 ## The transcript keeps everything compaction summarised
 

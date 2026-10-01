@@ -22,6 +22,7 @@ import { mrkdwn } from "../slack/format";
 import { agentClosedDetail, bossClosedDetail, closedNotice } from "../toolapi/announce";
 import { rowToIncident, type IncidentRow, type SignalRow } from "../toolapi/assign";
 import type { PostmortemSections, RecurrenceAnalysis, TimelineEvent } from "../types";
+import { GOAL_VERDICT_KIND } from "../types";
 import { renderReportPdf } from "./pdf";
 import { parsePostmortemSections } from "./postmortem";
 import {
@@ -208,11 +209,12 @@ export const readReportData = async (
     ],
   );
 
+  // Goal verdicts are the harness's bookkeeping, not moments in the incident.
   const timeline = deps.db.query<TimelineEvent>(
     `SELECT id, kind, occurredAt, recordedAt, summary, evidenceUrl
-       FROM incident_timeline_event WHERE incidentId = ?
+       FROM incident_timeline_event WHERE incidentId = ? AND kind != ?
        ORDER BY occurredAt, id`,
-    [incidentId],
+    [incidentId, GOAL_VERDICT_KIND],
   );
 
   // Tokens and modelId come off the row, which rollUpUsage keeps current;

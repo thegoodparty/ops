@@ -917,7 +917,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       const gap = recurrenceGap(incident, args.recurrence);
       if (gap) return reject(gap);
 
-      const recorded = readTimelineEvents(db, incidentId);
+      const recorded = readTimelineEvents(db, incidentId).filter((event) => event.kind !== GOAL_VERDICT_KIND);
       const problem = postmortemProblem(args, recorded);
       if (problem) return reject(problem);
       const sections = pickSections(args);

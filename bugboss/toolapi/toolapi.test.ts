@@ -280,6 +280,7 @@ describe("the status progression", () => {
       "https://github.com/thegoodparty/omni/pull/9999",
     ]);
 
+    await tools.trackTimelineEvent({ kind: "goal_verdict", occurredAt: Date.now() - 1_000, summary: "analysis met: harness bookkeeping" });
     const closed = await tools.reportAnalysis({
       ...SECTIONS,
       usersImpacted: 11,
@@ -289,6 +290,7 @@ describe("the status progression", () => {
     assert.equal(incidentRow(id)?.status, "CLOSED");
     assert.ok(incidentRow(id)?.closedAt);
     assert.match(incidentRow(id)?.postmortem ?? "", /## Five whys/);
+    assert.doesNotMatch(incidentRow(id)?.postmortem ?? "", /harness bookkeeping/, "a goal verdict is not a post-mortem event");
   });
 
   it("rejects every transition taken out of order", async () => {
