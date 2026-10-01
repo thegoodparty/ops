@@ -1124,6 +1124,31 @@ test("a redelivered firing stays silent", async () => {
   assert.equal(firings(first.signalId!), 1);
 });
 
+test("a refire recorded before a crash is announced by Grafana's retry", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
+  const [first] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-e", "refire-crash-errors", "firing", FIRST_FIRING),
+  );
+  const incidentId = first.incidentId!;
+  // What a process that died after recording the firing leaves behind.
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      "INSERT INTO signal_firing (signalId, startedAt, receivedAt) VALUES (?, ?, ?)",
+    ).run(first.signalId, Date.parse(LATER_FIRING), Date.now());
+  });
+
+  const [retry] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-e", "refire-crash-errors", "firing", LATER_FIRING),
+  );
+
+  assert.equal(retry.action, "refired");
+  assert.equal(refireThread(incidentId).length, 1);
+  assert.equal(refireDirectives(incidentId).length, 1);
+  assert.equal(firings(first.signalId!), 1);
+});
+
 test("a resolved notification for an open signal posts nothing", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
   const [first] = await boss.ingest(
