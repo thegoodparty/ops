@@ -581,9 +581,18 @@ export const TIMELINE_EVENT_KINDS = [
 
 export type TimelineEventKind = (typeof TIMELINE_EVENT_KINDS)[number];
 
+/**
+ * A stage-goal verdict, written by the harness rather than the agent. Kept
+ * out of `TIMELINE_EVENT_KINDS` because that list is the agent's tool schema,
+ * and a kind the agent may not record has no place in it.
+ */
+export const GOAL_VERDICT_KIND = "goal_verdict";
+
+export type RecordedTimelineKind = TimelineEventKind | typeof GOAL_VERDICT_KIND;
+
 export interface TimelineEvent {
   id: number;
-  kind: TimelineEventKind;
+  kind: RecordedTimelineKind;
   occurredAt: number;
   recordedAt: number;
   summary: string;
@@ -609,6 +618,26 @@ export interface IncidentView {
    * another one cannot do it honestly without having read the other one.
    */
   absorbed: PriorIncident[];
+}
+
+/**
+ * What the stage-goal evaluator reads about an incident, without the drain a
+ * `getIncident` would make: it runs between turns and inside tools, where a
+ * drained directive would land in a result the model never sees.
+ */
+export interface GoalContext {
+  incident: Pick<
+    Incident,
+    | "id"
+    | "status"
+    | "rootCause"
+    | "usersImpacted"
+    | "impactQuery"
+    | "prUrls"
+    | "resolvedEvidence"
+  >;
+  signals: Pick<SignalView, "id" | "kind" | "source" | "title" | "body">[];
+  timeline: TimelineEvent[];
 }
 
 // ---------------------------------------------------------------------------

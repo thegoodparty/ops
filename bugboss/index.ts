@@ -2066,6 +2066,9 @@ export const createBugBoss = async (
         ? { [TEST_DB_ENV_VAR]: config.testDatabase.url }
         : {}),
       ...(secrets.agentModelId ? { BUGBOSS_MODEL_ID: secrets.agentModelId } : {}),
+      ...(process.env.BUGBOSS_GOAL_MODEL_ID
+        ? { BUGBOSS_GOAL_MODEL_ID: process.env.BUGBOSS_GOAL_MODEL_ID }
+        : {}),
       ...(config.inferenceProfiles
         ? { BUGBOSS_INFERENCE_PROFILES: config.inferenceProfiles }
         : {}),
