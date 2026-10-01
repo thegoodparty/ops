@@ -33,8 +33,9 @@ no link and says so by having none.
 
 `signalOrigin` gives a url, or null, and the link text: `original alert` or
 `original report`, never anything about the alert itself. A url with no path
-is the Grafana root, not the alert, and counts as none. The thread header is
-the only caller, and a signal with no url gets no link line there.
+is the Grafana root, not the alert, and counts as none. The callers are the
+thread header and the "fired again" line, and a signal with no url gets no
+link from either.
 
 A silence link is dropped at ingress: it is neither in a signal's body nor on
 its labels, so nothing downstream can offer one.
@@ -112,6 +113,24 @@ So a resolved delivery produces no signal and leaves no state. This used to
 mark the fingerprint resolved in a process-local set, which did not survive
 a restart and fed a resolution path that manufactured duplicate incidents.
 Both are gone.
+
+## A fingerprint fires more than once
+
+Every firing of a Grafana alert instance carries the same fingerprint, so a
+route that recovered and broke again hours later arrives as the signal still
+open on its incident. What tells a new firing from a redelivery is
+`startsAt`: a redelivery repeats it, a new firing starts later.
+
+`recordSignal` writes a later `startsAt` to `signal_firing`, keyed on
+(signal, startsAt), so a retried refire is one row. When the signal's
+incident is INVESTIGATING or FIXING, the agent gets a `signal_refired`
+directive (steered into a live run, and it lifts a wait that lifts on a Boss
+message) and the thread gets one line with the alert's link. Anything else
+stays a silent `duplicate`. A signal a resolution closed is not open, so its
+next firing is a new signal and goes through triage and recurrence as before.
+
+Human reports are excluded: their `openedAt` is when the report arrived, and
+their id is the message, so a second report is already a second signal.
 
 ## Evidence fails loudly, and this is the pattern to copy
 

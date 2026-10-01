@@ -546,6 +546,8 @@ const grafanaBody = (
   fingerprint: string,
   slug: string,
   status: "firing" | "resolved" = "firing",
+  startsAt = new Date().toISOString(),
+  generatorURL?: string,
 ) => ({
   headers: { "x-grafana-alerting-signature": "valid-in-test" },
   rawBody: JSON.stringify({
@@ -556,7 +558,8 @@ const grafanaBody = (
         fingerprint,
         labels: { alert_slug: slug, environment: "prod" },
         annotations: { summary: `[PROD] ${slug}` },
-        startsAt: new Date().toISOString(),
+        startsAt,
+        ...(generatorURL ? { generatorURL } : {}),
       },
     ],
   }),
@@ -1020,6 +1023,153 @@ test("the sweep places a signal no redelivery will ever repeat", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "swept up" });
   assert.equal(await boss.sweepOrphans(), 1);
   assert.ok(incidentOf("fp-71"), "the sweep is the only thing that recovers it");
+});
+
+// --- an open signal that fires again ---------------------------------------
+
+/**
+ * The 2026-09-30 case. A Grafana fingerprint is the same for every firing of
+ * an alert instance, so a route that broke at 17:03, recovered, and broke
+ * again at 20:55 arrives as the signal still open on its incident. It was
+ * answered "duplicate" and nobody heard about it.
+ */
+const refireThread = (incidentId: string) =>
+  fakeSlack.posts.filter(
+    (p) => p.threadTs === threadOf(incidentId) && /fired again/.test(p.text),
+  );
+const refireDirectives = (incidentId: string) =>
+  boss.db
+    .query<{ payload: string }>(
+      "SELECT payload FROM pending_directive WHERE incidentId = ?",
+      [incidentId],
+    )
+    .map((row) => JSON.parse(row.payload) as { type: string; signalId?: string })
+    .filter((d) => d.type === "signal_refired");
+const firings = (signalId: string) =>
+  boss.db.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM signal_firing WHERE signalId = ?",
+    [signalId],
+  )!.n;
+
+const FIRST_FIRING = "2026-09-30T17:03:40.000Z";
+const LATER_FIRING = "2026-09-30T20:56:40.000Z";
+const RULE_URL = "https://goodparty.grafana.net/alerting/grafana/bfzqqwjbk1beof/view";
+
+test("a new firing of an open signal reaches its thread and its agent", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
+  const [first] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-a", "resend-cv-pin-errors", "firing", FIRST_FIRING, RULE_URL),
+  );
+  const incidentId = first.incidentId!;
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      "INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, startedAt) VALUES (?, 'a person', NULL, ?)",
+    ).run(incidentId, Date.now());
+  });
+
+  const [again] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-a", "resend-cv-pin-errors", "firing", LATER_FIRING, RULE_URL),
+  );
+
+  assert.equal(again.action, "refired");
+  assert.equal(again.signalId, first.signalId, "the same alert, not a new signal");
+  assert.equal(again.incidentId, incidentId);
+  const lines = refireThread(incidentId);
+  assert.equal(lines.length, 1, "one line in the incident's thread");
+  assert.match(lines[0].text, /\*The alert fired again\* at 20:56 UTC: \[PROD\] resend-cv-pin-errors/);
+  assert.ok(lines[0].text.includes(`<${RULE_URL}|alert>`), "with the alert's link");
+  assert.deepEqual(
+    refireDirectives(incidentId).map((d) => d.signalId),
+    [first.signalId],
+    "the agent is told",
+  );
+  assert.equal(
+    boss.db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [incidentId]),
+    undefined,
+    "a parked agent is woken",
+  );
+  assert.equal(firings(first.signalId!), 1, "the firing is recorded");
+  assert.equal(
+    boss.db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM signal WHERE sourceId = 'fp-refire-a'",
+    )!.n,
+    1,
+  );
+});
+
+test("a redelivered firing stays silent", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
+  const [first] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-b", "refire-redelivery-errors", "firing", FIRST_FIRING),
+  );
+  const incidentId = first.incidentId!;
+
+  const [original] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-b", "refire-redelivery-errors", "firing", FIRST_FIRING),
+  );
+  assert.equal(original.action, "duplicate", "the first firing, delivered again");
+
+  const refire = grafanaBody("fp-refire-b", "refire-redelivery-errors", "firing", LATER_FIRING);
+  const [once] = await boss.ingest("grafana", refire);
+  const [twice] = await boss.ingest("grafana", refire);
+
+  assert.equal(once.action, "refired");
+  assert.equal(twice.action, "duplicate", "Grafana retrying the same refire");
+  assert.equal(refireThread(incidentId).length, 1);
+  assert.equal(refireDirectives(incidentId).length, 1);
+  assert.equal(firings(first.signalId!), 1);
+});
+
+test("a resolved notification for an open signal posts nothing", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
+  const [first] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-c", "refire-resolved-errors", "firing", FIRST_FIRING),
+  );
+  const incidentId = first.incidentId!;
+
+  const placed = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-c", "refire-resolved-errors", "resolved", LATER_FIRING),
+  );
+
+  assert.deepEqual(placed, []);
+  assert.equal(refireThread(incidentId).length, 0);
+  assert.equal(refireDirectives(incidentId).length, 0);
+  assert.equal(firings(first.signalId!), 0);
+});
+
+test("a firing after its incident resolved is a new signal for triage", async () => {
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "first firing" });
+  const [first] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-d", "refire-after-close-errors", "firing", FIRST_FIRING),
+  );
+  const incidentId = first.incidentId!;
+  // What a resolution does to the row: closeOpenSignals in the tool API.
+  await boss.db.withWrite((w) => {
+    w.prepare("UPDATE signal SET closedAt = ? WHERE id = ?").run(Date.now(), first.signalId);
+    w.prepare("UPDATE incident SET status = 'RESOLVED', resolvedAt = ? WHERE id = ?").run(
+      Date.now(),
+      incidentId,
+    );
+  });
+
+  fakeModel.triageDecisions.push({ action: "new_incident", reason: "it came back" });
+  const [again] = await boss.ingest(
+    "grafana",
+    grafanaBody("fp-refire-d", "refire-after-close-errors", "firing", LATER_FIRING),
+  );
+
+  assert.equal(again.action, "new_incident", "placed by triage as before");
+  assert.notEqual(again.signalId, first.signalId);
+  assert.notEqual(again.incidentId, incidentId);
+  assert.equal(refireThread(incidentId).length, 0);
+  assert.equal(refireDirectives(incidentId).length, 0);
 });
 
 test("an attach target that merges away mid-triage opens a new incident", async () => {

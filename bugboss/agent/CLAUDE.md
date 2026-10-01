@@ -259,7 +259,8 @@ to `pending_directive` from another process, so `createDirectiveWatcher`
 restart keeps it. Only the Boss tools drain the queue, and an agent writing a
 fix or watching CI calls none of them for minutes: incident 94's agent ran ten
 bash and monitor calls past a redirection and read it only when a deploy
-restarted it.
+restarted it. A `signal_refired` (an alert already on the incident firing
+again) is steered and consumed the same way, and ends a wait too.
 
 A steer lands between tool batches, so a wait has to be cancellable or it
 holds the message for as long as it lasts. `createWaitInterrupt` (`tools.ts`)

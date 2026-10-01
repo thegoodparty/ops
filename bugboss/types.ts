@@ -266,7 +266,13 @@ export type Directive =
    */
   | { type: "boss_message"; text: string; at: number }
   /** Carries how long the agent was gone, so it can re-check before continuing. */
-  | { type: "resumed_after"; seconds: number };
+  | { type: "resumed_after"; seconds: number }
+  /**
+   * A signal already on this incident fired again: it stopped, then started
+   * failing anew. No new signal row exists, because it is the same alert, so
+   * this is the only way the agent hears of it.
+   */
+  | { type: "signal_refired"; signalId: string; title: string; startedAt: number };
 
 /**
  * What an incident agent sends up. `question` is one it is blocked on until

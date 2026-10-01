@@ -101,7 +101,15 @@ export type RelayEvent =
       signalTitle: string;
       slug: string;
     }
-  | { type: "pr_needs_merge"; incidentId: string; prUrl: string };
+  | { type: "pr_needs_merge"; incidentId: string; prUrl: string }
+  | {
+      type: "signal_refired";
+      incidentId: string;
+      title: string;
+      startedAt: number;
+      /** The alert's own link, already checked by `signalOrigin`. */
+      url: string | null;
+    };
 
 /**
  * At roughly 20 incidents a week, pinging the rotation for things that resolve
@@ -195,6 +203,13 @@ export const renderEvent = (event: RelayEvent): string => {
         mrkdwn`${event.signalTitle} (\`${event.slug}\`)`,
         "_An agent is working it. This is a heads up, not a handover._",
       ].join("\n");
+    case "signal_refired": {
+      // One line, because it is the third or tenth firing of something the
+      // thread already knows about. The minute is enough to find it in Loki.
+      const at = `${new Date(event.startedAt).toISOString().slice(11, 16)} UTC`;
+      const line = mrkdwn`*The alert fired again* at ${at}: ${event.title}`;
+      return event.url ? `${line} · ${link(event.url, "alert")}` : line;
+    }
     case "pr_needs_merge":
       return [
         mrkdwn`*A PR needs review and merge for incident ${event.incidentId}*`,

@@ -82,6 +82,19 @@ export const bossMessageText = (directive: Directive): string | null => {
 const bossLine = (text: string): string => `FROM THE BOSS: ${text}`;
 
 /**
+ * Shared by the tool results and the steer, so a live agent and a relaunched
+ * one read the same sentence.
+ */
+export const refiredLine = (directive: {
+  signalId: string;
+  title: string;
+  startedAt: number;
+}): string =>
+  `ALERT FIRED AGAIN: ${directive.signalId} (${directive.title}) started firing again at ` +
+  `${new Date(directive.startedAt).toISOString()}. It is already on this incident, so this is ` +
+  "a new failure, not a new problem: check whether your cause and fix account for it.";
+
+/**
  * How a directive reaches the model. The Boss tools and `message_boss` both
  * render them, so it sits with the tools rather than with either one.
  */
@@ -116,6 +129,8 @@ export const renderDirectives = (directives: Directive[]): string => {
         return bossLine(directive.text);
       case "resumed_after":
         return `RESUMED after ${directive.seconds}s. Re-check anything time-sensitive before continuing.`;
+      case "signal_refired":
+        return refiredLine(directive);
       default: {
         const text = bossMessageText(directive as Directive);
         return text === null
