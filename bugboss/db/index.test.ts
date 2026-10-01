@@ -18,7 +18,7 @@ import { after, before, describe, it } from "node:test";
 import Database from "better-sqlite3";
 import type { S3Client } from "@aws-sdk/client-s3";
 
-import { Db, type LateColumn } from ".";
+import { Db, committedLocally, type LateColumn } from ".";
 
 const SCHEMA = join(__dirname, "schema.sql");
 
@@ -754,5 +754,166 @@ describe("the write-only owner column", () => {
     };
     walk(root);
     assert.deepEqual(offenders, [], "owner is write-only; this SQL reads it");
+  });
+});
+
+describe("a snapshot PUT that fails", () => {
+  let dir: string;
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "bugboss-db-halt-"));
+  });
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const skewed = () => {
+    const err = new Error("The difference between the request time and the current time is too large.");
+    err.name = "RequestTimeTooSkewed";
+    return err;
+  };
+
+  /** Fails each PUT while `failing` says so, and keeps the last body that landed. */
+  const flakyS3 = () => {
+    const state = { failing: () => false, puts: 0, landed: null as Buffer | null };
+    const s3 = {
+      send: async (cmd: { constructor: { name: string }; input: { Body?: Buffer } }) => {
+        if (cmd.constructor.name === "GetObjectCommand") {
+          const err = new Error("NoSuchKey");
+          err.name = "NoSuchKey";
+          throw err;
+        }
+        state.puts += 1;
+        if (state.failing()) throw skewed();
+        state.landed = Buffer.from(cmd.input.Body!);
+        return {};
+      },
+    };
+    return { s3: s3 as unknown as S3Client, state };
+  };
+
+  const captureAlarms = async (fn: () => Promise<unknown>): Promise<string[]> => {
+    const original = console.error;
+    const events: string[] = [];
+    console.error = (line: unknown) => {
+      try {
+        events.push(JSON.parse(String(line)).event);
+      } catch {
+        original(line);
+      }
+    };
+    try {
+      await fn();
+    } finally {
+      console.error = original;
+    }
+    return events;
+  };
+
+  const timing = { retryDelaysMs: [1, 1], haltRetryMs: 1_000, haltRetryMaxMs: 4_000, haltAlarmMs: 300_000 };
+
+  const insert = (db: Db, id: string) =>
+    db.withWrite((w) => {
+      w.prepare("INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', 1)").run(id);
+    });
+
+  it("is retried with a new request, and a write whose retry lands does not halt", async () => {
+    const { s3, state } = flakyS3();
+    let failures = 1;
+    state.failing = () => failures-- > 0;
+    const db = await Db.open({ path: join(dir, "once.db"), bucket: "b", key: "k", s3, snapshotTiming: timing });
+    try {
+      await insert(db, "1");
+      await insert(db, "2");
+      assert.equal(state.puts, 3, "one failed attempt, its retry, and the next write");
+      assert.equal(db.query("SELECT id FROM incident").length, 2);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("halts on a PUT that keeps failing, alarms, and resumes on its own once one lands", async () => {
+    const { s3, state } = flakyS3();
+    let down = true;
+    state.failing = () => down;
+    let clock = 1_000_000;
+    const db = await Db.open({
+      path: join(dir, "halt.db"),
+      bucket: "b",
+      key: "k",
+      s3,
+      snapshotTiming: timing,
+      now: () => clock,
+    });
+    try {
+      let thrown: unknown;
+      const first = await captureAlarms(() => insert(db, "lost-put").catch((err) => (thrown = err)));
+      assert.ok(first.includes("snapshot_failed_halting_writes"), "an alarm on the first failure");
+      assert.ok(committedLocally(thrown), "the one write that did commit says so");
+
+      // Inside the backoff: refused without another PUT, and nothing committed.
+      const puts = state.puts;
+      await assert.rejects(insert(db, "refused"), (err) => /writes halted/.test(String(err)) && !committedLocally(err));
+      assert.equal(state.puts, puts);
+
+      // Still down past the alarm threshold: said a second time.
+      clock += timing.haltAlarmMs;
+      const later = await captureAlarms(() => insert(db, "refused-2").catch(() => undefined));
+      assert.ok(later.includes("writes_still_halted"));
+
+      down = false;
+      clock += timing.haltRetryMaxMs;
+      await insert(db, "after");
+
+      const ids = db.query<{ id: string }>("SELECT id FROM incident ORDER BY id").map((r) => r.id);
+      assert.deepEqual(ids, ["after", "lost-put"], "nothing committed while halted");
+
+      const landed = join(dir, "landed.db");
+      writeFileSync(landed, state.landed!);
+      const copy = new Database(landed, { readonly: true });
+      try {
+        const inS3 = (copy.prepare("SELECT id FROM incident ORDER BY id").all() as { id: string }[]).map(
+          (r) => r.id,
+        );
+        assert.deepEqual(inS3, ["after", "lost-put"], "S3 is level with local again");
+      } finally {
+        copy.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it("gives up on a PUT that never answers instead of holding the write queue", async () => {
+    let attempts = 0;
+    const s3 = {
+      send: (cmd: { constructor: { name: string } }, opts?: { abortSignal?: AbortSignal }) => {
+        if (cmd.constructor.name === "GetObjectCommand") {
+          const err = new Error("NoSuchKey");
+          err.name = "NoSuchKey";
+          return Promise.reject(err);
+        }
+        attempts += 1;
+        if (attempts > 1) return Promise.resolve({});
+        // The stalled socket: no answer until the deadline aborts it.
+        return new Promise((_, reject) =>
+          opts?.abortSignal?.addEventListener("abort", () => reject(opts.abortSignal!.reason)),
+        );
+      },
+    } as unknown as S3Client;
+    const db = await Db.open({
+      path: join(dir, "stall.db"),
+      bucket: "b",
+      key: "k",
+      s3,
+      snapshotTiming: { ...timing, putTimeoutMs: 50 },
+    });
+    // AbortSignal.timeout does not hold the event loop open, and in this
+    // test nothing else would.
+    const keepAlive = setInterval(() => {}, 1_000);
+    try {
+      await insert(db, "1");
+      assert.equal(attempts, 2, "the stalled PUT was abandoned and a fresh one landed");
+    } finally {
+      clearInterval(keepAlive);
+      db.close();
+    }
   });
 });

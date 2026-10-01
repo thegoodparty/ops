@@ -50,9 +50,6 @@ export const LATE_COLUMNS: LateColumn[] = [
   // column and the thread header's. Nullable: an incident that has not been
   // given one falls back to its first signal's title.
   { table: "incident", column: "summary", type: "TEXT" },
-  // The structured post-mortem. Nullable: every incident closed before it
-  // existed keeps its free-form `postmortem` and renders that.
-  { table: "incident", column: "postmortemSections", type: "TEXT" },
   // Triage's own spend, per signal. The full declaration including
   // `NOT NULL DEFAULT 0`, not a bare `INTEGER`, and the difference is not
   // cosmetic: `ALTER TABLE ADD COLUMN x INTEGER` leaves the column nullable
@@ -186,7 +183,48 @@ export interface DbConfig {
    * worth covering, and it exists nowhere but inside `Db.open`.
    */
   lateColumns?: LateColumn[];
+  /** Overrides the snapshot timing below, so a test does not wait it out. */
+  snapshotTiming?: Partial<SnapshotTiming>;
+  now?: () => number;
 }
+
+export interface SnapshotTiming {
+  /** Per PUT. The SDK sets none by default, so a stalled socket waits forever. */
+  putTimeoutMs: number;
+  /** Pauses between the attempts one write makes before it halts. */
+  retryDelaysMs: number[];
+  /** First wait before a halted Db tries again; doubles up to the max. */
+  haltRetryMs: number;
+  haltRetryMaxMs: number;
+  /** A halt older than this alarms a second time, once. */
+  haltAlarmMs: number;
+}
+
+export const SNAPSHOT_TIMING: SnapshotTiming = {
+  putTimeoutMs: 20_000,
+  retryDelaysMs: [500, 2_000],
+  haltRetryMs: 5_000,
+  haltRetryMaxMs: 60_000,
+  haltAlarmMs: 5 * 60_000,
+};
+
+interface Halt {
+  error: string;
+  since: number;
+  nextRetryAt: number;
+  retryMs: number;
+  alarmedPersisting: boolean;
+}
+
+/**
+ * True for the error a write throws when its transaction did commit locally
+ * and only the upload failed. The halt's recovery upload carries that state
+ * to S3, so a marker written this way is as good as written, unless the
+ * process restarts before the halt lifts. A caller that records before it
+ * posts can go ahead and post on it, and the next tick still sees the marker.
+ */
+export const committedLocally = (err: unknown): boolean =>
+  (err as { committedLocally?: boolean } | null)?.committedLocally === true;
 
 export class Db {
   private readonly write: Database.Database;
@@ -196,11 +234,15 @@ export class Db {
   private readonly cfg: DbConfig;
   /** Serializes writes. One process, so a promise chain is the whole lock. */
   private queue: Promise<unknown> = Promise.resolve();
-  private halted: string | null = null;
+  private halted: Halt | null = null;
+  private readonly timing: SnapshotTiming;
+  private readonly now: () => number;
 
   private constructor(cfg: DbConfig, s3: S3Client) {
     this.cfg = cfg;
     this.s3 = s3;
+    this.timing = { ...SNAPSHOT_TIMING, ...cfg.snapshotTiming };
+    this.now = cfg.now ?? Date.now;
     this.write = new Database(cfg.path);
     this.write.pragma("journal_mode = WAL");
     this.write.pragma("foreign_keys = ON");
@@ -253,45 +295,51 @@ export class Db {
    * The only way to write. Runs fn in a transaction, snapshots, and does not
    * resolve until S3 has the snapshot.
    *
-   * A failed PUT halts writes rather than continuing. A process that keeps
-   * committing locally while S3 falls behind is worse than one that stops,
-   * because the divergence stays invisible until a restart loses it.
+   * A PUT that keeps failing halts writes rather than continuing. A process
+   * that keeps committing locally while S3 falls behind is worse than one
+   * that stops, because the divergence stays invisible until a restart loses
+   * it. The halt lifts itself: a halted Db retries the snapshot of its whole
+   * current state before the next write it is asked for, on a backoff, and
+   * resumes once one lands. Until then no new transaction runs, so S3 is
+   * never more than the failed write behind.
    */
   async withWrite<T>(fn: (db: Database.Database) => T): Promise<T> {
     const run = this.queue.then(async () => {
-      if (this.halted) throw new Error(`writes halted: ${this.halted}`);
+      if (this.halted) await this.retryHalted();
 
       const result = this.write.transaction(fn)(this.write);
 
-      const snapshot = `${this.cfg.path}.snapshot`;
-      try {
-        unlinkSync(snapshot);
-      } catch {
-        // First write, or already cleaned up.
-      }
-      this.write.exec(`VACUUM INTO '${snapshot}'`);
-
-      try {
-        await this.s3.send(
-          new PutObjectCommand({
-            Bucket: this.cfg.bucket,
-            Key: this.cfg.key,
-            Body: readFileSync(snapshot),
-          }),
-        );
-      } catch (err) {
-        this.halted = String(err);
-        log("snapshot_failed_halting_writes", { error: String(err) });
-        throw err;
-      } finally {
+      let lastErr: unknown;
+      for (let attempt = 0; attempt <= this.timing.retryDelaysMs.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, this.timing.retryDelaysMs[attempt - 1]));
+        }
         try {
-          unlinkSync(snapshot);
-        } catch {
-          // Nothing to clean up.
+          await this.putSnapshot();
+          if (attempt > 0) log("snapshot_retry_succeeded", { attempt: attempt + 1 });
+          return result;
+        } catch (err) {
+          lastErr = err;
+          log("snapshot_attempt_failed", { attempt: attempt + 1, error: String(err) });
         }
       }
 
-      return result;
+      const now = this.now();
+      this.halted = {
+        error: String(lastErr),
+        since: now,
+        nextRetryAt: now + this.timing.haltRetryMs,
+        retryMs: this.timing.haltRetryMs,
+        alarmedPersisting: false,
+      };
+      alarm("snapshot_failed_halting_writes", {
+        error: String(lastErr),
+        attempts: this.timing.retryDelaysMs.length + 1,
+        note: "writes refuse until a snapshot of the current state reaches S3; retried on the next write, with backoff",
+      });
+      throw Object.assign(lastErr instanceof Error ? lastErr : new Error(String(lastErr)), {
+        committedLocally: true,
+      });
     });
 
     // Keep the chain alive even when a write throws, or one failure would
@@ -299,6 +347,69 @@ export class Db {
     this.queue = run.catch(() => undefined);
     return run;
   }
+
+  /**
+   * Throws while S3 still will not take a snapshot, and clears the halt once
+   * it does. What it uploads is the current state, which already holds the
+   * write whose PUT failed, so a success brings S3 level with local before
+   * anything new commits.
+   */
+  private retryHalted = async (): Promise<void> => {
+    const halt = this.halted!;
+    const now = this.now();
+    if (!halt.alarmedPersisting && now - halt.since >= this.timing.haltAlarmMs) {
+      halt.alarmedPersisting = true;
+      alarm("writes_still_halted", {
+        haltedForMs: now - halt.since,
+        error: halt.error,
+        note: "every write in this process is refusing; S3 has not taken a snapshot since the halt",
+      });
+    }
+    if (now < halt.nextRetryAt) throw new Error(`writes halted: ${halt.error}`);
+
+    try {
+      await this.putSnapshot();
+    } catch (err) {
+      halt.error = String(err);
+      halt.retryMs = Math.min(halt.retryMs * 2, this.timing.haltRetryMaxMs);
+      halt.nextRetryAt = this.now() + halt.retryMs;
+      throw new Error(`writes halted: ${halt.error}`);
+    }
+    this.halted = null;
+    log("writes_resumed", { haltedForMs: this.now() - halt.since });
+  };
+
+  /**
+   * One snapshot, one PUT. A new command and a new SDK call every time, so
+   * every attempt is signed when it is sent. The deadline is what stops a
+   * stalled socket holding the write queue until its signature is too old
+   * for S3 to accept.
+   */
+  private putSnapshot = async (): Promise<void> => {
+    const snapshot = `${this.cfg.path}.snapshot`;
+    try {
+      unlinkSync(snapshot);
+    } catch {
+      // First write, or already cleaned up.
+    }
+    this.write.exec(`VACUUM INTO '${snapshot}'`);
+    try {
+      await this.s3.send(
+        new PutObjectCommand({
+          Bucket: this.cfg.bucket,
+          Key: this.cfg.key,
+          Body: readFileSync(snapshot),
+        }),
+        { abortSignal: AbortSignal.timeout(this.timing.putTimeoutMs) },
+      );
+    } finally {
+      try {
+        unlinkSync(snapshot);
+      } catch {
+        // Nothing to clean up.
+      }
+    }
+  };
 
   /** Read-only. This is what triage and the Slack agent query through. */
   query<T = unknown>(sql: string, params: unknown[] = []): T[] {
