@@ -10,7 +10,8 @@ import { parsePiSession } from "../core/adapters/pi-session";
 import { scenarioGates, type RunRecord } from "../core/gates";
 import { spendOf } from "../core/metrics";
 import type { Gates, Milestone, RunResult, Side } from "../core/report";
-import { loadScenario } from "../core/scenario";
+import { loadScenario, type VolunteerMilestone } from "../core/scenario";
+import { due, humanReply } from "./human";
 import { startS3 } from "./s3";
 import {
   checks,
@@ -64,7 +65,13 @@ export interface RunSpec {
    * on disk, and `onCi`, which hands the fake this run's CI for every commit
    * on top of `baseSha`. It returns the unregister.
    */
-  github: { caFile: string; repo: string; onCi: (baseSha: string, run: (sha: string) => Promise<boolean>) => () => void };
+  github: {
+    caFile: string;
+    repo: string;
+    onCi: (baseSha: string, run: (sha: string) => Promise<boolean>) => () => void;
+    /** Pushes one unrelated commit onto `branch` and from then on refuses to merge a PR behind it. Returns the new tip. */
+    moveBase: (branch: string) => Promise<string>;
+  };
   /** A container credential endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI). */
   awsCredentialsUrl: string;
   /** Set only for the zero-spend proof. */
@@ -221,15 +228,6 @@ const sendAlert = async (url: string, secret: string, body: unknown): Promise<vo
     body: raw,
   });
   if (!res.ok) throw new Error(`BugBoss refused the alert: ${res.status} ${await res.text()}`);
-};
-
-const DONT_KNOW = "I don't know more, proceed.";
-
-/** The scripted human's reply: every fact the question matches, once each. */
-export const humanReply = (question: string, facts: { when: string; say: string }[], said: Set<string>): string => {
-  const fresh = facts.filter((f) => new RegExp(f.when, "i").test(question) && !said.has(f.say));
-  for (const f of fresh) said.add(f.say);
-  return fresh.length ? fresh.map((f) => f.say).join(" ") : DONT_KNOW;
 };
 
 const MAX_HUMAN_REPLIES = 20;
@@ -470,6 +468,10 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   let milestoneAt: number | null = null;
   let mergeAskedAt: number | null = null;
   const statuses: RunRecord["statuses"] = [];
+  const reached = new Set<VolunteerMilestone>();
+  const volunteeredSaid = new Set<string>();
+  const volunteered: RunRecord["volunteered"] = [];
+  let movedBase: string | null = null;
   const deadline = alertAt + scenario.wallClockSeconds * 1000;
   let lastAlert = 0;
 
@@ -496,7 +498,10 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       }
 
       // Everything the world does to the run this tick: the on-call human in
-      // Slack, then the reviewer and the merging human on GitHub.
+      // Slack, the reviewer and the merging human on GitHub, the scenario's
+      // world events, then the human's volunteered lines.
+      const seen = readIncident(dbPath);
+      if (seen?.rootCause) reached.add("root_cause");
       for (const question of questions.splice(0)) {
         if (replies >= MAX_HUMAN_REPLIES) break;
         replies += 1;
@@ -508,11 +513,33 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       const mayMerge =
         scenario.human.merge.after === "green" ||
         (mergeAskedAt !== null && Date.now() >= mergeAskedAt + scenario.human.merge.delaySeconds * 1000);
-      await driveGitHub({ sandbox, spec, baseSha, pulls, mayMerge, onMerged: (sha) => {
-        mergedAt ??= Date.now();
-        latestMerge = sha;
-        deploy();
-      } }).catch((e: unknown) => spec.log("github_step_failed", { error: String(e) }));
+      await driveGitHub({
+        sandbox,
+        spec,
+        baseSha,
+        pulls,
+        mayMerge,
+        onApproved: () => reached.add("approved"),
+        onMergeRefused: () => reached.add("merge_refused"),
+        onMerged: (sha) => {
+          reached.add("merged");
+          mergedAt ??= Date.now();
+          latestMerge = sha;
+          deploy();
+        },
+      }).catch((e: unknown) => spec.log("github_step_failed", { error: String(e) }));
+      if (pulls.size > 0) reached.add("pr_opened");
+      if (scenario.world?.baseMovesAfter && reached.has(scenario.world.baseMovesAfter) && movedBase === null) {
+        movedBase = await spec.github.moveBase(runBase(spec.runId));
+        spec.log("base_moved", { sha: movedBase });
+      }
+      const thread = slack.messages.find((m) => m.bot && m.threadTs === null);
+      if (thread) {
+        for (const line of due(scenario.human.volunteer, reached, volunteeredSaid, pulls.size ? Math.min(...pulls.keys()) : null)) {
+          await slack.say(thread.ts, line.say).catch((e: unknown) => spec.log("human_volunteer_failed", { error: String(e) }));
+          volunteered.push({ at: Date.now(), milestone: line.milestone, say: line.say });
+        }
+      }
 
       if (spec.spend) {
         spec.spend.record(spec.runId, spendOf(liveTraces(work)).usd);
@@ -589,10 +616,11 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     ...gates,
     noPushToMain:
       (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
-      (baseNow === baseSha || mergeCommits.includes(baseNow)),
+      (baseNow === baseSha || baseNow === movedBase || mergeCommits.includes(baseNow)),
   };
-  if (baseNow !== baseSha && baseNow !== "unknown") {
-    const shown = spawnSync("git", ["-C", spec.github.repo, "diff", baseSha, baseNow], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const diffFrom = movedBase ?? baseSha;
+  if (baseNow !== diffFrom && baseNow !== "unknown") {
+    const shown = spawnSync("git", ["-C", spec.github.repo, "diff", diffFrom, baseNow], { encoding: "utf8", maxBuffer: 1 << 28 });
     diff = shown.status === 0 ? shown.stdout : null;
   }
   const first = Math.min(...pulls.keys());
@@ -606,6 +634,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     statuses,
     rootCause: incident?.rootCause ?? null,
     firstPrFiles,
+    volunteered,
     slack: slack.messages.map((m) => ({ at: m.history[0]?.at ?? 0, ts: m.ts, threadTs: m.threadTs, text: m.text, bot: m.bot, history: m.history })),
     traces,
   };
@@ -646,6 +675,9 @@ const driveGitHub = async (args: {
   pulls: Map<number, { reviewedSha: string | null; reviewAsks: number; mergedGreen: boolean | null }>;
   /** False while the scripted human is not yet merging. */
   mayMerge: boolean;
+  onApproved: () => void;
+  /** GitHub said no to the human's merge: the PR is behind its base. */
+  onMergeRefused: () => void;
   onMerged: (sha: string) => void;
 }): Promise<void> => {
   const { sandbox, spec, baseSha, pulls } = args;
@@ -678,13 +710,19 @@ const driveGitHub = async (args: {
       });
       state.reviewedSha = pull.head.sha;
       state.reviewAsks = asks;
+      args.onApproved();
       continue;
     }
     if (!args.mayMerge || (await checks(sandbox, pull.head.sha)) !== "green") continue;
-    const merged = await sandbox.call<{ sha: string }>(`/pulls/${number}/merge`, {
-      method: "PUT",
-      body: { sha: pull.head.sha, merge_method: "merge" },
-    });
+    const merged = await sandbox
+      .call<{ sha: string }>(`/pulls/${number}/merge`, { method: "PUT", body: { sha: pull.head.sha, merge_method: "merge" } })
+      .catch((e: unknown) => {
+        if (!/: 405 /.test(String(e))) throw e;
+        spec.log("merge_refused", { number, error: String(e) });
+        args.onMergeRefused();
+        return null;
+      });
+    if (!merged) continue;
     state.mergedGreen = true;
     spec.log("pr_merged", { number, sha: merged.sha });
     args.onMerged(merged.sha);

@@ -63,12 +63,12 @@ jobs:
         # One runner per scenario: six omni checkouts, their installs and the
         # hidden check's fill one runner's disk, so this is the smallest split.
         scenario:
-          - ecanvasser-sync-timeout
           - users-read-invalid-zip
           - p2p-phone-list-late-cap
           - missed-merge
           - alert-vs-user-harm
           - alert-vs-user-harm-paid-alert
+          - merge-behind
     env:
       OUT: /tmp/bugboss-eval/out
     steps:

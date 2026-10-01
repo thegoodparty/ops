@@ -79,7 +79,9 @@ const agentStep = (body: Body, patchPath: string): Answer => {
     {
       tool: "monitor",
       input: {
-        command: `gh pr view ${prUrl} --json state -q .state | grep -q MERGED`,
+        // Brings the branch up to date first, so a base that moved under the
+        // PR (merge-behind) gets a new head the harness can merge.
+        command: `(git fetch -q origin && git merge -q --no-edit origin/main && git push -q origin HEAD) > /dev/null 2>&1; gh pr view ${prUrl} --json state -q .state | grep -q MERGED`,
         intervalSeconds: 20,
         timeoutSeconds: 7200,
         description: "the PR to be merged",

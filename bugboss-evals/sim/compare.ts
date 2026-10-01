@@ -258,6 +258,24 @@ const run = async (argv: string[]): Promise<void> => {
                 ciRuns.set(base, ci);
                 return () => void ciRuns.delete(base);
               },
+              moveBase: async (branch) => {
+                const index = join(out, `index-${runId}`);
+                const git = (args: string[], input?: string) =>
+                  execFileSync("git", ["-C", repo, "-c", "user.name=bugboss-evals", "-c", "user.email=evals@invalid", ...args], {
+                    encoding: "utf8",
+                    input,
+                    env: { ...process.env, GIT_INDEX_FILE: index },
+                  }).trim();
+                const tip = git(["rev-parse", `refs/heads/${branch}`]);
+                git(["read-tree", tip]);
+                const note = git(["hash-object", "-w", "--stdin"], "Someone else's change landed on the base after approval.\n");
+                git(["update-index", "--add", "--cacheinfo", `100644,${note},docs/eval-base-moved.md`]);
+                const sha = git(["commit-tree", git(["write-tree"]), "-p", tip, "-m", "An unrelated change on the base"]);
+                rmSync(index, { force: true });
+                await fake.advance(SANDBOX_OWNER, SANDBOX_REPO, branch, sha);
+                fake.requireUpToDate(SANDBOX_OWNER, SANDBOX_REPO, branch);
+                return sha;
+              },
             },
             awsCredentialsUrl,
             npmCache,

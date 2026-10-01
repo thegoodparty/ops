@@ -54,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         # missed-merge and alert-vs-user-harm-paid-alert share another scenario's check.
-        scenario: [ecanvasser-sync-timeout, users-read-invalid-zip, p2p-phone-list-late-cap, alert-vs-user-harm]
+        scenario: [users-read-invalid-zip, p2p-phone-list-late-cap, alert-vs-user-harm, merge-behind]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,12 +88,12 @@ jobs:
       fail-fast: false
       matrix:
         scenario:
-          - ecanvasser-sync-timeout
           - users-read-invalid-zip
           - p2p-phone-list-late-cap
           - missed-merge
           - alert-vs-user-harm
           - alert-vs-user-harm-paid-alert
+          - merge-behind
     env:
       OUT: /tmp/evals/out
     steps:

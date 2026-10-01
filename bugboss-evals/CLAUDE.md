@@ -54,6 +54,12 @@ to end. The harness (`sim/run.ts`) is everything outside it:
 - **Slack** is `sim/slack.ts`. The on-call human is scripted: any bot message
   with a question mark gets the scenario's matching facts, once each, or
   "I don't know more, proceed."
+  It also volunteers `human.volunteer` lines unprompted, each once, when the
+  run first reaches a milestone (`sim/human.ts`).
+- **The world moves.** `world.baseMovesAfter: "approved"` pushes one
+  unrelated commit onto the run's base right after the first approval and
+  makes the fake refuse (405) to merge a PR behind it; that refusal is the
+  `merge_refused` milestone.
 - **AWS.** BugBoss resolves credentials from a local container-credential
   endpoint serving the workflow's Bedrock-only role, so every other call is
   denied. S3 (its snapshot and session files) is `sim/s3.ts`, on disk.
