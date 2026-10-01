@@ -103,10 +103,34 @@ const summarise = (runs: RunResult[]): SideSummary => {
 
 const verdictLine = (verdicts: CaseVerdict[]): string => {
   const judged = verdicts.filter((v) => v.excluded === null);
-  const wins = judged.filter((v) => v.winner === "candidate").length;
-  const losses = judged.filter((v) => v.winner === "baseline").length;
-  const ties = judged.length - wins - losses;
-  return `${wins}-${losses}-${ties}`;
+  const flips = judged.filter((v) => v.flipped).length;
+  const wins = judged.filter((v) => !v.flipped && v.winner === "candidate").length;
+  const losses = judged.filter((v) => !v.flipped && v.winner === "baseline").length;
+  const ties = judged.length - flips - wins - losses;
+  return `${wins}-${losses}-${ties}${flips ? ` (${flips} flipped)` : ""}`;
+};
+
+const POINTS = { tie: 0, better: 1, much_better: 2 } as const;
+
+/**
+ * The universal judge's call (omni packages/universal-judge), in this order:
+ * too many flips to trust, too small a mean to matter, too few decisive pairs
+ * to call, or better or worse with the sign test's p.
+ */
+export const qualityCall = (verdicts: CaseVerdict[]): string => {
+  const judged = verdicts.filter((v) => v.excluded === null);
+  if (judged.length === 0) return "Quality: no pairs judged.";
+  const flips = judged.filter((v) => v.flipped).length;
+  if (flips / judged.length > 0.2) return `Quality: inconclusive, the judge flipped on ${flips} of ${judged.length} pairs when their order was swapped.`;
+  const scored = judged.filter((v) => !v.flipped);
+  const score = scored.reduce((sum, v) => sum + (v.winner === "tie" ? 0 : (v.winner === "candidate" ? 1 : -1) * POINTS[v.margin]), 0) / scored.length;
+  const wins = scored.filter((v) => v.winner === "candidate").length;
+  const losses = scored.filter((v) => v.winner === "baseline").length;
+  const mean = `mean ${score >= 0 ? "+" : ""}${score.toFixed(2)} on -2..+2`;
+  if (Math.abs(score) < 0.25) return `Quality: no material change (${mean}).`;
+  if (wins + losses < 6) return `Quality: not enough cases to call (${mean}, ${wins + losses} decisive pairs; six is the fewest that can reach p < 0.05).`;
+  const p = signTest(wins, losses)!;
+  return `Quality: the candidate is ${Math.abs(score) >= 1 ? "much " : ""}${score > 0 ? "better" : "worse"} (${mean}, sign test p=${p.toFixed(3)} over ${wins + losses} decisive pairs${p < 0.05 ? "" : ", so this could be chance"}).`;
 };
 
 /**
@@ -137,11 +161,6 @@ export const renderReport = (args: {
       `${s.gatesPassed}/${s.runs} | ${s.meanUsd === null ? "–" : usd(s.meanUsd)} | ${minutes(s.meanWall)}`;
     return `| ${label} | ${cell(base)} | ${cell(cand)} | ${verdictLine(verdictsFor(scenario))} |`;
   };
-
-  const judged = args.verdicts.filter((v) => v.excluded === null);
-  const wins = judged.filter((v) => v.winner === "candidate").length;
-  const losses = judged.filter((v) => v.winner === "baseline").length;
-  const p = signTest(wins, losses);
 
   const gateTable = (["baseline", "candidate"] as Side[]).map((side) => {
     const s = summarise(pick(null, side));
@@ -179,9 +198,7 @@ export const renderReport = (args: {
     ...scenarios.map((s) => row(s, s)),
     row("**Total**", null),
     "",
-    p === undefined
-      ? "Quality: no decisive pairs."
-      : `Quality: sign test p=${p.toFixed(3)} over ${wins + losses} decisive pairs${p < 0.05 ? "." : ", so this could be chance."}`,
+    qualityCall(args.verdicts),
     "",
     "<details><summary>Gates and tokens</summary>",
     "",

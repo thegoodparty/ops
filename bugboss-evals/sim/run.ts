@@ -290,7 +290,7 @@ const exec = (command: string, args: string[], options: { env?: Record<string, s
 
 /** Merge means deploy: clone what merged and run the hidden check against it. */
 const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: string; command: string; timeoutSeconds: number }, sha: string, env: Record<string, string>): Promise<boolean> => {
-  const dir = join(spec.root, "deploy");
+  const dir = join(spec.root, `deploy-${sha.slice(0, 12)}`);
   const token = readFileSync(spec.tokenFile, "utf8").trim();
   const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
   if ((await exec("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--filter=blob:none", "--no-checkout", SANDBOX_URL, dir])) !== 0) return false;
@@ -403,6 +403,29 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const pulls = new Map<number, { reviewedSha: string | null; reviewAsks: number; mergedGreen: boolean | null }>();
   let fixed: boolean | null = null;
   let deploying: Promise<void> | null = null;
+  let latestMerge: string | null = null;
+  // A follow-up PR that merges while a check runs is checked once that check
+  // ends; the newest merge is what is deployed.
+  const deploy = (): void => {
+    const sha = latestMerge;
+    if (deploying || !sha) return;
+    spec.log("deploying", { sha });
+    deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, {
+      PATH: env.PATH,
+      HOME: home,
+      OMNI_TEST_POSTGRES_URL: postgres.url,
+      ...(spec.prebuilt ? { OMNI_PREBUILT: spec.prebuilt } : {}),
+    })
+      .then((passed) => {
+        fixed = passed;
+        spec.log("deployed", { sha, fixed });
+        emitter.setState(passed ? "healthy" : "fault");
+      })
+      .finally(() => {
+        deploying = null;
+        if (latestMerge !== sha) deploy();
+      });
+  };
   let end = "wall_clock";
   let closedAt: number | null = null;
   const said = new Set<string>();
@@ -451,18 +474,8 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
 
       if (sandbox) await driveGitHub({ sandbox, spec, baseSha, pulls, mayMerge, onMerged: (sha) => {
         mergedAt ??= Date.now();
-        if (deploying) return;
-        spec.log("deploying", { sha });
-        deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, {
-          PATH: env.PATH,
-          HOME: home,
-          OMNI_TEST_POSTGRES_URL: postgres.url,
-          ...(spec.prebuilt ? { OMNI_PREBUILT: spec.prebuilt } : {}),
-        }).then((passed) => {
-          fixed = passed;
-          spec.log("deployed", { fixed });
-          if (passed) emitter.setState("healthy");
-        });
+        latestMerge = sha;
+        deploy();
       } }).catch((e: unknown) => spec.log("github_step_failed", { error: String(e) }));
 
       if (spec.spend) {
@@ -497,7 +510,9 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   } finally {
     // Give the Boss a moment to roll the session up, then stop everything.
     await sleep(5000);
-    await (deploying as Promise<void> | null)?.catch((e: unknown) => spec.log("deploy_failed", { error: String(e) }));
+    while (deploying as Promise<void> | null) {
+      await (deploying as Promise<void> | null)?.catch((e: unknown) => spec.log("deploy_failed", { error: String(e) }));
+    }
     if (boss.pid) {
       try {
         process.kill(-boss.pid, "SIGTERM");

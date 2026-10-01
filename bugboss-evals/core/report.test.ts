@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import type { CaseVerdict } from "./judge";
 import { ZERO_SPEND } from "./metrics";
-import { renderReport, signTest, type RunResult, type Side } from "./report";
+import { qualityCall, renderReport, signTest, type RunResult, type Side } from "./report";
 
 test("the sign test is the exact two-sided binomial", () => {
   assert.equal(signTest(0, 0), undefined);
@@ -61,7 +61,7 @@ test("the report has a row per scenario and a total, and names the runs that fai
   assert.match(text, /\| \*\*Total\*\* \| 2\/2 \| \$10\.00 \| 60m \| 1\/2 \| \$8\.00 \| 60m \| 1-1-0 \|/);
   assert.match(text, /- a rep 1 candidate: ended wall_clock; closed$/m);
   assert.match(text, /\| b \| merge-noticed \| 0\/1 \| 1\/1 \|/);
-  assert.match(text, /sign test p=1\.000 over 2 decisive pairs, so this could be chance/);
+  assert.match(text, /Quality: no material change \(mean \+0\.00 on -2\.\.\+2\)/);
 });
 
 test("a fast-tier run's merge gates read n/a, and runs stopped at the cap are counted", () => {
@@ -90,4 +90,15 @@ test("a fast-tier run's merge gates read n/a, and runs stopped at the cap are co
   assert.match(text, /\| a \| thread-told \| n\/a \| n\/a \|/);
   assert.match(text, /\| a \| cause \| 1\/1 \| 1\/1 \|/);
   assert.match(text, /of the \$40\.00 cap\. 1 runs stopped at the cap\./);
+});
+
+test("the quality call follows the universal judge: flips, then materiality, then power, then direction", () => {
+  const many = (n: number, winner: CaseVerdict["winner"]) => Array.from({ length: n }, (_, i) => verdict(`s/${i}`, winner));
+  const flipped = { ...verdict("f/1", "tie"), flipped: true };
+  assert.match(qualityCall([...many(3, "candidate"), flipped]), /inconclusive, the judge flipped on 1 of 4/);
+  assert.match(qualityCall([...many(3, "candidate"), ...many(3, "baseline")]), /no material change \(mean \+0\.00/);
+  assert.match(qualityCall(many(5, "candidate")), /not enough cases to call \(mean \+1\.00 on -2\.\.\+2, 5 decisive pairs/);
+  assert.match(qualityCall(many(6, "baseline")), /the candidate is much worse \(mean -1\.00 on -2\.\.\+2, sign test p=0\.031 over 6 decisive pairs\)/);
+  assert.match(qualityCall([...many(5, "candidate"), ...many(2, "baseline"), ...many(3, "tie")]), /the candidate is better \(mean \+0\.30.*so this could be chance/);
+  assert.equal(qualityCall([{ ...verdict("x/1", "tie"), excluded: "too long" }]), "Quality: no pairs judged.");
 });

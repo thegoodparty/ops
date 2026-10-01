@@ -97,6 +97,9 @@ const startStack = async (): Promise<Stack> => {
     const ready = await Promise.all([
       fetch(`${stack.grafanaUrl}/api/health`).then((r) => r.ok, () => false),
       fetch(`${stack.lokiUrl}/ready`).then((r) => r.ok, () => false),
+      fetch(`${stack.prometheusUrl}/-/ready`).then((r) => r.ok, () => false),
+      // The proxy answers only once Prometheus behind it does.
+      fetch("http://127.0.0.1:9391/api/v1/query?query=up", { headers: { "X-Eval-Run": "ready" } }).then((r) => r.ok, () => false),
     ]);
     if (ready.every(Boolean)) return stack;
     await new Promise((r) => setTimeout(r, 2000));
