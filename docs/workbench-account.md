@@ -314,6 +314,27 @@ still need the console once.
       group, because no AWS page confirms a record is written when every
       modality is disabled.)
 
+- [ ] 18. Grant `WorkbenchAccess` read on the Brave search secret: doing
+      (2026-10-01, pi-brave). `gp-pi` gained an always-on `web_search` tool,
+      and its key goes here because the container already holds a
+      `WorkbenchAccess` SSO session and can read the secret with the same
+      credentials it invokes Bedrock with. The secret is `gp-pi/brave-search`,
+      one JSON key `BRAVE_API_KEY`, created out of band by jeff on 2026-10-01.
+      The grant is a single statement in `workbenchAccess`, on that secret's
+      ARN and nothing else, held there by
+      `deploy/identity-center-workbench.test.ts`.
+
+      This is the first thing in the account that is worth reading, which the
+      account's design avoided until now, so the reasoning is worth keeping.
+      The key is shared by every engineer's sandbox, it does not expire, and an
+      agent that has been prompt-injected can read it. The mitigations are the
+      one-secret scope, a key dedicated to `gp-pi` rather than the one the
+      product uses, and revocation in Brave. `gp-pi`'s `docs/design.md` under
+      Web search carries the rest.
+
+      Done when the grant has applied and a `WorkbenchAccess` session can read
+      the secret and return a search result.
+
 Facts discovered during implementation go here as they are learned:
 
 - Workbench account id: `024901689212`. Created 2026-09-21 13:17:15 UTC,
@@ -407,6 +428,13 @@ Facts discovered during implementation go here as they are learned:
   reference only: do **not** add it to the `permissionSets` entry, because an
   `id` there is what switches the resource from create to import, and
   importing a resource Pulumi already owns is not a no-op.
+- Brave search secret for `gp-pi`: `gp-pi/brave-search` in the workbench
+  account, a flat JSON object with one key, `BRAVE_API_KEY`. Created out of
+  band on 2026-10-01 rather than in Pulumi, so the grant in `workbenchAccess`
+  names the ARN with a `-??????` suffix wildcard instead of a Pulumi Output.
+  The name is a seam with `etc/pi/extensions/gp-websearch.ts` in the `gp-pi`
+  repo; renaming it on either side without the other is an AccessDenied at the
+  first search.
 - Workbench account assignments, both created 2026-09-22 12:55 UTC:
   `Engineers` (`383193a0-7001-70d9-a321-ffe6d8af7378`) to `WorkbenchAccess`,
   and `Admins` (`88c1b330-a001-707a-06ca-94e289013bf5`) to
