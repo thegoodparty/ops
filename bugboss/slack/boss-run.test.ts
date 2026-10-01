@@ -21,6 +21,7 @@ import { emptyModelUsage, type ModelReply, type ModelRequest, type SizedModelCli
 import { closeIncidentByBoss } from "../toolapi";
 import {
   SlackAgent,
+  slackSessionPrefix,
   SUMMARY_UNAVAILABLE,
   type ObjectStore,
   type SlackAgentModel,
@@ -512,18 +513,31 @@ describe("incident 100, replayed", () => {
     return { model, requests };
   };
 
-  const run = async (text: string, tagged: boolean) => {
+  const HUNDRED_THREAD = "1790869000.000100";
+
+  const run = async (
+    text: string,
+    tagged: boolean,
+    opts: { inbox?: boolean; earlier?: SlackMessage; lastSeenTs?: string } = {},
+  ) => {
     await db.withWrite((d) => {
       d.prepare(
         `INSERT INTO incident (id, status, firstSignalAt, slackThreadTs, summary, prUrls)
          VALUES ('100', 'INVESTIGATING', 1, ?, 'Checkout latency', '[]')`,
-      ).run("1790869000.000100");
+      ).run(HUNDRED_THREAD);
     });
-    const { store } = memoryStore();
+    const { store, objects } = memoryStore();
+    if (opts.lastSeenTs) {
+      objects.set(
+        `${slackSessionPrefix(CHANNEL, HUNDRED_THREAD)}state.json`,
+        JSON.stringify({ lastSeenTs: opts.lastSeenTs, lastActivityAt: 0 }),
+      );
+    }
     const slack = fakeSlack();
     const ts = "1790869358.078479";
     slack.replies.push(
-      { user: BOT, botId: "B0BUGBOSS", text: "*Incident 100 opened*", ts: "1790869000.000100" },
+      { user: BOT, botId: "B0BUGBOSS", text: "*Incident 100 opened*", ts: HUNDRED_THREAD },
+      ...(opts.earlier ? [opts.earlier] : []),
       { user: "U0SWAIN", botId: null, text, ts },
     );
     const { model, requests } = incidentHundredModel();
@@ -539,7 +553,10 @@ describe("incident 100, replayed", () => {
       closeIncident: () => Promise.reject(new Error("no close expected")),
     });
     const lines = await captureLogs(() =>
-      agent.handleIncident({ incidentId: "100", trigger: { kind: "human", user: "U0SWAIN", text, ts, tagged } }),
+      agent.handleIncident({
+        incidentId: "100",
+        trigger: opts.inbox ? { kind: "inbox" } : { kind: "human", user: "U0SWAIN", text, ts, tagged },
+      }),
     );
     const input = requests[0].messages.find((m) => m.role === "user")?.text ?? "";
     return { posts: slack.posts, lines, input, requests };
@@ -562,5 +579,23 @@ describe("incident 100, replayed", () => {
     assert.equal(posts.length, 0);
     assert.ok(lines.some((l) => l.includes('"event":"stay_silent"')));
     assert.ok(!lines.some((l) => l.includes('"level":"error"')), lines.join("\n"));
+  });
+
+  // The tag's own run failed before answering, so its trigger is gone; the
+  // retry is woken by the agent and finds the tag still in the thread.
+  test("an unanswered tag the thread still shows is answered on a run the inbox woke", async () => {
+    const { posts, lines, input } = await run(STATUS_ASK, false, { inbox: true });
+
+    assert.match(input, /@BugBoss \(you\) what's the status here\?/);
+    assert.ok(!lines.some((l) => l.includes('"event":"stay_silent"')), "silence was not recorded");
+    assert.equal(posts.length, 1);
+  });
+
+  test("a tag already answered does not take silence away from the chatter after it", async () => {
+    const earlier = { user: "U0SWAIN", botId: null, text: STATUS_ASK, ts: "1790869100.000100" };
+    const { posts, lines } = await run(CHAT, false, { earlier, lastSeenTs: "1790869200.000100" });
+
+    assert.equal(posts.length, 0);
+    assert.ok(lines.some((l) => l.includes('"event":"stay_silent"')));
   });
 });

@@ -437,8 +437,9 @@ allowed (`allowSilence`), so it hands back empty rather than an apology.
 
 A message that tags the Boss is never met with silence, in an incident
 thread or anywhere. The relay marks an `incident_reply` `tagged`, and a run
-with any tagged message in it has `allowSilence: false`, so `stay_silent` is
-refused. The Boss's own `<@ID>` or `<@ID|name>` is rendered as
+with a tagged trigger, or a tag the thread shows past the last watermark (a
+failed run's leftover, retried by an inbox wake), has `allowSilence: false`,
+so `stay_silent` is refused. The Boss's own `<@ID>` or `<@ID|name>` is rendered as
 `@BugBoss (you)` in the incident-thread input: raw, incident 100's Boss read
 its own id as somebody else and stayed silent on "what's the status here?".
 

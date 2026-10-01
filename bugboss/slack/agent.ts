@@ -11,7 +11,7 @@ import type { Db } from "../db";
 import type { SlackReactor } from "./ack";
 import type { SlackLinker } from "./client";
 import type { SlackPoster } from "./relay";
-import { botMentionPattern, mentionPrefix, stripBotMention } from "./relay";
+import { botMentionPattern, mentionPrefix, mentionsBot, stripBotMention } from "./relay";
 import {
   channelLink,
   link,
@@ -1267,8 +1267,19 @@ export class SlackAgent {
 
       // Two people talking to each other in the thread may get silence. A
       // message that tags the Boss is a question to it, and incident 100's
-      // "what's the status here?" went unanswered when it was not.
-      const tagged = humans.some((h) => h.tagged);
+      // "what's the status here?" went unanswered when it was not. A tag the
+      // thread shows past the watermark counts too: a run that failed before
+      // answering one leaves it there, and the retry may be woken by the inbox.
+      const unanswered = prior?.lastSeenTs;
+      const tagged =
+        humans.some((h) => h.tagged) ||
+        shown.some(
+          (m) =>
+            !m.botId &&
+            m.user !== this.cfg.botUserId &&
+            (unanswered === undefined || tsAfter(m.ts, unanswered)) &&
+            mentionsBot(m.text, this.cfg.botUserId),
+        );
       const allowSilence = !tagged;
       const silence: SilenceChoice = { allowed: allowSilence, reason: null };
       // The newest person in this run is who a report is filed for. A run
