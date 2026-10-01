@@ -493,7 +493,9 @@ phone screen, and each one caused retry loops in the runs that hit it.
 
 What the agent writes that does reach Slack is posted by `toolapi` on a
 transition, and that is where the thread budget lives: resolution evidence
-is refused past `THREAD_PROSE_CHARS`, and the post-mortem has no cap.
+is refused past `THREAD_PROSE_CHARS`, and the post-mortem has no character
+cap; only its `practiceChanges` section has a word range, and it refuses
+rather than cuts.
 
 The Slack agent has compaction too — `compactTranscript` in `slack/agent.ts`,
 wired into the loop in the composition root — so what is left on that surface
@@ -647,9 +649,10 @@ event so a replayed call after a restart records nothing twice.
 
 It exists because of compaction. The first error scrolls out of the context
 long before the closer writes the post-mortem, so the closer reads the
-timeline from `get_incident` instead of rebuilding it, and the closing
-report prints it as "Recorded timeline" under the post-mortem. The prompt
-asks for events on the turn they are learned, not at the end.
+timeline from `get_incident` instead of rebuilding it. Its post-mortem
+timeline rows name events by `recordedEventId`, and the report merges the two
+into one table with the recorded times (`report/CLAUDE.md`). The prompt asks
+for events on the turn they are learned, not at the end.
 
 **The model is pinned in the session.** On resume it resolves from the
 stored prefix, not from env — Bedrock does not restore it, and the SSM

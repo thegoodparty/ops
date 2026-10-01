@@ -131,7 +131,7 @@ test("the agent is told to record the timeline as it happens, and why", () => {
   assert.match(prompt, /taken from the evidence\nrather than from when you noticed/);
   // The closer reads the table, so the agent has to know the post-mortem is
   // built from it rather than from a context that has been summarised.
-  assert.match(prompt, /build its timeline from the `timeline` get_incident returns/);
+  assert.match(prompt, /give each timeline row the recordedEventId of the event it\s+describes/);
   assert.doesNotMatch(prompt, /notes/);
 });
 
@@ -470,12 +470,12 @@ test("the prompt does not understate how far the GitHub token reaches", () => {
   assert.match(prompt, /every repository in the thegoodparty/);
 });
 
-test("the thread cap on resolution evidence is a refusal, and the post-mortem has none", () => {
+test("the thread cap on resolution evidence is a refusal, and the post-mortem has no character cap", () => {
   const prompt = composeSystemPrompt(input());
 
   assert.match(prompt, new RegExp(`capped at\\s+${THREAD_PROSE_CHARS} characters`));
   assert.match(prompt, /a longer one is refused and\s+handed back/);
-  assert.match(prompt, /The post-mortem has no cap\s+at all/);
+  assert.match(prompt, /The post-mortem has no\s+character cap/);
   assert.match(prompt, /becomes a file attached to the thread/);
 });
 

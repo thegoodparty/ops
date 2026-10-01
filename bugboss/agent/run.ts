@@ -601,9 +601,29 @@ export const createBossTools = async (args: {
       name: "report_analysis",
       label: "Report analysis",
       description:
-        "RESOLVED -> CLOSED, your last act. Markdown post-mortem: summary, timeline (built from get_incident's timeline), humans involved, impact, root cause with five whys, owned prevention items. On a recurrence, `recurrence` is required.",
+        "RESOLVED -> CLOSED, your last act. The post-mortem as sections; code renders them in a fixed order and adds the agent run. No headings of your own. On a recurrence, `recurrence` is required.",
       parameters: Type.Object({
-        postmortem: Type.String(),
+        atAGlance: Type.String({ description: "2-3 sentences: what broke, who it hurt, that it is fixed." }),
+        timeline: Type.Array(
+          Type.Object({
+            at: Type.Optional(Type.String({ description: "ISO 8601 UTC, e.g. 2026-10-01T02:14:30Z." })),
+            event: Type.String(),
+            evidenceUrl: Type.Optional(Type.String()),
+            recordedEventId: Type.Optional(
+              Type.Number({ description: "get_incident timeline id this row describes; its time wins." }),
+            ),
+          }),
+        ),
+        userImpact: Type.String(),
+        rootCause: Type.String(),
+        fiveWhys: Type.Array(Type.Object({ why: Type.String(), because: Type.String() }), {
+          description: "Exactly five.",
+        }),
+        resolutionActions: Type.Array(Type.String(), { description: "Done, not planned." }),
+        practiceChanges: Type.String({
+          description:
+            "About 200 words: development-practice changes that would prevent similar issues. Not follow-up work on this one.",
+        }),
         usersImpacted: Type.Number(),
         impactQuery: Type.String(),
         recurrence: Type.Optional(

@@ -88,8 +88,24 @@ const BODIES = {
     prUrls: z.array(z.url()),
     evidence: z.string().min(1),
   }),
+  // Shape only. Empty sections, the five whys' count and practiceChanges'
+  // length are refused by the tool API, with a sentence naming the section
+  // and what to write instead.
   analysis: z.object({
-    postmortem: z.string().min(1),
+    atAGlance: z.string(),
+    timeline: z.array(
+      z.object({
+        at: z.string().optional(),
+        event: z.string(),
+        evidenceUrl: z.url().optional(),
+        recordedEventId: z.number().int().optional(),
+      }),
+    ),
+    userImpact: z.string(),
+    rootCause: z.string(),
+    fiveWhys: z.array(z.object({ why: z.string(), because: z.string() })),
+    resolutionActions: z.array(z.string()),
+    practiceChanges: z.string(),
     usersImpacted: z.number(),
     impactQuery: z.string().min(1),
     recurrence: z

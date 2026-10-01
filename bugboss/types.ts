@@ -108,6 +108,12 @@ export interface Incident {
   resolvedEvidence: string | null;
   /** JSON `RecurrenceAnalysis`. Required to close an incident that recurred. */
   recurrenceAnalysis: string | null;
+  /**
+   * JSON `PostmortemSections`, the structured write-up `report_analysis`
+   * takes. Null for an incident closed before it existed or closed by the
+   * Boss; those render `postmortem` as written.
+   */
+  postmortemSections: string | null;
 
   sessionRef: string | null;
   /** When the current or most recent launch started. Survives a restart. */
@@ -328,8 +334,7 @@ export interface ToolApi {
   }): Promise<ToolResponse>;
 
   /** RESOLVED -> CLOSED. Terminal; the agent exits after this. */
-  reportAnalysis(args: {
-    postmortem: string;
+  reportAnalysis(args: PostmortemSections & {
     usersImpacted: number;
     impactQuery: string;
     /**
@@ -494,6 +499,42 @@ export type RecurrenceCategory =
   | "resolution_evidence_too_weak"
   /** BugBoss let a premature close happen. The fix belongs in ops. */
   | "bugboss_defect";
+
+/**
+ * One row of the post-mortem's timeline. `recordedEventId` names the
+ * `incident_timeline_event` this row describes, and its recorded time wins
+ * over `at`; a row without one must carry `at`.
+ */
+export interface PostmortemTimelineRow {
+  /** ISO 8601 in UTC, e.g. 2026-10-01T02:14:30Z. */
+  at?: string;
+  event: string;
+  evidenceUrl?: string;
+  recordedEventId?: number;
+}
+
+export interface FiveWhy {
+  why: string;
+  because: string;
+}
+
+/**
+ * The post-mortem as fields, rendered by code in a fixed order so every
+ * report reads the same way.
+ *
+ * `practiceChanges` is about how we build, not about this incident: what
+ * would stop a *similar* issue. Work still to do on this incident has no
+ * field, because a closed incident has none.
+ */
+export interface PostmortemSections {
+  atAGlance: string;
+  timeline: PostmortemTimelineRow[];
+  userImpact: string;
+  rootCause: string;
+  fiveWhys: FiveWhy[];
+  resolutionActions: string[];
+  practiceChanges: string;
+}
 
 export interface RecurrenceAnalysis {
   category: RecurrenceCategory;
