@@ -1485,6 +1485,7 @@ export const runIncidentAgent = async (
   await registerBedrockRouting({
     runtime: modelRuntime,
     invokeModelIdFor: invokeModelIdFor(profiles),
+    incidentId: options.incidentId,
   });
   assertBedrockInvokeModelRouting(modelRuntime, model);
   // `invokedAs` is the only place the two ids are visible together. They

@@ -35,6 +35,7 @@ import {
   mapThinkingLevelToEffort,
   resolveCacheRetention,
 } from "./options";
+import { makeAlarm } from "../logging";
 import { regionFromModelId } from "./model";
 import {
   type AnthropicStreamEvent,
@@ -107,6 +108,44 @@ const defaultInvoke: BedrockInvoke = async (input, { signal, region }) => {
 
 const decoder = new TextDecoder();
 
+const alarm = makeAlarm("bedrock");
+
+/**
+ * How long a model call may go without a single byte before it is abandoned.
+ *
+ * Nothing else bounds it. The SDK sets no request or socket timeout, and the
+ * agent's own deadline is a day out, so a stream that stops sending without
+ * closing held incident 100's agent silent for over an hour. Idle rather than
+ * total, because a healthy call that thinks for minutes keeps sending: across
+ * 3,788 production turns the slowest whole call took 316s and the next 126s,
+ * and an idle gap can only be shorter than the call it sits in.
+ */
+export const MODEL_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Yields `source` until it ends, refreshing the idle timer on every item, and
+ * rejects as soon as `stalled` does even if the pending read never settles.
+ * The race is the point: aborting the request is not proof the SDK unblocks
+ * a read that is already waiting on a socket.
+ */
+const untilStalled = async function* <T>(
+  source: AsyncIterable<T>,
+  stalled: Promise<never>,
+  touch: () => void,
+): AsyncGenerator<T> {
+  const iterator = source[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const next = await Promise.race([iterator.next(), stalled]);
+      if (next.done) return;
+      touch();
+      yield next.value;
+    }
+  } finally {
+    void iterator.return?.()?.catch(() => {});
+  }
+};
+
 /**
  * Reported once per provider, not once per turn. A downgrade is a property of
  * the deployment rather than of a turn, and an incident runs ~90 of them; 90
@@ -178,11 +217,17 @@ export interface CreateBedrockInvokeModelProviderOptions {
    * lets a session started before a profile existed resume after one does.
    */
   invokeModelIdFor?: (modelId: string) => string;
+  /** Overridden in tests; see MODEL_IDLE_TIMEOUT_MS. */
+  idleTimeoutMs?: number;
+  /** Put on `model_call_stalled` so a stall names the incident it froze. */
+  incidentId?: string;
 }
 
 export const createBedrockInvokeModelProvider = async ({
   invoke = defaultInvoke,
   invokeModelIdFor = (modelId) => modelId,
+  idleTimeoutMs = MODEL_IDLE_TIMEOUT_MS,
+  incidentId,
 }: CreateBedrockInvokeModelProviderOptions = {}): Promise<
   ApiProvider<BedrockInvokeModelApi, BedrockInvokeModelOptions>
 > => {
@@ -207,6 +252,32 @@ export const createBedrockInvokeModelProvider = async ({
       timestamp: Date.now(),
     };
     if (options.effort) output.providerThinkingLevel = options.effort;
+
+    const idle = new AbortController();
+    const stalled = new Promise<never>((_, reject) => {
+      idle.signal.addEventListener("abort", () => reject(idle.signal.reason), { once: true });
+    });
+    stalled.catch(() => {});
+    let idleTimer: NodeJS.Timeout | undefined;
+    let startedAt = Date.now();
+    const touch = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        const elapsedMs = Date.now() - startedAt;
+        alarm("model_call_stalled", {
+          incidentId: incidentId ?? null,
+          modelId: model.id,
+          idleTimeoutMs,
+          elapsedMs,
+        });
+        // "timed out" is in the wording on purpose: it is what Pi's
+        // isRetryableAssistantError matches, so a stall is retried as a
+        // transient failure and only then exits the run.
+        idle.abort(
+          new Error(`Bedrock model call timed out: no response for ${idleTimeoutMs}ms`),
+        );
+      }, idleTimeoutMs);
+    };
 
     void (async () => {
       try {
@@ -234,15 +305,24 @@ export const createBedrockInvokeModelProvider = async ({
         const replacement = await options.onPayload?.(body, model);
         if (replacement !== undefined) body = replacement as InvokeModelBody;
 
-        const response = await invoke(
-          {
-            modelId: invokeModelIdFor(model.id),
-            contentType: "application/json",
-            accept: "application/json",
-            body: new TextEncoder().encode(JSON.stringify(body)),
-          },
-          { signal: options.signal, region: options.region },
-        );
+        startedAt = Date.now();
+        touch();
+        const response = await Promise.race([
+          invoke(
+            {
+              modelId: invokeModelIdFor(model.id),
+              contentType: "application/json",
+              accept: "application/json",
+              body: new TextEncoder().encode(JSON.stringify(body)),
+            },
+            {
+              signal: options.signal ? AbortSignal.any([options.signal, idle.signal]) : idle.signal,
+              region: options.region,
+            },
+          ),
+          stalled,
+        ]);
+        touch();
 
         await options.onResponse?.(
           { status: response.$metadata?.httpStatusCode ?? 200, headers: {} },
@@ -252,7 +332,7 @@ export const createBedrockInvokeModelProvider = async ({
         if (!response.body) throw new Error("Bedrock returned no response stream");
 
         await consumeAnthropicStream({
-          events: decodeEvents(response.body),
+          events: decodeEvents(untilStalled(response.body, stalled, touch)),
           output,
           push: (event) => eventStream.push(event),
           applyCost: () => {
@@ -279,6 +359,8 @@ export const createBedrockInvokeModelProvider = async ({
         output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
         eventStream.push({ type: "error", reason: output.stopReason, error: output });
         eventStream.end();
+      } finally {
+        clearTimeout(idleTimer);
       }
     })();
 

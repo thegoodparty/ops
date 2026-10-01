@@ -9,6 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   EXIT_ENTRY_TYPE,
   PROMPT_ENTRY_TYPE,
+  createS3SessionStore,
   createSessionSync,
   readStoredPrefixFromFile,
   readStoredPrefixFromJsonl,
@@ -478,4 +479,41 @@ test("lastSessionEventAt is the newest stamp in the file, whatever order it is i
 test("lastSessionEventAt is null for a file with no readable stamp", () => {
   assert.equal(lastSessionEventAt(""), null);
   assert.equal(lastSessionEventAt(JSON.stringify({ type: "message" })), null);
+});
+
+test("a session PUT that never answers fails the sync instead of freezing turn_end", { timeout: 5000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bugboss-hung-"));
+  const file = join(dir, "inc-100.jsonl");
+  await writeFile(file, sessionJsonl);
+
+  // The stalled socket: no answer until the deadline aborts it.
+  const client = {
+    send: (_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+      new Promise((_, reject) => {
+        options?.abortSignal?.addEventListener("abort", () => reject(options.abortSignal!.reason));
+      }),
+  };
+  const store = createS3SessionStore("bugboss-test", "us-west-2", { client, timeoutMs: 50 });
+  const sync = createSessionSync({ store, key: "sessions/inc-100.jsonl", sessionFile: () => file });
+  const handlers: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+  const pi = {
+    on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => {
+      handlers[event] = handler;
+      return () => {};
+    },
+  } as unknown as ExtensionAPI;
+  const failures: number[] = [];
+  sessionSyncExtension(sync, (_error, streak) => failures.push(streak))(pi);
+
+  // AbortSignal.timeout does not hold the event loop open on its own.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    const started = Date.now();
+    await handlers.turn_end({ type: "turn_end" }, {});
+    assert.ok(Date.now() - started < 1000);
+    assert.deepEqual(failures, [1]);
+    assert.ok(sync.lastError());
+  } finally {
+    clearInterval(keepAlive);
+  }
 });

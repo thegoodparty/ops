@@ -570,6 +570,12 @@ restart starts from scratch with the whole investigation lost, and combined
 with relaunch that is an unbounded loop of agents each beginning again. N
 consecutive failures steers the agent to escalate.
 
+Every read and write also has a deadline (`SESSION_STORE_TIMEOUT_MS`, 60s).
+The flush runs on `turn_end`, which Pi awaits before the next model call, so
+a PUT that never answers froze the agent with no error, the same as a model
+stream that stops sending (`bedrock/CLAUDE.md`). With the deadline a hung
+write is an ordinary sync failure and counts towards the streak.
+
 The session file is also the run's **cost ledger** -- `sumSessionUsage`
 reads it back after the child exits, so the key the agent writes and the key
 the Boss reads are one function. A drift between them costs no session and no

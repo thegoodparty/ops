@@ -43,11 +43,23 @@ export const sessionKeyFor = (incidentId: string): string =>
 export const sessionFileFor = (sessionDir: string, incidentId: string): string =>
   join(sessionDir, `${incidentId}.jsonl`);
 
+/**
+ * Every session read and write has a deadline, because the SDK sets none and
+ * the write runs on Pi's turn_end, which Pi awaits before the next model
+ * call: a PUT that never answers freezes the agent exactly as a stalled model
+ * stream does. A failed write is already survivable (see SessionSync); a hung
+ * one was not. A minute is far beyond any healthy whole-file PUT and still
+ * nothing against the cost of an agent that stops.
+ */
+export const SESSION_STORE_TIMEOUT_MS = 60_000;
+
 export const createS3SessionStore = (
   bucket: string,
   region?: string,
+  deps: { client?: any; timeoutMs?: number } = {},
 ): SessionStore => {
-  let clientPromise: Promise<any> | null = null;
+  const timeoutMs = deps.timeoutMs ?? SESSION_STORE_TIMEOUT_MS;
+  let clientPromise: Promise<any> | null = deps.client ? Promise.resolve(deps.client) : null;
   const client = (): Promise<any> => {
     if (!clientPromise) {
       clientPromise = import("@aws-sdk/client-s3").then(
@@ -66,6 +78,7 @@ export const createS3SessionStore = (
       try {
         const res = await s3.send(
           new GetObjectCommand({ Bucket: bucket, Key: key }),
+          { abortSignal: AbortSignal.timeout(timeoutMs) },
         );
         const bytes = await res.Body?.transformToByteArray();
         return bytes ? Buffer.from(bytes) : null;
@@ -87,6 +100,7 @@ export const createS3SessionStore = (
           Body: body,
           ContentType: "application/x-ndjson",
         }),
+        { abortSignal: AbortSignal.timeout(timeoutMs) },
       );
     },
   };
