@@ -612,7 +612,9 @@ export class Dispatcher {
         if (ok) {
           escalated.push(row.id);
         } else {
-          await this.unpark(row.id);
+          // Still parked and still untold, so the count stays at the ceiling
+          // and the escalation is tried again when the park lifts.
+          if (!(await this.unpark(row.id))) this.fastFailures.set(row.id, failures);
           alarm("crash_loop_escalation_failed", {
             incidentId: row.id,
             failures,
@@ -643,7 +645,7 @@ export class Dispatcher {
         if (ok) {
           escalated.push(row.id);
         } else {
-          await this.unpark(row.id);
+          if (!(await this.unpark(row.id))) this.launches.set(row.id, launches);
           alarm("stalled_escalation_failed", {
             incidentId: row.id,
             launches,
@@ -1164,17 +1166,19 @@ export class Dispatcher {
   };
 
   /** Takes back a park whose escalation never reached anyone. */
-  private unpark = async (incidentId: string): Promise<void> => {
+  private unpark = async (incidentId: string): Promise<boolean> => {
     try {
       await this.db.withWrite((db) => {
         db.prepare("DELETE FROM incident_wait WHERE incidentId = ?").run(incidentId);
       });
+      return true;
     } catch (err) {
       alarm("unpark_failed", {
         incidentId,
         error: String(err),
-        note: "parked with nobody told; the cooldown, a reply or the stale sweep lifts it",
+        note: "parked with nobody told; the cooldown, a reply or the stale sweep lifts it, and the escalation is tried again then",
       });
+      return false;
     }
   };
 

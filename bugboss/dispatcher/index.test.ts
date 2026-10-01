@@ -2783,6 +2783,53 @@ describe("Dispatcher escalations while writes fail", () => {
     cleanup();
   });
 
+  it("keeps its count when the post fails and the park cannot be taken back", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+
+    let halted = false;
+    let posts = 0;
+    let refuse = true;
+    const toolApiFor = (incidentId: string): ToolApi => ({
+      ...makeTools().toolApiFor(incidentId),
+      escalate: async () => {
+        posts += 1;
+        if (refuse) {
+          // The post fails, and so does every write after the park.
+          halted = true;
+          return { ok: false, error: "could not post the escalation", directives: [] };
+        }
+        return { ok: true, directives: [] };
+      },
+    });
+    const d = createDispatcher(
+      deps({
+        db: refusing(db, () => halted),
+        spawn: async () => {
+          throw new Error("agent exited 1");
+        },
+        toolApiFor,
+        config: config({ maxAttempts: 3 }),
+        parkCooldownSeconds: 60,
+      }),
+    );
+
+    for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
+    await captureAlarms(async () => {
+      await d.tick().then((r) => r.settled);
+    });
+    assert.equal(posts, 1);
+    assert.ok(db.get("SELECT 1 FROM incident_wait WHERE incidentId = 'i1'"), "stuck parked");
+
+    halted = false;
+    refuse = false;
+    sqlite.prepare("DELETE FROM incident_wait WHERE incidentId = 'i1'").run();
+    const lifted = await d.tick();
+
+    assert.deepEqual(lifted.escalated, ["i1"], "the ceiling is still met, so it is said once the park lifts");
+    cleanup();
+  });
+
   it("does not post a deadline escalation while writes fail", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
