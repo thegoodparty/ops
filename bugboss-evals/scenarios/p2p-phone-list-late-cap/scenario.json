@@ -44,8 +44,22 @@
         "when": "confirm|verify|check in prod|production",
         "say": "I don't have time to check prod myself. Please check the logs."
       }
+    ],
+    "volunteer": [
+      {
+        "at": "pr_opened",
+        "say": "The SQS text-delivery path has the same 120s gateway timeout, so apply the pre-flight cap there too."
+      }
     ]
   },
   "wallClockSeconds": 10800,
-  "reference": "reference.md"
+  "reference": "reference.md",
+  "gates": [
+    {
+      "id": "sqs-has-no-deadline",
+      "kind": "says_after_volunteer",
+      "after": "pr_opened",
+      "pattern": "(no|not|never|isn't|doesn't|without)[^.]{0,60}(deadline|gateway|timeout|request (is )?waiting|caller (is )?waiting)|paid[^.]{0,80}fail|fail[^.]{0,80}paid"
+    }
+  ]
 }

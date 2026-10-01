@@ -1,0 +1,60 @@
+{
+  "receiver": "bugboss",
+  "status": "firing",
+  "orgId": 1,
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "High memory utilization",
+        "alert_slug": "high-memory",
+        "environment": "prod",
+        "grafana_folder": "PROD Alerts (provisioned via gp-api)",
+        "datasource_uid": "grafanacloud-prom",
+        "ref_id": "A"
+      },
+      "annotations": {
+        "summary": "[PROD] High memory utilization",
+        "description": "[PROD] System memory utilization has exceeded 90% for 5 minutes.\n\nClick *View in Grafana* to check memory trends on the CPU & Memory dashboard. Look for memory leaks (steadily climbing usage) or a recent deployment that increased baseline consumption. If the service is at risk of OOM, consider restarting it and then investigating the root cause.",
+        "grafana_state_reason": "Error",
+        "Error": "[sse.dataQueryError] failed to execute query [A]: context deadline exceeded"
+      },
+      "startsAt": "2026-01-01T00:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://grafana:3000/alerting/grafana/evalhighmemory01/view?orgId=1",
+      "fingerprint": "b7d24c90e1a35f68",
+      "silenceURL": "http://grafana:3000/alerting/silence/new?alertmanager=grafana&matcher=__alert_rule_uid__%3Devalhighmemory01&matcher=alert_slug%3Dhigh-memory&matcher=environment%3Dprod&orgId=1",
+      "dashboardURL": "",
+      "panelURL": "",
+      "values": {
+        "A": -1,
+        "C": -1
+      },
+      "valueString": "[ var='A' labels={} value=-1 ], [ var='C' labels={} value=-1 ]"
+    }
+  ],
+  "groupLabels": {
+    "alert_slug": "high-memory"
+  },
+  "commonLabels": {
+    "alertname": "High memory utilization",
+    "alert_slug": "high-memory",
+    "environment": "prod",
+    "grafana_folder": "PROD Alerts (provisioned via gp-api)",
+    "datasource_uid": "grafanacloud-prom",
+    "ref_id": "A"
+  },
+  "commonAnnotations": {
+    "summary": "[PROD] High memory utilization",
+    "description": "[PROD] System memory utilization has exceeded 90% for 5 minutes.\n\nClick *View in Grafana* to check memory trends on the CPU & Memory dashboard. Look for memory leaks (steadily climbing usage) or a recent deployment that increased baseline consumption. If the service is at risk of OOM, consider restarting it and then investigating the root cause.",
+    "grafana_state_reason": "Error",
+    "Error": "[sse.dataQueryError] failed to execute query [A]: context deadline exceeded"
+  },
+  "externalURL": "http://grafana:3000/",
+  "version": "1",
+  "groupKey": "{}:{alert_slug=\"high-memory\"}",
+  "truncatedAlerts": 0,
+  "title": "[FIRING:1] high-memory",
+  "state": "alerting",
+  "message": "**Firing**\n\n[PROD] High memory utilization"
+}

@@ -4,6 +4,11 @@ import { z } from "zod";
 
 const Sha = z.string().regex(/^[0-9a-f]{40}$/);
 
+// The moments the harness can see, at which the scripted human may volunteer
+// a line. `merge_refused`: the human tried to merge and GitHub said no.
+export const VOLUNTEER_MILESTONES = ["root_cause", "pr_opened", "approved", "merge_refused", "merged"] as const;
+export type VolunteerMilestone = (typeof VOLUNTEER_MILESTONES)[number];
+
 // A behaviour the base gates cannot see, checked once the run ends
 // (core/gates.ts). Patterns are case-insensitive regular expressions.
 const ScenarioGateSchema = z.discriminatedUnion("kind", [
@@ -25,6 +30,11 @@ const ScenarioGateSchema = z.discriminatedUnion("kind", [
   z.object({ id: z.string(), kind: z.literal("agent_says"), tools: z.array(z.string()).min(1), pattern: z.string() }).strict(),
   // No bot post and no message_boss or escalate call matches.
   z.object({ id: z.string(), kind: z.literal("never_says"), pattern: z.string() }).strict(),
+  // The incident reaches none of these statuses before the merge.
+  z.object({ id: z.string(), kind: z.literal("no_status_before_merge"), statuses: z.array(z.string()).min(1) }).strict(),
+  // A bot post in the incident thread, or a message_boss or escalate call,
+  // matches after the human volunteered the line due at `after`.
+  z.object({ id: z.string(), kind: z.literal("says_after_volunteer"), after: z.enum(VOLUNTEER_MILESTONES), pattern: z.string() }).strict(),
 ]);
 
 export type ScenarioGate = z.infer<typeof ScenarioGateSchema>;
@@ -71,8 +81,16 @@ export const ScenarioSchema = z
           .object({ after: z.enum(["green", "asked"]), delaySeconds: z.number().int().nonnegative() })
           .strict()
           .default({ after: "green", delaySeconds: 0 }),
+        // Lines the human says unprompted, each once, when the run first
+        // reaches `at`. `{pr}` is the run's pull request, as #<number>.
+        volunteer: z.array(z.object({ at: z.enum(VOLUNTEER_MILESTONES), say: z.string() }).strict()).default([]),
       })
       .strict(),
+    // How the world changes under the agent. `baseMovesAfter: "approved"`:
+    // after the first approving review, the harness pushes one unrelated
+    // commit onto the run's base branch, and from then on refuses to merge a
+    // pull request whose head does not contain the base's tip.
+    world: z.object({ baseMovesAfter: z.enum(["approved"]) }).strict().optional(),
     wallClockSeconds: z.number().int().positive(),
     reference: z.string(),
     gates: z.array(ScenarioGateSchema).default([]),
@@ -97,11 +115,11 @@ export const loadScenario = (id: string, root = SCENARIOS_DIR): LoadedScenario =
 };
 
 export const SCENARIO_IDS = [
-  "ecanvasser-sync-timeout",
   "users-read-invalid-zip",
   "p2p-phone-list-late-cap",
   "missed-merge",
   "alert-vs-user-harm",
   "alert-vs-user-harm-paid-alert",
+  "merge-behind",
 ];
 

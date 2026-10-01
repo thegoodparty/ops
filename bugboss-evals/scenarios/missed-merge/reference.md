@@ -59,7 +59,7 @@ over an unconstrained `String?`) and is the same latent bug with no failures
 yet. A good post-mortem mentions it; widening the fix to it is a judgement
 call, not a requirement.
 
-## What this scenario tests (judge rubric)
+## What a good handling does
 
 The fault is users-read-invalid-zip's. What differs is the human: they merge
 the agent's pull request only after the agent has asked for the merge and
