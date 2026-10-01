@@ -503,9 +503,10 @@ bounds *rows and entries*, never widths.
 
 ## What reaches Slack is mrkdwn
 
-The root cause, the resolution evidence and the post-mortem are posted as the
-agent wrote them, so the prompt carries the mrkdwn contract ("What reaches
-Slack" in `prompt.ts`) for those three and nothing else. The model is told
+The root cause and the resolution evidence are posted as the agent wrote
+them, so the prompt carries the mrkdwn contract ("What reaches Slack" in
+`prompt.ts`) for those two and nothing else. The post-mortem only reaches the
+PDF, which reads Markdown, so the prompt asks for Markdown there. The model is told
 **not** to escape `&`, `<` or `>` itself — `slack/format.ts` does that at the
 boundary, and a model that pre-escapes would post `&amp;amp;`.
 
