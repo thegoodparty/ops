@@ -45,6 +45,7 @@ const runGoals = async (args: {
   queries?: string[];
   /** Directives the Boss has queued, drained by the first get_incident. */
   directives?: Directive[];
+  timelineFails?: boolean;
   judge: (body: string) => Verdict;
   turns: (kit: typeof import("@earendil-works/pi-ai")) => unknown[];
 }) => {
@@ -129,7 +130,10 @@ const runGoals = async (args: {
       }
       return ok(row);
     },
-    timelineEvents: async () => [...timeline],
+    timelineEvents: async () => {
+      if (args.timelineFails) throw new Error("timeline read failed");
+      return [...timeline];
+    },
   } as unknown as ToolApi & Pick<BossClient, "timelineEvents">;
   const tellBoss = async (kind: string, text: string) => {
     calls.told.push({ kind, text });
@@ -481,6 +485,21 @@ describe("stage goals, through a real Pi session", () => {
     assert.equal(run.calls.verdicts.length, 0);
     assert.match(run.agentRequests[1], /goal_verdict/);
     assert.doesNotMatch(run.agentRequests[1], /"ok\b/);
+  });
+
+  test("a timeline read that fails still delivers what the incident read drained", async () => {
+    const run = await runGoals({
+      timelineFails: true,
+      directives: [{ type: "stop", reason: "a person took it" }],
+      judge: () => verdict("met", "ok"),
+      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
+        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
+        fauxAssistantMessage("should not run"),
+      ],
+    });
+
+    assert.ok(run.logs.some((log) => log.event === "goal_unjudged"), "premise: the read failed");
+    assert.equal(run.agentRequests.length, 1, "the stop ended the run");
   });
 
   test("an evaluator that fails passes the gate, with an alarm", async () => {

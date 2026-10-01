@@ -2093,9 +2093,14 @@ export const goalApi = (
   alarm: (event: string, fields: Record<string, unknown>) => void,
 ): Pick<StageGoalsDeps, "context" | "recordVerdict" | "escalate"> => ({
   context: async () => {
-    const [view, timeline] = await Promise.all([api.getIncident(), api.timelineEvents()]);
-    if (!view.ok || !view.data) {
-      return { context: null, error: view.error ?? "no data", directives: view.directives ?? [] };
+    const view = await api.getIncident();
+    const directives = view.directives ?? [];
+    if (!view.ok || !view.data) return { context: null, error: view.error ?? "no data", directives };
+    let timeline: TimelineEvent[];
+    try {
+      timeline = await api.timelineEvents();
+    } catch (err: unknown) {
+      return { context: null, error: `the timeline could not be read: ${String(err)}`, directives };
     }
     const { incident, signals } = view.data;
     return {
@@ -2104,7 +2109,7 @@ export const goalApi = (
         signals: signals.map(({ id, kind, source, title, body }) => ({ id, kind, source, title, body })),
         timeline,
       },
-      directives: view.directives ?? [],
+      directives,
     };
   },
   recordVerdict: async (verdict) => {
