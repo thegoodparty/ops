@@ -121,15 +121,21 @@ export const DEADLINE_GRACE_SECONDS = 180;
  * fifteen agents do that at once. A turn is a model call, so it is the unit
  * that does not inflate while nobody is working.
  *
- * 200 rather than 92: high enough that no incident like the ones we have seen
- * touches it, low enough that a runaway stops. It is a bound before a dollar
+ * 300 rather than 92: high enough that no incident like the ones we have seen
+ * touches it, low enough that a runaway stops. It was 200 until several real
+ * investigations spent it mid-fix and parked, which is the measurement the
+ * escalation's spend line exists to produce. It is a bound before a dollar
  * cap, not instead of one -- the escalation carries what the run spent so the
  * next number is measured rather than guessed.
+ *
+ * Raising it resumes incidents parked on the old number: the dispatcher lifts
+ * a budget wait at boot when the incident's used turns are now under it. See
+ * `liftRaisedBudgets` in `dispatcher/index.ts`.
  *
  * Overridden by `BUGBOSS_MAX_TURNS`, which keeps the plain name because it is
  * the only turn budget that is settable from the environment.
  */
-export const INCIDENT_AGENT_MAX_TURNS = 200;
+export const INCIDENT_AGENT_MAX_TURNS = 300;
 
 /**
  * Turns held back from `maxTurns` for the hand-off, the way
@@ -1211,7 +1217,7 @@ export const turnBudgetBrief = (state: TurnBudgetState): string => {
     // nothing to do with having run out of turns. So the two things named
     // here are the two that actually move it, and both happen outside the
     // thread.
-    `The ${state.max}-turn budget for this incident is spent, so neither a reply in the thread nor a message to me will restart it. To continue the work, somebody has to raise BUGBOSS_MAX_TURNS or pick it up themselves.`,
+    `The ${state.max}-turn budget for this incident is spent, so neither a reply in the thread nor a message to me will restart it. To continue the work, somebody has to raise the turn budget, which resumes it on the next deploy, or pick it up themselves.`,
   ].join("\n");
 };
 

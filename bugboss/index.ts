@@ -2046,6 +2046,10 @@ export const createBugBoss = async (
       const raw = await store.get(sessionRef);
       return raw ? lastSessionEventAt(raw) : null;
     },
+    sessionTurns: async (sessionRef) => {
+      const raw = await store.get(sessionRef);
+      return raw ? sumSessionUsage(raw).turns : null;
+    },
     childBaseEnv: {
       ...pickBaseEnv(process.env),
       AWS_REGION: secrets.awsRegion ?? process.env.AWS_REGION,

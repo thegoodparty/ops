@@ -99,7 +99,7 @@ they block, so the first nine-hour incident spent about eight of those hours
 inside a single turn waiting on a person. 92 turns, $18.51, against a
 24-hour deadline that fifteen agents could each have spent in full.
 
-So there is a second bound in turns — `INCIDENT_AGENT_MAX_TURNS`, 200,
+So there is a second bound in turns — `INCIDENT_AGENT_MAX_TURNS`, 300,
 overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
 
 - **It is counted over the incident, not the process.** Every merge to ops
@@ -152,18 +152,20 @@ overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
   `shouldAnnounceExhaustion` is `!state.escalated` and nothing more. There
   was a second arm for a launch that began over budget, and it was treating
   the wake rather than preventing it; once a budget wait survives a reply
-  the wake does not happen. Nothing lifts a budget wait now: the stale sweep
+  the wake does not happen. No reply or timer lifts a budget wait: the stale sweep
   reads `liftsOnReply` too, so it announces one and leaves it standing
   rather than relaunching an agent that would exhaust before its first turn.
   Suppressing here as well would only take away the saying-so, and an
   incident a day quiet and still out of turns is exactly what should be said
   out loud.
   The brief says plainly that replying will not restart it, because it will
-  not — raising `BUGBOSS_MAX_TURNS` or taking the work over is what
-  continues it.
+  not — raising the turn budget or taking the work over is what continues
+  it. A raised budget resumes the incident on the next boot: the dispatcher
+  lifts a budget wait whose used turns are under the new number
+  (`liftRaisedBudgets`, `dispatcher/CLAUDE.md`).
 - **The brief carries what the run spent.** Turns, tokens and a cost
-  estimate, because shipping 200 before a dollar cap is only worth anything
-  if somebody learns what 200 turns costs. It is called an estimate there
+  estimate, because shipping a turn cap before a dollar cap is only worth
+  anything if somebody learns what those turns cost. It is called an estimate there
   too.
 
 **This is not the Slack agent's budget.** `SLACK_AGENT_MAX_TURNS` is 24 and
