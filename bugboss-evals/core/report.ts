@@ -4,13 +4,17 @@ import { addSpend, ZERO_SPEND, type Spend } from "./metrics";
 
 export type Side = "baseline" | "candidate";
 
+/** Where a run stops. `closed` is the whole lifecycle. */
+export type Milestone = "root_cause" | "pr_opened" | "closed";
+
+/** Null is not applicable: the run's tier stops before a merge. */
 export interface Gates {
   /** The incident reached CLOSED. */
-  closed: boolean;
-  /** The hidden check passed on what was merged. Null when nothing merged. */
+  closed: boolean | null;
+  /** The hidden check passed on what was merged. */
   fixed: boolean | null;
   /** Every merged pull request had green CI at its head. */
-  mergedGreen: boolean;
+  mergedGreen: boolean | null;
   /** Nothing moved the sandbox's main, or the run's base, except a merge. */
   noPushToMain: boolean;
 }
@@ -22,8 +26,7 @@ export const GATE_NAMES: Record<keyof Gates, string> = {
   noPushToMain: "no push to main",
 };
 
-export const gatesPass = (gates: Gates): boolean =>
-  gates.closed && gates.fixed === true && gates.mergedGreen && gates.noPushToMain;
+export const gatesPass = (gates: Gates): boolean => Object.values(gates).every((g) => g !== false);
 
 export interface RunResult {
   runId: string;
@@ -31,13 +34,15 @@ export interface RunResult {
   rep: number;
   side: Side;
   ref: string;
-  /** How the run ended: `closed`, `root_cause`, `pr_opened`, `wall_clock`, or `error: …`. */
+  /** Where the run's tier stops. */
+  until: Milestone;
+  /** How the run ended: `closed`, `root_cause`, `pr_opened`, `wall_clock`, `spend_cap`, or `error: …`. */
   end: string;
   gates: Gates;
   /** The scenario's own gates (core/gates.ts), by id. */
-  scenarioGates: Record<string, boolean>;
+  scenarioGates: Record<string, boolean | null>;
   spend: Spend;
-  /** From the alert to the close. Null when it never closed. */
+  /** From the alert to the tier's milestone. Null when it never got there. */
   wallClockSeconds: number | null;
   output: IncidentOutput;
 }
@@ -64,28 +69,32 @@ const minutes = (seconds: number | null) => (seconds === null ? "–" : `${Math.
 const mean = (values: number[]) => (values.length ? values.reduce((a, b) => a + b, 0) / values.length : null);
 const tokens = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 
+const MILESTONE_NAMES: Record<Milestone, string> = { root_cause: "root cause", pr_opened: "PR opened", closed: "close" };
+
+/** Passed over applicable, or n/a when the gate applied to none of the runs. */
+const ratio = (values: (boolean | null | undefined)[]) => {
+  const applicable = values.filter((v) => v !== null && v !== undefined);
+  return applicable.length ? `${applicable.filter((v) => v === true).length}/${applicable.length}` : "n/a";
+};
+
 interface SideSummary {
   runs: number;
   gatesPassed: number;
-  gateCounts: Record<keyof Gates, number>;
+  gateCells: Record<keyof Gates, string>;
   spend: Spend;
   meanUsd: number | null;
   meanWall: number | null;
 }
 
 const summarise = (runs: RunResult[]): SideSummary => {
-  const gateCounts = { closed: 0, fixed: 0, mergedGreen: 0, noPushToMain: 0 };
-  for (const run of runs) {
-    if (run.gates.closed) gateCounts.closed += 1;
-    if (run.gates.fixed === true) gateCounts.fixed += 1;
-    if (run.gates.mergedGreen) gateCounts.mergedGreen += 1;
-    if (run.gates.noPushToMain) gateCounts.noPushToMain += 1;
-  }
+  const gateCells = Object.fromEntries(
+    (Object.keys(GATE_NAMES) as (keyof Gates)[]).map((g) => [g, ratio(runs.map((r) => r.gates[g]))]),
+  ) as Record<keyof Gates, string>;
   const walls = runs.map((r) => r.wallClockSeconds).filter((w): w is number => w !== null);
   return {
     runs: runs.length,
     gatesPassed: runs.filter((r) => gatesPass(r.gates)).length,
-    gateCounts,
+    gateCells,
     spend: runs.reduce((sum, r) => addSpend(sum, r.spend), ZERO_SPEND),
     meanUsd: mean(runs.map((r) => r.spend.usd)),
     meanWall: walls.length ? mean(walls) : null,
@@ -109,7 +118,12 @@ export const renderReport = (args: {
   runs: RunResult[];
   verdicts: CaseVerdict[];
   judgeUsd: number;
+  /** `fast`, `full` or `stub`. */
+  tier: string;
+  /** The comparison's spend cap, summed over its jobs. Null when uncapped. */
+  capUsd: number | null;
 }): string => {
+  const milestone = MILESTONE_NAMES[args.runs[0]?.until ?? "closed"];
   const scenarios = [...new Set(args.runs.map((r) => r.scenario))].sort();
   const pick = (scenario: string | null, side: Side) =>
     args.runs.filter((r) => r.side === side && (scenario === null || r.scenario === scenario));
@@ -131,7 +145,7 @@ export const renderReport = (args: {
 
   const gateTable = (["baseline", "candidate"] as Side[]).map((side) => {
     const s = summarise(pick(null, side));
-    return `| ${side} | ${(Object.keys(GATE_NAMES) as (keyof Gates)[]).map((g) => `${s.gateCounts[g]}/${s.runs}`).join(" | ")} |`;
+    return `| ${side} | ${(Object.keys(GATE_NAMES) as (keyof Gates)[]).map((g) => s.gateCells[g]).join(" | ")} |`;
   });
 
   const spendTable = (["baseline", "candidate"] as Side[]).map((side) => {
@@ -142,10 +156,7 @@ export const renderReport = (args: {
   const scenarioGateRows = scenarios.flatMap((scenario) => {
     const ids = [...new Set(args.runs.filter((r) => r.scenario === scenario).flatMap((r) => Object.keys(r.scenarioGates ?? {})))];
     return ids.map((id) => {
-      const cell = (side: Side) => {
-        const runs = pick(scenario, side);
-        return `${runs.filter((r) => r.scenarioGates?.[id] === true).length}/${runs.length}`;
-      };
+      const cell = (side: Side) => ratio(pick(scenario, side).map((r) => r.scenarioGates?.[id]));
       return `| ${scenario} | ${id} | ${cell("baseline")} | ${cell("candidate")} |`;
     });
   });
@@ -153,11 +164,15 @@ export const renderReport = (args: {
   const failures = args.runs.filter((r) => !gatesPass(r.gates));
   const excluded = args.verdicts.filter((v) => v.excluded !== null);
   const unpriced = [...new Set(args.runs.flatMap((r) => r.spend.unpriced))];
+  const spent = args.runs.reduce((sum, r) => sum + r.spend.usd, 0) + args.judgeUsd;
+  const capped = args.runs.filter((r) => r.end === "spend_cap").length;
 
   return [
     "## BugBoss eval (advisory)",
     "",
-    `Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, mean estimated cost per run (priced from tokens), and mean time from alert to close. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
+    `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed, mean estimated cost per run (priced from tokens), and mean time from alert to ${milestone}. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge.`,
+    "",
+    `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
     "",
     "| Scenario | Baseline gates | cost | wall | Candidate gates | cost | wall | Quality W-L-T |",
     "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -190,7 +205,7 @@ export const renderReport = (args: {
           ...failures.map(
             (r) =>
               `- ${r.scenario} rep ${r.rep} ${r.side}: ended ${r.end}; ${(Object.keys(GATE_NAMES) as (keyof Gates)[])
-                .filter((g) => r.gates[g] !== true)
+                .filter((g) => r.gates[g] === false)
                 .map((g) => GATE_NAMES[g])
                 .join(", ")}`,
           ),

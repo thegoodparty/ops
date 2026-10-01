@@ -87,5 +87,8 @@ const passes = (gate: ScenarioGate, record: RunRecord): boolean => {
   }
 };
 
-export const scenarioGates = (gates: ScenarioGate[], record: RunRecord): Record<string, boolean> =>
-  Object.fromEntries(gates.map((gate) => [gate.id, passes(gate, record)]));
+const AFTER_MERGE = new Set<ScenarioGate["kind"]>(["thread_after_merge", "header_clears_after_merge", "status_after_merge", "turn_after_merge"]);
+
+/** With `beforeMerge`, the run's tier stopped before any merge, so a gate about the merge is null: not applicable. */
+export const scenarioGates = (gates: ScenarioGate[], record: RunRecord, beforeMerge = false): Record<string, boolean | null> =>
+  Object.fromEntries(gates.map((gate) => [gate.id, beforeMerge && AFTER_MERGE.has(gate.kind) ? null : passes(gate, record)]));

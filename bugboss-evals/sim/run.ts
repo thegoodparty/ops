@@ -9,7 +9,7 @@ import Database from "better-sqlite3";
 import { parsePiSession } from "../core/adapters/pi-session";
 import { scenarioGates, type RunRecord } from "../core/gates";
 import { spendOf } from "../core/metrics";
-import type { Gates, RunResult, Side } from "../core/report";
+import type { Gates, Milestone, RunResult, Side } from "../core/report";
 import { loadScenario } from "../core/scenario";
 import { startS3 } from "./s3";
 import {
@@ -70,11 +70,33 @@ export interface RunSpec {
   until?: Milestone;
   /** A shared npm cache, warmed once, every run's HOME points at. */
   npmCache?: string;
+  /** An omni tree at the scenario's base with its dependencies built, which the hidden check copies from. */
+  prebuilt?: string;
+  /** The job's spend, shared by every run in it. */
+  spend?: SpendPool;
   seed: number;
   log: (event: string, fields?: Record<string, unknown>) => void;
 }
 
-export type Milestone = "root_cause" | "pr_opened" | "closed";
+export type { Milestone };
+
+/**
+ * Every run in a job reports its live spend here; once the total reaches the
+ * stop point every run ends with `spend_cap`. In-flight turns land after the
+ * stop, so the stop sits below the cap.
+ */
+export interface SpendPool {
+  record: (runId: string, usd: number) => void;
+  exhausted: () => boolean;
+}
+
+export const createSpendPool = (capUsd: number, stopAt = 0.9): SpendPool => {
+  const spent = new Map<string, number>();
+  return {
+    record: (runId, usd) => void spent.set(runId, usd),
+    exhausted: () => [...spent.values()].reduce((a, b) => a + b, 0) >= capUsd * stopAt,
+  };
+};
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -92,7 +114,7 @@ const freePort = (): Promise<number> =>
  * key, not the workflow's token, not the runner's sudo. umask 0 so the
  * harness, as the runner, can still read and write what it leaves behind.
  */
-const asUser = (runAs: string | undefined, command: string, args: string[], env: Record<string, string>) =>
+export const asUser = (runAs: string | undefined, command: string, args: string[], env: Record<string, string>) =>
   runAs
     ? {
         command: "sudo",
@@ -239,6 +261,19 @@ const sessionsUnder = (dir: string): string[] =>
       })
     : [];
 
+/** The agents' sessions as they are being written, under each incident's `session/` directory. A half-written last line is left for the next read. */
+const liveTraces = (work: string) =>
+  sessionsUnder(work)
+    .filter((path) => path.includes("/session/"))
+    .flatMap((path) => {
+      const text = readFileSync(path, "utf8");
+      try {
+        return [parsePiSession(path, text.slice(0, text.lastIndexOf("\n") + 1))];
+      } catch {
+        return [];
+      }
+    });
+
 const exec = (command: string, args: string[], options: { env?: Record<string, string>; timeoutMs?: number; log?: string } = {}): Promise<number | null> =>
   new Promise((resolve) => {
     const child = spawn(command, args, { env: options.env ?? process.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -373,6 +408,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const said = new Set<string>();
   let replies = 0;
   let mergedAt: number | null = null;
+  let milestoneAt: number | null = null;
   let mergeAskedAt: number | null = null;
   const statuses: RunRecord["statuses"] = [];
   const deadline = alertAt + scenario.wallClockSeconds * 1000;
@@ -417,12 +453,25 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         mergedAt ??= Date.now();
         if (deploying) return;
         spec.log("deploying", { sha });
-        deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, { PATH: env.PATH, HOME: home, OMNI_TEST_POSTGRES_URL: postgres.url }).then((passed) => {
+        deploying = hiddenCheck(spec, scenarioDir, scenario.check, sha, {
+          PATH: env.PATH,
+          HOME: home,
+          OMNI_TEST_POSTGRES_URL: postgres.url,
+          ...(spec.prebuilt ? { OMNI_PREBUILT: spec.prebuilt } : {}),
+        }).then((passed) => {
           fixed = passed;
           spec.log("deployed", { fixed });
           if (passed) emitter.setState("healthy");
         });
       } }).catch((e: unknown) => spec.log("github_step_failed", { error: String(e) }));
+
+      if (spec.spend) {
+        spec.spend.record(spec.runId, spendOf(liveTraces(work)).usd);
+        if (spec.spend.exhausted()) {
+          end = "spend_cap";
+          break;
+        }
+      }
 
       const incident = readIncident(dbPath);
       if (incident && statuses.at(-1)?.status !== incident.status) statuses.push({ at: Date.now(), status: incident.status });
@@ -433,10 +482,12 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       }
       if (until === "root_cause" && incident?.rootCause) {
         end = "root_cause";
+        milestoneAt = Date.now();
         break;
       }
       if (until === "pr_opened" && pulls.size > 0) {
         end = "pr_opened";
+        milestoneAt = Date.now();
         break;
       }
       await sleep(15_000);
@@ -461,8 +512,16 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
 
   const incident = readIncident(dbPath);
   const merged = [...pulls.entries()].filter(([, p]) => p.mergedGreen !== null);
-  const traces = sessionsUnder(s3Root).map((path) => parsePiSession(path, readFileSync(path, "utf8")));
-  let gates: Gates = { closed: incident?.status === "CLOSED", fixed, mergedGreen: merged.every(([, p]) => p.mergedGreen === true), noPushToMain: true };
+  // A run stopped early may never have rolled its session up to S3.
+  const rolledUp = sessionsUnder(s3Root).map((path) => parsePiSession(path, readFileSync(path, "utf8")));
+  const traces = rolledUp.length ? rolledUp : liveTraces(work);
+  const lifecycle = until === "closed";
+  let gates: Gates = {
+    closed: lifecycle ? incident?.status === "CLOSED" : null,
+    fixed: lifecycle ? fixed === true : null,
+    mergedGreen: lifecycle ? merged.every(([, p]) => p.mergedGreen === true) : null,
+    noPushToMain: true,
+  };
   let diff: string | null = null;
   let firstPrFiles: string[] | null = null;
   if (sandbox) {
@@ -496,17 +555,19 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     traces,
   };
 
+  const reachedAt = lifecycle ? closedAt : milestoneAt;
   const result: RunResult = {
     runId: spec.runId,
     scenario: scenario.id,
     rep: spec.rep,
     side: spec.side,
     ref: spec.ref,
+    until,
     end,
     gates,
-    scenarioGates: scenarioGates(scenario.gates, record),
+    scenarioGates: scenarioGates(scenario.gates, record, !lifecycle),
     spend: spendOf(traces),
-    wallClockSeconds: closedAt ? Math.round((closedAt - alertAt) / 1000) : null,
+    wallClockSeconds: reachedAt ? Math.round((reachedAt - alertAt) / 1000) : null,
     output: { rootCause: incident?.rootCause ?? null, diff, postmortem: incident?.postmortem ?? null },
   };
   writeFileSync(join(spec.root, "result.json"), JSON.stringify(result, null, 2));

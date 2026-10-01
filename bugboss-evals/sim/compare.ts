@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
 import { renderReport, type RunResult, type Side } from "../core/report";
 import { loadScenario, SCENARIO_IDS } from "../core/scenario";
-import { runOne, type Milestone, type Stack } from "./run";
+import { asUser, createSpendPool, runOne, type Milestone, type Stack } from "./run";
 import { scenarioBranch, SANDBOX_URL } from "./sandbox";
 import { startStubModel } from "./stub-model";
 
@@ -18,7 +18,11 @@ import { startStubModel } from "./stub-model";
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
  *     --token-file /tmp/token --out /tmp/evals [--scenarios a,b] [--reps 3] [--stub <omni>] [--run-as user] \
- *     [--until root_cause|pr_opened|closed] [--offline]
+ *     [--until root_cause|pr_opened|closed] [--offline] [--spend-cap-usd 6.67]
+ *
+ * `--spend-cap-usd` is this process's share of the comparison's cap: every
+ * run stops, ending `spend_cap`, once their live sessions together price at
+ * 90% of it.
  *
  * `--offline` needs `--stub`: no GitHub and no token, the sandbox a local
  * bare repository with the scenario's base as one commit, each run ending at
@@ -29,6 +33,7 @@ import { startStubModel } from "./stub-model";
 
 const OPS_ROOT = resolve(__dirname, "..", "..");
 const STACK_DIR = join(__dirname, "stack");
+const SETUP_OMNI = join(__dirname, "..", "scenarios", "_lib", "setup-omni.sh");
 
 const log = (event: string, fields: Record<string, unknown> = {}) =>
   console.error(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
@@ -145,18 +150,27 @@ const offlineRepo = (omni: string, id: string, out: string): { repo: string; bas
 };
 
 /**
- * One npm cache for every run, warmed with each scenario's lockfile, so the
- * agents' installs and the hidden checks' read tarballs from disk instead of
- * the registry. Each run's HOME links `.npm` to it.
+ * An omni tree at one base with its dependencies installed and built, as the
+ * run-as user, through the hidden check's own setup. It warms the one npm
+ * cache every run's HOME links `.npm` to, and the hidden check hardlinks its
+ * node_modules. Skipped when the workflow's cache restored it. False when the
+ * build failed, and the checks then install for themselves.
  */
-const warmNpmCache = async (cache: string, dir: string): Promise<void> => {
-  await new Promise<void>((resolve) =>
-    execFile("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", cache], { cwd: dir, maxBuffer: 1 << 26 }, (error) => {
-      if (error) log("npm_cache_warm_failed", { dir, error: error.message.slice(0, 500) });
-      resolve();
+const prebuild = async (dir: string, npmCache: string, runAs: string | undefined): Promise<boolean> => {
+  if (existsSync(join(dir, "node_modules"))) return true;
+  const home = join(dir, "..", `${dir.split("/").pop()}-home`);
+  mkdirSync(home, { recursive: true });
+  execFileSync("chmod", ["-R", "a+rwX", dir, home, npmCache]);
+  const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, npm_config_cache: npmCache };
+  const { command, args, env: stepEnv } = asUser(runAs, "bash", [SETUP_OMNI, dir], env);
+  const ok = await new Promise<boolean>((resolve) =>
+    execFile(command, args, { env: stepEnv ?? env, maxBuffer: 1 << 28 }, (error, _stdout, stderr) => {
+      if (error) log("prebuild_failed", { dir, error: error.message, stderr });
+      resolve(!error);
     }),
   );
-  rmSync(join(dir, "node_modules"), { recursive: true, force: true });
+  if (!ok) rmSync(join(dir, "node_modules"), { recursive: true, force: true });
+  return ok;
 };
 
 const run = async (argv: string[]): Promise<void> => {
@@ -172,6 +186,8 @@ const run = async (argv: string[]): Promise<void> => {
   const runAs = flag(argv, "run-as");
   const sides = (flag(argv, "sides")?.split(",") ?? ["baseline", "candidate"]) as Side[];
   const until = flag(argv, "until") as Milestone | undefined;
+  const capUsd = flag(argv, "spend-cap-usd") === undefined ? null : Number(flag(argv, "spend-cap-usd"));
+  const spend = capUsd === null ? undefined : createSpendPool(capUsd);
   if (offline && !stubOmni) throw new Error("--offline runs only against the stub: pass --stub <omni>");
   if (!offline && !existsSync(tokenFile)) throw new Error("--token-file must name the file the trusted minter keeps fresh");
   mkdirSync(out, { recursive: true });
@@ -180,18 +196,20 @@ const run = async (argv: string[]): Promise<void> => {
 
   const npmCache = join(out, "npm-cache");
   mkdirSync(npmCache, { recursive: true });
+  const baseOf = (id: string) => loadScenario(id).scenario.omni.baseSha;
+  const prebuilt: Record<string, string> = {};
   const warming = Promise.all(
-    [...new Set(scenarios.map((id) => loadScenario(id).scenario.omni.baseSha))].map(async (sha) => {
-      const id = scenarios.find((s) => loadScenario(s).scenario.omni.baseSha === sha)!;
-      if (offline) return warmNpmCache(npmCache, join(out, "offline", id, "base"));
-      const dir = join(out, "warm", id);
-      const token = readFileSync(tokenFile, "utf8").trim();
-      const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
-      await new Promise<void>((resolve) =>
-        execFile("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--depth", "1", "--branch", scenarioBranch(id), SANDBOX_URL, dir], () => resolve()),
-      );
-      if (existsSync(join(dir, "package-lock.json"))) await warmNpmCache(npmCache, dir);
-      rmSync(dir, { recursive: true, force: true });
+    [...new Set(scenarios.map(baseOf))].map(async (sha) => {
+      const id = scenarios.find((s) => baseOf(s) === sha)!;
+      const dir = offline ? join(out, "offline", id, "base") : join(out, "prebuilt", sha);
+      if (!offline && !existsSync(join(dir, "package-lock.json"))) {
+        const token = readFileSync(tokenFile, "utf8").trim();
+        const auth = `http.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+        await new Promise<void>((resolve) =>
+          execFile("git", ["-c", "credential.helper=", "-c", auth, "clone", "-q", "--depth", "1", "--branch", scenarioBranch(id), SANDBOX_URL, dir], () => resolve()),
+        );
+      }
+      if (existsSync(join(dir, "package-lock.json")) && (await prebuild(dir, npmCache, runAs))) prebuilt[sha] = dir;
     }),
   );
 
@@ -230,6 +248,8 @@ const run = async (argv: string[]): Promise<void> => {
             tokenFile,
             awsCredentialsUrl,
             npmCache,
+            ...(prebuilt[baseOf(scenarioId)] ? { prebuilt: prebuilt[baseOf(scenarioId)] } : {}),
+            ...(spend ? { spend } : {}),
             ...(offline ? { offline: offlineRepos[scenarioId] } : {}),
             ...(until ? { until } : {}),
             ...(stub ? { stubModelUrl: stub.url } : {}),
@@ -277,14 +297,15 @@ const run = async (argv: string[]): Promise<void> => {
       );
     }
   }
-  writeFileSync(join(out, "results.json"), JSON.stringify({ baselineRef, candidateRef, runs, verdicts }, null, 2));
+  writeFileSync(join(out, "results.json"), JSON.stringify({ baselineRef, candidateRef, spendCapUsd: capUsd, runs, verdicts }, null, 2));
   log("results_written", { path: join(out, "results.json") });
 };
 
 const report = (argv: string[]): void => {
   const files = argv.filter((a, i) => !a.startsWith("--") && !argv[i - 1]?.startsWith("--"));
-  const all = files.map((f) => JSON.parse(readFileSync(f, "utf8")) as { runs: RunResult[]; verdicts: CaseVerdict[] });
+  const all = files.map((f) => JSON.parse(readFileSync(f, "utf8")) as { spendCapUsd: number | null; runs: RunResult[]; verdicts: CaseVerdict[] });
   const verdicts = all.flatMap((a) => a.verdicts);
+  const caps = all.map((a) => a.spendCapUsd).filter((c): c is number => typeof c === "number");
   process.stdout.write(
     renderReport({
       baselineRef: flag(argv, "baseline") ?? "main",
@@ -292,6 +313,8 @@ const report = (argv: string[]): void => {
       runs: all.flatMap((a) => a.runs),
       verdicts,
       judgeUsd: verdicts.reduce((sum, v) => sum + v.judgeCostUsd, 0),
+      tier: flag(argv, "tier") ?? "full",
+      capUsd: caps.length ? caps.reduce((a, b) => a + b, 0) : null,
     }) + "\n",
   );
 };
