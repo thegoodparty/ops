@@ -11,12 +11,17 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-const exec = (command: string, args: string[], cwd?: string): Promise<string> =>
+const exec = (
+  command: string,
+  args: string[],
+  cwd?: string,
+  timeout?: number,
+): Promise<string> =>
   new Promise((resolve, reject) => {
     execFile(
       command,
       args,
-      { cwd, maxBuffer: 16 * 1024 * 1024, encoding: "utf8" },
+      { cwd, timeout, maxBuffer: 16 * 1024 * 1024, encoding: "utf8" },
       (error, stdout, stderr) => {
         if (error) reject(new Error(`${command} failed: ${stderr || stdout || error.message}`));
         else resolve(stdout);
@@ -204,6 +209,14 @@ export const sweepWorkspaces = async (args: {
   return swept;
 };
 
+// In a child process, never `fs.rm`. Node's recursive rm queues one libuv
+// threadpool task per file, and the Boss's DNS lookups wait in that same
+// four-thread queue. Emptying a workspace with node_modules on EFS starved
+// every new outbound connection for minutes: Slack, S3 and Bedrock calls all
+// timed out while the event loop itself stayed healthy.
+//
+// The deadline is above the 23 minutes a full omni workspace took on 10-01. A
+// killed rm loses nothing: the next tick's rm starts on what is left.
 export const emptyTrash = async (workRoot: string): Promise<void> => {
-  await rm(join(workRoot, TRASH_DIR), { recursive: true, force: true });
+  await exec("rm", ["-rf", join(workRoot, TRASH_DIR)], undefined, 45 * 60 * 1000);
 };
