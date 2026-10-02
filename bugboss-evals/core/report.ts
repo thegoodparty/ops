@@ -207,6 +207,18 @@ export const renderReport = (args: {
     "",
     qualityCall(args.verdicts),
     "",
+    "<details><summary>Judge's reasoning, pair by pair</summary>",
+    "",
+    ...args.verdicts
+      .filter((v) => v.excluded === null)
+      .flatMap((v) => [
+        `**${v.pairId}**: ${v.winner === "tie" ? "tie" : `${v.winner} ${v.margin.replace("_", " ")}`}${v.flipped ? " (flipped when swapped, excluded from the count)" : ""}. Decided on ${v.decidingCriterion}.`,
+        "",
+        v.rationale,
+        "",
+      ]),
+    "</details>",
+    "",
     "<details><summary>Gates and tokens</summary>",
     "",
     `| Side | ${Object.values(GATE_NAMES).join(" | ")} |`,

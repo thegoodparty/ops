@@ -152,6 +152,9 @@ jobs:
           path: |
             ${{ env.OUT }}/results.json
             ${{ env.OUT }}/runs/*/result.json
+            ${{ env.OUT }}/runs/*/activity.json
+            ${{ env.OUT }}/runs/*/diff.patch
+            ${{ env.OUT }}/runs/*/proxy.jsonl
             ${{ env.OUT }}/runs/*/*.log
             ${{ env.OUT }}/runs/*/state/*.log
             ${{ env.OUT }}/runs/*/slack.json
