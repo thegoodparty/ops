@@ -183,10 +183,16 @@ jobs:
           TIER: ${{ needs.gate.outputs.tier }}
         run: |
           files=$(ls results/*/results.json 2>/dev/null || true)
+          found=$(echo "$files" | grep -c . || true)
+          expected=$(ls bugboss-evals/scenarios/*/scenario.json | wc -l | tr -d ' ')
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -z "$files" ]; then
-            body="BugBoss eval produced no results: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            body="Incident eval produced no results: $run_url"
           else
             body="$(npx tsx bugboss-evals/sim/compare.ts report --tier "$TIER" --baseline main --candidate "${{ needs.gate.outputs.sha }}" $files)"
+            if [ "$found" -lt "$expected" ]; then
+              body="> [!WARNING]"$'\n'"> Partial results: $found of $expected scenarios finished. The table omits the rest; the failures are in the [run log]($run_url)."$'\n\n'"$body"
+            fi
           fi
           if [ "$TIER" = stub ]; then
             body="**Stub run**: scripted model, one rep, no Bedrock. It shows the pipeline works, not whether the change is better."$'\n\n'"$body"
