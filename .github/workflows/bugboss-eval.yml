@@ -32,6 +32,8 @@ jobs:
     outputs:
       sha: ${{ steps.pr.outputs.sha }}
       tier: ${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}
+      # Reps are a matrix dimension, so a full tier runs its reps in parallel.
+      reps: ${{ github.event.comment.body == 'bugboss eval full' && '[1, 2, 3]' || '[1]' }}
     steps:
       - id: pr
         env:
@@ -58,8 +60,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One runner per scenario: six omni checkouts, their installs and the
-        # hidden check's fill one runner's disk, so this is the smallest split.
+        # One runner per scenario and rep: six omni checkouts, their installs
+        # and the hidden check's fill one runner's disk, so this is the
+        # smallest split, and reps in parallel keep a full tier to one run's
+        # wall clock.
         scenario:
           - users-read-invalid-zip
           - p2p-phone-list-late-cap
@@ -67,6 +71,7 @@ jobs:
           - alert-vs-user-harm
           - alert-vs-user-harm-paid-alert
           - merge-behind
+        rep: ${{ fromJSON(needs.gate.outputs.reps) }}
     env:
       OUT: /tmp/bugboss-eval/out
     steps:
@@ -121,24 +126,24 @@ jobs:
       - name: Run
         env:
           TIER: ${{ needs.gate.outputs.tier }}
-          JOBS: ${{ strategy.job-total }}
           GH_TOKEN: ghs_bugbossevalfaketoken
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Each job holds its even share of the comparison's cap.
-          share() { awk -v cap="$1" -v jobs="$JOBS" 'BEGIN { printf "%.2f", cap / jobs }'; }
+          # The cap is per run. A prod incident cost about $55 to close and
+          # about $3 bought six minutes of investigation, so these reach the
+          # tier's milestone with room, and nothing more.
           case "$TIER" in
-            fast) mode=(--reps 1 --until pr_opened --spend-cap-usd "$(share 40)") ;;
-            full) mode=(--reps 3 --spend-cap-usd "$(share 200)") ;;
+            fast) mode=(--until pr_opened --spend-cap-per-run-usd 25) ;;
+            full) mode=(--spend-cap-per-run-usd 60) ;;
           esac
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
             --runtime bugboss --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
-            --scenarios "${{ matrix.scenario }}" "${mode[@]}" \
+            --scenarios "${{ matrix.scenario }}" --rep "${{ matrix.rep }}" "${mode[@]}" \
             --omni /tmp/omni --out "$OUT" --run-as bugboss-eval
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.scenario }}
+          name: results-${{ matrix.scenario }}-${{ matrix.rep }}
           path: |
             ${{ env.OUT }}/results.json
             ${{ env.OUT }}/runs/*/result.json
@@ -177,7 +182,7 @@ jobs:
         run: |
           files=$(ls results/*/results.json 2>/dev/null || true)
           found=$(echo "$files" | grep -c . || true)
-          expected=$(ls bugboss-evals/scenarios/*/scenario.json | wc -l | tr -d ' ')
+          expected=$(( $(ls bugboss-evals/scenarios/*/scenario.json | wc -l | tr -d ' ') * $(jq length <<< '${{ needs.gate.outputs.reps }}') ))
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -z "$files" ]; then
             body="Incident eval produced no results: $run_url"

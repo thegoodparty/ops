@@ -24,8 +24,8 @@ import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from ".
  * `report`: one or more results.json into the table posted on the PR.
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
- *     --omni /tmp/omni --out /tmp/evals [--runtime bugboss] [--scenarios a,b] [--reps 3] \
- *     [--run-as user] [--until pr_opened|closed] [--spend-cap-usd 6.67] [--idle-minutes 15]
+ *     --omni /tmp/omni --out /tmp/evals [--runtime bugboss] [--scenarios a,b] [--reps 3 | --rep 2] \
+ *     [--run-as user] [--until pr_opened|closed] [--spend-cap-usd 6.67 | --spend-cap-per-run-usd 25] [--idle-minutes 15]
  *
  * `--runtime` names the system under test (`sim/runtimes/`); both refs are
  * built by it. `--omni` is a clone holding every scenario's shas, which seeds
@@ -174,6 +174,8 @@ const run = async (argv: string[]): Promise<void> => {
   const candidateRef = flag(argv, "candidate") ?? "HEAD";
   const scenarios = flag(argv, "scenarios")?.split(",") ?? SCENARIO_IDS;
   const reps = Number(flag(argv, "reps") ?? 3);
+  // `--rep N` runs one rep of each scenario, so a matrix can spread reps over jobs.
+  const repNumbers = flag(argv, "rep") === undefined ? Array.from({ length: reps }, (_, i) => i + 1) : [Number(flag(argv, "rep"))];
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
   if (!anthropicApiKey) throw new Error("ANTHROPIC_API_KEY is unset: the system under test and the judge both spend through it");
   const runAs = flag(argv, "run-as");
@@ -181,7 +183,13 @@ const run = async (argv: string[]): Promise<void> => {
   const until = flag(argv, "until") as Milestone | undefined;
   const maxRunMinutes = flag(argv, "max-run-minutes");
   const idleMinutes = Number(flag(argv, "idle-minutes") ?? 15);
-  const capUsd = flag(argv, "spend-cap-usd") === undefined ? null : Number(flag(argv, "spend-cap-usd"));
+  const perRunCapUsd = flag(argv, "spend-cap-per-run-usd") === undefined ? null : Number(flag(argv, "spend-cap-per-run-usd"));
+  const capUsd =
+    flag(argv, "spend-cap-usd") !== undefined
+      ? Number(flag(argv, "spend-cap-usd"))
+      : perRunCapUsd !== null
+        ? perRunCapUsd * scenarios.length * repNumbers.length * sides.length
+        : null;
   const spend = capUsd === null ? undefined : createSpendPool(capUsd);
   if (!existsSync(join(omni, ".git"))) throw new Error("--omni must name a clone holding every scenario's shas");
   mkdirSync(out, { recursive: true });
@@ -238,7 +246,7 @@ const run = async (argv: string[]): Promise<void> => {
   const stamp = Date.now().toString(36);
 
   const jobs = scenarios.flatMap((scenarioId) =>
-    Array.from({ length: reps }, (_, i) => i + 1).flatMap((rep) =>
+    repNumbers.flatMap((rep) =>
       sides.map(async (side): Promise<RunResult> => {
         const runId = `${stamp}-${scenarioId}-${rep}-${side}`;
         return runOne({
@@ -329,7 +337,7 @@ const run = async (argv: string[]): Promise<void> => {
       alert: JSON.parse(readFileSync(join(dir, scenario.alert.file), "utf8")),
       reference: readFileSync(join(dir, scenario.reference), "utf8"),
     };
-    for (let rep = 1; rep <= reps; rep++) {
+    for (const rep of repNumbers) {
       const baseline = runs.find((r) => r.scenario === scenarioId && r.rep === rep && r.side === "baseline");
       const candidate = runs.find((r) => r.scenario === scenarioId && r.rep === rep && r.side === "candidate");
       if (!baseline || !candidate) continue;

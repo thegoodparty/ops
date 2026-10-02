@@ -11,17 +11,18 @@ and it scores only what came back out through those same surfaces. So two
 systems built nothing alike, one agent or a swarm or a state machine, are
 measured on the same terms.
 
-| Comment | Runs | Each run stops at | Spend cap |
+| Comment | Runs | Each run stops at | Cap per run |
 | --- | --- | --- | --- |
-| `bugboss eval` | 1 rep per scenario, 6 pairs | the PR opening | $40 |
-| `bugboss eval full` | 3 reps per scenario | the close | $200 |
+| `bugboss eval` | 1 rep per scenario, 6 pairs, 12 runs | the PR opening | $25, about $300 all in |
+| `bugboss eval full` | 3 reps per scenario, 18 pairs, 36 runs | the close | $60, about $2,200 all in |
 
 The model is the Anthropic API, paid for with `ANTHROPIC_API_KEY` from the
 repository's secrets. Nothing in the eval touches AWS or `deploy/`.
 
 One rep of six scenarios is six pairs, the fewest the sign test can call.
-Each matrix job holds an even share of the cap, and every run in it stops,
-ending `spend_cap`, once their live sessions price at 90% of that share.
+Each matrix job is one scenario and one rep, both sides, so reps run in
+parallel and a full tier takes one run's wall clock. A run stops, ending
+`spend_cap`, once its job's live sessions price at 90% of the job's cap.
 
 ## What a run is
 
