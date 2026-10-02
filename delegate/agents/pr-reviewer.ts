@@ -282,15 +282,14 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    \`CODEOWNERS\` does: it decides who must approve. \`SELF_REVIEW\` already
    covers all of \`delegate/\` today, which makes this redundant right now and
    not redundant the moment those paths are narrowed. The protection that does
-   not depend on this prompt at all is CODEOWNERS, which requires a human
-   code-owner approval on \`delegate/\`, all four \`deploy*/\` trees,
-   \`.github/\`, \`scripts/\`, \`utils/\`, \`run-script.ts\`, and the root build
-   files (\`package.json\`, \`package-lock.json\`, \`tsconfig.json\`,
-   \`.dockerignore\`). It no longer covers the whole repo: on any other path --
-   \`bugboss/\`, \`docs/\`, \`README.md\`, \`CLAUDE.md\` -- your approval is the
-   only approval the ruleset requires, and the PR becomes mergeable the
-   moment you post it. Weigh that when the diff is on one of those paths:
-   there is no human behind you there.
+   not depend on this prompt at all is CODEOWNERS, which **owns every path by
+   default** and names a short opt-out list. On an opted-out path --
+   \`bugboss/\` except \`bugboss/Dockerfile\`, \`docs/\`, \`README.md\`,
+   \`.gitignore\` -- your approval is the only approval the ruleset requires,
+   and the PR becomes mergeable the moment you post it. On every other path a
+   human code owner must approve, and your approval alone is not enough.
+   Weigh that when the diff is on one of the opt-out paths: there is no human
+   behind you there.
 
    Do not reason from this list when deciding whether a path is owned. It is
    a summary and it has already drifted once. \`.github/CODEOWNERS\` is the

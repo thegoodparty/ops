@@ -1,94 +1,103 @@
 # Who must approve what in this repo.
 #
-# The ruleset on the default branch requires one approving review and
-# code-owner review. Code owners are listed below by path; every path NOT
-# listed has no owner, so the code-owner requirement is satisfied vacuously
-# and the single required approval can come from anyone who can review --
-# including delegate-reviewer[bot], whose approvals are real approvals.
+# The default is a human on @thegoodparty/gp-contrib: `*` below owns every
+# path, and the opt-out list after it is the entire set of paths that can
+# merge on a bot approval. The ruleset on the default branch requires one
+# approving review and code-owner review, and a path with no owner satisfies
+# the code-owner half vacuously, so a pattern with no owners opts a path out.
 #
-# So the list below is the whole boundary. A path on it needs a human; a path
-# off it can merge on a bot approval alone.
+# Deliberately opt-out rather than opt-in. An opt-in list has to be extended
+# every time a tree is added, and forgetting is silent: a new Pulumi project
+# or a new credentialled workflow lands with no human behind it. With `*`
+# owned, adding a directory cannot leave it unowned. The cost moves to the
+# other side and fails safe -- a new tree that should merge on a bot approval
+# needs an opt-out line, and until it has one it needs a human.
 #
 # gp-contrib is used because it is the only team with write access to this
 # repo; gp-secops has read only, and GitHub silently ignores code owners
 # without write access.
 #
-# ## The test
+# ## The test for an opt-out
 #
-# Scoped access that does not touch security posture does not need a human.
-# Applying it means asking not "is this application code?" but "what
-# credential can this reach?" -- and in this repo the answer is often not the
-# tree the file lives in. Three of the entries below are here only because
-# something outside their directory reaches in.
+# Ask what credential the path can reach, not whether it is application code.
+# A path belongs on the opt-out list only if nothing in it -- and nothing that
+# reads or executes it -- can change what a credential is allowed to do, or
+# what code runs with one. When in doubt, leave it owned: the whole point of
+# the default is that the safe answer is the one you get by not acting.
 #
-# ## The trees that define the posture
+# ## The opt-outs
 #
-# `/.github/` -- all of it. OIDC trust keys on the ref, not the filename, so a
-# workflow *added* on main can assume the deploy roles. This file is here for
-# the obvious reason: it decides who must approve.
+# `/bugboss/` -- application code. Its AWS reach is fixed in
+# `deploy/components/bugboss.ts`, which is owned, and `.github/workflows/deploy.yml`
+# runs install, test and build before the credentials step, so a bot-approved
+# BugBoss change does not reach the deploy role. `bugboss/Dockerfile` is
+# re-owned below; see there.
 #
-# `/delegate/` -- all of it, not just `agents/pr-reviewer.ts`. The framework,
-# the lambda dispatcher, the worker entrypoint and the subagent prompts all
-# shape what the reviewer does, and every delegate agent shares one worker
-# runtime and one GitHub App installation token with write access to the
-# product repos. Letting the reviewer's approval merge a change to the
-# reviewer collapses the boundary between coder and reviewer.
+# `/docs/`, `/README.md` -- documentation.
 #
-# `/deploy/`, `/deploy-org/`, `/deploy-workbench/`, `/deploy-infrastructure/`
-# -- all four Pulumi projects, not just the role and permission-set files. A
-# new component that mints an IAM role is one `index.ts` import away.
+# `/.gitignore` -- inert.
 #
-# ## The paths that reach a credential from outside their tree
+# Everything else is owned by the default. The trees that define the posture
+# are the ones to keep in mind when reviewing an opt-out request:
 #
-# `/utils/` -- `deploy/components/identity-center/policies.ts` imports
-# `bedrockInvokeResources` from `utils/bedrock-models.ts`, and the account ids
-# in `utils/accounts.ts` feed the same permission set's resource ARNs. Those
-# read like constants files and edit like IAM policy.
-#
-# `/scripts/`, `/run-script.ts` -- `.github/workflows/deploy-workbench.yml`
-# triggers on `scripts/enable-bedrock-models.ts` and runs `APPLY=1 npm run
-# script enable-bedrock-models` under a deploy role; that script accepts model
-# provider terms on GoodParty's behalf. `run-script.ts` dynamically imports
-# anything in `scripts/`, so the entrypoint is generic even though the
-# workflow trigger is not.
-#
-# `/package.json`, `/package-lock.json`, `/tsconfig.json` -- one
-# `package.json` builds every image, so a dependency added for any one
-# service also installs into the delegate worker that holds the GitHub App
-# token.
-# `tsconfig.json` governs the same `tsc` that compiles `delegate/`.
-#
-# `/.dockerignore` -- the build context for both images.
+# - `.github/` -- all of it. OIDC trust keys on the ref, not the filename, so
+#   a workflow *added* on main can assume the deploy roles.
+# - `delegate/` -- the framework, the lambda dispatcher, the worker entrypoint
+#   and the subagent prompts all shape what the reviewer does, and every
+#   delegate agent shares one worker runtime and one GitHub App installation
+#   token with write access to the product repos. Letting the reviewer's
+#   approval merge a change to the reviewer collapses the boundary between
+#   coder and reviewer.
+# - `deploy/`, `deploy-org/`, `deploy-workbench/`, `deploy-infrastructure/` --
+#   every Pulumi project, not just the role and permission-set files. A new
+#   component that mints an IAM role is one `index.ts` import away.
+# - `utils/` -- `deploy/components/identity-center/policies.ts` imports
+#   `bedrockInvokeResources` from `utils/bedrock-models.ts`, and the account
+#   ids in `utils/accounts.ts` feed the same permission set's resource ARNs.
+#   Those read like constants files and edit like IAM policy.
+# - `scripts/`, `run-script.ts` -- `deploy-workbench.yml` triggers on
+#   `scripts/enable-bedrock-models.ts` and runs it under a deploy role; that
+#   script accepts model provider terms on GoodParty's behalf, and
+#   `run-script.ts` dynamically imports anything in `scripts/`.
+# - `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore` --
+#   one `package.json` builds every image, so a dependency added for any one
+#   service also installs into the delegate worker that holds the GitHub App
+#   token; `tsconfig.json` governs the same `tsc` that compiles `delegate/`;
+#   `.dockerignore` is the build context for both images.
+# - `CLAUDE.md` at the root -- the reviewer is told to read it as
+#   authoritative for conventions, so a bot-approved edit changes what the
+#   reviewer accepts on every later PR. That is the one kind of change that
+#   compounds, which is why it is not on the opt-out list.
 #
 # ## Rules for editing this list
 #
-# Scope by directory. A file-scoped gate leaves the same hole one file over:
-# adding `deploy/components/evil.ts` touches no file-scoped path, so it would
-# need no human review. This repo has already been bitten by exactly that --
+# Scope by directory. A file-scoped opt-out leaves the same hole one file
+# over: opting out `deploy/components/evil.ts` says nothing about the next
+# file added beside it. This repo has already been bitten by exactly that --
 # see the `job_workflow_ref` comment in
-# `deploy/components/ci-roles/policies.ts`. The five file-scoped entries below
-# are singletons referenced by name from an owned path, where there is no
-# "one file over" to add.
+# `deploy/components/ci-roles/policies.ts`. The one file-scoped entry below is
+# re-owned rather than opted out, and is named because it is executed by name
+# from an owned path.
 #
-# Before adding a path to the unowned side, check what executes it. The
+# Before adding a path to the opt-out side, check what executes it. The
 # ordering in `deploy.yml` -- install, test and build strictly before the
-# credentials step -- is load-bearing for every unowned path in this repo, and
+# credentials step -- is load-bearing for every opt-out path in this repo, and
 # is the only reason an unowned test file is not an admin-credentialled shell.
 #
-# Narrowing this list is a security change. It is also, by construction, a
-# change to a path on the list, so it needs a human.
+# Widening this list is a security change. It is also, by construction, a
+# change to a path the default owns, so it needs a human.
 
-/.github/                        @thegoodparty/gp-contrib
-/delegate/                       @thegoodparty/gp-contrib
-/deploy/                         @thegoodparty/gp-contrib
-/deploy-org/                     @thegoodparty/gp-contrib
-/deploy-workbench/               @thegoodparty/gp-contrib
-/deploy-infrastructure/          @thegoodparty/gp-contrib
-/scripts/                        @thegoodparty/gp-contrib
-/utils/                          @thegoodparty/gp-contrib
-/run-script.ts                   @thegoodparty/gp-contrib
-/package.json                    @thegoodparty/gp-contrib
-/package-lock.json               @thegoodparty/gp-contrib
-/tsconfig.json                   @thegoodparty/gp-contrib
-/.dockerignore                   @thegoodparty/gp-contrib
+*                                @thegoodparty/gp-contrib
 
+/bugboss/
+/docs/
+/README.md
+/.gitignore
+
+# Re-owned after the `/bugboss/` opt-out, because the last matching pattern
+# wins. `deploy.yml` builds this image after the Configure AWS Credentials
+# step, so the Dockerfile runs inside a job holding the deploy role. The build
+# container does not inherit the runner's environment, which is why the tree
+# opt-out is otherwise defensible, but this is the one BugBoss path that
+# executes in a credentialled job, and a human on it costs little.
+/bugboss/Dockerfile              @thegoodparty/gp-contrib
