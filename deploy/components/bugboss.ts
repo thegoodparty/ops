@@ -531,11 +531,10 @@ export const createBugBoss = (config: BugBossConfig) => {
                 `arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:application-inference-profile/*`,
               ],
             },
-            {
-              Effect: "Allow",
-              Action: ["secretsmanager:GetSecretValue"],
-              Resource: [secret.arn],
-            },
+            // No secretsmanager here. ECS injects BUGBOSS_SECRETS at launch
+            // through the execution role, and incident agents run with this
+            // role's credentials, so a grant here let any agent read every
+            // credential BugBoss holds.
             // The task mounts the work file system through its access point
             // with IAM auth, and this is the only way it is allowed to.
             {
