@@ -160,5 +160,6 @@ jobs:
             ${{ env.OUT }}/results.json
             ${{ env.OUT }}/runs/*/result.json
             ${{ env.OUT }}/runs/*/*.log
+            ${{ env.OUT }}/runs/*/state/*.log
             ${{ env.OUT }}/runs/*/slack.json
           if-no-files-found: warn

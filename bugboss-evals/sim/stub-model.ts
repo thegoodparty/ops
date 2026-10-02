@@ -93,7 +93,13 @@ const agentStep = (body: Body, patchPath: string): Answer => {
     {
       tool: "report_analysis",
       input: {
-        postmortem: "# Post-mortem\n\nStub run. The proving fix was applied and merged.",
+        atAGlance: "Stub run. The scenario's known fault broke one route for its users; the proving fix is merged and deployed.",
+        timeline: [{ at: new Date().toISOString(), event: "Stub: the proving fix was applied, merged and deployed." }],
+        userImpact: "Stub: nobody, this is the eval harness.",
+        rootCause: "Stub: the scenario's known fault.",
+        fiveWhys: Array.from({ length: 5 }, (_, i) => ({ why: `Stub why ${i + 1}`, because: `Stub because ${i + 1}` })),
+        resolutionActions: [`Merged ${prUrl || "the stub fix"}`],
+        practiceChanges: STUB_PRACTICE_CHANGES,
         usersImpacted: 0,
         impactQuery: "stub",
       },
@@ -101,6 +107,21 @@ const agentStep = (body: Body, patchPath: string): Answer => {
   ];
   return script[turn] ?? { text: "Done." };
 };
+
+/** Between the post-mortem's word bounds (`PRACTICE_WORDS`), which refuse rather than cut. */
+const STUB_PRACTICE_CHANGES = [
+  "Stub run from the eval harness. The scenario's known fault was fixed by applying its proving patch, so nothing here",
+  "was learned about how we build. In a real incident this section would name the development practice that let the",
+  "fault ship: a test pattern that would have caught it, a review gate that would have asked the question, an alert",
+  "designed to fire on the user's harm rather than on a proxy for it, or an architectural seam that would have kept the",
+  "blast radius small. It would then argue for one change to that practice, say who owns it, and keep follow-up work on",
+  "this incident out of it, because the post-mortem is about preventing the next incident of this kind rather than",
+  "finishing this one. This paragraph exists so the harness can prove the close path at zero model spend.",
+].join(" ");
+
+/** The stage-goal evaluator has no tools and asks for one JSON verdict; it is told apart by its system prompt. */
+const isGoalEvaluator = (body: Body): boolean =>
+  (body.tools ?? []).length === 0 && JSON.stringify(body.system ?? "").includes("goal evaluator for BugBoss");
 
 export const createStubBrain = (patchPath: string) => {
   let commanderRuns = 0;
@@ -110,6 +131,7 @@ export const createStubBrain = (patchPath: string) => {
       return { tool: "record_verdict", input: { winner: "tie", margin: "tie", deciding_criterion: "none", rationale: "Stub judge." } };
     }
     if (tools.has("report_root_cause")) return agentStep(body, patchPath);
+    if (isGoalEvaluator(body)) return { text: JSON.stringify({ verdict: "met", reason: "Stub evaluator." }) };
     if (tools.has("decide")) return { tool: "decide", input: { action: "new_incident", reason: "Stub triage." } };
     if (tools.has("stay_silent")) {
       commanderRuns += 1;
