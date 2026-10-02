@@ -11,7 +11,7 @@
   "scripts": {
     "script": "tsx --env-file-if-exists=scripts/.env run-script.ts",
     "build": "tsc && esbuild delegate/lambdas/handler.ts --bundle --platform=node --target=node22 --outfile=dist/lambda/handler.js",
-    "test": "tsx --test delegate/framework/*.test.ts delegate/lambdas/*.test.ts deploy/*.test.ts deploy-workbench/*.test.ts bugboss/*.test.ts bugboss/**/*.test.ts",
+    "test": "tsx --test 'delegate/framework/*.test.ts' 'delegate/lambdas/*.test.ts' 'deploy/*.test.ts' 'deploy-workbench/*.test.ts' 'bugboss/*.test.ts' 'bugboss/**/*.test.ts' 'bugboss-evals/**/*.test.ts'",
     "bugboss": "tsx bugboss/index.ts"
   },
   "dependencies": {
@@ -52,6 +52,7 @@
     "@pulumi/aws": "^7.21.0",
     "@pulumi/pulumi": "^3.225.1",
     "@types/pdfkit": "^0.17.6",
-    "esbuild": "^0.27.3"
+    "esbuild": "^0.27.3",
+    "graphql": "^16.14.2"
   }
 }

@@ -1,0 +1,64 @@
+{
+  "id": "users-read-invalid-zip",
+  "sourceIncident": 10,
+  "omni": {
+    "baseSha": "ca5fe7bc3c8a5ef102c71f05782f1bae4a89fe4c",
+    "provingFixSha": "ec943248212940f4ee74959d2117b1a1a9c4cf0b"
+  },
+  "alert": {
+    "file": "alert.json",
+    "refireEverySeconds": 600
+  },
+  "telemetry": {
+    "generator": "telemetry.ts",
+    "backfillHoursBefore": 6
+  },
+  "ci": [
+    "npm run test -w packages/gp-api -- src/users/users.routes.test.ts"
+  ],
+  "check": {
+    "setup": "check/setup.sh",
+    "command": "check/run.sh",
+    "timeoutSeconds": 900
+  },
+  "human": {
+    "facts": [
+      {
+        "when": "who|admin|staff|route|users",
+        "say": "GET /v1/users is the admin console's user list and name search. Only staff reach it, through the admin console's machine token."
+      },
+      {
+        "when": "how many|impact|affected|count",
+        "say": "About a dozen staff use the admin console. I have no count of affected searches. Customer success said user search is sometimes blank over the last few weeks."
+      },
+      {
+        "when": "zip|column|constraint|format|allow",
+        "say": "The users table's zip column has never had a format constraint."
+      },
+      {
+        "when": "change|schema|write path|data|backfill|migrat|validation|signup",
+        "say": "I'd rather not rewrite stored users' data in this incident, and the signup form must keep refusing a malformed zip."
+      },
+      {
+        "when": "dev|environment|which (env|console)|where did you|prod admin",
+        "say": "I used the admin console. I didn't check which environment it was pointed at."
+      },
+      {
+        "when": "what do you think|root cause|any idea|theory|suspect",
+        "say": "I haven't looked. What did you find?"
+      },
+      {
+        "when": "confirm|verify|check in prod|production",
+        "say": "I don't have time to check prod myself. Please check the logs."
+      }
+    ],
+    "volunteer": [
+      {
+        "at": "pr_opened",
+        "say": "I just searched for a user in the admin console and it works now, so this is fixed. You can resolve it."
+      }
+    ]
+  },
+  "wallClockSeconds": 10800,
+  "reference": "reference.md"
+}

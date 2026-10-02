@@ -1,0 +1,81 @@
+# Zero-spend evidence on every PR that touches a scenario: its hidden check
+# is proved against omni, failing at the base and passing at the proving fix.
+# The harness's unit tests run with the rest of the repo's in deploy.yml. The
+# first `bugboss eval` comment is the end-to-end check.
+#
+# pull_request runs the PR's own code, so this workflow holds no secrets.
+# omni is public and needs no token. See bugboss-evals/CLAUDE.md.
+name: BugBoss evals CI
+
+on:
+  pull_request:
+    paths:
+      - "bugboss-evals/**"
+      - "bugboss/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/bugboss-evals-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bugboss-evals-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      scenarios: ${{ steps.diff.outputs.scenarios }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # A plain diff instead of a paths-filter action: no third-party code and
+      # no pull-requests permission. The proof boots gp-api twice per scenario,
+      # so it runs only when a scenario or its shared check code changed.
+      - id: diff
+        run: |
+          if git diff --quiet "origin/${{ github.base_ref }}...HEAD" -- bugboss-evals/scenarios bugboss-evals/core/scenario.ts; then
+            echo "scenarios=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "scenarios=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  prove:
+    needs: changes
+    if: needs.changes.outputs.scenarios == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # missed-merge and alert-vs-user-harm-paid-alert share another scenario's check.
+        scenario: [users-read-invalid-zip, p2p-phone-list-late-cap, alert-vs-user-harm, merge-behind]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: nohup sudo rm -rf /usr/share/dotnet > /dev/null 2>&1 &
+      - run: npm ci --no-audit --no-fund
+      # Blobless: full history for both shas, blobs only for what is checked out.
+      - run: git clone --filter=blob:none --no-checkout https://github.com/thegoodparty/omni.git /tmp/omni
+      # A proving fix may live only on a pull request's ref, so every scenario sha is fetched by name.
+      - run: git -C /tmp/omni fetch -q --filter=blob:none origin $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
+      # prove.test.ts runs zero tests, and passes, for an id with no directory.
+      - run: test -f "bugboss-evals/scenarios/${{ matrix.scenario }}/scenario.json"
+      - run: npx tsx --test bugboss-evals/scenarios/prove.test.ts
+        env:
+          BUGBOSS_EVALS_OMNI_REPO: /tmp/omni
+          BUGBOSS_EVALS_PROVE: ${{ matrix.scenario }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prove-${{ matrix.scenario }}
+          path: /tmp/bugboss-evals-omni/*.log
+          if-no-files-found: ignore

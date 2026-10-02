@@ -238,6 +238,7 @@ conditions hold to:
   so the result carries every review in the window, oldest first, whole, with
   inline comments. A capped review wait with no marker returns the `since` to
   resume from.
+  `BUGBOSS_REVIEW_SETTLE_SECONDS` overrides the window; only the eval sets it.
 - **Arguments GitHub rejects end the wait at once** (401, 404, GraphQL
   errors); a 5xx or a network failure is waited through.
 

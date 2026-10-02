@@ -167,6 +167,15 @@ export const createCachingLinker = (
   };
 };
 
+/**
+ * `SLACK_API_URL`: where the Web API is. Unset in production, where the SDK
+ * keeps its own default; the eval harness points it at its Slack stand-in.
+ */
+export const slackApiUrl = (
+  url = process.env.SLACK_API_URL,
+): { slackApiUrl?: string } =>
+  url ? { slackApiUrl: url.endsWith("/") ? url : `${url}/` } : {};
+
 export const createSlackClient = (
   token: string,
   defaultChannel: string,
@@ -178,6 +187,7 @@ export const createSlackClient = (
   // minutes rather than half an hour.
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    ...slackApiUrl(),
   });
   const linker = createCachingLinker(
     {
@@ -281,6 +291,7 @@ export const createSlackFileUploader = (token: string): FileUploader => {
     // Two retry loops stacked is how a bound stops meaning anything.
     retryConfig: { retries: 0 },
     timeout: UPLOAD_CALL_TIMEOUT_MS,
+    ...slackApiUrl(),
   });
   return {
     upload: async (file) => {
@@ -394,6 +405,7 @@ export const createRotationReader = (
 ): (() => Promise<string[] | null>) => {
   const web = new WebClient(token, {
     retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+    ...slackApiUrl(),
   });
   let cached: { at: number; members: string[] } | null = null;
 

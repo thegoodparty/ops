@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createPrStateReader } from "./github";
+import { createPrStateReader, tokenFromFile } from "./github";
 
 interface Sent {
   url: string;
@@ -321,4 +321,19 @@ test("no PRs means no calls at all", async () => {
 
   assert.deepEqual(states, {});
   assert.deepEqual(sent, []);
+});
+
+test("a token file is read on every use, so a harness that rewrites it is picked up", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const path = join(mkdtempSync(join(tmpdir(), "token-")), "token");
+  const token = tokenFromFile(path);
+
+  writeFileSync(path, "ghs_first\n");
+  assert.equal(await token(), "ghs_first");
+  writeFileSync(path, "ghs_second");
+  assert.equal(await token(), "ghs_second");
+  writeFileSync(path, "\n");
+  await assert.rejects(token(), /holds no GitHub token/);
 });

@@ -8,6 +8,7 @@ import {
   createCachingLinker,
   createSlackClient,
   createSlackFileUploader,
+  slackApiUrl,
 } from "./client";
 import { UploadOutcomeUnknownError, type ReportUpload } from "../report";
 
@@ -638,4 +639,11 @@ describe("a thread is read to the end", () => {
       axios.defaults.adapter = realAdapter;
     }
   });
+});
+
+test("SLACK_API_URL points the Web API elsewhere, and unset leaves the SDK default", () => {
+  assert.deepEqual(slackApiUrl(undefined), {});
+  assert.deepEqual(slackApiUrl(""), {});
+  assert.deepEqual(slackApiUrl("http://127.0.0.1:9100/api"), { slackApiUrl: "http://127.0.0.1:9100/api/" });
+  assert.deepEqual(slackApiUrl("http://127.0.0.1:9100/api/"), { slackApiUrl: "http://127.0.0.1:9100/api/" });
 });
