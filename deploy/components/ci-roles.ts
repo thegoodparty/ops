@@ -229,7 +229,24 @@ export const createCiRoles = () => {
     description:
       "Universal Judge background sweeps from judge.yml on main in thegoodparty/omni. Dev only.",
     assumeRolePolicy: JSON.stringify(githubActionsJudgeSweepTrust),
-    maxSessionDuration: 3600,
+    // FOUR HOURS, not the one hour every role above takes.
+    //
+    // Those roles run Pulumi and Terraform, which finish in minutes. This one
+    // waits: a background sweep dispatches a Fargate run and then polls S3
+    // until the artifact lands, and the agents declare timeouts up to an hour
+    // EACH, several per arm, inside a job allowed three hours.
+    //
+    // At the default the credentials expire mid-poll, and the shape of that
+    // failure is the expensive one: the dispatch has already happened, the
+    // Fargate task keeps running and billing, and the poll fails with an auth
+    // error that the sweep records as an infraError — a run paid for and
+    // excluded from the comparison. Raising it is the only fix available,
+    // because `role-duration-seconds` cannot exceed what the role allows.
+    //
+    // Four hours covers the job's own `timeout-minutes: 180` with slack and
+    // nothing beyond it. The credentials cannot outlive the job that holds
+    // them, so the extra window is reachable only by a job already running.
+    maxSessionDuration: 14400,
   });
 
   new aws.iam.RolePolicyAttachment("githubActionsJudgeSweepAttachment", {

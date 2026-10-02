@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { githubActionsJudgeSweepTrust } from "./components/ci-roles/policies";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const SUBJECT_KEY = "token.actions.githubusercontent.com:sub";
 const WORKFLOW_KEY = "token.actions.githubusercontent.com:job_workflow_ref";
@@ -82,5 +84,48 @@ describe("githubActionsJudgeSweepTrust", () => {
     );
     assert.equal(statements[0].Action, "sts:AssumeRoleWithWebIdentity");
     assert.equal(statements[0].Effect, "Allow");
+  });
+});
+
+// THE SESSION HAS TO OUTLAST THE POLL, which is what makes this role
+// different from every other one in this file. The others run Pulumi or
+// Terraform and finish in minutes; this one dispatches a Fargate run and then
+// waits for it, against agents declaring timeouts up to an hour each.
+//
+// Asserted against the source text rather than a Pulumi output because the
+// resource is only constructed inside `createCiRoles()`, which needs a Pulumi
+// runtime. The number is what matters and the number is right here.
+describe("the judge role's session length", () => {
+  const source = readFileSync(
+    join(__dirname, "components", "ci-roles.ts"),
+    "utf8"
+  );
+
+  const judgeBlock = () => {
+    const start = source.indexOf('new aws.iam.Role("githubActionsJudgeSweep"');
+    assert.ok(start > -1, "the judge role is gone");
+    return source.slice(start, source.indexOf("});", start));
+  };
+
+  // At the one hour every other role here takes, credentials expire mid-poll:
+  // the dispatch has happened, the Fargate task keeps billing, and the poll
+  // fails with an auth error recorded as an infraError — paid for and
+  // excluded from the comparison.
+  it("outlasts the sweep job's own three-hour timeout", () => {
+    const declared = /maxSessionDuration:\s*(\d+)/.exec(judgeBlock())?.[1];
+    assert.ok(declared, "no maxSessionDuration on the judge role");
+    assert.ok(
+      Number(declared) > 180 * 60,
+      `maxSessionDuration ${declared}s does not cover a 180-minute job`
+    );
+  });
+
+  // Not open-ended either. The credentials cannot outlive the job holding
+  // them, so anything past the job's budget plus slack is reach nobody needs.
+  it("is not longer than it needs to be", () => {
+    const declared = Number(
+      /maxSessionDuration:\s*(\d+)/.exec(judgeBlock())?.[1]
+    );
+    assert.ok(declared <= 4 * 3600, `maxSessionDuration ${declared}s is loose`);
   });
 });
