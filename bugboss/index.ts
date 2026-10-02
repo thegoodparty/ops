@@ -1708,10 +1708,13 @@ export const createBugBoss = async (
       try {
         // Read first: the orphan sweep may have placed the recorded row, or
         // an earlier placement may have finished after open_incident stopped
-        // waiting on it.
+        // waiting on it. Closed rows count too: an incident that opened and
+        // was closed while its notice kept failing must not be filed again.
         const row = db.get<{ id: string; incidentId: string | null }>(
           `SELECT id, incidentId FROM signal
-             WHERE source = ? AND sourceId = ? AND closedAt IS NULL`,
+             WHERE source = ? AND sourceId = ?
+             ORDER BY incidentId IS NULL, openedAt DESC
+             LIMIT 1`,
           [HUMAN_SOURCE, sourceId],
         );
         let incidentId = row?.incidentId ?? null;
