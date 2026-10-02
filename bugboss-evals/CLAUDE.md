@@ -17,6 +17,10 @@ measured on the same terms.
 | `bugboss eval full` | 3 reps per scenario | the close | $200 |
 | `bugboss eval stub` | 1 rep, scripted model | the close | $0 |
 
+On the stub tier a scenario's scripted human waits at most 30 seconds before
+merging, whatever `human.merge.delaySeconds` says: the wait is realism for a
+real model and dead time in a smoke test.
+
 One rep of six scenarios is six pairs, the fewest the sign test can call.
 Each matrix job holds an even share of the cap, and every run in it stops,
 ending `spend_cap`, once their live sessions price at 90% of that share.

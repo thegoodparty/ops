@@ -329,6 +329,10 @@ const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: s
 
 export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const { scenario, dir: scenarioDir } = loadScenario(spec.scenarioId);
+
+  // A scripted wait is realism for a real model and dead time for the stub,
+  // which proves plumbing. The stub tier caps it.
+  const mergeDelaySeconds = spec.stubModelUrl ? Math.min(scenario.human.merge.delaySeconds, 30) : scenario.human.merge.delaySeconds;
   const home = join(spec.root, "home");
   const work = join(spec.root, "work");
   const s3Root = join(spec.root, "s3");
@@ -491,7 +495,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       if (mergeAskedAt === null && slack.messages.some((m) => m.bot && /\bmerg/i.test(m.text))) mergeAskedAt = Date.now();
       const mayMerge =
         scenario.human.merge.after === "green" ||
-        (mergeAskedAt !== null && Date.now() >= mergeAskedAt + scenario.human.merge.delaySeconds * 1000);
+        (mergeAskedAt !== null && Date.now() >= mergeAskedAt + mergeDelaySeconds * 1000);
       await driveGitHub({
         sandbox,
         spec,
