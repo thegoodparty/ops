@@ -155,7 +155,7 @@ export const renderReport = (args: {
   runs: RunResult[];
   verdicts: CaseVerdict[];
   judgeUsd: number;
-  /** `fast`, `full` or `stub`. */
+  /** `fast` or `full`. */
   tier: string;
   /** The comparison's spend cap, summed over its jobs. Null when uncapped. */
   capUsd: number | null;
@@ -198,9 +198,7 @@ export const renderReport = (args: {
     "",
     `Tier: **${args.tier}**, each run stopping at ${milestone}. Baseline \`${args.baselineRef}\` against candidate \`${args.candidateRef}\`. Each cell is gates passed (closed, fix check, CI green at merge, no push to main), then per run the mean model turns, estimated cost (priced from tokens at the provider boundary) and minutes from the alert to the PR, the merge and the close. Quality is the candidate's wins-losses-ties from a blind, order-swapped judge shown each side's full Slack thread, GitHub events and fix diff.`,
     "",
-    args.tier === "stub"
-      ? "No Bedrock spend: a scripted model answered every call. The costs below price its token counts as if the configured model had."
-      : `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
+    `Estimated spend: ${usd(spent)}${args.capUsd === null ? "" : ` of the ${usd(args.capUsd)} cap`}.${capped ? ` ${capped} runs stopped at the cap.` : ""}`,
     "",
     "| Scenario | Baseline gates | turns | cost | to PR | to merge | to close | Candidate gates | turns | cost | to PR | to merge | to close | Quality W-L-T |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",

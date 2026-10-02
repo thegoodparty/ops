@@ -32,7 +32,7 @@ import { priceTokens, ratesFor } from "./price";
 
 export const RUBRIC_DIR = join(__dirname, "rubrics");
 
-export const DEFAULT_JUDGE_MODEL = "us.anthropic.claude-opus-5";
+export const DEFAULT_JUDGE_MODEL = "claude-opus-5-5";
 
 export type VariantRole = "baseline" | "candidate";
 export type Margin = "much_better" | "better" | "tie";
@@ -66,6 +66,7 @@ export const VERDICT_TOOL = {
       },
     },
     required: ["winner", "margin", "deciding_criterion", "rationale"],
+    additionalProperties: false,
   },
 };
 
@@ -81,7 +82,7 @@ export interface JudgeResponse {
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
-/** One judging call. Tests pass a fake; `createBedrockJudgeModel` is the real one. */
+/** One judging call. Tests pass a fake; `createAnthropicJudgeModel` is the real one. */
 export type JudgeModel = (request: JudgeRequest) => Promise<JudgeResponse>;
 
 /**
@@ -92,52 +93,57 @@ export class PromptTooLongError extends Error {}
 
 const TOO_LONG = /too long|too many tokens|context (window|length)|maximum.*tokens|input is too large/i;
 
-export const createBedrockJudgeModel = (args: {
-  modelId?: string;
-  region?: string;
-  /** Anything with the SDK's `send`, so a test never needs the network. */
-  client?: { send: (command: unknown) => Promise<unknown> };
-}): JudgeModel => {
-  const modelId = args.modelId ?? DEFAULT_JUDGE_MODEL;
-  let client: Promise<{ send: (command: unknown) => Promise<unknown> }> | null = args.client
-    ? Promise.resolve(args.client)
-    : null;
-  const sdk = import("@aws-sdk/client-bedrock-runtime");
+export const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+
+/**
+ * The judge on the Anthropic API, with plain fetch. The eval has no AWS and
+ * no new dependency. The verdict comes back as a tool call: the model cannot
+ * be forced to make it (that is a 400 on this model), so the tool is strict
+ * and the prompt asks for exactly one call; a reply with no call is a judge
+ * failure the pair reports, not a verdict.
+ */
+export const createAnthropicJudgeModel = (
+  args: {
+    apiKey?: string;
+    model?: string;
+    /** Tests only. */
+    fetch?: typeof fetch;
+    url?: string;
+  } = {},
+): JudgeModel => {
+  const model = args.model ?? DEFAULT_JUDGE_MODEL;
+  const doFetch = args.fetch ?? fetch;
   return async (request) => {
-    const { BedrockRuntimeClient, InvokeModelCommand } = await sdk;
+    const apiKey = args.apiKey ?? process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new Error("the judge needs an Anthropic API key: pass apiKey or set ANTHROPIC_API_KEY");
+    const body = {
+      model,
+      max_tokens: 16000,
+      system: request.system,
+      tools: [{ ...VERDICT_TOOL, strict: true }],
+      tool_choice: { type: "auto" },
+      messages: [{ role: "user", content: request.prompt }],
+    };
     // A judging call is one short structured verdict. When it has not
     // answered in two minutes it is wedged, and one excluded pair is better
     // than a comparison that sits for the SDK's default.
-    client ??= Promise.resolve(
-      new BedrockRuntimeClient({
-        ...(args.region ? { region: args.region } : {}),
-        requestHandler: { requestTimeout: 120_000 },
-      }) as unknown as { send: (command: unknown) => Promise<unknown> },
-    );
-    const body = {
-      anthropic_version: "bedrock-2023-05-31",
-      max_tokens: 2000,
-      system: request.system,
-      tools: [VERDICT_TOOL],
-      tool_choice: { type: "tool", name: VERDICT_TOOL.name },
-      messages: [{ role: "user", content: request.prompt }],
-    };
-    let raw: { body: Uint8Array };
-    try {
-      raw = (await (await client).send(
-        new InvokeModelCommand({
-          modelId,
-          contentType: "application/json",
-          accept: "application/json",
-          body: JSON.stringify(body),
-        }),
-      )) as { body: Uint8Array };
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
+    const response = await doFetch(args.url ?? ANTHROPIC_MESSAGES_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      let message = text;
+      try {
+        const json = JSON.parse(text) as { error?: { message?: string } };
+        message = json.error?.message ?? text;
+      } catch {}
       if (TOO_LONG.test(message)) throw new PromptTooLongError(message);
-      throw error;
+      throw new Error(`judge model call failed: HTTP ${response.status}: ${message}`);
     }
-    const parsed = JSON.parse(Buffer.from(raw.body).toString("utf8")) as {
+    const parsed = JSON.parse(text) as {
       content?: Array<{ type: string; name?: string; input?: Record<string, unknown> }>;
       stop_reason?: string;
       usage?: {

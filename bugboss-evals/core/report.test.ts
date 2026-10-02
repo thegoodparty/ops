@@ -99,9 +99,3 @@ test("the quality call follows the universal judge: flips, then materiality, the
   assert.match(qualityCall([...many(5, "candidate"), ...many(2, "baseline"), ...many(3, "tie")]), /the candidate is better \(mean \+0\.30.*so this could be chance/);
   assert.equal(qualityCall([{ ...verdict("x/1", "tie"), excluded: "too long" }]), "Quality: no pairs judged.");
 });
-
-test("a stub report says no Bedrock money was spent", () => {
-  const text = renderReport({ baselineRef: "main", candidateRef: "pr", runs: [run("a", 1, "baseline"), run("a", 1, "candidate")], verdicts: [], judgeUsd: 0, tier: "stub", capUsd: null });
-  assert.match(text, /No Bedrock spend: a scripted model answered every call\./);
-  assert.doesNotMatch(text, /Estimated spend/);
-});

@@ -15,11 +15,9 @@ measured on the same terms.
 | --- | --- | --- | --- |
 | `bugboss eval` | 1 rep per scenario, 6 pairs | the PR opening | $40 |
 | `bugboss eval full` | 3 reps per scenario | the close | $200 |
-| `bugboss eval stub` | 1 rep, scripted model | the close | $0 |
 
-On the stub tier a scenario's scripted human waits at most 30 seconds before
-merging, whatever `human.merge.delaySeconds` says: the wait is realism for a
-real model and dead time in a smoke test.
+The model is the Anthropic API, paid for with `ANTHROPIC_API_KEY` from the
+repository's secrets. Nothing in the eval touches AWS or `deploy/`.
 
 One rep of six scenarios is six pairs, the fewest the sign test can call.
 Each matrix job holds an even share of the cap, and every run in it stops,
@@ -71,16 +69,18 @@ to end. The harness (`sim/run.ts`) is everything outside it:
   unrelated commit onto the run's base right after the first approval and
   makes the fake refuse (405) to merge a PR behind it; that refusal is the
   `merge_refused` milestone.
-- **AWS.** BugBoss resolves credentials from a local container-credential
-  endpoint serving the workflow's Bedrock-only role, so every other call is
-  denied. S3 (its snapshot and session files) is `sim/s3.ts`, on disk.
-- **The model** is reached through a counting proxy (`sim/model-proxy/`).
-  The system is pointed at it with `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` for
-  Bedrock or `ANTHROPIC_BASE_URL` for the Anthropic API. The proxy forwards
-  every request, logs its model, usage and assembled response, and keeps the
-  running spend that the cap reads. It is the only place turns and cost come
-  from: nothing reads a transcript, a session file or the system's own
-  accounting.
+- **AWS is fake.** BugBoss resolves credentials from a local
+  container-credential endpoint serving made-up keys; the only AWS it can
+  reach is `sim/s3.ts` (its snapshot and session files, on disk) and the model
+  proxy, and neither checks a signature.
+- **The model** is the Anthropic API, reached through a counting proxy
+  (`sim/model-proxy/`) that holds `ANTHROPIC_API_KEY`. The proxy presents the
+  face the runtime speaks (`modelProtocol` in `sim/runtimes/`): BugBoss sends
+  Bedrock InvokeModel calls to `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` and the proxy
+  translates them, so BugBoss is unchanged and never sees the key. It logs
+  every request's model, usage and assembled response and keeps the running
+  spend that the cap reads. It is the only place turns and cost come from:
+  nothing reads a transcript, a session file or the system's own accounting.
 - **Postgres** for omni's tests is one container per run, as
   `OMNI_TEST_POSTGRES_URL`.
 - **npm and omni's dependencies.** Once per base, before the runs start, an
@@ -153,26 +153,24 @@ The BugBoss options the adapter sets are all unset in production:
 
 The Slack sim speaks HTTP mode: it delivers events as signed Events API
 callbacks to `slackEventsUrl`. A runtime that only takes Slack over Socket
-Mode needs a Socket Mode face on `sim/slack.ts`, which is not built. On the
-stub tier the system talks to the scripted model directly and no proxy sits
-in front of it, so stub runs report zero spend.
+Mode needs a Socket Mode face on `sim/slack.ts`, which is not built.
 
 ## Trust
 
 The workflow runs from main, so a PR cannot change how it is measured, and
 its own harness changes take effect only once merged. The PR's BugBoss, CI
 and the hidden check over code its agent wrote run as `bugboss-eval`, a user
-with no sudo and no workflow token, whose only AWS access is the Bedrock-only
-role served through the credential endpoint. No GitHub credential exists
-anywhere: the fake is the only GitHub the run can reach.
+with no sudo, no workflow token and no real credential of any kind: the model
+key stays in the harness's proxy, which runs as the workflow user. No GitHub
+credential exists anywhere: the fake is the only GitHub the run can reach.
 
 ## Running it
 
-In CI: the `bugboss eval` comment. Every PR touching BugBoss or the evals
-also runs `bugboss-evals-ci.yml`, which holds no secrets: it proves each
-changed scenario's hidden check against omni (public), and runs every
-scenario's whole lifecycle against the stub, both sides the PR's BugBoss,
-asserting each run closed with every gate passed.
+In CI: the `bugboss eval` comment. A PR that changes a scenario also runs
+`bugboss-evals-ci.yml`, which holds no secrets and proves the hidden check
+against omni (public). The harness's unit tests run with `npm test` in
+`deploy.yml`. Nothing exercises the rig end to end without spend: the first
+`bugboss eval` on a change is its integration test.
 
 `reference.md` is what the judge compares against. Beyond the vetted
 mechanism it should say what the immediate mitigation and the systemic fix
@@ -185,12 +183,13 @@ the default, is the whole lifecycle.
 Never run any of this on a Mac: host git and docker there reach the macOS
 keychain and prompt without end, and the fake needs `/etc/hosts` and port 443.
 On Linux, with an omni clone holding every scenario's shas, the steps in
-`bugboss-evals-ci.yml` before `Run` set the machine up; then:
+`bugboss-eval.yml` before `Run` set the machine up; then, with
+`ANTHROPIC_API_KEY` in the environment:
 
-    npx tsx bugboss-evals/sim/compare.ts run --stub --omni /tmp/omni \
-      --baseline HEAD --candidate HEAD --scenarios missed-merge --reps 1 --out /tmp/evals
+    npx tsx bugboss-evals/sim/compare.ts run --omni /tmp/omni \
+      --baseline origin/main --candidate HEAD --scenarios missed-merge --reps 1 --out /tmp/evals
 
-Without `--stub` it spends real Bedrock money.
+Every run spends real money; `--spend-cap-usd` bounds it.
 
 ## Adding a scenario
 

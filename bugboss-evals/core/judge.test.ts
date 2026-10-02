@@ -4,7 +4,7 @@ import { test } from "node:test";
 import type { SideOutput } from "./blind";
 import {
   buildPrompt,
-  createBedrockJudgeModel,
+  createAnthropicJudgeModel,
   judgePair,
   loadRubric,
   NO_REFERENCE,
@@ -190,36 +190,43 @@ test("an absent part is shown as none produced", () => {
   assert.match(prompt, /### Fix diff\n\n\(none produced\)/);
 });
 
-test("the Bedrock judge sends a forced tool call and prices the usage", async () => {
-  const sent: unknown[] = [];
-  const client = {
-    send: async (command: unknown) => {
-      sent.push(command);
-      return {
-        body: Buffer.from(
-          JSON.stringify({
-            content: [{ type: "tool_use", name: "record_verdict", input: { winner: "tie", margin: "tie" } }],
-            stop_reason: "tool_use",
-            usage: { input_tokens: 10, output_tokens: 2 },
-          }),
-        ),
-      };
-    },
-  };
-  const model = createBedrockJudgeModel({ client });
+test("the Anthropic judge posts a strict verdict tool with no forced choice and no thinking field, and reads the call back", async () => {
+  const sent: { url: string; init: RequestInit }[] = [];
+  const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    sent.push({ url: String(url), init: init ?? {} });
+    return new Response(
+      JSON.stringify({
+        content: [{ type: "tool_use", name: "record_verdict", input: { winner: "tie", margin: "tie" } }],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 10, output_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+  const model = createAnthropicJudgeModel({ apiKey: "sk-test", fetch: fakeFetch });
   const response = await model({ system: "S", prompt: "P" });
   assert.deepEqual(response.toolInput, { winner: "tie", margin: "tie" });
-  const body = JSON.parse((sent[0] as { input: { body: string } }).input.body);
-  assert.equal(body.anthropic_version, "bedrock-2023-05-31");
-  assert.deepEqual(body.tool_choice, { type: "tool", name: "record_verdict" });
+  assert.deepEqual(response.usage, { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 });
+  assert.equal(sent[0].url, "https://api.anthropic.com/v1/messages");
+  const headers = sent[0].init.headers as Record<string, string>;
+  assert.equal(headers["x-api-key"], "sk-test");
+  assert.equal(headers["anthropic-version"], "2023-06-01");
+  const body = JSON.parse(String(sent[0].init.body));
+  assert.equal(body.model, "claude-opus-5-5");
+  assert.equal(body.max_tokens, 16000);
+  assert.equal("thinking" in body, false);
+  assert.equal("anthropic_version" in body, false);
+  assert.deepEqual(body.tool_choice, { type: "auto" });
+  assert.equal(body.tools[0].strict, true);
+  assert.equal(body.tools[0].input_schema.additionalProperties, false);
 });
 
-test("the Bedrock judge turns a context overflow into a refusal", async () => {
-  const client = {
-    send: async () => {
-      throw new Error("ValidationException: prompt is too long: 1204112 tokens > 1000000 maximum");
-    },
-  };
-  await assert.rejects(createBedrockJudgeModel({ client })({ system: "S", prompt: "P" }), PromptTooLongError);
+test("the Anthropic judge turns a context overflow into a refusal and surfaces other errors", async () => {
+  const tooLong = (async () =>
+    new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "prompt is too long: 1204112 tokens > 1000000 maximum" } }), { status: 400 })) as typeof fetch;
+  await assert.rejects(createAnthropicJudgeModel({ apiKey: "sk-test", fetch: tooLong })({ system: "S", prompt: "P" }), PromptTooLongError);
+  const limited = (async () => new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }), { status: 429 })) as typeof fetch;
+  await assert.rejects(createAnthropicJudgeModel({ apiKey: "sk-test", fetch: limited })({ system: "S", prompt: "P" }), /HTTP 429: slow down/);
+  await assert.rejects(createAnthropicJudgeModel({ apiKey: "", fetch: limited })({ system: "S", prompt: "P" }), /ANTHROPIC_API_KEY/);
 });
 

@@ -69,6 +69,29 @@ const applyInvocationMetrics = (usage: ProxyUsage, metrics: Record<string, numbe
   usage.cacheWrite ||= metrics.cacheWriteInputTokenCount ?? 0;
 };
 
+/** Splits a server-sent event stream into the `data:` text of each event, across chunk boundaries. */
+export class SseReader {
+  private pending = "";
+
+  push(text: string): string[] {
+    this.pending += text;
+    const out: string[] = [];
+    let boundary = this.pending.indexOf("\n\n");
+    while (boundary !== -1) {
+      const chunk = this.pending.slice(0, boundary);
+      this.pending = this.pending.slice(boundary + 2);
+      const data = chunk
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .join("\n");
+      if (data !== "") out.push(data);
+      boundary = this.pending.indexOf("\n\n");
+    }
+    return out;
+  }
+}
+
 interface PartialBlock {
   block: AssembledBlock;
   json: string;

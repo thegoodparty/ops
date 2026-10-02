@@ -76,11 +76,10 @@ export interface RunSpec {
     /** Pushes one unrelated commit onto `branch` and from then on refuses to merge a PR behind it. Returns the new tip. */
     moveBase: (branch: string) => Promise<string>;
   };
-  /** A container credential endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI). */
+  /** A container credential endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI). Fake: nothing the system reaches checks a signature. */
   awsCredentialsUrl: string;
-  awsRegion?: string;
-  /** Set only for the zero-spend proof: the system talks to the scripted model directly and no proxy counts anything. */
-  stubModelUrl?: string;
+  /** The one real credential. Only the model proxy holds it; the system under test never sees it. */
+  anthropicApiKey: string;
   /** Run the system, the sandbox's CI and the hidden check as this user, which holds no secrets. */
   runAs?: string;
   /** Where a run stops. `closed` is the whole lifecycle. */
@@ -329,10 +328,6 @@ const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: s
 
 export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const { scenario, dir: scenarioDir } = loadScenario(spec.scenarioId);
-
-  // A scripted wait is realism for a real model and dead time for the stub,
-  // which proves plumbing. The stub tier caps it.
-  const mergeDelaySeconds = spec.stubModelUrl ? Math.min(scenario.human.merge.delaySeconds, 30) : scenario.human.merge.delaySeconds;
   const home = join(spec.root, "home");
   const work = join(spec.root, "work");
   const s3Root = join(spec.root, "s3");
@@ -380,17 +375,21 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     },
   });
 
-  const region = spec.awsRegion ?? "us-west-2";
-  const proxy: ModelProxy | null = spec.stubModelUrl
-    ? null
-    : await startModelProxy({ upstream: spec.runtime.modelUpstream, region, logPath: join(spec.root, "proxy.jsonl") });
+  // The system never reaches AWS: the region only lets its SDK build clients.
+  const region = "us-west-2";
+  const proxy: ModelProxy = await startModelProxy({
+    upstream: "anthropic",
+    face: spec.runtime.modelProtocol,
+    apiKey: spec.anthropicApiKey,
+    logPath: join(spec.root, "proxy.jsonl"),
+  });
 
   await shareWith(spec.runAs, spec.root);
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: home,
     LANG: "C.UTF-8",
-    ...(proxy ? modelProxyEnv(proxy, spec.runtime.modelUpstream) : { AWS_ENDPOINT_URL_BEDROCK_RUNTIME: spec.stubModelUrl! }),
+    ...modelProxyEnv(proxy, spec.runtime.modelProtocol),
   };
 
   const checkEnv: Record<string, string> = {
@@ -495,7 +494,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       if (mergeAskedAt === null && slack.messages.some((m) => m.bot && /\bmerg/i.test(m.text))) mergeAskedAt = Date.now();
       const mayMerge =
         scenario.human.merge.after === "green" ||
-        (mergeAskedAt !== null && Date.now() >= mergeAskedAt + mergeDelaySeconds * 1000);
+        (mergeAskedAt !== null && Date.now() >= mergeAskedAt + scenario.human.merge.delaySeconds * 1000);
       await driveGitHub({
         sandbox,
         spec,
@@ -527,7 +526,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         }
       }
 
-      if (spec.spend && proxy) {
+      if (spec.spend) {
         spec.spend.record(spec.runId, proxy.spentUsd());
         if (spec.spend.exhausted()) {
           end = "spend_cap";
@@ -566,7 +565,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     slack.close();
     s3.server.close();
     await postgres.stop();
-    await proxy?.close();
+    await proxy.close();
   }
 
   const merged = [...pulls.entries()].filter(([, p]) => p.mergedGreen !== null);

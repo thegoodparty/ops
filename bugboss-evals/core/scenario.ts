@@ -16,8 +16,8 @@ export const ScenarioSchema = z
     omni: z
       .object({
         baseSha: Sha,
-        // A commit whose tree fixes the fault. Only the check's own proof and
-        // the zero-spend stub use it; the agent and the judge never see it.
+        // A commit whose tree fixes the fault. Only the check's own proof
+        // uses it; the agent and the judge never see it.
         provingFixSha: Sha,
       })
       .strict(),

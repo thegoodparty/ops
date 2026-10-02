@@ -43,7 +43,7 @@ const incidentClosed = (dbPath: string): boolean => {
 
 export const bugboss: Runtime = {
   id: "bugboss",
-  modelUpstream: "bedrock",
+  modelProtocol: "bedrock",
   build,
   launch: async ({ build, env, ports, workRoot, world, runAs }) => {
     const url = `http://127.0.0.1:${ports.http}`;

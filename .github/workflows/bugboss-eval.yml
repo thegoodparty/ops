@@ -2,13 +2,12 @@
 # on every scenario, and get one advisory table back:
 #   `bugboss eval`       fast: one rep, each run stops once its PR opens, $40 cap
 #   `bugboss eval full`  the whole lifecycle, three reps, $200 cap
-#   `bugboss eval stub`  the whole lifecycle with the scripted model, one rep,
-#                        no Bedrock: it proves the pipeline, not the change
 #
 # issue_comment runs this file, and the harness, from main, so a PR cannot
 # change how it is measured. The PR's BugBoss runs as an unprivileged user.
-# GitHub is a fake on the runner, so no GitHub credential is involved. See
-# bugboss-evals/CLAUDE.md.
+# GitHub is a fake on the runner, so no GitHub credential is involved. The
+# only secret is ANTHROPIC_API_KEY, held by the harness's model proxy and
+# never handed to the system under test. See bugboss-evals/CLAUDE.md.
 name: BugBoss eval
 
 on:
@@ -25,14 +24,14 @@ jobs:
   gate:
     if: >-
       github.event.issue.pull_request &&
-      contains(fromJSON('["bugboss eval","bugboss eval full","bugboss eval stub"]'), github.event.comment.body) &&
+      contains(fromJSON('["bugboss eval","bugboss eval full"]'), github.event.comment.body) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     outputs:
       sha: ${{ steps.pr.outputs.sha }}
-      tier: ${{ github.event.comment.body == 'bugboss eval full' && 'full' || github.event.comment.body == 'bugboss eval stub' && 'stub' || 'fast' }}
+      tier: ${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}
     steps:
       - id: pr
         env:
@@ -48,7 +47,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
-            --body "BugBoss eval (${{ github.event.comment.body == 'bugboss eval full' && 'full' || github.event.comment.body == 'bugboss eval stub' && 'stub' || 'fast' }}) started for \`${{ steps.pr.outputs.sha }}\`: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --body "Incident eval (${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}) started for \`${{ steps.pr.outputs.sha }}\`: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   eval:
     needs: gate
@@ -56,7 +55,6 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +84,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       # Every scenario sha by name, one commit deep: a proving fix may live
       # only on a pull request's ref. The sandbox is seeded from these
-      # snapshots, and the stub diffs base against fix.
+      # snapshots.
       - run: |
           git init -q /tmp/omni
           git -C /tmp/omni fetch -q --depth 1 --no-tags https://github.com/thegoodparty/omni.git $(jq -r '.omni[]' bugboss-evals/scenarios/*/scenario.json | sort -u)
@@ -100,12 +98,6 @@ jobs:
             ${{ env.OUT }}/prebuilt/${{ steps.base.outputs.sha }}
             ${{ env.OUT }}/npm-cache
           key: bugboss-eval-omni-${{ steps.base.outputs.sha }}
-      - if: needs.gate.outputs.tier != 'stub'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::333022194791:role/github-actions-bugboss-eval
-          role-duration-seconds: 21600
-          aws-region: us-west-2
       - name: Create the user BugBoss runs as
         run: |
           sudo useradd --create-home bugboss-eval
@@ -128,18 +120,13 @@ jobs:
           TIER: ${{ needs.gate.outputs.tier }}
           JOBS: ${{ strategy.job-total }}
           GH_TOKEN: ghs_bugbossevalfaketoken
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           # Each job holds its even share of the comparison's cap.
           share() { awk -v cap="$1" -v jobs="$JOBS" 'BEGIN { printf "%.2f", cap / jobs }'; }
           case "$TIER" in
             fast) mode=(--reps 1 --until pr_opened --spend-cap-usd "$(share 40)") ;;
             full) mode=(--reps 3 --spend-cap-usd "$(share 200)") ;;
-            stub)
-              mode=(--reps 1 --stub)
-              # With no role assumed, the judge's stubbed Bedrock client still
-              # signs and needs some credentials to resolve. These are not real.
-              export AWS_ACCESS_KEY_ID=AKIAEVALFAKE AWS_SECRET_ACCESS_KEY=fake AWS_REGION=us-west-2
-              ;;
           esac
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
             --runtime bugboss --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
@@ -196,8 +183,5 @@ jobs:
             if [ "$found" -lt "$expected" ]; then
               body="> [!WARNING]"$'\n'"> Partial results: $found of $expected scenarios finished. The table omits the rest; the failures are in the [run log]($run_url)."$'\n\n'"$body"
             fi
-          fi
-          if [ "$TIER" = stub ]; then
-            body="**Stub run**: scripted model, one rep, no Bedrock. It shows the pipeline works, not whether the change is better."$'\n\n'"$body"
           fi
           gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$body"

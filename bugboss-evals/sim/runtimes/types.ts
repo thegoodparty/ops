@@ -36,7 +36,8 @@ export interface RuntimeLaunch {
 
 export interface Runtime {
   id: string;
-  modelUpstream: "bedrock" | "anthropic";
+  /** The wire protocol the runtime speaks to its model provider. The proxy presents that face and forwards to the Anthropic API. */
+  modelProtocol: "bedrock" | "anthropic";
   build: (ref: string, out: string) => Promise<RuntimeBuild>;
   launch: (opts: {
     build: RuntimeBuild;

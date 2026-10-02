@@ -8,7 +8,7 @@ import { getCACertificates, setDefaultCACertificates } from "node:tls";
 
 import { ActivitySchema, renderTimeline } from "../core/activity";
 import type { SideOutput } from "../core/blind";
-import { createBedrockJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
+import { createAnthropicJudgeModel, judgePair, type CaseVerdict } from "../core/judge";
 import { renderReport, type RunResult, type Side } from "../core/report";
 import { loadScenario, SCENARIO_IDS } from "../core/scenario";
 import { asUser, createSpendPool, runOne, type Milestone, type Stack } from "./run";
@@ -17,7 +17,6 @@ import type { CiResult } from "./github/store";
 import { bugboss } from "./runtimes/bugboss";
 import type { Runtime } from "./runtimes/types";
 import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from "./sandbox";
-import { startStubModel } from "./stub-model";
 
 /**
  * `run`: baseline against candidate, every scenario x rep, both sides of a
@@ -25,15 +24,16 @@ import { startStubModel } from "./stub-model";
  * `report`: one or more results.json into the table posted on the PR.
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
- *     --omni /tmp/omni --out /tmp/evals [--runtime bugboss] [--scenarios a,b] [--reps 3] [--stub] \
+ *     --omni /tmp/omni --out /tmp/evals [--runtime bugboss] [--scenarios a,b] [--reps 3] \
  *     [--run-as user] [--until pr_opened|closed] [--spend-cap-usd 6.67]
  *
  * `--runtime` names the system under test (`sim/runtimes/`); both refs are
  * built by it. `--omni` is a clone holding every scenario's shas, which seeds
- * the fake GitHub's sandbox. `--stub` swaps Bedrock for the scripted model. GitHub is
- * always the fake, so the machine must map github.com and api.github.com to
- * 127.0.0.1 and let Node bind 443 (see the workflows); the harness trusts the
- * fake's CA itself, through sudo.
+ * the fake GitHub's sandbox. The model is the Anthropic API, through the
+ * proxy, with `ANTHROPIC_API_KEY` from the environment; nothing here touches
+ * AWS. GitHub is always the fake, so the machine must map github.com and
+ * api.github.com to 127.0.0.1 and let Node bind 443 (see the workflows); the
+ * harness trusts the fake's CA itself, through sudo.
  *
  * `--spend-cap-usd` is this process's share of the comparison's cap: every
  * run stops, ending `spend_cap`, once their model proxies together price at
@@ -54,17 +54,16 @@ const flag = (argv: string[], name: string): string | undefined => {
 
 /**
  * The container credential endpoint the system under test resolves AWS
- * through. It serves this process's own credentials, which in CI are the
- * Bedrock-only OIDC role, so every other AWS call is denied. With --stub it
- * serves fake ones.
+ * through. The credentials are not real: the only AWS the system can reach
+ * is the fake S3 and the model proxy, and neither checks a signature.
  */
-const startCredentials = async (fake: boolean): Promise<string> => {
+const startCredentials = async (): Promise<string> => {
   const server = createServer((_req, res) => {
     res.writeHead(200, { "content-type": "application/json" }).end(
       JSON.stringify({
-        AccessKeyId: fake ? "AKIAEVALFAKE" : process.env.AWS_ACCESS_KEY_ID,
-        SecretAccessKey: fake ? "fake" : process.env.AWS_SECRET_ACCESS_KEY,
-        Token: fake ? "fake" : process.env.AWS_SESSION_TOKEN,
+        AccessKeyId: "AKIAEVALFAKE",
+        SecretAccessKey: "fake",
+        Token: "fake",
         Expiration: new Date(Date.now() + 15 * 60_000).toISOString(),
       }),
     );
@@ -174,7 +173,8 @@ const run = async (argv: string[]): Promise<void> => {
   const candidateRef = flag(argv, "candidate") ?? "HEAD";
   const scenarios = flag(argv, "scenarios")?.split(",") ?? SCENARIO_IDS;
   const reps = Number(flag(argv, "reps") ?? 3);
-  const stub = argv.includes("--stub");
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) throw new Error("ANTHROPIC_API_KEY is unset: the system under test and the judge both spend through it");
   const runAs = flag(argv, "run-as");
   const sides = (flag(argv, "sides")?.split(",") ?? ["baseline", "candidate"]) as Side[];
   const until = flag(argv, "until") as Milestone | undefined;
@@ -232,26 +232,14 @@ const run = async (argv: string[]): Promise<void> => {
   await warming;
   share(npmCache);
   const stack = await startStack();
-  const awsCredentialsUrl = await startCredentials(stub);
+  const awsCredentialsUrl = await startCredentials();
   const stamp = Date.now().toString(36);
-
-  // Written before any run starts: a synchronous git call stalls the fake.
-  const patches = Object.fromEntries(
-    scenarios.map((id) => {
-      const { scenario } = loadScenario(id);
-      const path = join(out, `${id}.patch`);
-      writeFileSync(path, execFileSync("git", ["-C", omni, "diff", scenario.omni.baseSha, scenario.omni.provingFixSha], { maxBuffer: 1 << 26 }));
-      return [id, path];
-    }),
-  );
 
   const jobs = scenarios.flatMap((scenarioId) =>
     Array.from({ length: reps }, (_, i) => i + 1).flatMap((rep) =>
       sides.map(async (side): Promise<RunResult> => {
         const runId = `${stamp}-${scenarioId}-${rep}-${side}`;
-        const stubModel = stub ? await startStubModel(patches[scenarioId]!) : null;
-        try {
-          return await runOne({
+        return runOne({
             runId,
             scenarioId,
             rep,
@@ -296,19 +284,16 @@ const run = async (argv: string[]): Promise<void> => {
               },
             },
             awsCredentialsUrl,
+            anthropicApiKey,
             npmCache,
             ...(prebuilt[baseOf(scenarioId)] ? { prebuilt: prebuilt[baseOf(scenarioId)] } : {}),
             ...(spend ? { spend } : {}),
             ...(until ? { until } : {}),
             ...(maxRunMinutes ? { maxRunSeconds: Number(maxRunMinutes) * 60 } : {}),
-            ...(stubModel ? { stubModelUrl: stubModel.url } : {}),
             ...(runAs ? { runAs } : {}),
             seed: rep,
             log: (event, fields) => log(event, { runId, ...fields }),
-          });
-        } finally {
-          stubModel?.server.close();
-        }
+        });
       }),
     ),
   );
@@ -325,15 +310,7 @@ const run = async (argv: string[]): Promise<void> => {
   ).filter((r): r is RunResult => r !== null);
   await fake.close();
 
-  if (stub) {
-    const judgeStub = await startStubModel("/dev/null");
-    Object.assign(process.env, {
-      AWS_ENDPOINT_URL_BEDROCK_RUNTIME: judgeStub.url,
-      AWS_ACCESS_KEY_ID: "AKIAEVALFAKE",
-      AWS_SECRET_ACCESS_KEY: "fake",
-    });
-  }
-  const model = createBedrockJudgeModel({ region: "us-west-2" });
+  const model = createAnthropicJudgeModel({ apiKey: anthropicApiKey });
   // What the judge sees of a run: the activity the harness recorded, rendered
   // whole, and the fix diff. judgePair blinds both.
   const sideOutput = (run: RunResult): SideOutput => {

@@ -9,6 +9,8 @@
  * as-is and BugBoss's SDK checks them.
  */
 
+import { crc32 } from "node:zlib";
+
 export type HeaderValue = string | number | boolean | bigint | Uint8Array;
 
 export interface Frame {
@@ -103,3 +105,38 @@ export class FrameReader {
     return this.pending.length;
   }
 }
+
+/**
+ * One frame with string headers, the only kind the proxy writes when it
+ * turns an Anthropic SSE stream into the event stream BugBoss's SDK expects.
+ * Both CRCs are real here, because that SDK checks them.
+ */
+export const encodeFrame = (headers: Record<string, string>, payload: Buffer): Buffer => {
+  const headerParts: Buffer[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    const nameBytes = Buffer.from(name, "utf8");
+    const valueBytes = Buffer.from(value, "utf8");
+    const part = Buffer.alloc(1 + nameBytes.length + 1 + 2 + valueBytes.length);
+    let offset = 0;
+    part.writeUInt8(nameBytes.length, offset);
+    offset += 1;
+    nameBytes.copy(part, offset);
+    offset += nameBytes.length;
+    part.writeUInt8(7, offset);
+    offset += 1;
+    part.writeUInt16BE(valueBytes.length, offset);
+    offset += 2;
+    valueBytes.copy(part, offset);
+    headerParts.push(part);
+  }
+  const headerBytes = Buffer.concat(headerParts);
+  const total = 12 + headerBytes.length + payload.length + 4;
+  const frame = Buffer.alloc(total);
+  frame.writeUInt32BE(total, 0);
+  frame.writeUInt32BE(headerBytes.length, 4);
+  frame.writeUInt32BE(crc32(frame.subarray(0, 8)), 8);
+  headerBytes.copy(frame, 12);
+  payload.copy(frame, 12 + headerBytes.length);
+  frame.writeUInt32BE(crc32(frame.subarray(0, total - 4)), total - 4);
+  return frame;
+};

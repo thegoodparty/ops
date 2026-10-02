@@ -16,6 +16,7 @@ import { fromUtf8, toUtf8 } from "@smithy/util-utf8";
 
 import { parseProxyLog, type ProxyLogRecord } from "../../core/adapters/proxy-log";
 import { modelProxyEnv, startModelProxy, type ModelProxy, type ModelProxyOptions } from "./index";
+import { anthropicModelOf } from "./proxy";
 
 const BEDROCK_MODEL = "us.anthropic.claude-opus-5";
 const ANTHROPIC_MODEL = "claude-opus-5-5";
@@ -414,4 +415,117 @@ test("the wrong face is refused: HTTP/1.1 to a bedrock proxy never reaches upstr
   session.close();
   assert.equal(status, 404);
   assert.equal(bedrock.seen.length, 0);
+});
+
+// 10*5 + 100000*25 + 1e6*0.5 + 200000*10, per million: the Anthropic list price of claude-opus-5.
+const TRANSLATED_USD = (10 * 5 + 100_000 * 25 + 1_000_000 * 0.5 + 200_000 * 10) / 1e6;
+
+const sseStream = (): Buffer => {
+  const lines: string[] = [];
+  EVENTS.forEach((event, i) => {
+    lines.push(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    if (i === 3) lines.push(`event: ping\ndata: {"type":"ping"}\n\n`);
+  });
+  return Buffer.from(lines.join(""), "utf8");
+};
+
+const translated = (reply: (req: Seen, res: http.ServerResponse) => void, extra: Partial<ModelProxyOptions> = {}) =>
+  startStack("anthropic", reply, { face: "bedrock", apiKey: "sk-eval", ...extra });
+
+test("anthropicModelOf strips the Bedrock catalog prefix and version suffix", () => {
+  assert.equal(anthropicModelOf("us.anthropic.claude-opus-5"), "claude-opus-5");
+  assert.equal(anthropicModelOf("global.anthropic.claude-sonnet-5"), "claude-sonnet-5");
+  assert.equal(anthropicModelOf("anthropic.claude-sonnet-5-v1:0"), "claude-sonnet-5");
+  assert.equal(anthropicModelOf("claude-opus-5-5"), "claude-opus-5-5");
+});
+
+test("translation: a Bedrock stream request becomes an Anthropic SSE call, and the SDK reads the events back framed, with metrics on the last", async () => {
+  const stack = await translated((_req, res) =>
+    writeInPieces(res, 200, { "content-type": "text/event-stream", "request-id": "req_anthropic_1" }, sseStream()),
+  );
+  const events = await readEvents(await bedrockClient(stack.proxy).send(streamCommand()));
+  assert.equal(events.length, EVENTS.length);
+  assert.deepEqual(events.slice(0, -1), EVENTS.slice(0, -1));
+  const last = events[events.length - 1] as Record<string, unknown>;
+  assert.equal(last.type, "message_stop");
+  const metrics = last["amazon-bedrock-invocationMetrics"] as Record<string, number>;
+  assert.equal(metrics.inputTokenCount, 10);
+  assert.equal(metrics.outputTokenCount, 100_000);
+  assert.ok(metrics.invocationLatency >= 0);
+
+  const [upstream] = stack.seen;
+  assert.equal(upstream.path, "/v1/messages");
+  assert.equal(upstream.headers["x-api-key"], "sk-eval");
+  assert.equal(upstream.headers["anthropic-version"], "2023-06-01");
+  assert.equal(upstream.headers.authorization, undefined);
+  const body = JSON.parse(upstream.body.toString("utf8"));
+  assert.equal(body.model, "claude-opus-5");
+  assert.equal(body.stream, true);
+  assert.equal("anthropic_version" in body, false);
+  assert.deepEqual(body.messages, REQUEST_BODY.messages);
+  assert.deepEqual(body.system, REQUEST_BODY.system);
+
+  assert.ok(Math.abs(stack.proxy.spentUsd() - TRANSLATED_USD) < 1e-9);
+  const [record] = stack.log();
+  assert.equal(record.upstream, "anthropic");
+  assert.equal(record.operation, "invoke-with-response-stream");
+  assert.equal(record.modelId, BEDROCK_MODEL);
+  assert.equal(record.model, "claude-opus-5");
+  assert.equal(record.priced, true);
+  assert.equal(record.outcome, "ok");
+  assert.equal(record.requestId, "req_anthropic_1");
+  assert.deepEqual(record.response.message?.content, ASSEMBLED_CONTENT);
+  assert.equal(record.response.invocationMetrics?.inputTokenCount, 10);
+  const trace = parseProxyLog(readFileSync(stack.logPath, "utf8"));
+  assert.equal(trace.turns[0].model, "claude-opus-5");
+  assert.ok(Math.abs(trace.turns[0].usage.cost.total - TRANSLATED_USD) < 1e-9);
+});
+
+test("translation: a non-streaming InvokeModel passes the Anthropic JSON back under Bedrock headers, and moves anthropic_beta to a header", async () => {
+  const reply = { id: "msg_t", model: "claude-opus-5", content: [{ type: "text", text: "done" }], stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 1 } };
+  const stack = await translated((_req, res) => {
+    const body = JSON.stringify(reply);
+    res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(body), "request-id": "req_anthropic_2" });
+    res.end(body);
+  });
+  const response = await bedrockClient(stack.proxy).send(
+    new InvokeModelCommand({
+      modelId: BEDROCK_MODEL,
+      contentType: "application/json",
+      accept: "application/json",
+      body: new TextEncoder().encode(JSON.stringify({ ...REQUEST_BODY, anthropic_beta: ["interleaved-thinking-2025-05-14", "context-1m-2025-08-07"] })),
+    }),
+  );
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), reply);
+  const [upstream] = stack.seen;
+  assert.equal(upstream.headers["anthropic-beta"], "interleaved-thinking-2025-05-14,context-1m-2025-08-07");
+  const body = JSON.parse(upstream.body.toString("utf8"));
+  assert.equal("anthropic_beta" in body, false);
+  assert.equal(body.model, "claude-opus-5");
+  assert.equal("stream" in body, false);
+  const [record] = stack.log();
+  assert.equal(record.operation, "invoke");
+  assert.equal(record.outcome, "ok");
+  assert.equal(record.response.message?.stopReason, "end_turn");
+  assert.ok(Math.abs(stack.proxy.spentUsd() - (5 * 5 + 1 * 25) / 1e6) < 1e-12);
+});
+
+test("translation: an Anthropic error comes back as the matching Bedrock exception, 429 preserved, and bills nothing", async () => {
+  const stack = await translated((_req, res) => {
+    const body = JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "slow down" } });
+    res.writeHead(429, { "content-type": "application/json", "content-length": Buffer.byteLength(body), "request-id": "req_anthropic_3" });
+    res.end(body);
+  });
+  await assert.rejects(bedrockClient(stack.proxy).send(streamCommand()), (error: Error & { name: string; $metadata?: { httpStatusCode?: number } }) => {
+    assert.equal(error.name, "ThrottlingException");
+    assert.equal(error.$metadata?.httpStatusCode, 429);
+    assert.match(error.message, /slow down/);
+    return true;
+  });
+  const [record] = stack.log();
+  assert.equal(record.outcome, "upstream_error");
+  assert.equal(record.status, 429);
+  assert.equal(record.error?.type, "ThrottlingException");
+  assert.equal(record.cost.total, 0);
+  assert.equal(stack.proxy.spentUsd(), 0);
 });
