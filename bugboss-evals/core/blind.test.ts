@@ -49,7 +49,7 @@ test("prose keeps evidence about the system, including its own durations", () =>
 });
 
 test("identifiers are replaced: SHAs, PR numbers, branches, timestamps and model ids", () => {
-  const { text } = blind(POSTMORTEM, "prose");
+  const { text } = blind(POSTMORTEM, "prose", { identifying: ["bugboss/incident-83-pool"] });
   assert.ok(!text.includes("3f9a2c1d7e"));
   assert.ok(!text.includes("2213"));
   assert.ok(!text.includes("bugboss/incident-83-pool"));
@@ -58,7 +58,7 @@ test("identifiers are replaced: SHAs, PR numbers, branches, timestamps and model
   assert.match(text, /<sha>/);
   assert.match(text, /PR <n>/);
   assert.match(text, /\/pull\/<n>/);
-  assert.match(text, /<branch>/);
+  assert.match(text, /<redacted>/);
   assert.match(text, /<time>/);
 });
 
@@ -92,10 +92,11 @@ test("branch names of either common shape are replaced; file paths are not", () 
   const { text } = blind(
     "Opened fix/users-zip-read from bugboss/incident-83-pool; see packages/gp-api/src/users/users.schema.ts and a/src/pool.ts",
     "prose",
+    { identifying: ["bugboss/incident-83-pool"] },
   );
   assert.ok(!text.includes("fix/users-zip-read"));
   assert.ok(!text.includes("bugboss/incident-83-pool"));
-  assert.match(text, /Opened <branch> from <branch>/);
+  assert.match(text, /Opened <branch> from <redacted>/);
   assert.match(text, /packages\/gp-api\/src\/users\/users\.schema\.ts/);
   assert.match(text, /a\/src\/pool\.ts/);
 });
@@ -118,7 +119,10 @@ test("a rendered timeline keeps every message and loses only identifiers and run
     },
     (s) => s,
   );
-  const { output, droppedLines } = blindSide({ timeline, diff: "index 3f9a2c1d..9b8e7f6a 100644\n+const limit = 50" });
+  const { output, droppedLines } = blindSide(
+    { timeline, diff: "index 3f9a2c1d..9b8e7f6a 100644\n+const limit = 50" },
+    { identifying: ["bugboss/incident-83-pool"] },
+  );
   const text = output.timeline;
   for (const kept of [
     "Investigating. Root cause suspected in the 25-connection pool.",
@@ -148,8 +152,17 @@ test("blindSide keeps an absent diff absent", () => {
 });
 
 test("a repository slug whose name merely starts with a branch keyword is not a branch", () => {
-  const text = blindSide({ timeline: "Working on thegoodparty/bugboss-eval-sandbox, branch swain/bug-77 and acme/fixtures-data.", diff: null }).output.timeline;
+  const text = blindSide(
+    { timeline: "Working on thegoodparty/bugboss-eval-sandbox and acme/eval-data, branch swain/bug-77, then fix/zip-read.", diff: null },
+    { identifying: ["swain/bug-77"] },
+  ).output.timeline;
   assert.match(text, /thegoodparty\/bugboss-eval-sandbox/);
-  assert.match(text, /acme\/fixtures-data/);
-  assert.match(text, /branch <branch>/);
+  assert.match(text, /acme\/eval-data/);
+  assert.match(text, /branch <redacted>, then <branch>/);
+});
+
+test("a dollar amount in evidence survives; a dollar amount about the run does not", () => {
+  const { text } = blind("The candidate was charged $499.80 for texts that never went out.\nEstimated cost: $22.52 for this run.", "prose");
+  assert.match(text, /charged \$499\.80/);
+  assert.ok(!text.includes("$22.52"));
 });

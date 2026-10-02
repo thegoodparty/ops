@@ -43,7 +43,6 @@ const RUN_SECTION = /^(#{1,6})\s*(agent run|run|cost|costs|spend|usage|run stats
 // evidence about the system and must reach the judge; only statements about
 // the run doing the work are removed.
 const RUN_LINE: RegExp[] = [
-  /\$\s?\d[\d,]*\.\d\d\b/,
   /\b(cost|spend|spent|usd|dollars?|price[ds]?|bill(ed)?)\b.*\$\s?\d/i,
   /\$\s?\d.*\b(cost|spend|spent|usd|dollars?|bill(ed)?)\b/i,
   /\bestimated cost\b/i,
@@ -75,10 +74,11 @@ const SUBSTITUTIONS: Array<[RegExp, string]> = [
   [/\b(us\.|global\.|eu\.)?anthropic\.[\w.:-]+/g, "<model>"],
   [/\bclaude-[a-z0-9][\w.-]*/gi, "<model>"],
   [/\brefs\/heads\/[\w./-]+/g, "<branch>"],
-  // Branch names, by the shapes agents and people give them: `<owner>/<kind>-…`
-  // or `<kind>/<name>`. File paths and URLs are left alone, because a path
-  // in a message or a diff header is evidence the judge needs.
-  [/(?<![\w./-])[a-z][\w-]*\/(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)(?![a-z])[\w./-]*/gi, "<branch>"],
+  // Branch names of the `<kind>/<name>` shape. An `<owner>/<name>` shape is
+  // indistinguishable from a repository slug, so those are blinded only by
+  // name, through `identifying`, which the harness fills from the PRs it saw.
+  // File paths and URLs are left alone, because a path in a message or a
+  // diff header is evidence the judge needs.
   [/(?<![\w./-])(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)\/[\w][\w./-]*/gi, "<branch>"],
   [/\/pull\/\d+/g, "/pull/<n>"],
   [/\bPR\s+#?\d+\b/g, "PR <n>"],

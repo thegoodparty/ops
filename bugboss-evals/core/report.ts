@@ -41,6 +41,8 @@ export interface RunResult {
   spend: Spend;
   /** Seconds from the alert to each milestone. Null when the run never got there. */
   wallClock: WallClock;
+  /** Head branch of every pull request the run opened, so blinding can remove them by name. */
+  prHeads?: string[];
 }
 
 export interface WallClock {

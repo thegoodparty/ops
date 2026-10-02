@@ -576,7 +576,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   const gates: Gates = {
     closed: lifecycle ? end === "closed" : null,
     fixed: lifecycle ? fixed === true : null,
-    mergedGreen: lifecycle ? merged.every(([, p]) => p.mergedGreen === true) : null,
+    mergedGreen: lifecycle && merged.length > 0 ? merged.every(([, p]) => p.mergedGreen === true) : null,
     noPushToMain:
       (await refSha(sandbox, "main").catch(() => "unknown")) === mainAtStart &&
       (baseNow === baseSha || baseNow === movedBase || mergeCommits.includes(baseNow)),
@@ -623,6 +623,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
     gates,
     spend: traces.length ? spendOf(traces) : ZERO_SPEND,
     wallClock: { prOpened: seconds(prOpenedAt), merged: seconds(mergedAt), closed: seconds(closedAt) },
+    prHeads: [...pulls.values()].map((p) => p.head),
   };
   writeFileSync(join(spec.root, "activity.json"), JSON.stringify(activity, null, 2));
   writeFileSync(join(spec.root, "diff.patch"), diff);
@@ -635,6 +636,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
 const REVIEW_BODY = "Approved.\n\nRecommendation: approve";
 
 interface PullState {
+  head: string;
   reviewedSha: string | null;
   reviewAsks: number;
   mergedGreen: boolean | null;
@@ -674,7 +676,7 @@ const driveGitHub = async (args: {
     if (pull.base.ref === "main") {
       await sandbox.call(`/pulls/${pull.number}`, { method: "PATCH", body: { base: runBase(spec.runId) } });
     }
-    pulls.set(pull.number, { reviewedSha: null, reviewAsks: 0, mergedGreen: null, ciRecorded: new Map() });
+    pulls.set(pull.number, { head: pull.head.ref, reviewedSha: null, reviewAsks: 0, mergedGreen: null, ciRecorded: new Map() });
     record({ at: Date.now(), kind: "pr_opened", number: pull.number, title: pull.title, files: await pullFiles(sandbox, pull.number) });
     args.onOpened();
     spec.log("pr_claimed", { number: pull.number });

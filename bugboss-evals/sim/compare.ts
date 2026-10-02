@@ -361,7 +361,16 @@ const run = async (argv: string[]): Promise<void> => {
           candidate: sideOutput(candidate),
           model,
           blinding: {
-            identifying: [baselineRef, candidateRef, builds.baseline.sha, builds.candidate.sha, baseline.runId, candidate.runId].filter(
+            identifying: [
+              baselineRef,
+              candidateRef,
+              builds.baseline.sha,
+              builds.candidate.sha,
+              baseline.runId,
+              candidate.runId,
+              ...(baseline.prHeads ?? []),
+              ...(candidate.prHeads ?? []),
+            ].filter(
               (s): s is string => typeof s === "string",
             ),
           },
