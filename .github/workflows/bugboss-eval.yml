@@ -13,27 +13,33 @@ name: BugBoss eval
 on:
   issue_comment:
     types: [created]
+  # TEMPORARY, remove before merge: a push to the PR branch runs the fast
+  # tier against PR #206 so the harness can be proven before it is on main.
+  push:
+    branches: [feat/bugboss-evals-basic]
 
 permissions: {}
 
 concurrency:
-  group: bugboss-eval-${{ github.event.issue.number }}
+  group: bugboss-eval-${{ github.event.issue.number || 206 }}
   cancel-in-progress: false
 
 jobs:
   gate:
     if: >-
-      github.event.issue.pull_request &&
+      github.event_name == 'push' ||
+      (github.event.issue.pull_request &&
       contains(fromJSON('["bugboss eval","bugboss eval full"]'), github.event.comment.body) &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     outputs:
-      sha: ${{ steps.pr.outputs.sha }}
+      sha: ${{ github.event_name == 'push' && github.sha || steps.pr.outputs.sha }}
       tier: ${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}
     steps:
       - id: pr
+        if: github.event_name != 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -46,8 +52,8 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
-            --body "Incident eval (${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}) started for \`${{ steps.pr.outputs.sha }}\`: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh pr comment "${{ github.event.issue.number || 206 }}" --repo "${{ github.repository }}" \
+            --body "Incident eval (${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}) started for \`${{ github.event_name == 'push' && github.sha || steps.pr.outputs.sha }}\`: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   eval:
     needs: gate
@@ -72,11 +78,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
           fetch-depth: 0
           persist-credentials: false
       - run: nohup sudo rm -rf /usr/share/dotnet > /dev/null 2>&1 &
-      - run: git fetch --no-tags origin "pull/${{ github.event.issue.number }}/head"
+      - if: github.event_name != 'push'
+        run: git fetch --no-tags origin "pull/${{ github.event.issue.number }}/head"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -158,7 +165,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -184,4 +191,4 @@ jobs:
               body="> [!WARNING]"$'\n'"> Partial results: $found of $expected scenarios finished. The table omits the rest; the failures are in the [run log]($run_url)."$'\n\n'"$body"
             fi
           fi
-          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$body"
+          gh pr comment "${{ github.event.issue.number || 206 }}" --repo "${{ github.repository }}" --body "$body"
