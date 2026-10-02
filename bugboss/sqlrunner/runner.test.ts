@@ -210,7 +210,7 @@ describe("the posted message", () => {
     assert.ok(text.includes("The query is 2 lines; read all of it before reacting."));
     assert.ok(text.includes("&lt;!channel&gt; look"));
     assert.ok(text.includes("Incident 4"));
-    assert.ok(text.includes("React with :arrow_forward: to run it or :x: to refuse. Only the on-call rotation counts."));
+    assert.ok(text.includes("React with :white_check_mark: to run it or :x: to refuse. Only the on-call rotation counts."));
   });
 });
 
@@ -218,7 +218,7 @@ describe("decisions", () => {
   it("runs on a rotation member's approval and returns rows only through GET", async () => {
     const t = setup();
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     const s = await t.status(id);
     assert.equal(s.status, "done");
@@ -232,7 +232,7 @@ describe("decisions", () => {
   it("keeps an approved request pending when the re-read fails, and runs it on the next tick", async () => {
     const t = setup();
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     const reply = t.slack.reply;
     t.slack.reply = async () => {
       throw new Error("ratelimited");
@@ -248,7 +248,7 @@ describe("decisions", () => {
   it("lets a refusal win over an approval", async () => {
     const t = setup();
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     t.react(t.lastPostTs(), "x", [ONCALL]);
     await t.runner.tick();
     assert.equal((await t.status(id)).status, "refused");
@@ -260,7 +260,7 @@ describe("decisions", () => {
     const t = setup();
     t.setRotation([ONCALL, BOT]);
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [BOT]);
+    t.react(t.lastPostTs(), "white_check_mark", [BOT]);
     await t.runner.tick();
     assert.equal((await t.status(id)).status, "failed");
     assert.equal(t.executed.length, 0);
@@ -269,7 +269,7 @@ describe("decisions", () => {
   it("ignores reactions from people outside the rotation", async () => {
     const t = setup();
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [OTHER]);
+    t.react(t.lastPostTs(), "white_check_mark", [OTHER]);
     await t.runner.tick();
     assert.equal((await t.status(id)).status, "pending");
     assert.equal(t.executed.length, 0);
@@ -280,7 +280,7 @@ describe("decisions", () => {
     const id = await created(await t.submit({}));
     const ts = t.lastPostTs();
     t.messages.get(ts)!.edited = true;
-    t.react(ts, "arrow_forward", [ONCALL]);
+    t.react(ts, "white_check_mark", [ONCALL]);
     await t.runner.tick();
     const s = await t.status(id);
     assert.equal(s.status, "failed");
@@ -293,7 +293,7 @@ describe("decisions", () => {
     const id = await created(await t.submit({}));
     const ts = t.lastPostTs();
     t.messages.get(ts)!.text = "something else";
-    t.react(ts, "arrow_forward", [ONCALL]);
+    t.react(ts, "white_check_mark", [ONCALL]);
     await t.runner.tick();
     assert.equal((await t.status(id)).status, "failed");
     assert.equal(t.executed.length, 0);
@@ -316,7 +316,7 @@ describe("result caps", () => {
     const rows = Array.from({ length: 201 }, (_, i) => ({ id: i, email: SECRET }));
     const t = setup({ result: { columns: ["id", "email"], rows } });
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     const s = await t.status(id);
     assert.equal(s.status, "failed");
@@ -328,7 +328,7 @@ describe("result caps", () => {
     const rows = Array.from({ length: 200 }, (_, i) => ({ id: i }));
     const t = setup({ result: { columns: ["id"], rows } });
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     assert.equal((await t.status(id)).rowCount, 200);
   });
@@ -337,7 +337,7 @@ describe("result caps", () => {
     const rows = [{ blob: SECRET + "x".repeat(100_000) }];
     const t = setup({ result: { columns: ["blob"], rows } });
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     const s = await t.status(id);
     assert.equal(s.status, "failed");
@@ -347,7 +347,7 @@ describe("result caps", () => {
   it("fails duplicate column names rather than losing one", async () => {
     const t = setup({ result: { columns: ["id", "id"], rows: [{ id: 1 }] } });
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     assert.equal((await t.status(id)).status, "failed");
   });
@@ -356,7 +356,7 @@ describe("result caps", () => {
     const err = Object.assign(new Error(`invalid input syntax for type integer: "${SECRET}"`), { code: "22P02" });
     const t = setup({ result: err });
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     const s = await t.status(id);
     assert.equal(s.status, "failed");
@@ -421,7 +421,7 @@ describe("rows never reach Slack", () => {
     for (const result of outcomes) {
       const t = setup({ result });
       await created(await t.submit({}));
-      t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+      t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
       await t.runner.tick();
       assert.ok(t.calls.some((c) => c.method === "update"));
       assert.ok(!JSON.stringify(t.calls).includes(SECRET));
@@ -476,7 +476,7 @@ describe("a reaction from the bot itself", () => {
   it("fails the request even when a rotation member approved too", async () => {
     const t = setup();
     const id = await created(await t.submit({}));
-    t.react(t.lastPostTs(), "arrow_forward", [BOT, ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [BOT, ONCALL]);
     await t.runner.tick();
     const s = await t.status(id);
     assert.equal(s.status, "failed");
@@ -488,7 +488,7 @@ describe("a reaction from the bot itself", () => {
     const t = setup();
     const id = await created(await t.submit({}));
     t.react(t.lastPostTs(), "eyes", [BOT]);
-    t.react(t.lastPostTs(), "arrow_forward", [ONCALL]);
+    t.react(t.lastPostTs(), "white_check_mark", [ONCALL]);
     await t.runner.tick();
     assert.equal((await t.status(id)).status, "failed");
     assert.deepEqual(t.executed, []);
