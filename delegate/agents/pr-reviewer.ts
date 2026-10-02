@@ -285,7 +285,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    not depend on this prompt at all is CODEOWNERS, which **owns every path by
    default** and names a short opt-out list. On an opted-out path --
    \`bugboss/\` except \`bugboss/Dockerfile\`, \`docs/\`, \`README.md\`,
-   \`.gitignore\` -- your approval is the only approval the ruleset requires,
+   \`.gitignore\`, \`CLAUDE.md\` -- your approval is the only approval the
+   ruleset requires,
    and the PR becomes mergeable the moment you post it. On every other path a
    human code owner must approve, and your approval alone is not enough.
    Weigh that when the diff is on one of the opt-out paths: there is no human

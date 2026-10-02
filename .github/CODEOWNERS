@@ -37,6 +37,12 @@
 #
 # `/.gitignore` -- inert.
 #
+# `/CLAUDE.md` and `**/CLAUDE.md` -- removed from the review list by #173,
+# preserved here. The pattern fired on BugBoss documentation rather than on
+# changes to the reviewer's judgement, and the reviewer is told to read
+# CODEOWNERS as the authority rather than any summary. The root file is the
+# one the default would otherwise re-own.
+#
 # Everything else is owned by the default. The trees that define the posture
 # are the ones to keep in mind when reviewing an opt-out request:
 #
@@ -64,10 +70,6 @@
 #   service also installs into the delegate worker that holds the GitHub App
 #   token; `tsconfig.json` governs the same `tsc` that compiles `delegate/`;
 #   `.dockerignore` is the build context for both images.
-# - `CLAUDE.md` at the root -- the reviewer is told to read it as
-#   authoritative for conventions, so a bot-approved edit changes what the
-#   reviewer accepts on every later PR. That is the one kind of change that
-#   compounds, which is why it is not on the opt-out list.
 #
 # ## Rules for editing this list
 #
@@ -75,9 +77,10 @@
 # over: opting out `deploy/components/evil.ts` says nothing about the next
 # file added beside it. This repo has already been bitten by exactly that --
 # see the `job_workflow_ref` comment in
-# `deploy/components/ci-roles/policies.ts`. The one file-scoped entry below is
-# re-owned rather than opted out, and is named because it is executed by name
-# from an owned path.
+# `deploy/components/ci-roles/policies.ts`. The file-scoped entries below are
+# named singletons or repository-root files, which have no directory to scope
+# by: `bugboss/Dockerfile` is re-owned because it is executed by name from an
+# owned path.
 #
 # Before adding a path to the opt-out side, check what executes it. The
 # ordering in `deploy.yml` -- install, test and build strictly before the
@@ -93,6 +96,8 @@
 /docs/
 /README.md
 /.gitignore
+/CLAUDE.md
+**/CLAUDE.md
 
 # Re-owned after the `/bugboss/` opt-out, because the last matching pattern
 # wins. `deploy.yml` builds this image after the Configure AWS Credentials

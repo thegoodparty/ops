@@ -57,6 +57,8 @@ opts out:
   Configure AWS Credentials step.
 - `docs/`, `README.md` — documentation.
 - `.gitignore` — inert.
+- `CLAUDE.md`, at the root and in any directory — removed from the review list
+  by #173, and preserved as an opt-out here.
 
 **A human on `@thegoodparty/gp-contrib` must approve** everything else. The
 owned entries worth naming, because the file being edited does not obviously
@@ -68,9 +70,6 @@ reach a credential:
 - `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling
   code but are reached by IaC and by a credentialled workflow. See below.
 - `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore`
-- `CLAUDE.md` at the root — the reviewer reads it as authoritative for
-  conventions, so a bot-approved edit changes what it accepts on every later
-  PR.
 
 Keep changes that need a human in their own PR: one file under an owned path
 pulls the whole PR into human review.
