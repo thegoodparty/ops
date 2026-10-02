@@ -391,6 +391,25 @@ run. A run only an agent's inbox started has nobody to attribute a report to,
 so the tool refuses. The mention's ts is the dedup key, so a retry of the
 same call in the same run files nothing new.
 
+**A report that cannot be recorded is queued, not lost.** Slack has its ack
+by then and will not deliver the mention again, so on 2026-10-02 a report
+made while the database had halted writes existed nowhere but the thread.
+Now anything that stops a report reaching an incident -- the record
+refused, the placement failed, or the placement still running after two
+minutes -- puts it in `pendingReports` in the composition root, posts one
+code-composed "could not record this yet" in the reporter's thread, and
+answers the tool `queued`, so the Boss is not left to relay a failure. Each
+tick, `retryReports` reads the signal row first (the orphan sweep or the
+original placement may have got there) and otherwise files it again; the
+signal's dedup key and the `placing` set are what keep a retry that races
+either of those from opening a second incident. Placed, it posts "this is
+incident N" once. After 30 minutes it posts once that it gave up and alarms
+`report_retry_exhausted`.
+
+The queue is in memory, because the write that failed is the one that would
+have made it durable. A restart restores the last snapshot: a row that
+reached it is still placed by the orphan sweep, but its thread is not told.
+
 The relay records and routes; it does not decide what a message meant.
 
 ## The commander is the only interface
