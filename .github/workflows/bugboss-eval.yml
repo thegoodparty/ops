@@ -1,7 +1,8 @@
-# Comment on an ops PR to run BugBoss from main against BugBoss from the PR,
-# on every scenario, and get one advisory table back:
-#   `bugboss eval`       fast: one rep, each run stops once its PR opens, $40 cap
-#   `bugboss eval full`  the whole lifecycle, three reps, $200 cap
+# Comment on an ops PR to run BugBoss from main against BugBoss from the PR
+# and get one advisory table back:
+#   `bugboss eval <scenario>`  one scenario, one rep, to close, $60 a run (two runs)
+#   `bugboss eval`             every scenario, one rep, to PR opened, $25 a run
+#   `bugboss eval full`        every scenario, three reps, to close, $60 a run
 #
 # issue_comment runs this file, and the harness, from main, so a PR cannot
 # change how it is measured. The PR's BugBoss runs as an unprivileged user.
@@ -46,7 +47,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.issue.pull_request &&
-      contains(fromJSON('["bugboss eval","bugboss eval full"]'), github.event.comment.body) &&
+      startsWith(github.event.comment.body, 'bugboss eval') &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     permissions:
@@ -80,6 +81,7 @@ jobs:
           sparse-checkout: bugboss-evals/scenarios
       - id: plan
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           BODY: ${{ github.event.comment.body }}
           IN_SCENARIOS: ${{ inputs.scenarios }}
@@ -93,8 +95,16 @@ jobs:
             reps=$(seq 1 "$IN_REPS" | jq -sc .); until=$IN_UNTIL; cap=$IN_CAP
           elif [ "$BODY" = "bugboss eval full" ]; then
             scenarios=$all; reps='[1,2,3]'; until=closed; cap=60
-          else
+          elif [ "$BODY" = "bugboss eval" ]; then
             scenarios=$all; reps='[1]'; until=pr_opened; cap=25
+          else
+            # `bugboss eval <scenario>`: one scenario, to close.
+            want=${BODY#bugboss eval }
+            if ! jq -e --arg s "$want" 'index($s) != null' <<< "$all" > /dev/null; then
+              gh pr comment "$PR" --repo "${{ github.repository }}" --body "No scenario named \`$want\`. Known: $(jq -r 'join(", ")' <<< "$all")."
+              exit 1
+            fi
+            scenarios=$(jq -nc --arg s "$want" '[$s]'); reps='[1]'; until=closed; cap=60
           fi
           { echo "scenarios=$scenarios"; echo "reps=$reps"; echo "until=$until"; echo "cap=$cap"; } >> "$GITHUB_OUTPUT"
       - env:

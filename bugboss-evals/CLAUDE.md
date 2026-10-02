@@ -13,6 +13,7 @@ measured on the same terms.
 
 | Comment | Runs | Each run stops at | Cap per run |
 | --- | --- | --- | --- |
+| `bugboss eval <scenario>` | 1 rep of one scenario, 2 runs | the close | $60, about $120 all in |
 | `bugboss eval` | 1 rep per scenario, 6 pairs, 12 runs | the PR opening | $25, about $300 all in |
 | `bugboss eval full` | 3 reps per scenario, 18 pairs, 36 runs | the close | $60, about $2,200 all in |
 
