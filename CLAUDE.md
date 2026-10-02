@@ -48,19 +48,16 @@ no owner satisfies the code-owner half vacuously, so on those paths a
 
 **A human on `@thegoodparty/gp-contrib` must approve** a PR touching:
 
-- `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/` —
-  the trees that define IAM, CI and the reviewer itself
+- `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/`,
+  `deploy-infrastructure/` — the trees that define IAM, CI and the reviewer
+  itself
 - `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling
   code but are reached by IaC and by a credentialled workflow. See below.
 - `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore`
-- `bugboss/toolapi/`, `bugboss/dispatcher/`, `bugboss/github.ts`,
-  `bugboss/slack-app-manifest.yaml`, `bugboss/Dockerfile` — BugBoss's security
-  boundaries, as opposed to its application code
-- `CLAUDE.md`, at the root and in any directory — the reviewer is told to
-  read these as authoritative for conventions, so they shape what it accepts
 
-**Everything else merges on a bot approval** — the rest of `bugboss/`,
-`docs/`, and `README.md`.
+**Everything else merges on a bot approval** — `bugboss/` (application code;
+its AWS reach is fixed in `deploy/components/bugboss.ts`, which is owned),
+`docs/`, `README.md`, and `CLAUDE.md` at the root and in any directory.
 
 Keep changes that need a human in their own PR: one file under an owned path
 pulls the whole PR into human review.
@@ -72,8 +69,7 @@ resource ARNs from `utils/bedrock-models.ts` and its account ids from
 `utils/accounts.ts`; `deploy-workbench.yml` runs
 `scripts/enable-bedrock-models.ts` under a deploy role; and `run-script.ts`
 dynamically imports anything in `scripts/`. Before you assume a file is
-harmless, check what executes it, or what reads it: `CLAUDE.md` is owned for
-the second reason rather than the first.
+harmless, check what executes it, or what reads it.
 
 The same applies to CI ordering. `deploy.yml` runs install, test and build
 **strictly before** the Configure AWS Credentials step, because the deploy

@@ -34,9 +34,9 @@
 # product repos. Letting the reviewer's approval merge a change to the
 # reviewer collapses the boundary between coder and reviewer.
 #
-# `/deploy/`, `/deploy-org/`, `/deploy-workbench/` -- all three Pulumi
-# projects, not just the role and permission-set files. A new component that
-# mints an IAM role is one `index.ts` import away.
+# `/deploy/`, `/deploy-org/`, `/deploy-workbench/`, `/deploy-infrastructure/`
+# -- all four Pulumi projects, not just the role and permission-set files. A
+# new component that mints an IAM role is one `index.ts` import away.
 #
 # ## The paths that reach a credential from outside their tree
 #
@@ -83,6 +83,7 @@
 /deploy/                         @thegoodparty/gp-contrib
 /deploy-org/                     @thegoodparty/gp-contrib
 /deploy-workbench/               @thegoodparty/gp-contrib
+/deploy-infrastructure/          @thegoodparty/gp-contrib
 /scripts/                        @thegoodparty/gp-contrib
 /utils/                          @thegoodparty/gp-contrib
 /run-script.ts                   @thegoodparty/gp-contrib
