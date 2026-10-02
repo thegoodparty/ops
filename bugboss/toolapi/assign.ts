@@ -19,7 +19,7 @@
 // inside Db.withWrite's transaction. A merge touches two incidents and the
 // whole point of SQL here is that it either lands on both or on neither.
 
-import { makeLog } from "../logging";
+import { makeAlarm, makeLog } from "../logging";
 import type Database from "better-sqlite3";
 
 import type {
@@ -58,12 +58,15 @@ export interface AssignResult {
   moved: string[];
   actor: AssignActor;
   reason: string;
+  /** Owed to the agents this move concerns, once the write commits. */
+  notices: AgentNotice[];
 }
 
 /** Thrown for a rejected assign. Callers turn it into a ToolResponse error. */
 export class AssignError extends Error {}
 
 const log = makeLog("toolapi");
+const alarm = makeAlarm("toolapi");
 
 /**
  * Statuses a signal may be attached to. Narrower than the set the dispatcher
@@ -121,48 +124,47 @@ export const getSignalsFor = (
 };
 
 // ---------------------------------------------------------------------------
-// Directives
+// Telling agents
 // ---------------------------------------------------------------------------
 
-export const pushDirective = (
-  db: Database.Database,
-  incidentId: string,
-  directive: Directive,
-): void => {
-  db.prepare(
-    "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
-  ).run(incidentId, JSON.stringify(directive), Date.now());
-  // The Boss is the only thing a person's word reaches an agent through, so
-  // its message is what wakes a parked incident. A reply in the thread no
-  // longer can: it goes to the Boss, and relaunching an agent that has
-  // nothing new to read costs a launch for chatter.
-  if (directive.type === "boss_message") {
-    db.prepare(
-      "DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1",
-    ).run(incidentId);
-  }
-};
+/**
+ * How a committed change reaches the agent it concerns. The composition root
+ * turns each directive into an act on that agent's conversation: a steer for
+ * `new_signals` and `boss_message`, an abort for `merged`, an abort and a
+ * reset for `stop`. Called only after the write that made the change has
+ * committed, so an agent is never told about a transition that rolled back.
+ */
+export interface AgentNotifier {
+  notify(incidentId: string, directive: Directive): void;
+}
+
+/** One directive owed to one incident's agent once the write commits. */
+export interface AgentNotice {
+  incidentId: string;
+  directive: Directive;
+}
 
 /**
- * Read and delete in the same transaction, so a directive is delivered exactly
- * once even though two calls can race for the same incident.
+ * Delivers notices after their commit. A failure alarms and goes no further:
+ * the change is durable either way, and the agent reads the incident's state
+ * on its next get_incident.
  */
-export const drainDirectives = (
-  db: Database.Database,
-  incidentId: string,
-): Directive[] => {
-  const rows = db
-    .prepare(
-      "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-    )
-    .all(incidentId) as { id: number; payload: string }[];
-  if (rows.length === 0) return [];
-
-  db.prepare(
-    `DELETE FROM pending_directive WHERE id IN (${placeholders(rows.length)})`,
-  ).run(...rows.map((r) => r.id));
-
-  return rows.map((r) => JSON.parse(r.payload) as Directive);
+export const notifyAgents = (
+  agents: AgentNotifier | undefined,
+  notices: readonly AgentNotice[],
+): void => {
+  if (!agents) return;
+  for (const notice of notices) {
+    try {
+      agents.notify(notice.incidentId, notice.directive);
+    } catch (err) {
+      alarm("agent_notify_failed", {
+        incidentId: notice.incidentId,
+        directive: notice.directive.type,
+        error: String(err),
+      });
+    }
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -352,6 +354,7 @@ export const assign = (
   // split that happened to take everything, and calling that a merge would
   // record the incident as absorbed by its own offspring.
   const merged: string[] = [];
+  const notices: AgentNotice[] = [];
   if (!created) {
     for (const source of sources) {
       const left = db
@@ -365,7 +368,7 @@ export const assign = (
       db.prepare(
         "UPDATE incident SET status = 'MERGED', mergedInto = ? WHERE id = ?",
       ).run(target, source);
-      pushDirective(db, source, { type: "merged", into: target });
+      notices.push({ incidentId: source, directive: { type: "merged", into: target } });
       merged.push(source);
     }
   }
@@ -377,22 +380,25 @@ export const assign = (
   if (movedIntoRunningAgent) {
     const row = getIncidentRow(db, target);
     if (row && ATTACHABLE_STATUSES.includes(row.status)) {
-      pushDirective(db, target, {
-        type: "new_signals",
-        count: moved.length,
-        summary: req.reason,
-        // Named, not implied. Signals arriving because another incident was
-        // emptied into this one is a different event from signals arriving
-        // because a new alert fired, and the surviving agent is the one that
-        // has to write a title covering both -- which it cannot do honestly
-        // for an incident it was never told about. The details follow on its
-        // next get_incident, as `absorbed`.
-        ...(merged.length > 0 ? { absorbed: merged } : {}),
+      notices.push({
+        incidentId: target,
+        directive: {
+          type: "new_signals",
+          count: moved.length,
+          summary: req.reason,
+          // Named, not implied. Signals arriving because another incident was
+          // emptied into this one is a different event from signals arriving
+          // because a new alert fired, and the surviving agent is the one that
+          // has to write a title covering both -- which it cannot do honestly
+          // for an incident it was never told about. The details follow on its
+          // next get_incident, as `absorbed`.
+          ...(merged.length > 0 ? { absorbed: merged } : {}),
+        },
       });
     }
   }
 
-  return { target, created, merged, moved, actor, reason: req.reason };
+  return { target, created, merged, moved, actor, reason: req.reason, notices };
 };
 
 /**
@@ -425,8 +431,10 @@ export const applyAssign = async (
   req: AssignRequest,
   actor: AssignActor,
   opts: AssignOptions = {},
+  agents?: AgentNotifier,
 ): Promise<AssignResult> => {
   const result = await db.withWrite((h) => assign(h, req, actor, opts));
   logAssign(result);
+  notifyAgents(agents, result.notices);
   return result;
 };

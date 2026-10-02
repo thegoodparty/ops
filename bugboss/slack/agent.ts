@@ -6,6 +6,11 @@
 // anything an agent sends up through the Boss inbox, and so does an @bugboss
 // mention anywhere else. It reads, answers, talks to agents, and changes
 // incident state through the write tools in `boss/commands.ts`.
+//
+// Each Slack thread is one Pi Durable conversation on the shared harness. A
+// trigger is a follow-up submission to it, so the conversation's own queue is
+// what serializes two messages in one thread, and a deploy mid-answer resumes
+// the run rather than losing it.
 
 import type { Db } from "../db";
 import type { SlackReactor } from "./ack";
@@ -26,22 +31,36 @@ import { boardOnRequest } from "../board";
 import {
   buildCommandTools,
   buildGrantTurnsTool,
+  type AgentLine,
   type BossCommandDeps,
-  type CloseIncident,
 } from "../boss/commands";
 import { markSeenByBoss, unseenByBoss } from "../boss/inbox";
 import type { BossInboxItem } from "../types";
 import {
-  describeOutcome,
-  lastSessionEventAt,
-  readSessionOutcome,
-  sumSessionUsage,
-} from "../agent/session";
+  allEntries,
+  loadPi,
+  type AssistantMessage,
+  type BugbossHarness,
+  type Context,
+  type Conversation,
+  type ConversationDocToken,
+  type ConversationId,
+  type EntryId,
+  type EntryRecord,
+  type Extension,
+  type HookApi,
+  type ModelRef,
+  type SettledSubmissionRecord,
+  type ToolExecutionResult,
+  type ToolRegistration,
+  type UsageState,
+} from "../agent/harness";
+import { spendOf } from "../agent/budget";
 import { makeAlarm, makeLog } from "../logging";
-import type { ModelClient, ModelTurn } from "../model";
-import { buildGhTool, GH_TIMEOUT_MS, type GhExec } from "./gh";
+import type { ModelClient } from "../model";
+import { buildGhTool, type GhExec } from "./gh";
 import { buildReadSlackLinkTool } from "./link";
-import { renderSessionTurns } from "./session-view";
+import { describeRun, lastEntryAt, renderSessionTurns } from "./session-view";
 import {
   forModelToPaste,
   oneLine,
@@ -49,27 +68,14 @@ import {
   STATUS_FACTS_SQL,
   type StatusFacts,
 } from "./status";
-import { prepareQuery, searchTool, usageForLog, type ModelUsage } from "../triage";
+import { addModelUsage, emptyModelUsage, prepareQuery, searchTool, usageForLog, type ModelUsage } from "../triage";
 
 const log = makeLog("slack-agent");
 
 /** Error level, for the failures whose only other notice is a Slack post. */
 const alarm = makeAlarm("slack-agent");
 
-// ---------------------------------------------------------------------------
-// Session keys
-// ---------------------------------------------------------------------------
-
-/**
- * Keyed by thread rather than incident, because not every thread is an
- * incident thread. Someone may mention @bugboss anywhere to ask a question.
- */
-export const slackSessionPrefix = (channel: string, threadTs: string): string =>
-  `sessions/slack/${channel}/${threadTs}/`;
-
-export const incidentSessionPrefix = (incidentId: string): string =>
-  `sessions/incident/${incidentId}/`;
-
+/** A thread nobody has talked to the Boss in for this long starts on a reset context. */
 export const IDLE_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -111,79 +117,105 @@ export type SlackConversation = SlackPoster & SlackReader & SlackLinker;
 /** Everything BugBoss does to Slack, which is what the composition root injects. */
 export type SlackClient = SlackConversation & SlackReactor;
 
-/** Whole-object S3, which is all the session wrapper ever does. */
-export interface ObjectStore {
-  get(key: string): Promise<string | null>;
-  put(key: string, body: string): Promise<void>;
-  list(prefix: string): Promise<string[]>;
-}
+/**
+ * The person whose message this run is answering. Taken from the Slack
+ * event, which is signed, so a report is attributed to whoever sent it and
+ * never to a name the model or the message supplied.
+ *
+ * A type rather than an interface because it is stored in `ThreadDoc`, which
+ * only holds JSON objects.
+ */
+export type Reporter = {
+  user: string;
+  channel: string;
+  /** Null for a top-level mention, which is its own thread. */
+  threadTs: string | null;
+  messageTs: string;
+};
 
-export interface SlackAgentTool {
-  name: string;
-  description: string;
-  /** JSON Schema. A literal, because prefix binding is bound to its bytes. */
-  inputSchema: Record<string, unknown>;
-  run(input: Record<string, unknown>): Promise<string>;
-}
-
-export interface SlackAgentRun {
-  /** Byte-stable across a resume. Prefix binding is bound to it. */
-  system: string;
-  /** Byte-stable across a resume, ordering included. */
-  tools: SlackAgentTool[];
-  /** S3 prefix the harness reads and writes the session under. */
-  sessionKey: string;
-  /** True when the prior session expired and the run must start clean. */
-  fresh: boolean;
-  input: string;
-  maxTurns: number;
+/**
+ * What one run was started with, which its tools read back. Recorded per
+ * request id before the submission, because a follow-up queued behind a run
+ * is a different run with different rules, and a tool cannot be handed
+ * anything by the submit that started it.
+ */
+export type ThreadRun = {
   /**
-   * True in an incident thread, where saying nothing is a normal outcome: two
-   * people talking to each other are not talking to the Boss. The harness
-   * hands back an empty answer rather than an apology when the model ends
-   * its run without writing anything, and the text it hands back is only
-   * what the final turn wrote, never narration from between tool calls.
+   * True in an incident thread and for an untagged follow-up, where saying
+   * nothing is a normal outcome: two people talking to each other are not
+   * talking to the Boss. A tagged mention is always answered.
    */
   allowSilence: boolean;
+  /** Null when no person's message started this run. */
+  reporter: Reporter | null;
+};
+
+export type ThreadState = {
+  /** ts of the last thread message this agent has already been shown. */
+  lastSeenTs: string;
+  /**
+   * What this agent posted after `lastSeenTs`. Its own replies are already in
+   * its conversation, and they come from the same bot user as the transition
+   * notices it does need to read, so they are told apart by ts.
+   */
+  ownTs: string[];
+  runs: { [requestId: string]: ThreadRun };
+};
+
+/**
+ * The thread's watermark and the per-run context, committed in the harness
+ * beside the transcript they describe. Built as the token `defineDoc` returns,
+ * because Pi's values arrive through a dynamic import and this has to exist at
+ * module load.
+ */
+export const ThreadDoc = {
+  definition: {
+    kind: "bugboss.thread",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    initial: (): ThreadState => ({ lastSeenTs: "", ownTs: [], runs: {} }),
+  },
+} as ConversationDocToken<ThreadState>;
+
+/** Requests remembered in `ThreadDoc.runs`. A crashed run never removes its own. */
+const KEPT_RUNS = 50;
+
+/** What a tool run is told about the call it is answering. */
+export interface BossCall {
+  /** The tool task's id: stable across a rerun, so a send keyed on it happens once. */
+  taskId: string;
+  conversationId: number;
+  run: ThreadRun;
 }
 
-/** The harness, behind an interface so tests can fake it. */
-export interface SlackAgentModel {
-  /**
-   * The usage is every request the run made, the wrap-up and the failed ones
-   * included. Returned rather than logged inside the harness because what a
-   * question cost belongs on the line that says the question was answered.
-   */
-  run(req: SlackAgentRun): Promise<{ text: string; usage: ModelUsage }>;
+/** A result that ends the run once the rest of its round has run. */
+export interface TerminalResult {
+  text: string;
+  terminate: true;
 }
 
 /**
- * Two mentions in one thread arriving together would have two runs resuming
- * and appending to one session, corrupting it. A conditional acquire keyed by
- * thread is enough.
+ * `call` is what the extension hands every call it runs. It is optional only
+ * so a tool that never needs it can be exercised with its input alone.
  */
-export interface ThreadLock {
-  /** False when another run already holds this thread. */
-  acquire(key: string, ttlMs: number): Promise<boolean>;
-  release(key: string): Promise<void>;
+export interface SlackAgentTool<Out = string> {
+  name: string;
+  description: string;
+  /** JSON Schema, as a literal. */
+  inputSchema: Record<string, unknown>;
+  run(input: Record<string, unknown>, call?: BossCall): Promise<Out>;
 }
 
-export const createMemoryThreadLock = (): ThreadLock => {
-  const held = new Map<string, number>();
-  return {
-    acquire: (key, ttlMs) => {
-      const now = Date.now();
-      const heldUntil = held.get(key);
-      if (heldUntil !== undefined && heldUntil > now) return Promise.resolve(false);
-      held.set(key, now + ttlMs);
-      return Promise.resolve(true);
-    },
-    release: (key) => {
-      held.delete(key);
-      return Promise.resolve();
-    },
-  };
-};
+/**
+ * An incident agent's transcript, read from the harness. Behind an interface
+ * so the read tools are plain code a test can hand any transcript.
+ */
+export interface AgentTranscripts {
+  /** Null when the incident has no conversation yet. */
+  read(incidentId: string): Promise<{ entries: readonly EntryRecord[]; busy: boolean; usage: UsageState } | null>;
+}
 
 // ---------------------------------------------------------------------------
 // Read-only SQL
@@ -193,12 +225,9 @@ export const createMemoryThreadLock = (): ThreadLock => {
  * Rows, not characters. Every bound left on this surface is a count of
  * things -- rows, entries -- rather than a width, because a row cut in half
  * is a row the model reads as complete and wrong, and the width was never
- * the thing anybody wanted to limit anyway.
- *
- * What made the widths necessary was this loop having no compaction at all:
- * results accumulated on a transcript that is also persisted per thread, so
- * the only bound on the context was how narrow each result had been made.
- * `compactTranscript` below is what replaced them.
+ * the thing anybody wanted to limit anyway. What bounds the context is the
+ * harness's compaction, which summarises older turns rather than narrowing
+ * a result.
  */
 export const MAX_SQL_ROWS = 50;
 /**
@@ -211,7 +240,7 @@ export const MAX_SQL_ROWS = 50;
 export const DEFAULT_SESSION_TURNS = 15;
 export const MAX_SESSION_TURNS = 60;
 
-/** How much of the session the one model-written line of the card reads. */
+/** How much of the transcript the one model-written line of the card reads. */
 export const STATUS_SUMMARY_TURNS = 12;
 
 /**
@@ -234,35 +263,11 @@ export const tsAfter = (a: string, b: string): boolean => {
 // ---------------------------------------------------------------------------
 
 /**
- * Named so the turn loop (`createSlackAgentModel`) can recognise a call to it
- * without string literals drifting between the two files. Calling this tool
- * is terminal: the harness that drives this tool set ends the run the moment
- * it is called, before another model request goes out, and discards any text
- * the same turn also wrote. See `createSlackAgentModel` in `../index.ts`.
+ * Calling this tool is terminal: its result ends the run once the round it
+ * was called in has run, before another model request goes out, and any text
+ * the same turn also wrote is discarded. See `createBossExtension`.
  */
 export const STAY_SILENT_TOOL = "stay_silent";
-
-/**
- * Whether this run chose to say nothing, and why. One per run, written by
- * `stay_silent` and read by the run once the model is done.
- */
-export interface SilenceChoice {
-  allowed: boolean;
-  reason: string | null;
-}
-
-/**
- * The person whose message this run is answering. Taken from the Slack
- * event, which is signed, so a report is attributed to whoever sent it and
- * never to a name the model or the message supplied.
- */
-export interface Reporter {
-  user: string;
-  channel: string;
-  /** Null for a top-level mention, which is its own thread. */
-  threadTs: string | null;
-  messageTs: string;
-}
 
 /** What placing a report did. Mirrors the composition root's PlacedSignal. */
 export interface OpenedReport {
@@ -281,9 +286,10 @@ export type OpenIncident = (report: {
 }) => Promise<OpenedReport[]>;
 
 /**
- * The one model-written line of the status card, cached per session position.
- * A position is the number of entries in the session, so asking twice about
- * an agent that has not moved costs one call, and a turn later costs another.
+ * The one model-written line of the status card, cached per transcript
+ * position. A position is the number of entries in the agent's conversation,
+ * so asking twice about an agent that has not moved costs one call, and a
+ * turn later costs another.
  */
 export interface StatusSummaries {
   summarise(rendered: string): Promise<string>;
@@ -293,34 +299,16 @@ export interface StatusSummaries {
 
 export interface ToolDeps {
   db: Db;
-  store: ObjectStore;
   commands: BossCommandDeps;
-  silence: SilenceChoice;
   status: StatusSummaries;
   openIncident: OpenIncident;
-  /** Null when no person's message triggered this run. */
-  reporter: Reporter | null;
   /** Null when this deployment has no GitHub App credentials; the tool still exists and says so. */
   gh: GhExec | null;
   /** What `read_slack_link` reads a linked thread with. */
   slack: SlackReader;
+  transcripts: AgentTranscripts;
 }
 
-/**
- * Sixteen tools, in a fixed order, built from literals: six that read,
- * `stay_silent`, `open_incident`, the five write tools from
- * `boss/commands.ts`, then `gh`, `read_slack_link` and `grant_turns`, each
- * appended at the end when it was added. Nothing here may vary
- * between two builds in two processes: the tools array is part of the prefix
- * every thinking block in the session is bound to.
- *
- * None of them hands back a Slack url, deliberately. Linking an incident is
- * not the model's job any more: it writes "incident 4" in prose and
- * `slack/incidents.ts` renders it on the way out, from every surface. A
- * `threadPermalink` field here would be a second mechanism for the same
- * thing with the model holding one of them, which is the arrangement that
- * produced the inconsistency to begin with.
- */
 /**
  * What a run has spent, as one line above the transcript tail.
  *
@@ -329,39 +317,19 @@ export interface ToolDeps {
  * asked what an incident cost. Tokens are what Bedrock returned; the price is
  * arithmetic over them against a table that goes stale the day a rate moves,
  * and a number nobody hedged reads as a bill.
+ *
+ * The model named is the one that produced the most output, so the goal
+ * evaluator's cheaper model adds its tokens without taking the line's name.
  */
-export const describeSpend = (body: string): string => {
-  const usage = sumSessionUsage(body);
-  const tokens = usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite;
+export const describeSpend = (usage: UsageState, turns: number): string => {
+  const spend = spendOf(usage);
+  const tokens = spend.tokensIn + spend.tokensOut + spend.cacheRead + spend.cacheWrite;
   const priced =
-    usage.costUsd > 0
-      ? `, estimated cost $${usage.costUsd.toFixed(2)} (derived from those tokens, not an invoiced figure)`
+    spend.costUsd > 0
+      ? `, estimated cost $${spend.costUsd.toFixed(2)} (derived from those tokens, not an invoiced figure)`
       : "";
-  return `${usage.turns} turns, ${tokens} tokens on ${usage.modelId ?? "an unrecorded model"}${priced}`;
+  return `${turns} turns, ${tokens} tokens on ${spend.modelId ?? "an unrecorded model"}${priced}`;
 };
-
-export const sessionSpend = (body: string): string => `spend: ${describeSpend(body)}`;
-
-/** The newest session object for an incident, or why there is none. */
-const latestSession = async (
-  store: ObjectStore,
-  incidentId: string,
-): Promise<{ key: string; body: string } | { missing: string }> => {
-  const prefix = incidentSessionPrefix(incidentId);
-  const keys = (await store.list(prefix)).filter((k) => k.endsWith(".jsonl"));
-  if (keys.length === 0) {
-    return {
-      missing: `No session under ${prefix}. The agent may not have produced an assistant message yet.`,
-    };
-  }
-  const key = keys.sort()[keys.length - 1];
-  const body = await store.get(key);
-  if (body === null) return { missing: `Session ${key} disappeared between list and read.` };
-  return { key, body };
-};
-
-const sessionPosition = (body: string): number =>
-  body.split("\n").filter((l) => l.trim().length > 0).length;
 
 /**
  * What the agent is doing, in one sentence, from its last few turns.
@@ -396,17 +364,34 @@ export const createStatusSummariser =
 
 export const SUMMARY_UNAVAILABLE = "summary unavailable";
 
+/** The turns an incident agent has used, as the dispatcher counts them. */
+const turnsUsedOf = (db: Db, incidentId: string): number =>
+  db.get<{ turnsUsed: number }>("SELECT turnsUsed FROM incident WHERE id = ?", [incidentId])?.turnsUsed ?? 0;
+
+/**
+ * Sixteen tools, in a fixed order, built from literals: six that read,
+ * `stay_silent`, `open_incident`, the five write tools from
+ * `boss/commands.ts`, then `gh`, `read_slack_link` and `grant_turns`, each
+ * appended at the end when it was added. The tool list is part of what every
+ * request sends, and Pi only resends what changed, so nothing here may vary
+ * between two builds in two processes.
+ *
+ * None of them hands back a Slack url, deliberately. Linking an incident is
+ * not the model's job any more: it writes "incident 4" in prose and
+ * `slack/incidents.ts` renders it on the way out, from every surface. A
+ * `threadPermalink` field here would be a second mechanism for the same
+ * thing with the model holding one of them, which is the arrangement that
+ * produced the inconsistency to begin with.
+ */
 export const buildTools = ({
   db,
-  store,
   commands,
-  silence,
   status,
   openIncident,
-  reporter,
   gh,
   slack,
-}: ToolDeps): SlackAgentTool[] => {
+  transcripts,
+}: ToolDeps): SlackAgentTool<string | TerminalResult>[] => {
   /**
    * Triage's tool, adapted to this surface's shape rather than rebuilt, so
    * one search answers the same three ways wherever it is called from: hits,
@@ -445,7 +430,7 @@ export const buildTools = ({
       name: "query_incidents",
       description: [
         "Run one read-only SQL SELECT against the incident database and get back JSON rows.",
-        "Tables include incident, signal, incident_wait, pending_question, boss_inbox and pending_directive.",
+        "Tables include incident, signal, incident_wait, pending_question and boss_inbox.",
         "Run \"SELECT name, sql FROM sqlite_master WHERE type='table'\" for the live schema.",
         `At most ${MAX_SQL_ROWS} rows come back, so add your own LIMIT and ORDER BY.`,
       ].join(" "),
@@ -484,7 +469,7 @@ export const buildTools = ({
     {
       name: "read_agent_session",
       description:
-        "Read an incident agent's last turns, live or archived, one line per tool call: what it called, with which arguments, and what came back. Long texts are described rather than shown. Also reports how the run ended and what it has spent, in turns and tokens, with a cost estimate derived from them.",
+        "Read an incident agent's last turns, one line per tool call: what it called, with which arguments, and what came back. Long texts are described rather than shown. Also reports whether it is running now or how its last run ended, and what it has spent, in turns and tokens, with a cost estimate derived from them.",
       inputSchema: {
         type: "object",
         properties: {
@@ -499,9 +484,11 @@ export const buildTools = ({
       },
       run: async (input) => {
         const incidentId = String(input.incidentId ?? "");
-        const session = await latestSession(store, incidentId);
-        if ("missing" in session) return session.missing;
-        const { key, body } = session;
+        if (!db.get("SELECT 1 FROM incident WHERE id = ?", [incidentId])) return `No incident ${incidentId}.`;
+        const transcript = await transcripts.read(incidentId);
+        if (!transcript) {
+          return `Incident ${incidentId}'s agent has no conversation yet: no run has been launched for it since it opened, or since BugBoss moved to its current harness.`;
+        }
 
         const requested = Number(input.turns ?? DEFAULT_SESSION_TURNS);
         const turns = Math.min(
@@ -510,14 +497,10 @@ export const buildTools = ({
             : DEFAULT_SESSION_TURNS,
           MAX_SESSION_TURNS,
         );
-        const view = renderSessionTurns(body, turns);
-        // Without this the tail of a killed run and the tail of a finished
-        // one read the same: both stop on an ordinary entry, and the reader
-        // is left inferring from the content of the last turn. That is the
-        // inference that let a 9.5-hour run sit dead behind a last message
-        // which was still true.
-        const outcome = describeOutcome(readSessionOutcome(body));
-        return `${key}: ${view.totalTurns} turns, last ${view.shownTurns} -- ${outcome}\n${sessionSpend(body)}\n${view.text}`;
+        const view = renderSessionTurns(transcript.entries, turns);
+        const run = describeRun(transcript.entries, transcript.busy);
+        const spend = describeSpend(transcript.usage, turnsUsedOf(db, incidentId));
+        return `Incident ${incidentId}'s agent: ${view.totalTurns} turns, last ${view.shownTurns} -- ${run}\nspend: ${spend}\n${view.text}`;
       },
     },
     {
@@ -569,22 +552,21 @@ export const buildTools = ({
           alarm("status_pr_urls_unreadable", { incidentId, error: String(err) });
         }
 
-        const session = await latestSession(store, incidentId);
+        const transcript = await transcripts.read(incidentId);
         let now = "the agent has not recorded a turn yet";
         let lastActivityAt: number | null = null;
         let spend: string | null = null;
-        if (!("missing" in session)) {
-          lastActivityAt = lastSessionEventAt(session.body);
-          spend = describeSpend(session.body);
-          const position = sessionPosition(session.body);
+        if (transcript) {
+          lastActivityAt = lastEntryAt(transcript.entries);
+          spend = describeSpend(transcript.usage, turnsUsedOf(db, incidentId));
+          const position = transcript.entries.length;
+          const view = renderSessionTurns(transcript.entries, STATUS_SUMMARY_TURNS);
           const cached = status.cache.get(incidentId);
-          if (cached && cached.position === position) {
+          if (view.totalTurns > 0 && cached && cached.position === position) {
             now = cached.text;
-          } else {
+          } else if (view.totalTurns > 0) {
             try {
-              now = await status.summarise(
-                renderSessionTurns(session.body, STATUS_SUMMARY_TURNS).text,
-              );
+              now = await status.summarise(view.text);
               status.cache.set(incidentId, { position, text: now });
             } catch (err) {
               // Never the raw lines instead: that is the one failure this
@@ -624,18 +606,18 @@ export const buildTools = ({
         required: ["reason"],
         additionalProperties: false,
       },
-      run: (input) => {
+      run: (input, call) => {
         const reason = String(input.reason ?? "").trim();
-        if (!silence.allowed) {
+        if (!call?.run.allowSilence) {
           return Promise.resolve("Refused: this message tags you, so it is always answered. Write your reply.");
         }
         if (!reason) {
           return Promise.resolve("Refused: say why nothing here is for you. Nothing was recorded.");
         }
-        silence.reason = reason;
-        return Promise.resolve(
-          "Silence recorded. The run ends here; anything else you write in this turn is discarded, not posted.",
-        );
+        return Promise.resolve({
+          text: SILENCE_RECORDED,
+          terminate: true as const,
+        });
       },
     },
     {
@@ -654,9 +636,10 @@ export const buildTools = ({
         required: ["report"],
         additionalProperties: false,
       },
-      run: async (input) => {
+      run: async (input, call) => {
         const text = typeof input.report === "string" ? input.report.trim() : "";
         if (!text) return "Refused: the report is empty. Nothing was opened.";
+        const reporter = call?.run.reporter ?? null;
         if (!reporter) {
           return "Refused: no person's message started this run, so there is nobody to record as the reporter. Nothing was opened.";
         }
@@ -697,11 +680,11 @@ export const buildTools = ({
 // ---------------------------------------------------------------------------
 
 /**
- * Composed once, as a literal, and replayed verbatim on resume. Nothing
- * nondeterministic may enter it: a timestamp, a cwd, a branch or a count all
- * invalidate every thinking block recorded after they change. The live schema
- * is reachable through sqlite_master rather than pasted here for the same
- * reason.
+ * The Boss extension's one prompt section. Pi stores sections positionally in
+ * the transcript and resends only what changed, so nothing nondeterministic
+ * may enter it: a timestamp, a cwd, a branch or a count would be a changed
+ * section on every request. The live schema is reachable through
+ * sqlite_master rather than pasted here for the same reason.
  */
 export const SLACK_AGENT_SYSTEM = [
   "You are BugBoss, the incident commander for the incidents this system runs.",
@@ -787,7 +770,7 @@ export const SLACK_AGENT_SYSTEM = [
 ].join("\n");
 
 // ---------------------------------------------------------------------------
-// The agent
+// The turn budget
 // ---------------------------------------------------------------------------
 
 /**
@@ -801,216 +784,606 @@ export const SLACK_AGENT_SYSTEM = [
  * uses, nowhere near what an incident agent's run costs -- so what bounds
  * this is how long somebody will sit in a thread waiting, not the bill.
  */
-// Not the incident agent's budget. That one is INCIDENT_AGENT_MAX_TURNS in
-// agent/run.ts, an order of magnitude larger, and it ends in a hand-off
-// rather than in a reply -- because nobody is sitting in a thread waiting on
-// an investigator. Two budgets, two right answers on exhaustion.
+// Not the incident agent's budget. That one is an order of magnitude larger,
+// and it ends in a hand-off rather than in a reply -- because nobody is
+// sitting in a thread waiting on an investigator. Two budgets, two right
+// answers on exhaustion.
 export const SLACK_AGENT_MAX_TURNS = 24;
 
-/** One model call's wall-clock bound, which every turn gets its own of. */
+/**
+ * One turn's share of a run's wall clock. A run that has not settled after
+ * every turn and the wrap-up have each spent this much is aborted, so a
+ * thread is never left waiting on a run that will not end.
+ */
 export const SLACK_AGENT_BUDGET_MS = 120_000;
 
-// ---------------------------------------------------------------------------
-// Compaction
-// ---------------------------------------------------------------------------
-
-/** The most this loop asks for in one reply. Matches the `maxTokens` it sends. */
-export const SLACK_AGENT_MAX_OUTPUT_TOKENS = 4096;
+export const SILENCE_RECORDED =
+  "Silence recorded. The run ends here; anything else you write in this turn is discarded, not posted.";
 
 /**
- * Room held back for everything that is not the transcript.
+ * Appended to every result of the round that spends the last turn.
+ * Everything the run read is still in the transcript, and throwing it away to
+ * post an apology is a silent failure wearing a message: the person waited,
+ * the work was paid for, and they learn nothing. So the next response is the
+ * wrap-up, written from what the run already has, naming its own gaps.
  *
- * The system prompt and the tool schemas ride on every request and are not
- * in `messages`, so compacting `messages` to the whole window would still
- * overflow. The reply comes out of the same window too, which is the term
- * `reserveTokensFor` in `agent/run.ts` exists to get right -- a reserve
- * under `maxTokens` asks for output that cannot fit whatever else is going
- * on. 16,000 covers this agent's prompt and its ten tool schemas several
- * times over.
+ * It rides on the tool results rather than a user turn of its own, because
+ * the round's results are already the next thing the model reads.
  */
-export const SLACK_AGENT_RESERVE_TOKENS = SLACK_AGENT_MAX_OUTPUT_TOKENS + 16_000;
+export const WRAP_UP_INSTRUCTION = [
+  "You have used your whole turn budget. Your next message is your last and any tool you call in it will not run.",
+  "Answer the question now from what you have already read. Say what you found, and say plainly which part of the question you did not reach.",
+  "Do not apologise and do not offer to keep looking.",
+].join(" ");
 
-/**
- * Characters per token, low on purpose.
- *
- * Nothing here can count tokens -- the tokenizer is the provider's -- so the
- * estimate errs towards compacting sooner. English prose runs about four
- * characters a token and JSON runs worse, and most of what this transcript
- * holds is JSON rows and session entries. Three is the pessimistic end of
- * that range, so the projection over-reads and the agent compacts early
- * rather than discovering the ceiling as a provider error.
- */
-const CHARS_PER_TOKEN = 3;
+/** What a call after the wrap-up gets: nothing runs, and the run ends with it. */
+const PAST_BUDGET =
+  "Not run: the turn budget is spent, and this run ends with this message.";
 
-const turnChars = (turn: ModelTurn): number =>
-  turn.text.length +
-  (turn.role === "assistant"
-    ? turn.toolCalls.reduce(
-        (total, call) => total + call.name.length + JSON.stringify(call.input).length,
-        0,
-      )
-    : 0);
-
-/**
- * What the model is told about what is gone. It is told: a round that
- * vanishes silently is a round the model will answer as though it had never
- * happened, and go and read the same thing again.
- */
-const droppedNote = (dropped: number): string =>
-  `[${dropped} earlier turn${dropped === 1 ? "" : "s"} in this thread are no longer in ` +
-  "context. Everything they read is still in the incident database; ask again " +
-  "for anything from them rather than recalling it.]";
-
-/** A note this function wrote on an earlier pass. No `]` appears inside one. */
-const NOTE = /^\[(\d+) earlier turns? in this thread [^\]]*\]\n\n/;
-
-/**
- * Peel a note off a turn that already carries one, and say what it stood
- * for.
- *
- * A long run compacts more than once, and the second pass lands on the head
- * turn the first pass wrote onto. Left alone the notes stack, and each one
- * counts only its own pass -- so a transcript that had lost eight turns said
- * "4 earlier turns are gone" twice. Two claims that are each wrong, in the
- * one sentence whose entire job is to be accurate about what the model
- * cannot see any more.
- */
-const priorNote = (text: string): { text: string; dropped: number } => {
-  const found = NOTE.exec(text);
-  return found
-    ? { text: text.slice(found[0].length), dropped: Number(found[1]) }
-    : { text, dropped: 0 };
+/** "about 4 minutes", "under a minute" -- scale, not a measurement. */
+const roughly = (ms: number): string => {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return "under a minute";
+  return minutes === 1 ? "about a minute" : `about ${minutes} minutes`;
 };
 
 /**
- * Where each round starts: a user turn, or an assistant turn and the tool
- * results behind it.
+ * Reached only when the run produced nothing worth posting, so the reader
+ * gets this instead of an answer they waited minutes for.
  *
- * Rounds rather than turns, because Anthropic rejects a tool result that is
- * not immediately behind the assistant message that called for it -- so a
- * cut between the two is a 400, not a smaller request.
+ * Running out of steps and failing to compose anything are two different
+ * events and the reply has to say which, because the advice differs. Running
+ * out is deterministic in the question: the same question spends the budget
+ * the same way, so "ask me again" is advice that buys another four-minute
+ * wait for the same non-answer. What helps is a smaller question, and the
+ * reply says so and says how. The other case really can be a bad minute, and
+ * there asking again is the right thing to try.
  *
- * Assistant turns and not only user turns, which is the thing that makes
- * this work at all here. One mention is one user turn followed by however
- * many tool rounds it takes, so a transcript with user turns as its only
- * boundaries has exactly one boundary per mention and nothing to drop
- * inside the run that is currently growing.
+ * Neither sends anybody to the logs. The person reading this is on call in the
+ * middle of something else; a pointer to a log group is a second task, and
+ * whoever owns the budget already has the alarm.
  */
-const roundStarts = (messages: ModelTurn[]): number[] =>
-  messages
-    .map((turn, index) => (turn.role === "toolResult" ? -1 : index))
-    .filter((index) => index >= 0);
+export const noAnswerReply = (exhausted: boolean, turns: number, elapsedMs: number): string =>
+  exhausted
+    ? `I ran out of steps before I could answer that: ${turns} of them, taking ${roughly(elapsedMs)}, and I still could not put anything together worth posting. Asking the same question again spends the same budget the same way, so narrow it instead: one incident, or one specific thing you want to know about all of them.`
+    : "I could not put an answer together for that one, and I have nothing partial worth posting. Ask me again, or narrow it to one incident.";
+
+// ---------------------------------------------------------------------------
+// Reading a conversation
+// ---------------------------------------------------------------------------
+
+const ASSISTANT = "pi.assistant";
+const TOOL_RESULT = "pi.tool-result";
+const USER = "pi.user";
+const RESET = "pi.reset";
+
+const assistantOf = (entry: EntryRecord): AssistantMessage | undefined => {
+  const message = entry.model?.[0];
+  return message?.role === "assistant" ? message : undefined;
+};
 
 /**
- * Drop whole rounds off the front of a transcript until it fits.
- *
- * This is what replaced the per-result character caps, and the difference is
- * the whole point: nothing here cuts text. A tool result lands whole, the
- * transcript is measured, and what gives way is the oldest *complete* round
- * -- the same trade Pi makes for the incident agent, for the same reason. A
- * row cut in half is a row the model reads as complete and acts on; a round
- * that is gone is a round the model is told is gone.
- *
- * The question survives whatever else does not. If the cut reaches past it,
- * it is put back on the front -- a transcript has to open on a user turn,
- * and the one worth spending that turn on is the one being answered.
- *
- * The last round is kept whatever it measures. A single tool result larger
- * than the window is out of scope here exactly as it is for the incident
- * agent: the request fails loudly and the reader is told the question was
- * too big, which beats answering it off half a row.
+ * A response that counts against the budget. A failed attempt is stored as an
+ * assistant entry too, and a retried request is not a turn the model took.
  */
-export const compactTranscript = (
-  messages: ModelTurn[],
-  contextWindow: number,
-): { messages: ModelTurn[]; dropped: number } => {
-  const budget =
-    Math.max(0, contextWindow - SLACK_AGENT_RESERVE_TOKENS) * CHARS_PER_TOKEN;
+const isTurn = (entry: EntryRecord): boolean => {
+  const message = entry.kind === ASSISTANT ? assistantOf(entry) : undefined;
+  return message !== undefined && message.stopReason !== "error" && message.stopReason !== "aborted";
+};
 
-  let total = 0;
-  for (const turn of messages) total += turnChars(turn);
-  if (total <= budget) return { messages, dropped: 0 };
+const textOf = (message: AssistantMessage | undefined): string =>
+  (message?.content ?? []).flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
 
-  const starts = roundStarts(messages);
-  // Latest first: the newest boundary that still fits keeps the most recent
-  // work, which is what the question being asked now is about. The last
-  // boundary is the floor, so there is always a round left to send.
-  let cut = starts[starts.length - 1] ?? 0;
-  for (const start of [...starts].reverse()) {
-    let kept = 0;
-    for (let i = start; i < messages.length; i++) kept += turnChars(messages[i]);
-    if (kept > budget) break;
-    cut = start;
+const toolResultText = (entry: EntryRecord): string => {
+  const message = entry.model?.[0];
+  if (message?.role !== "toolResult") return "";
+  return message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+};
+
+/** The entries of one run: its input, and everything up to the next run's. */
+const runEntries = (entries: readonly EntryRecord[]): EntryRecord[] => {
+  const next = entries.findIndex((entry, index) => index > 0 && (entry.kind === USER || entry.kind === RESET));
+  return next < 0 ? [...entries] : entries.slice(0, next);
+};
+
+const usageOfRun = (entries: readonly EntryRecord[]): ModelUsage => {
+  const usage = emptyModelUsage();
+  for (const entry of entries) {
+    const message = entry.kind === ASSISTANT ? assistantOf(entry) : undefined;
+    if (!message) continue;
+    addModelUsage(usage, {
+      tokensIn: message.usage.input,
+      tokensOut: message.usage.output,
+      cacheRead: message.usage.cacheRead,
+      cacheWrite: message.usage.cacheWrite,
+      costUsd: message.usage.cost.total,
+      modelId: message.model,
+      calls: 1,
+    });
   }
-  if (cut === 0) return { messages, dropped: 0 };
+  return usage;
+};
 
-  const kept = messages.slice(cut);
-  const before = messages.slice(0, cut);
+const NO_RUN: ThreadRun = { allowSilence: false, reporter: null };
 
-  /**
-   * What an earlier pass's notes already stood for.
-   *
-   * A note is a claim about turns that are gone, so its count has to carry
-   * forward however the next cut falls -- whether that note is on the turn
-   * that survives, or on one of the turns now being dropped. Left behind
-   * either way, the running total understates what the model cannot see,
-   * which is the one thing this sentence exists to get right.
-   */
-  const carried = (turns: ModelTurn[]): number =>
-    turns.reduce((total, turn) => total + priorNote(turn.text).dropped, 0);
+// ---------------------------------------------------------------------------
+// The extension
+// ---------------------------------------------------------------------------
 
-  const head = kept[0];
-  if (head?.role === "user") {
-    const prior = priorNote(head.text);
-    return {
-      messages: [
-        {
-          role: "user",
-          text: `${droppedNote(cut + carried(before) + prior.dropped)}\n\n${prior.text}`,
-        },
-        ...kept.slice(1),
-      ],
-      dropped: cut,
-    };
-  }
+export const BOSS_EXTENSION = "bugboss.boss";
 
-  // The cut went past the question. Anthropic needs a user turn in front of
-  // an assistant one anyway, so the turn that has to exist carries the
-  // question back rather than being spent on the note alone.
-  const question = [...before].reverse().find((turn) => turn.role === "user");
-  const lost = before.filter((turn) => turn !== question);
-  // Putting the question back is not dropping it, so a cut that reached
-  // nothing else has freed nothing and has nothing to announce. This is the
-  // single-oversized-round case: it goes out whole and says so by saying
-  // nothing.
-  if (lost.length === 0) return { messages, dropped: 0 };
-  const prior = question ? priorNote(question.text) : null;
-  const gone = lost.length + carried(lost) + (prior?.dropped ?? 0);
-  kept.unshift({
-    role: "user",
-    text: prior ? `${droppedNote(gone)}\n\n${prior.text}` : droppedNote(gone),
+/** A rerun after a restart repeats these harmlessly; everything else reads "interrupted". */
+const REPLAY_SAFE = new Set([
+  "get_incident",
+  "query_incidents",
+  "read_agent_session",
+  "search_incidents",
+  "incident_board",
+  "incident_status",
+  STAY_SILENT_TOOL,
+  "message_agent",
+  "read_slack_link",
+]);
+
+export type BossExtensionDeps = Omit<ToolDeps, "commands" | "transcripts"> & {
+  commands: Omit<BossCommandDeps, "agents">;
+  harness: () => BugbossHarness;
+  /** Told before a `stop_agent` aborts, so the dispatcher does not read the abort as a crash. */
+  onAgentStop?: (incidentId: string) => void;
+  maxTurns?: number;
+  now?: () => number;
+};
+
+/** The conversation of an incident's agent, or null before its first launch. */
+export const incidentConversation = async (
+  db: Db,
+  h: BugbossHarness,
+  incidentId: string,
+): Promise<Conversation | null> => {
+  const row = db.get<{ conversationId: number | null }>("SELECT conversationId FROM incident WHERE id = ?", [incidentId]);
+  if (row?.conversationId === null || row?.conversationId === undefined) return null;
+  return (await h.harness.conversation(row.conversationId as ConversationId, h.context)) ?? null;
+};
+
+/**
+ * How anything reaches an incident's agent: the Boss's `message_agent` and
+ * `stop_agent`, and the tool API's notices after a commit.
+ */
+export const createAgentLine = (deps: {
+  db: Db;
+  harness: () => BugbossHarness;
+  now?: () => number;
+  onStop?: (incidentId: string) => void;
+}): AgentLine => {
+  const now = deps.now ?? Date.now;
+  return {
+    // A steer to a running agent, which is what ends a wait it is blocked in
+    // (`agent/wait.ts` ends on steers and nothing else, so a compaction's
+    // write does not). A write to an idle one, which puts it in the
+    // transcript without starting a run outside the dispatcher -- no
+    // checkout, no concurrency slot, and past a spent turn budget. A run that
+    // ends between the check and the steer starts one such run; that is the
+    // accepted cost of not polling.
+    tell: async (incidentId, text, requestId) => {
+      const h = deps.harness();
+      const conversation = await incidentConversation(deps.db, h, incidentId);
+      if (!conversation) return false;
+      await conversation.submit(
+        (await h.isBusy(conversation.id))
+          ? { type: "input", content: text, whenBusy: "steer", requestId }
+          : {
+              type: "write",
+              requestId,
+              entry: { kind: h.pi.durable.UserEntry.kind, model: [{ role: "user", content: text, timestamp: now() }] },
+            },
+        h.context,
+      );
+      return true;
+    },
+    // No fresh input here: the incident stays open and unparked, so the
+    // dispatcher's next tick submits one to the idle conversation, with a
+    // checkout and a slot, and the reset's handoff is the first thing it reads.
+    stop: async (incidentId, reason) => {
+      const h = deps.harness();
+      const conversation = await incidentConversation(deps.db, h, incidentId);
+      if (!conversation) return false;
+      deps.onStop?.(incidentId);
+      await conversation.abort(h.context);
+      await conversation.reset(`The Boss stopped your run: ${reason}. Call get_incident and continue.`, h.context);
+      return true;
+    },
+  };
+};
+
+/**
+ * The Boss's tools and its one prompt section, as a Pi Durable extension
+ * every Slack thread's conversation selects.
+ *
+ * The tools are this module's plain ones, adapted: each call learns what its
+ * run was started with from `ThreadDoc`, and the adapter decides what a
+ * result does to the run. `stay_silent` ends it, and so does every other call
+ * in a round where it was called, because Pi ends a run only when every
+ * result of the round asks to. The round that spends the last turn carries
+ * the wrap-up instruction, and any call after it is refused and ends the run,
+ * so a model that ignores the instruction cannot keep reading.
+ */
+export const createBossExtension = async (deps: BossExtensionDeps): Promise<Extension> => {
+  const { durable } = await loadPi();
+  const { Type } = await import("typebox");
+  const maxTurns = deps.maxTurns ?? SLACK_AGENT_MAX_TURNS;
+  const now = deps.now ?? Date.now;
+
+  const agents = createAgentLine({ db: deps.db, harness: deps.harness, now, onStop: deps.onAgentStop });
+
+  const transcripts: AgentTranscripts = {
+    read: async (incidentId) => {
+      const h = deps.harness();
+      const conversation = await incidentConversation(deps.db, h, incidentId);
+      if (!conversation) return null;
+      return {
+        entries: await allEntries(conversation, h.context),
+        busy: await h.isBusy(conversation.id),
+        usage: await h.usage(conversation.id),
+      };
+    },
+  };
+
+  /** The run a tool call or a response belongs to, and the turns it has taken. */
+  const runOf = async (conversationId: ConversationId): Promise<{ run: ThreadRun; turns: number }> => {
+    const h = deps.harness();
+    const live = await h.harness.snapshot(durable.LiveDoc, conversationId, h.context);
+    const first = live?.run?.inputs[0];
+    const submission = first === undefined ? undefined : await h.harness.submission(first, h.context);
+    const record = await submission?.status(h.context);
+    const thread = await h.harness.snapshot(ThreadDoc, conversationId, h.context);
+    const requestId = record?.requestId;
+    const run = (requestId === undefined ? undefined : thread?.runs[requestId]) ?? NO_RUN;
+    if (record?.entry === undefined) return { run, turns: 0 };
+    const entries = await allEntries(await h.conversation(conversationId), h.context, record.entry);
+    return { run, turns: runEntries(entries).filter(isTurn).length };
+  };
+
+  const tools = buildTools({ ...deps, commands: { ...deps.commands, agents }, transcripts });
+  const text = (body: string): ToolExecutionResult["content"] => [{ type: "text", text: body }];
+
+  const registrations: ToolRegistration[] = tools.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: Type.Unsafe<Record<string, unknown>>(tool.inputSchema),
+    ...(REPLAY_SAFE.has(tool.name) ? { replay: "safe" as const } : {}),
+    execute: async (args, api, context) => {
+      const { run, turns } = await runOf(api.conversationId);
+      if (turns > maxTurns) {
+        return { content: text(PAST_BUDGET), isError: true, control: { terminate: true } };
+      }
+      const out = await tool.run(args as Record<string, unknown>, {
+        taskId: String(api.taskId),
+        conversationId: api.conversationId,
+        run,
+      });
+      const result = typeof out === "string" ? { text: out, terminate: false } : out;
+      const silenced =
+        result.terminate ||
+        (tool.name !== STAY_SILENT_TOOL &&
+          ((await api.snapshot(durable.LiveDoc, api.conversationId, context))?.tools ?? []).some(
+            (slot) => slot.name === STAY_SILENT_TOOL,
+          ));
+      if (silenced) return { content: text(result.text), control: { terminate: true } };
+      return { content: text(turns === maxTurns ? `${result.text}\n\n${WRAP_UP_INSTRUCTION}` : result.text) };
+    },
+  }));
+
+  // Loud, because a question that needed more turns than it was given is how
+  // somebody gets a partial answer, and the budget is the thing to change.
+  const afterResponse = async (message: AssistantMessage, api: HookApi): Promise<void> => {
+    const calls = message.content.filter((block) => block.type === "toolCall");
+    if (calls.length === 0 || calls.some((call) => call.name === STAY_SILENT_TOOL)) return;
+    // The response being classified is not an entry yet, so it is the next turn.
+    const { turns } = await runOf(api.conversationId);
+    if (turns + 1 === maxTurns) {
+      alarm("slack_agent_turns_exhausted", { conversationId: api.conversationId, turns: maxTurns });
+    }
+  };
+
+  return durable.defineExtension({
+    name: BOSS_EXTENSION,
+    sections: [durable.section("commander", () => SLACK_AGENT_SYSTEM, { tag: false })],
+    tools: registrations,
+    hooks: [durable.hook(durable.GenerationTask, { afterResponse })],
   });
-  return { messages: kept, dropped: lost.length };
 };
 
-/**
- * The lock has to outlive the run it stands in front of, or it is not a lock:
- * it would expire mid-run, a second mention would take the thread, and both
- * runs would write the same transcript key -- the corruption ThreadLock
- * exists to prevent. So it is derived rather than chosen, and raising the
- * turn budget raises it too. Every turn plus the wrap-up, each spending its
- * whole call budget, and a gh call running to its bound on every turn, is
- * the worst a run can do.
- *
- * Long is the safe direction. Both entry points release in a `finally`, so
- * the only thing this covers is a run that never settles at all -- and for
- * that, a message waiting behind a dead run beats corrupting the session it
- * is about. It is held for one run, never across the follow-up runs
- * `handleIncident` makes for what arrived meanwhile.
- */
-export const SLACK_AGENT_LOCK_TTL_MS =
-  (SLACK_AGENT_MAX_TURNS + 1) * SLACK_AGENT_BUDGET_MS +
-  SLACK_AGENT_MAX_TURNS * GH_TIMEOUT_MS;
+// ---------------------------------------------------------------------------
+// The runtime: one conversation per thread
+// ---------------------------------------------------------------------------
+
+export interface BossThread {
+  id: ConversationId;
+  /** True for a new conversation, and for one just reset after a week idle. */
+  fresh: boolean;
+  state: Readonly<ThreadState>;
+}
+
+export interface BossAnswer {
+  /** What to post. Empty only when the run chose silence or wrote nothing it was allowed to. */
+  text: string;
+  /** True only when `stay_silent` ended the run. Empty text without it is a failure. */
+  silent: boolean;
+  silenceReason: string | null;
+  exhausted: boolean;
+  /**
+   * Every request the run made, the wrap-up and the failed ones included,
+   * because what a question cost belongs on the line that says it was
+   * answered.
+   */
+  usage: ModelUsage;
+}
+
+/** A run that could not answer at all. Carries what it spent anyway. */
+export class BossRunFailed extends Error {
+  constructor(
+    message: string,
+    readonly usage: ModelUsage,
+  ) {
+    super(message);
+    this.name = "BossRunFailed";
+  }
+}
+
+export interface BossRuntime {
+  /** The thread's conversation, created and recorded in `boss_thread` on first use. */
+  threadConversation(channel: string, threadTs: string): Promise<BossThread>;
+  saveThread(id: ConversationId, change: (state: ThreadState) => void): Promise<void>;
+  /**
+   * Admit one trigger as a follow-up. Resolves once the submission is durable,
+   * so the caller can advance its watermark before the next trigger reads it;
+   * `answer()` waits for the run.
+   */
+  ask(
+    id: ConversationId,
+    input: string,
+    o: { requestId: string; allowSilence: boolean; reporter: Reporter | null },
+  ): Promise<{ answer(): Promise<BossAnswer> }>;
+}
+
+export interface BossRuntimeDeps {
+  db: Db;
+  harness: () => BugbossHarness;
+  /** What `createBossExtension` built, which every thread's conversation selects. */
+  extension: Extension;
+  model: ModelRef;
+  maxTurns?: number;
+  idleExpiryMs?: number;
+  runBudgetMs?: number;
+  now?: () => number;
+}
+
+export const createBossRuntime = (deps: BossRuntimeDeps): BossRuntime => {
+  const { db } = deps;
+  const now = deps.now ?? Date.now;
+  const maxTurns = deps.maxTurns ?? SLACK_AGENT_MAX_TURNS;
+  const idleMs = deps.idleExpiryMs ?? IDLE_EXPIRY_MS;
+  const runBudgetMs = deps.runBudgetMs ?? (maxTurns + 1) * SLACK_AGENT_BUDGET_MS;
+  const creating = new Map<string, Promise<BossThread>>();
+
+  const stateOf = async (id: ConversationId): Promise<ThreadState> => {
+    const h = deps.harness();
+    const state = await h.harness.snapshot(ThreadDoc, id, h.context);
+    return state
+      ? { lastSeenTs: state.lastSeenTs, ownTs: [...state.ownTs], runs: { ...state.runs } }
+      : ThreadDoc.definition.initial();
+  };
+
+  const touch = async (id: ConversationId): Promise<void> => {
+    try {
+      await db.withWrite((w) => {
+        w.prepare("UPDATE boss_thread SET lastActivityAt = ? WHERE conversationId = ?").run(now(), id);
+      });
+    } catch (err) {
+      // Costs the idle reset its clock, not the answer.
+      alarm("boss_thread_activity_unrecorded", { conversationId: id, error: String(err) });
+    }
+  };
+
+  const open = async (channel: string, threadTs: string): Promise<BossThread> => {
+    const h = deps.harness();
+    const row = db.get<{ conversationId: number | null; lastActivityAt: number | null }>(
+      "SELECT conversationId, lastActivityAt FROM boss_thread WHERE channel = ? AND threadTs = ?",
+      [channel, threadTs],
+    );
+    const recorded = row?.conversationId ?? null;
+    const existing =
+      recorded === null ? undefined : await h.harness.conversation(recorded as ConversationId, h.context);
+    if (existing) {
+      const idle = row?.lastActivityAt !== null && row?.lastActivityAt !== undefined && now() - row.lastActivityAt > idleMs;
+      if (!idle) return { id: existing.id, fresh: false, state: await stateOf(existing.id) };
+      // A week-old context answers today's question off last week's reads.
+      // The transcript stays in storage; the model just stops seeing it.
+      await existing.reset(undefined, h.context);
+      await existing.commit(async (tx) => {
+        const state = await tx.doc(ThreadDoc, existing.id);
+        state.lastSeenTs = "";
+        state.ownTs = [];
+      }, h.context);
+      await touch(existing.id);
+      log("thread_reset_idle", { thread: `${channel}/${threadTs}`, conversationId: existing.id });
+      return { id: existing.id, fresh: true, state: await stateOf(existing.id) };
+    }
+    if (recorded !== null) {
+      // The row names a conversation the harness does not have: a lost
+      // snapshot. Starting over is right, but it is not normal.
+      alarm("boss_thread_conversation_missing", { thread: `${channel}/${threadTs}`, conversationId: recorded });
+    }
+
+    const created = await h.harness.createConversation(
+      { ownership: { kind: "ownerless" }, agent: { model: deps.model, extensions: [deps.extension] } },
+      h.context,
+    );
+    try {
+      await db.withWrite((w) => {
+        w.prepare(
+          `INSERT INTO boss_thread (channel, threadTs, since, conversationId, lastActivityAt)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (channel, threadTs) DO UPDATE SET conversationId = excluded.conversationId`,
+        ).run(channel, threadTs, now(), created.id, now());
+      });
+    } catch (err) {
+      // This run still answers. The next trigger cannot find the
+      // conversation, so it starts another, and the thread loses its memory.
+      alarm("boss_thread_unrecorded", { channel, threadTs, error: String(err) });
+    }
+    return { id: created.id, fresh: true, state: ThreadDoc.definition.initial() };
+  };
+
+  const settle = async (
+    conversation: Conversation,
+    wait: () => Promise<SettledSubmissionRecord>,
+    o: { requestId: string; allowSilence: boolean },
+    startedAt: number,
+  ): Promise<BossAnswer> => {
+    const h = deps.harness();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      alarm("slack_agent_run_timed_out", { conversationId: conversation.id, requestId: o.requestId, budgetMs: runBudgetMs });
+      conversation.abort(h.context).catch((err: unknown) =>
+        alarm("slack_agent_abort_failed", { conversationId: conversation.id, error: String(err) }),
+      );
+    }, runBudgetMs);
+    timer.unref();
+    let settled: SettledSubmissionRecord;
+    try {
+      settled = await wait();
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const run = settled.entry === undefined ? [] : runEntries(await allEntries(conversation, h.context, settled.entry));
+    const usage = usageOfRun(run);
+    const turns = run.filter(isTurn);
+    const exhausted = turns.length > maxTurns;
+    const lastText = [...turns].reverse().map((entry) => textOf(assistantOf(entry))).find((said) => said.trim()) ?? "";
+    const elapsed = now() - startedAt;
+
+    if (settled.status !== "done") {
+      // The wrap-up request is the one that failed. Everything before it is
+      // still the run's, so what it wrote is better than an apology.
+      if (turns.length >= maxTurns && !timedOut) {
+        alarm("slack_agent_wrap_up_failed", { conversationId: conversation.id, reason: settled.reason });
+        return {
+          text: lastText.trim() ? lastText : noAnswerReply(true, maxTurns, elapsed),
+          silent: false,
+          silenceReason: null,
+          exhausted: true,
+          usage,
+        };
+      }
+      throw new BossRunFailed(
+        `the run ended unanswered (${settled.reason}${timedOut ? ", over its time budget" : ""})`,
+        usage,
+      );
+    }
+
+    const answerEntry = run.find((entry) => entry.id === settled.answer);
+    const final = answerEntry ? assistantOf(answerEntry) : undefined;
+    const finalText = textOf(final);
+    const silentCall = final?.content.find(
+      (block) => block.type === "toolCall" && block.name === STAY_SILENT_TOOL,
+    );
+    const chose =
+      silentCall?.type === "toolCall" &&
+      run.some(
+        (entry) =>
+          entry.kind === TOOL_RESULT &&
+          entry.model?.[0]?.role === "toolResult" &&
+          entry.model[0].toolCallId === silentCall.id &&
+          toolResultText(entry) === SILENCE_RECORDED,
+      );
+    if (chose && silentCall?.type === "toolCall") {
+      // Production once took one more turn after choosing silence, which is
+      // how the literal text "(silpersisted)" reached a thread. The turn that
+      // chose silence is the last one, and what it wrote is not an answer.
+      if (finalText.trim()) {
+        log("slack_agent_stay_silent_text_discarded", { conversationId: conversation.id, text: finalText });
+      }
+      return {
+        text: "",
+        silent: true,
+        silenceReason: String(silentCall.arguments.reason ?? "").trim(),
+        exhausted: false,
+        usage,
+      };
+    }
+
+    if (exhausted && !finalText.trim()) {
+      // An empty completion is not an exception, so `wrap_up_failed` does
+      // not see it -- and the outcome is the worse of the two: a whole run's
+      // reading sits on the transcript and the reader still gets the
+      // apology. Nothing here can make the model speak, but a silent hole
+      // between a run that read everything and a reply that says nothing is
+      // the one shape this system does not allow.
+      alarm("slack_agent_wrap_up_empty", { conversationId: conversation.id });
+    }
+
+    // A run that may stay silent posts only what its final turn wrote:
+    // narration between tool calls is not an answer. A run that must answer
+    // falls back to it rather than to an apology.
+    const answer = o.allowSilence && !exhausted ? finalText : finalText.trim() ? finalText : lastText;
+    if (!answer.trim() && o.allowSilence && !exhausted) {
+      return { text: "", silent: false, silenceReason: null, exhausted, usage };
+    }
+    if (!answer.trim()) alarm("slack_agent_no_answer", { conversationId: conversation.id });
+    return {
+      text: answer.trim() ? answer : noAnswerReply(exhausted, maxTurns, elapsed),
+      silent: false,
+      silenceReason: null,
+      exhausted,
+      usage,
+    };
+  };
+
+  return {
+    threadConversation: (channel, threadTs) => {
+      const key = `${channel}/${threadTs}`;
+      const pending = creating.get(key);
+      if (pending) return pending;
+      // Two triggers for a thread with no conversation yet must not create two.
+      const work = open(channel, threadTs).finally(() => creating.delete(key));
+      creating.set(key, work);
+      return work;
+    },
+
+    saveThread: async (id, change) => {
+      const h = deps.harness();
+      const conversation = await h.conversation(id);
+      await conversation.commit(async (tx) => {
+        change((await tx.doc(ThreadDoc, id)) as ThreadState);
+      }, h.context);
+    },
+
+    ask: async (id, input, o) => {
+      const h = deps.harness();
+      const conversation = await h.conversation(id);
+      await conversation.commit(async (tx) => {
+        const state = await tx.doc(ThreadDoc, id);
+        state.runs[o.requestId] = { allowSilence: o.allowSilence, reporter: o.reporter };
+        const keys = Object.keys(state.runs);
+        for (const key of keys.slice(0, Math.max(0, keys.length - KEPT_RUNS))) delete state.runs[key];
+      }, h.context);
+      await touch(id);
+      const submission = await conversation.submit(
+        { type: "input", content: input, whenBusy: "followUp", requestId: o.requestId },
+        h.context,
+      );
+      const startedAt = now();
+      return { answer: () => settle(conversation, () => submission.wait(h.context), o, startedAt) };
+    },
+  };
+};
+
+// ---------------------------------------------------------------------------
+// The agent
+// ---------------------------------------------------------------------------
 
 export interface SlackMention {
   channel: string;
@@ -1040,42 +1413,13 @@ export interface SlackAgentConfig {
   rotationGroupId: string | null;
   /** Where every incident thread lives. */
   incidentChannel: string;
-  maxTurns?: number;
-  lockTtlMs?: number;
-  idleExpiryMs?: number;
 }
 
 export interface SlackAgentDeps {
   db: Db;
-  store: ObjectStore;
   slack: SlackConversation;
-  model: SlackAgentModel;
+  runtime: BossRuntime;
   config: SlackAgentConfig;
-  /** The tool API's Boss close, so either closer leaves the same record. */
-  closeIncident: CloseIncident;
-  /** The human-report ingest, so a report the Boss files lands as any report does. */
-  openIncident: OpenIncident;
-  /**
-   * Writes the one model line of the status card. A cheap direct call, not
-   * the Boss's loop: one sentence out of a dozen rendered turns.
-   */
-  summaryModel: ModelClient;
-  /** The same GitHub access an incident agent has. Null when the App is not configured. */
-  gh: GhExec | null;
-  lock?: ThreadLock;
-  now?: () => number;
-}
-
-interface ThreadState {
-  /** ts of the last thread message this agent has already been shown. */
-  lastSeenTs: string;
-  lastActivityAt: number;
-  /**
-   * What this agent posted after `lastSeenTs`. Its own replies are already in
-   * its session, and they come from the same bot user as the transition
-   * notices it does need to read, so they are told apart by ts.
-   */
-  ownTs?: string[];
 }
 
 /** Why the Boss is running in an incident thread. */
@@ -1090,82 +1434,60 @@ interface IncidentContext {
   slackThreadTs: string | null;
 }
 
-const BUSY_REPLY =
-  "Still working on the previous question in this thread. Ask me again once I have answered it.";
-
 const FAILURE_REPLY =
   "I could not finish that one. The error is in the BugBoss logs.";
 
 export class SlackAgent {
-  private readonly store: ObjectStore;
   private readonly slack: SlackConversation;
-  private readonly model: SlackAgentModel;
+  private readonly runtime: BossRuntime;
   private readonly cfg: SlackAgentConfig;
-  private readonly lock: ThreadLock;
   private readonly db: Db;
-  private readonly commands: BossCommandDeps;
-  private readonly summaries: StatusSummaries;
-  private readonly openIncident: OpenIncident;
-  private readonly gh: GhExec | null;
   /**
-   * Threads something arrived for while their run held the lock. Set before
-   * the lock is tried and read after it is released, so a message landing in
-   * any gap between the two is still picked up by one run or the other.
+   * Admissions per thread, one after another. Not a lock on the run -- the
+   * conversation's own queue orders the runs -- but the read-watermark,
+   * fetch, submit, advance-watermark step has to be atomic per thread, or two
+   * triggers read the same stretch of thread and each hands it to the Boss.
    */
-  private readonly dirty = new Set<string>();
-  /**
-   * Messages that triggered a run and have not been in one yet. The thread
-   * fetch is what the run reads, but a message that has only just been posted
-   * is not guaranteed to be in it, and a failed fetch has none of them.
-   */
-  private readonly waiting = new Map<string, Extract<IncidentTrigger, { kind: "human" }>[]>();
+  private readonly admitting = new Map<string, Promise<unknown>>();
 
   constructor(deps: SlackAgentDeps) {
-    this.store = deps.store;
     this.slack = deps.slack;
-    this.model = deps.model;
+    this.runtime = deps.runtime;
     this.cfg = deps.config;
-    this.lock = deps.lock ?? createMemoryThreadLock();
     this.db = deps.db;
-    this.openIncident = deps.openIncident;
-    this.gh = deps.gh;
-    const channel = deps.config.incidentChannel;
-    this.commands = {
-      db: deps.db,
-      threads: {
-        post: (threadTs, text) => deps.slack.post(threadTs, text, channel),
-        permalink: (messageTs) => deps.slack.permalink(messageTs, channel),
-      },
-      closeIncident: deps.closeIncident,
-      rotationGroupId: deps.config.rotationGroupId,
-    };
-    this.summaries = {
-      summarise: createStatusSummariser(deps.summaryModel),
-      cache: new Map(),
-      now: deps.now ?? Date.now,
-    };
   }
 
-  private tools(silence: SilenceChoice, reporter: Reporter | null): SlackAgentTool[] {
-    return buildTools({
-      db: this.db,
-      store: this.store,
-      commands: this.commands,
-      silence,
-      status: this.summaries,
-      openIncident: this.openIncident,
-      reporter,
-      gh: this.gh,
-      slack: this.slack,
-    });
+  private async admit<T>(key: string, step: () => Promise<T>): Promise<T> {
+    const prior = this.admitting.get(key) ?? Promise.resolve();
+    const run = prior.catch(() => undefined).then(step);
+    const tail = run.catch(() => undefined);
+    this.admitting.set(key, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.admitting.get(key) === tail) this.admitting.delete(key);
+    }
+  }
+
+  /** The answer is already posted or queued; a failed write costs a watermark, never the answer. */
+  private async saveThread(
+    id: ConversationId,
+    thread: string,
+    change: (state: ThreadState) => void,
+  ): Promise<void> {
+    try {
+      await this.runtime.saveThread(id, change);
+    } catch (err) {
+      log("state_write_failed", { thread, error: String(err) });
+    }
   }
 
   /**
    * Everything that happens in an incident thread: a person saying anything
    * there, or the incident's agent sending something up. Never answered with
    * "busy" and never dropped -- a trigger that arrives while this thread's run
-   * is in flight marks the thread, and whoever holds it runs again before
-   * letting go, until nothing new is left.
+   * is in flight is queued behind it as a follow-up, holding only what was
+   * new when it arrived.
    */
   async handleIncident(args: {
     incidentId: string;
@@ -1185,34 +1507,162 @@ export class SlackAgent {
     }
     const channel = this.cfg.incidentChannel;
     const threadTs = incident.slackThreadTs;
-    const key = `${channel}/${threadTs}`;
+    const thread = `${channel}/${threadTs}`;
+    const human = args.trigger.kind === "human" ? args.trigger : null;
 
-    if (args.trigger.kind === "human") {
-      this.waiting.set(key, [...(this.waiting.get(key) ?? []), args.trigger]);
-    }
-    this.dirty.add(key);
+    const failed = async (err: unknown): Promise<void> => {
+      alarm("incident_run_failed", { thread, incidentId: incident.id, error: String(err) });
+      // Somebody who spoke is owed a word that it failed. An inbox run has
+      // nobody waiting in the thread.
+      if (human) {
+        await this.reportFailure({ channel, threadTs, ts: human.ts, user: human.user, text: human.text }, err);
+      }
+    };
 
-    const ttl = this.cfg.lockTtlMs ?? SLACK_AGENT_LOCK_TTL_MS;
-    for (;;) {
-      if (!(await this.lock.acquire(key, ttl))) {
-        log("thread_busy_queued", { thread: key, incidentId: incident.id });
-        return;
-      }
-      let settled = false;
-      try {
-        this.dirty.delete(key);
-        const humans = this.waiting.get(key) ?? [];
-        this.waiting.delete(key);
-        settled = await this.runIncident(incident.id, channel, threadTs, humans);
-      } finally {
-        await this.lock.release(key);
-      }
-      if (this.dirty.has(key)) continue;
-      // A failed run leaves its rows unseen for the next trigger rather than
-      // retrying them here, which would spin on a model that is down.
-      if (settled && this.hasUnseen(incident.id)) continue;
+    let admitted;
+    try {
+      admitted = await this.admit(thread, async () => {
+        const boss = await this.runtime.threadConversation(channel, threadTs);
+        const since = boss.fresh || !boss.state.lastSeenTs ? undefined : boss.state.lastSeenTs;
+        const own = new Set(boss.fresh ? [] : boss.state.ownTs);
+
+        const fetched = await this.threadSince(channel, threadTs, since);
+        const shown = (fetched ?? []).filter(
+          (m) => (since === undefined || tsAfter(m.ts, since)) && !own.has(m.ts),
+        );
+        // A message posted a moment ago is not guaranteed to be in the fetch
+        // yet, and a failed fetch has none of them.
+        if (
+          human &&
+          !shown.some((m) => m.ts === human.ts) &&
+          (since === undefined || tsAfter(human.ts, since))
+        ) {
+          shown.push({ user: human.user, botId: null, text: human.text, ts: human.ts });
+        }
+        shown.sort((a, b) => (a.ts === b.ts ? 0 : tsAfter(a.ts, b.ts) ? 1 : -1));
+
+        const inbox = this.hasUnseen(incident.id)
+          ? await this.db.withWrite((w) => unseenByBoss(w, incident.id))
+          : [];
+
+        if (shown.length === 0 && inbox.length === 0 && !boss.fresh) {
+          log("incident_nothing_new", { thread, incidentId: incident.id });
+          return null;
+        }
+
+        const current = this.readIncident(incident.id);
+        if (!current) throw new Error(`incident ${incident.id} disappeared mid-run`);
+        const question = this.db.get<{ askedAt: number; message: string }>(
+          "SELECT askedAt, message FROM pending_question WHERE incidentId = ?",
+          [incident.id],
+        );
+
+        // The person in this trigger is who a report is filed for. A run
+        // woken by the agent alone has nobody to attribute one to.
+        const reporter: Reporter | null = human
+          ? { user: human.user, channel, threadTs, messageTs: human.ts }
+          : null;
+        const requestId = human
+          ? `slack:${channel}:${human.ts}`
+          : `inbox:${incident.id}:${inbox.at(-1)?.id ?? `at-${Date.now()}`}`;
+        const pending = await this.runtime.ask(
+          boss.id,
+          this.buildIncidentInput(current, boss.fresh, shown, inbox, question),
+          { requestId, allowSilence: true, reporter },
+        );
+
+        // Seen once the submission holding them is durable: that submission
+        // is now the record, and a queued run behind this one must not be
+        // shown them again.
+        if (inbox.length > 0) {
+          try {
+            await this.db.withWrite((w) => markSeenByBoss(w, inbox.map((row) => row.id)));
+          } catch (err) {
+            alarm("inbox_mark_failed", { incidentId: incident.id, rows: inbox.length, error: String(err) });
+          }
+        }
+
+        // A failed fetch moves nothing: the next trigger reads the same
+        // stretch of thread again, which repeats a message rather than
+        // losing one.
+        let watermark = since ?? "0";
+        if (fetched) {
+          for (const m of [...fetched, ...shown]) if (tsAfter(m.ts, watermark)) watermark = m.ts;
+        }
+        await this.saveThread(boss.id, thread, (state) => {
+          state.lastSeenTs = watermark;
+          state.ownTs = state.ownTs.filter((ts) => tsAfter(ts, watermark));
+        });
+        return { pending, id: boss.id, fresh: boss.fresh, shown: shown.length, inbox: inbox.length };
+      });
+    } catch (err) {
+      await failed(err);
       return;
     }
+    if (!admitted) return;
+
+    let answer: BossAnswer;
+    try {
+      answer = await admitted.pending.answer();
+    } catch (err) {
+      await failed(err);
+      return;
+    }
+
+    // Silence has to be chosen. Empty text used to be read as a deliberate
+    // silence, and that is how a request to close incident 2 vanished: the
+    // Boss read a 200,000-character session, its next turn came back with
+    // no text and no tool call, and nothing was posted or logged. A run
+    // that ends empty without stay_silent is a run that failed to answer.
+    if (!answer.text.trim()) {
+      if (!answer.silent) {
+        alarm("incident_run_silent_unchosen", {
+          thread,
+          incidentId: incident.id,
+          trigger: human ? "human" : "inbox",
+          triggerTs: human?.ts ?? null,
+          triggerUser: human?.user ?? null,
+          inbox: admitted.inbox,
+          ...usageForLog(answer.usage),
+        });
+        if (human) {
+          await this.reportFailure(
+            { channel, threadTs, ts: human.ts, user: human.user, text: human.text },
+            new Error("the run ended with no reply and without choosing silence"),
+          );
+        }
+        return;
+      }
+      log("stay_silent", { thread, incidentId: incident.id, reason: answer.silenceReason });
+    }
+
+    const posted: string[] = [];
+    try {
+      if (answer.text.trim()) {
+        for (const part of splitForSlack(toMrkdwn(answer.text))) {
+          posted.push((await this.slack.post(threadTs, part, channel)).ts);
+        }
+      }
+    } catch (err) {
+      await failed(err);
+      return;
+    }
+    if (posted.length > 0) {
+      await this.saveThread(admitted.id, thread, (state) => {
+        for (const ts of posted) {
+          if (!state.lastSeenTs || tsAfter(ts, state.lastSeenTs)) state.ownTs.push(ts);
+        }
+      });
+    }
+    log("incident_answered", {
+      thread,
+      incidentId: incident.id,
+      fresh: admitted.fresh,
+      shown: admitted.shown,
+      inbox: admitted.inbox,
+      spoke: posted.length > 0,
+      ...usageForLog(answer.usage),
+    });
   }
 
   private readIncident(incidentId: string): IncidentContext | undefined {
@@ -1231,157 +1681,6 @@ export class SlackAgent {
         incidentId,
       ]) !== undefined
     );
-  }
-
-  /** True when the run finished, whether or not it had anything to say. */
-  private async runIncident(
-    incidentId: string,
-    channel: string,
-    threadTs: string,
-    humans: Extract<IncidentTrigger, { kind: "human" }>[],
-  ): Promise<boolean> {
-    const thread = `${channel}/${threadTs}`;
-    const sessionKey = slackSessionPrefix(channel, threadTs);
-    const stateKey = `${sessionKey}state.json`;
-    try {
-      const prior = await this.readState(stateKey);
-      const idleLimit = this.cfg.idleExpiryMs ?? IDLE_EXPIRY_MS;
-      const fresh = !prior || Date.now() - prior.lastActivityAt > idleLimit;
-      const since = fresh || !prior ? undefined : prior.lastSeenTs;
-      const own = new Set(fresh || !prior ? [] : (prior.ownTs ?? []));
-
-      const fetched = await this.threadSince(channel, threadTs, since);
-      const shown = (fetched ?? []).filter(
-        (m) => (since === undefined || tsAfter(m.ts, since)) && !own.has(m.ts),
-      );
-      for (const human of humans) {
-        if (shown.some((m) => m.ts === human.ts)) continue;
-        if (since !== undefined && !tsAfter(human.ts, since)) continue;
-        shown.push({ user: human.user, botId: null, text: human.text, ts: human.ts });
-      }
-      shown.sort((a, b) => (a.ts === b.ts ? 0 : tsAfter(a.ts, b.ts) ? 1 : -1));
-
-      const inbox = this.hasUnseen(incidentId)
-        ? await this.db.withWrite((w) => unseenByBoss(w, incidentId))
-        : [];
-
-      if (shown.length === 0 && inbox.length === 0 && !fresh) {
-        log("incident_nothing_new", { thread, incidentId });
-        return true;
-      }
-
-      const incident = this.readIncident(incidentId);
-      if (!incident) throw new Error(`incident ${incidentId} disappeared mid-run`);
-      const question = this.db.get<{ askedAt: number; message: string }>(
-        "SELECT askedAt, message FROM pending_question WHERE incidentId = ?",
-        [incidentId],
-      );
-
-      const silence: SilenceChoice = { allowed: true, reason: null };
-      // The newest person in this run is who a report is filed for. A run
-      // woken by the agent alone has nobody to attribute one to.
-      const latest = humans.at(-1);
-      const reporter: Reporter | null = latest
-        ? { user: latest.user, channel, threadTs, messageTs: latest.ts }
-        : null;
-      const { text, usage } = await this.model.run({
-        system: SLACK_AGENT_SYSTEM,
-        tools: this.tools(silence, reporter),
-        sessionKey,
-        fresh,
-        input: this.buildIncidentInput(incident, fresh, shown, inbox, question),
-        maxTurns: this.cfg.maxTurns ?? SLACK_AGENT_MAX_TURNS,
-        allowSilence: true,
-      });
-
-      // Silence has to be chosen. Empty text used to be read as a deliberate
-      // silence, and that is how a request to close incident 2 vanished: the
-      // Boss read a 200,000-character session, its next turn came back with
-      // no text and no tool call, and nothing was posted or logged. A run
-      // that ends empty without stay_silent is a run that failed to answer.
-      if (!text.trim()) {
-        if (silence.reason === null) {
-          const last = humans.at(-1);
-          alarm("incident_run_silent_unchosen", {
-            thread,
-            incidentId,
-            trigger: last ? "human" : "inbox",
-            triggerTs: last?.ts ?? null,
-            triggerUser: last?.user ?? null,
-            inbox: inbox.length,
-            ...usageForLog(usage),
-          });
-          if (last) {
-            await this.reportFailure(
-              { channel, threadTs, ts: last.ts, user: last.user, text: last.text },
-              new Error("the run ended with no reply and without choosing silence"),
-            );
-          }
-          // Not settled: the inbox rows stay unseen and the watermark stays
-          // where it was, so the next run reads this stretch again.
-          return false;
-        }
-        log("stay_silent", { thread, incidentId, reason: silence.reason });
-      } else if (silence.reason !== null) {
-        log("stay_silent_overridden", { thread, incidentId, reason: silence.reason });
-      }
-
-      const posted: string[] = [];
-      if (text.trim()) {
-        for (const part of splitForSlack(toMrkdwn(text))) {
-          posted.push((await this.slack.post(threadTs, part, channel)).ts);
-        }
-      }
-
-      // Seen once the run that read them is over, so a run that died before
-      // answering leaves them for the next one.
-      if (inbox.length > 0) {
-        try {
-          await this.db.withWrite((w) => markSeenByBoss(w, inbox.map((row) => row.id)));
-        } catch (err) {
-          alarm("inbox_mark_failed", { incidentId, rows: inbox.length, error: String(err) });
-          return false;
-        }
-      }
-
-      // A failed fetch moves nothing: the next run reads the same stretch of
-      // thread again, which repeats a message rather than losing one.
-      let watermark = prior && !fresh ? prior.lastSeenTs : "0";
-      if (fetched) {
-        for (const m of [...fetched, ...shown]) if (tsAfter(m.ts, watermark)) watermark = m.ts;
-      }
-      try {
-        await this.writeState(stateKey, {
-          lastSeenTs: watermark,
-          lastActivityAt: Date.now(),
-          ownTs: [...own, ...posted].filter((ts) => tsAfter(ts, watermark)),
-        });
-      } catch (err) {
-        log("state_write_failed", { thread, error: String(err) });
-      }
-      log("incident_answered", {
-        thread,
-        incidentId,
-        fresh,
-        shown: shown.length,
-        inbox: inbox.length,
-        spoke: posted.length > 0,
-        ...usageForLog(usage),
-      });
-      return true;
-    } catch (err) {
-      alarm("incident_run_failed", { thread, incidentId, error: String(err) });
-      // Somebody who spoke is owed a word that it failed. An inbox run has
-      // nobody waiting in the thread, and its rows are still unseen.
-      const last = humans.at(-1);
-      if (last) {
-        await this.reportFailure(
-          { channel, threadTs, ts: last.ts, user: last.user, text: last.text },
-          err,
-        );
-      }
-      return false;
-    }
   }
 
   /** Null when the fetch failed, which is different from nothing having been said. */
@@ -1452,111 +1751,85 @@ export class SlackAgent {
   }
 
   async handle(mention: SlackMention): Promise<void> {
-    const lockKey = `${mention.channel}/${mention.threadTs}`;
-    const ttl = this.cfg.lockTtlMs ?? SLACK_AGENT_LOCK_TTL_MS;
+    const thread = `${mention.channel}/${mention.threadTs}`;
+    // A tagged mention is always answered. An untagged follow-up may be two
+    // people talking under a Boss answer, so there, as in an incident thread,
+    // silence is allowed -- but only chosen with stay_silent.
+    const allowSilence = mention.tagged === false;
 
-    if (!(await this.lock.acquire(lockKey, ttl))) {
-      log("thread_busy", { thread: lockKey });
-      await this.slack.post(mention.threadTs, BUSY_REPLY, mention.channel);
-      return;
-    }
-
-    const sessionKey = slackSessionPrefix(mention.channel, mention.threadTs);
-    const stateKey = `${sessionKey}state.json`;
-
+    let admitted;
+    let answer: BossAnswer;
     try {
-      const prior = await this.readState(stateKey);
-      const idleLimit = this.cfg.idleExpiryMs ?? IDLE_EXPIRY_MS;
-      const fresh = !prior || Date.now() - prior.lastActivityAt > idleLimit;
-
-      // Resume does both things: the session carries this agent's own
-      // reasoning and tool results, and a thread fetch covers the human
-      // chatter that arrived while it was away.
-      // A first mention in a thread somebody else started is usually about
-      // what was said above it: "log an incident for this" under a report.
-      // Without the thread the Boss is answering a pointer to nothing. A
-      // session that expired is fresh too, so its own earlier posts come
-      // with it, or it would redo what it already did.
-      const missed =
-        fresh || !prior
+      admitted = await this.admit(thread, async () => {
+        const boss = await this.runtime.threadConversation(mention.channel, mention.threadTs);
+        // The conversation carries this agent's own reasoning and tool
+        // results, and a thread fetch covers the human chatter that arrived
+        // while it was away. A first mention in a thread somebody else
+        // started is usually about what was said above it: "log an incident
+        // for this" under a report. Without the thread the Boss is answering
+        // a pointer to nothing. A conversation reset after a week idle is
+        // fresh too, so its own earlier posts come with it, or it would redo
+        // what it already did.
+        const firstTime = boss.fresh || !boss.state.lastSeenTs;
+        const missed = firstTime
           ? mention.threadTs === mention.ts
             ? []
             : await this.missedMessages(mention, "0", true)
-          : await this.missedMessages(mention, prior.lastSeenTs);
-
-      // A tagged mention is always answered. An untagged follow-up may be
-      // two people talking under a Boss answer, so there, as in an incident
-      // thread, silence is allowed -- but only chosen with stay_silent.
-      const allowSilence = mention.tagged === false;
-      const silence: SilenceChoice = { allowed: allowSilence, reason: null };
-      const tools = this.tools(silence, {
-        user: mention.user,
-        channel: mention.channel,
-        threadTs: mention.threadTs === mention.ts ? null : mention.threadTs,
-        messageTs: mention.ts,
+          : await this.missedMessages(mention, boss.state.lastSeenTs);
+        const pending = await this.runtime.ask(boss.id, this.buildInput(mention, missed, firstTime), {
+          requestId: `slack:${mention.channel}:${mention.ts}`,
+          allowSilence,
+          reporter: {
+            user: mention.user,
+            channel: mention.channel,
+            threadTs: mention.threadTs === mention.ts ? null : mention.threadTs,
+            messageTs: mention.ts,
+          },
+        });
+        await this.saveThread(boss.id, thread, (state) => {
+          if (!state.lastSeenTs || tsAfter(mention.ts, state.lastSeenTs)) state.lastSeenTs = mention.ts;
+        });
+        return { pending, fresh: boss.fresh, missed: missed.length };
       });
+      answer = await admitted.pending.answer();
+    } catch (err) {
+      log("run_failed", { thread, error: String(err) });
+      await this.reportFailure(mention, err);
+      return;
+    }
 
-      const { text, usage } = await this.model.run({
-        system: SLACK_AGENT_SYSTEM,
-        tools,
-        sessionKey,
-        fresh,
-        input: this.buildInput(mention, missed, fresh || !prior),
-        maxTurns: this.cfg.maxTurns ?? SLACK_AGENT_MAX_TURNS,
-        allowSilence,
-      });
-
-      if (!text.trim()) {
-        if (silence.reason === null) {
-          alarm("followup_run_silent_unchosen", {
-            thread: lockKey,
-            trigger: "human",
-            triggerTs: mention.ts,
-            triggerUser: mention.user,
-            ...usageForLog(usage),
-          });
-          await this.reportFailure(mention, new Error("the run ended with no reply and without choosing silence"));
-          return;
-        }
-        log("stay_silent", { thread: lockKey, reason: silence.reason });
-        try {
-          await this.writeState(stateKey, { lastSeenTs: mention.ts, lastActivityAt: Date.now() });
-        } catch (err) {
-          log("state_write_failed", { thread: lockKey, error: String(err) });
-        }
+    if (!answer.text.trim()) {
+      if (!answer.silent) {
+        alarm("followup_run_silent_unchosen", {
+          thread,
+          trigger: "human",
+          triggerTs: mention.ts,
+          triggerUser: mention.user,
+          ...usageForLog(answer.usage),
+        });
+        await this.reportFailure(mention, new Error("the run ended with no reply and without choosing silence"));
         return;
       }
-      if (silence.reason !== null) {
-        log("stay_silent_overridden", { thread: lockKey, reason: silence.reason });
-      }
+      log("stay_silent", { thread, reason: answer.silenceReason });
+      return;
+    }
+    try {
       await postProse(
         (part) => this.slack.post(mention.threadTs, part, mention.channel),
-        text,
-        { thread: lockKey },
+        answer.text,
+        { thread },
       );
-
-      // The answer is already posted. A failed state write costs the next
-      // resume its watermark; it must not turn an answer into an apology.
-      try {
-        await this.writeState(stateKey, {
-          lastSeenTs: mention.ts,
-          lastActivityAt: Date.now(),
-        });
-      } catch (err) {
-        log("state_write_failed", { thread: lockKey, error: String(err) });
-      }
-      log("answered", {
-        thread: lockKey,
-        fresh,
-        missed: missed.length,
-        ...usageForLog(usage),
-      });
     } catch (err) {
-      log("run_failed", { thread: lockKey, error: String(err) });
+      log("run_failed", { thread, error: String(err) });
       await this.reportFailure(mention, err);
-    } finally {
-      await this.lock.release(lockKey);
+      return;
     }
+    log("answered", {
+      thread,
+      fresh: admitted.fresh,
+      missed: admitted.missed,
+      ...usageForLog(answer.usage),
+    });
   }
 
   /**
@@ -1660,37 +1933,5 @@ export class SlackAgent {
       "",
       line,
     ].join("\n");
-  }
-
-  private async readState(key: string): Promise<ThreadState | null> {
-    const body = await this.store.get(key);
-    if (!body) return null;
-    try {
-      const parsed = JSON.parse(body) as Partial<ThreadState>;
-      if (
-        typeof parsed.lastSeenTs !== "string" ||
-        typeof parsed.lastActivityAt !== "number"
-      ) {
-        log("state_unusable", { key, reason: "shape" });
-        return null;
-      }
-      return {
-        lastSeenTs: parsed.lastSeenTs,
-        lastActivityAt: parsed.lastActivityAt,
-        ownTs: Array.isArray(parsed.ownTs)
-          ? parsed.ownTs.filter((ts): ts is string => typeof ts === "string")
-          : [],
-      };
-    } catch (err) {
-      // Unreadable state means start clean rather than resume into garbage,
-      // which silently drops every reply since the last answer, so it is said
-      // out loud rather than looking like the bot forgot the thread.
-      log("state_unusable", { key, reason: "unparseable", error: String(err) });
-      return null;
-    }
-  }
-
-  private async writeState(key: string, state: ThreadState): Promise<void> {
-    await this.store.put(key, JSON.stringify(state));
   }
 }

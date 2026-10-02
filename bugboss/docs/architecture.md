@@ -3,26 +3,53 @@
 Why it is built this way, and where each piece lives. For what it is *for*,
 read [`purpose.md`](./purpose.md) first.
 
-## One container
+## One container, one process
 
-BugBoss is a single ECS Fargate task. Incident agents are **child processes
-of that task**, not separate tasks.
+BugBoss is a single ECS Fargate task, and every agent runs **inside the Boss's
+own process**: each incident agent and each Slack thread the Boss talks in is
+a conversation on one Pi Durable harness (`agent/harness.ts`), not a task or
+a process of its own.
 
-That one decision removes a lot: no `RunTask`, no client tokens, no
-`ListTasks` eventual-consistency window, no leases, no SQS, no Service
-Connect. The cost is that a deploy takes everything down together, which is
-why `deploymentMinimumHealthyPercent` is `0` — two tasks would put two
-processes on the same SQLite file and the same agent sessions, and that is a
+That removes a lot: no `RunTask`, no leases, no SQS, no Service Connect, and
+nothing between an agent and the Boss but a function call into the same code
+the Boss runs. The cost is that a deploy takes everything down together,
+which is why
+`deploymentMinimumHealthyPercent` is `0` — two tasks would put two processes
+on the same SQLite files and the same conversations, and that is a
 correctness bug rather than a tuning choice.
 
 ```
 Grafana ─┐
          ├─► ALB ─► container ──┬─► triage ─► assign ─► dispatcher
 Slack  ──┘                      │                          │
-                                │                          ├─► agent (child)
-                                └─► SQLite ──► S3          ├─► agent (child)
-                                    (every write)          └─► … up to 15
+                                │                          ▼
+                                │                 harness, in process:
+                                │                 an agent conversation per
+                                │                 incident (up to 15) and a
+                                │                 Boss conversation per thread
+                                │                          │
+                                ├─► bugboss.db ─► S3       │
+                                │   (every write)          │
+                                └─► harness.sqlite ─► S3 ◄─┘
+                                    (once per tick)
 ```
+
+### One process, no isolation
+
+This is the cost of one process, accepted on purpose and stated here so
+nobody has to rediscover it. Every agent shares the event loop with every
+other agent and with the Boss. A wedged `bash` is stopped by the run's abort,
+which `exec` honours by killing the child pids it started. A tool that wedges
+*inside JavaScript* rather than in a subprocess has nothing that can stop it:
+an abort is cooperative, and nothing in this process can preempt a
+synchronous loop or a promise that never settles. Such a tool stalls its own conversation for good,
+and a hot synchronous one stalls every agent and the webhooks with it.
+
+What keeps that rare is that an agent's own work is subprocesses (`bash`,
+`git`, `npm`, `gh`) and its in-process tools are thin calls into the tool API
+and Grafana's MCP server. A new in-process tool that does real work of its
+own is the change that makes it likely, and is worth refusing in favour of a
+subprocess.
 
 ## The data model
 
@@ -120,16 +147,19 @@ incoherent: `search_incidents` reaches `RESOLVED` and `CLOSED` incidents in
 full, so an agent knew the past and could not see the open incident beside it,
 while the Boss served that incident to anyone in the channel.
 
-The credential is still scoped: the loopback route refuses a path id that is
-not the caller's, and every write goes to that one record.
+Writes are still scoped: an agent's tools read the incident from the
+conversation's `IncidentDoc`, never from an argument, so every write goes to
+that one record.
 
 ## Two agents
 
-The incident agent (`agent/`) is a Pi session in a child process that works
-one incident. Everything else that reaches a model is the Boss -- triage,
+The incident agent (`agent/`) is a conversation on the harness that works one
+incident. Everything else that reaches a model is the Boss -- triage,
 root-cause correlation, the inbound-language read and the incident commander
-in `slack/agent.ts`. They share one request path (`bedrock/client.ts`), one
-read-only query guard (`triage/sql.ts`) and one usage accumulator.
+in `slack/agent.ts`, whose every Slack thread is a conversation on the same
+harness. They share one request path (one pi-ai `Models`, built by
+`createBugbossModels`), one read-only query guard (`triage/sql.ts`) and one
+usage accumulator.
 
 The commander sits between people and agents (see "The human boundary"),
 and besides relaying it can close, merge, stop and page. Every Boss write is
@@ -193,9 +223,10 @@ along with the only shape that can answer "how often does a resolution hold".
 
 **4. Dispatch** (`dispatcher/`) launches one agent per incident, up to 15.
 That cap is a circuit breaker, not a scheduler — hitting it means something
-is wrong. Ticks are serialized against each other: a tick awaits an S3 put
-and an STS call before recording a launch, so overlapping ticks would start
-two children on one incident, and both would write the same session file.
+is wrong. A launch is a submit into the incident's conversation, created on
+the first one; preparing the checkout runs off the tick, because it is
+minutes of git. Ticks are serialized against each other and a launch in
+progress is remembered, so two ticks cannot submit the same kickoff twice.
 
 The dispatcher is also the only thing that notices an incident nobody is
 working. Every other guard watches a run, so an incident with no run at all
@@ -228,11 +259,11 @@ take a `CHECK`. It cannot, so it is refused at the tool instead — and an agent
 that cannot answer escalates, which leaves a recurrence nobody can explain
 open with somebody told it needs them.
 
-**5. The agent** (`agent/`) runs Pi against Bedrock in the same container.
-It gets its own `git clone --filter=blob:none` of omni on an EFS volume that
-survives a restart, the Grafana MCP
-toolset, and a scoped token for the Boss's loopback API. It investigates,
-fixes, opens a PR, waits for a merge and a deploy, and writes a post-mortem.
+**5. The agent** (`agent/`) runs on the harness against Bedrock, in the
+Boss's process. It gets its own `git clone --filter=blob:none` of omni on an
+EFS volume that survives a restart, the Grafana MCP toolset, and the incident
+tools, which call the tool API in-process. It investigates, fixes, opens a
+PR, waits for a merge and a deploy, and writes a post-mortem.
 
 ## The human boundary
 
@@ -262,12 +293,15 @@ webhook acknowledges before it works.
 
 ## The agent boundary
 
-An agent is a child process of the Boss, running as the same user. It
-resolves the task role through the container credential provider, exactly as
-its parent does, so whatever the Boss can reach in AWS an agent can reach
-too. There is no privilege boundary inside the container — a child can read
-the parent's own environment — so anything claimed at that line would be a
-claim rather than a control.
+An agent runs inside the Boss's process, and its shell commands run as the
+same user. `bash` starts each command with an allowlisted environment
+(`agent/shell-env.ts`) and a freshly minted GitHub token, so the Boss's secret
+blob is not in what a command inherits. That is hygiene, not a fence: a
+command can still reach the task role through the container credential
+provider exactly as the Boss does, and a process running as the Boss's user
+can read the Boss's own environment. There is no privilege boundary inside
+the container, so anything claimed at that line would be a claim rather than
+a control.
 
 The boundary that is real is the task. The agent's container holds no
 database credentials, no deploy role and no merge rights. Its AWS identity
@@ -280,11 +314,12 @@ pull requests and cannot merge one, enforced by branch protection on `main`
 rather than by the prompt. So every effect an agent can have on the platform
 arrives as a pull request a human approves.
 
-The loopback API is the **interface** to incident state, not a fence around
-it. Every transition is one HTTP call on `127.0.0.1` carrying a bearer token
-minted per launch; the incident is derived from the token and then checked
-against the path, so a valid token for incident A cannot be aimed at B. That
-check is what keeps fifteen concurrent agents out of each other's incidents.
+The tool API is the **interface** to incident state, not a fence around it.
+Every transition is one in-process call from an incident tool, and the
+incident it acts on is the one recorded in the conversation's `IncidentDoc`
+when the dispatcher created it. No tool takes an incident id to write to, so
+an agent working incident A has no argument it could aim at B. That is what
+keeps fifteen concurrent agents out of each other's incidents.
 
 Four tools that move the incident through its lifecycle, two that move it
 through nothing, and two reads:
@@ -314,9 +349,10 @@ the dispatcher slot, which is the easiest thing here to read the wrong way
 round: an agent parked inside `monitor` is alive and still holds one,
 deliberately.
 
-Plus two blocking tools that live in the harness, each costing one turn no
-matter how long it waits — which is what keeps a multi-day incident from
-saturating context on polling. The same property makes them the only thing
+Plus two blocking tools, each costing one turn no matter how long it waits —
+which is what keeps a multi-day incident from saturating context on polling.
+Both end the moment the Boss sends the agent anything, because they watch the
+conversation's inbox as well as their own condition. The same property makes them the only thing
 that ever misses the prompt cache, which is why the prefix is written with a
 1h ttl; see `bugboss/bedrock/CLAUDE.md`.
 
@@ -334,11 +370,19 @@ that ever misses the prompt cache, which is why the prefix is written with a
   `boss_message` ends the wait. A wait nobody answers escalates to the Boss,
   and the agent goes on waiting
 
+Both are replay-safe: a deploy mid-wait resumes the wait from its
+`pending_wait` or `pending_question` marker and costs no turn.
+
 ### How an agent learns things changed
 
-There is no push channel and an agent is never addressable. Directives ride
-back on responses to calls the agent was already making — `stop`, `merged`,
-`new_signals`, `boss_message`, `resumed_after`.
+By a submission into its conversation. A `boss_message` and `new_signals`
+are steers: they land at the agent's next turn boundary, and a blocking tool
+returns as soon as one is queued, so a message reaches an agent in an
+hour-long wait within milliseconds. `stop` aborts the run, resets the
+conversation with a hand-off and submits a fresh input. `merged` aborts the
+absorbed incident's run; its status is no longer eligible, so nothing
+resubmits it. `resumed_after` is a steer the dispatcher sends at boot to a
+run the restart interrupted.
 
 `new_signals` names the incidents that were emptied into this one, when that
 is how the signals arrived. Without it a merge reaches the surviving agent as
@@ -401,12 +445,13 @@ volume, not the environment.
 
 **The flow.**
 
-1. The agent calls `request_sql_query(sql, reason)` on the loopback tool API.
+1. The agent calls `request_sql_query(sql, reason)`, an in-process tool.
 2. The Boss adds the incident's thread and forwards it to the runner.
 3. The runner checks with Slack that the thread is a top-level message the
    bot posted, headed with that incident's number, then posts the exact SQL
-   in it and waits. The agent can call the runner directly, so step 2 is
-   not what keeps a request in its own incident's thread; this check is.
+   in it and waits. The agent's shell can call the runner directly, so step
+   2 is not what keeps a request in its own incident's thread; this check
+   is.
 4. A member of the rotation group reacts to approve or refuse. The runner
    polls `reactions.get`, ignores anyone not in the rotation, fails the
    request if the bot itself has reacted, and re-reads the message before
@@ -457,11 +502,26 @@ A failed PUT **halts writes** rather than continuing. A process that keeps
 committing locally while S3 falls behind is worse than one that stops,
 because the divergence stays invisible until a restart loses it.
 
-**Agent sessions are JSONL on local disk, mirrored to S3 per turn.** A
-restart restores the file and Pi resumes, replaying thinking blocks. This
-works because a thinking block's signature is bound to the prefix — the
-system prompt, the tools array and every earlier message — and does not
-expire.
+**Conversations are a second SQLite file, mirrored to S3 once per tick.**
+Pi Durable keeps every conversation, task and document in
+`/data/harness.sqlite`, beside `bugboss.db` rather than in it: its
+adapter is `node:sqlite` with async transactions and ours is better-sqlite3
+with synchronous ones, so they cannot share a transaction and one file would
+buy nothing but lock contention. It commits partial output every 100 ms, so
+a PUT per commit is impossible; `db/mirror.ts` snapshots it with `VACUUM
+INTO` and PUTs `state/harness.sqlite` on the tick when anything committed,
+and once more on SIGTERM. Boot restores it before the harness opens, then
+`harness.resume()` carries on every run that was in flight. A failed PUT
+alarms (`harness_snapshot_failed`, then `harness_snapshot_still_failing`
+after five minutes) and never halts the incident database: halting incident
+writes for a transcript upload would couple the wrong things.
+
+The loss window is one tick of transcript. That is safe because the incident
+tables stay the system of record and every tool effect is a guarded,
+idempotent write there, so a transcript behind the incident table costs the
+model one "already FIXING" result, and resume re-requests the last
+generation at worst. A thinking block's signature is bound to the prefix and
+does not expire, so a resumed run replays it.
 
 Every merge to ops `main` restarts this container, so resume is the normal
 path, not the exceptional one. That is why the agents' workspaces
@@ -484,13 +544,13 @@ by id, and the report prints one timeline with the recorded times.
 | `triage/` | The decision, and the rules that bound it |
 | `toolapi/` | `assign`, the transitions, correlation |
 | `dispatcher/` | Launch, deadlines, escalation, parking, the stale sweep, the circuit breaker |
-| `agent/` | The incident agent: Pi session, tools, prompt, resume |
-| `bedrock/` | The Pi provider over Bedrock `InvokeModel`, and the Boss's client on it |
+| `agent/` | The harness, the incident agent's extension, its tools, prompt and in-process port |
+| `bedrock/` | The pi-ai provider over Bedrock `InvokeModel`, and the Boss's client on it |
 | `slack/` | Outbound relay, inbound routing to the Boss, the mention read, the incident commander, and how outbound text is rendered |
 | `board/` | When the status board says anything: headers, the morning post, the all-clear |
 | `report/` | The closing report: assemble, render, publish once |
-| `http/` | Public routes and the loopback tool API |
-| `db/` | SQLite, and the S3 mirror |
+| `http/` | Webhooks and health |
+| `db/` | SQLite, its S3 mirror, and the harness file's mirror |
 | `testdb/` | The test Postgres URL, its guard and its boot probe |
 | `sqlrunner/` | The sidecar that runs a human-approved read-only query against gp-api prod |
 | `index.ts` | The composition root. The only place real services are named |
@@ -535,19 +595,23 @@ reaches every surface rather than the ones somebody remembered.
 blocks that have empty text but live signatures, which is exactly the shape
 Opus 5 produces. Resume depends on those surviving.
 
-**The provider is reached by wrapping Pi's Bedrock provider, not by claiming
-an api id.** Pi looks a provider up by `model.provider`, and installs its
-builtin untouched when that id has no `models.json` entry and no registered
-extension -- so the registry that `model.api` indexes is never consulted, and
-the builtin serves Converse to every model it owns. `bedrock/runtime.ts`
-registers a native provider that dispatches on `model.api` instead, and
-`agent/run.ts` asserts the routing before the session starts.
+**The provider is reached by wrapping pi-ai's Bedrock provider, not by
+claiming an api id.** pi-ai resolves a model from the provider's own catalog
+by id, and the builtin Bedrock catalog stamps Converse on every entry, so the
+builtin would serve Converse to every model it owns. `createBugbossModels`
+wraps it with `routeBedrockProvider`, which dispatches on `model.api`, and
+overrides the catalog so our resolved models replace the Converse entries.
+`assertBedrockInvokeModelRouting` checks both halves before anything runs:
+that the provider is ours, and that the catalog hands back the InvokeModel
+api for the id. A missed override is exactly the silent misroute it exists
+to catch.
 
-Both callers reach the model through it: the agent streams, and the Boss's own
-bounded calls do one request each through `bedrock/client.ts`, asserting the
-same routing before the first one. One path deliberately, so a fix to the
-request lands once -- two paths is how a beta header present on one and absent
-from the other killed every incident agent while triage carried on working.
+Every caller reaches the model through that one `Models`: the incident agent
+and the commander stream on the harness, and triage, correlation and the goal
+evaluator make one bounded request each through `bedrock/client.ts`. One path
+deliberately, so a fix to the request lands once -- two paths is how a beta
+header present on one and absent from the other killed every incident agent
+while triage carried on working.
 
 **Two bounds on a run, and the wall clock is the weaker one.** A deadline is
 external, so it costs nothing in harness capability, but it does not measure
@@ -556,30 +620,38 @@ block, and the first nine-hour incident spent about eight of those hours
 inside a single turn waiting on a person. So the run is also bounded in
 **turns**, counted across every launch of one incident -- 92 turns for that
 nine-hour run against a ceiling of 200. Both bounds have the same two
-layers: the child steers itself to write a brief at the soft edge, then it
-is stopped. The wall clock's stop is the parent's SIGKILL, strictly later;
-the turn budget's is `session.abort()` in the child, after the harness has
-escalated to the Boss (so a person can be told, with the spend) and parked (so the
-dispatcher does not relaunch it into the same exhausted budget).
+layers: the agent is steered to write a brief at the soft edge, then its run
+is aborted. The wall clock's steer and abort come from the dispatcher, the
+abort `DEADLINE_GRACE_SECONDS` after the steer. The turn budget's come from a
+hook after every model response, which increments `incident.turnsUsed`
+(awaited, so the count is in S3 before the next request) and at the cap
+escalates to the Boss (so a person can be told, with the spend), parks (so
+the dispatcher does not relaunch it into the same exhausted budget) and
+aborts. Boot rewrites every open incident's `turnsUsed` from its transcript,
+so an increment lost to a restart costs nothing. An abort is cooperative; see
+"One process, no isolation" for what that cannot stop.
 
 Turns rather than dollars because dollars here are an estimate (below) and a
 cap on an estimate is a cap on arithmetic. 200 is a bound before a price
 cap, not instead of one: the escalation carries what the run spent so the
 next number is measured rather than guessed.
 
-**Compaction just in time, and no cap on tool output.** Pi re-projects the
-session after a tool result is appended and before the next provider request,
-and compacts there if the projection is over `contextWindow - reserveTokens`.
-So a result never has to be cut to fit: it lands whole, gets measured, and
-what gives way is summarised history, which the session transcript still
-holds. Cutting the result instead meant losing the middle of a stack trace or
-a log dump the run had just paid a tool call to fetch.
+**Compaction just in time, and no cap on tool output.** Pi Durable measures
+the context after a tool result is appended and before the next provider
+request, and compacts there if it is over `contextWindow - reserveTokens`. So
+a result never has to be cut to fit: it lands whole, gets measured, and what
+gives way is summarised history, which the conversation's entries still hold.
+Cutting the result instead meant losing the middle of a stack trace or a log
+dump the run had just paid a tool call to fetch.
 
 That threshold is the backstop. The ordinary compaction happens at each stage
-transition -- root cause reported, fix PR opened, fix merged -- with a prompt
-that keeps what the next stage needs and the timeline (`agent/CLAUDE.md`,
-"Compaction at each stage"). Compaction appends; the session file keeps every
-entry it summarised.
+transition -- root cause reported, fix PR opened, fix merged -- where the tool
+whose success is the transition asks for `conversation.compact` with a prompt
+that keeps what the next stage needs and the timeline (`agent/CLAUDE.md`).
+Pi Durable summarises in the background and places the summary at the next
+turn boundary, and a compaction a restart interrupted is a checkpointed task
+that resumes. Compaction appends; the conversation keeps every entry it
+summarised.
 
 `reserveTokensFor` is `maxTokens + keepRecentTokens` — the most the model can
 emit in one response, plus the tail compaction will not summarise. It was 5%
@@ -597,15 +669,18 @@ shown, from those tokens and Pi's Bedrock catalog rates for `modelId`
 (`priceTokens` in `bedrock/model.ts`), and called an **estimate** in the
 closing report, in Slack and in `read_agent_session`.
 
-`rollUpUsage` keeps the tokens current. It sums the incident's session file
-and writes absolute totals, never increments, so a re-read cannot double
-count: after every child exits, on every tick for the agents that are
-running, and over every row at boot. The boot pass is the one that matters
-most, because every deploy kills the children along with the `.finally` that
-would have rolled them up. A total below the stored one is never written:
-the file only grows, so a smaller one is a stale read. A merged incident
-keeps its own tokens on its own row; the closing report prices the merged-in
-rows and adds them to the incident that absorbed them.
+`rollUpUsage` keeps the tokens current. It sums the conversation's
+`UsageDoc` -- every model bucket, the goal evaluator's among them, plus the
+tool buckets -- and writes absolute totals, never increments, so a re-read
+cannot double count: on every tick for the agents that are busy, and over
+every row at boot. A total below the stored one is never written: usage only
+grows, so a smaller one is a stale read. That rule is also what carries an
+incident across the cutover to the harness, whose fresh conversation starts
+at zero beside the totals its old session file already put on the row. The
+row's `modelId` is the bucket that produced the most output, so the goal
+evaluator's cheaper model adds its tokens without taking the row. A merged
+incident keeps its own tokens on its own row; the closing report prices the
+merged-in rows and adds them to the incident that absorbed them.
 
 The one way to check the estimate is an **application inference profile**: a
 tagged wrapper the agent is invoked through, since Bedrock puts no
@@ -613,7 +688,7 @@ cost tag on an InvokeModel request. Its usage lands under `Project: bugboss`
 in Cost Explorer, about a day late -- too late to enforce anything, and the
 only mechanism that would ever reveal the local price table had drifted. The
 profile ARN is the request field only; `model.id` stays the logical id, so
-the signed session prefix is untouched and a model nobody wrapped loses its
+the signed prefix is untouched and a model nobody wrapped loses its
 attribution rather than its agent.
 
 The Boss's own bounded calls are costed the same way. `runStructuredCall`
@@ -632,8 +707,8 @@ an incident, so an incident-shaped record cannot hold it, and it is the
 decision that arrives in bulk.
 
 The signal write accumulates rather than replaces, which is the opposite of
-`rollUpUsage`. That one re-reads a whole session file, so its total is already
-absolute. A triage decision only ever knows what it just spent, and a signal
+`rollUpUsage`. That one re-reads a whole conversation's usage, so its total is
+already absolute. A triage decision only ever knows what it just spent, and a signal
 can be triaged twice -- a re-delivery of a signal nothing ever placed falls
 through to be placed again, and both attempts were paid for. There is no
 `costUsd` column on either row.
@@ -657,14 +732,3 @@ prompt. The post-mortem is the
 one field with no cap, because it leaves as the file rather than as thread
 text. `slack/CLAUDE.md` has the table of which bound applies where. `report/CLAUDE.md` has the rest, including why the
 report's token figures are as of the close.
-
-**Usage is read back off the session file**, after the child exits, by
-`sumSessionUsage`. Pi writes a turn's usage nested at `message.usage` and
-writes the billed non-turn calls -- compaction's summarization, a cache warm
--- at the top level, so both are summed. The totals are absolute over the
-whole file, which is what makes resume correct: a relaunched agent appends to
-the restored file, so re-reading it counts every launch exactly once. Turns
-are counted alongside the tokens because a turn that reached the model always
-spends some, so turns above zero with tokens at zero means the reader has
-drifted from what Pi writes, and the Boss alarms rather than storing a free
-incident.

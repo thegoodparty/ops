@@ -5,9 +5,10 @@ agent, after a person in the on-call rotation approves it in Slack. Its own
 container ("sqlrunner") in the BugBoss task, same image, entry point
 `main.ts`, listening on `127.0.0.1:8790`.
 
-The agent's `request_sql_query` tool goes through the Boss's loopback tool
-API, which adds the incident's thread and forwards here. The agent can also
-call this port directly, so nothing a caller sends is taken on trust.
+The agent's `request_sql_query` tool goes through the Boss's in-process
+`createSidecarSqlPort` (`agent/sql.ts`), which adds the incident's thread and
+forwards here. The agent can also call this port directly, so nothing a caller
+sends is taken on trust.
 
 - `runner.ts`: the state machine and the HTTP routes. Every decision.
 - `slack.ts`, `execute.ts`: the Slack and Postgres wiring it is handed.

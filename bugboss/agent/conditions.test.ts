@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -13,16 +10,58 @@ import {
   REVIEW_SETTLE_SECONDS,
   type GitHubReadPort,
 } from "./conditions";
+import { loadPi, type InboxState, type ToolExecutionApi, type ToolExecutionResult } from "./harness";
 import type { GitHubResult } from "./rerun";
 import {
+  BOSS_SAYS,
   createMonitorTool,
-  createWaitInterrupt,
-  pollingGuardExtension,
+  localWait,
   pollingRefusal,
   runMonitor,
   type HeartbeatDeps,
+  type MonitorDeps,
   type PendingWait,
 } from "./tools";
+
+const textOf = (result: ToolExecutionResult): string => {
+  const first = result.content?.[0];
+  return first?.type === "text" ? String(first.text) : "";
+};
+
+/** A tool call whose inbox the test can push a steer into, as a commit would. */
+const fakeCall = () => {
+  let steers: string[] = [];
+  let listener: ((value: InboxState) => Promise<void>) | null = null;
+  const inbox = (): InboxState => ({
+    items: steers.map((content, index) => ({ id: index as never, mode: "steer" as const, content })),
+  });
+  const api = {
+    conversationId: 7,
+    memo: async () => undefined,
+    watchDoc: async () => ({
+      value: inbox(),
+      start: (callback: (value: InboxState) => Promise<void>) => {
+        listener = callback;
+      },
+      stop: async () => {
+        listener = null;
+      },
+    }),
+    snapshot: async () => undefined,
+  } as unknown as ToolExecutionApi;
+  return {
+    api,
+    steer: (text: string) => {
+      steers = [...steers, text];
+      void listener?.(inbox());
+    },
+  };
+};
+
+const monitorCall = async (deps: MonitorDeps, args: Record<string, unknown>, api = fakeCall().api) => {
+  const tool = await createMonitorTool({ resolve: async () => ({ wait: localWait(deps), ...deps }) });
+  return tool.execute(args, api, (await loadPi()).context);
+};
 
 const HEAD = "a".repeat(40);
 const MERGE = "b".repeat(40);
@@ -170,11 +209,8 @@ test("a typed condition missing what it watches is refused before any wait", asy
   assert.equal(conditionProblem({ condition: "pr_closed", pr: "omni#1" }), null);
 
   const github = fakeGitHub();
-  const tool = await createMonitorTool({ github: github.port });
-  const out = (await tool.execute("c1", { ...base, condition: "pr_checks" } as never, undefined, undefined, {} as never)) as {
-    content: { text: string }[];
-  };
-  assert.match(out.content[0].text, /^Rejected, nothing was waited for/);
+  const out = await monitorCall({ github: github.port }, { ...base, condition: "pr_checks" });
+  assert.match(textOf(out), /^Rejected, nothing was waited for/);
   assert.equal(github.paths.length, 0);
 });
 
@@ -544,108 +580,20 @@ test("the read port follows every page and never sends a token it does not have"
 // ---------------------------------------------------------------------------
 
 test("a Boss message interrupts a typed wait", async () => {
-  const waits = createWaitInterrupt();
-  const clock = fakeClock();
+  const fake = fakeCall();
   const github = fakeGitHub((check) => {
-    if (check === 3) waits.interrupt();
+    if (check === 3) fake.steer(`${BOSS_SAYS}stop watching, it is reverted`);
   });
-  const tool = await createMonitorTool({
-    github: github.port,
-    waitSignal: waits.signal,
-    now: clock.now,
-    sleep: clock.sleep,
-  });
+  const tool = await createMonitorTool({ resolve: async () => ({ github: github.port }) });
 
-  const out = (await tool.execute(
-    "c1",
-    { ...base, condition: "pr_closed", pr: "omni#2262", description: "omni#2262 to merge" } as never,
-    undefined,
-    undefined,
-    {} as never,
-  )) as { content: { text: string }[] };
+  const out = await tool.execute(
+    { ...base, intervalSeconds: 1, condition: "pr_closed", pr: "omni#2262", description: "omni#2262 to merge" },
+    fake.api,
+    (await loadPi()).context,
+  );
 
-  assert.match(out.content[0].text, /^STOPPED WAITING for: omni#2262 to merge \(interrupted\)/);
+  assert.match(textOf(out), /^STOPPED WAITING for: omni#2262 to merge \(interrupted\)/);
   assert.equal(github.checks(), 3, "ended at the check the message landed on");
-});
-
-const fauxSession = async (tools: Awaited<ReturnType<typeof createMonitorTool>>[], toolNames: string[]) => {
-  const ai = await import("@earendil-works/pi-ai");
-  const pi = await import("@earendil-works/pi-coding-agent");
-  const core = ai.createFauxCore({ provider: "faux", api: "faux", models: [{ id: "m" }] });
-  const dir = mkdtempSync(join(tmpdir(), "typed-waits-"));
-  const runtime = await pi.ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-  runtime.registerProvider("faux", {
-    api: core.api as never,
-    apiKey: "x",
-    baseUrl: "http://faux.invalid",
-    streamSimple: core.streamSimple as never,
-    models: [
-      { id: "m", name: "m", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1000 },
-    ],
-  });
-  const settingsManager = pi.SettingsManager.inMemory({});
-  const resourceLoader = new pi.DefaultResourceLoader({
-    cwd: dir,
-    agentDir: dir,
-    settingsManager,
-    noContextFiles: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    extensionFactories: [pollingGuardExtension],
-  });
-  await resourceLoader.reload();
-  const model = runtime.getModel("faux", "m");
-  const { session } = await pi.createAgentSession({
-    cwd: dir,
-    agentDir: dir,
-    modelRuntime: runtime,
-    model,
-    settingsManager,
-    resourceLoader,
-    sessionManager: pi.SessionManager.inMemory(dir),
-    tools: toolNames,
-    customTools: tools,
-  });
-  return { ai, core, session };
-};
-
-test("a wait spends no model request between the call and the condition", async () => {
-  const clock = fakeClock();
-  const github = fakeGitHub((check) => {
-    github.world.checks = [checkRun("Test", check < 40 ? "IN_PROGRESS" : "COMPLETED", check < 40 ? null : "SUCCESS")];
-  });
-  const monitor = await createMonitorTool({ github: github.port, sleep: clock.sleep, now: clock.now });
-  const { ai, core, session } = await fauxSession([monitor], ["monitor"]);
-  const requestsAt: number[] = [];
-  core.setResponses([
-    () => {
-      requestsAt.push(github.checks());
-      return ai.fauxAssistantMessage(ai.fauxToolCall("monitor", { ...base, condition: "pr_checks", pr: "omni#2262" }));
-    },
-    () => {
-      requestsAt.push(github.checks());
-      return ai.fauxAssistantMessage("green");
-    },
-  ]);
-
-  await session.prompt("wait for CI");
-
-  assert.equal(github.checks(), 40, "the premise: the wait checked forty times");
-  assert.deepEqual(requestsAt, [0, 40], "one request to start the wait, one after it fired, none between");
-});
-
-test("bash refuses a sleep and gh's watchers, and runs nothing", async () => {
-  const { ai, core, session } = await fauxSession([], ["bash"]);
-  core.setResponses([
-    ai.fauxAssistantMessage(ai.fauxToolCall("bash", { command: "sleep 600; touch ran" })),
-    ai.fauxAssistantMessage("ok"),
-  ]);
-
-  await session.prompt("go");
-
-  const result = session.messages.find((message) => message.role === "toolResult") as { content: { text: string }[] };
-  assert.match(result.content[0].text, /^Refused, nothing ran: this bash call waits \(sleep 600s\)/);
-  assert.match(result.content[0].text, /monitor/);
 });
 
 test("the bash guard refuses only what can be nothing but a wait", () => {
@@ -666,7 +614,7 @@ test("a PR GitHub cannot find ends a person-wait without telling the Boss it is 
     getAll: async () => ({ ok: true, data: [] }),
     graphql: async () => ({ ok: true, data: {} as never }),
   };
-  const tool = await createMonitorTool({
+  const out = await monitorCall({
     github: port,
     sleep: clock.sleep,
     now: clock.now,
@@ -680,19 +628,12 @@ test("a PR GitHub cannot find ends a person-wait without telling the Boss it is 
       },
       boss: { tellBoss: async (_kind, text) => void told.push(text), escalationsSince: async () => ({ count: 0, lastAt: null }) },
     },
-  });
-  const out = (await tool.execute(
-    "c1",
-    { ...base, condition: "pr_closed", pr: "omni#99999", awaitingHuman: "Merge it" } as never,
-    undefined,
-    undefined,
-    {} as never,
-  )) as { content: { text: string }[] };
+  }, { ...base, condition: "pr_closed", pr: "omni#99999", awaitingHuman: "Merge it" });
 
   assert.deepEqual(told, [], "nothing happened, so nobody is told it is done");
   assert.equal(cleared, true);
-  assert.match(out.content[0].text, /^CHECK FAILED/);
-  assert.doesNotMatch(out.content[0].text, /Condition met/);
+  assert.match(textOf(out), /^CHECK FAILED/);
+  assert.doesNotMatch(textOf(out), /Condition met/);
 });
 
 test("a GraphQL request says it is JSON", async () => {

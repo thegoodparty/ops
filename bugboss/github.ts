@@ -45,16 +45,6 @@ export interface GitHubAppConfig {
   installationId: string;
 }
 
-export const gitHubAppFromEnv = (
-  env: NodeJS.ProcessEnv,
-): GitHubAppConfig | null => {
-  const appId = env.GITHUB_APP_ID;
-  const privateKey = env.GITHUB_APP_PRIVATE_KEY;
-  const installationId = env.GITHUB_APP_INSTALLATION_ID;
-  if (!appId || !privateKey || !installationId) return null;
-  return { appId, privateKey, installationId };
-};
-
 /**
  * Returns the current installation token, minting a new one when the cached
  * one is spent. Call it before each use rather than holding the result: over a

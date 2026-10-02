@@ -347,9 +347,9 @@ export interface StatusCardView {
   prUrls: readonly string[];
   /** The one model-written line, or "summary unavailable". */
   now: string;
-  /** When the session last recorded anything, or null for no session. */
+  /** When the agent's conversation last recorded anything, or null for no conversation. */
   lastActivityAt: number | null;
-  /** `describeSpend` over the session, or null for no session. */
+  /** `describeSpend` over the conversation's `UsageDoc`, or null for no conversation. */
   spend: string | null;
   at: number;
 }

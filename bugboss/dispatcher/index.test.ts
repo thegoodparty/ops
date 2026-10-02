@@ -1,25 +1,24 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import type { ChildProcess } from "node:child_process";
 
 import Database from "better-sqlite3";
 
-import { DEADLINE_GRACE_SECONDS } from "../agent/run";
+import type { ConversationId } from "../agent/harness";
 import type { DispatcherConfig, ToolApi } from "../types";
+import { DEADLINE_GRACE_SECONDS } from "../agent/budget";
 import {
   RESUME_ALARM_SECONDS,
   createDispatcher,
   staleNotice,
+  turnBudgetWaitingFor,
+  type AgentRuntime,
+  type Dispatcher,
   type DispatcherDb,
   type DispatcherDeps,
 } from "./index";
-import { createChildProcessSpawn, type AgentSpawnContext, type SpawnAgent } from "./spawn";
-import { buildGrantTurnsTool } from "../boss/commands";
-import type { Db } from "../db";
 
 const T0 = 1_700_000_000_000;
 
@@ -62,9 +61,11 @@ interface IncidentOverrides {
   status?: string;
   mergedInto?: string;
   attempts?: number;
-  sessionRef?: string | null;
+  conversationId?: number | null;
   firstSignalAt?: number;
   lastStartedAt?: number | null;
+  turnsUsed?: number;
+  grantedTurns?: number;
 }
 
 const insertIncident = (
@@ -75,17 +76,19 @@ const insertIncident = (
   sqlite
     .prepare(
       `INSERT INTO incident
-         (id, status, firstSignalAt, attempts, sessionRef, lastStartedAt,
-          resolvedAt, closedAt, postmortem, mergedInto)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, status, firstSignalAt, attempts, conversationId, lastStartedAt,
+          turnsUsed, grantedTurns, resolvedAt, closedAt, postmortem, mergedInto)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
       over.status ?? "INVESTIGATING",
       over.firstSignalAt ?? T0,
       over.attempts ?? 0,
-      over.sessionRef ?? null,
+      over.conversationId ?? null,
       over.lastStartedAt ?? null,
+      over.turnsUsed ?? 0,
+      over.grantedTurns ?? 0,
       // Terminal statuses carry the fields that define them. The schema
       // enforces it now, so a fixture cannot build a CLOSED incident with no
       // post-mortem, which is a state no code path can reach.
@@ -95,7 +98,7 @@ const insertIncident = (
       over.mergedInto ?? null,
     );
 
-const ok = async () => ({ ok: true, directives: [] });
+const ok = async () => ({ ok: true });
 
 /** The dispatcher's alarms are structured stderr, so that is the assertion. */
 const captureAlarms = async (fn: () => Promise<void>): Promise<string[]> => {
@@ -136,35 +139,123 @@ const makeTools = () => {
     trackTimelineEvent: ok,
     escalate: async ({ reason, brief }) => {
       escalations.push({ incidentId, reason, brief });
-      return { ok: true, directives: [] };
+      return { ok: true };
     },
     park: ok,
   });
   return { toolApiFor, escalations };
 };
 
-/** Spawns that never finish until released, so "live" means something. */
-const heldSpawn = () => {
-  const contexts: AgentSpawnContext[] = [];
-  const releases: (() => void)[] = [];
-  const spawn: SpawnAgent = (ctx) => {
-    contexts.push(ctx);
-    return new Promise<void>((resolve) => releases.push(resolve));
+type Outcome = "done" | "unanswered";
+
+interface Submitted {
+  incidentId: string;
+  conversationId: ConversationId;
+  content: string;
+  requestId: string;
+  whenBusy: "steer" | "followUp";
+}
+
+/**
+ * The harness, in memory. The dispatcher's whole contract with Pi is this
+ * seam, so a fake of it is the real boundary rather than a mock of one.
+ *
+ * A launch input (`followUp`) makes the conversation busy until the test
+ * finishes it, or until `settle` does so on the spot. A steer is recorded and
+ * changes nothing. `abort` ends the run unanswered, as the harness does.
+ */
+const fakeRuntime = (opts: {
+  settle?: (s: Submitted) => Outcome | "hold";
+  onSubmit?: (s: Submitted) => void | Promise<void>;
+  create?: (incidentId: string) => void;
+} = {}) => {
+  let next = 1;
+  const owner = new Map<number, string>();
+  const created: { incidentId: string; cwd: string; instructions: string }[] = [];
+  const submits: Submitted[] = [];
+  const pending = new Map<number, (o: Outcome) => void>();
+  const aborts: string[] = [];
+
+  const finish = (id: number, outcome: Outcome = "done") => {
+    const resolve = pending.get(id);
+    pending.delete(id);
+    resolve?.(outcome);
   };
-  return { spawn, contexts, releaseAll: () => releases.forEach((r) => r()) };
+
+  const runtime: AgentRuntime = {
+    createIncidentConversation: async (incidentId, a) => {
+      opts.create?.(incidentId);
+      created.push({ incidentId, ...a });
+      const id = (100 + next++) as ConversationId;
+      owner.set(id, incidentId);
+      return id;
+    },
+    submit: async (id, content, o) => {
+      const s: Submitted = {
+        incidentId: owner.get(id) ?? `conversation ${id}`,
+        conversationId: id,
+        content,
+        requestId: o.requestId,
+        whenBusy: o.whenBusy,
+      };
+      submits.push(s);
+      if (o.whenBusy === "steer") return { wait: async () => "done" as const };
+      const result = new Promise<Outcome>((resolve) => pending.set(id, resolve));
+      await opts.onSubmit?.(s);
+      const verdict = opts.settle?.(s) ?? "hold";
+      if (verdict !== "hold") finish(id, verdict);
+      return { wait: () => result };
+    },
+    isBusy: async (id) => pending.has(id),
+    abort: async (id) => {
+      aborts.push(owner.get(id) ?? `conversation ${id}`);
+      finish(id, "unanswered");
+    },
+    reset: async () => {},
+  };
+
+  return {
+    runtime,
+    created,
+    submits,
+    aborts,
+    launches: () => submits.filter((s) => s.whenBusy === "followUp"),
+    steers: () => submits.filter((s) => s.whenBusy === "steer"),
+    /** A conversation a deploy left running, which `harness.resume()` picked up. */
+    hold: (id: number, incidentId: string) => {
+      owner.set(id, incidentId);
+      pending.set(id, () => {});
+    },
+    finish,
+    finishAll: (outcome: Outcome = "done") => {
+      for (const id of [...pending.keys()]) finish(id, outcome);
+    },
+    /** The runs ended while no dispatcher was watching, as a restart leaves them. */
+    idleAll: () => pending.clear(),
+  };
 };
 
 const deps = (
-  over: Partial<DispatcherDeps> & Pick<DispatcherDeps, "db" | "spawn" | "toolApiFor">,
+  over: Partial<DispatcherDeps> & Pick<DispatcherDeps, "db" | "runtime" | "toolApiFor">,
 ): DispatcherDeps => ({
   config: config(),
-  mintToken: (id) => `tok-${id}`,
-  // What Fargate gives the parent, and so what a launch is expected to hand
-  // down. Without it every launch alarms that the child cannot reach AWS.
-  childBaseEnv: { AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/creds" },
+  composePrompt: async (incidentId) => `prompt for ${incidentId}`,
+  messages: {
+    kickoff: (incidentId, o) =>
+      `kickoff ${incidentId}${o.resumedWithoutTranscript ? " without transcript" : ""}`,
+    resume: (checkout, npmCiFailed) => `resume ${checkout}${npmCiFailed ? " npm ci failed" : ""}`,
+  },
   now: () => T0,
   ...over,
 });
+
+const resumedSeconds = (content: string): number | null => {
+  const match = /RESUMED after (\d+)s/.exec(content);
+  return match ? Number(match[1]) : null;
+};
+
+/** Lets every background launch run up to its first real wait. */
+const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 describe("Dispatcher.tick", () => {
   // Status is the whole of eligibility now. Nothing marks an open incident as
@@ -184,16 +275,12 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i4", { status: "CLOSED" });
     insertIncident(sqlite, "i5", { status: "MERGED", mergedInto: "i1" });
 
-    const spawned: string[] = [];
-    const spawn: SpawnAgent = async (ctx) => {
-      spawned.push(ctx.incidentId);
-    };
-
-    const d = createDispatcher(deps({ db, spawn, toolApiFor }));
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
     const result = await d.tick();
     await result.settled;
 
-    assert.deepEqual(spawned.sort(), ["i1", "i2", "i3"]);
+    assert.deepEqual(rt.launches().map((s) => s.incidentId).sort(), ["i1", "i2", "i3"]);
     assert.deepEqual(
       result.started.map((a) => a.incidentId).sort(),
       ["i1", "i2", "i3"],
@@ -209,47 +296,161 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
+  it("creates the conversation on the first launch, pins the prompt to it, and reuses it after", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    let clock = T0;
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor, now: () => clock }));
+
+    await (await d.tick()).settled;
+    assert.deepEqual(rt.created, [
+      { incidentId: "i1", cwd: "/work/i1/omni", instructions: "prompt for i1" },
+    ]);
+    const stored = db.get<{ conversationId: number }>(
+      "SELECT conversationId FROM incident WHERE id = 'i1'",
+    )?.conversationId;
+    assert.equal(stored, rt.launches()[0].conversationId, "the id lands on the row");
+    assert.equal(rt.launches()[0].content, "kickoff i1");
+    assert.equal(rt.launches()[0].requestId, "incident:i1:launch:1");
+
+    // It answered and the incident is still open, which is what a child exit
+    // used to mean: the next tick relaunches into the same conversation.
+    clock += 600_000;
+    await (await d.tick()).settled;
+    assert.equal(rt.created.length, 1, "one conversation per incident, ever");
+    assert.equal(rt.launches()[1].conversationId, stored);
+    assert.equal(rt.launches()[1].requestId, "incident:i1:launch:2");
+    assert.match(rt.launches()[1].content, /^resume reused/);
+    cleanup();
+  });
+
+  // The cutover. Every incident open at the first boot on the harness has a
+  // launch behind it and no conversation, so its transcript is a JSONL file
+  // nothing reads any more, and the kickoff has to say so.
+  it("tells an incident from before the harness that its transcript is gone", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", { attempts: 3, lastStartedAt: T0 - 600_000 });
+    insertIncident(sqlite, "i2");
+
+    const rt = fakeRuntime();
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
+    await d.tick();
+
+    const content = Object.fromEntries(rt.launches().map((s) => [s.incidentId, s.content]));
+    assert.deepEqual(content, { i1: "kickoff i1 without transcript", i2: "kickoff i2" });
+    rt.finishAll();
+    await d.drain();
+    cleanup();
+  });
+
+  it("hands the prompt the alert slugs of its incident's signals, and no one else's", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+    insertIncident(sqlite, "i2", { status: "CLOSED" });
+    const signal = sqlite.prepare(
+      `INSERT INTO signal (id, source, sourceId, kind, title, body, labels, openedAt, incidentId)
+       VALUES (?, 'grafana', ?, 'alert', 't', 'b', ?, ?, ?)`,
+    );
+    signal.run("s1", "f1", JSON.stringify({ alert_slug: "route-errors-win" }), T0, "i1");
+    signal.run("s2", "f2", JSON.stringify({ alert_slug: "high-cpu" }), T0, "i1");
+    signal.run("s3", "f3", JSON.stringify({ alert_slug: "high-cpu" }), T0, "i1");
+    signal.run("s4", "f4", JSON.stringify({}), T0, "i1");
+    signal.run("s5", "f5", JSON.stringify({ alert_slug: "someone-elses" }), T0, "i2");
+
+    const seen: string[][] = [];
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(
+      deps({
+        db,
+        runtime: rt.runtime,
+        toolApiFor,
+        composePrompt: async (_id, a) => {
+          seen.push(a.alertSlugs);
+          return "prompt";
+        },
+      }),
+    );
+    await (await d.tick()).settled;
+
+    assert.deepEqual(seen, [["high-cpu", "route-errors-win"]]);
+    cleanup();
+  });
+
+  // The checkout is minutes of git and runs in the background, so for those
+  // minutes the conversation is not busy yet and only the dispatcher's own
+  // record of the launch stops the next tick submitting a second one.
+  it("does not launch again while a launch is still preparing", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    let ready = () => {};
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(
+      deps({
+        db,
+        runtime: rt.runtime,
+        toolApiFor,
+        composePrompt: () =>
+          new Promise<string>((resolve) => {
+            ready = () => resolve("prompt");
+          }),
+      }),
+    );
+
+    const first = await d.tick();
+    const second = await d.tick();
+    assert.deepEqual(first.started.map((a) => a.incidentId), ["i1"]);
+    assert.deepEqual(second.started, [], "still preparing is still live");
+    assert.deepEqual(d.list().map((a) => a.incidentId), ["i1"]);
+
+    ready();
+    await first.settled;
+    assert.equal(rt.created.length, 1);
+    assert.equal(rt.launches().length, 1);
+    cleanup();
+  });
+
   it("resumes and escalates a RESOLVED incident, because the post-mortem is the agent's", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    // The container restarted while the agent was drafting the post-mortem.
+    // The container restarted while the agent was drafting the post-mortem,
+    // and its run had ended by the time the harness came back.
     insertIncident(sqlite, "i1", {
       status: "RESOLVED",
       attempts: 1,
-      sessionRef: "s-1",
+      conversationId: 7,
       lastStartedAt: T0 - 600_000,
     });
 
     let clock = T0;
-    let kills = 0;
-    const releases: (() => void)[] = [];
-    const contexts: AgentSpawnContext[] = [];
-    const spawn: SpawnAgent = (ctx) => {
-      contexts.push(ctx);
-      ctx.register({ pid: 91, kill: () => { kills += 1; } });
-      return new Promise<void>((resolve) => releases.push(resolve));
-    };
-
+    const rt = fakeRuntime();
     const d = createDispatcher(
-      deps({ db, spawn, toolApiFor, config: config({ agentTimeoutSeconds: 60 }), now: () => clock }),
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ agentTimeoutSeconds: 60 }), now: () => clock }),
     );
 
     const first = await d.tick();
     assert.deepEqual(first.started.map((a) => a.incidentId), ["i1"]);
-    assert.equal(contexts[0].sessionRef, "s-1", "resume the post-mortem, not restart it");
+    assert.equal(rt.created.length, 0, "resume the post-mortem, not restart it");
+    assert.equal(rt.launches()[0].conversationId, 7);
     assert.deepEqual(d.list().map((a) => a.phase), ["RESOLVED"]);
 
     // And if it wedges there, RESOLVED must still be said out loud rather
     // than going quiet: the post-mortem is the last thing anyone is waiting
     // for, and nothing else in the system would ever mention it again.
-    clock = T0 + 60_000 + 211_000;
+    clock = T0 + 60_000 + 181_000;
     const second = await d.tick();
-    assert.equal(kills, 1);
-    assert.deepEqual(second.killed, ["i1"]);
+    assert.equal(rt.aborts.length, 1);
+    assert.deepEqual(second.aborted, ["i1"]);
     assert.deepEqual(second.escalated, ["i1"]);
     assert.equal(escalations.length, 1);
 
-    releases.forEach((r) => r());
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -259,13 +460,14 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1");
 
-    const held = heldSpawn();
-    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor }));
+    const rt = fakeRuntime();
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
 
     await d.tick();
+    await flush();
     const second = await d.tick();
 
-    assert.equal(held.contexts.length, 1, "one live agent, one launch");
+    assert.equal(rt.launches().length, 1, "one live agent, one launch");
     assert.deepEqual(second.started, []);
     assert.deepEqual(d.list().map((a) => a.incidentId), ["i1"]);
     assert.equal(
@@ -274,8 +476,54 @@ describe("Dispatcher.tick", () => {
       1,
     );
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
+    cleanup();
+  });
+
+  // A deploy stops the process, not the run: `harness.resume()` picks it up
+  // at boot, so a fresh dispatcher has to see it as live without having
+  // launched it.
+  it("treats a conversation the harness resumed as live, and counts it against the ceiling", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", { conversationId: 7, attempts: 1, lastStartedAt: T0 - 60_000 });
+    insertIncident(sqlite, "i2");
+
+    const rt = fakeRuntime();
+    rt.hold(7, "i1");
+    const d = createDispatcher(
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxConcurrentAgents: 1 }) }),
+    );
+    const result = await d.tick();
+
+    assert.deepEqual(result.started, [], "i1 is still running, and it fills the only slot");
+    assert.equal(result.circuitOpen, true);
+    assert.deepEqual(d.list().map((a) => a.incidentId), ["i1"]);
+    assert.equal(rt.launches().length, 0);
+    cleanup();
+  });
+
+  it("counts a conversation it cannot read as live, and says the read is broken", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1", { conversationId: 7, attempts: 1, lastStartedAt: T0 - 60_000 });
+
+    const rt = fakeRuntime();
+    const runtime: AgentRuntime = {
+      ...rt.runtime,
+      isBusy: async () => {
+        throw new Error("harness.sqlite is locked");
+      },
+    };
+    const d = createDispatcher(deps({ db, runtime, toolApiFor }));
+    let started: string[] = [];
+    const alarms = await captureAlarms(async () => {
+      started = (await d.tick()).started.map((a) => a.incidentId);
+    });
+
+    assert.deepEqual(started, [], "a second launch into a running conversation is the worse mistake");
+    assert.ok(alarms.includes("busy_check_failed"));
     cleanup();
   });
 
@@ -284,31 +532,30 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor } = makeTools();
     for (const id of ["i1", "i2", "i3", "i4", "i5"]) insertIncident(sqlite, id);
 
-    const held = heldSpawn();
+    const rt = fakeRuntime();
     const d = createDispatcher(
-      deps({ db, spawn: held.spawn, toolApiFor, config: config({ maxConcurrentAgents: 2 }) }),
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxConcurrentAgents: 2 }) }),
     );
 
     const first = await d.tick();
     assert.equal(first.started.length, 2);
     assert.equal(first.circuitOpen, true);
-    assert.equal(held.contexts.length, 2);
 
     // No queue: the ceiling refuses, it does not defer. A second tick while
     // the slots are still full launches nothing.
     const second = await d.tick();
     assert.equal(second.started.length, 0);
     assert.equal(second.circuitOpen, true);
-    assert.equal(held.contexts.length, 2);
+    assert.equal(rt.launches().length, 2);
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
 
     const third = await d.tick();
     assert.equal(third.started.length, 2, "slots freed, the next tick fills them");
     assert.equal(third.circuitOpen, true);
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -316,28 +563,22 @@ describe("Dispatcher.tick", () => {
   it("escalates a crash loop instead of relaunching forever", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
-    let launches = 0;
-    // Dies the instant it starts, and dies badly: run.ts exits non-zero and
-    // the spawn wrapper turns that into a rejection. Both halves matter now
-    // -- a short exit that succeeded is a deploy draining an agent, not a
-    // crash, and counting it walked a rolling deploy to this escalation.
-    const spawn: SpawnAgent = async () => {
-      launches += 1;
-      throw new Error("agent exited 1");
-    };
-
+    // Ends the instant it starts, and ends without an answer. Both halves
+    // matter -- a short run that answered is a deploy draining an agent, not
+    // a crash, and counting it walked a rolling deploy to this escalation.
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     const d = createDispatcher(
-      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxAttempts: 3 }) }),
     );
 
     for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
-    assert.equal(launches, 3);
+    assert.equal(rt.launches().length, 3);
     assert.equal(escalations.length, 0, "the limit is a ceiling, not a trigger");
 
     const fourth = await d.tick();
-    assert.equal(launches, 3, "no relaunch past three consecutive fast deaths");
+    assert.equal(rt.launches().length, 3, "no relaunch past three consecutive fast deaths");
     assert.deepEqual(fourth.escalated, ["i1"]);
     assert.match(escalations[0].reason, /consecutive launches died/);
     assert.match(escalations[0].brief, /crash loop/);
@@ -358,16 +599,11 @@ describe("Dispatcher.tick", () => {
   it("gives up on a crash loop once, and then says nothing further", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
-    let launches = 0;
-    const spawn: SpawnAgent = async () => {
-      launches += 1;
-      throw new Error("agent exited 1");
-    };
-
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     const d = createDispatcher(
-      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxAttempts: 3 }) }),
     );
 
     for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
@@ -378,7 +614,7 @@ describe("Dispatcher.tick", () => {
     // brief until somebody closes the incident.
     for (let i = 0; i < 20; i += 1) await (await d.tick()).settled;
 
-    assert.equal(launches, 3, "no relaunch after the dispatcher gave up");
+    assert.equal(rt.launches().length, 3, "no relaunch after the dispatcher gave up");
     assert.equal(escalations.length, 1, "and no second copy of the brief");
     // The incident is untouched and still open: giving up on relaunching it
     // is not a transition, and the status is the only thing eligibility reads.
@@ -389,26 +625,45 @@ describe("Dispatcher.tick", () => {
     cleanup();
   });
 
-  // The rolling-deploy case. Before SIGTERM exited zero and the counter
-  // required a failure, three bounces of a freshly-launched agent handed a
-  // human a crash-loop brief for a deploy that worked.
-  it("does not count a short clean exit as a crash", async () => {
+  // The rolling-deploy case: three bounces of a freshly-launched agent once
+  // handed a human a crash-loop brief for a deploy that worked.
+  it("does not count a short run that answered as a crash", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
-    let launches = 0;
-    const spawn: SpawnAgent = async () => {
-      launches += 1;
-    };
-
+    const rt = fakeRuntime({ settle: () => "done" });
     const d = createDispatcher(
-      deps({ db, spawn, toolApiFor, config: config({ maxAttempts: 3 }) }),
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxAttempts: 3 }) }),
     );
 
     for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
 
-    assert.equal(launches, 5, "it keeps relaunching rather than giving up");
+    assert.equal(rt.launches().length, 5, "it keeps relaunching rather than giving up");
+    assert.deepEqual(escalations, [], "and nobody is handed a crash-loop brief");
+    cleanup();
+  });
+
+  // A Boss stop_agent aborts the run the dispatcher launched, and the run
+  // settles unanswered a moment after it started: the shape of a crash.
+  it("does not count a run the Boss stopped as a crash", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    const rt = fakeRuntime({
+      settle: () => {
+        d.noteStopped("i1");
+        return "unanswered";
+      },
+    });
+    const d = createDispatcher(
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxAttempts: 3 }) }),
+    );
+
+    for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
+
+    assert.equal(rt.launches().length, 5, "every stop is followed by a fresh run");
     assert.deepEqual(escalations, [], "and nobody is handed a crash-loop brief");
     cleanup();
   });
@@ -416,14 +671,9 @@ describe("Dispatcher.tick", () => {
   it("falls back to relaunching when the crash-loop escalation fails", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
-    let launches = 0;
-    const spawn: SpawnAgent = async () => {
-      launches += 1;
-      throw new Error("agent exited 1");
-    };
-
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     let escalationFails = true;
     const failingToolApiFor = (incidentId: string): ToolApi => ({
       ...toolApiFor(incidentId),
@@ -436,24 +686,25 @@ describe("Dispatcher.tick", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor: failingToolApiFor,
         config: config({ maxAttempts: 3 }),
       }),
     );
+    const launches = () => rt.launches().length;
 
     for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
-    assert.equal(launches, 3);
+    assert.equal(launches(), 3);
 
     const failed = await d.tick();
     assert.deepEqual(failed.escalated, [], "the escalation threw, so nobody was told");
-    assert.equal(launches, 3, "this tick spends itself on the escalation");
+    assert.equal(launches(), 3, "this tick spends itself on the escalation");
 
     // An untold escalation must not stop the relaunching, because nothing
     // else is coming: the counter stayed at the ceiling before, so every
     // later tick retried the same failing call and the incident never moved.
     await (await d.tick()).settled;
-    assert.equal(launches, 4, "a failed escalation falls back to relaunching");
+    assert.equal(launches(), 4, "a failed escalation falls back to relaunching");
 
     escalationFails = false;
     for (let i = 0; i < 2; i += 1) await (await d.tick()).settled;
@@ -464,7 +715,7 @@ describe("Dispatcher.tick", () => {
     // Only the escalation that landed ends the relaunching. Up to here every
     // failure fell back, which is why the fallback cannot be permanent.
     for (let i = 0; i < 5; i += 1) await (await d.tick()).settled;
-    assert.equal(launches, 6);
+    assert.equal(launches(), 6);
     assert.equal(escalations.length, 1);
     cleanup();
   });
@@ -472,20 +723,14 @@ describe("Dispatcher.tick", () => {
   it("escalates an agent that dies just past the fast-failure window", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let clock = T0;
-    let launches = 0;
-    const releases: (() => void)[] = [];
-    const spawn: SpawnAgent = () => {
-      launches += 1;
-      return new Promise<void>((resolve) => releases.push(resolve));
-    };
-
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         fastFailureSeconds: 60,
@@ -495,22 +740,23 @@ describe("Dispatcher.tick", () => {
     );
 
     // Bedrock throttling, an OOM, credentials expiring: dies at 61s every
-    // time, which clears the consecutive-fast counter on every exit, so
+    // time, which clears the consecutive-fast counter on every ending, so
     // nothing bounded this. It relaunched every tick for as long as the
     // incident stayed open.
     const die = async () => {
-      await d.tick();
+      const result = await d.tick();
       clock += 61_000;
-      releases.forEach((r) => r());
-      await d.drain();
+      await flush();
+      rt.finishAll("unanswered");
+      await result.settled;
     };
 
     for (let i = 0; i < 3; i += 1) await die();
-    assert.equal(launches, 3);
+    assert.equal(rt.launches().length, 3);
     assert.equal(escalations.length, 0, "the limit is a ceiling, not a trigger");
 
     const fourth = await d.tick();
-    assert.equal(launches, 3, "no relaunch past the launch ceiling");
+    assert.equal(rt.launches().length, 3, "no relaunch past the launch ceiling");
     assert.deepEqual(fourth.escalated, ["i1"]);
     assert.match(escalations[0].reason, /launches/);
     assert.match(escalations[0].brief, /has finished none of them/);
@@ -524,20 +770,15 @@ describe("Dispatcher.tick", () => {
   it("keeps an incident it gave up on parked across a restart, and wakes it on the cooldown", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let clock = T0;
-    let launches = 0;
-    const releases: (() => void)[] = [];
-    const spawn: SpawnAgent = () => {
-      launches += 1;
-      return new Promise<void>((resolve) => releases.push(resolve));
-    };
+    const rt = fakeRuntime();
     const build = () =>
       createDispatcher(
         deps({
           db,
-          spawn,
+          runtime: rt.runtime,
           toolApiFor,
           config: config({ maxAttempts: 3 }),
           fastFailureSeconds: 60,
@@ -549,19 +790,20 @@ describe("Dispatcher.tick", () => {
 
     const d = build();
     for (let i = 0; i < 2; i += 1) {
-      await d.tick();
+      const result = await d.tick();
       clock += 61_000;
-      releases.forEach((r) => r());
-      await d.drain();
+      await flush();
+      rt.finishAll("unanswered");
+      await result.settled;
     }
     assert.deepEqual((await d.tick()).escalated, ["i1"]);
-    assert.equal(launches, 2);
+    assert.equal(rt.launches().length, 2);
     assert.deepEqual((await d.tick()).started, [], "this container is done with it");
     assert.equal(escalations.length, 1, "said once, not once a tick");
 
-    // A new container, same database. The stop is a row now rather than a
-    // Set, so a restart does not undo it -- which is the point. A crash loop
-    // that a deploy could clear is a crash loop that a deploy would relaunch
+    // A new container, same database. The stop is a row rather than a Set,
+    // so a restart does not undo it -- which is the point. A crash loop that
+    // a deploy could clear is a crash loop that a deploy would relaunch
     // straight into.
     const restarted = build();
     assert.deepEqual(
@@ -569,7 +811,7 @@ describe("Dispatcher.tick", () => {
       [],
       "the park outlives the process that decided it",
     );
-    assert.equal(launches, 2);
+    assert.equal(rt.launches().length, 2);
 
     // The cooldown is what lifts it, because none of the reasons it parked
     // are permanent -- and it has to lift on the container that gave up, not
@@ -584,33 +826,24 @@ describe("Dispatcher.tick", () => {
       ["i1"],
       "not now is not the same as not ever",
     );
-    assert.equal(launches, 3);
     assert.equal(escalations.length, 1, "and it is not escalated straight back");
 
-    releases.forEach((r) => r());
+    rt.finishAll();
     await d.drain();
-    await restarted.drain();
     cleanup();
   });
 
   it("gives a crash loop another go at the cooldown instead of paging again", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let clock = T0;
-    let launches = 0;
-    // Dies the instant it starts and dies badly, which is what the
-    // fast-failure counter is looking for.
-    const spawn: SpawnAgent = async () => {
-      launches += 1;
-      throw new Error("agent exited 1");
-    };
-
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         maxLaunches: 99,
@@ -627,7 +860,7 @@ describe("Dispatcher.tick", () => {
     await gaveUp.settled;
     assert.deepEqual(gaveUp.escalated, ["i1"]);
     assert.equal(escalations.length, 1);
-    assert.equal(launches, 3, "no relaunch past the ceiling");
+    assert.equal(rt.launches().length, 3, "no relaunch past the ceiling");
 
     // Nothing for the whole cooldown, on the same container.
     const during = await d.tick();
@@ -659,20 +892,14 @@ describe("Dispatcher.tick", () => {
   it("gives a stalled incident another go at the cooldown instead of paging again", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let clock = T0;
-    let launches = 0;
-    const releases: (() => void)[] = [];
-    const spawn: SpawnAgent = () => {
-      launches += 1;
-      return new Promise<void>((resolve) => releases.push(resolve));
-    };
-
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         fastFailureSeconds: 60,
@@ -683,16 +910,17 @@ describe("Dispatcher.tick", () => {
     );
 
     // Dies at 61s every time: slow enough to clear the fast-failure counter
-    // on each exit, so this is the launch ceiling and only it.
+    // on each ending, so this is the launch ceiling and only it.
     for (let i = 0; i < 2; i += 1) {
-      await d.tick();
+      const result = await d.tick();
       clock += 61_000;
-      releases.forEach((r) => r());
-      await d.drain();
+      await flush();
+      rt.finishAll("unanswered");
+      await result.settled;
     }
     assert.deepEqual((await d.tick()).escalated, ["i1"]);
     assert.equal(escalations.length, 1);
-    assert.equal(launches, 2, "no relaunch past the ceiling");
+    assert.equal(rt.launches().length, 2, "no relaunch past the ceiling");
 
     assert.deepEqual((await d.tick()).started, [], "parked for the cooldown");
     assert.equal(escalations.length, 1, "said once, not once a tick");
@@ -709,7 +937,7 @@ describe("Dispatcher.tick", () => {
     );
     assert.equal(escalations.length, 1, "and nobody was paged twice for it");
 
-    releases.forEach((r) => r());
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -724,7 +952,7 @@ describe("Dispatcher.tick", () => {
   it("parks over a wait whose wake time has already passed", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
     sqlite
       .prepare(
         `INSERT INTO incident_wait
@@ -733,16 +961,11 @@ describe("Dispatcher.tick", () => {
       )
       .run(T0 - 1000, T0 - 2000);
 
-    let launches = 0;
-    const spawn: SpawnAgent = async () => {
-      launches += 1;
-      throw new Error("agent exited 1");
-    };
-
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         maxLaunches: 99,
@@ -754,7 +977,7 @@ describe("Dispatcher.tick", () => {
     // The expired wake is what makes it eligible at all, so these launches
     // are the proof the conflict branch is reachable rather than theoretical.
     for (let i = 0; i < 3; i += 1) await (await d.tick()).settled;
-    assert.equal(launches, 3);
+    assert.equal(rt.launches().length, 3);
     assert.deepEqual((await d.tick()).escalated, ["i1"]);
     assert.equal(escalations.length, 1);
 
@@ -773,7 +996,7 @@ describe("Dispatcher.tick", () => {
       [],
       "which is what makes the park a stop rather than a row nobody replaced",
     );
-    assert.equal(launches, 3);
+    assert.equal(rt.launches().length, 3);
     cleanup();
   });
 
@@ -792,20 +1015,11 @@ describe("Dispatcher.tick", () => {
       )
       .run(T0);
 
-    const spawned: string[] = [];
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn: async (ctx) => {
-          spawned.push(ctx.incidentId);
-        },
-        toolApiFor,
-        now: () => T0,
-      }),
-    );
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor, now: () => T0 }));
 
     await (await d.tick()).settled;
-    assert.deepEqual(spawned, [], "parked, so nothing runs it");
+    assert.deepEqual(rt.launches(), [], "parked, so nothing runs it");
 
     // What the relay does on every reply. Three of them, because the failure
     // was per-comment: each one woke it and each wake paged.
@@ -828,7 +1042,7 @@ describe("Dispatcher.tick", () => {
 
     await (await d.tick()).settled;
     assert.deepEqual(
-      spawned,
+      rt.launches(),
       [],
       "and nothing relaunched it into the wall it just hit",
     );
@@ -848,27 +1062,18 @@ describe("Dispatcher.tick", () => {
       )
       .run(T0 + 86_400_000, T0);
 
-    const spawned: string[] = [];
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn: async (ctx) => {
-          spawned.push(ctx.incidentId);
-        },
-        toolApiFor,
-        now: () => T0,
-      }),
-    );
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor, now: () => T0 }));
 
     await (await d.tick()).settled;
-    assert.deepEqual(spawned, [], "parked, so nothing runs it");
+    assert.deepEqual(rt.launches(), [], "parked, so nothing runs it");
 
     // What the relay does when a reply lands, which is the whole fix: talking
     // to an incident wakes it, with no model in the path.
     sqlite.prepare("DELETE FROM incident_wait WHERE incidentId = 'i1'").run();
 
     await (await d.tick()).settled;
-    assert.deepEqual(spawned, ["i1"]);
+    assert.deepEqual(rt.launches().map((s) => s.incidentId), ["i1"]);
     cleanup();
   });
 
@@ -877,15 +1082,15 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor, escalations } = makeTools();
     // Every merge to ops main restarts this container. That is routine, so it
     // must never read as an agent that cannot stay up.
-    insertIncident(sqlite, "i1", { attempts: 40, sessionRef: "s-1" });
+    insertIncident(sqlite, "i1", { attempts: 40 });
 
     let clock = T0;
+    const rt = fakeRuntime();
     for (let i = 0; i < 6; i += 1) {
-      const held = heldSpawn();
       const restarted = createDispatcher(
         deps({
           db,
-          spawn: held.spawn,
+          runtime: rt.runtime,
           toolApiFor,
           config: config({ maxAttempts: 3 }),
           fastFailureSeconds: 60,
@@ -899,6 +1104,9 @@ describe("Dispatcher.tick", () => {
         ["i1"],
         `restart ${i} must still staff the incident`,
       );
+      await flush();
+      // The run ended while the container was down, so nobody saw it end.
+      rt.idleAll();
       clock += 900_000;
     }
 
@@ -911,14 +1119,14 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor, escalations } = makeTools();
     // A high total: every merge to ops main restarts this container, and a
     // long incident collects launches that way.
-    insertIncident(sqlite, "i1", { attempts: 12, sessionRef: "s-1" });
+    insertIncident(sqlite, "i1", { attempts: 12 });
 
     let clock = T0;
-    const held = heldSpawn();
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn: held.spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         fastFailureSeconds: 60,
@@ -927,13 +1135,14 @@ describe("Dispatcher.tick", () => {
     );
 
     for (let i = 0; i < 4; i += 1) {
-      await d.tick();
+      const result = await d.tick();
       clock += 600_000;
-      held.releaseAll();
-      await d.drain();
+      await flush();
+      rt.finishAll("unanswered");
+      await result.settled;
     }
 
-    assert.equal(held.contexts.length, 4, "a healthy agent is always relaunched");
+    assert.equal(rt.launches().length, 4, "a healthy agent is always relaunched");
     assert.deepEqual(escalations, [], "attempts alone must never escalate");
     assert.equal(
       db.get<{ attempts: number }>("SELECT attempts FROM incident WHERE id = 'i1'")
@@ -950,58 +1159,46 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1");
     insertIncident(sqlite, "i2");
 
-    const held = heldSpawn();
-
+    const rt = fakeRuntime({
+      create: (incidentId) => {
+        if (incidentId === "i1") throw new Error("harness refused the conversation");
+      },
+    });
     const d = createDispatcher(
-      deps({
-        db,
-        spawn: held.spawn,
-        toolApiFor,
-        config: config({ maxAttempts: 2 }),
-        mintToken: (id) => {
-          if (id === "i1") throw new Error("token minting failed");
-          return `tok-${id}`;
-        },
-      }),
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ maxAttempts: 2 }) }),
     );
 
     await d.tick();
+    await flush();
     assert.deepEqual(
-      held.contexts.map((c) => c.incidentId),
+      rt.launches().map((s) => s.incidentId),
       ["i2"],
       "i1's failure must not stall i2",
     );
 
     await d.tick();
+    await flush();
     const third = await d.tick();
     assert.deepEqual(third.escalated, ["i1"], "a launch that never starts escalates");
     assert.match(escalations[0].reason, /consecutive launches died/);
     assert.deepEqual(d.list().map((a) => a.incidentId), ["i2"], "i2 ran throughout");
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
 
-  it("leaves the child its whole brief-writing grace before the kill", async () => {
+  it("steers at the soft deadline, and gives the agent its whole grace before the abort", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1");
 
-    let kills = 0;
-    const contexts: AgentSpawnContext[] = [];
-    const releases: (() => void)[] = [];
-    const spawn: SpawnAgent = (ctx) => {
-      contexts.push(ctx);
-      ctx.register({ pid: 4242, kill: () => { kills += 1; } });
-      return new Promise<void>((resolve) => releases.push(resolve));
-    };
-
     let clock = T0;
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ agentTimeoutSeconds: 60, tickSeconds: 30 }),
         now: () => clock,
@@ -1009,67 +1206,78 @@ describe("Dispatcher.tick", () => {
     );
 
     await d.tick();
-    assert.deepEqual(d.list(), [
-      { incidentId: "i1", pid: 4242, startedAt: T0, phase: "INVESTIGATING" },
-    ]);
-    assert.equal(
-      contexts[0].deadlineAt,
-      T0 + 60_000,
-      "the child still gets the soft deadline, unchanged",
-    );
+    await flush();
+    assert.deepEqual(d.list(), [{ incidentId: "i1", startedAt: T0, phase: "INVESTIGATING" }]);
 
     // Every clock below is a literal on purpose. Deriving them from the
-    // imported constant would move them in lockstep with it, so changing the
-    // child's grace would silently move the parent's backstop and leave this
-    // green. The literals encode 180s of grace and a 30s tick, and this is
-    // the assertion that says so.
+    // constant would move them in lockstep with it, so changing the grace
+    // would silently move the abort and leave this green. The literals encode
+    // 180s of grace, and this is the assertion that says so.
     assert.equal(
       DEADLINE_GRACE_SECONDS,
       180,
-      "agent/run.ts changed its grace; the clocks in this test encode 180s",
+      "the grace changed; the clocks in this test encode 180s",
     );
 
-    // The soft deadline is the child's to act on: it steers itself to write a
-    // brief and hard-stops 180s later. A parent SIGKILL here is what
+    // The soft deadline asks the agent for its brief. An abort here is what
     // left every timeout escalation with an empty brief.
     clock = T0 + 61_000;
-    const duringGrace = await d.tick();
-    assert.equal(kills, 0, "killing at the soft deadline eats the grace window");
-    assert.deepEqual(duringGrace.killed, []);
-    assert.deepEqual(duringGrace.escalated, []);
-    assert.equal(escalations.length, 0);
+    const atSoft = await d.tick();
+    assert.equal(rt.aborts.length, 0, "aborting at the soft deadline eats the grace window");
+    assert.deepEqual(atSoft.aborted, []);
+    assert.deepEqual(atSoft.escalated, []);
+    assert.deepEqual(
+      rt.steers().map((s) => [s.requestId, s.conversationId]),
+      [["incident:i1:deadline:1", rt.launches()[0].conversationId]],
+    );
+    assert.match(rt.steers()[0].content, /deadline has expired/);
+    assert.match(rt.steers()[0].content, /180 seconds/);
 
-    // 1s before the child's own hard stop at 60s + 180s.
+    // 1s before the end of the grace. Still the agent's, and steered once.
     clock = T0 + 239_000;
-    const beforeHardStop = await d.tick();
-    assert.equal(kills, 0, "still inside the grace the child was promised");
-    assert.deepEqual(beforeHardStop.killed, []);
+    const beforeAbort = await d.tick();
+    assert.equal(rt.aborts.length, 0, "still inside the grace the agent was promised");
+    assert.deepEqual(beforeAbort.aborted, []);
+    assert.equal(rt.steers().length, 1, "one steer, not one a tick");
 
-    // 1s past the hard stop. Still not the parent's turn: the backstop is a
-    // further tick out, so a child mid-flush is not cut off.
+    // 60s + 180s + 1s. Only now, and only for an agent too wedged to have
+    // used any of it.
     clock = T0 + 241_000;
-    const atHardStop = await d.tick();
-    assert.equal(kills, 0, "the child gets a tick to exit on its own first");
-    assert.deepEqual(atHardStop.killed, []);
-
-    // 60s + 180s grace + 30s tick + 1s. Only now, and only for an agent too
-    // wedged to have used any of it.
-    clock = T0 + 271_000;
     const afterGrace = await d.tick();
-
-    assert.equal(kills, 1, "the parent is the backstop for a wedged agent");
-    assert.deepEqual(afterGrace.killed, ["i1"]);
+    assert.equal(rt.aborts.length, 1, "the abort is the backstop for a wedged agent");
+    assert.deepEqual(afterGrace.aborted, ["i1"]);
     assert.deepEqual(afterGrace.escalated, ["i1"]);
     assert.equal(escalations.length, 1);
     assert.match(escalations[0].reason, /deadline/);
 
-    // Killed once, not once per tick.
+    // Aborted once, not once per tick.
     clock += 60_000;
     await d.tick();
-    assert.equal(kills, 1);
+    assert.equal(rt.aborts.length, 1);
 
-    releases.forEach((r) => r());
+    rt.finishAll();
     await d.drain();
+    cleanup();
+  });
+
+  it("aborts a run the harness resumed once it passes the deadline its launch set", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    // Launched before the deploy, resumed by the harness after it, and never
+    // launched by this process. The deadline lives on the row, so it still
+    // reaches it.
+    insertIncident(sqlite, "i1", { conversationId: 7, attempts: 1, lastStartedAt: T0 - 300_000 });
+
+    const rt = fakeRuntime();
+    rt.hold(7, "i1");
+    const d = createDispatcher(
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ agentTimeoutSeconds: 60 }) }),
+    );
+    const result = await d.tick();
+
+    assert.deepEqual(result.aborted, ["i1"]);
+    assert.equal(escalations.length, 1);
+    assert.match(escalations[0].brief, /conversation 7/);
     cleanup();
   });
 
@@ -1078,20 +1286,24 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1");
 
-    let kills = 0;
-    const spawn: SpawnAgent = async (ctx) => {
-      ctx.register({ pid: 55, kill: () => { kills += 1; } });
-      // What the child does with the grace the soft deadline buys it. It says
-      // what it knows and exits; the incident is still open afterwards,
-      // because saying so was never a transition.
-      await ctx.escalate({ reason: "out of time", brief: "the real brief" });
-    };
+    let d: Dispatcher | null = null;
+    // What the agent does with the grace the soft deadline buys it. It says
+    // what it knows and ends its run; the incident is still open afterwards,
+    // because saying so was never a transition.
+    const rt = fakeRuntime({
+      onSubmit: async (s) => {
+        if (s.requestId !== "incident:i1:launch:1") return;
+        await toolApiFor("i1").escalate({ reason: "out of time", brief: "the real brief" });
+        d?.noteEscalated("i1");
+      },
+      settle: () => "done",
+    });
 
     let clock = T0;
-    const d = createDispatcher(
+    d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ agentTimeoutSeconds: 60 }),
         now: () => clock,
@@ -1103,14 +1315,14 @@ describe("Dispatcher.tick", () => {
     clock = T0 + 300_000;
     const after = await d.tick();
 
-    assert.equal(kills, 0, "it exited on its own; there is nothing to kill");
-    assert.deepEqual(after.killed, []);
+    assert.equal(rt.aborts.length, 0, "it ended on its own; there is nothing to abort");
+    assert.deepEqual(after.aborted, []);
     assert.deepEqual(
       after.escalated,
       [],
       "the deadline brief is for an agent too wedged to write its own",
     );
-    // An open incident always has an agent, so the exit is staffed again
+    // An open incident always has an agent, so the ending is staffed again
     // rather than left: the escalation said the incident needs a person, and
     // that is not the same thing as it no longer needing an agent.
     assert.deepEqual(after.started.map((a) => a.incidentId), ["i1"]);
@@ -1119,6 +1331,8 @@ describe("Dispatcher.tick", () => {
       ["the real brief"],
       "the agent's brief, never the dispatcher's placeholder",
     );
+    rt.finishAll();
+    await d.drain();
     cleanup();
   });
 
@@ -1127,26 +1341,24 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor, escalations } = makeTools();
     insertIncident(sqlite, "i1");
 
-    // The sequence, not the outcome. The test above has the child exit after
+    // The sequence, not the outcome. The test above has the run end after
     // escalating, so the deadline never fires on it and it passes whether or
     // not anything suppresses the second brief. The case that matters is the
-    // one the deadline kill exists for: an agent wedged badly enough that it
-    // uses its grace to say what it knows and then still cannot exit.
-    let kills = 0;
-    let released = () => {};
-    const spawn: SpawnAgent = async (ctx) => {
-      ctx.register({ pid: 55, kill: () => { kills += 1; } });
-      await ctx.escalate({ reason: "out of time", brief: "the real brief" });
-      await new Promise<void>((resolve) => {
-        released = resolve;
-      });
-    };
+    // one the abort exists for: an agent wedged badly enough that it uses its
+    // grace to say what it knows and then still does not stop.
+    let d: Dispatcher | null = null;
+    const rt = fakeRuntime({
+      onSubmit: async () => {
+        await toolApiFor("i1").escalate({ reason: "out of time", brief: "the real brief" });
+        d?.noteEscalated("i1");
+      },
+    });
 
     let clock = T0;
-    const d = createDispatcher(
+    d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ agentTimeoutSeconds: 60 }),
         now: () => clock,
@@ -1154,19 +1366,20 @@ describe("Dispatcher.tick", () => {
     );
 
     await d.tick();
-    // Past the soft deadline, the grace, and the tick the backstop adds.
+    await flush();
+    // Past the soft deadline and the grace.
     clock = T0 + 300_000;
     const after = await d.tick();
 
-    assert.equal(kills, 1, "it was too wedged to exit, so it is killed");
-    assert.deepEqual(after.killed, ["i1"]);
+    assert.equal(rt.aborts.length, 1, "it was too wedged to stop, so it is aborted");
+    assert.deepEqual(after.aborted, ["i1"]);
     assert.deepEqual(
       after.escalated,
       [],
       "it already spoke for itself, so the dispatcher does not speak over it",
     );
     assert.deepEqual(
-      escalations.map((h) => h.brief),
+      [...new Set(escalations.map((h) => h.brief))],
       ["the real brief"],
       "one brief, the agent's",
     );
@@ -1178,39 +1391,143 @@ describe("Dispatcher.tick", () => {
       false,
     );
 
-    released();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
 
-  it("resumes an existing session and reports how long the agent was gone", async () => {
+  it("does not call its own deadline abort an agent failure, and staffs the incident again", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    let clock = T0;
+    const rt = fakeRuntime();
+    const d = createDispatcher(
+      deps({
+        db,
+        runtime: rt.runtime,
+        toolApiFor,
+        config: config({ agentTimeoutSeconds: 60 }),
+        now: () => clock,
+      }),
+    );
+
+    await d.tick();
+    await flush();
+    clock = T0 + 300_000;
+
+    const events = await captureAlarms(async () => {
+      await d.tick();
+      await flush();
+    });
+
+    assert.ok(events.includes("agent_deadline_exceeded"), `${events}`);
+    assert.equal(
+      events.includes("agent_failed"),
+      false,
+      "the dispatcher aborted it on purpose and already said why",
+    );
+    // The same tick staffs the incident again, and that is the point of the
+    // abort: an incident too wedged to finish still needs an agent on it, and
+    // the escalation beside this one is what tells a person to look. Nothing
+    // here takes the incident away from the agents.
+    assert.deepEqual(d.list().map((a) => a.incidentId), ["i1"]);
+    assert.equal(d.list()[0].startedAt, clock, "a fresh run, not the aborted one");
+
+    rt.finishAll();
+    await d.drain();
+    cleanup();
+  });
+
+  it("reports a run that ends without answering instead of calling it a clean run", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    const rt = fakeRuntime({ settle: () => "unanswered" });
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
+    const events = await captureAlarms(async () => {
+      await (await d.tick()).settled;
+    });
+
+    assert.ok(events.includes("agent_failed"), `no agent_failed in ${events}`);
+    cleanup();
+  });
+
+  it("stays quiet about a run that answered", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor } = makeTools();
+    insertIncident(sqlite, "i1");
+
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
+    const events = await captureAlarms(async () => {
+      await (await d.tick()).settled;
+    });
+
+    assert.equal(events.includes("agent_failed"), false, `${events}`);
+    cleanup();
+  });
+
+  // Turns are work done, so a budget spent before a launch stays spent, and
+  // the first request of a launch rewrites the whole context into the cache:
+  // incident 80 came back at 266 of 200 and spent $4.04 on one get_incident.
+  it("does not launch an incident whose budget is already spent, and parks it on the budget", async () => {
+    const { db, sqlite, cleanup } = makeDb();
+    const { toolApiFor, escalations } = makeTools();
+    insertIncident(sqlite, "i1", { conversationId: 7, attempts: 4, turnsUsed: 300 });
+    insertIncident(sqlite, "i2", { conversationId: 8, attempts: 4, turnsUsed: 299 });
+
+    const rt = fakeRuntime({ settle: () => "done" });
+    const d = createDispatcher(
+      deps({ db, runtime: rt.runtime, toolApiFor, config: config({ agentMaxTurns: 300 }) }),
+    );
+    const first = await d.tick();
+    await first.settled;
+
+    assert.deepEqual(rt.launches().map((s) => s.incidentId), ["conversation 8"], "one turn left is a launch");
+    assert.deepEqual(first.escalated, ["i1"]);
+    assert.match(escalations[0].brief, /already spent/);
+    assert.equal(/did not say|said nothing/.test(escalations[0].brief), false);
+    const wait = db.get<{ waitingFor: string; liftsOnReply: number; wakeAt: number | null }>(
+      "SELECT waitingFor, liftsOnReply, wakeAt FROM incident_wait WHERE incidentId = 'i1'",
+    );
+    assert.deepEqual(wait, {
+      waitingFor: turnBudgetWaitingFor(300),
+      liftsOnReply: 0,
+      wakeAt: null,
+    });
+
+    await (await d.tick()).settled;
+    assert.equal(rt.launches().filter((s) => s.conversationId === 7).length, 0, "and nothing relaunches it");
+    assert.equal(escalations.length, 1);
+    cleanup();
+  });
+
+  it("resumes an existing conversation and tells the agent how long it was gone", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
-      sessionRef: "s-1",
+      conversationId: 7,
       lastStartedAt: T0 - 600_000,
     });
     insertIncident(sqlite, "i2");
 
-    const held = heldSpawn();
-    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor }));
+    const rt = fakeRuntime();
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
     await d.tick();
+    await flush();
 
-    const resumed = held.contexts.find((c) => c.incidentId === "i1");
-    assert.equal(resumed?.sessionRef, "s-1", "resume, not restart");
-    assert.equal(resumed?.attempt, 2);
-
-    const directives = db.query<{ incidentId: string; payload: string }>(
-      "SELECT incidentId, payload FROM pending_directive",
-    );
-    assert.equal(directives.length, 1, "only a resumed agent gets one");
-    assert.equal(directives[0].incidentId, "i1");
-    assert.deepEqual(JSON.parse(directives[0].payload), {
-      type: "resumed_after",
-      seconds: 600,
-    });
+    const resumed = rt.launches().find((s) => s.conversationId === 7);
+    assert.ok(resumed, "resume, not restart");
+    assert.equal(resumed.requestId, "incident:i1:launch:2");
+    assert.match(resumed.content, /^resume reused/);
+    assert.equal(resumedSeconds(resumed.content), 600);
+    const fresh = rt.launches().find((s) => s.incidentId === "i2");
+    assert.equal(resumedSeconds(fresh?.content ?? ""), null, "only a resumed agent is told");
 
     assert.equal(
       db.get<{ lastStartedAt: number }>(
@@ -1220,46 +1537,45 @@ describe("Dispatcher.tick", () => {
       "every launch records its own start for the next resume",
     );
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
 
-  it("measures the gap from lastStartedAt after a container restart", async () => {
+  // A deploy no longer relaunches anything: the harness resumes the run where
+  // it stopped. The agent still has to re-check what moved while it was down,
+  // so the first tick after boot steers it with the gap.
+  it("steers a run the harness resumed at boot with how long it was gone", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
-    // The container dies mid-run: no exit is observed and no memory survives.
-    const first = createDispatcher(
-      deps({ db, spawn: heldSpawn().spawn, toolApiFor, now: () => T0 }),
-    );
+    const rt = fakeRuntime();
+    const first = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor, now: () => T0 }));
     await first.tick();
+    await flush();
+    const conversationId = rt.launches()[0].conversationId;
 
     const restarted = createDispatcher(
-      deps({
-        db,
-        spawn: heldSpawn().spawn,
-        toolApiFor,
-        now: () => T0 + 420_000,
-      }),
+      deps({ db, runtime: rt.runtime, toolApiFor, now: () => T0 + 420_000 }),
     );
+    const result = await restarted.tick();
     await restarted.tick();
 
-    const directives = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive",
+    assert.deepEqual(result.started, [], "still running, so nothing is launched");
+    assert.equal(rt.launches().length, 1);
+    assert.deepEqual(
+      rt.steers().map((s) => [s.conversationId, resumedSeconds(s.content), s.requestId]),
+      [[conversationId, 420, `incident:i1:resumed:${T0 + 420_000}`]],
+      "once, at boot",
     );
-    assert.deepEqual(JSON.parse(directives[directives.length - 1].payload), {
-      type: "resumed_after",
-      seconds: 420,
-    });
     assert.deepEqual(escalations, [], "a restart is not a crash loop");
     cleanup();
   });
 
   // The three real runs that were killed were resumed automatically and
   // nobody noticed. Operators learn from the alarm and the agent from the
-  // directive; the thread is not told, because the post asked nothing of
+  // resume text; the thread is not told, because the post asked nothing of
   // anyone and fired on every ordinary deploy.
   it("alarms and tells the agent, and posts nothing, when it resumes an agent gone a long time", async () => {
     const { db, sqlite, cleanup } = makeDb();
@@ -1267,16 +1583,16 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
-      sessionRef: "s-1",
+      conversationId: 7,
       lastStartedAt: T0 - (RESUME_ALARM_SECONDS + 60) * 1000,
     });
 
     const notices: string[] = [];
-    const held = heldSpawn();
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn: held.spawn,
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           notices.push(text);
@@ -1286,19 +1602,15 @@ describe("Dispatcher.tick", () => {
     let started: string[] = [];
     const alarms = await captureAlarms(async () => {
       started = (await d.tick()).started.map((a) => a.incidentId);
+      await flush();
     });
 
     assert.deepEqual(started, ["i1"]);
     assert.deepEqual(notices, [], "nothing is posted to the thread");
     assert.ok(alarms.includes("agent_resumed_after_gap"));
-    const directives = db
-      .query<{ payload: string }>("SELECT payload FROM pending_directive")
-      .map((r) => JSON.parse(r.payload));
-    assert.deepEqual(directives, [
-      { type: "resumed_after", seconds: RESUME_ALARM_SECONDS + 60 },
-    ]);
+    assert.equal(resumedSeconds(rt.launches()[0].content), RESUME_ALARM_SECONDS + 60);
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -1311,16 +1623,16 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
-      sessionRef: "s-1",
+      conversationId: 7,
       lastStartedAt: T0 - 90_000,
     });
 
     const notices: string[] = [];
-    const held = heldSpawn();
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn: held.spawn,
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           notices.push(text);
@@ -1329,17 +1641,15 @@ describe("Dispatcher.tick", () => {
     );
     const alarms = await captureAlarms(async () => {
       await d.tick();
+      await flush();
     });
 
     assert.deepEqual(notices, []);
     assert.ok(!alarms.includes("agent_resumed_after_gap"));
     // The agent is still told, because it is the one that has to re-check.
-    const directives = db.query<{ payload: string }>(
-      "SELECT payload FROM pending_directive",
-    );
-    assert.equal(directives.length, 1);
+    assert.equal(resumedSeconds(rt.launches()[0].content), 90);
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -1349,16 +1659,17 @@ describe("Dispatcher.tick", () => {
     const { toolApiFor } = makeTools();
     insertIncident(sqlite, "i1", {
       attempts: 1,
-      sessionRef: "s-1",
+      conversationId: 7,
       lastStartedAt: T0 - 5_000,
     });
 
-    const held = heldSpawn();
-    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor }));
+    const rt = fakeRuntime();
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor }));
     await d.tick();
+    await flush();
 
-    assert.equal(db.query("SELECT id FROM pending_directive").length, 0);
-    held.releaseAll();
+    assert.equal(resumedSeconds(rt.launches()[0].content), null);
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -1367,23 +1678,20 @@ describe("Dispatcher.tick", () => {
   // thread was told its agent had been gone 4.5h and to disregard its last
   // message. The agent had asked the Boss a question three minutes earlier.
   // 4.5h was the time since launch, which is all the old clock read.
-  describe("after a restart kills an agent that was working", () => {
+  describe("after a restart stops an agent that was working", () => {
     const LAUNCHED_AGO_MS = 16_200_000;
     const ACTIVE_AGO_MS = 180_000;
 
-    const restartWith = async (signals: {
-      inbox: boolean;
-      session: boolean;
-    }) => {
+    const restartWith = async (inbox: boolean) => {
       const { db, sqlite, cleanup } = makeDb();
       const { toolApiFor } = makeTools();
       insertIncident(sqlite, "i1", {
         status: "INVESTIGATING",
         attempts: 1,
-        sessionRef: "sessions/incident/i1/session.jsonl",
+        conversationId: 7,
         lastStartedAt: T0 - LAUNCHED_AGO_MS,
       });
-      if (signals.inbox) {
+      if (inbox) {
         sqlite
           .prepare(
             "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES (?, 'question', ?, ?)",
@@ -1392,71 +1700,40 @@ describe("Dispatcher.tick", () => {
       }
 
       const notices: string[] = [];
-      const held = heldSpawn();
+      const rt = fakeRuntime();
+      rt.hold(7, "i1");
       const d = createDispatcher(
         deps({
           db,
-          spawn: held.spawn,
+          runtime: rt.runtime,
           toolApiFor,
+          config: config({ agentTimeoutSeconds: 86_400 }),
           postNotice: async (_id, text) => {
             notices.push(text);
           },
-          lastSessionEventAt: async () =>
-            signals.session ? T0 - ACTIVE_AGO_MS : null,
         }),
       );
       const alarms = await captureAlarms(async () => {
         await d.tick();
       });
-      const directives = db
-        .query<{ payload: string }>("SELECT payload FROM pending_directive")
-        .map((r) => JSON.parse(r.payload));
-
-      held.releaseAll();
-      await d.drain();
+      const gaps = rt.steers().map((s) => resumedSeconds(s.content));
       cleanup();
-      return { notices, alarms, directives };
+      return { notices, alarms, gaps };
     };
 
-    it("measured from launch, the old clock, this is a gap worth alarming", async () => {
+    it("with nothing else to read, launch is the clock, and that gap alarms", async () => {
       assert.ok(LAUNCHED_AGO_MS / 1000 >= RESUME_ALARM_SECONDS);
-      const { notices, alarms, directives } = await restartWith({
-        inbox: false,
-        session: false,
-      });
-      assert.ok(
-        alarms.includes("agent_resumed_after_gap"),
-        "with no activity to read, launch is the clock",
-      );
+      const { notices, alarms, gaps } = await restartWith(false);
+      assert.ok(alarms.includes("agent_resumed_after_gap"));
       assert.deepEqual(notices, []);
-      assert.deepEqual(directives, [
-        { type: "resumed_after", seconds: LAUNCHED_AGO_MS / 1000 },
-      ]);
+      assert.deepEqual(gaps, [LAUNCHED_AGO_MS / 1000]);
     });
 
-    it("does not alarm and logs the real three minutes", async () => {
-      const { notices, alarms, directives } = await restartWith({
-        inbox: true,
-        session: true,
-      });
+    it("does not alarm and reports the real three minutes", async () => {
+      const { notices, alarms, gaps } = await restartWith(true);
       assert.deepEqual(notices, []);
       assert.ok(!alarms.includes("agent_resumed_after_gap"));
-      assert.deepEqual(directives, [
-        { type: "resumed_after", seconds: ACTIVE_AGO_MS / 1000 },
-      ]);
-    });
-
-    it("reads either clock on its own", async () => {
-      for (const signals of [
-        { inbox: true, session: false },
-        { inbox: false, session: true },
-      ]) {
-        const { notices, directives } = await restartWith(signals);
-        assert.deepEqual(notices, [], JSON.stringify(signals));
-        assert.deepEqual(directives, [
-          { type: "resumed_after", seconds: ACTIVE_AGO_MS / 1000 },
-        ]);
-      }
+      assert.deepEqual(gaps, [ACTIVE_AGO_MS / 1000]);
     });
   });
 
@@ -1466,7 +1743,7 @@ describe("Dispatcher.tick", () => {
     insertIncident(sqlite, "i1", {
       status: "FIXING",
       attempts: 1,
-      sessionRef: "sessions/incident/i1/session.jsonl",
+      conversationId: 7,
       lastStartedAt: T0 - 7_200_000,
     });
     sqlite
@@ -1482,49 +1759,43 @@ describe("Dispatcher.tick", () => {
       .run(T0 - 60_000);
 
     const notices: string[] = [];
-    const held = heldSpawn();
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn: held.spawn,
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           notices.push(text);
         },
-        lastSessionEventAt: async () => T0 - 3_600_000,
       }),
     );
     const alarms = await captureAlarms(async () => {
       await d.tick();
+      await flush();
     });
 
     assert.deepEqual(notices, []);
     assert.ok(alarms.includes("agent_resumed_after_gap"));
-    const directives = db
-      .query<{ payload: string }>("SELECT payload FROM pending_directive")
-      .map((r) => JSON.parse(r.payload));
-    assert.deepEqual(directives, [{ type: "resumed_after", seconds: 3600 }]);
+    assert.equal(resumedSeconds(rt.launches()[0].content), 3900);
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
 
   // A blocking wait writes nothing while it blocks. An agent an hour into a
   // question to the Boss, or a wait on a person, looks idle by every
-  // timestamp, and a deploy killing it is still just a deploy.
-  describe("after a restart kills an agent inside a blocking wait", () => {
+  // timestamp, and a deploy stopping it is still just a deploy.
+  describe("after a restart stops an agent inside a blocking wait", () => {
     const ASKED_AGO_MS = 3_000_000;
 
-    const restartDuring = async (
-      marker: "question" | "wait" | null,
-      sessionAt: number | null = T0 - ASKED_AGO_MS - 5_000,
-    ) => {
+    const restartDuring = async (marker: "question" | "wait" | null) => {
       const { db, sqlite, cleanup } = makeDb();
       const { toolApiFor } = makeTools();
       insertIncident(sqlite, "i1", {
         attempts: 1,
-        sessionRef: "sessions/incident/i1/session.jsonl",
+        conversationId: 7,
         lastStartedAt: T0 - 16_200_000,
       });
       sqlite
@@ -1547,22 +1818,20 @@ describe("Dispatcher.tick", () => {
           .run(T0 - ASKED_AGO_MS);
       }
 
-      // The process boots at T0 and its first tick runs a tick later.
+      // The process boots at T0 and its first tick runs a little later.
       let clock = T0;
       const notices: string[] = [];
-      const held = heldSpawn();
+      const rt = fakeRuntime();
+      rt.hold(7, "i1");
       const d = createDispatcher(
         deps({
           db,
-          spawn: held.spawn,
+          runtime: rt.runtime,
           toolApiFor,
+          config: config({ agentTimeoutSeconds: 86_400 }),
           now: () => clock,
           postNotice: async (_id, text) => {
             notices.push(text);
-          },
-          lastSessionEventAt: async () => {
-            if (sessionAt === null) throw new Error("s3 is down");
-            return sessionAt;
           },
         }),
       );
@@ -1570,14 +1839,9 @@ describe("Dispatcher.tick", () => {
       const alarms = await captureAlarms(async () => {
         await d.tick();
       });
-      const directives = db
-        .query<{ payload: string }>("SELECT payload FROM pending_directive")
-        .map((r) => JSON.parse(r.payload));
-
-      held.releaseAll();
-      await d.drain();
+      const gaps = rt.steers().map((s) => resumedSeconds(s.content));
       cleanup();
-      return { notices, alarms, directives };
+      return { notices, alarms, gaps };
     };
 
     it("without an open marker, the last timestamp alone reads as an hour gone", async () => {
@@ -1588,416 +1852,12 @@ describe("Dispatcher.tick", () => {
 
     it("an open question or wait means it was alive until the restart", async () => {
       for (const marker of ["question", "wait"] as const) {
-        const { notices, alarms, directives } = await restartDuring(marker);
+        const { notices, alarms, gaps } = await restartDuring(marker);
         assert.deepEqual(notices, [], marker);
         assert.ok(!alarms.includes("agent_resumed_after_gap"), marker);
-        assert.deepEqual(directives, [{ type: "resumed_after", seconds: 45 }], marker);
+        assert.deepEqual(gaps, [45], marker);
       }
     });
-
-    // A SIGKILL mid-wait leaves its marker behind, and a resumed agent that
-    // never re-enters that wait leaves it there. Its later turns are newer
-    // than the marker, which is how an orphan is told from a live wait.
-    it("a marker counts for nothing when the session cannot be read", async () => {
-      const { notices, alarms } = await restartDuring("question", null);
-      assert.ok(alarms.includes("agent_resumed_after_gap"));
-      assert.ok(alarms.includes("resume_session_read_failed"));
-      assert.deepEqual(notices, []);
-    });
-
-    it("an orphaned marker older than the session proves nothing", async () => {
-      const { notices, alarms, directives } = await restartDuring(
-        "question",
-        T0 - ASKED_AGO_MS + 600_000,
-      );
-      assert.ok(alarms.includes("agent_resumed_after_gap"));
-      assert.deepEqual(notices, []);
-      assert.deepEqual(directives, [
-        { type: "resumed_after", seconds: (ASKED_AGO_MS - 600_000 + 45_000) / 1000 },
-      ]);
-    });
-  });
-
-  it("does not let a session read that never settles hold up the tick", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1", {
-      attempts: 1,
-      sessionRef: "sessions/incident/i1/session.jsonl",
-      lastStartedAt: T0 - 600_000,
-    });
-
-    const held = heldSpawn();
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn: held.spawn,
-        toolApiFor,
-        lastSessionEventAt: () => new Promise<number | null>(() => {}),
-      }),
-    );
-    const alarms = await captureAlarms(async () => {
-      const result = await d.tick();
-      assert.deepEqual(result.started.map((a) => a.incidentId), ["i1"]);
-    });
-    assert.ok(alarms.includes("resume_session_read_failed"));
-
-    held.releaseAll();
-    await d.drain();
-    cleanup();
-  });
-
-  it("falls back to the database when the session cannot be read", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1", {
-      attempts: 1,
-      sessionRef: "sessions/incident/i1/session.jsonl",
-      lastStartedAt: T0 - 16_200_000,
-    });
-    sqlite
-      .prepare(
-        "INSERT INTO boss_inbox (incidentId, kind, text, createdAt) VALUES ('i1', 'message', 'PR is up', ?)",
-      )
-      .run(T0 - 120_000);
-
-    const notices: string[] = [];
-    const held = heldSpawn();
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn: held.spawn,
-        toolApiFor,
-        postNotice: async (_id, text) => {
-          notices.push(text);
-        },
-        lastSessionEventAt: async () => {
-          throw new Error("s3 is down");
-        },
-      }),
-    );
-    const alarms = await captureAlarms(async () => {
-      await d.tick();
-    });
-
-    assert.deepEqual(notices, []);
-    assert.ok(alarms.includes("resume_session_read_failed"));
-    const directives = db.query<{ payload: string }>("SELECT payload FROM pending_directive");
-    assert.deepEqual(JSON.parse(directives[0].payload), {
-      type: "resumed_after",
-      seconds: 120,
-    });
-
-    held.releaseAll();
-    await d.drain();
-    cleanup();
-  });
-});
-
-describe("the spawned environment", () => {
-  it("carries the container credential path, and only what it was handed", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    process.env.SLACK_BOT_TOKEN = "xoxb-parent-only";
-
-    const held = heldSpawn();
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn: held.spawn,
-        toolApiFor,
-        childBaseEnv: {
-          PATH: "/usr/bin",
-          AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/task-role",
-        },
-        childCredentials: { GITHUB_TOKEN: "ghs_agent" },
-      }),
-    );
-    await d.tick();
-
-    const { env } = held.contexts[0];
-    assert.equal(
-      env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI,
-      "/v2/credentials/task-role",
-      "the child resolves the task role through the container provider",
-    );
-    assert.equal(
-      env.SLACK_BOT_TOKEN,
-      undefined,
-      "the parent's own credentials are not part of the allowlist",
-    );
-    assert.equal(env.GITHUB_TOKEN, "ghs_agent");
-    assert.equal(env.BUGBOSS_TOKEN, "tok-i1");
-    assert.equal(env.BUGBOSS_INCIDENT_ID, "i1");
-
-    held.releaseAll();
-    await d.drain();
-    delete process.env.SLACK_BOT_TOKEN;
-    cleanup();
-  });
-
-  it("hands the child the alert slugs of its incident's signals, and no one else's", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-    insertIncident(sqlite, "i2", { status: "CLOSED" });
-    const signal = sqlite.prepare(
-      `INSERT INTO signal (id, source, sourceId, kind, title, body, labels, openedAt, incidentId)
-       VALUES (?, 'grafana', ?, 'alert', 't', 'b', ?, ?, ?)`,
-    );
-    signal.run("s1", "f1", JSON.stringify({ alert_slug: "route-errors-win" }), T0, "i1");
-    signal.run("s2", "f2", JSON.stringify({ alert_slug: "high-cpu" }), T0, "i1");
-    signal.run("s3", "f3", JSON.stringify({ alert_slug: "high-cpu" }), T0, "i1");
-    signal.run("s4", "f4", JSON.stringify({}), T0, "i1");
-    signal.run("s5", "f5", JSON.stringify({ alert_slug: "someone-elses" }), T0, "i2");
-
-    const held = heldSpawn();
-    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor }));
-    await d.tick();
-
-    assert.equal(held.contexts[0].env.BUGBOSS_ALERT_SLUGS, '["high-cpu","route-errors-win"]');
-
-    held.releaseAll();
-    await d.drain();
-    cleanup();
-  });
-
-  it("is what child_process actually gets, with nothing inherited", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    process.env.BUGBOSS_PARENT_ONLY = "slack-token-shaped-thing";
-
-    let captured: NodeJS.ProcessEnv | undefined;
-    const fakeSpawn = ((_cmd: string, _args: string[], opts: { env?: NodeJS.ProcessEnv }) => {
-      captured = opts.env;
-      const child = new EventEmitter() as ChildProcess;
-      Object.assign(child, { pid: 777, kill: () => true });
-      setImmediate(() => child.emit("exit", 0, null));
-      return child;
-    }) as never;
-
-    const d = createDispatcher(
-      deps({
-        db,
-        toolApiFor,
-        spawn: createChildProcessSpawn({
-          modulePath: "/app/bugboss/agent/run.js",
-          spawnFn: fakeSpawn,
-        }),
-        childBaseEnv: {
-          PATH: "/usr/bin",
-          AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/creds",
-        },
-      }),
-    );
-    const result = await d.tick();
-    await result.settled;
-
-    assert.ok(captured, "the child was given an explicit environment");
-    assert.equal(captured.BUGBOSS_PARENT_ONLY, undefined, "nothing is inherited");
-    assert.equal(captured.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, "/v2/creds");
-    assert.equal(captured.PATH, "/usr/bin");
-    assert.equal(result.started[0].pid, 777, "the pid is tracked for the kill path");
-
-    delete process.env.BUGBOSS_PARENT_ONLY;
-    cleanup();
-  });
-
-  it("reports a child that exits non-zero instead of calling it a clean run", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    // agent/run.ts exits 1 from its failure handler. Resolving on any exit
-    // made that byte-identical to an agent that finished in good order.
-    const crashingSpawn = ((_cmd: string, _args: string[]) => {
-      const child = new EventEmitter() as ChildProcess;
-      Object.assign(child, { pid: 778, kill: () => true });
-      setImmediate(() => child.emit("exit", 1, null));
-      return child;
-    }) as never;
-
-    const d = createDispatcher(
-      deps({
-        db,
-        toolApiFor,
-        spawn: createChildProcessSpawn({
-          modulePath: "/app/bugboss/agent/run.js",
-          spawnFn: crashingSpawn,
-        }),
-        childBaseEnv: { PATH: "/usr/bin" },
-      }),
-    );
-
-    const events = await captureAlarms(async () => {
-      await (await d.tick()).settled;
-    });
-
-    assert.ok(events.includes("agent_failed"), `no agent_failed in ${events}`);
-    cleanup();
-  });
-
-  it("does not call a signalled child a clean run either", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    const signalledSpawn = ((_cmd: string, _args: string[]) => {
-      const child = new EventEmitter() as ChildProcess;
-      Object.assign(child, { pid: 779, kill: () => true });
-      setImmediate(() => child.emit("exit", null, "SIGSEGV"));
-      return child;
-    }) as never;
-
-    const d = createDispatcher(
-      deps({
-        db,
-        toolApiFor,
-        spawn: createChildProcessSpawn({
-          modulePath: "/app/bugboss/agent/run.js",
-          spawnFn: signalledSpawn,
-        }),
-        childBaseEnv: { PATH: "/usr/bin" },
-      }),
-    );
-
-    const events = await captureAlarms(async () => {
-      await (await d.tick()).settled;
-    });
-
-    assert.ok(events.includes("agent_failed"), `no agent_failed in ${events}`);
-    cleanup();
-  });
-
-  it("alarms on a SIGKILL it did not send", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    // The kernel's OOM killer and the dispatcher's backstop send the same
-    // signal, so the signal cannot be the discriminator. `entry.killed` is,
-    // and it is only ever set by enforceDeadlines. An OOM inside the deadline
-    // must still reach a human as an agent failure.
-    const oomSpawn = ((_cmd: string, _args: string[]) => {
-      const child = new EventEmitter() as ChildProcess;
-      Object.assign(child, { pid: 782, kill: () => true });
-      setImmediate(() => child.emit("exit", null, "SIGKILL"));
-      return child;
-    }) as never;
-
-    const d = createDispatcher(
-      deps({
-        db,
-        toolApiFor,
-        spawn: createChildProcessSpawn({
-          modulePath: "/app/bugboss/agent/run.js",
-          spawnFn: oomSpawn,
-        }),
-        childBaseEnv: { PATH: "/usr/bin" },
-        config: config({ agentTimeoutSeconds: 1800 }),
-      }),
-    );
-
-    const events = await captureAlarms(async () => {
-      await (await d.tick()).settled;
-    });
-
-    assert.ok(events.includes("agent_failed"), `no agent_failed in ${events}`);
-    assert.equal(
-      events.includes("agent_deadline_exceeded"),
-      false,
-      "it died 1800s early; the deadline had nothing to do with it",
-    );
-    cleanup();
-  });
-
-  it("stays quiet about a clean exit", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    const cleanSpawn = ((_cmd: string, _args: string[]) => {
-      const child = new EventEmitter() as ChildProcess;
-      Object.assign(child, { pid: 780, kill: () => true });
-      setImmediate(() => child.emit("exit", 0, null));
-      return child;
-    }) as never;
-
-    const d = createDispatcher(
-      deps({
-        db,
-        toolApiFor,
-        spawn: createChildProcessSpawn({
-          modulePath: "/app/bugboss/agent/run.js",
-          spawnFn: cleanSpawn,
-        }),
-        childBaseEnv: { PATH: "/usr/bin" },
-      }),
-    );
-
-    const events = await captureAlarms(async () => {
-      await (await d.tick()).settled;
-    });
-
-    assert.equal(events.includes("agent_failed"), false, `${events}`);
-    cleanup();
-  });
-
-  it("does not call its own deadline kill an agent failure", async () => {
-    const { db, sqlite, cleanup } = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(sqlite, "i1");
-
-    let clock = T0;
-    const exits: (() => void)[] = [];
-    const spawn: SpawnAgent = (ctx) => {
-      ctx.register({
-        pid: 781,
-        // A SIGKILLed child exits on a signal, which is now a rejection.
-        kill: () => exits.forEach((e) => e()),
-      });
-      return new Promise<void>((_resolve, reject) => {
-        exits.push(() => reject(new Error("agent killed by SIGKILL")));
-      });
-    };
-
-    const d = createDispatcher(
-      deps({
-        db,
-        spawn,
-        toolApiFor,
-        config: config({ agentTimeoutSeconds: 60 }),
-        now: () => clock,
-      }),
-    );
-
-    await d.tick();
-    clock = T0 + 300_000;
-
-    const events = await captureAlarms(async () => {
-      await d.tick();
-    });
-
-    assert.ok(events.includes("agent_deadline_exceeded"), `${events}`);
-    assert.equal(
-      events.includes("agent_failed"),
-      false,
-      "the dispatcher killed it on purpose and already said why",
-    );
-    // The same tick staffs the incident again, and that is the point of the
-    // kill: an incident too wedged to finish still needs an agent on it, and
-    // the escalation beside this one is what tells a person to look. Nothing
-    // here takes the incident away from the agents.
-    assert.deepEqual(d.list().map((a) => a.incidentId), ["i1"]);
-    assert.equal(d.list()[0].startedAt, clock, "a fresh run, not the killed one");
-
-    exits.forEach((e) => e());
-    await d.drain();
-    cleanup();
   });
 });
 
@@ -2041,16 +1901,19 @@ describe("Dispatcher stale sweep", () => {
       )
       .run(id, at);
 
-  // The same row `turnBudgetPark` writes: a wait on a person that a reply
-  // does not end, because what it is short of is turns rather than news.
-  const budgetPark = (sqlite: Database.Database, id: string, at: number) =>
+  // The same row a spent budget writes: a wait on a person that a reply
+  // does not end, because what it is short of is turns rather than news. The
+  // turns are spent too, or the raised-budget lift would take the wait away.
+  const budgetPark = (sqlite: Database.Database, id: string, at: number) => {
+    sqlite.prepare("UPDATE incident SET turnsUsed = 200 WHERE id = ?").run(id);
     sqlite
       .prepare(
         `INSERT INTO incident_wait
            (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
-         VALUES (?, 'a person, after the 200-turn budget ran out', NULL, 0, ?)`,
+         VALUES (?, ?, NULL, 0, ?)`,
       )
-      .run(id, at);
+      .run(id, turnBudgetWaitingFor(200), at);
+  };
 
   const waits = (db: DispatcherDb, id: string) =>
     db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id])
@@ -2087,7 +1950,7 @@ describe("Dispatcher stale sweep", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn: async () => {},
+        runtime: fakeRuntime({ settle: () => "done" }).runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           posts.push(text);
@@ -2123,13 +1986,11 @@ describe("Dispatcher stale sweep", () => {
     // is the shape that could otherwise wait forever.
     park(sqlite, "i1", T0 - 2 * DAY);
 
-    const spawned: string[] = [];
+    const rt = fakeRuntime({ settle: () => "done" });
     const d = createDispatcher(
       deps({
         db,
-        spawn: async (ctx) => {
-          spawned.push(ctx.incidentId);
-        },
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async () => {},
       }),
@@ -2148,7 +2009,7 @@ describe("Dispatcher stale sweep", () => {
 
     const second = await d.tick();
     await second.settled;
-    assert.deepEqual(spawned, ["i1"]);
+    assert.deepEqual(rt.launches().map((l) => l.incidentId), ["i1"]);
     cleanup();
   });
 
@@ -2170,7 +2031,7 @@ describe("Dispatcher stale sweep", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn: async () => {},
+        runtime: fakeRuntime({ settle: () => "done" }).runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           posts.push(text);
@@ -2206,7 +2067,7 @@ describe("Dispatcher stale sweep", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn: async () => {},
+        runtime: fakeRuntime({ settle: () => "done" }).runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           posts.push(text);
@@ -2224,14 +2085,14 @@ describe("Dispatcher stale sweep", () => {
   it("never sweeps an incident whose agent is still running", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor } = makeTools();
-    const { spawn, releaseAll } = heldSpawn();
+    const rt = fakeRuntime();
     // A run may last a day, so a healthy agent's own launch timestamp ages
-    // past the threshold under it. Only the running map can say otherwise.
+    // past the threshold under it. Only the harness can say otherwise.
     insertIncident(sqlite, "i1", {
       status: "INVESTIGATING",
       firstSignalAt: T0 - 3 * DAY,
       lastStartedAt: T0 - 2 * DAY,
-      sessionRef: "s-1",
+      conversationId: 7,
       attempts: 1,
     });
 
@@ -2240,7 +2101,7 @@ describe("Dispatcher stale sweep", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn,
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ agentTimeoutSeconds: 3 * 86_400 }),
         now: () => clock,
@@ -2259,7 +2120,7 @@ describe("Dispatcher stale sweep", () => {
       [],
     );
 
-    releaseAll();
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
@@ -2280,7 +2141,7 @@ describe("Dispatcher stale sweep", () => {
       createDispatcher(
         deps({
           db,
-          spawn: async () => {},
+          runtime: fakeRuntime({ settle: () => "done" }).runtime,
           toolApiFor,
           now: () => clock,
           postNotice: async (_id, text) => {
@@ -2317,7 +2178,7 @@ describe("Dispatcher stale sweep", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn: async () => {},
+        runtime: fakeRuntime({ settle: () => "done" }).runtime,
         toolApiFor,
         now: () => clock,
         postNotice: async (_id, text) => {
@@ -2353,7 +2214,7 @@ describe("Dispatcher stale sweep", () => {
     const d = createDispatcher(
       deps({
         db,
-        spawn: async () => {},
+        runtime: fakeRuntime({ settle: () => "done" }).runtime,
         toolApiFor,
         config: config({ staleAfterSeconds: 0 }),
         postNotice: async (_id, text) => {
@@ -2385,7 +2246,7 @@ describe("Dispatcher stale sweep", () => {
     });
 
     const d = createDispatcher(
-      deps({ db, spawn: async () => {}, toolApiFor, postNotice: async () => {} }),
+      deps({ db, runtime: fakeRuntime({ settle: () => "done" }).runtime, toolApiFor, postNotice: async () => {} }),
     );
     const result = await d.tick();
     await result.settled;
@@ -2403,7 +2264,7 @@ describe("Dispatcher stale sweep", () => {
     });
     park(sqlite, "i1", T0 - 2 * DAY);
 
-    const d = createDispatcher(deps({ db, spawn: async () => {}, toolApiFor }));
+    const d = createDispatcher(deps({ db, runtime: fakeRuntime({ settle: () => "done" }).runtime, toolApiFor }));
     const events = await captureAlarms(async () => {
       const result = await d.tick();
       await result.settled;
@@ -2440,14 +2301,12 @@ describe("Dispatcher stale sweep", () => {
     park(sqlite, "i1", T0 - 2 * DAY);
     budgetPark(sqlite, "i2", T0 - 2 * DAY);
 
-    const spawned: string[] = [];
+    const rt = fakeRuntime({ settle: () => "done" });
     const posts: Array<[string, string]> = [];
     const d = createDispatcher(
       deps({
         db,
-        spawn: async (ctx) => {
-          spawned.push(ctx.incidentId);
-        },
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async (id, text) => {
           posts.push([id, text]);
@@ -2479,7 +2338,7 @@ describe("Dispatcher stale sweep", () => {
     // day, which is the loop `liftsOnReply` was added to end.
     const second = await d.tick();
     await second.settled;
-    assert.deepEqual(spawned, ["i1"]);
+    assert.deepEqual(rt.launches().map((l) => l.incidentId), ["i1"]);
     cleanup();
   });
 
@@ -2493,15 +2352,13 @@ describe("Dispatcher stale sweep", () => {
     });
     budgetPark(sqlite, "i1", T0 - 2 * DAY);
 
-    const spawned: string[] = [];
+    const rt = fakeRuntime({ settle: () => "done" });
     const posts: string[] = [];
     let clock = T0;
     const d = createDispatcher(
       deps({
         db,
-        spawn: async (ctx) => {
-          spawned.push(ctx.incidentId);
-        },
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async (_id, text) => {
           posts.push(text);
@@ -2520,7 +2377,7 @@ describe("Dispatcher stale sweep", () => {
       clock += DAY;
     }
 
-    assert.deepEqual(spawned, [], "nothing ever relaunched it");
+    assert.deepEqual(rt.launches(), [], "nothing ever relaunched it");
     assert.equal(waits(db, "i1"), 1, "the wait outlived every sweep");
     assert.equal(sweeps(db, "i1"), 3, "and was still said out loud each day");
     assert.equal(posts.length, 3);
@@ -2580,8 +2437,8 @@ describe("Dispatcher workspace sweep", () => {
     insertIncident(sqlite, "i5", { status: "MERGED", mergedInto: "i1" });
     for (const id of ["i1", "i2", "i4", "i5", "no-such-incident"]) workspace(root, id);
 
-    const held = heldSpawn();
-    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor, workRoot: root }));
+    const rt = fakeRuntime();
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor, workRoot: root }));
     await d.tick();
 
     assert.ok(existsSync(join(root, "i1", "omni", "uncommitted.ts")));
@@ -2593,7 +2450,7 @@ describe("Dispatcher workspace sweep", () => {
     assert.ok(existsSync(join(root, "no-such-incident")));
     assert.ok(await trashEmptied(root), "the deleted trees are removed from disk, not just moved");
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     rmSync(root, { recursive: true, force: true });
     cleanup();
@@ -2606,16 +2463,17 @@ describe("Dispatcher workspace sweep", () => {
     insertIncident(sqlite, "i1", { status: "RESOLVED" });
     workspace(root, "i1");
 
-    const held = heldSpawn();
-    const d = createDispatcher(deps({ db, spawn: held.spawn, toolApiFor, workRoot: root }));
+    const rt = fakeRuntime();
+    const d = createDispatcher(deps({ db, runtime: rt.runtime, toolApiFor, workRoot: root }));
     await d.tick();
+    await flush();
     sqlite
       .prepare("UPDATE incident SET status = 'CLOSED', closedAt = ?, postmortem = 'pm' WHERE id = 'i1'")
       .run(T0);
     await d.tick();
     assert.ok(existsSync(join(root, "i1", "omni", "uncommitted.ts")), "its agent is still writing to it");
 
-    held.releaseAll();
+    rt.finishAll();
     await d.drain();
     await d.tick();
     assert.ok(!existsSync(join(root, "i1")));
@@ -2634,43 +2492,41 @@ describe("Dispatcher raised turn budget", () => {
            (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
          VALUES (?, ?, NULL, 0, ?)`,
       )
-      .run(id, `a person to decide what happens next; the ${max}-turn budget is spent`, T0 - 1000);
+      .run(id, turnBudgetWaitingFor(max), T0 - 1000);
 
   const waits = (db: DispatcherDb, id: string) =>
     db.query("SELECT incidentId FROM incident_wait WHERE incidentId = ?", [id]).length;
 
-  const setup = (turns: Record<string, number>) => {
+  const setup = () => {
     const made = makeDb();
     const { toolApiFor } = makeTools();
-    const launched: string[] = [];
+    const rt = fakeRuntime({ settle: () => "done" });
     const posts: { incidentId: string; text: string }[] = [];
     const d = createDispatcher(
       deps({
         db: made.db,
         config: config({ agentMaxTurns: 300 }),
-        spawn: async (ctx) => {
-          launched.push(ctx.incidentId);
-        },
+        runtime: rt.runtime,
         toolApiFor,
         postNotice: async (incidentId, text) => {
           posts.push({ incidentId, text });
         },
-        sessionTurns: async (ref) => turns[ref] ?? null,
       }),
     );
+    const launched = () => rt.launches().map((l) => l.incidentId);
     return { ...made, d, launched, posts };
   };
 
   it("lifts a wait parked on a 200 budget once the max is 300, and says so once", async () => {
-    const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 200 });
-    insertIncident(sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    const { db, sqlite, cleanup, d, launched, posts } = setup();
+    insertIncident(sqlite, "i1", { status: "FIXING", turnsUsed: 200 });
     budgetWait(sqlite, "i1", 200);
 
     await (await d.tick()).settled;
     await (await d.tick()).settled;
 
     assert.equal(waits(db, "i1"), 0);
-    assert.ok(launched.includes("i1"), "the incident is runnable again");
+    assert.ok(launched().includes("i1"), "the incident is runnable again");
     assert.deepEqual(posts, [
       {
         incidentId: "i1",
@@ -2689,20 +2545,19 @@ describe("Dispatcher raised turn budget", () => {
   it("records the lift before posting, so a failed post loses nothing", async () => {
     const made = makeDb();
     const { toolApiFor } = makeTools();
-    insertIncident(made.sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
+    insertIncident(made.sqlite, "i1", { status: "FIXING", turnsUsed: 270 });
     budgetWait(made.sqlite, "i1", 200);
     let waitAtPost = -1;
     const d = createDispatcher(
       deps({
         db: made.db,
         config: config({ agentMaxTurns: 300 }),
-        spawn: async () => {},
+        runtime: fakeRuntime({ settle: () => "done" }).runtime,
         toolApiFor,
         postNotice: async () => {
           waitAtPost = waits(made.db, "i1");
           throw new Error("slack down");
         },
-        sessionTurns: async () => 270,
       }),
     );
 
@@ -2716,9 +2571,11 @@ describe("Dispatcher raised turn budget", () => {
   });
 
   it("holds a spent wait whose used turns still reach the max", async () => {
-    const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 300, "s/i2": 320 });
-    insertIncident(sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
-    insertIncident(sqlite, "i2", { status: "INVESTIGATING", sessionRef: "s/i2" });
+    const { db, sqlite, cleanup, d, launched, posts } = setup();
+    insertIncident(sqlite, "i1", { status: "FIXING", turnsUsed: 300 });
+    // A launch can overrun the budget it parked on: incident 80 sat at 270
+    // of 200, which the wait's text alone would have read as 200.
+    insertIncident(sqlite, "i2", { status: "INVESTIGATING", turnsUsed: 320 });
     budgetWait(sqlite, "i1", 300);
     budgetWait(sqlite, "i2", 200);
 
@@ -2726,103 +2583,38 @@ describe("Dispatcher raised turn budget", () => {
 
     assert.equal(waits(db, "i1"), 1);
     assert.equal(waits(db, "i2"), 1);
-    assert.deepEqual(launched, []);
+    assert.deepEqual(launched(), []);
     assert.deepEqual(posts, []);
     cleanup();
   });
 
-  it("retries a failed session read on the next tick, and reads a held wait once", async () => {
-    const made = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(made.sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
-    insertIncident(made.sqlite, "i2", { status: "FIXING", sessionRef: "s/i2" });
-    budgetWait(made.sqlite, "i1", 200);
-    budgetWait(made.sqlite, "i2", 300);
-    const reads: string[] = [];
-    const posts: string[] = [];
-    const d = createDispatcher(
-      deps({
-        db: made.db,
-        config: config({ agentMaxTurns: 300 }),
-        spawn: async () => {},
-        toolApiFor,
-        postNotice: async (_id, text) => {
-          posts.push(text);
-        },
-        sessionTurns: async (ref) => {
-          reads.push(ref);
-          if (ref === "s/i1" && reads.filter((r) => r === ref).length === 1) {
-            throw new Error("s3 blip");
-          }
-          return ref === "s/i1" ? 200 : 300;
-        },
-      }),
+  it("resumes a spent incident on the tick after a grant, and says so once", async () => {
+    const { db, sqlite, cleanup, d, launched, posts } = setup();
+    insertIncident(sqlite, "i1", { status: "FIXING", turnsUsed: 300 });
+    budgetWait(sqlite, "i1", 300);
+
+    await (await d.tick()).settled;
+    assert.deepEqual(launched(), [], "premise: spent at 300 of 300, it is held");
+
+    // What the Boss's grant_turns writes. The dispatcher reads nothing else.
+    sqlite.prepare("UPDATE incident SET grantedTurns = grantedTurns + 50 WHERE id = 'i1'").run();
+
+    await (await d.tick()).settled;
+    await (await d.tick()).settled;
+
+    assert.equal(waits(db, "i1"), 0);
+    assert.ok(launched().includes("i1"), "budget plus grant is over what it used");
+    assert.deepEqual(
+      posts.map((p) => p.text),
+      ["Granted more turns; the agent is resuming with 50 left of 350."],
     );
-
-    const alarms = await captureAlarms(async () => {
-      await (await d.tick()).settled;
-    });
-    assert.ok(alarms.includes("budget_check_failed"));
-    assert.equal(waits(made.db, "i1"), 1);
-
-    await (await d.tick()).settled;
-    await (await d.tick()).settled;
-
-    assert.equal(waits(made.db, "i1"), 0, "the second read lifted it");
-    assert.equal(waits(made.db, "i2"), 1);
-    assert.equal(reads.filter((r) => r === "s/i2").length, 1, "a held wait is not read every tick");
-    assert.equal(posts.length, 1);
-    made.cleanup();
-  });
-
-  it("resumes a spent incident on the tick after a grant, with the granted budget, and says so once", async () => {
-    const made = makeDb();
-    const { toolApiFor } = makeTools();
-    insertIncident(made.sqlite, "i1", { status: "FIXING", sessionRef: "s/i1" });
-    budgetWait(made.sqlite, "i1", 300);
-    const launches: { incidentId: string; maxTurns: string }[] = [];
-    const posts: string[] = [];
-    const d = createDispatcher(
-      deps({
-        db: made.db,
-        config: config({ agentMaxTurns: 300 }),
-        spawn: async (ctx) => {
-          launches.push({ incidentId: ctx.incidentId, maxTurns: ctx.env.BUGBOSS_MAX_TURNS });
-        },
-        toolApiFor,
-        postNotice: async (_id, text) => {
-          posts.push(text);
-        },
-        sessionTurns: async () => 300,
-      }),
-    );
-
-    await (await d.tick()).settled;
-    assert.deepEqual(launches, [], "premise: spent at 300 of 300, it is held");
-
-    const grant = buildGrantTurnsTool(made.db as unknown as Db);
-    assert.match(
-      await grant.run({
-        incidentId: "i1",
-        turns: 50,
-        reason: "Swain asked in the thread for the agent to rebase its PR onto main now.",
-      }),
-      /^Granted 50 turns/,
-    );
-
-    await (await d.tick()).settled;
-    await (await d.tick()).settled;
-
-    assert.equal(waits(made.db, "i1"), 0);
-    assert.deepEqual(launches[0], { incidentId: "i1", maxTurns: "350" }, "the child gets budget + grant");
-    assert.deepEqual(posts, ["Granted more turns; the agent is resuming with 50 left of 350."]);
-    made.cleanup();
+    cleanup();
   });
 
   it("leaves closed incidents and waits on anything else alone", async () => {
-    const { db, sqlite, cleanup, d, launched, posts } = setup({ "s/i1": 200, "s/i2": 10 });
-    insertIncident(sqlite, "i1", { status: "CLOSED", sessionRef: "s/i1" });
-    insertIncident(sqlite, "i2", { status: "FIXING", sessionRef: "s/i2" });
+    const { db, sqlite, cleanup, d, launched, posts } = setup();
+    insertIncident(sqlite, "i1", { status: "CLOSED", turnsUsed: 200 });
+    insertIncident(sqlite, "i2", { status: "FIXING", turnsUsed: 10 });
     budgetWait(sqlite, "i1", 200);
     sqlite
       .prepare(
@@ -2835,7 +2627,7 @@ describe("Dispatcher raised turn budget", () => {
 
     assert.equal(waits(db, "i1"), 1);
     assert.equal(waits(db, "i2"), 1);
-    assert.deepEqual(launched, []);
+    assert.deepEqual(launched(), []);
     assert.deepEqual(posts, []);
     cleanup();
   });
@@ -2861,14 +2653,13 @@ describe("Dispatcher escalations while writes fail", () => {
   it("replays the incident 93 storm and posts nothing", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "93", { sessionRef: "s-1" });
+    insertIncident(sqlite, "93");
 
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     const d = createDispatcher(
       deps({
         db: refusing(db, () => true),
-        spawn: async () => {
-          throw new Error("unreachable: the launch write fails first");
-        },
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
       }),
@@ -2880,6 +2671,7 @@ describe("Dispatcher escalations while writes fail", () => {
       }
     });
 
+    assert.equal(rt.launches().length, 0, "the launch write fails first");
     assert.equal(escalations.length, 0, "a park that cannot be written posts nothing");
     cleanup();
   });
@@ -2887,17 +2679,14 @@ describe("Dispatcher escalations while writes fail", () => {
   it("keeps its count when the park fails, so the escalation goes out once writes return", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let halted = false;
-    let launches = 0;
+    const rt = fakeRuntime({ settle: () => "unanswered" });
     const d = createDispatcher(
       deps({
         db: refusing(db, () => halted),
-        spawn: async () => {
-          launches += 1;
-          throw new Error("agent exited 1");
-        },
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
       }),
@@ -2911,7 +2700,7 @@ describe("Dispatcher escalations while writes fail", () => {
     halted = false;
     const recovered = await d.tick();
 
-    assert.equal(launches, 3, "no relaunch spent rebuilding a count it already had");
+    assert.equal(rt.launches().length, 3, "no relaunch spent rebuilding a count it already had");
     assert.deepEqual(recovered.escalated, ["i1"]);
     assert.equal(escalations.length, 1);
     cleanup();
@@ -2920,7 +2709,7 @@ describe("Dispatcher escalations while writes fail", () => {
   it("parks before it posts a crash loop", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     const parkedAtPost: boolean[] = [];
     const toolApiFor = (incidentId: string): ToolApi => ({
@@ -2930,16 +2719,14 @@ describe("Dispatcher escalations while writes fail", () => {
           db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [incidentId]) !== undefined,
         );
         escalations.push({ incidentId, reason, brief });
-        return { ok: true, directives: [] };
+        return { ok: true };
       },
     });
 
     const d = createDispatcher(
       deps({
         db,
-        spawn: async () => {
-          throw new Error("agent exited 1");
-        },
+        runtime: fakeRuntime({ settle: () => "unanswered" }).runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
       }),
@@ -2952,10 +2739,9 @@ describe("Dispatcher escalations while writes fail", () => {
 
   it("parks before it posts a launch ceiling, and takes the park back when the post fails", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let clock = T0;
-    const releases: (() => void)[] = [];
     const parkedAtPost: boolean[] = [];
     const toolApiFor = (incidentId: string): ToolApi => ({
       ...makeTools().toolApiFor(incidentId),
@@ -2964,14 +2750,15 @@ describe("Dispatcher escalations while writes fail", () => {
           db.get("SELECT 1 FROM incident_wait WHERE incidentId = ?", [incidentId]) !== undefined,
         );
         // What the tool API answers when its post fails: a refusal, not a throw.
-        return { ok: false, error: "could not post the escalation", directives: [] };
+        return { ok: false, error: "could not post the escalation" };
       },
     });
 
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db,
-        spawn: () => new Promise<void>((resolve) => releases.push(resolve)),
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         fastFailureSeconds: 60,
@@ -2982,10 +2769,11 @@ describe("Dispatcher escalations while writes fail", () => {
 
     const alarms = await captureAlarms(async () => {
       for (let i = 0; i < 3; i += 1) {
-        await d.tick();
+        const result = await d.tick();
         clock += 61_000;
-        releases.forEach((r) => r());
-        await d.drain();
+        await flush();
+        rt.finishAll("unanswered");
+        await result.settled;
       }
       await d.tick();
     });
@@ -2997,14 +2785,14 @@ describe("Dispatcher escalations while writes fail", () => {
       "nobody was told, so it relaunches rather than sitting parked",
     );
     assert.ok(alarms.includes("stalled_escalation_failed"));
-    releases.forEach((r) => r());
+    rt.finishAll();
     await d.drain();
     cleanup();
   });
 
   it("keeps its count when the post fails and the park cannot be taken back", async () => {
     const { db, sqlite, cleanup } = makeDb();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let halted = false;
     let posts = 0;
@@ -3016,17 +2804,15 @@ describe("Dispatcher escalations while writes fail", () => {
         if (refuse) {
           // The post fails, and so does every write after the park.
           halted = true;
-          return { ok: false, error: "could not post the escalation", directives: [] };
+          return { ok: false, error: "could not post the escalation" };
         }
-        return { ok: true, directives: [] };
+        return { ok: true };
       },
     });
     const d = createDispatcher(
       deps({
         db: refusing(db, () => halted),
-        spawn: async () => {
-          throw new Error("agent exited 1");
-        },
+        runtime: fakeRuntime({ settle: () => "unanswered" }).runtime,
         toolApiFor,
         config: config({ maxAttempts: 3 }),
         parkCooldownSeconds: 60,
@@ -3052,18 +2838,15 @@ describe("Dispatcher escalations while writes fail", () => {
   it("does not post a deadline escalation while writes fail", async () => {
     const { db, sqlite, cleanup } = makeDb();
     const { toolApiFor, escalations } = makeTools();
-    insertIncident(sqlite, "i1", { sessionRef: "s-1" });
+    insertIncident(sqlite, "i1");
 
     let clock = T0;
     let halted = false;
-    const releases: (() => void)[] = [];
+    const rt = fakeRuntime();
     const d = createDispatcher(
       deps({
         db: refusing(db, () => halted),
-        spawn: (ctx) => {
-          ctx.register({ pid: 1, kill: () => releases.forEach((r) => r()) });
-          return new Promise<void>((resolve) => releases.push(resolve));
-        },
+        runtime: rt.runtime,
         toolApiFor,
         config: config({ agentTimeoutSeconds: 60 }),
         now: () => clock,
@@ -3071,6 +2854,7 @@ describe("Dispatcher escalations while writes fail", () => {
     );
 
     await d.tick();
+    await flush();
     halted = true;
     clock = T0 + 60_000 + (DEADLINE_GRACE_SECONDS + 1) * 1000;
     const alarms = await captureAlarms(async () => {
@@ -3080,6 +2864,7 @@ describe("Dispatcher escalations while writes fail", () => {
       }
     });
 
+    assert.equal(rt.aborts.length, 1, "the abort writes nothing, so it still happens");
     assert.equal(escalations.length, 0);
     assert.ok(alarms.includes("deadline_escalation_unrecorded"));
 
@@ -3089,8 +2874,20 @@ describe("Dispatcher escalations while writes fail", () => {
     await d.tick();
     assert.equal(escalations.length, 1);
     assert.match(escalations[0].reason, /deadline/);
-    releases.forEach((r) => r());
+    rt.finishAll();
     await d.drain();
     cleanup();
+  });
+});
+
+describe("the dispatcher's imports", () => {
+  it("reach Pi only through the AgentRuntime seam", () => {
+    const src = readFileSync(join(__dirname, "index.ts"), "utf8");
+    assert.equal(/from "@earendil-works\//.test(src), false, "no Pi package import");
+    assert.equal(
+      /^import \{[^}]*\} from "\.\.\/agent\/harness"/m.test(src),
+      false,
+      "types only from the harness module, so nothing of Pi loads with the dispatcher",
+    );
   });
 });

@@ -15,7 +15,6 @@ import {
   type InvokeModelBody,
   parseInferenceProfiles,
   priceTokens,
-  registerBedrockInvokeModelProvider,
   resolveBedrockModel,
 } from "./index";
 
@@ -373,16 +372,6 @@ test("the region option and an abort signal reach the client", async () => {
 
   assert.equal(seen[0].region, "us-west-2");
   assert.equal(seen[0].signal, controller.signal);
-});
-
-test("registering claims the new id and leaves the builtin converse id alone", async () => {
-  const compat = await import("@earendil-works/pi-ai/compat");
-  const builtinBefore = compat.getApiProvider("bedrock-converse-stream");
-
-  await registerBedrockInvokeModelProvider({ invoke: async () => chunks(silentThinkingTurn) });
-
-  assert.ok(compat.getApiProvider(BEDROCK_INVOKE_MODEL_API));
-  assert.equal(compat.getApiProvider("bedrock-converse-stream"), builtinBefore);
 });
 
 // Asserted here rather than only on buildInvokeModelBody for the reason this

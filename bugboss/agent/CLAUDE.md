@@ -1,7 +1,15 @@
 # agent
 
-The incident agent: a Pi session running in a child process, against
-Bedrock, with its own checkout of omni that outlives a restart.
+The incident agent: one Pi Durable conversation per incident, run by the
+Boss's own harness in the Boss's own process, against Bedrock, with its own
+checkout of omni that outlives a restart.
+
+`extension.ts` is the agent: three extensions (`bugboss.incident`,
+`bugboss.coding`, `bugboss.grafana`), the IncidentDoc that binds a
+conversation to its incident, and what a launch says. `port.ts` is
+everything it reaches that is not the tool API. `wait.ts` is how a tool
+blocks. `budget.ts` is the turn budget and the deadline's words. `stages.ts`
+is stage compaction. `shell-env.ts` is what its shell may see.
 
 ## What it is allowed to do
 
@@ -16,11 +24,28 @@ Nothing inside the container separates the two, so what limits an agent is
 what the task can reach at all — no database, no release path. The one
 database read it has goes through a person: `request_sql_query`, below.
 
-GitHub is different. It gets the App's **credentials**, not a token minted for
-it, and re-mints every twenty minutes. Installation tokens last an hour and an incident can
-run for a day, so a token handed down at launch would expire
-mid-investigation and surface as `gh` refusing to push a branch the agent
-had already built.
+GitHub is different. The composition root holds the App and keeps its
+installation token fresh; `bash` builds its environment on every call
+(`createBashTool({ prepare })`) with the allowlist from `shell-env.ts` and the
+token as it is at that moment, under both `GITHUB_TOKEN` and `GH_TOKEN`.
+Installation tokens last an hour and an incident can run for a day, so a token
+handed down at launch would expire mid-investigation and surface as `gh`
+refusing to push a branch the agent had already built. The App's private key
+never reaches the shell. `configureGitCredentials` installs a git credential
+helper that reads `$GITHUB_TOKEN` when git asks, once, at boot.
+
+**The shell never inherits the Boss's environment.** The agent runs inside
+the process that holds `BUGBOSS_SECRETS`, so `bash` sets `inheritEnv = false`,
+and so does every exec the harness's environment makes. A `monitor` command,
+`npm ci` and the Grafana MCP server get the same allowlist.
+
+The eval harness (`bugboss-evals/`) sets five more things, and production
+sets none of them. The Boss reads `BUGBOSS_OMNI_REPO` (clone the sandbox, not
+omni), `BUGBOSS_WORK_ROOT`, `BUGBOSS_GITHUB_TOKEN_FILE` (a sandbox-scoped
+token the harness keeps fresh, read instead of the App's credentials) and
+`BUGBOSS_REVIEW_SETTLE_SECONDS` itself; the allowlist also carries them, plus
+`NODE_EXTRA_CA_CERTS` and any `AWS_ENDPOINT_URL_*`, so `bash` and `npm ci`
+trust the harness's CA and send AWS calls where the Boss's own do.
 
 What that token may do is [`../github-app.md`](../github-app.md), which is the
 GitHub counterpart to the checked-in Slack manifest. Read it before assuming
@@ -30,8 +55,10 @@ prompt used to say otherwise and was wrong.
 
 ## The Grafana MCP surface is bounded twice, in code
 
-`mcp.ts` exposes mcp-grafana, which ships ~80 tools, and fifteen agents can
-hold it at once. On 2026-09-28 a third of all Loki read volume was ad-hoc MCP
+`mcp.ts` exposes mcp-grafana, which ships ~80 tools, through one stdio process
+the Boss shares between every agent (`bugboss.grafana`). A process that exits
+alarms and is respawned on the next call. Fifteen agents can hold the tools at
+once. On 2026-09-28 a third of all Loki read volume was ad-hoc MCP
 queries — 2.06 TB/day from 130 of them, single 30-day reads at 54-149 GB. So:
 
 - **`GRAFANA_READ_TOOLS` is the surface.** Reads only, and only the ones
@@ -78,14 +105,19 @@ investigation needs for its first queries (the Loki selector and the
 `Request completed` fields). Everything else is an index entry: a path, what
 it answers and when to read it. The agent has the checkout.
 
-**The alert that fired is the one exception.** The dispatcher passes the
-incident's `alert_slug`s to the child as `BUGBOSS_ALERT_SLUGS`, read in
-SQL at launch rather than through `get_incident`, which would drain the
-directives the agent has not seen yet. `findFiredAlert` locates each slug in
+**The alert that fired is the one exception.** The dispatcher reads the
+incident's `alert_slug`s in SQL when it composes the prompt for a new
+conversation. `findFiredAlert` locates each slug in
 omni's alert source -- a literal `slug:`, then a template slug, then the
 longest quoted dash-prefix, for a slug assembled from parts -- and inlines
 the enclosing object literal, or a `file:line` pointer when there is no
 literal to show.
+
+The prompt is the conversation's `instructions`, pinned in `pi.agent` when the
+conversation is created, and so is the model. A doc that changes in the
+checkout, or a model id retuned in SSM, reaches the next incident and never
+moves one already running, so no cached turn is invalidated by it. The
+incident extension has no prompt sections for the same reason.
 
 `prompt.test.ts` pins an upper bound on the composed prefix. Raising it is a
 decision to make every turn of every incident dearer; make it in the PR, not
@@ -100,73 +132,62 @@ inside a single turn waiting on a person. 92 turns, $18.51, against a
 24-hour deadline that fifteen agents could each have spent in full.
 
 So there is a second bound in turns — `INCIDENT_AGENT_MAX_TURNS`, 300,
-overridable by `BUGBOSS_MAX_TURNS` — and three things about it matter:
+overridable by `BUGBOSS_MAX_TURNS`, plus whatever the Boss granted — and these
+things about it matter (`budget.ts`):
 
-- **It is counted over the incident, not the process.** Every merge to ops
-  `main` restarts this container, so a budget that started from zero on each
-  launch would bound nothing. `createTurnBudget` is seeded from
-  `sumSessionUsage` over the restored transcript, which counts assistant
-  messages — the same unit `turn_end` fires on.
+- **It is counted over the incident, in the incident row.** An `afterResponse`
+  hook increments `incident.turnsUsed` through `withWrite` after every model
+  response, awaited, so the count is in the snapshot before the next request
+  is made. At boot `reconcileTurns` rewrites every open incident's count from
+  the `pi.assistant` entries in its conversation, absolute and idempotent,
+  which repairs the one drift the increment has: a crash between its commit
+  and the response's. An incident from before the harness has no count but
+  its old session file, which nothing reads, so it starts again from 0 --
+  except one parked on a spent budget, whose park names the budget it spent:
+  `backfillSpentBudgets` writes that number once at boot, before the
+  reconcile, so the dispatcher does not read 0 as a raised budget and
+  relaunch it.
 - **It announces and parks; it does not just stop.** Same two layers as the
-  deadline: at `maxTurns - TURN_BUDGET_GRACE_TURNS` the blocking-tool abort
-  fires and the model is steered to write a brief, and at `maxTurns` the
-  harness does it on the agent's behalf. Two calls, and only one of them is
-  optional. `escalate` is the announcement and is skipped when the agent
+  deadline. At the grace edge the hook steers `turnBudgetMessage`, once per
+  budget (the steer's request id carries the budget), and a blocking tool
+  sees the steer and returns, so an agent inside a day-long `monitor` does
+  not spend its grace there. At the cap it escalates, parks and aborts the
+  conversation. `escalate` is the announcement and is skipped when the agent
   already escalated inside its grace. **`park` is not skippable.** Nothing
   else stops the dispatcher relaunching, and a relaunched agent is instantly
   over budget again, so without it the run escalates, stops, relaunches and
   escalates every tick — the hot loop `park` exists for, named in its own
-  doc comment in `types.ts`. Announcing is what a person sees; parking is
-  what makes it stop.
-- **A launch that starts spent makes no model request.** `turn_end` fires
-  only after a turn is paid for, and the first turn of a relaunch rewrites
-  the whole restored context: incident 80 came back at 266 of 200 turns and
-  spent $4.04 on one `get_incident`. So `promptWithinBudget` runs the same
-  hand-off before the first prompt when the restored count is already at the
-  cap. The dispatcher cannot make this call itself: it never reads the
-  session file the count lives in.
-- **The agent escalating itself wins the announcement.** The steer asks for
-  exactly that and the model can answer on its very last grace turn, which
-  ends the same `turn_end` the cap fires on. The budget watches
-  `toolResults` for a successful `escalate`, because sending both puts "it
-  never wrote a brief" directly under the brief it just wrote. A *failed*
-  escalation does not count — the Boss was never told, which is the case the
-  harness exists for.
+  doc comment in `types.ts`.
+- **The cap waits for its round's tools.** A response that reaches the cap
+  and calls tools is handled in `afterTools`, after they ran, so an
+  `escalate` the model made on its very last turn is seen rather than cut off
+  by the stop. A response with no tool calls is handled at once.
+- **A launch that starts spent makes no model request.** The first turn of a
+  relaunch rewrites the whole context: incident 80 came back at 266 of 200
+  turns and spent $4.04 on one `get_incident`. The dispatcher checks
+  `turnsUsed` before it submits.
+- **The agent escalating itself wins the announcement.** `escalatedWithin`
+  reads the conversation for a successful `escalate` result inside the last
+  `graceTurns` responses. A *failed* escalation does not count — the Boss was
+  never told, which is the case the harness exists for.
 - **The grace is clamped to half the budget.** `TURN_BUDGET_GRACE_TURNS` is
-  a constant and `maxTurns` is settable, so the two configure into nonsense
+  a constant and the budget is settable, so the two configure into nonsense
   at small budgets: unclamped, `BUGBOSS_MAX_TURNS=10` puts the soft edge at
-  turn 0 and the agent is told to wrap up before it has done anything, with
-  nine turns left unused. The clamp is on the grace rather than a floor
-  under `maxTurns`, because a small budget is a legitimate ask and the
-  honest reading of it is "wrap up sooner". `TurnBudgetState.graceTurns`
-  carries what was actually given, so the brief cannot quote a window nobody
-  had.
-- **The park is the stop, and it opts out of lifting on a reply.**
-  `ToolApi.park` defaults `liftsOnReply` to true, which is right for a wait
-  on a person and wrong for this one: a reply is not news about having run
-  out of turns. Without `liftsOnReply: false` every comment on the thread
-  woke an agent that was over budget before it started, stopped again, and
-  paged the rotation. The argument is in `turnBudgetPark` rather than at the
-  call site so a test fails if it is dropped.
-- **The announcement is suppressed only when the agent already made it.**
-  `shouldAnnounceExhaustion` is `!state.escalated` and nothing more. There
-  was a second arm for a launch that began over budget, and it was treating
-  the wake rather than preventing it; once a budget wait survives a reply
-  the wake does not happen. No reply or timer lifts a budget wait: the stale sweep
-  reads `liftsOnReply` too, so it announces one and leaves it standing
-  rather than relaunching an agent that would exhaust before its first turn.
-  Suppressing here as well would only take away the saying-so, and an
-  incident a day quiet and still out of turns is exactly what should be said
-  out loud.
-  The brief says plainly that replying will not restart it, because it will
-  not — raising the turn budget or taking the work over is what continues
-  it. A raised budget resumes the incident on the next boot: the dispatcher
-  lifts a budget wait whose used turns are under the new number
-  (`liftRaisedBudgets`, `dispatcher/CLAUDE.md`).
+  turn 0. The clamp is on the grace rather than a floor under the budget,
+  because a small budget is a legitimate ask and the honest reading of it is
+  "wrap up sooner". `TurnBudgetState.graceTurns` carries what was actually
+  given, so the brief cannot quote a window nobody had.
+- **The park opts out of lifting on a reply.** `ToolApi.park` defaults
+  `liftsOnReply` to true, which is right for a wait on a person and wrong for
+  this one: a reply is not news about having run out of turns. The argument
+  is in `turnBudgetPark` rather than at the call site so a test fails if it is
+  dropped. No reply or timer lifts a budget wait; raising the budget does, on
+  the next boot (`liftRaisedBudgets`, `dispatcher/CLAUDE.md`). The brief says
+  plainly that replying will not restart it.
 - **The brief carries what the run spent.** Turns, tokens and a cost
-  estimate, because shipping a turn cap before a dollar cap is only worth
-  anything if somebody learns what those turns cost. It is called an estimate there
-  too.
+  estimate, from the conversation's `pi.usage`, because shipping a turn cap
+  before a dollar cap is only worth anything if somebody learns what those
+  turns cost. It is called an estimate there too.
 
 **This is not the Slack agent's budget.** `SLACK_AGENT_MAX_TURNS` is 24 and
 ends by posting that the run is out of steps, which is right when a person is
@@ -175,26 +196,45 @@ ending is an escalation and a park. Same mechanism, different number,
 different last act — the names say which is which so the next change picks
 the right one.
 
-`turn_end` cannot stop the loop. Pi reads a boundary result's `continue` as
-"force another turn" and never as "stop", so the stop is `session.abort()` —
-which leaves an error message behind exactly as a failing turn does. That is
-why `exitCodeFor` exempts `turnsExhausted`: without it a bound working as
-designed reaches the dispatcher as `agent_failed` and alarms every time.
+**The deadline is the dispatcher's.** It steers `deadlineMessage` at
+`lastStartedAt + agentTimeoutSeconds` and aborts the conversation
+`DEADLINE_GRACE_SECONDS` later. An abort kills the child processes a running
+`bash` started. A tool wedged inside JavaScript rather than a subprocess
+cannot be stopped from in-process; that is the cost of one process with no
+isolation (`docs/architecture.md`).
 
 ## It talks to the Boss and nobody else
 
 An incident agent never posts to Slack and never reads it. Everything it has
 to say to a person goes into the Boss's inbox (`boss_inbox`, through
-`POST /incidents/:id/boss-inbox`), which wakes the Boss, and the Boss decides
-whether anybody hears it, who, and in what words. Everything a person says
-reaches the agent as a `boss_message` directive the Boss chose to send.
-`BossInboxPort` in `tools.ts` is the whole of that surface: `tellBoss(kind,
-text)` and `escalationsSince(since)`. There is no thread-posting method on the
-Boss client.
+`AgentPort.tellBoss`), which commits the row and then wakes the Boss, and the
+Boss decides whether anybody hears it, who, and in what words. Everything a
+person says reaches the agent as a steer the Boss chose to send, opening
+`The Boss says:` (`BOSS_SAYS`). `BossInboxPort` in `tools.ts` is the whole of
+that surface: `tellBoss(kind, text)` and `escalationsSince(since)`. There is
+no thread-posting method on the port.
+
+An escalation marked `ownBrief` is the agent's own `escalate` and also tells
+the dispatcher, so its deadline does not post a placeholder brief over the
+agent's. The heartbeat's rungs are not marked.
 
 What does still reach Slack from an agent's words is deterministic and posted
 by `toolapi` on a transition: the root cause, the resolution evidence and the
 post-mortem. Those are records, not conversation.
+
+## Containment is the IncidentDoc
+
+Every incident tool reads its incident id from the conversation's
+`IncidentDoc`, written once in the commit that creates the conversation
+(`incidentInit`), and calls `toolApiFor(incidentId)` or `port(incidentId)`
+in-process. The id is never an argument, so a conversation cannot aim a write
+at another incident's record. A conversation with no IncidentDoc gets an
+error from every incident tool and reaches nothing.
+
+The zod bodies in `extension.ts` run before every tool API call, on top of
+Pi's own TypeBox validation: a URL is a URL (`<!channel>` inside `<…>` pages
+everyone), an epoch is a positive integer, a string is not empty. A refused
+argument or transition is a tool result the model can read and correct.
 
 ## The two blocking tools
 
@@ -256,22 +296,16 @@ a person for 1h40m after the merge the wait had seen within a minute.
 real work; everything subtler (a one-off `gh pr checks`) is left to the
 prompt and the tool description.
 
-**A Boss message is a user message, and it ends a wait.** The Boss writes it
-to `pending_directive` from another process, so `createDirectiveWatcher`
-(`run.ts`) polls every ten seconds and delivers each `boss_message` with
-`session.steer`, then consumes it; the steered message is in the session, so a
-restart keeps it. Only the Boss tools drain the queue, and an agent writing a
-fix or watching CI calls none of them for minutes: incident 94's agent ran ten
-bash and monitor calls past a redirection and read it only when a deploy
-restarted it.
-
-A steer lands between tool batches, so a wait has to be cancellable or it
-holds the message for as long as it lasts. `createWaitInterrupt` (`tools.ts`)
-is a per-wait `AbortController`, replaced after every interrupt, and the
-blocking tools combine it with `wrapUpAbort` at call start. An interrupted
-`monitor` says `(interrupted)` and clears its wait marker, so the board stops
-saying what it was waiting on. `stop` and `merged` interrupt too but stay
-queued: the next Boss tool drains them, and only its result can end the run.
+**A message for the agent ends a wait.** Every blocking tool waits through
+`waitUntil` (`wait.ts`), which ends on the condition, the timeout, the
+conversation's abort, or a steer queued in the conversation's `pi.inbox`. A
+Boss message, the deadline, the turn-budget warning, new signals and a resume
+are all steers, so a wait returns within milliseconds of one, the steer is
+placed after the round, and nothing polls. Follow-ups and writes do not end a
+wait: they are placed only when the run answers, so a wait that ended on them
+would return at once on every call until then. An interrupted `monitor` says
+`(interrupted)` and clears its wait marker, so the board stops saying what it
+was waiting on.
 
 **One turn is not one bill, and the prompt used to say it was.** A block that
 outlives the prompt cache pays a full cache write on the turn after it, which
@@ -284,14 +318,14 @@ came out of the wait with anything.
   `command`, so a call recorded before conditions existed replays unchanged.
   A typed wait's marker is keyed on `conditionKey`, the condition and what it
   watches, the way a command wait is keyed on its command.
-- `monitor(command, …)` — **the command must be read-only.** On a container
-  restart the session holds a tool call with no result, so the tool runs
-  again; an action would be performed twice.
+- `monitor(command, …)` — **the command must be read-only.** `monitor` is
+  replay-safe, so a container restart in the middle of a wait runs it again;
+  an action would be performed twice.
 - `monitor(…, waitingFor)` — required: one plain sentence for the incident
   board and status card ("someone to merge omni#2189"). They show it in place
   of the command, which is shell and never shown. Required by the schema
-  only: a restart replays calls recorded before it existed, so a missing one
-  runs anyway and the board says "a check the agent is running".
+  only: a call recorded before it existed can still run after a restart, so a
+  missing one runs anyway and the board says "a check the agent is running".
 - `monitor(…, awaitingHuman)` — the heartbeat. Set, it means a *person* is
   what the wait is on, and the harness tells the Boss when they do not turn
   up. Unset, the wait is silent, which is right for a deploy, a migration or
@@ -308,7 +342,10 @@ came out of the wait with anything.
   human-facing behaviour.
 - `message_boss(message, wait?, seconds?)` — without `wait` it records a
   `message` row and returns. With it, it records a `question` row, writes the
-  `pending_question` marker, and blocks until **any** `boss_message` arrives.
+  `pending_question` marker, and blocks until **any** Boss steer arrives. The
+  result says the Boss answered and does not repeat the words: the steer is
+  the next message the model reads, and saying it twice reads as two
+  instructions.
 
 ## Re-running CI: the capability and its bound are one object
 
@@ -332,9 +369,10 @@ affordance is the tool, and the tool carries the discipline:
   attempt 2 and refuses instead of re-running twice. It also refuses a run a
   human already re-ran, which is right.
 - **A budget across the incident**, so "push something small, re-run, repeat"
-  runs out. Process-scoped, and a restart hands it back — but every run
-  already re-run is still at attempt 2, so what a restart buys is only runs it
-  has not touched.
+  runs out. Held in process memory, one ledger per incident since one process
+  runs them all, and a restart hands it back — but every run already re-run
+  is still at attempt 2, so what a restart buys is only runs it has not
+  touched.
 - **The Boss is told by the tool, not by the model.** The `suspicion`
   argument is required and goes to the Boss's inbox verbatim, so somebody it
   shows it to can say "that is not a flake, that is your change". Sent
@@ -366,19 +404,21 @@ is a bigger change than this one.
 ## Production SQL goes through a person and a sidecar
 
 `request_sql_query` (`sql.ts`) runs one SELECT against gp-api's production
-reader, and the agent never holds the password. The tool calls the loopback
-API (`POST /incidents/:id/sql-requests`), the Boss adds the incident's own
-thread and forwards to the `sqlrunner` sidecar, and the sidecar checks the
+reader, and the agent never holds the password. The tool calls
+`createSidecarSqlPort` in-process, which adds the incident's own thread and
+forwards to the `sqlrunner` sidecar, and the sidecar checks the
 thread with Slack, asks for approval in it and runs the query once a person
 on the rotation approves. The agent has a shell and the Boss's secrets, so none of that can
 live on this side.
 
 - **It is a blocking tool**, like `monitor`: one turn, capped at
-  `MAX_BLOCK_SECONDS`, polled every `SQL_POLL_SECONDS`, and ended by a Boss
-  message through `createWaitInterrupt`. A wait that ends unsettled returns
-  the `requestId`, and calling again with it resumes rather than asking twice.
-- **The sidecar's refusals arrive verbatim**, status and body, so the client
-  method returns `{status, text}` instead of throwing like `call`.
+  `MAX_BLOCK_SECONDS`, polled every `SQL_POLL_SECONDS`, and ended by a steer.
+  A wait that ends unsettled returns the `requestId`, and calling again with
+  it resumes rather than asking twice. The request id is also memoized on the
+  call (`api.memo("sent")`), so a rerun after a crash waits on the same
+  request rather than posting a second approval ask.
+- **The sidecar's refusals arrive verbatim**, status and body, so the port
+  returns `{status, text}` instead of throwing.
 - **A 404 means the sidecar restarted.** It holds requests in memory, so the
   agent is told to ask again. Any other unreadable answer ends the wait too;
   retrying a sidecar that is down would alarm on every poll.
@@ -397,22 +437,19 @@ records an `escalation` row saying what it asked and how long it has waited,
 and carries on waiting; only an answer, a `stop`, a `merged` or the harness
 deadline ends it. The details it rests on:
 
-- **Any `boss_message` is the answer.** The Boss does not chat, so every
-  message it sends is deliberate. Several pending at once are one answer, all
-  consumed, rather than one answer and a leftover that `get_incident` would
-  deliver again.
-- **A legacy `human_message` reads as the Boss.** Rows written before the
-  directive was renamed can still be pending; `bossMessageText` is the one
-  place that knows the old shape.
+- **Any Boss steer is the answer.** The Boss does not chat, so every
+  message it sends is deliberate, and several at once are one answer. A steer
+  that is not the Boss's -- the deadline, the turn budget, new signals -- ends
+  the wait without answering it: the marker stays, and calling again with the
+  same message resumes rather than asking twice.
 - **The question goes up before the marker.** A crash between the two asks the
   Boss twice; the other order leaves a marker for a question the Boss never
   received, and a wait on an answer to nothing.
 - **The floor.** A requested wait below `MESSAGE_BOSS_MIN_WAIT_SECONDS` is
   raised to it, not answered early. Without that, the escalation is opt-out.
-- **Not on the deadline abort.** The soft deadline has its own path — the run
-  steers the model to write a real brief inside the grace window — and
-  escalating here would spend the turn that brief needs.
-- **The clock runs from `askedAt`, not from process start.** A restart is not
+- **Not on an abort.** A stop and the hard deadline have their own paths to
+  the Boss, and escalating here would spend the turn a brief needs.
+- **The clock runs from `askedAt`, not from the call.** A restart is not
   an answer. A deadline of `now() + wait` hands a crash-looping agent a fresh
   wait every time and defers the escalation for as long as the crashes last.
 - **The ladder is read off the inbox.** After the first escalation the next
@@ -460,11 +497,6 @@ resumed agent resumes the wait it was in and the timeout is measured from
 between the two costs one rung, where the other order repeats it on every
 resume, and every merge to ops `main` resumes every agent.
 
-Both blocking tools take the harness's deadline signal combined with Pi's own,
-so the soft deadline can interrupt a blocking tool. Without that, `steer` only lands
-after the current turn's tool calls finish — and the agent spends most of
-its life inside a `monitor` with an hours-long timeout.
-
 ## A recurrence arrives with its own history, and a second job
 
 When the incident carries `recurrenceOf`, `get_incident` returns
@@ -498,7 +530,7 @@ clipped at `MAX_PRIOR_POSTMORTEM_CHARS`, on the reasoning that the agent's own
 tool-output truncation kept a head and a tail so an unbounded post-mortem
 would eat the middle of the incident rather than itself — and that truncation
 is gone, so the cap outlived the thing it was protecting against.
-`get_incident` renders as JSON followed by the pending directives, uncut.
+`get_incident` renders as JSON, uncut.
 
 ## Nothing is cut by character count, anywhere
 
@@ -509,6 +541,11 @@ and test output, where the answer is usually in the middle — so it protected
 the session by destroying the evidence the run had just paid a tool call to
 fetch. Pi compacts just in time instead (`docs/architecture.md`), so a result
 lands whole and summarised history is what gives way. Do not add a cap back.
+Pi Durable bounds a tool's explicit result to 50KB unless the tool says
+otherwise, so every BugBoss tool declares `outputLimits` of
+`Number.MAX_SAFE_INTEGER` (`WHOLE_OUTPUT`). The built-in `bash` keeps its own
+tail and spills the rest to a file it names in a diagnostic; that is the
+library's, and nothing is lost.
 
 **What the agent sends the Boss is never cut or refused for length.** The Boss
 reads it, and what reaches a person is the Boss's own words, so there is no
@@ -521,10 +558,6 @@ transition, and that is where the thread budget lives: resolution evidence
 is refused past `THREAD_PROSE_CHARS`, and the post-mortem has no character
 cap; only its `practiceChanges` section has a word range, and it refuses
 rather than cuts.
-
-The Slack agent has compaction too — `compactTranscript` in `slack/agent.ts`,
-wired into the loop in the composition root — so what is left on that surface
-bounds *rows and entries*, never widths.
 
 ## What reaches Slack is mrkdwn
 
@@ -542,67 +575,47 @@ root cause and post-mortem stay as the agent wrote them.
 The prompt also tells the agent not to narrate in plain text between tool
 calls. Nothing reads it: one run wrote 56,000 characters of it.
 
-## Directives
+## A restart resumes the run where it stopped
 
-The poll in `message_boss` uses a **non-draining** read
-(`GET /incidents/:id/directives`). Draining there destroyed `stop`,
-`merged`, `new_signals` and `resumed_after` — including the
-`resumed_after` the dispatcher inserts at launch, which the agent's first
-replayed call would eat before it ever ran `get_incident`.
+The conversation is in `/data/harness.sqlite`, mirrored to S3 once a tick
+(`db/CLAUDE.md`), and `harness.resume()` at boot continues every run a
+deploy interrupted, from its last checkpoint, with no relaunch. A run that is
+still pending in storage cannot look finished.
 
-The answer it acts on is consumed by id. Everything else stays pending
-for `get_incident` to deliver. A `boss_message` left pending would
-otherwise come back a turn later and read as a *new* instruction, since
-directives render as prose.
+What a crash in the middle of a tool round does is the **replay policy**,
+declared per tool:
 
-That read is on the **read-only** connection, so a 30-second poll never
-queues behind the write queue's synchronous S3 PUT.
+- **Safe, rerun as they are:** `get_incident`, `search_incidents`,
+  `set_summary`, `report_impact`, `track_incident_timeline_event` (idempotent
+  on the whole event), `park`, every Grafana read, `read`, and `monitor`,
+  whose `pending_wait` marker makes a rerun resume its clock and heartbeat
+  rung, so a deploy in the middle of a wait costs no turn.
+- **Safe behind a memo:** `message_boss`, `escalate`, `rerun_ci` and
+  `request_sql_query` record what they sent with `api.memo`, so a rerun
+  resumes rather than sending again. `message_boss` memoizes its merge
+  check-in too, which is a paid model call. `rerun_ci` keeps its `run_attempt`
+  check as well.
+- **Unsafe, come back interrupted:** `bash`, `edit`, `write`, `propose_merge`
+  and the three gates `report_root_cause`, `report_resolved` and
+  `report_analysis`. A gate's goal evaluation is a paid model call and its
+  `UPDATE` guard already refuses a second transition, so the model reads
+  "interrupted" and calls again.
 
-## Sessions and resume
+`extension.test.ts` kills a real child process in the middle of a round and
+resumes it in a fresh one.
 
-One layout: `sessions/incident/<id>/session.jsonl`, which the Slack agent
-and the S3 lifecycle rule both expect. `BUGBOSS_SESSION_REF`
-is **required** — there is no fallback, because the old default wrote to a
-key nothing read, producing a session that appeared to persist and restored
-nothing.
-
-Every flush checks `lastError()`. A silently failing S3 write means the next
-restart starts from scratch with the whole investigation lost, and combined
-with relaunch that is an unbounded loop of agents each beginning again. N
-consecutive failures steers the agent to escalate.
-
-The session file is also the run's **cost ledger** -- `sumSessionUsage`
-reads it back after the child exits, so the key the agent writes and the key
-the Boss reads are one function. A drift between them costs no session and no
-error, only an incident that appears to have been free.
-
-## The exit record
-
-The last entry a launch writes is a `bugboss_exit` custom entry naming how
-the run ended: `completed`, `timed_out`, `turn_error` or `signal`. Without it
-a killed run and a finished one are the same shape on disk -- the writer
-appends per event and the file closes with the last one, and S3
-`LastModified` sits within a second of it either way. Three of seven real
-runs died mid-turn and read exactly like the four that did not; the longest
-was 9.5 hours and $42.71, with an approved PR and green checks waiting, and
-nobody knew to finish it.
-
-`readSessionOutcome` is the reader. **It is not last-record-wins**: every
-launch writes its own record, so a restored file carries an older one under
-the turns that followed it, and a record with session events after it means
-the run carried on past it and then died. `empty` is kept separate from
-`killed`, because a child killed before its first turn synced has lost
-nothing and alarming on it would alarm on every crash at boot.
-
-`SIGTERM` and `SIGINT` write one too. `SIGKILL` cannot, and the dispatcher's
-backstop uses it, so the absence of a record is still the common signature of
-a kill -- which is exactly what `killed` means.
+**Launch messages.** `kickoffMessage` opens a new conversation;
+`resumedWithoutTranscript` says the agent worked this incident before under a
+harness whose transcript did not carry over, and `cutoverHandoff` hands it the
+durable story instead: the record, the timeline, the newest inbox rows and any
+open wait or question. `resumeMessage` opens a relaunch of an idle
+conversation and says whether the workspace survived.
 
 ## Compaction at each stage
 
-The agent's context is summarised at every stage transition, by Pi, with a
-prompt that keeps only what the next stage needs. `compaction.ts`; the
-threshold backstop at ~85% of the window is still there underneath it.
+The agent's context is summarised at every stage transition, with a prompt
+that keeps only what the next stage needs (`stages.ts`). The threshold
+backstop, `reserveTokensFor` the agent model, is still there underneath it.
 
 Why: the backstop never fired. No incident got past 431k of a 1M window, so
 every turn re-read everything the agent had ever seen, and cache reads of
@@ -610,39 +623,23 @@ history were half of what the fleet spent. Incidents 80, 86 and 94 hit the
 turn cap carrying an investigation they had finished hours earlier.
 
 - **Three transitions, all tool calls.** `report_root_cause` succeeding,
-  which now means its stage goal was judged met first (see "Stage goals"),
-  (`root_cause`), and `track_incident_timeline_event` recording `fix_pr_opened`
-  (`fix_opened`) or `fix_merged` (`fix_merged`). The tools report them through
-  `onRootCause` / `onTimelineEvent`; nothing reads what the agent wrote.
-- **Pi does the compaction.** The turn that made the transition arms it by
-  raising `reserveTokens` to the whole window, so Pi's own between-turn check
-  compacts before the next request. `session_before_compact` puts the reserve
-  back, then calls Pi's exported `compact()` on Pi's preparation with the
-  stage's instructions and the timeline. A `turn_start` with the stage still
-  armed means Pi found nothing to compact, and disarms too: a reserve left at
-  the window would compact every turn after.
-- **The split turn is folded in.** An incident is one user-message span, so
-  Pi's cut nearly always lands inside it, and Pi summarises that prefix with
-  a fixed prompt that takes no instructions. `createPiSummarizer` moves the
-  prefix into the history so one call, with the stage's focus, covers it all.
-- **Skipped below `STAGE_COMPACTION_MIN_TOKENS` (50k).** A summary is a model
-  call over the history plus a cache rewrite after it, and on a small context
-  that costs more than it saves.
-- **The timeline goes into every stage prompt, verbatim**, read through the
-  non-draining `GET /incidents/:id/timeline`. A failed read or a failed
-  summary logs and falls back to Pi's default summary; the context still
-  shrinks, it just loses the stage's focus.
-- **An armed stage survives a restart.** Arming is process memory, and every
-  ops deploy restarts every agent, so the turn that arms also appends a
-  `bugboss_stage_compaction` custom entry (`{ stage }`) to the session file.
-  `stages.extension` runs ahead of the session sync so that entry is in the
-  same turn_end upload. On launch, `startWithinBudget` checks the turn budget,
-  then `stages.resume` compacts for the stage if the last stage entry on the
-  branch has no `compaction` entry after it, then sends the first prompt. A
-  spent budget does neither. Compacting first makes the relaunch's cold cache
-  write a summary rather than the history. The compaction entry clears the
-  marker; `{ stage: null }` clears it when Pi found nothing to compact or the
-  resume compaction failed.
+  which means its stage goal was judged met first (`root_cause`), and
+  `track_incident_timeline_event` recording `fix_pr_opened` (`fix_opened`) or
+  `fix_merged` (`fix_merged`). The tool records the stage; nothing reads what
+  the agent wrote.
+- **One compaction per round, for the later stage.** The incident
+  extension's `afterTools` hook flushes what the round requested, so a root
+  cause and a PR in the same batch cost one summary, for the stage the next
+  turn is in. It calls `conversation.compact(instructions)`; Pi Durable
+  summarises in the background and places the summary at the next turn
+  boundary, and a deploy mid-summary resumes the task.
+- **Skipped below `STAGE_COMPACTION_MIN_TOKENS` (50k)**, read off the newest
+  response's usage. A summary is a model call over the history plus a cache
+  rewrite after it, and on a small context that costs more than it saves.
+- **The timeline goes into every stage prompt, verbatim**, read through
+  `AgentPort.timelineEvents`, without goal verdicts. A failed read or a failed
+  compaction logs; the threshold backstop still shrinks the context, it just
+  loses the stage's focus.
 
 The replay of incidents 94 and 86 at these three transitions came to about
 43% less spend on the two ($31 of $73.50), nearly all of it cache reads.
@@ -663,9 +660,7 @@ outcomes.
 - **The three gates.** `report_root_cause`, `report_resolved` and
   `report_analysis` run their transition only on a met verdict, so stage
   compaction rests on a verified gate. Not met returns the reason and the goal
-  text as the tool result, and the agent keeps working. A refused gate or
-  merge ask still delivers the Boss's queued directives, so a stop is not
-  held behind a retry.
+  text as the tool result, and the agent keeps working.
 - **The merge check-in.** Every `message_boss` is judged first. The evaluator
   decides whether the message asks for a merge: `not_applicable` lets it
   through, and no code reads the message's words. Not met blocks the message
@@ -677,40 +672,26 @@ outcomes.
   and no timeline row. A gate held shut by an outage would stop every
   incident at once.
 - **What it reads.** The goal, the attempt (a gate's arguments whole), the
-  incident and signals from `getIncident`, the timeline from the
-  non-draining `GET /incidents/:id/timeline`, and the agent's projected
-  context: the latest compaction summary and everything after. Nothing is cut
+  incident and signals from `getIncident`, the timeline from
+  `AgentPort.timelineEvents`, and the conversation's model context: the
+  latest compaction summary and everything after. Nothing is cut
   by character count. A transcript that outgrows the evaluator's window
   leaves out its oldest messages whole and says how many.
-- **No routes of its own.** `getIncident` drains directives, and so does the
-  verdict write, so `goalApi` (`run.ts`) hands what they drained back to the
-  judged tool, which delivers it like any other tool result.
-- **Every verdict is recorded twice.** As a `goal_verdict` row written by
-  `goalApi` through the timeline route, and as a `bugboss_goal_verdict`
-  session entry carrying its usage, which `sumSessionUsage` adds to the
-  incident's tokens but not its turns or its `modelId`. The agent's
+- **Every verdict is a `goal_verdict` row**, written through the tool API's
+  timeline call, and its spend is the judged tool's `usage`, so it lands in
+  the conversation's `pi.usage.tools`: the incident's tokens, not its turns
+  or its `modelId`. The agent's
   `track_incident_timeline_event` tool refuses `goal_verdict`; `getIncident`,
   stage compaction, the post-mortem and the closing report leave the rows
   out, and the evaluator reads them back as earlier verdicts.
 
 ## The transcript keeps everything compaction summarised
 
-Pi's compaction appends a `compaction` entry (`summary`, `firstKeptEntryId`,
-`tokensBefore`, `details`) and deletes nothing, so the session file -- and the
-whole-file copy of it at `s3://bugboss-prod/sessions/incident/<id>/session.jsonl`
--- still holds every entry the summary replaced. That was checked in Pi's
-`session-manager.js`, not assumed: `appendCompaction` goes through
-`_appendEntry`, and the only whole-file rewrites are a version migration
-(which keeps every entry) and branching (a new file, which this agent never
-does). `compaction.test.ts` pins it against a real session.
-
-**The compaction entry is the anchor.** To read what a summary stands for,
-take the entries between the previous compaction's `firstKeptEntryId` (or
-the start of the file) and this one's `firstKeptEntryId`; those are verbatim.
-To rebuild the context as it was before a compaction, stop reading the file
-at that compaction entry: `SessionManager.open` over the truncated copy
-projects the uncompacted conversation. A stage compaction also carries
-`details.stage`.
+A compaction appends a `pi.compaction` entry holding the summary, which heads
+the first entry it keeps, and deletes nothing: the conversation's older
+entries stay in `harness.sqlite`, and so in its S3 snapshot. What the model
+sees is the entries from the newest head marker onward. To read what a
+summary stands for, read the conversation's entries before its head.
 
 ## The timeline
 
@@ -727,15 +708,15 @@ timeline rows name events by `recordedEventId`, and the report merges the two
 into one table with the recorded times (`report/CLAUDE.md`). The prompt asks
 for events on the turn they are learned, not at the end.
 
-**The model is pinned in the session.** On resume it resolves from the
-stored prefix, not from env — Bedrock does not restore it, and the SSM
-mapping retunes without a deploy. Replaying against a different model
-rejects every thinking block, and `drop_block` is deliberately quiet.
+**The model is pinned in the conversation.** `pi.agent` stores it when the
+conversation is created, so a resume never reads it from the environment —
+the SSM mapping retunes without a deploy, and replaying against a different
+model rejects every thinking block.
 
 ## The workspace survives a restart
 
-`/work/<id>` (the checkout, its node_modules, the npm ci markers and the
-session directory) is on an EFS volume mounted at `/work`
+`/work/<id>` (the checkout, its node_modules and the npm ci markers) is on an
+EFS volume mounted at `/work`
 (`deploy/components/bugboss.ts`), because every ops deploy replaces the task
 and its ephemeral disk. Before that, every deploy re-cloned omni for every
 open incident and lost uncommitted edits: incident 86 redid 29 turns.
@@ -758,16 +739,10 @@ open incident and lost uncommitted edits: incident 86 redid 29 turns.
 - **The dispatcher deletes it** once the incident is CLOSED or MERGED and no
   agent is running. See `dispatcher/CLAUDE.md`.
 
-One agent per incident is still what makes this safe: the dispatcher's
-`running` map within a task, and the service's stop-then-start deploy
-across tasks. Nothing on the volume locks against a second writer.
+One agent per incident is still what makes this safe: one conversation per
+incident within a task, and the service's stop-then-start deploy across
+tasks. Nothing on the volume locks against a second writer.
 
-The volume is not backed up. The session transcript in S3 and the incident's
-timeline are still the only record guaranteed to survive; a lost volume only
-costs a re-clone.
-
-## Exit
-
-`exitCodeFor` returns non-zero when `session.state.errorMessage` is set. A
-soft timeout the agent handed off inside still exits 0: the signal is an
-aborted turn, not the deadline.
+The volume is not backed up. The harness snapshot in S3 and the incident's
+timeline are the only record guaranteed to survive; a lost volume only costs
+a re-clone.

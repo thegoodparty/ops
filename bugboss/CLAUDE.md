@@ -13,13 +13,13 @@ This file is what you need before editing anything here.
 | The triage decision or its rules | [`triage/CLAUDE.md`](./triage/CLAUDE.md) |
 | Transitions, merge, split, correlation | [`toolapi/CLAUDE.md`](./toolapi/CLAUDE.md) |
 | Launch, deadlines, escalation | [`dispatcher/CLAUDE.md`](./dispatcher/CLAUDE.md) |
-| The incident agent, its tools, resume | [`agent/CLAUDE.md`](./agent/CLAUDE.md) |
+| The harness, the incident agent, its tools, resume | [`agent/CLAUDE.md`](./agent/CLAUDE.md) |
 | The Bedrock request path every model call takes | [`bedrock/CLAUDE.md`](./bedrock/CLAUDE.md) |
 | Threads, relay, the Slack agent | [`slack/CLAUDE.md`](./slack/CLAUDE.md) |
 | The status board, the morning post, the all-clear | [`board/CLAUDE.md`](./board/CLAUDE.md) |
 | The closing report an incident ends with | [`report/CLAUDE.md`](./report/CLAUDE.md) |
-| Routes, the loopback API | [`http/CLAUDE.md`](./http/CLAUDE.md) |
-| The database or its S3 mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
+| Webhooks and health | [`http/CLAUDE.md`](./http/CLAUDE.md) |
+| The database, its S3 mirror, the harness file's mirror | [`db/CLAUDE.md`](./db/CLAUDE.md) |
 | What the GitHub App may do, and why | [`github-app.md`](./github-app.md) |
 | The Postgres agents run omni's tests against | [`testdb/CLAUDE.md`](./testdb/CLAUDE.md) |
 | The human-approved read-only query against gp-api prod | [`sqlrunner/CLAUDE.md`](./sqlrunner/CLAUDE.md) |
@@ -33,14 +33,16 @@ named. `types.ts` is the contract everything else is built against.
 ## There are two agents here, not four
 
 **The incident agent** (`agent/`) investigates, opens a pull request, waits,
-and writes a post-mortem. It runs Pi in a child process and moves its own
-incident through the loopback tool API. It never reads Slack and never posts
-free text to it: everything it needs from a person goes up to the Boss.
+and writes a post-mortem. It is one Pi Durable conversation per incident, on
+the harness the Boss's own process opens (`agent/harness.ts`), and it moves
+its own incident through in-process tools. It never reads Slack and never
+posts free text to it: everything it needs from a person goes up to the Boss.
 
 **The Boss** is everything else that talks to a model: triage, root-cause
-correlation and the incident commander (`slack/agent.ts`). They share one
-request path (`bedrock/client.ts`) and one read-only query guard
-(`triage/sql.ts`).
+correlation and the incident commander (`slack/agent.ts`), which is one
+conversation per Slack thread on the same harness. Everything shares one
+request path (one pi-ai `Models`, from `createBugbossModels`) and one
+read-only query guard (`triage/sql.ts`).
 
 **The commander is the only interface between people and agents.** Every
 message a person writes in an incident thread runs it, with that incident as
@@ -71,13 +73,17 @@ anything it writes is posted whole, and it posts nothing only by calling
 
 **Two loops, on purpose.** `runStructuredCall` bounds a whole call with one
 wall-clock budget and a round count, and throws so every caller takes its
-conservative default. The commander bounds each turn separately, because what
-limits it is how long a person will sit in a thread, and it ends an exhausted
-run with a tool-less wrap-up rather than a throw -- somebody is waiting, and
-the reading is already paid for. Those are different bound shapes, not one
-shape with options, and folding them would cost triage its readability to
-serve the commander. They share the request path, the query guard and the
-usage accounting, which is where the duplication actually was.
+conservative default. The commander runs Pi's own loop on the harness and
+bounds a run in turns, because what limits it is how long a person will sit
+in a thread: an `afterResponse` hook counts the run's turns, the round that
+spends the last one carries the wrap-up instruction on its results, every
+tool refuses after that, and a run that has not settled in time is aborted
+whole. It ends an exhausted run with a tool-less wrap-up rather than a throw
+-- somebody is waiting, and the reading is already paid for. Those are
+different bound shapes, not one shape with options, and folding them would
+cost triage its readability to serve the commander. They share the request
+path, the query guard and the usage accounting, which is where the
+duplication actually was.
 
 ## The rules that are not negotiable
 
@@ -149,15 +155,24 @@ synchronous S3 PUT, so the window is hundreds of milliseconds. Put the
 predicate in the `UPDATE` and reject on `changes === 0`.
 
 **The agent is untrusted, and the container is what bounds it.** An agent
-reads attacker-writable log lines for a living, and it runs as a child of the
-Boss with the Boss's own credentials — there is no fence inside the task.
+reads attacker-writable log lines for a living, and it runs inside the Boss's
+process with the Boss's own credentials — there is no fence inside the task.
 What holds is outside it: the container holds no database credential and
 no release path, and its GitHub App cannot merge. It can reach the gp-api
 prod reader over the network, but only the `sqlrunner` sidecar holds the
 read-only credential, in a container the agent cannot read, and it runs a
-query only after a rotation member reacts on the sidecar's own message. The loopback API is how an agent moves
-incident state, with a per-launch token scoped to one incident so concurrent
-agents cannot reach each other's work.
+query only after a rotation member reacts on the sidecar's own message. An
+agent moves incident state only through its in-process tools, which take the
+incident from the conversation's `IncidentDoc` and never from an argument, so
+concurrent agents cannot reach each other's work.
+
+**One process means no isolation between agents.** Every agent shares the
+event loop with every other one and with the Boss. A run's abort kills the
+subprocesses its `bash` started, which is how a deadline stops a wedged
+command; a tool that wedges inside JavaScript has nothing that can stop it.
+So an agent's real work stays in subprocesses, and an in-process tool stays a
+thin call into the tool API. `docs/architecture.md`, "One process, no
+isolation", has the rest.
 
 Where GitHub offers no such fence, the bound goes in the tool and the gap is
 written down rather than implied. Re-running a failed CI job is the case:
@@ -233,8 +248,10 @@ the code, against the same misunderstandings. A test that passes for the
 wrong reason is worse than a missing one.
 
 The end-to-end tests in `test/e2e.test.ts` drive real ingress, real triage,
-real assign and real SQLite, faking only the model, Slack, S3 and the
-spawned agent. That is where a cross-module bug shows up.
+real assign, real SQLite and a real harness over `MemoryStorage`, faking only
+the model (a scripted faux provider that calls the real tools), Slack and S3.
+That is where a cross-module bug shows up. One of them boots over the real
+harness file instead, to cover its restore and its two snapshots.
 
 ## Style
 

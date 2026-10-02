@@ -1,18 +1,22 @@
 // The end-to-end contract. Written in Phase 0, before the fan-out, so the
 // interfaces in types.ts are exercised rather than merely declared.
 //
-// Four fakes stand in for everything outside the process: the model, Slack,
-// the spawned agent, and S3. Everything between them is the real thing —
-// real webhook parsing, real triage rules, real assign, real tool API, real
-// dispatcher, real SQLite with its snapshot write path.
+// Three fakes stand in for everything outside the process: the model, Slack
+// and S3. Everything between them is the real thing — real webhook parsing,
+// real triage rules, real assign, real tool API, real dispatcher, a real
+// harness over MemoryStorage running the real incident and Boss tools, and
+// real SQLite with its snapshot write path. The model is a scripted faux
+// provider: it decides which tool to call, and the harness calls it.
 //
 // Design spec: bugboss/docs/architecture.md
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, mock, test } from "node:test";
+
+import type { S3Client } from "@aws-sdk/client-s3";
 
 import {
   bossConfigFromEnv,
@@ -23,14 +27,13 @@ import {
   settingsEnv,
   withSlackDeadline,
   type BugBoss,
+  type CreateBugBossOptions,
 } from "../index";
-import { createBossClient } from "../agent/run";
+import { incidentAgentChange, incidentInit } from "../agent/extension";
+import { loadPi, openBugbossHarness, type Api, type ConversationId, type Model } from "../agent/harness";
+import { createHarnessMirror } from "../db/mirror";
 import { classifySlackEvent, type SlackConfig } from "../ingress";
-import { runMessageBoss } from "../agent/tools";
-import type { AgentSpawnContext } from "../dispatcher";
-import type { SlackAgentRun } from "../slack/agent";
 import { SlackRelay, type SlackEvent } from "../slack/relay";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { emptyModelUsage } from "../model";
 import type { ModelReply, ModelRequest, ModelUsage } from "../triage";
 import { readReportData, renderReportDocument, renderReportPdf, type ReportUpload } from "../report";
@@ -42,15 +45,12 @@ type QueuedDecision = TriageDecision & { recurrenceOf?: string };
 // --- fakes -----------------------------------------------------------------
 
 /**
- * Stands in for Bedrock. Answers triage's `decide` tool from a queue, which
- * means the real prompt, the real answer schema and the real rule enforcement
- * in triage/triage.ts all run against these decisions.
+ * Stands in for Bedrock on the Boss's bounded calls. Answers triage's
+ * `decide` tool from a queue, which means the real prompt, the real answer
+ * schema and the real rule enforcement in triage/triage.ts all run against
+ * these decisions.
  */
 const fakeModel = {
-  /**
-   * Wide enough that nothing here compacts. The Slack agent reads this off
-   * its model to decide what to drop; compaction has its own tests.
-   */
   contextWindow: 1_000_000,
   // `recurrenceOf` rides along on a new_incident decision; the decide tool's
   // schema carries it even though TriageDecision itself does not.
@@ -160,72 +160,192 @@ const fakeSlack = {
   },
 };
 
+// --- the scripted model ------------------------------------------------------
+
+interface Transcript {
+  messages: readonly { role: string; content?: unknown; toolName?: string }[];
+}
+
+const textOf = (content: unknown): string =>
+  typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .map((block: { type?: string; text?: string }) => (block?.type === "text" ? (block.text ?? "") : ""))
+          .join("")
+      : "";
+
+const isIncidentAgent = (transcript: Transcript): boolean =>
+  transcript.messages.some(
+    (m) => m.role === "system" && /incident agent for BugBoss/.test(JSON.stringify(m)),
+  );
+
+/** Every result in the transcript from one tool, oldest first. */
+const resultsOf = (transcript: Transcript, tool: string): string[] =>
+  transcript.messages.filter((m) => m.role === "toolResult" && m.toolName === tool).map((m) => textOf(m.content));
+
+/** The tool results since the model last spoke, in order. */
+const latestResults = (transcript: Transcript): string[] => {
+  const out: string[] = [];
+  for (let i = transcript.messages.length - 1; i >= 0; i--) {
+    const m = transcript.messages[i];
+    if (m.role === "system") continue;
+    if (m.role !== "toolResult") break;
+    out.unshift(textOf(m.content));
+  }
+  return out;
+};
+
+const lastUserText = (transcript: Transcript): string =>
+  textOf([...transcript.messages].reverse().find((m) => m.role === "user")?.content);
+
+/** A tool result is `ok` or `error: …`, then the data as JSON. */
+const dataOf = <T>(result: string | undefined): T | null => {
+  if (!result) return null;
+  const at = result.indexOf("\n\n");
+  try {
+    return at < 0 ? null : (JSON.parse(result.slice(at + 2)) as T);
+  } catch {
+    return null;
+  }
+};
+
+type Call = [name: string, input: Record<string, unknown>];
+
 /**
- * Stands in for a spawned incident agent. Rather than running Pi, it drives
- * the tool API through the same sequence a real agent would.
+ * What the incident agent does when nothing else is scripted: the sequence
+ * a real agent takes to close an incident, through the real tools, one call
+ * a turn, reading each answer before the next.
  */
-const fakeAgent = async (tools: AgentSpawnContext) => {
-  const view = await tools.getIncident();
-  await tools.reportRootCause({
-    cause: "Pro upgrade webhook wrote to the wrong column",
-    explainedSignalIds: (view.data?.signals ?? []).map((s) => s.id),
-    usersImpacted: 3,
-    impactQuery: '{service_name="gp-api"} |= "pro_upgrade"',
-  });
-  await tools.reportResolved({
-    prUrls: ["https://github.com/thegoodparty/omni/pull/9999"],
-    evidence: "two clean runs through the flow after deploy",
-  });
-  await tools.reportAnalysis({
-    ...SECTIONS,
-    usersImpacted: 3,
-    impactQuery: '{service_name="gp-api"} |= "pro_upgrade"',
-  });
+const closeTheIncident = (transcript: Transcript): Call | string => {
+  const view = resultsOf(transcript, "get_incident").at(-1);
+  if (!view) return ["get_incident", {}];
+  if (resultsOf(transcript, "report_root_cause").length === 0) {
+    const signals = dataOf<{ signals?: { id: string }[] }>(view)?.signals ?? [];
+    return [
+      "report_root_cause",
+      {
+        cause: "Pro upgrade webhook wrote to the wrong column",
+        explainedSignalIds: signals.map((s) => s.id),
+        usersImpacted: 3,
+        impactQuery: '{service_name="gp-api"} |= "pro_upgrade"',
+      },
+    ];
+  }
+  if (resultsOf(transcript, "report_resolved").length === 0) {
+    return [
+      "report_resolved",
+      {
+        prUrls: ["https://github.com/thegoodparty/omni/pull/9999"],
+        evidence: "two clean runs through the flow after deploy",
+      },
+    ];
+  }
+  if (resultsOf(transcript, "report_analysis").length === 0) {
+    return [
+      "report_analysis",
+      { ...SECTIONS, usersImpacted: 3, impactQuery: '{service_name="gp-api"} |= "pro_upgrade"' },
+    ];
+  }
+  return "Closed.";
 };
 
 /**
- * The Boss's harness. A run records what it was given and, when a test has
- * scripted one, acts through the real tools the Boss was handed -- so a write
- * it makes goes down the same guarded path a model's would. Unscripted, it
+ * The incident agent's script. One step per model request, decided from the
+ * transcript, so a resumed or relaunched conversation carries on from where
+ * its own history says it is.
+ */
+const fakeAgent = {
+  step: closeTheIncident as (transcript: Transcript) => Call | Call[] | string | Promise<Call | Call[] | string>,
+};
+
+/** The Boss's plan for one input: tool calls the harness runs, then what it says. */
+interface BossPlan {
+  calls?: Call[];
+  /** What it says once the calls are answered. A function reads their results. */
+  text?: string | ((results: string[]) => string);
+}
+
+/**
+ * The Boss. A run records the input it was given and, when a test has
+ * scripted one, calls the real tools the Boss was given -- so a write it
+ * makes goes down the same guarded path a model's would. Unscripted, it
  * answers with a line and touches nothing.
  */
 const fakeSlackAgent = {
   asked: [] as string[],
-  script: null as ((req: SlackAgentRun) => Promise<string>) | null,
-  async run(req: SlackAgentRun) {
-    fakeSlackAgent.asked.push(req.input);
-    const script = fakeSlackAgent.script;
-    fakeSlackAgent.script = null;
-    return {
-      text: script ? await script(req) : "two incidents are open right now.",
-      usage: emptyModelUsage(),
-    };
-  },
+  script: null as ((req: { input: string }) => BossPlan | Promise<BossPlan>) | null,
+  /** Plans waiting for their tool results, by the input that started them. */
+  pending: new Map<string, BossPlan>(),
 };
 
 /** What the person said, as the Boss is shown it. */
-const saidIn = (req: SlackAgentRun): string => req.input.split(" says: ").at(-1) ?? "";
+const saidIn = (req: { input: string }): string => req.input.split(" says: ").at(-1) ?? "";
 
 /**
  * The next Boss run reads its message as a report and files it whole, the
  * way the prompt tells it to: through open_incident, in the reporter's words.
  */
 const reportAsBoss = (): void => {
-  fakeSlackAgent.script = async (req) => {
-    await bossTool(req, "open_incident", { report: saidIn(req) });
-    return "Filed that as an incident.";
-  };
+  fakeSlackAgent.script = (req) => ({
+    calls: [["open_incident", { report: saidIn(req) }]],
+    text: "Filed that as an incident.",
+  });
 };
 
-/** One of the Boss's real tools, called the way the harness would. */
-const bossTool = (
-  req: SlackAgentRun,
-  name: string,
-  input: Record<string, unknown>,
-): Promise<string> => {
-  const tool = req.tools.find((t) => t.name === name);
-  if (!tool) throw new Error(`the Boss has no ${name} tool`);
-  return tool.run(input);
+let callIds = 0;
+
+/** One response for any conversation on any harness in this file. */
+const scriptedResponse = async (transcript: Transcript) => {
+  const { fauxAssistantMessage, fauxText, fauxToolCall } = await import("@earendil-works/pi-ai/providers/faux");
+  const answer = (step: Call | Call[] | string) => {
+    if (typeof step === "string") return fauxAssistantMessage([fauxText(step)]);
+    const calls = (Array.isArray(step[0]) ? step : [step]) as Call[];
+    return fauxAssistantMessage(
+      calls.map(([name, input]) => fauxToolCall(name, input as never, { id: `call-${++callIds}` })),
+      { stopReason: "toolUse" },
+    );
+  };
+
+  if (isIncidentAgent(transcript)) {
+    return answer(await fakeAgent.step(transcript));
+  }
+
+  const input = lastUserText(transcript);
+  // System entries are positional, so one can follow the newest input.
+  const last = [...transcript.messages].reverse().find((m) => m.role !== "system");
+  if (last?.role === "toolResult") {
+    const plan = fakeSlackAgent.pending.get(input);
+    fakeSlackAgent.pending.delete(input);
+    const text = plan?.text;
+    return answer(typeof text === "function" ? text(latestResults(transcript)) : (text ?? ""));
+  }
+  fakeSlackAgent.asked.push(input);
+  const script = fakeSlackAgent.script;
+  fakeSlackAgent.script = null;
+  if (!script) return answer("two incidents are open right now.");
+  const plan = await script({ input });
+  if (!plan.calls?.length) return answer(typeof plan.text === "function" ? plan.text([]) : (plan.text ?? ""));
+  fakeSlackAgent.pending.set(input, plan);
+  return answer(plan.calls);
+};
+
+/**
+ * A `Models` with one faux provider whose every response is the script
+ * above, and the two models the harness pins its conversations to.
+ */
+const scriptedModels = async (): Promise<CreateBugBossOptions["models"]> => {
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { fauxProvider } = await import("@earendil-works/pi-ai/providers/faux");
+  const faux = fauxProvider({ models: [{ id: "agent-1", contextWindow: 1_000_000 }, { id: "boss-1" }] });
+  faux.setResponses(Array.from({ length: 5_000 }, () => (transcript) => scriptedResponse(transcript)));
+  const models = createModels();
+  models.setProvider(faux.provider);
+  return {
+    models,
+    agent: faux.getModel("agent-1") as Model<Api>,
+    boss: faux.getModel("boss-1") as Model<Api>,
+  };
 };
 
 /** Slack's user group, which changes under us and keeps no history. */
@@ -266,37 +386,46 @@ const config = (path: string): BugBossConfig => ({
   prodCriticalSlugs: [],
 });
 
-before(async () => {
-  dir = mkdtempSync(join(tmpdir(), "bugboss-e2e-"));
-  boss = await createBugBoss({
+/** A Boss of its own, over its own database and its own harness. */
+const createScriptedBoss = async (
+  overrides: Partial<CreateBugBossOptions> & Pick<CreateBugBossOptions, "config">,
+): Promise<BugBoss> => {
+  const { durable } = await loadPi();
+  return createBugBoss({
     gh: null,
-    config: config(join(dir, "test.db")),
-    // Every external dependency is injected, which is what makes this test
-    // possible and what keeps the composition root honest.
     model: fakeModel,
     slack: fakeSlack,
-    spawnAgent: fakeAgent,
+    models: await scriptedModels(),
+    harnessStorage: new durable.MemoryStorage(),
     s3: undefined,
-    // Who is on call is an external fact, and a mutable one.
-    rotationMembers: async () => {
-      if (rotation.fail) throw new Error("slack: usergroups.users.list failed");
-      return rotation.members;
-    },
     // Without this the relay cannot strip its own mention out of a message
     // before the model reads it, and an @bugboss report opens an incident
     // titled with the raw mention markup.
     secrets: { slackBotUserId: "B0BOSS" },
-    slackAgentModel: fakeSlackAgent,
     fileUploader: fakeUploader,
     // The webhook bodies below carry no real signature, no timestamp and no
     // basic auth, so verification is replaced outright. This seam exists for
     // this file alone; bugBossFromEnv never sets it.
     insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
+    workRoot: join(dir, "work"),
+    ...overrides,
+  });
+};
+
+before(async () => {
+  dir = mkdtempSync(join(tmpdir(), "bugboss-e2e-"));
+  boss = await createScriptedBoss({
+    config: config(join(dir, "test.db")),
+    // Who is on call is an external fact, and a mutable one.
+    rotationMembers: async () => {
+      if (rotation.fail) throw new Error("slack: usergroups.users.list failed");
+      return rotation.members;
+    },
   });
 });
 
-after(() => {
-  boss?.stop();
+after(async () => {
+  await boss?.stop();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -362,12 +491,23 @@ test("a Grafana alert becomes a resolved, written-up incident", async () => {
   assert.match(report.comment ?? "", new RegExp(`\\*Incident ${id} closed\\*`));
   assert.equal(report.threadTs, fakeSlack.posts[0].threadTs ?? "ts-1");
   assert.equal(report.filename, `incident-${id}.pdf`);
-  // The PDF is deterministic, so the file can be checked against the report
-  // this incident's row renders to, and the row's report checked for content.
+  // The row's report is checked for content. The attached PDF is not
+  // compared byte for byte with it any more: the report is built at the
+  // close, and the agent's run spends one more response and rolls its usage
+  // up after that, so the row's turns and tokens have moved on since. The
+  // renderer's determinism is pinned in report/pdf.test.ts.
   const data = await readReportData(
     {
       db: boss.db,
-      sessions: { get: async () => null },
+      // The span the close's own report read, from the same conversation.
+      conversationSpan: async (conversationId) => {
+        const h = boss.agents;
+        const page = await (await h.conversation(conversationId as never)).entries({}, 500, undefined, h.context);
+        const at = page.items
+          .filter((entry) => entry.kind === "pi.assistant")
+          .map((entry) => (entry.model?.[0] as { timestamp: number }).timestamp);
+        return at.length ? { firstAt: Math.min(...at), lastAt: Math.max(...at) } : null;
+      },
       post: fakeSlack.post.bind(fakeSlack),
       channel: "C0TEST",
       uploader: fakeUploader,
@@ -375,14 +515,18 @@ test("a Grafana alert becomes a resolved, written-up incident", async () => {
     id,
   );
   const document = renderReportDocument(data!);
-  assert.ok(report.content.equals(await renderReportPdf(document)));
+  assert.equal(report.content.subarray(0, 5).toString("latin1"), "%PDF-");
+  assert.ok((await renderReportPdf(document)).length > 0);
   assert.match(document, /## Five whys/);
   assert.match(document, /## Preventing similar issues/);
   assert.match(document, /\| Users impacted \| 3 \|/);
   assert.match(document, /pull\/9999/);
-  // This fake agent never wrote a session file, so there is nothing to bill
-  // it from. The report says that rather than printing a free run.
-  assert.match(document, /\| Turns \| not recorded \|/);
+  // The agent ran on the harness, so its turns are on the row: one response
+  // per tool call above, then the closing word.
+  const turns = boss.db.get<{ turnsUsed: number }>("SELECT turnsUsed FROM incident WHERE id = ?", [id])!.turnsUsed;
+  assert.ok(turns >= 4, `the turn hook counted the agent's responses, got ${turns}`);
+  assert.match(document, new RegExp(`\\| Turns \\| ${turns} \\|`));
+  assert.match(document, /\| Wall clock \| .*first to last turn/, "and its wall clock comes off the conversation");
 });
 
 test("a second alert for the same cause attaches rather than opening", async () => {
@@ -437,81 +581,35 @@ test("a resolved notification changes nothing at all", async () => {
   );
 });
 
-// --- the agent reaches its incident over loopback HTTP ---------------------
-
-/** Drives the Boss's real loopback routes without binding a port. */
-const bossClientFor = (incidentId: string, token: string) =>
-  createBossClient({
-    baseUrl: "http://boss.local",
-    incidentId,
-    authToken: token,
-    fetchImpl: ((input: string, init?: RequestInit) =>
-      boss.loopbackApp.fetch(new Request(input, init))) as typeof fetch,
-  });
-
-test("an incident agent reaches its own incident over the loopback API", async () => {
-  const incidentId = boss.db.get<{ id: string }>(
-    "SELECT id FROM incident WHERE status = 'INVESTIGATING' LIMIT 1",
-  )!.id;
-  const client = bossClientFor(incidentId, boss.mintToken(incidentId));
-
-  const view = await client.getIncident();
-  assert.ok(view.ok, view.error);
-  assert.equal(view.data?.incident.id, incidentId);
-  assert.ok(view.data!.signals.length > 0, "the agent can see its signals");
-});
+// --- the agent reaches its incident in-process -----------------------------
 
 test("an agent's question marker is recorded once, however often it is replayed", async () => {
   const incidentId = boss.db.get<{ id: string }>(
     "SELECT id FROM incident WHERE status = 'INVESTIGATING' LIMIT 1",
   )!.id;
-  const client = bossClientFor(incidentId, boss.mintToken(incidentId));
+  const port = boss.portFor(incidentId);
 
-  assert.equal(await client.getPending(), null);
+  assert.equal(await port.getPending(), null);
 
   // A restart replays the tool call with no result. The second run has to
   // find the first question rather than ask twice.
-  const asked = await client.recordPending("Can someone merge the PR?");
-  const replayed = await client.recordPending("Can someone merge the PR?");
+  const asked = await port.recordPending("Can someone merge the PR?");
+  const replayed = await port.recordPending("Can someone merge the PR?");
   assert.equal(replayed.askedAt, asked.askedAt);
 
-  await client.clearPending();
-  assert.equal(await client.getPending(), null);
-});
-
-test("the loopback API refuses anything but this incident's own token", async () => {
-  const [first, second] = boss.db.query<{ id: string }>(
-    "SELECT id FROM incident ORDER BY id",
-  );
-
-  const anonymous = await boss.loopbackApp.request(`/incidents/${first.id}`);
-  assert.equal(anonymous.status, 401);
-  assert.match(anonymous.headers.get("www-authenticate") ?? "", /^Bearer/);
-
-  const forged = await boss.loopbackApp.request(`/incidents/${first.id}`, {
-    headers: { authorization: "Bearer not-a-token" },
-  });
-  assert.equal(forged.status, 401);
-
-  // The credential comes from the token, so a valid token cannot be pointed
-  // at a different incident: that is the containment story for a co-located
-  // agent that reads attacker-writable log lines for a living. It is about
-  // what the token may *write*.
-  const crossed = await boss.loopbackApp.request(`/incidents/${second.id}`, {
-    headers: { authorization: `Bearer ${boss.mintToken(first.id)}` },
-  });
-  assert.equal(crossed.status, 403);
+  await port.clearPending();
+  assert.equal(await port.getPending(), null);
 });
 
 /**
- * And reading is the other half, which the same route used to refuse by
- * accident. `/incidents/:id` took an id and threw it away, so an agent could
- * find another incident through `search_incidents` and had no way to open
- * it. The token still scopes every write to one record; the read is not a
- * write, and the Boss has served any incident to anyone in the
- * channel the whole time.
+ * Containment is the conversation's IncidentDoc. No tool takes the incident
+ * it writes to as an argument, so an agent bound to one incident has nothing
+ * it could aim at another, which is what keeps an agent that reads
+ * attacker-writable log lines for a living to its own incident. Reading is
+ * the other half, and is open on purpose: the Boss has
+ * served any incident to anyone in the channel the whole time.
  */
-test("an agent reads another incident over the loopback, with its own token", async () => {
+test("an agent writes only to its own incident, and can read another", async () => {
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "mine" });
   await boss.ingest("grafana", grafanaBody("fp-read-a", "cross-read-mine"));
   const mine = incidentOf("fp-read-a")!;
@@ -519,22 +617,57 @@ test("an agent reads another incident over the loopback, with its own token", as
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "theirs" });
   await boss.ingest("grafana", grafanaBody("fp-read-b", "cross-read-theirs"));
   const theirs = incidentOf("fp-read-b")!;
+  const theirsWas = boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [theirs]);
 
-  const res = await boss.loopbackApp.request(
-    `/incidents/${mine}?incident=${theirs}`,
-    { headers: { authorization: `Bearer ${boss.mintToken(mine)}` } },
+  const h = boss.agents;
+  const agent = await h.harness.createConversation(
+    {
+      ownership: { kind: "ownerless" },
+      agent: incidentAgentChange({
+        model: { provider: "faux", modelId: "agent-1" },
+        cwd: join(dir, "work", mine),
+        instructions: "You are the incident agent for BugBoss.",
+      }),
+      init: incidentInit(mine),
+    },
+    h.context,
   );
 
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as {
-    ok: boolean;
-    data: { incident: { id: string }; signals: { sourceId: string }[] };
+  let read = "";
+  let wrote = "";
+  const previous = fakeAgent.step;
+  fakeAgent.step = (transcript) => {
+    const reads = resultsOf(transcript, "get_incident");
+    if (reads.length === 0) return ["get_incident", { incidentId: theirs }];
+    read = reads[0];
+    const writes = resultsOf(transcript, "report_impact");
+    if (writes.length === 0) {
+      return ["report_impact", { usersImpacted: 41, query: `the incident ${theirs} says so` }];
+    }
+    wrote = writes[0];
+    return "Done.";
   };
-  assert.equal(body.ok, true);
-  assert.equal(body.data.incident.id, theirs);
+  try {
+    const settled = await (await agent.submit({ type: "input", content: "go" }, h.context)).wait(h.context);
+    assert.equal(settled.status, "done");
+  } finally {
+    fakeAgent.step = previous;
+  }
+
+  const view = dataOf<{ incident: { id: string }; signals: { sourceId: string }[] }>(read);
+  assert.equal(view?.incident.id, theirs, "the read reached the other incident");
+  assert.deepEqual(view?.signals.map((s) => s.sourceId), ["fp-read-b"]);
+  assert.match(wrote, /^ok/, wrote);
+  assert.equal(
+    boss.db.get<{ usersImpacted: number | null }>("SELECT usersImpacted FROM incident WHERE id = ?", [mine])
+      ?.usersImpacted,
+    41,
+    "the write landed on the conversation's own incident",
+  );
   assert.deepEqual(
-    body.data.signals.map((s) => s.sourceId),
-    ["fp-read-b"],
+    boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [theirs]),
+    theirsWas,
+    "and the incident the text named is untouched",
   );
 });
 
@@ -1118,12 +1251,11 @@ test("an agent's message sent before its thread opened reaches the Boss once it 
   const said = "The webhook secret rotated at 09:10 and every failure starts then.";
   const askedBefore = fakeSlackAgent.asked.length;
   let shown = "";
-  fakeSlackAgent.script = async (req) => {
+  fakeSlackAgent.script = (req) => {
     shown = req.input;
-    await bossTool(req, "stay_silent", { reason: "the agent's message is context for me, not news for the thread" });
-    return "";
+    return { calls: [["stay_silent", { reason: "the agent's message is context for me, not news for the thread" }]] };
   };
-  await bossClientFor(incidentId, boss.mintToken(incidentId)).tellBoss("message", said);
+  await boss.portFor(incidentId).tellBoss("message", said);
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(fakeSlackAgent.asked.length, askedBefore, "and the wake found no thread to run in");
 
@@ -1257,13 +1389,8 @@ test("a delivery that cannot be written answers a failure, not ok", async () => 
       ? Promise.reject(new Error("s3 is refusing writes"))
       : send(command)) as typeof refusing.send;
 
-  const halted = await createBugBoss({
-    gh: null,
+  const halted = await createScriptedBoss({
     config: config(join(dir, "halted.db")),
-    model: fakeModel,
-    slack: fakeSlack,
-    fileUploader: fakeUploader,
-    spawnAgent: fakeAgent,
     s3: refusing,
     insecureTestVerifiers: { grafana: () => {} },
   });
@@ -1280,7 +1407,7 @@ test("a delivery that cannot be written answers a failure, not ok", async () => 
     // and the source has to be told to send it again.
     assert.equal(res.status, 500);
   } finally {
-    halted.stop();
+    await halted.stop();
   }
 });
 
@@ -1799,11 +1926,9 @@ test("an untagged follow-up the Boss chooses to ignore gets no reply at all", as
   const postsBefore = fakeSlack.posts.length;
   const asked = fakeSlackAgent.asked.length;
 
-  fakeSlackAgent.script = async (req) => {
-    assert.equal(req.allowSilence, true, "premise: an untagged follow-up may be silent");
-    await bossTool(req, "stay_silent", { reason: "two people deciding where to eat" });
-    return "";
-  };
+  fakeSlackAgent.script = () => ({
+    calls: [["stay_silent", { reason: "two people deciding where to eat" }]],
+  });
   await deliver(threaded("2150.2", "2150.1", "want to grab lunch after this?"));
   await until(() => fakeSlackAgent.asked.length > asked, "the Boss to read the follow-up");
 
@@ -1821,47 +1946,6 @@ test("the same words in a thread the Boss has never spoken in stay ignored", asy
 
   assert.equal(fakeSlackAgent.asked.length, asked, "the Boss was not run");
   assert.equal(fakeSlack.reactions.length, reactions, "no :eyes: on chatter");
-});
-
-/**
- * Threads the Boss answered before `boss_thread` existed have no row, and
- * are still its conversations: the Slack agent's persisted session state
- * says so. A fresh process, so no memo from an earlier test can answer.
- */
-test("a thread known only by its persisted session state still counts", async () => {
-  const s3 = createMemoryS3();
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: "bugboss-test",
-      Key: "sessions/slack/C0TEST/2300.1/state.json",
-      Body: JSON.stringify({ lastSeenTs: "2300.1", lastActivityAt: Date.now() }),
-    }),
-  );
-  const fresh = await createBugBoss({
-    gh: null,
-    config: config(join(dir, "state-only.db")),
-    model: fakeModel,
-    slack: fakeSlack,
-    fileUploader: fakeUploader,
-    spawnAgent: fakeAgent,
-    s3,
-    secrets: { slackBotUserId: "B0BOSS" },
-    slackAgentModel: fakeSlackAgent,
-    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
-  });
-  try {
-    assert.equal(
-      fresh.db.get("SELECT 1 FROM boss_thread WHERE threadTs = '2300.1'"),
-      undefined,
-      "premise: no row records this thread",
-    );
-    const route = await fresh.relay.handle(threaded("2300.2", "2300.1", "and the other one?"));
-    assert.equal(route.kind, "slack_agent");
-    const unrelated = await fresh.relay.handle(threaded("2400.2", "2400.1", "and the other one?"));
-    assert.equal(unrelated.kind, "ignore");
-  } finally {
-    fresh.stop();
-  }
 });
 
 // --- a reply reaches the Boss, and cannot take the incident away -----------
@@ -1909,11 +1993,6 @@ test("a person saying they have it reaches the Boss and keeps the incident", asy
 
   assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "the Boss read it");
   assert.deepEqual(
-    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [row.id]),
-    [],
-    "nothing reaches the agent that the Boss did not send",
-  );
-  assert.deepEqual(
     boss.db.get<Record<string, unknown>>("SELECT * FROM incident WHERE id = ?", [
       row.id,
     ]),
@@ -1949,10 +2028,11 @@ test("an untagged reply in an incident thread reaches the Boss with the incident
   const input = fakeSlackAgent.asked.at(-1)!;
   assert.ok(input.includes(said), "carrying what was said, whole");
   assert.match(input, new RegExp(`\\b${id}\\b`), "and the incident it was said under");
-  assert.deepEqual(
-    boss.db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [id]),
-    [],
-    "the agent hears nothing the Boss did not choose to tell it",
+  assert.equal(
+    boss.db.get<{ conversationId: number | null }>("SELECT conversationId FROM incident WHERE id = ?", [id])
+      ?.conversationId,
+    null,
+    "the agent hears nothing the Boss did not choose to tell it: it has not even been started",
   );
 });
 
@@ -1965,11 +2045,11 @@ test("an agent's question is answered by the Boss, and the agent's wait ends on 
   fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
   await boss.ingest("grafana", grafanaBody("fp-boss-ask", "billing-errors"));
   const id = incidentOf("fp-boss-ask")!;
-  const client = bossClientFor(id, boss.mintToken(id));
   const question = "Is this every org, or only org X?";
   const answer = "Only org X. The other orgs never touch that webhook.";
 
   let settled = false;
+  let continued = "";
   const premise: {
     marker: boolean;
     question: boolean;
@@ -1994,31 +2074,54 @@ test("an agent's question is answered by the Boss, and the agent's wait ends on 
       ) !== undefined;
     premise.settled = settled;
     premise.input = req.input;
-    await bossTool(req, "message_agent", { incidentId: id, text: answer });
-    await bossTool(req, "stay_silent", { reason: "the answer went to the agent; the thread needs nothing more" });
-    return "";
+    return {
+      calls: [
+        ["message_agent", { incidentId: id, text: answer }],
+        ["stay_silent", { reason: "the answer went to the agent; the thread needs nothing more" }],
+      ],
+    };
   };
 
-  const postsBefore = fakeSlack.posts.length;
-  const result = await runMessageBoss(
-    { message: question, wait: true, seconds: 600 },
+  const h = boss.agents;
+  const agent = await h.harness.createConversation(
     {
-      marker: client,
-      boss: client,
-      api: client,
-      sleep: () => new Promise((resolve) => setTimeout(resolve, 5)),
+      ownership: { kind: "ownerless" },
+      agent: incidentAgentChange({
+        model: { provider: "faux", modelId: "agent-1" },
+        cwd: join(dir, "work", id),
+        instructions: "You are the incident agent for BugBoss.",
+      }),
+      init: incidentInit(id),
     },
-  ).finally(() => {
-    settled = true;
+    h.context,
+  );
+  await boss.db.withWrite((w) => {
+    w.prepare("UPDATE incident SET conversationId = ? WHERE id = ?").run(agent.id, id);
   });
+
+  const postsBefore = fakeSlack.posts.length;
+  const previous = fakeAgent.step;
+  fakeAgent.step = (transcript) => {
+    if (resultsOf(transcript, "message_boss").length === 0) {
+      return ["message_boss", { message: question, wait: true, seconds: 600 }];
+    }
+    settled = true;
+    continued = JSON.stringify(transcript.messages.slice(-2));
+    return "Only org X, then. Carrying on.";
+  };
+  try {
+    const done = await (await agent.submit({ type: "input", content: "go" }, h.context)).wait(h.context);
+    assert.equal(done.status, "done");
+  } finally {
+    fakeAgent.step = previous;
+  }
 
   assert.equal(premise.marker, true, "the agent was blocked when the Boss answered");
   assert.equal(premise.question, true, "on a question row in the Boss's inbox");
   assert.equal(premise.settled, false, "and its wait had not ended yet");
   assert.ok(premise.input.includes(question), "the Boss was shown the question");
 
-  assert.equal(result.timedOut, false);
-  assert.equal(result.answer, answer, "the wait ends on the Boss's answer");
+  assert.ok(continued.includes(answer), "the wait ends on the Boss's answer, the next thing the agent reads");
   assert.equal(
     boss.db.get("SELECT 1 FROM pending_question WHERE incidentId = ?", [id]),
     undefined,
@@ -2055,11 +2158,12 @@ test("the Boss closing an incident posts the same closed notice an agent's close
 
   const reason =
     "the alert was a test rule somebody forgot to delete, and it has been deleted";
-  fakeSlackAgent.script = async (req) => {
-    await bossTool(req, "close_incident", { incidentId: id, reason });
-    await bossTool(req, "stay_silent", { reason: "the closed notice already says it" });
-    return "";
-  };
+  fakeSlackAgent.script = () => ({
+    calls: [
+      ["close_incident", { incidentId: id, reason }],
+      ["stay_silent", { reason: "the closed notice already says it" }],
+    ],
+  });
   await boss.slackEvent(replyIn(thread, "that alert was a leftover test rule, I deleted it"));
 
   assert.equal(
@@ -2111,12 +2215,11 @@ test("a message that arrives while the Boss is mid-run is read, not dropped", as
     release = resolve;
   });
   let running = false;
-  fakeSlackAgent.script = async (req) => {
+  fakeSlackAgent.script = async () => {
     running = true;
     await gate;
     running = false;
-    await bossTool(req, "stay_silent", { reason: "nothing here is for me" });
-    return "";
+    return { calls: [["stay_silent", { reason: "nothing here is for me" }]] };
   };
 
   const askedBefore = fakeSlackAgent.asked.length;
@@ -2130,12 +2233,15 @@ test("a message that arrives while the Boss is mid-run is read, not dropped", as
     ...replyIn(thread, "it is only the people search, not the district one"),
     ts: "5000.2",
   });
-  await second.settled;
+  // The second is queued behind the first rather than answered, so its
+  // settlement is its own answer, after the first lets go.
+  await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(running, true, "the premise: the first run was still going");
   assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "and nothing else had run");
 
   release();
   await first.settled;
+  await second.settled;
 
   assert.equal(fakeSlackAgent.asked.length, askedBefore + 2, "the holder ran again");
   assert.match(
@@ -2167,16 +2273,22 @@ test("an agent's escalation wakes the Boss, and the Boss's page reaches the rota
 
   const brief = "The refund fix needs a person with Stripe dashboard access to confirm it.";
   let shown = "";
-  fakeSlackAgent.script = async (req) => {
+  fakeSlackAgent.script = (req) => {
     shown = req.input;
-    await bossTool(req, "page_rotation", {
-      incidentId: id,
-      reason: "Somebody with Stripe dashboard access needs to confirm the refund fix before it ships.",
-    });
-    await bossTool(req, "stay_silent", { reason: "the page is the message" });
-    return "";
+    return {
+      calls: [
+        [
+          "page_rotation",
+          {
+            incidentId: id,
+            reason: "Somebody with Stripe dashboard access needs to confirm the refund fix before it ships.",
+          },
+        ],
+        ["stay_silent", { reason: "the page is the message" }],
+      ],
+    };
   };
-  await bossClientFor(id, boss.mintToken(id)).tellBoss("escalation", brief);
+  await boss.portFor(id).tellBoss("escalation", brief);
   await until(() => paged().length > 0, "the Boss to page the rotation");
 
   assert.ok(shown.includes(brief), "the Boss paged on the escalation it was shown");
@@ -2207,13 +2319,12 @@ test("an agent's escalation reaches the Boss, not the thread, and leaves the inc
 
   const brief = "The fix touches the payment path and wants a person to sign it off.";
   let shown = "";
-  fakeSlackAgent.script = async (req) => {
+  fakeSlackAgent.script = (req) => {
     shown = req.input;
-    await bossTool(req, "stay_silent", { reason: "the escalation is handled by the page, not a reply" });
-    return "";
+    return { calls: [["stay_silent", { reason: "the escalation is handled by the page, not a reply" }]] };
   };
   const before = fakeSlack.posts.length;
-  await bossClientFor(id, boss.mintToken(id)).tellBoss("escalation", brief);
+  await boss.portFor(id).tellBoss("escalation", brief);
   await until(() => shown !== "", "the Boss to wake on the escalation");
 
   assert.ok(shown.includes(brief), "the Boss was shown what the agent sent up");
@@ -2250,25 +2361,22 @@ test("an agent's escalation reaches the Boss, not the thread, and leaves the inc
  * The assertion is the tick. The same incident is launched again.
  */
 test("neither a reply nor an escalation can strand an incident", async () => {
-  const stranding = await createBugBoss({
-    gh: null,
+  const stranding = await createScriptedBoss({
     config: config(join(dir, "stranding.db")),
-    model: fakeModel,
-    slack: fakeSlack,
-    fileUploader: fakeUploader,
-    // Asks for a person and stops, which is what an agent out of ideas does.
-    spawnAgent: async (tools: AgentSpawnContext) => {
-      await tools.escalate({
-        reason: "the fix touches auth and wants a person",
-        brief: "Ruled out DNS and the CDN. The bad write is in the webhook.",
-      });
-    },
-    s3: undefined,
     rotationMembers: async () => rotation.members,
-    secrets: { slackBotUserId: "B0BOSS" },
-    slackAgentModel: fakeSlackAgent,
-    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
   });
+  // Asks for a person and stops, which is what an agent out of ideas does.
+  const previous = fakeAgent.step;
+  fakeAgent.step = (transcript) =>
+    resultsOf(transcript, "escalate").length === 0
+      ? [
+          "escalate",
+          {
+            reason: "the fix touches auth and wants a person",
+            brief: "Ruled out DNS and the CDN. The bad write is in the webhook.",
+          },
+        ]
+      : "I have asked for a person.";
 
   try {
     fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
@@ -2309,7 +2417,8 @@ test("neither a reply nor an escalation can strand an incident", async () => {
       "nothing along either route moved the incident anywhere",
     );
   } finally {
-    stranding.stop();
+    fakeAgent.step = previous;
+    await stranding.stop();
   }
 });
 
@@ -2327,26 +2436,27 @@ test("neither a reply nor an escalation can strand an incident", async () => {
  * reach the Boss and really did leave the wait in place.
  */
 test("a parked incident is left alone, and the Boss telling its agent something wakes it", async () => {
-  const parked = await createBugBoss({
-    gh: null,
+  const parked = await createScriptedBoss({
     config: config(join(dir, "parked.db")),
-    model: fakeModel,
-    slack: fakeSlack,
-    fileUploader: fakeUploader,
-    // Out of road for now: says so, parks itself, exits.
-    spawnAgent: async (tools: AgentSpawnContext) => {
-      await tools.escalate({
-        reason: "waiting on a credential rotation nobody has done yet",
-        brief: "Ruled out the CDN. The 401s start at the rotation window.",
-      });
-      await tools.park({ waitingFor: "the credential rotation" });
-    },
-    s3: undefined,
     rotationMembers: async () => rotation.members,
-    secrets: { slackBotUserId: "B0BOSS" },
-    slackAgentModel: fakeSlackAgent,
-    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
   });
+  // Out of road for now: says so, parks itself, ends its run.
+  const previous = fakeAgent.step;
+  fakeAgent.step = (transcript) => {
+    if (resultsOf(transcript, "escalate").length === 0) {
+      return [
+        "escalate",
+        {
+          reason: "waiting on a credential rotation nobody has done yet",
+          brief: "Ruled out the CDN. The 401s start at the rotation window.",
+        },
+      ];
+    }
+    if (resultsOf(transcript, "park").length === 0) {
+      return ["park", { waitingFor: "the credential rotation" }];
+    }
+    return "Parked until the rotation is done.";
+  };
 
   try {
     fakeModel.triageDecisions.push({ action: "new_incident", reason: "real" });
@@ -2370,19 +2480,17 @@ test("a parked incident is left alone, and the Boss telling its agent something 
     );
 
     const askedBefore = fakeSlackAgent.asked.length;
-    fakeSlackAgent.script = async () => "";
+    fakeSlackAgent.script = () => ({ calls: [["stay_silent", { reason: "two people talking" }]] });
     await parked.slackEvent(replyIn(row.slackThreadTs!, "anyone know who owns the rotation?"));
     assert.equal(fakeSlackAgent.asked.length, askedBefore + 1, "the Boss read it");
     assert.ok(waiting(), "and chatter the Boss let pass does not wake the agent");
 
-    fakeSlackAgent.script = async (req) => {
-      await bossTool(req, "message_agent", {
-        incidentId: row.id,
-        text: "The credential rotation is done; Ada did it at 10:40.",
-      });
-      await bossTool(req, "stay_silent", { reason: "the answer went to the agent; the thread needs nothing more" });
-      return "";
-    };
+    fakeSlackAgent.script = () => ({
+      calls: [
+        ["message_agent", { incidentId: row.id, text: "The credential rotation is done; Ada did it at 10:40." }],
+        ["stay_silent", { reason: "the answer went to the agent; the thread needs nothing more" }],
+      ],
+    });
     await parked.slackEvent(replyIn(row.slackThreadTs!, "rotation is done"));
     assert.equal(waiting(), false, "the Boss telling the agent is what wakes it");
 
@@ -2393,7 +2501,8 @@ test("a parked incident is left alone, and the Boss telling its agent something 
       "and the next tick puts an agent back on it",
     );
   } finally {
-    parked.stop();
+    fakeAgent.step = previous;
+    await parked.stop();
   }
 });
 
@@ -2463,10 +2572,10 @@ test("a message cannot reach the incident it names", async () => {
   );
 
   assert.deepEqual(
-    boss.db.query("SELECT id FROM pending_directive WHERE incidentId IN (?, ?)", [
-      other.id,
-      mine.id,
-    ]),
+    boss.db.query(
+      "SELECT id FROM incident WHERE id IN (?, ?) AND conversationId IS NOT NULL",
+      [other.id, mine.id],
+    ),
     [],
     "routing tells no agent anything, whatever the words said",
   );
@@ -2527,11 +2636,26 @@ test("a verified Slack delivery is acknowledged through the real wiring", async 
 // anyone. Threadless, so any post at all would land at channel root.
 test("a long resume alarms and posts nothing", async () => {
   const id = "orphan-resume";
+  // An agent that ran two hours ago, in a container that is gone: its
+  // conversation is on the harness and idle, and nothing has heard from it.
+  const h = boss.agents;
+  const conversation = await h.harness.createConversation(
+    {
+      ownership: { kind: "ownerless" },
+      agent: incidentAgentChange({
+        model: { provider: "faux", modelId: "agent-1" },
+        cwd: join(dir, "work", id),
+        instructions: "You are the incident agent for BugBoss.",
+      }),
+      init: incidentInit(id),
+    },
+    h.context,
+  );
   await boss.db.withWrite((w) => {
     w.prepare(
-      `INSERT INTO incident (id, status, firstSignalAt, attempts, sessionRef, lastStartedAt)
+      `INSERT INTO incident (id, status, firstSignalAt, attempts, conversationId, lastStartedAt)
        VALUES (?, 'FIXING', ?, 1, ?, ?)`,
-    ).run(id, Date.now() - 7_200_000, `sessions/incident/${id}/session.jsonl`, Date.now() - 7_200_000);
+    ).run(id, Date.now() - 7_200_000, conversation.id, Date.now() - 7_200_000);
   });
 
   const before = fakeSlack.posts.length;
@@ -2568,8 +2692,7 @@ test("a long resume alarms and posts nothing", async () => {
     .filter((p) => /stopped without finishing|started it again/.test(p.text));
   assert.deepEqual(resumePosts, [], "the resume is not posted anywhere");
 
-  // And the resume itself still happened. The directive is gone by now
-  // because the agent read it, so the launch is what is left to look at.
+  // And the resume itself still happened.
   assert.equal(
     boss.db.get<{ attempts: number }>(
       "SELECT attempts FROM incident WHERE id = ?",
@@ -2577,6 +2700,52 @@ test("a long resume alarms and posts nothing", async () => {
     )?.attempts,
     2,
     "the agent was relaunched regardless",
+  );
+});
+
+/**
+ * The cutover. An incident an agent worked before the harness has no
+ * conversation, and its JSONL transcript is read by nothing, so its first
+ * launch here says so and hands the agent the durable story instead: the
+ * record, the timeline and anything it was waiting on.
+ */
+test("an incident from before the harness starts over with its story, not from nothing", async () => {
+  const id = "pre-harness";
+  await boss.db.withWrite((w) => {
+    w.prepare(
+      `INSERT INTO incident (id, status, firstSignalAt, attempts, lastStartedAt, rootCause, fixingAt)
+       VALUES (?, 'FIXING', ?, 3, ?, 'The pool saturated after the deploy.', ?)`,
+    ).run(id, Date.now() - 86_400_000, Date.now() - 3_600_000, Date.now() - 80_000_000);
+    w.prepare(
+      `INSERT INTO incident_timeline_event (incidentId, kind, occurredAt, recordedAt, summary)
+       VALUES (?, 'fix_opened', ?, ?, 'Opened omni#4242 raising the pool to 40')`,
+    ).run(id, Date.now() - 7_000_000, Date.now() - 7_000_000);
+  });
+
+  let kickoff = "";
+  const previous = fakeAgent.step;
+  // Every eligible incident launches on this tick, so the one under test is
+  // picked out by the prompt it was pinned to.
+  fakeAgent.step = (transcript) => {
+    if (!JSON.stringify(transcript.messages).includes(`You are working incident ${id}.`)) {
+      return previous(transcript);
+    }
+    kickoff ||= lastUserText(transcript);
+    return "Picking it up from the PR.";
+  };
+  try {
+    await boss.dispatchOnce();
+  } finally {
+    fakeAgent.step = previous;
+  }
+
+  assert.match(kickoff, /transcript did not carry over/, "the agent is told its history is gone");
+  assert.match(kickoff, /Opened omni#4242 raising the pool to 40/, "and given the timeline");
+  assert.match(kickoff, /The pool saturated after the deploy\./, "and the record");
+  assert.ok(
+    boss.db.get<{ conversationId: number | null }>("SELECT conversationId FROM incident WHERE id = ?", [id])
+      ?.conversationId,
+    "and it has a conversation of its own from here on",
   );
 });
 
@@ -2899,10 +3068,7 @@ test("get_incident does not hand the agent triage's spend", async () => {
   // withholding it rather than about there being nothing there to withhold.
   assert.equal(spendOf("fp-spend-view")?.tokensIn, 2222);
 
-  const view = await bossClientFor(
-    incidentId,
-    boss.mintToken(incidentId),
-  ).getIncident();
+  const view = await boss.toolApiFor(incidentId).getIncident();
   assert.ok(view.ok, view.error);
 
   const signals = view.data!.signals;
@@ -3143,17 +3309,10 @@ test("the header follows the status and a wait on a person, and is not rewritten
  */
 test("the board runs off the tick, not off a schedule of its own", async () => {
   const own = mkdtempSync(join(tmpdir(), "bugboss-tick-"));
-  const ticking = await createBugBoss({
-    gh: null,
+  const ticking = await createScriptedBoss({
     config: { ...config(join(own, "tick.db")), s3Bucket: "bugboss-tick-test" },
-    model: fakeModel,
-    slack: fakeSlack,
-    spawnAgent: fakeAgent,
-    slackAgentModel: fakeSlackAgent,
-    fileUploader: fakeUploader,
-    // Ephemeral ports: this boss is started for real, which is the point.
-    http: { publicPort: 0, loopbackPort: 0 },
-    insecureTestVerifiers: { grafana: () => {}, slack: () => {} },
+    // An ephemeral port: this boss is started for real, which is the point.
+    http: { publicPort: 0 },
   });
   const state = () =>
     ticking.db.get<{ id: number }>("SELECT id FROM board_state WHERE id = 1");
@@ -3170,7 +3329,7 @@ test("the board runs off the tick, not off a schedule of its own", async () => {
     assert.ok(state(), "one tick of the existing loop is what runs the board");
   } finally {
     mock.timers.reset();
-    ticking.stop();
+    await ticking.stop();
     rmSync(own, { recursive: true, force: true });
   }
 });
@@ -3212,13 +3371,20 @@ test("a close request tagged in a board thread reaches the Boss, which acts on i
   const calls = fakeModel.calls;
   const posts = fakeSlack.posts.length;
   let input = "";
-  fakeSlackAgent.script = async (req) => {
+  fakeSlackAgent.script = (req) => {
     input = req.input;
-    await bossTool(req, "close_incident", {
-      incidentId: id,
-      reason: "Swain's latest message in the incident thread says the alert rule was a leftover test and he deleted it",
-    });
-    return `Closed incident ${id}.`;
+    return {
+      calls: [
+        [
+          "close_incident",
+          {
+            incidentId: id,
+            reason: "Swain's latest message in the incident thread says the alert rule was a leftover test and he deleted it",
+          },
+        ],
+      ],
+      text: `Closed incident ${id}.`,
+    };
   };
   await boss.slackEvent(event);
 
@@ -3248,19 +3414,22 @@ test("a plain bug report opens an incident through open_incident", async () => {
   const said = "the voter file export has been stuck at 0% since lunch";
   const calls = fakeModel.calls;
   let filed = "";
-  fakeSlackAgent.script = async (req) => {
-    const before = boss.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM signal")!.n;
+  let signalsBefore = 0;
+  let signalsAfter = 0;
+  fakeSlackAgent.script = (req) => {
+    signalsBefore = boss.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM signal")!.n;
     // Triage places the report, so its decision is queued only now: nothing
     // may have read the message before the Boss chose to file it.
     assert.equal(fakeModel.calls, calls, "the Boss is the first to read it");
     fakeModel.triageDecisions.push({ action: "new_incident", reason: "nothing open like it" });
-    filed = await bossTool(req, "open_incident", { report: saidIn(req) });
-    assert.equal(
-      boss.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM signal")!.n,
-      before + 1,
-      "the tool is what filed it",
-    );
-    return filed;
+    return {
+      calls: [["open_incident", { report: saidIn(req) }]],
+      text: (results) => {
+        signalsAfter = boss.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM signal")!.n;
+        filed = results[0] ?? "";
+        return filed;
+      },
+    };
   };
   await boss.slackEvent({
     type: "app_mention",
@@ -3270,6 +3439,7 @@ test("a plain bug report opens an incident through open_incident", async () => {
     ts: "2500.1",
   });
 
+  assert.equal(signalsAfter, signalsBefore + 1, "the tool is what filed it");
   const row = boss.db.get<{ incidentId: string | null; reportedBy: string; body: string }>(
     "SELECT incidentId, reportedBy, body FROM signal WHERE sourceId = ?",
     ["slack:C0TEST:2500.1"],
@@ -3290,4 +3460,90 @@ test("a bare @bugboss reaches the Boss and earns its :eyes:", async () => {
   assert.equal(fakeSlackAgent.asked.at(-1), "<@U-swain> tagged you and wrote nothing else.");
   assert.equal(fakeModel.calls, calls, "nothing read it first");
   assert.deepEqual(fakeSlack.reactions.slice(reactions).map((r) => r.ts), ["2600.1"]);
+});
+
+// --- boot: the harness file across a restart --------------------------------
+
+/**
+ * The composition root's own harness file, not MemoryStorage: restored from
+ * S3 before it opens, snapshotted on the tick once a commit dirties it, and
+ * once more on stop, so the next container restores every conversation the
+ * last one committed.
+ */
+test("the harness file is restored at boot, mirrored on the tick and on stop", async () => {
+  const bootDir = mkdtempSync(join(tmpdir(), "bugboss-boot-"));
+  const memory = createMemoryS3();
+  const harnessPuts: number[] = [];
+  const s3 = {
+    send: (command: { constructor: { name: string }; input: { Key?: string } }) => {
+      if (command.constructor.name === "PutObjectCommand" && command.input.Key === "state/harness.sqlite") {
+        harnessPuts.push(Date.now());
+      }
+      return memory.send(command as never);
+    },
+  } as unknown as S3Client;
+  const { sqlite } = await loadPi();
+  const models = await scriptedModels();
+  const agentRef = { provider: models.agent.provider, modelId: models.agent.id };
+  const bootConfig = (name: string): BugBossConfig => ({
+    ...config(join(bootDir, name, "boss.db")),
+    dispatcher: { ...config("").dispatcher, tickSeconds: 0.05 },
+  });
+  const createIn = async (bugboss: BugBoss["agents"]): Promise<ConversationId> =>
+    (await bugboss.harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: agentRef } }, bugboss.context)).id;
+  const conversationIn = async (bugboss: BugBoss["agents"], id: ConversationId) =>
+    bugboss.harness.conversation(id, bugboss.context);
+  const opened: BugBoss[] = [];
+  const bossIn = async (name: string): Promise<BugBoss> => {
+    mkdirSync(join(bootDir, name));
+    const b = await createScriptedBoss({
+      config: bootConfig(name),
+      harnessStorage: undefined,
+      s3,
+      http: { publicPort: 0 },
+      workRoot: join(bootDir, name, "work"),
+    });
+    opened.push(b);
+    return b;
+  };
+
+  try {
+    // The last container's harness, already in the bucket.
+    const seedPath = join(bootDir, "seed.sqlite");
+    const seed = await openBugbossHarness({
+      storage: await sqlite.openNodeSqliteStorage(seedPath),
+      models: models.models,
+      extensions: [],
+      shellEnv: () => ({}),
+      onReport: () => {},
+    });
+    const seeded = await createIn(seed);
+    await seed.close();
+    const seedMirror = createHarnessMirror({ path: seedPath, bucket: "bugboss-test", key: "state/harness.sqlite", s3 });
+    seedMirror.markDirty();
+    await seedMirror.snapshotIfDirty();
+    seedMirror.close();
+    assert.equal(harnessPuts.length, 1, "premise: the bucket holds a harness snapshot");
+
+    const first = await bossIn("first");
+    assert.ok(await conversationIn(first.agents, seeded), "restored before the harness opened");
+
+    first.start();
+    const beforeTick = harnessPuts.length;
+    const onTick = await createIn(first.agents);
+    await until(() => harnessPuts.length > beforeTick, "a tick to mirror the dirty harness");
+
+    const onStop = await createIn(first.agents);
+    const beforeStop = harnessPuts.length;
+    await first.stop();
+    assert.ok(harnessPuts.length > beforeStop, "stop mirrors the commits since the last tick");
+
+    const second = await bossIn("second");
+    for (const id of [seeded, onTick, onStop]) {
+      assert.ok(await conversationIn(second.agents, id), `conversation ${id} survived the restart`);
+    }
+  } finally {
+    for (const b of opened) await b.stop();
+    rmSync(bootDir, { recursive: true, force: true });
+  }
 });

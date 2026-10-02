@@ -1,4 +1,6 @@
-FROM node:22-alpine
+# Pinned, not floating: Pi Durable needs node >= 22.19 for node:sqlite, and a
+# stale cached `22-alpine` would boot without it.
+FROM node:22.23.3-alpine
 
 # git, gh and npm are the agent's hands: it clones omni, reads code, opens a
 # PR. aws is how it reads CloudWatch and ECS events to debug a deploy, which
@@ -30,7 +32,7 @@ COPY bugboss/db/schema.sql ./dist/bugboss/db/schema.sql
 # volume is mounted over it so workspaces survive a redeploy; the directory is
 # still made here so a local run, with nothing mounted, has somewhere to
 # write. It is /work rather than /app/work because that is DEFAULT_WORK_ROOT
-# in agent/run.ts, and the container runs as a non-root user who cannot
+# in agent/workspace.ts, and the container runs as a non-root user who cannot
 # create a directory at the filesystem root — so a mismatch here fails every
 # incident before checkout.
 #
@@ -38,8 +40,9 @@ COPY bugboss/db/schema.sql ./dist/bugboss/db/schema.sql
 # (AGENT_UID in deploy/components/bugboss.ts). 1001 is what adduser picked
 # anyway, after the base image's `node` user at 1000.
 #
-# /data holds the SQLite file, which is BUGBOSS_DB_PATH's default, and exists
-# for the same reason: without it the first write throws SQLITE_CANTOPEN and
+# /data holds the two SQLite files, the incident tables (BUGBOSS_DB_PATH's
+# default) and the harness transcripts beside them, and exists for the same
+# reason: without it the first write throws SQLITE_CANTOPEN and
 # the task crash-loops before it can report why.
 RUN mkdir -p /work /data && adduser -D -u 1001 -s /bin/bash agent \
   && chown -R agent:agent /app /work /data

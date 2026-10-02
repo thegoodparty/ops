@@ -115,7 +115,16 @@ export interface Incident {
    */
   postmortemSections: string | null;
 
-  sessionRef: string | null;
+  /**
+   * The incident agent's Pi Durable conversation, in harness.sqlite. Null
+   * until the first launch creates it.
+   */
+  conversationId: number | null;
+  /**
+   * Model responses spent on this incident, across every launch: counted
+   * after each response, and rewritten from the transcript at boot.
+   */
+  turnsUsed: number;
   /** When the current or most recent launch started. Survives a restart. */
   lastStartedAt: number | null;
   /** Total launches, informational. Escalation gates on fast failures. */
@@ -236,13 +245,12 @@ export interface ToolResponse<T = unknown> {
   ok: boolean;
   data?: T;
   error?: string;
-  directives: Directive[];
 }
 
 /**
- * How an agent learns something changed, as a side effect of a call it was
- * already making. There is no push channel and an agent never needs to be
- * addressable.
+ * Something that changed under an agent. Delivered after the change commits,
+ * as an act on the agent's conversation: a steer carrying this as text, or an
+ * abort for a `stop` or a `merged`.
  */
 export type Directive =
   | { type: "stop"; reason: string }
@@ -407,7 +415,7 @@ export interface ToolApi {
   }): Promise<ToolResponse<TimelineEvent>>;
 
   /**
-   * Rehydration after resume, plus pending directives. With an id, any
+   * Rehydration after resume. With an id, any
    * incident: reads are not contained.
    *
    * Containment is about writes. The argument for it -- a compromised agent
@@ -472,7 +480,7 @@ export interface PriorIncident {
   prUrls: string[];
   /** What the earlier agent claimed it watched stop happening. */
   resolvedEvidence: string | null;
-  /** Clipped: getIncident also carries directives, which must survive it. */
+  /** Whole. */
   postmortem: string | null;
   resolvedAt: number | null;
   closedAt: number | null;
@@ -623,54 +631,8 @@ export interface IncidentView {
 }
 
 // ---------------------------------------------------------------------------
-// Agent-local tools
-// ---------------------------------------------------------------------------
-
-/**
- * Blocking tools that live in the agent's harness rather than the Boss API.
- * Each costs one turn no matter how long it waits, which is what keeps a
- * multi-day incident from saturating context on polling.
- */
-export interface AgentTools {
-  /**
-   * Block until `command` exits 0, then return its output. The general
-   * primitive: PR merged, deploy shipped, signal quiet, anything else.
-   *
-   * The command MUST be a read-only check. On a container restart the session
-   * holds a tool call with no result and the tool runs again, so an action
-   * would be performed twice.
-   */
-  monitor(args: {
-    command: string;
-    intervalSeconds: number;
-    timeoutSeconds: number;
-    description: string;
-  }): Promise<{ output: string; timedOut: boolean }>;
-
-  /**
-   * Post to the incident thread and block until a human replies. Not named
-   * `ask_human`: the agent may be asking a question or asking someone to do
-   * something it cannot do itself.
-   *
-   * Re-entrant. Records its message timestamp on the incident before posting,
-   * so a resumed agent resumes waiting rather than asking twice.
-   */
-  contactHuman(args: {
-    message: string;
-    timeoutSeconds: number;
-  }): Promise<{ reply: string | null; timedOut: boolean }>;
-}
-
-// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
-
-export interface RunningAgent {
-  incidentId: string;
-  pid: number;
-  startedAt: number;
-  phase: string;
-}
 
 export interface DispatcherConfig {
   /** Circuit breaker, not a scheduler. Hitting it means something is wrong. */
@@ -735,24 +697,21 @@ export interface BugBossConfig {
   prodCriticalSlugs: string[];
   /**
    * When an agent blocked on a person may nudge the thread, as
-   * `America/New_York:10-19` or `America/New_York:10-19:1,2,3,4,5`. Carried as
-   * the raw string because the agent that acts on it is a child process and
-   * the environment is the only channel to it; parsed at both ends, so a typo
-   * fails the Boss at boot rather than every agent at launch.
+   * `America/New_York:10-19` or `America/New_York:10-19:1,2,3,4,5`. Parsed
+   * at boot, so a typo fails the Boss there rather than every agent at its
+   * first wait.
    */
   workingHours?: string;
   /**
-   * Model id to application inference profile ARN, as JSON. Carried raw for
-   * the same reason `workingHours` is: the agent that uses it is a child
-   * process and the environment is the only channel to it. Parsed at both
-   * ends, but only this end throws -- an unattributable run is worth less
-   * than a dead agent.
+   * Model id to application inference profile ARN, as JSON. Parsed at boot,
+   * which refuses a bad one.
    */
   inferenceProfiles?: string;
   /** The Postgres agents run omni's database-backed tests against. */
   testDatabase: TestDatabase;
   /**
-   * The SQL sidecar on loopback, which runs an approved request_sql_query.
+   * The SQL sidecar, on loopback beside the Boss, which runs an approved
+   * request_sql_query.
    * Absent leaves the tool answering with an error and an alarm.
    */
   sqlRunnerUrl?: string;

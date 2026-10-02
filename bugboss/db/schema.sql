@@ -76,7 +76,17 @@ CREATE TABLE IF NOT EXISTS incident (
   mergedInto        TEXT REFERENCES incident(id),
   recurrenceOf      TEXT REFERENCES incident(id),
 
-  sessionRef        TEXT,
+  -- The incident agent's Pi Durable conversation, in harness.sqlite. NULL
+  -- until the first launch creates it, and on every incident that predates
+  -- the harness, which is what makes the dispatcher's first launch of one a
+  -- cutover: the kickoff says the transcript is gone and hands the agent the
+  -- durable story instead.
+  conversationId    INTEGER,
+  -- Model responses spent on this incident, across every launch. Incremented
+  -- after each response and awaited, so the count is in S3 before the next
+  -- request; rewritten from the transcript at boot, so a lost increment
+  -- costs nothing. The budget is agentMaxTurns plus grantedTurns.
+  turnsUsed         INTEGER NOT NULL DEFAULT 0,
   -- When the current or most recent agent launch started. Survives a
   -- container restart, which is the case where the dispatcher has no memory
   -- of the run it is resuming.
@@ -343,17 +353,6 @@ CREATE TABLE IF NOT EXISTS boss_message_seen (
   PRIMARY KEY (channel, ts)
 );
 
--- Directives waiting for an agent to pick up on its next call.
-CREATE TABLE IF NOT EXISTS pending_directive (
-  id                INTEGER PRIMARY KEY AUTOINCREMENT,
-  incidentId        TEXT NOT NULL REFERENCES incident(id),
-  payload           TEXT NOT NULL,                -- JSON Directive
-  createdAt         INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS pending_directive_incident_idx
-  ON pending_directive (incidentId);
-
 -- Who did what. The post-mortem template has a "humans involved" section, and
 -- merge / close / stop / split are supposed to appear in it, so the actions
 -- need a home that survives the Slack thread.
@@ -450,11 +449,17 @@ CREATE TABLE IF NOT EXISTS board_state (
 --
 -- A row rather than a reading of the message: whether a thread is the Boss's
 -- is a fact about the thread, decided by what the Boss did in it, never by
--- the words somebody chose. The Slack agent's persisted session state is the
--- other half of the same answer, for threads that predate this table.
+-- the words somebody chose. Incident threads get a row too, so this table is
+-- the whole answer.
 CREATE TABLE IF NOT EXISTS boss_thread (
   channel           TEXT NOT NULL,
   threadTs          TEXT NOT NULL,
   since             INTEGER NOT NULL,
+  -- The Boss's Pi Durable conversation for this thread, in harness.sqlite.
+  -- NULL until the first run in the thread creates it.
+  conversationId    INTEGER,
+  -- When the Boss last ran here. A thread idle for seven days starts its
+  -- next run on a reset conversation rather than a week-old context.
+  lastActivityAt    INTEGER,
   PRIMARY KEY (channel, threadTs)
 );

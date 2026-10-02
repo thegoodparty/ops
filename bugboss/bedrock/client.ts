@@ -1,5 +1,5 @@
-// The Boss's ModelClient, over the same Pi runtime the incident agent streams
-// through.
+// The Boss's ModelClient, over the same Models collection the incident agent
+// streams through.
 //
 // WHY THIS REPLACED A SECOND INVOKEMODEL CALL:
 //
@@ -9,7 +9,7 @@
 // incident agent while triage carried on working, and opened two incidents no
 // agent could investigate.
 //
-// Going through the runtime inherits, rather than reimplements: the
+// Going through Models inherits, rather than reimplements: the
 // InvokeModel routing `bedrock/runtime.ts` exists to assert, the 1h cache
 // retention and its downgrade check, the lone-surrogate sanitizer, the
 // consecutive-tool-result coalescing Anthropic requires, and `calculateCost`
@@ -28,7 +28,7 @@ import type {
   Model,
   Tool,
 } from "@earendil-works/pi-ai";
-import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { Models } from "@earendil-works/pi-ai/models";
 
 import {
   ModelRequestFailed,
@@ -125,12 +125,12 @@ const toPiMessages = (turns: ModelTurn[]): Message[] =>
   });
 
 export interface PiModelClientDeps {
-  runtime: ModelRuntime;
+  models: Models;
   model: Model<BedrockInvokeModelApi>;
 }
 
 export const createPiModelClient = ({
-  runtime,
+  models,
   model,
 }: PiModelClientDeps): SizedModelClient => ({
   contextWindow: model.contextWindow,
@@ -146,7 +146,10 @@ export const createPiModelClient = ({
     // `model.maxTokens` when it is absent, which on a resolved Bedrock model
     // is 64000 -- so an omission is not a smaller request, it is a 30x
     // larger one.
-    const message = await runtime.complete(model, context, {
+    //
+    // `complete` rather than `completeSimple` so thinking can be turned off
+    // by name below; `completeSimple` would only leave it off by omission.
+    const message = await models.complete(model, context, {
       maxTokens: request.maxTokens,
       signal: request.signal,
       // Off, and not by omission.

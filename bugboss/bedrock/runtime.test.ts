@@ -2,13 +2,15 @@
 //
 // provider.test.ts proves the provider is correct and that it claims its api
 // id; it passed for the whole time production was streaming Converse, because
-// nothing in it asks the question this file asks: given a real ModelRuntime,
-// which implementation does a model with our api id actually reach?
+// nothing in it asks the question this file asks: given a real Models
+// collection, and a durable conversation that names our model only by id,
+// which implementation does the request actually reach?
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { Api, Model, Provider } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Models, Provider } from "@earendil-works/pi-ai/models";
 
 import {
   BEDROCK_INVOKE_MODEL_API,
@@ -17,12 +19,7 @@ import {
   invokeModelIdFor,
   resolveBedrockModel,
 } from "./index";
-import {
-  assertBedrockInvokeModelRouting,
-  BEDROCK_PROVIDER_ID,
-  registerBedrockRouting,
-  routeBedrockProvider,
-} from "./runtime";
+import { assertBedrockInvokeModelRouting, BEDROCK_PROVIDER_ID, routeBedrockProvider } from "./runtime";
 
 const encoder = new TextEncoder();
 
@@ -50,15 +47,36 @@ const turn = [
   { type: "message_stop" },
 ];
 
+const streamTurn: BedrockInvoke = async () => ({
+  $metadata: { httpStatusCode: 200 },
+  body: (async function* () {
+    for (const event of turn) {
+      yield { chunk: { bytes: encoder.encode(JSON.stringify(event)) } };
+    }
+  })(),
+});
+
 /**
- * A runtime built the way the agent builds one, minus the developer's own
- * ~/.pi/models.json and the catalog refresh, so the test sees only Pi's
- * builtins. Ambient AWS env vars stand in for the ECS task role that satisfies
- * the builtin's auth resolver in production.
+ * Models built the way `createBugbossModels` builds them. Ambient AWS env vars
+ * stand in for the ECS task role that satisfies the builtin's auth resolver in
+ * production.
  */
-const createRuntime = async () => {
-  const pi = await import("@earendil-works/pi-coding-agent");
-  return pi.ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+const routedModels = async (
+  invoke: BedrockInvoke,
+  ours: readonly Model<Api>[],
+  options: { invokeModelIdFor?: (modelId: string) => string } = {},
+): Promise<Models> => {
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { amazonBedrockProvider } = await import("@earendil-works/pi-ai/providers/amazon-bedrock");
+  const models = createModels();
+  models.setProvider(
+    routeBedrockProvider(
+      amazonBedrockProvider(),
+      await createBedrockInvokeModelProvider({ invoke, ...options }),
+      ours,
+    ),
+  );
+  return models;
 };
 
 const withAwsEnv = async (body: () => Promise<void>): Promise<void> => {
@@ -78,33 +96,21 @@ const withAwsEnv = async (body: () => Promise<void>): Promise<void> => {
   }
 };
 
-test("the model runtime streams our model through InvokeModel, not Converse", async () => {
+test("Models streams our model through InvokeModel, not Converse", async () => {
   await withAwsEnv(async () => {
-    const runtime = await createRuntime();
     const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
 
     let invoked = 0;
-    const invoke: BedrockInvoke = async () => {
+    const models = await routedModels(async (input, context) => {
       invoked += 1;
-      return {
-        $metadata: { httpStatusCode: 200 },
-        body: (async function* () {
-          for (const event of turn) {
-            yield { chunk: { bytes: encoder.encode(JSON.stringify(event)) } };
-          }
-        })(),
-      };
-    };
+      return streamTurn(input, context);
+    }, [model]);
+    assertBedrockInvokeModelRouting(models, model);
 
-    await registerBedrockRouting({ runtime, invoke });
-    assertBedrockInvokeModelRouting(runtime, model);
-
-    const message = await runtime
-      .streamSimple(model, {
-        systemPrompt: "You are the incident agent.",
-        messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
-      })
-      .result();
+    const message = await models.completeSimple(model, {
+      systemPrompt: "You are the incident agent.",
+      messages: [{ role: "user", content: "why are we 500ing", timestamp: 0 }],
+    });
 
     // Reaching our invoke at all is the assertion. Before the router existed
     // this was zero: the builtin provider served Converse to every model it
@@ -116,6 +122,55 @@ test("the model runtime streams our model through InvokeModel, not Converse", as
       message.content.find((block) => block.type === "thinking")?.thinkingSignature,
       "ErUBCkYIBRgCIkDsilent",
     );
+  });
+});
+
+// The harness never sees the model object we resolved. It stores
+// `{ provider, modelId }` and resolves it from the provider's catalog, so
+// this is the path that silently streamed Converse in the spike until the
+// router learnt to serve our catalog entries.
+test("a durable conversation that names our model by id streams InvokeModel and stores the signature", async () => {
+  await withAwsEnv(async () => {
+    const { AssistantEntry, MemoryStorage, Harness, createRegistry } = await import(
+      "@earendil-works/pi-durable"
+    );
+    const { BACKGROUND_CONTEXT: context } = await import("@earendil-works/chord/context");
+    const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+
+    let invoked = 0;
+    const models = await routedModels(async (input, ctx) => {
+      invoked += 1;
+      return streamTurn(input, ctx);
+    }, [model]);
+    assertBedrockInvokeModelRouting(models, model);
+
+    const harness = await Harness.open(
+      new MemoryStorage(),
+      { models, registry: createRegistry() },
+      context,
+    );
+    try {
+      const root = await harness.root(context, {
+        agent: { model: { provider: BEDROCK_PROVIDER_ID, modelId: model.id } },
+      });
+      const settled = await (
+        await root.submit({ type: "input", content: "why are we 500ing" }, context)
+      ).wait(context);
+
+      assert.equal(settled.status, "done");
+      assert.equal(invoked, 1, "the request reached our InvokeModel, not Converse");
+      if (settled.status !== "done" || settled.type !== "input") throw new Error("unreachable");
+      const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
+      const message = entry?.model?.[0];
+      assert.ok(message && message.role === "assistant");
+      assert.equal(message.api, BEDROCK_INVOKE_MODEL_API);
+      assert.equal(
+        message.content.find((block) => block.type === "thinking")?.thinkingSignature,
+        "ErUBCkYIBRgCIkDsilent",
+      );
+    } finally {
+      await harness.close(context);
+    }
   });
 });
 
@@ -155,76 +210,76 @@ test("a model on the builtin api still reaches the builtin", async () => {
   assert.deepEqual(seen, ["stream:bedrock-converse-stream", "streamSimple:bedrock-converse-stream"]);
 });
 
-test("an unrouted runtime is refused before the session starts", async () => {
-  const runtime = await createRuntime();
+test("an unrouted Models is refused before the session starts", async () => {
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { amazonBedrockProvider } = await import("@earendil-works/pi-ai/providers/amazon-bedrock");
+  const models = createModels();
+  models.setProvider(amazonBedrockProvider());
   const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
 
   assert.throws(
-    () => assertBedrockInvokeModelRouting(runtime, model),
+    () => assertBedrockInvokeModelRouting(models, model),
     /is Pi's builtin, not the bugboss InvokeModel router/,
   );
 });
 
 test("a model that lost the api id is refused rather than run on Converse", async () => {
-  await withAwsEnv(async () => {
-    const runtime = await createRuntime();
-    await registerBedrockRouting({ runtime, invoke: async () => ({}) });
-    const model = {
-      ...(await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" })),
-      api: "bedrock-converse-stream",
-    } as Model<Api>;
+  const resolved = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  const models = await routedModels(async () => ({}), [resolved]);
+  const model = { ...resolved, api: "bedrock-converse-stream" } as Model<Api>;
 
-    assert.throws(
-      () => assertBedrockInvokeModelRouting(runtime, model),
-      /Converse would drop its thinking signatures/,
-    );
-  });
+  assert.throws(
+    () => assertBedrockInvokeModelRouting(models, model),
+    /Converse would drop its thinking signatures/,
+  );
 });
 
-test("registering twice keeps one router rather than wrapping it in another", async () => {
-  await withAwsEnv(async () => {
-    const runtime = await createRuntime();
-    const first = await registerBedrockRouting({ runtime, invoke: async () => ({}) });
-    const second = await registerBedrockRouting({ runtime, invoke: async () => ({}) });
+// The bug the spike found. The router is installed and the model we hold is
+// right, but the catalog the harness resolves from still carries the
+// builtin's Converse entry for the same id.
+test("a router whose catalog still serves Converse for our id is refused", async () => {
+  const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
+  const models = await routedModels(async () => ({}), []);
 
-    assert.equal(first, second);
-    assert.equal(runtime.getProvider(BEDROCK_PROVIDER_ID), first);
-  });
+  assert.equal(models.getModel(BEDROCK_PROVIDER_ID, model.id)?.api, "bedrock-converse-stream");
+  assert.throws(
+    () => assertBedrockInvokeModelRouting(models, model),
+    /serves model "us.anthropic.claude-opus-5" with api "bedrock-converse-stream"/,
+  );
 });
 
-// The same seam this file exists for, one layer up. `registerBedrockRouting`
-// builds the provider, so a profile resolver it accepts and forgets to pass
+test("a model the builtin catalog does not list is still served", async () => {
+  const arn = "arn:aws:bedrock:us-west-2:333022194791:inference-profile/us.anthropic.claude-opus-5";
+  const model = await resolveBedrockModel({ id: arn });
+  const models = await routedModels(async () => ({}), [model]);
+
+  assert.equal(models.getModel(BEDROCK_PROVIDER_ID, arn)?.api, BEDROCK_INVOKE_MODEL_API);
+  assertBedrockInvokeModelRouting(models, model);
+});
+
+// The same seam this file exists for, one layer up. The router builds the
+// provider from options, so a profile resolver it accepts and forgets to pass
 // on fails exactly the way Converse did: nothing throws, every request looks
 // right, and the only symptom is a Cost Explorer line that never appears.
-test("the profile resolver survives the trip through registerBedrockRouting", async () => {
+test("the profile resolver survives the trip through the router", async () => {
   await withAwsEnv(async () => {
-    const runtime = await createRuntime();
     const model = await resolveBedrockModel({ id: "us.anthropic.claude-opus-5" });
     const arn =
       "arn:aws:bedrock:us-west-2:333022194791:application-inference-profile/abcd1234efgh";
 
     const ids: (string | undefined)[] = [];
-    const invoke: BedrockInvoke = async (input) => {
-      ids.push(input.modelId);
-      return {
-        $metadata: { httpStatusCode: 200 },
-        body: (async function* () {
-          for (const event of turn) {
-            yield { chunk: { bytes: encoder.encode(JSON.stringify(event)) } };
-          }
-        })(),
-      };
-    };
+    const models = await routedModels(
+      async (input, context) => {
+        ids.push(input.modelId);
+        return streamTurn(input, context);
+      },
+      [model],
+      { invokeModelIdFor: invokeModelIdFor({ "us.anthropic.claude-opus-5": arn }) },
+    );
 
-    await registerBedrockRouting({
-      runtime,
-      invoke,
-      invokeModelIdFor: invokeModelIdFor({ "us.anthropic.claude-opus-5": arn }),
+    await models.completeSimple(model, {
+      messages: [{ role: "user", content: "hi", timestamp: 0 }],
     });
-
-    await runtime
-      .streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] })
-      .result();
 
     assert.deepEqual(ids, [arn]);
   });

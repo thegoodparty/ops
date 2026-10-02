@@ -11,11 +11,11 @@
 //    valid only for anthropic.* model ids. The "bedrock-converse-stream" id
 //    also covers Nova, Llama, Mistral and DeepSeek in Pi's catalog, and
 //    hijacking the id would break every one of them in-process.
-// 2. The override would not reliably take effect anyway. pi-coding-agent's
-//    provider-composer prefers `base.stream()` whenever the builtin provider
-//    declares any model with that api id, and only falls through to
-//    getApiProvider() otherwise. A distinct api id is what actually routes a
-//    model through the registry.
+// 2. The api id is what routes a request. `routeBedrockProvider`
+//    (./runtime.ts) sits in front of Pi's builtin amazon-bedrock provider and
+//    sends a model here only when it carries this id; every other model goes
+//    to the builtin's Converse stream. Sharing the builtin's id would leave
+//    nothing to tell our models from its catalog.
 //
 // The cost is that model definitions must carry this api id, which is what
 // toInvokeModelModel() in ./model.ts is for. We have to pin the inference

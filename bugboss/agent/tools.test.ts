@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { BossInboxKind, Directive } from "../types";
+import { loadPi, type Context, type InboxState, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "./harness";
 import {
-  bossMessageText,
+  BOSS_SAYS,
   createMessageBossTool,
   createMonitorTool,
   formatWaited,
@@ -13,8 +14,9 @@ import {
   insideWorkingHours,
   MESSAGE_BOSS_MIN_WAIT_SECONDS,
   parseWorkingHours,
+  directiveText,
+  localWait,
   probeOutput,
-  renderDirectives,
   runMessageBoss,
   runMonitor,
   shellProbe,
@@ -22,11 +24,12 @@ import {
   type BossInboxPort,
   type HeartbeatDeps,
   type MessageBossDeps,
-  type PendingDirective,
+  type MonitorDeps,
   type PendingQuestion,
   type PendingWait,
   type Probe,
   type QuestionMarkerPort,
+  type Waiter,
 } from "./tools";
 
 const fakeClock = () => {
@@ -45,10 +48,70 @@ const fakeClock = () => {
   };
 };
 
-const toolText = (result: { content: { type: string; text?: string }[] }): string => {
-  const first = result.content[0];
-  return first.type === "text" ? String(first.text) : "";
+const toolText = (result: ToolExecutionResult): string => {
+  const first = result.content?.[0];
+  return first?.type === "text" ? String(first.text) : "";
 };
+
+/**
+ * One tool call's API, faked to the parts these tools touch: the memos, and
+ * the conversation's inbox, which a test fills with steers and announces with
+ * `push` the way a real commit would.
+ */
+const fakeCall = () => {
+  const memos = new Map<string, unknown>();
+  let steers: string[] = [];
+  let listener: ((value: InboxState) => Promise<void>) | null = null;
+  const inbox = (): InboxState => ({
+    items: steers.map((content, index) => ({ id: index as never, mode: "steer" as const, content })),
+  });
+  let watched: () => void = () => {};
+  const watching = new Promise<void>((resolve) => {
+    watched = resolve;
+  });
+  const api = {
+    conversationId: 7,
+    memo: async (name: string, ...rest: unknown[]) => {
+      if (rest.length === 1) return memos.get(name);
+      if (!memos.has(name)) memos.set(name, rest[0]);
+      return memos.get(name);
+    },
+    watchDoc: async () => ({
+      value: inbox(),
+      start: (callback: (value: InboxState) => Promise<void>) => {
+        listener = callback;
+        watched();
+      },
+      stop: async () => {
+        listener = null;
+      },
+    }),
+    snapshot: async () => undefined,
+  } as unknown as ToolExecutionApi;
+  return {
+    api,
+    memos,
+    /** Resolves once a wait is watching the inbox. */
+    watching,
+    steer: async (text: string) => {
+      steers = [...steers, text];
+      await listener?.(inbox());
+    },
+  };
+};
+
+const call = async (
+  tool: ToolRegistration,
+  args: Record<string, unknown>,
+  options: { api?: ToolExecutionApi; ctx?: Context } = {},
+): Promise<ToolExecutionResult> =>
+  tool.execute(args, options.api ?? fakeCall().api, options.ctx ?? (await loadPi()).context);
+
+/** A monitor tool over fixed deps, waiting on the fake clock rather than the inbox. */
+const monitorTool = (deps: MonitorDeps) =>
+  createMonitorTool({
+    resolve: async () => ({ wait: localWait(deps), ...deps }),
+  });
 
 // ---------------------------------------------------------------------------
 // monitor
@@ -125,8 +188,8 @@ test("monitor's description does not tell the agent to pre-summarise", async () 
   // the probe command itself, throwing the evidence away voluntarily. So the
   // instruction and the behaviour are asserted as one thing -- the tool says
   // output comes back whole, and it does.
-  const tool = await createMonitorTool({
-    probe: async () => ({ code: 0, output: "x".repeat(50_000) }),
+  const tool = await monitorTool({
+    probe: async () => ({ code: 0, output: "x".repeat(200_000) }),
   });
 
   assert.doesNotMatch(
@@ -135,27 +198,21 @@ test("monitor's description does not tell the agent to pre-summarise", async () 
     "the description promises a cap that no longer exists",
   );
   assert.match(tool.description, /whole/i);
+  assert.equal(tool.outputLimits?.maxBytes, Number.MAX_SAFE_INTEGER, "the harness is told not to cut it either");
 
-  const out = await tool.execute(
-    "c1",
-    {
-      command: "cat huge",
-      intervalSeconds: 1,
-      timeoutSeconds: 1,
-      description: "a big log",
-      waitingFor: "a big log",
-    } as never,
-    new AbortController().signal,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, {
+    command: "cat huge",
+    intervalSeconds: 1,
+    timeoutSeconds: 1,
+    description: "a big log",
+    waitingFor: "a big log",
+  });
   const text = toolText(out);
   assert.ok(text.startsWith("Condition met: a big log\n\n"));
   assert.ok(
-    text.includes("x".repeat(50_000)),
+    text.includes("x".repeat(200_000)),
     "the description says whole and the tool must deliver whole",
   );
-  assert.ok(!out.terminate, "a met condition is not the end of the incident");
 });
 
 test("monitor hands back everything the probe printed", async () => {
@@ -220,106 +277,185 @@ test("formatWaited rounds to minutes and never says zero", () => {
   assert.equal(formatWaited(63 * 3_600_000), "63h");
 });
 
-test("the harness deadline interrupts a blocking tool, not just the turn", async () => {
+test("an aborted conversation ends a blocking tool, not just the turn", async () => {
   const clock = fakeClock();
-  const deadline = new AbortController();
-  deadline.abort();
+  const stop = new AbortController();
+  stop.abort();
   let attempts = 0;
-
-  const tool = await createMonitorTool({
+  const tool = await monitorTool({
     probe: async () => {
       attempts += 1;
       return { code: 1, output: "still firing" };
     },
     sleep: clock.sleep,
     now: clock.now,
-    signal: deadline.signal,
+    signal: stop.signal,
   });
 
-  // Pi passes its own signal, which is not aborted. The tool has to honour
-  // both, or the soft deadline cannot reach an agent parked in a 24h wait.
-  const piSignal = new AbortController().signal;
-  assert.equal(piSignal.aborted, false);
-  const result = await tool.execute(
-    "call-1",
-    { command: "check", intervalSeconds: 30, timeoutSeconds: 86400, description: "quiet", waitingFor: "quiet" } as never,
-    piSignal,
-    undefined,
-    {} as never,
-  );
+  const result = await call(tool, {
+    command: "check",
+    intervalSeconds: 30,
+    timeoutSeconds: 86400,
+    description: "quiet",
+    waitingFor: "quiet",
+  });
 
   assert.equal(attempts, 1);
-  assert.equal(
-    toolText(result),
-    "TIMED OUT after 86400s waiting for: quiet\n\nstill firing",
-  );
-  assert.ok(!result.terminate, "a timed-out wait leaves the incident with the agent");
+  assert.equal(toolText(result), "TIMED OUT after 86400s waiting for: quiet\n\nstill firing");
 });
 
 // ---------------------------------------------------------------------------
-// renderDirectives
+// The inbox ends a wait
 // ---------------------------------------------------------------------------
 
-test("no directives render as nothing", () => {
-  assert.equal(renderDirectives([]), "");
+test("a steer queued for the conversation ends an hour-long monitor within milliseconds", async () => {
+  const fake = fakeCall();
+  const tool = await createMonitorTool({
+    resolve: async () => ({ probe: async () => ({ code: 1, output: "still pending" }) }),
+  });
+
+  const started = Date.now();
+  const pending = call(tool, {
+    command: "check",
+    intervalSeconds: 600,
+    timeoutSeconds: 3000,
+    description: "the merge",
+    waitingFor: "the merge",
+  }, { api: fake.api });
+  await fake.watching;
+  await fake.steer(`${BOSS_SAYS}hold off, the rollback is ours`);
+  const out = await pending;
+
+  assert.ok(Date.now() - started < 2000, "the wait returned on the steer, not on its interval");
+  assert.match(toolText(out), /^STOPPED WAITING for: the merge \(interrupted\)\. A message for you arrived and is next\./);
+  assert.match(toolText(out), /still pending/, "what the check last saw comes back with it");
 });
 
-test("stop and merged render as the instruction to end", () => {
+test("a steer already queued when the wait starts ends it after one check", async () => {
+  const fake = fakeCall();
+  await fake.steer("RESUMED after 600s. Re-check anything time-sensitive before continuing.");
+  let checks = 0;
+  const tool = await createMonitorTool({
+    resolve: async () => ({
+      probe: async () => {
+        checks += 1;
+        return { code: 1, output: "pending" };
+      },
+    }),
+  });
+
+  const out = await call(tool, {
+    command: "check",
+    intervalSeconds: 600,
+    timeoutSeconds: 3000,
+    description: "a deploy",
+    waitingFor: "a deploy",
+  }, { api: fake.api });
+
+  assert.equal(checks, 1);
+  assert.match(toolText(out), /\(interrupted\)/);
+});
+
+test("a met condition wins over a steer that arrived in the same moment", async () => {
+  const fake = fakeCall();
+  await fake.steer(`${BOSS_SAYS}anything`);
+  const tool = await createMonitorTool({
+    resolve: async () => ({ probe: async () => ({ code: 0, output: "MERGED" }) }),
+  });
+
+  const out = await call(tool, {
+    command: "check",
+    intervalSeconds: 60,
+    timeoutSeconds: 600,
+    description: "the merge",
+    waitingFor: "the merge",
+  }, { api: fake.api });
+
+  assert.match(toolText(out), /^Condition met: the merge/);
+});
+
+test("an interrupted wait on a person drops its marker, so the board stops showing it", async () => {
+  const fake = fakeCall();
+  let cleared = 0;
+  const marker: PendingWait = { command: "check", startedAt: Date.now(), pings: 0, lastPingAt: null };
+  const tool = await createMonitorTool({
+    resolve: async () => ({
+      probe: async () => ({ code: 1, output: "open" }),
+      heartbeat: {
+        marker: {
+          recordWait: async () => marker,
+          recordPing: async () => marker,
+          clearWait: async () => {
+            cleared += 1;
+          },
+        },
+        boss: { tellBoss: async () => {}, escalationsSince: async () => ({ count: 0, lastAt: null }) },
+      },
+    }),
+  });
+
+  const pending = call(tool, {
+    command: "check",
+    intervalSeconds: 600,
+    timeoutSeconds: 3000,
+    description: "the merge",
+    waitingFor: "the merge",
+    awaitingHuman: "merge it",
+  }, { api: fake.api });
+  await fake.watching;
+  await fake.steer(`${BOSS_SAYS}merged`);
+  await pending;
+
+  assert.equal(cleared, 1);
+});
+
+test("monitor and message_boss are replay-safe, and their results are never cut", async () => {
+  const monitor = await createMonitorTool({ resolve: async () => ({}) });
+  const message = await createMessageBossTool({ resolve: async () => ({}) as never });
+  for (const tool of [monitor, message]) {
+    assert.equal(tool.replay, "safe", tool.name);
+    assert.equal(tool.outputLimits?.maxLines, Number.MAX_SAFE_INTEGER, tool.name);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// directiveText
+// ---------------------------------------------------------------------------
+
+test("stop and merged read as the instruction to end", () => {
+  assert.equal(directiveText({ type: "stop", reason: "a human took it" }), "STOP: a human took it");
   assert.equal(
-    renderDirectives([{ type: "stop", reason: "a human took it" }]),
-    "\n\nDIRECTIVES\nSTOP: a human took it",
-  );
-  assert.equal(
-    renderDirectives([{ type: "merged", into: "inc-9" }]),
-    "\n\nDIRECTIVES\nMERGED: this incident is now part of inc-9. Stop work and exit.",
+    directiveText({ type: "merged", into: "inc-9" }),
+    "MERGED: this incident is now part of inc-9. Stop work.",
   );
 });
 
-test("new signals render plainly, and name what was absorbed with agreement", () => {
+test("new signals read plainly, and name what was absorbed with agreement", () => {
   assert.equal(
-    renderDirectives([{ type: "new_signals", count: 2, summary: "two more 500s" }]),
-    "\n\nDIRECTIVES\nNEW SIGNALS (2): two more 500s",
+    directiveText({ type: "new_signals", count: 2, summary: "two more 500s" }),
+    "NEW SIGNALS (2): two more 500s",
   );
 
-  const one = renderDirectives([
-    { type: "new_signals", count: 3, summary: "same root cause", absorbed: ["82"] },
-  ]);
+  const one = directiveText({ type: "new_signals", count: 3, summary: "same root cause", absorbed: ["82"] });
   assert.match(one, /NEW SIGNALS \(3\): incident 82 has been merged into yours and its signals are now yours\./);
   assert.match(one, /Why: same root cause\./);
   assert.match(one, /what that incident had already found/);
 
-  const many = renderDirectives([
-    { type: "new_signals", count: 5, summary: "same root cause", absorbed: ["81", "82", "83"] },
-  ]);
+  const many = directiveText({
+    type: "new_signals",
+    count: 5,
+    summary: "same root cause",
+    absorbed: ["81", "82", "83"],
+  });
   assert.match(many, /incidents 81, 82 and 83 have been merged into yours and their signals are now yours\./);
   assert.match(many, /what those incidents had already found/);
 });
 
-test("a boss message renders as the Boss speaking", () => {
+test("a Boss message reads as the Boss speaking, with the prefix message_boss recognises", () => {
   const directive: Directive = { type: "boss_message", text: "hold the rollback", at: 1_000 };
-  assert.equal(bossMessageText(directive), "hold the rollback");
-  assert.equal(
-    renderDirectives([directive]),
-    "\n\nDIRECTIVES\nFROM THE BOSS: hold the rollback",
-  );
-});
-
-test("a legacy human_message row renders the same way a boss message does", () => {
-  // Built the way a real one arrives: `JSON.parse` of a `pending_directive`
-  // row written before the type was renamed. Nothing validates it on the way
-  // in, so the cast is what the runtime actually sees.
-  const legacy = JSON.parse(
-    JSON.stringify({ type: "human_message", from: "U1", text: "go ahead", ts: "1000.500000" }),
-  ) as Directive;
-  assert.notEqual(legacy.type, "boss_message", "the premise: this is not the new shape");
-
-  assert.equal(bossMessageText(legacy), "go ahead");
-  assert.equal(renderDirectives([legacy]), "\n\nDIRECTIVES\nFROM THE BOSS: go ahead");
-});
-
-test("a directive that is not the Boss speaking has no boss text", () => {
-  assert.equal(bossMessageText({ type: "stop", reason: "done" }), null);
-  assert.equal(bossMessageText({ type: "resumed_after", seconds: 60 }), null);
+  assert.equal(directiveText(directive), `${BOSS_SAYS}hold the rollback`);
+  assert.ok(directiveText(directive).startsWith(BOSS_SAYS));
+  assert.ok(!directiveText({ type: "resumed_after", seconds: 60 }).startsWith(BOSS_SAYS));
 });
 
 // These tests follow one wait across hours of fake clock, so they lift the
@@ -810,26 +946,20 @@ test("a monitor rung that tells the Boss does not stop the agent", async () => {
     },
   });
 
-  const tool = await createMonitorTool({
+  const tool = await monitorTool({
     probe: stalled,
     sleep: clock.sleep,
     now: clock.now,
     maxBlockSeconds: UNCAPPED,
     heartbeat: harness.deps,
   });
-  const out = await tool.execute(
-    "call-1",
-    { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, { ...PR_WAIT, intervalSeconds: 60, timeoutSeconds: 86_400 });
 
   // The Boss was told and the wait then ran out on its own deadline, so what
   // the model gets back is an ordinary timeout on an incident it still holds.
   assert.equal(harness.told.length, 1);
   assert.match(toolText(out), /^TIMED OUT after 86400s waiting for: the PR to be merged/);
-  assert.ok(!out.terminate);
+  assert.equal(out.control, undefined, "nothing asks the run to end");
 });
 
 test("working hours are a window in one zone, and a weekend is outside it", () => {
@@ -867,16 +997,16 @@ test("a working-hours spec is parsed, and a malformed one throws", () => {
 // message_boss
 // ---------------------------------------------------------------------------
 
-type FeedEntry = { directive: Directive; at?: number };
+type FeedEntry = { steer: string; at?: number };
 
 /**
  * The Boss's side of a question, faked end to end. The inbox is a list of
  * what was told and when, and `escalationsSince` is read back from it, which
  * is the property the real one has: the ladder's memory is the inbox itself.
  *
- * The directive feed is time-based and does not drain. An entry becomes
- * visible once the clock reaches its `at`, and `consumeDirective` is the one
- * removal, so a consumed directive really is gone from every later read.
+ * The feed is the conversation's inbox, by time: a steer becomes visible once
+ * the clock reaches its `at`, and the wait reads it between checks, the way
+ * `waitUntil` sees a steer committed while it sleeps.
  */
 const questionHarness = (args: {
   clock: { now: () => number; sleep: (ms: number) => Promise<void> };
@@ -884,6 +1014,7 @@ const questionHarness = (args: {
   priorEscalations?: number[];
   escalationFails?: boolean;
   feed?: FeedEntry[];
+  signal?: AbortSignal;
 }) => {
   const now = args.clock.now;
   let pending: PendingQuestion | null = args.pending ?? null;
@@ -892,9 +1023,8 @@ const questionHarness = (args: {
   const escalationTimes = [...(args.priorEscalations ?? [])];
   const sinceCalls: number[] = [];
   let markerCalls = 0;
-  const consumed = new Set<number>();
   const reads: number[] = [];
-  const entries = (args.feed ?? []).map((entry, index) => ({ id: index + 1, ...entry }));
+  const feed = args.feed ?? [];
 
   const marker: QuestionMarkerPort = {
     getPending: async () => {
@@ -931,24 +1061,35 @@ const questionHarness = (args: {
     },
   };
 
-  const peekDirectives = async (): Promise<PendingDirective[]> => {
+  const visible = (): string[] => {
     reads.push(now());
-    return entries
-      .filter((entry) => (entry.at ?? Number.NEGATIVE_INFINITY) <= now() && !consumed.has(entry.id))
-      .map(({ id, directive }) => ({ id, directive }));
+    return feed.filter((entry) => (entry.at ?? Number.NEGATIVE_INFINITY) <= now()).map((entry) => entry.steer);
+  };
+
+  // The same order as `waitUntil`: a steer already queued is seen after the
+  // first check, and one that lands during a pause ends the wait as soon as
+  // the pause does, before the next check runs.
+  const wait: Waiter = async (options) => {
+    const deadline = now() + options.timeoutMs;
+    let value;
+    let steers = visible();
+    for (;;) {
+      if (args.signal?.aborted) return { ended: "aborted", value, steers: [] };
+      const state = await options.check();
+      value = state.value;
+      if (state.done) return { ended: "met", value, steers: [] };
+      if (steers.length) return { ended: "inbox", value, steers };
+      if (now() >= deadline) return { ended: "timeout", value, steers: [] };
+      await args.clock.sleep(Math.min(options.intervalMs, Math.max(0, deadline - now())));
+      steers = visible();
+      if (steers.length) return { ended: "inbox", value, steers };
+    }
   };
 
   const deps: MessageBossDeps = {
     marker,
     boss,
-    api: {
-      peekDirectives,
-      consumeDirective: async (id) => {
-        events.push(`consume:${id}`);
-        consumed.add(id);
-      },
-    },
-    sleep: args.clock.sleep,
+    wait,
     now,
     maxBlockSeconds: UNCAPPED,
   };
@@ -957,29 +1098,27 @@ const questionHarness = (args: {
     deps,
     events,
     told,
-    escalations: () => told.filter((call) => call.kind === "escalation"),
+    escalations: () => told.filter((entry) => entry.kind === "escalation"),
     sinceCalls,
     reads,
-    consumed,
-    peekDirectives,
     pending: () => pending,
     markerCalls: () => markerCalls,
   };
 };
 
-const boss = (text: string, at = 0): Directive => ({ type: "boss_message", text, at });
+const boss = (text: string): string => directiveText({ type: "boss_message", text, at: 0 });
 
 test("message_boss without wait tells the Boss once and returns at once", async () => {
   for (const wait of [undefined, false]) {
     const clock = fakeClock();
-    const harness = questionHarness({ clock, feed: [{ directive: boss("never read") }] });
+    const harness = questionHarness({ clock, feed: [{ steer: boss("never read") }] });
 
     const result = await runMessageBoss(
       { message: "PR #2150 is up and needs a merge.", wait },
       harness.deps,
     );
 
-    assert.deepEqual(result, { answer: null, timedOut: false, directives: [], terminate: false });
+    assert.deepEqual(result, { answered: false, timedOut: false });
     assert.deepEqual(
       harness.told.map(({ kind, text }) => ({ kind, text })),
       [{ kind: "message", text: "PR #2150 is up and needs a merge." }],
@@ -987,7 +1126,6 @@ test("message_boss without wait tells the Boss once and returns at once", async 
     assert.equal(harness.markerCalls(), 0, "nothing is outstanding, so nothing is recorded");
     assert.equal(harness.reads.length, 0, "and nothing is waited for");
     assert.equal(clock.sleeps(), 0);
-    assert.equal(harness.consumed.size, 0, "a Boss message sitting in the queue is left for get_incident");
   }
 });
 
@@ -995,7 +1133,7 @@ test("a question goes to the Boss before the marker is written, then waits for t
   const clock = fakeClock();
   const harness = questionHarness({
     clock,
-    feed: [{ directive: boss("restarted it"), at: 1_000_000 + 90_000 }],
+    feed: [{ steer: boss("restarted it"), at: 1_000_000 + 90_000 }],
   });
 
   const result = await runMessageBoss(
@@ -1003,32 +1141,17 @@ test("a question goes to the Boss before the marker is written, then waits for t
     { ...harness.deps, pollSeconds: 30 },
   );
 
-  assert.deepEqual(result, {
-    answer: "restarted it",
-    timedOut: false,
-    directives: [],
-    terminate: false,
-  });
-  assert.deepEqual(harness.events, [
-    "getPending",
-    "tellBoss:question",
-    "recordPending",
-    "clearPending",
-    "consume:1",
-  ]);
+  assert.deepEqual(result, { answered: true, timedOut: false });
+  assert.deepEqual(harness.events, ["getPending", "tellBoss:question", "recordPending", "clearPending"]);
   assert.equal(harness.told[0].pendingWhenTold, null, "the marker did not exist when the Boss was asked");
-  assert.deepEqual(harness.reads.length, 4, "polled at 0, 30, 60 and 90 seconds");
+  assert.deepEqual(harness.reads.length, 4, "looked at 0, 30, 60 and 90 seconds");
   assert.equal(harness.pending(), null);
 });
 
 test("a resumed agent resumes waiting instead of asking twice", async () => {
   const clock = fakeClock();
   const marker = { message: "Can someone restart the worker?", askedAt: 999_000 };
-  const harness = questionHarness({
-    clock,
-    pending: marker,
-    feed: [{ directive: boss("done") }],
-  });
+  const harness = questionHarness({ clock, pending: marker, feed: [{ steer: boss("done") }] });
   assert.equal(harness.pending()?.message, "Can someone restart the worker?", "the premise: the marker matches");
 
   const result = await runMessageBoss(
@@ -1036,18 +1159,18 @@ test("a resumed agent resumes waiting instead of asking twice", async () => {
     harness.deps,
   );
 
-  assert.equal(result.answer, "done");
+  assert.equal(result.answered, true);
   assert.equal(harness.told.length, 0, "the question already reached the Boss once");
   assert.ok(!harness.events.includes("recordPending"));
 });
 
-test("a marker left by a killed run does not silence the next, different question", async () => {
+test("a marker left by a run that died does not silence the next, different question", async () => {
   const clock = fakeClock();
-  // SIGKILL mid-wait skips clearPending, so the marker outlives the question.
+  // A wait that died with its process never cleared its marker.
   const harness = questionHarness({
     clock,
     pending: { message: "can someone merge the PR?", askedAt: 900_000 },
-    feed: [{ directive: boss("rolled back"), at: 1_000_000 + 30_000 }],
+    feed: [{ steer: boss("rolled back"), at: 1_000_000 + 30_000 }],
   });
   assert.equal(harness.pending()?.message, "can someone merge the PR?", "the premise: a stale marker");
 
@@ -1061,108 +1184,33 @@ test("a marker left by a killed run does not silence the next, different questio
     [{ kind: "question", text: "should I roll back the deploy?" }],
   );
   assert.ok(harness.events.includes("recordPending"));
-  assert.equal(result.answer, "rolled back");
+  assert.equal(result.answered, true);
 });
 
-test("any word from the Boss ends the wait, whenever it was written", async () => {
-  const clock = fakeClock();
-  const harness = questionHarness({
-    clock,
-    pending: { message: "anyone?", askedAt: 1_000_000 },
-    feed: [{ directive: boss("stand down", 1) }],
-  });
-  const directive = harness.deps.api;
-  const before = await directive.peekDirectives();
-  assert.equal(before.length, 1);
-  assert.ok(
-    (before[0].directive as { at: number }).at < 1_000_000,
-    "the premise: the message is older than the question",
-  );
-
-  const result = await runMessageBoss({ message: "anyone?", wait: true }, harness.deps);
-
-  assert.equal(result.answer, "stand down");
-  assert.equal(result.terminate, false);
-});
-
-test("a legacy human_message ends the wait as the Boss's answer", async () => {
-  const clock = fakeClock();
-  const legacy = JSON.parse(
-    JSON.stringify({ type: "human_message", from: "U1", text: "go ahead", ts: "1000.500000" }),
-  ) as Directive;
-  assert.notEqual(legacy.type, "boss_message", "the premise: this is the old shape");
-  const harness = questionHarness({ clock, feed: [{ directive: legacy }] });
-
-  const result = await runMessageBoss({ message: "may I restart it?", wait: true }, harness.deps);
-
-  assert.equal(result.answer, "go ahead");
-  assert.deepEqual([...harness.consumed], [1]);
-  assert.deepEqual(result.directives, []);
-});
-
-test("several Boss messages are one answer, and all of them are consumed", async () => {
+test("several Boss messages are one answer", async () => {
   const clock = fakeClock();
   const harness = questionHarness({
     clock,
     feed: [
-      { directive: boss("yes, roll it back") },
-      { directive: { type: "resumed_after", seconds: 420 } },
-      { directive: boss("and tell me when it is done") },
+      { steer: boss("yes, roll it back") },
+      { steer: directiveText({ type: "resumed_after", seconds: 420 }) },
+      { steer: boss("and tell me when it is done") },
     ],
   });
 
   const result = await runMessageBoss({ message: "roll back?", wait: true }, harness.deps);
 
-  assert.equal(result.answer, "yes, roll it back\n\nand tell me when it is done");
-  assert.deepEqual([...harness.consumed].sort(), [1, 3]);
-  assert.deepEqual(
-    await harness.peekDirectives(),
-    [{ id: 2, directive: { type: "resumed_after", seconds: 420 } }],
-    "get_incident would otherwise deliver the second half as a fresh instruction",
-  );
+  assert.deepEqual(result, { answered: true, timedOut: false });
+  assert.equal(harness.pending(), null);
 });
 
-test("the marker is cleared before the answer is consumed", async () => {
-  const clock = fakeClock();
-  const harness = questionHarness({ clock, feed: [{ directive: boss("a") }, { directive: boss("b") }] });
-
-  await runMessageBoss({ message: "?", wait: true }, harness.deps);
-
-  const clearAt = harness.events.indexOf("clearPending");
-  assert.ok(clearAt >= 0);
-  assert.deepEqual(harness.events.slice(clearAt), ["clearPending", "consume:1", "consume:2"]);
-});
-
-test("directives that are not the answer are handed back and left in the queue", async () => {
+test("a steer that is not the Boss ends the wait without answering it", async () => {
+  // The deadline, the turn budget, new signals: all of them have to reach the
+  // model now, and none of them is the answer, so the question stays open.
   const clock = fakeClock();
   const harness = questionHarness({
     clock,
-    feed: [
-      { directive: { type: "resumed_after", seconds: 420 } },
-      { directive: { type: "new_signals", count: 2, summary: "two more 500s" } },
-      { directive: boss("on it") },
-    ],
-  });
-
-  const result = await runMessageBoss({ message: "anyone?", wait: true }, harness.deps);
-
-  assert.equal(result.answer, "on it");
-  assert.deepEqual(result.directives, [
-    { type: "resumed_after", seconds: 420 },
-    { type: "new_signals", count: 2, summary: "two more 500s" },
-  ]);
-  assert.deepEqual([...harness.consumed], [3], "only the answer, by id");
-  assert.deepEqual((await harness.peekDirectives()).map((entry) => entry.id), [1, 2]);
-});
-
-test("directives other than an answer or an end do not end the wait", async () => {
-  const clock = fakeClock();
-  const harness = questionHarness({
-    clock,
-    feed: [
-      { directive: { type: "new_signals", count: 1, summary: "one more" }, at: 1_000_000 },
-      { directive: boss("ok"), at: 1_000_000 + 120_000 },
-    ],
+    feed: [{ steer: directiveText({ type: "new_signals", count: 1, summary: "one more" }), at: 1_000_000 + 60_000 }],
   });
 
   const result = await runMessageBoss(
@@ -1170,60 +1218,14 @@ test("directives other than an answer or an end do not end the wait", async () =
     { ...harness.deps, pollSeconds: 30 },
   );
 
-  assert.equal(harness.reads.length, 5, "the new signals were seen on four polls and did not end it");
-  assert.equal(result.answer, "ok");
-  assert.deepEqual(result.directives, [{ type: "new_signals", count: 1, summary: "one more" }]);
-});
-
-test("a stop ends the wait and the run", async () => {
-  const clock = fakeClock();
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: { type: "stop", reason: "a human took it" }, at: 1_000_000 + 60_000 }],
-  });
-
-  const result = await runMessageBoss(
-    { message: "anyone?", wait: true },
-    { ...harness.deps, pollSeconds: 30 },
-  );
-
-  assert.ok(harness.events.includes("recordPending"), "the premise: a question was outstanding");
-  assert.deepEqual(result, {
-    answer: null,
-    timedOut: false,
-    directives: [{ type: "stop", reason: "a human took it" }],
-    terminate: true,
-  });
-  assert.equal(harness.pending(), null);
-  assert.equal(harness.consumed.size, 0, "a stop is get_incident's to deliver, not the wait's to eat");
-});
-
-test("a merged directive ends the wait rather than being swallowed by it", async () => {
-  const clock = fakeClock();
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: { type: "merged", into: "inc-9" }, at: 1_000_000 + 30_000 }],
-  });
-
-  const result = await runMessageBoss(
-    { message: "can someone merge the PR?", wait: true },
-    { ...harness.deps, pollSeconds: 30 },
-  );
-
-  assert.equal(harness.reads.length, 2);
-  assert.equal(result.terminate, true);
-  assert.equal(result.answer, null);
-  assert.deepEqual(result.directives, [{ type: "merged", into: "inc-9" }]);
-  assert.equal(harness.pending(), null);
+  assert.deepEqual(result, { answered: false, timedOut: false, interrupted: true });
+  assert.notEqual(harness.pending(), null, "the question is still outstanding, so calling again resumes it");
 });
 
 test("a wait shorter than the floor is raised to it, not escalated early", async () => {
   const clock = fakeClock();
   const start = clock.now();
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: boss("here"), at: start + 900_000 }],
-  });
+  const harness = questionHarness({ clock, feed: [{ steer: boss("here"), at: start + 900_000 }] });
 
   await runMessageBoss(
     { message: "anyone?", wait: true, seconds: 60 },
@@ -1232,10 +1234,7 @@ test("a wait shorter than the floor is raised to it, not escalated early", async
 
   // Ten minutes, not one: the model cannot shorten its way out of the
   // escalation by asking for a wait nobody could answer inside.
-  assert.deepEqual(
-    harness.escalations().map((call) => (call.at - start) / 1000),
-    [600],
-  );
+  assert.deepEqual(harness.escalations().map((entry) => (entry.at - start) / 1000), [600]);
   assert.ok(harness.reads.some((at) => at - start === 60_000), "the premise: the requested minute was polled through");
 });
 
@@ -1244,16 +1243,13 @@ test("the default floor is MESSAGE_BOSS_MIN_WAIT_SECONDS", async () => {
   const start = clock.now();
   const harness = questionHarness({
     clock,
-    feed: [{ directive: boss("here"), at: start + (MESSAGE_BOSS_MIN_WAIT_SECONDS + 60) * 1000 }],
+    feed: [{ steer: boss("here"), at: start + (MESSAGE_BOSS_MIN_WAIT_SECONDS + 60) * 1000 }],
   });
 
-  await runMessageBoss(
-    { message: "anyone?", wait: true, seconds: 5 },
-    { ...harness.deps, pollSeconds: 60 },
-  );
+  await runMessageBoss({ message: "anyone?", wait: true, seconds: 5 }, { ...harness.deps, pollSeconds: 60 });
 
   assert.deepEqual(
-    harness.escalations().map((call) => (call.at - start) / 1000),
+    harness.escalations().map((entry) => (entry.at - start) / 1000),
     [MESSAGE_BOSS_MIN_WAIT_SECONDS],
   );
 });
@@ -1261,29 +1257,26 @@ test("the default floor is MESSAGE_BOSS_MIN_WAIT_SECONDS", async () => {
 test("a longer requested wait is honoured", async () => {
   const clock = fakeClock();
   const start = clock.now();
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: boss("here"), at: start + 3_000_000 }],
-  });
+  const harness = questionHarness({ clock, feed: [{ steer: boss("here"), at: start + 3_000_000 }] });
 
   await runMessageBoss(
     { message: "anyone?", wait: true, seconds: 2400 },
     { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
   );
 
-  assert.deepEqual(harness.escalations().map((call) => (call.at - start) / 1000), [2400]);
+  assert.deepEqual(harness.escalations().map((entry) => (entry.at - start) / 1000), [2400]);
 });
 
-test("the escalation clock runs from the question, not from this process", async () => {
+test("the escalation clock runs from the question, not from this call", async () => {
   const clock = fakeClock();
   const start = clock.now();
   // A marker 700 seconds old: the agent asked, the container died, and the
-  // replacement replays the call. A fresh wait here would let a crash loop
-  // defer the escalation for as long as the crashes last.
+  // call runs again. A fresh wait here would let a crash loop defer the
+  // escalation for as long as the crashes last.
   const harness = questionHarness({
     clock,
     pending: { message: "anyone?", askedAt: start - 700_000 },
-    feed: [{ directive: boss("here"), at: start + 60_000 }],
+    feed: [{ steer: boss("here"), at: start + 60_000 }],
   });
 
   await runMessageBoss(
@@ -1291,12 +1284,8 @@ test("the escalation clock runs from the question, not from this process", async
     { ...harness.deps, pollSeconds: 60, minWaitSeconds: 600 },
   );
 
-  assert.equal(harness.told.filter((call) => call.kind === "question").length, 0, "the premise: this is a resume");
-  assert.deepEqual(
-    harness.escalations().map((call) => call.at - start),
-    [0],
-    "already past the budget on the first poll",
-  );
+  assert.equal(harness.told.filter((entry) => entry.kind === "question").length, 0, "the premise: this is a resume");
+  assert.deepEqual(harness.escalations().map((entry) => entry.at - start), [0], "already past the budget on the first poll");
   assert.deepEqual(harness.sinceCalls, [start - 700_000], "the inbox is read from when it was asked");
   assert.match(harness.escalations()[0].text, /in 12m and I am still blocked/);
 });
@@ -1305,10 +1294,7 @@ test("an unanswered question escalates with the question whole, and the wait car
   const clock = fakeClock();
   const start = clock.now();
   const question = `${"q".repeat(20_000)}\nWhich of the two rollbacks is safe?`;
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: boss("the second one"), at: start + 900_000 }],
-  });
+  const harness = questionHarness({ clock, feed: [{ steer: boss("the second one"), at: start + 900_000 }] });
 
   const result = await runMessageBoss(
     { message: question, wait: true },
@@ -1321,25 +1307,14 @@ test("an unanswered question escalates with the question whole, and the wait car
   assert.ok(escalations[0].text.includes(question), "the question goes to the Boss whole");
   assert.match(escalations[0].text, /Nobody has answered my question in 10m/);
   assert.doesNotMatch(escalations[0].text, /truncat|elided|…/);
-  assert.ok(
-    harness.reads.some((at) => at > escalations[0].at),
-    "polling went on after the escalation",
-  );
-  assert.deepEqual(result, {
-    answer: "the second one",
-    timedOut: false,
-    directives: [],
-    terminate: false,
-  });
+  assert.ok(harness.reads.some((at) => at > escalations[0].at), "polling went on after the escalation");
+  assert.deepEqual(result, { answered: true, timedOut: false });
 });
 
 test("an unanswered question re-escalates on a doubling gap read from the inbox", async () => {
   const clock = fakeClock();
   const start = clock.now();
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: boss("finally"), at: start + 10_000_000 }],
-  });
+  const harness = questionHarness({ clock, feed: [{ steer: boss("finally"), at: start + 10_000_000 }] });
 
   await runMessageBoss(
     { message: "anyone?", wait: true },
@@ -1347,20 +1322,14 @@ test("an unanswered question re-escalates on a doubling gap read from the inbox"
   );
 
   // 600s to the first, then gaps of 1200, 2400 and 4800.
-  assert.deepEqual(
-    harness.escalations().map((call) => (call.at - start) / 1000),
-    [600, 1800, 4200, 9000],
-  );
-  assert.ok(harness.escalations().every((call) => call.pendingWhenTold !== null));
+  assert.deepEqual(harness.escalations().map((entry) => (entry.at - start) / 1000), [600, 1800, 4200, 9000]);
+  assert.ok(harness.escalations().every((entry) => entry.pendingWhenTold !== null));
 });
 
 test("the re-escalation gap stops at the ceiling", async () => {
   const clock = fakeClock();
   const start = clock.now();
-  const harness = questionHarness({
-    clock,
-    feed: [{ directive: boss("finally"), at: start + 7_000_000 }],
-  });
+  const harness = questionHarness({ clock, feed: [{ steer: boss("finally"), at: start + 7_000_000 }] });
 
   await runMessageBoss(
     { message: "anyone?", wait: true },
@@ -1368,10 +1337,7 @@ test("the re-escalation gap stops at the ceiling", async () => {
   );
 
   // 600, then gaps of 1200, 1800, 1800, 1800.
-  assert.deepEqual(
-    harness.escalations().map((call) => (call.at - start) / 1000),
-    [600, 1800, 3600, 5400],
-  );
+  assert.deepEqual(harness.escalations().map((entry) => (entry.at - start) / 1000), [600, 1800, 3600, 5400]);
 });
 
 test("a restart that finds a recent escalation does not escalate again at once", async () => {
@@ -1382,7 +1348,7 @@ test("a restart that finds a recent escalation does not escalate again at once",
       clock,
       pending: { message: "anyone?", askedAt: start - 700_000 },
       priorEscalations,
-      feed: [{ directive: boss("here"), at: start + 1_000_000 }],
+      feed: [{ steer: boss("here"), at: start + 1_000_000 }],
     });
     await runMessageBoss(
       { message: "anyone?", wait: true },
@@ -1395,7 +1361,7 @@ test("a restart that finds a recent escalation does not escalate again at once",
   // escalates on the first poll, which is what makes the case below mean
   // something.
   const control = await run([]);
-  assert.deepEqual(control.harness.escalations().map((call) => call.at - control.start), [0]);
+  assert.deepEqual(control.harness.escalations().map((entry) => entry.at - control.start), [0]);
 
   // One went up 100 seconds ago, before the restart. The next is owed 1200
   // seconds after it, which is past the answer.
@@ -1410,7 +1376,7 @@ test("a failed escalation costs the escalation, not the wait", async () => {
   const harness = questionHarness({
     clock,
     escalationFails: true,
-    feed: [{ directive: boss("here"), at: start + 720_000 }],
+    feed: [{ steer: boss("here"), at: start + 720_000 }],
   });
 
   const result = await runMessageBoss(
@@ -1419,133 +1385,114 @@ test("a failed escalation costs the escalation, not the wait", async () => {
   );
 
   assert.ok(harness.escalations().length > 0, "the premise: the escalation was tried and threw");
-  assert.equal(result.answer, "here");
-  assert.equal(result.timedOut, false);
+  assert.deepEqual(result, { answered: true, timedOut: false });
 });
 
-test("the harness deadline clears the marker and ends the wait without escalating", async () => {
+test("an aborted run clears the marker and ends the wait without escalating", async () => {
   const clock = fakeClock();
   const start = clock.now();
-  const deadline = new AbortController();
-  deadline.abort();
-  // Long past its escalation point, so an escalation here would be due.
+  const stop = new AbortController();
+  stop.abort();
+  // Long past its escalation point, so an escalation here would be due. An
+  // abort is a stop or the hard deadline, which have their own path to the
+  // Boss, and escalating here would spend the turn a brief needs.
   const harness = questionHarness({
     clock,
     pending: { message: "anyone?", askedAt: start - 7_200_000 },
-    feed: [{ directive: { type: "new_signals", count: 1, summary: "one more" } }],
+    signal: stop.signal,
   });
   assert.ok(harness.pending(), "the premise: a question is outstanding");
 
   const result = await runMessageBoss(
     { message: "anyone?", wait: true },
-    { ...harness.deps, minWaitSeconds: 600, signal: deadline.signal },
+    { ...harness.deps, minWaitSeconds: 600 },
   );
 
-  assert.deepEqual(result, {
-    answer: null,
-    timedOut: true,
-    directives: [{ type: "new_signals", count: 1, summary: "one more" }],
-    terminate: false,
-  });
+  assert.deepEqual(result, { answered: false, timedOut: true });
   assert.equal(harness.pending(), null);
-  // The run steers the model to write a real brief inside the grace window.
-  // Escalating here would spend the turn that brief needs.
   assert.equal(harness.escalations().length, 0);
-  assert.equal(harness.reads.length, 1);
 });
 
-test("the message_boss tool says the message was sent, and does not end the run", async () => {
+test("the message_boss tool says the message was sent, once, even when it runs again", async () => {
   const clock = fakeClock();
   const harness = questionHarness({ clock });
-  const tool = await createMessageBossTool(harness.deps);
+  const tool = await createMessageBossTool({ resolve: async () => harness.deps });
+  const fake = fakeCall();
 
-  const out = await tool.execute(
-    "call-1",
-    { message: "PR is up" } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
-
-  assert.equal(toolText(out), "Sent to the Boss.");
-  assert.equal(out.terminate, false);
+  assert.equal(toolText(await call(tool, { message: "PR is up" }, { api: fake.api })), "Sent to the Boss.");
+  // The same call rerun after a crash: the memo says it already went.
+  assert.equal(toolText(await call(tool, { message: "PR is up" }, { api: fake.api })), "Sent to the Boss.");
   assert.equal(harness.told.length, 1);
 });
 
-test("the message_boss tool hands back the answer and renders what else arrived", async () => {
+test("the message_boss tool says the Boss answered, and does not repeat the answer", async () => {
   const clock = fakeClock();
-  const harness = questionHarness({
-    clock,
-    feed: [
-      { directive: { type: "new_signals", count: 2, summary: "two more 500s" } },
-      { directive: boss("yes, restart it") },
-    ],
-  });
-  const tool = await createMessageBossTool(harness.deps);
+  const harness = questionHarness({ clock, feed: [{ steer: boss("yes, restart it") }] });
+  const tool = await createMessageBossTool({ resolve: async () => harness.deps });
 
-  const out = await tool.execute(
-    "call-1",
-    { message: "can I restart the worker?", wait: true } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, { message: "can I restart the worker?", wait: true });
 
-  assert.equal(
-    toolText(out),
-    "The Boss answered: yes, restart it\n\nDIRECTIVES\nNEW SIGNALS (2): two more 500s",
-  );
-  assert.equal(out.terminate, false);
+  assert.equal(toolText(out), "The Boss answered. Its message is the next one you read.");
+  assert.doesNotMatch(toolText(out), /yes, restart it/, "the steer delivers it; saying it twice reads as two instructions");
 });
 
-test("the message_boss tool stops the agent on a terminating directive", async () => {
+test("the message_boss tool, interrupted by something else, says how to keep waiting", async () => {
   const clock = fakeClock();
-  const harness = questionHarness({ clock, feed: [{ directive: { type: "merged", into: "inc-9" } }] });
-  const tool = await createMessageBossTool(harness.deps);
+  const harness = questionHarness({ clock, feed: [{ steer: "Your wall-clock deadline has expired." }] });
+  const tool = await createMessageBossTool({ resolve: async () => harness.deps });
 
-  const out = await tool.execute(
-    "call-1",
-    { message: "anyone?", wait: true } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, { message: "anyone?", wait: true });
 
-  assert.equal(out.terminate, true);
-  assert.equal(
-    toolText(out),
-    "The wait ended on a directive rather than an answer.\n\nDIRECTIVES\nMERGED: this incident is now part of inc-9. Stop work and exit.",
-  );
+  assert.match(toolText(out), /^Stopped waiting for the Boss's answer \(interrupted\)/);
+  assert.match(toolText(out), /call message_boss again with the same message and wait: true/);
 });
 
-test("message_boss honours the harness deadline alongside pi's signal", async () => {
+test("a blocked merge ask is not sent, and the judge's spend is the tool's", async () => {
   const clock = fakeClock();
-  const deadline = new AbortController();
-  deadline.abort();
   const harness = questionHarness({ clock });
-  const tool = await createMessageBossTool({ ...harness.deps, signal: deadline.signal });
+  const usage = {
+    input: 10,
+    output: 2,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 12,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+  };
+  const tool = await createMessageBossTool({
+    resolve: async () => ({ ...harness.deps, checkIn: async () => ({ blocked: "NOT MET: no green CI", usage }) }),
+  });
 
-  const piSignal = new AbortController().signal;
-  assert.equal(piSignal.aborted, false);
-  const out = await tool.execute(
-    "call-1",
-    { message: "anyone?", wait: true } as never,
-    piSignal,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, { message: "please merge omni#1" });
 
-  assert.equal(toolText(out), "Your deadline ended this wait. Escalate now, with a brief.");
-  assert.equal((out.details as { timedOut: boolean }).timedOut, true);
-  assert.equal(out.terminate, false);
-  assert.ok(harness.events.includes("recordPending"), "the premise: the question was outstanding");
-  assert.equal(harness.pending(), null);
-  assert.equal(harness.escalations().length, 0, "the deadline is its own escalation path");
+  assert.equal(toolText(out), "Not sent to the Boss. NOT MET: no green CI");
+  assert.deepEqual(out.usage, usage);
+  assert.equal(harness.told.length, 0);
 });
 
-test("a replayed monitor call from before waitingFor existed still resumes", async () => {
+test("a passed check-in is not judged again when the call runs again", async () => {
+  const clock = fakeClock();
+  const harness = questionHarness({ clock });
+  let judged = 0;
+  const tool = await createMessageBossTool({
+    resolve: async () => ({
+      ...harness.deps,
+      checkIn: async () => {
+        judged += 1;
+        return { blocked: null, usage: undefined };
+      },
+    }),
+  });
+  const fake = fakeCall();
+
+  await call(tool, { message: "please merge omni#1" }, { api: fake.api });
+  await call(tool, { message: "please merge omni#1" }, { api: fake.api });
+
+  assert.equal(judged, 1, "the judgement is a paid model call, and a rerun resumes past it");
+});
+
+test("a monitor call recorded before waitingFor existed still runs", async () => {
   let probes = 0;
-  const tool = await createMonitorTool({
+  const tool = await monitorTool({
     probe: async () => {
       probes += 1;
       return { code: 0, output: "" };
@@ -1555,13 +1502,7 @@ test("a replayed monitor call from before waitingFor existed still resumes", asy
     (tool.parameters as { required?: string[] }).required?.includes("waitingFor"),
     "the premise: the model is required to give one",
   );
-  const out = await tool.execute(
-    "c1",
-    { command: "true", intervalSeconds: 1, timeoutSeconds: 1, description: "x" } as never,
-    new AbortController().signal,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, { command: "true", intervalSeconds: 1, timeoutSeconds: 1, description: "x" });
   assert.doesNotMatch(toolText(out), /^Rejected/);
   assert.equal(probes, 1, "the recorded wait ran its check");
 });
@@ -1574,15 +1515,15 @@ test("a monitor asked for four hours returns inside the cache TTL and says it wa
   assert.ok(MAX_BLOCK_SECONDS < 3600, "the premise: the cap is under the one-hour cache TTL");
   const clock = fakeClock();
   const started = clock.now();
-  const tool = await createMonitorTool({ probe: stalled, sleep: clock.sleep, now: clock.now });
+  const tool = await monitorTool({ probe: stalled, sleep: clock.sleep, now: clock.now });
 
-  const out = await tool.execute(
-    "call-1",
-    { command: "check", intervalSeconds: 300, timeoutSeconds: 14_400, description: "the ratio to settle", waitingFor: "the ratio to settle" } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, {
+    command: "check",
+    intervalSeconds: 300,
+    timeoutSeconds: 14_400,
+    description: "the ratio to settle",
+    waitingFor: "the ratio to settle",
+  });
 
   assert.ok(clock.now() - started <= MAX_BLOCK_SECONDS * 1000, "waited no longer than the cap");
   assert.equal(clock.now() - started, MAX_BLOCK_SECONDS * 1000, "and did not give up early either");
@@ -1651,15 +1592,11 @@ test("a question with no answer returns at the cap and keeps its marker", async 
   const clock = fakeClock();
   const started = clock.now();
   const harness = questionHarness({ clock });
-  const tool = await createMessageBossTool({ ...harness.deps, maxBlockSeconds: MAX_BLOCK_SECONDS });
+  const tool = await createMessageBossTool({
+    resolve: async () => ({ ...harness.deps, maxBlockSeconds: MAX_BLOCK_SECONDS }),
+  });
 
-  const out = await tool.execute(
-    "call-1",
-    { message: "Can someone merge omni#2192?", wait: true, seconds: 86_400 } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
+  const out = await call(tool, { message: "Can someone merge omni#2192?", wait: true, seconds: 86_400 });
 
   assert.ok(clock.now() - started <= MAX_BLOCK_SECONDS * 1000);
   assert.match(toolText(out), /^No answer yet\. This call was capped at 3300s/);
@@ -1667,15 +1604,9 @@ test("a question with no answer returns at the cap and keeps its marker", async 
   assert.equal((out.details as { timedOut: boolean }).timedOut, false);
   assert.notEqual(harness.pending(), null, "the question is still outstanding");
 
-  await tool.execute(
-    "call-2",
-    { message: "Can someone merge omni#2192?", wait: true, seconds: 86_400 } as never,
-    undefined,
-    undefined,
-    {} as never,
-  );
+  await call(tool, { message: "Can someone merge omni#2192?", wait: true, seconds: 86_400 });
   assert.equal(
-    harness.told.filter((call) => call.kind === "question").length,
+    harness.told.filter((entry) => entry.kind === "question").length,
     1,
     "re-arming does not ask the Boss twice",
   );

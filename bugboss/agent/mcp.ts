@@ -1,4 +1,5 @@
-// A minimal MCP stdio client, because Pi has no MCP support of its own.
+// A minimal MCP stdio client, because Pi has no MCP support of its own. One
+// server process serves every incident agent in the Boss.
 //
 // It exists for the Grafana MCP server, whose tools encode real query-building
 // knowledge that the model would otherwise have to reinvent as hand-written
@@ -19,9 +20,9 @@
 // 30 days returns one number after reading 149 GB.
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-
 import { makeAlarm, makeLog } from "../logging";
+import type { ToolRegistration } from "./harness";
+import { pickBaseEnv } from "./shell-env";
 
 const log = makeLog("mcp");
 
@@ -50,7 +51,7 @@ export interface McpToolSpec {
 }
 
 export interface McpToolset {
-  tools: ToolDefinition[];
+  tools: ToolRegistration[];
   close: () => void;
 }
 
@@ -331,26 +332,55 @@ export const selectAllowedTools = (
   };
 };
 
+/**
+ * One server process for every incident agent in the Boss, so its death is
+ * everybody's: it is respawned on the next call rather than left dead until a
+ * deploy. The tool list is what was listed at connect, because the tools are
+ * installed once in the registry and ride in every conversation's prefix.
+ */
 class StdioClient {
-  private child: ChildProcessWithoutNullStreams;
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private ready: Promise<void> | null = null;
   private buffer = "";
   private nextId = 1;
   private pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
   >();
+  private closed = false;
 
   constructor(
     private config: McpServerConfig,
     private timeoutMs: number,
-  ) {
-    this.child = spawn(config.command, config.args, {
-      env: { ...process.env, ...config.env },
+  ) {}
+
+  private spawnChild(): ChildProcessWithoutNullStreams {
+    this.buffer = "";
+    // The Boss's own environment holds BUGBOSS_SECRETS, so the server gets
+    // the allowlisted essentials and its own configuration, nothing else.
+    const child = spawn(this.config.command, this.config.args, {
+      env: { ...pickBaseEnv(process.env), ...this.config.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    this.child.stdout.setEncoding("utf8");
-    this.child.stdout.on("data", (chunk: string) => this.onData(chunk));
-    this.child.on("exit", () => this.failAll(new Error(`${config.name} MCP server exited`)));
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => this.onData(chunk));
+    child.stdin.on("error", () => {});
+    child.on("exit", (code, signal) => {
+      if (this.child !== child) return;
+      this.child = null;
+      this.ready = null;
+      this.failAll(new Error(`${this.config.name} MCP server exited`));
+      if (!this.closed) {
+        alarm("mcp_server_exited", {
+          server: this.config.name,
+          code,
+          signal,
+          note: "respawned on the next call",
+        });
+      }
+    });
+    this.child = child;
+    return child;
   }
 
   private onData(chunk: string): void {
@@ -385,11 +415,11 @@ class StdioClient {
     this.pending.clear();
   }
 
-  notify(method: string, params?: unknown): void {
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  private write(child: ChildProcessWithoutNullStreams, message: unknown): void {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  request(method: string, params?: unknown): Promise<unknown> {
+  private send(child: ChildProcessWithoutNullStreams, method: string, params?: unknown): Promise<unknown> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -397,13 +427,48 @@ class StdioClient {
         reject(new Error(`${this.config.name} MCP ${method} timed out`));
       }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      this.write(child, { jsonrpc: "2.0", id, method, params });
     });
   }
 
+  /** A live, initialized server, spawning one if the last has died. */
+  private ensure(): Promise<ChildProcessWithoutNullStreams> {
+    if (this.closed) return Promise.reject(new Error(`${this.config.name} MCP server closed`));
+    if (this.child && this.ready) {
+      const child = this.child;
+      return this.ready.then(() => child);
+    }
+    const child = this.spawnChild();
+    const ready = (async () => {
+      await this.send(child, "initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "bugboss-incident-agent", version: "1" },
+      });
+      this.write(child, { jsonrpc: "2.0", method: "notifications/initialized" });
+    })();
+    this.ready = ready;
+    ready.catch(() => {
+      if (this.child === child) {
+        this.child = null;
+        this.ready = null;
+        child.kill();
+      }
+    });
+    return ready.then(() => child);
+  }
+
+  async request(method: string, params?: unknown): Promise<unknown> {
+    const child = await this.ensure();
+    return this.send(child, method, params);
+  }
+
   close(): void {
+    this.closed = true;
     this.failAll(new Error(`${this.config.name} MCP server closed`));
-    this.child.kill();
+    this.child?.kill();
+    this.child = null;
+    this.ready = null;
   }
 }
 
@@ -413,13 +478,6 @@ export const connectMcpToolset = async (
   const { Type } = await import("typebox");
   const timeoutMs = config.requestTimeoutMs ?? 120000;
   const client = new StdioClient(config, timeoutMs);
-
-  await client.request("initialize", {
-    protocolVersion: "2025-06-18",
-    capabilities: {},
-    clientInfo: { name: "bugboss-incident-agent", version: "1" },
-  });
-  client.notify("notifications/initialized");
 
   const listed = (await client.request("tools/list")) as { tools?: McpToolSpec[] };
   const specs = [...(listed.tools ?? [])].sort((a, b) =>
@@ -440,7 +498,7 @@ export const connectMcpToolset = async (
     alarm("mcp_tools_missing", { server: config.name, tools: selection.missing });
   }
 
-  const tools = selection.allowed.map((spec) => {
+  const tools = selection.allowed.map((spec): ToolRegistration => {
     const parameters = Type.Unsafe<Record<string, unknown>>(
       stripSchemaKeyword(spec.inputSchema),
     );
@@ -450,11 +508,13 @@ export const connectMcpToolset = async (
       : "";
     return {
       name: sanitizeToolName(config.name, spec.name),
-      label: spec.name,
       description: `${spec.description ?? spec.name}${bound}`,
       parameters,
-      execute: async (_toolCallId: string, params: unknown) => {
-        const given = (params ?? {}) as Record<string, unknown>;
+      // Reads only, so a call a restart interrupted is simply asked again.
+      replay: "safe",
+      outputLimits: { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER },
+      execute: async (args) => {
+        const given = (args ?? {}) as Record<string, unknown>;
         const clamped = shape
           ? clampTimeRange(given, shape, Date.now())
           : { arguments: given, notice: null };
@@ -471,10 +531,9 @@ export const connectMcpToolset = async (
           content: [
             { type: "text" as const, text: `${notice}${mcpResultToText(result)}` },
           ],
-          details: undefined,
         };
       },
-    } as unknown as ToolDefinition;
+    };
   });
 
   return { tools, close: () => client.close() };

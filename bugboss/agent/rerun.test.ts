@@ -1,15 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
-import { Db } from "../db";
-import { createMemoryS3 } from "../index";
-import { createToolApiRoutes } from "../http/toolapi";
-import { mintAgentToken } from "../toolapi";
-import { createBossClient } from "./run";
-import type { BossInboxKind, ToolApi } from "../types";
+import type { BossInboxKind } from "../types";
+import { loadPi, type ToolExecutionApi } from "./harness";
 import {
   MAX_RERUNS_PER_INCIDENT,
   createGitHubRunsPort,
@@ -22,7 +15,6 @@ import {
   type GitHubRunsPort,
   type WorkflowRunView,
 } from "./rerun";
-import { unseenByBoss } from "../boss/inbox";
 
 const aRun = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView => ({
   id: 42,
@@ -410,26 +402,52 @@ test("the port calls the documented endpoints with the current token", async () 
 
 type Tool = Awaited<ReturnType<typeof createRerunCiTool>>;
 
-/** The four trailing arguments Pi passes and this tool ignores. */
-const call = async (tool: Tool, params: object): Promise<string> => {
-  const result = await tool.execute("call-1", params as never, undefined, undefined, {} as never);
-  return result.content
+/** A tool call's api, with its memos in a map the test can carry across a "restart". */
+const fakeApi = (memos = new Map<string, unknown>()) =>
+  ({
+    memo: async (name: string, ...rest: unknown[]) => {
+      if (rest.length === 2) {
+        if (!memos.has(name)) memos.set(name, rest[0]);
+        return memos.get(name);
+      }
+      return memos.get(name);
+    },
+  }) as unknown as ToolExecutionApi;
+
+const call = async (tool: Tool, params: object, api = fakeApi()): Promise<string> => {
+  const result = await tool.execute(params as never, api, (await loadPi()).context);
+  return (result.content ?? [])
     .map((part) => (part.type === "text" ? part.text : ""))
     .join("\n");
 };
 
-test("the tool keeps one budget ledger for the life of the process", async () => {
+const toolFor = (h: Harness, incidentId = "7") =>
+  createRerunCiTool({ github: h.github, incidentFor: async () => ({ incidentId, boss: h.boss }) });
+
+test("the tool keeps one budget ledger per incident for the life of the process", async () => {
   const h = harness();
-  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
+  const ledgerOf: Record<string, string> = {};
+  const tool = await createRerunCiTool({
+    github: h.github,
+    incidentFor: async (api) => ({ incidentId: ledgerOf[String((api as unknown as { id: string }).id)], boss: h.boss }),
+  });
+  const apiFor = (incidentId: string) => {
+    const api = fakeApi() as unknown as { id: string };
+    api.id = incidentId;
+    ledgerOf[incidentId] = incidentId;
+    return api as unknown as ToolExecutionApi;
+  };
 
   for (let i = 0; i < MAX_RERUNS_PER_INCIDENT; i += 1) {
-    await call(tool, { ...args, runId: 200 + i });
+    await call(tool, { ...args, runId: 200 + i }, apiFor("7"));
   }
-  const refused = await call(tool, { ...args, runId: 500 });
+  const refused = await call(tool, { ...args, runId: 500 }, apiFor("7"));
+  const otherIncident = await call(tool, { ...args, runId: 600 }, apiFor("8"));
 
-  assert.equal(h.reruns.length, MAX_RERUNS_PER_INCIDENT);
+  assert.equal(h.reruns.length, MAX_RERUNS_PER_INCIDENT + 1);
   assert.match(refused, /Nothing was re-run/);
   assert.match(refused, /grinding a pull request to green/);
+  assert.match(otherIncident, /one attempt you get on this run/, "another incident's budget is its own");
 });
 
 test("the tool result for a 403 reaches the model with the permission named", async () => {
@@ -441,9 +459,7 @@ test("the tool result for a 403 reaches the model with the permission named", as
       acceptedPermissions: "actions=write",
     },
   });
-  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
-
-  const text = await call(tool, args);
+  const text = await call(await toolFor(h), args);
 
   assert.match(text, /Nothing was re-run/);
   assert.match(text, /actions=write/);
@@ -452,24 +468,53 @@ test("the tool result for a 403 reaches the model with the permission named", as
 
 test("a successful tool call tells the model the flake is still a defect", async () => {
   const h = harness();
-  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
-
-  const text = await call(tool, args);
+  const text = await call(await toolFor(h), args);
 
   assert.match(text, /one attempt you get on this run/);
   assert.match(text, /the flake is still a defect/);
   assert.match(text, /monitor/);
+  assert.equal(h.posts.length, 1);
 });
 
 test("a tool call whose announcement fails hands the model the text to send", async () => {
   const h = harness({ postFails: "boss 503" });
-  const tool = await createRerunCiTool({ github: h.github, boss: h.boss });
-
-  const text = await call(tool, args);
+  const text = await call(await toolFor(h), args);
 
   assert.match(text, /The Boss was NOT told/);
   assert.match(text, /boss 503/);
   assert.match(text, /Send this yourself with message_boss now/);
+});
+
+test("the tool is replay-safe and keeps whole results", async () => {
+  const tool = await toolFor(harness());
+  assert.equal(tool.replay, "safe");
+  assert.equal(tool.outputLimits?.maxBytes, Number.MAX_SAFE_INTEGER);
+});
+
+// Right after a re-run GitHub can still report attempt 1, so a replayed call
+// that trusted run_attempt alone could re-run twice. What it owes is the notice.
+test("a replayed call that already started its re-run neither re-runs nor tells the Boss twice", async () => {
+  const h = harness();
+  const memos = new Map<string, unknown>();
+  await call(await toolFor(h), args, fakeApi(memos));
+  const again = await call(await toolFor(h), args, fakeApi(memos));
+
+  assert.deepEqual(h.reruns, ["thegoodparty/omni#42"]);
+  assert.equal(h.posts.length, 1);
+  assert.match(again, /Boss has been told why/);
+});
+
+test("a replayed call whose notice never went out sends it once, on the replay", async () => {
+  const h = harness();
+  const memos = new Map<string, unknown>([
+    ["started", { notice: "the owed notice", key: "thegoodparty/omni#42" }],
+  ]);
+  const text = await call(await toolFor(h), args, fakeApi(memos));
+
+  assert.equal(h.reruns.length, 0, "GitHub is not asked again");
+  assert.deepEqual(h.posts, ["the owed notice"]);
+  assert.equal(memos.get("sent"), true);
+  assert.match(text, /Boss has been told why/);
 });
 
 test("a thrown fetch becomes a result the model can act on, not a stack", async () => {
@@ -510,72 +555,4 @@ test("a workflow name GitHub gave us goes in whole, however long", () => {
 
   assert.ok(notice.includes(name.trim()), "the whole name is the label");
   assert.doesNotMatch(notice, /…/);
-});
-
-/**
- * The wiring, not the tool: whether the port it is handed at launch reaches
- * the Boss's inbox is a fact about `agent/run.ts` and the `/boss-inbox`
- * route, so this drives all three.
- */
-test("the re-run notice lands in the Boss's inbox and wakes it, through the real client", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "bugboss-rerun-"));
-  const incidentId = "inc-rerun";
-  const secret = "test-secret";
-  const db = await Db.open({
-    path: join(dir, "test.db"),
-    bucket: "bugboss-test",
-    key: "db/test.db",
-    s3: createMemoryS3(),
-  });
-
-  try {
-    await db.withWrite((w) => {
-      w.prepare(
-        "INSERT INTO incident (id, status, firstSignalAt) VALUES (?, 'INVESTIGATING', ?)",
-      ).run(incidentId, 1_000_000);
-    });
-    const woken: string[] = [];
-
-    const app = createToolApiRoutes({
-      db,
-      tokenSecret: secret,
-      toolApiFor: () => ({}) as unknown as ToolApi,
-      wakeBoss: (id) => {
-        woken.push(id);
-      },
-      noteEscalated: () => {},
-      now: () => 2_000_000,
-    });
-
-    const boss = createBossClient({
-      baseUrl: "http://boss.local",
-      incidentId,
-      authToken: mintAgentToken(secret, { incidentId, attempt: 1 }, 3600),
-      fetchImpl: ((input: string, init?: RequestInit) =>
-        app.fetch(new Request(input, init))) as typeof fetch,
-    });
-
-    await db.withWrite((w) => {
-      assert.deepEqual(unseenByBoss(w, incidentId), [], "the inbox starts empty");
-    });
-
-    const result = await runRerunFailedJobs(args, {
-      github: harness().github,
-      boss,
-      attempted: new Set<string>(),
-    });
-
-    assert.equal(result.started, true);
-    assert.equal(result.postError, null);
-    await db.withWrite((w) => {
-      const rows = unseenByBoss(w, incidentId);
-      assert.equal(rows.length, 1);
-      assert.equal(rows[0].kind, "message");
-      assert.equal(rows[0].text, result.notice);
-    });
-    assert.deepEqual(woken, [incidentId]);
-  } finally {
-    db.close();
-    rmSync(dir, { recursive: true, force: true });
-  }
 });

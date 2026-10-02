@@ -110,7 +110,7 @@ This is about handing a model a sentence it can act on.
 Both fallbacks (`triage.ts`, `correlate.ts`) alarm and carry a **rate**, not
 just the event. A wrong model id or sustained throttling makes every signal
 fall back to `new_incident`: no dedup, no attach, no suppression. Fifteen
-alerts then open fifteen incidents, spawn fifteen agents and trip the
+alerts then open fifteen incidents, start fifteen agents and trip the
 circuit breaker — and the system looks busy and productive throughout.
 
 Correlation's fallback returns `merges: []`, which is byte-identical to
