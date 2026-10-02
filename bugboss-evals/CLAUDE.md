@@ -104,6 +104,13 @@ head when nothing merged) and the proxy's request log.
 That is the whole record. There is no transcript, tool call or incident row
 in it, because the judge must not be able to tell how a side was built.
 
+## Watching a run
+
+Each model call prints to the job log as the proxy completes it, one JSON line
+with model, outcome, usage and cost, so a running job can be watched in the
+Actions UI. A run with no harness event and no model call for
+`--idle-minutes` (default 15) ends as `stalled`, gates computed as usual.
+
 ## What the table says
 
 Per scenario and in total, per side:

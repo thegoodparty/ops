@@ -106,8 +106,11 @@ jobs:
             ${{ env.OUT }}/npm-cache
           key: bugboss-eval-omni-${{ steps.base.outputs.sha }}
       - name: Create the user BugBoss runs as
+        # The runner's home is 750, so without this the run-as user cannot
+        # read the harness checkout it is handed scripts and repositories from.
         run: |
           sudo useradd --create-home bugboss-eval
+          sudo chmod o+rx /home/runner
           mkdir -p /tmp/bugboss-eval && chmod 755 /tmp/bugboss-eval
       - run: |
           GRAFANA_ADMIN_PASSWORD=unused docker compose -f bugboss-evals/sim/stack/stack.yml pull -q
@@ -136,7 +139,7 @@ jobs:
             full) mode=(--reps 3 --spend-cap-usd "$(share 200)") ;;
           esac
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
-            --runtime bugboss --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
+            --runtime bugboss --baseline "${{ github.event_name == 'push' && needs.gate.outputs.sha || 'origin/main' }}" --candidate "${{ needs.gate.outputs.sha }}" \
             --scenarios "${{ matrix.scenario }}" "${mode[@]}" \
             --omni /tmp/omni --out "$OUT" --run-as bugboss-eval
       - if: always()
@@ -186,7 +189,7 @@ jobs:
           if [ -z "$files" ]; then
             body="Incident eval produced no results: $run_url"
           else
-            body="$(npx tsx bugboss-evals/sim/compare.ts report --tier "$TIER" --baseline main --candidate "${{ needs.gate.outputs.sha }}" $files)"
+            body="$(npx tsx bugboss-evals/sim/compare.ts report --tier "$TIER" --baseline "${{ github.event_name == 'push' && needs.gate.outputs.sha || 'main' }}" --candidate "${{ needs.gate.outputs.sha }}" $files)"
             if [ "$found" -lt "$expected" ]; then
               body="> [!WARNING]"$'\n'"> Partial results: $found of $expected scenarios finished. The table omits the rest; the failures are in the [run log]($run_url)."$'\n\n'"$body"
             fi

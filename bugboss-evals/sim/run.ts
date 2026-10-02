@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import { loadScenario, type VolunteerMilestone } from "../core/scenario";
 import type { CiResult } from "./github/store";
 import { due, humanReply } from "./human";
 import { modelProxyEnv, startModelProxy, type ModelProxy } from "./model-proxy";
+import { isStalled, type Liveness } from "./stall";
 import type { Runtime, RuntimeBuild, RuntimeLaunch } from "./runtimes/types";
 import { startS3 } from "./s3";
 import {
@@ -92,6 +93,8 @@ export interface RunSpec {
   prebuilt?: string;
   /** The job's spend, shared by every run in it. */
   spend?: SpendPool;
+  /** No harness event and no model call for this long ends the run as `stalled`. */
+  idleMs?: number;
   seed: number;
   log: (event: string, fields?: Record<string, unknown>) => void;
 }
@@ -326,7 +329,15 @@ const hiddenCheck = async (spec: RunSpec, scenarioDir: string, check: { setup: s
   return true;
 };
 
-export const runOne = async (spec: RunSpec): Promise<RunResult> => {
+export const runOne = async (given: RunSpec): Promise<RunResult> => {
+  const liveness: Liveness = { startedAt: Date.now(), lastEventAt: Date.now(), lastRequestAt: null };
+  const spec: RunSpec = {
+    ...given,
+    log: (event, fields) => {
+      liveness.lastEventAt = Date.now();
+      given.log(event, fields);
+    },
+  };
   const { scenario, dir: scenarioDir } = loadScenario(spec.scenarioId);
   const home = join(spec.root, "home");
   const work = join(spec.root, "work");
@@ -454,6 +465,49 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
   let movedBase: string | null = null;
   const deadline = alertAt + Math.min(scenario.wallClockSeconds, spec.maxRunSeconds ?? Infinity) * 1000;
   let lastAlert = 0;
+  let seenRequests = 0;
+
+  // Each model call, printed as the proxy completes it, so the job log shows
+  // the system working while the run is still going.
+  let proxyOffset = 0;
+  let proxyPartial = "";
+  const printModelCalls = () => {
+    const path = join(spec.root, "proxy.jsonl");
+    if (!existsSync(path)) return;
+    const size = statSync(path).size;
+    if (size <= proxyOffset) return;
+    const fd = openSync(path, "r");
+    const buffer = Buffer.alloc(size - proxyOffset);
+    readSync(fd, buffer, 0, buffer.length, proxyOffset);
+    closeSync(fd);
+    proxyOffset = size;
+    const lines = (proxyPartial + buffer.toString("utf8")).split("\n");
+    proxyPartial = lines.pop() ?? "";
+    for (const raw of lines.filter((l) => l !== "")) {
+      try {
+        const r = JSON.parse(raw) as Record<string, unknown> & { startedAt: number; endedAt: number };
+        console.log(
+          JSON.stringify({
+            at: r.endedAt,
+            runId: spec.runId,
+            scenario: spec.scenarioId,
+            side: spec.side,
+            event: "model_call",
+            model: r.model,
+            modelId: r.modelId,
+            operation: r.operation,
+            outcome: r.outcome,
+            status: r.status,
+            usage: r.usage,
+            cost: r.cost,
+            durationMs: r.endedAt - r.startedAt,
+          }),
+        );
+      } catch {
+        console.log(JSON.stringify({ at: Date.now(), runId: spec.runId, event: "model_call_unparsed", raw }));
+      }
+    }
+  };
 
   try {
     for (let i = 0; ; i++) {
@@ -526,6 +580,21 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
         }
       }
 
+      printModelCalls();
+      const requests = proxy.requests();
+      if (requests > seenRequests) liveness.lastRequestAt = Date.now();
+      seenRequests = requests;
+      if (spec.idleMs !== undefined && isStalled(liveness, Date.now(), spec.idleMs)) {
+        const lastPost = slack.messages.filter((m) => m.bot).map((m) => m.history[m.history.length - 1]!).sort((a, b) => b.at - a.at)[0];
+        spec.log("stalled", {
+          sinceEventSeconds: Math.round((Date.now() - liveness.lastEventAt) / 1000),
+          sinceRequestSeconds: Math.round((Date.now() - (liveness.lastRequestAt ?? liveness.startedAt)) / 1000),
+          lastSystemPost: lastPost ? { at: lastPost.at, text: lastPost.text } : null,
+        });
+        end = "stalled";
+        break;
+      }
+
       if (spec.spend) {
         spec.spend.record(spec.runId, proxy.spentUsd());
         if (spec.spend.exhausted()) {
@@ -562,6 +631,7 @@ export const runOne = async (spec: RunSpec): Promise<RunResult> => {
       }
     }
     unregisterCi();
+    printModelCalls();
     slack.close();
     s3.server.close();
     await postgres.stop();

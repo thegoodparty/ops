@@ -25,7 +25,7 @@ import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from ".
  *
  *   npx tsx bugboss-evals/sim/compare.ts run --baseline origin/main --candidate HEAD \
  *     --omni /tmp/omni --out /tmp/evals [--runtime bugboss] [--scenarios a,b] [--reps 3] \
- *     [--run-as user] [--until pr_opened|closed] [--spend-cap-usd 6.67]
+ *     [--run-as user] [--until pr_opened|closed] [--spend-cap-usd 6.67] [--idle-minutes 15]
  *
  * `--runtime` names the system under test (`sim/runtimes/`); both refs are
  * built by it. `--omni` is a clone holding every scenario's shas, which seeds
@@ -37,7 +37,8 @@ import { FAKE_TOKEN, SANDBOX_OWNER, SANDBOX_REPO, scenarioBranch, seed } from ".
  *
  * `--spend-cap-usd` is this process's share of the comparison's cap: every
  * run stops, ending `spend_cap`, once their model proxies together price at
- * 90% of it.
+ * 90% of it. `--idle-minutes` ends a run as `stalled` once nothing has
+ * happened for that long: no harness event and no model call.
  *   npx tsx bugboss-evals/sim/compare.ts report --baseline main --candidate pr out1/results.json …
  */
 
@@ -179,6 +180,7 @@ const run = async (argv: string[]): Promise<void> => {
   const sides = (flag(argv, "sides")?.split(",") ?? ["baseline", "candidate"]) as Side[];
   const until = flag(argv, "until") as Milestone | undefined;
   const maxRunMinutes = flag(argv, "max-run-minutes");
+  const idleMinutes = Number(flag(argv, "idle-minutes") ?? 15);
   const capUsd = flag(argv, "spend-cap-usd") === undefined ? null : Number(flag(argv, "spend-cap-usd"));
   const spend = capUsd === null ? undefined : createSpendPool(capUsd);
   if (!existsSync(join(omni, ".git"))) throw new Error("--omni must name a clone holding every scenario's shas");
@@ -291,6 +293,7 @@ const run = async (argv: string[]): Promise<void> => {
             ...(until ? { until } : {}),
             ...(maxRunMinutes ? { maxRunSeconds: Number(maxRunMinutes) * 60 } : {}),
             ...(runAs ? { runAs } : {}),
+            idleMs: idleMinutes * 60_000,
             seed: rep,
             log: (event, fields) => log(event, { runId, ...fields }),
         });
