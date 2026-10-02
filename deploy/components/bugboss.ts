@@ -16,7 +16,7 @@ const CONTAINER_PORT = 3000;
 /**
  * Where incident agents keep their workspaces, and the uid they write them
  * as. Both are fixed elsewhere and checked against these by a test: the path
- * is DEFAULT_WORK_ROOT in bugboss/agent/run.ts, and the uid is the `agent`
+ * is DEFAULT_WORK_ROOT in bugboss/agent/workspace.ts, and the uid is the `agent`
  * user bugboss/Dockerfile creates. The access point forces every write on the
  * volume to this uid, so a mismatch is a volume the container cannot write.
  */
@@ -30,8 +30,9 @@ export const AGENT_UID = 1001;
 //
 // The task grows by the sidecar's share rather than BugBoss giving it up.
 // Nobody has measured fifteen agents against 16 GB, and the failure if 14
-// turned out to be too little is an OOM-killed child mid-incident -- quiet,
-// and exactly the shape of failure this system exists to avoid.
+// turned out to be too little is an OOM-killed Boss with every agent in it
+// mid-incident -- quiet, and exactly the shape of failure this system exists
+// to avoid.
 //
 // The sidecar gets 3 GB rather than 2 because of what the two limits do when
 // they are hit. Measured on this image at 203 concurrent backends: 905 MB
@@ -182,9 +183,10 @@ export const createBugBoss = (config: BugBossConfig) => {
   new aws.s3.BucketLifecycleConfiguration("bugbossBucketLifecycle", {
     bucket: bucket.id,
     rules: [
-      // Session transcripts are never expired. They are the whole record of
-      // what an agent did and why, they are what a post-mortem is checked
-      // against months later, and they are small. Nothing here deletes them.
+      // Session transcripts under sessions/ are never expired. They are the
+      // record of what agents did before the harness, and they are small.
+      // Nothing here deletes them. The harness's own transcripts live in
+      // state/harness.sqlite, a snapshot like state/db, under the rule below.
       //
       // Versioning plus a whole-object PUT of the snapshot on every committed
       // write means thousands of noncurrent versions a day. Without this the
@@ -790,7 +792,8 @@ export const createBugBoss = (config: BugBossConfig) => {
             "awslogs-stream-prefix": "bugboss",
           },
         },
-        // Agents are child processes, so PID 1 has to reap them.
+        // Every agent's shell commands are child processes, so PID 1 has to
+        // reap them.
         linuxParameters: { initProcessEnabled: true },
       },
       // Fargate has no Docker socket, so testcontainers -- which is how omni
@@ -921,8 +924,8 @@ export const createBugBoss = (config: BugBossConfig) => {
     desiredCount: 1,
     launchType: "FARGATE",
     // Stop-then-start, and this is the one invariant the whole design rests
-    // on: two tasks would put two processes on the same SQLite file and the
-    // same agent sessions. A rolling deploy is a correctness bug here, not a
+    // on: two tasks would put two processes on the same SQLite files and the
+    // same agent conversations. A rolling deploy is a correctness bug here, not a
     // tuning choice. Accepting the gap in ingest is the trade.
     deploymentMinimumHealthyPercent: 0,
     deploymentMaximumPercent: 100,

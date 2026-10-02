@@ -1,7 +1,7 @@
 // What the Boss's own request path has to hold, now that it is the agent's
 // request path too.
 //
-// Every test here drives a real ModelRuntime with a scripted invoke, because
+// Every test here drives a real Models collection with a scripted invoke, because
 // the defects this file exists to catch all live in the wiring rather than in
 // a function: which provider the request reaches, whether a failure looks
 // like an answer, and whether anybody counted the tokens.
@@ -9,8 +9,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { type BedrockInvoke, resolveBedrockModel } from "./index";
-import { assertBedrockInvokeModelRouting, registerBedrockRouting } from "./runtime";
+import {
+  type BedrockInvoke,
+  createBedrockInvokeModelProvider,
+  resolveBedrockModel,
+} from "./index";
+import { assertBedrockInvokeModelRouting, routeBedrockProvider } from "./runtime";
 import { createPiModelClient } from "./client";
 import { addModelUsage, emptyModelUsage, ModelRequestFailed } from "../model";
 import { runStructuredCall } from "../triage/model";
@@ -103,12 +107,12 @@ interface Harness {
 }
 
 /**
- * The Boss's client over a real runtime, with the routing asserted exactly as
- * the composition root asserts it.
+ * The Boss's client over a real Models collection, with the routing asserted
+ * exactly as the composition root asserts it.
  */
 const harness = async (script: (ScriptedTurn | "fail")[]): Promise<Harness> => {
-  const pi = await import("@earendil-works/pi-coding-agent");
-  const runtime = await pi.ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { amazonBedrockProvider } = await import("@earendil-works/pi-ai/providers/amazon-bedrock");
   const model = await resolveBedrockModel({ id: "us.anthropic.claude-sonnet-5" });
 
   const bodies: Record<string, unknown>[] = [];
@@ -128,9 +132,16 @@ const harness = async (script: (ScriptedTurn | "fail")[]): Promise<Harness> => {
     };
   };
 
-  await registerBedrockRouting({ runtime, invoke });
-  assertBedrockInvokeModelRouting(runtime, model);
-  return { client: createPiModelClient({ runtime, model }), bodies };
+  const models = createModels();
+  models.setProvider(
+    routeBedrockProvider(
+      amazonBedrockProvider(),
+      await createBedrockInvokeModelProvider({ invoke }),
+      [model],
+    ),
+  );
+  assertBedrockInvokeModelRouting(models, model);
+  return { client: createPiModelClient({ models, model }), bodies };
 };
 
 const request = (over: Partial<Parameters<Harness["client"]["complete"]>[0]> = {}) => ({

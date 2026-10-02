@@ -1,6 +1,6 @@
 # dispatcher
 
-Decides which incidents get an agent, launches them, and kills the ones that
+Decides which incidents get an agent, launches them, and stops the ones that
 overrun.
 
 ## Eligibility is one list
@@ -22,65 +22,84 @@ The only thing `ELIGIBLE_SQL` adds to that is a `LEFT JOIN` on
 not runnable until its `wakeAt` passes. It is still the agent's incident. See
 "Parking".
 
+## An agent is a conversation behind a seam
+
+Every incident agent is one Pi Durable conversation, and the dispatcher
+reaches it only through `AgentRuntime` (`createIncidentConversation`,
+`submit`, `isBusy`, `abort`, `reset`). It imports nothing from Pi; the
+composition root implements the seam over the harness, and the unit tests
+implement it in memory, because the seam is the dispatcher's whole contract.
+
+"Alive" is `isBusy`, read every tick, plus `runs`: the launches this process
+made, from the attempts write until the run settles. `isBusy` alone cannot
+see a launch still cloning, so `runs` is what stops the next tick launching
+it twice. After a deploy `runs` is empty and `isBusy` is what sees every run
+`harness.resume()` picked up. A busy read that fails counts as busy and
+alarms `busy_check_failed`, because a second input into a running
+conversation is the worse mistake. The read covers every open incident with a
+conversation, plus a finished one launched within the deadline window, since
+a CLOSED incident's run is still writing to its workspace for a moment.
+
+A launch writes `attempts`/`lastStartedAt`, then runs the rest in the
+background: `prepareCheckout` and `startNpmCi`, on a first launch the
+prompt (`composePrompt`, with the incident's alert slugs) and
+`createIncidentConversation` (its id lands in `incident.conversationId`),
+then `submit` with `requestId: incident:<id>:launch:<attempts>` and
+`whenBusy: "followUp"`. The checkout is minutes of git and the tick is
+serialized, so awaiting it would hold up every other incident. The kickoff
+is `messages.kickoff`; an incident with launches behind it and no
+conversation predates the harness, and its kickoff says the transcript is
+gone. Every later launch is `messages.resume` plus the `resumed_after` line.
+
+The run's settlement (`wait()`) ends the launch. A conversation idle on an
+open, unparked incident is relaunched by the next tick, into the same
+conversation.
+
 ## Ticks are serialized against themselves
 
-`tick()` chains on the previous one. A tick awaits an S3 PUT *before* it
-records a launch in `running`, so an overlapping tick reads the same row as
-unclaimed and starts a second child. Two children then hold
-valid tokens for one incident and both whole-file write the same session
-transcript, overwriting each other's turns.
+`tick()` chains on the previous one. A tick awaits writes and harness reads
+before it records a launch in `runs`, so an overlapping tick would read the
+same row as unclaimed and submit a second launch.
+## Two deadline layers, both here
 
-That map is the single-writer guarantee the whole resume design rests on,
-and it is only authoritative if ticks cannot interleave.
+- At `lastStartedAt + agentTimeoutSeconds` the run is **steered**
+  (`deadlineMessage`, `requestId: incident:<id>:deadline:<attempts>`) to
+  write an escalation brief. A steer reaches it mid-turn, inside a wait too.
+- `DEADLINE_GRACE_SECONDS` later it is **aborted**, which also kills the
+  subprocesses its bash is running.
 
-## Two deadline layers
+They were once simultaneous, which meant the agent got none of its grace and
+every timeout escalation reached the thread with an empty brief.
 
-- The child gets `BUGBOSS_DEADLINE_AT` as its **soft** deadline. It steers
-  itself to write an escalation brief and sets its own hard stop at
-  `+ DEADLINE_GRACE_SECONDS`.
-- The parent's SIGKILL is at `deadlineAt + grace + one tick`, strictly
-  later, so the grace window actually happens.
+Both read the row, not memory, so a run the harness resumed after a deploy
+is bounded by the deadline its launch set. A resume is not a launch and does
+not refill the clock. A JavaScript tool wedged in-process is the one thing an
+abort cannot stop.
+## The turn budget is the agent's, and this only guards the launch
 
-They were once simultaneous, which meant the agent got at most one tick of
-its grace and every timeout escalation reached the thread with an empty brief.
+The agent's budget hook counts `incident.turnsUsed`, steers at the grace edge,
+and at the cap escalates and parks with `liftsOnReply = 0` (see
+`agent/CLAUDE.md`). The dispatcher does two things around it:
 
-`DEADLINE_GRACE_SECONDS` is imported from `agent/run.ts` rather than
-duplicated, with a runtime assertion at import: under `tsx` a renamed export
-arrives as `undefined`, `killAt` becomes `NaN`, and `now < NaN` is false —
-so the backstop would collapse to *zero* and kill every agent on its first
-tick. The grace test pins its clocks to literals for the same reason.
+- **A launch on a spent budget is not made.** When `turnsUsed` is already at
+  `agentMaxTurns + grantedTurns`, the tick parks the incident on the same
+  budget wait (`turnBudgetWaitingFor`) and escalates with
+  `spentBudgetBrief`, park first. No request goes out: the first request of
+  a launch rewrites the whole context into the cache, and incident 80 spent
+  $4.04 on one `get_incident` that way. A failed post keeps the park, since
+  relaunching a spent budget does nothing but stop again; the stale sweep
+  announces it within a day.
+- **A raised budget lifts the wait.** See "Raising the budget" below.
 
-## The turn budget is the child's, and this is only the courier
-
-`BUGBOSS_MAX_TURNS` goes down in `buildChildEnv` beside the deadline and
-nothing here enforces it. Its value is the incident's effective budget,
-`agentMaxTurns` plus the incident's `grantedTurns` (see "A grant" below), so
-the child's own checks, `promptWithinBudget` included, count against the
-granted number. That is deliberate: the count lives in the restored
-session file, which the dispatcher reads only to resume a raised budget (below), and the escalation has to
-carry what the run spent — which the incident row only has as of the last
-tick's `rollUpUsage`, not as of the turn that spent the budget. So the child owns both halves. It counts, it escalates with live
-numbers, and it calls `park` so this does not relaunch it into the same
-exhausted budget. See `agent/CLAUDE.md`.
-
-`BUGBOSS_ALERT_SLUGS` is the same kind of courier: the incident's
-`alert_slug`s, read in SQL at launch, so the child can put the rule that fired
-in its prompt without a `get_incident` that would drain its directives.
-
-The one thing to know here: the child hands off and then aborts, which
-leaves an error message behind. `exitCodeFor` exempts that case, so a budget
-doing its job arrives as a clean exit rather than as `agent_failed`.
-
-Unlike the deadline, the budget is **not** per launch. The deadline is
-`now + agentTimeoutSeconds` on every launch and a restart gives a full clock
-back; the budget does not, because turns are work done and a restart did not
-undo any of it.
-
+Unlike the deadline, the budget is **not** per launch. Turns are work done
+and a restart did not undo any of it.
 ## Relaunch bounds
 
 Two counters, both **in memory on purpose**:
 
-- `fastFailures` — consecutive deaths inside `fastFailureMs`, a crash loop.
+- `fastFailures` — consecutive runs that ended without an answer inside
+  `fastFailureMs`, a crash loop. A launch that failed before its input was
+  placed counts too: it never started.
 - `launches` — total launches for an incident since the last time the
   dispatcher gave up on it, ceiling `maxAttempts * 3`.
 
@@ -99,7 +118,7 @@ that fails takes the park back so the incident relaunches. Posting first is
 what turned the 2026-10-01 write halt into an escalation and a rotation page
 every two minutes for incident 93: every launch write failed, every third tick
 met the crash-loop ceiling, and the park after the post failed too. The
-deadline escalation has nothing to record, since `entry.killed` already makes
+deadline escalation has nothing to record, since its abort already makes
 it once per run, so it is gated on an empty write instead. A deadline held
 back by that gate is owed, in memory, and posted on the first tick a write
 lands. Without the park the same escalation goes to the thread every thirty
@@ -131,10 +150,9 @@ that has earned itself.
 
 `incident_wait` is how an incident stops being relaunched. `Dispatcher.park`
 writes it at the two ceilings above with a `PARK_COOLDOWN_SECONDS` wake;
-`ToolApi.park` writes it for an agent that has nothing it can do yet;
-`pushDirective` deletes it when the Boss sends the agent a `boss_message`,
-**if the wait says it lifts on one**, which a spent turn budget does not — see
-the stale sweep below.
+`ToolApi.park` writes it for an agent that has nothing it can do yet; a Boss
+`boss_message` (`boss/commands.ts`) deletes it **if the wait says it lifts on
+one**, which a spent turn budget does not — see the stale sweep below.
 
 It exists because `owner = 'human'` was doing two jobs at once: saying who had
 the work, and stopping the relaunch. Only the second was load-bearing.
@@ -175,7 +193,7 @@ and `park` makes that state reachable on purpose, since a wait with a `NULL`
 
 The clock is one `MAX` over four columns: `firstSignalAt`, `lastStartedAt`,
 the newest `thread_reply`, and the newest `incident_action`. Anything past
-`staleAfterSeconds` with no live child is swept. The threshold comes from
+`staleAfterSeconds` with no live agent is swept. The threshold comes from
 `BUGBOSS_STALE_HOURS`, default 24, and **a value that is not a positive
 number disables the sweep** rather than meaning "now": `Number()` over an
 unset variable is `NaN`, every comparison against `NaN` is false, and reading
@@ -183,14 +201,13 @@ that as zero would post into every open thread at once.
 
 Two exclusions, both load-bearing:
 
-- An incident in `running` is skipped. A run may last a day, so a live
+- An incident with a live agent is skipped. A run may last a day, so a live
   agent's own `lastStartedAt` ages past the threshold underneath it and no
-  row anywhere says the process is still alive. That map is the only thing
-  that can, and it is why an agent parked inside `monitor` is not swept while
-  it is still up.
+  row says the run is still going. Only the harness can, and it is why an
+  agent parked inside `monitor` is not swept while it is still up.
 - The sweep runs **after** the launch loop, so an incident this tick
-  relaunched is already in `running` and is not reported quiet on the
-  strength of the row it left behind.
+  relaunched is already live and is not reported quiet on the strength of
+  the row it left behind.
 
 Together those two bound what the sweep can ever reach: an incident the
 dispatcher *cannot* run. Anything runnable was launched moments earlier in
@@ -219,25 +236,20 @@ actually move it, raising the turn budget or taking the work over, and
 deliberately does not invite a reply, which is what the agent's own closing
 brief already promised.
 
-**Raising the budget lifts the wait on the next boot.** `liftRaisedBudgets`
-runs every tick before the eligibility read, and reads each wait at most once
-per process unless the read fails or passes `SESSION_READ_TIMEOUT_MS`: for
-each open incident with a budget wait, it reads the used turns off the synced
-session (`sessionTurns`) and, when they are under `agentMaxTurns`, deletes the
+**Raising the budget lifts the wait.** `liftRaisedBudgets` runs every tick
+before the eligibility read: for each open incident with a budget wait whose
+`incident.turnsUsed` is under `agentMaxTurns + grantedTurns`, it deletes the
 wait, writes a `turn_budget_raised` action, then posts "The turn budget was
-raised to N, so the agent is resuming with M turns left." A wait found still
-spent is not read again until the next restart, because the budget is a
-constant or an env var and only a restart changes it.
-The used turns come from the session rather than the wait's text because a
-launch can overrun its budget, and a wait the new number still does not cover
-stays held. Lift and marker commit before the post, as with the sweep.
+raised to N, so the agent is resuming with M turns left." Used turns come
+from the column rather than the wait's text because a launch can overrun its
+budget, and a wait the new number still does not cover stays held. Lift and
+marker commit before the post, as with the sweep.
 
 **A grant lifts it on the next tick.** The Boss's `grant_turns`
 (`boss/commands.ts`) adds to `incident.grantedTurns` and writes a
 `turns_granted` action; it posts nothing. The lift compares used turns with
-`agentMaxTurns + grantedTurns`, and the grant total is part of the held-wait
-key, so a wait held as spent is read again once a grant moves it. When the
-incident has a grant the notice is "Granted more turns; the agent is
+`agentMaxTurns + grantedTurns`, so a wait held as spent lifts on the first
+tick a grant covers it. When the incident has a grant the notice is "Granted more turns; the agent is
 resuming with M left of N." instead. It names no grant size: grants sum,
 and the wait does not record which of them it is being lifted by.
 
@@ -260,76 +272,60 @@ check is the poster's, in `../index.ts`, not the dispatcher's.
 ## The circuit breaker
 
 `maxConcurrentAgents` is a circuit breaker, not a scheduler. Hitting it
-means something is wrong. Setting it to `0` holds it open, which is the
-useful local mode: ingest and triage run, no agent is ever spawned.
+means something is wrong. It counts live agents, busy conversations included,
+so an agent parked inside a wait holds its slot. Setting it to `0` holds it
+open, which is the useful local mode: ingest and triage run, no agent is ever
+launched.
 
-## The child environment
+## The checkout runs in this process
 
-Built up from nothing rather than filtered down from `process.env`, so a
-child holds only what the composition root named: process essentials, the
-outbound tokens it needs, and its own incident identity. That is hygiene, not
-containment — a child can read the parent's environment — but a credential
-nobody handed the agent cannot end up in a log line or a Slack post by
-accident.
-
-AWS is the deliberate exception. `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` is
-passed through, so the child resolves the task role through the SDK's
-container provider and that provider refreshes for as long as the run lasts.
-A launch whose environment carries no credential path at all alarms:
-without it the agent loses Bedrock, and that surfaces a turn later as a model
-call failing with nothing pointing back at the environment.
-
-The eval harness (`bugboss-evals/`) passes four more things through, and
-production sets none of them: `BUGBOSS_OMNI_REPO` (clone the sandbox, not
-omni), `BUGBOSS_WORK_ROOT`, `BUGBOSS_GITHUB_TOKEN_FILE` (a sandbox-scoped
-token the harness keeps fresh, read instead of the App's credentials) and
-any `AWS_ENDPOINT_URL_*`.
+`workspace.env(incidentId)` is the whole environment of the clone, the fetch
+and the `npm ci` a launch starts. They run in the Boss process now, whose own
+environment holds every secret it has, and `npm ci` runs the checkout's
+postinstall scripts. The composition root passes the agent's shell allowlist
+plus a fresh `GITHUB_TOKEN`. Without `workspace` (the unit tests, the E2E) no
+checkout is touched.
 
 ## A resume tells the agent and alarms, and posts nothing
 
-Relaunch is automatic: an incident in an agent status gets a new child on
-the next tick, whatever killed the last one. Every resume after a gap of at
-least a tick gives the agent a `resumed_after` directive, because the agent
-is the one that has to re-check what moved. A gap longer than
+A deploy does not relaunch anything: `harness.resume()` picks every run up
+where it stopped. On the first tick after boot, every busy conversation whose
+agent was last heard from at least a tick ago is steered with a
+`resumed_after` line (`requestId: incident:<id>:resumed:<boot>`), because the
+agent is the one that has to re-check what moved. A relaunch of an idle
+conversation carries the same line after the resume text. A gap longer than
 `RESUME_ALARM_SECONDS` also raises `agent_resumed_after_gap`, which is how an
 operator learns agents are dying. A shorter one only logs `agent_resumed`.
 
-Nothing is posted to the thread. The post asked nothing of anyone: the
-relaunch had already happened and the agent had already been told. It also
-fired on ordinary deploys. ECS stops the old task before the new one starts,
-so a deploy gap runs about eight minutes from the agent's last activity,
-which is over the threshold, and the notice became noise on every merge.
+Nothing is posted to the thread. The post asked nothing of anyone and fired
+on every ordinary deploy, since ECS stops the old task before the new one
+starts and a deploy gap runs about eight minutes.
 
 **The gap runs from the agent's last activity, never from its launch.** When
-this process watched the exit, the exit time is exact. After a container
-restart it did not: a deploy kills every child with no exit record. The clock
-is then the newest of the session's last entry timestamp (synced after every
-turn, via `lastSessionEventAt`) and what the agent's blocking tools write
-while a turn is still open: `boss_inbox`, agent `incident_action`,
-`pending_question`, `pending_wait`. An open `pending_question` or
-`pending_wait` row goes further: both are deleted when the wait ends, so one
-still standing and newer than the session's last entry means the agent was
-blocked inside it when it was killed, and it counts as alive up to this
-process's start. One older than the session is an orphan from an earlier
-interrupted wait and counts for nothing, and so does any marker when the
-session could not be read, since nothing then tells the two apart. The session read is bounded by
-`SESSION_READ_TIMEOUT_MS`, because ticks are serialized and a hung read
-would stop every relaunch. Launch is only the floor. Measuring from
-launch told every thread on every deploy that an agent working minutes
-earlier had been gone for hours, and to disregard its last message.
+this process saw the last run settle, that time is exact. Otherwise it is the
+newest of what the agent writes while a turn is open: `boss_inbox`, agent
+`incident_action`, `pending_question`, `pending_wait`. An open
+`pending_question` or `pending_wait` row means the agent was blocked inside
+it when the process stopped, so it counts as alive up to this process's
+start. Launch is only the floor. Measuring from launch told every thread on
+every deploy that an agent working minutes earlier had been gone for hours.
 
-## Exit codes
+## How a run ends
 
-A child that exits non-zero or dies to a signal **rejects**. The dispatcher
-returns early when it did the killing itself, so its own deadline SIGKILL
-does not also report `agent_failed` under a name pointing at the wrong
-component.
+`wait()` resolves `done` when the run answered and `unanswered` when it was
+aborted or failed. An `unanswered` the dispatcher did not cause alarms
+`agent_failed`; its own deadline abort does not, since it already alarmed as
+`agent_deadline_exceeded`. A Boss `stop_agent` and a merge abort a run on
+purpose too, and call `noteStopped` first so the abort is not read as a
+failure. Only an unanswered run inside `fastFailureMs` counts toward the
+crash loop: a short run that answered is a deploy or a quick finish, not a
+crash.
 
 ## Workspaces are deleted here
 
 Each tick, before launching, `sweepWorkspaces` moves `/work/<id>` into
 `/work/.trash` when the incident's row is CLOSED or MERGED and it has no live
-child, then deletes the trash in the background (a 5 GB tree is slow to
+agent, then deletes the trash in the background (a 5 GB tree is slow to
 delete on EFS, and one delete runs at a time). The first tick after boot is
 therefore also the sweep of whatever the last task left.
 

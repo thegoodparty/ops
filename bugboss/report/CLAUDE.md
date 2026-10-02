@@ -33,13 +33,13 @@ retried; none propagates.
 ## Tokens are as of the close
 
 The tokens the report quotes reach the incident row from `rollUpUsage`, which
-reads the session file. Every publish rolls up first (`ReportDeps.rollUpUsage`),
-the sweep included, because a container that died mid-close may never have
-rolled up and a zero reads as a free run. The session syncs to S3 at the end
-of each turn, so at close that is everything but the turn that called
-`report_analysis` and any after it. The row catches up when the run exits;
-the report does not. That gap is the price of the close being one message
-sent at the moment it happens.
+sums the conversation's `UsageDoc` in the harness. Every publish rolls up
+first (`ReportDeps.rollUpUsage`), the sweep included, because a container that
+died mid-close may never have rolled up and a zero reads as a free run. The
+usage document commits with each response, so at close that is everything but
+the response after `report_analysis`. The row catches up on the next tick's
+roll-up; the report does not. That gap is the price of the close being one
+message sent at the moment it happens.
 
 ## Claimed before it uploads, retried when it fails
 
@@ -98,10 +98,12 @@ the write: 2x base input against 1.25x for 5m, and every run here asks for
 the long cache (`bedrock/CLAUDE.md`). A re-pricing that only had the total
 would understate a run by most of that gap.
 
-`turns` and the estimate come from the session file, so both are simply
-missing once it ages out under the S3 lifecycle rule while the row's tokens
-survive. Missing renders as "not recorded" — never as zero, which reads as a
-free run.
+`turns` is the row's `turnsUsed`, and the wall clock is the first to the last
+model response in the agent's conversation (`ReportDeps.conversationSpan`).
+An incident no agent ever ran has neither, and missing renders as "not
+recorded", never as zero, which reads as a free run. An incident that predates
+the harness counts only the turns since its first launch on it: the old
+transcripts are not read.
 
 ## It is the only reader of the recurrence answer
 
@@ -179,7 +181,7 @@ out in one order:
    of follow-up tasks: a closed incident has none. The heading and the field
    name say so on purpose.
 8. **Agent run**: code only. Model, launches and restarts, turns, wall clock
-   (first to last session entry, parked time included), tokens by class, and
+   (first to last model response, parked time included), tokens by class, and
    the labelled estimate. Signals and what people did follow as appendices.
 
 `postmortem.ts` checks the fields and refuses an empty section with a sentence

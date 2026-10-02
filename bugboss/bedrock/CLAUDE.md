@@ -44,31 +44,38 @@ application profile ARN goes on the request field and never on `model.id`.
 
 ## Claiming an api id does not route anything
 
-`registerApiProvider()` puts this provider in pi-ai's registry, and
-`resolveBedrockModel()` stamps `bedrock-invoke-model` onto the model. Neither
-selects an implementation. Pi's `ModelRuntime` resolves a provider by
-`model.provider`, and `recomposeProvider()` installs the builtin *untouched*
-when that id has no `models.json` entry and no registered extension -- which
-is our configuration, so `composeModelProvider()`, the only code that reads
-the registry, is never built. The builtin is a single-api provider, and
-`createProvider()` serves its one api to every model without reading
-`model.api`.
+`resolveBedrockModel()` stamps `bedrock-invoke-model` onto the model. That
+selects nothing. pi-ai's `Models` resolves a provider by `model.provider`, and
+the builtin `amazon-bedrock` is a single-api provider: `createProvider()`
+serves its one api to every model without reading `model.api`.
 
-That combination cannot report itself: `createProvider()`'s only "no API
-implementation" error belongs to the multi-api branch a single-api provider
-never takes. Production ran on Converse for days.
+That cannot report itself: `createProvider()`'s only "no API implementation"
+error belongs to the multi-api branch a single-api provider never takes.
+Production ran on Converse for days.
 
-`runtime.ts` is the fix. It wraps the builtin in a provider that dispatches on
-`model.api` and registers that natively, so Converse keeps Nova, Llama,
-Mistral and DeepSeek while our models reach `InvokeModel`.
-`assertBedrockInvokeModelRouting()` proves it before the session starts, and
-`runtime.test.ts` proves it against a real `ModelRuntime` -- which the tests
-next to it do not, since they drive the provider directly.
+Pi Durable adds a second way to miss. A conversation stores a
+`{ provider, modelId }` ref, not our model object, and generation resolves it
+through `models.getModel()` from the provider's own catalog. The builtin
+catalog stamps Converse on every entry, so a correct router is still handed a
+Converse model. The spike found exactly that.
+
+`runtime.ts` is the fix for both. `routeBedrockProvider(builtin, invokeModel,
+ours)` wraps the builtin in a provider that dispatches on `model.api`, and
+whose `getModels()` serves our resolved models in place of the builtin's
+entries with the same id (and adds ones it lacks, such as a system inference
+profile ARN). Converse keeps Nova, Llama, Mistral and DeepSeek.
+`createBugbossModels` (`../agent/harness.ts`) builds that one provider, sets
+it on one `Models`, and runs `assertBedrockInvokeModelRouting(models, model)`
+on every model it resolved before anything streams. The assertion checks two
+things: that `models.getProvider()` is the router by identity, and that
+`models.getModel(provider, id)?.api` is ours, which is the catalog miss above.
+`runtime.test.ts` proves both against a real `Models` and a real durable
+conversation that names the model only by id.
 
 ## One request path, not two
 
-`client.ts` is a `ModelClient` (`../model.ts`) over `ModelRuntime.complete()`,
-and it is what triage, root-cause correlation, the inbound-language read and
+`client.ts` is a `ModelClient` (`../model.ts`) over `Models.complete()` on the
+same `Models` the harness streams through, and it is what triage, root-cause correlation, the inbound-language read and
 the Slack agent make their bounded calls through.
 
 They do not build their own Anthropic body, and nothing here should grow one.
@@ -77,7 +84,7 @@ from the other, which is how an absent beta header killed every incident agent
 while triage carried on working, and opened two incidents no agent could
 investigate.
 
-Going through the runtime inherits rather than reimplements: the routing the
+Going through `Models` inherits rather than reimplements: the routing the
 section above exists to assert, the 1h retention and its downgrade check, the
 lone-surrogate sanitizer, the coalescing Anthropic requires of tool results
 answering one turn, and `calculateCost` -- which is what finally puts a number
@@ -86,8 +93,10 @@ on a triage decision.
 What it deliberately does not inherit is Pi's agent session.
 `runStructuredCall` (`../triage/model.ts`) still owns the loop, because the
 bound that matters there is an answer a Zod schema accepts inside a wall-clock
-budget, and `createAgentSession` owns a JSONL file, resume and compaction
-instead. `complete()` is one request.
+budget, and a durable conversation owns storage, resume and compaction
+instead. `complete()` is one request. It is `complete()` rather than
+`completeSimple()` so thinking is off by name (`thinkingEnabled: false`), not
+by an omitted `reasoning`.
 
 ### A failed request resolves rather than rejecting
 
@@ -111,10 +120,11 @@ prose reply back towards the answer tool, and a reply can be empty. Hence the
 
 ## Usage is the cost record, and it is tokens
 
-Per-turn usage is what the Boss sums out of the session file after a child
-exits. Nothing else records what a run cost, and it is read from the file
-rather than reported by the agent because a killed agent never gets to
-report — and the file is on disk either way.
+Per-turn usage is what the harness keeps in each conversation's `UsageDoc`,
+and what `rollUpUsage` sums onto the incident row. Nothing else records what
+a run cost, and it is read from storage rather than reported by the agent
+because an aborted run never gets to report — and the document is committed
+either way.
 
 **Tokens, never dollars.** Bedrock returns tokens; `pi.calculateCost` prices
 them from a hardcoded per-model table in `node_modules/@earendil-works/pi-ai`.
@@ -156,11 +166,10 @@ after it gets attribution from the resume onward and nothing else changes.
 runtime-configurable (`BUGBOSS_MODEL_ID`) and retunes from SSM without a
 deploy, so the map is routinely out of step with what is configured.
 `invokeModelIdFor` falls back to the bare id and never throws.
-`parseInferenceProfiles` does throw, and only the composition root calls it
-that way: a typo stops the container at boot where somebody is watching,
-while the child logs `inference_profiles_unreadable` and carries on. Killing
-an agent working a production incident over a billing tag is the same trade
-`stream.ts` refuses to make over an unhonoured cache retention.
+`parseInferenceProfiles` does throw, and only at boot: a typo stops the
+container where somebody is watching, rather than an agent working a
+production incident over a billing tag -- the same trade `stream.ts` refuses
+to make over an unhonoured cache retention.
 
 ## No explicit credentials
 
@@ -172,16 +181,15 @@ on its own schedule, so a client built at startup keeps working for the whole
 run. Setting credentials explicitly here would pin them at construction and
 defeat that.
 
-## The model id is pinned in the session
+## The model id is pinned in the conversation
 
 Bedrock does not restore it on resume, because deployment ids are
 provider-specific. The mapping lives in SSM and retunes without a deploy, so
-a restart after a retune would replay every running agent against a
-different model — rejecting every thinking block, quietly, since
-`drop_block` is deliberately silent.
-
-`agent/run.ts` resolves from the stored prefix for that reason, and alarms
-distinctly when the environment disagrees.
+a restart after a retune that re-read the environment would replay every
+running agent against a different model, rejecting every thinking block,
+quietly, since `drop_block` is deliberately silent. A conversation's
+`ModelRef` is stored in `pi.agent` when it is created, so a retune reaches new
+conversations only.
 
 ## No retries here
 
@@ -209,9 +217,10 @@ premium on ~291k written tokens, which is more than a whole run writes. A run th
 never blocks for more than five minutes pays about 0.5–1.2% more; every
 measured run had at least two blocking waits.
 
-Pi cannot carry this for us. `cacheRetention` has no path in through
-`createAgentSession`, and Pi's `PI_CACHE_RETENTION` env fallback is read by
-Pi's own providers, not by `resolveCacheControl()` here.
+The default is ours rather than Pi's. Pi Durable's `stream.cacheRetention`
+setting does reach this provider as `options.cacheRetention`, but an absent
+one must still mean 1h here, and Pi's `PI_CACHE_RETENTION` env fallback is
+read by Pi's own providers, not by `resolveCacheControl()` here.
 
 ### A downgrade is never silent
 
@@ -285,43 +294,24 @@ replayed under a deliberately changed system prompt was accepted even with
 and wedges the relaunch loop on the day enforcement arrives -- a quiet failure
 of exactly the kind this module exists to prevent. Keep the field, send the beta.
 
-**The second argument to `registerApiProvider()` is not a registry key.**
-`registerApiProvider(provider, "bugboss-bedrock-invoke-model")` passes a
-*source label*, used only by `unregisterApiProviders(sourceId)` for bulk
-removal. The registry keys on `provider.api`. That mismatched string sitting
-next to the api id is the first thing anyone chases, and it means nothing.
+**Build the router with the models it must serve.** `routeBedrockProvider`
+without `ours` still dispatches on `model.api`, but its catalog is the
+builtin's, so every durable conversation resolves a Converse model and the
+router hands it straight back. The assertion catches it; a test that streams
+the model object directly does not, since that skips the catalog lookup.
 
-**Do not "simplify" `runtime.ts` onto Pi's documented extension hook.** We use
-`registerNativeProvider`, which installs our provider as the base. The
-obvious-looking alternative, `registerProvider(id, { api, streamSimple })`,
-registers an *extension* and routes through `composeModelProvider`. In
-`streamWith`, the extension branch calls `extension.streamSimple(...)` for
-both the simple and the full stream paths, so a full `stream()` call carrying
-real `StreamOptions` is silently downgraded to `SimpleStreamOptions`. It works
-today only because `createAgentSession` never calls `stream()`. It breaks
-quietly the day something does.
-
-**Adding any `models.json` entry for `amazon-bedrock` changes which path
-routes us.** It moves `recomposeProvider` off the base-untouched short-circuit
-and into `composeModelProvider`, where `supportsBaseApi` finds no builtin model
-declaring our api and falls through to `getApiProvider("bedrock-invoke-model")`
--- which resolves only because `registerBedrockRouting` also does the
-api-registry registration. Both halves are load-bearing under different
-configs, and the file that switches between them is one nobody thinks of as
-routing.
-
-**`run.ts` builds `pi.ModelRuntime.create({})`.** That is identical to what
-`createAgentSession` does internally *only because nothing passes `agentDir`*.
-If someone adds `agentDir`, the session reads auth and models from one
-directory while streaming through a runtime built from another. Cheap to
-notice, silent if you do not.
+**Spreading the router into a new object loses it.** The assertion checks
+identity against a `WeakSet`, so `{ ...router, getModels }` is refused as
+Pi's builtin. Add behaviour inside `routeBedrockProvider`, not around it.
 
 ## Reproducing a misroute without AWS
 
-No credentials needed, about twenty lines. Register the api provider, resolve
-the model, build `ModelRuntime.create({ modelsPath: null, refreshOnCreate:
-false })`, call `runtime.streamSimple(model, ...)` with dummy
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, and print `message.api`.
+No credentials needed, about twenty lines. Resolve the model, build a
+`createModels()` and set the router on it, call
+`models.completeSimple(model, ...)` with dummy `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`, and print `message.api`. To cover the catalog lookup
+too, submit through a `MemoryStorage` harness instead, as `runtime.test.ts`
+does.
 
 Correct routing reaches `InvokeModel`. Wrong routing returns
 `bedrock-converse-stream` and an `UnrecognizedClientException` from the real

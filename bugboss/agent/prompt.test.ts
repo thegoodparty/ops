@@ -16,11 +16,8 @@ import {
   type FiredAlert,
   type PromptInput,
 } from "./prompt";
-import { createGitHubRunsPort, createRerunCiTool } from "./rerun";
 import { MAX_RERUNS_PER_INCIDENT } from "./rerun";
-import { createSqlQueryTool } from "./sql";
-import { createBossTools } from "./run";
-import { createMessageBossTool, createMonitorTool } from "./tools";
+import { createIncidentExtensions } from "./extension";
 import { TEST_DB_ENV_VAR } from "../testdb";
 
 const input = (overrides: Partial<PromptInput> = {}): PromptInput => ({
@@ -88,7 +85,7 @@ test("the load-bearing rules are all in there", () => {
   assert.match(prompt, /85% of the context window/);
   assert.match(prompt, /report_root_cause/);
   assert.match(prompt, /escalate/);
-  assert.match(prompt, /resumed_after/);
+  assert.match(prompt, /A RESUMED message tells you how long you were down/);
   assert.match(prompt, /Never cut text by character count/);
   assert.match(prompt, /read\s+`\.claude\/skills\/ship-pr\/SKILL\.md` in the checkout, all of it/);
 });
@@ -116,7 +113,7 @@ test("the agent talks only to the Boss and is told not to narrate", () => {
 
   assert.match(prompt, /## You talk to the Boss, and only the Boss/);
   assert.match(prompt, /You never talk to people and you never read what they write/);
-  assert.match(prompt, /FROM THE BOSS/);
+  assert.match(prompt, /The Boss says:/);
   // One run wrote 56k characters of prose between tool calls that nobody
   // ever saw. The prompt is the only thing that can stop the next one.
   assert.match(prompt, /\*\*Do not narrate between tool calls\.\*\*/);
@@ -360,25 +357,17 @@ const MAX_SYSTEM_PROMPT_CHARS = 42_000;
 const MAX_PREFIX_CHARS_WITHOUT_GRAFANA = 62_000;
 
 test("the composed prefix stays under its bound", async () => {
-  const pi = await import("@earendil-works/pi-coding-agent");
   const stub = {} as never;
-  const signal = new AbortController().signal;
-  const tools = [
-    ...(await createBossTools({ api: stub, boss: stub })),
-    await createMonitorTool({ signal }),
-    await createMessageBossTool({ marker: stub, boss: stub, api: stub, signal }),
-    await createRerunCiTool({ github: createGitHubRunsPort({ token: () => undefined }), boss: stub }),
-    await createSqlQueryTool({ port: stub, signal }),
-    ...[
-      pi.createBashToolDefinition,
-      pi.createEditToolDefinition,
-      pi.createFindToolDefinition,
-      pi.createGrepToolDefinition,
-      pi.createLsToolDefinition,
-      pi.createReadToolDefinition,
-      pi.createWriteToolDefinition,
-    ].map((create) => create("/work/inc-42/omni")),
-  ];
+  const extensions = await createIncidentExtensions({
+    db: stub,
+    toolApiFor: () => stub,
+    port: () => stub,
+    harness: () => stub,
+    githubToken: () => undefined,
+    shellEnv: () => ({}),
+    maxTurns: () => 300,
+  });
+  const tools = extensions.flatMap((extension) => extension.tools ?? []);
   const toolChars = tools
     .map((tool) =>
       JSON.stringify({ name: tool.name, description: tool.description, input_schema: tool.parameters }),
@@ -513,7 +502,7 @@ test("the prompt asks for behaviour over symbols, with a worked pair", () => {
 test("the prompt names the variable a database failure will be reported under", () => {
   // The one thing that stops an agent reading a connection error as a failing
   // test and editing code that is fine. It is the same constant the Boss puts
-  // in the child environment, so the two cannot drift.
+  // in the agent's shell environment, so the two cannot drift.
   const prompt = composeSystemPrompt(input());
 
   assert.ok(prompt.includes(TEST_DB_ENV_VAR));

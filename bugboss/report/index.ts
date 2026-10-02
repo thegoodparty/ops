@@ -15,7 +15,6 @@
 import type Database from "better-sqlite3";
 
 import type { Db } from "../db";
-import { sumSessionUsage } from "../agent/session";
 import { catalogRatesFor, priceTokens, type TokenCounts } from "../bedrock/model";
 import { makeAlarm, makeLog } from "../logging";
 import { mrkdwn } from "../slack/format";
@@ -134,8 +133,11 @@ export interface PrStateReader {
 
 export interface ReportDeps {
   db: Db;
-  /** Whole-object S3. The session file is where turns and cost come from. */
-  sessions: { get(key: string): Promise<string | null> };
+  /**
+   * When the agent's conversation first and last heard from the model. Null
+   * when the conversation has no response, or is gone.
+   */
+  conversationSpan(conversationId: number): Promise<{ firstAt: number; lastAt: number } | null>;
   post(threadTs: string | null, text: string): Promise<{ ts: string }>;
   /** The channel incident threads live in, which the upload has to name. */
   channel: string;
@@ -144,7 +146,7 @@ export interface ReportDeps {
   /** Defaults to the real PDF. Tests read the Markdown instead. */
   renderPdf?: (markdown: string) => Promise<Buffer>;
   /**
-   * Writes the run's tokens onto the row from its session file, before the
+   * Writes the run's tokens onto the row from its conversation, before the
    * report reads them. Every publisher needs it, the sweep included: a
    * container that died mid-close may never have rolled up at all, and zero
    * tokens reads as a free run. Never throws.
@@ -217,36 +219,24 @@ export const readReportData = async (
     [incidentId, GOAL_VERDICT_KIND],
   );
 
-  // Tokens and modelId come off the row, which rollUpUsage keeps current;
-  // the price is derived from them below. Turns are read back out of the
-  // session file, so they are simply missing once it ages out -- the honest
-  // shape, rather than a zero that reads as a run with no turns.
-  let turns: number | null = null;
+  // Tokens, modelId and turns come off the row, which rollUpUsage and the
+  // turn hook keep current; the price is derived from them below. An
+  // incident no agent ever ran has no turns to report rather than zero of
+  // them, which would read as a run that did nothing.
+  const run = deps.db.get<{ conversationId: number | null; turnsUsed: number }>(
+    "SELECT conversationId, turnsUsed FROM incident WHERE id = ?",
+    [incidentId],
+  );
+  const conversationId = run?.conversationId ?? null;
+  const turns = conversationId === null ? null : (run?.turnsUsed ?? null);
   let sessionSpanMs: number | null = null;
-  if (incident.sessionRef) {
+  if (conversationId !== null) {
     try {
-      const contents = await deps.sessions.get(incident.sessionRef);
-      if (contents) {
-        turns = sumSessionUsage(contents).turns;
-        let first: number | null = null;
-        let last: number | null = null;
-        for (const line of contents.split("\n")) {
-          let entry: { timestamp?: unknown };
-          try {
-            entry = JSON.parse(line) as typeof entry;
-          } catch {
-            continue;
-          }
-          const at = typeof entry?.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
-          if (!Number.isFinite(at)) continue;
-          if (first === null || at < first) first = at;
-          if (last === null || at > last) last = at;
-        }
-        if (first !== null && last !== null) sessionSpanMs = last - first;
-      }
+      const span = await deps.conversationSpan(conversationId);
+      if (span) sessionSpanMs = span.lastAt - span.firstAt;
     } catch (err) {
-      // A missing turn count is a worse report, not a worse incident.
-      alarm("session_read_failed", { incidentId, error: String(err) });
+      // A missing wall clock is a worse report, not a worse incident.
+      alarm("conversation_span_failed", { incidentId, conversationId, error: String(err) });
     }
   }
 

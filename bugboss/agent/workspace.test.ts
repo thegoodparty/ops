@@ -5,13 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { computePaths, startNpmCi } from "./run";
 import {
+  computePaths,
   lockfileHash,
   npmCiNeeded,
   npmCiPidRecord,
   npmCiRunning,
   prepareCheckout,
+  startNpmCi,
   sweepWorkspaces,
 } from "./workspace";
 
@@ -144,4 +145,29 @@ test("the sweep moves only what it is told is removable, and never its own trash
   assert.ok(existsSync(join(root, "open", "omni")));
   assert.ok(existsSync(join(root, ".trash", "closed-42", "omni")));
   assert.ok(existsSync(join(root, "stray-file")));
+});
+
+test("an install that cannot start is a failed install, not a Boss crash", async () => {
+  const paths = computePaths(mkdtempSync(join(tmpdir(), "bugboss-work-")), "inc-9");
+  const crashes: unknown[] = [];
+  const onCrash = (err: unknown) => crashes.push(err);
+  process.on("uncaughtException", onCrash);
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: string) => lines.push(line);
+  try {
+    startNpmCi(paths);
+    const deadline = Date.now() + 5000;
+    while (!existsSync(paths.npmCiFailed) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  } finally {
+    console.error = original;
+    process.off("uncaughtException", onCrash);
+  }
+
+  assert.deepEqual(crashes, []);
+  assert.match(readFileSync(paths.npmCiFailed, "utf8"), /npm ci did not start/);
+  assert.equal(npmCiNeeded(paths), false, "a relaunch reads the failure and does not retry it");
+  assert.ok(lines.some((line) => JSON.parse(line).event === "npm_ci_spawn_failed"));
 });

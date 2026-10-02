@@ -27,8 +27,8 @@ definition pointing fifteen agents' migration replay and
 `DROP DATABASE ... WITH (FORCE)` at a real cluster. omni's election-api
 harness has held the same guard since long before this existed.
 
-A refused URL is **withheld** from the child environment rather than passed
-on. With the variable unset omni goes back to starting its own container and
+A refused URL is **withheld** from the agents' shell environment rather than
+passed on. With the variable unset omni goes back to starting its own container and
 says so; with a bad one set it would try to use it.
 
 ## Isolation is omni's, not ours

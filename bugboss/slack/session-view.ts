@@ -1,5 +1,6 @@
-// An incident agent's session, as the Boss reads it: one entry per turn,
-// saying what the agent called and what came back, rather than the JSONL.
+// An incident agent's conversation, as the Boss reads it: one entry per turn,
+// saying what the agent called and what came back, rather than the raw
+// transcript entries.
 //
 // The raw tail is what the Boss used to get, and sixty lines of it was
 // 199,928 characters in prod -- file reads, test output and whole scripts --
@@ -39,24 +40,34 @@ type JsonValue =
   | boolean
   | number
   | string
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
 
-interface SessionLine {
-  type?: string;
-  timestamp?: string;
-  customType?: string;
-  data?: { reason?: string };
-  message?: {
-    role?: string;
-    content?: string | Part[];
-    toolCallId?: string;
-    toolName?: string;
-    isError?: boolean;
-    stopReason?: string;
-    errorMessage?: string;
-  };
+/** The fields of a transcript message this reads. Pi's `Message`, structurally. */
+interface MessageLike {
+  role?: string;
+  content?: string | readonly Part[];
+  toolCallId?: string;
+  toolName?: string;
+  isError?: boolean;
+  stopReason?: string;
+  errorMessage?: string;
+  timestamp?: number;
 }
+
+/** One transcript entry, as `Conversation.entries()` returns it. */
+export interface EntryLike {
+  kind: string;
+  model?: readonly unknown[];
+}
+
+const ASSISTANT = "pi.assistant";
+const TOOL_RESULT = "pi.tool-result";
+const USER = "pi.user";
+const RESET = "pi.reset";
+const COMPACTION = "pi.compaction";
+
+const messageOf = (entry: EntryLike): MessageLike | undefined => entry.model?.[0] as MessageLike | undefined;
 
 const count = (n: number): string => n.toLocaleString("en-US");
 
@@ -113,7 +124,7 @@ const describeArg = (key: string, value: JsonValue): string => {
 
 const PATH_KEYS = ["path", "file_path", "filePath", "file"];
 
-const pathOf = (args: Record<string, JsonValue>): string | null => {
+const pathOf = (args: Readonly<Record<string, JsonValue>>): string | null => {
   for (const key of PATH_KEYS) {
     const value = args[key];
     if (typeof value === "string") return value;
@@ -121,10 +132,10 @@ const pathOf = (args: Record<string, JsonValue>): string | null => {
   return null;
 };
 
-const partsOf = (content: string | Part[] | undefined): Part[] =>
+const partsOf = (content: string | readonly Part[] | undefined): readonly Part[] =>
   typeof content === "string" ? [{ type: "text", text: content }] : (content ?? []);
 
-const textOf = (parts: Part[]): string =>
+const textOf = (parts: readonly Part[]): string =>
   parts
     .filter((p): p is TextPart => p.type === "text")
     .map((p) => p.text)
@@ -132,7 +143,7 @@ const textOf = (parts: Part[]): string =>
 
 const outcomeOf = (
   call: ToolCallPart,
-  result: NonNullable<SessionLine["message"]> | undefined,
+  result: MessageLike | undefined,
 ): string => {
   if (!result) return "→ no result recorded";
   const parts = partsOf(result.content);
@@ -155,54 +166,47 @@ const outcomeOf = (
   return `→ ok, ${count(text.length)} characters over ${plural(lineCount(text), "line")}${extra}`;
 };
 
-const clock = (timestamp: string | undefined): string => {
-  if (!timestamp) return "";
-  const at = new Date(timestamp);
-  if (Number.isNaN(at.getTime())) return "";
-  return ` (${at.toISOString().substring(11, 19)}Z)`;
+const clock = (timestamp: number | undefined): string => {
+  if (timestamp === undefined || !Number.isFinite(timestamp)) return "";
+  return ` (${new Date(timestamp).toISOString().substring(11, 19)}Z)`;
 };
 
 type Item =
-  | { kind: "turn"; number: number; entry: SessionLine; parts: Part[] }
+  | { kind: "turn"; number: number; message: MessageLike; parts: readonly Part[] }
   | { kind: "note"; line: string };
 
+/** `entries` oldest first, the whole history rather than the active context. */
 export const renderSessionTurns = (
-  body: string,
+  entries: readonly EntryLike[],
   turns: number,
 ): { text: string; totalTurns: number; shownTurns: number } => {
   const items: Item[] = [];
-  const results = new Map<string, NonNullable<SessionLine["message"]>>();
-  let torn = 0;
+  const results = new Map<string, MessageLike>();
   let totalTurns = 0;
 
-  for (const line of body.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let entry: SessionLine;
-    try {
-      entry = JSON.parse(trimmed) as SessionLine;
-    } catch {
-      torn += 1;
-      continue;
-    }
-    if (entry.type === "compaction") {
+  for (const entry of entries) {
+    const message = messageOf(entry);
+    if (entry.kind === COMPACTION) {
       items.push({ kind: "note", line: "(earlier history was compacted into a summary here)" });
       continue;
     }
-    if (entry.type === "custom") {
-      if (entry.customType === "bugboss_exit" && entry.data?.reason) {
-        items.push({ kind: "note", line: `Run ended: ${entry.data.reason}${clock(entry.timestamp)}` });
-      }
+    if (entry.kind === RESET) {
+      const handoff = message ? textOf(partsOf(message.content)).trim() : "";
+      items.push({
+        kind: "note",
+        line: handoff
+          ? `The context was reset here, starting from: ${excerpt(handoff, "handoff")}`
+          : "(the context was reset here)",
+      });
       continue;
     }
-    if (entry.type !== "message" || !entry.message) continue;
-    const message = entry.message;
-    if (message.role === "assistant") {
+    if (!message) continue;
+    if (entry.kind === ASSISTANT) {
       totalTurns += 1;
-      items.push({ kind: "turn", number: totalTurns, entry, parts: partsOf(message.content) });
-    } else if (message.role === "toolResult" && message.toolCallId) {
+      items.push({ kind: "turn", number: totalTurns, message, parts: partsOf(message.content) });
+    } else if (entry.kind === TOOL_RESULT && message.toolCallId) {
       results.set(message.toolCallId, message);
-    } else if (message.role === "user") {
+    } else if (entry.kind === USER) {
       const text = textOf(partsOf(message.content)).trim();
       items.push({
         kind: "note",
@@ -224,7 +228,6 @@ export const renderSessionTurns = (
   const out: string[] = [];
   const hidden = Math.max(0, totalTurns - wanted);
   if (hidden > 0) out.push(`(${plural(hidden, "earlier turn")} not shown)`);
-  if (torn > 0) out.push(`(${plural(torn, "unreadable line")} skipped)`);
 
   let shownTurns = 0;
   for (const item of items.slice(start)) {
@@ -233,7 +236,7 @@ export const renderSessionTurns = (
       continue;
     }
     shownTurns += 1;
-    out.push(`Turn ${item.number}${clock(item.entry.timestamp)}`);
+    out.push(`Turn ${item.number}${clock(item.message.timestamp)}`);
     for (const part of item.parts) {
       if (part.type === "thinking") {
         const thinking = part as ThinkingPart;
@@ -252,8 +255,9 @@ export const renderSessionTurns = (
         .join(", ");
       out.push(`  ${call.name}(${args}) ${outcomeOf(call, results.get(call.id))}`);
     }
-    const message = item.entry.message;
-    if (message?.stopReason === "error" || message?.errorMessage) {
+    const message = item.message;
+    if (message.stopReason === "aborted") out.push("  the run was stopped during this turn");
+    if (message.stopReason === "error" || message.errorMessage) {
       out.push(
         `  the model call failed${message.errorMessage ? `: ${excerpt(message.errorMessage, "error text")}` : ""}`,
       );
@@ -261,4 +265,34 @@ export const renderSessionTurns = (
   }
 
   return { text: out.join("\n"), totalTurns, shownTurns };
+};
+
+/**
+ * Whether the agent is working, and how its last run ended if it is not.
+ *
+ * Without this the tail of a stopped run and the tail of a finished one read
+ * the same: both stop on an ordinary entry, and the reader is left inferring
+ * from the content of the last turn. That is the inference that let a
+ * 9.5-hour run sit dead behind a last message which was still true.
+ */
+export const describeRun = (entries: readonly EntryLike[], busy: boolean): string => {
+  if (busy) return "a run is in progress";
+  const last = [...entries].reverse().find((entry) => entry.kind === ASSISTANT);
+  if (!last) return "it has not taken a turn yet";
+  const message = messageOf(last);
+  if (message?.stopReason === "aborted") return "idle; its last run was stopped before it finished";
+  if (message?.stopReason === "error") {
+    return `idle; its last run ended on a failed model call${message.errorMessage ? ` (${excerpt(message.errorMessage, "error text")})` : ""}`;
+  }
+  return "idle; its last run ended with an answer";
+};
+
+/** When the transcript last recorded anything, as epoch ms, or null. */
+export const lastEntryAt = (entries: readonly EntryLike[]): number | null => {
+  let latest: number | null = null;
+  for (const entry of entries) {
+    const at = messageOf(entry)?.timestamp;
+    if (typeof at === "number" && Number.isFinite(at) && (latest === null || at > latest)) latest = at;
+  }
+  return latest;
 };

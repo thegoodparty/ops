@@ -117,7 +117,7 @@ after(() => {
 
 beforeEach(async () => {
   await db.withWrite((d) => {
-    d.prepare("DELETE FROM pending_directive").run();
+    d.prepare("DELETE FROM boss_inbox").run();
     d.prepare("DELETE FROM pending_question").run();
     d.prepare("DELETE FROM thread_reply").run();
     d.prepare("DELETE FROM incident_wait").run();
@@ -495,7 +495,7 @@ describe("inbound", () => {
     // Handing it to the Boss is the caller's, off Slack's three seconds.
     // Covered end to end in test/e2e.test.ts.
     assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
+      db.query("SELECT id FROM boss_inbox").length,
       0,
       "the relay records; it does not decide what a message meant",
     );
@@ -911,7 +911,7 @@ describe("a message in an incident thread", () => {
     assert.equal(route.kind, "incident_reply");
     assert.equal(db.query("SELECT id FROM thread_reply").length, 1);
     assert.equal(
-      db.query("SELECT id FROM pending_directive").length,
+      db.query("SELECT id FROM boss_inbox").length,
       0,
       "the relay records; what the sentence meant is the Boss's to read",
     );

@@ -1,32 +1,34 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { excerpt, renderSessionTurns } from "./session-view";
+import { describeRun, excerpt, lastEntryAt, renderSessionTurns, type EntryLike } from "./session-view";
 
 const SENTINEL = "MIDDLE_OF_THE_EVIDENCE_7f3a";
 
 let clockAt = Date.parse("2026-09-30T14:00:00Z");
-const stamp = (): string => {
+const stamp = (): number => {
   clockAt += 1000;
-  return new Date(clockAt).toISOString();
+  return clockAt;
 };
 
-const assistant = (content: object[], extra: object = {}): string =>
-  JSON.stringify({
-    type: "message",
-    timestamp: stamp(),
-    message: { role: "assistant", content, stopReason: "toolUse", ...extra },
-  });
+// Entries the shape `Conversation.entries()` hands back: a kind, and the one
+// model message that entry contributes.
+const assistant = (content: object[], extra: object = {}): EntryLike => ({
+  kind: "pi.assistant",
+  model: [{ role: "assistant", content, stopReason: "toolUse", timestamp: stamp(), ...extra }],
+});
 
-const result = (toolCallId: string, toolName: string, text: string, isError = false): string =>
-  JSON.stringify({
-    type: "message",
-    timestamp: stamp(),
-    message: { role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }], isError },
-  });
+const result = (toolCallId: string, toolName: string, text: string, isError = false): EntryLike => ({
+  kind: "pi.tool-result",
+  model: [{ role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }], isError, timestamp: stamp() }],
+});
 
-const user = (text: string): string =>
-  JSON.stringify({ type: "message", timestamp: stamp(), message: { role: "user", content: text } });
+const user = (text: string): EntryLike => ({
+  kind: "pi.user",
+  model: [{ role: "user", content: text, timestamp: stamp() }],
+});
+
+const width = (entries: readonly EntryLike[]): number => JSON.stringify(entries).length;
 
 /** A file with the sentinel buried in its middle, so any slice would show it. */
 const bigFile = (chars: number): string => {
@@ -49,7 +51,7 @@ const script = [
 
 const originals = { file: bigFile(60_000), longThinking, script };
 
-const bigSession = (): string => {
+const bigSession = (): EntryLike[] => {
   const lines = [user("You are the incident agent for incident 2.")];
   for (let i = 0; i < 3; i++) {
     lines.push(
@@ -79,19 +81,17 @@ const bigSession = (): string => {
       { type: "toolCall", id: "mon1", name: "monitor", arguments: { command: "gh pr view 2234 --json state", intervalSeconds: 60 } },
     ]),
   );
-  return lines.join("\n");
+  return lines;
 };
 
 describe("renderSessionTurns", () => {
   test("a 200k-character session renders as a bounded turn list", () => {
-    const body = bigSession();
-    const lines = body.split("\n");
+    const entries = bigSession();
 
-    // The premise: this is the prod shape, and the old tail was huge.
-    assert.ok(body.length >= 199_000, `body is ${body.length} characters`);
-    assert.ok(lines.slice(-60).join("\n").length > 150_000);
+    // The premise: this is the prod shape, and the raw entries are huge.
+    assert.ok(width(entries) >= 199_000, `entries are ${width(entries)} characters`);
 
-    const out = renderSessionTurns(body, 15);
+    const out = renderSessionTurns(entries, 15);
     assert.equal(out.totalTurns, 6);
     assert.equal(out.shownTurns, 6);
     assert.ok(out.text.length < 10_000, `rendered ${out.text.length} characters`);
@@ -135,24 +135,45 @@ describe("renderSessionTurns", () => {
     assert.match(text, /monitor\(command: "gh pr view 2234 --json state", intervalSeconds: 60\) → no result recorded/);
   });
 
-  test("a torn last line does not throw and is counted", () => {
-    const body = `${bigSession()}\n{"type":"message","mess`;
-    const out = renderSessionTurns(body, 2);
-    assert.match(out.text, /\(1 unreadable line skipped\)/);
-    assert.equal(out.shownTurns, 2);
-  });
-
-  test("redacted thinking, compaction and exit records render as one line each", () => {
-    const body = [
+  test("redacted thinking, a compaction and a reset render as one line each", () => {
+    const entries: EntryLike[] = [
       assistant([{ type: "thinking", redacted: true }]),
-      JSON.stringify({ type: "compaction", timestamp: stamp(), summary: "x".repeat(50_000) }),
-      JSON.stringify({ type: "custom", customType: "bugboss_exit", timestamp: stamp(), data: { reason: "turns_exhausted", at: 1, attempt: 1 } }),
-    ].join("\n");
-    const text = renderSessionTurns(body, 5).text;
+      { kind: "pi.compaction", model: [{ role: "user", content: "x".repeat(50_000), timestamp: stamp() }] },
+      { kind: "pi.reset", model: [{ role: "user", content: "The Boss stopped your run: wrong service.", timestamp: stamp() }] },
+      { kind: "pi.system", model: [{ role: "system", content: [], timestamp: stamp() }] },
+    ];
+    const text = renderSessionTurns(entries, 5).text;
     assert.match(text, /thought: \(redacted reasoning\)/);
     assert.match(text, /compacted into a summary/);
-    assert.match(text, /Run ended: turns_exhausted/);
+    assert.match(text, /reset here, starting from: "The Boss stopped your run: wrong service\."/);
     assert.ok(text.length < 500);
+  });
+
+  test("a turn the run was stopped in says so", () => {
+    const text = renderSessionTurns([assistant([{ type: "text", text: "checking" }], { stopReason: "aborted" })], 5).text;
+    assert.match(text, /the run was stopped during this turn/);
+  });
+});
+
+describe("describeRun", () => {
+  test("a run in flight, a stopped one, a failed one and a finished one read differently", () => {
+    const said = assistant([{ type: "text", text: "done" }], { stopReason: "stop" });
+    assert.equal(describeRun([said], true), "a run is in progress");
+    assert.equal(describeRun([said], false), "idle; its last run ended with an answer");
+    assert.match(describeRun([assistant([], { stopReason: "aborted" })], false), /stopped before it finished/);
+    assert.match(
+      describeRun([assistant([], { stopReason: "error", errorMessage: "throttled" })], false),
+      /failed model call \("throttled"\)/,
+    );
+    assert.equal(describeRun([user("go")], false), "it has not taken a turn yet");
+  });
+});
+
+describe("lastEntryAt", () => {
+  test("is the newest message timestamp, or null for nothing", () => {
+    const entries = [user("a"), user("b")];
+    assert.equal(lastEntryAt(entries), clockAt);
+    assert.equal(lastEntryAt([]), null);
   });
 });
 

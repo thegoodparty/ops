@@ -1,6 +1,8 @@
 # db
 
-SQLite on local disk, mirrored to S3 on every committed write.
+SQLite on local disk, mirrored to S3 on every committed write. The harness
+transcripts are a second SQLite file with a looser mirror; see the last
+section.
 
 ## `withWrite` is the only way to write
 
@@ -54,9 +56,8 @@ which lacks that marker, so that one notice can go out a second time. See
 
 ## Two connections
 
-`query` and `get` use a **separate, read-only** connection. That is why the
-30-second directive poll never queues behind the write chain and its
-synchronous PUT. Reads that must see a write in progress belong inside the
+`query` and `get` use a **separate, read-only** connection. That is why a
+read never queues behind the write chain and its synchronous PUT. Reads that must see a write in progress belong inside the
 `withWrite` callback, using the handle it passes.
 
 ## Schema changes
@@ -152,8 +153,8 @@ model id multiply out correctly after a price change; a stored dollar figure is
 a guess frozen at write time. Anything showing a person a dollar figure derives
 it and says it is an estimate.
 
-They are written accumulating, not replacing. `rollUpUsage` re-reads the whole
-session file so its total is absolute and a `SET` is right there; a triage
+They are written accumulating, not replacing. `rollUpUsage` re-reads the
+conversation's whole `pi.usage` so its total is absolute and a `SET` is right there; a triage
 decision knows only what it just spent, and a signal nothing ever placed is
 triaged again on its next delivery.
 
@@ -231,3 +232,33 @@ reading more than once.
 It is read from `__dirname` at boot, and `tsc` copies no non-TypeScript
 files. The Dockerfile copies it next to the compiled `db/index.js`. Without
 that the container starts and dies on its first query.
+
+## The harness file is mirrored per tick, and never halts anything
+
+`/data/harness.sqlite` is Pi Durable's storage, beside `/data/bugboss.sqlite`.
+Two files, because Pi Durable writes through `node:sqlite` with async
+transactions and `Db` through better-sqlite3 with synchronous ones; they could
+never share a transaction, so one file would buy only lock contention.
+
+`mirror.ts` (`createHarnessMirror`) keeps it in S3 at `state/harness.sqlite`,
+on rules deliberately unlike `withWrite`'s:
+
+1. **Restore at boot only when the local file is absent**, which after a
+   deploy is always, and before `Harness.open`. A stale `-wal`/`-shm` beside it
+   is removed first so it cannot be replayed onto the restored file.
+2. **A PUT per tick, not per commit.** Pi Durable commits a partial response
+   every 100 ms. `harness.onCommit` sets a dirty flag; `snapshotIfDirty()`
+   runs once per dispatcher tick and once on SIGTERM. The flag is cleared
+   before the copy, so a commit during an in-flight PUT is in the next one.
+3. **`VACUUM INTO` from a read-only better-sqlite3 connection.** Legal there,
+   consistent under WAL, and it cannot take Pi Durable's write lock.
+4. **A failed PUT alarms and halts nothing.** `harness_snapshot_failed` on the
+   first failure, `harness_snapshot_still_failing` once after 5 minutes,
+   `harness_snapshot_recovered` when one lands. The mirror stays dirty and
+   retries next tick. Halting `Db` writes over a transcript upload would couple
+   the wrong things: the incident tables are the system of record, and every
+   tool effect is a guarded, idempotent write there.
+
+The loss window is one tick of transcript. Resume then re-requests the last
+generation, so the worst case is one duplicate model call, and a transcript
+behind the incident table costs the model one "already FIXING" tool result.

@@ -1,10 +1,10 @@
-// The two blocking tools that live in the agent's harness rather than the Boss
+// The blocking tools that live in the agent's harness rather than the tool
 // API. Each costs one turn no matter how long it waits, which is what keeps a
 // multi-day incident from saturating context on polling.
 //
 // The loop is ours, the probe is theirs: every command invocation is a short
 // exec with a normal timeout and the waiting happens here. That is what
-// sidesteps Pi's per-call bash timeout, and it is why `monitor` cannot just be
+// sidesteps the per-call bash timeout, and it is why `monitor` cannot just be
 // `bash`.
 //
 // Neither of them reaches Slack. An agent talks to the Boss and nobody else:
@@ -12,7 +12,6 @@
 // person needs to hear it and how.
 
 import { execFile } from "node:child_process";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { makeAlarm, makeLog } from "../logging";
 import type { BossInboxKind, Directive } from "../types";
 import {
@@ -22,9 +21,12 @@ import {
   createConditionCheck,
   type ConditionArgs,
   type ConditionCheck,
+  type ConditionState,
   REVIEW_SETTLE_SECONDS,
   type GitHubReadPort,
 } from "./conditions";
+import type { Context, ToolExecutionApi, ToolExecutionResult, ToolRegistration, Usage } from "./harness";
+import { waitUntil, type WaitOptions, type WaitResult } from "./wait";
 
 const log = makeLog("agent-tools");
 const alarm = makeAlarm("agent-tools");
@@ -64,67 +66,49 @@ export const probeOutput = (output: string): string => {
 };
 
 /**
- * The words of a directive that is the Boss speaking, or null.
- *
- * `human_message` is the shape that came before `boss_message`, and a row
- * written before that deploy can still be sitting in `pending_directive`. It
- * reads as the Boss, text and all, rather than falling through the switch
- * below or being dropped: somebody meant it for this agent either way.
+ * How a Boss message opens when it reaches the agent. A steer is a user
+ * message, and this prefix is how the agent -- and `message_boss`, deciding
+ * whether a steer that ended its wait was the answer -- tells the Boss from
+ * the harness's own steers (the deadline, the turn budget). It is our own
+ * rendering being recognised, never a person's words being read.
  */
-export const bossMessageText = (directive: Directive): string | null => {
-  if (directive.type === "boss_message") return directive.text;
-  const legacy = directive as { type: string; text?: unknown };
-  return legacy.type === "human_message" && typeof legacy.text === "string"
-    ? legacy.text
-    : null;
-};
-
-const bossLine = (text: string): string => `FROM THE BOSS: ${text}`;
+export const BOSS_SAYS = "The Boss says: ";
 
 /**
- * How a directive reaches the model. The Boss tools and `message_boss` both
- * render them, so it sits with the tools rather than with either one.
+ * What a steer carrying a directive says. The Boss's messages, new signals,
+ * a merge and a resume all reach the agent as user messages now, so this is
+ * the one place their words are written.
  */
-export const renderDirectives = (directives: Directive[]): string => {
-  if (!directives.length) return "";
-  const lines = directives.map((directive) => {
-    switch (directive.type) {
-      case "stop":
-        return `STOP: ${directive.reason}`;
-      case "merged":
-        return `MERGED: this incident is now part of ${directive.into}. Stop work and exit.`;
-      case "new_signals": {
-        const head = `NEW SIGNALS (${directive.count})`;
-        const absorbed = directive.absorbed ?? [];
-        if (absorbed.length === 0) return `${head}: ${directive.summary}`;
-        // Agreement matters here beyond tidiness: this is the sentence that
-        // tells an agent how many other investigations it has inherited, and
-        // "incident 82 and 83 has been merged" reads as one of them.
-        const one = absorbed.length === 1;
-        const which = one
-          ? `incident ${absorbed[0]}`
-          : `incidents ${absorbed.slice(0, -1).join(", ")} and ${absorbed.at(-1)}`;
-        return (
-          `${head}: ${which} ${one ? "has" : "have"} been merged into yours ` +
-          `and ${one ? "its" : "their"} signals are now yours. Why: ` +
-          `${directive.summary}. Call get_incident: what ${one ? "that incident" : "those incidents"} ` +
-          `had already found comes back as \`absorbed\`, and your summary now ` +
-          "has to describe every part of it."
-        );
-      }
-      case "boss_message":
-        return bossLine(directive.text);
-      case "resumed_after":
-        return `RESUMED after ${directive.seconds}s. Re-check anything time-sensitive before continuing.`;
-      default: {
-        const text = bossMessageText(directive as Directive);
-        return text === null
-          ? `UNRECOGNISED DIRECTIVE: ${JSON.stringify(directive)}`
-          : bossLine(text);
-      }
+export const directiveText = (directive: Directive): string => {
+  switch (directive.type) {
+    case "stop":
+      return `STOP: ${directive.reason}`;
+    case "merged":
+      return `MERGED: this incident is now part of ${directive.into}. Stop work.`;
+    case "new_signals": {
+      const head = `NEW SIGNALS (${directive.count})`;
+      const absorbed = directive.absorbed ?? [];
+      if (absorbed.length === 0) return `${head}: ${directive.summary}`;
+      // Agreement matters here beyond tidiness: this is the sentence that
+      // tells an agent how many other investigations it has inherited, and
+      // "incident 82 and 83 has been merged" reads as one of them.
+      const one = absorbed.length === 1;
+      const which = one
+        ? `incident ${absorbed[0]}`
+        : `incidents ${absorbed.slice(0, -1).join(", ")} and ${absorbed.at(-1)}`;
+      return (
+        `${head}: ${which} ${one ? "has" : "have"} been merged into yours ` +
+        `and ${one ? "its" : "their"} signals are now yours. Why: ` +
+        `${directive.summary}. Call get_incident: what ${one ? "that incident" : "those incidents"} ` +
+        `had already found comes back as \`absorbed\`, and your summary now ` +
+        "has to describe every part of it."
+      );
     }
-  });
-  return `\n\nDIRECTIVES\n${lines.join("\n")}`;
+    case "boss_message":
+      return `${BOSS_SAYS}${directive.text}`;
+    case "resumed_after":
+      return `RESUMED after ${directive.seconds}s. Re-check anything time-sensitive before continuing.`;
+  }
 };
 
 export interface ProbeResult {
@@ -136,12 +120,21 @@ export type Probe = (command: string, timeoutMs: number) => Promise<ProbeResult>
 
 // The checkout, when there is one. Incident 94 lost a 900s wait to a check
 // script that ran `gh` without `--repo` and got "not a git repository".
-export const shellProbeIn = (cwd?: string): Probe => (command, timeoutMs) =>
+//
+// `env` is the agent's shell allowlist. Left out, the probe would inherit the
+// Boss's own environment, secrets and all, since the agent runs in-process.
+export const shellProbeIn = (cwd?: string, env?: Record<string, string>): Probe => (command, timeoutMs) =>
   new Promise((resolve) => {
     execFile(
       "/bin/sh",
       ["-c", command],
-      { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: "utf8", ...(cwd ? { cwd } : {}) },
+      {
+        timeout: timeoutMs,
+        maxBuffer: 8 * 1024 * 1024,
+        encoding: "utf8",
+        ...(cwd ? { cwd } : {}),
+        ...(env ? { env } : {}),
+      },
       (error, stdout, stderr) => {
         const output = `${stdout ?? ""}${stderr ?? ""}`;
         const code =
@@ -157,51 +150,48 @@ export const shellProbeIn = (cwd?: string): Probe => (command, timeoutMs) =>
 
 export const shellProbe: Probe = shellProbeIn();
 
-const wait = (ms: number, signal?: AbortSignal): Promise<void> =>
-  new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const done = (): void => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", done);
-      resolve();
-    };
-    const timer = setTimeout(done, ms);
-    signal?.addEventListener("abort", done, { once: true });
-  });
-
 /**
- * The signal that ends whichever wait is running now. A Boss message is a
- * user message, and `steer` only lands between tool batches, so a wait that
- * could not be cut short would hold it for as long as the wait lasts --
- * fifteen minutes and then a merge wait, on incident 94. `wrapUpAbort` is
- * one-shot and means "wrap up"; this one is replaced after every interrupt,
- * so the next wait starts clean. Tools read it when a call starts.
+ * The wait a tool runs without a conversation to watch: its own sleep and
+ * clock, ended by the signal. Tests drive the loops through it; the tools
+ * pass `waitUntil` over the call's inbox instead.
  */
-export const createWaitInterrupt = () => {
-  let current = new AbortController();
-  return {
-    signal: (): AbortSignal => current.signal,
-    interrupt: (): void => {
-      const ended = current;
-      current = new AbortController();
-      ended.abort();
-    },
+export const localWait =
+  (deps: { sleep?: (ms: number) => Promise<void>; now?: () => number; signal?: AbortSignal }) =>
+  async <T>(options: WaitOptions<T>): Promise<WaitResult<T>> => {
+    const now = deps.now ?? options.now ?? Date.now;
+    const sleep =
+      deps.sleep ??
+      ((ms: number) =>
+        new Promise<void>((resolve) => {
+          const signal = deps.signal;
+          if (signal?.aborted) return resolve();
+          const done = (): void => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", done);
+            resolve();
+          };
+          const timer = setTimeout(done, ms);
+          signal?.addEventListener("abort", done, { once: true });
+        }));
+    const deadline = now() + Math.max(0, options.timeoutMs);
+    let value: T | undefined;
+    for (;;) {
+      const state = await options.check();
+      value = state.value;
+      if (state.done) return { ended: "met", value, steers: [] };
+      if (deps.signal?.aborted) return { ended: "aborted", value, steers: [] };
+      if (now() >= deadline) return { ended: "timeout", value, steers: [] };
+      await sleep(Math.min(Math.max(1, options.intervalMs), Math.max(0, deadline - now())));
+    }
   };
-};
 
-/**
- * Pi's per-call signal and the harness's deadline signal, both honoured.
- * Preferring one would make the soft deadline unreachable: `steer` only
- * delivers once the current turn's tool calls finish, and these tools are
- * where an agent spends most of a long incident.
- */
-const eitherSignal = (
-  ...signals: (AbortSignal | undefined)[]
-): AbortSignal | undefined => {
-  const live = signals.filter((signal): signal is AbortSignal => !!signal);
-  if (live.length < 2) return live[0];
-  return AbortSignal.any(live);
-};
+export type Waiter = <T>(options: WaitOptions<T>) => Promise<WaitResult<T>>;
+
+/** A tool's wait over its own conversation's inbox. */
+export const inboxWait =
+  (api: Pick<ToolExecutionApi, "watchDoc" | "conversationId">, ctx: Context): Waiter =>
+  (options) =>
+    waitUntil(api, ctx, options);
 
 // ---------------------------------------------------------------------------
 // Telling the Boss
@@ -373,7 +363,7 @@ export interface PendingWait {
 
 /**
  * The durable half of a wait on a person, and the reason a resumed agent is
- * quiet. A restart replays the tool call with no result, so without this the
+ * quiet. A restart reruns the tool call that had no result, so without this the
  * elapsed clock restarts and a wait that has already been reported is
  * reported again -- and every merge to ops `main` restarts this container, so
  * that is the normal path rather than the exceptional one.
@@ -381,8 +371,9 @@ export interface PendingWait {
 export interface WaitMarkerPort {
   /**
    * Idempotent for the same command, and only for the same command.
-   * `clearWait` does not run when the child is SIGKILLed mid-wait, so a
-   * marker outlives the wait it was written for; matching on the command is
+   * `clearWait` does not run when the process dies mid-wait and the model
+   * moves on to a different wait, so a marker outlives the wait it was
+   * written for; matching on the command is
    * what stops that stale marker from silencing the next wait's first
    * reminder.
    */
@@ -489,16 +480,19 @@ export interface MonitorDeps {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   probeTimeoutSeconds?: number;
+  /** Ends a local wait. The tool passes `wait` instead, which watches the conversation. */
   signal?: AbortSignal;
+  /** How the call blocks. Absent, a local wait over `sleep`, `now` and `signal`. */
+  wait?: Waiter;
   /** Absent means no wait is ever reported, whatever the model asks for. */
   heartbeat?: HeartbeatDeps;
-  /** The current wait's interrupt, read when a call starts. */
-  waitSignal?: () => AbortSignal;
   maxBlockSeconds?: number;
   /** What the typed conditions read. Absent means only `command` can be waited on. */
   github?: GitHubReadPort;
   /** Where a command runs: the checkout, so a check script can use git and relative paths. */
   cwd?: string;
+  /** The agent's shell allowlist, which a command runs with. */
+  env?: Record<string, string>;
   settleSeconds?: number;
 }
 
@@ -508,8 +502,9 @@ export interface MonitorArgs extends ConditionArgs {
   description: string;
   /**
    * What the board and the status card say is being waited for. Required of
-   * the model by the schema, and still optional here: a restart replays a
-   * call recorded before the argument existed, and that wait must resume.
+   * the model by the schema, and still optional here: a call recorded
+   * before the argument existed can still be rerun after a restart, and that
+   * wait must resume.
    */
   waitingFor?: string;
   /**
@@ -534,6 +529,8 @@ export interface MonitorResult {
   since?: string;
   /** GitHub refused the arguments; nothing was observed. */
   failed?: boolean;
+  /** A message for the agent arrived and ended the wait; it is placed next. */
+  interrupted?: boolean;
 }
 
 /**
@@ -551,9 +548,9 @@ export const runMonitor = async (
   args: MonitorArgs,
   deps: MonitorDeps = {},
 ): Promise<MonitorResult> => {
-  const probe = deps.probe ?? (deps.cwd ? shellProbeIn(deps.cwd) : shellProbe);
-  const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
+  const probe = deps.probe ?? (deps.cwd || deps.env ? shellProbeIn(deps.cwd, deps.env) : shellProbe);
   const now = deps.now ?? Date.now;
+  const waitFor = deps.wait ?? localWait(deps);
   const probeTimeoutMs =
     (deps.probeTimeoutSeconds ?? DEFAULT_PROBE_TIMEOUT_SECONDS) * 1000;
   const intervalMs = Math.max(1, args.intervalSeconds) * 1000;
@@ -579,8 +576,8 @@ export const runMonitor = async (
     ? await heartbeat.marker.recordWait(key, args.waitingFor?.trim() || null)
     : null;
 
-  // Measured from when the wait began, not from this process start, which is
-  // the whole reason the marker is durable: a restart is not progress, and a
+  // Measured from when the wait began, not from this call, which is the
+  // whole reason the marker is durable: a restart is not progress, and a
   // deadline of `now() + timeout` hands a crash-looping agent a fresh day
   // every time round. `now()` only wins if the marker is ahead of this clock,
   // which is skew rather than a wait that started in the future.
@@ -594,7 +591,7 @@ export const runMonitor = async (
   const typed = (args.condition ?? "command") !== "command";
   const github = deps.github;
   if (typed && !github) throw new Error(`${args.condition} needs GitHub access, which this monitor was built without`);
-  const check: ConditionCheck = typed && github
+  const condition: ConditionCheck = typed && github
     ? createConditionCheck(args, {
         github,
         now,
@@ -610,118 +607,113 @@ export const runMonitor = async (
       ? (args.since ?? new Date(startedAt).toISOString())
       : undefined;
 
-  let last = "";
-  for (;;) {
-    const state = await check();
-    last = state.output;
-    const expired = deps.signal?.aborted || now() >= deadline;
-    // A review that landed and is still settling has happened, so the
-    // deadline ends it as met rather than throwing the verdict away.
-    if (state.failed) {
-      if (heartbeat) await release(heartbeat, key);
-      return { output: last, timedOut: false, capped: false, failed: true };
-    }
-    if (state.done || (expired && state.met && !deps.signal?.aborted)) {
-      if (heartbeat) {
-        await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, output: last });
-        await release(heartbeat, key);
-      }
-      return { output: last, timedOut: false, capped: false };
-    }
-    if (expired) {
-      const capped = !deps.signal?.aborted && capAt < requestedDeadline;
-      // A capped wait is not over, so the marker stays: the re-armed call
-      // resumes its clock and its heartbeat ladder instead of starting both
-      // again, which at a 55-minute cap would mean the first reminder at one
-      // hour never came.
-      if (heartbeat && !capped) await release(heartbeat, key);
-      return capped && !heartbeat
-        ? {
-            output: last,
-            timedOut: false,
-            capped,
-            remainingSeconds: Math.ceil((requestedDeadline - now()) / 1000),
-            ...(since ? { since } : {}),
-          }
-        : { output: last, timedOut: !capped, capped };
+  // One rung of the ladder, if one is due. Runs between checks, never on the
+  // check that ends the wait.
+  const remind = async (last: string): Promise<void> => {
+    if (!heartbeat || !marker) return;
+    const waitedMs = now() - startedAt;
+    const quietMs = now() - Math.min(marker.lastPingAt ?? startedAt, now());
+    const gapMs = heartbeatGapSeconds(marker.pings, firstSeconds, maxGapSeconds) * 1000;
+    // The window gates the reminder, not the clock. A wait that spans a
+    // night keeps accruing and stays silent, and the first poll after the
+    // window opens is the one that speaks -- so "silence until morning,
+    // then a reminder" falls out of the rule rather than being a case in
+    // it.
+    if (quietMs < gapMs || !insideWorkingHours(now(), heartbeat.workingHours)) return;
+    // Counted before it is sent, deliberately. A crash in between costs
+    // one reminder and the next threshold still comes; the other order
+    // repeats it on every resume, and every merge to ops `main` resumes
+    // every agent, so a deploy would become a page.
+    //
+    // A Boss error here costs the reminder and not the wait, for the same
+    // reason the send below does. Skipping the send when the count did
+    // not move is the part that matters: retried every interval with no
+    // backoff to advance, it would be the reminder that became the spam.
+    try {
+      marker = await heartbeat.marker.recordPing();
+    } catch (error: unknown) {
+      alarm("wait_heartbeat_record_failed", { command: key, error: String(error) });
+      return;
     }
 
-    if (heartbeat && marker) {
-      const waitedMs = now() - startedAt;
-      const quietMs = now() - Math.min(marker.lastPingAt ?? startedAt, now());
-      const gapMs =
-        heartbeatGapSeconds(marker.pings, firstSeconds, maxGapSeconds) * 1000;
-      // The window gates the reminder, not the clock. A wait that spans a
-      // night keeps accruing and stays silent, and the first poll after the
-      // window opens is the one that speaks -- so "silence until morning,
-      // then a reminder" falls out of the rule rather than being a case in
-      // it.
-      if (
-        quietMs >= gapMs &&
-        insideWorkingHours(now(), heartbeat.workingHours)
-      ) {
-        // Counted before it is sent, deliberately. A crash in between costs
-        // one reminder and the next threshold still comes; the other order
-        // repeats it on every resume, and every merge to ops `main` resumes
-        // every agent, so a deploy would become a page.
-        //
-        // A Boss error here costs the reminder and not the wait, for the same
-        // reason the send below does. Skipping the send when the count did
-        // not move is the part that matters: retried every interval with no
-        // backoff to advance, it would be the reminder that became the spam.
-        try {
-          marker = await heartbeat.marker.recordPing();
-        } catch (error: unknown) {
-          alarm("wait_heartbeat_record_failed", {
-            command: key,
-            error: String(error),
-          });
-          await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
-          continue;
-        }
-
-        // Every rung is an escalation, and the ladder never ends a wait.
-        // Whether this one reaches a person, and how loudly, is the Boss's
-        // call; the agent's job is to say, on a schedule it cannot forget,
-        // that it is still blocked on one.
-        try {
-          await heartbeat.boss.tellBoss(
-            "escalation",
-            waitEscalation({
-              description: args.description,
-              awaitingHuman: ask,
-              waitedMs,
-              rung: marker.pings,
-              status: last,
-              nextSeconds: heartbeatGapSeconds(
-                marker.pings,
-                firstSeconds,
-                maxGapSeconds,
-              ),
-            }),
-          );
-          log("wait_escalated", {
-            command: key,
-            pings: marker.pings,
-            waitedMs,
-          });
-        } catch (error: unknown) {
-          // The wait carries on either way, so the model is never handed a
-          // turn on which it could notice this. That makes the alarm the
-          // only reporter: a reminder nobody received looks, from outside,
-          // exactly like a wait that has not reached its next rung.
-          alarm("wait_escalation_undelivered", {
-            command: key,
-            pings: marker.pings,
-            waitedMs,
-            error: String(error),
-          });
-        }
-      }
+    // Every rung is an escalation, and the ladder never ends a wait.
+    // Whether this one reaches a person, and how loudly, is the Boss's
+    // call; the agent's job is to say, on a schedule it cannot forget,
+    // that it is still blocked on one.
+    try {
+      await heartbeat.boss.tellBoss(
+        "escalation",
+        waitEscalation({
+          description: args.description,
+          awaitingHuman: ask,
+          waitedMs,
+          rung: marker.pings,
+          status: last,
+          nextSeconds: heartbeatGapSeconds(marker.pings, firstSeconds, maxGapSeconds),
+        }),
+      );
+      log("wait_escalated", { command: key, pings: marker.pings, waitedMs });
+    } catch (error: unknown) {
+      // The wait carries on either way, so the model is never handed a
+      // turn on which it could notice this. That makes the alarm the
+      // only reporter: a reminder nobody received looks, from outside,
+      // exactly like a wait that has not reached its next rung.
+      alarm("wait_escalation_undelivered", {
+        command: key,
+        pings: marker.pings,
+        waitedMs,
+        error: String(error),
+      });
     }
+  };
 
-    await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
+  const ended = await waitFor<ConditionState>({
+    timeoutMs: Math.max(0, deadline - now()),
+    intervalMs,
+    now,
+    check: async () => {
+      const state = await condition();
+      const finished = Boolean(state.done || state.failed);
+      if (!finished && now() < deadline) await remind(state.output);
+      return { done: finished, value: state };
+    },
+  });
+  const last = ended.value?.output ?? "";
+
+  if (ended.value?.failed) {
+    if (heartbeat) await release(heartbeat, key);
+    return { output: last, timedOut: false, capped: false, failed: true };
   }
+  // A review that landed and is still settling has happened, so the
+  // deadline ends it as met rather than throwing the verdict away.
+  if (ended.ended === "met" || (ended.ended === "timeout" && ended.value?.met)) {
+    if (heartbeat) {
+      await closeAsk(heartbeat, { key, waitingFor: args.waitingFor?.trim() || args.description, output: last });
+      await release(heartbeat, key);
+    }
+    return { output: last, timedOut: false, capped: false };
+  }
+  if (ended.ended === "inbox") {
+    // The board stops saying what it was waiting on. A re-armed call writes
+    // the marker again, for the same command, from now.
+    if (heartbeat) await release(heartbeat, key);
+    return { output: last, timedOut: false, capped: false, interrupted: true };
+  }
+  const capped = ended.ended === "timeout" && capAt < requestedDeadline;
+  // A capped wait is not over, so the marker stays: the re-armed call
+  // resumes its clock and its heartbeat ladder instead of starting both
+  // again, which at a 55-minute cap would mean the first reminder at one
+  // hour never came.
+  if (heartbeat && !capped) await release(heartbeat, key);
+  return capped && !heartbeat
+    ? {
+        output: last,
+        timedOut: false,
+        capped,
+        remainingSeconds: Math.ceil((requestedDeadline - now()) / 1000),
+        ...(since ? { since } : {}),
+      }
+    : { output: last, timedOut: !capped, capped };
 };
 
 // ---------------------------------------------------------------------------
@@ -734,9 +726,9 @@ export interface PendingQuestion {
 }
 
 /**
- * The re-entrancy marker for a question the agent is blocked on. `ToolApi`
- * carries the answer (a `boss_message` directive) but has nowhere to record
- * that a question is outstanding, so that lives here.
+ * The re-entrancy marker for a question the agent is blocked on. The answer
+ * arrives as a steer, which has nowhere to record that a question is
+ * outstanding, so that lives here.
  */
 export interface QuestionMarkerPort {
   getPending(): Promise<PendingQuestion | null>;
@@ -744,47 +736,25 @@ export interface QuestionMarkerPort {
   clearPending(): Promise<void>;
 }
 
-/** A directive still in the queue, carrying the id needed to remove just it. */
-export interface PendingDirective {
-  id: number;
-  directive: Directive;
-}
-
-/**
- * The read the poll makes, and the reason it is not `getIncident`. Every
- * ToolApi response drains: it deletes the directives it carries. Polling one
- * every 30s while blocked therefore destroys the `stop`, `merged`,
- * `new_signals` and `resumed_after` an agent has not read yet, so this read
- * leaves them where they are and the drain stays on the calls whose result
- * the model actually sees.
- *
- * `consumeDirective` is the one exception: the answer that ends a wait is
- * removed by the wait, because it has already been delivered as that call's
- * result.
- */
-export interface DirectivePeek {
-  peekDirectives(): Promise<PendingDirective[]>;
-  consumeDirective(id: number): Promise<void>;
-}
-
 /**
  * The stage-goal check before a person is asked to merge. A null `blocked`
- * lets the message go out. `directives` were drained by the check's reads.
+ * lets the message go out. `usage` is the evaluator's spend, which the tool
+ * reports as its own.
  */
-export type MergeCheckIn = (ask: string) => Promise<{ blocked: string | null; directives: Directive[] }>;
+export type MergeCheckIn = (ask: string) => Promise<{ blocked: string | null; usage: Usage | undefined }>;
 
 export interface MessageBossDeps {
   marker: QuestionMarkerPort;
   boss: BossInboxPort;
-  api: DirectivePeek;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   pollSeconds?: number;
   minWaitSeconds?: number;
   maxGapSeconds?: number;
+  /** Ends a local wait. The tool passes `wait` instead, which watches the conversation. */
   signal?: AbortSignal;
-  /** The current wait's interrupt, read when a call starts. */
-  waitSignal?: () => AbortSignal;
+  /** How the call blocks. Absent, a local wait over `sleep`, `now` and `signal`. */
+  wait?: Waiter;
   maxBlockSeconds?: number;
   /** Judges whether this message asks for a merge, and if so whether it is ready. */
   checkIn?: MergeCheckIn;
@@ -799,16 +769,17 @@ export interface MessageBossArgs {
 }
 
 export interface MessageBossResult {
-  /** What the Boss said back. Null when nothing was waited for, or nothing came. */
-  answer: string | null;
-  /** Set when the harness deadline ended the wait. */
+  /**
+   * The Boss answered. Its message is a steer, placed as the next user
+   * message after this call, so the result says so rather than repeating it.
+   */
+  answered: boolean;
+  /** Set when the conversation was aborted under the wait. */
   timedOut: boolean;
   /** The call hit `MAX_BLOCK_SECONDS` with the question still outstanding. */
   capped?: boolean;
-  /** Everything the poll saw that was not the answer. The caller renders these. */
-  directives: Directive[];
-  /** A `stop` or a `merged` arrived: the incident is no longer the agent's. */
-  terminate: boolean;
+  /** Something other than the Boss ended the wait: the deadline, the turn budget. */
+  interrupted?: boolean;
 }
 
 /**
@@ -830,8 +801,8 @@ export const unansweredEscalation = (question: string, waitedMs: number): string
  * Tell the Boss something, or ask it and wait.
  *
  * Asking is re-entrant and loud when nobody answers, and both halves are in
- * code rather than the prompt. A restart replays a tool call with no result,
- * so the marker is what stops the same question going up twice. And a
+ * code rather than the prompt. A restart reruns a tool call that had no
+ * result, so the marker is what stops the same question going up twice. And a
  * question nobody answers looks, from inside the wait, exactly like one
  * nobody has answered *yet*, so the escalation is the harness's to make on a
  * clock.
@@ -839,7 +810,7 @@ export const unansweredEscalation = (question: string, waitedMs: number): string
  * What it does not do is end anything. The incident is still the agent's --
  * it always is -- so an unanswered question buys an escalation, then another
  * on a doubling gap up to a day, and the wait carries on. Only an answer, a
- * `stop`, a `merged` or the harness deadline ends it.
+ * stop, a merge or the harness deadline ends it.
  */
 export const runMessageBoss = async (
   args: MessageBossArgs,
@@ -847,11 +818,11 @@ export const runMessageBoss = async (
 ): Promise<MessageBossResult> => {
   if (!args.wait) {
     await deps.boss.tellBoss("message", args.message);
-    return { answer: null, timedOut: false, directives: [], terminate: false };
+    return { answered: false, timedOut: false };
   }
 
-  const sleep = deps.sleep ?? ((ms: number) => wait(ms, deps.signal));
   const now = deps.now ?? Date.now;
+  const waitFor = deps.wait ?? localWait(deps);
   const pollMs = (deps.pollSeconds ?? MESSAGE_BOSS_POLL_SECONDS) * 1000;
   const minWaitSeconds = deps.minWaitSeconds ?? MESSAGE_BOSS_MIN_WAIT_SECONDS;
   const maxGapSeconds = deps.maxGapSeconds ?? HEARTBEAT_MAX_GAP_SECONDS;
@@ -862,10 +833,10 @@ export const runMessageBoss = async (
   // never received, and the agent waits on an answer to nothing. Asking
   // twice is recoverable and the silence is not.
   //
-  // A marker for a *different* question is a stale one: clearPending does
-  // not run when the child is SIGKILLed mid-wait, so the marker outlives the
-  // question it was written for. Matching on the message is what stops it
-  // swallowing every later question.
+  // A marker for a *different* question is a stale one: a wait that died
+  // with the process never cleared it, so the marker outlives the question
+  // it was written for. Matching on the message is what stops it swallowing
+  // every later question.
   let pending = await deps.marker.getPending();
   if (!pending || pending.message !== args.message) {
     await deps.boss.tellBoss("question", args.message);
@@ -873,8 +844,8 @@ export const runMessageBoss = async (
   }
 
   const waitSeconds = Math.max(minWaitSeconds, args.seconds ?? minWaitSeconds);
-  // Measured from when the question was asked, not from this process start.
-  // A restart is not an answer, and a deadline of `now() + wait` would give a
+  // Measured from when the question was asked, not from this call. A
+  // restart is not an answer, and a deadline of `now() + wait` would give a
   // crash-looping agent a fresh wait each time and defer the escalation for
   // as long as the crashes last. `now()` only wins if the marker is somehow
   // ahead of this clock, which is skew rather than a question from the future.
@@ -882,80 +853,64 @@ export const runMessageBoss = async (
   const deadline = askedAt + waitSeconds * 1000;
   const capAt = now() + (deps.maxBlockSeconds ?? MAX_BLOCK_SECONDS) * 1000;
 
-  for (;;) {
-    const entries = await deps.api.peekDirectives();
-    // Any word from the Boss ends the wait. It does not chat, so every one
-    // is deliberate, and several at once are one answer, not an answer and a
-    // leftover that get_incident would deliver a second time.
-    const answers = entries.filter((entry) => bossMessageText(entry.directive) !== null);
-    const terminate = entries.some(
-      (entry) =>
-        entry.directive.type === "stop" || entry.directive.type === "merged",
-    );
-    const rest = entries
-      .filter((entry) => !answers.includes(entry))
-      .map((entry) => entry.directive);
-
-    if (answers.length || terminate) {
-      // Clearing the marker first: a failure after it re-asks, a failure
-      // before it is a question that looks outstanding after it was answered.
-      await deps.marker.clearPending();
-      for (const answer of answers) await deps.api.consumeDirective(answer.id);
-      return {
-        answer: answers.length
-          ? answers.map((entry) => bossMessageText(entry.directive)).join("\n\n")
-          : null,
-        timedOut: false,
-        directives: rest,
-        terminate,
-      };
-    }
-    // The harness deadline is an escalation path of its own: the run steers
-    // the model to write a real brief inside the grace window, and escalating
-    // here would spend the turn that brief needs.
-    if (deps.signal?.aborted) {
-      await deps.marker.clearPending();
-      return { answer: null, timedOut: true, directives: rest, terminate: false };
-    }
-
-    if (now() >= deadline) {
-      // A failure costs this escalation and not the wait: the next poll
-      // tries again, and nothing about an unsent row changes who can finish
-      // the work.
-      try {
-        const told = await deps.boss.escalationsSince(askedAt);
-        const dueAt =
-          told.count === 0 || told.lastAt === null
-            ? deadline
-            : told.lastAt + heartbeatGapSeconds(told.count, waitSeconds, maxGapSeconds) * 1000;
-        if (now() >= dueAt) {
-          await deps.boss.tellBoss(
-            "escalation",
-            unansweredEscalation(args.message, now() - askedAt),
-          );
-          log("question_escalated", {
-            waitedMs: now() - askedAt,
-            escalations: told.count + 1,
-          });
+  const ended = await waitFor<null>({
+    timeoutMs: Math.max(0, capAt - now()),
+    intervalMs: pollMs,
+    now,
+    check: async () => {
+      if (now() >= deadline) {
+        // A failure costs this escalation and not the wait: the next poll
+        // tries again, and nothing about an unsent row changes who can
+        // finish the work.
+        try {
+          const told = await deps.boss.escalationsSince(askedAt);
+          const dueAt =
+            told.count === 0 || told.lastAt === null
+              ? deadline
+              : told.lastAt + heartbeatGapSeconds(told.count, waitSeconds, maxGapSeconds) * 1000;
+          if (now() >= dueAt) {
+            await deps.boss.tellBoss("escalation", unansweredEscalation(args.message, now() - askedAt));
+            log("question_escalated", { waitedMs: now() - askedAt, escalations: told.count + 1 });
+          }
+        } catch (error: unknown) {
+          alarm("question_escalation_failed", { error: String(error) });
         }
-      } catch (error: unknown) {
-        alarm("question_escalation_failed", { error: String(error) });
       }
+      return { done: false, value: null };
+    },
+  });
+
+  if (ended.ended === "inbox") {
+    // Any word from the Boss is the answer. It does not chat, so every one
+    // is deliberate, and several at once are one answer. A steer that is not
+    // the Boss -- the deadline, the turn budget -- ends the wait without
+    // answering it, so the marker stays and calling again resumes rather
+    // than asking twice.
+    if (ended.steers.some((steer) => steer.startsWith(BOSS_SAYS))) {
+      await deps.marker.clearPending();
+      return { answered: true, timedOut: false };
     }
-    // `deadline` above is when the Boss is told, not when this wait ends: an
-    // unanswered question keeps waiting, and only the harness signal times it
-    // out. So reaching the cap is never a timeout, whatever `seconds` was. The
-    // marker stays, so calling again with the same message resumes this wait
-    // and its escalation clock rather than asking the Boss twice.
-    if (now() >= capAt) {
-      return { answer: null, timedOut: false, capped: true, directives: rest, terminate: false };
-    }
-    await sleep(Math.min(pollMs, Math.max(0, capAt - now())));
+    return { answered: false, timedOut: false, interrupted: true };
   }
+  // An abort is a stop or the hard deadline, both of which have their own
+  // path to the Boss, and escalating here would spend the turn a brief needs.
+  if (ended.ended === "aborted") {
+    await deps.marker.clearPending();
+    return { answered: false, timedOut: true };
+  }
+  // `deadline` above is when the Boss is told, not when this wait ends: an
+  // unanswered question keeps waiting. So reaching the cap is never a
+  // timeout, whatever `seconds` was. The marker stays, so calling again with
+  // the same message resumes this wait and its escalation clock rather than
+  // asking the Boss twice.
+  return { answered: false, timedOut: false, capped: true };
 };
 
 const INTERRUPTED =
-  "The Boss spoke: its message reaches you next. If none does, call get_incident before you do anything else.";
+  "A message for you arrived and is next. Read it before you do anything else.";
+
+/** Pi Durable bounds a result's text unless told otherwise, and nothing here is cut. */
+export const WHOLE_OUTPUT = { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER };
 
 const MONITOR_DESCRIPTION = [
   "Block until something is true, then return what it found. Use it for every",
@@ -991,8 +946,8 @@ const MONITOR_DESCRIPTION = [
   "sentence, no shell, e.g. \"someone to merge omni#2189 or #2195\" or \"the",
   "deploy of #2234 to finish\".",
   "",
-  "A command MUST BE A READ-ONLY CHECK. A restart replays this call and runs",
-  "it again, so a side effect happens twice. `gh pr merge` here is a bug.",
+  "A command MUST BE A READ-ONLY CHECK. A restart reruns this call, so a side",
+  "effect happens twice. `gh pr merge` here is a bug.",
   "",
   "Set `awaitingHuman` when a person must act for the wait to end: what they must",
   "do, with the link. The Boss is then told once the wait passes an hour inside",
@@ -1020,9 +975,10 @@ const MESSAGE_BOSS_DESCRIPTION = [
   "rather than asking twice.",
 ].join("\n");
 
-export const createMonitorTool = async (
-  deps: MonitorDeps = {},
-): Promise<ToolDefinition> => {
+export const createMonitorTool = async (deps: {
+  /** Everything this call waits with, for the incident whose conversation is calling. */
+  resolve: (api: ToolExecutionApi, ctx: Context) => Promise<MonitorDeps>;
+}): Promise<ToolRegistration> => {
   const { Type } = await import("typebox");
   const parameters = Type.Object({
     condition: Type.Optional(
@@ -1072,11 +1028,14 @@ export const createMonitorTool = async (
 
   return {
     name: MONITOR_TOOL_NAME,
-    label: "Monitor",
     description: MONITOR_DESCRIPTION,
     parameters,
-    execute: async (_toolCallId, params, signal) => {
-      const args = params as unknown as MonitorArgs;
+    // A rerun after a restart finds the wait marker and resumes its clock and
+    // its heartbeat rung, so a deploy in the middle of a wait costs nothing.
+    replay: "safe",
+    outputLimits: WHOLE_OUTPUT,
+    execute: async (params, api, ctx): Promise<ToolExecutionResult> => {
+      const args = params as MonitorArgs;
       const problem = conditionProblem(args);
       if (problem) {
         return {
@@ -1084,16 +1043,13 @@ export const createMonitorTool = async (
           details: { timedOut: false, rejected: true },
         };
       }
-      const interrupt = deps.waitSignal?.();
-      const result = await runMonitor(args, {
-        ...deps,
-        signal: eitherSignal(signal, deps.signal, interrupt),
-      });
+      const resolved = await deps.resolve(api, ctx);
+      const result = await runMonitor(args, { wait: inboxWait(api, ctx), ...resolved });
       const again = [
         ...(result.remainingSeconds === undefined ? [] : [`timeoutSeconds: ${result.remainingSeconds}, which is what is left of your wait`]),
         ...(result.since === undefined ? [] : [`since: "${result.since}", so a review that lands in between is not missed`]),
       ];
-      const header = interrupt?.aborted && result.timedOut
+      const header = result.interrupted
         ? `STOPPED WAITING for: ${args.description} (interrupted). ${INTERRUPTED}`
         : result.capped
           ? `STILL WAITING for: ${args.description}. This call was capped at ${MAX_BLOCK_SECONDS}s of the ${args.timeoutSeconds}s you asked for, so the prompt cache stays warm. Nothing has timed out. ${
@@ -1111,7 +1067,7 @@ export const createMonitorTool = async (
         details: { timedOut: result.timedOut, command: conditionKey(args) },
       };
     },
-  } as ToolDefinition;
+  };
 };
 
 /** Past this, a `sleep` in bash is a wait, not a pause for GitHub to catch up. */
@@ -1142,17 +1098,11 @@ export const pollingRefusal = (command: string): string | null => {
   ].join(" ");
 };
 
-export const pollingGuardExtension = (pi: ExtensionAPI): void => {
-  pi.on("tool_call", (event) => {
-    if (event.toolName !== "bash") return;
-    const reason = pollingRefusal(String((event.input as { command?: unknown }).command ?? ""));
-    return reason ? { block: true, reason } : undefined;
-  });
-};
-
-export const createMessageBossTool = async (
-  deps: MessageBossDeps,
-): Promise<ToolDefinition> => {
+export const createMessageBossTool = async (deps: {
+  /** Everything this call sends and waits with, for the calling conversation's incident. */
+  resolve: (api: ToolExecutionApi, ctx: Context) => Promise<MessageBossDeps>;
+  minWaitSeconds?: number;
+}): Promise<ToolRegistration> => {
   const { Type } = await import("typebox");
   const minWait = deps.minWaitSeconds ?? MESSAGE_BOSS_MIN_WAIT_SECONDS;
   const parameters = Type.Object({
@@ -1173,53 +1123,61 @@ export const createMessageBossTool = async (
 
   return {
     name: MESSAGE_BOSS_TOOL_NAME,
-    label: "Message the Boss",
     description: MESSAGE_BOSS_DESCRIPTION,
     parameters,
-    execute: async (_toolCallId, params, signal) => {
-      const args = params as unknown as MessageBossArgs;
-      let drained: Directive[] = [];
-      if (deps.checkIn) {
+    // Safe because of the memos: a rerun after a crash finds the check-in
+    // already judged and the message already sent, and resumes rather than
+    // paying for the judgement or telling the Boss twice. A question resumes
+    // through its pending_question marker as well.
+    replay: "safe",
+    outputLimits: WHOLE_OUTPUT,
+    execute: async (params, api, ctx): Promise<ToolExecutionResult> => {
+      const args = params as MessageBossArgs;
+      const resolved = { minWaitSeconds: minWait, ...(await deps.resolve(api, ctx)) };
+      let usage: Usage | undefined;
+      if (resolved.checkIn && (await api.memo<boolean>("checked", ctx)) === undefined) {
         // A question already asked is a resumed wait, not a new ask.
-        const resuming = args.wait && (await deps.marker.getPending())?.message === args.message;
-        const check = resuming
-          ? { blocked: null, directives: [] }
-          : await deps.checkIn(
-              `The agent is sending the Boss this message${args.wait ? " and waiting for the answer" : ""}:\n${args.message}`,
-            );
-        drained = check.directives;
-        const stopped = drained.some((directive) => directive.type === "stop" || directive.type === "merged");
-        if (check.blocked || stopped) {
-          return {
-            content: [{ type: "text", text: `Not sent to the Boss. ${check.blocked ?? ""}${renderDirectives(drained)}` }],
-            details: { timedOut: false },
-            terminate: stopped,
-          };
+        const resuming = args.wait && (await resolved.marker.getPending())?.message === args.message;
+        if (!resuming) {
+          const check = await resolved.checkIn(
+            `The agent is sending the Boss this message${args.wait ? " and waiting for the answer" : ""}:\n${args.message}`,
+          );
+          usage = check.usage;
+          if (check.blocked) {
+            return {
+              content: [{ type: "text", text: `Not sent to the Boss. ${check.blocked}` }],
+              details: { timedOut: false },
+              ...(usage ? { usage } : {}),
+            };
+          }
         }
+        await api.memo<boolean>("checked", true, ctx);
       }
-      const interrupt = deps.waitSignal?.();
-      const result = await runMessageBoss(args, {
-        ...deps,
-        signal: eitherSignal(signal, deps.signal, interrupt),
-      });
+
+      let result: MessageBossResult;
+      if (!args.wait) {
+        if ((await api.memo<boolean>("sent", ctx)) === undefined) {
+          await resolved.boss.tellBoss("message", args.message);
+          await api.memo<boolean>("sent", true, ctx);
+        }
+        result = { answered: false, timedOut: false };
+      } else {
+        result = await runMessageBoss(args, { wait: inboxWait(api, ctx), ...resolved });
+      }
       const text = !args.wait
         ? "Sent to the Boss."
-        : result.answer !== null
-          ? `The Boss answered: ${result.answer}`
-          : interrupt?.aborted
-            ? `Stopped waiting for the Boss's answer (interrupted). ${INTERRUPTED}`
+        : result.answered
+          ? "The Boss answered. Its message is the next one you read."
+          : result.interrupted
+            ? `Stopped waiting for the Boss's answer (interrupted). ${INTERRUPTED} Your question is still with the Boss; to keep waiting for the answer, call message_boss again with the same message and wait: true. It will not be asked twice.`
             : result.capped
-            ? `No answer yet. This call was capped at ${MAX_BLOCK_SECONDS}s so the prompt cache stays warm. The question is still with the Boss. If you still need the answer, call message_boss again with the same message and wait: true; it will not be asked twice.`
-            : result.timedOut
-            ? "Your deadline ended this wait. Escalate now, with a brief."
-            : "The wait ended on a directive rather than an answer.";
+              ? `No answer yet. This call was capped at ${MAX_BLOCK_SECONDS}s so the prompt cache stays warm. The question is still with the Boss. If you still need the answer, call message_boss again with the same message and wait: true; it will not be asked twice.`
+              : "Your run was stopped while you waited.";
       return {
-        content: [
-          { type: "text", text: `${text}${renderDirectives([...drained, ...result.directives])}` },
-        ],
+        content: [{ type: "text", text }],
         details: { timedOut: result.timedOut },
-        terminate: result.terminate,
+        ...(usage ? { usage } : {}),
       };
     },
-  } as ToolDefinition;
+  };
 };

@@ -300,18 +300,4 @@ export const createBedrockInvokeModelProvider = async ({
   return { api: BEDROCK_INVOKE_MODEL_API, stream, streamSimple };
 };
 
-/**
- * Registers the provider under its own api id. Import order does not matter:
- * pi-ai/compat registers the builtins when it loads and never clobbers an id
- * that is already claimed, and this id is not one of them.
- */
-export const registerBedrockInvokeModelProvider = async (
-  options: CreateBedrockInvokeModelProviderOptions = {},
-): Promise<ApiProvider<BedrockInvokeModelApi, BedrockInvokeModelOptions>> => {
-  const { registerApiProvider } = await import("@earendil-works/pi-ai/compat");
-  const provider = await createBedrockInvokeModelProvider(options);
-  registerApiProvider(provider, "bugboss-bedrock-invoke-model");
-  return provider;
-};
-
 export type BedrockInvokeModelProviderModel = Model<BedrockInvokeModelApi>;

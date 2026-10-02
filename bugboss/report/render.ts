@@ -55,10 +55,9 @@ export interface ReportAction {
 
 /**
  * What the agent spent. Tokens and `modelId` are the record and come off the
- * incident row, which `rollUpUsage` keeps current from the session file; the
- * dollar figures are priced from them at read time. `turns` comes from that
- * same file read once more at publish time, so it is null when the file has
- * aged out from under the lifecycle rule while the row survives.
+ * incident row, which `rollUpUsage` keeps current from the conversation's
+ * usage; the dollar figures are priced from them at read time. `turns` is the
+ * row's `turnsUsed`, null for an incident no agent ever ran.
  */
 export interface ReportRun {
   modelId: string | null;
@@ -71,8 +70,8 @@ export interface ReportRun {
   attempts: number;
   turns: number | null;
   /**
-   * First to last entry in the session file: how long the agent was on the
-   * incident, parked time included. Null when the file is gone.
+   * First to last model response in the conversation: how long the agent was
+   * on the incident, parked time included. Null when there is none.
    */
   sessionSpanMs: number | null;
   /**

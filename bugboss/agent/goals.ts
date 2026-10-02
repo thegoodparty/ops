@@ -16,14 +16,15 @@
 // as follow-up work nobody owned. Both passed gates that checked arguments,
 // not outcomes.
 
-import type { Message } from "@earendil-works/pi-ai";
 import { z } from "zod";
 
 import { ModelRequestFailed, type ModelClient, type ModelUsage } from "../model";
 import { GOAL_VERDICT_KIND } from "../types";
-import type { Directive, Incident, SignalView, TimelineEvent, ToolResponse } from "../types";
-import { renderTimeline } from "./compaction";
-import { GOAL_VERDICT_ENTRY_TYPE } from "./session";
+import type { Incident, SignalView, TimelineEvent, ToolResponse } from "../types";
+import type { ContextView, Usage } from "./harness";
+import { renderTimeline } from "./stages";
+
+type Message = ContextView["messages"][number];
 
 /** What the evaluator reads about an incident. */
 export interface GoalContext {
@@ -167,7 +168,8 @@ const renderContext = (context: GoalContext): string => {
 export const createGoalEvaluator = (deps: {
   client: ModelClient;
   contextWindow: number;
-  estimateTokens: (message: Message) => number;
+  /** Defaults to Pi's own rule, characters over four, of what the evaluator is shown. */
+  estimateTokens?: (message: Message) => number;
   maxTokens?: number;
   timeoutMs?: number;
 }) =>
@@ -179,6 +181,8 @@ export const createGoalEvaluator = (deps: {
     transcript: Message[];
   }): Promise<Evaluation> => {
     const maxTokens = deps.maxTokens ?? EVALUATOR_MAX_TOKENS;
+    const estimateTokens =
+      deps.estimateTokens ?? ((message: Message) => Math.ceil(renderMessage(message).length / 4));
     const system = `${EVALUATOR_SYSTEM}${input.gate === "merge_check_in" ? CHECK_IN_SYSTEM_EXTRA : ""}`;
     const head = [
       `# The goal: ${GATE_TITLE[input.gate]}`,
@@ -199,7 +203,7 @@ export const createGoalEvaluator = (deps: {
     let room = deps.contextWindow - maxTokens - roughly(system) - roughly(head) - 2_000;
     const kept: Message[] = [];
     for (let i = input.transcript.length - 1; i >= 0; i -= 1) {
-      const cost = deps.estimateTokens(input.transcript[i]);
+      const cost = estimateTokens(input.transcript[i]);
       if (cost > room) break;
       room -= cost;
       kept.unshift(input.transcript[i]);
@@ -262,68 +266,52 @@ export type GoalEvaluator = ReturnType<typeof createGoalEvaluator>;
 // The gates and the merge check-in
 // ---------------------------------------------------------------------------
 
-/** The parts of Pi's session manager this reads and writes. */
-export interface GoalSession {
-  buildSessionProjection(): { messages: unknown[] };
-  appendCustomEntry(customType: string, data?: unknown): string;
-}
-
 export interface StageGoalsDeps {
   evaluate: GoalEvaluator;
-  /**
-   * Both go through tool API calls that drain the Boss's directives, so both
-   * hand back what they drained, and the tool that was judged delivers it.
-   */
-  context: () => Promise<{ context: GoalContext | null; error?: string; directives: Directive[] }>;
-  recordVerdict: (verdict: { gate: Gate; verdict: Verdict; reason: string }) => Promise<Directive[]>;
+  context: () => Promise<{ context: GoalContext | null; error?: string }>;
+  recordVerdict: (verdict: { gate: Gate; verdict: Verdict; reason: string }) => Promise<void>;
   /** The escalate tool's own path to the Boss. */
   escalate: (reason: string, brief: string) => Promise<void>;
-  session: () => GoalSession | null;
-  /** Pi's message conversion, so the evaluator reads what the agent's model reads. */
-  toMessages: (messages: unknown[]) => Message[];
+  /** The agent's model context: the latest compaction summary and everything after. */
+  transcript: () => Promise<Message[]>;
   log: (event: string, fields: Record<string, unknown>) => void;
   alarm: (event: string, fields: Record<string, unknown>) => void;
 }
 
-const usageEntry = (usage: ModelUsage | null) =>
+/**
+ * The evaluator's spend, as the judged tool reports it. Returned as the
+ * tool result's `usage`, so it lands in the conversation's `pi.usage.tools`
+ * and counts towards the incident's tokens without counting as a turn or
+ * claiming the incident's model.
+ */
+export const goalUsage = (usage: ModelUsage | null): Usage | undefined =>
   usage
     ? {
         input: usage.tokensIn,
         output: usage.tokensOut,
         cacheRead: usage.cacheRead,
         cacheWrite: usage.cacheWrite,
-        cost: { total: usage.costUsd },
+        totalTokens: usage.tokensIn + usage.tokensOut + usage.cacheRead + usage.cacheWrite,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: usage.costUsd },
       }
     : undefined;
 
 export const createStageGoals = (deps: StageGoalsDeps) => {
-  /** The agent's context as its model sees it: the latest compaction summary and everything after. */
-  const transcript = (): Message[] => {
-    const session = deps.session();
-    return session ? deps.toMessages(session.buildSessionProjection().messages) : [];
-  };
-
-  const judge = async (gate: Gate, attempt: string): Promise<Evaluation & { directives: Directive[] }> => {
-    const directives: Directive[] = [];
+  const judge = async (gate: Gate, attempt: string): Promise<Evaluation> => {
     let evaluation: Evaluation;
     try {
       const read = await deps.context();
-      directives.push(...read.directives);
       evaluation = read.context
-        ? await deps.evaluate({ gate, goal: GOALS[gate], attempt, context: read.context, transcript: transcript() })
+        ? await deps.evaluate({
+            gate,
+            goal: GOALS[gate],
+            attempt,
+            context: read.context,
+            transcript: await deps.transcript(),
+          })
         : { judgement: "unjudged", reason: `the incident could not be read: ${read.error}`, usage: null };
     } catch (err: unknown) {
       evaluation = { judgement: "unjudged", reason: `the goal could not be judged: ${String(err)}`, usage: null };
-    }
-    try {
-      deps.session()?.appendCustomEntry(GOAL_VERDICT_ENTRY_TYPE, {
-        gate,
-        verdict: evaluation.judgement,
-        reason: evaluation.reason,
-        usage: usageEntry(evaluation.usage),
-      });
-    } catch (err: unknown) {
-      deps.alarm("goal_verdict_unrecorded", { gate, error: String(err) });
     }
     deps.log("goal_verdict", { gate, verdict: evaluation.judgement, reason: evaluation.reason });
     if (evaluation.judgement === "unjudged") {
@@ -336,14 +324,12 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
     // evaluator must not read it back as an earlier judgement.
     if (evaluation.judgement !== "not_applicable" && evaluation.judgement !== "unjudged") {
       try {
-        directives.push(
-          ...(await deps.recordVerdict({ gate, verdict: evaluation.judgement, reason: evaluation.reason })),
-        );
+        await deps.recordVerdict({ gate, verdict: evaluation.judgement, reason: evaluation.reason });
       } catch (err: unknown) {
         deps.alarm("goal_verdict_timeline_failed", { gate, error: String(err) });
       }
     }
-    return { ...evaluation, directives };
+    return evaluation;
   };
 
   const goalFooter = (gate: Gate): string => `The goal (${GATE_TITLE[gate]}):\n${GOALS[gate]}`;
@@ -364,40 +350,48 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
      * itself is the same call as before, so the tool API's own guards still
      * hold; this sits in front of them.
      */
-    gate: async (gate: StageGate, attempt: string, run: () => Promise<ToolResponse>): Promise<ToolResponse> => {
+    gate: async (
+      gate: StageGate,
+      attempt: string,
+      run: () => Promise<ToolResponse>,
+    ): Promise<{ response: ToolResponse; usage: Usage | undefined }> => {
       const evaluation = await judge(gate, attempt);
+      const usage = goalUsage(evaluation.usage);
       if (evaluation.judgement === "not_met") {
         return {
-          ok: false,
-          error: [
-            `NOT MET, nothing changed: ${evaluation.reason}`,
-            "",
-            goalFooter(gate),
-            "",
-            `Keep working, surface the evidence, then call ${GATE_TOOL[gate]} again.`,
-          ].join("\n"),
-          directives: evaluation.directives,
+          response: {
+            ok: false,
+            error: [
+              `NOT MET, nothing changed: ${evaluation.reason}`,
+              "",
+              goalFooter(gate),
+              "",
+              `Keep working, surface the evidence, then call ${GATE_TOOL[gate]} again.`,
+            ].join("\n"),
+          },
+          usage,
         };
       }
       if (evaluation.judgement === "impossible") {
         const told = await escalate(gate, evaluation.reason);
         return {
-          ok: false,
-          error: `IMPOSSIBLE, nothing changed: ${evaluation.reason}\n\n${told} Keep working the incident while a person decides.`,
-          directives: evaluation.directives,
+          response: {
+            ok: false,
+            error: `IMPOSSIBLE, nothing changed: ${evaluation.reason}\n\n${told} Keep working the incident while a person decides.`,
+          },
+          usage,
         };
       }
-      const response = await run();
-      return { ...response, directives: [...evaluation.directives, ...(response.directives ?? [])] };
+      return { response: await run(), usage };
     },
 
     /**
      * The check before a person is asked to merge. `blocked` is null when the
      * message may go out; otherwise what the tool returns instead of sending it.
      */
-    checkIn: async (ask: string): Promise<{ blocked: string | null; directives: Directive[] }> => {
+    checkIn: async (ask: string): Promise<{ blocked: string | null; usage: Usage | undefined }> => {
       const evaluation = await judge("merge_check_in", ask);
-      const { directives } = evaluation;
+      const usage = goalUsage(evaluation.usage);
       if (evaluation.judgement === "not_met") {
         const blocked = [
           `NOT MET, nothing changed: ${evaluation.reason}`,
@@ -406,15 +400,13 @@ export const createStageGoals = (deps: StageGoalsDeps) => {
           "",
           "The ask was not sent. Keep working, surface the evidence, then ask again.",
         ].join("\n");
-        return { blocked, directives };
+        return { blocked, usage };
       }
       if (evaluation.judgement === "impossible") {
         const told = await escalate("merge_check_in", evaluation.reason);
-        return { blocked: `IMPOSSIBLE, the ask was not sent: ${evaluation.reason}\n\n${told}`, directives };
+        return { blocked: `IMPOSSIBLE, the ask was not sent: ${evaluation.reason}\n\n${told}`, usage };
       }
-      return { blocked: null, directives };
+      return { blocked: null, usage };
     },
   };
 };
-
-export type StageGoals = ReturnType<typeof createStageGoals>;

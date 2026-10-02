@@ -37,9 +37,12 @@ served to anyone in the channel since it was written, and it is what makes
 `proposeMerge` worth having: an agent claiming two incidents are the same
 problem should have read the other one.
 
-The token still scopes every **write** to one record, and the loopback route
-still 403s a path id that is not the caller's. A read of another incident
-drains only the caller's own directives.
+Every **write** is still scoped to one record, and the record is never an
+argument. `ToolApiDeps.incidentId` is fixed when the API is built: the agent's
+tools read it from their conversation's `IncidentDoc` and call
+`toolApiFor(incidentId)` in-process, so nothing a model writes can aim a
+write at another incident. That is the property the per-launch bearer token
+used to provide.
 
 ## An agent asks; it does not decide
 
@@ -116,7 +119,7 @@ after a merge this process never saw.
 
 It exists because the surviving agent is asked to keep a title that is true
 of both halves, and for the half it never investigated the only honest source
-is what that agent concluded. The `new_signals` directive names the incidents
+is what that agent concluded. The `new_signals` notice names the incidents
 by id; this is where the detail arrives.
 
 ## Guard in the statement
@@ -193,7 +196,7 @@ incident and splits the signals the cause does not account for.
 Since the survivor is the more established incident rather than the reporting
 one, the incident carrying the root cause is routinely the one that closes.
 The cause travels with the signals as the merge's **reason** — which is what
-the surviving agent reads in its `new_signals` directive and what both threads
+the surviving agent reads in its `new_signals` notice and what both threads
 are told — and never as a column on the survivor. Writing it there would forge
 a transition no agent made, past the gate that makes every attached signal
 explained. It arrives as a claim to check, which is the only honest form for a
@@ -207,6 +210,16 @@ agent chases two causes and the other has nobody on it" miss the design
 names explicitly.
 
 ## Notify
+
+Two audiences, two paths. People read the thread (`announce.ts`, below).
+Agents are told through `AgentNotifier`, which `ToolApiDeps.agents` carries
+and `applyAssign` takes: a `merged` for an emptied incident, `new_signals` for
+the one that took its signals, `stop` for a Boss close. `assign` only
+collects these as `AssignResult.notices`; the caller delivers them **after**
+the `withWrite` resolves, so an agent is never told about a move that rolled
+back. The composition root turns each into an act on the agent's
+conversation (a steer, or an abort). A notify that throws alarms
+(`agent_notify_failed`) and the transition stands.
 
 The merge half lives in `announce.ts` rather than here, because there are two
 ways a merge happens and only one of them runs inside an agent's call:

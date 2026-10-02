@@ -48,57 +48,21 @@ const fakeS3 = () => {
   };
 };
 
-/** Two model turns and one out-of-band compaction call, as Pi writes them. */
-const SESSION = [
-  JSON.stringify({
-    type: "message",
-    message: {
-      role: "assistant",
-      model: "us.anthropic.claude-opus-5",
-      usage: {
-        input: 1_000,
-        output: 500,
-        cacheRead: 40_000,
-        cacheWrite: 2_000,
-        cost: { total: 1.5 },
-      },
-    },
-  }),
-  JSON.stringify({
-    type: "message",
-    message: {
-      role: "assistant",
-      model: "us.anthropic.claude-opus-5",
-      usage: {
-        input: 2_000,
-        output: 700,
-        cacheRead: 60_000,
-        cacheWrite: 0,
-        cost: { total: 2.25 },
-      },
-    },
-  }),
-  JSON.stringify({
-    type: "compaction",
-    usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
-  }),
-].join("\n");
-
 const OPENED = Date.UTC(2026, 8, 27, 10, 0, 0);
 const NOW = Date.UTC(2026, 8, 27, 12, 0, 0);
 
 let dir: string;
+let conversationIds = 1;
 let db: Db;
 let s3: ReturnType<typeof fakeS3>;
 let posts: { threadTs: string | null; text: string }[];
 let uploads: ReportUpload[];
 let uploadFails: boolean;
+let spans: Map<number, { firstAt: number; lastAt: number }>;
 
 const deps = (overrides: Partial<ReportDeps> = {}): ReportDeps => ({
   db,
-  sessions: {
-    get: async (key: string) => s3.objects.get(key)?.toString("utf8") ?? null,
-  },
+  conversationSpan: async (conversationId) => spans.get(conversationId) ?? null,
   post: async (threadTs, text) => {
     posts.push({ threadTs, text });
     return { ts: `ts-${posts.length}` };
@@ -121,7 +85,8 @@ interface SeedOptions {
   postmortem?: string | null;
   signalTitle?: string;
   rootCause?: string;
-  sessionRef?: string | null;
+  /** Null for an incident no agent ever ran. */
+  conversationId?: number | null;
   /** Null for "never recorded"; later than `OPENED` for a backwards row. */
   impactStartedAt?: number | null;
   resolvedAt?: number | null;
@@ -138,7 +103,7 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
     opts.postmortem === undefined
       ? "## Timeline\n\n10:00 impact began.\n\n## Five whys\n\n1. The pool saturated."
       : opts.postmortem;
-  const sessionRef = opts.sessionRef === undefined ? `sessions/incident/${id}/session.jsonl` : opts.sessionRef;
+  const conversationId = opts.conversationId === undefined ? conversationIds++ : opts.conversationId;
   const impactStartedAt =
     opts.impactStartedAt === undefined ? OPENED - 600_000 : opts.impactStartedAt;
   const resolvedAt =
@@ -153,10 +118,10 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
       `INSERT INTO incident (
          id, status, slackThreadTs, rootCause, prUrls, postmortem,
          usersImpacted, impactQuery, impactStartedAt, firstSignalAt, fixingAt,
-         resolvedAt, closedAt, rotationAtOpen, sessionRef, lastStartedAt,
-         attempts, modelId, tokensIn, tokensOut, cacheRead, cacheWrite,
-         cacheWrite1h, resolvedEvidence)
-       VALUES (?, ?, 'thread-1', ?, ?, ?, 1240, 'sum(rate(errors))', ?, ?, ?, ?, ?, ?, ?, ?, 2, 'us.anthropic.claude-opus-5', 3000, 1200, 100000, 2000, 1500, ?)`,
+         resolvedAt, closedAt, rotationAtOpen, conversationId, turnsUsed,
+         lastStartedAt, attempts, modelId, tokensIn, tokensOut, cacheRead,
+         cacheWrite, cacheWrite1h, resolvedEvidence)
+       VALUES (?, ?, 'thread-1', ?, ?, ?, 1240, 'sum(rate(errors))', ?, ?, ?, ?, ?, ?, ?, 2, ?, 2, 'us.anthropic.claude-opus-5', 3000, 1200, 100000, 2000, 1500, ?)`,
     ).run(
       id,
       status,
@@ -169,7 +134,7 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
       resolvedAt,
       closedAt,
       JSON.stringify(["U-ONCALL"]),
-      sessionRef,
+      conversationId,
       OPENED,
       "Errors stopped at 11:02; the alert cleared.",
     );
@@ -194,7 +159,7 @@ const seed = async (id: string, opts: SeedOptions = {}) => {
        VALUES (?, 'human', 'U-SWAIN', 'merge', 'same connection pool as inc-9', ?)`,
     ).run(id, OPENED + 120_000);
   });
-  if (sessionRef) s3.objects.set(sessionRef, Buffer.from(SESSION, "utf8"));
+  return conversationId;
 };
 
 before(() => {
@@ -212,6 +177,7 @@ beforeEach(async () => {
   posts = [];
   uploads = [];
   uploadFails = false;
+  spans = new Map();
   db = await Db.open({
     path: join(dir, `report-${Math.random().toString(36).slice(2)}.db`),
     bucket: "bugboss-test",
@@ -234,10 +200,10 @@ describe("the report assembles from a real incident row", () => {
     const data = await readReportData(deps(), "inc-1");
     assert.ok(data);
     assert.equal(data.run.modelId, "us.anthropic.claude-opus-5");
-    assert.equal(data.run.turns, 2, "turns come from the session file, not the row");
+    assert.equal(data.run.turns, 2, "turns come from the row the turn hook keeps");
     // 3,000 in at $5.50/M, 1,200 out at $27.50/M, 100,000 read at $0.55/M,
     // 500 5m writes at $6.875/M and 1,500 1h writes at $11/M. Priced from the
-    // row's tokens; the session file's own cost figures are not read.
+    // row's tokens.
     assert.equal(data.run.estimatedCostUsd, 0.1244375);
     assert.equal(data.run.cacheWrite1h, 1500, "the 1h split is the record, not the price");
     assert.equal(data.prs.length, 1);
@@ -353,7 +319,7 @@ describe("the report assembles from a real incident row", () => {
   });
 
   it("says so rather than inventing a number it does not have", async () => {
-    await seed("inc-2", { sessionRef: null });
+    await seed("inc-2", { conversationId: null });
     await db.withWrite((w) => {
       w.prepare(
         "UPDATE incident SET impactStartedAt = NULL, usersImpacted = NULL, modelId = NULL WHERE id = 'inc-2'",
@@ -1232,7 +1198,7 @@ describe("a structured post-mortem renders in one fixed order", () => {
   ];
 
   const seedStructured = async (id: string) => {
-    await seed(id);
+    const conversationId = await seed(id);
     await db.withWrite((w) => {
       w.prepare("UPDATE incident SET postmortemSections = ? WHERE id = ?").run(
         JSON.stringify({
@@ -1251,17 +1217,10 @@ describe("a structured post-mortem renders in one fixed order", () => {
       insert.run(1, id, "root_cause_found", Date.UTC(2026, 9, 1, 3, 0, 0), Date.UTC(2026, 9, 1, 3, 1, 0), "Root cause found", null);
       insert.run(2, id, "fix_verified", Date.UTC(2026, 9, 1, 7, 45, 2), Date.UTC(2026, 9, 1, 7, 50, 0), "Recorded only: 18 saves succeed", "https://grafana.example/explore");
     });
-    s3.objects.set(
-      `sessions/incident/${id}/session.jsonl`,
-      Buffer.from(
-        [
-          JSON.stringify({ type: "session", timestamp: "2026-10-01T02:20:00.000Z" }),
-          ...SESSION.split("\n"),
-          JSON.stringify({ type: "custom", timestamp: "2026-10-01T07:52:00.000Z" }),
-        ].join("\n"),
-        "utf8",
-      ),
-    );
+    spans.set(conversationId!, {
+      firstAt: Date.parse("2026-10-01T02:20:00.000Z"),
+      lastAt: Date.parse("2026-10-01T07:52:00.000Z"),
+    });
   };
 
   it("has the seven sections in order, then the evidence as appendices", async () => {

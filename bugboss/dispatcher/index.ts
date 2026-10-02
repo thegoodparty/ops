@@ -1,47 +1,42 @@
-// The dispatcher. Design spec: bugboss/docs/architecture.md, Job 3, plus
-// "The agent boundary" for the child environment.
+// The dispatcher. Design spec: bugboss/docs/architecture.md, Job 3.
 //
 // One question, every 30 seconds: does every incident that should have an
 // agent have a live one? Both sides of that comparison are in this process,
 // so there is nothing to reconcile. No task ARNs, no clientToken, no
 // ListTasks that cannot see a finished task, no orphan sweep, no lease.
 //
-// Everything else here is what co-location and a wall-clock bound force: an
-// allowlisted child environment, a kill backstop for the in-container deadline,
-// a relaunch limit, and a ceiling that is a circuit breaker rather than a
-// scheduler. There is deliberately no queue and no priority order.
+// An agent is a Pi Durable conversation, reached only through `AgentRuntime`,
+// so nothing here imports Pi. Everything else is what a wall-clock bound and
+// a shared process force: a deadline that steers and then aborts, a relaunch
+// limit, and a ceiling that is a circuit breaker rather than a scheduler.
+// There is deliberately no queue and no priority order.
+
+import { existsSync } from "node:fs";
 
 import type Database from "better-sqlite3";
 
-import type {
-  Directive,
-  DispatcherConfig,
-  IncidentStatus,
-  RunningAgent,
-  ToolApi,
-} from "../types";
-// The child's own grace, read rather than copied: the parent's backstop is
-// defined relative to it, so a change there must move this too.
-import { DEADLINE_GRACE_SECONDS, INCIDENT_AGENT_MAX_TURNS } from "../agent/run";
-import { emptyTrash, sweepWorkspaces } from "../agent/workspace";
-import { buildChildEnv, hasAwsCredentialPath } from "./env";
-import type { AgentProcess, AgentSpawnContext, SpawnAgent } from "./spawn";
+// The grace and the budget default are the agent's numbers too, so they are
+// defined once, beside the budget hook, and read here.
+import {
+  DEADLINE_GRACE_SECONDS,
+  INCIDENT_AGENT_MAX_TURNS,
+  deadlineMessage,
+} from "../agent/budget";
+import type { ConversationId } from "../agent/harness";
+import { directiveText } from "../agent/tools";
+import {
+  computePaths,
+  DEFAULT_WORK_ROOT,
+  emptyTrash,
+  prepareCheckout,
+  startNpmCi,
+  sweepWorkspaces,
+  type AgentPaths,
+  type CheckoutOutcome,
+} from "../agent/workspace";
+import type { DispatcherConfig, IncidentStatus, ToolApi } from "../types";
 import { committedLocally, writesHalted } from "../db";
 import { makeAlarm, makeLog } from "../logging";
-
-export * from "./env";
-export * from "./spawn";
-
-// `tsc` rejects a renamed or moved export outright, and the image is built
-// with `tsc && esbuild`, so prod cannot ship one. tsx does not typecheck,
-// though, so under it a rename arrives here as `undefined`, which makes
-// killAt NaN; `now < NaN` is false, so the backstop reads as already expired
-// and SIGKILLs every agent on its first tick. Fail at import instead.
-if (!Number.isFinite(DEADLINE_GRACE_SECONDS) || DEADLINE_GRACE_SECONDS <= 0) {
-  throw new Error(
-    `agent/run.ts must export DEADLINE_GRACE_SECONDS as a positive number; got ${DEADLINE_GRACE_SECONDS}. The dispatcher's kill backstop is defined relative to it.`,
-  );
-}
 
 const log = makeLog("dispatcher");
 
@@ -68,9 +63,6 @@ export const RESUME_ALARM_SECONDS = 300;
  * dispatcher parks an incident are all "not now".
  */
 export const PARK_COOLDOWN_SECONDS = 3600;
-
-/** How long a resume waits on the session read before measuring without it. */
-export const SESSION_READ_TIMEOUT_MS = 5000;
 
 /**
  * How long an incident may go with nothing at all happening to it.
@@ -99,6 +91,13 @@ export const budgetRaisedNotice = (max: number, used: number): string =>
 export const turnsGrantedNotice = (max: number, used: number): string =>
   `Granted more turns; the agent is resuming with ${max - used} left of ${max}.`;
 
+/**
+ * The park a spent budget writes. The same words the agent's own budget hook
+ * uses, because `liftRaisedBudgets` finds budget waits by them.
+ */
+export const turnBudgetWaitingFor = (max: number): string =>
+  `a person to decide what happens next; the ${max}-turn budget is spent`;
+
 export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   maxConcurrentAgents: 15,
   tickSeconds: 30,
@@ -106,7 +105,7 @@ export const DEFAULT_DISPATCHER_CONFIG: DispatcherConfig = {
   // are measured in hours, so a half-hour ceiling killed agents mid-wait.
   agentTimeoutSeconds: 86_400,
   // The bound that counts work rather than time, and the one a restart does
-  // not refill. See INCIDENT_AGENT_MAX_TURNS in agent/run.ts for the number.
+  // not refill. See INCIDENT_AGENT_MAX_TURNS in agent/budget.ts for the number.
   agentMaxTurns: INCIDENT_AGENT_MAX_TURNS,
   maxAttempts: 3,
   staleAfterSeconds: STALE_AFTER_SECONDS,
@@ -119,16 +118,56 @@ export interface DispatcherDb {
   withWrite<T>(fn: (db: Database.Database) => T): Promise<T>;
 }
 
+/**
+ * Everything the dispatcher may do to an agent. The composition root
+ * implements it over the harness; the dispatcher's tests implement it in
+ * memory, because this seam is the dispatcher's whole contract with Pi.
+ */
+export interface AgentRuntime {
+  createIncidentConversation(
+    incidentId: string,
+    a: { cwd: string; instructions: string },
+  ): Promise<ConversationId>;
+  submit(
+    id: ConversationId,
+    content: string,
+    o: { requestId: string; whenBusy: "steer" | "followUp" },
+  ): Promise<{ wait(): Promise<"done" | "unanswered"> }>;
+  isBusy(id: ConversationId): Promise<boolean>;
+  abort(id: ConversationId): Promise<void>;
+  reset(id: ConversationId, handoff: string): Promise<void>;
+}
+
+/** An incident with a live agent, for `list()` and the tick's result. */
+export interface RunningAgent {
+  incidentId: string;
+  startedAt: number;
+  phase: string;
+}
+
 export interface DispatcherDeps {
   db: DispatcherDb;
   config: DispatcherConfig;
-  spawn: SpawnAgent;
+  runtime: AgentRuntime;
   /** Chunk 4's per-incident tool API. Also the dispatcher's escalation path. */
   toolApiFor: (incidentId: string) => ToolApi;
-  /** Bearer for the tool API, scoped to one incident. */
-  mintToken: (incidentId: string) => string;
-  /** Outbound tokens a child may hold. The composition root decides. */
-  childCredentials?: Record<string, string | undefined>;
+  /**
+   * The system prompt a new conversation is pinned to. Called once per
+   * incident, after the checkout is ready, because the prompt reads the
+   * checkout's own agent docs.
+   */
+  composePrompt: (
+    incidentId: string,
+    a: { paths: AgentPaths; alertSlugs: string[] },
+  ) => Promise<string>;
+  /** The first input of a launch. The agent's to word; the dispatcher only picks. */
+  messages: {
+    kickoff: (
+      incidentId: string,
+      o: { resumedWithoutTranscript: boolean },
+    ) => string;
+    resume: (checkout: CheckoutOutcome, npmCiFailed: boolean) => string;
+  };
   /**
    * Says something in an incident's thread. Optional, because the E2E and
    * the unit tests run a dispatcher with no Slack at all -- but absent in
@@ -137,24 +176,9 @@ export interface DispatcherDeps {
    */
   postNotice?: (incidentId: string, text: string) => Promise<void>;
   /**
-   * The newest timestamp in an incident's synced session, or null. Read on a
-   * resume the dispatcher did not watch exit, to learn when the agent was
-   * last working. Optional for the same reason as postNotice; without it the
-   * gap falls back to what the database recorded.
-   */
-  lastSessionEventAt?: (sessionRef: string) => Promise<number | null>;
-  /**
-   * Turns an incident's synced session has spent, or null when there is no
-   * session. Read at boot for incidents parked on a spent turn budget, to
-   * learn whether a raised budget gives them turns back. Absent, nothing
-   * lifts such a wait.
-   */
-  sessionTurns?: (sessionRef: string) => Promise<number | null>;
-  /** Process essentials for the child; pickBaseEnv(process.env) in prod. */
-  childBaseEnv?: Record<string, string | undefined>;
-  /**
-   * An exit sooner than this after launch is a crash rather than a run.
-   * Defaults to two ticks, the shortest gap the dispatcher can even observe.
+   * A finish sooner than this after launch, without an answer, is a crash
+   * rather than a run. Defaults to two ticks, the shortest gap the dispatcher
+   * can even observe.
    */
   fastFailureSeconds?: number;
   /**
@@ -174,15 +198,24 @@ export interface DispatcherDeps {
    * as in tests that run no real agent, it leaves the filesystem alone.
    */
   workRoot?: string;
+  /**
+   * Given, a launch clones or fetches the checkout under `workRoot` and
+   * restarts an interrupted `npm ci`, with `env` as the whole environment of
+   * both. Absent, as in the unit tests and the E2E, no checkout is touched.
+   */
+  workspace?: {
+    repoUrl: string;
+    env: (incidentId: string) => Promise<Record<string, string>>;
+  };
   now?: () => number;
 }
 
 export interface TickResult {
   started: RunningAgent[];
-  /** Incidents escalated this tick, by either escalation path. */
+  /** Incidents escalated this tick, by any escalation path. */
   escalated: string[];
-  /** Incidents whose child was killed for passing its deadline. */
-  killed: string[];
+  /** Incidents whose run was aborted for passing its deadline and its grace. */
+  aborted: string[];
   running: number;
   /** The ceiling stopped a launch. Something is wrong; a human should look. */
   circuitOpen: boolean;
@@ -192,18 +225,24 @@ export interface TickResult {
    * waiting. See `sweepStale`.
    */
   swept: string[];
-  /** Resolves when everything this tick started has exited. */
+  /** Resolves when every run this tick started has settled. */
   settled: Promise<void>;
 }
 
 interface EligibleRow {
   id: string;
   status: IncidentStatus;
-  sessionRef: string | null;
+  conversationId: ConversationId | null;
   attempts: number;
   lastStartedAt: number | null;
   firstSignalAt: number;
   grantedTurns: number;
+  turnsUsed: number;
+  modelId: string | null;
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
 }
 
 /**
@@ -222,15 +261,38 @@ const AGENT_STATUSES: readonly IncidentStatus[] = [
 
 // No ORDER BY: a priority order is a scheduler, and this is not one.
 const ELIGIBLE_SQL = `
-  SELECT i.id AS id, i.status AS status, i.sessionRef AS sessionRef,
+  SELECT i.id AS id, i.status AS status, i.conversationId AS conversationId,
          i.attempts AS attempts, i.lastStartedAt AS lastStartedAt,
-         i.firstSignalAt AS firstSignalAt, i.grantedTurns AS grantedTurns
+         i.firstSignalAt AS firstSignalAt, i.grantedTurns AS grantedTurns,
+         i.turnsUsed AS turnsUsed, i.modelId AS modelId,
+         i.tokensIn AS tokensIn, i.tokensOut AS tokensOut,
+         i.cacheRead AS cacheRead, i.cacheWrite AS cacheWrite
   FROM incident i
   LEFT JOIN incident_wait w ON w.incidentId = i.id
   WHERE i.status IN (${AGENT_STATUSES.map((s) => `'${s}'`).join(", ")})
     AND (w.incidentId IS NULL OR (w.wakeAt IS NOT NULL AND w.wakeAt <= ?))
 `;
 
+interface LiveRow {
+  id: string;
+  status: IncidentStatus;
+  conversationId: ConversationId;
+  attempts: number;
+  lastStartedAt: number | null;
+  firstSignalAt: number;
+}
+
+// The conversations worth asking about. Every open one, and a finished one
+// launched recently enough that its run may still be going: a CLOSED
+// incident's agent is still writing to its workspace for a moment after
+// `report_analysis`, and the deadline still has to reach a run that never
+// stops. Anything launched before the window is past its hard stop already.
+const LIVE_SQL = `
+  SELECT id, status, conversationId, attempts, lastStartedAt, firstSignalAt
+  FROM incident
+  WHERE conversationId IS NOT NULL
+    AND (status NOT IN ('CLOSED', 'MERGED') OR COALESCE(lastStartedAt, 0) >= ?)
+`;
 interface StaleRow {
   id: string;
   status: IncidentStatus;
@@ -282,65 +344,36 @@ const STALE_SQL = `
   WHERE i.status NOT IN ('CLOSED', 'MERGED')
 `;
 
-interface Entry {
+interface Run {
   incidentId: string;
-  pid: number;
   startedAt: number;
-  phase: string;
-  /** What the child got as BUGBOSS_DEADLINE_AT: its own soft deadline. */
-  deadlineAt: number;
-  /**
-   * The parent's backstop, a tick later than the child's hard stop. The child
-   * treats deadlineAt as soft, steers itself to write a brief, and
-   * aborts DEADLINE_GRACE_SECONDS later; killing at deadlineAt gave it one
-   * tick of that window, so every timeout escalation handed a human the
-   * placeholder brief instead of the agent's.
-   */
-  killAt: number;
-  sessionRef: string | null;
   attempt: number;
-  proc: AgentProcess | null;
-  killed: boolean;
-  /**
-   * This run has already escalated, so the deadline must not escalate over
-   * the top of it.
-   *
-   * `owner` used to carry this without anyone naming it: the agent's own
-   * `hand_off` set it to human and the dispatcher's escalate re-read it and
-   * became a no-op. Deleting the column took the suppression with it, and
-   * the result was two briefs on a wedged agent -- its own, then a
-   * dispatcher placeholder claiming it had said nothing.
-   *
-   * Per-run and in memory by nature: the question is whether *this child*
-   * spoke, and a restart is a new child that will write its own brief.
-   */
-  escalated: boolean;
+  phase: string;
+  /** Null until a first launch has created the conversation. */
+  conversationId: ConversationId | null;
+  /** The launch input is placed; from here `isBusy` covers the run too. */
+  submitted: boolean;
+  /** Aborted on purpose (its deadline, a stop, a merge), so its ending is not a failure. */
+  aborted: boolean;
   done: Promise<void>;
 }
 
-const toRunningAgent = (e: Entry): RunningAgent => ({
-  incidentId: e.incidentId,
-  pid: e.pid,
-  startedAt: e.startedAt,
-  phase: e.phase,
-});
-
-const deadlineBrief = (e: Entry, ranSeconds: number): string =>
+const deadlineBrief = (row: LiveRow, ranSeconds: number): string =>
   [
     // Never claims the agent said nothing. The suppression below means this
     // brief should not be reachable at all once it has, but a sentence that
     // asserts something the code can check is one wrong suppression away from
     // the system contradicting itself in the thread, directly under the
     // agent's own brief.
-    "Escalated by the dispatcher, which killed the agent at its deadline.",
+    "Escalated by the dispatcher, which stopped the agent at its deadline.",
     "",
-    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${e.attempt}, did not finish in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was killed.`,
+    `It passed its wall-clock deadline after ${ranSeconds}s on attempt ${row.attempts}, was asked to write a brief, did not finish in the ${DEADLINE_GRACE_SECONDS}s it was given to, and was stopped.`,
     "",
     "What I believe now: whatever the agent last reported on this incident.",
     "What I ruled out: not recorded.",
     "What I was about to do: unknown. It was still working when time ran out.",
-    "Side effects: check the incident for PRs it opened before it died.",
-    `Full transcript: session ${e.sessionRef ?? "none written yet"}.`,
+    "Side effects: check the incident for PRs it opened before it stopped.",
+    `Full transcript: conversation ${row.conversationId}.`,
   ].join("\n");
 
 const crashLoopBrief = (
@@ -350,20 +383,26 @@ const crashLoopBrief = (
 ): string =>
   [
     // Same rule as `deadlineBrief`, and this one cannot be suppressed at all:
-    // `entry.escalated` lives on the run, and the run is out of `running`
-    // before crash-loop detection looks. A fast-failing agent that escalates
-    // in its first seconds and then dies badly would get this posted under
-    // its own brief, so the sentence must not claim it said nothing.
+    // nothing records whether a run that ended spoke first. A fast-failing
+    // agent that escalates in its first seconds and then dies badly would get
+    // this posted under its own brief, so the sentence must not claim it said
+    // nothing.
     "Escalated by the dispatcher after a crash loop.",
     "",
-    `Its last ${failures} launches each died within ${fastFailureSeconds}s of starting, which is a crash loop rather than an interrupted investigation, so relaunching stopped. Total launches to date: ${row.attempts}.`,
+    `Its last ${failures} launches each ended without an answer within ${fastFailureSeconds}s of starting, which is a crash loop rather than an interrupted investigation, so relaunching stopped. Total launches to date: ${row.attempts}.`,
     "",
     "What I believe now: whatever the agent last reported on this incident.",
     "What I ruled out: not recorded.",
     "What I was about to do: unknown; each launch died before saying.",
     "Side effects: check the incident for PRs an earlier launch opened.",
-    `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
+    `Full transcript: conversation ${row.conversationId ?? "none created yet"}.`,
   ].join("\n");
+
+const toRunningAgent = (r: Run): RunningAgent => ({
+  incidentId: r.incidentId,
+  startedAt: r.startedAt,
+  phase: r.phase,
+});
 
 /**
  * What the sweep did with the wait it found, which is the distinction the
@@ -408,41 +447,56 @@ export const staleNotice = (
 
 const stalledBrief = (row: EligibleRow, launches: number): string =>
   [
-    // As above: no live entry by the time this fires, so nothing here knows
-    // whether the run spoke before it stopped.
+    // As above: nothing here knows whether the run spoke before it stopped.
     "Escalated by the dispatcher after too many launches without a finish.",
     "",
-    `It has been launched ${launches} times on this incident and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a session it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
+    `It has been launched ${launches} times on this incident and has finished none of them, while dying slowly enough each time to not look like a crash loop. Something is ending the run just past the point where relaunching looks reasonable: throttling, memory, credentials expiring, or a transcript it cannot replay. Total launches to date, this container and every earlier one: ${row.attempts}.`,
     "",
     "What I believe now: whatever the agent last reported on this incident.",
     "What I ruled out: not recorded.",
     "What I was about to do: unknown; no launch got far enough to say.",
     "Side effects: check the incident for PRs an earlier launch opened.",
-    `Full transcript: session ${row.sessionRef ?? "none written yet"}.`,
+    `Full transcript: conversation ${row.conversationId ?? "none created yet"}.`,
+  ].join("\n");
+
+/**
+ * The brief for an incident whose budget was already spent when its turn to
+ * launch came: a park that never landed, or a budget a restart's reconcile
+ * found spent. Nothing is launched, because the first request of a launch
+ * rewrites the whole context into the cache and incident 80 spent $4.04 on
+ * one `get_incident` that way.
+ */
+const spentBudgetBrief = (row: EligibleRow, max: number): string =>
+  [
+    "Escalated by the dispatcher, which found the turn budget already spent at launch.",
+    "",
+    `This incident has used ${row.turnsUsed} of the ${max} turns it gets, counted across every launch, so no agent was started on it.`,
+    `Spend so far: ${row.turnsUsed} turns on ${row.modelId ?? "an unrecorded model"}, ${row.tokensIn} tokens in, ${row.tokensOut} out, ${row.cacheRead} cache read, ${row.cacheWrite} cache write.`,
+    "",
+    "What I believe now: whatever the agent last reported on this incident.",
+    "What I ruled out: not recorded.",
+    "What I was about to do: nothing on this launch; the budget was gone before it started.",
+    "Side effects: check the incident for PRs an earlier launch opened.",
+    "",
+    // Deliberately not "reply and it will carry on": a budget wait is not
+    // lifted by a reply, so the two things named are the two that move it.
+    `The ${max}-turn budget for this incident is spent, so neither a reply in the thread nor a message to me will restart it. To continue the work, somebody has to raise the turn budget, or grant this incident more turns, or pick it up themselves.`,
   ].join("\n");
 
 export class Dispatcher {
   private readonly db: DispatcherDb;
   private readonly config: DispatcherConfig;
-  private readonly spawn: SpawnAgent;
+  private readonly runtime: AgentRuntime;
   private readonly toolApiFor: (incidentId: string) => ToolApi;
-  private readonly mintToken: (incidentId: string) => string;
-  private readonly childCredentials: Record<string, string | undefined>;
-  private readonly childBaseEnv: Record<string, string | undefined>;
+  private readonly composePrompt: DispatcherDeps["composePrompt"];
+  private readonly messages: DispatcherDeps["messages"];
   private readonly postNotice: ((incidentId: string, text: string) => Promise<void>) | null;
-  private readonly lastSessionEventAt: ((sessionRef: string) => Promise<number | null>) | null;
-  private readonly sessionTurns: ((sessionRef: string) => Promise<number | null>) | null;
-  /**
-   * Budget waits already read and found still spent, keyed by incident and
-   * wait start. Only a deploy changes the budget, so each is read once per
-   * process; a read that failed is not in here and is tried again next tick.
-   */
-  private readonly budgetsHeld = new Set<string>();
   private readonly fastFailureMs: number;
   private readonly maxLaunches: number;
   private readonly parkCooldownMs: number;
   private readonly staleAfterSeconds: number;
   private readonly workRoot: string | null;
+  private readonly workspace: DispatcherDeps["workspace"] | null;
   /** The delete in flight, so two ticks never race one `rm` over the same tree. */
   private emptying: Promise<void> | null = null;
   /** Logged once each rather than every tick. */
@@ -451,22 +505,32 @@ export class Dispatcher {
   /** When this process began dispatching, the nearest clock to the last restart. */
   private readonly bootedAt: number;
 
-  /** The live side of the comparison. In-process, so it is simply true. */
-  private readonly running = new Map<string, Entry>();
-  /** When we last saw an agent exit, for the resumed_after figure. */
+  /**
+   * Launches this process made, from the attempts write until the run
+   * settles. It covers the minutes of git before the conversation is busy,
+   * which `isBusy` cannot see, so the next tick does not launch twice.
+   */
+  private readonly runs = new Map<string, Run>();
+  /**
+   * The live side of the comparison as of this tick: every run above plus
+   * every conversation the harness says is busy, which after a restart is
+   * every run the harness resumed.
+   */
+  private alive = new Map<string, RunningAgent>();
+  /** When we last saw a run settle, for the resumed_after figure. */
   private readonly lastExitAt = new Map<string, number>();
   /**
-   * Launches that died almost immediately, in a row. Deliberately not
-   * persisted: a container that came back up healthy is not evidence that
-   * the agent is crashing, and a crash-looping container is ECS service
-   * health's alarm rather than this counter's.
+   * Launches that ended without an answer almost immediately, in a row.
+   * Deliberately not persisted: a container that came back up healthy is not
+   * evidence that the agent is crashing, and a crash-looping container is ECS
+   * service health's alarm rather than this counter's.
    */
   private readonly fastFailures = new Map<string, number>();
   /**
    * Launches per incident, total rather than consecutive, and in memory for
    * the same reason as fastFailures: a restart is not evidence about the
    * agent. `maxAttempts` bounds only deaths fast enough to look like a crash
-   * loop, and every exit slower than that *clears* that counter, so an agent
+   * loop, and every ending slower than that *clears* that counter, so an agent
    * dying just past the window — throttling, OOM, credentials expiring, a 400
    * on a replay it cannot get through — was relaunched every tick for as long
    * as the incident stayed open. The persisted `attempts` column cannot do
@@ -481,24 +545,32 @@ export class Dispatcher {
 
   /**
    * Deadline escalations a failing write held back, by incident. In memory,
-   * like the run they describe: the kill already happened, and this is only
+   * like the run they describe: the abort already happened, and this is only
    * the post still owed for it. Retried at the top of every tick.
    */
   private readonly owedDeadlines = new Map<string, { reason: string; brief: string }>();
+  /** Soft-deadline steers sent and hard stops made, by incident and attempt. */
+  private readonly steered = new Set<string>();
+  private readonly stopped = new Set<string>();
+  /**
+   * When the agent on an incident last escalated with its own brief, so the
+   * deadline does not post a placeholder over it. Compared against the run's
+   * `lastStartedAt`, which makes it per run without a run to hang it on.
+   */
+  private readonly escalatedAt = new Map<string, number>();
+  /** The boot-time `resumed_after` steer has been sent. */
+  private resumeSteered = false;
 
   private timer: NodeJS.Timeout | null = null;
 
   constructor(deps: DispatcherDeps) {
     this.db = deps.db;
     this.config = deps.config;
-    this.spawn = deps.spawn;
+    this.runtime = deps.runtime;
     this.toolApiFor = deps.toolApiFor;
-    this.mintToken = deps.mintToken;
-    this.childCredentials = deps.childCredentials ?? {};
-    this.childBaseEnv = deps.childBaseEnv ?? {};
+    this.composePrompt = deps.composePrompt;
+    this.messages = deps.messages;
     this.postNotice = deps.postNotice ?? null;
-    this.lastSessionEventAt = deps.lastSessionEventAt ?? null;
-    this.sessionTurns = deps.sessionTurns ?? null;
     this.fastFailureMs =
       (deps.fastFailureSeconds ?? deps.config.tickSeconds * 2) * 1000;
     this.maxLaunches = deps.maxLaunches ?? deps.config.maxAttempts * 3;
@@ -506,6 +578,7 @@ export class Dispatcher {
     this.staleAfterSeconds =
       deps.config.staleAfterSeconds ?? STALE_AFTER_SECONDS;
     this.workRoot = deps.workRoot ?? null;
+    this.workspace = deps.workspace ?? null;
     this.now = deps.now ?? Date.now;
     this.bootedAt = this.now();
   }
@@ -527,51 +600,51 @@ export class Dispatcher {
   };
 
   /**
-   * Stops ticking. Children are left alone: a deploy kills the container and
-   * every child with it, each losing at most its turn in progress, and the
-   * first tick after boot resumes them from their sessions.
+   * Stops ticking. Runs are left alone: they live in the harness, a deploy
+   * stops them where they are, and `harness.resume()` picks each one up at
+   * boot.
    */
   stop = (): void => {
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = null;
-    log("stopped", { running: this.running.size });
+    log("stopped", { running: this.alive.size });
   };
 
-  list = (): RunningAgent[] => [...this.running.values()].map(toRunningAgent);
+  list = (): RunningAgent[] => [...this.alive.values()];
 
   /**
-   * Record that the agent on this incident escalated, so the deadline does
-   * not post a placeholder brief over the top of the one it just wrote.
+   * Record that the agent on this incident escalated with its own brief, so
+   * the deadline does not post a placeholder brief over the top of it.
    *
-   * Needed because the spawn context is not the path a real child takes. In
-   * process -- the E2E, the unit tests -- the child calls the context's
-   * `escalate` and the dispatcher sees it directly. A real child is a
-   * separate process calling the loopback API, which records its escalation
-   * in the Boss's inbox without the dispatcher in the call at all. So the
-   * loopback's inbox route tells us.
-   *
-   * A no-op for an incident with no live run, which is the honest answer:
-   * there is no placeholder pending for one, and nothing to suppress.
+   * The agent's escalate tool reaches the Boss's inbox without the
+   * dispatcher in the call, so whatever records that escalation tells us.
    */
   noteEscalated = (incidentId: string): void => {
-    const entry = this.running.get(incidentId);
-    if (entry) entry.escalated = true;
-  };
-
-  /** Waits for everything currently running. For tests and shutdown. */
-  drain = async (): Promise<void> => {
-    await Promise.all([...this.running.values()].map((e) => e.done));
+    this.escalatedAt.set(incidentId, this.now());
   };
 
   /**
-   * Serialized against itself. A tick awaits an S3 PUT before it records a
-   * launch in `running`, so an overlapping tick would read the same row as
-   * unclaimed and start a second child. Two children on one
-   * incident both hold valid tokens and both whole-file PUT the same session
-   * transcript, so they overwrite each other's turns. The single-writer
-   * guarantee the whole resume design rests on is this map, and the map is
-   * only authoritative if ticks cannot interleave.
+   * Record that something other than the deadline is about to abort this
+   * incident's run on purpose -- a Boss stop, a merge -- so its unanswered
+   * ending is not counted toward the crash-loop ceiling or alarmed as a
+   * failure.
+   */
+  noteStopped = (incidentId: string): void => {
+    const run = this.runs.get(incidentId);
+    if (run) run.aborted = true;
+  };
+
+  /** Waits for every run this process launched. For tests and shutdown. */
+  drain = async (): Promise<void> => {
+    await Promise.all([...this.runs.values()].map((r) => r.done));
+  };
+
+  /**
+   * Serialized against itself. A tick awaits writes and harness reads before
+   * it records a launch in `runs`, so an overlapping tick would read the same
+   * row as unclaimed and submit a second launch into the same conversation.
+   * The map is only authoritative if ticks cannot interleave.
    */
   tick = async (): Promise<TickResult> => {
     const mine = this.ticking.then(() => this.runTick());
@@ -586,7 +659,25 @@ export class Dispatcher {
 
   private runTick = async (): Promise<TickResult> => {
     const now = this.now();
-    const expired = await this.enforceDeadlines(now);
+    const live = await this.readLive(now);
+    const expired = await this.enforceDeadlines(live, now);
+    if (!this.resumeSteered) {
+      this.resumeSteered = true;
+      await this.steerResumed(live, now);
+    }
+    this.alive = new Map(
+      [...live.values()].map((row) => [
+        row.id,
+        {
+          incidentId: row.id,
+          startedAt: this.runs.get(row.id)?.startedAt ?? row.lastStartedAt ?? row.firstSignalAt,
+          phase: row.status,
+        },
+      ]),
+    );
+    for (const run of this.runs.values()) {
+      if (!this.alive.has(run.incidentId)) this.alive.set(run.incidentId, toRunningAgent(run));
+    }
     // Before the launch loop, so a workspace is out of the way before
     // anything could start into it.
     await this.sweepWorkspaces();
@@ -600,9 +691,17 @@ export class Dispatcher {
     let circuitOpen = false;
 
     for (const row of eligible) {
-      const live = this.running.get(row.id);
-      if (live) {
-        live.phase = row.status;
+      const running = this.alive.get(row.id);
+      if (running) {
+        running.phase = row.status;
+        continue;
+      }
+
+      // Before any launch, because a launch on a spent budget pays for the
+      // turn it is not allowed: the first request rewrites the whole context.
+      const maxTurns = this.config.agentMaxTurns + row.grantedTurns;
+      if (row.turnsUsed >= maxTurns) {
+        if (await this.holdSpentBudget(row, maxTurns, now)) escalated.push(row.id);
         continue;
       }
 
@@ -692,17 +791,15 @@ export class Dispatcher {
         continue;
       }
 
-      if (this.running.size >= this.config.maxConcurrentAgents) {
+      if (this.alive.size >= this.config.maxConcurrentAgents) {
         circuitOpen = true;
         continue;
       }
 
-      // One incident's bad launch must not stall the rest of the tick. A
-      // launch that never started is a fast failure by definition, so a
-      // persistent one escalates rather than retrying every 30s forever.
-      let entry: Entry;
+      // One incident's bad launch must not stall the rest of the tick.
+      let run: Run;
       try {
-        entry = await this.launch(row, now);
+        run = await this.launch(row, now);
       } catch (err) {
         // A launch the database refused is not the agent crashing. Counted,
         // a halt of three ticks met the crash-loop ceiling on every open
@@ -720,13 +817,14 @@ export class Dispatcher {
         });
         continue;
       }
-      started.push(toRunningAgent(entry));
-      settling.push(entry.done);
+      this.alive.set(row.id, toRunningAgent(run));
+      started.push(toRunningAgent(run));
+      settling.push(run.done);
     }
 
     if (circuitOpen) {
       alarm("circuit_breaker_open", {
-        running: this.running.size,
+        running: this.alive.size,
         maxConcurrentAgents: this.config.maxConcurrentAgents,
         eligible: eligible.length,
         note: "dispatch stopped at the ceiling; nothing is queued, and hitting this means something is wrong",
@@ -734,19 +832,49 @@ export class Dispatcher {
     }
 
     // After the launch loop on purpose: an incident this tick relaunched is
-    // in `this.running` by the time the sweep looks, so it is skipped rather
+    // in `this.alive` by the time the sweep looks, so it is skipped rather
     // than reported quiet on the strength of the row it left behind.
     const swept = await this.sweepStale(now);
 
     return {
       started,
       escalated,
-      killed: expired.killed,
-      running: this.running.size,
+      aborted: expired.aborted,
+      running: this.alive.size,
       circuitOpen,
       swept,
       settled: Promise.all(settling).then(() => undefined),
     };
+  };
+
+  /**
+   * Which incidents have a live agent. A run this process launched is live
+   * by the map; anything else is live when the harness says its conversation
+   * is busy, which is how a run the harness resumed after a deploy is seen at
+   * all. A read that fails counts as busy: a second launch into a running
+   * conversation is the worse mistake, and the alarm says the read is broken.
+   */
+  private readLive = async (now: number): Promise<Map<string, LiveRow>> => {
+    const window = (this.config.agentTimeoutSeconds + DEADLINE_GRACE_SECONDS + this.config.tickSeconds) * 1000;
+    const live = new Map<string, LiveRow>();
+    for (const row of this.db.query<LiveRow>(LIVE_SQL, [now - window])) {
+      if (this.runs.has(row.id)) {
+        live.set(row.id, row);
+        continue;
+      }
+      try {
+        if (await this.runtime.isBusy(row.conversationId)) live.set(row.id, row);
+      } catch (err) {
+        alarm("busy_check_failed", {
+          incidentId: row.id,
+          conversationId: row.conversationId,
+          error: String(err),
+          note: "counted as busy, so it is not launched again until the read works",
+        });
+        live.set(row.id, row);
+      }
+    }
+    return live;
   };
 
   /**
@@ -772,7 +900,7 @@ export class Dispatcher {
       const swept = await sweepWorkspaces({
         workRoot,
         removable: (incidentId) => {
-          if (this.running.has(incidentId)) return false;
+          if (this.alive.has(incidentId)) return false;
           const current = status.get(incidentId);
           if (current === undefined) {
             if (!this.orphanWorkspaces.has(incidentId)) {
@@ -829,9 +957,9 @@ export class Dispatcher {
       // is only true when nothing can.
       //
       // A run may last a day, so a live agent's own launch timestamp ages
-      // past the threshold underneath it, and no row anywhere says the
-      // process is still alive. This map is the only thing that can.
-      if (this.running.has(row.id)) continue;
+      // past the threshold underneath it, and no row says the run is still
+      // going. Only the harness can, and this map is its answer this tick.
+      if (this.alive.has(row.id)) continue;
 
       const quietSeconds = Math.round((now - row.lastActivityAt) / 1000);
       if (quietSeconds < this.staleAfterSeconds) continue;
@@ -931,28 +1059,25 @@ export class Dispatcher {
    * A budget wait is the one park nothing else lifts: not a reply, not the
    * cooldown, not the stale sweep. That is right while the budget stands, and
    * wrong once it rises above what the incident spent, because then it has
-   * turns again and the park is holding back work it could do. The budget is
-   * a constant or an environment variable plus the incident's grants, so a
-   * wait found still spent is not read again until a grant moves it, and a
-   * read that failed or timed out is retried on the next tick.
+   * turns again and the park is holding back work it could do.
    *
-   * Turns are read from the session, not from the wait's text, because a
-   * launch can overrun the budget it parked on (incident 80 sat at 270 of
-   * 200), and a wait the new budget still does not cover must stay held.
+   * Turns are read from `incident.turnsUsed`, not from the wait's text,
+   * because a launch can overrun the budget it parked on (incident 80 sat at
+   * 270 of 200), and a wait the new budget still does not cover must stay
+   * held. It is a column, so it is read every tick.
    *
    * Lift and marker commit before the post, so a failed post never leaves a
    * notice for a lift that did not happen. The delete is guarded on the wait
    * it read, so a wait rewritten in between is left alone.
    */
   private liftRaisedBudgets = async (now: number): Promise<void> => {
-    if (!this.sessionTurns) return;
     const rows = this.db.query<{
       id: string;
-      sessionRef: string | null;
+      used: number;
       startedAt: number;
       grantedTurns: number;
     }>(
-      `SELECT i.id AS id, i.sessionRef AS sessionRef, w.startedAt AS startedAt,
+      `SELECT i.id AS id, i.turnsUsed AS used, w.startedAt AS startedAt,
               i.grantedTurns AS grantedTurns
        FROM incident i
        JOIN incident_wait w ON w.incidentId = i.id
@@ -962,34 +1087,8 @@ export class Dispatcher {
     );
     for (const row of rows) {
       const max = this.config.agentMaxTurns + row.grantedTurns;
-      const key = `${row.id}:${row.startedAt}:${row.grantedTurns}`;
-      if (this.running.has(row.id) || this.budgetsHeld.has(key)) continue;
-      if (!row.sessionRef) {
-        this.budgetsHeld.add(key);
-        continue;
-      }
-      let used: number | null;
-      let timer: NodeJS.Timeout | undefined;
-      try {
-        used = await Promise.race([
-          this.sessionTurns(row.sessionRef),
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(
-              () => reject(new Error(`session read took over ${SESSION_READ_TIMEOUT_MS}ms`)),
-              SESSION_READ_TIMEOUT_MS,
-            );
-          }),
-        ]).finally(() => clearTimeout(timer));
-      } catch (err) {
-        alarm("budget_check_failed", { incidentId: row.id, error: String(err) });
-        continue;
-      }
-      if (used === null || used >= max) {
-        this.budgetsHeld.add(key);
-        continue;
-      }
+      if (this.alive.has(row.id) || row.used >= max) continue;
 
-      const usedTurns = used;
       let lifted: boolean;
       try {
         lifted = await this.db.withWrite((db) => {
@@ -1005,7 +1104,7 @@ export class Dispatcher {
           ).run(
             row.id,
             BUDGET_RAISED_ACTION,
-            `turn budget raised to ${max} with ${usedTurns} turns used`,
+            `turn budget raised to ${max} with ${row.used} turns used`,
             now,
           );
           return true;
@@ -1016,7 +1115,7 @@ export class Dispatcher {
       }
       if (!lifted) continue;
 
-      log("turn_budget_raised", { incidentId: row.id, used, max, granted: row.grantedTurns });
+      log("turn_budget_raised", { incidentId: row.id, used: row.used, max, granted: row.grantedTurns });
       if (!this.postNotice) {
         alarm("budget_notice_undeliverable", {
           incidentId: row.id,
@@ -1026,15 +1125,70 @@ export class Dispatcher {
       }
       const notice =
         row.grantedTurns > 0
-          ? turnsGrantedNotice(max, used)
-          : budgetRaisedNotice(max, used);
+          ? turnsGrantedNotice(max, row.used)
+          : budgetRaisedNotice(max, row.used);
       await this.postNotice(row.id, notice).catch((err: unknown) =>
         alarm("budget_notice_failed", { incidentId: row.id, error: String(err) }),
       );
     }
   };
 
-  private launch = async (row: EligibleRow, now: number): Promise<Entry> => {
+  /**
+   * Park and announce an incident whose budget was spent before its launch.
+   * The same park the agent's own budget hook writes, so a reply does not
+   * lift it and a raised budget or a grant does. Park first, then the post,
+   * as at the ceilings; unlike them, a failed post keeps the park, because
+   * relaunching a spent budget only spends nothing and stops again.
+   */
+  private holdSpentBudget = async (
+    row: EligibleRow,
+    max: number,
+    now: number,
+  ): Promise<boolean> => {
+    try {
+      await this.db.withWrite((db) => {
+        db.prepare(
+          `INSERT INTO incident_wait
+             (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
+           VALUES (?, ?, NULL, 0, ?)
+           ON CONFLICT(incidentId) DO UPDATE SET
+             waitingFor = excluded.waitingFor,
+             wakeAt = excluded.wakeAt,
+             liftsOnReply = excluded.liftsOnReply,
+             startedAt = excluded.startedAt`,
+        ).run(row.id, turnBudgetWaitingFor(max), now);
+      });
+    } catch (err) {
+      if (!committedLocally(err)) {
+        alarm("turn_budget_escalation_unrecorded", {
+          incidentId: row.id,
+          error: String(err),
+          note: "the park could not be written, so the escalation was not posted; it is tried again next tick",
+        });
+        return false;
+      }
+    }
+    log("turn_budget_spent_at_launch", { incidentId: row.id, used: row.turnsUsed, max });
+    const ok = await this.escalate(
+      row.id,
+      `the ${max}-turn budget was spent before launch`,
+      spentBudgetBrief(row, max),
+    );
+    if (!ok) {
+      alarm("turn_budget_escalation_failed", {
+        incidentId: row.id,
+        note: "parked on its spent budget with nobody told; the stale sweep announces it within a day",
+      });
+    }
+    return ok;
+  };
+
+  /**
+   * Record the launch, then start it in the background. Only the attempts
+   * write is awaited here: the checkout is minutes of git, and the tick is
+   * serialized, so a launch that blocked it would hold up every other.
+   */
+  private launch = async (row: EligibleRow, now: number): Promise<Run> => {
     const attempt = row.attempts + 1;
     await this.db.withWrite((db) => {
       db.prepare(
@@ -1043,155 +1197,160 @@ export class Dispatcher {
     });
     this.launches.set(row.id, (this.launches.get(row.id) ?? 0) + 1);
 
-    if (row.sessionRef) await this.emitResumedAfter(row, now);
-
-    const token = this.mintToken(row.id);
-    const deadlineAt = now + this.config.agentTimeoutSeconds * 1000;
-    const alertSlugs = this.db
-      .query<{ slug: string }>(
-        "SELECT DISTINCT json_extract(labels, '$.alert_slug') AS slug FROM signal WHERE incidentId = ? AND json_extract(labels, '$.alert_slug') IS NOT NULL ORDER BY slug",
-        [row.id],
-      )
-      .map((r) => String(r.slug));
-
-    const env = buildChildEnv({
-      base: this.childBaseEnv,
-      credentials: this.childCredentials,
+    const run: Run = {
       incidentId: row.id,
-      token,
-      sessionRef: row.sessionRef,
-      deadlineAt,
-      maxTurns: this.config.agentMaxTurns + row.grantedTurns,
-      attempt,
-      alertSlugs,
-    });
-    // The child resolves AWS through the container credential provider, so
-    // the allowlist in env.ts has to carry that path. Dropping a name from
-    // it would cost the agent Bedrock and surface a turn later as a model
-    // call failing, with nothing pointing back at the environment.
-    if (!hasAwsCredentialPath(env)) {
-      alarm("child_has_no_aws_credentials", {
-        incidentId: row.id,
-        note: "no AWS credential path reached the child; it cannot call Bedrock",
-      });
-    }
-
-    const entry: Entry = {
-      incidentId: row.id,
-      pid: 0,
       startedAt: now,
-      phase: row.status,
-      deadlineAt,
-      killAt:
-        deadlineAt +
-        (DEADLINE_GRACE_SECONDS + this.config.tickSeconds) * 1000,
-      sessionRef: row.sessionRef,
       attempt,
-      proc: null,
-      killed: false,
-      escalated: false,
+      phase: row.status,
+      conversationId: row.conversationId,
+      submitted: false,
+      aborted: false,
       done: Promise.resolve(),
     };
-    this.running.set(row.id, entry);
-
-    const tools = this.toolApiFor(row.id);
-    const ctx: AgentSpawnContext = {
-      reportRootCause: (args) => tools.reportRootCause(args),
-      setSummary: (args) => tools.setSummary(args),
-      reportImpact: (args) => tools.reportImpact(args),
-      reportResolved: (args) => tools.reportResolved(args),
-      reportAnalysis: (args) => tools.reportAnalysis(args),
-      escalate: async (args) => {
-        const response = await tools.escalate(args);
-        if (response.ok) entry.escalated = true;
-        return response;
-      },
-      park: (args) => tools.park(args),
-      getIncident: (args) => tools.getIncident(args),
-      proposeMerge: (args) => tools.proposeMerge(args),
-      searchIncidents: (args) => tools.searchIncidents(args),
-      trackTimelineEvent: (args) => tools.trackTimelineEvent(args),
-      incidentId: row.id,
-      sessionRef: row.sessionRef,
-      attempt,
-      deadlineAt,
-      token,
-      env,
-      register: (proc) => {
-        entry.pid = proc.pid;
-        entry.proc = proc;
-        if (entry.killed) proc.kill();
-      },
-    };
-
+    this.runs.set(row.id, run);
     log("agent_started", {
       incidentId: row.id,
       attempt,
-      resumed: row.sessionRef !== null,
-      deadlineAt,
-      killAt: entry.killAt,
+      resumed: row.conversationId !== null,
+      deadlineAt: now + this.config.agentTimeoutSeconds * 1000,
     });
-
-    // Called synchronously so a child registers its pid before this returns.
-    let run: Promise<void>;
-    try {
-      run = this.spawn(ctx);
-    } catch (err) {
-      run = Promise.reject(err);
-    }
-
-    // Set by the catch below, and read by the then after it. A crash loop is
-    // made of crashes: an exit code of zero inside the window is a short run,
-    // not a failing one, and counting it was what let a rolling deploy walk
-    // a freshly-launched incident to a crash-loop escalation in three
-    // bounces. SIGTERM exits zero for exactly this reason.
-    let failed = false;
-    entry.done = run
-      .catch((err) => {
-        failed = true;
-        // A child the dispatcher killed exits on a signal, which is a
-        // rejection now. That is not an agent failure and it already alarmed
-        // as agent_deadline_exceeded, so it would be the same event twice
-        // under a name that points at the wrong component.
-        if (entry.killed) return;
-        alarm("agent_failed", {
-          incidentId: row.id,
-          attempt,
-          error: String(err),
-        });
-      })
-      .then(() => {
-        if (this.running.get(row.id) === entry) this.running.delete(row.id);
-        const exitedAt = this.now();
-        this.lastExitAt.set(row.id, exitedAt);
-
-        // A crash loop dies quickly after starting *and* dies badly. A
-        // deploy-killed agent was either running fine for a while or shut
-        // down in good order; neither should escalate.
-        const ranMs = exitedAt - entry.startedAt;
-        const fast = !entry.killed && failed && ranMs < this.fastFailureMs;
-        const failures = fast ? (this.fastFailures.get(row.id) ?? 0) + 1 : 0;
-        if (fast) this.fastFailures.set(row.id, failures);
-        else this.fastFailures.delete(row.id);
-
-        log("agent_exited", {
-          incidentId: row.id,
-          attempt,
-          pid: entry.pid,
-          killed: entry.killed,
-          failed,
-          ranSeconds: Math.round(ranMs / 1000),
-          consecutiveFastFailures: failures,
-        });
-      });
-
-    return entry;
+    run.done = this.settle(row, run);
+    return run;
   };
 
+  private settle = async (row: EligibleRow, run: Run): Promise<void> => {
+    let outcome: "done" | "unanswered";
+    try {
+      outcome = await this.startRun(row, run);
+    } catch (err) {
+      if (!run.submitted) {
+        if (this.runs.get(row.id) === run) this.runs.delete(row.id);
+        if (writesHalted(err)) {
+          log("launch_deferred", { incidentId: row.id, error: String(err) });
+          return;
+        }
+        // A launch that never started is a fast failure by definition, so a
+        // persistent one escalates rather than retrying every 30s forever.
+        const failures = (this.fastFailures.get(row.id) ?? 0) + 1;
+        this.fastFailures.set(row.id, failures);
+        alarm("launch_failed", {
+          incidentId: row.id,
+          attempt: run.attempt,
+          error: String(err),
+          consecutiveFastFailures: failures,
+        });
+        return;
+      }
+      alarm("agent_wait_failed", { incidentId: row.id, attempt: run.attempt, error: String(err) });
+      outcome = "unanswered";
+    }
+
+    if (this.runs.get(row.id) === run) this.runs.delete(row.id);
+    const endedAt = this.now();
+    this.lastExitAt.set(row.id, endedAt);
+
+    // A crash loop ends quickly after starting *and* ends badly. A run that
+    // answered was a short run, not a failing one, and a run the dispatcher
+    // aborted at its deadline already alarmed under its own name.
+    const ranMs = endedAt - run.startedAt;
+    const failed = outcome === "unanswered" && !run.aborted;
+    if (failed) {
+      alarm("agent_failed", {
+        incidentId: row.id,
+        attempt: run.attempt,
+        ranSeconds: Math.round(ranMs / 1000),
+        note: "the run ended without answering",
+      });
+    }
+    const fast = failed && ranMs < this.fastFailureMs;
+    const failures = fast ? (this.fastFailures.get(row.id) ?? 0) + 1 : 0;
+    if (fast) this.fastFailures.set(row.id, failures);
+    else this.fastFailures.delete(row.id);
+
+    log("agent_exited", {
+      incidentId: row.id,
+      attempt: run.attempt,
+      outcome,
+      aborted: run.aborted,
+      ranSeconds: Math.round(ranMs / 1000),
+      consecutiveFastFailures: failures,
+    });
+  };
+
+  /**
+   * The background half of a launch: the checkout, the conversation on a
+   * first launch, then the input. Resolves with how the run ended.
+   */
+  private startRun = async (
+    row: EligibleRow,
+    run: Run,
+  ): Promise<"done" | "unanswered"> => {
+    const paths = computePaths(this.workRoot ?? DEFAULT_WORK_ROOT, row.id);
+    let checkout: CheckoutOutcome = "reused";
+    if (this.workspace) {
+      const env = await this.workspace.env(row.id);
+      checkout = await prepareCheckout(this.workspace.repoUrl, paths.checkout, env);
+      // A log means an install was started in this workspace before, and the
+      // task it ran in may have died mid-way. Picking it up here is what stops
+      // a FIXING agent waiting on a done marker that nothing is going to write.
+      if (checkout !== "cloned" && existsSync(paths.npmCiLog)) startNpmCi(paths, env);
+    }
+
+    let conversationId = row.conversationId;
+    let content: string;
+    if (conversationId === null) {
+      const alertSlugs = this.db
+        .query<{ slug: string }>(
+          "SELECT DISTINCT json_extract(labels, '$.alert_slug') AS slug FROM signal WHERE incidentId = ? AND json_extract(labels, '$.alert_slug') IS NOT NULL ORDER BY slug",
+          [row.id],
+        )
+        .map((r) => String(r.slug));
+      const instructions = await this.composePrompt(row.id, { paths, alertSlugs });
+      const created = await this.runtime.createIncidentConversation(row.id, {
+        cwd: paths.checkout,
+        instructions,
+      });
+      try {
+        await this.db.withWrite((db) => {
+          db.prepare("UPDATE incident SET conversationId = ? WHERE id = ?").run(created, row.id);
+        });
+      } catch (err) {
+        if (!committedLocally(err)) throw err;
+      }
+      conversationId = created;
+      // An incident that was launched before and has no conversation is one
+      // from before the harness: its transcript is a JSONL file nothing reads.
+      content = this.messages.kickoff(row.id, { resumedWithoutTranscript: row.attempts > 0 });
+    } else {
+      const gap = this.resumeGap(row, run.startedAt);
+      content = [
+        this.messages.resume(checkout, existsSync(paths.npmCiFailed)),
+        ...(gap === null ? [] : [directiveText({ type: "resumed_after", seconds: gap })]),
+      ].join("\n\n");
+    }
+    run.conversationId = conversationId;
+
+    const submission = await this.runtime.submit(conversationId, content, {
+      requestId: `incident:${row.id}:launch:${run.attempt}`,
+      whenBusy: "followUp",
+    });
+    run.submitted = true;
+    return submission.wait();
+  };
+
+  /**
+   * The two deadline layers, over every live run, read off the row so a run
+   * the harness resumed after a deploy is bounded too. At `lastStartedAt +
+   * agentTimeoutSeconds` the run is steered to write its brief; at
+   * `DEADLINE_GRACE_SECONDS` past that it is aborted, which also kills any
+   * subprocess its bash is in. Steering and aborting at once was what left
+   * every timeout escalation with an empty brief.
+   */
   private enforceDeadlines = async (
+    live: Map<string, LiveRow>,
     now: number,
-  ): Promise<{ killed: string[]; escalated: string[] }> => {
-    const killed: string[] = [];
+  ): Promise<{ aborted: string[]; escalated: string[] }> => {
+    const aborted: string[] = [];
     const escalated: string[] = [];
     for (const [incidentId, owed] of [...this.owedDeadlines]) {
       try {
@@ -1202,54 +1361,190 @@ export class Dispatcher {
       this.owedDeadlines.delete(incidentId);
       if (await this.escalate(incidentId, owed.reason, owed.brief)) escalated.push(incidentId);
     }
-    for (const entry of [...this.running.values()]) {
-      if (entry.killed || now < entry.killAt) continue;
-      entry.killed = true;
-      killed.push(entry.incidentId);
-      const ranSeconds = Math.round((now - entry.startedAt) / 1000);
+    for (const row of [...live.values()]) {
+      if (row.lastStartedAt === null) continue;
+      const run = this.runs.get(row.id);
+      if (run && !run.submitted) continue;
+      const key = `${row.id}:${row.attempts}`;
+      const deadlineAt = row.lastStartedAt + this.config.agentTimeoutSeconds * 1000;
+      if (now < deadlineAt) continue;
+
+      if (now < deadlineAt + DEADLINE_GRACE_SECONDS * 1000) {
+        if (this.steered.has(key)) continue;
+        this.steered.add(key);
+        try {
+          await this.runtime.submit(row.conversationId, deadlineMessage(DEADLINE_GRACE_SECONDS), {
+            requestId: `incident:${row.id}:deadline:${row.attempts}`,
+            whenBusy: "steer",
+          });
+          log("deadline_steered", { incidentId: row.id, deadlineAt });
+        } catch (err) {
+          this.steered.delete(key);
+          alarm("deadline_steer_failed", { incidentId: row.id, error: String(err) });
+        }
+        continue;
+      }
+
+      if (this.stopped.has(key)) continue;
+      this.stopped.add(key);
+      const ranSeconds = Math.round((now - row.lastStartedAt) / 1000);
       alarm("agent_deadline_exceeded", {
-        incidentId: entry.incidentId,
-        pid: entry.pid,
+        incidentId: row.id,
         ranSeconds,
-        deadlineAt: entry.deadlineAt,
+        deadlineAt,
         graceSeconds: DEADLINE_GRACE_SECONDS,
       });
-      entry.proc?.kill();
+      try {
+        if (run) run.aborted = true;
+        await this.runtime.abort(row.conversationId);
+        aborted.push(row.id);
+        if (run && this.runs.get(row.id) === run) this.runs.delete(row.id);
+        live.delete(row.id);
+      } catch (err) {
+        alarm("agent_abort_failed", { incidentId: row.id, error: String(err) });
+      }
 
       // An agent that used its grace to escalate has already put a better
       // brief in the thread and already reached the rotation. Posting the
       // placeholder on top of it is the system saying the same thing twice,
       // the second time worse.
-      if (entry.escalated) {
+      if ((this.escalatedAt.get(row.id) ?? -Infinity) >= row.lastStartedAt) {
         log("deadline_brief_suppressed", {
-          incidentId: entry.incidentId,
+          incidentId: row.id,
           ranSeconds,
           note: "the agent escalated during its grace window, so its own brief stands",
         });
         continue;
       }
 
-      // Nothing here records the escalation, since `entry.killed` above
-      // already makes it once per run. The empty write is a gate instead:
-      // it lands only when the database can, so a halted one posts nothing,
-      // which is the rule every other dispatcher escalation keeps.
+      // Nothing here records the escalation, since `stopped` above already
+      // makes it once per run. The empty write is a gate instead: it lands
+      // only when the database can, so a halted one posts nothing, which is
+      // the rule every other dispatcher escalation keeps.
       const reason = `wall-clock deadline of ${this.config.agentTimeoutSeconds}s expired`;
-      const brief = deadlineBrief(entry, ranSeconds);
+      const brief = deadlineBrief(row, ranSeconds);
       try {
         await this.db.withWrite(() => undefined);
       } catch (err) {
-        this.owedDeadlines.set(entry.incidentId, { reason, brief });
+        this.owedDeadlines.set(row.id, { reason, brief });
         alarm("deadline_escalation_unrecorded", {
-          incidentId: entry.incidentId,
+          incidentId: row.id,
           error: String(err),
           note: "writes are failing, so the deadline escalation waits; it is posted on the first tick a write lands",
         });
         continue;
       }
-      const ok = await this.escalate(entry.incidentId, reason, brief);
-      if (ok) escalated.push(entry.incidentId);
+      if (await this.escalate(row.id, reason, brief)) escalated.push(row.id);
     }
-    return { killed, escalated };
+    return { aborted, escalated };
+  };
+
+  /**
+   * Tell every run the harness resumed at boot how long it was gone. The
+   * agent is the one that has to re-check what moved while it was down, and
+   * a steer reaches it mid-turn, inside a wait if need be.
+   */
+  private steerResumed = async (live: Map<string, LiveRow>, now: number): Promise<void> => {
+    for (const row of live.values()) {
+      if (this.runs.has(row.id)) continue;
+      const seconds = Math.max(0, Math.round((now - this.lastAliveAt(row)) / 1000));
+      if (seconds < this.config.tickSeconds) continue;
+      try {
+        await this.runtime.submit(
+          row.conversationId,
+          directiveText({ type: "resumed_after", seconds }),
+          { requestId: `incident:${row.id}:resumed:${this.bootedAt}`, whenBusy: "steer" },
+        );
+      } catch (err) {
+        alarm("resume_steer_failed", { incidentId: row.id, error: String(err) });
+      }
+      this.reportResume(row, seconds, "last_activity");
+    }
+  };
+
+  /**
+   * How long a relaunched agent was gone, or null when it was under a tick.
+   * Exact when this process saw the last run settle; otherwise from the last
+   * thing the agent is known to have done.
+   */
+  private resumeGap = (row: EligibleRow, now: number): number | null => {
+    const endedAt = this.lastExitAt.get(row.id);
+    const since = endedAt ?? this.lastAliveAt(row);
+    const seconds = Math.max(0, Math.round((now - since) / 1000));
+    if (seconds < this.config.tickSeconds) return null;
+    this.reportResume(row, seconds, endedAt === undefined ? "last_activity" : "exit");
+    return seconds;
+  };
+
+  private reportResume = (
+    row: { id: string; attempts: number; status: IncidentStatus },
+    seconds: number,
+    measuredFrom: "last_activity" | "exit",
+  ): void => {
+    if (seconds < RESUME_ALARM_SECONDS) {
+      // The normal path: every merge to ops main restarts this container and
+      // every live agent with it.
+      log("agent_resumed", { incidentId: row.id, gapSeconds: seconds, measuredFrom });
+      return;
+    }
+    alarm("agent_resumed_after_gap", {
+      incidentId: row.id,
+      deadSeconds: seconds,
+      measuredFrom,
+      attempts: row.attempts,
+      status: row.status,
+      note: "the previous run stopped without finishing and nothing was heard from it for this long before the resume",
+    });
+  };
+
+  /**
+   * The last moment the agent on this incident is known to have been alive.
+   *
+   * The blocking tools make a turn last as long as the wait, so the rows the
+   * agent writes as it runs are the clock: a question or message to the Boss,
+   * a wait on a person and its reminders, and anything it did through the
+   * tool API. Launch is only the floor. Measuring from it is what told every
+   * thread on every deploy that an agent working minutes earlier had been
+   * gone for hours.
+   *
+   * Human rows are left out on purpose. A reply in the thread says a person
+   * was there, not that the agent was.
+   *
+   * An open wait marker is stronger than any timestamp. Both are deleted when
+   * the wait ends, and a wait writes nothing while it blocks, so its question
+   * can be an hour old on an agent that was alive until the restart. It
+   * counts as alive up to when this process started.
+   */
+  private lastAliveAt = (row: {
+    id: string;
+    lastStartedAt: number | null;
+    firstSignalAt: number;
+  }): number => {
+    const open =
+      this.db.get<{ open: number }>(
+        `SELECT (EXISTS (SELECT 1 FROM pending_question WHERE incidentId = ?)
+                 OR EXISTS (SELECT 1 FROM pending_wait WHERE incidentId = ?)) AS open`,
+        [row.id, row.id],
+      )?.open === 1;
+    const recorded =
+      this.db.get<{ at: number }>(
+        `SELECT MAX(
+           COALESCE((SELECT MAX(createdAt) FROM boss_inbox
+                      WHERE incidentId = ?), 0),
+           COALESCE((SELECT MAX(at) FROM incident_action
+                      WHERE incidentId = ? AND actorKind = 'agent'), 0),
+           COALESCE((SELECT MAX(askedAt) FROM pending_question
+                      WHERE incidentId = ?), 0),
+           COALESCE((SELECT MAX(startedAt, COALESCE(lastPingAt, 0))
+                      FROM pending_wait WHERE incidentId = ?), 0)
+         ) AS at`,
+        [row.id, row.id, row.id, row.id],
+      )?.at ?? 0;
+    return Math.max(
+      recorded,
+      open ? this.bootedAt : 0,
+      row.lastStartedAt ?? row.firstSignalAt,
+    );
   };
 
   /**
@@ -1370,139 +1665,6 @@ export class Dispatcher {
            liftsOnReply = excluded.liftsOnReply,
            startedAt = excluded.startedAt`,
       ).run(incidentId, waitingFor, now + this.parkCooldownMs, now);
-    });
-  };
-
-  /**
-   * The last moment the agent on this incident is known to have been alive.
-   *
-   * The session is the primary clock: the agent writes it and it is synced
-   * after every turn, so it tracks the agent working rather than anything
-   * else touching the incident. It cannot see inside a turn, and the blocking
-   * tools make a turn last as long as the wait, so the rows those tools write
-   * as they run count too: a question or message to the Boss, a wait on a
-   * person and its reminders, and anything the agent did through the tool
-   * API. Launch is only the floor. Measuring from it is what told every
-   * thread on every deploy that an agent working minutes earlier had been
-   * gone for hours.
-   *
-   * Human rows are left out on purpose. A reply in the thread says a person
-   * was there, not that the agent was.
-   *
-   * An open wait marker can be stronger than any timestamp. Both are deleted
-   * when the wait ends, and a wait writes nothing while it blocks, so its
-   * question can be an hour old on an agent that was alive until the
-   * restart. It counts as alive up to when this process started, but only
-   * when the wait is the last thing the agent did: a marker older than the
-   * session's last entry is an orphan from a wait a SIGKILL interrupted
-   * earlier, and the agent has since moved on, so it proves nothing.
-   */
-  private lastAliveAt = async (row: EligibleRow): Promise<number> => {
-    const markerAt =
-      this.db.get<{ at: number | null }>(
-        // SQLite's two-argument MAX is NULL if either side is, so each side is
-        // zeroed and a result of zero means no marker at all.
-        `SELECT NULLIF(MAX(
-           COALESCE((SELECT askedAt FROM pending_question
-                      WHERE incidentId = ?), 0),
-           COALESCE((SELECT MAX(startedAt, COALESCE(lastPingAt, 0))
-                      FROM pending_wait WHERE incidentId = ?), 0)
-         ), 0) AS at`,
-        [row.id, row.id],
-      )?.at ?? null;
-    const recorded =
-      this.db.get<{ at: number }>(
-        `SELECT MAX(
-           COALESCE((SELECT MAX(createdAt) FROM boss_inbox
-                      WHERE incidentId = ?), 0),
-           COALESCE((SELECT MAX(at) FROM incident_action
-                      WHERE incidentId = ? AND actorKind = 'agent'), 0),
-           COALESCE((SELECT MAX(askedAt) FROM pending_question
-                      WHERE incidentId = ?), 0),
-           COALESCE((SELECT MAX(startedAt, COALESCE(lastPingAt, 0))
-                      FROM pending_wait WHERE incidentId = ?), 0)
-         ) AS at`,
-        [row.id, row.id, row.id, row.id],
-      )?.at ?? 0;
-
-    let session: number | null = null;
-    if (this.lastSessionEventAt && row.sessionRef) {
-      try {
-        // Bounded because ticks are serialized: a GetObject that never
-        // settles would stop every relaunch behind it.
-        let timer: NodeJS.Timeout | undefined;
-        session = await Promise.race([
-          this.lastSessionEventAt(row.sessionRef),
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(
-              () => reject(new Error(`session read took over ${SESSION_READ_TIMEOUT_MS}ms`)),
-              SESSION_READ_TIMEOUT_MS,
-            );
-          }),
-        ]).finally(() => clearTimeout(timer));
-      } catch (err: unknown) {
-        alarm("resume_session_read_failed", {
-          incidentId: row.id,
-          sessionRef: row.sessionRef,
-          error: String(err),
-          note: "the gap is measured from the database alone, so it may read longer than it was",
-        });
-      }
-    }
-
-    return Math.max(
-      recorded,
-      session ?? 0,
-      // No session, no way to tell a live wait from an orphan, and hiding a
-      // real gap is worse than reporting a false one the alarm above explains.
-      markerAt !== null && session !== null && markerAt >= session
-        ? this.bootedAt
-        : 0,
-      row.lastStartedAt ?? row.firstSignalAt,
-    );
-  };
-
-  private emitResumedAfter = async (
-    row: EligibleRow,
-    now: number,
-  ): Promise<void> => {
-    // Exact when we watched the exit ourselves. After a container restart we
-    // did not, and a SIGKILLed process writes no exit time, so the gap runs
-    // from the last thing the agent is known to have done.
-    const exitedAt = this.lastExitAt.get(row.id);
-    const since = exitedAt ?? (await this.lastAliveAt(row));
-    const seconds = Math.max(0, Math.round((now - since) / 1000));
-    if (seconds < this.config.tickSeconds) return;
-    await this.emitDirective(row.id, { type: "resumed_after", seconds });
-    if (seconds < RESUME_ALARM_SECONDS) {
-      // The normal path: every merge to ops main restarts this container and
-      // every live agent with it.
-      log("agent_resumed", {
-        incidentId: row.id,
-        gapSeconds: seconds,
-        measuredFrom: exitedAt === undefined ? "last_activity" : "exit",
-      });
-      return;
-    }
-
-    alarm("agent_resumed_after_gap", {
-      incidentId: row.id,
-      deadSeconds: seconds,
-      measuredFrom: exitedAt === undefined ? "last_activity" : "exit",
-      attempts: row.attempts,
-      status: row.status,
-      note: "the previous run stopped without finishing and nothing was heard from it for this long before the relaunch",
-    });
-  };
-
-  private emitDirective = async (
-    incidentId: string,
-    directive: Directive,
-  ): Promise<void> => {
-    await this.db.withWrite((db) => {
-      db.prepare(
-        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
-      ).run(incidentId, JSON.stringify(directive), this.now());
     });
   };
 }

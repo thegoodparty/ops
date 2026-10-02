@@ -9,12 +9,12 @@ import type { S3Client } from "@aws-sdk/client-s3";
 import { Db } from "../db";
 import type { Directive } from "../types";
 import {
-  applyAssign,
+  applyAssign as applyAssignTo,
   assign,
   AssignError,
   establishedOf,
   logAssign,
-  pushDirective,
+  type AgentNotice,
 } from "./assign";
 
 const fakeS3 = () => {
@@ -54,13 +54,20 @@ const seed = async (id: string, opts: { closedAt?: number } = {}) => {
   });
 };
 
+// What the agents were told, in order. Only applyAssign delivers, and only
+// after its write commits, so a notice in here is one a committed move owed.
+let told: AgentNotice[] = [];
+const agents = { notify: (incidentId: string, directive: Directive) => void told.push({ incidentId, directive }) };
+
+const applyAssign = (
+  to: Db,
+  req: Parameters<typeof applyAssignTo>[1],
+  actor: Parameters<typeof applyAssignTo>[2],
+  opts: Parameters<typeof applyAssignTo>[3] = {},
+) => applyAssignTo(to, req, actor, opts, agents);
+
 const directivesFor = (incidentId: string): Directive[] =>
-  db
-    .query<{ payload: string }>(
-      "SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-      [incidentId],
-    )
-    .map((r) => JSON.parse(r.payload) as Directive);
+  told.filter((notice) => notice.incidentId === incidentId).map((notice) => notice.directive);
 
 const incident = (id: string) =>
   db.get<{ id: string; status: string; mergedInto: string | null; recurrenceOf: string | null; firstSignalAt: number }>(
@@ -88,6 +95,7 @@ after(() => {
 beforeEach(async () => {
   db?.close();
   seq = 0;
+  told = [];
   s3 = fakeS3();
   db = await Db.open({
     path: join(dir, `assign-${Math.random().toString(36).slice(2)}.db`),
@@ -162,7 +170,7 @@ describe("assign: one primitive, four operations", () => {
     assert.deepEqual(
       directivesFor(b),
       [{ type: "merged", into: a }],
-      "the losing agent learns through a directive, not a push",
+      "the losing agent is told it was merged away",
     );
   });
 
@@ -529,43 +537,27 @@ describe("establishedOf: which record stays", () => {
   });
 });
 
-describe("pushDirective: the Boss's message wakes a parked incident", () => {
-  const park = (incidentId: string, liftsOnReply: number) =>
-    db.withWrite((w) => {
-      w.prepare(
-        `INSERT INTO incident_wait (incidentId, waitingFor, wakeAt, liftsOnReply, startedAt)
-         VALUES (?, 'an answer', NULL, ?, 1)`,
-      ).run(incidentId, liftsOnReply);
-    });
-  const waiting = (incidentId: string) =>
-    db.get<{ n: number }>(
-      "SELECT COUNT(*) AS n FROM incident_wait WHERE incidentId = ?",
-      [incidentId],
-    )?.n;
-
-  it("lifts a wait on news, and only a boss_message does", async () => {
+describe("telling agents", () => {
+  it("keeps a committed move when telling the agent fails", async () => {
     await seed("sig-a");
-    const id = (await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "r" }, { kind: "boss" })).target;
-    await park(id, 1);
+    await seed("sig-b");
+    const a = (await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "a" }, { kind: "boss" })).target;
+    const b = (await applyAssign(db, { signalIds: ["sig-b"], target: "NEW", reason: "b" }, { kind: "boss" })).target;
 
-    await db.withWrite((w) => pushDirective(w, id, { type: "stop", reason: "r" }));
-    assert.equal(waiting(id), 1, "the premise: other directives leave the wait in place");
-
-    await db.withWrite((w) =>
-      pushDirective(w, id, { type: "boss_message", text: "org X only", at: 1 }),
+    const result = await applyAssignTo(
+      db,
+      { signalIds: ["sig-b"], target: a, reason: "one bug" },
+      { kind: "boss" },
+      {},
+      { notify: () => { throw new Error("conversation store down"); } },
     );
-    assert.equal(waiting(id), 0);
-    assert.deepEqual(directivesFor(id).at(-1), { type: "boss_message", text: "org X only", at: 1 });
-  });
 
-  it("leaves a run that is out of turns parked", async () => {
-    await seed("sig-a");
-    const id = (await applyAssign(db, { signalIds: ["sig-a"], target: "NEW", reason: "r" }, { kind: "boss" })).target;
-    await park(id, 0);
-
-    await db.withWrite((w) =>
-      pushDirective(w, id, { type: "boss_message", text: "carry on", at: 1 }),
+    assert.deepEqual(result.merged, [b]);
+    assert.equal(incident(b)?.status, "MERGED", "the move stands");
+    assert.deepEqual(
+      result.notices.map((n) => n.incidentId).sort(),
+      [a, b].sort(),
+      "and the result still says who was owed a notice",
     );
-    assert.equal(waiting(id), 1);
   });
 });

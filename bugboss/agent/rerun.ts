@@ -30,7 +30,8 @@
 //      to replay: a restarted agent's recorded call runs again, finds attempt
 //      2, and refuses instead of re-running twice.
 //   2. A budget across the incident, so the pattern of "push something small,
-//      re-run, repeat" runs out. Process-scoped, and a restart hands it back —
+//      re-run, repeat" runs out. Process-scoped and keyed by incident, because
+//      one process runs every incident's agent, and a restart hands it back —
 //      but every run already re-run is still at attempt 2 and still refused,
 //      so what a restart buys is only the runs it has not touched.
 //   3. The Boss hears about it. The notice is sent by this tool, not by the
@@ -45,7 +46,7 @@
 // discipline attached, plus a prompt rule, and that honest gap. Read
 // `CLAUDE.md` in this directory before widening it.
 
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { Context, ToolExecutionApi, ToolRegistration } from "./harness";
 import type { BossInboxPort } from "./tools";
 
 export const RERUN_TOOL_NAME = "rerun_ci";
@@ -152,7 +153,7 @@ export const createGitHubRunsPort = (deps: {
     path: string,
   ): Promise<GitHubResult<T>> => {
     const token = deps.token();
-    // The token is refreshed in place by `keepGitHubTokenFresh`, so an absent
+    // The token is refreshed in place by the composition root, so an absent
     // one means the App credentials never resolved at boot. Said plainly here
     // rather than sent as `Bearer undefined` for GitHub to call a 401.
     if (!token) {
@@ -442,13 +443,33 @@ const RERUN_DESCRIPTION = [
   "not block; wait for the re-run with monitor.",
 ].join("\n");
 
+/** What a started re-run left for a replayed call: the notice it owes the Boss. */
+type StartedMemo = {
+  notice: string;
+  key: string;
+};
+
 export const createRerunCiTool = async (deps: {
   github: GitHubRunsPort;
-  boss: Pick<BossInboxPort, "tellBoss">;
-}): Promise<ToolDefinition> => {
+  incidentFor: (
+    api: ToolExecutionApi,
+    ctx: Context,
+  ) => Promise<{ incidentId: string; boss: Pick<BossInboxPort, "tellBoss"> }>;
+  maxReruns?: number;
+}): Promise<ToolRegistration> => {
   const { Type } = await import("typebox");
-  // One ledger for the life of the process, which is one incident.
-  const attempted = new Set<string>();
+  // One ledger per incident for the life of the process. The process runs
+  // every incident's agent, so a single set would let one agent's re-runs
+  // spend another's budget.
+  const ledgers = new Map<string, Set<string>>();
+  const ledgerFor = (incidentId: string): Set<string> => {
+    let ledger = ledgers.get(incidentId);
+    if (!ledger) {
+      ledger = new Set();
+      ledgers.set(incidentId, ledger);
+    }
+    return ledger;
+  };
 
   const parameters = Type.Object({
     repo: Type.String({
@@ -462,44 +483,82 @@ export const createRerunCiTool = async (deps: {
     }),
   });
 
+  const startedText = (runId: number, postError: string | null, notice: string): string =>
+    postError
+      ? [
+          `Re-running the failed jobs in run ${runId}. This is the one attempt you get on it.`,
+          "",
+          `The Boss was NOT told: sending failed with ${postError}. Send this yourself with message_boss now, before you wait for the result:`,
+          "",
+          notice,
+        ].join("\n")
+      : [
+          `Re-running the failed jobs in run ${runId}, and the Boss has been told why.`,
+          "",
+          "This is the one attempt you get on this run. If the same job fails again,",
+          "that is a finding to report rather than something to re-run. If it goes",
+          "green, the flake is still a defect: name the test and the job, and open a",
+          "pull request if the fix is small.",
+          "",
+          "Wait for the new attempt with monitor.",
+        ].join("\n");
+
   return {
     name: RERUN_TOOL_NAME,
-    label: "Re-run CI",
     description: RERUN_DESCRIPTION,
     parameters,
-    execute: async (_toolCallId: string, params: unknown) => {
+    // Safe to rerun after a restart: GitHub's run_attempt refuses a second
+    // re-run of the same run, and the memos below stop a replayed call that
+    // already started one from either asking GitHub again or telling the Boss
+    // twice.
+    replay: "safe",
+    outputLimits: { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER },
+    execute: async (params, api, ctx) => {
       const args = params as unknown as RerunArgs;
+      const { incidentId, boss } = await deps.incidentFor(api, ctx);
+      const attempted = ledgerFor(incidentId);
+
+      // A replay of a call whose re-run already started: right after a
+      // re-run GitHub can still report attempt 1, so asking again could
+      // re-run twice, and what the interrupted call still owed was the notice.
+      const started = await api.memo<StartedMemo>("started", ctx);
+      if (started) {
+        attempted.add(started.key);
+        let postError: string | null = null;
+        if (!(await api.memo<boolean>("sent", ctx))) {
+          try {
+            await boss.tellBoss("message", started.notice);
+            await api.memo("sent", true, ctx);
+          } catch (err) {
+            postError = String(err);
+          }
+        }
+        return { content: [{ type: "text", text: startedText(args.runId, postError, started.notice) }] };
+      }
+
+      let startedNotice: string | null = null;
       const result = await runRerunFailedJobs(args, {
         github: deps.github,
-        boss: deps.boss,
+        boss: {
+          tellBoss: async (kind, text, options) => {
+            startedNotice = text;
+            await api.memo<StartedMemo>("started", { notice: text, key: `${args.repo}#${args.runId}` }, ctx);
+            await boss.tellBoss(kind, text, options);
+            await api.memo("sent", true, ctx);
+          },
+        },
         attempted,
+        ...(deps.maxReruns === undefined ? {} : { maxReruns: deps.maxReruns }),
       });
       const text = result.refused
         ? `Nothing was re-run: ${result.refused}`
         : result.error
           ? `Nothing was re-run. ${result.error}`
-          : result.postError
-            ? [
-                `Re-running the failed jobs in run ${args.runId}. This is the one attempt you get on it.`,
-                "",
-                `The Boss was NOT told: sending failed with ${result.postError}. Send this yourself with message_boss now, before you wait for the result:`,
-                "",
-                result.notice,
-              ].join("\n")
-            : [
-                `Re-running the failed jobs in run ${args.runId}, and the Boss has been told why.`,
-                "",
-                "This is the one attempt you get on this run. If the same job fails again,",
-                "that is a finding to report rather than something to re-run. If it goes",
-                "green, the flake is still a defect: name the test and the job, and open a",
-                "pull request if the fix is small.",
-                "",
-                "Wait for the new attempt with monitor.",
-              ].join("\n");
+          : startedText(args.runId, result.postError, startedNotice ?? result.notice);
       return {
         content: [{ type: "text", text }],
         details: { started: result.started, runId: args.runId },
       };
     },
-  } as ToolDefinition;
+  };
 };

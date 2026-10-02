@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { AGENT_UID, WORK_MOUNT_PATH } from "./components/bugboss";
-import { DEFAULT_WORK_ROOT } from "../bugboss/agent/run";
+import { DEFAULT_WORK_ROOT } from "../bugboss/agent/workspace";
 
 // The EFS access point writes every file as AGENT_UID and the task mounts the
 // volume at WORK_MOUNT_PATH. Neither is checked by AWS against the image, so a

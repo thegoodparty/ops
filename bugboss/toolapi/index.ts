@@ -1,11 +1,13 @@
 // Job 4: serve the agent tool API. Design spec: bugboss/docs/architecture.md.
 //
 // The agent's only path to state. Six methods, three of which are state
-// transitions, and every response carries the directives the agent has not
-// picked up yet. That array is the whole coordination mechanism: there is no
-// push channel and an agent never has to be addressable, so it learns that a
-// human took over or that its incident was merged away as a side effect of a
-// call it was already making.
+// transitions. The incident is the caller's own, fixed when this API is built
+// for it: the agent's tools read the id from their conversation's
+// IncidentDoc, so it is never an argument a model could aim elsewhere. A
+// change that concerns some other agent -- a merge that empties its incident,
+// signals that land on it, a close -- is handed to the AgentNotifier once the
+// write has committed, and the composition root steers or stops that agent's
+// conversation.
 //
 // This is the single writer for incident state, so the two invariants are
 // enforced here rather than anywhere they could be bypassed:
@@ -24,7 +26,6 @@ import { indexIncident, searchIncidents, UnsearchableQuery } from "../db/search"
 import { pickSections, postmortemProblem } from "../report/postmortem";
 import { renderPostmortem } from "../report/render";
 import type {
-  Directive,
   Evidence,
   Incident,
   IncidentStatus,
@@ -45,9 +46,11 @@ import {
   getIncidentRow,
   getSignalsFor,
   logAssign,
-  pushDirective,
+  notifyAgents,
   rowToIncident,
   rowToSignal,
+  type AgentNotifier,
+  type AgentNotice,
   type AssignResult,
   type IncidentRow,
   type SignalRow,
@@ -59,7 +62,6 @@ import {
   createAnnouncer,
   type AnnouncePoster,
 } from "./announce";
-import { verifyAgentToken } from "./token";
 import {
   bullets,
   escape,
@@ -75,7 +77,6 @@ import { makeAlarm, makeLog } from "../logging";
 
 export * from "./announce";
 export * from "./assign";
-export * from "./token";
 
 const log = makeLog("toolapi");
 
@@ -157,9 +158,14 @@ export interface EvidenceStore {
 
 export interface ToolApiDeps {
   db: Db;
-  /** The scoped token the dispatcher minted for this run. */
-  token: string;
-  tokenSecret: string;
+  /**
+   * The caller's incident. Every write this API makes is scoped to it, and it
+   * comes from whoever built the API -- the agent's IncidentDoc, or the
+   * dispatcher naming the incident it is acting on -- never from an argument.
+   */
+  incidentId: string;
+  /** Told about a committed change that concerns an agent, after the commit. */
+  agents: AgentNotifier;
   correlator: Correlator;
   slack: ThreadPoster;
   evidence: EvidenceStore;
@@ -300,80 +306,32 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       .map(rowToSignal);
 
   /**
-   * Read and delete together. The read-only probe first keeps the common case
-   * off the write path, since every write costs a full snapshot PUT to S3.
-   */
-  const drain = async (incidentId: string): Promise<Directive[]> => {
-    const pending = db.query(
-      "SELECT id FROM pending_directive WHERE incidentId = ? LIMIT 1",
-      [incidentId],
-    );
-    if (pending.length === 0) return [];
-    return db.withWrite((w) => {
-      const rows = w
-        .prepare(
-          "SELECT id, payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-        )
-        .all(incidentId) as { id: number; payload: string }[];
-      if (rows.length === 0) return [];
-      w.prepare(
-        `DELETE FROM pending_directive WHERE id IN (${placeholders(rows.length)})`,
-      ).run(...rows.map((r) => r.id));
-      return rows.map((r) => JSON.parse(r.payload) as Directive);
-    });
-  };
-
-  /**
-   * Directive delivery is best effort. The transaction that deletes them is
-   * the only thing that can fail here, and it rolls back, so a failure means
-   * the same directives arrive on the next call rather than being lost --
-   * which is a far better outcome than telling an agent its committed
-   * transition failed.
-   */
-  const drainSafely = async (
-    incidentId: string,
-    tool: string,
-  ): Promise<Directive[]> => {
-    try {
-      return await drain(incidentId);
-    } catch (err) {
-      alarm("drain_failed", { tool, incidentId, error: String(err) });
-      return [];
-    }
-  };
-
-  /**
-   * Every method goes through here, which is what makes three properties
-   * unskippable: the incident comes from the token and never from an
-   * argument, directives drain on the failure path as well as the success
-   * path, and a rejected write reaches the model as an error it can read
+   * Every method goes through here, which is what makes two properties
+   * unskippable: the incident is the one this API was built for and never an
+   * argument, and a rejected write reaches the model as an error it can read
    * rather than as a crashed harness.
    */
   const call = async <T>(
     tool: string,
     fn: (incidentId: string) => Promise<Body<T>>,
   ): Promise<ToolResponse<T>> => {
-    let incidentId: string;
-    try {
-      incidentId = verifyAgentToken(deps.tokenSecret, deps.token).incidentId;
-    } catch (err) {
-      log("token_rejected", { tool, error: String(err) });
-      return { ok: false, error: (err as Error).message, directives: [] };
-    }
-
+    const { incidentId } = deps;
     try {
       const body = await fn(incidentId);
       if (!body.ok) log("rejected", { tool, incidentId, error: body.error });
-      return { ...body, directives: await drainSafely(incidentId, tool) };
+      return body;
     } catch (err) {
       alarm("failed", { tool, incidentId, error: String(err) });
-      return {
-        ok: false,
-        error: (err as Error).message,
-        directives: await drainSafely(incidentId, tool),
-      };
+      return { ok: false, error: (err as Error).message };
     }
   };
+
+  /** After the commit that owes them, never inside it. */
+  const notifyAll = (results: readonly AssignResult[]): void =>
+    notifyAgents(
+      deps.agents,
+      results.flatMap((result): AgentNotice[] => result.notices),
+    );
 
   const { notify, threadRef, announceMerge } = createAnnouncer({ db, slack });
 
@@ -633,6 +591,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       });
       if (splits === null) return raced(incidentId, "reportRootCause");
       splits.forEach(logAssign);
+      notifyAll(splits);
 
       if (splits.length > 0) await announceSplit(incident, splits);
 
@@ -667,6 +626,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
         .filter((o) => o.kind === "applied")
         .map((o) => o.result);
       applied.forEach(logAssign);
+      notifyAll(applied);
 
       for (const merge of applied) await announceMerge(merge);
 
@@ -674,9 +634,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       // reporting incident itself -- when an older incident turns out to be
       // the same bug, the cause travels to it and this record is the one
       // that closes -- so the FIXING this call just wrote is no longer
-      // something it can claim afterwards. The `merged` directive riding
-      // out with this response is what stands the agent down; a status
-      // saying FIXING underneath it would contradict it.
+      // something it can claim afterwards. The `merged` notice sent above is
+      // what stands the agent down; a status saying FIXING in this result
+      // would contradict it.
       return {
         ok: true,
         data: {
@@ -831,6 +791,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       });
       if (splits === null) return raced(incidentId, "reportResolved");
       splits.forEach(logAssign);
+      notifyAll(splits);
 
       if (splits.length > 0) await announceSplit(incident, splits);
 
@@ -1157,9 +1118,9 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
     });
 
   /**
-   * Read-only and outside the transition set, so it drains no directives and
-   * changes nothing. The agent gets the same reach triage has: an exact
-   * signal key finds the same alert returning, and only the post-mortems
+   * Read-only and outside the transition set, so it changes nothing. The
+   * agent gets the same reach triage has: an exact signal key finds the same
+   * alert returning, and only the post-mortems
    * find the same cause returning through a different one.
    */
   const searchIncidentsTool: ToolApi["searchIncidents"] = (args) =>
@@ -1266,6 +1227,7 @@ export const createToolApi = (deps: ToolApiDeps): ToolApi => {
       }
 
       logAssign(outcome.result);
+      notifyAll([outcome.result]);
       await announceMerge(outcome.result);
 
       const record = outcome.result.target;
@@ -1318,6 +1280,8 @@ export const closeIncidentByBoss = async (
   deps: {
     db: Db;
     slack: AnnouncePoster;
+    /** Stops the incident's agent once the close has committed. */
+    agents: AgentNotifier;
     announceClose?: (incidentId: string) => Promise<void>;
   },
   args: { incidentId: string; reason: string },
@@ -1361,10 +1325,6 @@ export const closeIncidentByBoss = async (
       ).run(incidentId, reason, at);
       closeOpenSignals(w, incidentId, at);
       indexIncident(w, incidentId);
-      pushDirective(w, incidentId, {
-        type: "stop",
-        reason: `BugBoss closed this incident: ${reason}`,
-      });
       return { ok: true, from: row.status };
     },
   );
@@ -1374,6 +1334,12 @@ export const closeIncidentByBoss = async (
   }
 
   log("boss_closed", { incidentId, from: outcome.from });
+  notifyAgents(deps.agents, [
+    {
+      incidentId,
+      directive: { type: "stop", reason: `BugBoss closed this incident: ${reason}` },
+    },
+  ]);
   if (deps.announceClose) {
     await deps.announceClose(incidentId);
     return outcome;

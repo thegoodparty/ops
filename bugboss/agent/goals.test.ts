@@ -1,18 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, test } from "node:test";
 
-import type { TranscriptContext } from "@earendil-works/pi-ai";
+import type { ModelReply, ModelRequest, ModelUsage } from "../model";
+import type { IncidentStatus, TimelineEvent, ToolResponse } from "../types";
+import type { ContextView } from "./harness";
+import { createGoalEvaluator, createStageGoals, GOALS, type Gate, type Verdict as Judged } from "./goals";
 
-import { createPiModelClient } from "../bedrock/client";
-import type { Directive, IncidentStatus, TimelineEvent, ToolApi, ToolResponse } from "../types";
-import { createGoalEvaluator, createStageGoals, GOALS } from "./goals";
-import { createBossTools, goalApi, startWithinBudget, type BossClient } from "./run";
-import { sumSessionUsage } from "./session";
-import { createMessageBossTool } from "./tools";
-
+type Message = ContextView["messages"][number];
 type Verdict = { verdict: string; reason: string };
 
 const SIGNAL = {
@@ -32,200 +26,99 @@ const MERGED: TimelineEvent = {
   evidenceUrl: "https://github.com/thegoodparty/omni/pull/2265",
 };
 
+const USAGE: ModelUsage = {
+  tokensIn: 1_200,
+  tokensOut: 40,
+  cacheRead: 0,
+  cacheWrite: 0,
+  costUsd: 0.0013,
+  modelId: "haiku",
+  calls: 1,
+};
+
+const toolResult = (text: string): Message =>
+  ({
+    role: "toolResult",
+    toolCallId: "c",
+    toolName: "run_query",
+    content: [{ type: "text", text }],
+    isError: false,
+    timestamp: 0,
+  }) as unknown as Message;
+
 /**
- * A real Pi session with two stand-in models: the agent, scripted turn by
- * turn, and the evaluator, a function of what it is shown. Everything between
- * them -- the tool calls, the gate, the reason landing in the agent's next
- * request -- is the production code.
+ * The gates over a stand-in evaluator model, a function of the prompt it is
+ * shown. Everything between the transcript and the verdict -- the prompt, the
+ * parse, the verdict row, the escalation -- is the production code.
  */
-const runGoals = async (args: {
+const harness = (args: {
   status?: IncidentStatus;
   timeline?: TimelineEvent[];
-  /** What the stand-in `run_query` tool returns, in call order. */
-  queries?: string[];
-  /** Directives the Boss has queued, drained by the first get_incident. */
-  directives?: Directive[];
   timelineFails?: boolean;
   escalationFails?: boolean;
   judge: (body: string) => Verdict;
-  turns: (kit: typeof import("@earendil-works/pi-ai")) => unknown[];
 }) => {
-  const pi = await import("@earendil-works/pi-coding-agent");
-  const kit = await import("@earendil-works/pi-ai");
-  const { Type } = await import("typebox");
-  const dir = await mkdtemp(join(tmpdir(), "bugboss-goals-"));
-
-  const faux = kit.fauxProvider({
-    models: [
-      { id: "faux-opus", contextWindow: 1_000_000, maxTokens: 1_000 },
-      { id: "faux-haiku", contextWindow: 200_000, maxTokens: 1_000 },
-    ],
-  });
-  const modelRuntime = await pi.ModelRuntime.create({
-    authPath: join(dir, "auth.json"),
-    modelsPath: null,
-    refreshOnCreate: false,
-  });
-  modelRuntime.registerNativeProvider(faux.provider);
-  const agentModel = faux.getModel("faux-opus");
-  const evaluatorModel = faux.getModel("faux-haiku");
-  assert.ok(agentModel && evaluatorModel);
-
-  const agentRequests: string[] = [];
-  const evaluatorBodies: string[] = [];
-  const scripted = args.turns(kit);
-  faux.setResponses(
-    Array.from({ length: 60 }, () => (context: TranscriptContext, _o: unknown, _s: unknown, model: { id: string }) => {
-      if (model.id === "faux-haiku") {
-        const body = JSON.stringify(context.messages);
-        evaluatorBodies.push(body);
-        return kit.fauxAssistantMessage(JSON.stringify(args.judge(body)));
-      }
-      agentRequests.push(JSON.stringify(context.messages));
-      const next = scripted.shift();
-      return (next ?? kit.fauxAssistantMessage("done")) as ReturnType<typeof kit.fauxAssistantMessage>;
-    }),
-  );
-
-  const calls = {
-    reportRootCause: 0,
-    reportResolved: 0,
-    reportAnalysis: 0,
-    told: [] as { kind: string; text: string }[],
-    verdicts: [] as { gate: string; verdict: string; reason: string }[],
-  };
-  const queued = [...(args.directives ?? [])];
-  // Every tool API call drains, as the real one does.
-  const ok = (data?: unknown): ToolResponse<never> =>
-    ({ ok: true, directives: queued.splice(0), ...(data === undefined ? {} : { data }) }) as ToolResponse<never>;
-  const incident = {
-    id: "94",
-    status: args.status ?? "INVESTIGATING",
-    rootCause: null,
-    usersImpacted: null,
-    impactQuery: null,
-    prUrls: [],
-    resolvedEvidence: null,
-  };
-  const timeline: TimelineEvent[] = [...(args.timeline ?? [])];
-  const api = {
-    reportRootCause: async () => {
-      calls.reportRootCause += 1;
-      return ok();
-    },
-    reportResolved: async () => {
-      calls.reportResolved += 1;
-      return ok();
-    },
-    reportAnalysis: async () => {
-      calls.reportAnalysis += 1;
-      return ok();
-    },
-    getIncident: async () => ok({ incident, signals: [SIGNAL] }),
-    trackTimelineEvent: async (event: Omit<TimelineEvent, "id" | "recordedAt">) => {
-      const row = { ...event, id: timeline.length + 1, recordedAt: event.occurredAt, evidenceUrl: null };
-      timeline.push(row);
-      const verdict = /^(\S+) (\S+): (.*)$/s.exec(event.summary);
-      if (event.kind === "goal_verdict" && verdict) {
-        calls.verdicts.push({ gate: verdict[1], verdict: verdict[2], reason: verdict[3] });
-      }
-      return ok(row);
-    },
-    timelineEvents: async () => {
-      if (args.timelineFails) throw new Error("timeline read failed");
-      return [...timeline];
-    },
-  } as unknown as ToolApi & Pick<BossClient, "timelineEvents">;
-  const tellBoss = async (kind: string, text: string) => {
-    if (kind === "escalation" && args.escalationFails) throw new Error("inbox down");
-    calls.told.push({ kind, text });
-  };
-
-  let manager: import("@earendil-works/pi-coding-agent").SessionManager | null = null;
+  const transcript: Message[] = [];
+  const bodies: string[] = [];
+  const told: { reason: string; brief: string }[] = [];
+  const verdicts: { gate: Gate; verdict: Judged; reason: string }[] = [];
   const logs: { event: string; fields: Record<string, unknown> }[] = [];
+  const evaluate = createGoalEvaluator({
+    client: {
+      complete: async (request: ModelRequest): Promise<ModelReply> => {
+        const body = request.messages.map((message) => ("text" in message ? message.text : "")).join("\n");
+        bodies.push(body);
+        return { text: JSON.stringify(args.judge(body)), usage: USAGE } as unknown as ModelReply;
+      },
+    },
+    contextWindow: 200_000,
+  });
   const goals = createStageGoals({
-    evaluate: createGoalEvaluator({
-      client: createPiModelClient({ runtime: modelRuntime, model: evaluatorModel as never }),
-      contextWindow: evaluatorModel.contextWindow,
-      estimateTokens: (message) => pi.estimateTokens(message),
-    }),
-    ...goalApi({ ...api, tellBoss: (kind, text) => tellBoss(kind, text) }, (event, fields) => logs.push({ event, fields })),
-    session: () => manager,
-    toMessages: (messages) => pi.convertToLlm(messages as Parameters<typeof pi.convertToLlm>[0]),
+    evaluate,
+    context: async () => {
+      if (args.timelineFails) return { context: null, error: "the timeline could not be read: down" };
+      return {
+        context: {
+          incident: {
+            id: "94",
+            status: args.status ?? "INVESTIGATING",
+            rootCause: null,
+            usersImpacted: null,
+            impactQuery: null,
+            prUrls: [],
+            resolvedEvidence: null,
+          },
+          signals: [SIGNAL],
+          timeline: args.timeline ?? [],
+        },
+      };
+    },
+    recordVerdict: async (verdict) => {
+      verdicts.push(verdict);
+    },
+    escalate: async (reason, brief) => {
+      if (args.escalationFails) throw new Error("inbox down");
+      told.push({ reason, brief });
+    },
+    transcript: async () => [...transcript],
     log: (event, fields) => logs.push({ event, fields }),
     alarm: (event, fields) => logs.push({ event, fields }),
   });
-
-  const queries = [...(args.queries ?? [])];
-  const queryTool = {
-    name: "run_query",
-    label: "Run query",
-    description: "A stand-in for any tool that surfaces evidence.",
-    parameters: Type.Object({ query: Type.String() }),
-    execute: async () => ({
-      content: [{ type: "text" as const, text: queries.shift() ?? "(no rows)" }],
-      details: undefined,
-    }),
+  let transitions = 0;
+  const run = async (): Promise<ToolResponse> => {
+    transitions += 1;
+    return { ok: true };
   };
-  const customTools = [
-    ...(await createBossTools({
-      api,
-      boss: { tellBoss: (kind, text) => tellBoss(kind, text) },
-      goals,
-    })),
-    await createMessageBossTool({
-      marker: {
-        getPending: async () => null,
-        recordPending: async () => ({ message: "", askedAt: 0 }),
-        clearPending: async () => {},
-      },
-      boss: { tellBoss: (kind, text) => tellBoss(kind, text), escalationsSince: async () => ({ count: 0, lastAt: null }) },
-      api: { peekDirectives: async () => [], consumeDirective: async () => {} },
-      checkIn: goals.checkIn,
-    }),
-    queryTool,
-  ] as import("@earendil-works/pi-coding-agent").ToolDefinition[];
-
-  const settings = pi.SettingsManager.inMemory({
-    compaction: { enabled: true, reserveTokens: 148_000, keepRecentTokens: 10 },
-  });
-  const resourceLoader = new pi.DefaultResourceLoader({
-    cwd: dir,
-    agentDir: join(dir, "agent"),
-    settingsManager: settings,
-    noContextFiles: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    systemPromptOverride: () => "You are a test agent.",
-    appendSystemPromptOverride: () => [],
-  });
-  await resourceLoader.reload();
-
-  manager = pi.SessionManager.create(dir, join(dir, "sessions"), { id: "inc-94" });
-  const { session } = await pi.createAgentSession({
-    cwd: dir,
-    model: agentModel,
-    modelRuntime,
-    tools: customTools.map((tool) => tool.name),
-    customTools,
-    resourceLoader,
-    settingsManager: settings,
-    sessionManager: manager,
-  });
-
-  await startWithinBudget({
-    budget: { stopIfSpent: async () => false },
-    stages: { resume: async () => {} },
-    session,
-    message: "Incident 94 is yours.",
-  });
-  const error = session.state.errorMessage ?? null;
-  session.dispose();
-
-  const file = manager.getSessionFile();
-  assert.ok(file);
-  const raw = await readFile(file, "utf8");
-  return { calls, agentRequests, evaluatorBodies, goals, logs, error, raw };
+  return {
+    goals,
+    run,
+    transitions: () => transitions,
+    surface: (text: string) => transcript.push(toolResult(text)),
+    bodies,
+    told,
+    verdicts,
+    logs,
+  };
 };
 
 const verdict = (v: string, reason: string): Verdict => ({ verdict: v, reason });
@@ -236,57 +129,45 @@ const verdict = (v: string, reason: string): Verdict => ({ verdict: v, reason })
  * searched the whole prompt would be judging the goal, not the evidence.
  */
 const sections = (body: string) => {
-  const text = (JSON.parse(body) as { content: unknown }[])
-    .map((message) => JSON.stringify(message.content))
-    .join("\n")
-    .replace(/\\n/g, "\n");
-  const at = (heading: string) => text.indexOf(heading);
+  const at = (heading: string) => body.indexOf(heading);
   return {
-    gate: text.slice(at("# The goal: "), at("# What the agent is doing now")),
-    attempt: text.slice(at("# What the agent is doing now"), at("# The incident record")),
-    transcript: text.slice(at("# The agent's conversation since its last compaction")),
+    attempt: body.slice(at("# What the agent is doing now"), at("# The incident record")),
+    transcript: body.slice(at("# The agent's conversation since its last compaction")),
   };
 };
 
-describe("stage goals, through a real Pi session", () => {
+describe("stage goals", () => {
   test("incident 94: a root cause that explains only the alert is rejected, then accepted once user harm is shown", async () => {
     const alertShaped =
       "Peerly refused the draft for a bit.ly link and the refusal reached Stripe as a retryable gateway error instead of a permanent one -- that 502 is what paged.";
-    const run = await runGoals({
-      queries: [
-        "3 candidates were charged $634.10 for P2P text sends Peerly refused after payment; none were sent.",
-      ],
+    const h = harness({
       judge: (body) =>
         sections(body).transcript.includes("charged $634.10")
           ? verdict("met", "The transcript shows candidates charged for sends that never went out, and the 502 is explained.")
           : verdict("not_met", "Nothing shows what happened to a user: who paid, and what did they get instead of the send?"),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: alertShaped, explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "charged with no send" })),
-        fauxAssistantMessage(
-          fauxToolCall("report_root_cause", {
-            cause: "A candidate was charged for a P2P text send that could never be created, because we take the money before asking Peerly whether the message is sendable.",
-            explainedSignalIds: ["s1"],
-          }),
-        ),
-        fauxAssistantMessage("done"),
-      ],
     });
 
-    assert.equal(run.calls.reportRootCause, 1, "the transition ran once, on the met verdict");
-    assert.match(run.agentRequests[1], /NOT MET, nothing changed: Nothing shows what happened to a user/);
+    const first = await h.goals.gate("root_cause", `The agent called report_root_cause with:\n${alertShaped}`, h.run);
+    assert.equal(first.response.ok, false);
+    assert.match(first.response.error ?? "", /NOT MET, nothing changed: Nothing shows what happened to a user/);
     assert.match(
-      run.agentRequests[1],
+      first.response.error ?? "",
       /comprehensive picture of what went wrong for an actual human user/,
       "the goal text comes back with the reason",
     );
+    assert.equal(h.transitions(), 0);
+
+    h.surface("3 candidates were charged $634.10 for P2P text sends Peerly refused after payment; none were sent.");
+    const second = await h.goals.gate("root_cause", "The agent called report_root_cause with: a charge before sendability", h.run);
+    assert.equal(second.response.ok, true);
+    assert.equal(h.transitions(), 1, "the transition ran once, on the met verdict");
     assert.deepEqual(
-      run.calls.verdicts.filter((v) => v.gate === "root_cause").map((v) => v.verdict),
+      h.verdicts.map((v) => v.verdict),
       ["not_met", "met"],
-      "every verdict reaches the timeline",
+      "every verdict is recorded",
     );
-    assert.match(run.evaluatorBodies[0], /POST \/v1\/payments\/events returned 5xx/, "the evaluator sees the signals");
-    assert.match(run.evaluatorBodies[0], /that 502 is what paged/, "and the claim it is judging, whole");
+    assert.match(h.bodies[0], /POST \/v1\/payments\/events returned 5xx/, "the evaluator sees the signals");
+    assert.match(h.bodies[0], /that 502 is what paged/, "and the claim it is judging, whole");
   });
 
   test("resolved is rejected until the deploy, the replay, the repairs and the follow-ups are all shown", async () => {
@@ -296,276 +177,156 @@ describe("stage goals, through a real Pi session", () => {
       ["Refunded 3 charges in Stripe", "The 3 charged candidates are not shown refunded."],
       ["release run 1188 succeeded on omni#2270", "Follow-up omni#2270 is not shown merged and deployed."],
     ];
-    const run = await runGoals({
+    const h = harness({
       status: "FIXING",
       timeline: [MERGED],
-      queries: evidence.map(([shown]) => shown),
       judge: (body) => {
         const missing = evidence.find(([shown]) => !sections(body).transcript.includes(shown));
         return missing
           ? verdict("not_met", missing[1])
           : verdict("met", "Deploy, replay, repairs and follow-up all shown.");
       },
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => {
-        const resolve = (text: string) =>
-          fauxAssistantMessage(
-            fauxToolCall("report_resolved", { prUrls: ["https://github.com/thegoodparty/omni/pull/2265"], evidence: text }),
-          );
-        return [
-          resolve("the alert has been quiet for an hour"),
-          ...evidence.flatMap(([shown]) => [
-            fauxAssistantMessage(fauxToolCall("run_query", { query: shown })),
-            resolve(`shown: ${shown}`),
-          ]),
-          fauxAssistantMessage("done"),
-        ];
-      },
     });
 
-    assert.equal(run.calls.reportResolved, 1, "only the last attempt ran the transition");
-    evidence.forEach(([, reason], i) => {
-      assert.ok(run.agentRequests[1 + 2 * i].includes(reason), `refused for: ${reason}`);
-    });
-    assert.deepEqual(
-      run.calls.verdicts.map((v) => v.verdict),
-      ["not_met", "not_met", "not_met", "not_met", "met"],
-    );
+    const first = await h.goals.gate("resolved", "the alert has been quiet for an hour", h.run);
+    assert.ok(first.response.error?.includes(evidence[0][1]));
+    for (const [i, [shown]] of evidence.entries()) {
+      h.surface(shown);
+      const next = await h.goals.gate("resolved", `shown: ${shown}`, h.run);
+      if (i < evidence.length - 1) assert.ok(next.response.error?.includes(evidence[i + 1][1]), `refused for: ${evidence[i + 1][1]}`);
+    }
+    assert.equal(h.transitions(), 1, "only the last attempt ran the transition");
+    assert.deepEqual(h.verdicts.map((v) => v.verdict), ["not_met", "not_met", "not_met", "not_met", "met"]);
+    assert.match(h.bodies[0], /omni#2265 merged/, "the recorded timeline reaches the evaluator");
   });
 
   test("closing is rejected while the post-mortem lists follow-up work on this incident, and accepts practice-level prevention", async () => {
-    const sections_ = (resolutionActions: string[]) => ({
-      atAGlance: "Candidates were charged for sends that never went out. Fixed.",
-      timeline: [{ at: "2026-09-30T19:02:11Z", event: "first refused send" }],
-      userImpact: "3 candidates charged $634.10 with no send.",
-      rootCause: "We took the money before asking Peerly whether the message was sendable.",
-      fiveWhys: Array.from({ length: 5 }, (_, i) => ({ why: `why ${i}`, because: `because ${i}` })),
-      resolutionActions,
-      practiceChanges:
-        "Check a send is deliverable before any payment step, as a test pattern for every paid flow.",
-      usersImpacted: 3,
-      impactQuery: "select ...",
-    });
-    const run = await runGoals({
+    const h = harness({
       status: "RESOLVED",
       judge: (body) =>
         sections(body).attempt.includes("Follow-up:")
           ? verdict("not_met", "A resolution action is follow-up work on this incident; ship it or escalate it as a decision.")
           : verdict("met", "Timeline, impact and cause match; no follow-up work on this incident."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(
-          fauxToolCall("report_analysis", sections_(["Refunded the 3 candidates", "Follow-up: add the pre-payment gate"])),
-        ),
-        fauxAssistantMessage(
-          fauxToolCall("report_analysis", sections_(["Refunded the 3 candidates", "Shipped the pre-payment gate in omni#2270"])),
-        ),
-        fauxAssistantMessage("closed"),
-      ],
     });
-
-    assert.equal(run.calls.reportAnalysis, 1);
-    assert.match(run.agentRequests[1], /follow-up work on this incident; ship it/);
-    assert.match(run.evaluatorBodies[1], /test pattern for every paid flow/, "practice-level prevention reaches the evaluator and passes");
+    const refused = await h.goals.gate("analysis", "resolutionActions: Refunded; Follow-up: add the pre-payment gate", h.run);
+    assert.match(refused.response.error ?? "", /follow-up work on this incident; ship it/);
+    const accepted = await h.goals.gate(
+      "analysis",
+      "resolutionActions: Shipped the pre-payment gate. practiceChanges: a test pattern for every paid flow",
+      h.run,
+    );
+    assert.equal(accepted.response.ok, true);
+    assert.equal(h.transitions(), 1);
+    assert.match(h.bodies[1], /test pattern for every paid flow/, "practice-level prevention reaches the evaluator and passes");
   });
 
   test("the merge check-in holds the ask while delegate's last verdict is not approve", async () => {
-    const run = await runGoals({
+    const h = harness({
       status: "FIXING",
-      queries: ["delegate-reviewer on 9c1e: request changes", "delegate-reviewer on 3b7d: APPROVED; checks green"],
       judge: (body) =>
         sections(body).transcript.includes("APPROVED")
           ? verdict("met", "Approved on the head commit, CI green.")
           : verdict("not_met", "delegate-reviewer's last verdict on the head commit is request changes."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "reviews" })),
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
-        fauxAssistantMessage(fauxToolCall("run_query", { query: "reviews again" })),
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
-        fauxAssistantMessage("done"),
-      ],
     });
-
-    const asks = run.calls.told.filter((told) => told.kind === "message");
-    assert.equal(asks.length, 1, "the first ask never left; the second did");
-    assert.match(run.agentRequests[2], /Not sent to the Boss\. NOT MET.*request changes/s);
+    h.surface("delegate-reviewer on 9c1e: request changes");
+    const held = await h.goals.checkIn("Please get omni#2265 merged.");
+    assert.match(held.blocked ?? "", /NOT MET.*request changes/s);
+    assert.match(held.blocked ?? "", /The ask was not sent/);
+    h.surface("delegate-reviewer on 3b7d: APPROVED; checks green");
+    const sent = await h.goals.checkIn("Please get omni#2265 merged.");
+    assert.equal(sent.blocked, null);
     assert.deepEqual(
-      run.calls.verdicts.filter((v) => v.gate === "merge_check_in").map((v) => v.verdict),
+      h.verdicts.filter((v) => v.gate === "merge_check_in").map((v) => v.verdict),
       ["not_met", "met"],
     );
   });
 
   test("a message that asks nobody to merge goes out, and records no verdict", async () => {
-    const run = await runGoals({
-      status: "FIXING",
-      judge: () => verdict("not_applicable", "A status update, not a merge ask."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Root cause found; writing the fix now." })),
-        fauxAssistantMessage("done"),
-      ],
-    });
+    const h = harness({ status: "FIXING", judge: () => verdict("not_applicable", "A status update, not a merge ask.") });
+    const result = await h.goals.checkIn("Root cause found; writing the fix now.");
+    assert.equal(h.bodies.length, 1, "premise: the evaluator was asked");
+    assert.equal(result.blocked, null);
+    assert.equal(h.verdicts.length, 0);
+  });
 
-    assert.equal(run.evaluatorBodies.length, 1, "premise: the evaluator was asked");
-    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 1);
-    assert.equal(run.calls.verdicts.length, 0);
+  test("not_applicable on a stage gate is an outage, not a pass with a verdict", async () => {
+    const h = harness({ judge: () => verdict("not_applicable", "?") });
+    const result = await h.goals.gate("root_cause", "x", h.run);
+    assert.equal(result.response.ok, true, "fails open");
+    assert.ok(h.logs.some((log) => log.event === "goal_unjudged"));
+    assert.equal(h.verdicts.length, 0);
   });
 
   test("an evaluator that fails on a merge check-in lets the ask out, with an alarm", async () => {
-    const run = await runGoals({
-      status: "FIXING",
-      judge: () => ({ verdict: "maybe", reason: "" }),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
-        fauxAssistantMessage("done"),
-      ],
-    });
-
-    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 1, "the ask went out");
-    assert.ok(run.logs.some((log) => log.event === "goal_unjudged"));
-    assert.equal(run.calls.verdicts.length, 0);
-  });
-
-  test("a merge check-in delivers a stop it drained instead of sending the ask", async () => {
-    const run = await runGoals({
-      status: "FIXING",
-      directives: [{ type: "stop", reason: "a person took it" }],
-      judge: () => verdict("met", "Approved and green."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
-        fauxAssistantMessage("should not run"),
-      ],
-    });
-
-    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 0);
-    assert.equal(run.agentRequests.length, 1, "the stop ended the run");
+    const h = harness({ status: "FIXING", judge: () => ({ verdict: "maybe", reason: "" }) });
+    const result = await h.goals.checkIn("Please get omni#2265 merged.");
+    assert.equal(result.blocked, null, "the ask goes out");
+    assert.ok(h.logs.some((log) => log.event === "goal_unjudged"));
+    assert.equal(h.verdicts.length, 0);
   });
 
   test("impossible escalates through escalate, and the agent keeps working", async () => {
-    const run = await runGoals({
+    const h = harness({
       judge: () => verdict("impossible", "Only Stripe support can say which charges were refunded; a person has to ask them."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("still here"),
-      ],
     });
-
-    assert.equal(run.calls.reportRootCause, 0, "the transition did not run");
-    assert.equal(run.calls.told.length, 1);
-    assert.equal(run.calls.told[0].kind, "escalation");
-    assert.match(run.calls.told[0].text, /Only Stripe support can say/);
-    assert.match(run.agentRequests[1], /IMPOSSIBLE, nothing changed: Only Stripe support.*The Boss has it as an escalation/s);
-    assert.deepEqual(run.calls.verdicts.map((v) => v.verdict), ["impossible"]);
-  });
-
-  test("a refused gate still delivers a stop the Boss queued", async () => {
-    const run = await runGoals({
-      directives: [{ type: "stop", reason: "a person took it" }],
-      judge: () => verdict("not_met", "No user harm shown."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("should not run"),
-      ],
-    });
-
-    assert.equal(run.calls.reportRootCause, 0, "premise: the gate was refused");
-    assert.equal(run.agentRequests.length, 1, "the stop ended the run on the refused call");
+    const result = await h.goals.gate("root_cause", "x", h.run);
+    assert.equal(h.transitions(), 0, "the transition did not run");
+    assert.equal(h.told.length, 1);
+    assert.match(h.told[0].reason, /Only Stripe support can say/);
+    assert.match(result.response.error ?? "", /IMPOSSIBLE, nothing changed: Only Stripe support.*The Boss has it as an escalation/s);
+    assert.deepEqual(h.verdicts.map((v) => v.verdict), ["impossible"]);
   });
 
   test("an impossible verdict whose escalation fails tells the agent to escalate itself, with an alarm", async () => {
-    const run = await runGoals({
-      escalationFails: true,
-      judge: () => verdict("impossible", "Only a person can decide this."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("still here"),
-      ],
-    });
-
-    assert.equal(run.calls.reportRootCause, 0);
-    assert.match(run.agentRequests[1], /The escalation to the Boss failed; call escalate yourself/);
-    assert.ok(run.logs.some((log) => log.event === "goal_escalation_failed"));
+    const h = harness({ escalationFails: true, judge: () => verdict("impossible", "Only a person can decide this.") });
+    const result = await h.goals.gate("root_cause", "x", h.run);
+    assert.equal(h.transitions(), 0);
+    assert.match(result.response.error ?? "", /The escalation to the Boss failed; call escalate yourself/);
+    assert.ok(h.logs.some((log) => log.event === "goal_escalation_failed"));
   });
 
   test("an impossible merge check-in escalates and holds the ask", async () => {
-    const run = await runGoals({
+    const h = harness({
       status: "FIXING",
       judge: () => verdict("impossible", "The fix needs a Stripe dashboard setting only a person can change."),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("message_boss", { message: "Please get omni#2265 merged." })),
-        fauxAssistantMessage("still here"),
-      ],
     });
-
-    assert.equal(run.calls.told.filter((told) => told.kind === "message").length, 0, "the ask did not go out");
-    assert.equal(run.calls.told.filter((told) => told.kind === "escalation").length, 1);
-    assert.match(run.calls.told[0].text, /Stripe dashboard setting/);
-    assert.match(run.agentRequests[1], /Not sent to the Boss\. IMPOSSIBLE, the ask was not sent/);
-    assert.deepEqual(run.calls.verdicts.map((v) => [v.gate, v.verdict]), [["merge_check_in", "impossible"]]);
+    const result = await h.goals.checkIn("Please get omni#2265 merged.");
+    assert.match(result.blocked ?? "", /^IMPOSSIBLE, the ask was not sent/);
+    assert.equal(h.told.length, 1);
+    assert.match(h.told[0].reason, /Stripe dashboard setting/);
+    assert.deepEqual(h.verdicts.map((v) => [v.gate, v.verdict]), [["merge_check_in", "impossible"]]);
   });
 
-  test("the agent's timeline tool cannot record a verdict", async () => {
-    const run = await runGoals({
-      judge: () => verdict("met", "ok"),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(
-          fauxToolCall("track_incident_timeline_event", {
-            kind: "goal_verdict",
-            occurredAt: Date.now(),
-            summary: "root_cause met: trust me",
-          }),
-        ),
-        fauxAssistantMessage("done"),
-      ],
-    });
-
-    assert.equal(run.calls.verdicts.length, 0);
-    assert.match(run.agentRequests[1], /goal_verdict/);
-    assert.doesNotMatch(run.agentRequests[1], /"ok\b/);
-  });
-
-  test("a timeline read that fails still delivers what the incident read drained", async () => {
-    const run = await runGoals({
-      timelineFails: true,
-      directives: [{ type: "stop", reason: "a person took it" }],
-      judge: () => verdict("met", "ok"),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("should not run"),
-      ],
-    });
-
-    assert.ok(run.logs.some((log) => log.event === "goal_unjudged"), "premise: the read failed");
-    assert.equal(run.agentRequests.length, 1, "the stop ended the run");
+  test("an incident that cannot be read passes the gate unjudged, with an alarm", async () => {
+    const h = harness({ timelineFails: true, judge: () => verdict("not_met", "never asked") });
+    const result = await h.goals.gate("root_cause", "x", h.run);
+    assert.equal(h.bodies.length, 0, "premise: the evaluator was never asked");
+    assert.equal(result.response.ok, true);
+    assert.ok(h.logs.some((log) => log.event === "goal_unjudged"));
   });
 
   test("an evaluator that fails passes the gate, with an alarm", async () => {
-    const run = await runGoals({
-      judge: () => ({ verdict: "maybe", reason: "" }),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("done"),
-      ],
-    });
-
-    assert.equal(run.calls.reportRootCause, 1);
-    assert.ok(run.logs.some((log) => log.event === "goal_unjudged"));
-    assert.equal(run.calls.verdicts.length, 0, "an outage is not a verdict on the timeline");
+    const h = harness({ judge: () => ({ verdict: "maybe", reason: "" }) });
+    const result = await h.goals.gate("root_cause", "x", h.run);
+    assert.equal(result.response.ok, true);
+    assert.equal(h.transitions(), 1);
+    assert.ok(h.logs.some((log) => log.event === "goal_unjudged"));
+    assert.equal(h.verdicts.length, 0, "an outage is not a verdict on the timeline");
   });
 
-  test("the evaluator's tokens count in the incident's usage, and not as turns", async () => {
-    const run = await runGoals({
-      judge: () => verdict("met", "ok"),
-      turns: ({ fauxAssistantMessage, fauxToolCall }) => [
-        fauxAssistantMessage(fauxToolCall("report_root_cause", { cause: "x", explainedSignalIds: ["s1"] })),
-        fauxAssistantMessage("done"),
-      ],
-    });
-
-    const lines = run.raw.trim().split("\n");
-    const withoutVerdicts = lines.filter((line) => !line.includes("bugboss_goal_verdict")).join("\n");
-    const all = sumSessionUsage(run.raw);
-    const agentOnly = sumSessionUsage(withoutVerdicts);
-    assert.equal(all.turns, agentOnly.turns);
-    assert.ok(all.tokensIn > agentOnly.tokensIn, "the evaluator's input tokens are on the bill");
-    assert.equal(all.modelId, agentOnly.modelId, "the row stays priced as the agent's model");
+  // The judged tool returns this as its result's usage, which is what puts
+  // the evaluator's tokens on the incident's bill without a turn of its own.
+  test("every judgement hands back the evaluator's spend as tool usage", async () => {
+    const h = harness({ judge: () => verdict("not_met", "no") });
+    const gated = await h.goals.gate("root_cause", "x", h.run);
+    const checked = await h.goals.checkIn("merge please");
+    for (const usage of [gated.usage, checked.usage]) {
+      assert.ok(usage);
+      assert.equal(usage.input, USAGE.tokensIn);
+      assert.equal(usage.output, USAGE.tokensOut);
+      assert.equal(usage.totalTokens, USAGE.tokensIn + USAGE.tokensOut);
+      assert.equal(usage.cost.total, USAGE.costUsd);
+    }
   });
 });
 

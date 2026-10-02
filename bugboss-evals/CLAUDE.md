@@ -72,8 +72,8 @@ to end. The harness (`sim/run.ts`) is everything outside it:
   `merge_refused` milestone.
 - **AWS is fake.** BugBoss resolves credentials from a local
   container-credential endpoint serving made-up keys; the only AWS it can
-  reach is `sim/s3.ts` (its snapshot and session files, on disk) and the model
-  proxy, and neither checks a signature.
+  reach is `sim/s3.ts` (its database and harness snapshots, on disk) and the
+  model proxy, and neither checks a signature.
 - **The model** is the Anthropic API, reached through a counting proxy
   (`sim/model-proxy/`) that holds `ANTHROPIC_API_KEY`. The proxy presents the
   face the runtime speaks (`modelProtocol` in `sim/runtimes/`): BugBoss sends

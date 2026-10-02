@@ -9,12 +9,13 @@ import type { S3Client } from "@aws-sdk/client-s3";
 
 import { Db } from "../db";
 import type {
+  Directive,
   Evidence,
   IncidentView,
   MergeOutcomeView,
   ToolApi,
 } from "../types";
-import { applyAssign } from "./assign";
+import { applyAssign as applyAssignTo } from "./assign";
 import {
   closeIncidentByBoss,
   createToolApi,
@@ -22,13 +23,23 @@ import {
   type CorrelationMerge,
   type MergeVerdict,
 } from "./index";
-import jwt from "jsonwebtoken";
-
-import { mintAgentToken, verifyAgentToken } from "./token";
 import { THREAD_PROSE_CHARS } from "../slack/format";
 import { SECTIONS } from "../report/postmortem.fixture";
 
-const SECRET = "test-secret-not-a-real-one";
+/** What the agents were told, in order. Delivered only after a commit. */
+let told: { incidentId: string; directive: Directive }[] = [];
+const agents = {
+  notify: (incidentId: string, directive: Directive) => void told.push({ incidentId, directive }),
+};
+/** Every assign here goes through the real entry point, with its notifier. */
+const applyAssign = (
+  to: Db,
+  req: Parameters<typeof applyAssignTo>[1],
+  actor: Parameters<typeof applyAssignTo>[2],
+  opts: Parameters<typeof applyAssignTo>[3] = {},
+) => applyAssignTo(to, req, actor, opts, agents);
+const toldTo = (incidentId: string): Directive[] =>
+  told.filter((notice) => notice.incidentId === incidentId).map((notice) => notice.directive);
 
 const fakeS3 = () => {
   const objects = new Map<string, Buffer>();
@@ -100,8 +111,8 @@ const evidence = { load: async () => evidenceRows };
 const toolsFor = (incidentId: string): ToolApi =>
   createToolApi({
     db,
-    token: mintAgentToken(SECRET, { incidentId, attempt: 1 }, 3600),
-    tokenSecret: SECRET,
+    incidentId,
+    agents,
     correlator,
     slack,
     evidence,
@@ -229,6 +240,7 @@ beforeEach(async () => {
   db?.close();
   seq = 0;
   posts = [];
+  told = [];
   merges = [];
   evidenceRows = [];
   db = await Db.open({
@@ -386,7 +398,7 @@ describe("a status check the write does not repeat", () => {
     assert.equal(incidentRow(b)?.mergedInto, a);
     assert.equal(incidentRow(b)?.rootCause, null);
     assert.deepEqual(
-      res.directives,
+      toldTo(b),
       [{ type: "merged", into: a }],
       "and the agent learns why on its way out",
     );
@@ -753,8 +765,8 @@ describe("park", () => {
   });
 });
 
-describe("the scoped token", () => {
-  it("refuses a token for another incident reaching this one's signals", async () => {
+describe("containment: the API is built for one incident", () => {
+  it("refuses another incident's signals", async () => {
     await seed("sig-a");
     await seed("sig-b");
     const a = await openIncident(["sig-a"]);
@@ -786,48 +798,6 @@ describe("the scoped token", () => {
     assert.equal(incidentRow(a)?.status, "INVESTIGATING", "nothing leaked across");
     assert.deepEqual(signalsOn(a), ["sig-a"]);
   });
-
-  it("stops working when the token for the run expires", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const expired = createToolApi({
-      db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, -1),
-      tokenSecret: SECRET,
-      correlator,
-      slack,
-      evidence,
-    });
-
-    const res = await expired.reportRootCause({
-      cause: "late",
-      explainedSignalIds: ["sig-a"],
-    });
-
-    assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /invalid agent token/);
-    assert.equal(incidentRow(id)?.status, "INVESTIGATING");
-  });
-
-  it("rejects a forged token and returns no directives with it", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    const forged = createToolApi({
-      db,
-      token: mintAgentToken("a-different-secret", { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
-      correlator,
-      slack,
-      evidence,
-    });
-
-    const res = await forged.getIncident();
-
-    assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /invalid agent token/);
-    assert.deepEqual(res.directives, [], "an unidentified caller drains nothing");
-    assert.equal(incidentRow(id)?.status, "INVESTIGATING");
-  });
 });
 
 describe("reads are not contained", () => {
@@ -858,31 +828,17 @@ describe("reads are not contained", () => {
     assert.equal((res.data as IncidentView).incident.id, mine);
   });
 
-  it("reading another incident moves nothing and drains only the caller's own", async () => {
+  it("reading another incident moves nothing and tells nobody", async () => {
     await seed("sig-a");
     await seed("sig-b");
     const mine = await openIncident(["sig-a"]);
     const theirs = await openIncident(["sig-b"]);
-    await db.withWrite((w) => {
-      w.prepare(
-        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
-      ).run(theirs, JSON.stringify({ type: "stop", reason: "not yours" }), 1);
-    });
+    told = [];
 
     const res = await toolsFor(mine).getIncident({ incidentId: theirs });
 
     assert.equal(res.ok, true, res.error);
-    assert.deepEqual(
-      res.directives,
-      [],
-      "a read of somebody else's incident does not collect their directives",
-    );
-    assert.equal(
-      db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [theirs])
-        .length,
-      1,
-      "and leaves them where the agent that owns them will find them",
-    );
+    assert.deepEqual(told, [], "a read concerns no agent");
     assert.deepEqual(signalsOn(theirs), ["sig-b"], "reading is not moving");
   });
 });
@@ -1007,8 +963,8 @@ describe("proposeMerge: the agent asks", () => {
   });
 });
 
-describe("directives", () => {
-  it("returns a merge the agent never asked about", async () => {
+describe("telling agents", () => {
+  it("tells the agent of a merge it never asked about", async () => {
     await seed("sig-a");
     await seed("sig-b");
     const a = await openIncident(["sig-a"]);
@@ -1021,13 +977,13 @@ describe("directives", () => {
     });
 
     assert.equal(res.ok, true, res.error);
-    assert.deepEqual(res.directives, [{ type: "merged", into: a }]);
+    assert.deepEqual(toldTo(b), [{ type: "merged", into: a }]);
     assert.equal(incidentRow(b)?.status, "MERGED");
     assert.equal(incidentRow(b)?.mergedInto, a);
     assert.deepEqual(signalsOn(a), ["sig-a", "sig-b"]);
     // Read back rather than asserted. This call wrote FIXING and correlation
     // then absorbed the incident out from under it, so a response repeating
-    // what it wrote would contradict the directive travelling beside it --
+    // what it wrote would contradict the merge the agent was just told of --
     // and the direction rule makes an absorbed reporting incident the
     // ordinary case rather than a corner of one.
     assert.equal(
@@ -1055,21 +1011,15 @@ describe("directives", () => {
     // signal explained. So it reaches the surviving agent as something to
     // check, and the agent that found it is the one that closes.
     assert.equal(incidentRow(older)?.rootCause, null);
-    const handed = db
-      .query<{ payload: string }>(
-        "SELECT payload FROM pending_directive WHERE incidentId = ? ORDER BY id",
-        [older],
-      )
-      .map((r) => JSON.parse(r.payload) as { type: string; summary?: string });
-    const news = handed.find((d) => d.type === "new_signals");
+    const news = toldTo(older).find((d) => d.type === "new_signals");
     assert.ok(news, "the surviving agent is told signals arrived");
     assert.match(
-      news.summary ?? "",
+      news.type === "new_signals" ? news.summary : "",
       /upgrade webhook holds a connection per request/,
       "and told the cause the incident that just closed had found for them",
     );
     assert.match(
-      news.summary ?? "",
+      news.type === "new_signals" ? news.summary : "",
       /nothing has checked it against the signals/,
       "as a claim to verify, which is the only honest form for an unverified cause",
     );
@@ -1103,7 +1053,7 @@ describe("directives", () => {
     assert.match(declined!, /"intoStatus":"RESOLVED"/);
   });
 
-  it("drains on a rejected call as well as a successful one", async () => {
+  it("tells the agent when the merge commits, not on its next call", async () => {
     await seed("sig-a");
     await seed("sig-b");
     const a = await openIncident(["sig-a"]);
@@ -1113,6 +1063,7 @@ describe("directives", () => {
       { signalIds: ["sig-b"], target: a, reason: "a human merged these" },
       { kind: "human", slackUserId: "U1" },
     );
+    assert.deepEqual(toldTo(b), [{ type: "merged", into: a }], "told as the merge landed");
 
     const res = await toolsFor(b).reportRootCause({
       cause: "still working on it",
@@ -1120,28 +1071,7 @@ describe("directives", () => {
     });
 
     assert.equal(res.ok, false, "the incident is gone");
-    assert.deepEqual(
-      res.directives,
-      [{ type: "merged", into: a }],
-      "the reason for the rejection is the directive it came back with",
-    );
-  });
-
-  it("delivers each directive exactly once", async () => {
-    await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    await db.withWrite((w) => {
-      w.prepare(
-        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
-      ).run(id, JSON.stringify({ type: "resumed_after", seconds: 900 }), Date.now());
-    });
-    const tools = toolsFor(id);
-
-    const first = await tools.getIncident();
-    const second = await tools.getIncident();
-
-    assert.deepEqual(first.directives, [{ type: "resumed_after", seconds: 900 }]);
-    assert.deepEqual(second.directives, []);
+    assert.deepEqual(toldTo(b), [{ type: "merged", into: a }], "and the refusal tells it nothing twice");
   });
 });
 
@@ -1323,8 +1253,8 @@ describe("escalate", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: id,
+      agents,
       correlator,
       slack: {
         ...linking,
@@ -1389,8 +1319,8 @@ describe("getIncident", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: id,
+      agents,
       correlator,
       slack,
       evidence: {
@@ -1514,40 +1444,35 @@ describe("assign never attaches across RESOLVED", () => {
 
 
 describe("when the database stops taking writes", () => {
-  it("keeps a committed transition when directive delivery fails", async () => {
+  it("keeps a committed transition when telling an agent fails", async () => {
     await seed("sig-a");
-    const id = await openIncident(["sig-a"]);
-    await toolsFor(id).reportRootCause({ cause: "c", explainedSignalIds: ["sig-a"] });
-    await db.withWrite((w) => {
-      w.prepare(
-        "INSERT INTO pending_directive (incidentId, payload, createdAt) VALUES (?, ?, ?)",
-      ).run(id, JSON.stringify({ type: "resumed_after", seconds: 60 }), Date.now());
-    });
+    await seed("sig-b");
+    const a = await openIncident(["sig-a"]);
+    const b = await openIncident(["sig-b"]);
+    merges.push({ absorb: b, into: a, reason: "same pool exhaustion" });
     const tools = createToolApi({
-      db: writesDieAfter(1),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      db,
+      incidentId: b,
+      agents: {
+        notify: () => {
+          throw new Error("conversation store down");
+        },
+      },
       correlator,
       slack,
       evidence,
     });
 
-    let res: Awaited<ReturnType<ToolApi["reportResolved"]>> | undefined;
+    let res: Awaited<ReturnType<ToolApi["reportRootCause"]>> | undefined;
     const alarms = await alarmsDuring(async () => {
-      res = await tools.reportResolved({ prUrls: [], evidence: "quiet" });
+      res = await tools.reportRootCause({ cause: "pool exhaustion", explainedSignalIds: ["sig-b"] });
     });
 
     assert.equal(res?.ok, true, "the transition committed, so it must not be reported as failed");
-    assert.equal(incidentRow(id)?.status, "RESOLVED");
-    assert.deepEqual(res?.directives, [], "delivery is deferred, not claimed");
-    assert.equal(
-      db.query("SELECT id FROM pending_directive WHERE incidentId = ?", [id]).length,
-      1,
-      "and the directive is still queued for the next call",
-    );
+    assert.equal(incidentRow(b)?.status, "MERGED", "and the merge it set off stands");
     assert.ok(
-      alarms.some((line) => line.includes('"drain_failed"')),
-      "a delivery that could not happen is worth telling someone about",
+      alarms.some((line) => line.includes('"agent_notify_failed"')),
+      "an agent nobody could tell is worth telling someone about",
     );
   });
 
@@ -1556,8 +1481,8 @@ describe("when the database stops taking writes", () => {
     const id = await openIncident(["sig-a"]);
     const tools = createToolApi({
       db: writesDieAfter(0),
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: id,
+      agents,
       correlator,
       slack,
       evidence,
@@ -1571,6 +1496,7 @@ describe("when the database stops taking writes", () => {
     assert.equal(res?.ok, false, "and it still reaches the model as an error, not a crash");
     assert.match(res?.error ?? "", /writes halted/);
     assert.equal(incidentRow(id)?.status, "INVESTIGATING", "the transition is gone");
+    assert.deepEqual(told.filter((n) => n.incidentId === id), [], "and no agent is told of a write that never committed");
     assert.ok(
       alarms.some(
         (line) => line.includes('"level":"error"') && line.includes('"failed"'),
@@ -1609,36 +1535,6 @@ describe("time to detect", () => {
     // A guess would be worse than nothing: an invented start makes the metric
     // look computed when it is fabricated.
     assert.equal(incidentRow(id)?.impactStartedAt, null);
-  });
-});
-
-describe("agent tokens expire", () => {
-  it("refuses a token carrying no expiry", () => {
-    // jwt.verify rejects an `exp` in the past but accepts one that is absent,
-    // so a token minted without an expiry would verify forever. The threat is
-    // not the Boss minting one by accident; it is that a child which leaked
-    // its token keeps a working credential against the still-running Boss
-    // long after its incident closed.
-    const forever = jwt.sign({ attempt: 1 }, SECRET, {
-      algorithm: "HS256",
-      audience: "bugboss-toolapi",
-      subject: "42",
-    });
-
-    assert.throws(
-      () => verifyAgentToken(SECRET, forever),
-      /carries no expiry/,
-    );
-  });
-
-  it("refuses a token past its expiry", () => {
-    const expired = mintAgentToken(SECRET, { incidentId: "42", attempt: 1 }, -1);
-    assert.throws(() => verifyAgentToken(SECRET, expired), /invalid agent token/);
-  });
-
-  it("accepts a live one", () => {
-    const live = mintAgentToken(SECRET, { incidentId: "42", attempt: 1 }, 3600);
-    assert.equal(verifyAgentToken(SECRET, live).incidentId, "42");
   });
 });
 
@@ -1708,8 +1604,8 @@ describe("a merge is told to both threads", () => {
     merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: b,
+      agents,
       correlator,
       slack: {
         ...linking,
@@ -1748,8 +1644,8 @@ describe("a merge is told to both threads", () => {
     merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: b,
+      agents,
       correlator,
       // Only the surviving thread is down. The absorbed one is the half that
       // never gets another chance, so it cannot be the one that loses.
@@ -1810,8 +1706,8 @@ describe("a merge is told to both threads", () => {
     merges.push({ absorb: b, into: a, reason: "one pool, two alerts" });
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: b, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: b,
+      agents,
       correlator,
       slack: {
         ...slack,
@@ -1992,8 +1888,8 @@ describe("a split is told to both threads", () => {
     await withThread(id);
     const tools = createToolApi({
       db,
-      token: mintAgentToken(SECRET, { incidentId: id, attempt: 1 }, 3600),
-      tokenSecret: SECRET,
+      incidentId: id,
+      agents,
       correlator,
       slack: {
         ...slack,
@@ -2375,13 +2271,11 @@ describe("an incident that absorbed another one", () => {
    * pile of new signals, and the agent is then expected to keep an honest
    * title for an incident it was never told about.
    */
-  it("is told so, by name, on the directive that carries the signals", async () => {
+  it("is told so, by name, in the notice that carries the signals", async () => {
     const { survivor, absorbed } = await merged("abs1");
 
-    const view = await toolsFor(survivor).getIncident();
-
-    const news = view.directives.find((d) => d.type === "new_signals");
-    assert.ok(news, JSON.stringify(view.directives));
+    const news = toldTo(survivor).find((d) => d.type === "new_signals");
+    assert.ok(news, JSON.stringify(told));
     assert.deepEqual(
       news.type === "new_signals" ? news.absorbed : null,
       [absorbed],
@@ -2422,9 +2316,7 @@ describe("an incident that absorbed another one", () => {
    */
   it("is still readable by a process that did not see the merge happen", async () => {
     const { survivor, absorbed } = await merged("abs4");
-    await db.withWrite((w) => {
-      w.prepare("DELETE FROM pending_directive WHERE incidentId = ?").run(survivor);
-    });
+    told = [];
 
     const view = await toolsFor(survivor).getIncident();
 
@@ -2454,7 +2346,7 @@ describe("the Boss closing an incident", () => {
     assert.equal(before?.postmortem, null);
 
     const closed = await closeIncidentByBoss(
-      { db, slack },
+      { db, slack, agents },
       { incidentId: id, reason: "incident 4 fixed this and the alert has been quiet for a day" },
     );
 
@@ -2483,9 +2375,8 @@ describe("the Boss closing an incident", () => {
       0,
     );
 
-    const directives = (await toolsFor(id).getIncident()).directives;
     assert.ok(
-      directives.some((d) => d.type === "stop"),
+      toldTo(id).some((d) => d.type === "stop"),
       "the agent still on it is told to stop",
     );
 
@@ -2508,7 +2399,7 @@ describe("the Boss closing an incident", () => {
     await seed("sig-b");
     const other = await openIncident(["sig-b"]);
     await withThread(other);
-    await closeIncidentByBoss({ db, slack }, { incidentId: other, reason: "a duplicate report" });
+    await closeIncidentByBoss({ db, slack, agents }, { incidentId: other, reason: "a duplicate report" });
     const bossHeadline = (postsIn(other).at(-1) ?? "").split("\n")[0];
 
     assert.equal(agentHeadline, `*Incident ${id} closed*`);
@@ -2525,7 +2416,7 @@ describe("the Boss closing an incident", () => {
     const resolvedAt = incidentRow(id)?.resolvedAt;
     assert.ok(resolvedAt);
 
-    const closed = await closeIncidentByBoss({ db, slack }, { incidentId: id, reason: "the agent stalled" });
+    const closed = await closeIncidentByBoss({ db, slack, agents }, { incidentId: id, reason: "the agent stalled" });
 
     assert.deepEqual(closed, { ok: true, from: "RESOLVED" });
     assert.equal(incidentRow(id)?.resolvedAt, resolvedAt);
@@ -2539,18 +2430,20 @@ describe("the Boss closing an incident", () => {
     await mergedAway("sig-b", into);
     assert.equal(incidentRow(gone)?.status, "MERGED");
 
-    const merged = await closeIncidentByBoss({ db, slack }, { incidentId: gone, reason: "r" });
+    told = [];
+    const merged = await closeIncidentByBoss({ db, slack, agents }, { incidentId: gone, reason: "r" });
     assert.equal(merged.ok, false);
     assert.equal(incidentRow(gone)?.status, "MERGED");
+    assert.deepEqual(told, [], "a refused close stops nobody");
 
-    await closeIncidentByBoss({ db, slack }, { incidentId: into, reason: "r" });
-    const again = await closeIncidentByBoss({ db, slack }, { incidentId: into, reason: "r" });
+    await closeIncidentByBoss({ db, slack, agents }, { incidentId: into, reason: "r" });
+    const again = await closeIncidentByBoss({ db, slack, agents }, { incidentId: into, reason: "r" });
     assert.equal(again.ok, false);
     assert.match(again.ok ? "" : again.error, /is CLOSED/);
 
     await seed("sig-c");
     const open = await openIncident(["sig-c"]);
-    const bare = await closeIncidentByBoss({ db, slack }, { incidentId: open, reason: "  " });
+    const bare = await closeIncidentByBoss({ db, slack, agents }, { incidentId: open, reason: "  " });
     assert.equal(bare.ok, false);
     assert.equal(incidentRow(open)?.status, "INVESTIGATING");
   });

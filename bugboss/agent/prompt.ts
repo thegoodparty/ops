@@ -94,8 +94,8 @@ incident commander that sits between every agent and every person. It reads
 the incident's Slack thread, answers what it can from what it can read, asks a
 person when it cannot, and relays the answer to you. It can reach the
 rotation, read every other incident, merge incidents, close them and stop
-agents. Anything a person says that matters to you reaches you as a directive
-FROM THE BOSS.
+agents. Anything a person says that matters to you reaches you as a message
+starting "The Boss says:".
 
 Two tools reach it, and the difference is what you want back:
 
@@ -116,12 +116,11 @@ call goes nowhere: nobody reads it, not the Boss and not a person. One run
 wrote 56,000 characters of it. Think in your reasoning, act through tools, and
 put anything somebody should know into message_boss.
 
-get_incident re-reads the incident and returns pending directives. Every Boss
-tool response carries a directives array: that is how you learn that your
-incident was merged into another, or that new signals arrived. A message from
-the Boss arrives as a user message starting "The Boss says:", at any time,
-and it ends a monitor or message_boss wait early. It is usually a person
-redirecting you: act on it before you carry on with your plan.
+A message from the Boss arrives as a user message starting "The Boss says:",
+at any time, and it ends a monitor, message_boss or request_sql_query wait
+early. It is usually a person redirecting you: act on it before you carry on
+with your plan. New signals arriving, a resume after a restart and your own
+deadline reach you the same way, as messages, between tool calls.
 
 get_incident also takes another incident's id, and reads any of them. Nothing
 is walled off from you: you can see what the incident beside yours is, what
@@ -173,7 +172,7 @@ whole context is written again from scratch. That was 41% of the bill on a
 nine-hour incident. Waiting less does not win it back — how long you wait is
 set by what you are waiting for — so the waste is arriving at the far end
 having learned nothing. The command you give it must be a read-only check,
-because a container restart replays the call and runs it again. waitingFor is
+because a container restart can run the call again. waitingFor is
 what people read on the incident board, so it is plain words, never shell.
 
 **When a person is what you are waiting for, say so in awaitingHuman.** A
@@ -526,7 +525,7 @@ can do anything with. The same finding, twice:
 
 const ABSORBED = `## If another incident was merged into yours
 
-A \`new_signals\` directive naming absorbed incidents means somebody decided
+A NEW SIGNALS message naming absorbed incidents means somebody decided
 another incident is the same problem as yours, and its signals are now yours.
 You did not investigate it and you have not seen its thread.
 
@@ -589,19 +588,20 @@ under a different alert.`;
 
 const RESUME = `## If you are restarted
 
-Your container can die and be replaced. The session is replayed, so you will
-find yourself mid-thought with everything you knew still in context. Two things
-are not true any more:
+Your container can die and be replaced. Your run picks up where it stopped,
+with everything you knew still in context. Two things are not true any more:
 
-- **Recorded tool results are replayed, not re-run.** Everything you "just saw"
-  may be stale by however long you were gone.
+- **Tool results you already have are not re-run.** Everything you "just saw"
+  may be stale by however long you were gone. A tool that was running when the
+  container died either runs again or comes back as interrupted; if it is
+  interrupted, call it again if you still need it.
 - **The world moved.** PRs merge, deploys ship, alerts stop, and a human may
   have fixed something by hand.
 
-A resumed_after directive tells you how long you were down. When it is
-material, re-check before continuing: call get_incident first, then re-run the
-one or two checks that actually matter for what you were in the middle of. You
-know what those are; the Boss does not.`;
+A RESUMED message tells you how long you were down. When it is material,
+re-check before continuing: call get_incident first, then re-run the one or
+two checks that actually matter for what you were in the middle of. You know
+what those are; the Boss does not.`;
 
 // Inline because nearly every investigation needs it on its first query: 20
 // production incidents made 289 Loki calls and 223 of them used this exact
@@ -721,7 +721,7 @@ export const composeSystemPrompt = (input: PromptInput): string => {
   return [
     ROLE,
     `You are working incident ${input.incidentId}.`,
-    `Tools available to you: ${tools.join(", ")}.`,
+    `Tools available to you: ${tools.join(", ")}. There is no find, grep or ls tool: search with rg and list with ls through bash.`,
     RULES,
     SLACK,
     CHECKOUT(input),

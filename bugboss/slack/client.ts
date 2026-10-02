@@ -10,14 +10,13 @@
 
 import {
   GetObjectCommand,
-  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
 import { ErrorCode, retryPolicies, WebClient } from "@slack/web-api";
 
 import { makeAlarm } from "../logging";
-import type { ObjectStore, SlackClient, SlackMessage } from "./agent";
+import type { SlackClient, SlackMessage } from "./agent";
 import { UploadOutcomeUnknownError, type FileUploader } from "../report";
 
 /**
@@ -337,6 +336,12 @@ export const createSlackFileUploader = (token: string): FileUploader => {
   };
 };
 
+/** Whole-object S3: the evidence store in the composition root. */
+export interface ObjectStore {
+  get(key: string): Promise<string | null>;
+  put(key: string, body: string): Promise<void>;
+}
+
 export const createS3ObjectStore = (
   bucket: string,
   client?: S3Client,
@@ -363,24 +368,6 @@ export const createS3ObjectStore = (
       await s3.send(
         new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }),
       );
-    },
-    list: async (prefix) => {
-      const keys: string[] = [];
-      let token: string | undefined;
-      do {
-        const res = await s3.send(
-          new ListObjectsV2Command({
-            Bucket: bucket,
-            Prefix: prefix,
-            ContinuationToken: token,
-          }),
-        );
-        for (const obj of res.Contents ?? []) {
-          if (obj.Key) keys.push(obj.Key);
-        }
-        token = res.IsTruncated ? res.NextContinuationToken : undefined;
-      } while (token);
-      return keys;
     },
   };
 };

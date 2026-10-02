@@ -37,10 +37,11 @@ that matters. All it does is mint installation tokens, for two holders:
 
 The agent gets the App's *credentials* rather than a token minted at launch,
 because an installation token lasts an hour and an incident can run for a day.
-[`github.ts`](./github.ts) does the minting; `keepGitHubTokenFresh` in
-[`agent/run.ts`](./agent/run.ts) refreshes the environment in place every
-twenty minutes, and a git credential helper presents the current one so no
-token is ever written into `.git/config`.
+[`github.ts`](./github.ts) does the minting; the composition root
+([`index.ts`](./index.ts)) refreshes its cached token every twenty minutes,
+every `bash` call puts the current one in that command's environment, and a
+git credential helper presents it so no token is ever written into
+`.git/config`.
 
 ## Permissions
 
@@ -52,7 +53,7 @@ names the missing permission rather than quietly falling back to asking.
 | Permission | Level | What uses it |
 | --- | --- | --- |
 | `metadata` | read | Mandatory for every App. Nothing calls it directly. |
-| `contents` | write | The agent pushes its fix branch. `git push` through the credential helper configured in `agent/run.ts`. |
+| `contents` | write | The agent pushes its fix branch. `git push` through the credential helper `configureGitCredentials` (`agent/extension.ts`) sets at boot. |
 | `pull_requests` | write | `gh pr create`, `gh pr comment` (including the bare `delegate review` that fires the reviewer), and reading review state. Driven by the ship-pr skill the prompt points the agent at. The Boss's `gh` reads PRs, their files and reviews with it. |
 | `actions` | **write** (requested) | Reading workflow runs and jobs to tell whether a PR is green (`gh run list`, `gh run view`) needs only `read`. Re-running a run's failed jobs — `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`, via [`agent/rerun.ts`](./agent/rerun.ts) — needs `write`. |
 | `checks` | read | `gh pr checks` and the `statusCheckRollup` field of `gh pr view --json`, for the Boss and for agents watching CI. |
@@ -157,9 +158,9 @@ Both steps are a human's, and neither can be done by an agent or from CI.
    API keeps returning 403.
 
 Nothing needs redeploying afterwards. The App id, private key and installation
-id are unchanged, and the next token the agent mints carries the new
-permissions — tokens live an hour, and `keepGitHubTokenFresh` re-mints every
-twenty minutes, so an agent that is already running picks it up without a
+id are unchanged, and the next token the Boss mints carries the new
+permissions — tokens live an hour, and the Boss re-mints every twenty
+minutes, so an agent that is already running picks it up without a
 restart.
 
 A permission that is granted but not written down here is the state this file

@@ -71,9 +71,9 @@ back out of the url would point later links at the wrong message.
 
 Tagged or not, a message in an incident thread is recorded in `thread_reply`
 and handed to `SlackAgent.handleIncident` with the incident as context. The
-Boss answers, stays silent, or tells the agent something with a
-`boss_message` directive. Nothing on the way reads what the message meant, and
-no human text reaches an agent except through the Boss.
+Boss answers, stays silent, or tells the agent something with
+`message_agent`. Nothing on the way reads what the message meant, and no
+human text reaches an agent except through the Boss.
 
 Nothing classifies a reply or asks who it was for, and a thread needs no
 `@bugboss` to be heard. The Boss reads every message, and two people talking
@@ -82,8 +82,9 @@ to each other is a message it lets pass.
 The `thread_reply` insert stays inside the Slack ack because its id derives
 from `(channel, ts)`: it is what collapses a Slack retry, so the Boss does not
 run twice on one message. A reply does **not** lift an `incident_wait`. The
-Boss telling the agent something does (`pushDirective` on a `boss_message`),
-because an agent relaunched for chatter has nothing new to read.
+Boss telling the agent something does (`message_agent` deletes a wait with
+`liftsOnReply = 1`), because an agent relaunched for chatter has nothing new
+to read.
 
 A reply here has to stay visible at ingress: `classifySlackEvent` keeps an
 `incident_reply` kind, and the HTTP layer keys its :eyes: off not being
@@ -93,9 +94,9 @@ A reply here has to stay visible at ingress: `classifySlackEvent` keeps an
 threads the route used to be "tagged or dropped", so a person replying to the
 Boss the way people reply to anyone — without an `@` — was talking to nobody.
 A thread where the Boss already has a conversation (a `boss_thread` row,
-recorded by `answerMention` in the composition root, or a
-persisted session `state.json` under `slackSessionPrefix`) routes an untagged
-reply to `slack_agent`, exactly as a tagged one in that thread. Ingress calls
+recorded by `answerMention` in the composition root and by the runtime when it
+creates the thread's conversation) routes an untagged reply to `slack_agent`,
+exactly as a tagged one in that thread. Ingress calls
 it `boss_thread_reply` so it keeps its :eyes:. Both layers take the one
 predicate built in `index.ts`, and it is handed the thread, never the text.
 
@@ -288,7 +289,7 @@ is facts, so it is rendered in `slack/status.ts` and the Boss pastes it.
 | the few-word title | `incident.summary`, falling back to the first signal's title |
 | waiting on | `incident_wait.waitingFor`, `pending_question`, `pending_wait.waitingFor` and unread inbox questions, or "nobody"; a parked incident is the one sentence "a person to decide what happens next; the turn budget is spent" and nothing else |
 | now | the one model-written line; see below |
-| impact, PR, spend | `usersImpacted`, `prUrls`, and `describeSpend` over the session, with its estimate wording |
+| impact, PR, spend | `usersImpacted`, `prUrls`, and `describeSpend` over the agent conversation's `UsageDoc` and `incident.turnsUsed`, with its estimate wording |
 
 Two scales, and `waitingOn` and `lifecycleWord` are shared so they cannot
 disagree:
@@ -312,8 +313,8 @@ every minute against a Tier 3 budget. Only the card shows ages.
 (`createStatusSummariser`, on `intentModel` so `BUGBOSS_INTENT_MODEL_ID` can
 move it somewhere cheaper) over the agent's
 last `STATUS_SUMMARY_TURNS` rendered turns. It is cached per incident at a
-**session position**, the number of entries in the session, so asking twice
-about an agent that has not moved costs one call. A failed call renders
+**transcript position**, the number of entries in the agent's conversation, so
+asking twice about an agent that has not moved costs one call. A failed call renders
 "summary unavailable" and alarms; it never falls back to raw lines, and a
 failure is not cached.
 
@@ -402,73 +403,93 @@ escalation arrives. Agents never read the thread, so a person is never talking
 to one: they talk to the Boss, and the Boss decides what the agent hears.
 `handle(mention)` is the other entry point, for an `@bugboss` anywhere else.
 
+**One conversation per thread.** Each Slack thread the Boss talks in, incident
+threads included, is one Pi Durable conversation on the shared harness,
+recorded in `boss_thread.conversationId` and created on first use by
+`createBossRuntime`. It selects only the `bugboss.boss` extension
+(`createBossExtension`): the system prompt as its one section, the tools, and
+the turn-budget hook. The thread's watermark and the Boss's own reply
+timestamps live in `ThreadDoc`, committed in the harness beside the transcript
+they describe. A thread idle for `IDLE_EXPIRY_MS` (seven days, from
+`boss_thread.lastActivityAt`) is reset on its next trigger: the model stops
+seeing last week's reads, and the run is treated as fresh.
+
+**A trigger is a follow-up submission.** The input is built, submitted with
+`whenBusy: "followUp"` and `requestId: "slack:<channel>:<ts>"` (or
+`inbox:<incident>:<row>`), then waited on, and the answer is posted. A message
+that arrives while the thread's run is in flight is queued behind it by the
+conversation's own inbox and starts the next run when this one answers; it is
+never told the Boss is busy and never dropped. The one thing serialised in
+process is admission: reading the watermark, fetching the thread, submitting
+and advancing the watermark happen one trigger at a time per thread, so two
+triggers never hand the Boss the same stretch of thread. The run itself is not
+held by anything. The triggering message is merged into the input too, since
+a message posted a moment ago is not guaranteed to be in the fetch yet. A
+trigger with nothing new since the last one does not call the model.
+
+What a run was started with -- whether it may stay silent, and who the
+reporter is -- is recorded in `ThreadDoc.runs` under its request id before the
+submit, because a follow-up queued behind a run is a different run with
+different rules and a tool cannot be handed anything by the submit that
+started it. Each tool call reads it back through `pi.live` and its run's
+first input.
+
 **The incident is always given.** A run is told which incident the thread is,
 its status and its title, and what is in the thread -- **BugBoss posts
 included**. The opening alert, the root cause, the resolution and the merge
 notices are the incident's record, and a Boss that could see only the humans
 answered "what is this about" without the one message that says. A fresh
-session reads the whole thread; a resume reads everything since the
-watermark except the Boss's own replies, which are already in its session.
-Those come from the same bot user as the notices it does need, so they are
-told apart by ts: `state.json` keeps the ts of each reply posted after the
-watermark. The agent's unseen `boss_inbox` rows ride in the same input,
-labelled as the agent's and saying which one it is blocked on, and are marked
-seen after the run -- so a run that died before answering leaves them for the
-next one.
+conversation reads the whole thread; a later trigger reads everything since
+the watermark except the Boss's own replies, which are already in its
+conversation. Those come from the same bot user as the notices it does need,
+so they are told apart by ts: `ThreadDoc.ownTs` keeps the ts of each reply
+posted after the watermark. The agent's unseen `boss_inbox` rows ride in the
+same input, labelled as the agent's and saying which one it is blocked on,
+and are marked seen once the submission holding them is durable: that
+submission is now the record, and a run queued behind it must not be shown
+them again. A run that then fails still has them in its transcript.
 
 **A mention outside an incident reads the thread above it, once.** The first
 `@bugboss` in a thread somebody else started is handed every message before
 it, other bots' posts included, because "log an incident for this" under a
-report means that report. The same holds when an old session expired: the
-Boss reads the thread again, its own earlier posts marked as its own, so it
-does not redo what it already did. A mention that starts its own thread has
-nothing above it and fetches nothing. A resume reads only what people said
-since the watermark.
-
-**It never drops a trigger.** A message that arrives while the thread's run
-is in flight marks the thread dirty rather than being told the Boss is busy,
-and the holder runs again before it lets go: while the thread is dirty, and
-while unseen inbox rows exist. Dirty is set before the lock is tried and read
-after it is released, so a message in any gap between the two is picked up by
-one run or the other. The lock is held for one run at a time, never across
-the follow-ups, because its TTL is derived from one run's budget. The
-triggering message is also queued in memory, since a message posted a moment
-ago is not guaranteed to be in the fetch yet. A run with nothing new since the
-last one does not call the model.
+report means that report. The same holds after an idle reset: the Boss reads
+the thread again, its own earlier posts marked as its own, so it does not redo
+what it already did. A mention that starts its own thread has nothing above it
+and fetches nothing. A later mention reads only what people said since the
+watermark.
 
 **Silence is chosen, never inferred.** Two people talking to each other are
 not talking to the Boss, and it says nothing by calling `stay_silent` with a
-reason, which is logged at info. The harness is still told silence is
-allowed (`allowSilence`), so it hands back empty rather than an apology.
+reason, which is logged at info. Whether a run may do that is its
+`ThreadRun.allowSilence`; a tagged mention may not, and the tool refuses.
 
 Empty text alone used to be read as that choice, and that is how a request
 to close incident 2 vanished: the Boss read 199,928 characters of raw
 session, its next turn came back with no text and no tool call, and nothing
 was posted or logged. So a run that ends empty **without** `stay_silent` is a
 failure: `incident_run_silent_unchosen` alarms with the thread and the
-trigger, the person who spoke gets the failure reply, and the run does not
-settle, so its inbox rows stay unseen and the watermark stays put. A close, merge
-or page posts its own notice; when that is the whole answer the Boss still has
-to say so with `stay_silent`.
+trigger, and the person who spoke gets the failure reply. A close, merge or
+page posts its own notice; when that is the whole answer the Boss still has to
+say so with `stay_silent`.
 
 An untagged follow-up in a non-incident thread the Boss already talks in
 gets the same rule, because it may be two people talking under a Boss
 answer: `handle` runs it with silence allowed, `stay_silent` posts nothing,
 and an empty run without it alarms (`followup_run_silent_unchosen`) and
-posts the failure reply. An intent read of `unclear` on one goes to the Boss
-rather than asking "report or question?". A tagged mention is always
-answered.
+posts the failure reply. A tagged mention is always answered.
 
-**Calling `stay_silent` is terminal.** The turn loop (`createSlackAgentModel`
-in `../index.ts`) ends the run the instant that tool is called: no further
-model request goes out, and any text the same turn also wrote is discarded
-and logged, never posted. A tool called alongside it in the same turn --
-`close_incident`, say -- still runs, because its effect is real; what changes
-is that nothing more is read or posted afterward. Incident 2's second failure
-on 2026-09-30 was this exact gap: `close_incident` posted its own notice, the
-Boss called `stay_silent` as the prompt instructs, and the harness asked for
-one more turn anyway, which is where the literal text `(silpersisted)`
-reached the thread after silence had already been chosen.
+**Calling `stay_silent` is terminal.** Its result carries
+`control: { terminate: true }`, and Pi ends a run without another model
+request only when every result of the round asks for that, so the extension
+adds it to every other call in a round where `stay_silent` was called. Any
+text the same turn also wrote is discarded and logged, never posted. A tool
+called alongside it in the same turn -- `close_incident`, say -- still runs,
+because its effect is real; what changes is that nothing more is read or
+posted afterward. Incident 2's second failure on 2026-09-30 was this exact
+gap: `close_incident` posted its own notice, the Boss called `stay_silent` as
+the prompt instructs, and the harness asked for one more turn anyway, which is
+where the literal text `(silpersisted)` reached the thread after silence had
+already been chosen.
 
 **It can change state, on evidence.** The write tools are in
 `boss/commands.ts`, appended after the read tools in a fixed order because
@@ -476,12 +497,26 @@ the tools array is part of the cache prefix:
 
 | Tool | What code does with the ask |
 | --- | --- |
-| `message_agent` | pushes a `boss_message` directive, which ends a blocked agent's wait and lifts a wait on a person |
+| `message_agent` | puts "The Boss says: ..." in front of the agent, keyed `boss:<taskId>` so a rerun sends once, and lifts a wait on a person; see below |
 | `close_incident` | the tool API's Boss close, which posts the same closed notice an agent's close does |
-| `merge_incidents` | `assign` then `announceMerge`, inside one write; the older incident survives whichever way round it was asked |
-| `stop_agent` | pushes a `stop` directive; the dispatcher starts a fresh run on its next tick |
+| `merge_incidents` | `assign` inside one write, then the notices it owes both agents and `announceMerge`; the older incident survives whichever way round it was asked |
+| `stop_agent` | aborts the agent's run and resets its context to a handoff carrying the reason; the dispatcher starts the next run on its next tick |
 | `page_rotation` | posts the rotation mention into the thread through code |
 | `grant_turns` | adds 1-200 turns to `incident.grantedTurns`; the dispatcher lifts a spent-budget wait on its next tick and posts the notice. Appended after `read_slack_link`, at the end |
+
+**`message_agent` steers a running agent and writes to an idle one.** A
+steer is placed at the agent's next tool boundary, and it is what ends a wait
+the agent is blocked in (`agent/wait.ts` ends on a steer and nothing else). An
+idle agent gets the message as a passive write in its transcript and reads it
+when the dispatcher next launches it, because an input there would start a
+run from the Boss's tool call: outside the dispatcher's concurrency cap, with
+no checkout prepared, and past a spent turn budget. A run that ends between
+the busy check and the steer starts one such run; that is the price of not
+polling. An incident whose first launch has not
+created a conversation yet is refused in so many words, so the Boss tries
+again rather than believing it was delivered. `stop_agent` likewise does not
+submit the next run; the incident stays open and unparked, so the
+dispatcher's next tick does, and the handoff is the first thing it reads.
 
 Each takes an incident and a reason. A close, merge, stop or grant refuses a reason
 under forty characters, because the reason is what the record keeps of why
@@ -505,7 +540,7 @@ asked for the link to be pasted.
 | env built, not inherited | the child sees `GH_TOKEN`, `GH_REPO=thegoodparty/omni` and its own `GH_CONFIG_DIR`, none of the Boss's other secrets |
 | `auth`, `alias`, `extension`, `config` refused | `gh auth token` prints the token into a transcript one answer from Slack; an alias or extension runs a program that could read this process's environment |
 | the token scrubbed from output | nothing gh prints carries it back |
-| `GH_TIMEOUT_MS` per call | counted into `SLACK_AGENT_LOCK_TTL_MS` |
+| `GH_TIMEOUT_MS` per call | a call that hangs costs one turn, not the run |
 | `MAX_GH_OUTPUT_CHARS`, a **refusal** | past it nothing is shown and the model is told to ask for `--json` fields, `--jq`, `--limit`; never the first part of the output |
 
 Anything `gh` changes on GitHub -- a comment, a review, a close, a merge, a
@@ -559,64 +594,43 @@ corpus that has nothing like this, and an `error:` for a query that never
 reached the index. A search that never ran, reported as nothing found, tells
 somebody asking "have we seen this before" that the problem is new.
 
-What a run spent comes back from the harness beside the answer and lands on
-the `answered` or `incident_answered` log line. The wrap-up call and a call
-that failed are both in it: the run that cost the most is the one that
-answered least.
+What a run spent is summed from its own assistant entries, failed attempts
+included, and lands on the `answered` or `incident_answered` log line. The
+wrap-up and a call that failed are both in it: the run that cost the most is
+the one that answered least.
 
 Its failures must not die in the channel that failed: the in-thread apology
 is tried first, and if that throws it is logged distinctly and re-posted to
 `alertChannel`. Both use the same token and API, so the likely causes — a
 revoked token, the bot removed, exhausted rate-limit retries — fail both
 identically. An incident run a person triggered gets the same apology; one
-only an agent triggered alarms and leaves its inbox rows unseen, since nobody
-in the thread is waiting on it.
+only an agent triggered alarms and posts nothing, since nobody in the thread
+is waiting on it.
 
 `alertChannel`, `rotationGroupId` and `incidentChannel` are **required**, not
 optional. An optional field nobody sets is a fix that exists in the source and
 not in production, which had already happened three times here.
 
-## The Slack agent compacts; it does not narrow its results
+## The Boss does not narrow its results
 
-Its loop is hand-rolled (`createSlackAgentModel`, in the composition root)
-and its transcript is persisted per thread, so it grows across a run *and*
-across mentions. That used to be bounded the only way it could be with no
-compaction: every tool result was cut — each SQL row at 2,000 characters,
-the session tail at 24,000, `get_incident` at 100,000. A row cut in half is
-a row the model reads as complete and answers off, which is the failure
-those caps were buying protection from a different failure with.
-
-`compactTranscript` replaced them, on the shape Pi uses for the incident
-agent: measure after a result lands, before the next request, and drop the
-oldest **whole round** rather than narrowing anything.
-
-- Rounds, not turns. Anthropic rejects a tool result that is not immediately
-  behind the assistant message that called for it, so a cut between the two
-  is a 400 and not a smaller request. A round starts at a `user` *or* an
-  `assistant` turn — assistant matters, because one mention is one user turn
-  and then however many tool rounds it takes, so user turns alone give one
-  boundary per mention and nothing to drop inside the run that is growing.
-- The question survives. If the cut reaches past it, it goes back on the
-  front: a transcript has to open on a user turn, and that is the turn worth
-  spending.
-- The model is **told** what is gone, on that turn. A round that vanishes
-  silently is a round it will go and read again.
-- The window is read off the model (`SizedModelClient.contextWindow`), never
-  chosen. `resolveBedrockModel` throws rather than substitute one for the
-  same reason: a wrong window is invisible in both directions.
-- One round larger than the window is kept whole. It fails loudly at the
-  provider and the reader is told the question was too big, which beats
-  being answered off half a row.
+Every tool result lands whole. What bounds the context is the harness's
+compaction, which summarises older turns at a turn boundary rather than
+cutting anything. Results used to be cut -- each SQL row at 2,000 characters,
+the session tail at 24,000, `get_incident` at 100,000 -- and a row cut in half
+is a row the model reads as complete and answers off.
 
 What is left bounding this surface counts **things**: `MAX_SQL_ROWS`,
 `MAX_SESSION_TURNS`, the reply `LIMIT`. Never a width.
 
-`read_agent_session` renders turns, not JSONL (`slack/session-view.ts`): per
-turn, each tool call with its key arguments and a one-line outcome, and the
-model's own text only where it is short enough to show whole. A text too long
-for that is shown as its whole first line or paragraph, labelled, or
-described ("read 12,400 characters from `alerts.ts`"). Nothing is cut
-mid-content; sixty raw lines of one session were 199,928 characters.
+`read_agent_session` renders the agent conversation's entries, not the raw
+transcript (`slack/session-view.ts`): per turn, each tool call with its key
+arguments and a one-line outcome, and the model's own text only where it is
+short enough to show whole. A text too long for that is shown as its whole
+first line or paragraph, labelled, or described ("read 12,400 characters from
+`alerts.ts`"). Nothing is cut mid-content; sixty raw lines of one session were
+199,928 characters. It also says whether a run is in progress and, if not,
+how the last one ended (`describeRun`), because the tail of a stopped run and
+the tail of a finished one otherwise read the same.
 
 ## A budget spent reading is a question left unanswered
 
@@ -642,24 +656,22 @@ did not cover eleven incidents. What bounds this is how long somebody will
 sit in a thread waiting, not the bill — this surface runs on the same model
 triage does, nowhere near what an incident agent costs.
 
-**The thread lock is derived from that budget, not chosen.** A lock that
-expires mid-run is not a lock: the next message takes the thread and two runs
-write one transcript key. `SLACK_AGENT_LOCK_TTL_MS` is every turn plus the
-wrap-up, each spending its whole call budget, so raising the turns raises the
-lease with it. Long is the safe direction — both entry points release in a
-`finally`, so the lease only ever covers a run that never settles, and a
-message waiting behind a dead run beats corrupting the session it is about.
-A channel mention that finds the lock held is still told the Boss is busy; an
-incident thread never is.
-
 **Exhaustion no longer throws the run's work away.** Everything it read is
-still on the transcript, so the harness (`createSlackAgentModel`, in
-`index.ts`) spends one more call with no tools attached, which the model
-cannot answer any way but from what it already has. It is told to name the
-part of the question it did not reach, so the gaps are in the answer rather
-than implied by its shortness. Running out is still a real event and still
-**alarms** — visible to whoever owns the budget, not to whoever asked the
-question.
+still on the transcript, so the round that spends the last turn carries
+`WRAP_UP_INSTRUCTION` on its results, and the next response is the answer.
+Any tool it calls after that is refused without running and ends the run, so
+a model that ignores the instruction cannot keep reading. It is told to name
+the part of the question it did not reach, so the gaps are in the answer
+rather than implied by its shortness. Running out is still a real event and
+still **alarms** (`slack_agent_turns_exhausted`, from an `afterResponse` hook
+counting the run's turns) — visible to whoever owns the budget, not to whoever
+asked the question. A wrap-up request that fails outright
+(`slack_agent_wrap_up_failed`) posts the last prose the run wrote, if any.
+
+A run that has not settled after `(SLACK_AGENT_MAX_TURNS + 1) *
+SLACK_AGENT_BUDGET_MS` is aborted (`slack_agent_run_timed_out`) and the
+person is told it failed, so a thread is never left waiting on a run that
+will not end.
 
 A wrap-up that produces nothing is **not** the same as one that fails, and
 until recently only the second was visible: an empty completion raises no
@@ -679,15 +691,6 @@ the same non-answer. It asks for a smaller question instead. The other case
 really can be a bad minute, and there asking again is the right thing to try.
 Neither sends anybody to the logs — the person reading this is on call in the
 middle of something else, and whoever owns the budget has the alarm already.
-
-**The transcript always ends on the assistant**, whatever happened. Whatever
-the harness returns is what gets posted, so it is recorded as the turn it
-was. Left ending in tool results — which a wrap-up that threw does — the next
-mention pushes its question straight behind them, and tool results and a
-question are both user messages to the model, so the resume is rejected
-before it starts. That break surfaces hours later in another process with
-nothing pointing back at the run that caused it, which is why it is closed by
-construction rather than on the one branch somebody noticed.
 
 **A status answer is the rendered one.** "What needs me?" and "what is
 open?" are the board, and "what is the status of incident 4?" is the card,

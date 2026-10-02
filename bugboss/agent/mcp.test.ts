@@ -11,6 +11,7 @@ import {
   timeRangeShapeFor,
   type McpToolset,
 } from "./mcp";
+import { loadPi } from "./harness";
 
 const HOUR = 3_600_000;
 
@@ -69,9 +70,11 @@ const TEMPO_TOOL: FakeTool = {
 interface ExecutableTool {
   name: string;
   description: string;
+  replay?: string;
   execute: (
-    id: string,
     params: Record<string, string>,
+    api: unknown,
+    ctx: unknown,
   ) => Promise<{ content: Array<{ type: string; text: string }> }>;
 }
 
@@ -109,7 +112,7 @@ const callArgs = async (
   tool: ExecutableTool,
   params: Record<string, string>,
 ): Promise<{ echoed: Record<string, string>; text: string }> => {
-  const result = await tool.execute("call-1", params);
+  const result = await tool.execute(params, {}, (await loadPi()).context);
   const text = result.content[0].text;
   const body = text.slice(text.indexOf("{"));
   return { echoed: JSON.parse(body) as Record<string, string>, text };
@@ -373,12 +376,12 @@ test("a huge MCP result arrives whole, with the clamp notice still leading", asy
   try {
     const [tool] = executable(set);
     const needle = "NEEDLE_IN_THE_MIDDLE";
-    const out = await tool.execute("c1", {
+    const out = await tool.execute({
       // Echoed back, so this is what makes the result long.
       logql: `${"x".repeat(echoed / 2)}${needle}${"x".repeat(echoed / 2)}`,
       startRfc3339: "now-30d",
       endRfc3339: "now",
-    });
+    }, {}, (await loadPi()).context);
     const text = out.content[0].text;
     assert.match(text, /^\[bugboss\]/, "the notice still leads");
     assert.ok(
@@ -429,4 +432,66 @@ test("a future end with a real start keeps the start and pulls the end back", ()
     now - 2 * HOUR,
     "the half the agent got right is left alone",
   );
+});
+
+// One server serves every agent in the Boss now, so a crash would otherwise
+// leave every Grafana read failing until the next deploy.
+test("a server that dies is alarmed on and respawned by the next call", async () => {
+  const dying = FAKE_SERVER.replace(
+    'if (message.method === "tools/call")',
+    'if (message.method === "tools/call" && message.params.arguments.logql === "die") process.exit(3);\n    if (message.method === "tools/call")',
+  );
+  const { result: set, err } = await captureLogs(() =>
+    connectMcpToolset({
+      name: "grafana",
+      command: process.execPath,
+      args: ["-e", dying],
+      env: { FAKE_TOOLS: JSON.stringify([LOKI_TOOL]) },
+      allowedTools: [LOKI_TOOL.name],
+    }),
+  );
+  try {
+    const [tool] = executable(set);
+    const ctx = (await loadPi()).context;
+    const realError = console.error;
+    const alarms: string[] = [];
+    console.error = (line: string) => alarms.push(line);
+    try {
+      await assert.rejects(tool.execute({ logql: "die", startRfc3339: "now-1h", endRfc3339: "now" }, {}, ctx));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      console.error = realError;
+    }
+    assert.ok(alarms.some((line) => line.includes("mcp_server_exited")), alarms.join("\n"));
+    const { echoed } = await callArgs(tool, { logql: "up", startRfc3339: "now-1h", endRfc3339: "now" });
+    assert.equal(echoed.logql, "up");
+    assert.equal(err.length, 0);
+  } finally {
+    set.close();
+  }
+});
+
+test("the server gets the allowlisted environment, never the Boss's secrets", async () => {
+  const envServer = FAKE_SERVER.replace(
+    "content: [{ type: \"text\", text: JSON.stringify(message.params.arguments) }]",
+    "content: [{ type: \"text\", text: JSON.stringify({ secrets: process.env.BUGBOSS_SECRETS ?? null, path: process.env.PATH ?? null }) }]",
+  );
+  process.env.BUGBOSS_SECRETS = "do-not-leak";
+  const set = await connectMcpToolset({
+    name: "grafana",
+    command: process.execPath,
+    args: ["-e", envServer],
+    env: { FAKE_TOOLS: JSON.stringify([LOKI_TOOL]) },
+    allowedTools: [LOKI_TOOL.name],
+  });
+  try {
+    const [tool] = executable(set);
+    assert.equal(tool.replay, "safe");
+    const { echoed } = await callArgs(tool, { logql: "up", startRfc3339: "now-1h", endRfc3339: "now" });
+    assert.equal(echoed.secrets, null);
+    assert.equal(echoed.path, process.env.PATH);
+  } finally {
+    delete process.env.BUGBOSS_SECRETS;
+    set.close();
+  }
 });

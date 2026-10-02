@@ -17,12 +17,14 @@ import {
   getIncidentRow,
   getSignalsFor,
   logAssign,
-  pushDirective,
+  notifyAgents,
   rowToIncident,
+  type AgentNotifier,
   type AnnouncePoster,
   type AssignResult,
   type IncidentRow,
 } from "../toolapi";
+import { BOSS_SAYS } from "../agent/tools";
 import { makeAlarm, makeLog } from "../logging";
 
 const log = makeLog("boss");
@@ -38,8 +40,31 @@ export type CloseIncident = (args: {
   reason: string;
 }) => Promise<{ ok: true; from: IncidentStatus } | { ok: false; error: string }>;
 
+/**
+ * How the Boss reaches an incident's agent: its conversation in the harness,
+ * found through `incident.conversationId`. Behind an interface so the tools
+ * here stay plain code over a seam a test can fake.
+ */
+export interface AgentLine {
+  /**
+   * Put `text` in front of the agent, as it is. A running agent reads it at
+   * its next tool boundary, which also ends a wait it is blocked in; an idle
+   * one finds it in its transcript when the dispatcher next launches it. False when the
+   * incident has no conversation yet. `requestId` makes a retry deliver once.
+   */
+  tell(incidentId: string, text: string, requestId: string | undefined): Promise<boolean>;
+  /**
+   * Abort the run in flight and start the agent's next context from `reason`.
+   * False when there is no conversation to stop.
+   */
+  stop(incidentId: string, reason: string): Promise<boolean>;
+}
+
 export interface BossCommandDeps {
   db: Db;
+  agents: AgentLine;
+  /** What a merge owes the agents it moved work between, delivered once it commits. */
+  notifier: AgentNotifier;
   /** Posts and links in the incident channel, where every incident thread is. */
   threads: AnnouncePoster;
   closeIncident: CloseIncident;
@@ -88,25 +113,35 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
         required: ["incidentId", "text"],
         additionalProperties: false,
       },
-      run: async (input) => {
+      run: async (input, call) => {
         const incidentId = str(input.incidentId);
         const text = str(input.text).trim();
         if (!text) return "Rejected: the message is empty, so nothing was sent.";
-        const outcome = await db.withWrite((w: Database.Database) => {
-          const row = getIncidentRow(w, incidentId);
-          if (!row) return { sent: false as const, why: `there is no incident ${incidentId}` };
-          if (!AGENT_STATUSES.includes(row.status)) {
-            return {
-              sent: false as const,
-              why: `incident ${incidentId} is ${row.status}, so no agent is working it to read this`,
-            };
-          }
-          pushDirective(w, incidentId, { type: "boss_message", text, at: Date.now() });
-          return { sent: true as const };
+        const row = readRow(incidentId);
+        if (!row) return `Rejected: there is no incident ${incidentId}.`;
+        if (!AGENT_STATUSES.includes(row.status)) {
+          return `Rejected: incident ${incidentId} is ${row.status}, so no agent is working it to read this.`;
+        }
+        // Keyed by the tool call's own task, so a rerun after a restart finds
+        // the message it already sent rather than sending it twice.
+        let told: boolean;
+        try {
+          told = await deps.agents.tell(incidentId, `${BOSS_SAYS}${text}`, call ? `boss:${call.taskId}` : undefined);
+        } catch (err) {
+          alarm("agent_message_failed", { incidentId, error: String(err) });
+          return "Failed: the message did not reach the agent. The error is in the BugBoss logs; it is worth calling again.";
+        }
+        if (!told) {
+          return `Not sent: incident ${incidentId}'s agent has not started its first run, so there is nothing to deliver it to yet. Try again once it has.`;
+        }
+        // The Boss is the only thing a person's word reaches an agent through,
+        // so its message is what wakes a parked incident. A spent turn budget
+        // is the one wait it does not lift: that takes grant_turns.
+        await db.withWrite((w: Database.Database) => {
+          w.prepare("DELETE FROM incident_wait WHERE incidentId = ? AND liftsOnReply = 1").run(incidentId);
         });
-        if (!outcome.sent) return `Rejected: ${outcome.why}.`;
         log("agent_messaged", { incidentId, chars: text.length });
-        return `Sent to incident ${incidentId}'s agent. It reads it on its next tool call, and if it was waiting on an answer this ends that wait.`;
+        return `Sent to incident ${incidentId}'s agent. It reads it at its next tool call, which also ends a wait it is blocked in, and if it is parked waiting on a person this wakes it.`;
       },
     },
     {
@@ -208,6 +243,7 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
         }
         if (outcome.kind === "refused") return `Rejected: ${outcome.why}.`;
         logAssign(outcome.result);
+        notifyAgents(deps.notifier, outcome.result.notices);
         await announce.announceMerge(outcome.result);
         return `Incident ${absorb} is now part of incident ${into}${into === to ? "" : ", which is the older record and so survives"}. Both threads have been told; do not announce it again.`;
       },
@@ -215,7 +251,7 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
     {
       name: "stop_agent",
       description:
-        "Stop the run an incident's agent is in the middle of. It exits on its next tool call. The incident stays open and the dispatcher starts a fresh run on its next tick, which re-reads everything, so this is for an agent heading somewhere wrong, not for ending an incident -- that is close_incident. Tell it what to do differently with message_agent first, so the next run reads why.",
+        "Stop the run an incident's agent is in the middle of, at once. The incident stays open and the dispatcher starts a fresh run on its next tick, which re-reads everything, so this is for an agent heading somewhere wrong, not for ending an incident -- that is close_incident. Its next run starts from your reason, so say in it what to do differently.",
       inputSchema: {
         type: "object",
         properties: {
@@ -230,18 +266,21 @@ export const buildCommandTools = (deps: BossCommandDeps): SlackAgentTool[] => {
         const reason = str(input.reason).trim();
         const short = shortReason("stop_agent", reason);
         if (short) return `Rejected: ${short}`;
-        const outcome = await db.withWrite((w: Database.Database) => {
-          const row = getIncidentRow(w, incidentId);
-          if (!row) return `there is no incident ${incidentId}`;
-          if (!AGENT_STATUSES.includes(row.status)) {
-            return `incident ${incidentId} is ${row.status}, so no agent is running on it`;
-          }
-          pushDirective(w, incidentId, { type: "stop", reason });
-          return null;
-        });
-        if (outcome) return `Rejected: ${outcome}.`;
+        const row = readRow(incidentId);
+        if (!row) return `Rejected: there is no incident ${incidentId}.`;
+        if (!AGENT_STATUSES.includes(row.status)) {
+          return `Rejected: incident ${incidentId} is ${row.status}, so no agent is running on it.`;
+        }
+        let stopped: boolean;
+        try {
+          stopped = await deps.agents.stop(incidentId, reason);
+        } catch (err) {
+          alarm("agent_stop_failed", { incidentId, error: String(err) });
+          return "Failed: the agent could not be stopped. The error is in the BugBoss logs.";
+        }
+        if (!stopped) return `Rejected: incident ${incidentId}'s agent has not started a run, so there is nothing to stop.`;
         log("agent_stopped", { incidentId });
-        return `Incident ${incidentId}'s agent will stop on its next tool call.`;
+        return `Incident ${incidentId}'s agent has stopped. Its next run starts on the dispatcher's next tick, from your reason.`;
       },
     },
     {
