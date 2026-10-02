@@ -146,3 +146,10 @@ test("blindSide keeps an absent diff absent", () => {
   assert.equal(output.diff, null);
   assert.equal(droppedLines, 0);
 });
+
+test("a repository slug whose name merely starts with a branch keyword is not a branch", () => {
+  const text = blindSide({ timeline: "Working on thegoodparty/bugboss-eval-sandbox, branch swain/bug-77 and acme/fixtures-data.", diff: null }).output.timeline;
+  assert.match(text, /thegoodparty\/bugboss-eval-sandbox/);
+  assert.match(text, /acme\/fixtures-data/);
+  assert.match(text, /branch <branch>/);
+});

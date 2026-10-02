@@ -78,7 +78,7 @@ const SUBSTITUTIONS: Array<[RegExp, string]> = [
   // Branch names, by the shapes agents and people give them: `<owner>/<kind>-…`
   // or `<kind>/<name>`. File paths and URLs are left alone, because a path
   // in a message or a diff header is evidence the judge needs.
-  [/(?<![\w./-])[a-z][\w-]*\/(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)[\w./-]*/gi, "<branch>"],
+  [/(?<![\w./-])[a-z][\w-]*\/(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)(?![a-z])[\w./-]*/gi, "<branch>"],
   [/(?<![\w./-])(?:incident|fix|feat|feature|eval|hotfix|bug|chore|refactor)\/[\w][\w./-]*/gi, "<branch>"],
   [/\/pull\/\d+/g, "/pull/<n>"],
   [/\bPR\s+#?\d+\b/g, "PR <n>"],
