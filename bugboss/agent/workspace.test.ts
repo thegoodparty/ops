@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { computePaths, startNpmCi } from "./run";
 import {
+  emptyTrash,
   lockfileHash,
   npmCiNeeded,
   npmCiPidRecord,
@@ -144,4 +146,32 @@ test("the sweep moves only what it is told is removable, and never its own trash
   assert.ok(existsSync(join(root, "open", "omni")));
   assert.ok(existsSync(join(root, ".trash", "closed-42", "omni")));
   assert.ok(existsSync(join(root, "stray-file")));
+});
+
+test("emptying the trash leaves this process's threadpool free for DNS while it runs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bugboss-work-"));
+  for (let d = 0; d < 200; d++) {
+    const dir = join(root, ".trash", "closed-1", "node_modules", `pkg${d}`);
+    mkdirSync(dir, { recursive: true });
+    for (let f = 0; f < 200; f++) writeFileSync(join(dir, `f${f}.js`), "");
+  }
+  const probe = join(root, "probe");
+  writeFileSync(probe, "");
+
+  let done = false;
+  const emptying = emptyTrash(root).then(() => {
+    done = true;
+  });
+  const waits: number[] = [];
+  while (!done) {
+    const started = performance.now();
+    await stat(probe);
+    waits.push(performance.now() - started);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await emptying;
+
+  assert.ok(waits.length >= 3, `the delete finished after ${waits.length} probes; the tree is too small to test anything`);
+  assert.ok(Math.max(...waits) < 100, `a threadpool call waited ${Math.round(Math.max(...waits))}ms behind the delete`);
+  assert.ok(!existsSync(join(root, ".trash")));
 });

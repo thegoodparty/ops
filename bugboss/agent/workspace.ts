@@ -204,6 +204,11 @@ export const sweepWorkspaces = async (args: {
   return swept;
 };
 
+// In a child process, never `fs.rm`. Node's recursive rm queues one libuv
+// threadpool task per file, and the Boss's DNS lookups wait in that same
+// four-thread queue. Emptying a workspace with node_modules on EFS starved
+// every new outbound connection for minutes: Slack, S3 and Bedrock calls all
+// timed out while the event loop itself stayed healthy.
 export const emptyTrash = async (workRoot: string): Promise<void> => {
-  await rm(join(workRoot, TRASH_DIR), { recursive: true, force: true });
+  await exec("rm", ["-rf", join(workRoot, TRASH_DIR)]);
 };
