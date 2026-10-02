@@ -13,7 +13,7 @@ measured on the same terms.
 
 | Comment | Runs | Each run stops at | Cap per run |
 | --- | --- | --- | --- |
-| `bugboss eval` | 1 rep per scenario, 6 pairs, 12 runs | the PR opening | $25, about $300 all in |
+| `bugboss eval` | 1 rep per scenario, 6 pairs, 12 runs | the close | $60, about $720 all in |
 | `bugboss eval full` | 3 reps per scenario, 18 pairs, 36 runs | the close | $60, about $2,200 all in |
 
 The model is the Anthropic API, paid for with `ANTHROPIC_API_KEY` from the
@@ -117,8 +117,7 @@ Actions UI. A run with no harness event and no model call for
 Per scenario and in total, per side:
 
 - **Gates**, from the fake GitHub and the close: closed, the hidden check
-  passed on what merged, CI green at every merge, nothing pushed to main. On
-  the fast tier the merge gates read n/a.
+  passed on what merged, CI green at every merge, nothing pushed to main.
 - **Turns and estimated cost**, from the proxy log priced by `core/price.ts`.
 - **Minutes from the alert** to the pull request, the merge and the close.
 
