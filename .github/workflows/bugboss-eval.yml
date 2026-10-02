@@ -13,43 +13,95 @@ name: BugBoss eval
 on:
   issue_comment:
     types: [created]
+  # A manual run with explicit bounds, for one scenario at a time while the
+  # suite is new. Everything it spends is visible in the inputs.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number whose head is the candidate; main is the baseline
+        required: true
+      scenarios:
+        description: Comma-separated scenario ids, or "all"
+        default: users-read-invalid-zip
+      reps:
+        description: Reps per scenario
+        default: "1"
+      until:
+        description: Where each run stops
+        type: choice
+        options: [pr_opened, closed]
+        default: closed
+      cap_per_run_usd:
+        description: Spend cap per run, in dollars
+        default: "60"
 
 permissions: {}
 
 concurrency:
-  group: bugboss-eval-${{ github.event.issue.number }}
+  group: bugboss-eval-${{ github.event.issue.number || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
   gate:
     if: >-
-      github.event.issue.pull_request &&
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request &&
       contains(fromJSON('["bugboss eval","bugboss eval full"]'), github.event.comment.body) &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
+    env:
+      PR: ${{ github.event.issue.number || inputs.pr }}
     outputs:
+      pr: ${{ github.event.issue.number || inputs.pr }}
       sha: ${{ steps.pr.outputs.sha }}
-      tier: ${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}
-      # Reps are a matrix dimension, so a full tier runs its reps in parallel.
-      reps: ${{ github.event.comment.body == 'bugboss eval full' && '[1, 2, 3]' || '[1]' }}
+      until: ${{ steps.plan.outputs.until }}
+      tier: ${{ steps.plan.outputs.until == 'pr_opened' && 'fast' || 'full' }}
+      cap: ${{ steps.plan.outputs.cap }}
+      # Reps and scenarios are matrix dimensions, so everything runs in parallel.
+      reps: ${{ steps.plan.outputs.reps }}
+      scenarios: ${{ steps.plan.outputs.scenarios }}
     steps:
       - id: pr
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" \
+          gh api "repos/${{ github.repository }}/pulls/$PR" \
             --jq '"sha=\(.head.sha)", "fork=\(.head.repo.full_name != .base.repo.full_name)"' >> "$GITHUB_OUTPUT"
       - if: steps.pr.outputs.fork == 'true'
         run: |
           echo "BugBoss evals do not run a fork's code." >&2
           exit 1
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: bugboss-evals/scenarios
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BODY: ${{ github.event.comment.body }}
+          IN_SCENARIOS: ${{ inputs.scenarios }}
+          IN_REPS: ${{ inputs.reps }}
+          IN_UNTIL: ${{ inputs.until }}
+          IN_CAP: ${{ inputs.cap_per_run_usd }}
+        run: |
+          all=$(ls -d bugboss-evals/scenarios/*/ | xargs -n1 basename | jq -R . | jq -sc .)
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$IN_SCENARIOS" = all ]; then scenarios=$all; else scenarios=$(tr ',' '\n' <<< "$IN_SCENARIOS" | sed 's/ //g' | jq -R . | jq -sc .); fi
+            reps=$(seq 1 "$IN_REPS" | jq -sc .); until=$IN_UNTIL; cap=$IN_CAP
+          elif [ "$BODY" = "bugboss eval full" ]; then
+            scenarios=$all; reps='[1,2,3]'; until=closed; cap=60
+          else
+            scenarios=$all; reps='[1]'; until=pr_opened; cap=25
+          fi
+          { echo "scenarios=$scenarios"; echo "reps=$reps"; echo "until=$until"; echo "cap=$cap"; } >> "$GITHUB_OUTPUT"
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
-            --body "Incident eval (${{ github.event.comment.body == 'bugboss eval full' && 'full' || 'fast' }}) started for \`${{ steps.pr.outputs.sha }}\`: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh pr comment "$PR" --repo "${{ github.repository }}" \
+            --body "Incident eval started for \`${{ steps.pr.outputs.sha }}\`: scenarios ${{ steps.plan.outputs.scenarios }}, reps ${{ steps.plan.outputs.reps }}, each run to ${{ steps.plan.outputs.until }} under \$${{ steps.plan.outputs.cap }}: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   eval:
     needs: gate
@@ -64,13 +116,7 @@ jobs:
         # and the hidden check's fill one runner's disk, so this is the
         # smallest split, and reps in parallel keep a full tier to one run's
         # wall clock.
-        scenario:
-          - users-read-invalid-zip
-          - p2p-phone-list-late-cap
-          - missed-merge
-          - alert-vs-user-harm
-          - alert-vs-user-harm-paid-alert
-          - merge-behind
+        scenario: ${{ fromJSON(needs.gate.outputs.scenarios) }}
         rep: ${{ fromJSON(needs.gate.outputs.reps) }}
     env:
       OUT: /tmp/bugboss-eval/out
@@ -81,7 +127,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: nohup sudo rm -rf /usr/share/dotnet > /dev/null 2>&1 &
-      - run: git fetch --no-tags origin "pull/${{ github.event.issue.number }}/head"
+      - run: git fetch --no-tags origin "pull/${{ needs.gate.outputs.pr }}/head"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -125,17 +171,14 @@ jobs:
           echo "127.0.0.1 github.com api.github.com" | sudo tee -a /etc/hosts
       - name: Run
         env:
-          TIER: ${{ needs.gate.outputs.tier }}
+          UNTIL: ${{ needs.gate.outputs.until }}
+          CAP: ${{ needs.gate.outputs.cap }}
           GH_TOKEN: ghs_bugbossevalfaketoken
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           # The cap is per run. A prod incident cost about $55 to close and
-          # about $3 bought six minutes of investigation, so these reach the
-          # tier's milestone with room, and nothing more.
-          case "$TIER" in
-            fast) mode=(--until pr_opened --spend-cap-per-run-usd 25) ;;
-            full) mode=(--spend-cap-per-run-usd 60) ;;
-          esac
+          # about $3 bought six minutes of investigation.
+          mode=(--until "$UNTIL" --spend-cap-per-run-usd "$CAP")
           GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)" npx tsx bugboss-evals/sim/compare.ts run \
             --runtime bugboss --baseline origin/main --candidate "${{ needs.gate.outputs.sha }}" \
             --scenarios "${{ matrix.scenario }}" --rep "${{ matrix.rep }}" "${mode[@]}" \
@@ -182,7 +225,7 @@ jobs:
         run: |
           files=$(ls results/*/results.json 2>/dev/null || true)
           found=$(echo "$files" | grep -c . || true)
-          expected=$(( $(ls bugboss-evals/scenarios/*/scenario.json | wc -l | tr -d ' ') * $(jq length <<< '${{ needs.gate.outputs.reps }}') ))
+          expected=$(( $(jq length <<< '${{ needs.gate.outputs.scenarios }}') * $(jq length <<< '${{ needs.gate.outputs.reps }}') ))
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -z "$files" ]; then
             body="Incident eval produced no results: $run_url"
@@ -192,4 +235,4 @@ jobs:
               body="> [!WARNING]"$'\n'"> Partial results: $found of $expected scenarios finished. The table omits the rest; the failures are in the [run log]($run_url)."$'\n\n'"$body"
             fi
           fi
-          gh pr comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body "$body"
+          gh pr comment "${{ needs.gate.outputs.pr }}" --repo "${{ github.repository }}" --body "$body"

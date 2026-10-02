@@ -174,6 +174,14 @@ credential exists anywhere: the fake is the only GitHub the run can reach.
 
 ## Running it
 
+For one scenario at a time, with every bound explicit, dispatch the workflow
+by hand instead of commenting:
+
+    gh workflow run bugboss-eval.yml -f pr=<n> -f scenarios=users-read-invalid-zip \
+      -f reps=1 -f until=closed -f cap_per_run_usd=60
+
+That is two runs and at most $120. `scenarios=all` runs the whole suite.
+
 A PR that changes nothing under `bugboss/` is an A/A run: main against itself.
 That is the judge's noise floor on real incidents, and the first thing to run
 after a change to the harness or the rubric.
