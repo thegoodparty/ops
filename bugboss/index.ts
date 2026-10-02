@@ -17,7 +17,7 @@ import { S3Client } from "@aws-sdk/client-s3";
 import type Database from "better-sqlite3";
 import type { Hono } from "hono";
 
-import { Db } from "./db";
+import { Db, type SnapshotTiming } from "./db";
 import { reconcileSearchIndex } from "./db/search";
 import {
   createChildProcessSpawn,
@@ -185,6 +185,17 @@ const ORPHAN_SWEEP_LIMIT = 25;
 const TRIAGE_CONCURRENCY = 5;
 
 /**
+ * How long open_incident waits on a report's placement before it answers
+ * "queued" instead. Placement is a triage call and an assign, and both queue
+ * behind a write path that can stall for minutes: on 2026-10-02 the Boss's
+ * tool call waited thirteen of them, and nobody in the thread heard a thing.
+ */
+const REPORT_PLACEMENT_WAIT_MS = 120_000;
+
+/** How long a report that could not be recorded is retried before giving up. */
+const REPORT_RETRY_DEADLINE_MS = 30 * 60_000;
+
+/**
  * Where an incident agent's session lives. Chunk 5's own default writes to
  * `sessions/<id>.jsonl`, but the Slack agent's read_agent_session tool and
  * the S3 lifecycle rule both read `sessions/incident/<id>/`, so the launch
@@ -286,6 +297,8 @@ export interface CreateBugBossOptions {
     grafana?: GrafanaVerifier;
     slack?: SlackVerifier;
   };
+  /** TEST ONLY. The database's snapshot retry timing, so a halt is quick to reach and lift. */
+  snapshotTiming?: Partial<SnapshotTiming>;
   now?: () => number;
 }
 
@@ -294,7 +307,8 @@ export type PlacedAction =
   | "attach"
   | "suppress"
   | "duplicate"
-  | "failed";
+  | "failed"
+  | "queued";
 
 export interface PlacedSignal {
   /** Null only when the signal could not be recorded at all. */
@@ -350,6 +364,8 @@ export interface BugBoss {
   /** Ask every adapter whether its signal stopped. Never moves an incident. */
   /** Re-place signals that reached no incident. Returns how many moved. */
   sweepOrphans(): Promise<number>;
+  /** Try again to place every report that could not be recorded, and tell its thread. */
+  retryReports(): Promise<void>;
   /** Open a Slack thread for any incident still without one. */
   ensureIncidentThreads(): Promise<number>;
   /** Attach the closing report for any closed incident still without it. */
@@ -802,6 +818,7 @@ export const createBugBoss = async (
     bucket: config.s3Bucket,
     key: "state/db",
     s3,
+    snapshotTiming: options.snapshotTiming,
   });
   const store = createS3ObjectStore(config.s3Bucket, s3);
 
@@ -984,8 +1001,7 @@ export const createBugBoss = async (
       closeIncidentByBoss({ db, slack: threads, announceClose }, args),
     // The same executor a report always went through; only who decides a
     // message is a report has moved, from a classifier to the Boss.
-    openIncident: async (report) =>
-      (await reportAccepted({ ...report, reportedAt: now() })).settled,
+    openIncident: (report) => fileReport({ ...report, reportedAt: now() }),
     // The status card's one model-written sentence, on the knob that moves a
     // small bounded call to a cheaper model (BUGBOSS_INTENT_MODEL_ID) without
     // a deploy.
@@ -1590,6 +1606,160 @@ export const createBugBoss = async (
    */
   const reportAccepted = (report: HumanReport): Promise<AcceptedIngest> =>
     acceptSignals([humanSignal(report)], ingress.get(HUMAN_SOURCE));
+
+  /**
+   * Reports the Boss could not record or place yet, by sourceId. The person
+   * was told so in their thread, and Slack already has its ack, so nothing
+   * would ever deliver the mention again: this is the only copy of the report
+   * outside the thread itself. In memory because the write that failed is the
+   * same one that would have made it durable. A restart restores whatever
+   * snapshot last landed, so a row that reached it is still placed by the
+   * orphan sweep, but its thread is not told.
+   */
+  const pendingReports = new Map<
+    string,
+    { report: HumanReport; since: number; retrying: boolean }
+  >();
+
+  const replyToReport = (report: HumanReport, text: string) =>
+    slack.post(report.threadTs ?? report.messageTs ?? null, text, report.channel ?? undefined);
+
+  const queueReport = async (
+    report: HumanReport,
+    signalId: string | null,
+    cause: string,
+  ): Promise<PlacedSignal> => {
+    const sourceId = humanSignal(report).sourceId;
+    if (pendingReports.has(sourceId)) {
+      return {
+        signalId,
+        incidentId: null,
+        action: "queued",
+        reason: "already queued for retry, and the thread was told",
+      };
+    }
+    pendingReports.set(sourceId, {
+      report,
+      since: now(),
+      retrying: false,
+    });
+    alarm("report_queued", { sourceId, signalId, error: cause });
+    try {
+      await replyToReport(
+        report,
+        "I could not record this report yet, because saving it failed on my side. I am retrying, and I will post here once it is an incident.",
+      );
+    } catch (err) {
+      alarm("report_queued_notice_failed", { sourceId, error: String(err) });
+      return {
+        signalId,
+        incidentId: null,
+        action: "queued",
+        reason: "queued for retry, but the notice to the thread could not be posted",
+      };
+    }
+    return {
+      signalId,
+      incidentId: null,
+      action: "queued",
+      reason: "queued for retry, and the thread was told",
+    };
+  };
+
+  /**
+   * open_incident's executor. Whatever stops a report reaching an incident --
+   * the record refused, the placement failed, or the placement still running
+   * past REPORT_PLACEMENT_WAIT_MS -- ends in the queue above, never in a
+   * failure the model is left to relay or a wait nobody sees the end of.
+   */
+  const fileReport = async (report: HumanReport): Promise<PlacedSignal[]> => {
+    let accepted: AcceptedIngest;
+    try {
+      accepted = await reportAccepted(report);
+    } catch (err) {
+      return [await queueReport(report, null, String(err))];
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const placed = await Promise.race([
+      accepted.settled,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), REPORT_PLACEMENT_WAIT_MS);
+        timer.unref();
+      }),
+    ]);
+    clearTimeout(timer);
+    if (placed === null) {
+      return [await queueReport(report, null, "placement still running")];
+    }
+    const first = placed[0];
+    if (first?.action === "failed") {
+      return [await queueReport(report, first.signalId, first.reason)];
+    }
+    // A redelivery that got through is announced by the Boss's own answer,
+    // so the retry must not announce it a second time.
+    if (first?.incidentId) pendingReports.delete(humanSignal(report).sourceId);
+    return placed;
+  };
+
+  const retryReports = async (): Promise<void> => {
+    for (const [sourceId, pending] of pendingReports) {
+      if (pending.retrying) continue;
+      pending.retrying = true;
+      try {
+        // Read first: the orphan sweep may have placed the recorded row, or
+        // an earlier placement may have finished after open_incident stopped
+        // waiting on it.
+        const row = db.get<{ id: string; incidentId: string | null }>(
+          `SELECT id, incidentId FROM signal
+             WHERE source = ? AND sourceId = ? AND closedAt IS NULL`,
+          [HUMAN_SOURCE, sourceId],
+        );
+        let incidentId = row?.incidentId ?? null;
+        if (!incidentId && !(row && placing.has(row.id))) {
+          try {
+            const placed = (await (await reportAccepted(pending.report)).settled)[0];
+            incidentId = placed?.incidentId ?? null;
+            if (!incidentId) {
+              log("report_retry_failed", { sourceId, reason: placed?.reason ?? "nothing placed" });
+            }
+          } catch (err) {
+            log("report_retry_failed", { sourceId, reason: String(err) });
+          }
+        }
+
+        if (incidentId) {
+          try {
+            await replyToReport(
+              pending.report,
+              `Recorded it now: this is incident ${incidentId}, and an agent is on it.`,
+            );
+            log("report_retry_placed", { sourceId, incidentId });
+            pendingReports.delete(sourceId);
+          } catch (err) {
+            alarm("report_retry_notice_failed", { sourceId, incidentId, error: String(err) });
+            if (now() - pending.since >= REPORT_RETRY_DEADLINE_MS) pendingReports.delete(sourceId);
+          }
+          continue;
+        }
+
+        if (now() - pending.since < REPORT_RETRY_DEADLINE_MS) continue;
+        pendingReports.delete(sourceId);
+        alarm("report_retry_exhausted", {
+          sourceId,
+          reportedBy: pending.report.reportedBy,
+          minutes: Math.round((now() - pending.since) / 60_000),
+        });
+        await replyToReport(
+          pending.report,
+          `I still could not record this report after ${Math.round(REPORT_RETRY_DEADLINE_MS / 60_000)} minutes, so nothing is open for it. I have raised an alarm; please report it again once I am answering normally.`,
+        ).catch((err: unknown) =>
+          alarm("report_retry_exhausted_notice_failed", { sourceId, error: String(err) }),
+        );
+      } finally {
+        pending.retrying = false;
+      }
+    }
+  };
 
   const ingest = async (
     source: string,
@@ -2228,6 +2398,7 @@ export const createBugBoss = async (
     resolutionTimer = setInterval(() => {
       background("usage_sweep", sweepUsage);
       background("orphan_sweep", sweepOrphans);
+      background("report_retry", retryReports);
       background("thread_sweep", ensureIncidentThreads);
       // After the thread sweep, so an incident whose thread was opened on
       // this tick can carry a header on it rather than waiting for the next.
@@ -2266,6 +2437,7 @@ export const createBugBoss = async (
     slackEventAccepted,
     dispatchOnce,
     sweepOrphans,
+    retryReports,
     ensureIncidentThreads,
     sweepReports,
     sweepBoard: sweepTheBoard,

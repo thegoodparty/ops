@@ -679,6 +679,11 @@ export const buildTools = ({
         if (first.action === "new_incident" || first.action === "attach") {
           return `Filed as incident ${first.incidentId}${first.action === "attach" ? ", which was already open for the same problem" : ""}. Its thread announces it; tell the person the incident number in one line.`;
         }
+        if (first.action === "queued") {
+          return /could not be posted/.test(first.reason)
+            ? "Not recorded yet: saving the report failed, and it is queued for retry. The thread will be told when it becomes an incident, but the notice saying so could not be posted, so tell the person that in one line."
+            : "Not recorded yet: saving the report failed, and it is queued for retry. The thread has already been told, and will be told again when it becomes an incident or if the retry gives up. Do not repeat it; at most acknowledge in one line.";
+        }
         if (first.action === "duplicate") {
           return `Already filed from this message${first.incidentId ? ` as incident ${first.incidentId}` : ""}. Nothing new was opened.`;
         }

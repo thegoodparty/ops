@@ -1284,6 +1284,166 @@ test("a delivery that cannot be written answers a failure, not ok", async () => 
   }
 });
 
+// --- a report the Boss cannot record is retried, not lost -------------------
+
+/**
+ * A database whose S3 mirror refuses PUTs until told otherwise, which is what
+ * halts writes. The halt retries on every write here, so lifting it is
+ * immediate rather than a backoff away.
+ */
+const haltableBoss = async (name: string, clock: { at: number }) => {
+  const s3 = createMemoryS3();
+  const send = s3.send.bind(s3) as (c: unknown) => Promise<unknown>;
+  const gate = { refusing: false };
+  s3.send = ((command: { constructor: { name: string } }) =>
+    gate.refusing && command.constructor.name === "PutObjectCommand"
+      ? Promise.reject(new Error("AbortError: Request aborted"))
+      : send(command)) as typeof s3.send;
+  const instance = await createBugBoss({
+    gh: null,
+    config: config(join(dir, `${name}.db`)),
+    model: fakeModel,
+    slack: fakeSlack,
+    spawnAgent: async () => {},
+    s3,
+    secrets: { slackBotUserId: "B0BOSS" },
+    slackAgentModel: fakeSlackAgent,
+    fileUploader: fakeUploader,
+    snapshotTiming: { retryDelaysMs: [], haltRetryMs: 0, haltRetryMaxMs: 0 },
+    now: () => clock.at,
+  });
+  return { instance, gate };
+};
+
+const captureAlarms = async <T>(work: () => Promise<T>): Promise<{ result: T; alarms: string[] }> => {
+  const alarms: string[] = [];
+  const realError = console.error;
+  console.error = (line: string) => alarms.push(String(line));
+  try {
+    return { result: await work(), alarms };
+  } finally {
+    console.error = realError;
+  }
+};
+
+/**
+ * Production, 2026-10-02: "@BugBoss track a new incident for this issue" got
+ * its :eyes:, then the database halted writes under it. No incident was
+ * opened, the Boss never replied, and Slack had its ack so it never sent the
+ * mention again. The report existed nowhere but the thread.
+ */
+test("a report made while writes are halted is told once, then opened once when they resume", async () => {
+  const clock = { at: Date.now() };
+  const { instance, gate } = await haltableBoss("report-halted", clock);
+  try {
+    const said = "the candidate dashboard 500s on load";
+    const thread = "2900.1";
+    const inThread = () => fakeSlack.posts.filter((p) => p.threadTs === thread).map((p) => p.text);
+    let filed = "";
+    fakeSlackAgent.script = async (req) => {
+      gate.refusing = true;
+      filed = await bossTool(req, "open_incident", { report: saidIn(req) });
+      return "On it.";
+    };
+    await instance.slackEvent({
+      type: "app_mention",
+      channel: "C0TEST",
+      user: "U-swain",
+      text: `<@B0BOSS> ${said}`,
+      ts: thread,
+    });
+
+    assert.match(filed, /queued for retry/, "the Boss is told the truth, not silence");
+    assert.equal(
+      inThread().filter((t) => /could not record this report yet/.test(t)).length,
+      1,
+      "the person is told once, in code",
+    );
+
+    // Still halted: a retry changes nothing and says nothing new.
+    await instance.retryReports();
+    assert.equal(inThread().filter((t) => /could not record/.test(t)).length, 1);
+
+    gate.refusing = false;
+    // The retry races the orphan sweep and itself, with triage held open, so
+    // all three reach the same row while it is being placed.
+    let release!: () => void;
+    fakeModel.gate = new Promise<void>((resolve) => (release = resolve));
+    fakeModel.triageDecisions.push({ action: "new_incident", reason: "nothing open like it" });
+    const racing = Promise.all([
+      instance.retryReports(),
+      instance.sweepOrphans(),
+      instance.retryReports(),
+    ]);
+    await until(() => fakeModel.inFlight > 0, "the retry to reach triage");
+    release();
+    await racing;
+    fakeModel.gate = null;
+    await instance.retryReports();
+
+    const incidents = instance.db.query<{ id: string }>(
+      `SELECT DISTINCT i.id FROM incident i JOIN signal s ON s.incidentId = i.id
+        WHERE s.sourceId = ?`,
+      [`slack:C0TEST:${thread}`],
+    );
+    assert.equal(incidents.length, 1, "opened exactly once");
+    assert.equal(
+      instance.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM incident")!.n,
+      1,
+      "and no rival incident",
+    );
+    const announced = inThread().filter((t) => /Recorded it now/.test(t));
+    assert.equal(announced.length, 1, "announced once");
+    assert.match(announced[0], new RegExp(`ncident ${incidents[0].id}\\b`));
+
+    await instance.retryReports();
+    assert.equal(inThread().filter((t) => /Recorded it now/.test(t)).length, 1, "and never again");
+  } finally {
+    fakeModel.gate = null;
+    instance.stop();
+  }
+});
+
+test("a report that never records ends with one failure message and an alarm", async () => {
+  const clock = { at: Date.now() };
+  const { instance, gate } = await haltableBoss("report-never", clock);
+  try {
+    const thread = "2901.1";
+    const inThread = () => fakeSlack.posts.filter((p) => p.threadTs === thread).map((p) => p.text);
+    fakeSlackAgent.script = async (req) => {
+      gate.refusing = true;
+      await bossTool(req, "open_incident", { report: saidIn(req) });
+      return "On it.";
+    };
+    await instance.slackEvent({
+      type: "app_mention",
+      channel: "C0TEST",
+      user: "U-swain",
+      text: "<@B0BOSS> exports are stuck",
+      ts: thread,
+    });
+    assert.equal(inThread().filter((t) => /could not record this report yet/.test(t)).length, 1);
+
+    clock.at += 29 * 60_000;
+    await instance.retryReports();
+    assert.equal(inThread().filter((t) => /still could not record/.test(t)).length, 0, "not yet");
+
+    clock.at += 2 * 60_000;
+    const { alarms } = await captureAlarms(() => instance.retryReports());
+    assert.equal(inThread().filter((t) => /still could not record/.test(t)).length, 1);
+    assert.equal(
+      alarms.filter((line) => JSON.parse(line).event === "report_retry_exhausted").length,
+      1,
+    );
+
+    await instance.retryReports();
+    assert.equal(inThread().filter((t) => /still could not record/.test(t)).length, 1, "said once");
+    assert.equal(instance.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM incident")!.n, 0);
+  } finally {
+    instance.stop();
+  }
+});
+
 // --- configuration a person supplies reaches the code that needs it --------
 
 const withBlob = (settings: Record<string, string>): NodeJS.ProcessEnv =>
