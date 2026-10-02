@@ -75,7 +75,7 @@ what other incidents asked for or got back.
   protocol (one statement per Parse, so Postgres refuses a second), always
   `ROLLBACK`, a fresh client per query and always `end()`. The `;` check in
   validation is a clear error for the agent, not the fence.
-- **Refusal wins.** Any rotation `:x:` beats any `:arrow_forward:`.
+- **Refusal wins.** Any rotation `:x:` beats any `:white_check_mark:`.
 - **State is memory only.** A restart loses pending requests; the agent's
   tool treats a 404 as "lost, ask again". Do not add persistence that the
   agent's container could reach.

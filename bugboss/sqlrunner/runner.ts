@@ -30,7 +30,7 @@ export const MAX_PENDING_TOTAL = 5;
 export const PENDING_TTL_MS = 3600 * 1000;
 export const TERMINAL_TTL_MS = 2 * 3600 * 1000;
 export const ROTATION_TTL_MS = 60 * 1000;
-export const APPROVE_REACTION = "arrow_forward";
+export const APPROVE_REACTION = "white_check_mark";
 export const REFUSE_REACTION = "x";
 
 export type RequestStatus =
