@@ -41,39 +41,47 @@ whole suite with `npm test`.
 ## Review and approval
 
 Who has to approve a PR here depends on which paths it touches. The default
-branch requires one approving review plus code-owner review, and
-`.github/CODEOWNERS` names owners for some trees and not others. A path with
-no owner satisfies the code-owner half vacuously, so on those paths a
-`delegate-reviewer[bot]` approval is enough to merge, with no human behind it.
+branch requires one approving review plus code-owner review.
+`.github/CODEOWNERS` **owns every path by default** and names a short opt-out
+list, so a human on `@thegoodparty/gp-contrib` must approve anything not
+explicitly opted out. A path with no owner satisfies the code-owner half
+vacuously, so on an opted-out path a `delegate-reviewer[bot]` approval is
+enough to merge, with no human behind it.
 
-**A human on `@thegoodparty/gp-contrib` must approve** a PR touching:
+**Everything merges on a bot approval except** the paths `.github/CODEOWNERS`
+opts out:
 
-- `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/` —
-  the trees that define IAM, CI and the reviewer itself
+- `bugboss/` — application code. Its AWS reach is fixed in
+  `deploy/components/bugboss.ts`, which is owned. `bugboss/Dockerfile` is the
+  exception and stays owned, because `deploy.yml` builds it after the
+  Configure AWS Credentials step.
+- `docs/`, `README.md` — documentation.
+- `.gitignore` — inert.
+- `CLAUDE.md`, at the root and in any directory — removed from the review list
+  by #173, and preserved as an opt-out here.
+
+**A human on `@thegoodparty/gp-contrib` must approve** everything else. The
+owned entries worth naming, because the file being edited does not obviously
+reach a credential:
+
+- `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/`,
+  `deploy-infrastructure/` — the trees that define IAM, CI and the reviewer
+  itself
 - `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling
   code but are reached by IaC and by a credentialled workflow. See below.
 - `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore`
-- `bugboss/toolapi/`, `bugboss/dispatcher/`, `bugboss/github.ts`,
-  `bugboss/slack-app-manifest.yaml`, `bugboss/Dockerfile` — BugBoss's security
-  boundaries, as opposed to its application code
-- `CLAUDE.md`, at the root and in any directory — the reviewer is told to
-  read these as authoritative for conventions, so they shape what it accepts
-
-**Everything else merges on a bot approval** — the rest of `bugboss/`,
-`docs/`, and `README.md`.
 
 Keep changes that need a human in their own PR: one file under an owned path
 pulls the whole PR into human review.
 
-**The non-obvious part.** Three of those entries are owned because something
+**The non-obvious part.** Some owned paths are owned because something
 outside their directory reaches in, and you cannot see it from the file:
 `deploy/components/identity-center/policies.ts` imports its permission-set
 resource ARNs from `utils/bedrock-models.ts` and its account ids from
 `utils/accounts.ts`; `deploy-workbench.yml` runs
 `scripts/enable-bedrock-models.ts` under a deploy role; and `run-script.ts`
 dynamically imports anything in `scripts/`. Before you assume a file is
-harmless, check what executes it, or what reads it: `CLAUDE.md` is owned for
-the second reason rather than the first.
+harmless, check what executes it, or what reads it.
 
 The same applies to CI ordering. `deploy.yml` runs install, test and build
 **strictly before** the Configure AWS Credentials step, because the deploy
