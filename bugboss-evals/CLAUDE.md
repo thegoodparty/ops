@@ -174,6 +174,10 @@ credential exists anywhere: the fake is the only GitHub the run can reach.
 
 ## Running it
 
+A PR that changes nothing under `bugboss/` is an A/A run: main against itself.
+That is the judge's noise floor on real incidents, and the first thing to run
+after a change to the harness or the rubric.
+
 In CI: the `bugboss eval` comment. A PR that changes a scenario also runs
 `bugboss-evals-ci.yml`, which holds no secrets and proves the hidden check
 against omni (public). The harness's unit tests run with `npm test` in
