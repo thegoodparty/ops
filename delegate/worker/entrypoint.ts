@@ -31,6 +31,113 @@ const reportFatal = async (job: AgentJob | undefined, message: string) => {
   }
 };
 
+// The prompt tells pr-reviewer to pin its review to REVIEW_HEAD_SHA and to
+// skip APPROVE when the tip moved, but that is only an instruction. This runs
+// after the agent and enforces it: any APPROVED review from the reviewer App
+// that is not on both the reviewed SHA and the live PR head gets dismissed.
+// Without it, "push A, request review, push B" could land an approval of A
+// after B was pushed, which dismiss-stale-reviews-on-push never sees.
+const enforceApprovalSha = async (
+  repoFullName: string,
+  prNumber: string,
+  reviewedSha: string,
+) => {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) return;
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "Content-Type": "application/json",
+  };
+  const api = `https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`;
+
+  try {
+    const viewerRes = await fetch("https://api.github.com/graphql", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query: "{ viewer { login } }" }),
+    });
+    const botLogin = ((await viewerRes.json()) as {
+      data?: { viewer?: { login?: string } };
+    }).data?.viewer?.login;
+    if (!botLogin) {
+      console.error("approval SHA guard: could not resolve reviewer login");
+      return;
+    }
+
+    const prRes = await fetch(api, { headers });
+    const liveSha = ((await prRes.json()) as { head?: { sha?: string } }).head
+      ?.sha;
+    if (!liveSha) {
+      console.error("approval SHA guard: could not resolve live PR head");
+      return;
+    }
+
+    const reviews: Array<{
+      id: number;
+      state: string;
+      commit_id: string;
+      user: { login: string } | null;
+    }> = [];
+    for (let page = 1; ; page++) {
+      const res = await fetch(`${api}/reviews?per_page=100&page=${page}`, {
+        headers,
+      });
+      const batch = (await res.json()) as typeof reviews;
+      reviews.push(...batch);
+      if (batch.length < 100) break;
+    }
+
+    const stale = reviews.filter(
+      (r) =>
+        r.user?.login === botLogin &&
+        r.state === "APPROVED" &&
+        (r.commit_id !== reviewedSha || r.commit_id !== liveSha),
+    );
+
+    for (const review of stale) {
+      const message = `Dismissed automatically: this approval is on ${review.commit_id.slice(0, 7)}, but the reviewed commit is ${reviewedSha.slice(0, 7)} and the PR head is ${liveSha.slice(0, 7)}. Reply \`delegate review\` for a fresh review.`;
+      const res = await fetch(`${api}/reviews/${review.id}/dismissals`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ message, event: "DISMISS" }),
+      });
+      console.log(
+        JSON.stringify({
+          service_name: "delegate-reviewer",
+          event: "stale_approval_dismissed",
+          repo: repoFullName,
+          pr_number: Number(prNumber),
+          review_id: review.id,
+          review_sha: review.commit_id,
+          reviewed_sha: reviewedSha,
+          live_sha: liveSha,
+          ok: res.ok,
+          status: res.status,
+        }),
+      );
+      if (!res.ok) {
+        await fetch(
+          `https://api.github.com/repos/${repoFullName}/statuses/${liveSha}`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              state: "failure",
+              context: "pr-reviewer",
+              description:
+                "Approval is on a stale commit and could not be dismissed",
+            }),
+          },
+        );
+      }
+    }
+  } catch (err) {
+    console.error("approval SHA guard failed:", err);
+  }
+};
+
 const parseJob = (): AgentJob | undefined => {
   const raw = process.env.AGENT_JOB;
   if (!raw) return undefined;
@@ -376,7 +483,23 @@ const main = async () => {
     }
   }
 
-  const result = await runAgent(config, message, cwd, abortController);
+  const result = await runAgent(config, message, cwd, abortController).finally(
+    async () => {
+      if (
+        job.agent === "pr-reviewer" &&
+        process.env.PR_REVIEWER_APPROVAL_ENABLED === "true" &&
+        process.env.REVIEW_HEAD_SHA &&
+        job.metadata?.repo &&
+        job.metadata?.prNumber
+      ) {
+        await enforceApprovalSha(
+          job.metadata.repo,
+          String(job.metadata.prNumber),
+          process.env.REVIEW_HEAD_SHA,
+        );
+      }
+    },
+  );
   clearTimeout(deadline);
 
   console.log(`Agent completed in ${(result.durationMs / 1000).toFixed(1)}s`);
