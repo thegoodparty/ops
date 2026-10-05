@@ -1,0 +1,199 @@
+# agent-swarm 1.163.0 on swarm.goodparty.org
+# Derived from docker-compose.example.yml at that tag. .env is rendered by
+# render-env.sh from Secrets Manager:AGENT_SWARM; never edit .env by hand.
+# Start with: ./up.sh  (docker compose --profile tls up -d)
+
+x-agent-entrypoint: &agent-entrypoint
+  - /bin/sh
+  - -ec
+  - |
+    ID_FILE="/workspace/personal/.agent-id"
+    if [ -n "$${AGENT_ID:-}" ]; then
+      printf '%s\n' "$$AGENT_ID" > "$$ID_FILE"
+    elif [ -s "$$ID_FILE" ]; then
+      AGENT_ID=$$(cat "$$ID_FILE")
+    else
+      AGENT_ID=$$(cat /proc/sys/kernel/random/uuid)
+      printf '%s\n' "$$AGENT_ID" > "$$ID_FILE"
+    fi
+    export AGENT_ID
+    exec /docker-entrypoint.sh "$$@"
+  - --
+
+x-worker-env: &worker-env
+  HARNESS_PROVIDER: ${HARNESS_PROVIDER:-claude}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  API_KEY: ${API_KEY}
+  MCP_BASE_URL: http://api:3013
+  MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
+  YOLO: "true"
+  GITHUB_TOKEN: ${GITHUB_TOKEN}
+  GITHUB_NAME: ${GITHUB_NAME:-Swarm}
+  GITHUB_EMAIL: ${GITHUB_EMAIL:-swarm@goodparty.org}
+  CLICKUP_API_TOKEN: ${CLICKUP_API_TOKEN}
+  CLICKUP_API_KEY: ${CLICKUP_API_TOKEN}
+  GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+  GRAFANA_URL: ${GRAFANA_URL:-https://goodparty.grafana.net}
+  SWARM_URL: swarm.goodparty.org
+
+x-worker-base: &worker-base
+  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.163.0}"
+  entrypoint: *agent-entrypoint
+  platform: linux/amd64
+  stop_grace_period: 60s
+  depends_on:
+    api:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    platform: linux/amd64
+    command: --model-id nomic-ai/nomic-embed-text-v1.5 --max-client-batch-size 64
+    volumes:
+      - tei_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:80/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First boot downloads the model from Hugging Face before listening.
+      start_period: 600s
+    restart: unless-stopped
+
+  api:
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.163.0}"
+    platform: linux/amd64
+    stop_grace_period: 60s
+    pids_limit: 1024
+    depends_on:
+      tei:
+        condition: service_started
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - API_KEY=${API_KEY}
+      - RBAC_ENABLED=${RBAC_ENABLED:-true}
+      - SECRETS_ENCRYPTION_KEY=${SECRETS_ENCRYPTION_KEY}
+      - MCP_BASE_URL=${MCP_BASE_URL}
+      - PUBLIC_MCP_BASE_URL=${PUBLIC_MCP_BASE_URL}
+      - APP_URL=${APP_URL:-https://app.agent-swarm.dev}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      - API_DRAIN_MAX_MS=${API_DRAIN_MAX_MS:-30000}
+      # Workflow LLM nodes run in the API with the worker model.
+      - MODEL_OVERRIDE=${WORKER_MODEL_OVERRIDE}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - EMBEDDING_API_BASE_URL=${EMBEDDING_API_BASE_URL:-http://tei:80/v1}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-local}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text-v1.5}
+      - MEMORY_RATERS=${MEMORY_RATERS-implicit-citation,explicit-self}
+      - MEMORY_HYBRID_SEARCH=${MEMORY_HYBRID_SEARCH-1}
+      - MEMORY_GRAPH_EXPANSION=${MEMORY_GRAPH_EXPANSION-1}
+      - MEMORY_DEMOTION_FLOOR=${MEMORY_DEMOTION_FLOOR-1.0}
+      - SLACK_DISABLE=${SLACK_DISABLE:-false}
+      - SLACK_MODE=${SLACK_MODE:-socket}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - SLACK_ALLOWED_EMAIL_DOMAINS=${SLACK_ALLOWED_EMAIL_DOMAINS:-goodparty.org}
+      - SLACK_ALERTS_CHANNEL=${SLACK_ALERTS_CHANNEL:-C0C6RUJ9VMK}
+      - GITHUB_DISABLE=${GITHUB_DISABLE:-true}
+      # grafana-mcp is a compose-internal hostname; the MCP wrapper refuses
+      # private-network URLs in production unless this is set.
+      - ALLOW_PRIVATE_NETWORK_URLS=true
+    ports:
+      - "127.0.0.1:3013:3013"
+    volumes:
+      - swarm_api_data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:3013/health || wget -q --spider http://localhost:3013/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  lead:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${LEAD_AGENT_ID:-}
+      AGENT_ROLE: lead
+      TEMPLATE_ID: official/lead
+      MODEL_OVERRIDE: ${LEAD_MODEL_OVERRIDE}
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_lead:/workspace/personal
+
+  worker-coder:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${CODER_AGENT_ID:-}
+      AGENT_ROLE: worker
+      TEMPLATE_ID: official/coder
+      MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_worker_coder:/workspace/personal
+
+  worker-reviewer:
+    <<: *worker-base
+    environment:
+      <<: *worker-env
+      AGENT_ID: ${REVIEWER_AGENT_ID:-}
+      AGENT_ROLE: worker
+      TEMPLATE_ID: official/reviewer
+      MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
+    volumes:
+      - swarm_logs:/logs
+      - swarm_shared:/workspace/shared
+      - swarm_worker_reviewer:/workspace/personal
+
+  grafana-mcp:
+    image: grafana/mcp-grafana:latest
+    # --allowed-hosts: the image validates the Host header and defaults to
+    # loopback only; the api reaches it as grafana-mcp:8000.
+    command:
+      - -t
+      - streamable-http
+      - --address
+      - 0.0.0.0:8000
+      - --allowed-hosts
+      - grafana-mcp:8000,grafana-mcp
+    environment:
+      - GRAFANA_URL=https://goodparty.grafana.net
+      - GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.11.4@sha256:13ba145cba2f3e28fa801994876e4c086d1b95d5aa2a520a734765ffb6b12017
+    profiles: ["tls"]
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  tei_data:
+  caddy_data:
+  caddy_config:
+  swarm_api_data:
+  swarm_logs:
+  swarm_shared:
+  swarm_lead:
+  swarm_worker_coder:
+  swarm_worker_reviewer:

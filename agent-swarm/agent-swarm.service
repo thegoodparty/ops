@@ -1,0 +1,19 @@
+[Unit]
+Description=agent-swarm (docker compose stack in /opt/agent-swarm)
+Requires=docker.service network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ec2-user
+Group=docker
+WorkingDirectory=/opt/agent-swarm
+Environment=AWS_REGION=us-west-2
+ExecStart=/opt/agent-swarm/up.sh
+ExecStop=/usr/bin/docker compose --profile tls down
+TimeoutStartSec=900
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

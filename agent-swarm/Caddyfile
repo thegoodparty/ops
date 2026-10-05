@@ -1,0 +1,4 @@
+swarm.goodparty.org {
+	encode zstd gzip
+	reverse_proxy api:3013
+}
