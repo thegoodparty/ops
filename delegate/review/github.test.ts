@@ -208,7 +208,7 @@ describe("createGitHub", () => {
     assert.equal(calls[1].method, "GET");
     assert.equal(
       calls[1].url,
-      `https://api.github.com/repos/${REPO}/pulls/${PR}/reviews/99/comments`,
+      `https://api.github.com/repos/${REPO}/pulls/${PR}/reviews/99/comments?per_page=100`,
     );
 
     assert.equal(result.reviewId, 99);

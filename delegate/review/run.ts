@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { isAbsolute, resolve, sep } from "node:path";
+import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { getAgent, runAgent } from "../framework";
 import { buildReviewPrompt } from "../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "./anchors";
@@ -21,27 +24,77 @@ import { emit } from "./telemetry";
 export type ReviewTrigger = ReviewRecord["trigger"];
 
 // Everything the Claude Code subprocess (and therefore the model) can see in
-// its environment. No GitHub, Slack, ClickUp or AWS material: the agent has
-// no network tools, but a Read on /proc/self/environ would still leak them.
-const ENV_DENYLIST = [
-  /^GITHUB_/,
-  /^REVIEWER_/,
-  /^SLACK_/,
-  /^CLICKUP_/,
-  /^GRAFANA_/,
-  /^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|CONTAINER_CREDENTIALS_RELATIVE_URI|CONTAINER_AUTHORIZATION_TOKEN)$/,
-  /^AGENT_JOB$/,
-  /^GH_TOKEN$/,
-];
+// its environment. Allowlist, not denylist: the worker's env is the whole
+// DELEGATES secret bundle, and a Read on /proc/self/environ would leak any
+// key we forgot to name. Only what the CLI needs to run and reach the model.
+const ENV_ALLOW_EXACT = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "NODE_OPTIONS",
+  "AWS_DEFAULT_REGION",
+  "AWS_REGION",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_MODEL",
+]);
+const ENV_ALLOW_PREFIX = ["CLAUDE_", "DISABLE_"];
 
 export const agentEnv = (
   source: NodeJS.ProcessEnv = process.env,
 ): Record<string, string | undefined> =>
   Object.fromEntries(
     Object.entries(source).filter(
-      ([key]) => !ENV_DENYLIST.some((re) => re.test(key)),
+      ([key]) =>
+        ENV_ALLOW_EXACT.has(key) || ENV_ALLOW_PREFIX.some((p) => key.startsWith(p)),
     ),
   );
+
+// The agent's file tools may only touch the review checkout. The worker
+// process next door still holds every token, and /proc/<ppid>/environ is a
+// regular file to the Read tool, so a cwd alone is not a boundary.
+export const pathGuardHook = (reviewDir: string): HookCallback => {
+  const root = realpathSync(reviewDir);
+  const inside = (p: string) => {
+    const abs = isAbsolute(p) ? p : resolve(root, p);
+    let real: string;
+    try {
+      real = realpathSync(abs);
+    } catch {
+      real = resolve(abs);
+    }
+    return real === root || real.startsWith(root + sep);
+  };
+  return async (input) => {
+    const i = input as { hook_event_name?: string; tool_name?: string; tool_input?: unknown };
+    if (i.hook_event_name !== "PreToolUse") return { continue: true };
+    if (!i.tool_name || !["Read", "Grep", "Glob"].includes(i.tool_name)) {
+      return { continue: true };
+    }
+    const ti = (i.tool_input ?? {}) as Record<string, unknown>;
+    const candidates = [ti.file_path, ti.path].filter(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    const outside = candidates.find((p) => !inside(p));
+    if (outside === undefined) return { continue: true };
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `Path is outside the review checkout: ${outside}`,
+      },
+    };
+  };
+};
+
+export const latestCompletedRecord = (records: ReviewRecord[]): ReviewRecord | undefined =>
+  [...records].reverse().find((r) => r.action === "approved" || r.action === "commented");
 
 export const parseReviewOutput = (
   result: { structuredOutput?: unknown; output: string },
@@ -142,7 +195,7 @@ export const runReview = async (args: {
         .catch((err: unknown) => console.error("pending status failed:", err));
     }
 
-    prior = await store.latestRecord(repo, prNumber);
+    prior = latestCompletedRecord(await store.listRecords(repo, prNumber));
     bundle = await buildBundle({
       repo,
       prNumber,
@@ -227,6 +280,7 @@ export const runReview = async (args: {
     abortController: args.abortController,
     mcpServers: { git: createGitTool(reviewDir) },
     env: agentEnv(),
+    preToolUseHooks: [pathGuardHook(reviewDir)],
   });
 
   if (result.errorSubtype) {
@@ -282,28 +336,40 @@ export const runReview = async (args: {
   });
 
   const inline = fresh.filter((f) => !f.demoted);
-  const posted = await github.postReview(repo, prNumber, {
-    commitId: headSha,
-    event: decision.action === "approve" ? "APPROVE" : "COMMENT",
-    body,
-    comments: inline.map(({ finding }) => ({
-      path: finding.path,
-      line: finding.endLine ?? finding.line,
-      side: "RIGHT",
-      ...(finding.endLine && finding.endLine !== finding.line
-        ? { start_line: finding.line, start_side: "RIGHT" as const }
-        : {}),
-      body: finding.suggestion
-        ? `${finding.body}\n\n\`\`\`suggestion\n${finding.suggestion}\n\`\`\``
-        : finding.body,
-    })),
-  });
+  let posted: Awaited<ReturnType<typeof github.postReview>>;
+  try {
+    posted = await github.postReview(repo, prNumber, {
+      commitId: headSha,
+      event: decision.action === "approve" ? "APPROVE" : "COMMENT",
+      body,
+      comments: inline.map(({ finding }) => ({
+        path: finding.path,
+        line: finding.endLine ?? finding.line,
+        side: "RIGHT",
+        ...(finding.endLine && finding.endLine !== finding.line
+          ? { start_line: finding.line, start_side: "RIGHT" as const }
+          : {}),
+        body: finding.suggestion
+          ? `${finding.body}\n\n\`\`\`suggestion\n${finding.suggestion}\n\`\`\``
+          : finding.body,
+      })),
+    });
+  } catch (err) {
+    return fail(
+      `posting the review failed: ${err instanceof Error ? err.message : String(err)}`,
+      { output, costUsd: result.costUsd },
+    );
+  }
 
+  const unmatched = [...posted.comments];
   for (const { finding } of inline) {
-    const match = posted.comments.find(
+    const idx = unmatched.findIndex(
       (c) => c.path === finding.path && c.line === (finding.endLine ?? finding.line),
     );
-    finding.commentId = match?.id;
+    if (idx !== -1) {
+      finding.commentId = unmatched[idx].id;
+      unmatched.splice(idx, 1);
+    }
   }
 
   if (prior && (carried.length > 0 || prior.findings.length > 0 || inline.length > 0)) {

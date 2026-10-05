@@ -25,13 +25,48 @@ export const buildBundle = async (args: {
 }): Promise<Bundle> => {
   const pull = await args.github.getPull(args.repo, args.prNumber);
 
-  const mergeBase = execFileSync(
+  const headSha = execFileSync(
     "git",
-    ["merge-base", pull.baseSha, "HEAD"],
+    ["rev-parse", "HEAD"],
     { cwd: args.reviewDir, ...EXEC_OPTS },
   )
     .toString()
     .trim();
+
+  // The checkout is a shallow clone of the default branch plus the PR head.
+  // The merge base may be outside that window or on another branch, so ask
+  // GitHub for it and fetch exactly that commit when it is missing locally.
+  const hasCommit = (sha: string) => {
+    try {
+      execFileSync("git", ["cat-file", "-e", `${sha}^{commit}`], {
+        cwd: args.reviewDir,
+        ...EXEC_OPTS,
+        stdio: "ignore",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  let mergeBase: string;
+  try {
+    mergeBase = execFileSync(
+      "git",
+      ["merge-base", pull.baseSha, "HEAD"],
+      { cwd: args.reviewDir, ...EXEC_OPTS, stdio: ["ignore", "pipe", "ignore"] },
+    )
+      .toString()
+      .trim();
+  } catch {
+    mergeBase = await args.github.getMergeBase(args.repo, pull.baseSha, headSha);
+    if (!hasCommit(mergeBase)) {
+      execFileSync(
+        "git",
+        ["fetch", "--depth=1", "origin", mergeBase],
+        { cwd: args.reviewDir, ...EXEC_OPTS },
+      );
+    }
+  }
 
   const diff = execFileSync(
     "git",
@@ -48,14 +83,6 @@ export const buildBundle = async (args: {
     .trim()
     .split("\n")
     .filter(Boolean);
-
-  const headSha = execFileSync(
-    "git",
-    ["rev-parse", "HEAD"],
-    { cwd: args.reviewDir, ...EXEC_OPTS },
-  )
-    .toString()
-    .trim();
 
   return {
     repo: args.repo,

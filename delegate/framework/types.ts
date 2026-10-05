@@ -1,4 +1,4 @@
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import type { HookCallback, Options } from "@anthropic-ai/claude-agent-sdk";
 
 export type McpServerConfig = NonNullable<Options["mcpServers"]>[string];
 
@@ -28,6 +28,7 @@ export type RunOverrides = {
   abortController?: AbortController;
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
+  preToolUseHooks?: HookCallback[];
 };
 
 export type AgentJob = {

@@ -80,6 +80,12 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     };
   };
 
+  const getMergeBase = async (repo: string, base: string, head: string): Promise<string> => {
+    const res = await doFetch("GET", `${BASE_URL}/repos/${repo}/compare/${base}...${head}`);
+    const data = (await res.json()) as { merge_base_commit: { sha: string } };
+    return data.merge_base_commit.sha;
+  };
+
   const getHeadSha = async (repo: string, prNumber: number): Promise<string> => {
     const res = await doFetch("GET", `${BASE_URL}/repos/${repo}/pulls/${prNumber}`);
     const pr = (await res.json()) as { head: { sha: string } };
@@ -133,15 +139,19 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     const reviewData = (await reviewRes.json()) as { id: number };
     const reviewId = reviewData.id;
 
-    const commentsRes = await doFetch(
-      "GET",
-      `${BASE_URL}/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments`,
-    );
-    const rawComments = (await commentsRes.json()) as Array<{
-      id: number;
-      path: string;
-      line: number | null;
-    }>;
+    const rawComments: Array<{ id: number; path: string; line: number | null }> = [];
+    let commentsUrl: string | undefined =
+      `${BASE_URL}/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments?per_page=100`;
+    while (commentsUrl) {
+      const commentsRes = await doFetch("GET", commentsUrl);
+      const page = (await commentsRes.json()) as Array<{
+        id: number;
+        path: string;
+        line: number | null;
+      }>;
+      for (const c of page) rawComments.push(c);
+      commentsUrl = parseLinkNext(commentsRes.headers.get("Link"));
+    }
 
     return {
       reviewId,
@@ -270,6 +280,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
 
   return {
     getPull,
+    getMergeBase,
     getHeadSha,
     postStatus,
     postReview,

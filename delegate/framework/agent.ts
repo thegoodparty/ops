@@ -90,7 +90,9 @@ export const runAgent = async (
       permissionMode: config.permissionMode ?? "bypassPermissions",
       cwd,
       hooks: {
-        PreToolUse: [{ hooks: [forceSynchronousTaskHook] }],
+        PreToolUse: [
+          { hooks: [forceSynchronousTaskHook, ...(overrides.preToolUseHooks ?? [])] },
+        ],
       },
       stderr: (data: string) => console.error("[claude stderr]", data),
     },

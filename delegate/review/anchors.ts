@@ -80,7 +80,11 @@ export const placeFindings = (
   findings: Finding[],
   anchors: Map<string, Set<number>>,
 ): Array<{ finding: Finding; demoted: boolean }> =>
-  findings.map((finding) => {
+  findings.map((raw) => {
+    const finding =
+      raw.endLine !== undefined && raw.endLine < raw.line
+        ? { ...raw, line: raw.endLine, endLine: raw.line }
+        : raw;
     const anchorable = isAnchorable(
       anchors,
       finding.path,
