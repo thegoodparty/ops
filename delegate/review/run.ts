@@ -275,13 +275,18 @@ export const runReview = async (args: {
     return record;
   };
 
-  const result = await runAgent(config, buildReviewPrompt(bundle), {
-    cwd: reviewDir,
-    abortController: args.abortController,
-    mcpServers: { git: createGitTool(reviewDir) },
-    env: agentEnv(),
-    preToolUseHooks: [pathGuardHook(reviewDir)],
-  });
+  let result: Awaited<ReturnType<typeof runAgent>>;
+  try {
+    result = await runAgent(config, buildReviewPrompt(bundle), {
+      cwd: reviewDir,
+      abortController: args.abortController,
+      mcpServers: { git: createGitTool(reviewDir) },
+      env: agentEnv(),
+      preToolUseHooks: [pathGuardHook(reviewDir)],
+    });
+  } catch (err) {
+    return fail(`agent crashed: ${err instanceof Error ? err.message : String(err)}`, {});
+  }
 
   if (result.errorSubtype) {
     return fail(`agent error (${result.errorSubtype}): ${result.output.slice(0, 300)}`, {
@@ -334,6 +339,40 @@ export const runReview = async (args: {
     })),
     demoted: fresh.filter((f) => f.demoted).map((f) => f.finding),
   });
+
+  // Pushes dispatch their own run, so a review of a sha that is no longer the
+  // tip is superseded, not stale-but-useful. Posting it would duplicate the
+  // findings the newer run is about to post. Record it and stop.
+  const liveBeforePost = await github.getHeadSha(repo, prNumber).catch(() => headSha);
+  if (liveBeforePost !== headSha) {
+    await github
+      .postStatus(repo, headSha, {
+        state: "success",
+        description: `Superseded by ${liveBeforePost.slice(0, 7)}; review not posted`,
+        targetUrl: args.logsUrl,
+      })
+      .catch((err: unknown) => console.error("superseded status failed:", err));
+    const record = finish({
+      output,
+      verdict: decision.verdict,
+      action: "skipped",
+      gates: decision.gates,
+      findings: [...fresh.map((f) => f.finding), ...carried],
+      tipMovedTo: liveBeforePost,
+      costUsd: result.costUsd,
+    });
+    await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
+    emit("review_skipped", {
+      repo,
+      pr_number: prNumber,
+      head_sha: headSha,
+      run_id: runId,
+      reason: "superseded",
+      tip: liveBeforePost,
+      cost_usd: result.costUsd ?? null,
+    });
+    return record;
+  }
 
   const inline = fresh.filter((f) => !f.demoted);
   let posted: Awaited<ReturnType<typeof github.postReview>>;
@@ -474,7 +513,7 @@ export const runReview = async (args: {
     tipMovedTo,
     costUsd: result.costUsd,
   });
-  await store.putRecord(record);
+  await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
 
   emit("review_posted", {
     repo,

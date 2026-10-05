@@ -258,17 +258,20 @@ const main = async () => {
       ? `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskArn.split("/").pop()}`
       : undefined;
 
-    await runReview({
-      repo: repoFullName,
-      prNumber: Number(prNumber),
-      reviewDir,
-      trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
-      token: reviewerToken,
-      abortController,
-      logsUrl,
-    });
-    clearTimeout(deadline);
-    await removeGitHubReaction(job, reviewerToken);
+    try {
+      await runReview({
+        repo: repoFullName,
+        prNumber: Number(prNumber),
+        reviewDir,
+        trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
+        token: reviewerToken,
+        abortController,
+        logsUrl,
+      });
+    } finally {
+      clearTimeout(deadline);
+      await removeGitHubReaction(job, reviewerToken);
+    }
     return;
   }
 

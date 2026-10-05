@@ -106,12 +106,47 @@ Continuation verbs are routed by parsing the most recent bot post's `[phase=...]
 
 ## PR reviewer
 
-`pr-reviewer` reviews every non-draft PR opened or marked ready in a `REVIEW_REPOS` repo, and again on a `delegate review` comment. The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else. Rules that hold regardless of what the model says:
+`pr-reviewer` reviews every push to a non-draft PR in a `REVIEW_REPOS` repo (opened, marked ready, or synchronized), and again on a `delegate review` comment. The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else.
+
+### Before and after
+
+```
+Before                                              After
+
+GitHub webhook                                      GitHub webhook
+   │                                                   │
+   ▼                                                   ▼
+Lambda ── RunTask ──▶ Fargate worker                Lambda ── RunTask ──▶ Fargate worker
+                        │ checkout PR @ head sha                            │ checkout PR @ head sha
+                        ▼                                                   ▼
+                      Agent (opus) + Bash + gh + App token              review/run.ts  (plain code, tested)
+                        │  800-line prompt tells the model to:            │ S3 lock (pr, sha)
+                        │  - dedup via statuses, debounce                 │ bundle: PR meta + local diff + own prior findings
+                        │  - scout → deep-reviewers                       ▼
+                        │  - reconcile prior threads, saturation        Agent (opus): Read/Grep/Glob + read-only git tool
+                        │  - apply gates (self-review, TDD, perms)        │ no Bash, no network, allowlisted env,
+                        │  - decide approve / comment                     │ file tools confined to the checkout
+                        │  - gh api: post review, statuses, telemetry     │ scout → deep-reviewers
+                        ▼                                                 ▼
+                      GitHub review + status                            { findings[], summary } | { failed }
+                      (whatever the model decided to run)                 │ Zod-validated
+                                                                          ▼
+                                                                        review/run.ts
+                                                                          │ verdict = findings.length === 0
+                                                                          │ never-approve author gate
+                                                                          │ anchor findings to diff lines
+                                                                          │ superseded if tip moved; dismiss stale approve
+                                                                          │ resolve / un-resolve own threads
+                                                                          ▼
+                                                                        GitHub review + per-sha status + S3 record
+```
+
+Rules that hold regardless of what the model says:
 
 - Approve means zero findings. A finding is a blocker. The bot never posts REQUEST_CHANGES.
 - Authors in `NEVER_APPROVE_AUTHORS` (`delegate/review/gates.ts`) get a comment-only review whose body still says `Recommendation: approve`; a human approves.
-- The review and the `pr-reviewer` status are pinned to the sha that was checked out. If the tip moves during the run, the approval is dismissed. `pr-reviewer` is a required check on omni, so a new push is unmergeable until it is reviewed.
-- One run per `(pr, sha)` from webhooks (S3 conditional-put lock). `delegate review` bypasses the lock with a new run id.
+- The review and the `pr-reviewer` status are pinned to the sha that was checked out. `pr-reviewer` is a required check on omni, so a new push is unmergeable until its own run finishes.
+- One run per `(pr, sha)` from webhooks (S3 conditional-put lock). Runs on different shas of the same PR may overlap. If the tip has moved by the time a run is ready to post, it posts nothing: the status on its sha reads "Superseded", the record is kept with `action: skipped`, and the newer sha's run carries the findings. An approve that lands just before a push is dismissed. `delegate review` bypasses the lock with a new run id.
 - Re-review compares against the bot's own last record in S3, not GitHub thread state. Still-present findings are not reposted; their threads are listed in the body and un-resolved if a human resolved them. Fixed findings get their threads resolved.
 - A schema or subagent failure posts `Review failed: <reason>`, sets the status to `error`, and writes a record with `action: failed`.
 
