@@ -36,15 +36,20 @@ starting the work, not after. Make `who` name the *session*, not the model.
       needed: STS has to see `OrganizationAccountAccessRole` before step 7 can
       assume it, and a transient failure there is expected rather than a
       permissions bug.
-- [ ] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
-      the new OU: doing (pi-infra-step4, 2026-10-05). This is applied by
-      `deploy.yml` and its consumer is applied by `deploy-org.yml`, so it must
-      merge **and finish applying** before step 5. See "Apply ordering between
-      workflows" in the workbench document for why the grant cannot ride along
-      with the policy it enables.
+- [x] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
+      the new OU: done (2026-10-05, pi-infra-step4, PR #241 merged as 61a94c9.
+      The merge's CI run 37360050783 was green at 19:05 UTC: it updated
+      `github-actions-org-deploy`'s inline `OrgDeploy` policy (4 updated, 74
+      unchanged) and the applied document carries the Infrastructure OU ARN in
+      both `ServiceControlPolicyAttachment` and
+      `ServiceControlPolicyListingForTarget`. Read from the apply log rather
+      than an `iam:get-role-policy`, because no management-account SSO token
+      was live; the log shows the document Pulumi actually sent, which is the
+      same read-back shape workbench step 9 part 2 used. That is the evidence
+      step 5's attach will not be refused.)
 - [ ] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`:
-      todo. Design in "The infrastructure SCP" below; read that before
-      starting, not this summary.
+      doing (pi-infra-step5, 2026-10-05). Design in "The infrastructure SCP"
+      below; read that before starting, not this summary.
 - [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
       Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
       Applied by `deploy.yml`; must merge and finish applying before step 7.
