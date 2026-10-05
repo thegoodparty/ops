@@ -111,7 +111,7 @@ const main = async () => {
     console.error(`Judging ${records.length} case(s) with model ${modelId}, ${passes} passes each...`);
 
     const model = createAnthropicJudgeModel({ model: modelId });
-    const verdicts = await judgeAll(records, resultsA, resultsB, model);
+    const verdicts = await judgeAll(records, resultsA, resultsB, model, passes);
 
     const summary = summarize(verdicts);
     const report = renderMarkdown(summary, verdicts, { labelA, labelB });

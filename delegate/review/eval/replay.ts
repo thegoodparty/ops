@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { rmSync } from "node:fs";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import "../../agents";
@@ -33,15 +34,20 @@ export type RunAgentImpl = (
 
 export type CheckoutFn = (bundle: Bundle, repoDir: string) => void | Promise<void>;
 
+// A recorded sha may be far behind the PR's live tip (re-reviews, force
+// pushes), so fetch the exact commit rather than the ref. GitHub serves any
+// reachable sha. The directory is wiped first so a second variant or a
+// --force rerun on the same work dir starts clean.
 const defaultCheckout: CheckoutFn = (bundle, repoDir) => {
+  rmSync(repoDir, { recursive: true, force: true });
   execFileSync(
     "gh",
-    ["repo", "clone", bundle.repo, repoDir, "--", "--depth=50"],
+    ["repo", "clone", bundle.repo, repoDir, "--", "--depth=1", "--no-checkout"],
     { stdio: "pipe", timeout: 300_000 },
   );
   execFileSync(
     "git",
-    ["fetch", "--depth=50", "origin", `refs/pull/${bundle.prNumber}/head`],
+    ["fetch", "--depth=50", "origin", bundle.headSha],
     { cwd: repoDir, stdio: "pipe", timeout: 120_000 },
   );
   execFileSync("git", ["checkout", bundle.headSha], {
