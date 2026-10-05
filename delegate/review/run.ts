@@ -10,6 +10,7 @@ import { createGitTool } from "./git-tool";
 import { createGitHub } from "./github";
 import {
   ReviewOutputSchema,
+  type Bundle,
   type PostedFinding,
   type ReviewOutput,
   type ReviewRecord,
@@ -99,25 +100,59 @@ export const runReview = async (args: {
     }
   }
 
-  const pull = await github.getPull(repo, prNumber);
-  if (pull.isDraft) {
-    emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, reason: "draft" });
-    return undefined;
-  }
-
-  if (trigger !== "re-review") {
+  // Boot-phase failure: nothing to review yet, so no record. Post enough to
+  // GitHub that the check does not sit on pending forever.
+  const abort = async (reason: string) => {
+    console.error(`review aborted: ${reason}`);
     await github
       .postStatus(repo, headSha, {
-        state: "pending",
-        description: "Review in progress",
+        state: "error",
+        description: reason.slice(0, 140),
         targetUrl: args.logsUrl,
       })
-      .catch((err: unknown) => console.error("pending status failed:", err));
-  }
+      .catch((err: unknown) => console.error("error status failed:", err));
+    emit("review_failed", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId, reason });
+    return undefined;
+  };
 
-  const prior = await store.latestRecord(repo, prNumber);
-  const priorFindings = priorFindingsFrom(prior);
-  const bundle = await buildBundle({ repo, prNumber, reviewDir, github, priorFindings });
+  let bundle: Bundle;
+  let prior: ReviewRecord | undefined;
+  try {
+    const pull = await github.getPull(repo, prNumber);
+    if (pull.isDraft) {
+      emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, reason: "draft" });
+      if (trigger === "re-review") {
+        await github
+          .postStatus(repo, headSha, {
+            state: "error",
+            description: "Draft PR: mark it ready and re-trigger",
+          })
+          .catch(() => undefined);
+      }
+      return undefined;
+    }
+
+    if (trigger !== "re-review") {
+      await github
+        .postStatus(repo, headSha, {
+          state: "pending",
+          description: "Review in progress",
+          targetUrl: args.logsUrl,
+        })
+        .catch((err: unknown) => console.error("pending status failed:", err));
+    }
+
+    prior = await store.latestRecord(repo, prNumber);
+    bundle = await buildBundle({
+      repo,
+      prNumber,
+      reviewDir,
+      github,
+      priorFindings: priorFindingsFrom(prior),
+    });
+  } catch (err) {
+    return abort(`could not build review input: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   const finish = (
     partial: Pick<ReviewRecord, "output" | "verdict" | "action" | "gates" | "findings"> &
