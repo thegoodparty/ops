@@ -643,6 +643,15 @@ const pulumiBackendReadStatements = (projects: string[]): PolicyStatement[] => [
 const ORG_ID = "o-uuiolqc1di";
 const WORKBENCH_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/ou-jqqe-dv88i5zn`;
 
+// The Infrastructure OU, added by step 4 of
+// `docs/infrastructure-account.md`. A second literal rather than a pattern
+// over `ou-jqqe-*`: the property this grant is praised for is that the role
+// can name only the OUs it is responsible for, and a prefix pattern would
+// pick up `ElectionAPI` and every OU added later for free. Recorded from the
+// apply that created it, `Deploy org` run 37354688503, not assembled from
+// the ARN format string.
+const INFRASTRUCTURE_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/ou-jqqe-orrk423t`;
+
 /**
  * Every service control policy this organization owns, and nothing else.
  *
@@ -743,14 +752,15 @@ export const githubActionsOrgDeploy: PolicyDocument = {
     },
     // Attach and detach name two resources, the policy and its target, and
     // the request has to be permitted for both. Listing only our own policy
-    // namespace and only the Workbench OU is therefore two independent
-    // bounds: this role cannot attach our policy to the root, and it cannot
-    // detach FullAWSAccess from anything.
+    // namespace and only the two OUs this role is responsible for is
+    // therefore two independent bounds: this role cannot attach our policy to
+    // the root or to any other OU, and it cannot detach FullAWSAccess from
+    // anything.
     {
       Sid: "ServiceControlPolicyAttachment",
       Effect: "Allow",
       Action: ["organizations:AttachPolicy", "organizations:DetachPolicy"],
-      Resource: [ORG_SCP_ARN_PATTERN, WORKBENCH_OU_ARN],
+      Resource: [ORG_SCP_ARN_PATTERN, WORKBENCH_OU_ARN, INFRASTRUCTURE_OU_ARN],
       Condition: SCP_ONLY,
     },
     {
@@ -766,11 +776,15 @@ export const githubActionsOrgDeploy: PolicyDocument = {
       Resource: ORG_SCP_ARN_PATTERN,
       Condition: SCP_ONLY,
     },
+    // Both OUs, matching the attachment above. The provider reads an
+    // attachment back by listing the target's policies, so this has to name
+    // every OU the attachment statement can touch or the read-back fails
+    // after the attach has already happened.
     {
       Sid: "ServiceControlPolicyListingForTarget",
       Effect: "Allow",
       Action: ["organizations:ListPoliciesForTarget"],
-      Resource: WORKBENCH_OU_ARN,
+      Resource: [WORKBENCH_OU_ARN, INFRASTRUCTURE_OU_ARN],
       Condition: SCP_ONLY,
     },
     // The one policy action that accepts no resource type at all, so it
