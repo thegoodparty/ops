@@ -138,6 +138,23 @@ test("judgePair resolves unstable when a and b wins are evenly split", async () 
   assert.equal(verdict.winner, "unstable");
 });
 
+test("judgePair resolves unstable when a side only ties the tie count", async () => {
+  const record = makeRecord();
+  const a = makeResult({ caseId: record.runId });
+  const b = makeResult({ caseId: record.runId });
+
+  // passes alternate order: a is output_1 on even passes, output_2 on odd
+  const model = fakeModel([
+    { winner: "output_1", margin: "better" },
+    { winner: "tie", margin: "tie" },
+    { winner: "output_1", margin: "better" },
+    { winner: "tie", margin: "tie" },
+  ]);
+
+  const verdict = await judgePair({ record, a, b, model, passes: 4 });
+  assert.equal(verdict.winner, "unstable");
+});
+
 test("judgePair handles model returning no tool call", async () => {
   const record = makeRecord();
   const a = makeResult({ caseId: record.runId });

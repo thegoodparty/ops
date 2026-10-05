@@ -120,8 +120,7 @@ const deriveOverallWinner = (
   if (aWins > bWins && aWins > tieCount) return "a";
   if (bWins > aWins && bWins > tieCount) return "b";
   if (tieCount > aWins && tieCount > bWins) return "tie";
-  if (aWins === bWins) return "unstable";
-  return aWins > bWins ? "a" : "b";
+  return "unstable";
 };
 
 export const judgePair = async (args: {
