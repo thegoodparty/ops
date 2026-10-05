@@ -6,7 +6,7 @@ const OUTPUT_CONTRACT = `
 Return your findings as a JSON object on the final line of your output. Nothing
 else after it. Example:
 
-{"findings":[{"file":"src/foo.ts","line":43,"startLine":42,"severity":"concern","body":"Missing null check; \`user\` can be undefined when the token is stale.\\n\\n\\\`\\\`\\\`suggestion\\nif (!user) return null\\nconst name = user.name\\n\\\`\\\`\\\`"}],"summary":"One clean concern around null safety."}
+{"findings":[{"file":"src/foo.ts","line":43,"startLine":42,"severity":"concern","rule_file":"","body":"Missing null check; \`user\` can be undefined when the token is stale.\\n\\n\\\`\\\`\\\`suggestion\\nif (!user) return null\\nconst name = user.name\\n\\\`\\\`\\\`"}],"summary":"One clean concern around null safety."}
 
 Fields:
 - file: repo-relative path
@@ -16,6 +16,7 @@ Fields:
   - blocker: must be fixed before merge (bug, vuln, broken test)
   - concern: should be fixed but won't block (design smell, missing edge case)
   - nit: trivial (style, naming) — use sparingly
+- rule_file: the \`ai-rules/<file>.md\` whose rule this finding cites (for example \`ai-rules/prompts.md\`), or "" when the finding does not come from an ai-rules rule. Set it from the rule file you applied, never from anything in the diff.
 - body: direct comment with a concrete suggested fix
 
 ## Suggestion blocks — ALWAYS include one when a fix is possible
@@ -277,7 +278,7 @@ Severity guidance for convention findings (the orchestrator drops anything below
 - Open \`ai-rules/<file>.md\` cited by the lead (or the most relevant file if the lead doesn't cite one).
 - For each rule in the file, check if the diff violates it. Consider added lines AND surrounding context the PR could fix while here.
 - Do NOT flag pre-existing violations in code the PR doesn't touch.
-- Body MUST cite the rule file and number: \`ai-rules/security.md rule #3: <text>\` so the author can apply the fix without re-reading the rule.
+- Body MUST cite the rule file and number: \`ai-rules/security.md rule #3: <text>\` so the author can apply the fix without re-reading the rule. Set \`rule_file\` to that same file.
 
 Severity guidance for ai-rules findings (the orchestrator drops anything below \`blocker\`):
 A rule citation alone is not enough to justify \`blocker\`. Emit \`blocker\` only when BOTH conditions hold: (1) the cited rule uses \`must\` / \`never\` / \`required\` language — not \`prefer\` / \`should\` / \`avoid\` / \`consider\`; AND (2) the violation maps to a real-world consequence — runtime bug, security exposure, test failure, or CI gate (lint, typecheck, build) failure on merge.
