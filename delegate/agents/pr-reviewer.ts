@@ -352,7 +352,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 6. **Aggregate — keep blockers only, then apply saturation cap.** Collect the JSON findings from every deep-reviewer. Dedupe entries that overlap (prefer the most specific wording; prefer a finding that cites an \`ai-rules/\` rule by name over one that doesn't, because the citation is the more actionable one). **Drop every finding whose severity is not \`blocker\`.** Concerns and nits are discarded entirely — this bot does not surface non-blocking commentary.
 
-   **Trial rule files.** \`TRIAL_RULE_FILES\` is the list [\`ai-rules/prompts.md\`]. After the blocker filter, move every remaining finding whose body cites a file in that list into \`TRIAL_FINDINGS\`. Trial findings are posted (step 9) but are not blockers: they skip the saturation cap below, do not count in step 8, and never set \`request-changes\`. The list exists so a new critic can be read on real PRs before its findings are allowed to withhold approval; ending a trial is removing the file from the list.
+   **Trial rule files.** \`TRIAL_RULE_FILES\` is the list [\`ai-rules/prompts.md\`]. After the blocker filter, move every remaining finding whose body cites a file in that list into \`TRIAL_FINDINGS\`. Trial findings are not blockers: they skip the skip-list and the saturation cap below, do not count in step 8, and never set \`request-changes\`. They are posted in one PR comment of their own (step 9), never as inline review comments, so they create no review threads: they never enter \`$PRIOR_BLOCKER_LINES\` or the prior-thread set, and a re-review replaces the previous round's comment instead of re-posting. The list exists so a new critic can be read on real PRs before its findings are allowed to withhold approval; ending a trial is removing the file from the list.
 
    **On re-review only:** additionally drop any finding whose \`(path, line)\` matches a skip-list entry AND whose body substantively repeats the prior comment (same issue, not merely adjacent code). Be strict about "substantively repeats" — if the prior comment flagged a null-check and the new finding flags a different bug on the same line, post the new one. When in doubt, drop it; duplicates are worse than a missed finding.
 
@@ -435,15 +435,15 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 9. **Post the review.** ONE \`gh api\` call.
 
-   - Auto-approve: \`event=APPROVE\`, \`comments\` holding only \`TRIAL_FINDINGS\` (empty when there are none), body per the **Review body format** rules below, with recommendation \`approve\`.
-   - Comment-only (normal): \`event=COMMENT\`, inline comments for blocker findings and \`TRIAL_FINDINGS\`, body per the **Review body format** rules below, with the recommendation step 8 computed. Even when there are zero blockers, still post the comment-only review — the body carries the recommendation and the gate reasoning the human needs.
+   - Auto-approve: \`event=APPROVE\`, empty \`comments\` array, body per the **Review body format** rules below, with recommendation \`approve\`.
+   - Comment-only (normal): \`event=COMMENT\`, inline comments only for blocker findings, body per the **Review body format** rules below, with the recommendation step 8 computed. Even when there are zero blockers, still post the comment-only review — the body carries the recommendation and the gate reasoning the human needs.
    - Comment-only (advisory mode): \`event=COMMENT\`, **empty \`comments\` array** (do NOT post inline anchors), body per the **Advisory-mode body** rules below. The remaining blockers are rendered as plain markdown sections inside the body itself, not as inline review comments. This is the structural part of advisory mode — the bot has decided to stop blocking after N rounds, and the visual signal of "no inline blockers, just a body summary" matches that decision.
 
-   Trial findings post inline on both the auto-approve and the comment-only (normal) events. Each one's body opens with \`**Advisory (prompt critic trial).** This finding does not affect the verdict.\` and otherwise follows the normal finding format. In advisory mode they are rendered in the body with the rest, under their own heading.
+   Trial findings never ride in the review payload, on any event. They go in ONE PR comment of their own, posted after the review has landed (or after the fallback comment, when the review POST failed), per the **Trial findings comment** procedure in "Error handling". That ordering is the point: a 422 on the review's inline comments is its most common failure, and a trial finding with a bad anchor must not be able to take an approval down the fallback path with it. A failure to post the trial comment is logged to stderr and ignored; it is never retried into the review and never changes the verdict.
 
    If the review POST returns a 4xx (most commonly 422 on the inline comments), use the **fallback PR comment** procedure in the "Error handling" section — one consolidated comment, upserted by HTML marker. **Never** post one PR comment per blocker.
 
-   **After a 2xx from the review POST your job on this PR is effectively done.** Proceed to step 10 (emit telemetry), step 11 (post terminal status check), print the "Posted:" line, and exit. Do not re-enter steps 5–8, do not post a second review on the same SHA, do not process any deep-reviewer stream events that arrive later — those should never arrive (you waited for all of them in step 5), but if they do, ignore them. A second review on the same SHA is a worse outcome than a missed late finding; the next push will trigger a fresh run anyway.
+   **After a 2xx from the review POST your job on this PR is effectively done.** Post the trial findings comment if \`TRIAL_FINDINGS\` is non-empty (or refresh a stale one; see "Error handling"), then proceed to step 10 (emit telemetry), step 11 (post terminal status check), print the "Posted:" line, and exit. Do not re-enter steps 5–8, do not post a second review on the same SHA, do not process any deep-reviewer stream events that arrive later — those should never arrive (you waited for all of them in step 5), but if they do, ignore them. A second review on the same SHA is a worse outcome than a missed late finding; the next push will trigger a fresh run anyway.
 
 10. **Emit telemetry events.** Before the terminal status check, emit the structured CloudWatch log events that drive review metrics. Schema is documented in the "Telemetry events" section. Order does not matter — all events land in the same log group and are joined at query time.
 
@@ -474,7 +474,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
         --argjson wall "$WALL_MS" \\
         '{service_name:"delegate-reviewer",event:"review_posted",repo:$repo,pr_number:$pr,head_sha:$sha,is_rereview:$rereview,scout_leads:$leads,deep_reviewers_dispatched:$drs,deep_reviewer_failures:$drfails,scout_failed:$scoutfail,blockers_posted:$blockers,blockers_suppressed_by_saturation:$suppressed,prior_review_count:$priorcount,advisory_mode:$advisory,verdict:$verdict,recommendation:$rec,tdd_linkage_ok:$linkage_ok,self_review:$self_review,permission_change:$perm_change,wall_time_ms:$wall}'
 
-    Then emit ONE \`finding_emitted\` event per inline comment you posted (or per blocker section in the fallback comment), using the \`finding_id → (file, line, severity, lead area/category, has_suggestion)\` mapping you remembered in step 9:
+    Then emit ONE \`finding_emitted\` event per inline comment you posted (or per blocker section in the fallback comment), and one per section in the trial findings comment with \`severity\` \`"trial"\`, using the \`finding_id → (file, line, severity, lead area/category, has_suggestion)\` mapping you remembered in step 9:
 
       jq -nc \\
         --arg repo "$REPO" \\
@@ -489,7 +489,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
         --arg lcat "$LEAD_CATEGORY" \\
         '{service_name:"delegate-reviewer",event:"finding_emitted",repo:$repo,pr_number:$pr,head_sha:$sha,finding_id:$fid,file:$file,line:$line,severity:$sev,has_suggestion:$hassug,from_lead_area:$larea,from_lead_category:$lcat}'
 
-    If the review was auto-approved (no comments posted) or no blockers were posted on a comment-only review, emit only the \`review_posted\` event — there are no findings to emit. **Telemetry emission must never fail the review.** Wrap each \`jq\` call in a way that swallows errors silently (e.g., \`|| true\`); a missing variable or malformed jq invocation should be logged to stderr and skipped, not bubbled up.
+    If nothing was posted at all (no inline comments, no fallback sections, and no trial findings), emit only the \`review_posted\` event — there are no findings to emit. An auto-approve with trial findings still emits one event per trial finding; those rounds are what the trial measures. **Telemetry emission must never fail the review.** Wrap each \`jq\` call in a way that swallows errors silently (e.g., \`|| true\`); a missing variable or malformed jq invocation should be logged to stderr and skipped, not bubbled up.
 
 11. **Post terminal status check.** After the review has been posted (or on your final error fallback), update the commit status. Reuse the \`$LOGS_URL\` you computed in step 1:
 
@@ -530,7 +530,7 @@ Build the comments array as JSON, then post a single review via the GitHub API. 
 
 Every payload MUST set \`"commit_id": "<HEAD_SHA>"\` (your authoritative \`$REVIEW_HEAD_SHA\`). Omitting it makes GitHub attach the review to whatever the live tip is at post time — which is exactly how an APPROVE can land on commits you never read.
 
-Auto-approve payload (\`comments\` carries \`TRIAL_FINDINGS\` when there are any; the example shows none):
+Auto-approve payload:
 
   {
     "event": "APPROVE",
@@ -592,14 +592,14 @@ Keep the body short: the inline blockers (or the fallback PR comment when those 
 
   _<gates/coverage line>_
 
-- **Justification** — 1–3 sentences on an approval, 2–4 otherwise. One clause of scope for the human's orientation (what the diff touches, drawn from the scout's summary), then what the review verified and what it found, then the decisive reason for this recommendation. When a who-may-approve gate (self-review, permission-change, App config) withheld the bot's APPROVE on an otherwise-clean review, name the gate and the actual paths (canonical phrasing in the sentence list below) and say plainly that the gate controls who may approve, not whether this change is mergeable. That framing is only for those three: when linkage or saturation is what fired, the justification presents the open question the human is deciding (a draft or mismatched design; anchors flagged for the third time), not a mergeability claim. When the recommendation is \`request changes\`, name the blocker themes in one sentence, let the inline comments carry the detail, and end with \`Reply \\\`delegate review\\\` after fixing.\` When \`TRIAL_FINDINGS\` were posted, add one sentence: \`N advisory finding(s) from the prompt critic trial; they do not affect this verdict.\`
+- **Justification** — 1–3 sentences on an approval, 2–4 otherwise. One clause of scope for the human's orientation (what the diff touches, drawn from the scout's summary), then what the review verified and what it found, then the decisive reason for this recommendation. When a who-may-approve gate (self-review, permission-change, App config) withheld the bot's APPROVE on an otherwise-clean review, name the gate and the actual paths (canonical phrasing in the sentence list below) and say plainly that the gate controls who may approve, not whether this change is mergeable. That framing is only for those three: when linkage or saturation is what fired, the justification presents the open question the human is deciding (a draft or mismatched design; anchors flagged for the third time), not a mergeability claim. When the recommendation is \`request changes\`, name the blocker themes in one sentence, let the inline comments carry the detail, and end with \`Reply \\\`delegate review\\\` after fixing.\` When \`TRIAL_FINDINGS\` is non-empty, add one sentence: \`N advisory finding(s) from the prompt critic trial are in a separate comment; they do not affect this verdict.\`
 - **Gates/coverage line** — one italic line. Name the gates that fired with their real matched paths (never a generic parenthetical), the coverage (\`scout + <N>/<N> deep-reviewers clean\`, or which subagent failed), and the linkage status (\`n/a\`, \`ok\`, or the failure). Skip gates that did not fire. On gated or failure rounds, end the line with \`Reply \\\`delegate review\\\` to re-check.\` Examples:
   \`_Gates: permission-change (deploy/components/ci-roles/policies.ts) · Coverage: scout + 3/3 deep-reviewers clean · Linkage: n/a — Reply \\\`delegate review\\\` to re-check._\`
   \`_Coverage: scout + 2/2 deep-reviewers clean · Linkage: verified against [tech design](<TDD_URL>)._\`
 
 **Advisory-mode body** (for \`event=COMMENT\` when \`ADVISORY_MODE=true\`):
 
-Body shape — the recommendation line comes first (always \`comment\` in advisory mode: the bot is explicitly not vouching anymore), then the mode explanation, then any blockers as plain markdown. The \`comments\` array stays empty; the bot does not anchor inline on advisory rounds.
+Body shape — the recommendation line comes first (always \`comment\` in advisory mode: the bot is explicitly not vouching anymore), then the mode explanation, then any blockers as plain markdown. The \`comments\` array stays empty; the bot does not anchor inline on advisory rounds. Trial findings are not rendered in this body either; they go in the trial findings comment, as on every other round.
 
   **Recommendation: comment**
 
@@ -688,7 +688,7 @@ Emitted exactly once per orchestrator run, in step 10, AFTER the review POST has
 
 ### \`finding_emitted\`
 
-Emitted once per inline comment (or fallback section) posted in this run, in step 10. Zero such events on auto-approve or zero-blocker comment-only review.
+Emitted once per inline comment (or fallback section) and once per trial finding posted in this run, in step 10. Zero such events only when nothing was posted: an auto-approve or zero-blocker round with no trial findings.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -696,7 +696,7 @@ Emitted once per inline comment (or fallback section) posted in this run, in ste
 | \`head_sha\` | string | |
 | \`finding_id\` | string (UUIDv4) | the same UUID embedded in the comment's HTML marker |
 | \`file\` | string | repo-relative path |
-| \`line\` | integer | the comment's anchor line (the \`line\` field of the posted comment, not \`start_line\`) |
+| \`line\` | integer | the comment's anchor line (the \`line\` field of the posted comment, not \`start_line\`); for a trial finding, the line its section names |
 | \`severity\` | string | \`"blocker"\`, or \`"trial"\` for a trial finding; nothing else is ever posted |
 | \`has_suggestion\` | boolean | true if the body contains a \`\\\`\\\`\\\`suggestion\\\`\\\`\\\`\` block |
 | \`from_lead_area\` | string | the scout lead's \`area\` field; \`""\` if unknown |
@@ -775,7 +775,7 @@ Procedure:
         --input <(jq -n --rawfile b "$BODY" '{body: $b}')
     fi
 
-Comment body shape (single comment, all blockers consolidated):
+Comment body shape (single comment, all blockers consolidated; trial findings never go here, they have their own comment below):
 
     <!-- delegate-reviewer-state -->
     <one of the comment-only body shapes from "Review body format">
@@ -784,6 +784,22 @@ Comment body shape (single comment, all blockers consolidated):
 
     ### \`path/to/file.ts:LINE\` — <one-line title>
     <body of finding, suggestion block preserved verbatim>
+
+    ### \`path/to/other.ts:LINE\` — <next>
+    ...
+
+### Trial findings comment — upsert by marker
+
+Trial findings (step 6) are posted in one PR comment of their own, after the review (or the fallback comment) has landed. Same upsert procedure as above, with the marker \`<!-- delegate-reviewer-trial -->\` in place of \`<!-- delegate-reviewer-state -->\`, so the two comments never collide. Give each trial finding a fresh UUIDv4 \`finding_id\` and end its section with the same \`<!-- delegate-finding-id: <uuid> -->\` marker inline comments carry, so step 10 emits it like any other finding. When \`TRIAL_FINDINGS\` is empty but a prior trial comment exists, PATCH it to the marker plus the single line \`No advisory findings this round.\` so a stale advisory does not outlive its cause. When it is empty and no prior comment exists, post nothing.
+
+Comment body shape:
+
+    <!-- delegate-reviewer-trial -->
+    **Advisory findings (prompt critic trial).** These do not affect the verdict or the recommendation above. They are here so the critic can be read on real changes before its findings are allowed to withhold approval.
+
+    ### \`path/to/file.ts:LINE\` — <one-line title>
+    <body of finding, suggestion block preserved verbatim>
+    <!-- delegate-finding-id: <uuid> -->
 
     ### \`path/to/other.ts:LINE\` — <next>
     ...
