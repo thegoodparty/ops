@@ -352,6 +352,8 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
 6. **Aggregate — keep blockers only, then apply saturation cap.** Collect the JSON findings from every deep-reviewer. Dedupe entries that overlap (prefer the most specific wording; prefer a finding that cites an \`ai-rules/\` rule by name over one that doesn't, because the citation is the more actionable one). **Drop every finding whose severity is not \`blocker\`.** Concerns and nits are discarded entirely — this bot does not surface non-blocking commentary.
 
+   **Trial rule files.** \`TRIAL_RULE_FILES\` is the list [\`ai-rules/prompts.md\`]. After the blocker filter, move every remaining finding whose body cites a file in that list into \`TRIAL_FINDINGS\`. Trial findings are posted (step 9) but are not blockers: they skip the saturation cap below, do not count in step 8, and never set \`request-changes\`. The list exists so a new critic can be read on real PRs before its findings are allowed to withhold approval; ending a trial is removing the file from the list.
+
    **On re-review only:** additionally drop any finding whose \`(path, line)\` matches a skip-list entry AND whose body substantively repeats the prior comment (same issue, not merely adjacent code). Be strict about "substantively repeats" — if the prior comment flagged a null-check and the new finding flags a different bug on the same line, post the new one. When in doubt, drop it; duplicates are worse than a missed finding.
 
    **Same-line saturation cap.** For each remaining blocker, look up \`(path, line)\` in \`$PRIOR_BLOCKER_LINES\` (built in step 2). If that anchor has been flagged in **2 or more** prior reviews on this PR, drop the new blocker unconditionally — even if its content differs from the prior ones. Rationale: by the third round on the same anchor, the bot has either repeated itself, oscillated, or chased adjacent issues — none of which produces useful new signal for the author. The author has heard the bot; the human reviewer can decide. This rule applies whether or not the deep-reviewer's anti-reversal logic caught the contradiction internally; it's a structural backstop.
@@ -413,7 +415,7 @@ On a re-review, additionally reconcile with the bot's prior review state on this
    Otherwise (\`ADVISORY_MODE=false\`), pick between auto-approve and the normal comment-only review:
 
    - **Auto-approve** if ALL of the following hold:
-     - Zero blocker findings (after the saturation cap in step 6).
+     - Zero blocker findings (after the saturation cap in step 6). \`TRIAL_FINDINGS\` do not count.
      - \`BLOCKERS_SUPPRESSED_BY_SATURATION=0\`. If any blocker was suppressed by the saturation cap, do NOT auto-approve: the cap's rationale is "the human reviewer can decide," so this round must remain comment-only.
      - \`LINKAGE_OK=true\` (no TDD referenced, OR the referenced TDD is blessed and matches the diff).
      - The scout returned valid JSON AND every dispatched deep-reviewer returned valid JSON. If the scout failed, you never had a list of leads to verify; if a deep-reviewer failed, its lead was never verified — in either case your "no blockers" signal would only mean "no blockers found by the subagents that ran." A scout that legitimately emits zero leads is NOT a failure — it's a positive signal that the diff is low-risk; that path auto-approves.
@@ -427,15 +429,17 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Then set \`RECOMMENDATION\` — the advice to the human reviewer, which the event alone does not express.** The value is a single lowercase token — \`approve\`, \`comment\`, or \`request-changes\` (hyphenated) — because it is written verbatim into telemetry, the status check description, and the log line. The body line alone renders it with a space, matching GitHub's own vocabulary: \`Recommendation: request changes\`. The mapping:
 
-   - \`request-changes\`: one or more blockers are being posted. The inline comments carry the substance; the recommendation points at them.
-   - \`approve\`: zero blockers, full subagent coverage, and \`LINKAGE_OK=true\` — *regardless* of the self-review, permission-change, or App-config gates. Those gates say who may approve, not whether the change is mergeable; the justification names the gate and states that the bot's own approval is withheld by it.
+   - \`request-changes\`: one or more blockers are being posted. The inline comments carry the substance; the recommendation points at them. Trial findings alone never produce it.
+   - \`approve\`: zero blockers, full subagent coverage, and \`LINKAGE_OK=true\` — *regardless* of the self-review, permission-change, or App-config gates. Those gates say who may approve, not whether the change is mergeable; the justification names the gate and states that the bot's own approval is withheld by it. Trial findings alone never change it.
    - \`comment\`: the analysis cannot fully vouch, or a judgment call belongs to the human — scout or deep-reviewer failure (incomplete coverage), blockers suppressed by the saturation cap, any linkage failure, the tip moved mid-review, or any advisory-mode round.
 
 9. **Post the review.** ONE \`gh api\` call.
 
-   - Auto-approve: \`event=APPROVE\`, empty \`comments\` array, body per the **Review body format** rules below, with recommendation \`approve\`.
-   - Comment-only (normal): \`event=COMMENT\`, inline comments only for blocker findings, body per the **Review body format** rules below, with the recommendation step 8 computed. Even when there are zero blockers, still post the comment-only review — the body carries the recommendation and the gate reasoning the human needs.
+   - Auto-approve: \`event=APPROVE\`, \`comments\` holding only \`TRIAL_FINDINGS\` (empty when there are none), body per the **Review body format** rules below, with recommendation \`approve\`.
+   - Comment-only (normal): \`event=COMMENT\`, inline comments for blocker findings and \`TRIAL_FINDINGS\`, body per the **Review body format** rules below, with the recommendation step 8 computed. Even when there are zero blockers, still post the comment-only review — the body carries the recommendation and the gate reasoning the human needs.
    - Comment-only (advisory mode): \`event=COMMENT\`, **empty \`comments\` array** (do NOT post inline anchors), body per the **Advisory-mode body** rules below. The remaining blockers are rendered as plain markdown sections inside the body itself, not as inline review comments. This is the structural part of advisory mode — the bot has decided to stop blocking after N rounds, and the visual signal of "no inline blockers, just a body summary" matches that decision.
+
+   Trial findings post inline on both the auto-approve and the comment-only (normal) events. Each one's body opens with \`**Advisory (prompt critic trial).** This finding does not affect the verdict.\` and otherwise follows the normal finding format. In advisory mode they are rendered in the body with the rest, under their own heading.
 
    If the review POST returns a 4xx (most commonly 422 on the inline comments), use the **fallback PR comment** procedure in the "Error handling" section — one consolidated comment, upserted by HTML marker. **Never** post one PR comment per blocker.
 
@@ -526,7 +530,7 @@ Build the comments array as JSON, then post a single review via the GitHub API. 
 
 Every payload MUST set \`"commit_id": "<HEAD_SHA>"\` (your authoritative \`$REVIEW_HEAD_SHA\`). Omitting it makes GitHub attach the review to whatever the live tip is at post time — which is exactly how an APPROVE can land on commits you never read.
 
-Auto-approve payload:
+Auto-approve payload (\`comments\` carries \`TRIAL_FINDINGS\` when there are any; the example shows none):
 
   {
     "event": "APPROVE",
@@ -588,7 +592,7 @@ Keep the body short: the inline blockers (or the fallback PR comment when those 
 
   _<gates/coverage line>_
 
-- **Justification** — 1–3 sentences on an approval, 2–4 otherwise. One clause of scope for the human's orientation (what the diff touches, drawn from the scout's summary), then what the review verified and what it found, then the decisive reason for this recommendation. When a who-may-approve gate (self-review, permission-change, App config) withheld the bot's APPROVE on an otherwise-clean review, name the gate and the actual paths (canonical phrasing in the sentence list below) and say plainly that the gate controls who may approve, not whether this change is mergeable. That framing is only for those three: when linkage or saturation is what fired, the justification presents the open question the human is deciding (a draft or mismatched design; anchors flagged for the third time), not a mergeability claim. When the recommendation is \`request changes\`, name the blocker themes in one sentence, let the inline comments carry the detail, and end with \`Reply \\\`delegate review\\\` after fixing.\`
+- **Justification** — 1–3 sentences on an approval, 2–4 otherwise. One clause of scope for the human's orientation (what the diff touches, drawn from the scout's summary), then what the review verified and what it found, then the decisive reason for this recommendation. When a who-may-approve gate (self-review, permission-change, App config) withheld the bot's APPROVE on an otherwise-clean review, name the gate and the actual paths (canonical phrasing in the sentence list below) and say plainly that the gate controls who may approve, not whether this change is mergeable. That framing is only for those three: when linkage or saturation is what fired, the justification presents the open question the human is deciding (a draft or mismatched design; anchors flagged for the third time), not a mergeability claim. When the recommendation is \`request changes\`, name the blocker themes in one sentence, let the inline comments carry the detail, and end with \`Reply \\\`delegate review\\\` after fixing.\` When \`TRIAL_FINDINGS\` were posted, add one sentence: \`N advisory finding(s) from the prompt critic trial; they do not affect this verdict.\`
 - **Gates/coverage line** — one italic line. Name the gates that fired with their real matched paths (never a generic parenthetical), the coverage (\`scout + <N>/<N> deep-reviewers clean\`, or which subagent failed), and the linkage status (\`n/a\`, \`ok\`, or the failure). Skip gates that did not fire. On gated or failure rounds, end the line with \`Reply \\\`delegate review\\\` to re-check.\` Examples:
   \`_Gates: permission-change (deploy/components/ci-roles/policies.ts) · Coverage: scout + 3/3 deep-reviewers clean · Linkage: n/a — Reply \\\`delegate review\\\` to re-check._\`
   \`_Coverage: scout + 2/2 deep-reviewers clean · Linkage: verified against [tech design](<TDD_URL>)._\`
@@ -693,7 +697,7 @@ Emitted once per inline comment (or fallback section) posted in this run, in ste
 | \`finding_id\` | string (UUIDv4) | the same UUID embedded in the comment's HTML marker |
 | \`file\` | string | repo-relative path |
 | \`line\` | integer | the comment's anchor line (the \`line\` field of the posted comment, not \`start_line\`) |
-| \`severity\` | string | literal \`"blocker"\` — non-blockers are never posted |
+| \`severity\` | string | \`"blocker"\`, or \`"trial"\` for a trial finding; nothing else is ever posted |
 | \`has_suggestion\` | boolean | true if the body contains a \`\\\`\\\`\\\`suggestion\\\`\\\`\\\`\` block |
 | \`from_lead_area\` | string | the scout lead's \`area\` field; \`""\` if unknown |
 | \`from_lead_category\` | string | the scout lead's \`category\` field; \`""\` if unknown |
