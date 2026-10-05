@@ -85,8 +85,20 @@ All API calls go to `https://swarm.goodparty.org` with
 
 ## Dashboard
 
-Open https://app.agent-swarm.dev, point it at `https://swarm.goodparty.org`,
-and sign in with the `API_KEY` value from the secret.
+Caddy serves the dashboard SPA at https://swarm.goodparty.org and proxies
+the API path prefixes (`/api/*`, `/p/*`, `/@swarm/*`, `/mcp`, `/health`, ...)
+to the `api` container; every other path falls back to `index.html`.
+
+The SPA is built on the host from a clone of the pinned tag at
+`/opt/agent-swarm/src`: `bun install --frozen-lockfile && bun run build` in
+`apps/ui`, output copied to `/opt/agent-swarm/ui-dist`, which the `caddy`
+service mounts read-only at `/srv/ui`. Rebuild and recopy on every version
+bump.
+
+First visit redirects to `/setup`. Enter API URL `https://swarm.goodparty.org`
+and either the `API_KEY` from the secret or a per-user `aswt_` token. The
+hosted https://app.agent-swarm.dev still works against this API as a fallback
+(`CORS_ALLOWED_ORIGINS` is left at its default allowlist).
 
 ## AWS access from inside the swarm
 

@@ -62,7 +62,7 @@ REVIEWER_AGENT_ID=a0799d09-6816-445a-957d-1339b672d38b
 SWARM_API_DOMAIN=swarm.goodparty.org
 MCP_BASE_URL=https://swarm.goodparty.org
 PUBLIC_MCP_BASE_URL=https://swarm.goodparty.org
-APP_URL=https://app.agent-swarm.dev
+APP_URL=https://swarm.goodparty.org
 API_DRAIN_MAX_MS=30000
 
 EMBEDDING_API_BASE_URL=http://tei:80/v1
