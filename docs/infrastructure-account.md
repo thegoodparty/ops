@@ -37,10 +37,11 @@ starting the work, not after. Make `who` name the *session*, not the model.
       assume it, and a transient failure there is expected rather than a
       permissions bug.
 - [ ] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
-      the new OU: todo. This is applied by `deploy.yml` and its consumer is
-      applied by `deploy-org.yml`, so it must merge **and finish applying**
-      before step 5. See "Apply ordering between workflows" in the workbench
-      document for why the grant cannot ride along with the policy it enables.
+      the new OU: doing (pi-infra-step4, 2026-10-05). This is applied by
+      `deploy.yml` and its consumer is applied by `deploy-org.yml`, so it must
+      merge **and finish applying** before step 5. See "Apply ordering between
+      workflows" in the workbench document for why the grant cannot ride along
+      with the policy it enables.
 - [ ] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`:
       todo. Design in "The infrastructure SCP" below; read that before
       starting, not this summary.
