@@ -3,7 +3,7 @@ set -euo pipefail
 
 SECRET_ID=AGENT_SWARM
 REGION=us-west-2
-MANIFEST=/Users/swain/.claude/jobs/6b936fd3/tmp/swarm-slack-manifest.json
+MANIFEST="$(dirname "$0")/slack-manifest.json"
 
 bold() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 ask() {
