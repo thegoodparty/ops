@@ -90,6 +90,57 @@ const workbench = new aws.organizations.Account(
 export const workbenchOuId = workbenchOu.id;
 export const workbenchAccountId = workbench.id;
 
+// The second OU and account, for internal automation and machinery. Design and
+// staging are in docs/infrastructure-account.md. The workbench account above
+// is deliberately sleepy; this one is not, because it runs build automation
+// and privileged maintenance. That is why it gets its own SCP (below) rather
+// than the Workbench one, and why the two accounts sit in separate OUs.
+//
+// The same orphan warning as the Workbench OU applies: Organizations does not
+// enforce unique OU names under a parent, so an apply that fails partway and
+// leaves the OU in AWS but not in state produces a *second* OU also called
+// Infrastructure on a rerun. Check for an orphan before rerunning this file.
+const infrastructureOu = new aws.organizations.OrganizationalUnit(
+  "infrastructure",
+  {
+    name: "Infrastructure",
+    parentId: "r-jqqe",
+  },
+);
+
+// The same four independent guards as the workbench account above, for the
+// same reason: deleting this account is the thing reviewing this file is for.
+// `protect: true` blocks the delete; `closeOnDeletion: false` makes a delete
+// that somehow got past it detach rather than close; and
+// github-actions-org-deploy holds neither organizations:CloseAccount nor
+// organizations:RemoveAccountFromOrganization, so IAM refuses both delete
+// paths independently. Do not add either action in order to make a destroy
+// work.
+//
+// CreateAccount is asynchronous here too, so expect the apply to take minutes,
+// and the likely failure is EMAIL_ALREADY_EXISTS. The address is the group
+// alias from step 1 of the plan, never a person: it is the break-glass
+// recovery path for this account's root user.
+const infrastructure = new aws.organizations.Account(
+  "infrastructure",
+  {
+    name: "goodparty-infrastructure",
+    email: "aws-infrastructure@goodparty.org",
+    parentId: infrastructureOu.id,
+    iamUserAccessToBilling: "ALLOW",
+    closeOnDeletion: false,
+  },
+  { protect: true },
+);
+
+// Exported for humans reading `pulumi stack output`, and to record the ids in
+// docs/infrastructure-account.md at step 3. Deliberately not consumed by the
+// other projects through a StackReference, on the same grounds as the
+// workbench ids above: the values are immutable for the life of the account,
+// so the consuming projects hardcode them as constants instead.
+export const infrastructureOuId = infrastructureOu.id;
+export const infrastructureAccountId = infrastructure.id;
+
 // ---------------------------------------------------------------------------
 // The workbench service control policy. Step 9 part 3 of
 // docs/workbench-account.md; the document itself is in ./policies.ts and the
