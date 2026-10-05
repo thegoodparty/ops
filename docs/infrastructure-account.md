@@ -25,9 +25,9 @@ starting the work, not after. Make `who` name the *session*, not the model.
       the alias is the root-user recovery path. It must be a group rather than
       a person, and it must never have been used for any other AWS account.
 - [ ] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
-      account in `deploy-org/`: todo. No grant PR in front of this one; the
-      existing `github-actions-org-deploy` policy already covers OU and
-      account creation and the reads that follow.
+      account in `deploy-org/`: doing (pi-infra-step2, 2026-10-05). No grant PR
+      in front of this one; the existing `github-actions-org-deploy` policy
+      already covers OU and account creation and the reads that follow.
 - [ ] 3. Record the account id and OU id below, then let it settle: todo.
       `CreateAccount` is asynchronous and the id is unknown until it lands, so
       this is a separate step. The settle is the same one workbench step 6
