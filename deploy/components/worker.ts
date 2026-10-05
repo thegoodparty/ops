@@ -85,6 +85,32 @@ export const createWorker = (config: WorkerConfig) => {
     ],
   });
 
+  const reviewsBucket = new aws.s3.BucketV2("reviewsBucket", {
+    bucket: "delegate-reviews",
+  });
+
+  new aws.s3.BucketVersioningV2("reviewsBucketVersioning", {
+    bucket: reviewsBucket.id,
+    versioningConfiguration: { status: "Enabled" },
+  });
+
+  new aws.s3.BucketPublicAccessBlock("reviewsBucketPublicAccess", {
+    bucket: reviewsBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+  });
+
+  new aws.s3.BucketServerSideEncryptionConfigurationV2("reviewsBucketEncryption", {
+    bucket: reviewsBucket.id,
+    rules: [
+      {
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+      },
+    ],
+  });
+
   const taskRole = new aws.iam.Role("agentTaskRole", {
     name: "delegate-task-role",
     assumeRolePolicy: JSON.stringify({
@@ -146,6 +172,18 @@ export const createWorker = (config: WorkerConfig) => {
               Resource: ["*"],
             },
             {
+              Sid: "ReviewBucketObjects",
+              Effect: "Allow",
+              Action: ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"],
+              Resource: ["arn:aws:s3:::delegate-reviews/*"],
+            },
+            {
+              Sid: "ReviewBucketList",
+              Effect: "Allow",
+              Action: ["s3:ListBucket"],
+              Resource: ["arn:aws:s3:::delegate-reviews"],
+            },
+            {
               Sid: "LambdaMetadataNoEnvVars",
               Effect: "Allow",
               Action: [
@@ -188,7 +226,13 @@ export const createWorker = (config: WorkerConfig) => {
         cpu: 1024,
         memory: 4096,
         essential: true,
-        environment: [{ name: "AWS_DEFAULT_REGION", value: "us-west-2" }],
+        environment: [
+          { name: "AWS_DEFAULT_REGION", value: "us-west-2" },
+          { name: "REVIEW_BUCKET", value: "delegate-reviews" },
+          // The image tag is the ops commit; the review record stores it as
+          // agentVersion so evals can name the variant that produced a review.
+          { name: "AGENT_VERSION", value: config.imageUri.split(":").pop() ?? "unknown" },
+        ],
         secrets: config.secretKeys.sort().map((key) => ({
           name: key,
           valueFrom: `${config.secretArn}:${key}::`,

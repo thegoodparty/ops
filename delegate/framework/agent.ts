@@ -1,5 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentConfig, AgentResult } from "./types";
+import type { AgentConfig, AgentResult, RunOverrides } from "./types";
 
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
@@ -41,15 +41,22 @@ const forceSynchronousTaskHook = async (input: unknown) => {
 export const runAgent = async (
   config: AgentConfig,
   message: string,
-  cwd?: string,
-  abortController?: AbortController,
+  cwdOrOverrides?: string | RunOverrides,
+  legacyAbortController?: AbortController,
 ): Promise<AgentResult> => {
+  const overrides: RunOverrides =
+    typeof cwdOrOverrides === "string" || cwdOrOverrides === undefined
+      ? { cwd: cwdOrOverrides, abortController: legacyAbortController }
+      : cwdOrOverrides;
+  const { cwd, abortController } = overrides;
   const start = Date.now();
   let output = "";
   let sessionId: string | undefined;
   let turnCount = 0;
   let costUsd: number | undefined;
   let resultTurns: number | undefined;
+  let structuredOutput: unknown;
+  let errorSubtype: string | undefined;
 
   for await (const msg of query({
     prompt: message,
@@ -57,7 +64,13 @@ export const runAgent = async (
       abortController,
       systemPrompt: config.systemPrompt,
       model: config.model,
-      mcpServers: config.mcpServers,
+      mcpServers:
+        config.mcpServers || overrides.mcpServers
+          ? { ...config.mcpServers, ...overrides.mcpServers }
+          : undefined,
+      env: overrides.env,
+      tools: config.tools,
+      outputFormat: config.outputFormat,
       agents: config.agents,
       plugins: config.plugins,
       settingSources: config.settingSources,
@@ -77,7 +90,9 @@ export const runAgent = async (
       permissionMode: config.permissionMode ?? "bypassPermissions",
       cwd,
       hooks: {
-        PreToolUse: [{ hooks: [forceSynchronousTaskHook] }],
+        PreToolUse: [
+          { hooks: [forceSynchronousTaskHook, ...(overrides.preToolUseHooks ?? [])] },
+        ],
       },
       stderr: (data: string) => console.error("[claude stderr]", data),
     },
@@ -186,6 +201,7 @@ export const runAgent = async (
       output = msg.result;
       costUsd = msg.total_cost_usd;
       resultTurns = msg.num_turns;
+      structuredOutput = msg.structured_output;
       log(config.name, "completed", {
         turns: msg.num_turns,
         costUsd: msg.total_cost_usd,
@@ -218,6 +234,7 @@ export const runAgent = async (
       output = `Agent error: ${err.errors ?? "unknown error"}`;
       costUsd = err.total_cost_usd;
       resultTurns = err.num_turns;
+      errorSubtype = err.subtype;
       log(config.name, "error", {
         subtype: err.subtype,
         errors: err.errors,
@@ -247,5 +264,7 @@ export const runAgent = async (
     sessionId,
     costUsd,
     turns: resultTurns,
+    structuredOutput,
+    errorSubtype,
   };
 };
