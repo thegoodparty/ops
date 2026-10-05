@@ -6,18 +6,12 @@ import type { Decision } from "./gates";
 
 const approveDecision: Decision = { verdict: "approve", action: "approve", gates: [] };
 const commentDecision: Decision = { verdict: "comment", action: "comment", gates: [] };
-const gatedDecision: Decision = {
-  verdict: "approve",
-  action: "comment",
-  gates: ["never-approve-author"],
-};
 
 const baseArgs = {
   decision: approveDecision,
   summary: "Looks good",
   runId: "00000000-0000-0000-0000-000000000001",
   headSha: "abc1234567890def",
-  author: "swain",
   carriedForward: [] as Array<{ id: string; path: string; line: number; url?: string }>,
   demoted: [] as Finding[],
 };
@@ -36,18 +30,6 @@ describe("renderBody", () => {
   it("includes the summary text", () => {
     const body = renderBody(baseArgs);
     assert.ok(body.includes("Looks good"));
-  });
-
-  it("includes the never-approve gate message with author name", () => {
-    const body = renderBody({ ...baseArgs, decision: gatedDecision });
-    assert.ok(body.includes("never-approve list"));
-    assert.ok(body.includes("swain"));
-    assert.ok(body.includes("human must approve"));
-  });
-
-  it("does not include gate message when no gates", () => {
-    const body = renderBody(baseArgs);
-    assert.ok(!body.includes("never-approve list"));
   });
 
   it("lists carried-forward findings with link when url is present", () => {

@@ -133,7 +133,6 @@ Lambda ── RunTask ──▶ Fargate worker                Lambda ── RunT
                                                                           ▼
                                                                         review/run.ts
                                                                           │ verdict = findings.length === 0
-                                                                          │ never-approve author gate
                                                                           │ anchor findings to diff lines
                                                                           │ superseded if tip moved; dismiss stale approve
                                                                           │ resolve / un-resolve own threads
@@ -144,7 +143,7 @@ Lambda ── RunTask ──▶ Fargate worker                Lambda ── RunT
 Rules that hold regardless of what the model says:
 
 - Approve means zero findings. A finding is a blocker. The bot never posts REQUEST_CHANGES.
-- Authors in `NEVER_APPROVE_AUTHORS` (`delegate/review/gates.ts`) get a comment-only review whose body still says `Recommendation: approve`; a human approves.
+- Who may merge is not delegate's decision. Classic branch protection on `main` (omni and ops) restricts pushes, and therefore merges, to the `gp-contrib` team; bots open and review PRs but cannot merge them.
 - The review and the `pr-reviewer` status are pinned to the sha that was checked out. `pr-reviewer` is a required check on omni, so a new push is unmergeable until its own run finishes.
 - One run per `(pr, sha)` from webhooks (S3 conditional-put lock). Runs on different shas of the same PR may overlap. If the tip has moved by the time a run is ready to post, it posts nothing: the status on its sha reads "Superseded", the record is kept with `action: skipped`, and the newer sha's run carries the findings. An approve that lands just before a push is dismissed. `delegate review` bypasses the lock with a new run id.
 - Re-review compares against the bot's own last record in S3, not GitHub thread state. Still-present findings are not reposted; their threads are listed in the body and un-resolved if a human resolved them. Fixed findings get their threads resolved.

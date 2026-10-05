@@ -6,7 +6,6 @@ export const renderBody = (args: {
   summary: string;
   runId: string;
   headSha: string;
-  author: string;
   carriedForward: Array<{ id: string; path: string; line: number; url?: string }>;
   demoted: Finding[];
 }): string => {
@@ -15,12 +14,6 @@ export const renderBody = (args: {
 
   parts.push(`**Recommendation: ${args.decision.verdict}**`);
   parts.push(args.summary);
-
-  if (args.decision.gates.includes("never-approve-author")) {
-    parts.push(
-      `Approval withheld: ${args.author} is on the never-approve list; a human must approve.`,
-    );
-  }
 
   if (args.carriedForward.length > 0) {
     const n = args.carriedForward.length;

@@ -302,7 +302,7 @@ export const runReview = async (args: {
     return fail(output.reason, { output, costUsd: result.costUsd });
   }
 
-  const decision = decide(output, { author: bundle.author });
+  const decision = decide(output);
   const priorById = new Map((prior?.findings ?? []).map((f) => [f.id, f]));
   const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
 
@@ -330,7 +330,6 @@ export const runReview = async (args: {
     summary: output.summary,
     runId,
     headSha,
-    author: bundle.author,
     carriedForward: carried.map((f) => ({
       id: f.id,
       path: f.path,
