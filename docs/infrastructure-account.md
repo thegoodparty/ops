@@ -47,9 +47,21 @@ starting the work, not after. Make `who` name the *session*, not the model.
       was live; the log shows the document Pulumi actually sent, which is the
       same read-back shape workbench step 9 part 2 used. That is the evidence
       step 5's attach will not be refused.)
-- [ ] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`:
-      doing (pi-infra-step5, 2026-10-05). Design in "The infrastructure SCP"
-      below; read that before starting, not this summary.
+- [x] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`: done
+      (2026-10-05, pi-infra-step5). `deploy-org/policies.ts` holds
+      `infrastructureScp` and `deploy-org/index.ts` the `aws.organizations.Policy`
+      and `PolicyAttachment`, following `workbenchScp` and its comments. Three
+      statements, per "The infrastructure SCP" below; the three denies the
+      workbench policy carries that are deliberately absent here are recorded
+      as exclusions rather than left to look like omissions. Unprotected,
+      deliberately: the failure mode of an SCP is denying something real, and
+      the way out sits outside the policy — SCPs never apply to the management
+      account, and github-actions-org-deploy can detach from exactly the two
+      OUs it can attach to. Marked done in the PR that creates it, per workbench
+      step 13: the merge's `Deploy org` run is the read-back, so a red run
+      beside this entry means the entry is wrong in the visible way. It has to
+      be green before step 7, because this policy binds the in-account
+      `pulumi-deploy` role step 7 creates.
 - [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
       Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
       Applied by `deploy.yml`; must merge and finish applying before step 7.

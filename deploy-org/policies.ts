@@ -1,22 +1,25 @@
-// The service control policy attached to the Workbench OU.
+// The service control policies: one for the Workbench OU and one for the
+// Infrastructure OU.
 //
 // In TypeScript rather than JSON so the shape is type-checked, matching
 // deploy/components/*/policies.ts. Design, and the reasoning for every
-// statement below, is in docs/workbench-account.md under "The workbench SCP".
-// Read that before changing anything here: several of these look
-// over-cautious until you know what they are guarding, and two of the
-// exemptions look like holes until you know what breaks without them.
+// statement, is in docs/workbench-account.md under "The workbench SCP" and
+// docs/infrastructure-account.md under "The infrastructure SCP". Read the
+// relevant one before changing anything here: several of the workbench
+// statements look over-cautious until you know what they are guarding, and
+// two of its exemptions look like holes until you know what breaks without
+// them.
 //
-// Shape: a deny list layered on top of the AWS-managed FullAWSAccess, not an
-// allow-list replacing it. An allow-list means detaching FullAWSAccess, and
-// any gap in the replacement takes the account out entirely rather than
-// refusing one service.
+// Shape, for both: a deny list layered on top of the AWS-managed
+// FullAWSAccess, not an allow-list replacing it. An allow-list means
+// detaching FullAWSAccess, and any gap in the replacement takes the account
+// out entirely rather than refusing one service.
 //
-// Scope, so this is not credited with more than it does: it binds every
-// principal in the workbench account, including `pulumi-deploy`, the role CI
-// deploys as there (`OrganizationAccountAccessRole` until step 10's cutover).
-// It does not bind the management account,
-// which is exempt from SCPs by design and is where production runs.
+// Scope, so neither is credited with more than it does: each binds every
+// principal in its own account, including the in-account `pulumi-deploy` role
+// CI deploys as there, and neither binds the management account, which is
+// exempt from SCPs by design and is where production runs. The workbench one
+// also bound `OrganizationAccountAccessRole` until step 10's cutover.
 
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 
@@ -210,6 +213,75 @@ export const workbenchScp: PolicyDocument = {
       Condition: {
         StringNotEquals: { "aws:RequestedRegion": REGION },
       },
+    },
+  ],
+};
+
+// The service control policy attached to the Infrastructure OU.
+//
+// Design is in docs/infrastructure-account.md under "The infrastructure SCP".
+// It is deliberately three statements where the workbench policy has six. The
+// three denies the workbench account can afford are exclusions here rather
+// than omissions, and each exclusion is argued in that section: a region deny
+// would refuse the cross-region scans and maintenance the account exists for,
+// a cross-account S3 deny would block automation that reads other accounts'
+// buckets, and a data-store deny would refuse DynamoDB locking and RDS
+// reporting before anyone has decided those jobs do not exist.
+//
+// What remains is only what is universal. These three hold whatever the
+// account is used for, which is why they are safe to write now, while it is
+// empty. The same review rule as the workbench policy applies: this binds the
+// in-account `pulumi-deploy` role step 7 will create, so every future addition
+// has to be checked against what deploy-infrastructure.yml does, not only
+// against what a person does.
+export const infrastructureScp: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      // Leaving strands the account outside consolidated billing and outside
+      // every governance control at once, including this policy.
+      Sid: "DenyLeaveOrganization",
+      Effect: "Deny",
+      Action: "organizations:LeaveOrganization",
+      Resource: "*",
+    },
+    {
+      // Access here is federated through Identity Center or assumed. A
+      // long-lived access key in an account that exists to hold privileged
+      // automation is the credential most likely to end up somewhere it
+      // cannot be revoked from.
+      //
+      // Deliberately not iam:CreateRole. Step 7 creates the in-account
+      // `pulumi-deploy` and `pulumi-preview` roles and any scanner roles are
+      // created by IAM too, so denying role creation breaks the pipeline.
+      //
+      // This is the statement most likely to need loosening if a third-party
+      // tool insists on an IAM user. Loosen it deliberately, in a PR that
+      // names the tool.
+      Sid: "DenyIamUsersAndLongLivedKeys",
+      Effect: "Deny",
+      Action: [
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+      ],
+      Resource: "*",
+    },
+    {
+      // Inert until there is a trail, and correct the moment there is one.
+      // This matters more here than in the workbench account: an attacker who
+      // reaches privileged automation would want the audit trail off, and a
+      // tamper deny written before the trail exists is what makes the trail
+      // trustworthy afterwards.
+      Sid: "DenyCloudTrailTampering",
+      Effect: "Deny",
+      Action: [
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:UpdateTrail",
+        "cloudtrail:PutEventSelectors",
+      ],
+      Resource: "*",
     },
   ],
 };
