@@ -26,16 +26,20 @@ starting the work, not after. Make `who` name the *session*, not the model.
       without a working address, and the alias is the root-user recovery path.
       It must be a group rather than a person, and it must never have been
       used for any other AWS account.
-- [ ] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
-      account in `deploy-org/`: doing (pi-infra-step2, 2026-10-05). No grant PR
-      in front of this one; the existing `github-actions-org-deploy` policy
-      already covers OU and account creation and the reads that follow.
-- [ ] 3. Record the account id and OU id below, then let it settle: todo.
-      `CreateAccount` is asynchronous and the id is unknown until it lands, so
-      this is a separate step. The settle is the same one workbench step 6
-      needed: STS has to see `OrganizationAccountAccessRole` before step 7 can
-      assume it, and a transient failure there is expected rather than a
-      permissions bug.
+- [x] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
+      account in `deploy-org/`: done (2026-10-05, pi-infra-step2, PR #238
+      merged as 6609eb9. The `Deploy org` run 37354688503 was green at 18:18
+      UTC, created exactly the 2 expected resources and nothing else, and the
+      account reached `ACTIVE` at 18:18:31Z with id `394495727159` inside the
+      new OU `ou-jqqe-orrk423t`. No grant PR in front of it; the existing
+      `github-actions-org-deploy` policy already covered OU and account
+      creation and the reads that followed. Ids recorded in the facts below.)
+- [ ] 3. Record the account id and OU id below, then let it settle: doing
+      (pi-infra-step3, 2026-10-05). `CreateAccount` is asynchronous and the id
+      is unknown until it lands, so this is a separate step. The settle is the
+      same one workbench step 6 needed: STS has to see
+      `OrganizationAccountAccessRole` before step 7 can assume it, and a
+      transient failure there is expected rather than a permissions bug.
 - [ ] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
       the new OU: todo. This is applied by `deploy.yml` and its consumer is
       applied by `deploy-org.yml`, so it must merge **and finish applying**
