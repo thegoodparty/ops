@@ -251,6 +251,16 @@ export const infrastructureScp: PolicyDocument = {
       // automation is the credential most likely to end up somewhere it
       // cannot be revoked from.
       //
+      // The two Update actions are a deliberate tightening beyond the
+      // workbench policy. Creation is only half the statement's job: a deny
+      // that stops a new key but lets an existing one be re-enabled does not
+      // do what the Sid says. The reachable set is small while the account is
+      // empty — no IAM user can be created, so no key can exist — but the
+      // deny is meant to hold as the account fills. `UpdateAccessKey` is also
+      // how a key is deactivated, so remediation becomes `DeleteAccessKey`,
+      // which is stronger. Raised in review of the first version, which
+      // carried only the three Create actions the plan first listed.
+      //
       // Deliberately not iam:CreateRole. Step 7 creates the in-account
       // `pulumi-deploy` and `pulumi-preview` roles and any scanner roles are
       // created by IAM too, so denying role creation breaks the pipeline.
@@ -264,6 +274,8 @@ export const infrastructureScp: PolicyDocument = {
         "iam:CreateUser",
         "iam:CreateAccessKey",
         "iam:CreateLoginProfile",
+        "iam:UpdateAccessKey",
+        "iam:UpdateLoginProfile",
       ],
       Resource: "*",
     },

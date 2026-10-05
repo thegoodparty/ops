@@ -51,7 +51,10 @@ starting the work, not after. Make `who` name the *session*, not the model.
       (2026-10-05, pi-infra-step5). `deploy-org/policies.ts` holds
       `infrastructureScp` and `deploy-org/index.ts` the `aws.organizations.Policy`
       and `PolicyAttachment`, following `workbenchScp` and its comments. Three
-      statements, per "The infrastructure SCP" below; the three denies the
+      statements, per "The infrastructure SCP" below; one is deliberately
+      tighter than workbench's, since review pointed out that denying only the
+      `Create` actions still lets an existing access key be re-enabled. The
+      three denies the
       workbench policy carries that are deliberately absent here are recorded
       as exclusions rather than left to look like omissions. Unprotected,
       deliberately: the failure mode of an SCP is denying something real, and
@@ -274,14 +277,26 @@ Three statements, all universal rather than workload-specific, all in
    strands the account outside consolidated billing and every governance
    control at once.
 2. **`DenyIamUsersAndLongLivedKeys`** — `iam:CreateUser`,
-   `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access here is federated
-   through Identity Center or assumed, and a long-lived key in an account that
-   exists to hold privileged automation is the credential most likely to end up
-   somewhere it cannot be revoked from. Deliberately not `iam:CreateRole`: the
-   deploy roles and any scanner roles are created by IAM, and denying role
-   creation breaks the pipeline. This is the statement most likely to need
-   loosening if a third-party tool insists on an IAM user; loosen it
-   deliberately, in a PR that names the tool.
+   `iam:CreateAccessKey`, `iam:CreateLoginProfile`, `iam:UpdateAccessKey`,
+   `iam:UpdateLoginProfile`. Access here is federated through Identity Center
+   or assumed, and a long-lived key in an account that exists to hold
+   privileged automation is the credential most likely to end up somewhere it
+   cannot be revoked from. Deliberately not `iam:CreateRole`: the deploy roles
+   and any scanner roles are created by IAM, and denying role creation breaks
+   the pipeline. This is the statement most likely to need loosening if a
+   third-party tool insists on an IAM user; loosen it deliberately, in a PR
+   that names the tool.
+
+   The two `Update` actions are a deliberate tightening beyond the workbench
+   policy, which denies only the three `Create` actions. Review of the first
+   version pointed out that it stopped new credentials but not the re-enabling
+   of an existing one, which is not what the Sid says. The reachable set is
+   small while the account is empty — no IAM user can be created, so no key
+   can exist — but the deny is meant to hold as the account fills and it costs
+   nothing to make it complete. `UpdateAccessKey` is also how a key is
+   deactivated, so remediation becomes `DeleteAccessKey`, which is stronger.
+   The workbench policy is left alone: that account is deliberately sleepy and
+   this one is not, and changing a live guardrail there belongs in its own PR.
 3. **`DenyCloudTrailTampering`** — `cloudtrail:StopLogging`, `DeleteTrail`,
    `UpdateTrail`, `PutEventSelectors`. Inert until there is a trail, and
    correct the moment there is one. This matters more here than in the workbench
