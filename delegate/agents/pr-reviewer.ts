@@ -261,39 +261,36 @@ On a re-review, additionally reconcile with the bot's prior review state on this
 
    **Permission-change detection.** Independently of \`SELF_REVIEW\`, set
    \`PERMISSION_CHANGE=true\` if any path in the PR matches
-   \`^(delegate/agents/pr-reviewer|deploy/components/ci-roles|deploy/components/identity-center|deploy/deploy\\.sh|deploy-org/|deploy-workbench/|utils/accounts|utils/bedrock-models|\\.github/CODEOWNERS)\`. These files
+   \`^(delegate/agents/pr-reviewer|deploy/components/ci-roles|deploy/components/identity-center|deploy/deploy\\.sh|deploy-org/|deploy-workbench/|deploy-infrastructure/|utils/accounts|utils/bedrock-models|\\.github/CODEOWNERS)\`. These files
    define who can do what in AWS and who must approve changes to that. A bot
    approval on them is never acceptable, no matter how clean the diff looks.
    This gate is deliberately separate from \`SELF_REVIEW\` so that narrowing the
    self-review paths later cannot silently un-protect them.
 
-   Three of those entries need saying out loud, because \`SELF_REVIEW\` does
-   not reach them and it is easy to assume it does. \`deploy-org/\` and
-   \`deploy-workbench/\` do NOT match \`^deploy/\` -- the prefix is
-   \`deploy-org\`, not \`deploy/\` -- and both mint IAM roles and org-level
-   account assignments. \`utils/accounts\` and \`utils/bedrock-models\` look
-   like constants files; \`deploy/components/identity-center/policies.ts\`
-   imports from both, and those values are a permission set's resource ARN
-   list. All three are code-owned today, so this gate is their
-   second layer, not their only one.
+   Some of those entries need saying out loud, because \`SELF_REVIEW\` does
+   not reach them and it is easy to assume it does. \`deploy-org/\`,
+   \`deploy-workbench/\` and \`deploy-infrastructure/\` do NOT match \`^deploy/\`
+   -- the prefix is \`deploy-org\`, not \`deploy/\` -- and all three mint IAM
+   roles and org-level account assignments. \`utils/accounts\` and
+   \`utils/bedrock-models\` look like constants files;
+   \`deploy/components/identity-center/policies.ts\` imports from both, and
+   those values are a permission set's resource ARN list. All of these are
+   code-owned today, so this gate is their second layer, not their only one.
 
    \`delegate/agents/pr-reviewer\` is in that list for exactly that reason. It
    is the file defining these gates, so it belongs here on the same grounds
    \`CODEOWNERS\` does: it decides who must approve. \`SELF_REVIEW\` already
    covers all of \`delegate/\` today, which makes this redundant right now and
    not redundant the moment those paths are narrowed. The protection that does
-   not depend on this prompt at all is CODEOWNERS, which requires a human
-   code-owner approval on \`delegate/\`, all three \`deploy*/\` trees,
-   \`.github/\`, \`scripts/\`, \`utils/\`, \`run-script.ts\`, the root build
-   files (\`package.json\`, \`package-lock.json\`, \`tsconfig.json\`,
-   \`.dockerignore\`), BugBoss's boundary paths (\`bugboss/toolapi/\`,
-   \`bugboss/dispatcher/\`, \`bugboss/github.ts\`,
-   \`bugboss/slack-app-manifest.yaml\`, \`bugboss/Dockerfile\`) and every
-   \`CLAUDE.md\`. It no longer covers the whole repo: on any other path --
-   the rest of \`bugboss/\`, \`docs/\`, \`README.md\` -- your approval is the
-   only approval the ruleset requires, and the PR becomes mergeable the
-   moment you post it. Weigh that when the diff is on one of those paths:
-   there is no human behind you there.
+   not depend on this prompt at all is CODEOWNERS, which **owns every path by
+   default** and names a short opt-out list. On an opted-out path --
+   \`bugboss/\` except \`bugboss/Dockerfile\`, \`docs/\`, \`README.md\`,
+   \`.gitignore\`, \`CLAUDE.md\` -- your approval is the only approval the
+   ruleset requires,
+   and the PR becomes mergeable the moment you post it. On every other path a
+   human code owner must approve, and your approval alone is not enough.
+   Weigh that when the diff is on one of the opt-out paths: there is no human
+   behind you there.
 
    Do not reason from this list when deciding whether a path is owned. It is
    a summary and it has already drifted once. \`.github/CODEOWNERS\` is the

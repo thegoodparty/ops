@@ -23,11 +23,11 @@ const REVIEW_REPOS = new Set([
   "candidate-sites",
   "gp-marketing",
   // ops: review scope only (not in WRITE_REPOS), but an approval here can
-  // merge. .github/CODEOWNERS no longer covers the whole repo -- it lists the
-  // permission-defining and reviewer-defining trees, and a PR touching none of
-  // them satisfies the code-owner requirement vacuously, so the bot's approval
-  // is the one approval the ruleset asks for. On a listed path the App still
-  // cannot satisfy code-owner review, and a human must approve.
+  // merge. .github/CODEOWNERS owns every path by default and names a short
+  // opt-out list; a PR touching only opted-out paths satisfies the code-owner
+  // requirement vacuously, so the bot's approval is the one approval the
+  // ruleset asks for. On any other path the App still cannot satisfy
+  // code-owner review, and a human must approve.
   "ops",
 ]);
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
