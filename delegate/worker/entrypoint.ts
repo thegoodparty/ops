@@ -4,6 +4,7 @@ import { WebClient } from "@slack/web-api";
 import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
 import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
+import { runReview } from "../review/run";
 
 // Workflow agents (PRD-to-code) need the runbooks repo on disk and the
 // ClickUp credentials in env. Framework agents (slack-responder, pr-reviewer)
@@ -29,6 +30,27 @@ const reportFatal = async (job: AgentJob | undefined, message: string) => {
   } catch {
     // intentionally silent — we're already exiting
   }
+};
+
+// The lambda posts :eyes: as the reviewer App when a `delegate review`
+// comment fires; delete it once the review lands so the comment stops
+// showing the in-progress signal. Same identity that owns the reaction.
+const removeGitHubReaction = async (job: AgentJob, token: string) => {
+  const { reactionRepo, reactionCommentId, reactionId } = job.metadata ?? {};
+  if (!reactionRepo || !reactionCommentId || !reactionId) return;
+  await fetch(
+    `https://api.github.com/repos/${reactionRepo}/issues/comments/${reactionCommentId}/reactions/${reactionId}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    },
+  ).catch((err: unknown) => {
+    console.error("Failed to remove eyes reaction:", err);
+  });
 };
 
 const parseJob = (): AgentJob | undefined => {
@@ -181,7 +203,6 @@ const main = async () => {
         { stdio: "inherit", timeout: 120_000 },
       );
       cwd = reviewDir;
-      process.env.REVIEW_HEAD_SHA = headSha;
       console.log(
         `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,
       );
@@ -219,6 +240,36 @@ const main = async () => {
       }
       process.exit(1);
     }
+
+    // The review runs through the deterministic layer, not the generic
+    // runAgent + callback path: it builds the agent's input, strips every
+    // credential from the agent's environment, validates the structured
+    // output, and is the only thing that touches GitHub.
+    const reviewerToken = process.env.REVIEWER_GITHUB_TOKEN;
+    if (!reviewerToken) {
+      console.error("REVIEWER_GITHUB_TOKEN missing; pr-reviewer cannot post");
+      process.exit(1);
+    }
+    const taskArn = await fetch(`${process.env.ECS_CONTAINER_METADATA_URI_V4}/task`)
+      .then((r) => r.json() as Promise<{ TaskARN?: string }>)
+      .then((t) => t.TaskARN)
+      .catch(() => undefined);
+    const logsUrl = taskArn
+      ? `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskArn.split("/").pop()}`
+      : undefined;
+
+    await runReview({
+      repo: repoFullName,
+      prNumber: Number(prNumber),
+      reviewDir,
+      trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
+      token: reviewerToken,
+      abortController,
+      logsUrl,
+    });
+    clearTimeout(deadline);
+    await removeGitHubReaction(job, reviewerToken);
+    return;
   }
 
   const needsRunbooks = isWorkflowAgent(job.agent);
@@ -287,27 +338,6 @@ const main = async () => {
 
   console.log(`Starting agent: ${job.agent}`);
   if (job.metadata) console.log("Metadata:", job.metadata);
-
-  // pr-reviewer posts reviews from a separate GitHub App so its approvals
-  // come from a different identity than the delegate App (which authors PRs
-  // via task-execution-agent — GitHub blocks self-approval). Swap the token
-  // the agent's `gh` calls will use; all read ops still work because the
-  // reviewer App has Contents:Read on the same repos. The agent reads
-  // PR_REVIEWER_APPROVAL_ENABLED to decide whether it may emit event=APPROVE
-  // — when the swap doesn't happen (reviewer key not provisioned), the agent
-  // is forced into comment-only mode rather than approving from the wrong App.
-  if (job.agent === "pr-reviewer") {
-    if (process.env.REVIEWER_GITHUB_TOKEN) {
-      process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
-      process.env.PR_REVIEWER_APPROVAL_ENABLED = "true";
-      console.log("pr-reviewer: using reviewer GitHub App token");
-    } else {
-      process.env.PR_REVIEWER_APPROVAL_ENABLED = "false";
-      console.log(
-        "pr-reviewer: REVIEWER_GITHUB_TOKEN missing — comment-only mode",
-      );
-    }
-  }
 
   const config = getAgent(job.agent);
 
@@ -395,37 +425,6 @@ const main = async () => {
         channel: job.metadata.channel,
         timestamp: job.metadata.reactionTs,
         name: "eyes",
-      }),
-    );
-  }
-
-  // Mirror of the Slack cleanup above for GitHub re-review acks. The lambda
-  // posts :eyes: as the reviewer App when a `delegate review` (or legacy
-  // `/delegate-review`) comment fires; we delete it here so the comment
-  // doesn't keep showing the in-progress signal after the review lands. By
-  // this point GITHUB_TOKEN has been swapped to the reviewer App token (see
-  // above), so we're acting as the same identity that owns the reaction.
-  if (
-    job.metadata?.source === "github" &&
-    job.metadata.reactionRepo &&
-    job.metadata.reactionCommentId &&
-    job.metadata.reactionId &&
-    process.env.GITHUB_TOKEN
-  ) {
-    const { reactionRepo, reactionCommentId, reactionId } = job.metadata;
-    callbacks.push(
-      fetch(
-        `https://api.github.com/repos/${reactionRepo}/issues/comments/${reactionCommentId}/reactions/${reactionId}`,
-        {
-          method: "DELETE",
-          headers: {
-            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-            Accept: "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-          },
-        },
-      ).catch((err: unknown) => {
-        console.error("Failed to remove eyes reaction:", err);
       }),
     );
   }

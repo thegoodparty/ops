@@ -19,6 +19,15 @@ export type AgentConfig = {
   agents?: Options["agents"];
   plugins?: Options["plugins"];
   settingSources?: Options["settingSources"];
+  tools?: Options["tools"];
+  outputFormat?: Options["outputFormat"];
+};
+
+export type RunOverrides = {
+  cwd?: string;
+  abortController?: AbortController;
+  mcpServers?: Record<string, McpServerConfig>;
+  env?: Record<string, string | undefined>;
 };
 
 export type AgentJob = {
@@ -36,4 +45,6 @@ export type AgentResult = {
   sessionId?: string;
   costUsd?: number;
   turns?: number;
+  structuredOutput?: unknown;
+  errorSubtype?: string;
 };

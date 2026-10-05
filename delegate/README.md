@@ -102,6 +102,20 @@ Continuation verbs are routed by parsing the most recent bot post's `[phase=...]
 
 - The `delegate` GitHub App must be installed on `thegoodparty/omni` (read access). The worker entrypoint does a partial + sparse clone of omni (just `packages/runbooks`) on every Fargate task boot for workflow agents; framework agents (`slack-responder`, `pr-reviewer`) skip the clone.
 - The `delegate` GitHub App must be installed on every repo in `WRITE_REPOS` with `pull_requests:write` (for `task-execution-agent` to open PRs).
+- The reviewer GitHub App must be installed on every repo in `REVIEW_REPOS` with `pull_requests:write` and `statuses:write`, and the worker task role must reach the `delegate-reviews` S3 bucket (`deploy/components/worker.ts`).
+
+## PR reviewer
+
+`pr-reviewer` reviews every non-draft PR opened or marked ready in a `REVIEW_REPOS` repo, and again on a `delegate review` comment. The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else. Rules that hold regardless of what the model says:
+
+- Approve means zero findings. A finding is a blocker. The bot never posts REQUEST_CHANGES.
+- Authors in `NEVER_APPROVE_AUTHORS` (`delegate/review/gates.ts`) get a comment-only review whose body still says `Recommendation: approve`; a human approves.
+- The review and the `pr-reviewer` status are pinned to the sha that was checked out. If the tip moves during the run, the approval is dismissed. `pr-reviewer` is a required check on omni, so a new push is unmergeable until it is reviewed.
+- One run per `(pr, sha)` from webhooks (S3 conditional-put lock). `delegate review` bypasses the lock with a new run id.
+- Re-review compares against the bot's own last record in S3, not GitHub thread state. Still-present findings are not reposted; their threads are listed in the body and un-resolved if a human resolved them. Fixed findings get their threads resolved.
+- A schema or subagent failure posts `Review failed: <reason>`, sets the status to `error`, and writes a record with `action: failed`.
+
+Every run writes `s3://delegate-reviews/reviews/<repo>/<pr>/<sha>/<runId>.json` with the full input bundle, the agent output, the posted action, cost and `agentVersion` (the ops commit of the image).
 
 ## Operator: bot got stuck
 

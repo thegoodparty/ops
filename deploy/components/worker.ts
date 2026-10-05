@@ -229,6 +229,9 @@ export const createWorker = (config: WorkerConfig) => {
         environment: [
           { name: "AWS_DEFAULT_REGION", value: "us-west-2" },
           { name: "REVIEW_BUCKET", value: "delegate-reviews" },
+          // The image tag is the ops commit; the review record stores it as
+          // agentVersion so evals can name the variant that produced a review.
+          { name: "AGENT_VERSION", value: config.imageUri.split(":").pop() ?? "unknown" },
         ],
         secrets: config.secretKeys.sort().map((key) => ({
           name: key,

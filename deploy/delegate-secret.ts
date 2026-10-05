@@ -25,7 +25,7 @@ export const DELEGATE_SECRET_KEYS = [
 
   // GitHub App (reviewer[bot]) — a separate App so pr-reviewer's approvals
   // come from a different identity than delegate[bot]. Read by
-  // `worker/github-auth.ts`; without it pr-reviewer runs comment-only.
+  // `worker/github-auth.ts`; pr-reviewer exits at boot without it.
   "REVIEWER_APP_PRIVATE_KEY",
 
   // ClickUp. `CLICKUP_API_TOKEN` is what the worker reads. `CLICKUP_TOKEN` is
