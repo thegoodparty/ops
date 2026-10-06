@@ -30,6 +30,17 @@ const commentPayload = (repo: string) => ({
   repository: { name: repo, full_name: `thegoodparty/${repo}` },
 });
 
+describe("dispatch actions", () => {
+  it("dispatches on open and ready_for_review, never on a plain push", () => {
+    for (const action of ["opened", "ready_for_review"]) {
+      assert.equal(shouldDispatch("pull_request", { ...prPayload("omni"), action }), true);
+    }
+    for (const action of ["synchronize", "edited", "reopened"]) {
+      assert.equal(shouldDispatch("pull_request", { ...prPayload("omni"), action }), false);
+    }
+  });
+});
+
 describe("REVIEW_REPOS scope", () => {
   it("dispatches reviews for ops PRs", () => {
     assert.equal(shouldDispatch("pull_request", prPayload("ops")), true);

@@ -30,6 +30,10 @@ const REVIEW_REPOS = new Set([
   // code-owner review, and a human must approve.
   "ops",
 ]);
+// The first reviewable state of a PR gets a run on its own; every later push
+// is reviewed only when someone comments `delegate review`. The `pr-reviewer`
+// check is per-sha and required, so a push without a requested review is
+// visibly unmergeable rather than silently unreviewed.
 const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 
 // Matches either form, case-insensitive, on its own line (with optional
@@ -254,7 +258,7 @@ const fetchHeadSha = async (
 // context+state), so the agent's step 1 explicitly SKIPS its own pending post
 // on the re-review path — only this lambda post lands. On the non-re-review
 // path (opened / ready_for_review) the lambda does not post pending; the
-// agent's step 1 does.
+// worker does.
 const postPendingStatus = async (
   token: string,
   repoFullName: string,
