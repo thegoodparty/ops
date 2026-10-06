@@ -112,7 +112,7 @@ const extractJsonObjects = (text: string): unknown[] => {
       else if (ch === '"') inString = false;
       continue;
     }
-    if (ch === '"') inString = true;
+    if (depth > 0 && ch === '"') inString = true;
     else if (ch === "{") {
       if (depth === 0) start = i;
       depth++;

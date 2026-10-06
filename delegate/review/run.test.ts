@@ -123,6 +123,13 @@ Done.`,
   });
 });
 
+test("parseReviewOutput ignores an unmatched quote in the prose", () => {
+  const out = parseReviewOutput({
+    output: `Here's the "result:\n{"status":"complete","findings":[],"summary":"clean"}`,
+  });
+  assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
+});
+
 test("parseReviewOutput reports non-JSON text", () => {
   const out = parseReviewOutput({ output: "I approve this PR." });
   assert.ok("error" in out);
