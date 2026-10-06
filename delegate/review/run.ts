@@ -180,12 +180,23 @@ export const runReview = async (args: {
   const agentVersion = process.env.AGENT_VERSION ?? "unknown";
   const config = getAgent("pr-reviewer");
 
-  if (trigger === "webhook") {
-    const locked = await store.acquireLock(repo, prNumber, headSha);
-    if (!locked) {
-      emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, reason: "locked" });
-      return undefined;
+  // One run per (pr, sha), whoever asked. The lock is the whole gate: a
+  // second run would review the same tree twice and could land a second,
+  // different verdict on it. A failed run stays failed until the author
+  // pushes; `delegate review` only helps a sha that has no run at all.
+  const locked = await store.acquireLock(repo, prNumber, headSha);
+  if (!locked) {
+    emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId, reason: "locked" });
+    if (trigger === "re-review") {
+      await github
+        .postIssueComment(
+          repo,
+          prNumber,
+          `\`${headSha.slice(0, 7)}\` already has a review run. Each commit is reviewed once; push a new commit to get a fresh review.`,
+        )
+        .catch((err: unknown) => console.error("already-reviewed comment failed:", err));
     }
+    return undefined;
   }
 
   // Boot-phase failure: nothing to review yet, so no record. Post enough to

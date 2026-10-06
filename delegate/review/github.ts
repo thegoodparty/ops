@@ -86,6 +86,10 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     return data.merge_base_commit.sha;
   };
 
+  const postIssueComment = async (repo: string, prNumber: number, body: string): Promise<void> => {
+    await doFetch("POST", `${BASE_URL}/repos/${repo}/issues/${prNumber}/comments`, { body });
+  };
+
   const getHeadSha = async (repo: string, prNumber: number): Promise<string> => {
     const res = await doFetch("GET", `${BASE_URL}/repos/${repo}/pulls/${prNumber}`);
     const pr = (await res.json()) as { head: { sha: string } };
@@ -280,6 +284,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
 
   return {
     getPull,
+    postIssueComment,
     getMergeBase,
     getHeadSha,
     postStatus,

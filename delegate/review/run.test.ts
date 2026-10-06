@@ -128,3 +128,4 @@ test("parseReviewOutput reports non-JSON text", () => {
   assert.ok("error" in out);
   assert.match(out.error, /no JSON/);
 });
+
