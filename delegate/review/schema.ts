@@ -70,7 +70,8 @@ export const PostedFindingSchema = FindingSchema.extend({
   id: z.string().uuid(),
   commentId: z.number().int().optional(),
   threadId: z.string().optional(),
-  demoted: z.boolean(),
+  anchorAdjusted: z.boolean().default(false),
+  demoted: z.boolean().optional(),
 });
 export type PostedFinding = z.infer<typeof PostedFindingSchema>;
 

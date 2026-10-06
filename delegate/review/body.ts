@@ -1,19 +1,24 @@
-import type { Finding } from "./schema";
 import type { Decision } from "./gates";
 
+// Nothing the model wrote goes in the body. Findings are inline comments;
+// the body is the verdict and the bookkeeping a reader needs to trust it.
 export const renderBody = (args: {
   decision: Decision;
-  summary: string;
   runId: string;
   headSha: string;
+  inlineCount: number;
   carriedForward: Array<{ id: string; path: string; line: number; url?: string }>;
-  demoted: Finding[];
 }): string => {
   const parts: string[] = [];
   const sha7 = args.headSha.slice(0, 7);
 
   parts.push(`**Recommendation: ${args.decision.verdict}**`);
-  parts.push(args.summary);
+
+  if (args.inlineCount > 0) {
+    parts.push(
+      `${args.inlineCount} new finding(s) inline. Each one blocks merge on its own; push a fix to get a fresh review.`,
+    );
+  }
 
   if (args.carriedForward.length > 0) {
     const n = args.carriedForward.length;
@@ -22,10 +27,6 @@ export const renderBody = (args: {
       return cf.url ? `- [${label}](${cf.url})` : `- ${label}`;
     });
     parts.push(`${n} prior finding(s) still open:\n${bullets.join("\n")}`);
-  }
-
-  for (const finding of args.demoted) {
-    parts.push(`### ${finding.path}:${finding.line}\n${finding.body}`);
   }
 
   parts.push(`_run ${args.runId} · ${sha7}_`);
@@ -40,5 +41,5 @@ export const renderFailureBody = (args: {
 }): string => {
   const sha7 = args.headSha.slice(0, 7);
   const footer = `_run ${args.runId} · ${sha7}_`;
-  return `Review failed: ${args.reason}. Re-trigger with \`delegate review\`.\n\n${footer}`;
+  return `Review failed: ${args.reason}. Push a new commit to get a fresh review.\n\n${footer}`;
 };

@@ -176,14 +176,15 @@ describe("createGitHub", () => {
     assert.equal(body.context, "pr-reviewer");
   });
 
-  it("postReview posts review then fetches comment ids", async () => {
+  it("postReview posts the review, then matches its comments from the PR-wide endpoint", async () => {
     const { mockFetch, calls } = createMockFetch([
       { status: 200, body: { id: 99 } },
       {
         status: 200,
         body: [
-          { id: 1001, path: "src/foo.ts", line: 5 },
-          { id: 1002, path: "src/bar.ts", line: null },
+          { id: 1001, path: "src/foo.ts", line: 5, original_line: 5, pull_request_review_id: 99 },
+          { id: 1002, path: "src/bar.ts", line: null, original_line: 12, pull_request_review_id: 99 },
+          { id: 900, path: "src/old.ts", line: 1, original_line: 1, pull_request_review_id: 42 },
         ],
       },
     ]);
@@ -208,13 +209,13 @@ describe("createGitHub", () => {
     assert.equal(calls[1].method, "GET");
     assert.equal(
       calls[1].url,
-      `https://api.github.com/repos/${REPO}/pulls/${PR}/reviews/99/comments?per_page=100`,
+      `https://api.github.com/repos/${REPO}/pulls/${PR}/comments?per_page=100`,
     );
 
     assert.equal(result.reviewId, 99);
     assert.deepEqual(result.comments, [
       { id: 1001, path: "src/foo.ts", line: 5 },
-      { id: 1002, path: "src/bar.ts", line: null },
+      { id: 1002, path: "src/bar.ts", line: 12 },
     ]);
   });
 

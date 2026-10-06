@@ -180,6 +180,43 @@ export const runReview = async (args: {
   const agentVersion = process.env.AGENT_VERSION ?? "unknown";
   const config = getAgent("pr-reviewer");
 
+  // Boot-phase failure: nothing to review yet, so no record. Post enough to
+  // GitHub that the check does not sit on pending forever.
+  const abort = async (reason: string) => {
+    console.error(`review aborted: ${reason}`);
+    await github
+      .postStatus(repo, headSha, {
+        state: "error",
+        description: reason.slice(0, 140),
+        targetUrl: args.logsUrl,
+      })
+      .catch((err: unknown) => console.error("error status failed:", err));
+    emit("review_failed", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId, reason });
+    return undefined;
+  };
+
+  // Draft check comes before the lock on purpose: the lock is permanent, and
+  // a draft that later goes ready_for_review on the same sha must still get
+  // its one run.
+  let pull: Awaited<ReturnType<typeof github.getPull>>;
+  try {
+    pull = await github.getPull(repo, prNumber);
+  } catch (err) {
+    return abort(`could not read the PR: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (pull.isDraft) {
+    emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, reason: "draft" });
+    if (trigger === "re-review") {
+      await github
+        .postStatus(repo, headSha, {
+          state: "error",
+          description: "Draft PR: mark it ready and re-trigger",
+        })
+        .catch(() => undefined);
+    }
+    return undefined;
+  }
+
   // One run per (pr, sha), whoever asked. The lock is the whole gate: a
   // second run would review the same tree twice and could land a second,
   // different verdict on it. A failed run stays failed until the author
@@ -199,38 +236,9 @@ export const runReview = async (args: {
     return undefined;
   }
 
-  // Boot-phase failure: nothing to review yet, so no record. Post enough to
-  // GitHub that the check does not sit on pending forever.
-  const abort = async (reason: string) => {
-    console.error(`review aborted: ${reason}`);
-    await github
-      .postStatus(repo, headSha, {
-        state: "error",
-        description: reason.slice(0, 140),
-        targetUrl: args.logsUrl,
-      })
-      .catch((err: unknown) => console.error("error status failed:", err));
-    emit("review_failed", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId, reason });
-    return undefined;
-  };
-
   let bundle: Bundle;
   let prior: ReviewRecord | undefined;
   try {
-    const pull = await github.getPull(repo, prNumber);
-    if (pull.isDraft) {
-      emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, reason: "draft" });
-      if (trigger === "re-review") {
-        await github
-          .postStatus(repo, headSha, {
-            state: "error",
-            description: "Draft PR: mark it ready and re-trigger",
-          })
-          .catch(() => undefined);
-      }
-      return undefined;
-    }
-
     if (trigger !== "re-review") {
       await github
         .postStatus(repo, headSha, {
@@ -352,37 +360,45 @@ export const runReview = async (args: {
   const priorById = new Map((prior?.findings ?? []).map((f) => [f.id, f]));
   const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
 
+  const unplaceable = placed.find((p) => "unplaceable" in p);
+  if (unplaceable) {
+    return fail(
+      `finding anchored to a path not in the diff: ${unplaceable.finding.path}:${unplaceable.finding.line}`,
+      { output, costUsd: result.costUsd },
+    );
+  }
+
   const carried: PostedFinding[] = [];
-  const fresh: Array<{ finding: PostedFinding; demoted: boolean }> = [];
-  for (const { finding, demoted } of placed) {
-    const priorFinding = finding.priorFindingId
-      ? priorById.get(finding.priorFindingId)
+  const fresh: PostedFinding[] = [];
+  for (const p of placed) {
+    if ("unplaceable" in p) continue;
+    const priorFinding = p.finding.priorFindingId
+      ? priorById.get(p.finding.priorFindingId)
       : undefined;
     if (priorFinding) {
       carried.push({
-        ...finding,
+        ...p.finding,
         id: priorFinding.id,
         commentId: priorFinding.commentId,
         threadId: priorFinding.threadId,
-        demoted: priorFinding.demoted,
+        anchorAdjusted: priorFinding.anchorAdjusted,
       });
     } else {
-      fresh.push({ finding: { ...finding, id: randomUUID(), demoted }, demoted });
+      fresh.push({ ...p.finding, id: randomUUID(), anchorAdjusted: p.adjusted });
     }
   }
 
   const body = renderBody({
     decision,
-    summary: output.summary,
     runId,
     headSha,
+    inlineCount: fresh.length,
     carriedForward: carried.map((f) => ({
       id: f.id,
       path: f.path,
       line: f.line,
       url: f.commentId ? commentUrl(repo, prNumber, f.commentId) : undefined,
     })),
-    demoted: fresh.filter((f) => f.demoted).map((f) => f.finding),
   });
 
   // Pushes dispatch their own run, so a review of a sha that is no longer the
@@ -402,7 +418,7 @@ export const runReview = async (args: {
       verdict: decision.verdict,
       action: "skipped",
       gates: decision.gates,
-      findings: [...fresh.map((f) => f.finding), ...carried],
+      findings: [...fresh, ...carried],
       tipMovedTo: liveBeforePost,
       costUsd: result.costUsd,
     });
@@ -419,14 +435,14 @@ export const runReview = async (args: {
     return record;
   }
 
-  const inline = fresh.filter((f) => !f.demoted);
+  const inline = fresh;
   let posted: Awaited<ReturnType<typeof github.postReview>>;
   try {
     posted = await github.postReview(repo, prNumber, {
       commitId: headSha,
       event: decision.action === "approve" ? "APPROVE" : "COMMENT",
       body,
-      comments: inline.map(({ finding }) => ({
+      comments: inline.map((finding) => ({
         path: finding.path,
         line: finding.endLine ?? finding.line,
         side: "RIGHT",
@@ -446,7 +462,7 @@ export const runReview = async (args: {
   }
 
   const unmatched = [...posted.comments];
-  for (const { finding } of inline) {
+  for (const finding of inline) {
     const idx = unmatched.findIndex(
       (c) => c.path === finding.path && c.line === (finding.endLine ?? finding.line),
     );
@@ -465,7 +481,7 @@ export const runReview = async (args: {
       });
     const carriedIds = new Set(carried.map((f) => f.id));
 
-    for (const { finding } of inline) {
+    for (const finding of inline) {
       if (finding.commentId) {
         finding.threadId = github.findThreadIdByCommentId(threads, finding.commentId);
       }
@@ -511,7 +527,7 @@ export const runReview = async (args: {
       inline.length > 0
         ? await github.listReviewThreads(repo, prNumber).catch(() => [])
         : [];
-    for (const { finding } of inline) {
+    for (const finding of inline) {
       if (finding.commentId) {
         finding.threadId = github.findThreadIdByCommentId(threads, finding.commentId);
       }
@@ -553,7 +569,7 @@ export const runReview = async (args: {
     verdict: decision.verdict,
     action: decision.action === "approve" ? "approved" : "commented",
     gates: decision.gates,
-    findings: [...fresh.map((f) => f.finding), ...carried],
+    findings: [...fresh, ...carried],
     reviewId: posted.reviewId,
     tipMovedTo,
     costUsd: result.costUsd,
@@ -571,12 +587,12 @@ export const runReview = async (args: {
     gates: decision.gates,
     findings_new: fresh.length,
     findings_carried: carried.length,
-    findings_demoted: fresh.filter((f) => f.demoted).length,
+    findings_adjusted: fresh.filter((f) => f.anchorAdjusted).length,
     tip_moved: Boolean(tipMovedTo),
     cost_usd: result.costUsd ?? null,
     wall_time_ms: record.wallTimeMs,
   });
-  for (const { finding } of fresh) {
+  for (const finding of fresh) {
     emit("finding_emitted", {
       repo,
       pr_number: prNumber,
@@ -588,7 +604,7 @@ export const runReview = async (args: {
       category: finding.category,
       confidence: finding.confidence,
       has_suggestion: Boolean(finding.suggestion),
-      demoted: finding.demoted,
+      anchor_adjusted: finding.anchorAdjusted,
     });
   }
 

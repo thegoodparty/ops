@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { renderBody, renderFailureBody } from "./body";
-import type { Finding } from "./schema";
 import type { Decision } from "./gates";
 
 const approveDecision: Decision = { verdict: "approve", action: "approve", gates: [] };
@@ -9,101 +8,59 @@ const commentDecision: Decision = { verdict: "comment", action: "comment", gates
 
 const baseArgs = {
   decision: approveDecision,
-  summary: "Looks good",
   runId: "00000000-0000-0000-0000-000000000001",
   headSha: "abc1234567890def",
+  inlineCount: 0,
   carriedForward: [] as Array<{ id: string; path: string; line: number; url?: string }>,
-  demoted: [] as Finding[],
 };
 
 describe("renderBody", () => {
-  it("first line is Recommendation: approve for approve verdict", () => {
+  it("leads with the recommendation", () => {
+    assert.ok(renderBody(baseArgs).startsWith("**Recommendation: approve**"));
+    assert.ok(
+      renderBody({ ...baseArgs, decision: commentDecision }).startsWith(
+        "**Recommendation: comment**",
+      ),
+    );
+  });
+
+  it("contains no model text: an approve is the recommendation and the footer only", () => {
     const body = renderBody(baseArgs);
-    assert.ok(body.startsWith("**Recommendation: approve**"));
+    assert.deepEqual(body.split("\n\n"), [
+      "**Recommendation: approve**",
+      "_run 00000000-0000-0000-0000-000000000001 · abc1234_",
+    ]);
   });
 
-  it("first line is Recommendation: comment for comment verdict", () => {
-    const body = renderBody({ ...baseArgs, decision: commentDecision });
-    assert.ok(body.startsWith("**Recommendation: comment**"));
+  it("counts new inline findings instead of repeating them", () => {
+    const body = renderBody({ ...baseArgs, decision: commentDecision, inlineCount: 3 });
+    assert.ok(body.includes("3 new finding(s) inline"));
   });
 
-  it("includes the summary text", () => {
-    const body = renderBody(baseArgs);
-    assert.ok(body.includes("Looks good"));
-  });
-
-  it("lists carried-forward findings with link when url is present", () => {
-    const cf = [
-      { id: "aaa", path: "foo.ts", line: 10, url: "https://github.com/org/repo/pull/1#comment-123" },
-    ];
-    const body = renderBody({ ...baseArgs, carriedForward: cf });
-    assert.ok(body.includes("1 prior finding(s) still open:"));
-    assert.ok(body.includes("[foo.ts:10](https://github.com/org/repo/pull/1#comment-123)"));
-  });
-
-  it("lists carried-forward findings as plain path:line when no url", () => {
-    const cf = [{ id: "bbb", path: "bar.ts", line: 20 }];
-    const body = renderBody({ ...baseArgs, carriedForward: cf });
-    assert.ok(body.includes("1 prior finding(s) still open:"));
-    assert.ok(body.includes("- bar.ts:20"));
-    assert.ok(!body.includes("[bar.ts:20]("));
-  });
-
-  it("uses correct count for multiple carried-forward items", () => {
-    const cf = [
-      { id: "aaa", path: "a.ts", line: 1 },
-      { id: "bbb", path: "b.ts", line: 2, url: "https://example.com" },
-    ];
-    const body = renderBody({ ...baseArgs, carriedForward: cf });
+  it("lists prior findings still open with links when available", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: commentDecision,
+      carriedForward: [
+        { id: "a", path: "src/a.ts", line: 3, url: "https://x/1" },
+        { id: "b", path: "src/b.ts", line: 9 },
+      ],
+    });
     assert.ok(body.includes("2 prior finding(s) still open:"));
+    assert.ok(body.includes("- [src/a.ts:3](https://x/1)"));
+    assert.ok(body.includes("- src/b.ts:9"));
   });
 
-  it("omits carried-forward section when empty", () => {
-    const body = renderBody(baseArgs);
-    assert.ok(!body.includes("prior finding"));
-  });
-
-  it("renders demoted findings as ### sections", () => {
-    const finding: Finding = {
-      path: "src/service.ts",
-      line: 42,
-      body: "Missing null check here",
-      category: "bugs",
-      confidence: "high",
-    };
-    const body = renderBody({ ...baseArgs, demoted: [finding] });
-    assert.ok(body.includes("### src/service.ts:42"));
-    assert.ok(body.includes("Missing null check here"));
-  });
-
-  it("includes footer with sha7 (first 7 chars of headSha)", () => {
-    const body = renderBody(baseArgs);
-    assert.ok(body.includes("_run 00000000-0000-0000-0000-000000000001 · abc1234_"));
-  });
-
-  it("sections are separated by blank lines", () => {
-    const body = renderBody(baseArgs);
-    assert.ok(body.includes("\n\n"));
+  it("ends with the run footer", () => {
+    assert.ok(renderBody(baseArgs).endsWith("_run 00000000-0000-0000-0000-000000000001 · abc1234_"));
   });
 });
 
 describe("renderFailureBody", () => {
-  it("includes failure reason and re-trigger instruction", () => {
-    const body = renderFailureBody({
-      runId: "00000000-0000-0000-0000-000000000002",
-      headSha: "deadbeef1234",
-      reason: "agent timed out",
-    });
-    assert.ok(body.includes("Review failed: agent timed out"));
-    assert.ok(body.includes("`delegate review`"));
-  });
-
-  it("includes footer with sha7", () => {
-    const body = renderFailureBody({
-      runId: "00000000-0000-0000-0000-000000000002",
-      headSha: "deadbeef1234",
-      reason: "crash",
-    });
-    assert.ok(body.includes("_run 00000000-0000-0000-0000-000000000002 · deadbee_"));
+  it("names the reason and the run", () => {
+    const body = renderFailureBody({ runId: "r1", headSha: "abc1234567", reason: "agent crashed" });
+    assert.ok(body.startsWith("Review failed: agent crashed."));
+    assert.ok(body.includes("Push a new commit"));
+    assert.ok(body.endsWith("_run r1 · abc1234_"));
   });
 });

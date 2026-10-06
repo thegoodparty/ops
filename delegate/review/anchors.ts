@@ -76,25 +76,33 @@ export const isAnchorable = (
   return true;
 };
 
+// Every finding posts inline; the review body carries no model text. A span
+// that runs past the hunk is clamped to its start line, a start line outside
+// the hunk snaps to the nearest changed line in the file, and a path that is
+// not in the diff cannot be placed at all. A snapped or clamped finding loses
+// its suggestion, which would otherwise replace the wrong lines.
+export type Placement =
+  | { finding: Finding; adjusted: boolean }
+  | { finding: Finding; unplaceable: true };
+
 export const placeFindings = (
   findings: Finding[],
   anchors: Map<string, Set<number>>,
-): Array<{ finding: Finding; demoted: boolean }> =>
+): Placement[] =>
   findings.map((raw) => {
     const finding =
       raw.endLine !== undefined && raw.endLine < raw.line
         ? { ...raw, line: raw.endLine, endLine: raw.line }
         : raw;
-    const anchorable = isAnchorable(
-      anchors,
-      finding.path,
-      finding.line,
-      finding.endLine,
-    );
-    if (!anchorable && finding.suggestion !== undefined) {
-      const { suggestion, ...rest } = finding;
-      const bodyWithSuggestion = `${rest.body}\n\n\`\`\`\n${suggestion}\n\`\`\``;
-      return { finding: { ...rest, body: bodyWithSuggestion }, demoted: true };
+    const set = anchors.get(finding.path);
+    if (!set || set.size === 0) return { finding, unplaceable: true };
+    if (isAnchorable(anchors, finding.path, finding.line, finding.endLine)) {
+      return { finding, adjusted: false };
     }
-    return { finding, demoted: !anchorable };
+    const { suggestion: _dropped, endLine: _end, ...rest } = finding;
+    if (set.has(finding.line)) return { finding: rest, adjusted: true };
+    const nearest = [...set].reduce((best, l) =>
+      Math.abs(l - finding.line) < Math.abs(best - finding.line) ? l : best,
+    );
+    return { finding: { ...rest, line: nearest }, adjusted: true };
   });
