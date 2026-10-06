@@ -46,8 +46,11 @@ export default defineAgent({
   agents: prReviewerSubagents,
   maxTurns: 80,
   maxBudgetUsd: 10,
-  tools: ["Read", "Grep", "Glob", "Task"],
-  allowedTools: ["Read", "Grep", "Glob", "Task", ...GIT_TOOL_NAMES],
+  // StructuredOutput is the built-in tool the SDK's outputFormat routes the
+  // final answer through; restricting `tools` without it leaves the model no
+  // way to return structured_output and it falls back to prose.
+  tools: ["Read", "Grep", "Glob", "Task", "StructuredOutput"],
+  allowedTools: ["Read", "Grep", "Glob", "Task", "StructuredOutput", ...GIT_TOOL_NAMES],
   outputFormat: { type: "json_schema", schema: REVIEW_OUTPUT_JSON_SCHEMA },
   systemPrompt: `You are the PR-review orchestrator for GoodParty's engineering team. You receive a <bundle> in your user message and emit a single JSON object matching ReviewOutputSchema. You have no network access and no GitHub token — a deterministic layer built your input and will post the result.
 

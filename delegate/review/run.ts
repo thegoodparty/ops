@@ -96,27 +96,62 @@ export const pathGuardHook = (reviewDir: string): HookCallback => {
 export const latestCompletedRecord = (records: ReviewRecord[]): ReviewRecord | undefined =>
   [...records].reverse().find((r) => r.action === "approved" || r.action === "commented");
 
+// The model sometimes wraps the JSON in prose. Take the last balanced
+// top-level object in the text; that is where the final answer lands.
+const extractJsonObjects = (text: string): unknown[] => {
+  const found: unknown[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        try {
+          found.push(JSON.parse(text.slice(start, i + 1)));
+        } catch {
+          // not JSON, keep scanning
+        }
+        start = -1;
+      }
+      if (depth < 0) depth = 0;
+    }
+  }
+  return found;
+};
+
 export const parseReviewOutput = (
   result: { structuredOutput?: unknown; output: string },
 ): ReviewOutput | { error: string } => {
-  const candidate =
-    result.structuredOutput !== undefined
-      ? result.structuredOutput
-      : (() => {
-          try {
-            return JSON.parse(result.output);
-          } catch {
-            return undefined;
-          }
-        })();
-  if (candidate === undefined) {
-    return { error: `agent returned no JSON: ${result.output.slice(0, 300)}` };
-  }
-  const parsed = ReviewOutputSchema.safeParse(candidate);
-  if (!parsed.success) {
+  if (result.structuredOutput !== undefined) {
+    const parsed = ReviewOutputSchema.safeParse(result.structuredOutput);
+    if (parsed.success) return parsed.data;
     return { error: `agent output failed schema: ${parsed.error.message.slice(0, 500)}` };
   }
-  return parsed.data;
+  const candidates = extractJsonObjects(result.output);
+  if (candidates.length === 0) {
+    return { error: `agent returned no JSON: ${result.output.slice(0, 300)}` };
+  }
+  for (const candidate of [...candidates].reverse()) {
+    const parsed = ReviewOutputSchema.safeParse(candidate);
+    if (parsed.success) return parsed.data;
+  }
+  const last = ReviewOutputSchema.safeParse(candidates[candidates.length - 1]);
+  return {
+    error: `agent output failed schema: ${last.success ? "" : last.error.message.slice(0, 500)}`,
+  };
 };
 
 const commentUrl = (repo: string, prNumber: number, commentId: number) =>
