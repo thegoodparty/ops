@@ -26,16 +26,23 @@ starting the work, not after. Make `who` name the *session*, not the model.
       without a working address, and the alias is the root-user recovery path.
       It must be a group rather than a person, and it must never have been
       used for any other AWS account.
-- [ ] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
-      account in `deploy-org/`: doing (pi-infra-step2, 2026-10-05). No grant PR
-      in front of this one; the existing `github-actions-org-deploy` policy
-      already covers OU and account creation and the reads that follow.
-- [ ] 3. Record the account id and OU id below, then let it settle: todo.
-      `CreateAccount` is asynchronous and the id is unknown until it lands, so
-      this is a separate step. The settle is the same one workbench step 6
-      needed: STS has to see `OrganizationAccountAccessRole` before step 7 can
-      assume it, and a transient failure there is expected rather than a
-      permissions bug.
+- [x] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
+      account in `deploy-org/`: done (2026-10-05, pi-infra-step2, PR #238
+      merged as 6609eb9. The `Deploy org` run 37354688503 was green at 18:18
+      UTC, created exactly the 2 expected resources and nothing else, and the
+      account reached `ACTIVE` at 18:18:31Z with id `394495727159` inside the
+      new OU `ou-jqqe-orrk423t`. No grant PR in front of it; the existing
+      `github-actions-org-deploy` policy already covered OU and account
+      creation and the reads that followed. Ids recorded in the facts below.)
+- [x] 3. Record the account id and OU id below, then let it settle: done
+      (2026-10-05, pi-infra-step3). Ids recorded in the facts below, and
+      `INFRASTRUCTURE_ACCOUNT_ID` added to `utils/accounts.ts`. The apply's
+      outputs report `Status` and `State` both `ACTIVE`, so the Organizations
+      half of the settle is over. The other half, STS seeing
+      `OrganizationAccountAccessRole`, is unverified and cannot be checked from
+      the `WorkbenchAccess` session this ran in: the assume is the first thing
+      step 7 does, so a transient failure there is the expected place to find
+      out, not a permissions bug. Step 4 does not wait on it.
 - [ ] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
       the new OU: doing (pi-infra-step4, 2026-10-05). This is applied by
       `deploy.yml` and its consumer is applied by `deploy-org.yml`, so it must
@@ -478,8 +485,17 @@ finishes applying before its consumer merges.
 
 ## Facts discovered during implementation
 
-- Infrastructure account id: _not yet created_
-- `Infrastructure` OU id and ARN: _not yet created_
+- Infrastructure account id: `394495727159`. Created 2026-10-05 18:18:31
+  UTC, `ACTIVE`, email `aws-infrastructure@goodparty.org`, joined with
+  `JoinedMethod: CREATED`. This is the `INFRASTRUCTURE_ACCOUNT_ID` step 3 adds
+  to `utils/accounts.ts`, the account step 7 deploys into, and the assignment
+  target step 8 needs.
+- `Infrastructure` OU: `ou-jqqe-orrk423t`, directly under root `r-jqqe`, ARN
+  `arn:aws:organizations::333022194791:ou/o-uuiolqc1di/ou-jqqe-orrk423t`. The
+  account's full path is
+  `o-uuiolqc1di/r-jqqe/ou-jqqe-orrk423t/394495727159/`. That ARN is the
+  literal step 4 adds to the two `github-actions-org-deploy` statements scoped
+  to `WORKBENCH_OU_ARN` today.
 
 ## Context: the management account
 

@@ -27,3 +27,13 @@ export const MANAGEMENT_ACCOUNT_ID = "333022194791";
 
 /** The workbench account. Step 6 of `docs/workbench-account.md`. */
 export const WORKBENCH_ACCOUNT_ID = "024901689212";
+
+/**
+ * The infrastructure account. Step 3 of `docs/infrastructure-account.md`.
+ *
+ * Read by `deploy-org/policies.ts` for the Infrastructure SCP, by
+ * `deploy-infrastructure/` for its provider, and by `identity-center.ts` for
+ * the admin assignment, so this one constant stands in for the three copies
+ * those consumers would otherwise each carry.
+ */
+export const INFRASTRUCTURE_ACCOUNT_ID = "394495727159";
