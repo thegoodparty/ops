@@ -449,6 +449,7 @@ export const runReview = async (args: {
 
   const body = renderBody({
     decision,
+    summary: output.summary,
     runId,
     headSha,
     inlineCount: fresh.length,

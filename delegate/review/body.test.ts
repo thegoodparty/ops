@@ -8,6 +8,7 @@ const commentDecision: Decision = { verdict: "comment", action: "comment", gates
 
 const baseArgs = {
   decision: approveDecision,
+  summary: "Reviewed the lock path and the anchor fallbacks; both leads were falsified against the tests.",
   runId: "00000000-0000-0000-0000-000000000001",
   headSha: "abc1234567890def",
   inlineCount: 0,
@@ -24,10 +25,11 @@ describe("renderBody", () => {
     );
   });
 
-  it("contains no model text: an approve is the recommendation and the footer only", () => {
+  it("an approve is the recommendation, the reasoning, and the footer", () => {
     const body = renderBody(baseArgs);
     assert.deepEqual(body.split("\n\n"), [
       "**Recommendation: approve**",
+      "Reviewed the lock path and the anchor fallbacks; both leads were falsified against the tests.",
       "_run 00000000-0000-0000-0000-000000000001 · abc1234_",
     ]);
   });
