@@ -45,6 +45,7 @@ const baseRecord: ReviewRecord = {
   action: "approved",
   gates: [],
   findings: [],
+  droppedFindings: [],
 };
 
 describe("acquireLock", () => {
@@ -118,6 +119,42 @@ describe("acquireLock", () => {
     await store.acquireLock("thegoodparty/ops", 42, "bbbbbb");
     assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/lock");
     assert.equal(captured["IfNoneMatch"], "*");
+  });
+});
+
+describe("releaseLock and lockAcquiredAt", () => {
+  it("releaseLock deletes the lock key", async () => {
+    const calls: Array<{ name: string; input: Record<string, unknown> }> = [];
+    const store = createStore({
+      send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        calls.push({ name: cmd.constructor.name, input: cmd.input });
+        return {};
+      },
+    } as unknown as S3Client);
+    await store.releaseLock("thegoodparty/ops", 42, "bbbbbb");
+    assert.equal(calls[0].name, "DeleteObjectCommand");
+    assert.equal(calls[0].input.Key, "reviews/thegoodparty/ops/42/bbbbbb/lock");
+  });
+
+  it("lockAcquiredAt reads the timestamp and treats a missing lock as undefined", async () => {
+    const body = (text: string) => ({
+      Body: (async function* () {
+        yield Buffer.from(text);
+      })(),
+    });
+    const present = createStore({
+      send: async () => body(JSON.stringify({ acquiredAt: "2026-01-01T00:00:00.000Z" })),
+    } as unknown as S3Client);
+    assert.equal(
+      (await present.lockAcquiredAt("thegoodparty/ops", 42, "bbbbbb"))?.toISOString(),
+      "2026-01-01T00:00:00.000Z",
+    );
+    const missing = createStore({
+      send: async () => {
+        throw Object.assign(new Error("NoSuchKey"), { $metadata: { httpStatusCode: 404 } });
+      },
+    } as unknown as S3Client);
+    assert.equal(await missing.lockAcquiredAt("thegoodparty/ops", 42, "bbbbbb"), undefined);
   });
 });
 

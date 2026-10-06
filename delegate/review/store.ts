@@ -2,6 +2,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  DeleteObjectCommand,
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import { ReviewRecordSchema, recordKey, lockKey } from "./schema";
@@ -37,6 +38,31 @@ export const createStore = (client: S3Client = new S3Client({})) => {
       const status = (err as { $metadata?: { httpStatusCode?: number } })
         ?.$metadata?.httpStatusCode;
       if (status === 412 || status === 409) return false;
+      throw err;
+    }
+  };
+
+  const releaseLock = async (repo: string, prNumber: number, headSha: string): Promise<void> => {
+    await client.send(
+      new DeleteObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+    );
+  };
+
+  const lockAcquiredAt = async (
+    repo: string,
+    prNumber: number,
+    headSha: string
+  ): Promise<Date | undefined> => {
+    try {
+      const res = await client.send(
+        new GetObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+      );
+      const parsed = JSON.parse(await readBody(res.Body)) as { acquiredAt?: string };
+      return parsed.acquiredAt ? new Date(parsed.acquiredAt) : undefined;
+    } catch (err: unknown) {
+      const status = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
+        ?.httpStatusCode;
+      if (status === 404) return undefined;
       throw err;
     }
   };
@@ -112,5 +138,5 @@ export const createStore = (client: S3Client = new S3Client({})) => {
     return records[records.length - 1];
   };
 
-  return { acquireLock, putRecord, listRecords, latestRecord };
+  return { acquireLock, releaseLock, lockAcquiredAt, putRecord, listRecords, latestRecord };
 };
