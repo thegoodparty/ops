@@ -16,7 +16,7 @@ export const renderBody = (args: {
 
   if (args.inlineCount > 0) {
     parts.push(
-      `${args.inlineCount} new finding(s) inline. Each one blocks merge on its own; push a fix to get a fresh review.`,
+      `${args.inlineCount} new finding(s) inline. Each one blocks merge on its own. Push a fix, then comment \`delegate review\`.`,
     );
   }
 
@@ -41,5 +41,5 @@ export const renderFailureBody = (args: {
 }): string => {
   const sha7 = args.headSha.slice(0, 7);
   const footer = `_run ${args.runId} · ${sha7}_`;
-  return `Review failed: ${args.reason}. Push a new commit to get a fresh review.\n\n${footer}`;
+  return `Review failed: ${args.reason}. Push a new commit, then comment \`delegate review\`.\n\n${footer}`;
 };

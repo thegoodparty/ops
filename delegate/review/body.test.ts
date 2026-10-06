@@ -60,7 +60,7 @@ describe("renderFailureBody", () => {
   it("names the reason and the run", () => {
     const body = renderFailureBody({ runId: "r1", headSha: "abc1234567", reason: "agent crashed" });
     assert.ok(body.startsWith("Review failed: agent crashed."));
-    assert.ok(body.includes("Push a new commit"));
+    assert.ok(body.includes("Push a new commit, then comment `delegate review`"));
     assert.ok(body.endsWith("_run r1 · abc1234_"));
   });
 });

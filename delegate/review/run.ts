@@ -229,7 +229,7 @@ export const runReview = async (args: {
         .postIssueComment(
           repo,
           prNumber,
-          `\`${headSha.slice(0, 7)}\` already has a review run. Each commit is reviewed once; push a new commit to get a fresh review.`,
+          `\`${headSha.slice(0, 7)}\` already has a review run. Each commit is reviewed once; push a new commit, then comment \`delegate review\`.`,
         )
         .catch((err: unknown) => console.error("already-reviewed comment failed:", err));
     }
@@ -401,9 +401,9 @@ export const runReview = async (args: {
     })),
   });
 
-  // Pushes dispatch their own run, so a review of a sha that is no longer the
-  // tip is superseded, not stale-but-useful. Posting it would duplicate the
-  // findings the newer run is about to post. Record it and stop.
+  // A review of a sha that is no longer the tip is superseded: the author has
+  // moved on, and the next `delegate review` will cover the new tip. Posting
+  // it would attach findings to code nobody is looking at. Record it and stop.
   const liveBeforePost = await github.getHeadSha(repo, prNumber).catch(() => headSha);
   if (liveBeforePost !== headSha) {
     await github

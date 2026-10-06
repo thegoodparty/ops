@@ -106,7 +106,7 @@ Continuation verbs are routed by parsing the most recent bot post's `[phase=...]
 
 ## PR reviewer
 
-`pr-reviewer` reviews every push to a non-draft PR in a `REVIEW_REPOS` repo (opened, marked ready, or synchronized), and again on a `delegate review` comment. The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else.
+`pr-reviewer` reviews a PR in a `REVIEW_REPOS` repo when it is opened or marked ready, and reviews a later push only when someone comments `delegate review`. The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else.
 
 ### Before and after
 
@@ -145,8 +145,8 @@ Rules that hold regardless of what the model says:
 - Approve means zero findings. A finding is a blocker. The bot never posts REQUEST_CHANGES.
 - The review body contains no model text: the recommendation line, a count of new inline findings, the prior findings still open, and the run footer. Every finding is an inline comment. A finding whose line is outside the diff hunks is moved to the nearest changed line in that file; a finding on a path not in the diff fails the run. The agent's summary is kept in the record for evals, not posted.
 - Who may merge is not delegate's decision. Classic branch protection on `main` (omni and ops) restricts pushes, and therefore merges, to the `gp-contrib` team; bots open and review PRs but cannot merge them.
-- The review and the `pr-reviewer` status are pinned to the sha that was checked out. `pr-reviewer` is a required check on omni, so a new push is unmergeable until its own run finishes.
-- One run per `(pr, sha)`, whoever asked (S3 conditional-put lock). A `delegate review` comment on a sha that already has a run gets a one-line reply and nothing else, failed runs included; push a new commit to get another review. The comment exists for a sha with no run at all, such as a dropped webhook. Runs on different shas of the same PR may overlap. If the tip has moved by the time a run is ready to post, it posts nothing: the status on its sha reads "Superseded", the record is kept with `action: skipped`, and the newer sha's run carries the findings. An approve that lands just before a push is dismissed.
+- The review and the `pr-reviewer` status are pinned to the sha that was checked out. `pr-reviewer` is a required check on omni, so a push nobody asked delegate to review is unmergeable until someone does.
+- One run per `(pr, sha)`, whoever asked (S3 conditional-put lock). A `delegate review` comment on a sha that already has a run gets a one-line reply and nothing else, failed runs included; push a new commit and comment again. Runs on different shas of the same PR may overlap. If the tip has moved by the time a run is ready to post, it posts nothing: the status on its sha reads "Superseded", the record is kept with `action: skipped`, and the newer sha's run carries the findings. An approve that lands just before a push is dismissed.
 - Re-review compares against the bot's own last record in S3, not GitHub thread state. Still-present findings are not reposted; their threads are listed in the body and un-resolved if a human resolved them. Fixed findings get their threads resolved.
 - A schema or subagent failure posts `Review failed: <reason>`, sets the status to `error`, and writes a record with `action: failed`.
 

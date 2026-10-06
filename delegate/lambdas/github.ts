@@ -30,11 +30,11 @@ const REVIEW_REPOS = new Set([
   // code-owner review, and a human must approve.
   "ops",
 ]);
-// `synchronize` is every push. The worker holds a per-(pr, sha) lock, so
-// duplicate deliveries collapse, and runs on different shas of one PR are
-// allowed to overlap: the `pr-reviewer` check is per-sha, so only the run on
-// the current head can make the PR mergeable.
-const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review", "synchronize"]);
+// The first reviewable state of a PR gets a run on its own; every later push
+// is reviewed only when someone comments `delegate review`. The `pr-reviewer`
+// check is per-sha and required, so a push without a requested review is
+// visibly unmergeable rather than silently unreviewed.
+const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 
 // Matches either form, case-insensitive, on its own line (with optional
 // surrounding whitespace). Anchoring to a full line keeps incidental phrases
@@ -257,8 +257,8 @@ const fetchHeadSha = async (
 // the worker (re)boots. GitHub status checks accumulate (they don't upsert by
 // context+state), so the agent's step 1 explicitly SKIPS its own pending post
 // on the re-review path — only this lambda post lands. On the non-re-review
-// path (opened / ready_for_review / synchronize) the lambda does not post
-// pending; the worker does.
+// path (opened / ready_for_review) the lambda does not post pending; the
+// worker does.
 const postPendingStatus = async (
   token: string,
   repoFullName: string,

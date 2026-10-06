@@ -31,11 +31,13 @@ const commentPayload = (repo: string) => ({
 });
 
 describe("dispatch actions", () => {
-  it("dispatches on every push, not just open", () => {
-    for (const action of ["opened", "ready_for_review", "synchronize"]) {
+  it("dispatches on open and ready_for_review, never on a plain push", () => {
+    for (const action of ["opened", "ready_for_review"]) {
       assert.equal(shouldDispatch("pull_request", { ...prPayload("omni"), action }), true);
     }
-    assert.equal(shouldDispatch("pull_request", { ...prPayload("omni"), action: "edited" }), false);
+    for (const action of ["synchronize", "edited", "reopened"]) {
+      assert.equal(shouldDispatch("pull_request", { ...prPayload("omni"), action }), false);
+    }
   });
 });
 
