@@ -86,6 +86,10 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     return data.merge_base_commit.sha;
   };
 
+  const postIssueComment = async (repo: string, prNumber: number, body: string): Promise<void> => {
+    await doFetch("POST", `${BASE_URL}/repos/${repo}/issues/${prNumber}/comments`, { body });
+  };
+
   const getHeadSha = async (repo: string, prNumber: number): Promise<string> => {
     const res = await doFetch("GET", `${BASE_URL}/repos/${repo}/pulls/${prNumber}`);
     const pr = (await res.json()) as { head: { sha: string } };
@@ -139,23 +143,29 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     const reviewData = (await reviewRes.json()) as { id: number };
     const reviewId = reviewData.id;
 
-    const rawComments: Array<{ id: number; path: string; line: number | null }> = [];
+    // /reviews/{id}/comments returns the legacy shape with no `line`, so the
+    // PR-wide comments endpoint is the one that can be matched to findings.
+    const rawComments: Array<{
+      id: number;
+      path: string;
+      line: number | null;
+      original_line: number | null;
+      pull_request_review_id: number | null;
+    }> = [];
     let commentsUrl: string | undefined =
-      `${BASE_URL}/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments?per_page=100`;
+      `${BASE_URL}/repos/${repo}/pulls/${prNumber}/comments?per_page=100`;
     while (commentsUrl) {
       const commentsRes = await doFetch("GET", commentsUrl);
-      const page = (await commentsRes.json()) as Array<{
-        id: number;
-        path: string;
-        line: number | null;
-      }>;
+      const page = (await commentsRes.json()) as typeof rawComments;
       for (const c of page) rawComments.push(c);
       commentsUrl = parseLinkNext(commentsRes.headers.get("Link"));
     }
 
     return {
       reviewId,
-      comments: rawComments.map((c) => ({ id: c.id, path: c.path, line: c.line })),
+      comments: rawComments
+        .filter((c) => c.pull_request_review_id === reviewId)
+        .map((c) => ({ id: c.id, path: c.path, line: c.line ?? c.original_line })),
     };
   };
 
@@ -280,6 +290,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
 
   return {
     getPull,
+    postIssueComment,
     getMergeBase,
     getHeadSha,
     postStatus,

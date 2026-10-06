@@ -106,8 +106,33 @@ test("parseReviewOutput rejects a verdict the agent is not allowed to emit", () 
   assert.match(out.error, /failed schema/);
 });
 
+test("parseReviewOutput finds the JSON when the model wraps it in prose", () => {
+  const out = parseReviewOutput({
+    output: `All four deep-reviewers returned zero findings. Every lead was falsified:
+
+1. **Thing**: not a bug {see line 3}
+
+{"status":"complete","findings":[],"summary":"Reviewed the \\"diff\\"; clean."}
+
+Done.`,
+  });
+  assert.deepEqual(out, {
+    status: "complete",
+    findings: [],
+    summary: 'Reviewed the "diff"; clean.',
+  });
+});
+
+test("parseReviewOutput ignores an unmatched quote in the prose", () => {
+  const out = parseReviewOutput({
+    output: `Here's the "result:\n{"status":"complete","findings":[],"summary":"clean"}`,
+  });
+  assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
+});
+
 test("parseReviewOutput reports non-JSON text", () => {
   const out = parseReviewOutput({ output: "I approve this PR." });
   assert.ok("error" in out);
   assert.match(out.error, /no JSON/);
 });
+

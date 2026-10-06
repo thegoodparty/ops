@@ -46,8 +46,11 @@ export default defineAgent({
   agents: prReviewerSubagents,
   maxTurns: 80,
   maxBudgetUsd: 10,
-  tools: ["Read", "Grep", "Glob", "Task"],
-  allowedTools: ["Read", "Grep", "Glob", "Task", ...GIT_TOOL_NAMES],
+  // StructuredOutput is the built-in tool the SDK's outputFormat routes the
+  // final answer through; restricting `tools` without it leaves the model no
+  // way to return structured_output and it falls back to prose.
+  tools: ["Read", "Grep", "Glob", "Task", "StructuredOutput"],
+  allowedTools: ["Read", "Grep", "Glob", "Task", "StructuredOutput", ...GIT_TOOL_NAMES],
   outputFormat: { type: "json_schema", schema: REVIEW_OUTPUT_JSON_SCHEMA },
   systemPrompt: `You are the PR-review orchestrator for GoodParty's engineering team. You receive a <bundle> in your user message and emit a single JSON object matching ReviewOutputSchema. You have no network access and no GitHub token — a deterministic layer built your input and will post the result.
 
@@ -106,16 +109,16 @@ Status "failed" — scout errored or a subagent failure prevents a reliable verd
 {"status":"failed","reason":"<specific reason>"}
 
 Finding fields:
-- path: exactly as it appears in the diff (required)
-- line: new-side line number from the diff hunk (required)
-- endLine: last line of a multi-line span (optional)
+- path: exactly as it appears in the diff (required). A path that is not in the diff fails the whole run.
+- line: new-side line number inside a diff hunk (required). Every finding is posted as an inline comment on this line; there is no other place for it to go. A line outside the hunks is moved to the nearest changed line in that file.
+- endLine: last line of a multi-line span (optional). Keep spans short and inside one hunk; a span that leaves the hunk is clamped to its start line and loses its suggestion.
 - body: markdown; must include a falsification-check sentence (required)
 - suggestion: literal replacement text for line..endLine, no code fences (optional)
 - category: one of bugs | security | tests | conventions | ai-rules | cross-file | thematic (required)
 - confidence: "high" | "medium" (required)
 - priorFindingId: id of the prior finding this continues (optional)
 
-summary describes what was reviewed (scope) and what was found. Zero findings with a complete status means the diff is clean; no need to editorialize.
+summary describes what was reviewed (scope) and what was found, in 1–3 sentences. It is stored with the run for evaluation and is not shown on the PR, so put everything the author needs into the findings themselves.
 
 Never guess around a missing subagent result. If a deep-reviewer returned malformed JSON, emit status "failed" with the reason.`,
 });

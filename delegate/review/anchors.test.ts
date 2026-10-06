@@ -175,41 +175,54 @@ describe("placeFindings", () => {
     confidence: "high",
   };
 
-  it("marks a finding as not demoted when anchorable", () => {
+  const placed = (p: ReturnType<typeof placeFindings>[number]) =>
+    "unplaceable" in p ? "unplaceable" : p.adjusted ? "adjusted" : "exact";
+
+  it("keeps an anchorable finding as is", () => {
     const anchors = new Map([["foo.ts", new Set([5])]]);
     const result = placeFindings([anchoredFinding], anchors);
-    assert.equal(result[0].demoted, false);
+    assert.equal(placed(result[0]), "exact");
     assert.deepEqual(result[0].finding, anchoredFinding);
   });
 
-  it("marks a finding as demoted when not anchorable", () => {
-    const anchors = new Map([["foo.ts", new Set([5])]]);
+  it("snaps a start line outside the hunk to the nearest changed line", () => {
+    const anchors = new Map([["foo.ts", new Set([5, 90, 120])]]);
     const result = placeFindings([unanchoredFinding], anchors);
-    assert.equal(result[0].demoted, true);
-    assert.deepEqual(result[0].finding, unanchoredFinding);
+    assert.equal(placed(result[0]), "adjusted");
+    assert.equal(result[0].finding.line, 90);
   });
 
-  it("folds suggestion into body and drops suggestion field when demoted", () => {
-    const anchors = new Map<string, Set<number>>();
-    const result = placeFindings([findingWithSuggestion], anchors);
-    assert.equal(result[0].demoted, true);
-    assert.ok(result[0].finding.body.includes("please fix this"));
-    assert.ok(result[0].finding.body.includes("const x = 1;"));
+  it("clamps a span that runs past the hunk to its start line and drops the suggestion", () => {
+    const anchors = new Map([["foo.ts", new Set([10, 11, 12])]]);
+    const result = placeFindings(
+      [{ ...findingWithSuggestion, line: 10, endLine: 40 }],
+      anchors,
+    );
+    assert.equal(placed(result[0]), "adjusted");
+    assert.equal(result[0].finding.line, 10);
+    assert.equal(result[0].finding.endLine, undefined);
     assert.equal(result[0].finding.suggestion, undefined);
+  });
+
+  it("normalises an inverted range", () => {
+    const anchors = new Map([["foo.ts", new Set([10, 11, 12])]]);
+    const result = placeFindings([{ ...anchoredFinding, line: 12, endLine: 10 }], anchors);
+    assert.equal(placed(result[0]), "exact");
+    assert.equal(result[0].finding.line, 10);
+    assert.equal(result[0].finding.endLine, 12);
+  });
+
+  it("cannot place a finding on a path that is not in the diff", () => {
+    const anchors = new Map([["bar.ts", new Set([5])]]);
+    const result = placeFindings([anchoredFinding], anchors);
+    assert.equal(placed(result[0]), "unplaceable");
   });
 
   it("preserves suggestion when finding is anchorable", () => {
     const anchors = new Map([["foo.ts", new Set([99])]]);
     const result = placeFindings([findingWithSuggestion], anchors);
-    assert.equal(result[0].demoted, false);
+    assert.equal(placed(result[0]), "exact");
     assert.equal(result[0].finding.suggestion, "const x = 1;");
-  });
-
-  it("handles mixed anchorable and demoted findings", () => {
-    const anchors = new Map([["foo.ts", new Set([5])]]);
-    const result = placeFindings([anchoredFinding, unanchoredFinding], anchors);
-    assert.equal(result[0].demoted, false);
-    assert.equal(result[1].demoted, true);
   });
 
   it("returns empty array for empty input", () => {
