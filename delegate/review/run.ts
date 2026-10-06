@@ -45,15 +45,26 @@ const ENV_ALLOW_EXACT = new Set([
 ]);
 const ENV_ALLOW_PREFIX = ["CLAUDE_", "DISABLE_"];
 
+// The CLI auto-installs the official plugin marketplace over ssh at startup
+// and phones home for non-essential traffic. Neither has a place in a
+// review run: the first hangs on hosts without an ssh agent, the second is
+// network the agent should not have.
+const ENV_FORCED: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+};
+
 export const agentEnv = (
   source: NodeJS.ProcessEnv = process.env,
-): Record<string, string | undefined> =>
-  Object.fromEntries(
+): Record<string, string | undefined> => ({
+  ...Object.fromEntries(
     Object.entries(source).filter(
       ([key]) =>
         ENV_ALLOW_EXACT.has(key) || ENV_ALLOW_PREFIX.some((p) => key.startsWith(p)),
     ),
-  );
+  ),
+  ...ENV_FORCED,
+});
 
 // The agent's file tools may only touch the review checkout. The worker
 // process next door still holds every token, and /proc/<ppid>/environ is a

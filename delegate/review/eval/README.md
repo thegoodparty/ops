@@ -33,7 +33,7 @@ npm run review:eval -- replay \
 
 For each case, clones the target repo at `bundle.headSha`, runs the agent exactly as production does, and writes a `Result` JSON. Skips cases that already have a result file (use `--force` to re-run).
 
-Each replay is a full agent run — budget roughly $1–5 per case depending on diff size.
+Each replay is a full agent run — budget roughly $1–5 per case depending on diff size. Replays run the agent with the same environment production uses, including the switches that stop the Claude Code CLI from fetching its plugin marketplace over ssh at startup; without them a local replay can hang before the first turn.
 
 ### Judge two sets of results
 

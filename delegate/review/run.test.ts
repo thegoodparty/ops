@@ -26,9 +26,17 @@ test("agentEnv strips every credential the worker holds", () => {
   assert.deepEqual(Object.keys(env).sort(), [
     "ANTHROPIC_API_KEY",
     "AWS_DEFAULT_REGION",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
     "HOME",
     "PATH",
   ]);
+});
+
+test("agentEnv forces the marketplace and telemetry switches off", () => {
+  const env = agentEnv({ CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "0" });
+  assert.equal(env.CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL, "1");
+  assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
 });
 
 test("agentEnv drops anything it was not told about", () => {
@@ -38,7 +46,11 @@ test("agentEnv drops anything it was not told about", () => {
     SOME_NEW_SECRET: "x",
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000",
   });
-  assert.deepEqual(Object.keys(env), ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]);
+  assert.deepEqual(Object.keys(env).sort(), [
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+  ]);
 });
 
 const hookCall = async (hook: ReturnType<typeof pathGuardHook>, tool: string, input: unknown) =>
