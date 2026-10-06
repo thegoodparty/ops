@@ -22,6 +22,20 @@ export interface Result {
   wallTimeMs: number;
 }
 
+// What production actually posted, as a Result, so "prod vs my branch" is the
+// default experiment and needs no replay on the prod side.
+export const resultFromRecord = (record: ReviewRecord): Result => ({
+  caseId: record.runId,
+  repo: record.repo,
+  prNumber: record.prNumber,
+  headSha: record.headSha,
+  variant: `prod-${record.agentVersion.slice(0, 7)}`,
+  output: record.output,
+  error: record.error,
+  costUsd: record.costUsd,
+  wallTimeMs: record.wallTimeMs,
+});
+
 export type RunAgentImpl = (
   config: AgentConfig,
   prompt: string,

@@ -1,7 +1,7 @@
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadCases, saveCases } from "./cases";
-import { replayAll } from "./replay";
+import { replayAll, resultFromRecord } from "./replay";
 import type { Result } from "./replay";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
 import { summarize, renderMarkdown } from "./report";
@@ -42,6 +42,7 @@ const usage = () => {
     [
       "Usage:",
       "  review:eval cases snapshot --out <dir> [--repo <r>] [--limit <n>]",
+      "  review:eval results from-cases --cases <dir|s3> --out <dir>",
       "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 3] [--work-dir /tmp/review-eval] [--force]",
       "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--model <id>] [--out <report.md>]",
     ].join("\n"),
@@ -66,6 +67,25 @@ const main = async () => {
     const records = await loadCases({ from: "s3", repo, limit });
     saveCases(records, out);
     console.error(`Saved ${records.length} case(s) to ${out}`);
+    return;
+  }
+
+  if (command === "results") {
+    const subcommand = argv[1];
+    if (subcommand !== "from-cases") usage();
+    const flags = parseFlags(argv.slice(2));
+    const casesFrom = flag(flags, "cases");
+    const out = flag(flags, "out");
+    if (!casesFrom || !out) { console.error("--cases and --out are required"); process.exit(1); }
+    const records = await loadCases({ from: casesFrom });
+    mkdirSync(out, { recursive: true });
+    let written = 0;
+    for (const record of records) {
+      if (record.action !== "approved" && record.action !== "commented") continue;
+      writeFileSync(join(out, `${record.runId}.json`), JSON.stringify(resultFromRecord(record), null, 2));
+      written++;
+    }
+    console.error(`Wrote ${written} production result(s) to ${out} (skipped ${records.length - written} that posted nothing)`);
     return;
   }
 

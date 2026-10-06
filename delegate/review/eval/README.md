@@ -20,6 +20,14 @@ npm run review:eval -- cases snapshot --out ./eval-cases [--repo thegoodparty/gp
 
 Lists every `ReviewRecord` in S3 (`REVIEW_BUCKET`, default `delegate-reviews`) and writes them to a local directory. Freeze a corpus before running an experiment so both variants are judged on exactly the same cases.
 
+### Use what production posted as a side
+
+```sh
+npm run review:eval -- results from-cases --cases ./eval-cases --out ./results-prod
+```
+
+Writes one result per case from the record's own output, so "production vs my branch" needs a replay on one side only. Records that posted nothing (failed, superseded) are skipped.
+
 ### Replay from a variant
 
 ```sh
