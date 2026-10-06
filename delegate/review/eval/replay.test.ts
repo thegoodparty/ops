@@ -39,6 +39,7 @@ const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
   action: "approved",
   gates: [],
   findings: [],
+  droppedFindings: [],
   ...overrides,
 });
 
