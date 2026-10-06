@@ -94,6 +94,7 @@ export const ReviewRecordSchema = z.object({
   action: z.enum(["approved", "commented", "failed", "skipped"]),
   gates: z.array(z.string()),
   findings: z.array(PostedFindingSchema),
+  droppedFindings: z.array(FindingSchema).default([]),
   reviewId: z.number().int().optional(),
   tipMovedTo: z.string().optional(),
   error: z.string().optional(),

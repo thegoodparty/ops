@@ -130,6 +130,14 @@ test("parseReviewOutput ignores an unmatched quote in the prose", () => {
   assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
 });
 
+test("parseReviewOutput survives an unmatched brace in the prose", () => {
+  const out = parseReviewOutput({
+    output: "the handler `function f() {` returns early, so no finding.\n\n" +
+      '{"status":"complete","findings":[],"summary":"clean"}',
+  });
+  assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
+});
+
 test("parseReviewOutput reports non-JSON text", () => {
   const out = parseReviewOutput({ output: "I approve this PR." });
   assert.ok("error" in out);

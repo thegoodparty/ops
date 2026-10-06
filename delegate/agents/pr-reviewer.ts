@@ -109,7 +109,7 @@ Status "failed" — scout errored or a subagent failure prevents a reliable verd
 {"status":"failed","reason":"<specific reason>"}
 
 Finding fields:
-- path: exactly as it appears in the diff (required). A path that is not in the diff fails the whole run.
+- path: exactly as it appears in the diff (required). A finding on a file the diff does not touch cannot be posted and is dropped; if a change breaks a caller elsewhere, anchor the finding on the changed line that breaks it and name the caller in the body.
 - line: new-side line number inside a diff hunk (required). Every finding is posted as an inline comment on this line; there is no other place for it to go. A line outside the hunks is moved to the nearest changed line in that file.
 - endLine: last line of a multi-line span (optional). Keep spans short and inside one hunk; a span that leaves the hunk is clamped to its start line and loses its suggestion.
 - body: markdown; must include a falsification-check sentence (required)

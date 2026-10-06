@@ -37,6 +37,11 @@ describe("renderBody", () => {
     assert.ok(body.includes("3 new finding(s) inline"));
   });
 
+  it("counts findings that could not be anchored instead of printing them", () => {
+    const body = renderBody({ ...baseArgs, decision: commentDecision, droppedCount: 2 });
+    assert.ok(body.includes("2 finding(s) pointed at files outside the diff"));
+  });
+
   it("lists prior findings still open with links when available", () => {
     const body = renderBody({
       ...baseArgs,

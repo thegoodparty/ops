@@ -7,6 +7,7 @@ export const renderBody = (args: {
   runId: string;
   headSha: string;
   inlineCount: number;
+  droppedCount?: number;
   carriedForward: Array<{ id: string; path: string; line: number; url?: string }>;
 }): string => {
   const parts: string[] = [];
@@ -17,6 +18,12 @@ export const renderBody = (args: {
   if (args.inlineCount > 0) {
     parts.push(
       `${args.inlineCount} new finding(s) inline. Each one blocks merge on its own. Push a fix, then comment \`delegate review\`.`,
+    );
+  }
+
+  if (args.droppedCount) {
+    parts.push(
+      `${args.droppedCount} finding(s) pointed at files outside the diff and could not be posted inline. They count against approval; the run record has them.`,
     );
   }
 

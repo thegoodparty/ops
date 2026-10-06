@@ -93,18 +93,34 @@ export const pathGuardHook = (reviewDir: string): HookCallback => {
   };
 };
 
+// Longer than the worker's wall-clock deadline (45 min) plus teardown.
+const STALE_LOCK_MS = 60 * 60 * 1000;
+
+const statusForRecord = (
+  record: ReviewRecord,
+  targetUrl?: string,
+): { state: "success" | "error"; description: string; targetUrl?: string } => {
+  if (record.action === "approved") return { state: "success", description: "Approved", targetUrl };
+  if (record.action === "commented") {
+    return { state: "success", description: `Commented: ${record.findings.length} finding(s)`, targetUrl };
+  }
+  if (record.action === "skipped") {
+    return { state: "success", description: `Superseded by ${(record.tipMovedTo ?? "").slice(0, 7)}; review not posted`, targetUrl };
+  }
+  return { state: "error", description: "Review failed", targetUrl };
+};
+
 export const latestCompletedRecord = (records: ReviewRecord[]): ReviewRecord | undefined =>
   [...records].reverse().find((r) => r.action === "approved" || r.action === "commented");
 
-// The model sometimes wraps the JSON in prose. Take the last balanced
-// top-level object in the text; that is where the final answer lands.
-const extractJsonObjects = (text: string): unknown[] => {
-  const found: unknown[] = [];
+// The model sometimes wraps the JSON in prose. Prose can hold stray quotes
+// and braces, so every `{` is a candidate start: scan a balanced object from
+// it, string-aware, and keep the ones that parse.
+const balancedObjectEnd = (text: string, start: number): number => {
   let depth = 0;
-  let start = -1;
   let inString = false;
   let escaped = false;
-  for (let i = 0; i < text.length; i++) {
+  for (let i = start; i < text.length; i++) {
     const ch = text[i];
     if (inString) {
       if (escaped) escaped = false;
@@ -112,22 +128,31 @@ const extractJsonObjects = (text: string): unknown[] => {
       else if (ch === '"') inString = false;
       continue;
     }
-    if (depth > 0 && ch === '"') inString = true;
-    else if (ch === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === "}") {
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
       depth--;
-      if (depth === 0 && start !== -1) {
-        try {
-          found.push(JSON.parse(text.slice(start, i + 1)));
-        } catch {
-          // not JSON, keep scanning
-        }
-        start = -1;
-      }
-      if (depth < 0) depth = 0;
+      if (depth === 0) return i;
     }
+  }
+  return -1;
+};
+
+const extractJsonObjects = (text: string): unknown[] => {
+  const found: unknown[] = [];
+  let i = text.indexOf("{");
+  while (i !== -1) {
+    const end = balancedObjectEnd(text, i);
+    if (end !== -1) {
+      try {
+        found.push(JSON.parse(text.slice(i, end + 1)));
+        i = text.indexOf("{", end + 1);
+        continue;
+      } catch {
+        // not JSON from here; try the next brace
+      }
+    }
+    i = text.indexOf("{", i + 1);
   }
   return found;
 };
@@ -181,9 +206,17 @@ export const runReview = async (args: {
   const config = getAgent("pr-reviewer");
 
   // Boot-phase failure: nothing to review yet, so no record. Post enough to
-  // GitHub that the check does not sit on pending forever.
+  // GitHub that the check does not sit on pending forever, and give the lock
+  // back when this run holds it: nothing was reviewed, so the next
+  // `delegate review` must be able to run.
+  let holdsLock = false;
   const abort = async (reason: string) => {
     console.error(`review aborted: ${reason}`);
+    if (holdsLock) {
+      await store.releaseLock(repo, prNumber, headSha).catch((err: unknown) =>
+        console.error("releaseLock failed:", err),
+      );
+    }
     await github
       .postStatus(repo, headSha, {
         state: "error",
@@ -220,21 +253,49 @@ export const runReview = async (args: {
   // One run per (pr, sha), whoever asked. The lock is the whole gate: a
   // second run would review the same tree twice and could land a second,
   // different verdict on it. A failed run stays failed until the author
-  // pushes; `delegate review` only helps a sha that has no run at all.
-  const locked = await store.acquireLock(repo, prNumber, headSha);
+  // pushes. The one exception is a lock with no record behind it that is
+  // older than any run can live: the task died before writing, and the
+  // sha would otherwise be unreviewable forever.
+  let locked = await store.acquireLock(repo, prNumber, headSha);
   if (!locked) {
-    emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId, reason: "locked" });
-    if (trigger === "re-review") {
-      await github
-        .postIssueComment(
-          repo,
-          prNumber,
-          `\`${headSha.slice(0, 7)}\` already has a review run. Each commit is reviewed once; push a new commit, then comment \`delegate review\`.`,
-        )
-        .catch((err: unknown) => console.error("already-reviewed comment failed:", err));
+    const latestForSha = (await store.listRecords(repo, prNumber))
+      .filter((r) => r.headSha === headSha)
+      .at(-1);
+    if (!latestForSha && trigger === "re-review") {
+      const acquiredAt = await store.lockAcquiredAt(repo, prNumber, headSha).catch(() => undefined);
+      if (acquiredAt && Date.now() - acquiredAt.getTime() > STALE_LOCK_MS) {
+        await store.releaseLock(repo, prNumber, headSha).catch(() => undefined);
+        locked = await store.acquireLock(repo, prNumber, headSha);
+        if (locked) {
+          emit("review_lock_reclaimed", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId });
+        }
+      }
     }
-    return undefined;
+    if (!locked) {
+      emit("review_skipped", { repo, pr_number: prNumber, head_sha: headSha, run_id: runId, reason: "locked" });
+      if (trigger === "re-review") {
+        // The lambda already flipped the check to pending for this comment;
+        // put back whatever the real run concluded so it does not sit there.
+        if (latestForSha) {
+          await github
+            .postStatus(repo, headSha, statusForRecord(latestForSha, args.logsUrl))
+            .catch((err: unknown) => console.error("status restore failed:", err));
+        }
+        await github
+          .postIssueComment(
+            repo,
+            prNumber,
+            latestForSha
+              ? `\`${headSha.slice(0, 7)}\` already has a review run (${latestForSha.action}). Each commit is reviewed once; push a new commit, then comment \`delegate review\`.`
+              : `\`${headSha.slice(0, 7)}\` has a review run in progress.`,
+          )
+          .catch((err: unknown) => console.error("already-reviewed comment failed:", err));
+      }
+      return undefined;
+    }
   }
+
+  holdsLock = true;
 
   let bundle: Bundle;
   let prior: ReviewRecord | undefined;
@@ -263,7 +324,7 @@ export const runReview = async (args: {
 
   const finish = (
     partial: Pick<ReviewRecord, "output" | "verdict" | "action" | "gates" | "findings"> &
-      Partial<Pick<ReviewRecord, "reviewId" | "tipMovedTo" | "error" | "costUsd" | "model">>,
+      Partial<Pick<ReviewRecord, "reviewId" | "tipMovedTo" | "error" | "costUsd" | "model" | "droppedFindings">>,
   ): ReviewRecord => {
     const finishedAt = new Date();
     return {
@@ -285,6 +346,7 @@ export const runReview = async (args: {
       action: partial.action,
       gates: partial.gates,
       findings: partial.findings,
+      droppedFindings: partial.droppedFindings ?? [],
       reviewId: partial.reviewId,
       tipMovedTo: partial.tipMovedTo,
       error: partial.error,
@@ -360,12 +422,9 @@ export const runReview = async (args: {
   const priorById = new Map((prior?.findings ?? []).map((f) => [f.id, f]));
   const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
 
-  const unplaceable = placed.find((p) => "unplaceable" in p);
-  if (unplaceable) {
-    return fail(
-      `finding anchored to a path not in the diff: ${unplaceable.finding.path}:${unplaceable.finding.line}`,
-      { output, costUsd: result.costUsd },
-    );
+  const dropped = placed.filter((p) => "unplaceable" in p).map((p) => p.finding);
+  for (const f of dropped) {
+    console.warn(`finding dropped, path not in diff: ${f.path}:${f.line}`);
   }
 
   const carried: PostedFinding[] = [];
@@ -393,6 +452,7 @@ export const runReview = async (args: {
     runId,
     headSha,
     inlineCount: fresh.length,
+    droppedCount: dropped.length,
     carriedForward: carried.map((f) => ({
       id: f.id,
       path: f.path,
@@ -419,6 +479,7 @@ export const runReview = async (args: {
       action: "skipped",
       gates: decision.gates,
       findings: [...fresh, ...carried],
+      droppedFindings: dropped,
       tipMovedTo: liveBeforePost,
       costUsd: result.costUsd,
     });
@@ -570,6 +631,7 @@ export const runReview = async (args: {
     action: decision.action === "approve" ? "approved" : "commented",
     gates: decision.gates,
     findings: [...fresh, ...carried],
+    droppedFindings: dropped,
     reviewId: posted.reviewId,
     tipMovedTo,
     costUsd: result.costUsd,
@@ -588,6 +650,7 @@ export const runReview = async (args: {
     findings_new: fresh.length,
     findings_carried: carried.length,
     findings_adjusted: fresh.filter((f) => f.anchorAdjusted).length,
+    findings_dropped: dropped.length,
     tip_moved: Boolean(tipMovedTo),
     cost_usd: result.costUsd ?? null,
     wall_time_ms: record.wallTimeMs,
