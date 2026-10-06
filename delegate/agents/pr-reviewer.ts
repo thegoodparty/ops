@@ -118,7 +118,7 @@ Finding fields:
 - confidence: "high" | "medium" (required)
 - priorFindingId: id of the prior finding this continues (optional)
 
-summary describes what was reviewed (scope) and what was found, in 1–3 sentences. It is stored with the run for evaluation and is not shown on the PR, so put everything the author needs into the findings themselves.
+summary is posted as the review body and is the reasoning behind the verdict, written for a human reviewer who will check that the PR description, this review, and the code agree. 3–6 sentences: what the change does as you read it from the diff (and whether that matches the PR description), which areas the scout flagged and what the deep-reviewers verified or falsified in each, and anything the human should confirm that you could not (migrations against real data, external behavior). Never put a finding in the summary: findings are inline comments and nothing else. A summary that says "no issues found" without saying what was checked is not acceptable.
 
 Never guess around a missing subagent result. If a deep-reviewer returned malformed JSON, emit status "failed" with the reason.`,
 });

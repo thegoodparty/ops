@@ -1,9 +1,11 @@
 import type { Decision } from "./gates";
 
-// Nothing the model wrote goes in the body. Findings are inline comments;
-// the body is the verdict and the bookkeeping a reader needs to trust it.
+// Findings are inline comments, never body text. The body carries the verdict,
+// the agent's reasoning for it (so a human can check that the PR description,
+// the review and the code agree), and the bookkeeping a reader needs to trust it.
 export const renderBody = (args: {
   decision: Decision;
+  summary: string;
   runId: string;
   headSha: string;
   inlineCount: number;
@@ -14,6 +16,7 @@ export const renderBody = (args: {
   const sha7 = args.headSha.slice(0, 7);
 
   parts.push(`**Recommendation: ${args.decision.verdict}**`);
+  parts.push(args.summary.trim());
 
   if (args.inlineCount > 0) {
     parts.push(
