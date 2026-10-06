@@ -43,15 +43,35 @@ starting the work, not after. Make `who` name the *session*, not the model.
       the `WorkbenchAccess` session this ran in: the assume is the first thing
       step 7 does, so a transient failure there is the expected place to find
       out, not a permissions bug. Step 4 does not wait on it.
-- [ ] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
-      the new OU: doing (pi-infra-step4, 2026-10-05). This is applied by
-      `deploy.yml` and its consumer is applied by `deploy-org.yml`, so it must
-      merge **and finish applying** before step 5. See "Apply ordering between
-      workflows" in the workbench document for why the grant cannot ride along
-      with the policy it enables.
-- [ ] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`:
-      todo. Design in "The infrastructure SCP" below; read that before
-      starting, not this summary.
+- [x] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
+      the new OU: done (2026-10-05, pi-infra-step4, PR #241 merged as 61a94c9.
+      The merge's CI run 37360050783 was green at 19:05 UTC: it updated
+      `github-actions-org-deploy`'s inline `OrgDeploy` policy (4 updated, 74
+      unchanged) and the applied document carries the Infrastructure OU ARN in
+      both `ServiceControlPolicyAttachment` and
+      `ServiceControlPolicyListingForTarget`. Read from the apply log rather
+      than an `iam:get-role-policy`, because no management-account SSO token
+      was live; the log shows the document Pulumi actually sent, which is the
+      same read-back shape workbench step 9 part 2 used. That is the evidence
+      step 5's attach will not be refused.)
+- [x] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`: done
+      (2026-10-05, pi-infra-step5). `deploy-org/policies.ts` holds
+      `infrastructureScp` and `deploy-org/index.ts` the `aws.organizations.Policy`
+      and `PolicyAttachment`, following `workbenchScp` and its comments. Three
+      statements, per "The infrastructure SCP" below; one is deliberately
+      tighter than workbench's, since review pointed out that denying only the
+      `Create` actions still lets an existing access key be re-enabled. The
+      three denies the
+      workbench policy carries that are deliberately absent here are recorded
+      as exclusions rather than left to look like omissions. Unprotected,
+      deliberately: the failure mode of an SCP is denying something real, and
+      the way out sits outside the policy — SCPs never apply to the management
+      account, and github-actions-org-deploy can detach from exactly the two
+      OUs it can attach to. Marked done in the PR that creates it, per workbench
+      step 13: the merge's `Deploy org` run is the read-back, so a red run
+      beside this entry means the entry is wrong in the visible way. It has to
+      be green before step 7, because this policy binds the in-account
+      `pulumi-deploy` role step 7 creates.
 - [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
       Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
       Applied by `deploy.yml`; must merge and finish applying before step 7.
@@ -264,14 +284,26 @@ Three statements, all universal rather than workload-specific, all in
    strands the account outside consolidated billing and every governance
    control at once.
 2. **`DenyIamUsersAndLongLivedKeys`** — `iam:CreateUser`,
-   `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access here is federated
-   through Identity Center or assumed, and a long-lived key in an account that
-   exists to hold privileged automation is the credential most likely to end up
-   somewhere it cannot be revoked from. Deliberately not `iam:CreateRole`: the
-   deploy roles and any scanner roles are created by IAM, and denying role
-   creation breaks the pipeline. This is the statement most likely to need
-   loosening if a third-party tool insists on an IAM user; loosen it
-   deliberately, in a PR that names the tool.
+   `iam:CreateAccessKey`, `iam:CreateLoginProfile`, `iam:UpdateAccessKey`,
+   `iam:UpdateLoginProfile`. Access here is federated through Identity Center
+   or assumed, and a long-lived key in an account that exists to hold
+   privileged automation is the credential most likely to end up somewhere it
+   cannot be revoked from. Deliberately not `iam:CreateRole`: the deploy roles
+   and any scanner roles are created by IAM, and denying role creation breaks
+   the pipeline. This is the statement most likely to need loosening if a
+   third-party tool insists on an IAM user; loosen it deliberately, in a PR
+   that names the tool.
+
+   The two `Update` actions are a deliberate tightening beyond the workbench
+   policy, which denies only the three `Create` actions. Review of the first
+   version pointed out that it stopped new credentials but not the re-enabling
+   of an existing one, which is not what the Sid says. The reachable set is
+   small while the account is empty — no IAM user can be created, so no key
+   can exist — but the deny is meant to hold as the account fills and it costs
+   nothing to make it complete. `UpdateAccessKey` is also how a key is
+   deactivated, so remediation becomes `DeleteAccessKey`, which is stronger.
+   The workbench policy is left alone: that account is deliberately sleepy and
+   this one is not, and changing a live guardrail there belongs in its own PR.
 3. **`DenyCloudTrailTampering`** — `cloudtrail:StopLogging`, `DeleteTrail`,
    `UpdateTrail`, `PutEventSelectors`. Inert until there is a trail, and
    correct the moment there is one. This matters more here than in the workbench
