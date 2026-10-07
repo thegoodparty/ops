@@ -10,6 +10,8 @@ import {
   githubActionsPulumiPreviewTrust,
   githubActionsWorkbenchDeploy,
   githubActionsWorkbenchDeployTrust,
+  githubActionsInfrastructureDeploy,
+  githubActionsInfrastructureDeployTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -144,6 +146,27 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsWorkbenchDeploy),
   });
 
+  // The infrastructure account's counterpart to the workbench role above,
+  // step 6 of docs/infrastructure-account.md. Same shape and same reasoning:
+  // inline policy, trusted by one workflow on main, and no protect while step
+  // 7 is still in flight.
+  const infrastructureDeployRole = new aws.iam.Role(
+    "githubActionsInfrastructureDeploy",
+    {
+      name: "github-actions-infrastructure-deploy",
+      description:
+        "Infrastructure account Pulumi deploys (deploy-infrastructure). Assumed only by deploy-infrastructure.yml on thegoodparty/ops main.",
+      assumeRolePolicy: JSON.stringify(githubActionsInfrastructureDeployTrust),
+      maxSessionDuration: 3600,
+    },
+  );
+
+  new aws.iam.RolePolicy("githubActionsInfrastructureDeployPolicy", {
+    name: "InfrastructureDeploy",
+    role: infrastructureDeployRole.id,
+    policy: JSON.stringify(githubActionsInfrastructureDeploy),
+  });
+
   // The PR preview role. Created rather than imported, and trusted only by
   // `pull_request` runs in this repo. Its policy is read-only across ops, org
   // and workbench, which is what makes it safe to hand to an unreviewed
@@ -202,6 +225,7 @@ export const createCiRoles = () => {
     deployPolicy,
     orgDeployRole,
     workbenchDeployRole,
+    infrastructureDeployRole,
     previewRole,
     planRole,
   };

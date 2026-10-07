@@ -72,15 +72,51 @@ starting the work, not after. Make `who` name the *session*, not the model.
       beside this entry means the entry is wrong in the visible way. It has to
       be green before step 7, because this policy binds the in-account
       `pulumi-deploy` role step 7 creates.
-- [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
-      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
-      Applied by `deploy.yml`; must merge and finish applying before step 7.
-- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: todo. Two
-      pull requests, forced by bootstrap causality, the same shape as
-      workbench steps 7 and 10: the first applies against
+- [x] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
+      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: done
+      (2026-10-07, pi-swarm-infra-step6). The role and its inline
+      `InfrastructureDeploy` policy are in `deploy/components/ci-roles.ts`
+      and `ci-roles/policies.ts`, following the workbench role. One
+      difference from that precedent, and it is a simplification: workbench
+      step 4 created its role with backend access alone because the account
+      id was not known yet, and step 7 added the assume grant in a PR of its
+      own. Here the id was recorded at step 3, so the bootstrap grant ships
+      with the role and there is no deferred statement. A local preview of
+      the `ops` stack planned exactly the two creates, the role and its
+      policy, and 84 unchanged. Trusted only by `deploy-infrastructure.yml`
+      on `main`, which does not exist yet, so the role is inert on merge and
+      step 7 must use exactly that filename. Marked done in the PR that
+      creates it, per step 5: the merge's `deploy.yml` run is the read-back,
+      so a red run beside this entry means the entry is wrong in the visible
+      way. It has to be green before step 7 merges.
+- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: doing
+      (pi-swarm-infra-step7a, 2026-10-07; pi-infra-step7-grant, 2026-10-07).
+      Three pull requests, not the two the shape first suggested, and the
+      extra one exists because the grant has to be applied before the
+      consumer that uses it. The first applies against
       `OrganizationAccountAccessRole` and creates the in-account `pulumi-deploy`
-      and `pulumi-preview` roles; the second repoints the provider at
+      and `pulumi-preview` roles; the second adds the
+      `AssumeInfrastructureDeployRole` grant on
+      `github-actions-infrastructure-deploy` alongside the bootstrap grant and
+      is applied by `deploy.yml` alone; the third repoints the provider at
       `pulumi-deploy` and removes the bootstrap grant.
+
+      PR 1 merged as #258 (aa6b54e). Its `Deploy infrastructure` run
+      37653077384 was green: the two roles and the `AdministratorAccess`
+      attachment created alongside the stack and its provider, `accountId`
+      reading 394495727159 (which also closes step 3's STS half), and the two
+      role ARNs in the outputs. Not previewed before merge: neither the stack
+      nor a role a preview could assume existed yet.
+
+      PR 1 did not add the `pulumi-deploy` grant, which is why a second PR
+      precedes the cutover rather than a single in-place swap. The swap is
+      what the workbench step 10 history warns against: `deploy.yml` builds
+      two Docker images before it applies this policy, while
+      `deploy-infrastructure.yml` is a small apply that reaches its assume
+      first, so a provider repointed to `pulumi-deploy` in the same push would
+      call `sts:AssumeRole` before the grant for it existed. Gain-then-remove
+      makes the ordering unnecessary to time. PR 3, the cutover, follows once
+      PR 2's `deploy.yml` run is green.
 - [ ] 8. Extend `identity-center.ts` to assign `Admins` to
       `AdministratorAccess` in the new account: todo. This is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in.
@@ -150,8 +186,13 @@ and compliance scans, drift detection, cost scans, automated maintenance and
 rotation jobs.
 
 Does not belong here: product environments, the developer inner loop (that is
-the workbench account), anything that holds product or voter data as a system
-of record, and anything the delegate agents need at runtime.
+the workbench account), and anything that holds product or voter data as a
+system of record.
+
+The agent-swarm deployment (the Delegate swarm) runs here, by Swain's decision
+on 2026-10-07. It reaches production read-only, through a role in the
+management account, rather than holding production credentials in this
+account.
 
 The failure mode is the same junk drawer the workbench plan names, with a
 sharper edge: because this account is expected to hold broad permissions, an

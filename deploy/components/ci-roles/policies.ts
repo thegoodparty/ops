@@ -14,6 +14,7 @@
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
 import {
+  INFRASTRUCTURE_ACCOUNT_ID,
   MANAGEMENT_ACCOUNT_ID,
   WORKBENCH_ACCOUNT_ID,
 } from "../../../utils/accounts";
@@ -459,6 +460,14 @@ export const githubActionsOrgDeployTrust = opsWorkflowTrust("deploy-org.yml");
 export const githubActionsWorkbenchDeployTrust =
   opsWorkflowTrust("deploy-workbench.yml");
 
+// Pinned ahead of the workflow existing, for the same reason as the workbench
+// trust above. Step 7 of `docs/infrastructure-account.md` creates
+// `.github/workflows/deploy-infrastructure.yml` and must use exactly this
+// filename; until it does, no job can assume the role.
+export const githubActionsInfrastructureDeployTrust = opsWorkflowTrust(
+  "deploy-infrastructure.yml",
+);
+
 // Trust for the PR preview role. The subject is the `pull_request` subject
 // exactly: not `:*`, not `main`, and no other repository. Fork PRs cannot
 // obtain an OIDC token at all, but the workflow skips them explicitly so the
@@ -843,6 +852,59 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`,
     },
     ...pulumiBackendStatements("workbench"),
+  ],
+};
+
+// The management-account half of the infrastructure deploy path, step 6 of
+// `docs/infrastructure-account.md`: assumed by deploy-infrastructure.yml on
+// main, and holds the two assume grants below (one transitional) plus this
+// project's Pulumi backend access. Nothing else in this account.
+//
+// The same apply ordering as the workbench role above: this is in `deploy/`
+// and applied by `deploy.yml`, while its consumer is applied by
+// `deploy-infrastructure.yml`. That ordering is why there are two grants for
+// the span of step 7's cutover, the workbench step 10 "gain-then-remove"
+// shape rather than an oversight. The `pulumi-deploy` grant has to be applied
+// by `deploy.yml` before the cutover PR repoints the provider at it; the
+// bootstrap grant is then removed by that same cutover PR. Swapping the
+// resource in place in one PR would race itself: `deploy.yml` builds two
+// Docker images before it applies this policy, while
+// `deploy-infrastructure.yml` is a small apply that reaches its assume first,
+// so the repointed provider would call sts:AssumeRole before a grant for
+// `pulumi-deploy` existed and fail. Keeping both until the cutover is what
+// makes the ordering unnecessary to time.
+//
+// What the bootstrap grant reaches is administrator in the infrastructure
+// account, which is what OrganizationAccountAccessRole is. The first apply
+// needed it because no in-account role existed yet. `pulumi-deploy` is the
+// narrower replacement: its trust names exactly this CI role rather than the
+// management account root. That narrowing matters more here than it did for
+// workbench, because this account exists to hold privileged automation.
+//
+// The bootstrap role's trust names the management account root, which
+// delegates the decision to IAM here, so this identity-based statement is the
+// whole control on that path. The `pulumi-deploy` trust names this role
+// exactly, so both sides agree and the grant above is the entire control.
+export const githubActionsInfrastructureDeploy: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    // Step 7's cutover needs this applied before it repoints the provider.
+    // Inert until then: nothing assumes `pulumi-deploy` yet.
+    {
+      Sid: "AssumeInfrastructureDeployRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/pulumi-deploy`,
+    },
+    // Transitional. Removed by step 7's cutover PR once the provider assumes
+    // `pulumi-deploy`, so no permanent admin path is left behind.
+    {
+      Sid: "AssumeInfrastructureBootstrapRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+    },
+    ...pulumiBackendStatements("infrastructure"),
   ],
 };
 
