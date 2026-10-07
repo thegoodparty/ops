@@ -145,9 +145,9 @@ starting the work, not after. Make `who` name the *session*, not the model.
 - [ ] 9. Harden the account's root user, in the console: todo. Enable MFA,
       remove any root access keys, and set the alternate contacts. The group
       alias from step 1 is the recovery path, not the daily driver.
-- [ ] 10. Spend threshold alerts by email: todo. One `aws.budgets.Budget` in
-      `deploy-infrastructure/` with notifications to the step 1 group alias,
-      mirroring workbench step 13.
+- [ ] 10. Spend threshold alerts by email: doing (pi-infra-step10,
+      2026-10-07). One `aws.budgets.Budget` in `deploy-infrastructure/` with
+      notifications to the step 1 group alias, mirroring workbench step 13.
 - [ ] 11. Extend the PR preview role and workflow to cover the new project:
       todo. Design in "PR previews" below.
 - [ ] 12. Document how an admin reaches the account, and whether the container
