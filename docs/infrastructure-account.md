@@ -73,7 +73,8 @@ starting the work, not after. Make `who` name the *session*, not the model.
       be green before step 7, because this policy binds the in-account
       `pulumi-deploy` role step 7 creates.
 - [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
-      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
+      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: doing
+      (pi-swarm-infra-step6, 2026-10-07).
       Applied by `deploy.yml`; must merge and finish applying before step 7.
 - [ ] 7. Add the `deploy-infrastructure/` project and its CI job: todo. Two
       pull requests, forced by bootstrap causality, the same shape as
