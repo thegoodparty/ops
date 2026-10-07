@@ -1,0 +1,10 @@
+[Unit]
+Description=Run agent-swarm-health.service every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

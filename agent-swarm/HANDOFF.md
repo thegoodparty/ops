@@ -64,8 +64,8 @@ Everything is tagged `Name=agent-swarm`, `Environment=infra`, `Project=agent-swa
 | IAM role + instance profile | `agent-swarm-host`. Managed: `AmazonSSMManagedInstanceCore`. Inline `agent-swarm-host-inline`: `secretsmanager:GetSecretValue` on `arn:aws:secretsmanager:us-west-2:333022194791:secret:AGENT_SWARM*`, `logs:*` write on `/agent-swarm/*`. Inline `agent-swarm-aws-readonly`: read-only CloudWatch, Logs (incl. Insights queries), ECS, ECR, Application Auto Scaling describe, Cost Explorer, Budgets, CUR describe, Pricing. Documents in `iam/`. |
 | Route53 | `swarm.goodparty.org` A → `52.10.75.185`, zone `Z10392302OXMPNQLPO07K` |
 | Secrets Manager | `AGENT_SWARM` (`arn:aws:secretsmanager:us-west-2:333022194791:secret:AGENT_SWARM-3S3N74`). Keys: `ANTHROPIC_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `GITHUB_TOKEN`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `CLICKUP_API_TOKEN` (copied from the `DELEGATES` secret), `API_KEY` (operator bearer, generated), `SECRETS_ENCRYPTION_KEY` (generated; losing it loses every secret the swarm encrypted in its DB). |
-| Logs | Docker `json-file` on the host (50m x 5 per container). **Nothing ships to CloudWatch** despite the policy allowing it. |
-| Backups | **None.** State is the `agent-swarm_swarm_api_data` Docker volume (SQLite + `.page-session-secret`) plus the encryption key. |
+| Logs | CloudWatch Logs `/agent-swarm/containers` via the awslogs driver, one stream per container, 30 days. |
+| Backups | DLM policy `agent-swarm-snapshots`: nightly instance snapshot at 10:00 UTC, 14 kept. State is the `agent-swarm_swarm_api_data` Docker volume (SQLite + `.page-session-secret`) plus the encryption key in the secret. |
 | Access | `aws ssm start-session --region us-west-2 --target i-04cc03c17787f5d59`. No SSH key exists. |
 
 Not in AWS but part of the deployment:
@@ -78,24 +78,23 @@ Not in AWS but part of the deployment:
 
 ## 4. Host layout and the compose stack
 
-`/opt/agent-swarm/` on the host, owned by `ec2-user`. Every file except `.env` and the build outputs is in this directory of the repo and matched byte for byte on 2026-10-05.
+`/opt/agent-swarm/` on the host, owned by `ec2-user`. Every file except `.env` and `ui-dist/` comes from `host/` in this directory and is installed by the SSM association on every deploy (README, "How it deploys").
 
 | File | Purpose |
 | --- | --- |
-| `docker-compose.yml` | Services: `api`, `lead`, `worker-coder`, `worker-reviewer`, `tei`, `grafana-mcp`, `caddy` (profile `tls`). Images pinned (`AGENT_SWARM_VERSION=1.163.0`, `caddy:2.11.4@sha256`, `text-embeddings-inference:cpu-1.9`). `grafana/mcp-grafana:latest` is the one unpinned image. `api` binds `127.0.0.1:3013` only; no worker ports; no Docker socket anywhere. |
+| `docker-compose.yml` | Services: `api`, `lead`, `worker-coder`, `worker-reviewer`, `tei`, `grafana-mcp`, `caddy` (profile `tls`). Images pinned (`AGENT_SWARM_VERSION=1.163.0`, `caddy:2.11.4@sha256`, `text-embeddings-inference:cpu-1.9`). `grafana/mcp-grafana` is pinned by digest. `api` binds `127.0.0.1:3013` only; no worker ports; no Docker socket anywhere. |
 | `render-env.sh` | Reads `AGENT_SWARM` from Secrets Manager via the instance role, merges with static values, writes `.env` (mode 600). Refuses if any secret value is `TODO`. Run after any secret change. |
 | `up.sh` | `render-env.sh` then `docker compose --profile tls up -d --remove-orphans`. |
 | `agent-swarm.service` | systemd oneshot, enabled. `start` = `up.sh`; `stop` = `docker compose down` (triggers the API drain). |
 | `Caddyfile` | `swarm.goodparty.org`: API prefixes (`/api/*`, `/p/*`, `/@swarm/*`, `/mcp`, `/mcp-user`, `/health`, `/status`, `/docs*`, `/openapi.json`, `/x/*`, `/ping`, `/close`) → `api:3013`; everything else serves `/srv/ui` with SPA fallback. `Caddyfile.bak-20261005-214352` is the pre-dashboard version. |
 | `global-setup-script.sh`, `apply-global-setup-script.sh` | agent-swarm's admin `SETUP_SCRIPT` global config (id `9a537fcc-5b05-4973-9379-3dd208db93f1`). Runs as root at every agent container start. Installs AWS CLI v2 once into the persistent `swarm_shared` volume and relinks `/usr/local/bin/aws`. Edit the script, run the apply script, restart the agents. |
-| `ui-dist/` (host only) | Built dashboard, 12 MB, buildId `f1c9398ccf0be33f`. Mounted read-only into caddy at `/srv/ui`. |
-| `src/` (host only) | Shallow clone of the agent-swarm tag used to build the UI. Rebuild on every version bump: `cd src/apps/ui && bun install --frozen-lockfile && bun run build`, copy `dist/` to `ui-dist/`. |
+| `ui-dist/` (host only) | Built dashboard, buildId `f1c9398ccf0be33f`. Mounted read-only into caddy at `/srv/ui`. `build-ui.sh` rebuilds it when `ui-dist/.agent-swarm-version` differs from `AGENT_SWARM_VERSION`. |
 
 Key env (names only; see `render-env.sh` and the compose file for the full set):
 
 - API: `NODE_ENV=production` (Bun defaults to `development`, which **silently blocks Slack Socket Mode**), `CAPABILITIES` unset (defaults include scheduling, pages, slack, mcp, kv, memory, repo), `ALLOW_PRIVATE_NETWORK_URLS=true` (needed to register `http://grafana-mcp:8000/mcp`), `GITHUB_DISABLE=true` (no inbound GitHub webhooks), `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org`, `SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK`, `APP_URL=https://swarm.goodparty.org`, `MCP_BASE_URL` and `PUBLIC_MCP_BASE_URL=https://swarm.goodparty.org`, `EMBEDDING_API_BASE_URL=http://tei:80/v1`, `EMBEDDING_API_KEY=local`, `EMBEDDING_MODEL=nomic-embed-text-v1.5`, `API_DRAIN_MAX_MS=30000`, `SECRETS_ENCRYPTION_KEY` via env (not a file secret).
 - Agents (shared `x-worker-env` anchor): `HARNESS_PROVIDER=claude`, `ANTHROPIC_API_KEY`, `MODEL_OVERRIDE` as a **bare model id** (`claude-opus-5-5` lead, `claude-sonnet-5-5` workers), `MCP_BASE_URL=http://api:3013`, `APP_URL`, `GITHUB_TOKEN`, `GITHUB_NAME=Swarm`, `GITHUB_EMAIL=swarm@goodparty.org`, `CLICKUP_API_TOKEN` and `CLICKUP_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `GRAFANA_URL`. Agent ids are pinned in env so they survive recreation.
-- `grafana-mcp`: `-t streamable-http --address 0.0.0.0:8000 --allowed-hosts grafana-mcp:8000,grafana-mcp` (it rejects non-loopback Host headers otherwise). It has **no caller auth**; only the compose network reaches it.
+- `grafana-mcp`: pinned by digest; `-t streamable-http --address 0.0.0.0:8000 --allowed-hosts grafana-mcp:8000,grafana-mcp` (it rejects non-loopback Host headers otherwise). It has **no caller auth**; only the compose network reaches it.
 
 Resource use on 2026-10-07: 15 GB of 120 GB disk, 2.9 GB of 15.6 GB RAM. TEI holds about 1.85 GB.
 
@@ -145,20 +144,48 @@ Verified in the v1.163.0 source; cite `src/...` paths from a checkout of the tag
 - **Models**: `MODEL_OVERRIDE` is passed verbatim to `claude --model` on the claude harness. `modelTier` (`smol|regular|smart|ultra`) via `MODEL_TIER_MAP` is the provider-agnostic alternative. Session summaries/memory rating use OpenRouter → Anthropic → OpenAI in that precedence; workflow LLM nodes accept only `openrouter`/`openai`.
 - **Images**: worker is 5.4 GB unpacked (full toolchain + Playwright). `pull_policy: always` was removed since the tag is pinned.
 
-## 8. Open items and a suggested order
+## 8. Productionization status (updated 2026-10-07)
 
-Swain has not decided the long-term home or the account. Everything below is the agent's recommendation.
+Account: stays in `333022194791`, where it already ran. Revisit only if the
+long-term home moves.
 
-1. **Infrastructure as code.** Pulumi in this repo, same pattern as `deploy/` (one stack, EC2 + EIP + SG + role + Route53 + secret lookup; the secret stays clickops per the repo convention). Keep the compose file and scripts as-is and ship them with user-data or a small sync step. Decide the account with Swain first; `333022194791` is where it is now and where delegate and BugBoss live.
-2. **Backups.** Nightly EBS snapshot of the root volume is the cheapest correct answer (SQLite WAL on the same disk, so snapshot consistency is good enough for a pilot). Litestream is Helm-only upstream. Store the encryption key's existence (not value) in the runbook; it is already in Secrets Manager.
-3. **Login.** `oauth2-proxy` (Google, `goodparty.org`) in front via Caddy `forward_auth`, bypassing `/mcp`, `/mcp-user`, `/health`, `/status`, `/ping`, `/api/*/webhook`, `/api/mcp-oauth/callback`, `/api/oauth/callback`. Then mint `aswt_` per-user tokens for pilots instead of sharing `API_KEY`. Needs a Google OAuth client with redirect `https://swarm.goodparty.org/oauth2/callback`; Swain creates it. Full proposal: `docs/sso-proposal.md`.
-4. **GitHub machine user.** Replace Swain's PAT with a bot account in `gp-contrib` and a fine-grained PAT; same permissions. Set `GITHUB_NAME`/`GITHUB_EMAIL` to match. Rotation before 2027-01-03 regardless.
-5. **Observability.** Ship container logs to CloudWatch or Loki (the role already allows `/agent-swarm/*`), alert on host down / API unhealthy / disk > 80%, and track Anthropic spend (the dedicated workspace makes this a console read).
-6. **Pin `grafana/mcp-grafana`** to a digest. Consider a bearer header in front of it; today only the compose network reaches it.
-7. **Review the schedules** with Swain (section 5). Several daily audits were not explicitly requested.
-8. **Grafana ingress** when he wants proactivity beyond schedules: a workflow with a webhook trigger, and a second webhook integration on the Grafana contact point (contact points in this Grafana are UI-edited; see memory). Not started.
-9. **Version bumps**: pick a cadence, write the procedure (stop, bump, rebuild UI, start, verify three agents idle and Slack connected), and clear Claude Code's `mcp-needs-auth-cache.json` if any OAuth server was reconnected.
-10. **Small cleanups**: delete `Caddyfile.bak-*`; the `.worktrees/` dir is not in this repo's `.gitignore`; `fill-secrets.sh` is the interactive way to fill the secret and lives here.
+Done in the PR that adopted the host into Pulumi:
+
+1. **Infrastructure as code.** `deploy/components/agent-swarm.ts` in the `ops`
+   stack imports the instance, EIP, security group, role, instance profile,
+   inline policies and DNS record, and protects the stateful ones. Host files
+   live in `host/` and reach the host through S3 and an SSM association on
+   every deploy; `pulumi up` waits for it. The secret stays clickops.
+2. **Backups.** Nightly DLM instance snapshot, 14 kept.
+5. **Observability.** Container logs to CloudWatch; a minutely health timer
+   reports `ApiHealthy`, `PublicHealthy`, `DiskUsedPercent`; five alarms post
+   to `#swarm-testing` through `agent-swarm-alarm-notifier`; EC2 status
+   checks recover or reboot automatically. Anthropic spend stays a console
+   read on the `agent-swarm` workspace.
+6. **`grafana/mcp-grafana` pinned** to the digest that was running. No bearer
+   added in front of it: only the compose network reaches it.
+9. **Version bumps** are a one-line PR (README, "Upgrade agent-swarm"); the
+   dashboard rebuilds itself when the version changes.
+10. **Cleanups.** `Caddyfile.bak-*`, the stale `/opt/agent-swarm/src` clone
+   and the old unit copy are removed by `install.sh`; `.worktrees/` is in
+   `.gitignore`.
+
+Built and waiting on Swain:
+
+3. **Login.** oauth2-proxy and the SSO Caddy routes are in place and switch
+   on when the secret holds the three `OAUTH2_PROXY_*` keys. Needs a Google
+   OAuth client (README, "Google login"). A hand-out link carrying an
+   `aswt_` token passes through Google's `state` on an unauthenticated
+   visit, so hand tokens out separately once login is on.
+4. **GitHub machine user.** Needs a bot account in `gp-contrib`. Rotate
+   Swain's PAT before 2027-01-03 regardless.
+7. **Schedules.** 8 enabled, 7 disabled; most daily audits were seeded by the
+   lead's template, not asked for. Swain decides which stay.
+
+Not started, by choice:
+
+8. **Grafana ingress**: a workflow with a webhook trigger plus a second
+   contact-point integration, when proactivity beyond schedules is wanted.
 
 ## 9. Where everything the agent wrote lives
 
@@ -167,7 +194,7 @@ Swain has not decided the long-term home or the account. Everything below is the
 - **Pilot guide for users** (Claude artifact, private, Swain owns it): https://claude.ai/artifact/S1oPLMimpwCfGuN2f5sEzu . Source HTML was in the job's tmp dir and is not in git; the content is a prose version of sections 1 to 7.
 - **Swain's Claude memory** (`~/.claude/projects/-Users-swain-Repos-thegoodparty-omni/memory/swarm-playground-2026-10.md`): a shorter record of the same facts for his future sessions. `memory/attic/agent-swarm-*.md` is the earlier attempt he asked not to be used.
 - **Not in git** (ephemeral, in a Claude job tmp dir that is deleted with the job): SSM helper scripts, the read-only IAM policy JSON (copied to `iam/` here), probe scripts. Nothing of value that is not also in this directory or on the host.
-- **No changes were made to omni, gp-api, or any product repo.** No changes to `delegate/`, `deploy/`, or `bugboss/` in this repo.
+- **No changes were made to omni, gp-api, or any product repo.** The AWS side lives in `deploy/components/agent-swarm.ts`; nothing in `delegate/` or `bugboss/` was touched.
 
 ## 10. Working with Swain on this
 

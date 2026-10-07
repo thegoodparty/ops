@@ -1,7 +1,17 @@
 # agent-swarm 1.163.0 on swarm.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
 # render-env.sh from Secrets Manager:AGENT_SWARM; never edit .env by hand.
-# Start with: ./up.sh  (docker compose --profile tls up -d)
+# Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
+
+x-logging: &logging
+  driver: awslogs
+  options:
+    awslogs-region: us-west-2
+    awslogs-group: /agent-swarm/containers
+    awslogs-create-group: "false"
+    tag: "{{.Name}}"
+    mode: non-blocking
+    max-buffer-size: 4m
 
 x-agent-entrypoint: &agent-entrypoint
   - /bin/sh
@@ -47,6 +57,7 @@ x-worker-base: &worker-base
     api:
       condition: service_healthy
   restart: unless-stopped
+  logging: *logging
 
 services:
   tei:
@@ -63,6 +74,7 @@ services:
       # First boot downloads the model from Hugging Face before listening.
       start_period: 600s
     restart: unless-stopped
+    logging: *logging
 
   api:
     image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.163.0}"
@@ -117,6 +129,7 @@ services:
       retries: 3
       start_period: 40s
     restart: unless-stopped
+    logging: *logging
 
   lead:
     <<: *worker-base
@@ -158,7 +171,7 @@ services:
       - swarm_worker_reviewer:/workspace/personal
 
   grafana-mcp:
-    image: grafana/mcp-grafana:latest
+    image: grafana/mcp-grafana@sha256:2ed63c4d9d67557c8ea6cc6988743ddd9008e248bd9842e760fec378a0b61062
     # --allowed-hosts: the image validates the Host header and defaults to
     # loopback only; the api reaches it as grafana-mcp:8000.
     command:
@@ -172,6 +185,7 @@ services:
       - GRAFANA_URL=https://goodparty.grafana.net
       - GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_SERVICE_ACCOUNT_TOKEN}
     restart: unless-stopped
+    logging: *logging
 
   caddy:
     image: caddy:2.11.4@sha256:13ba145cba2f3e28fa801994876e4c086d1b95d5aa2a520a734765ffb6b12017
@@ -179,6 +193,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    environment:
+      - SWARM_AUTH=${SWARM_AUTH:-open}
     ports:
       - "80:80"
       - "443:443"
@@ -189,6 +205,33 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     restart: unless-stopped
+    logging: *logging
+
+  # Google login in front of the dashboard (Caddy forward_auth, see
+  # Caddyfile). Only started when render-env.sh finds the OAUTH2_PROXY_* keys.
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
+    profiles: ["sso"]
+    environment:
+      OAUTH2_PROXY_PROVIDER: google
+      OAUTH2_PROXY_CLIENT_ID: ${OAUTH2_PROXY_CLIENT_ID:-}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:-}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:-}
+      OAUTH2_PROXY_EMAIL_DOMAINS: goodparty.org
+      OAUTH2_PROXY_REDIRECT_URL: https://swarm.goodparty.org/oauth2/callback
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_UPSTREAMS: static://202
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_EXPIRE: 168h
+      OAUTH2_PROXY_COOKIE_REFRESH: 1h
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_WHITELIST_DOMAINS: swarm.goodparty.org
+    restart: unless-stopped
+    logging: *logging
 
 volumes:
   tei_data:

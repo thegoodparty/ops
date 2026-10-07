@@ -11,7 +11,7 @@ Group=docker
 WorkingDirectory=/opt/agent-swarm
 Environment=AWS_REGION=us-west-2
 ExecStart=/opt/agent-swarm/up.sh
-ExecStop=/usr/bin/docker compose --profile tls down
+ExecStop=/usr/bin/docker compose --profile "*" down
 TimeoutStartSec=900
 TimeoutStopSec=180
 

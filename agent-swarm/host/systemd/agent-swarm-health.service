@@ -1,0 +1,9 @@
+[Unit]
+Description=agent-swarm health metrics to CloudWatch (namespace AgentSwarm)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/agent-swarm/health.sh
+TimeoutStartSec=50

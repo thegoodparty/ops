@@ -16,27 +16,81 @@
 # /connections /scripts /script-runs /approval-requests /usage /settings
 # /templates /mcp-servers /skills /repos /people /memory /pages /apps /file
 # /setup /integrations).
+#
+# SWARM_AUTH (set by render-env.sh, passed to the caddy container) picks the
+# snippet: "open" (bearer auth only) or "sso" (Google login via oauth2-proxy
+# in front of everything except machine callers; see docs/sso-proposal.md).
 
-swarm.goodparty.org {
-	encode zstd gzip
+(spa) {
+	root * /srv/ui
 
+	# index.html and version.json carry the build id the SPA polls to
+	# prompt a reload (apps/ui/vite.config.ts buildVersionManifest), so
+	# they must never be cached. Hashed assets are immutable.
+	@nocache path / /index.html /version.json
+	header @nocache Cache-Control "no-cache"
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	try_files {path} /index.html
+	file_server
+}
+
+(open) {
 	@api path /api/* /p/* /@swarm/* /mcp /mcp-user /health /status /docs /docs/* /openapi.json /x/* /ping /close
 	handle @api {
 		reverse_proxy api:3013
 	}
 
 	handle {
-		root * /srv/ui
-
-		# index.html and version.json carry the build id the SPA polls to
-		# prompt a reload (apps/ui/vite.config.ts buildVersionManifest), so
-		# they must never be cached. Hashed assets are immutable.
-		@nocache path / /index.html /version.json
-		header @nocache Cache-Control "no-cache"
-		@assets path /assets/*
-		header @assets Cache-Control "public, max-age=31536000, immutable"
-
-		try_files {path} /index.html
-		file_server
+		import spa
 	}
+}
+
+(sso) {
+	# oauth2-proxy's own endpoints: login start, Google callback, sign out.
+	handle /oauth2/* {
+		reverse_proxy oauth2-proxy:4180 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Uri {uri}
+		}
+	}
+
+	# Machine callers with their own bearer or signature, and IdP callbacks
+	# that carry their own state: no browser cookie.
+	@noauth path /mcp /mcp-user /health /status /ping /api/github/webhook /api/gitlab/webhook /api/azure-devops/webhook /api/agentmail/webhook /api/integrations/kapso/webhook /api/mcp-oauth/callback /api/oauth/callback /api/oauth/*/callback
+	handle @noauth {
+		reverse_proxy api:3013
+	}
+
+	handle {
+		forward_auth oauth2-proxy:4180 {
+			uri /oauth2/auth
+			copy_headers X-Auth-Request-User X-Auth-Request-Email X-Auth-Request-Groups X-Forwarded-User X-Forwarded-Email
+
+			# Browser navigations go to the login page; fetches from the SPA
+			# get a plain 401 instead of a redirect into Google's HTML.
+			@error status 401 403
+			handle_response @error {
+				@navigation header Accept *text/html*
+				redir @navigation /oauth2/start?rd={http.request.uri_escaped} 302
+				respond 401
+			}
+		}
+
+		@api path /api/* /p/* /@swarm/* /docs /docs/* /openapi.json /x/* /close
+		handle @api {
+			reverse_proxy api:3013
+		}
+
+		handle {
+			import spa
+		}
+	}
+}
+
+swarm.goodparty.org {
+	encode zstd gzip
+
+	import {$SWARM_AUTH:open}
 }

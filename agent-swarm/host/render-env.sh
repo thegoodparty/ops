@@ -34,6 +34,27 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
+SSO_KEYS=(
+  OAUTH2_PROXY_CLIENT_ID
+  OAUTH2_PROXY_CLIENT_SECRET
+  OAUTH2_PROXY_COOKIE_SECRET
+)
+
+sso_present=0
+for k in "${SSO_KEYS[@]}"; do
+  if jq -e --arg k "$k" 'has($k)' <<<"$SECRET_JSON" >/dev/null; then
+    sso_present=$((sso_present + 1))
+  fi
+done
+if ((sso_present == ${#SSO_KEYS[@]})); then
+  SWARM_AUTH=sso
+elif ((sso_present == 0)); then
+  SWARM_AUTH=open
+else
+  echo "render-env: secret $SECRET_ID has some but not all of: ${SSO_KEYS[*]}" >&2
+  exit 1
+fi
+
 todo="$(jq -r 'to_entries[] | select((.value|tostring) == "TODO" or (.value|tostring) == "") | .key' <<<"$SECRET_JSON")"
 if [[ -n "$todo" ]]; then
   echo "render-env: secret $SECRET_ID still has TODO/empty values for:" >&2
@@ -78,9 +99,11 @@ GITHUB_EMAIL=swarm@goodparty.org
 
 GRAFANA_URL=https://goodparty.grafana.net
 EOF
+  echo
+  echo "SWARM_AUTH=$SWARM_AUTH"
 } >"$TMP"
 
 chmod 600 "$TMP"
 mv -f "$TMP" "$OUT"
 trap - EXIT
-echo "render-env: wrote $OUT ($(grep -c '=' "$OUT") keys)"
+echo "render-env: wrote $OUT ($(grep -c '=' "$OUT") keys, SWARM_AUTH=$SWARM_AUTH)"

@@ -19,6 +19,8 @@ on:
       - "deploy-org/**"
       - "deploy-workbench/**"
       - "delegate/**"
+      # The ops stack uploads these to the agent-swarm host.
+      - "agent-swarm/**"
       # A shared input: all three projects import the account ids from it, so
       # an edit here changes their plans and must start a preview.
       - "utils/accounts.ts"
@@ -133,7 +135,7 @@ jobs:
             const shared =
               /^(package\.json|package-lock\.json|tsconfig\.json|\.nvmrc|utils\/accounts\.ts|\.github\/workflows\/pulumi-preview\.yml)$/;
             const matrix = [];
-            if (any(/^(deploy\/|delegate\/)/) || any(shared)) {
+            if (any(/^(deploy\/|delegate\/|agent-swarm\/)/) || any(shared)) {
               matrix.push({ project: "ops", dir: "deploy", build: true });
             }
             if (any(/^deploy-org\//) || any(shared)) {
