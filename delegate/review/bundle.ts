@@ -68,9 +68,11 @@ export const buildBundle = async (args: {
     }
   }
 
+  // A deleted file shows as a header only. Its full preimage adds nothing to
+  // review and is what pushed a large teardown past the model's context.
   const diff = execFileSync(
     "git",
-    ["diff", mergeBase, "HEAD"],
+    ["diff", "--irreversible-delete", mergeBase, "HEAD"],
     { cwd: args.reviewDir, ...EXEC_OPTS },
   ).toString();
 

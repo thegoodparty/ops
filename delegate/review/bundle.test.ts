@@ -75,11 +75,13 @@ describe("buildBundle", () => {
     git("config", "user.name", "Test User");
 
     writeFileSync(join(tempDir, "foo.ts"), "const x = 1;\n");
+    writeFileSync(join(tempDir, "gone.ts"), "const deletedBody = 1;\n");
     git("add", ".");
     git("commit", "-m", "base commit");
     baseSha = git("rev-parse", "HEAD");
 
     writeFileSync(join(tempDir, "foo.ts"), "const x = 2;\n");
+    rmSync(join(tempDir, "gone.ts"));
     git("add", ".");
     git("commit", "-m", "pr change");
     headSha = git("rev-parse", "HEAD");
@@ -120,12 +122,14 @@ describe("buildBundle", () => {
     assert.equal(bundle.author, "testuser");
     assert.equal(bundle.title, "Test PR");
     assert.equal(bundle.body, "PR description");
-    assert.deepEqual(bundle.changedFiles, ["foo.ts"]);
+    assert.deepEqual(bundle.changedFiles, ["foo.ts", "gone.ts"]);
     assert.deepEqual(bundle.priorFindings, []);
 
     assert.ok(bundle.diff.includes("foo.ts"), "diff should reference the changed file");
     assert.ok(bundle.diff.includes("-const x = 1"), "diff should show removed line");
     assert.ok(bundle.diff.includes("+const x = 2"), "diff should show added line");
+    assert.ok(bundle.diff.includes("deleted file mode"), "diff should name the deleted file");
+    assert.ok(!bundle.diff.includes("deletedBody"), "diff should omit a deleted file's contents");
   });
 
   it("changedFiles is empty when merge-base equals HEAD", async () => {
