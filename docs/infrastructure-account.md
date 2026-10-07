@@ -89,7 +89,8 @@ starting the work, not after. Make `who` name the *session*, not the model.
       creates it, per step 5: the merge's `deploy.yml` run is the read-back,
       so a red run beside this entry means the entry is wrong in the visible
       way. It has to be green before step 7 merges.
-- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: todo. Two
+- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: doing
+      (pi-swarm-infra-step7a, 2026-10-07). Two
       pull requests, forced by bootstrap causality, the same shape as
       workbench steps 7 and 10: the first applies against
       `OrganizationAccountAccessRole` and creates the in-account `pulumi-deploy`
