@@ -856,9 +856,7 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
  * resource-scoped; it exists so preview mode can resolve the currently
  * deployed delegate image rather than invent a URI. `secretsmanager` is
  * `DescribeSecret` metadata only: the value read was removed in step 3, which
- * is what lets this role exist without `GetSecretValue`. `acm:ListCertificates`
- * likewise cannot be resource-scoped; it backs the `getCertificate` data
- * source in `components/bugboss.ts`.
+ * is what lets this role exist without `GetSecretValue`.
  */
 export const githubActionsPulumiPreview: PolicyDocument = {
   Version: "2012-10-17",
@@ -867,21 +865,18 @@ export const githubActionsPulumiPreview: PolicyDocument = {
     {
       Sid: "RuntimeSecretMetadata",
       Effect: "Allow",
-      // The two Secrets Manager secrets the ops program looks up by name:
-      // `DELEGATES` (`deploy/index.ts`) and `BUGBOSS` (`components/bugboss.ts`).
-      // The `getSecret` data source reads the secret's resource policy along
-      // with `DescribeSecret` (tags come back from the describe itself), so
-      // `GetResourcePolicy` is needed as well. All metadata; none returns a
-      // value. Both secrets were found by running real previews: the first
-      // failed on `GetResourcePolicy` for `DELEGATES`, the second on
-      // `DescribeSecret` for `BUGBOSS`.
+      // The Secrets Manager secret the ops program looks up by name:
+      // `DELEGATES` (`deploy/index.ts`). The `getSecret` data source reads the
+      // secret's resource policy along with `DescribeSecret` (tags come back
+      // from the describe itself), so `GetResourcePolicy` is needed as well.
+      // All metadata; neither returns a value. Found by running a real
+      // preview, which failed on `GetResourcePolicy`.
       Action: [
         "secretsmanager:DescribeSecret",
         "secretsmanager:GetResourcePolicy",
       ],
       Resource: [
         "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
-        "arn:aws:secretsmanager:us-west-2:333022194791:secret:BUGBOSS-??????",
       ],
     },
     {
@@ -889,37 +884,6 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       Effect: "Allow",
       Action: ["ecs:DescribeTaskDefinition"],
       Resource: "*",
-    },
-    {
-      Sid: "CertificateList",
-      Effect: "Allow",
-      // `components/bugboss.ts` resolves the wildcard certificate with the
-      // `getCertificate` data source, which lists certificates matching the
-      // domain and then describes the one it picked. `ListCertificates` takes
-      // no resource, so it cannot be scoped. Found by running a real preview:
-      // the role failed on `acm:ListCertificates`.
-      Action: ["acm:ListCertificates"],
-      Resource: "*",
-    },
-    {
-      Sid: "CertificateRead",
-      Effect: "Allow",
-      // The read half of the same lookup. The data source describes the
-      // certificate it chose, lists its tags to match the provider default
-      // tags the ops stack sets (`Environment`, `Project`), and, because it
-      // filters to `ISSUED`, fetches that certificate's PEM and chain. All
-      // three accept the certificate ARN, so they share one scoped statement.
-      // `GetCertificate` returns the public certificate and chain, not the
-      // private key. `ListTagsForCertificate` is the one Bugbot named on #133:
-      // the data source passes its `tags` argument through as a filter, and
-      // the default tags make that non-empty even though BugBoss passes no
-      // explicit `tags`.
-      Action: [
-        "acm:DescribeCertificate",
-        "acm:GetCertificate",
-        "acm:ListTagsForCertificate",
-      ],
-      Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
     },
     {
       Sid: "AssumeWorkbenchPreviewRole",

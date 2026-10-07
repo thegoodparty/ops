@@ -242,10 +242,8 @@ derived from `CI`, and in that mode each `deploy.sh`:
 
 - runs `stack select` **without** `--create`;
 - sets config as today (local `Pulumi.*.yaml`, gitignored, not state);
-- for `ops`, resolves `IMAGE_URI` and `BUGBOSS_IMAGE_URI` to the currently
-  deployed images from the `delegate` and `bugboss` task definitions, so
-  code-only PRs show no task-definition diff (and, for BugBoss, are not
-  previewed as destroyed — its resources are gated on `bugbossImageUri`);
+- for `ops`, resolves `IMAGE_URI` to the currently deployed image from the
+  `delegate` task definition, so code-only PRs show no task-definition diff;
 - runs `pulumi preview` once per invocation: `--json` to the path in
   `PULUMI_PREVIEW_JSON` for the summary and diagnostics, `--diff` to stdout for
   the body. Never `up`. One setup means the resolved images are consistent
