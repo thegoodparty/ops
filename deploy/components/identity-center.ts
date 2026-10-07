@@ -1,6 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import {
+  INFRASTRUCTURE_ACCOUNT_ID,
   MANAGEMENT_ACCOUNT_ID,
   WORKBENCH_ACCOUNT_ID,
 } from "../../utils/accounts";
@@ -231,6 +232,25 @@ const accounts = {
     adopted: false,
     assignments: {
       Engineers: ["workbench"],
+      Admins: ["administrator"],
+    },
+  },
+  // The infrastructure account, 394495727159. Step 8 of
+  // docs/infrastructure-account.md.
+  //
+  // Admins get AdministratorAccess. This is the human admin path and, since
+  // step 7's cutover, the break-glass route: the stack is self-referential
+  // there, the apply running as the `pulumi-deploy` role the apply manages, so
+  // this assignment is what recovers the account if a bad edit locks CI out.
+  //
+  // No Engineers entry yet. The account holds privileged automation, not an
+  // inner loop, and adding a set before there is a job for it gives away the
+  // boundary the account exists for.
+  infrastructure: {
+    id: INFRASTRUCTURE_ACCOUNT_ID,
+    namePrefix: "infrastructure-",
+    adopted: false,
+    assignments: {
       Admins: ["administrator"],
     },
   },
