@@ -26,25 +26,52 @@ starting the work, not after. Make `who` name the *session*, not the model.
       without a working address, and the alias is the root-user recovery path.
       It must be a group rather than a person, and it must never have been
       used for any other AWS account.
-- [ ] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
-      account in `deploy-org/`: doing (pi-infra-step2, 2026-10-05). No grant PR
-      in front of this one; the existing `github-actions-org-deploy` policy
-      already covers OU and account creation and the reads that follow.
-- [ ] 3. Record the account id and OU id below, then let it settle: todo.
-      `CreateAccount` is asynchronous and the id is unknown until it lands, so
-      this is a separate step. The settle is the same one workbench step 6
-      needed: STS has to see `OrganizationAccountAccessRole` before step 7 can
-      assume it, and a transient failure there is expected rather than a
-      permissions bug.
-- [ ] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
-      the new OU: doing (pi-infra-step4, 2026-10-05). This is applied by
-      `deploy.yml` and its consumer is applied by `deploy-org.yml`, so it must
-      merge **and finish applying** before step 5. See "Apply ordering between
-      workflows" in the workbench document for why the grant cannot ride along
-      with the policy it enables.
-- [ ] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`:
-      todo. Design in "The infrastructure SCP" below; read that before
-      starting, not this summary.
+- [x] 2. Add the `Infrastructure` OU and the `goodparty-infrastructure`
+      account in `deploy-org/`: done (2026-10-05, pi-infra-step2, PR #238
+      merged as 6609eb9. The `Deploy org` run 37354688503 was green at 18:18
+      UTC, created exactly the 2 expected resources and nothing else, and the
+      account reached `ACTIVE` at 18:18:31Z with id `394495727159` inside the
+      new OU `ou-jqqe-orrk423t`. No grant PR in front of it; the existing
+      `github-actions-org-deploy` policy already covered OU and account
+      creation and the reads that followed. Ids recorded in the facts below.)
+- [x] 3. Record the account id and OU id below, then let it settle: done
+      (2026-10-05, pi-infra-step3). Ids recorded in the facts below, and
+      `INFRASTRUCTURE_ACCOUNT_ID` added to `utils/accounts.ts`. The apply's
+      outputs report `Status` and `State` both `ACTIVE`, so the Organizations
+      half of the settle is over. The other half, STS seeing
+      `OrganizationAccountAccessRole`, is unverified and cannot be checked from
+      the `WorkbenchAccess` session this ran in: the assume is the first thing
+      step 7 does, so a transient failure there is the expected place to find
+      out, not a permissions bug. Step 4 does not wait on it.
+- [x] 4. Widen `github-actions-org-deploy`'s service-control-policy grant to
+      the new OU: done (2026-10-05, pi-infra-step4, PR #241 merged as 61a94c9.
+      The merge's CI run 37360050783 was green at 19:05 UTC: it updated
+      `github-actions-org-deploy`'s inline `OrgDeploy` policy (4 updated, 74
+      unchanged) and the applied document carries the Infrastructure OU ARN in
+      both `ServiceControlPolicyAttachment` and
+      `ServiceControlPolicyListingForTarget`. Read from the apply log rather
+      than an `iam:get-role-policy`, because no management-account SSO token
+      was live; the log shows the document Pulumi actually sent, which is the
+      same read-back shape workbench step 9 part 2 used. That is the evidence
+      step 5's attach will not be refused.)
+- [x] 5. Add the `Infrastructure` SCP and its attachment in `deploy-org/`: done
+      (2026-10-05, pi-infra-step5). `deploy-org/policies.ts` holds
+      `infrastructureScp` and `deploy-org/index.ts` the `aws.organizations.Policy`
+      and `PolicyAttachment`, following `workbenchScp` and its comments. Three
+      statements, per "The infrastructure SCP" below; one is deliberately
+      tighter than workbench's, since review pointed out that denying only the
+      `Create` actions still lets an existing access key be re-enabled. The
+      three denies the
+      workbench policy carries that are deliberately absent here are recorded
+      as exclusions rather than left to look like omissions. Unprotected,
+      deliberately: the failure mode of an SCP is denying something real, and
+      the way out sits outside the policy — SCPs never apply to the management
+      account, and github-actions-org-deploy can detach from exactly the two
+      OUs it can attach to. Marked done in the PR that creates it, per workbench
+      step 13: the merge's `Deploy org` run is the read-back, so a red run
+      beside this entry means the entry is wrong in the visible way. It has to
+      be green before step 7, because this policy binds the in-account
+      `pulumi-deploy` role step 7 creates.
 - [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
       Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
       Applied by `deploy.yml`; must merge and finish applying before step 7.
@@ -257,14 +284,26 @@ Three statements, all universal rather than workload-specific, all in
    strands the account outside consolidated billing and every governance
    control at once.
 2. **`DenyIamUsersAndLongLivedKeys`** — `iam:CreateUser`,
-   `iam:CreateAccessKey`, `iam:CreateLoginProfile`. Access here is federated
-   through Identity Center or assumed, and a long-lived key in an account that
-   exists to hold privileged automation is the credential most likely to end up
-   somewhere it cannot be revoked from. Deliberately not `iam:CreateRole`: the
-   deploy roles and any scanner roles are created by IAM, and denying role
-   creation breaks the pipeline. This is the statement most likely to need
-   loosening if a third-party tool insists on an IAM user; loosen it
-   deliberately, in a PR that names the tool.
+   `iam:CreateAccessKey`, `iam:CreateLoginProfile`, `iam:UpdateAccessKey`,
+   `iam:UpdateLoginProfile`. Access here is federated through Identity Center
+   or assumed, and a long-lived key in an account that exists to hold
+   privileged automation is the credential most likely to end up somewhere it
+   cannot be revoked from. Deliberately not `iam:CreateRole`: the deploy roles
+   and any scanner roles are created by IAM, and denying role creation breaks
+   the pipeline. This is the statement most likely to need loosening if a
+   third-party tool insists on an IAM user; loosen it deliberately, in a PR
+   that names the tool.
+
+   The two `Update` actions are a deliberate tightening beyond the workbench
+   policy, which denies only the three `Create` actions. Review of the first
+   version pointed out that it stopped new credentials but not the re-enabling
+   of an existing one, which is not what the Sid says. The reachable set is
+   small while the account is empty — no IAM user can be created, so no key
+   can exist — but the deny is meant to hold as the account fills and it costs
+   nothing to make it complete. `UpdateAccessKey` is also how a key is
+   deactivated, so remediation becomes `DeleteAccessKey`, which is stronger.
+   The workbench policy is left alone: that account is deliberately sleepy and
+   this one is not, and changing a live guardrail there belongs in its own PR.
 3. **`DenyCloudTrailTampering`** — `cloudtrail:StopLogging`, `DeleteTrail`,
    `UpdateTrail`, `PutEventSelectors`. Inert until there is a trail, and
    correct the moment there is one. This matters more here than in the workbench
@@ -478,8 +517,17 @@ finishes applying before its consumer merges.
 
 ## Facts discovered during implementation
 
-- Infrastructure account id: _not yet created_
-- `Infrastructure` OU id and ARN: _not yet created_
+- Infrastructure account id: `394495727159`. Created 2026-10-05 18:18:31
+  UTC, `ACTIVE`, email `aws-infrastructure@goodparty.org`, joined with
+  `JoinedMethod: CREATED`. This is the `INFRASTRUCTURE_ACCOUNT_ID` step 3 adds
+  to `utils/accounts.ts`, the account step 7 deploys into, and the assignment
+  target step 8 needs.
+- `Infrastructure` OU: `ou-jqqe-orrk423t`, directly under root `r-jqqe`, ARN
+  `arn:aws:organizations::333022194791:ou/o-uuiolqc1di/ou-jqqe-orrk423t`. The
+  account's full path is
+  `o-uuiolqc1di/r-jqqe/ou-jqqe-orrk423t/394495727159/`. That ARN is the
+  literal step 4 adds to the two `github-actions-org-deploy` statements scoped
+  to `WORKBENCH_OU_ARN` today.
 
 ## Context: the management account
 

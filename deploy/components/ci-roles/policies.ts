@@ -13,7 +13,10 @@
 // (the first statement below). The policy document is still as adopted.
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
-import { WORKBENCH_ACCOUNT_ID } from "../../../utils/accounts";
+import {
+  MANAGEMENT_ACCOUNT_ID,
+  WORKBENCH_ACCOUNT_ID,
+} from "../../../utils/accounts";
 
 // The assume-role document carries a Principal, which PolicyStatement does
 // not model, so it gets its own narrow type rather than widening that one.
@@ -639,9 +642,12 @@ const pulumiBackendReadStatements = (projects: string[]): PolicyStatement[] => [
 // actions too.
 // Organizations resource ARNs, verified against live AWS on 2026-09-22 rather
 // than assembled from the ARN format strings, because the two disagree in a
-// way that matters below.
+// way that matters below. The account segment is `MANAGEMENT_ACCOUNT_ID`
+// rather than a repeated literal: the organization is always addressed
+// through the management account, and that id already has one home in
+// `utils/accounts.ts`.
 const ORG_ID = "o-uuiolqc1di";
-const WORKBENCH_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/ou-jqqe-dv88i5zn`;
+const WORKBENCH_OU_ARN = `arn:aws:organizations::${MANAGEMENT_ACCOUNT_ID}:ou/${ORG_ID}/ou-jqqe-dv88i5zn`;
 
 // The Infrastructure OU, added by step 4 of
 // `docs/infrastructure-account.md`. A second literal rather than a pattern
@@ -650,7 +656,7 @@ const WORKBENCH_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/ou-jq
 // pick up `ElectionAPI` and every OU added later for free. Recorded from the
 // apply that created it, `Deploy org` run 37354688503, not assembled from
 // the ARN format string.
-const INFRASTRUCTURE_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/ou-jqqe-orrk423t`;
+const INFRASTRUCTURE_OU_ARN = `arn:aws:organizations::${MANAGEMENT_ACCOUNT_ID}:ou/${ORG_ID}/ou-jqqe-orrk423t`;
 
 /**
  * Every service control policy this organization owns, and nothing else.
@@ -668,7 +674,7 @@ const INFRASTRUCTURE_OU_ARN = `arn:aws:organizations::333022194791:ou/${ORG_ID}/
  * once, and the role is structurally unable to name it rather than merely
  * discouraged from it.
  */
-const ORG_SCP_ARN_PATTERN = `arn:aws:organizations::333022194791:policy/${ORG_ID}/service_control_policy/*`;
+const ORG_SCP_ARN_PATTERN = `arn:aws:organizations::${MANAGEMENT_ACCOUNT_ID}:policy/${ORG_ID}/service_control_policy/*`;
 
 // Every policy action accepts this condition key, so it is applied to all of
 // them. It keeps the grant to service control policies even if tag policies,

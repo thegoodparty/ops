@@ -1,6 +1,6 @@
 import * as aws from "@pulumi/aws";
 
-import { workbenchScp } from "./policies";
+import { infrastructureScp, workbenchScp } from "./policies";
 
 /**
  * Organization-level resources: organizational units and member accounts.
@@ -193,3 +193,48 @@ new aws.organizations.PolicyAttachment("workbenchScp", {
 // outside the thing being changed, which is the property that makes applying
 // this safe to do at all.
 export const workbenchScpId = workbenchPolicy.id;
+
+// ---------------------------------------------------------------------------
+// The infrastructure service control policy. Step 5 of
+// docs/infrastructure-account.md; the document is in ./policies.ts and the
+// design is in that doc under "The infrastructure SCP".
+//
+// The grant this needs is step 4, landed in its own PR (#241) that had to
+// finish applying before this one merges, because the grant is applied by
+// deploy.yml and this is applied by deploy-org.yml and nothing sequences the
+// two. The apply confirms the widened policy reaches this OU: CI run
+// 37360050783 updated `OrgDeploy` with the OU ARN in both
+// ServiceControlPolicyAttachment and ServiceControlPolicyListingForTarget.
+
+const infrastructurePolicy = new aws.organizations.Policy(
+  "infrastructureScp",
+  {
+    name: "InfrastructureGuardrails",
+    description:
+      "Bounds the infrastructure account: no leaving the organization, no IAM users or long-lived keys, and no CloudTrail tampering. Deliberately no region, data-store or cross-account S3 deny, because scans, maintenance and temporary privilege escalation need them.",
+    type: "SERVICE_CONTROL_POLICY",
+    content: JSON.stringify(infrastructureScp),
+  },
+);
+
+// Attached to the OU rather than to the account, so any future automation
+// account placed here inherits it, on the same grounds as the workbench
+// attachment above.
+//
+// infrastructureOu.id rather than the literal, so Pulumi orders the
+// attachment after the OU and a renamed or recreated OU cannot leave this
+// pointing at nothing. The OU id is recorded in docs/infrastructure-account.md
+// as ou-jqqe-orrk423t.
+new aws.organizations.PolicyAttachment("infrastructureScp", {
+  policyId: infrastructurePolicy.id,
+  targetId: infrastructureOu.id,
+});
+
+// Deliberately unprotected, for the same reason as the workbench policy
+// above. The failure mode of an SCP is denying something real, and the fix is
+// to withdraw it quickly rather than to walk through a two-step emergency.
+// Recovery does not depend on this stack: SCPs never apply to the management
+// account, github-actions-org-deploy's DetachPolicy grant now names exactly
+// the two OUs it may attach to, and Admins hold AdministratorAccess as a
+// second path.
+export const infrastructureScpId = infrastructurePolicy.id;
