@@ -3,6 +3,7 @@ import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 import { createPreviewRole } from "./preview-role";
 import { createAgentSwarm } from "./agent-swarm";
+import { createInfraZone } from "./dns";
 
 /**
  * Contents of the `goodparty-infrastructure` account.
@@ -88,9 +89,16 @@ const previewRole = createPreviewRole({ provider });
 /** Evidence for the step 7 entry: the apply log should show this ARN. */
 export const previewRoleArn = previewRole.arn;
 
-// The Delegate swarm host. DNS for delegate-swarm.goodparty.org lives in the
-// management account's zone and is pointed at this address separately.
-const agentSwarm = createAgentSwarm({ provider });
+// infra.goodparty.org, the account's own DNS zone. The management account's
+// goodparty.org zone delegates it with one NS record in deploy/, which needs
+// these name servers; after that, records here need no change there.
+const infraZone = createInfraZone({ provider });
+
+export const infraZoneId = infraZone.zoneId;
+export const infraZoneNameServers = infraZone.nameServers;
+
+// The Delegate swarm host, at delegate-swarm.infra.goodparty.org.
+const agentSwarm = createAgentSwarm({ provider, zone: infraZone });
 
 export const delegateSwarmInstanceId = agentSwarm.instance.id;
 export const delegateSwarmPublicIp = agentSwarm.eip.publicIp;

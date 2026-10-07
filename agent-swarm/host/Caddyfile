@@ -1,4 +1,4 @@
-# delegate-swarm.goodparty.org: serve the self-built dashboard SPA from
+# delegate-swarm.infra.goodparty.org: serve the self-built dashboard SPA from
 # /srv/ui and reverse-proxy every API path to the api container.
 #
 # API prefixes (agent-swarm v1.163.0):
@@ -89,7 +89,7 @@
 	}
 }
 
-delegate-swarm.goodparty.org {
+delegate-swarm.infra.goodparty.org {
 	encode zstd gzip
 
 	import {$SWARM_AUTH:open}

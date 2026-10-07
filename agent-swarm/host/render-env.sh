@@ -80,10 +80,10 @@ LEAD_AGENT_ID=9f8efd62-469d-4067-9dca-24d72b13864b
 CODER_AGENT_ID=458bcd6d-4384-4366-83fa-63072ef55eab
 REVIEWER_AGENT_ID=a0799d09-6816-445a-957d-1339b672d38b
 
-SWARM_API_DOMAIN=delegate-swarm.goodparty.org
-MCP_BASE_URL=https://delegate-swarm.goodparty.org
-PUBLIC_MCP_BASE_URL=https://delegate-swarm.goodparty.org
-APP_URL=https://delegate-swarm.goodparty.org
+SWARM_API_DOMAIN=delegate-swarm.infra.goodparty.org
+MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org
+PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org
+APP_URL=https://delegate-swarm.infra.goodparty.org
 API_DRAIN_MAX_MS=30000
 
 EMBEDDING_API_BASE_URL=http://tei:80/v1

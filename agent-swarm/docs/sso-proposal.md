@@ -1,4 +1,4 @@
-# SSO for delegate-swarm.goodparty.org (agent-swarm v1.163.0)
+# SSO for delegate-swarm.infra.goodparty.org (agent-swarm v1.163.0)
 
 Source read: `docs-site/content/docs/(documentation)/guides/self-hosted-sso.mdx`,
 `examples/sso/docker-compose.sso.yml`, `examples/sso/oauth2-proxy.cfg`,
@@ -33,7 +33,7 @@ choices for what people type into the SPA's connection form:
   returned once; `src/be/users.ts:432-453` `aswt_` + 24 base62). The SPA then
   calls `GET /api/whoami` (`src/http/users.ts:149-170`) and locks the tab to
   that user. Hand it out as
-  `https://delegate-swarm.goodparty.org/?apiUrl=https://delegate-swarm.goodparty.org&apiKey=aswt_...`
+  `https://delegate-swarm.infra.goodparty.org/?apiUrl=https://delegate-swarm.infra.goodparty.org&apiKey=aswt_...`
   (`apps/ui/src/hooks/use-config.ts:118-135` stores it tab-locally in
   sessionStorage). Users are created with `POST /api/users`
   (`src/http/users.ts:191`). This is the only per-user identity path today.
@@ -65,7 +65,7 @@ browser reaches Caddy's upstreams at all.
 
 - oauth2-proxy callback: `/oauth2/callback` (default; `oauth2-proxy.cfg`
   `redirect_url`, `self-hosted-sso.mdx:71`). Register
-  `https://delegate-swarm.goodparty.org/oauth2/callback` in the Google OAuth client.
+  `https://delegate-swarm.infra.goodparty.org/oauth2/callback` in the Google OAuth client.
   Everything under `/oauth2/*` (`/oauth2/start`, `/oauth2/auth`,
   `/oauth2/sign_out`, `/oauth2/userinfo`) is proxied to oauth2-proxy itself.
 - Agents never cross the proxy. Workers use `MCP_BASE_URL: http://api:3013`
@@ -74,7 +74,7 @@ browser reaches Caddy's upstreams at all.
   the swarm does internally.
 - Paths that MUST bypass forward_auth because the caller has no browser cookie:
   - `/mcp` and `/mcp-user`: external MCP clients (Claude Code, Cursor) connect
-    to `PUBLIC_MCP_BASE_URL=https://delegate-swarm.goodparty.org` with a bearer
+    to `PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org` with a bearer
     (`src/http/mcp.ts:158`, `src/http/mcp-user.ts:46`). Bearer auth still
     applies there.
   - `/health`, `/status`, `/ping` (`src/http/core.ts:416`, `status.ts:766`,
@@ -117,7 +117,7 @@ oauth2-proxy:
     OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET}
     OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET} # openssl rand -base64 32 | tr -- '+/' '-_'
     OAUTH2_PROXY_EMAIL_DOMAINS: goodparty.org
-    OAUTH2_PROXY_REDIRECT_URL: https://delegate-swarm.goodparty.org/oauth2/callback
+    OAUTH2_PROXY_REDIRECT_URL: https://delegate-swarm.infra.goodparty.org/oauth2/callback
     OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
     OAUTH2_PROXY_REVERSE_PROXY: "true"
     OAUTH2_PROXY_UPSTREAMS: static://202
@@ -128,7 +128,7 @@ oauth2-proxy:
     OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
     OAUTH2_PROXY_PASS_USER_HEADERS: "true"
     OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
-    OAUTH2_PROXY_WHITELIST_DOMAINS: delegate-swarm.goodparty.org
+    OAUTH2_PROXY_WHITELIST_DOMAINS: delegate-swarm.infra.goodparty.org
 ```
 
 No `ports:`; only Caddy talks to it on the compose network. Add the three
@@ -144,7 +144,7 @@ ready for the day the API grows DES-445, per the doc's Mode 2.
 ### Caddyfile (replaces Caddyfile.proposed when SSO goes live)
 
 ```caddyfile
-delegate-swarm.goodparty.org {
+delegate-swarm.infra.goodparty.org {
 	encode zstd gzip
 
 	# oauth2-proxy's own endpoints: login start, Google callback, sign out.
@@ -214,11 +214,11 @@ drop the `copy_headers` line.
 ### Order of operations (none of this touches the running stack yet)
 
 1. Create the Google OAuth client (Web application) with redirect URI
-   `https://delegate-swarm.goodparty.org/oauth2/callback`; put client id, secret and a
+   `https://delegate-swarm.infra.goodparty.org/oauth2/callback`; put client id, secret and a
    cookie secret in Secrets Manager `DELEGATE_SWARM`.
 2. Add the `oauth2-proxy` service and the three keys to render-env.sh.
 3. Swap the Caddyfile for the SSO version above and `docker compose --profile
 tls up -d oauth2-proxy caddy`.
-4. Confirm `curl -sI https://delegate-swarm.goodparty.org/health` is 200 without a
-   cookie and `curl -sI https://delegate-swarm.goodparty.org/` is a 302 to
+4. Confirm `curl -sI https://delegate-swarm.infra.goodparty.org/health` is 200 without a
+   cookie and `curl -sI https://delegate-swarm.infra.goodparty.org/` is a 302 to
    `/oauth2/start`.

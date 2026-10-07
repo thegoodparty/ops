@@ -4,7 +4,7 @@
 
 The deployment of [agent-swarm](https://github.com/desplega-ai/agent-swarm)
 v1.163.0 that shows up in Slack as **Delegate** and serves its dashboard at
-https://delegate-swarm.goodparty.org. One EC2 host in the infrastructure
+https://delegate-swarm.infra.goodparty.org. One EC2 host in the infrastructure
 account runs the whole stack in Docker Compose. State, decisions and history are in
 `HANDOFF.md`; this file is how to operate it.
 
@@ -35,7 +35,7 @@ host; the next deploy overwrites them.
 ## Where it runs
 
 - AWS account 394495727159 (infrastructure), region us-west-2
-- `delegate-swarm.goodparty.org`
+- `delegate-swarm.infra.goodparty.org`
 - Docker's state, including every compose volume, lives on a separate EBS
   data volume mounted at `/var/lib/docker`. `ec2-user-data.sh` mounts it
   before docker starts and formats it only if it is blank, so a replacement
@@ -127,8 +127,8 @@ To turn it on:
 
 1. Google Cloud console, APIs and services, Credentials, Create OAuth client
    ID, type Web application. Authorized JavaScript origin
-   `https://delegate-swarm.goodparty.org`, redirect URI
-   `https://delegate-swarm.goodparty.org/oauth2/callback`. Make the consent
+   `https://delegate-swarm.infra.goodparty.org`, redirect URI
+   `https://delegate-swarm.infra.goodparty.org/oauth2/callback`. Make the consent
    screen Internal so only `goodparty.org` accounts can sign in.
 2. `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --sso` from this
    directory. It asks for the client id and secret and generates the cookie
@@ -164,7 +164,7 @@ Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
 add.
 
 Anything else goes through the dashboard or the API at
-`https://delegate-swarm.goodparty.org` (`http://127.0.0.1:3013` on the host)
+`https://delegate-swarm.infra.goodparty.org` (`http://127.0.0.1:3013` on the host)
 with `Authorization: Bearer $API_KEY` (the `API_KEY` key in the secret).
 
 ## Agents
@@ -245,11 +245,16 @@ the management account, which is torn down once this one is live. In order:
 4. **Bootstrap.** On the host: `sudo /opt/agent-swarm/bootstrap.sh`. It waits
    up to 5 minutes for the three agents to register, then prints one line
    per item. ClickUp shows as not connected; that is step 6.
-5. **DNS.** A follow-up PR, because the `goodparty.org` zone is in the
-   management account: point `delegate-swarm.goodparty.org` at the
-   `delegateSwarmPublicIp` stack output. Until it merges the dashboard is
-   not reachable and Caddy keeps retrying its certificate; the OAuth
-   callback in step 6 needs it too.
+5. **DNS.** The first apply creates the `infra.goodparty.org` zone in this
+   account and the A record for `delegate-swarm.infra.goodparty.org` in it,
+   but nothing resolves until `goodparty.org` delegates the zone. That
+   zone is in the management account, so this is a one-time PR in
+   `deploy/`: an NS record for `infra.goodparty.org` with the four name
+   servers from the `infraZoneNameServers` stack output, written as
+   constants. It is the last DNS change the management account ever needs
+   for this account; every later record goes in the zone here. Until it
+   merges the dashboard is not reachable and Caddy keeps retrying its
+   certificate; the OAuth callback in step 6 needs it too.
 6. **Connect ClickUp.** In the dashboard, MCP servers, clickup, Connect, and
    sign in to ClickUp as the Delegate service seat. Then on the host run
    `sudo /opt/agent-swarm/bootstrap.sh` again, which installs it on the

@@ -7,12 +7,14 @@ import {
   INFRASTRUCTURE_ACCOUNT_ID,
   MANAGEMENT_ACCOUNT_ID,
 } from "../utils/accounts";
+import { INFRA_ZONE_NAME } from "./dns";
 
 // The Delegate swarm host: one EC2 instance running agent-swarm in Docker
 // Compose. Operating procedures are in agent-swarm/README.md, history and
 // decisions in agent-swarm/HANDOFF.md.
 
 const NAME = "delegate-swarm";
+export const SWARM_HOSTNAME = `${NAME}.${INFRA_ZONE_NAME}`;
 const REGION = "us-west-2";
 const AVAILABILITY_ZONE = "us-west-2a";
 const VPC_ID = "vpc-0930cabea81245d01";
@@ -23,8 +25,8 @@ const PROD_READ_ROLE_ARN = `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/delegate-
 const DATA_VOLUME_NAME = "delegate-swarm-data";
 const DATA_VOLUME_PLACEHOLDER = "__DATA_VOLUME_ID__";
 
-// Overrides the provider's `infrastructure` default tags.
-const TAGS = { Name: NAME, Environment: "infra", Project: NAME };
+// `Environment` comes from the provider's default tags; `Project` overrides them.
+const TAGS = { Name: NAME, Project: NAME };
 
 const ROOT = path.resolve(__dirname, "../agent-swarm");
 const HOST_DIR = path.join(ROOT, "host");
@@ -78,8 +80,11 @@ export const userData = (dataVolumeId: string) => {
   return script.replaceAll(DATA_VOLUME_PLACEHOLDER, dataVolumeId);
 };
 
-export const createAgentSwarm = (args: { provider: aws.Provider }) => {
-  const { provider } = args;
+export const createAgentSwarm = (args: {
+  provider: aws.Provider;
+  zone: aws.route53.Zone;
+}) => {
+  const { provider, zone } = args;
 
   const securityGroup = new aws.ec2.SecurityGroup(
     "delegateSwarmSecurityGroup",
@@ -338,6 +343,18 @@ export const createAgentSwarm = (args: { provider: aws.Provider }) => {
     "delegateSwarmEip",
     { domain: "vpc", instance: instance.id, tags: TAGS },
     { provider, protect: true },
+  );
+
+  new aws.route53.Record(
+    "delegateSwarmRecord",
+    {
+      zoneId: zone.zoneId,
+      name: SWARM_HOSTNAME,
+      type: "A",
+      ttl: 300,
+      records: [eip.publicIp],
+    },
+    { provider },
   );
 
   const hash = hostFilesHash();

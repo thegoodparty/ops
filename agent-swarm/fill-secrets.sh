@@ -59,8 +59,8 @@ cat <<'EOF'
   https://console.cloud.google.com/apis/credentials  (a project in the goodparty.org org)
   a. OAuth consent screen: User type Internal, so only goodparty.org accounts can sign in.
   b. Create credentials -> OAuth client ID -> Web application, name "delegate-swarm".
-     Authorized JavaScript origins: https://delegate-swarm.goodparty.org
-     Authorized redirect URIs:      https://delegate-swarm.goodparty.org/oauth2/callback
+     Authorized JavaScript origins: https://delegate-swarm.infra.goodparty.org
+     Authorized redirect URIs:      https://delegate-swarm.infra.goodparty.org/oauth2/callback
   c. Copy the client ID and the client secret.
   A new cookie secret is generated for you (this signs everyone out once).
 EOF

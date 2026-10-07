@@ -43,7 +43,7 @@ Swain's intent, in his words paraphrased from the kickoff on 2026-10-05:
 
 | Decision | Chosen | By | Notes |
 | --- | --- | --- | --- |
-| Where it runs | EC2 in account `394495727159` (infrastructure), `us-west-2`, Pulumi in `deploy-infrastructure/`. Hostname `delegate-swarm.goodparty.org` | Swain | It started as a hand-built host in `333022194791` (the management account) at `swarm.goodparty.org`. `docs/infrastructure-account.md` records why it lives in the infrastructure account. |
+| Where it runs | EC2 in account `394495727159` (infrastructure), `us-west-2`, Pulumi in `deploy-infrastructure/`. Hostname `delegate-swarm.infra.goodparty.org` | Swain | It started as a hand-built host in `333022194791` (the management account) at `swarm.goodparty.org`. `docs/infrastructure-account.md` records why it lives in the infrastructure account. |
 | The move | Fresh state, no migration. The old host is torn down once the new one is live | Swain | `host/bootstrap.sh` rebuilds what the repo defines; schedules, apps, pages and memory start empty. |
 | State | Docker's whole state on a separate EBS data volume at `/var/lib/docker` | Swain | A replacement instance mounts it and keeps the swarm. `ec2-user-data.sh` formats it only if blank. |
 | Slack identity | The existing Delegate app, Socket Mode, without `chat:write.customize` | Swain | Replaces the Swarm app and the delegate bot's use of the Delegate app. Without the scope Slack ignores the per-agent username and emoji agent-swarm sends (the lead's would be a crown), so every message is the Delegate app's own name and icon. |
@@ -52,7 +52,7 @@ Swain's intent, in his words paraphrased from the kickoff on 2026-10-05:
 | GitHub identity | A service user's fine-grained PAT, repos `omni` + `ops`, Contents/PRs/Issues RW, Actions/Metadata R, no Workflows, longest lifetime allowed | Swain | Replaces Swain's own 90-day PAT. Commit name and email are placeholders (`Delegate`, `delegate@goodparty.org`) until the user exists. |
 | Day-one access | GitHub (above), Grafana read-only, ClickUp. AWS: production read-only through `arn:aws:iam::333022194791:role/delegate-swarm-prod-read` | Swain | Agents assume the role through `host/aws-config`. The api container has no AWS access. |
 | Embeddings | Local `text-embeddings-inference` container (`nomic-embed-text-v1.5`, 512 dims) | Agent, after Swain asked "can we use AWS?" | Bedrock's OpenAI-compatible API has no `/v1/embeddings`. Summaries use the Anthropic key (Haiku fallback). Workflow LLM nodes still need OpenAI/OpenRouter; not configured. |
-| Dashboard | Self-hosted SPA at `delegate-swarm.goodparty.org`, built from `apps/ui` | Swain: "I'd want the dashboards to be on our urls" | `app.agent-swarm.dev` still works as a fallback (CORS default left in place). |
+| Dashboard | Self-hosted SPA at `delegate-swarm.infra.goodparty.org`, built from `apps/ui` | Swain: "I'd want the dashboards to be on our urls" | `app.agent-swarm.dev` still works as a fallback (CORS default left in place). |
 | Login in front | Not done. Recommended: `oauth2-proxy` with Google, domain `goodparty.org` | Swain asked for "our oauth"; agent recommended Google | Proposal in `docs/sso-proposal.md`. Needs a Google OAuth client from Swain. See section 8. |
 | API exposure | Public 443 with bearer-key auth | Agent, same posture as delegate Lambda URL and BugBoss ALB | VPN-only restriction was offered as a stopgap; not applied. |
 | Home channel | `#swarm-testing` (`C0C6RUJ9VMK`) | Swain | Also `SLACK_ALERTS_CHANNEL`. Bot replies only where addressed. |
@@ -75,7 +75,7 @@ instance, volume and address ids are in the stack outputs and the EC2 console.
 | Config bucket | `delegate-swarm-config-394495727159`: `host/` (deployed files), `ssm-output/` (association runs) |
 | Logs | CloudWatch Logs `/delegate-swarm/containers` via the awslogs driver, one stream per container |
 | Production read | `arn:aws:iam::333022194791:role/delegate-swarm-prod-read`, assumed by the agents with the instance role's credentials |
-| DNS | The `goodparty.org` zone (`Z10392302OXMPNQLPO07K`) is in the management account. Pointing `delegate-swarm` at the new host is a follow-up PR. |
+| DNS | A record `delegate-swarm.infra.goodparty.org` → the Elastic IP, in the infrastructure account's own zone `infra.goodparty.org` (`deploy-infrastructure/dns.ts`). The `goodparty.org` zone (`Z10392302OXMPNQLPO07K`) in the management account delegates it with one NS record in `deploy/`, added by a follow-up PR (section 8). |
 | Access | `aws ssm start-session` with a profile for the infrastructure account (README, "Connect") |
 
 ### Old home: account 333022194791, to tear down
@@ -114,7 +114,7 @@ Grafana service account `agent-swarm`.
 | `render-env.sh` | Reads `DELEGATE_SWARM` from Secrets Manager via the instance role, merges with static values, writes `.env` (mode 600). Refuses if any secret value is `TODO`. Run after any secret change. |
 | `up.sh` | `render-env.sh` then `docker compose --profile tls up -d --remove-orphans`. |
 | `agent-swarm.service` | systemd oneshot, enabled. `start` = `up.sh`; `stop` = `docker compose down` (triggers the API drain). `install.sh` leaves it stopped while the secret has no value. |
-| `Caddyfile` | `delegate-swarm.goodparty.org`: API prefixes (`/api/*`, `/p/*`, `/@swarm/*`, `/mcp`, `/mcp-user`, `/health`, `/status`, `/docs*`, `/openapi.json`, `/x/*`, `/ping`, `/close`) → `api:3013`; everything else serves `/srv/ui` with SPA fallback. |
+| `Caddyfile` | `delegate-swarm.infra.goodparty.org`: API prefixes (`/api/*`, `/p/*`, `/@swarm/*`, `/mcp`, `/mcp-user`, `/health`, `/status`, `/docs*`, `/openapi.json`, `/x/*`, `/ping`, `/close`) → `api:3013`; everything else serves `/srv/ui` with SPA fallback. |
 | `aws-config` | AWS shared config mounted read-only into the lead and both workers (`AWS_CONFIG_FILE`): default profile assumes `delegate-swarm-prod-read` with the instance's IMDS credentials. |
 | `global-setup-script.sh` | agent-swarm's admin `SETUP_SCRIPT` global config. Runs as root at every agent container start. Installs AWS CLI v2 once into the persistent `swarm_shared` volume and relinks `/usr/local/bin/aws`. Edit the script, merge, run `bootstrap.sh`, restart the agents. |
 | `bootstrap.sh` | Run as root after the stack is up; idempotent. Rebuilds the SQLite state the repo defines (section 5) through the API on `127.0.0.1:3013`, reading `API_KEY` from `.env` without printing it. |
@@ -123,7 +123,7 @@ Grafana service account `agent-swarm`.
 
 Key env (names only; see `render-env.sh` and the compose file for the full set):
 
-- API: `NODE_ENV=production` (Bun defaults to `development`, which **silently blocks Slack Socket Mode**), `CAPABILITIES` unset (defaults include scheduling, pages, slack, mcp, kv, memory, repo), `ALLOW_PRIVATE_NETWORK_URLS=true` (needed to register `http://grafana-mcp:8000/mcp`), `GITHUB_DISABLE=true` (no inbound GitHub webhooks), `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org`, `SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK`, `APP_URL=https://delegate-swarm.goodparty.org`, `MCP_BASE_URL` and `PUBLIC_MCP_BASE_URL=https://delegate-swarm.goodparty.org`, `EMBEDDING_API_BASE_URL=http://tei:80/v1`, `EMBEDDING_API_KEY=local`, `EMBEDDING_MODEL=nomic-embed-text-v1.5`, `API_DRAIN_MAX_MS=30000`, `SECRETS_ENCRYPTION_KEY` via env (not a file secret). No `MODEL_OVERRIDE`: the API reads none.
+- API: `NODE_ENV=production` (Bun defaults to `development`, which **silently blocks Slack Socket Mode**), `CAPABILITIES` unset (defaults include scheduling, pages, slack, mcp, kv, memory, repo), `ALLOW_PRIVATE_NETWORK_URLS=true` (needed to register `http://grafana-mcp:8000/mcp`), `GITHUB_DISABLE=true` (no inbound GitHub webhooks), `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org`, `SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK`, `APP_URL=https://delegate-swarm.infra.goodparty.org`, `MCP_BASE_URL` and `PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org`, `EMBEDDING_API_BASE_URL=http://tei:80/v1`, `EMBEDDING_API_KEY=local`, `EMBEDDING_MODEL=nomic-embed-text-v1.5`, `API_DRAIN_MAX_MS=30000`, `SECRETS_ENCRYPTION_KEY` via env (not a file secret). No `MODEL_OVERRIDE`: the API reads none.
 - Agents (shared `x-worker-env` anchor): `HARNESS_PROVIDER=pi`, `ANTHROPIC_API_KEY`, `MODEL_OVERRIDE` **provider-prefixed** (`anthropic/claude-opus-5-5` lead, `anthropic/claude-sonnet-5-5` workers), `MCP_BASE_URL=http://api:3013`, `APP_URL`, `GITHUB_TOKEN`, `GITHUB_NAME=Delegate`, `GITHUB_EMAIL=delegate@goodparty.org` (placeholders), `CLICKUP_API_TOKEN` and `CLICKUP_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `GRAFANA_URL`, `AWS_CONFIG_FILE`, `AWS_SDK_LOAD_CONFIG=1`. The lead also has `AGENT_NAME=Delegate`. Agent ids are pinned in env so they survive recreation. Agent-scope `HARNESS_PROVIDER` and `MODEL_OVERRIDE` rows in the swarm's config win over these env values.
 - `grafana-mcp`: pinned by digest; `-t streamable-http --address 0.0.0.0:8000 --allowed-hosts grafana-mcp:8000,grafana-mcp` (it rejects non-loopback Host headers otherwise). It has **no caller auth**; only the compose network reaches it.
 
@@ -207,7 +207,12 @@ Open, waiting on Swain (README, "Bringing it up", has the order):
 2. **ClickUp service seat** and its token; then connect the clickup MCP
    server as that seat.
 3. **Grafana service account** `delegate` and its token.
-4. **DNS** follow-up PR for `delegate-swarm.goodparty.org`.
+4. **DNS delegation**: after the first apply, a one-time PR in `deploy/`
+   adds the NS record for `infra.goodparty.org` with the four
+   `infraZoneNameServers` stack outputs as constants. That is the last DNS
+   change the management account ever needs for this account; the
+   `delegate-swarm` A record and every later one live in the zone in the
+   infrastructure account.
 5. **Delegate Slack switch**: manifest, Socket Mode, reinstall, invite the
    bot to its channels.
 6. **Google OAuth client** for login. oauth2-proxy and the SSO Caddy routes
