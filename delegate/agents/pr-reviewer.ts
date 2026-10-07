@@ -47,7 +47,7 @@ ${pd.inline}
 ${bundle.changedFiles.join("\n")}
   </changed_files>
   <diff_stat>
-${pd.stat}
+${escapeText(pd.stat)}
   </diff_stat>
 ${deletedXml}  <prior_findings>
 ${priorXml}
