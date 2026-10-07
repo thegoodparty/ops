@@ -19,6 +19,7 @@ have their own, and the larger subsystems under `bugboss/` have theirs.
 - `deploy/` — Pulumi IaC for AWS infrastructure (ECS, Lambda, etc.)
 - `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
 - `deploy-workbench/` — Pulumi IaC for the contents of the `goodparty-workbench` account
+- `deploy-infrastructure/` — Pulumi IaC for the contents of the `goodparty-infrastructure` account
 - `.github/workflows/` — CI/CD and scheduled automation
 
 ## Repo-wide facts that will bite

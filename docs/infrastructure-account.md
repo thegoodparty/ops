@@ -89,12 +89,28 @@ starting the work, not after. Make `who` name the *session*, not the model.
       creates it, per step 5: the merge's `deploy.yml` run is the read-back,
       so a red run beside this entry means the entry is wrong in the visible
       way. It has to be green before step 7 merges.
-- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: todo. Two
+- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: doing
+      (pi-swarm-infra-step7a, 2026-10-07). Two
       pull requests, forced by bootstrap causality, the same shape as
       workbench steps 7 and 10: the first applies against
       `OrganizationAccountAccessRole` and creates the in-account `pulumi-deploy`
       and `pulumi-preview` roles; the second repoints the provider at
       `pulumi-deploy` and removes the bootstrap grant.
+
+      PR 1 of 2 is open, stacked on step 6 (#257): `deploy-infrastructure/`
+      with the provider on `OrganizationAccountAccessRole`, `pulumi-deploy`
+      (`AdministratorAccess`, trusted only by
+      `github-actions-infrastructure-deploy`) and `pulumi-preview` (no
+      permissions, trusted by `github-actions-pulumi-preview` and the
+      management `ReadOnlyAccess` session), plus `deploy-infrastructure.yml`.
+      It cannot merge until #257 has merged and its `deploy.yml` run has
+      applied the role and grant it assumes. Its merge's `Deploy
+      infrastructure` run is the read-back: green, the two roles and the
+      `AdministratorAccess` attachment created alongside the stack and its
+      provider, `accountId` reading 394495727159 (which also closes step 3's
+      STS half), and the two role ARNs in the outputs. Not previewed before
+      merge: neither the stack nor a role a preview could assume exists yet.
+      PR 2, the cutover, follows once that run is green.
 - [ ] 8. Extend `identity-center.ts` to assign `Admins` to
       `AdministratorAccess` in the new account: todo. This is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in.

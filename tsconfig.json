@@ -6,6 +6,7 @@
     "deploy/**/*.ts",
     "deploy-org/**/*.ts",
     "deploy-workbench/**/*.ts",
+    "deploy-infrastructure/**/*.ts",
     "bugboss/**/*.ts",
     "bugboss-evals/**/*.ts"
   ],
