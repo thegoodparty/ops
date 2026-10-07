@@ -160,7 +160,8 @@ const main = async () => {
       const comment = renderPrComment(summary, verdicts, {
         labelA,
         labelB,
-        casesCount: verdicts.length,
+        casesCount: records.length,
+        unjudgedCount: records.length - verdicts.length,
         replayCost,
         replayFailures,
         runUrl,

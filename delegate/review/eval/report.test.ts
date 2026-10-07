@@ -203,3 +203,18 @@ test("renderPrComment shows replay failures and cost", () => {
   assert.ok(visiblePart.includes("2 replay(s) failed"));
   assert.ok(visiblePart.includes("$3.14"));
 });
+
+test("renderPrComment names cases that could not be judged", () => {
+  const verdicts = [verdict("a")];
+  const summary = summarize(verdicts);
+  const out = renderPrComment(summary, verdicts, {
+    labelA: "prod",
+    labelB: "pr",
+    casesCount: 3,
+    unjudgedCount: 2,
+    replayCost: 1,
+    replayFailures: 2,
+    runUrl: "https://example.com/run",
+  });
+  assert.ok(out.includes("3 cases, 1 judged (2 missing a result on one side)"));
+});

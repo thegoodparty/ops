@@ -79,6 +79,7 @@ export interface PrCommentOptions {
   labelA: string;
   labelB: string;
   casesCount: number;
+  unjudgedCount?: number;
   replayCost: number;
   replayFailures: number;
   runUrl: string;
@@ -161,7 +162,7 @@ export const renderPrComment = (
   verdicts: PairVerdict[],
   opts: PrCommentOptions,
 ): string => {
-  const { labelA, labelB, casesCount, replayCost, replayFailures, runUrl, resultsA = [], resultsB = [] } = opts;
+  const { labelA, labelB, casesCount, unjudgedCount = 0, replayCost, replayFailures, runUrl, resultsA = [], resultsB = [] } = opts;
   const lines: string[] = [];
 
   lines.push("<!-- delegate-eval -->");
@@ -175,7 +176,7 @@ export const renderPrComment = (
   const costNote = replayCost > 0 ? ` Replay cost: $${replayCost.toFixed(2)}.` : "";
 
   lines.push(
-    `Judged ${casesCount} cases. ${labelA} won ${summary.a}, ${labelB} won ${summary.b}, ` +
+    `${casesCount} cases, ${casesCount - unjudgedCount} judged${unjudgedCount ? ` (${unjudgedCount} missing a result on one side)` : ""}. ${labelA} won ${summary.a}, ${labelB} won ${summary.b}, ` +
     `${summary.ties + summary.unstable} tied or unstable. ` +
     `Sign-test p=${pStr} (${interpretation}).${failureNote}${costNote}`,
   );
