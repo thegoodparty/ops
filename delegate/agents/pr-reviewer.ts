@@ -19,7 +19,7 @@ export const buildReviewPrompt = (
 ): string => {
   const pd = promptDiff(bundle.diff);
   const deletedXml = pd.deletedFiles.length
-    ? `  <deleted_files>\n${pd.deletedFiles.join("\n")}\n  </deleted_files>\n`
+    ? `  <deleted_files>\n${pd.deletedFiles.map(escapeText).join("\n")}\n  </deleted_files>\n`
     : "";
   const diffXml = options.diffPath
     ? `  <diff path="${escapeAttr(options.diffPath)}">

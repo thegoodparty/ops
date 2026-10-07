@@ -392,11 +392,11 @@ export const runReview = async (args: {
     return record;
   };
 
-  // Inside the checkout so the path guard allows it; untracked so git sees
-  // it as noise, not a change.
+  // Under .git/ so it is inside the checkout for the path guard but never
+  // shows up in the working tree the agent is reviewing.
   let diffPath: string | undefined;
   if (promptDiff(bundle.diff).oversized) {
-    const dir = resolve(reviewDir, ".delegate-review");
+    const dir = resolve(reviewDir, ".git", "delegate-review");
     mkdirSync(dir, { recursive: true });
     diffPath = resolve(dir, "diff.patch");
     writeFileSync(diffPath, promptDiff(bundle.diff).inline);
