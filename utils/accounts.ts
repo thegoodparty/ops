@@ -16,8 +16,8 @@
  * Deliberately not exhaustive. The literal occurrences of the management
  * account id inside `deploy/components/ci-roles/policies.ts` are a verbatim
  * capture of an AWS-adopted policy, where interpolation would trade its
- * "captured from AWS" audit property for tidiness; `bugboss.ts` and
- * `ci-roles.ts` keep local `ACCOUNT_ID`s on the same grounds. This module
+ * "captured from AWS" audit property for tidiness; `ci-roles.ts` keeps a
+ * local `ACCOUNT_ID` on the same grounds. This module
  * exists to stop the workbench id being declared in four files, not to sweep
  * every 12-digit string in the repo.
  */

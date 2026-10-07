@@ -67,7 +67,6 @@ const fakeModel = (
         rationale: "because reasons",
       },
       stopReason: "tool_use",
-      usage: { input: 1000, output: 100, cacheRead: 0, cacheWrite: 0 },
     };
   };
 };
@@ -75,7 +74,6 @@ const fakeModel = (
 const noToolModel: JudgeModel = async () => ({
   toolInput: null,
   stopReason: "end_turn",
-  usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
 });
 
 test("judgePair picks a when a consistently beats b across order-swapped passes", async () => {
@@ -193,7 +191,6 @@ test("judgePair renders failed result as FAILED text", async () => {
     return {
       toolInput: { winner: "output_2", margin: "better", deciding_criterion: "c1", rationale: "r" },
       stopReason: "tool_use",
-      usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
     };
   };
 

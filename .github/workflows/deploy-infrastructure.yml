@@ -71,8 +71,8 @@ jobs:
           pulumi-version: "^3"
 
       # The first hop. This role lives in the management account; index.ts
-      # makes the second hop into 394495727159 by assuming
-      # OrganizationAccountAccessRole through an explicit provider.
+      # makes the second hop into 394495727159 by assuming pulumi-deploy
+      # through an explicit provider.
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:

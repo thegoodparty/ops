@@ -24,7 +24,6 @@ permissions:
 env:
   AWS_REGION: us-west-2
   IMAGE_URI: 333022194791.dkr.ecr.us-west-2.amazonaws.com/delegate-worker:${{ github.sha }}
-  BUGBOSS_IMAGE_URI: 333022194791.dkr.ecr.us-west-2.amazonaws.com/bugboss:${{ github.sha }}
 
 jobs:
   deploy:
@@ -38,14 +37,12 @@ jobs:
           cache: npm
 
       # Install, test and build BEFORE assuming the role. Every one of these
-      # executes repository code -- `npm test` is `tsx --test` over
-      # `bugboss/**/*.test.ts` -- and the role carries `AdministratorAccess`
+      # executes repository code -- `npm test` is `tsx --test` over every
+      # `*.test.ts` file -- and the role carries `AdministratorAccess`
       # (`deploy/components/ci-roles.ts`). Run them after the credentials step
       # and any test file in the repo is an admin-credentialled shell.
       #
-      # That was survivable while `CODEOWNERS` was `*` and every path on main
-      # had a human approval behind it. It is not now: `.github/CODEOWNERS`
-      # lists the trees that need a human, and `bugboss/` tests are not on it,
+      # `.github/CODEOWNERS` lets its opted-out paths merge on a bot approval,
       # so this ordering is what keeps a bot-approved merge from reaching the
       # deploy role. Nothing below needs AWS except the ECR push and the
       # deploy itself.
@@ -82,14 +79,6 @@ jobs:
         if: ${{ github.event_name != 'pull_request' }}
         run: docker push "$IMAGE_URI"
 
-      # Sequential on purpose. Both are emulated amd64 builds on an arm-free
-      # runner either way, and running two at once just contends for the same
-      # cores.
-      - name: Build BugBoss Image
-        run: docker build -t "$BUGBOSS_IMAGE_URI" --platform linux/amd64 -f bugboss/Dockerfile .
-      - name: Push BugBoss Image
-        if: ${{ github.event_name != 'pull_request' }}
-        run: docker push "$BUGBOSS_IMAGE_URI"
       - name: Deploy
         working-directory: deploy
         if: ${{ github.event_name != 'pull_request' }}

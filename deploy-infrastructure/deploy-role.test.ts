@@ -7,7 +7,7 @@ const MANAGEMENT_ACCOUNT_ID = "333022194791";
 describe("infrastructureDeployRoleTrust", () => {
   // The trust is the whole control on an admin role. Widening it to the
   // management account root would recreate OrganizationAccountAccessRole,
-  // which is what step 7's second PR exists to retire.
+  // which is what step 7's cutover exists to retire.
   it("admits only github-actions-infrastructure-deploy", () => {
     assert.equal(infrastructureDeployRoleTrust.Statement.length, 1);
 

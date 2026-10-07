@@ -32,17 +32,15 @@ describe("githubActionsInfrastructureDeployTrust", () => {
 });
 
 describe("githubActionsInfrastructureDeploy", () => {
-  // The bootstrap grant. Step 7's second PR replaces it with the in-account
-  // pulumi-deploy role, and this assertion changes with it rather than
-  // gaining a second ARN.
-  it("assumes only the infrastructure account's bootstrap role", () => {
+  // The bootstrap grant is gone after the cutover. The only role this CI role
+  // may assume is the in-account deploy role, whose trust names it exactly, so
+  // a single role ARN on both sides is the whole control.
+  it("assumes only the in-account pulumi-deploy role", () => {
     const assumes = githubActionsInfrastructureDeploy.Statement.filter((s) =>
       asList(s.Action).includes("sts:AssumeRole")
     );
-    assert.equal(assumes.length, 1);
-    assert.deepEqual(asList(assumes[0].Resource), [
-      "arn:aws:iam::394495727159:role/OrganizationAccountAccessRole",
-    ]);
+    const arns = assumes.flatMap((s) => asList(s.Resource)).sort();
+    assert.deepEqual(arns, ["arn:aws:iam::394495727159:role/pulumi-deploy"]);
   });
 
   // Every project shares one passphrase, so the object ARNs are the only

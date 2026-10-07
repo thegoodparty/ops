@@ -860,39 +860,29 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
 // main, and holds the assume grant below plus this project's Pulumi backend
 // access. Nothing else in this account.
 //
-// The same apply ordering as the workbench role above: this is in `deploy/`
-// and applied by `deploy.yml`, while its consumer will be applied by
-// `deploy-infrastructure.yml`, so this has to finish applying before step 7
-// merges.
+// The grant moved rather than gained. Until step 7's cutover this also granted
+// the Organizations-planted `OrganizationAccountAccessRole`, and the cutover
+// removed that statement once the provider was repointed at `pulumi-deploy`.
+// Git history shows the two coexisting; that was the workbench step 10
+// "gain-then-remove" transition, not the end state. Keeping both would have
+// left a permanent admin path that nothing uses and nobody would notice.
+//
+// The target side narrowed at the same time: the bootstrap role trusted the
+// management account root, delegating the decision to any principal there
+// holding sts:AssumeRole, while `pulumi-deploy` names this role exactly. A
+// cross-account assume needs both sides to allow it, and both sides now agree
+// on a single role. That narrowing matters more here than it did for
+// workbench, because this account exists to hold privileged automation.
 export const githubActionsInfrastructureDeploy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
-    // The bootstrap grant, and the shape the workbench role had before its
-    // step 10 cutover. Unlike that role, the account id was known before this
-    // was written, so there is no deferred statement and no window where the
-    // role holds backend access alone.
-    //
-    // What this grants is administrator in the infrastructure account, which
-    // is what OrganizationAccountAccessRole is. The first apply needs it
-    // because no in-account role exists yet. Step 7's second PR replaces it
-    // with `pulumi-deploy`, whose trust names exactly this role, and this
-    // statement moves then rather than being joined by another: keeping both
-    // would leave a permanent admin path that nothing uses and nobody would
-    // notice. That narrowing matters more here than it did for workbench,
-    // because this account exists to hold privileged automation.
-    //
-    // Nothing on the target side needs changing. The bootstrap role's trust
-    // policy names the management account root, which delegates the decision
-    // to IAM here, so this identity-based statement is the whole control.
-    //
-    // Inert on merge, deliberately. `github-actions-infrastructure-deploy`
-    // pins job_workflow_ref to `deploy-infrastructure.yml`, which does not
-    // exist, so no job can assume the role that now holds this.
+    // The role's reason to exist: reach the infrastructure account's deploy
+    // role, whose trust names this role exactly.
     {
-      Sid: "AssumeInfrastructureBootstrapRole",
+      Sid: "AssumeInfrastructureDeployRole",
       Effect: "Allow",
       Action: ["sts:AssumeRole"],
-      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/pulumi-deploy`,
     },
     ...pulumiBackendStatements("infrastructure"),
   ],
@@ -908,9 +898,7 @@ export const githubActionsInfrastructureDeploy: PolicyDocument = {
  * resource-scoped; it exists so preview mode can resolve the currently
  * deployed delegate image rather than invent a URI. `secretsmanager` is
  * `DescribeSecret` metadata only: the value read was removed in step 3, which
- * is what lets this role exist without `GetSecretValue`. `acm:ListCertificates`
- * likewise cannot be resource-scoped; it backs the `getCertificate` data
- * source in `components/bugboss.ts`.
+ * is what lets this role exist without `GetSecretValue`.
  */
 export const githubActionsPulumiPreview: PolicyDocument = {
   Version: "2012-10-17",
@@ -919,21 +907,18 @@ export const githubActionsPulumiPreview: PolicyDocument = {
     {
       Sid: "RuntimeSecretMetadata",
       Effect: "Allow",
-      // The two Secrets Manager secrets the ops program looks up by name:
-      // `DELEGATES` (`deploy/index.ts`) and `BUGBOSS` (`components/bugboss.ts`).
-      // The `getSecret` data source reads the secret's resource policy along
-      // with `DescribeSecret` (tags come back from the describe itself), so
-      // `GetResourcePolicy` is needed as well. All metadata; none returns a
-      // value. Both secrets were found by running real previews: the first
-      // failed on `GetResourcePolicy` for `DELEGATES`, the second on
-      // `DescribeSecret` for `BUGBOSS`.
+      // The Secrets Manager secret the ops program looks up by name:
+      // `DELEGATES` (`deploy/index.ts`). The `getSecret` data source reads the
+      // secret's resource policy along with `DescribeSecret` (tags come back
+      // from the describe itself), so `GetResourcePolicy` is needed as well.
+      // All metadata; neither returns a value. Found by running a real
+      // preview, which failed on `GetResourcePolicy`.
       Action: [
         "secretsmanager:DescribeSecret",
         "secretsmanager:GetResourcePolicy",
       ],
       Resource: [
         "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
-        "arn:aws:secretsmanager:us-west-2:333022194791:secret:BUGBOSS-??????",
       ],
     },
     {
@@ -941,37 +926,6 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       Effect: "Allow",
       Action: ["ecs:DescribeTaskDefinition"],
       Resource: "*",
-    },
-    {
-      Sid: "CertificateList",
-      Effect: "Allow",
-      // `components/bugboss.ts` resolves the wildcard certificate with the
-      // `getCertificate` data source, which lists certificates matching the
-      // domain and then describes the one it picked. `ListCertificates` takes
-      // no resource, so it cannot be scoped. Found by running a real preview:
-      // the role failed on `acm:ListCertificates`.
-      Action: ["acm:ListCertificates"],
-      Resource: "*",
-    },
-    {
-      Sid: "CertificateRead",
-      Effect: "Allow",
-      // The read half of the same lookup. The data source describes the
-      // certificate it chose, lists its tags to match the provider default
-      // tags the ops stack sets (`Environment`, `Project`), and, because it
-      // filters to `ISSUED`, fetches that certificate's PEM and chain. All
-      // three accept the certificate ARN, so they share one scoped statement.
-      // `GetCertificate` returns the public certificate and chain, not the
-      // private key. `ListTagsForCertificate` is the one Bugbot named on #133:
-      // the data source passes its `tags` argument through as a filter, and
-      // the default tags make that non-empty even though BugBoss passes no
-      // explicit `tags`.
-      Action: [
-        "acm:DescribeCertificate",
-        "acm:GetCertificate",
-        "acm:ListTagsForCertificate",
-      ],
-      Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
     },
     {
       Sid: "AssumeWorkbenchPreviewRole",

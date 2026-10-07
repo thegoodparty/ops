@@ -89,33 +89,59 @@ starting the work, not after. Make `who` name the *session*, not the model.
       creates it, per step 5: the merge's `deploy.yml` run is the read-back,
       so a red run beside this entry means the entry is wrong in the visible
       way. It has to be green before step 7 merges.
-- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: doing
-      (pi-swarm-infra-step7a, 2026-10-07). Two
-      pull requests, forced by bootstrap causality, the same shape as
-      workbench steps 7 and 10: the first applies against
+- [x] 7. Add the `deploy-infrastructure/` project and its CI job: done
+      (2026-10-07, pi-swarm-infra-step7a; pi-infra-step7-grant;
+      pi-infra-step7-cutover).
+      Three pull requests, not the two the shape first suggested, and the
+      extra one exists because the grant has to be applied before the
+      consumer that uses it. The first applies against
       `OrganizationAccountAccessRole` and creates the in-account `pulumi-deploy`
-      and `pulumi-preview` roles; the second repoints the provider at
+      and `pulumi-preview` roles; the second adds the
+      `AssumeInfrastructureDeployRole` grant on
+      `github-actions-infrastructure-deploy` alongside the bootstrap grant and
+      is applied by `deploy.yml` alone; the third repoints the provider at
       `pulumi-deploy` and removes the bootstrap grant.
 
-      PR 1 of 2 is open, stacked on step 6 (#257): `deploy-infrastructure/`
-      with the provider on `OrganizationAccountAccessRole`, `pulumi-deploy`
-      (`AdministratorAccess`, trusted only by
-      `github-actions-infrastructure-deploy`) and `pulumi-preview` (no
-      permissions, trusted by `github-actions-pulumi-preview` and the
-      management `ReadOnlyAccess` session), plus `deploy-infrastructure.yml`.
-      It cannot merge until #257 has merged and its `deploy.yml` run has
-      applied the role and grant it assumes. Its merge's `Deploy
-      infrastructure` run is the read-back: green, the two roles and the
-      `AdministratorAccess` attachment created alongside the stack and its
-      provider, `accountId` reading 394495727159 (which also closes step 3's
-      STS half), and the two role ARNs in the outputs. Not previewed before
-      merge: neither the stack nor a role a preview could assume exists yet.
-      PR 2, the cutover, follows once that run is green.
-- [ ] 8. Extend `identity-center.ts` to assign `Admins` to
-      `AdministratorAccess` in the new account: todo. This is the human admin
-      path — the "admin role" a member of the admin group picks at SSO sign-in.
-      No grant PR in front of it; the shared deploy role already holds
-      `sso:*`.
+      PR 1 merged as #258 (aa6b54e). Its `Deploy infrastructure` run
+      37653077384 was green: the two roles and the `AdministratorAccess`
+      attachment created alongside the stack and its provider, `accountId`
+      reading 394495727159 (which also closes step 3's STS half), and the two
+      role ARNs in the outputs. Not previewed before merge: neither the stack
+      nor a role a preview could assume existed yet.
+
+      PR 1 did not add the `pulumi-deploy` grant, which is why a second PR
+      precedes the cutover rather than a single in-place swap. The swap is
+      what the workbench step 10 history warns against: `deploy.yml` builds
+      two Docker images before it applies this policy, while
+      `deploy-infrastructure.yml` is a small apply that reaches its assume
+      first, so a provider repointed to `pulumi-deploy` in the same push would
+      call `sts:AssumeRole` before the grant for it existed. Gain-then-remove
+      makes the ordering unnecessary to time.
+
+      PR 2 merged as #260 (132360d), and its `deploy.yml` run 37662617931 was
+      green at 17:58 UTC. PR 3, the cutover, is in this PR: the provider
+      assumes `pulumi-deploy`, and the bootstrap statement is removed from
+      `github-actions-infrastructure-deploy` — the grant moves rather than
+      being joined by a second one. The stack is now self-referential, the
+      apply running as the role the apply manages; `protect` on the role and
+      its attachment is the lockout guard. Its merge's `Deploy infrastructure`
+      run is the read-back, so a red run beside this entry means the entry is
+      wrong in the visible way. Green there means the provider assumed
+      `pulumi-deploy`, which is also the first time STS is exercised on the
+      role's trust. `OrganizationAccountAccessRole` itself is left in the
+      account; nothing in this repo manages or deletes it.
+- [x] 8. Extend `identity-center.ts` to assign `Admins` to
+      `AdministratorAccess` in the new account: done (2026-10-07,
+      pi-infra-step8). The `accounts` map gains an `infrastructure` entry,
+      `namePrefix: "infrastructure-"`, `adopted: false`, `Admins:
+      ["administrator"]` and no `Engineers` entry. This is the human admin
+      path — the "admin role" a member of the admin group picks at SSO sign-in
+      — and, now that step 7's cutover made the deploy stack self-referential,
+      the break-glass route that does not depend on CI. No grant PR in front of
+      it; the shared deploy role already holds `sso:*` on `*`. Applied by
+      `deploy.yml`, and the merge's `Deploy` run is the read-back: green, the
+      `AdministratorAccess` set provisioned into `394495727159` for the Admins
+      group.
 - [ ] 9. Harden the account's root user, in the console: todo. Enable MFA,
       remove any root access keys, and set the alternate contacts. The group
       alias from step 1 is the recovery path, not the daily driver.
@@ -252,13 +278,13 @@ credentials fails before any resource is touched.
 only for `repo:thegoodparty/ops:ref:refs/heads/main`, holding Pulumi backend
 access for the `infrastructure` project and `sts:AssumeRole` into the account.
 
-Two things differ from the workbench role, both because of the SCP:
+Two things are worth recording about the role, the first because of the SCP:
 
-- The bootstrap target is `OrganizationAccountAccessRole`, which the
-  Organizations-planted role trusts to the management account **root**. The
-  first apply needs it because no in-account role exists yet. Step 7's second
-  PR replaces it with an in-account `pulumi-deploy` whose trust names exactly
-  this CI role, and removes the bootstrap grant. That narrowing is the security
+- The provider assumes an in-account `pulumi-deploy` whose trust names this CI
+  role exactly. The bootstrap step was `OrganizationAccountAccessRole`, the
+  Organizations-planted role trusting the management account **root**, needed
+  because no in-account role existed for the first apply. Step 7's cutover
+  replaced it and removed the bootstrap grant. That narrowing is the security
   content, and it matters more here than it did for workbench.
 - The in-account `pulumi-deploy` role is subject to the Infrastructure SCP.
   Anything the SCP denies is denied to the pipeline that maintains the account,
@@ -483,10 +509,14 @@ finishes applying before its consumer merges.
    `deploy-role.ts`, plus `.github/workflows/deploy-infrastructure.yml` and a
    `tsconfig.json` entry so `deploy.yml` type-checks it on every PR. The first
    apply's provider assumes `OrganizationAccountAccessRole` and creates the
-   in-account `pulumi-deploy` and `pulumi-preview` roles. A second PR repoints
-   the provider at `pulumi-deploy` and removes the bootstrap grant, exactly the
-   two-PR shape of workbench step 10, forced by the same causality: the apply
-   that creates the role cannot assume it.
+   in-account `pulumi-deploy` and `pulumi-preview` roles. A second, `deploy/`-
+   only PR adds the `pulumi-deploy` assume grant alongside the bootstrap one
+   and is applied by `deploy.yml` alone; the third repoints the provider at
+   `pulumi-deploy` and removes the bootstrap grant. The extra PR is the
+   workbench step 10 gain-then-remove shape, forced by the same causality —
+   the apply that creates the role cannot assume it — plus the cross-workflow
+   ordering: an in-place swap would repoint the provider before `deploy.yml`,
+   which builds two Docker images first, had applied the grant.
 
    The workflow filename is load bearing for the same reason as
    `deploy-workbench.yml`: the CI role's trust pins `job_workflow_ref` to this
