@@ -145,9 +145,17 @@ starting the work, not after. Make `who` name the *session*, not the model.
 - [ ] 9. Harden the account's root user, in the console: todo. Enable MFA,
       remove any root access keys, and set the alternate contacts. The group
       alias from step 1 is the recovery path, not the daily driver.
-- [ ] 10. Spend threshold alerts by email: doing (pi-infra-step10,
-      2026-10-07). One `aws.budgets.Budget` in `deploy-infrastructure/` with
-      notifications to the step 1 group alias, mirroring workbench step 13.
+- [x] 10. Spend threshold alerts by email: done (2026-10-07, pi-infra-step10).
+      One `aws.budgets.Budget` in `deploy-infrastructure/`, taking the explicit
+      provider, with four notifications by email to the step 1 group alias
+      `aws-infrastructure@goodparty.org`: actual monthly spend over $5,000 and
+      $10,000, forecasted over $10,000 and $20,000. The amounts are the
+      workbench budget's, copied so the two accounts read the same and each a
+      one-line change. Marked done in the PR that creates it, per workbench
+      step 13: the merge's `Deploy infrastructure` run is the read-back, so a
+      red run beside this entry means the entry is wrong in the visible way. A
+      green apply shows the budget and its subscribers exist, not that an email
+      arrives — delivery can only be proven by a real crossing.
 - [ ] 11. Extend the PR preview role and workflow to cover the new project:
       todo. Design in "PR previews" below.
 - [ ] 12. Document how an admin reaches the account, and whether the container
