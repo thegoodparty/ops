@@ -131,7 +131,8 @@ starting the work, not after. Make `who` name the *session*, not the model.
       role's trust. `OrganizationAccountAccessRole` itself is left in the
       account; nothing in this repo manages or deletes it.
 - [ ] 8. Extend `identity-center.ts` to assign `Admins` to
-      `AdministratorAccess` in the new account: todo. This is the human admin
+      `AdministratorAccess` in the new account: doing (pi-infra-step8,
+      2026-10-07). This is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in.
       No grant PR in front of it; the shared deploy role already holds
       `sso:*`.
