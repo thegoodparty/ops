@@ -90,27 +90,33 @@ starting the work, not after. Make `who` name the *session*, not the model.
       so a red run beside this entry means the entry is wrong in the visible
       way. It has to be green before step 7 merges.
 - [ ] 7. Add the `deploy-infrastructure/` project and its CI job: doing
-      (pi-swarm-infra-step7a, 2026-10-07). Two
-      pull requests, forced by bootstrap causality, the same shape as
-      workbench steps 7 and 10: the first applies against
+      (pi-swarm-infra-step7a, 2026-10-07; pi-infra-step7-grant, 2026-10-07).
+      Three pull requests, not the two the shape first suggested, and the
+      extra one exists because the grant has to be applied before the
+      consumer that uses it. The first applies against
       `OrganizationAccountAccessRole` and creates the in-account `pulumi-deploy`
-      and `pulumi-preview` roles; the second repoints the provider at
+      and `pulumi-preview` roles; the second adds the
+      `AssumeInfrastructureDeployRole` grant on
+      `github-actions-infrastructure-deploy` alongside the bootstrap grant and
+      is applied by `deploy.yml` alone; the third repoints the provider at
       `pulumi-deploy` and removes the bootstrap grant.
 
-      PR 1 of 2 is open, stacked on step 6 (#257): `deploy-infrastructure/`
-      with the provider on `OrganizationAccountAccessRole`, `pulumi-deploy`
-      (`AdministratorAccess`, trusted only by
-      `github-actions-infrastructure-deploy`) and `pulumi-preview` (no
-      permissions, trusted by `github-actions-pulumi-preview` and the
-      management `ReadOnlyAccess` session), plus `deploy-infrastructure.yml`.
-      It cannot merge until #257 has merged and its `deploy.yml` run has
-      applied the role and grant it assumes. Its merge's `Deploy
-      infrastructure` run is the read-back: green, the two roles and the
-      `AdministratorAccess` attachment created alongside the stack and its
-      provider, `accountId` reading 394495727159 (which also closes step 3's
-      STS half), and the two role ARNs in the outputs. Not previewed before
-      merge: neither the stack nor a role a preview could assume exists yet.
-      PR 2, the cutover, follows once that run is green.
+      PR 1 merged as #258 (aa6b54e). Its `Deploy infrastructure` run
+      37653077384 was green: the two roles and the `AdministratorAccess`
+      attachment created alongside the stack and its provider, `accountId`
+      reading 394495727159 (which also closes step 3's STS half), and the two
+      role ARNs in the outputs. Not previewed before merge: neither the stack
+      nor a role a preview could assume existed yet.
+
+      PR 1 did not add the `pulumi-deploy` grant, which is why a second PR
+      precedes the cutover rather than a single in-place swap. The swap is
+      what the workbench step 10 history warns against: `deploy.yml` builds
+      two Docker images before it applies this policy, while
+      `deploy-infrastructure.yml` is a small apply that reaches its assume
+      first, so a provider repointed to `pulumi-deploy` in the same push would
+      call `sts:AssumeRole` before the grant for it existed. Gain-then-remove
+      makes the ordering unnecessary to time. PR 3, the cutover, follows once
+      PR 2's `deploy.yml` run is green.
 - [ ] 8. Extend `identity-center.ts` to assign `Admins` to
       `AdministratorAccess` in the new account: todo. This is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in.

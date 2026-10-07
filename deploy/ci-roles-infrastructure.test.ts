@@ -32,17 +32,29 @@ describe("githubActionsInfrastructureDeployTrust", () => {
 });
 
 describe("githubActionsInfrastructureDeploy", () => {
-  // The bootstrap grant. Step 7's second PR replaces it with the in-account
-  // pulumi-deploy role, and this assertion changes with it rather than
-  // gaining a second ARN.
-  it("assumes only the infrastructure account's bootstrap role", () => {
+  // Two assume statements during step 7's gain-then-remove window: the
+  // `pulumi-deploy` grant the cutover needs applied first, and the bootstrap
+  // grant the provider still uses until that cutover. The cutover PR drops the
+  // bootstrap ARN; this assertion is where that shows up.
+  it("assumes pulumi-deploy, with the bootstrap grant still present until the cutover", () => {
     const assumes = githubActionsInfrastructureDeploy.Statement.filter((s) =>
       asList(s.Action).includes("sts:AssumeRole")
     );
-    assert.equal(assumes.length, 1);
-    assert.deepEqual(asList(assumes[0].Resource), [
+    const arns = assumes.flatMap((s) => asList(s.Resource)).sort();
+    assert.deepEqual(arns, [
       "arn:aws:iam::394495727159:role/OrganizationAccountAccessRole",
+      "arn:aws:iam::394495727159:role/pulumi-deploy",
     ]);
+  });
+
+  // The grant the cutover depends on. Asserted on its own so a later edit that
+  // removes it while touching the bootstrap grant fails loudly here rather
+  // than at the cutover's first assume.
+  it("grants the in-account deploy role the cutover will assume", () => {
+    assert.equal(
+      resources().includes("arn:aws:iam::394495727159:role/pulumi-deploy"),
+      true
+    );
   });
 
   // Every project shares one passphrase, so the object ARNs are the only

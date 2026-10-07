@@ -857,37 +857,47 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
 
 // The management-account half of the infrastructure deploy path, step 6 of
 // `docs/infrastructure-account.md`: assumed by deploy-infrastructure.yml on
-// main, and holds the assume grant below plus this project's Pulumi backend
-// access. Nothing else in this account.
+// main, and holds the two assume grants below (one transitional) plus this
+// project's Pulumi backend access. Nothing else in this account.
 //
 // The same apply ordering as the workbench role above: this is in `deploy/`
-// and applied by `deploy.yml`, while its consumer will be applied by
-// `deploy-infrastructure.yml`, so this has to finish applying before step 7
-// merges.
+// and applied by `deploy.yml`, while its consumer is applied by
+// `deploy-infrastructure.yml`. That ordering is why there are two grants for
+// the span of step 7's cutover, the workbench step 10 "gain-then-remove"
+// shape rather than an oversight. The `pulumi-deploy` grant has to be applied
+// by `deploy.yml` before the cutover PR repoints the provider at it; the
+// bootstrap grant is then removed by that same cutover PR. Swapping the
+// resource in place in one PR would race itself: `deploy.yml` builds two
+// Docker images before it applies this policy, while
+// `deploy-infrastructure.yml` is a small apply that reaches its assume first,
+// so the repointed provider would call sts:AssumeRole before a grant for
+// `pulumi-deploy` existed and fail. Keeping both until the cutover is what
+// makes the ordering unnecessary to time.
+//
+// What the bootstrap grant reaches is administrator in the infrastructure
+// account, which is what OrganizationAccountAccessRole is. The first apply
+// needed it because no in-account role existed yet. `pulumi-deploy` is the
+// narrower replacement: its trust names exactly this CI role rather than the
+// management account root. That narrowing matters more here than it did for
+// workbench, because this account exists to hold privileged automation.
+//
+// The bootstrap role's trust names the management account root, which
+// delegates the decision to IAM here, so this identity-based statement is the
+// whole control on that path. The `pulumi-deploy` trust names this role
+// exactly, so both sides agree and the grant above is the entire control.
 export const githubActionsInfrastructureDeploy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
-    // The bootstrap grant, and the shape the workbench role had before its
-    // step 10 cutover. Unlike that role, the account id was known before this
-    // was written, so there is no deferred statement and no window where the
-    // role holds backend access alone.
-    //
-    // What this grants is administrator in the infrastructure account, which
-    // is what OrganizationAccountAccessRole is. The first apply needs it
-    // because no in-account role exists yet. Step 7's second PR replaces it
-    // with `pulumi-deploy`, whose trust names exactly this role, and this
-    // statement moves then rather than being joined by another: keeping both
-    // would leave a permanent admin path that nothing uses and nobody would
-    // notice. That narrowing matters more here than it did for workbench,
-    // because this account exists to hold privileged automation.
-    //
-    // Nothing on the target side needs changing. The bootstrap role's trust
-    // policy names the management account root, which delegates the decision
-    // to IAM here, so this identity-based statement is the whole control.
-    //
-    // Inert on merge, deliberately. `github-actions-infrastructure-deploy`
-    // pins job_workflow_ref to `deploy-infrastructure.yml`, which does not
-    // exist, so no job can assume the role that now holds this.
+    // Step 7's cutover needs this applied before it repoints the provider.
+    // Inert until then: nothing assumes `pulumi-deploy` yet.
+    {
+      Sid: "AssumeInfrastructureDeployRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/pulumi-deploy`,
+    },
+    // Transitional. Removed by step 7's cutover PR once the provider assumes
+    // `pulumi-deploy`, so no permanent admin path is left behind.
     {
       Sid: "AssumeInfrastructureBootstrapRole",
       Effect: "Allow",
