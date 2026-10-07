@@ -1,13 +1,17 @@
-# agent-swarm 1.163.0 on swarm.goodparty.org
+# agent-swarm 1.163.0 on delegate-swarm.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
-# render-env.sh from Secrets Manager:AGENT_SWARM; never edit .env by hand.
+# render-env.sh from Secrets Manager:DELEGATE_SWARM; never edit .env by hand.
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
+
+# Fixed so the volume names (agent-swarm_swarm_api_data and so on) do not
+# depend on the directory, and match the volumes migrated from the old host.
+name: agent-swarm
 
 x-logging: &logging
   driver: awslogs
   options:
     awslogs-region: us-west-2
-    awslogs-group: /agent-swarm/containers
+    awslogs-group: /delegate-swarm/containers
     awslogs-create-group: "false"
     tag: "{{.Name}}"
     mode: non-blocking
@@ -31,22 +35,26 @@ x-agent-entrypoint: &agent-entrypoint
   - --
 
 x-worker-env: &worker-env
-  HARNESS_PROVIDER: ${HARNESS_PROVIDER:-claude}
+  HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   API_KEY: ${API_KEY}
   MCP_BASE_URL: http://api:3013
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
   YOLO: "true"
   GITHUB_TOKEN: ${GITHUB_TOKEN}
-  GITHUB_NAME: ${GITHUB_NAME:-Swarm}
-  GITHUB_EMAIL: ${GITHUB_EMAIL:-swarm@goodparty.org}
+  GITHUB_NAME: ${GITHUB_NAME:-Delegate}
+  GITHUB_EMAIL: ${GITHUB_EMAIL:-delegate@goodparty.org}
   CLICKUP_API_TOKEN: ${CLICKUP_API_TOKEN}
   CLICKUP_API_KEY: ${CLICKUP_API_TOKEN}
   GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN}
   GRAFANA_URL: ${GRAFANA_URL:-https://goodparty.grafana.net}
-  SWARM_URL: swarm.goodparty.org
-  APP_URL: ${APP_URL:-https://swarm.goodparty.org}
-  PUBLIC_MCP_BASE_URL: ${PUBLIC_MCP_BASE_URL:-https://swarm.goodparty.org}
+  SWARM_URL: delegate-swarm.goodparty.org
+  APP_URL: ${APP_URL:-https://delegate-swarm.goodparty.org}
+  PUBLIC_MCP_BASE_URL: ${PUBLIC_MCP_BASE_URL:-https://delegate-swarm.goodparty.org}
+  # Production AWS, read-only: the SDKs and the CLI assume the prod-read role
+  # with the instance credentials from IMDS (hop limit 2). See aws-config.
+  AWS_CONFIG_FILE: /etc/delegate-swarm/aws-config
+  AWS_SDK_LOAD_CONFIG: "1"
 
 x-worker-base: &worker-base
   image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.163.0}"
@@ -91,11 +99,9 @@ services:
       - SECRETS_ENCRYPTION_KEY=${SECRETS_ENCRYPTION_KEY}
       - MCP_BASE_URL=${MCP_BASE_URL}
       - PUBLIC_MCP_BASE_URL=${PUBLIC_MCP_BASE_URL}
-      - APP_URL=${APP_URL:-https://swarm.goodparty.org}
+      - APP_URL=${APP_URL:-https://delegate-swarm.goodparty.org}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - API_DRAIN_MAX_MS=${API_DRAIN_MAX_MS:-30000}
-      # Workflow LLM nodes run in the API with the worker model.
-      - MODEL_OVERRIDE=${WORKER_MODEL_OVERRIDE}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - EMBEDDING_API_BASE_URL=${EMBEDDING_API_BASE_URL:-http://tei:80/v1}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-local}
@@ -137,9 +143,11 @@ services:
       <<: *worker-env
       AGENT_ID: ${LEAD_AGENT_ID:-}
       AGENT_ROLE: lead
+      AGENT_NAME: Delegate
       TEMPLATE_ID: official/lead
       MODEL_OVERRIDE: ${LEAD_MODEL_OVERRIDE}
     volumes:
+      - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
       - swarm_shared:/workspace/shared
       - swarm_lead:/workspace/personal
@@ -153,6 +161,7 @@ services:
       TEMPLATE_ID: official/coder
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
     volumes:
+      - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
       - swarm_shared:/workspace/shared
       - swarm_worker_coder:/workspace/personal
@@ -166,6 +175,7 @@ services:
       TEMPLATE_ID: official/reviewer
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
     volumes:
+      - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
       - swarm_shared:/workspace/shared
       - swarm_worker_reviewer:/workspace/personal
@@ -218,7 +228,7 @@ services:
       OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET:-}
       OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:-}
       OAUTH2_PROXY_EMAIL_DOMAINS: goodparty.org
-      OAUTH2_PROXY_REDIRECT_URL: https://swarm.goodparty.org/oauth2/callback
+      OAUTH2_PROXY_REDIRECT_URL: https://delegate-swarm.goodparty.org/oauth2/callback
       OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
       OAUTH2_PROXY_REVERSE_PROXY: "true"
       OAUTH2_PROXY_UPSTREAMS: static://202
@@ -229,7 +239,7 @@ services:
       OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
       OAUTH2_PROXY_PASS_USER_HEADERS: "true"
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
-      OAUTH2_PROXY_WHITELIST_DOMAINS: swarm.goodparty.org
+      OAUTH2_PROXY_WHITELIST_DOMAINS: delegate-swarm.goodparty.org
     restart: unless-stopped
     logging: *logging
 

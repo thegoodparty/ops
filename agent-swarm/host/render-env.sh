@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-SECRET_ID="${AGENT_SWARM_SECRET_ID:-AGENT_SWARM}"
+SECRET_ID="${DELEGATE_SWARM_SECRET_ID:-DELEGATE_SWARM}"
 REGION="${AWS_REGION:-us-west-2}"
 OUT="/opt/agent-swarm/.env"
 TMP="$(mktemp /opt/agent-swarm/.env.XXXXXX)"
@@ -72,18 +72,18 @@ fi
   cat <<'EOF'
 AGENT_SWARM_VERSION=1.163.0
 NODE_ENV=production
-HARNESS_PROVIDER=claude
-LEAD_MODEL_OVERRIDE=claude-opus-5-5
-WORKER_MODEL_OVERRIDE=claude-sonnet-5-5
+HARNESS_PROVIDER=pi
+LEAD_MODEL_OVERRIDE=anthropic/claude-opus-5-5
+WORKER_MODEL_OVERRIDE=anthropic/claude-sonnet-5-5
 
 LEAD_AGENT_ID=9f8efd62-469d-4067-9dca-24d72b13864b
 CODER_AGENT_ID=458bcd6d-4384-4366-83fa-63072ef55eab
 REVIEWER_AGENT_ID=a0799d09-6816-445a-957d-1339b672d38b
 
-SWARM_API_DOMAIN=swarm.goodparty.org
-MCP_BASE_URL=https://swarm.goodparty.org
-PUBLIC_MCP_BASE_URL=https://swarm.goodparty.org
-APP_URL=https://swarm.goodparty.org
+SWARM_API_DOMAIN=delegate-swarm.goodparty.org
+MCP_BASE_URL=https://delegate-swarm.goodparty.org
+PUBLIC_MCP_BASE_URL=https://delegate-swarm.goodparty.org
+APP_URL=https://delegate-swarm.goodparty.org
 API_DRAIN_MAX_MS=30000
 
 EMBEDDING_API_BASE_URL=http://tei:80/v1
@@ -94,8 +94,8 @@ SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org
 SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK
 
 GITHUB_DISABLE=true
-GITHUB_NAME=Swarm
-GITHUB_EMAIL=swarm@goodparty.org
+GITHUB_NAME=Delegate
+GITHUB_EMAIL=delegate@goodparty.org
 
 GRAFANA_URL=https://goodparty.grafana.net
 EOF

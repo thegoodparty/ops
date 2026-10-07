@@ -21,21 +21,33 @@ cd "$STAGE"
 while IFS= read -r -d '' f; do
   f="${f#./}"
   install -d -o ec2-user -g ec2-user "$DEST/$(dirname "$f")"
-  # cp onto an existing file rewrites it in place. The Caddyfile is a
-  # single-file bind mount, so a replaced inode would stay invisible to caddy.
+  # cp onto an existing file rewrites it in place. The Caddyfile and
+  # aws-config are single-file bind mounts, so a replaced inode would stay
+  # invisible to the containers.
   cp "$f" "$DEST/$f"
   chown ec2-user:ec2-user "$DEST/$f"
   if [[ "$f" == *.sh ]]; then chmod 755 "$DEST/$f"; else chmod 644 "$DEST/$f"; fi
 done < <(find . -path ./systemd -prune -o -type f -print0)
 
-install -m 644 "$STAGE"/systemd/*.service "$STAGE"/systemd/*.timer /etc/systemd/system/
+install -m 644 "$STAGE"/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable agent-swarm.service
-systemctl enable --now agent-swarm-health.timer
 
 # Leftovers from the hand-built host: the pre-dashboard Caddyfile, the unit
 # file's old copy, and the clone build-ui.sh no longer uses.
 rm -rf "$DEST"/Caddyfile.bak-* "$DEST/agent-swarm.service" "$DEST/src"
+
+# A new host is installed before anyone has filled the secret. Leave the
+# stack down until they have, but still fail on any other error.
+if ! err="$(aws secretsmanager get-secret-value --secret-id DELEGATE_SWARM \
+  --region us-west-2 --query VersionId --output text 2>&1 >/dev/null)"; then
+  if [[ "$err" == *ResourceNotFoundException* ]]; then
+    echo "install: DELEGATE_SWARM has no value yet; files installed, stack not started. Fill the secret, then run: sudo systemctl start agent-swarm"
+    exit 0
+  fi
+  echo "install: cannot read DELEGATE_SWARM: $err" >&2
+  exit 1
+fi
 
 # Never restart the unit: that would stop the whole stack. If it is not active
 # yet (new instance), start it so its ExecStop drains the stack on shutdown.
