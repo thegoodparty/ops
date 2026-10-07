@@ -24,14 +24,18 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      # The comment body is attacker-controlled text. It reaches the shell as
+      # an environment variable, never as template substitution into the
+      # script, so nothing in it can execute.
       - name: Parse trigger
         id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          body="${{ github.event.comment.body }}"
-          n=$(echo "$body" | sed -n 's/^delegate eval[[:space:]]*\([0-9]*\).*/\1/p')
+          n=$(printf '%s' "$COMMENT_BODY" | sed -n 's/^delegate eval[[:space:]]*\([0-9]*\).*/\1/p')
           echo "cases=${n:-12}" >> "$GITHUB_OUTPUT"
-          pr_number=${{ github.event.issue.number }}
-          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: React with eyes
         env:
