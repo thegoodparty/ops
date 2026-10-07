@@ -4,7 +4,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { replayCase, replayAll } from "./replay";
+import { replayCase, replayAll, resultFromRecord } from "./replay";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { ReviewRecord } from "../schema";
 
@@ -269,4 +269,13 @@ test("replayAll runs multiple cases with the worker pool", async () => {
 
   assert.equal(results.length, 3);
   assert.equal(callCount, 3);
+});
+
+test("resultFromRecord turns what production posted into a judgeable side", () => {
+  const record = makeRecord({ action: "commented", agentVersion: "abcdef1234567" });
+  const result = resultFromRecord(record);
+  assert.equal(result.caseId, record.runId);
+  assert.equal(result.variant, "prod-abcdef1");
+  assert.deepEqual(result.output, record.output);
+  assert.equal(result.costUsd, record.costUsd);
 });

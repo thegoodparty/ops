@@ -1,0 +1,177 @@
+name: Delegate eval
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: delegate-eval-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  eval:
+    if: |
+      github.event.issue.pull_request != null &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      startsWith(github.event.comment.body, 'delegate eval')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Parse trigger
+        id: parse
+        run: |
+          body="${{ github.event.comment.body }}"
+          n=$(echo "$body" | sed -n 's/^delegate eval[[:space:]]*\([0-9]*\).*/\1/p')
+          echo "cases=${n:-12}" >> "$GITHUB_OUTPUT"
+          pr_number=${{ github.event.issue.number }}
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+
+      - name: React with eyes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method POST \
+            repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content=eyes
+
+      - name: Resolve PR head sha
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api repos/${{ github.repository }}/pulls/${{ steps.parse.outputs.pr_number }} --jq '.head.sha')
+          echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main (tooling)
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: .
+
+      - name: Checkout PR head (agent under test)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          path: pr/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps (main)
+        run: npm ci
+
+      - name: Install deps (pr)
+        run: npm ci
+        working-directory: pr/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Snapshot cases
+        env:
+          REVIEW_BUCKET: delegate-reviews
+        run: |
+          npm run -s review:eval -- cases snapshot \
+            --out ./eval/cases \
+            --limit ${{ steps.parse.outputs.cases }} \
+            --only-complete
+
+      - name: Build prod baseline from cases
+        env:
+          REVIEW_BUCKET: delegate-reviews
+        run: |
+          npm run -s review:eval -- results from-cases \
+            --cases ./eval/cases \
+            --out ./eval/results-prod
+
+      - name: Replay from PR head
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          cd pr && npm run -s review:eval -- replay \
+            --cases ../eval/cases \
+            --out ../eval/results-pr \
+            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --concurrency 4 \
+            --work-dir ${{ runner.temp }}/work
+
+      - name: Judge
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+        run: |
+          npm run -s review:eval -- judge \
+            --cases ./eval/cases \
+            --a ./eval/results-prod \
+            --b ./eval/results-pr \
+            --label-a prod \
+            --label-b pr-${{ steps.pr.outputs.sha7 }} \
+            --passes 4 \
+            --concurrency 6 \
+            --out ./eval/report.md \
+            --pr-comment ./eval/comment.md \
+            --run-url https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Post or update PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(cat ./eval/comment.md)
+          pr=${{ steps.parse.outputs.pr_number }}
+          existing_id=$(gh api repos/${{ github.repository }}/issues/${pr}/comments \
+            --jq '[.[] | select(.body | startswith("<!-- delegate-eval -->"))] | first | .id // empty')
+          if [ -n "$existing_id" ]; then
+            gh api --method PATCH repos/${{ github.repository }}/issues/comments/${existing_id} \
+              -f body="$body"
+          else
+            gh api --method POST repos/${{ github.repository }}/issues/${pr}/comments \
+              -f body="$body"
+          fi
+
+      - name: Upload eval artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-${{ steps.pr.outputs.sha7 }}
+          path: ./eval/
+
+      - name: Remove eyes reaction
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reaction_id=$(gh api \
+            repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            --jq '[.[] | select(.content == "eyes")] | first | .id // empty')
+          if [ -n "$reaction_id" ]; then
+            gh api --method DELETE \
+              repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id}
+          fi

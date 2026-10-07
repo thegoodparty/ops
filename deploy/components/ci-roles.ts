@@ -12,6 +12,8 @@ import {
   githubActionsWorkbenchDeployTrust,
   githubActionsInfrastructureDeploy,
   githubActionsInfrastructureDeployTrust,
+  githubActionsDelegateEval,
+  githubActionsDelegateEvalTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -220,6 +222,20 @@ export const createCiRoles = () => {
     policyArn: READ_ONLY_ACCESS_ARN,
   });
 
+  const delegateEvalRole = new aws.iam.Role("githubActionsDelegateEval", {
+    name: "github-actions-delegate-eval",
+    description:
+      "PR-comment eval runs for the delegate pr-reviewer. Assumed only by delegate-eval.yml on thegoodparty/ops main.",
+    assumeRolePolicy: JSON.stringify(githubActionsDelegateEvalTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsDelegateEvalPolicy", {
+    name: "DelegateEval",
+    role: delegateEvalRole.id,
+    policy: JSON.stringify(githubActionsDelegateEval),
+  });
+
   return {
     deployRole,
     deployPolicy,
@@ -228,5 +244,6 @@ export const createCiRoles = () => {
     infrastructureDeployRole,
     previewRole,
     planRole,
+    delegateEvalRole,
   };
 };

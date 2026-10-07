@@ -268,11 +268,12 @@ export const judgeAll = async (
   resultsB: Result[],
   model: JudgeModel,
   passes = 4,
+  concurrency = 6,
 ): Promise<PairVerdict[]> => {
   const aById = new Map(resultsA.map((r) => [r.caseId, r]));
   const bById = new Map(resultsB.map((r) => [r.caseId, r]));
 
-  const verdicts: PairVerdict[] = [];
+  const pairs: { record: ReviewRecord; a: Result; b: Result }[] = [];
   for (const record of records) {
     const a = aById.get(record.runId);
     const b = bById.get(record.runId);
@@ -282,7 +283,23 @@ export const judgeAll = async (
       );
       continue;
     }
-    verdicts.push(await judgePair({ record, a, b, model, passes }));
+    pairs.push({ record, a, b });
   }
-  return verdicts;
+
+  const verdicts: (PairVerdict | undefined)[] = new Array(pairs.length);
+  let index = 0;
+  const worker = async () => {
+    while (index < pairs.length) {
+      const i = index++;
+      const { record, a, b } = pairs[i];
+      verdicts[i] = await judgePair({ record, a, b, model, passes });
+    }
+  };
+
+  const workerCount = Math.min(concurrency, pairs.length);
+  if (workerCount > 0) {
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  }
+
+  return verdicts.filter((v): v is PairVerdict => v !== undefined);
 };

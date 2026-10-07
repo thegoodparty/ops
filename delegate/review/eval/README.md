@@ -2,6 +2,26 @@
 
 Replay recorded production reviews against the agent code in any checkout and compare two variants pairwise.
 
+## From a PR
+
+Comment `delegate eval` on any ops PR (or `delegate eval 20` to use 20 cases instead of the default 12). The workflow:
+
+1. Takes a snapshot of the N most recent completed production review cases from S3.
+2. Uses what production posted as the baseline side.
+3. Replays the cases using the agent code from your PR head.
+4. Judges the two sides pairwise and posts a single comment to the PR: a short summary under 250 words with per-case details in a drop-down.
+5. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
+
+**Cost and time:** each replay is a full `claude-opus-4-6` agent run at roughly $1.50 per case. 12 cases at concurrency 4 takes about 15 minutes and costs around $18 in replay plus a few dollars for judging.
+
+**Repo settings the workflow needs:**
+
+- Variable `DELEGATE_EVAL_APP_ID`: the app ID of a GitHub App with `contents:read` on the repos being reviewed (used to clone target repos during replay).
+- Secret `DELEGATE_EVAL_APP_PRIVATE_KEY`: the private key for that GitHub App.
+- Secret `ANTHROPIC_API_KEY`: standard Anthropic API key for agent replay and judging.
+
+The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLABORATOR` association on the repository.
+
 ## Concepts
 
 **Case** — one production `ReviewRecord` stored in S3. The record contains the full `bundle` (diff, changed files, prior findings, PR metadata) that was the agent's complete input. Because the bundle is self-contained, a case can be replayed without calling GitHub — except for checking out the repo at `bundle.headSha` so the agent can read files.
