@@ -44,7 +44,7 @@ ${pd.inline}
   <title>${untrusted(bundle.title)}</title>
   <body>${untrusted(bundle.body)}</body>
   <changed_files>
-${bundle.changedFiles.join("\n")}
+${bundle.changedFiles.map(escapeText).join("\n")}
   </changed_files>
   <diff_stat>
 ${escapeText(pd.stat)}
