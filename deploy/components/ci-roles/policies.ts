@@ -857,52 +857,32 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
 
 // The management-account half of the infrastructure deploy path, step 6 of
 // `docs/infrastructure-account.md`: assumed by deploy-infrastructure.yml on
-// main, and holds the two assume grants below (one transitional) plus this
-// project's Pulumi backend access. Nothing else in this account.
+// main, and holds the assume grant below plus this project's Pulumi backend
+// access. Nothing else in this account.
 //
-// The same apply ordering as the workbench role above: this is in `deploy/`
-// and applied by `deploy.yml`, while its consumer is applied by
-// `deploy-infrastructure.yml`. That ordering is why there are two grants for
-// the span of step 7's cutover, the workbench step 10 "gain-then-remove"
-// shape rather than an oversight. The `pulumi-deploy` grant has to be applied
-// by `deploy.yml` before the cutover PR repoints the provider at it; the
-// bootstrap grant is then removed by that same cutover PR. Swapping the
-// resource in place in one PR would race itself: `deploy.yml` builds two
-// Docker images before it applies this policy, while
-// `deploy-infrastructure.yml` is a small apply that reaches its assume first,
-// so the repointed provider would call sts:AssumeRole before a grant for
-// `pulumi-deploy` existed and fail. Keeping both until the cutover is what
-// makes the ordering unnecessary to time.
+// The grant moved rather than gained. Until step 7's cutover this also granted
+// the Organizations-planted `OrganizationAccountAccessRole`, and the cutover
+// removed that statement once the provider was repointed at `pulumi-deploy`.
+// Git history shows the two coexisting; that was the workbench step 10
+// "gain-then-remove" transition, not the end state. Keeping both would have
+// left a permanent admin path that nothing uses and nobody would notice.
 //
-// What the bootstrap grant reaches is administrator in the infrastructure
-// account, which is what OrganizationAccountAccessRole is. The first apply
-// needed it because no in-account role existed yet. `pulumi-deploy` is the
-// narrower replacement: its trust names exactly this CI role rather than the
-// management account root. That narrowing matters more here than it did for
+// The target side narrowed at the same time: the bootstrap role trusted the
+// management account root, delegating the decision to any principal there
+// holding sts:AssumeRole, while `pulumi-deploy` names this role exactly. A
+// cross-account assume needs both sides to allow it, and both sides now agree
+// on a single role. That narrowing matters more here than it did for
 // workbench, because this account exists to hold privileged automation.
-//
-// The bootstrap role's trust names the management account root, which
-// delegates the decision to IAM here, so this identity-based statement is the
-// whole control on that path. The `pulumi-deploy` trust names this role
-// exactly, so both sides agree and the grant above is the entire control.
 export const githubActionsInfrastructureDeploy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
-    // Step 7's cutover needs this applied before it repoints the provider.
-    // Inert until then: nothing assumes `pulumi-deploy` yet.
+    // The role's reason to exist: reach the infrastructure account's deploy
+    // role, whose trust names this role exactly.
     {
       Sid: "AssumeInfrastructureDeployRole",
       Effect: "Allow",
       Action: ["sts:AssumeRole"],
       Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/pulumi-deploy`,
-    },
-    // Transitional. Removed by step 7's cutover PR once the provider assumes
-    // `pulumi-deploy`, so no permanent admin path is left behind.
-    {
-      Sid: "AssumeInfrastructureBootstrapRole",
-      Effect: "Allow",
-      Action: ["sts:AssumeRole"],
-      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
     },
     ...pulumiBackendStatements("infrastructure"),
   ],

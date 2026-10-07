@@ -10,7 +10,7 @@ import { MANAGEMENT_ACCOUNT_ID } from "../utils/accounts";
  * exactly one CI role, because the trust is the control and the permission
  * list was friction without a boundary. Read that before changing either.
  *
- * What this replaces, at step 7's second PR: `OrganizationAccountAccessRole`,
+ * What this replaces, at step 7's cutover: `OrganizationAccountAccessRole`,
  * which trusts the management account *root*, so any principal there holding
  * `sts:AssumeRole` can walk in. This role is the same front door with the
  * trust narrowed to `github-actions-infrastructure-deploy`. That narrowing
