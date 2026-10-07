@@ -43,7 +43,7 @@ describe("githubActionsPulumiPreview", () => {
     // `sts:AssumeRole` is the one non-read action; it only reaches the
     // workbench preview role, asserted separately below.
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List)|sts:AssumeRole)/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List)|ec2:Describe|iam:(Get|List)|logs:(Describe|List)|route53:(Get|List)|sts:AssumeRole)/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
@@ -59,6 +59,21 @@ describe("githubActionsPulumiPreview", () => {
     assert.equal(
       assume.Resource,
       "arn:aws:iam::024901689212:role/pulumi-preview"
+    );
+  });
+
+  // Instance attributes include user data, which on other hosts can carry
+  // secrets, so this is the one EC2 read that must not widen to "*".
+  it("scopes instance attributes to the agent-swarm host", () => {
+    const attribute = githubActionsPulumiPreview.Statement.find((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
+        "ec2:DescribeInstanceAttribute"
+      )
+    );
+    assert.ok(attribute);
+    assert.equal(
+      attribute.Resource,
+      "arn:aws:ec2:us-west-2:333022194791:instance/i-04cc03c17787f5d59"
     );
   });
 

@@ -921,6 +921,70 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       ],
       Resource: "arn:aws:acm:us-west-2:333022194791:certificate/*",
     },
+    // The agent-swarm host was built by hand and is adopted into the ops
+    // stack with `import` (`components/agent-swarm.ts`). A preview of an
+    // import reads the live resource, so these are the reads that import
+    // performs. Found by running the ops preview under a copy of this policy
+    // and removing grants until it failed; each one here is the last that
+    // made it pass. Scoped to the swarm's own role, instance profile, log groups,
+    // hosted zone and instance where the action accepts a resource; the EC2
+    // describes do not, so they take "*" and return metadata only. Instance
+    // attributes (which include user data) are scoped to the one instance.
+    {
+      Sid: "AgentSwarmImportEc2",
+      Effect: "Allow",
+      Action: [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeTags",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeAddressesAttribute",
+        "ec2:DescribeSecurityGroups",
+      ],
+      Resource: "*",
+    },
+    {
+      Sid: "AgentSwarmImportInstanceAttributes",
+      Effect: "Allow",
+      Action: ["ec2:DescribeInstanceAttribute"],
+      Resource: "arn:aws:ec2:us-west-2:333022194791:instance/i-04cc03c17787f5d59",
+    },
+    {
+      Sid: "AgentSwarmImportIam",
+      Effect: "Allow",
+      Action: [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:GetInstanceProfile",
+      ],
+      Resource: [
+        "arn:aws:iam::333022194791:role/agent-swarm-host",
+        "arn:aws:iam::333022194791:instance-profile/agent-swarm-host",
+      ],
+    },
+    {
+      Sid: "AgentSwarmImportLogGroupListing",
+      Effect: "Allow",
+      // DescribeLogGroups authorizes against the account's log-group space,
+      // not a named group, so it cannot be narrowed further.
+      Action: ["logs:DescribeLogGroups"],
+      Resource: "*",
+    },
+    {
+      Sid: "AgentSwarmImportLogGroupTags",
+      Effect: "Allow",
+      Action: ["logs:ListTagsForResource"],
+      Resource: "arn:aws:logs:us-west-2:333022194791:log-group:/agent-swarm/*",
+    },
+    {
+      Sid: "AgentSwarmImportDns",
+      Effect: "Allow",
+      Action: ["route53:GetHostedZone", "route53:ListResourceRecordSets"],
+      Resource: "arn:aws:route53:::hostedzone/Z10392302OXMPNQLPO07K",
+    },
     {
       Sid: "AssumeWorkbenchPreviewRole",
       Effect: "Allow",
