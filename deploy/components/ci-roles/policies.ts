@@ -14,6 +14,7 @@
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
 import {
+  INFRASTRUCTURE_ACCOUNT_ID,
   MANAGEMENT_ACCOUNT_ID,
   WORKBENCH_ACCOUNT_ID,
 } from "../../../utils/accounts";
@@ -459,6 +460,16 @@ export const githubActionsOrgDeployTrust = opsWorkflowTrust("deploy-org.yml");
 export const githubActionsWorkbenchDeployTrust =
   opsWorkflowTrust("deploy-workbench.yml");
 
+// Pinned ahead of the workflow existing, deliberately, the same way the
+// workbench trust above is. Until step 7 creates
+// `.github/workflows/deploy-infrastructure.yml`, no workflow can satisfy this
+// condition and the role cannot be assumed at all, which is the correct state
+// for a role nothing uses yet. Step 7 must use exactly this filename; if it
+// does not, the assume fails with a message that does not obviously point
+// here.
+export const githubActionsInfrastructureDeployTrust =
+  opsWorkflowTrust("deploy-infrastructure.yml");
+
 // Trust for the PR preview role. The subject is the `pull_request` subject
 // exactly: not `:*`, not `main`, and no other repository. Fork PRs cannot
 // obtain an OIDC token at all, but the workflow skips them explicitly so the
@@ -843,6 +854,41 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`,
     },
     ...pulumiBackendStatements("workbench"),
+  ],
+};
+
+// The management-account half of the infrastructure deploy path: assumed by
+// deploy-infrastructure.yml on main, and holds the bootstrap assume grant
+// below plus this project's Pulumi backend access. Nothing else in this
+// account.
+//
+// The bootstrap grant names `OrganizationAccountAccessRole`, the role
+// Organizations plants in every new account and trusts to the management
+// account root. Step 7's first apply needs it because no in-account role
+// exists yet; step 7's second PR replaces this statement with the in-account
+// `pulumi-deploy` role and removes the bootstrap grant, the same
+// gain-then-remove shape as workbench step 10. Unlike the workbench role,
+// this one ships with the grant rather than deferring it to the project PR:
+// the account id is known from step 3, so there is no wildcard or placeholder
+// to avoid.
+//
+// Applied by `deploy.yml` and consumed by `deploy-infrastructure.yml`, so it
+// has to finish applying before step 7 merges. See "Apply ordering between
+// workflows" in `docs/workbench-account.md` for why the grant cannot ride
+// along with the project it enables.
+export const githubActionsInfrastructureDeploy: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    // The role's reason to exist: reach the infrastructure account's deploy
+    // role. Until step 7's cutover this is the Organizations-planted bootstrap
+    // role; after it, `pulumi-deploy`.
+    {
+      Sid: "AssumeInfrastructureDeployRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+    },
+    ...pulumiBackendStatements("infrastructure"),
   ],
 };
 

@@ -72,10 +72,18 @@ starting the work, not after. Make `who` name the *session*, not the model.
       beside this entry means the entry is wrong in the visible way. It has to
       be green before step 7, because this policy binds the in-account
       `pulumi-deploy` role step 7 creates.
-- [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
-      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: doing
-      (pi-infra-step6, 2026-10-07). Applied by `deploy.yml`; must merge and
-      finish applying before step 7.
+- [x] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
+      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: done
+      (2026-10-07, pi-infra-step6). `ci-roles.ts` holds the role and its inline
+      `InfrastructureDeploy` policy; `ci-roles/policies.ts` holds
+      `githubActionsInfrastructureDeployTrust`, pinned to
+      `deploy-infrastructure.yml` on main, and the policy document, which
+      assumes `OrganizationAccountAccessRole` in `394495727159` and scopes
+      Pulumi backend access to the `infrastructure` project. Applied by
+      `deploy.yml`, and the merge's `Deploy` run is the read-back, so a red run
+      beside this entry means the entry is wrong in the visible way. It must be
+      green before step 7: step 7's first apply assumes this role, and the
+      bootstrap grant it needs is the one here.
 - [ ] 7. Add the `deploy-infrastructure/` project and its CI job: todo. Two
       pull requests, forced by bootstrap causality, the same shape as
       workbench steps 7 and 10: the first applies against
@@ -529,6 +537,12 @@ finishes applying before its consumer merges.
   `o-uuiolqc1di/r-jqqe/ou-jqqe-orrk423t/394495727159/`. That ARN is the
   literal step 4 adds to the two `github-actions-org-deploy` statements scoped
   to `WORKBENCH_OU_ARN` today.
+- `github-actions-infrastructure-deploy` ARN:
+  `arn:aws:iam::333022194791:role/github-actions-infrastructure-deploy`, inline
+  policy `InfrastructureDeploy`. Created by step 6; step 7's workflows assume
+  it, and its bootstrap target is
+  `arn:aws:iam::394495727159:role/OrganizationAccountAccessRole` until step 7's
+  second PR repoints it at `pulumi-deploy`.
 
 ## Context: the management account
 
