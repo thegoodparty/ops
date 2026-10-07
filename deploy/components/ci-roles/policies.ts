@@ -14,6 +14,7 @@
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
 import {
+  INFRASTRUCTURE_ACCOUNT_ID,
   MANAGEMENT_ACCOUNT_ID,
   WORKBENCH_ACCOUNT_ID,
 } from "../../../utils/accounts";
@@ -459,6 +460,14 @@ export const githubActionsOrgDeployTrust = opsWorkflowTrust("deploy-org.yml");
 export const githubActionsWorkbenchDeployTrust =
   opsWorkflowTrust("deploy-workbench.yml");
 
+// Pinned ahead of the workflow existing, for the same reason as the workbench
+// trust above. Step 7 of `docs/infrastructure-account.md` creates
+// `.github/workflows/deploy-infrastructure.yml` and must use exactly this
+// filename; until it does, no job can assume the role.
+export const githubActionsInfrastructureDeployTrust = opsWorkflowTrust(
+  "deploy-infrastructure.yml",
+);
+
 // Trust for the PR preview role. The subject is the `pull_request` subject
 // exactly: not `:*`, not `main`, and no other repository. Fork PRs cannot
 // obtain an OIDC token at all, but the workflow skips them explicitly so the
@@ -843,6 +852,49 @@ export const githubActionsWorkbenchDeploy: PolicyDocument = {
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`,
     },
     ...pulumiBackendStatements("workbench"),
+  ],
+};
+
+// The management-account half of the infrastructure deploy path, step 6 of
+// `docs/infrastructure-account.md`: assumed by deploy-infrastructure.yml on
+// main, and holds the assume grant below plus this project's Pulumi backend
+// access. Nothing else in this account.
+//
+// The same apply ordering as the workbench role above: this is in `deploy/`
+// and applied by `deploy.yml`, while its consumer will be applied by
+// `deploy-infrastructure.yml`, so this has to finish applying before step 7
+// merges.
+export const githubActionsInfrastructureDeploy: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    // The bootstrap grant, and the shape the workbench role had before its
+    // step 10 cutover. Unlike that role, the account id was known before this
+    // was written, so there is no deferred statement and no window where the
+    // role holds backend access alone.
+    //
+    // What this grants is administrator in the infrastructure account, which
+    // is what OrganizationAccountAccessRole is. The first apply needs it
+    // because no in-account role exists yet. Step 7's second PR replaces it
+    // with `pulumi-deploy`, whose trust names exactly this role, and this
+    // statement moves then rather than being joined by another: keeping both
+    // would leave a permanent admin path that nothing uses and nobody would
+    // notice. That narrowing matters more here than it did for workbench,
+    // because this account exists to hold privileged automation.
+    //
+    // Nothing on the target side needs changing. The bootstrap role's trust
+    // policy names the management account root, which delegates the decision
+    // to IAM here, so this identity-based statement is the whole control.
+    //
+    // Inert on merge, deliberately. `github-actions-infrastructure-deploy`
+    // pins job_workflow_ref to `deploy-infrastructure.yml`, which does not
+    // exist, so no job can assume the role that now holds this.
+    {
+      Sid: "AssumeInfrastructureBootstrapRole",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/OrganizationAccountAccessRole`,
+    },
+    ...pulumiBackendStatements("infrastructure"),
   ],
 };
 
