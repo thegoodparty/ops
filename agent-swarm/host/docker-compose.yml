@@ -4,7 +4,7 @@
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
 
 # Fixed so the volume names (agent-swarm_swarm_api_data and so on) do not
-# depend on the directory, and match the volumes migrated from the old host.
+# depend on the directory.
 name: agent-swarm
 
 x-logging: &logging

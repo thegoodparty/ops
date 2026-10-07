@@ -1,6 +1,5 @@
 # delegate-swarm.goodparty.org: serve the self-built dashboard SPA from
 # /srv/ui and reverse-proxy every API path to the api container.
-# swarm.goodparty.org, the old name, redirects to the same path here.
 #
 # API prefixes (agent-swarm v1.163.0):
 #   /api/*          every REST route (src/http/*.ts: path: "/api/...")
@@ -94,8 +93,4 @@ delegate-swarm.goodparty.org {
 	encode zstd gzip
 
 	import {$SWARM_AUTH:open}
-}
-
-swarm.goodparty.org {
-	redir https://delegate-swarm.goodparty.org{uri} 308
 }

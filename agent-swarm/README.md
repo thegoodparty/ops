@@ -4,9 +4,8 @@
 
 The deployment of [agent-swarm](https://github.com/desplega-ai/agent-swarm)
 v1.163.0 that shows up in Slack as **Delegate** and serves its dashboard at
-https://delegate-swarm.goodparty.org. The old name, swarm.goodparty.org,
-redirects to the same path there. One EC2 host in the infrastructure account
-runs the whole stack in Docker Compose. State, decisions and history are in
+https://delegate-swarm.goodparty.org. One EC2 host in the infrastructure
+account runs the whole stack in Docker Compose. State, decisions and history are in
 `HANDOFF.md`; this file is how to operate it.
 
 ## How it deploys
@@ -36,7 +35,7 @@ host; the next deploy overwrites them.
 ## Where it runs
 
 - AWS account 394495727159 (infrastructure), region us-west-2
-- `delegate-swarm.goodparty.org`, and `swarm.goodparty.org` as a redirect
+- `delegate-swarm.goodparty.org`
 - Docker's state, including every compose volume, lives on a separate EBS
   data volume mounted at `/var/lib/docker`. `ec2-user-data.sh` mounts it
   before docker starts and formats it only if it is blank, so a replacement
@@ -144,17 +143,29 @@ per-user `aswt_` token an admin mints with
 `?apiKey=` link: an unauthenticated visit carries the whole link through
 Google's sign-in.
 
-## Changing agent behaviour without a deploy
+## Changing agent behaviour
 
-- Souls: `PUT /api/agents/{id}/profile` with the contents of `soul/`.
-- MCP servers: `/api/mcp-servers`.
-- The global `SETUP_SCRIPT` config (runs as root at every worker container
-  start): edit `host/global-setup-script.sh`, merge, then on the host run
-  `./apply-global-setup-script.sh` and
-  `docker compose restart lead worker-coder worker-reviewer`.
+What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`
+rebuilds the part that is in this repo: the global `SETUP_SCRIPT` from
+`host/global-setup-script.sh` (runs as root at every agent container start),
+the grafana and clickup MCP servers, the lead's soul from `host/soul/`, and
+each agent's harness and model from `.env`. To change one, edit the file,
+merge, then on the host:
 
-API calls go to `https://delegate-swarm.goodparty.org` with
-`Authorization: Bearer $API_KEY` (the `API_KEY` key in the secret).
+```sh
+sudo /opt/agent-swarm/bootstrap.sh
+cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-reviewer
+```
+
+A rerun replaces any edits the lead made to its own soul. If those matter,
+read them first from `GET /api/agents/{id}` and copy them into `host/soul/`.
+
+Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
+add.
+
+Anything else goes through the dashboard or the API at
+`https://delegate-swarm.goodparty.org` (`http://127.0.0.1:3013` on the host)
+with `Authorization: Bearer $API_KEY` (the `API_KEY` key in the secret).
 
 ## Agents
 
@@ -179,10 +190,15 @@ existing one is renamed with `PUT /api/agents/{id}/name`.
 
 ## MCP servers
 
-- grafana: the `grafana-mcp` sidecar, pinned by digest, id
-  `b67d4f9a-fe78-49ba-84af-0af708af3c81`. It has no caller auth; only the
-  compose network reaches it and Caddy does not route to it.
-- clickup: hosted OAuth, id `965d7f32-6134-4c00-9911-f13a39047fbf`
+Both are scope swarm, installed on all three agents, and registered by
+`bootstrap.sh`.
+
+- grafana: the `grafana-mcp` sidecar at `http://grafana-mcp:8000/mcp`,
+  pinned by digest. It has no caller auth; only the compose network reaches
+  it and Caddy does not route to it.
+- clickup: the hosted server at `https://mcp.clickup.com/mcp`, with OAuth.
+  `bootstrap.sh` installs it only once it is connected (Bringing it up,
+  step 6).
 
 ## Slack
 
@@ -205,134 +221,57 @@ the instance's own credentials from IMDS (the instance's hop limit is 2 so
 containers can reach IMDS). The api container has no AWS access.
 `host/global-setup-script.sh` installs the AWS CLI into the workers.
 
-## Moving from the old host
+## Bringing it up
 
-The swarm used to run on `i-04cc03c17787f5d59` in account 333022194791 as
-the Slack app Swarm. Moving it carries the SQLite state, the workspaces and
-the Caddy certificates across. In order:
+The swarm starts with fresh state. Nothing carries over from the old host in
+the management account, which is torn down once this one is live. In order:
 
-### 1. Apply the infrastructure
-
-Merge the PR that adds the host to `deploy-infrastructure/`. The first boot
-mounts the empty data volume, and the association installs `host/` and
-stops there, because the secret has no value yet. Its output in
-`s3://delegate-swarm-config-394495727159/ssm-output/` ends with
-`install: DELEGATE_SWARM has no value yet; files installed, stack not
-started.`
-
-### 2. Restore the volumes onto the new host
-
-On the old host (`AWS_PROFILE=gp-admin aws ssm start-session --region
-us-west-2 --target i-04cc03c17787f5d59`), stop the stack for good and pack
-the volumes that hold state:
-
-```sh
-sudo systemctl stop agent-swarm
-sudo systemctl disable agent-swarm
-cd /var/lib/docker/volumes
-sudo tar --numeric-owner -czpf /var/tmp/volumes.tar.gz \
-  agent-swarm_swarm_api_data agent-swarm_swarm_shared agent-swarm_swarm_lead \
-  agent-swarm_swarm_worker_coder agent-swarm_swarm_worker_reviewer agent-swarm_caddy_data
-ls -lh /var/tmp/volumes.tar.gz
-```
-
-The old host's role cannot write to the new account, so upload through a
-presigned URL made on a laptop. `aws s3 presign` only makes GET URLs, so
-use boto3 (`uv run --with boto3 python3 -c ...` if boto3 is not installed):
-
-```sh
-AWS_PROFILE=gp-infrastructure python3 -c 'import boto3; from botocore.config import Config; print(boto3.client("s3", region_name="us-west-2", config=Config(signature_version="s3v4")).generate_presigned_url("put_object", Params={"Bucket": "delegate-swarm-config-394495727159", "Key": "migration/volumes.tar.gz"}, ExpiresIn=3600))'
-```
-
-The URL is valid for an hour at most (less if the session expires first).
-Back on the old host:
-
-```sh
-curl -fsS --upload-file /var/tmp/volumes.tar.gz '<presigned url>'
-```
-
-On the new host, before the stack has ever started. The six volumes must
-not exist yet (`sudo docker volume ls`); if they do, the stack has run here,
-so first `cd /opt/agent-swarm && sudo docker compose --profile '*' down`
-and `sudo docker volume rm` them.
-
-```sh
-sudo systemctl stop agent-swarm
-sudo aws s3 cp --region us-west-2 \
-  s3://delegate-swarm-config-394495727159/migration/volumes.tar.gz /var/tmp/volumes.tar.gz
-for v in swarm_api_data swarm_shared swarm_lead swarm_worker_coder swarm_worker_reviewer caddy_data; do
-  sudo docker volume create \
-    --label com.docker.compose.project=agent-swarm \
-    --label com.docker.compose.volume="$v" "agent-swarm_$v"
-done
-sudo tar --numeric-owner -xzpf /var/tmp/volumes.tar.gz -C /var/lib/docker/volumes
-sudo ls -ln /var/lib/docker/volumes/agent-swarm_swarm_api_data/_data \
-  /var/lib/docker/volumes/agent-swarm_swarm_lead/_data
-sudo rm /var/tmp/volumes.tar.gz
-```
-
-The SQLite files belong to uid 0 and the agents' workspaces to uid 1001, as
-on the old host. The compose project name is fixed to `agent-swarm` at the
-top of `docker-compose.yml`, which is what makes these volume names line up.
-
-Delete the copy in S3 from the laptop; it holds the whole database:
-
-```sh
-AWS_PROFILE=gp-infrastructure aws s3 rm s3://delegate-swarm-config-394495727159/migration/volumes.tar.gz
-```
-
-### 3. Fill the secret
-
-From this directory on a laptop:
-
-```sh
-AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --copy-from-old
-AWS_PROFILE=gp-infrastructure ./fill-secrets.sh
-```
-
-`--copy-from-old` copies `API_KEY` and `SECRETS_ENCRYPTION_KEY` from the old
-`AGENT_SWARM` secret (with the `gp-admin` profile; set `OLD_AWS_PROFILE` to
-use another) without printing them. It has to be the same encryption key:
-the migrated database's stored secrets are unreadable with any other.
-
-The second run walks through the Delegate Slack app, Anthropic, GitHub,
-ClickUp and Grafana. Saving the manifest in the Delegate app is the moment
-the old delegate bot stops receiving Slack events, so do that step right
-before step 4. The script ends by listing any required key still missing.
-
-### 4. Start the stack
-
-On the new host:
-
-```sh
-sudo systemctl start agent-swarm
-sudo journalctl -u agent-swarm -f
-```
-
-The first start pulls the images (the worker image is about 5 GB) and, since
-`ui-dist/` is empty and has no version marker, builds the dashboard before
-`docker compose up`. Check `curl -s http://127.0.0.1:3013/health`,
-`cd /opt/agent-swarm && sudo docker compose ps`, then in Slack
-`/invite @Delegate` in `#swarm-testing` and mention it.
-
-### 5. DNS and Slack
-
-DNS is a follow-up PR: the `goodparty.org` zone is in the management
-account, and both `delegate-swarm.goodparty.org` and `swarm.goodparty.org`
-point at the new host's Elastic IP. Until it merges, the dashboard is not
-reachable by name and Caddy keeps retrying its certificates; Slack and the
-agents work without it. After it, swarm.goodparty.org answers with a 308 to
-the same path on delegate-swarm.goodparty.org.
-
-Slack switch order, end to end: the old Swarm app goes quiet in step 2 when
-the old stack stops; the Delegate app moves to Socket Mode in step 3; the
-swarm answers as Delegate from step 4. Once Delegate has answered, delete
-the old Swarm app (api.slack.com/apps, Swarm, Basic Information, Delete
-App). Threads Swarm started are not recognised as the swarm's own any more,
-so replies there need an @mention.
-
-Leave the old host stopped until the new one has run cleanly for a while,
-then tear it down (`HANDOFF.md` section 3 lists what is there).
+1. **Merge.** The deploy applies `deploy-infrastructure/`. The host installs
+   `host/` and does not start the stack, because the secret has no value
+   yet. The association output in
+   `s3://delegate-swarm-config-394495727159/ssm-output/` ends with
+   `install: DELEGATE_SWARM has no value yet; files installed, stack not
+   started.`
+2. **Fill the secret.** From this directory on a laptop:
+   `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh`. It asks for the Slack,
+   Anthropic, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
+   `SECRETS_ENCRYPTION_KEY` when the secret lacks them, and never prints
+   either. Losing `SECRETS_ENCRYPTION_KEY` loses every secret the swarm
+   stores. It ends by listing any required key still missing.
+3. **Start.** On the host: `sudo systemctl start agent-swarm`. The first
+   start pulls the images (the worker image is about 5 GB) and builds the
+   dashboard. Check `curl -s http://127.0.0.1:3013/health` and
+   `cd /opt/agent-swarm && sudo docker compose ps`.
+4. **Bootstrap.** On the host: `sudo /opt/agent-swarm/bootstrap.sh`. It waits
+   up to 5 minutes for the three agents to register, then prints one line
+   per item. ClickUp shows as not connected; that is step 6.
+5. **DNS.** A follow-up PR, because the `goodparty.org` zone is in the
+   management account: point `delegate-swarm.goodparty.org` at the
+   `delegateSwarmPublicIp` stack output. Until it merges the dashboard is
+   not reachable and Caddy keeps retrying its certificate; the OAuth
+   callback in step 6 needs it too.
+6. **Connect ClickUp.** In the dashboard, MCP servers, clickup, Connect, and
+   sign in to ClickUp as the Delegate service seat. Then on the host run
+   `sudo /opt/agent-swarm/bootstrap.sh` again, which installs it on the
+   three agents, and
+   `cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-reviewer`.
+   Connect before install: an agent session that meets the server before it
+   is authorized skips it for days (`HANDOFF.md`, gotchas).
+7. **Switch Slack.** Saving the manifest moves the Delegate app to Socket
+   Mode: from then on the old delegate bot gets no Slack events and the
+   swarm answers instead.
+   1. `pbcopy < slack-manifest.json`, then api.slack.com/apps, Delegate,
+      App Manifest. Switch the editor to JSON, paste over everything, Save
+      Changes, accept the scope prompt.
+   2. Settings, Socket Mode: turn on Enable Socket Mode.
+   3. Settings, Install App, Reinstall to GoodParty, Allow. If the Bot User
+      OAuth Token changed, run `./fill-secrets.sh` again with the new one
+      and `sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh` on
+      the host.
+   4. On the host, `cd /opt/agent-swarm && sudo docker compose restart api`
+      so it connects in Socket Mode.
+   5. `/invite @Delegate` in `#swarm-testing` and every other channel it
+      should hear, then mention it there.
 
 ## Replacing the instance
 
@@ -340,5 +279,5 @@ The data volume outlives the instance. A new instance's user-data waits for
 the volume, mounts it without formatting, and starts docker; the
 association installs `host/`, and since the secret already has a value,
 `up.sh` builds the dashboard and starts the stack with the same state and
-agent ids. Starting from a blank data volume gives an empty swarm
-(`HANDOFF.md` section 5 lists what lives only in SQLite).
+agent ids. Starting from a blank data volume gives an empty swarm; run
+`bootstrap.sh` (above) to rebuild what is in this repo.

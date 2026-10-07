@@ -14,6 +14,14 @@ describe("delegate swarm host files", () => {
     assert.ok(hostFiles().includes("install.sh"));
   });
 
+  // bootstrap.sh reads the lead's soul from /opt/agent-swarm/soul on the host.
+  it("ships bootstrap.sh and the soul files it reads", () => {
+    const files = hostFiles();
+    for (const file of ["bootstrap.sh", "soul/SOUL.md", "soul/IDENTITY.md"]) {
+      assert.ok(files.includes(file), file);
+    }
+  });
+
   it("puts the content hash in the command, so a file change reruns it", () => {
     const hash = hostFilesHash();
     assert.match(hash, /^[0-9a-f]{64}$/);

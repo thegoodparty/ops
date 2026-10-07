@@ -33,10 +33,6 @@ install -m 644 "$STAGE"/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable agent-swarm.service
 
-# Leftovers from the hand-built host: the pre-dashboard Caddyfile, the unit
-# file's old copy, and the clone build-ui.sh no longer uses.
-rm -rf "$DEST"/Caddyfile.bak-* "$DEST/agent-swarm.service" "$DEST/src"
-
 # A new host is installed before anyone has filled the secret. Leave the
 # stack down until they have, but still fail on any other error.
 if ! err="$(aws secretsmanager get-secret-value --secret-id DELEGATE_SWARM \

@@ -2,9 +2,8 @@
 # Fills the DELEGATE_SWARM secret in the infrastructure account from your
 # laptop. Values are read without echo and never printed.
 #
-#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh                  the five services
-#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --copy-from-old  API_KEY and SECRETS_ENCRYPTION_KEY
-#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --sso            Google login (optional)
+#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh        the five services, and the swarm's own keys
+#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --sso  Google login (optional)
 #
 # Until there is an SSO profile for the infrastructure account, assume
 # OrganizationAccountAccessRole from a management admin session. Add this to
@@ -14,17 +13,11 @@
 #   source_profile = gp-admin
 #   role_arn = arn:aws:iam::394495727159:role/OrganizationAccountAccessRole
 #   region = us-west-2
-#
-# --copy-from-old reads the old secret with OLD_AWS_PROFILE (default gp-admin).
 set -euo pipefail
 
 SECRET_ID=DELEGATE_SWARM
 ACCOUNT_ID=394495727159
 REGION=us-west-2
-OLD_SECRET_ID=AGENT_SWARM
-OLD_ACCOUNT_ID=333022194791
-OLD_AWS_PROFILE="${OLD_AWS_PROFILE:-gp-admin}"
-MANIFEST="$(dirname "$0")/slack-manifest.json"
 
 # Only keys set in this run are written, never ones that happen to be in
 # your shell's environment.
@@ -48,8 +41,7 @@ MODE=services
 case "${1:-}" in
   "") ;;
   --sso) MODE=sso ;;
-  --copy-from-old) MODE=copy ;;
-  *) echo "usage: $0 [--sso | --copy-from-old]"; exit 1 ;;
+  *) echo "usage: $0 [--sso]"; exit 1 ;;
 esac
 
 account="$(aws sts get-caller-identity --query Account --output text)" \
@@ -60,34 +52,7 @@ if [[ "$account" != "$ACCOUNT_ID" ]]; then
   exit 1
 fi
 
-if [[ $MODE == copy ]]; then
-
-bold "Copy API_KEY and SECRETS_ENCRYPTION_KEY from $OLD_SECRET_ID ($OLD_ACCOUNT_ID, profile $OLD_AWS_PROFILE)"
-cat <<'EOF'
-  The swarm's SQLite encrypts the secrets it stores with SECRETS_ENCRYPTION_KEY.
-  The migrated database is only readable with the same key, and API_KEY keeps
-  every existing dashboard login and MCP client working.
-EOF
-old_account="$(AWS_PROFILE="$OLD_AWS_PROFILE" aws sts get-caller-identity --query Account --output text)" \
-  || { echo "No session for $OLD_AWS_PROFILE. Run: aws sso login --profile $OLD_AWS_PROFILE"; exit 1; }
-if [[ "$old_account" != "$OLD_ACCOUNT_ID" ]]; then
-  echo "Profile $OLD_AWS_PROFILE is in account $old_account, not $OLD_ACCOUNT_ID."
-  exit 1
-fi
-OLD_JSON="$(AWS_PROFILE="$OLD_AWS_PROFILE" aws secretsmanager get-secret-value \
-  --secret-id "$OLD_SECRET_ID" --region "$REGION" --query SecretString --output text)"
-API_KEY="$(jq -r '.API_KEY // ""' <<<"$OLD_JSON")"
-SECRETS_ENCRYPTION_KEY="$(jq -r '.SECRETS_ENCRYPTION_KEY // ""' <<<"$OLD_JSON")"
-unset OLD_JSON
-if [[ -z "$API_KEY" || -z "$SECRETS_ENCRYPTION_KEY" ]]; then
-  echo "$OLD_SECRET_ID is missing API_KEY or SECRETS_ENCRYPTION_KEY; nothing written."
-  exit 1
-fi
-export API_KEY SECRETS_ENCRYPTION_KEY
-WRITE_KEYS+=(API_KEY SECRETS_ENCRYPTION_KEY)
-echo "  read both (${#API_KEY} and ${#SECRETS_ENCRYPTION_KEY} chars)"
-
-elif [[ $MODE == sso ]]; then
+if [[ $MODE == sso ]]; then
 
 bold "Google SSO (oauth2-proxy)"
 cat <<'EOF'
@@ -108,24 +73,16 @@ echo "  cookie secret generated"
 
 else
 
-bold "1/5  Delegate Slack app"
-pbcopy < "$MANIFEST"
+bold "1/5  Delegate Slack app tokens"
 cat <<'EOF'
-  The app manifest is on your clipboard.
-  Saving it moves the Delegate app to Socket Mode: from that moment the old
-  delegate bot stops receiving Slack events and the swarm answers instead.
-  Do it right before starting the stack (README, "Moving from the old host").
-  Not ready yet: press Enter twice to skip, and run the script again later.
-  a. https://api.slack.com/apps -> Delegate -> left nav Features -> App Manifest.
-     Switch the editor to JSON, select all, paste, Save Changes. Accept the
-     prompt about changed scopes.
-  b. Left nav Settings -> Socket Mode. "Enable Socket Mode" must be on; turn it
-     on if it is not.
-  c. Left nav Settings -> Basic Information -> App-Level Tokens -> Generate Token
-     and Scopes. Name "delegate-swarm", Add Scope connections:write, Generate.
-     Copy the xapp- token.
-  d. Left nav Settings -> Install App -> Reinstall to GoodParty -> Allow.
-     Copy the Bot User OAuth Token (xoxb-).
+  Neither step changes how the Delegate app behaves today. The switch to the
+  swarm (manifest, Socket Mode, reinstall) comes later: README, "Bringing it
+  up", step 7.
+  a. https://api.slack.com/apps -> Delegate -> left nav Settings -> Basic
+     Information -> App-Level Tokens -> Generate Token and Scopes. Name
+     "delegate-swarm", Add Scope connections:write, Generate. Copy the xapp- token.
+  b. Left nav Settings -> Install App. Copy the Bot User OAuth Token (xoxb-).
+     Do not reinstall yet.
 EOF
 ask SLACK_APP_TOKEN xapp-
 ask SLACK_BOT_TOKEN xoxb-
@@ -173,12 +130,6 @@ ask GRAFANA_SERVICE_ACCOUNT_TOKEN glsa_
 
 fi
 
-if ((${#WRITE_KEYS[@]} == 0)); then
-  echo "Nothing to write."
-  exit 0
-fi
-
-bold "Writing to Secrets Manager ($SECRET_ID in $ACCOUNT_ID)"
 TMP=$(mktemp); chmod 600 "$TMP"; trap 'rm -f "$TMP"' EXIT
 # Pulumi creates the secret with no value; the first write creates it.
 if ! current="$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
@@ -190,6 +141,35 @@ if ! current="$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --r
     exit 1
   fi
 fi
+
+if [[ $MODE == services ]]; then
+  if ! jq -e 'has("API_KEY")' <<<"$current" >/dev/null; then
+    API_KEY="$(openssl rand -hex 32)"
+    export API_KEY
+    WRITE_KEYS+=(API_KEY)
+    bold "API_KEY generated"
+    echo "  The operator key for the API and the dashboard. Read it from the secret when you need it."
+  fi
+  # agent-swarm wants 32 bytes, base64 (docs-site guides/secrets-encryption.mdx).
+  if ! jq -e 'has("SECRETS_ENCRYPTION_KEY")' <<<"$current" >/dev/null; then
+    SECRETS_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+    export SECRETS_ENCRYPTION_KEY
+    WRITE_KEYS+=(SECRETS_ENCRYPTION_KEY)
+    bold "SECRETS_ENCRYPTION_KEY generated"
+    cat <<'EOF'
+  The swarm encrypts every secret it stores (MCP OAuth tokens, secret config)
+  with this key, and it lives only in this secret. Losing or changing it loses
+  every one of those secrets. This script never replaces it once it exists.
+EOF
+  fi
+fi
+
+if ((${#WRITE_KEYS[@]} == 0)); then
+  echo "Nothing to write."
+  exit 0
+fi
+
+bold "Writing to Secrets Manager ($SECRET_ID in $ACCOUNT_ID)"
 jq 'reduce $ARGS.positional[] as $k (.; .[$k] = env[$k])' --args "${WRITE_KEYS[@]}" \
   <<<"$current" > "$TMP"
 unset current
@@ -217,7 +197,7 @@ elif [[ $MODE == sso ]]; then
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
 else
   echo "Done. Every required key is present. On the host, if the stack is not running yet:"
-  echo "  sudo systemctl start agent-swarm"
+  echo "  sudo systemctl start agent-swarm && sudo /opt/agent-swarm/bootstrap.sh"
   echo "If it is running, re-render .env and apply:"
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
 fi

@@ -1,8 +1,8 @@
 # Delegate swarm: handoff for productionizing
 
 Written 2026-10-07 for the agent taking over the agent-swarm pilot, and
-updated the same day for its move to the infrastructure account and the
-Delegate name. Everything below was verified against the live host or the
+updated the same day for its move to the infrastructure account, the
+Delegate name, and a fresh start with no state carried over. Everything below was verified against the live host or the
 v1.163.0 source on 2026-10-05 to 2026-10-07. Where something is a guess it
 says so. `README.md` in this
 directory holds operating procedures; this file holds state, decisions and
@@ -43,11 +43,12 @@ Swain's intent, in his words paraphrased from the kickoff on 2026-10-05:
 
 | Decision | Chosen | By | Notes |
 | --- | --- | --- | --- |
-| Where it runs | EC2 in account `394495727159` (infrastructure), `us-west-2`, Pulumi in `deploy-infrastructure/`. Hostname `delegate-swarm.goodparty.org`; `swarm.goodparty.org` 308-redirects to it | Swain | It started as a hand-built host in `333022194791` (the management account). `docs/infrastructure-account.md` records why it lives in the infrastructure account. |
+| Where it runs | EC2 in account `394495727159` (infrastructure), `us-west-2`, Pulumi in `deploy-infrastructure/`. Hostname `delegate-swarm.goodparty.org` | Swain | It started as a hand-built host in `333022194791` (the management account) at `swarm.goodparty.org`. `docs/infrastructure-account.md` records why it lives in the infrastructure account. |
+| The move | Fresh state, no migration. The old host is torn down once the new one is live | Swain | `host/bootstrap.sh` rebuilds what the repo defines; schedules, apps, pages and memory start empty. |
 | State | Docker's whole state on a separate EBS data volume at `/var/lib/docker` | Swain | A replacement instance mounts it and keeps the swarm. `ec2-user-data.sh` formats it only if blank. |
 | Slack identity | The existing Delegate app, Socket Mode, without `chat:write.customize` | Swain | Replaces the Swarm app and the delegate bot's use of the Delegate app. Without the scope Slack ignores the per-agent username and emoji agent-swarm sends (the lead's would be a crown), so every message is the Delegate app's own name and icon. |
 | Model provider | Anthropic API key in a dedicated Anthropic workspace `agent-swarm` with a spend limit | Swain | No Bedrock. No Claude Code OAuth token (incompatible with multi-worker use). |
-| Harness | pi for all three agents, models `anthropic/claude-opus-5-5` (lead) and `anthropic/claude-sonnet-5-5` (workers) | Swain | Switched live on the old host before the move. |
+| Harness | pi for all three agents, models `anthropic/claude-opus-5-5` (lead) and `anthropic/claude-sonnet-5-5` (workers) | Swain | Set in env by `render-env.sh`, and per agent by `bootstrap.sh`. |
 | GitHub identity | A service user's fine-grained PAT, repos `omni` + `ops`, Contents/PRs/Issues RW, Actions/Metadata R, no Workflows, longest lifetime allowed | Swain | Replaces Swain's own 90-day PAT. Commit name and email are placeholders (`Delegate`, `delegate@goodparty.org`) until the user exists. |
 | Day-one access | GitHub (above), Grafana read-only, ClickUp. AWS: production read-only through `arn:aws:iam::333022194791:role/delegate-swarm-prod-read` | Swain | Agents assume the role through `host/aws-config`. The api container has no AWS access. |
 | Embeddings | Local `text-embeddings-inference` container (`nomic-embed-text-v1.5`, 512 dims) | Agent, after Swain asked "can we use AWS?" | Bedrock's OpenAI-compatible API has no `/v1/embeddings`. Summaries use the Anthropic key (Haiku fallback). Workflow LLM nodes still need OpenAI/OpenRouter; not configured. |
@@ -70,36 +71,37 @@ instance, volume and address ids are in the stack outputs and the EC2 console.
 | --- | --- |
 | EC2 instance | AL2023, IMDSv2 required, **hop limit 2** (containers need it to assume the prod-read role) |
 | Data volume | Separate EBS volume mounted at `/var/lib/docker` by `ec2-user-data.sh` (the script's `DATA_VOLUME_ID=__DATA_VOLUME_ID__` line is filled in by Pulumi). Holds images and every compose volume. |
-| Secrets Manager | `DELEGATE_SWARM`. Created empty by Pulumi, filled by `fill-secrets.sh`. Keys as before; `API_KEY` and `SECRETS_ENCRYPTION_KEY` are copied from the old `AGENT_SWARM` secret. |
-| Config bucket | `delegate-swarm-config-394495727159`: `host/` (deployed files), `ssm-output/` (association runs), `migration/` (the one-off volume tarball, deleted after use) |
+| Secrets Manager | `DELEGATE_SWARM`. Created empty by Pulumi, filled by `fill-secrets.sh`, which generates `API_KEY` and `SECRETS_ENCRYPTION_KEY` when they are absent and never replaces them. |
+| Config bucket | `delegate-swarm-config-394495727159`: `host/` (deployed files), `ssm-output/` (association runs) |
 | Logs | CloudWatch Logs `/delegate-swarm/containers` via the awslogs driver, one stream per container |
 | Production read | `arn:aws:iam::333022194791:role/delegate-swarm-prod-read`, assumed by the agents with the instance role's credentials |
-| DNS | The `goodparty.org` zone (`Z10392302OXMPNQLPO07K`) is in the management account. Pointing `delegate-swarm` and `swarm` at the new host is a follow-up PR. |
+| DNS | The `goodparty.org` zone (`Z10392302OXMPNQLPO07K`) is in the management account. Pointing `delegate-swarm` at the new host is a follow-up PR. |
 | Access | `aws ssm start-session` with a profile for the infrastructure account (README, "Connect") |
 
-### Old home: account 333022194791, to tear down after the move
+### Old home: account 333022194791, to tear down
 
-Instance `i-04cc03c17787f5d59` (its root disk held the state), Elastic IP
-`52.10.75.185` (`eipalloc-0041bc8ffac0a5efd`), security group
-`sg-075cb6173b8b55291`, role and instance profile `agent-swarm-host`, secret
-`AGENT_SWARM`, log group `/agent-swarm/containers`, config bucket
-`agent-swarm-config-333022194791`, DLM policy `agent-swarm-snapshots` and its
-snapshots, and the `swarm.goodparty.org` A record (repointed, not deleted).
-Leave the instance stopped until the new host has run cleanly for a while.
+Nothing on it is kept. Once the new host is live, delete: instance
+`i-04cc03c17787f5d59`, Elastic IP `52.10.75.185`
+(`eipalloc-0041bc8ffac0a5efd`), security group `sg-075cb6173b8b55291`, role
+and instance profile `agent-swarm-host`, secret `AGENT_SWARM`, log group
+`/agent-swarm/containers`, config bucket `agent-swarm-config-333022194791`,
+DLM policy `agent-swarm-snapshots` and its snapshots, the old hostname's A
+record in the `goodparty.org` zone, the Slack app Swarm, and the pilot's
+Grafana service account `agent-swarm`.
 
 ### Not in AWS
 
 - Slack: the existing **Delegate** app, reconfigured from `slack-manifest.json`
   (Socket Mode). The old app **Swarm** (`A0C7RNR4N4Q`, bot user
-  `U0C6ZA542JD`, workspace `TG1ARMPK5`) is deleted after the move. Slash
+  `U0C6ZA542JD`, workspace `TG1ARMPK5`) goes with the old host. Slash
   commands `/agent-swarm-status` and `/agent-swarm-help` are hardcoded in
   agent-swarm.
 - Anthropic workspace `agent-swarm` (Swain created it; spend limit set by him).
-- Grafana service account `delegate` (Viewer), token without expiry. The
-  pilot's `agent-swarm` service account can go after the move.
+- Grafana service account `delegate` (Viewer), token without expiry.
 - ClickUp: a service seat's personal API token as `CLICKUP_API_TOKEN`, plus the
-  hosted MCP at `https://mcp.clickup.com/mcp`, authorized by Swain via OAuth
-  and stored in the swarm's SQLite, so it moves with the database.
+  hosted MCP at `https://mcp.clickup.com/mcp`, connected with OAuth in the
+  dashboard (README, "Bringing it up", step 6). The token lives in the swarm's
+  SQLite, encrypted with `SECRETS_ENCRYPTION_KEY`.
 - GitHub: the service user's fine-grained PAT (section 2).
 
 ## 4. Host layout and the compose stack
@@ -112,9 +114,11 @@ Leave the instance stopped until the new host has run cleanly for a while.
 | `render-env.sh` | Reads `DELEGATE_SWARM` from Secrets Manager via the instance role, merges with static values, writes `.env` (mode 600). Refuses if any secret value is `TODO`. Run after any secret change. |
 | `up.sh` | `render-env.sh` then `docker compose --profile tls up -d --remove-orphans`. |
 | `agent-swarm.service` | systemd oneshot, enabled. `start` = `up.sh`; `stop` = `docker compose down` (triggers the API drain). `install.sh` leaves it stopped while the secret has no value. |
-| `Caddyfile` | `delegate-swarm.goodparty.org`: API prefixes (`/api/*`, `/p/*`, `/@swarm/*`, `/mcp`, `/mcp-user`, `/health`, `/status`, `/docs*`, `/openapi.json`, `/x/*`, `/ping`, `/close`) → `api:3013`; everything else serves `/srv/ui` with SPA fallback. `swarm.goodparty.org` 308-redirects to the same path. |
+| `Caddyfile` | `delegate-swarm.goodparty.org`: API prefixes (`/api/*`, `/p/*`, `/@swarm/*`, `/mcp`, `/mcp-user`, `/health`, `/status`, `/docs*`, `/openapi.json`, `/x/*`, `/ping`, `/close`) → `api:3013`; everything else serves `/srv/ui` with SPA fallback. |
 | `aws-config` | AWS shared config mounted read-only into the lead and both workers (`AWS_CONFIG_FILE`): default profile assumes `delegate-swarm-prod-read` with the instance's IMDS credentials. |
-| `global-setup-script.sh`, `apply-global-setup-script.sh` | agent-swarm's admin `SETUP_SCRIPT` global config (id `9a537fcc-5b05-4973-9379-3dd208db93f1`). Runs as root at every agent container start. Installs AWS CLI v2 once into the persistent `swarm_shared` volume and relinks `/usr/local/bin/aws`. Edit the script, run the apply script, restart the agents. |
+| `global-setup-script.sh` | agent-swarm's admin `SETUP_SCRIPT` global config. Runs as root at every agent container start. Installs AWS CLI v2 once into the persistent `swarm_shared` volume and relinks `/usr/local/bin/aws`. Edit the script, merge, run `bootstrap.sh`, restart the agents. |
+| `bootstrap.sh` | Run as root after the stack is up; idempotent. Rebuilds the SQLite state the repo defines (section 5) through the API on `127.0.0.1:3013`, reading `API_KEY` from `.env` without printing it. |
+| `soul/` | The lead's `SOUL.md` and `IDENTITY.md`, which `bootstrap.sh` installs. |
 | `ui-dist/` (host only) | Built dashboard. Mounted read-only into caddy at `/srv/ui`. `build-ui.sh` rebuilds it when `ui-dist/.agent-swarm-version` differs from `AGENT_SWARM_VERSION`. |
 
 Key env (names only; see `render-env.sh` and the compose file for the full set):
@@ -127,19 +131,20 @@ Resource use on the old host on 2026-10-07: 15 GB of 120 GB disk, 2.9 GB of 15.6
 
 ## 5. State inside the swarm (SQLite, not in git)
 
-This is what a rebuild has to recreate or restore. Ids as of 2026-10-07.
+The swarm starts fresh. `host/bootstrap.sh` rebuilds everything below that
+the repo defines; the rest starts empty.
 
-**Agents** (ids pinned in compose): Lead `9f8efd62-469d-4067-9dca-24d72b13864b` (isLead), Coder `458bcd6d-4384-4366-83fa-63072ef55eab`, Reviewer `a0799d09-6816-445a-957d-1339b672d38b`. Templates `official/lead`, `official/coder`, `official/reviewer`.
+**Agents** (ids pinned in `render-env.sh`, so they are the same on every host): Lead `9f8efd62-469d-4067-9dca-24d72b13864b` (isLead), Coder `458bcd6d-4384-4366-83fa-63072ef55eab`, Reviewer `a0799d09-6816-445a-957d-1339b672d38b`. Templates `official/lead`, `official/coder`, `official/reviewer`. `bootstrap.sh` sets each one's harness (pi) and model from `.env` through `PATCH /api/agents/{id}/runtime`, so the agent-scope config matches env.
 
-**Lead persona**: `soul/SOUL.md` and `soul/IDENTITY.md` in this directory, installed via `PUT /api/agents/{lead}/profile` (3,130 and 3,215 chars). The lead may have edited them since (it is told to self-correct); read the live versions from `GET /api/agents/{lead}` before overwriting.
+**Lead persona**: `host/soul/SOUL.md` and `host/soul/IDENTITY.md`, installed by `bootstrap.sh` via `PUT /api/agents/{lead}/profile`. The lead may edit them later (it is told to self-correct); a rerun of `bootstrap.sh` overwrites those edits, so read the live versions from `GET /api/agents/{lead}` first.
 
-**MCP servers** (scope swarm, installed on all three agents): `grafana` `b67d4f9a-fe78-49ba-84af-0af708af3c81` (static, sidecar); `clickup` `965d7f32-6134-4c00-9911-f13a39047fbf` (OAuth, 61 tools).
+**MCP servers** (scope swarm, installed on all three agents, registered by `bootstrap.sh`): `grafana` (static, the sidecar at `http://grafana-mcp:8000/mcp`); `clickup` (`https://mcp.clickup.com/mcp`, OAuth). `bootstrap.sh` installs clickup only once it is connected in the dashboard.
 
-**Global config**: `SETUP_SCRIPT` (above), `SWARM_ORG_NAME`, telemetry keys agent-swarm writes itself. Per-agent `AGENT_MAX_TASKS`.
+**Global config**: `SETUP_SCRIPT` from `host/global-setup-script.sh`, set by `bootstrap.sh`. agent-swarm writes `SWARM_ORG_NAME` and its telemetry keys itself.
 
-**Schedules** (all `agent-task`): 8 enabled as of 2026-10-07: `omni-merged-prs-refresh` (23:55 UTC daily, created by the lead for the app), `clickup-swain-snark` (every 15 min, 07:00 to 20:00 PT, weekdays), `daily-org-changes-summary` (08:00 ET weekdays), `daily-usage-summary-slack` (07:30 ET), `daily-swarm-update-check` (09:00 UTC), `daily-workflow-health-audit` (08:00 UTC), `daily-status-report` (02:15 UTC), `daily-blocker-digest` (02:05 UTC). 7 disabled (weekly DORA, harness upgrade check, code health, dependabot triage, GTM review, HN briefing, compounding reflection). Most of the daily audits were created by the lead or seeded by its template, not asked for explicitly; review them with Swain before productionizing since each is model spend and may post to Slack.
+**Schedules**: none. They start empty and `bootstrap.sh` creates none; Swain decides which to add. Each one is model spend and may post to Slack.
 
-**Apps and pages**: app `Omni merged PRs` `09829706-da62-4af8-82c7-1ff889ebb1c3` (the first thing Swain asked it to build; daily heatmap, nightly refresh). Pages (all `authed`): two `Task Failure Audit`, two `Schedule Health Audit`, one `AWS spend, last 14 days`. 100 tasks run, 99 completed, 1 failed.
+**Apps, pages, tasks**: none at the start.
 
 **Memory**: searchable memory with 512-dim vectors from the local TEI model. Changing the embedding model to a different width means dropping `memory_vec` and re-embedding (`POST /api/memory/re-embed`); same-width swaps silently mix vectors.
 
@@ -157,7 +162,6 @@ This is what a rebuild has to recreate or restore. Ids as of 2026-10-07.
 - **The lead will guess URLs if `APP_URL` is empty** on the agents. It posted a dashboard link with no host. Fixed.
 - **Re-registering does not rename an agent.** `AGENT_NAME` names a new agent only; rename an existing one with `PUT /api/agents/{id}/name`.
 - **A harness switch can fail the next task.** The worker can claim a task before it reconciles the new harness (about 10 seconds).
-- **Old Swarm threads.** The swarm recognises its own thread roots by bot id, so threads the Swarm app started need an @mention after the move.
 - **Restoring a data volume snapshot on the same host** needs `mount -o nouuid`: the clone has the live volume's XFS UUID.
 - **Agents' own `/workspace/start-up.sh` exits 243** as the worker user (non-fatal warning, `STARTUP_SCRIPT_STRICT=false`). Not investigated.
 
@@ -177,7 +181,7 @@ Verified in the v1.163.0 source; cite `src/...` paths from a checkout of the tag
 
 ## 8. Productionization status (updated 2026-10-07)
 
-Done, or in the PR that moves the host:
+Done, in the PR that moves the host:
 
 1. **Infrastructure as code** in `deploy-infrastructure/`, account
    `394495727159`. Host files reach the host through S3 and an SSM
@@ -186,26 +190,31 @@ Done, or in the PR that moves the host:
    for the secret before it starts anything.
 2. **State on its own volume** at `/var/lib/docker`, so a replacement
    instance keeps the swarm. Backups are snapshots of that volume.
-3. **Production access** read-only through `delegate-swarm-prod-read`.
-4. **Delegate name**: Slack app, lead name, hostname. `swarm.goodparty.org`
-   redirects.
-5. **pi harness** for every agent.
-6. **`grafana/mcp-grafana` pinned** to the digest that was running.
-7. **Version bumps** are a one-line PR (README, "Upgrade agent-swarm"); the
+3. **Fresh state from the repo**: `host/bootstrap.sh` rebuilds the setup
+   script, MCP servers, lead soul and agent runtimes. No migration from the
+   old host.
+4. **Production access** read-only through `delegate-swarm-prod-read`.
+5. **Delegate name**: Slack app, lead name, hostname.
+6. **pi harness** for every agent.
+7. **`grafana/mcp-grafana` pinned** to a digest.
+8. **Version bumps** are a one-line PR (README, "Upgrade agent-swarm"); the
    dashboard rebuilds itself when the version changes.
 
-Waiting on Swain:
+Open, waiting on Swain (README, "Bringing it up", has the order):
 
-1. **The move itself**: README, "Moving from the old host", steps 1 to 5.
-2. **GitHub service user**: the account, its PAT, and its real login and
+1. **GitHub service user**: the account, its PAT, and its real login and
    email in `host/render-env.sh` (now placeholders).
-3. **ClickUp service seat** and its token.
-4. **DNS** follow-up PR for both hostnames.
-5. **Login.** oauth2-proxy and the SSO Caddy routes switch on when the
-   secret holds the three `OAUTH2_PROXY_*` keys (README, "Google login").
-6. **Schedules.** 8 enabled, 7 disabled; most daily audits were seeded by the
-   lead's template, not asked for. Swain decides which stay.
-7. **Old host teardown** once the new one has run cleanly (section 3).
+2. **ClickUp service seat** and its token; then connect the clickup MCP
+   server as that seat.
+3. **Grafana service account** `delegate` and its token.
+4. **DNS** follow-up PR for `delegate-swarm.goodparty.org`.
+5. **Delegate Slack switch**: manifest, Socket Mode, reinstall, invite the
+   bot to its channels.
+6. **Google OAuth client** for login. oauth2-proxy and the SSO Caddy routes
+   switch on when the secret holds the three `OAUTH2_PROXY_*` keys (README,
+   "Google login").
+7. **Schedules**: none exist. Swain decides which to add.
+8. **Old host teardown** once the new one is live (section 3).
 
 Not started, by choice:
 
@@ -214,7 +223,7 @@ Not started, by choice:
 
 ## 9. Where everything the agent wrote lives
 
-- **This directory** (`agent-swarm/` on branch `feat/agent-swarm-host`, draft PR [#245](https://github.com/thegoodparty/ops/pull/245)): compose, Caddyfile, `aws-config`, scripts, systemd unit, Slack manifest, EC2 user-data, `fill-secrets.sh`, the soul files, `README.md` (procedures), this file, `docs/sso-proposal.md`, `iam/agent-swarm-aws-readonly.json` (the production read-only policy; `deploy/components/delegate-swarm-prod-read.ts` applies it). Nothing here is application code; it is config.
+- **This directory** (`agent-swarm/` on branch `feat/agent-swarm-host`, draft PR [#245](https://github.com/thegoodparty/ops/pull/245)): compose, Caddyfile, `aws-config`, scripts, systemd unit, Slack manifest, EC2 user-data, `fill-secrets.sh`, the soul files (`host/soul/`), `README.md` (procedures), this file, `docs/sso-proposal.md`, `iam/agent-swarm-aws-readonly.json` (the production read-only policy; `deploy/components/delegate-swarm-prod-read.ts` applies it). Nothing here is application code; it is config.
 - **On the host** `/opt/agent-swarm/`: the same files plus `.env` (rendered, never commit) and `ui-dist/`.
 - **Pilot guide for users** (Claude artifact, private, Swain owns it): https://claude.ai/artifact/S1oPLMimpwCfGuN2f5sEzu . Source HTML was in the job's tmp dir and is not in git; the content is a prose version of sections 1 to 7.
 - **Swain's Claude memory** (`~/.claude/projects/-Users-swain-Repos-thegoodparty-omni/memory/swarm-playground-2026-10.md`): a shorter record of the same facts for his future sessions. `memory/attic/agent-swarm-*.md` is the earlier attempt he asked not to be used.

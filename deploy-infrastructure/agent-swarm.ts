@@ -159,12 +159,6 @@ export const createAgentSwarm = (args: { provider: aws.Provider }) => {
           filter: { prefix: "ssm-output/" },
           expiration: { days: 30 },
         },
-        {
-          id: "expire-migration",
-          status: "Enabled",
-          filter: { prefix: "migration/" },
-          expiration: { days: 14 },
-        },
       ],
     },
     { provider },
@@ -256,12 +250,6 @@ export const createAgentSwarm = (args: { provider: aws.Provider }) => {
                 Effect: "Allow",
                 Action: "s3:GetEncryptionConfiguration",
                 Resource: bucketArn,
-              },
-              {
-                Sid: "ReadMigration",
-                Effect: "Allow",
-                Action: "s3:GetObject",
-                Resource: `${bucketArn}/migration/*`,
               },
               // The agents' production reads go through this role in the
               // management account; worker containers reach the instance
