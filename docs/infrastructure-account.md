@@ -72,15 +72,45 @@ starting the work, not after. Make `who` name the *session*, not the model.
       beside this entry means the entry is wrong in the visible way. It has to
       be green before step 7, because this policy binds the in-account
       `pulumi-deploy` role step 7 creates.
-- [ ] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
-      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: todo.
-      Applied by `deploy.yml`; must merge and finish applying before step 7.
-- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: todo. Two
+- [x] 6. Create `github-actions-infrastructure-deploy` in `deploy/` with
+      Pulumi backend access and the bootstrap `sts:AssumeRole` grant: done
+      (2026-10-07, pi-swarm-infra-step6). The role and its inline
+      `InfrastructureDeploy` policy are in `deploy/components/ci-roles.ts`
+      and `ci-roles/policies.ts`, following the workbench role. One
+      difference from that precedent, and it is a simplification: workbench
+      step 4 created its role with backend access alone because the account
+      id was not known yet, and step 7 added the assume grant in a PR of its
+      own. Here the id was recorded at step 3, so the bootstrap grant ships
+      with the role and there is no deferred statement. A local preview of
+      the `ops` stack planned exactly the two creates, the role and its
+      policy, and 84 unchanged. Trusted only by `deploy-infrastructure.yml`
+      on `main`, which does not exist yet, so the role is inert on merge and
+      step 7 must use exactly that filename. Marked done in the PR that
+      creates it, per step 5: the merge's `deploy.yml` run is the read-back,
+      so a red run beside this entry means the entry is wrong in the visible
+      way. It has to be green before step 7 merges.
+- [ ] 7. Add the `deploy-infrastructure/` project and its CI job: doing
+      (pi-swarm-infra-step7a, 2026-10-07). Two
       pull requests, forced by bootstrap causality, the same shape as
       workbench steps 7 and 10: the first applies against
       `OrganizationAccountAccessRole` and creates the in-account `pulumi-deploy`
       and `pulumi-preview` roles; the second repoints the provider at
       `pulumi-deploy` and removes the bootstrap grant.
+
+      PR 1 of 2 is open, stacked on step 6 (#257): `deploy-infrastructure/`
+      with the provider on `OrganizationAccountAccessRole`, `pulumi-deploy`
+      (`AdministratorAccess`, trusted only by
+      `github-actions-infrastructure-deploy`) and `pulumi-preview` (no
+      permissions, trusted by `github-actions-pulumi-preview` and the
+      management `ReadOnlyAccess` session), plus `deploy-infrastructure.yml`.
+      It cannot merge until #257 has merged and its `deploy.yml` run has
+      applied the role and grant it assumes. Its merge's `Deploy
+      infrastructure` run is the read-back: green, the two roles and the
+      `AdministratorAccess` attachment created alongside the stack and its
+      provider, `accountId` reading 394495727159 (which also closes step 3's
+      STS half), and the two role ARNs in the outputs. Not previewed before
+      merge: neither the stack nor a role a preview could assume exists yet.
+      PR 2, the cutover, follows once that run is green.
 - [ ] 8. Extend `identity-center.ts` to assign `Admins` to
       `AdministratorAccess` in the new account: todo. This is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in.
@@ -150,8 +180,13 @@ and compliance scans, drift detection, cost scans, automated maintenance and
 rotation jobs.
 
 Does not belong here: product environments, the developer inner loop (that is
-the workbench account), anything that holds product or voter data as a system
-of record, and anything the delegate agents need at runtime.
+the workbench account), and anything that holds product or voter data as a
+system of record.
+
+The agent-swarm deployment (the Delegate swarm) runs here, by Swain's decision
+on 2026-10-07. It reaches production read-only, through a role in the
+management account, rather than holding production credentials in this
+account.
 
 The failure mode is the same junk drawer the workbench plan names, with a
 sharper edge: because this account is expected to hold broad permissions, an

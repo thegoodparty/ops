@@ -1,0 +1,81 @@
+name: Deploy infrastructure
+
+# The filename is load bearing. github-actions-infrastructure-deploy pins
+# token.actions.githubusercontent.com:job_workflow_ref to
+# `thegoodparty/ops/.github/workflows/deploy-infrastructure.yml@refs/heads/main`,
+# so renaming or moving this file makes the role unassumable, and the failure
+# reads as a trust problem rather than as a rename.
+#
+# A separate workflow rather than a job in deploy.yml, for the same two
+# reasons as deploy-org.yml and deploy-workbench.yml: path filters are per
+# workflow, and infrastructure changes should not queue behind the delegate
+# image build.
+#
+# No pull_request trigger, and there cannot be one. The role is trusted only
+# for the subject `repo:thegoodparty/ops:ref:refs/heads/main`; a pull_request
+# run presents a pull_request ref and the AssumeRoleWithWebIdentity call
+# fails. Review is the gate before merge here; the apply happens after.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "deploy-infrastructure/**"
+      - ".github/workflows/deploy-infrastructure.yml"
+      # The account id the provider assumes into. It lives outside this
+      # project, so an edit to it must still re-apply this stack.
+      - "utils/accounts.ts"
+
+# Its own group: a different stack with a different S3 lock from the other
+# deploy workflows, so there is nothing to serialize between them.
+# cancel-in-progress is false because cancelling mid-apply orphans the state
+# lock.
+concurrency:
+  group: deploy-infrastructure-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Well above the expected runtime, far below the six hour default that
+    # would let a wedged run hold the lock all day.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Install BEFORE assuming the role, the ordering deploy.yml documents.
+      # `npm ci` runs dependency install scripts, and the credentials below
+      # reach administrator in the infrastructure account, so nothing that
+      # does not need them should run after them. Nothing else here needs a
+      # build: Pulumi compiles index.ts itself.
+      - run: npm ci
+
+      - name: Install Pulumi
+        uses: pulumi/actions@v6
+        with:
+          pulumi-version: "^3"
+
+      # The first hop. This role lives in the management account; index.ts
+      # makes the second hop into 394495727159 by assuming
+      # OrganizationAccountAccessRole through an explicit provider.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-infrastructure-deploy
+          aws-region: us-west-2
+
+      - name: Deploy
+        working-directory: deploy-infrastructure
+        run: ./deploy.sh
