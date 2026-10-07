@@ -43,7 +43,7 @@ describe("githubActionsPulumiPreview", () => {
     // `sts:AssumeRole` is the one non-read action; it only reaches the
     // workbench preview role, asserted separately below.
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|acm:(Describe|Get|List)|sts:AssumeRole)/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|sts:AssumeRole)/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
@@ -96,35 +96,7 @@ describe("githubActionsPulumiPreview", () => {
       : [describe.Resource]
     ).sort();
     assert.deepEqual(resources, [
-      "arn:aws:secretsmanager:us-west-2:333022194791:secret:BUGBOSS-??????",
       "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
     ]);
-  });
-
-  it("lists certificates on * but scopes the certificate reads to this account", () => {
-    const list = githubActionsPulumiPreview.Statement.find((s) =>
-      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
-        "acm:ListCertificates"
-      )
-    );
-    assert.ok(list);
-    // ListCertificates does not accept a resource, so this one cannot narrow.
-    assert.equal(list.Resource, "*");
-
-    const read = githubActionsPulumiPreview.Statement.find((s) =>
-      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
-        "acm:DescribeCertificate"
-      )
-    );
-    assert.ok(read);
-    assert.deepEqual(read.Action, [
-      "acm:DescribeCertificate",
-      "acm:GetCertificate",
-      "acm:ListTagsForCertificate",
-    ]);
-    assert.equal(
-      read.Resource,
-      "arn:aws:acm:us-west-2:333022194791:certificate/*"
-    );
   });
 });

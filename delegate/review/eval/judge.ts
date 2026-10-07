@@ -1,17 +1,90 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import {
-  createAnthropicJudgeModel,
-  VERDICT_TOOL,
-} from "../../../bugboss-evals/core/judge";
-import type { JudgeModel } from "../../../bugboss-evals/core/judge";
 import type { Bundle, ReviewOutput, ReviewRecord } from "../schema";
 import type { Result } from "./replay";
 
-export { createAnthropicJudgeModel };
-export type { JudgeModel };
-
 export const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6";
+
+export const VERDICT_TOOL = {
+  name: "record_verdict",
+  description: "Record the comparison verdict. Call exactly once.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      winner: {
+        type: "string",
+        enum: ["output_1", "output_2", "tie"],
+        description: "Which output is better, or tie.",
+      },
+      margin: {
+        type: "string",
+        enum: ["much_better", "better", "tie"],
+        description:
+          'How much better. Must be "tie" when winner is "tie", and must not be "tie" otherwise.',
+      },
+      deciding_criterion: {
+        type: "string",
+        description:
+          'The single rubric criterion that decided it, named as it appears in the rubric. Use "none" for a tie.',
+      },
+      rationale: {
+        type: "string",
+        description:
+          "Two to four sentences citing the specific text that demonstrates the deciding criterion.",
+      },
+    },
+    required: ["winner", "margin", "deciding_criterion", "rationale"],
+    additionalProperties: false,
+  },
+};
+
+export interface JudgeRequest {
+  system: string;
+  prompt: string;
+}
+
+export interface JudgeResponse {
+  toolInput: Record<string, unknown> | null;
+  stopReason: string;
+}
+
+export type JudgeModel = (request: JudgeRequest) => Promise<JudgeResponse>;
+
+// The verdict comes back as a tool call. The model cannot be forced to make
+// it (that is a 400 on this model), so the tool is strict and the prompt asks
+// for exactly one call; a reply with no call is a judge failure, not a verdict.
+export const createAnthropicJudgeModel = (
+  args: { apiKey?: string; model?: string } = {},
+): JudgeModel => {
+  const model = args.model ?? DEFAULT_JUDGE_MODEL;
+  return async (request) => {
+    const apiKey = args.apiKey ?? process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new Error("the judge needs an Anthropic API key: pass apiKey or set ANTHROPIC_API_KEY");
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model,
+        max_tokens: 16000,
+        system: request.system,
+        tools: [{ ...VERDICT_TOOL, strict: true }],
+        tool_choice: { type: "auto" },
+        messages: [{ role: "user", content: request.prompt }],
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`judge model call failed: HTTP ${response.status}: ${text}`);
+    const parsed = JSON.parse(text) as {
+      content?: Array<{ type: string; name?: string; input?: Record<string, unknown> }>;
+      stop_reason?: string;
+    };
+    const block = parsed.content?.find(
+      (part) => part.type === "tool_use" && part.name === VERDICT_TOOL.name,
+    );
+    return { toolInput: block?.input ?? null, stopReason: parsed.stop_reason ?? "" };
+  };
+};
 
 export interface PassResult {
   order: "a=1,b=2" | "a=2,b=1";
@@ -213,5 +286,3 @@ export const judgeAll = async (
   }
   return verdicts;
 };
-
-export { VERDICT_TOOL };
