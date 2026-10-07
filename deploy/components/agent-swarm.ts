@@ -16,7 +16,10 @@ const INSTANCE_ID = "i-04cc03c17787f5d59";
 const NAME = "agent-swarm";
 const HOSTNAME = "swarm.goodparty.org";
 const HOSTED_ZONE_ID = "Z10392302OXMPNQLPO07K";
-const SECRET_NAME = "AGENT_SWARM";
+// By ARN rather than a `getSecret` lookup, so the PR preview role needs no
+// grant on this secret. Filled by hand; see agent-swarm/fill-secrets.sh.
+const SECRET_ARN =
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:AGENT_SWARM-3S3N74";
 const SLACK_ALERTS_CHANNEL = "C0C6RUJ9VMK";
 const CONFIG_BUCKET = `agent-swarm-config-${ACCOUNT_ID}`;
 const METRIC_NAMESPACE = "AgentSwarm";
@@ -70,8 +73,6 @@ const readJson = (file: string) =>
   JSON.stringify(JSON.parse(fs.readFileSync(path.join(ROOT, file), "utf8")));
 
 export const createAgentSwarm = () => {
-  const secret = aws.secretsmanager.getSecretOutput({ name: SECRET_NAME });
-
   const securityGroup = new aws.ec2.SecurityGroup(
     "agentSwarmSecurityGroup",
     {
@@ -405,18 +406,16 @@ export const createAgentSwarm = () => {
   new aws.iam.RolePolicy("agentSwarmNotifierSecret", {
     name: "read-agent-swarm-secret",
     role: notifierRole.name,
-    policy: secret.arn.apply((arn) =>
-      JSON.stringify({
-        Version: "2012-10-17",
-        Statement: [
-          {
-            Effect: "Allow",
-            Action: "secretsmanager:GetSecretValue",
-            Resource: arn,
-          },
-        ],
-      }),
-    ),
+    policy: JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Effect: "Allow",
+          Action: "secretsmanager:GetSecretValue",
+          Resource: SECRET_ARN,
+        },
+      ],
+    }),
   });
 
   const notifier = new aws.lambda.Function("agentSwarmNotifier", {
@@ -433,7 +432,7 @@ export const createAgentSwarm = () => {
     memorySize: 128,
     environment: {
       variables: {
-        SECRET_ID: secret.arn,
+        SECRET_ID: SECRET_ARN,
         SLACK_CHANNEL: SLACK_ALERTS_CHANNEL,
       },
     },
