@@ -27,18 +27,12 @@
 #
 # ## The opt-outs
 #
-# `/bugboss/` -- application code. Its AWS reach is fixed in
-# `deploy/components/bugboss.ts`, which is owned, and `.github/workflows/deploy.yml`
-# runs install, test and build before the credentials step, so a bot-approved
-# BugBoss change does not reach the deploy role. `bugboss/Dockerfile` is
-# re-owned below; see there.
-#
 # `/docs/`, `/README.md` -- documentation.
 #
 # `/.gitignore` -- inert.
 #
 # `/CLAUDE.md` and `**/CLAUDE.md` -- removed from the review list by #173,
-# preserved here. The pattern fired on BugBoss documentation rather than on
+# preserved here. The pattern fired on routine documentation rather than on
 # changes to the reviewer's judgement, and the reviewer is told to read
 # CODEOWNERS as the authority rather than any summary. The root file is the
 # one the default would otherwise re-own.
@@ -69,7 +63,7 @@
 #   one `package.json` builds every image, so a dependency added for any one
 #   service also installs into the delegate worker that holds the GitHub App
 #   token; `tsconfig.json` governs the same `tsc` that compiles `delegate/`;
-#   `.dockerignore` is the build context for both images.
+#   `.dockerignore` is the build context for the worker image.
 #
 # ## Rules for editing this list
 #
@@ -78,9 +72,7 @@
 # file added beside it. This repo has already been bitten by exactly that --
 # see the `job_workflow_ref` comment in
 # `deploy/components/ci-roles/policies.ts`. The file-scoped entries below are
-# named singletons or repository-root files, which have no directory to scope
-# by: `bugboss/Dockerfile` is re-owned because it is executed by name from an
-# owned path.
+# repository-root files, which have no directory to scope by.
 #
 # Before adding a path to the opt-out side, check what executes it. The
 # ordering in `deploy.yml` -- install, test and build strictly before the
@@ -92,17 +84,8 @@
 
 *                                @thegoodparty/gp-contrib
 
-/bugboss/
 /docs/
 /README.md
 /.gitignore
 /CLAUDE.md
 **/CLAUDE.md
-
-# Re-owned after the `/bugboss/` opt-out, because the last matching pattern
-# wins. `deploy.yml` builds this image after the Configure AWS Credentials
-# step, so the Dockerfile runs inside a job holding the deploy role. The build
-# container does not inherit the runner's environment, which is why the tree
-# opt-out is otherwise defensible, but this is the one BugBoss path that
-# executes in a credentialled job, and a human on it costs little.
-/bugboss/Dockerfile              @thegoodparty/gp-contrib

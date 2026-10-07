@@ -15,12 +15,10 @@ if [ "$PULUMI_MODE" = "preview" ]; then
   PREVIEW=true
 fi
 
-# A PR has no images, and inventing them makes every code-only PR look like a
-# task-definition change. Worse for BugBoss: `deploy/index.ts` gates its
-# resources on `bugbossImageUri` being set, so leaving it unset would preview
-# them as destroyed. In preview mode, reuse the images the `delegate` and
-# `bugboss` tasks are actually running. An explicit value still wins, for
-# previewing an image-specific change locally.
+# A PR has no image, and inventing one makes every code-only PR look like a
+# task-definition change. In preview mode, reuse the image the `delegate`
+# task is actually running. An explicit value still wins, for previewing an
+# image-specific change locally.
 resolve_image() {
   aws ecs describe-task-definition \
     --task-definition "$1" \
@@ -37,19 +35,6 @@ if [ -z "$IMAGE_URI" ]; then
     fi
   else
     echo "Error: IMAGE_URI is not set" >&2
-    exit 1
-  fi
-fi
-
-if [ -z "$BUGBOSS_IMAGE_URI" ]; then
-  if [ "$PREVIEW" = "true" ]; then
-    BUGBOSS_IMAGE_URI=$(resolve_image bugboss)
-    if [ -z "$BUGBOSS_IMAGE_URI" ] || [ "$BUGBOSS_IMAGE_URI" = "None" ]; then
-      echo "Error: could not resolve the deployed BugBoss image" >&2
-      exit 1
-    fi
-  else
-    echo "Error: BUGBOSS_IMAGE_URI is not set" >&2
     exit 1
   fi
 fi
@@ -84,7 +69,6 @@ export PULUMI_CONFIG_PASSPHRASE
 
   pulumi config set aws:region "$AWS_REGION"
   pulumi config set workerImageUri "$IMAGE_URI"
-  pulumi config set bugbossImageUri "$BUGBOSS_IMAGE_URI"
   pulumi config set --path aws:defaultTags.tags.Environment infra
   pulumi config set --path aws:defaultTags.tags.Project ops
 } 1>&2
