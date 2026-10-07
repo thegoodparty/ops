@@ -143,6 +143,7 @@ Lambda ── RunTask ──▶ Fargate worker                Lambda ── RunT
 Rules that hold regardless of what the model says:
 
 - Approve means zero findings. A finding is a blocker. The bot never posts REQUEST_CHANGES.
+- The agent sees the diff of added and modified files; deleted files appear as a list and a stat line, never as hunks. A diff over 120k characters is written to `.delegate-review/diff.patch` inside the checkout and the agent reads it in parts. The record always holds the full diff.
 - The review body is the recommendation line, the agent's reasoning for it (what the change does, what was checked and falsified, what a human should confirm), a count of new inline findings, the prior findings still open, and the run footer. Every finding is an inline comment; the body never carries one. A finding whose line is outside the diff hunks is moved to the nearest changed line in that file; a finding on a path not in the diff is not posted, still counts against approval, and is kept on the record. 
 - Who may merge is not delegate's decision. Classic branch protection on `main` (omni and ops) restricts pushes, and therefore merges, to the `gp-contrib` team; bots open and review PRs but cannot merge them.
 - The review and the `pr-reviewer` status are pinned to the sha that was checked out. `pr-reviewer` is a required check on omni, so a push nobody asked delegate to review is unmergeable until someone does.

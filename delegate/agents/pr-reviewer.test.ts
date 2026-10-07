@@ -101,3 +101,15 @@ describe("REVIEW_OUTPUT_JSON_SCHEMA", () => {
     assert.ok(statuses.includes("failed"), "must have a failed branch");
   });
 });
+
+it("buildReviewPrompt references a diff file instead of inlining when asked", () => {
+  const bundle: Bundle = {
+    repo: "thegoodparty/ops", prNumber: 1, baseRef: "main", baseSha: "a", headSha: "b", author: "x",
+    title: "t", body: "", diff: "diff --git a/f.ts b/f.ts\n--- a/f.ts\n+++ b/f.ts\n@@ -1 +1 @@\n-a\n+b\n",
+    changedFiles: ["f.ts"], priorFindings: [],
+  };
+  const prompt = buildReviewPrompt(bundle, { diffPath: "/app/review/.delegate-review/diff.patch" });
+  assert.ok(prompt.includes('<diff path="/app/review/.delegate-review/diff.patch">'));
+  assert.ok(!prompt.includes("+b\n"));
+  assert.ok(prompt.includes("<diff_stat>"));
+});
