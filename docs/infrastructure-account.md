@@ -130,12 +130,18 @@ starting the work, not after. Make `who` name the *session*, not the model.
       `pulumi-deploy`, which is also the first time STS is exercised on the
       role's trust. `OrganizationAccountAccessRole` itself is left in the
       account; nothing in this repo manages or deletes it.
-- [ ] 8. Extend `identity-center.ts` to assign `Admins` to
-      `AdministratorAccess` in the new account: doing (pi-infra-step8,
-      2026-10-07). This is the human admin
-      path — the "admin role" a member of the admin group picks at SSO sign-in.
-      No grant PR in front of it; the shared deploy role already holds
-      `sso:*`.
+- [x] 8. Extend `identity-center.ts` to assign `Admins` to
+      `AdministratorAccess` in the new account: done (2026-10-07,
+      pi-infra-step8). The `accounts` map gains an `infrastructure` entry,
+      `namePrefix: "infrastructure-"`, `adopted: false`, `Admins:
+      ["administrator"]` and no `Engineers` entry. This is the human admin
+      path — the "admin role" a member of the admin group picks at SSO sign-in
+      — and, now that step 7's cutover made the deploy stack self-referential,
+      the break-glass route that does not depend on CI. No grant PR in front of
+      it; the shared deploy role already holds `sso:*` on `*`. Applied by
+      `deploy.yml`, and the merge's `Deploy` run is the read-back: green, the
+      `AdministratorAccess` set provisioned into `394495727159` for the Admins
+      group.
 - [ ] 9. Harden the account's root user, in the console: todo. Enable MFA,
       remove any root access keys, and set the alternate contacts. The group
       alias from step 1 is the recovery path, not the daily driver.
