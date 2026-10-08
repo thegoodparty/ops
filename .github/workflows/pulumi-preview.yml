@@ -18,8 +18,9 @@ on:
       - "deploy/**"
       - "deploy-org/**"
       - "deploy-workbench/**"
+      - "deploy-infrastructure/**"
       - "delegate/**"
-      # A shared input: all three projects import the account ids from it, so
+      # A shared input: all four projects import the account ids from it, so
       # an edit here changes their plans and must start a preview.
       - "utils/accounts.ts"
       - "package.json"
@@ -146,6 +147,14 @@ jobs:
               matrix.push({
                 project: "workbench",
                 dir: "deploy-workbench",
+                build: false,
+              });
+            }
+            // Same as workbench: no `dist/lambda` archive, so no build.
+            if (any(/^deploy-infrastructure\//) || any(shared)) {
+              matrix.push({
+                project: "infrastructure",
+                dir: "deploy-infrastructure",
                 build: false,
               });
             }

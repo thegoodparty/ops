@@ -163,15 +163,22 @@ starting the work, not after. Make `who` name the *session*, not the model.
       red run beside this entry means the entry is wrong in the visible way. A
       green apply shows the budget and its subscribers exist, not that an email
       arrives — delivery can only be proven by a real crossing.
-- [ ] 11. Extend the PR preview role and workflow to cover the new project:
-      doing (pi-infra-step11, 2026-10-07). Design in "PR previews" below. Two
-      PRs, not one, for the ordering that section states: the management-side
-      grant and the provider's `providerRoleName` config land first, applied by
-      `deploy.yml` and `deploy-infrastructure.yml`, and the `pulumi-preview.yml`
-      change follows once the grant has applied. The split is load bearing for
-      a second reason: the preview workflow calls `deploy.sh` with `CI=true`,
-      so until the script learned `PULUMI_MODE` it would have run `pulumi up`
-      on a PR. The in-account `pulumi-preview` role already exists from step 7.
+- [x] 11. Extend the PR preview role and workflow to cover the new project:
+      done (2026-10-08, pi-infra-step11). Design in "PR previews" below. Two
+      PRs, not one, for the ordering that section states. PR 1 merged as #264
+      (263792b): the management-side `AssumeInfrastructurePreviewRole` grant
+      and `infrastructure` in the preview policy's read statements, applied by
+      `deploy.yml` run 37800257202, plus the provider's `providerRoleName`
+      config and the `PULUMI_MODE` block in `deploy.sh`. The split was load
+      bearing for a second reason: the preview workflow calls `deploy.sh` with
+      `CI=true`, so until the script learned `PULUMI_MODE`, wiring the workflow
+      first would have run `pulumi up` on a PR. PR 2, this one, adds
+      `deploy-infrastructure/**` to the `pulumi-preview.yml` path filter and the
+      `{ project: "infrastructure", dir: "deploy-infrastructure", build: false }`
+      matrix entry. The in-account `pulumi-preview` role already existed from
+      step 7 and holds no permissions; if the first real preview fails closed
+      it names an action, and that action gets added then, as the role's header
+      says.
 - [ ] 12. Document how an admin reaches the account, and whether the container
       gets a profile for it: todo.
 
