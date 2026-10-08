@@ -24,7 +24,10 @@ describe("delegate swarm hostname", () => {
   // takes the dashboard down.
   it("matches the Caddy site address and the oauth2-proxy host", () => {
     const caddyfile = fs.readFileSync(path.join(HOST_DIR, "Caddyfile"), "utf8");
-    assert.match(caddyfile, new RegExp(`^${SWARM_HOSTNAME.replaceAll(".", "\\.")} \\{$`, "m"));
+    assert.match(
+      caddyfile,
+      new RegExp(`^${SWARM_HOSTNAME.split(".").join("\\.")} \\{$`, "m"),
+    );
 
     const compose = fs.readFileSync(
       path.join(HOST_DIR, "docker-compose.yml"),
