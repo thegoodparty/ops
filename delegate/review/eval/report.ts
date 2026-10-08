@@ -154,10 +154,19 @@ export const qualityVerdict = (summary: Summary): "Better" | "Worse" | "Can't te
   return summary.b > summary.a ? "Better" : "Worse";
 };
 
-const avgCost = (results: Result[]): number | null => {
-  const priced = results.filter((r) => typeof r.costUsd === "number");
-  if (priced.length === 0) return null;
-  return priced.reduce((sum, r) => sum + (r.costUsd ?? 0), 0) / priced.length;
+// Same cases on both sides, or a replay that failed on one side moves the
+// headline without any review having changed price.
+const pairedAvgCost = (a: Result[], b: Result[]): [number | null, number | null] => {
+  const bById = new Map(b.map((r) => [r.caseId, r]));
+  const pairs = a
+    .map((ra) => [ra, bById.get(ra.caseId)] as const)
+    .filter((p): p is readonly [Result, Result] =>
+      p[1] !== undefined && typeof p[0].costUsd === "number" && typeof p[1].costUsd === "number",
+    );
+  if (pairs.length === 0) return [null, null];
+  const avg = (pick: (p: readonly [Result, Result]) => number) =>
+    pairs.reduce((sum, p) => sum + pick(p), 0) / pairs.length;
+  return [avg((p) => p[0].costUsd ?? 0), avg((p) => p[1].costUsd ?? 0)];
 };
 
 export const costVerdict = (
@@ -176,8 +185,7 @@ export const renderPrComment = (
   opts: PrCommentOptions,
 ): string => {
   const { labelA, labelB, casesCount, unjudgedCount = 0, replayFailures, runUrl, resultsA = [], resultsB = [] } = opts;
-  const before = avgCost(resultsA);
-  const after = avgCost(resultsB);
+  const [before, after] = pairedAvgCost(resultsA, resultsB);
   const money = (n: number | null) => (n === null ? "n/a" : `$${n.toFixed(2)}`);
   const judged = casesCount - unjudgedCount;
   const unjudgedNote = unjudgedCount ? `, ${unjudgedCount} not judged` : "";

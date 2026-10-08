@@ -164,3 +164,15 @@ test("renderPrComment names failures and unjudged cases", () => {
   assert.ok(md.includes("2 replay failure(s)"));
   assert.ok(md.includes("**Cost: Can't tell**"));
 });
+
+test("cost is averaged over cases priced on both sides only", () => {
+  const verdicts = [verdict("a"), verdict("a"), verdict("a")];
+  const resultsA = verdicts.map((v) => makeResult(v.caseId, { costUsd: 1 }));
+  const resultsB = [
+    makeResult(verdicts[0].caseId, { costUsd: 1 }),
+    makeResult(verdicts[1].caseId, { costUsd: 1 }),
+    makeResult(verdicts[2].caseId, { costUsd: null, error: "checkout failed", output: null }),
+  ];
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, resultsA, resultsB }));
+  assert.ok(md.includes("**Cost: Same** — $1.00 → $1.00 per review"));
+});
