@@ -1,5 +1,3 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import * as aws from "@pulumi/aws";
 import { INFRASTRUCTURE_ACCOUNT_ID } from "../../utils/accounts";
 
@@ -26,12 +24,54 @@ export const delegateSwarmProdReadTrust = {
   ],
 };
 
-export const delegateSwarmProdReadPolicy = JSON.parse(
-  fs.readFileSync(
-    path.resolve(__dirname, "../../agent-swarm/iam/agent-swarm-aws-readonly.json"),
-    "utf8",
-  ),
-);
+export const delegateSwarmProdReadPolicy = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "CloudWatchRead",
+      Effect: "Allow",
+      Action: [
+        "cloudwatch:Describe*",
+        "cloudwatch:Get*",
+        "cloudwatch:List*",
+        "logs:Describe*",
+        "logs:Get*",
+        "logs:List*",
+        "logs:FilterLogEvents",
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "logs:TestMetricFilter",
+      ],
+      Resource: "*",
+    },
+    {
+      Sid: "EcsRead",
+      Effect: "Allow",
+      Action: [
+        "ecs:Describe*",
+        "ecs:List*",
+        "ecr:Describe*",
+        "ecr:List*",
+        "application-autoscaling:Describe*",
+      ],
+      Resource: "*",
+    },
+    {
+      Sid: "CostRead",
+      Effect: "Allow",
+      Action: [
+        "ce:Get*",
+        "ce:Describe*",
+        "ce:List*",
+        "budgets:ViewBudget",
+        "budgets:Describe*",
+        "cur:Describe*",
+        "pricing:*",
+      ],
+      Resource: "*",
+    },
+  ],
+};
 
 export const createDelegateSwarmProdRead = () => {
   const tags = { Environment: "infra", Project: "delegate-swarm" };

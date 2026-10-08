@@ -228,11 +228,11 @@ Not started, by choice:
 
 ## 9. Where everything the agent wrote lives
 
-- **This directory** (`agent-swarm/` on branch `feat/agent-swarm-host`, draft PR [#245](https://github.com/thegoodparty/ops/pull/245)): compose, Caddyfile, `aws-config`, scripts, systemd unit, Slack manifest, EC2 user-data, `fill-secrets.sh`, the soul files (`host/soul/`), `README.md` (procedures), this file, `iam/agent-swarm-aws-readonly.json` (the production read-only policy; `deploy/components/delegate-swarm-prod-read.ts` applies it). Nothing here is application code; it is config.
+- **This directory** (`agent-swarm/` on branch `feat/agent-swarm-host`, draft PR [#245](https://github.com/thegoodparty/ops/pull/245)): compose, Caddyfile, `aws-config`, scripts, systemd unit, Slack manifest, EC2 user-data, `fill-secrets.sh`, the soul files (`host/soul/`), `README.md` (procedures), this file. The production read-only policy is inline in `deploy/components/delegate-swarm-prod-read.ts`. Nothing here is application code; it is config.
 - **On the host** `/opt/agent-swarm/`: the same files plus `.env` (rendered, never commit) and `ui-dist/`.
 - **Pilot guide for users** (Claude artifact, private, Swain owns it): https://claude.ai/artifact/S1oPLMimpwCfGuN2f5sEzu . Source HTML was in the job's tmp dir and is not in git; the content is a prose version of sections 1 to 7.
 - **Swain's Claude memory** (`~/.claude/projects/-Users-swain-Repos-thegoodparty-omni/memory/swarm-playground-2026-10.md`): a shorter record of the same facts for his future sessions. `memory/attic/agent-swarm-*.md` is the earlier attempt he asked not to be used.
-- **Not in git** (ephemeral, in a Claude job tmp dir that is deleted with the job): SSM helper scripts, the read-only IAM policy JSON (copied to `iam/` here), probe scripts. Nothing of value that is not also in this directory or on the host.
+- **Not in git** (ephemeral, in a Claude job tmp dir that is deleted with the job): SSM helper scripts and probe scripts. Nothing of value that is not also in this directory or on the host.
 - **No changes were made to omni, gp-api, or any product repo.** The AWS side lives in `deploy-infrastructure/`; nothing in `delegate/` or `bugboss/` was touched.
 
 ## 10. Working with Swain on this
