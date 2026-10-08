@@ -94,7 +94,7 @@ SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org
 SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK
 
 GITHUB_DISABLE=true
-GITHUB_NAME=Delegate
+GITHUB_NAME=delegate
 GITHUB_EMAIL=delegate@goodparty.org
 
 GRAFANA_URL=https://goodparty.grafana.net

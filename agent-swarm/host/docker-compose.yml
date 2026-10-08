@@ -42,7 +42,7 @@ x-worker-env: &worker-env
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
   YOLO: "true"
   GITHUB_TOKEN: ${GITHUB_TOKEN}
-  GITHUB_NAME: ${GITHUB_NAME:-Delegate}
+  GITHUB_NAME: ${GITHUB_NAME:-delegate}
   GITHUB_EMAIL: ${GITHUB_EMAIL:-delegate@goodparty.org}
   CLICKUP_API_TOKEN: ${CLICKUP_API_TOKEN}
   CLICKUP_API_KEY: ${CLICKUP_API_TOKEN}
@@ -143,7 +143,7 @@ services:
       <<: *worker-env
       AGENT_ID: ${LEAD_AGENT_ID:-}
       AGENT_ROLE: lead
-      AGENT_NAME: Delegate
+      AGENT_NAME: delegate
       TEMPLATE_ID: official/lead
       MODEL_OVERRIDE: ${LEAD_MODEL_OVERRIDE}
     volumes:

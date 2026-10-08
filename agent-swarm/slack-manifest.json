@@ -1,9 +1,9 @@
 {
   "display_information": {
-    "name": "Delegate",
+    "name": "delegate",
     "description": "GoodParty's engineering agent",
     "background_color": "#1f2937",
-    "long_description": "Self-hosted agent-swarm for the GoodParty engineering team. Ask Delegate in a channel, a DM, or the assistant pane; it delegates to coding agents, runs scheduled jobs, and builds internal apps."
+    "long_description": "Self-hosted agent-swarm for the GoodParty engineering team. Ask delegate in a channel, a DM, or the assistant pane; it delegates to coding agents, runs scheduled jobs, and builds internal apps."
   },
   "features": {
     "app_home": {
@@ -12,7 +12,7 @@
       "messages_tab_read_only_enabled": false
     },
     "bot_user": {
-      "display_name": "Delegate",
+      "display_name": "delegate",
       "always_online": true
     },
     "slash_commands": [
@@ -28,7 +28,7 @@
       }
     ],
     "agent_view": {
-      "agent_description": "Talk to Delegate, the GoodParty engineering agent",
+      "agent_description": "Talk to delegate, the GoodParty engineering agent",
       "suggested_prompts": []
     },
     "rich_previews": {

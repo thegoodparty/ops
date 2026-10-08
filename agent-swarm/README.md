@@ -49,7 +49,7 @@ host; the next deploy overwrites them.
   per container. `docker compose logs` on the host still works.
 - GitHub identity: a service user's fine-grained PAT. TODO: `GITHUB_NAME`
   and `GITHUB_EMAIL` in `host/render-env.sh` are the placeholders
-  `Delegate` and `delegate@goodparty.org`; set them to the service user's
+  `delegate` and `delegate@goodparty.org`; set them to the service user's
   real login and email once it exists.
 
 `fill-secrets.sh` is the interactive way to fill the secret from a laptop.
@@ -185,7 +185,7 @@ nodes need an OpenRouter or OpenAI key, which this swarm does not have).
 The first task after switching an agent's harness can fail: the worker
 claims it before it reconciles the new harness, about 10 seconds. Re-run it.
 
-`AGENT_NAME=Delegate` on the lead only names a newly registered lead. The
+`AGENT_NAME=delegate` on the lead only names a newly registered lead. The
 existing one is renamed with `PUT /api/agents/{id}/name`.
 
 ## MCP servers
@@ -268,14 +268,18 @@ the management account, which is torn down once this one is live. In order:
    1. `pbcopy < slack-manifest.json`, then api.slack.com/apps, Delegate,
       App Manifest. Switch the editor to JSON, paste over everything, Save
       Changes, accept the scope prompt.
-   2. Settings, Socket Mode: turn on Enable Socket Mode.
-   3. Settings, Install App, Reinstall to GoodParty, Allow. If the Bot User
+   2. Settings, Basic Information, Display Information: upload the app
+      icon (square PNG or JPG, 512 to 2000 px). Every message the swarm posts
+      carries it, because the manifest has no `chat:write.customize` and so
+      agents cannot set their own name or icon per message.
+   3. Settings, Socket Mode: turn on Enable Socket Mode.
+   4. Settings, Install App, Reinstall to GoodParty, Allow. If the Bot User
       OAuth Token changed, run `./fill-secrets.sh` again with the new one
       and `sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh` on
       the host.
-   4. On the host, `cd /opt/agent-swarm && sudo docker compose restart api`
+   5. On the host, `cd /opt/agent-swarm && sudo docker compose restart api`
       so it connects in Socket Mode.
-   5. `/invite @Delegate` in `#swarm-testing` and every other channel it
+   6. `/invite @delegate` in `#swarm-testing` and every other channel it
       should hear, then mention it there.
 
 ## Replacing the instance
