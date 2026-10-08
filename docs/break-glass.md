@@ -75,11 +75,12 @@ Stated as an invariant rather than a feature:
 
 - No one outside the current `Admins` set holds standing `AdministratorAccess`
   in any account, **for now**. This is a deliberate, two-phase softening of the
-  original "no person holds standing admin": the current members of `Admins`
-  are grandfathered and stay, and the JIT flow governs everyone else. A
-  follow-up PR removes those standing members manually and empties the
-  grandfather allowlist, after which the invariant is the original one. See
-  "Existing members and the grandfather allowlist".
+  original "no person holds standing admin": the members of `Admins` today stay
+  as memberships the tool does not manage, and the JIT flow governs everyone
+  else. The transition ends when the engineer removes the remaining standing
+  members manually and a follow-up PR promotes the sweeper's no-grant-record
+  case from informational to an alarm, after which the invariant is the
+  original one. See "Existing members".
 - Any engineer can request admin, for a bounded duration, with a stated reason.
 - A designated human approver, not the requester, must approve it.
 - The grant is time-boxed and revoked without anyone remembering to revoke it.
@@ -138,8 +139,14 @@ that group.
 ### The decision
 
 - **Grant**: `identitystore:CreateGroupMembership` adds the requester to
-  `Admins`.
-- **Revoke**: `identitystore:DeleteGroupMembership` removes them.
+  `Admins`. The call is idempotent, so a requester who is already a member is a
+  no-op, and the grant is still recorded with its expiry.
+- **Revoke**: `identitystore:DeleteGroupMembership` removes the requester,
+  unconditionally at expiry. It does not check whether the tool was the thing
+  that added them. A standing admin who drives a request through the tool
+  therefore loses their standing membership when the grant ends; the engineer
+  accepts this, and it is what keeps the tool's grant set and the group's
+  membership set in agreement without a baseline.
 - The `Admins` group is already assigned `AdministratorAccess` in the
   management, workbench and infrastructure accounts
   (`deploy/components/identity-center.ts`), so one membership grants admin in
@@ -201,12 +208,12 @@ that session reaches the permission set's `sessionDuration`. So:
 
 - The existing `administrator` `sessionDuration` drops from `PT8H` to `PT1H`.
   Identity Center permits 1 to 12 hours, so `PT1H` is the floor.
-- This shortens **every** `Admins` session, including the grandfathered standing
-  members, not only the JIT grants. That is deliberate and confirmed: it is a
-  feature, not a side effect. Nobody, standing admin or not, holds a long
-  session, and the escalated window is bounded for everyone. A standing member's
-  long-lived access is membership, in that they can sign in again at any time;
-  the session itself is one hour.
+- This shortens **every** `Admins` session, including the standing members, not
+  only the JIT grants. That is deliberate and confirmed: it is a feature, not a
+  side effect. Nobody, standing admin or not, holds a long session, and the
+  escalated window is bounded for everyone. A standing member's long-lived
+  access is membership, in that they can sign in again at any time; the session
+  itself is one hour.
 - Treat the requested duration as the **grant window**, not a guarantee. The
   honest worst case is `requested duration + remaining session`, which with a
   `PT1H` set is at most roughly twice the request. The Slack reply must say
@@ -243,31 +250,31 @@ groups were attractive and why dropping them is a real change: they were a
 blast-radius control that this design gives up. The compensating controls are
 the approver gate and the audit, not a narrower grant.
 
-### Existing members and the grandfather allowlist
+### Existing members
 
 The `Admins` group has members today. Review confirmed it is repurposed in
-place, so those members stay and there is no migration step. They are **not**
-removed by the sweeper. The engineer will remove them manually in a follow-up PR
-once the rest of the tool is working.
+place, so those members stay and there is no migration step. The tool manages
+**only the memberships it granted**; it keeps no second source of truth about
+who was already a member.
 
-That makes the reconciliation sweeper's definition of an **expected**
-membership the load-bearing one. The expected set is the union of:
+An existing member is therefore just a membership with no grant record, and the
+sweeper leaves it alone and logs it at informational level. During the
+transition that is the expected state for a standing admin, so it is not
+suspicious and must not page. The engineer will remove the remaining standing
+members manually once the rest of the tool is working; a follow-up PR then
+promotes the no-grant-record case from informational to an alarm, at which point
+any membership the tool cannot explain is genuinely suspicious.
 
-1. an **active grant**: a membership the tool created that has not expired, and
-2. the **grandfather allowlist**: a hardcoded `grandfatheredAdmins` array of the
-   current `Admins` member IDs, in the tool's code alongside the hardcoded
-   approver list.
+A standing member who drives a request through the tool is not special. The
+grant is recorded and the membership is added (a no-op, since they are already a
+member), and at expiry the revoke removes them like anyone else. They lose the
+standing membership when their grant ends; the engineer accepts this, and it is
+the point of managing only what the tool granted.
 
-A membership in neither set is unexpected, and unexpected is what alarms and
-gets revoked. Editing the allowlist is a code change, like the approver list, so
-it is reviewed rather than self-service.
-
-The allowlist is temporary by design. The manual-cleanup PR empties it and
-removes the standing members, and until that PR lands the invariant is
-deliberately softened to "no one outside the current `Admins` set holds standing
-admin". After it lands, the allowlist is empty and the invariant is the original
-"no standing admin". The two-phase wording is intentional: the tool enforces the
-first phase from day one, and the second phase is one reviewed PR away.
+The invariant is two-phase, and the transition is ended by a manual cleanup plus
+a one-line change to the sweeper's treatment of no-grant memberships, not by
+emptying a list. Until then it is "no one outside the current `Admins` set holds
+standing admin"; after that it is the original "no standing admin".
 
 ## Architecture
 
@@ -356,8 +363,8 @@ code, changed only by a reviewed PR.
    one-shot revoke, and post the SSO portal link and the expiry, with the
    session caveat, to the channel and to the requester.
 7. At expiry, EventBridge Scheduler invokes the same Lambda with a `revoke`
-   event. It calls `DeleteGroupMembership`, writes `revoked`, and posts to the
-   channel.
+   event. It calls `DeleteGroupMembership` unconditionally, writes `revoked`,
+   and posts to the channel.
 
 ### States
 
@@ -441,11 +448,11 @@ not be papered over. The mitigations are:
 
 - The code is deployed by CI from a reviewed branch, and `deploy/` and
   `deploy-infrastructure/` are owned paths requiring human review.
-- The reconciliation sweeper catches a membership that is neither an active
-  grant nor on the grandfather allowlist, and that **unexpected** membership is
-  what alarms. Every grant also writes a low-severity informational record, not
-  a page; paging on every grant is alert fatigue and would train people to
-  ignore it.
+- The reconciliation sweeper catches an **orphaned grant**: an expired grant
+  whose member is still in the group, meaning the normal revoke path did not
+  run. That is what alarms. Every grant also writes a low-severity informational
+  record, not a page; paging on every grant is alert fatigue and would train
+  people to ignore it.
 - The audit trail, once step 1 lands, is independent of the tool and cannot be
   rewritten by it, so a bad grant cannot be hidden after the fact, only seen.
 - The blast radius of the tool is `Admins` in all three accounts, which is the
@@ -462,9 +469,9 @@ access, not about the tool, and it belongs in the threat model.
 
 A structured-JSON CloudWatch Logs group, written by the Lambda, with one event
 per transition: `request.created`, `request.approved`, `request.denied`,
-`grant.created`, `grant.revoked`, `grant.expired`, `grant.failed`, and
-`membership.unexpected` from the sweeper. Each carries the request id,
-requester, approver, group, reason, ticket link, and timestamps.
+`grant.created`, `grant.revoked`, `grant.expired`, `grant.failed`,
+`membership.orphaned` and `membership.unmanaged` from the sweeper. Each carries
+the request id, requester, approver, group, reason, ticket link, and timestamps.
 
 There are two signals, and they are deliberately different in loudness:
 
@@ -474,9 +481,11 @@ There are two signals, and they are deliberately different in loudness:
   reconstructs the history from, and it is what makes the time-boxed gap while
   CloudTrail is absent survivable. It also posts to the channel so the approver
   can see their approval took effect.
-- **The loud alarm is on `membership.unexpected`**: a membership in neither the
-  active-grant set nor the grandfather allowlist, which is the signal that
-  something bypassed the tool. Only that pages.
+- **The loud alarm is on `membership.orphaned`**: an expired grant whose member
+  is still in the group, which is the signal that the normal revoke path did not
+  run. Only that pages. A membership with no grant record emits
+  `membership.unmanaged` at informational level and does not page; see
+  "Existing members".
 
 Metric filters turn those events into metrics. This layer answers *who asked,
 who approved, why, how long*.
@@ -534,14 +543,17 @@ tool's own records are structured for export and retention from day one.
 
 - **Never leave a grant open.** Two independent mechanisms: an EventBridge
   Scheduler one-shot at the exact expiry, with retries and a dead-letter queue,
-  and a periodic reconciliation sweeper. The sweeper lists the current `Admins`
-  memberships, compares them against the expected set (active grants plus the
-  grandfather allowlist), revokes anything expired, and alarms on a membership
-  in neither. The scheduler is the normal path; the sweeper is what catches a
-  failed schedule and a membership the tool did not create.
-- **Expected means an active grant or an entry on the grandfather allowlist.**
-  Defined under "Existing members and the grandfather allowlist"; it is the
-  whole basis for deciding what is drift.
+  and a periodic reconciliation sweeper. The sweeper reconciles only the tool's
+  own grants against the group's current memberships. An expired grant whose
+  member is still in the group is an **orphaned grant**: it revokes it and
+  alarms, because the normal revoke path did not run. An active grant is left
+  alone. A membership with **no grant record** is left alone and logged
+  informationally; the sweeper never removes it. The scheduler is the normal
+  path; the sweeper is what catches a failed schedule.
+- **Expected is defined by the tool's own grant records, not by a baseline.**
+  The tool manages only what it granted, so there is no second source of truth.
+  Drift is an orphaned grant, which is actionable without knowing who was a
+  member before the tool existed.
 - **Idempotent revoke.** `DeleteGroupMembership` on a non-member is a no-op
   worth tolerating, and the grant record's state makes a double revoke harmless.
   Both the scheduler and the sweeper may fire for the same grant.
@@ -589,8 +601,8 @@ rather than staying open.
 1. ~~**Human recovery path if the tool is down.**~~ **Settled in review:** the
    management-account root, with MFA, which is in place today. It is the
    documented recovery path, and it removes the first revision's option of
-   keeping an audited standing admin group. The `Admins` group is grandfathered
-   separately, under "Existing members".
+   keeping an audited standing admin group. The `Admins` group's existing
+   members are covered separately, under "Existing members".
 2. ~~**Slack app boundary.**~~ **Settled in review:** a separate Slack app with
    its own signing secret and bot token, stored in Secrets Manager in the
    infrastructure account, served by a new Lambda in the infrastructure account.
@@ -615,10 +627,11 @@ rather than staying open.
    audit log. A trail nobody can read is not an audit; a trail everyone can read
    is a data-exposure problem. This is step 1 and no longer blocks the runtime,
    so the gap is known and time-boxed rather than a prerequisite.
-8. ~~**The grandfathering residual ambiguity.**~~ **Settled by the engineer:**
+8. ~~**Existing members before manual cleanup.**~~ **Settled by the engineer:**
    existing `Admins` members stay and are not removed by the sweeper; they will
-   be removed manually in a follow-up PR, which also empties the grandfather
-   allowlist. See "Existing members and the grandfather allowlist".
+   be removed manually in a follow-up PR, which also promotes the sweeper's
+   no-grant-record case from informational to an alarm. See "Existing
+   members".
 
 ## Implementation plan
 
@@ -664,9 +677,10 @@ The Progress list is the checklist; this is the detail behind each step.
    post on revoke. The sweeper from step 4 is the backstop.
 
 There is no separate step to retire `Admins`; it is repurposed in place, and the
-grandfathered members are handled by the grandfather allowlist rather than by a
-migration. Removing them, and emptying the allowlist, is a deliberate follow-up
-PR once the rest of the tool is working, not part of this plan's steps.
+existing members are simply memberships the tool did not grant, left alone and
+logged informationally rather than reconciled against a baseline. Removing them,
+and promoting the no-grant-record case to an alarm, is a deliberate follow-up PR
+once the rest of the tool is working, not part of this plan's steps.
 
 ## Grounding: the files this touches
 
