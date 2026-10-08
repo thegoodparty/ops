@@ -157,7 +157,7 @@ starting the work, not after. Make `who` name the *session*, not the model.
       green apply shows the budget and its subscribers exist, not that an email
       arrives — delivery can only be proven by a real crossing.
 - [ ] 11. Extend the PR preview role and workflow to cover the new project:
-      todo. Design in "PR previews" below.
+      doing (pi-infra-step11, 2026-10-07). Design in "PR previews" below.
 - [ ] 12. Document how an admin reaches the account, and whether the container
       gets a profile for it: todo.
 
