@@ -179,8 +179,21 @@ starting the work, not after. Make `who` name the *session*, not the model.
       step 7 and holds no permissions; if the first real preview fails closed
       it names an action, and that action gets added then, as the role's header
       says.
-- [ ] 12. Document how an admin reaches the account, and whether the container
-      gets a profile for it: todo.
+- [x] 12. Document how an admin reaches the account, and whether the container
+      gets a profile for it: done (2026-10-08, pi-infra-step12). The human
+      path is Identity Center: a member of `Admins` signs in and picks
+      `AdministratorAccess` for `394495727159`, the assignment step 8 created.
+      That is the whole of it, because the only human need today is
+      break-glass and Identity Center already covers it. `gp-pi` gets no AWS
+      profile for this account, unlike workbench step 14, where `etc/aws-config`
+      in the container ships a `WorkbenchAccess` profile. The reason is the
+      boundary this document keeps drawing: this account holds privileged
+      automation rather than an inner loop, so an interactive session against
+      it is not something anyone needs yet. If that changes, it is a new
+      profile and a new permission set, and it belongs in a PR of its own.
+
+All twelve steps are done as of 2026-10-08. The open questions below stay
+open as recorded follow-ups rather than phase-one blockers.
 
 ## Goal
 
