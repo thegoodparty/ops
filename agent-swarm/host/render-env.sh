@@ -95,7 +95,7 @@ SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK
 
 GITHUB_DISABLE=true
 GITHUB_NAME=delegate
-GITHUB_EMAIL=delegate@goodparty.org
+GITHUB_EMAIL=339843712+delegate-gp-bot@users.noreply.github.com
 
 GRAFANA_URL=https://goodparty.grafana.net
 EOF
