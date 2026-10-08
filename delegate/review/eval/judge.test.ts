@@ -234,3 +234,40 @@ test("judgePair defaults to 4 passes", async () => {
 
   assert.equal(verdict.passes.length, 4);
 });
+
+test("judgeAll with concurrency > 1 returns results in record order", async () => {
+  const records = [makeRecord(), makeRecord(), makeRecord()];
+  const aResults = records.map((r) => makeResult({ caseId: r.runId }));
+  const bResults = records.map((r) => makeResult({ caseId: r.runId }));
+
+  let call = 0;
+  const winners = ["output_1", "output_2", "tie"];
+  const model: JudgeModel = async () => {
+    const winner = winners[Math.min(call++, winners.length - 1)];
+    return {
+      toolInput: { winner, margin: "better", deciding_criterion: "c", rationale: "r" },
+      stopReason: "tool_use",
+      usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+    };
+  };
+
+  const verdicts = await judgeAll(records, aResults, bResults, model, 1, 6);
+
+  assert.equal(verdicts.length, 3);
+  assert.deepEqual(
+    verdicts.map((v) => v.caseId),
+    records.map((r) => r.runId),
+    "verdicts should be in record order",
+  );
+});
+
+test("judgeAll with concurrency 1 behaves identically to serial", async () => {
+  const records = [makeRecord(), makeRecord()];
+  const aResults = records.map((r) => makeResult({ caseId: r.runId }));
+  const bResults = records.map((r) => makeResult({ caseId: r.runId }));
+
+  const model = fakeModel([{ winner: "tie", margin: "tie" }]);
+  const verdicts = await judgeAll(records, aResults, bResults, model, 1, 1);
+
+  assert.equal(verdicts.length, 2);
+});

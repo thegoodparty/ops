@@ -22,6 +22,18 @@ export interface Result {
   wallTimeMs: number;
 }
 
+export const resultFromRecord = (record: ReviewRecord): Result => ({
+  caseId: record.runId,
+  repo: record.repo,
+  prNumber: record.prNumber,
+  headSha: record.headSha,
+  variant: `prod-${record.agentVersion.slice(0, 7)}`,
+  output: record.output,
+  error: record.error,
+  costUsd: record.costUsd,
+  wallTimeMs: record.wallTimeMs,
+});
+
 export type RunAgentImpl = (
   config: AgentConfig,
   prompt: string,
@@ -161,7 +173,7 @@ export const replayAll = async (
   checkoutFn?: CheckoutFn,
 ): Promise<Result[]> => {
   const { out, variant, workDir = "/tmp/review-eval", force = false } = opts;
-  const { concurrency = 3 } = poolOpts;
+  const { concurrency = 4 } = poolOpts;
 
   mkdirSync(out, { recursive: true });
   mkdirSync(workDir, { recursive: true });

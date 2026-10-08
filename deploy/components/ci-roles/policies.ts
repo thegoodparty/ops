@@ -468,6 +468,26 @@ export const githubActionsInfrastructureDeployTrust = opsWorkflowTrust(
   "deploy-infrastructure.yml",
 );
 
+export const githubActionsDelegateEvalTrust = opsWorkflowTrust("delegate-eval.yml");
+
+export const githubActionsDelegateEval: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "DelegateReviewsRead",
+      Effect: "Allow",
+      Action: ["s3:GetObject", "s3:GetObjectVersion"],
+      Resource: "arn:aws:s3:::delegate-reviews/*",
+    },
+    {
+      Sid: "DelegateReviewsList",
+      Effect: "Allow",
+      Action: "s3:ListBucket",
+      Resource: "arn:aws:s3:::delegate-reviews",
+    },
+  ],
+};
+
 // Trust for the PR preview role. The subject is the `pull_request` subject
 // exactly: not `:*`, not `main`, and no other repository. Fork PRs cannot
 // obtain an OIDC token at all, but the workflow skips them explicitly so the
