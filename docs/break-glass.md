@@ -74,10 +74,12 @@ see "The CloudTrail gap" and open question 7.
 Stated as an invariant rather than a feature:
 
 - No one outside the current `Admins` set holds standing `AdministratorAccess`
-  in any account. This is a **deliberate softening** of the original "no person
-  holds standing admin": the current members of `Admins` are grandfathered as
-  standing admins for now, and the JIT flow governs everyone else. The softening
-  is flagged for confirmation under "Existing members" and in open question 8.
+  in any account, **for now**. This is a deliberate, two-phase softening of the
+  original "no person holds standing admin": the current members of `Admins`
+  are grandfathered and stay, and the JIT flow governs everyone else. A
+  follow-up PR removes those standing members manually and empties the
+  grandfather allowlist, after which the invariant is the original one. See
+  "Existing members and the grandfather allowlist".
 - Any engineer can request admin, for a bounded duration, with a stated reason.
 - A designated human approver, not the requester, must approve it.
 - The grant is time-boxed and revoked without anyone remembering to revoke it.
@@ -199,11 +201,12 @@ that session reaches the permission set's `sessionDuration`. So:
 
 - The existing `administrator` `sessionDuration` drops from `PT8H` to `PT1H`.
   Identity Center permits 1 to 12 hours, so `PT1H` is the floor.
-- A consequence to state out loud: this shortens **every** `Admins` session,
-  including the grandfathered standing members, not only the JIT grants. Their
-  "long-lived access" is membership, in that they can always sign in again; it
-  is no longer a long session. That is the intended trade, and it is what makes
-  the escalated window bounded at all.
+- This shortens **every** `Admins` session, including the grandfathered standing
+  members, not only the JIT grants. That is deliberate and confirmed: it is a
+  feature, not a side effect. Nobody, standing admin or not, holds a long
+  session, and the escalated window is bounded for everyone. A standing member's
+  long-lived access is membership, in that they can sign in again at any time;
+  the session itself is one hour.
 - Treat the requested duration as the **grant window**, not a guarantee. The
   honest worst case is `requested duration + remaining session`, which with a
   `PT1H` set is at most roughly twice the request. The Slack reply must say
@@ -240,37 +243,31 @@ groups were attractive and why dropping them is a real change: they were a
 blast-radius control that this design gives up. The compensating controls are
 the approver gate and the audit, not a narrower grant.
 
-### Existing members, grandfathering, and the residual ambiguity
+### Existing members and the grandfather allowlist
 
-The `Admins` group has members today. Review said to repurpose it in place
-rather than retire it, so those members stay and there is no migration step. The
-tool does not remove them on arrival.
+The `Admins` group has members today. Review confirmed it is repurposed in
+place, so those members stay and there is no migration step. They are **not**
+removed by the sweeper. The engineer will remove them manually in a follow-up PR
+once the rest of the tool is working.
 
 That makes the reconciliation sweeper's definition of an **expected**
-membership the load-bearing one. This document defines it as a membership that
-is either:
+membership the load-bearing one. The expected set is the union of:
 
-1. backed by an active grant (the tool created it, and it has not expired), or
-2. a **grandfathered standing member**: a member of `Admins` as of the snapshot
-   taken when the tool first lands.
+1. an **active grant**: a membership the tool created that has not expired, and
+2. the **grandfather allowlist**: a hardcoded `grandfatheredAdmins` array of the
+   current `Admins` member IDs, in the tool's code alongside the hardcoded
+   approver list.
 
-Anything else is unexpected, and unexpected is what alarms and gets revoked.
+A membership in neither set is unexpected, and unexpected is what alarms and
+gets revoked. Editing the allowlist is a code change, like the approver list, so
+it is reviewed rather than self-service.
 
-> **Residual ambiguity to confirm.** Review said two things that do not
-> obviously agree: existing `Admins` members "can stay in place until the
-> automation fires", and "Admins should keep long-lived access anyway". The
-> first reads as the sweeper eventually removing every membership not backed by
-> an active grant, which would strip standing access from today's members on its
-> first pass. The second reads as the opposite: those members keep standing
-> access and only the JIT grants are time-boxed. This document implements the
-> second reading, because the `sessionDuration` decision only makes sense if
-> grandfathered members remain members. The sweeper treats a grandfathered
-> standing member as expected and never removes one. The cost is that the
-> original "no person holds standing admin" invariant is softened to "no one
-> outside the current `Admins` set holds standing admin", which is a real change
-> and should be confirmed. If the first reading was intended, the sweeper should
-> remove grandfathered members on its first pass and this note should be
-> replaced with that.
+The allowlist is temporary by design. The manual-cleanup PR empties it and
+removes the standing members, and until that PR lands the invariant is
+deliberately softened to "no one outside the current `Admins` set holds standing
+admin". After it lands, the allowlist is empty and the invariant is the original
+"no standing admin". The two-phase wording is intentional: the tool enforces the
+first phase from day one, and the second phase is one reviewed PR away.
 
 ## Architecture
 
@@ -445,9 +442,10 @@ not be papered over. The mitigations are:
 - The code is deployed by CI from a reviewed branch, and `deploy/` and
   `deploy-infrastructure/` are owned paths requiring human review.
 - The reconciliation sweeper catches a membership that is neither an active
-  grant nor a grandfathered standing member, and that **unexpected** membership
-  is what alarms. A normal grant produces an informational record, not a page;
-  paging on every grant is alert fatigue and would train people to ignore it.
+  grant nor on the grandfather allowlist, and that **unexpected** membership is
+  what alarms. Every grant also writes a low-severity informational record, not
+  a page; paging on every grant is alert fatigue and would train people to
+  ignore it.
 - The audit trail, once step 1 lands, is independent of the tool and cannot be
   rewritten by it, so a bad grant cannot be hidden after the fact, only seen.
 - The blast radius of the tool is `Admins` in all three accounts, which is the
@@ -468,12 +466,20 @@ per transition: `request.created`, `request.approved`, `request.denied`,
 `membership.unexpected` from the sweeper. Each carries the request id,
 requester, approver, group, reason, ticket link, and timestamps.
 
-Metric filters turn those into metrics. The loud alarm is on
-`membership.unexpected`: a membership with no active grant and no grandfather
-record, which is the signal that something bypassed the tool. A normal
-`grant.created` produces a low-severity informational record and a channel post
-so the approver can see their approval took effect, but it does not page. This
-layer answers *who asked, who approved, why, how long*.
+There are two signals, and they are deliberately different in loudness:
+
+- **Every `grant.created` writes one low-severity informational audit event**,
+  non-paging. This is the durable record of the grant, independent of the tool's
+  own approval logic having behaved correctly; it is what a future reader
+  reconstructs the history from, and it is what makes the time-boxed gap while
+  CloudTrail is absent survivable. It also posts to the channel so the approver
+  can see their approval took effect.
+- **The loud alarm is on `membership.unexpected`**: a membership in neither the
+  active-grant set nor the grandfather allowlist, which is the signal that
+  something bypassed the tool. Only that pages.
+
+Metric filters turn those events into metrics. This layer answers *who asked,
+who approved, why, how long*.
 
 ### AWS audit
 
@@ -529,12 +535,13 @@ tool's own records are structured for export and retention from day one.
 - **Never leave a grant open.** Two independent mechanisms: an EventBridge
   Scheduler one-shot at the exact expiry, with retries and a dead-letter queue,
   and a periodic reconciliation sweeper. The sweeper lists the current `Admins`
-  memberships, compares them against active grants and the grandfathered
-  snapshot, revokes anything expired, and alarms on a membership that is neither
-  expected kind. The scheduler is the normal path; the sweeper is what catches a
+  memberships, compares them against the expected set (active grants plus the
+  grandfather allowlist), revokes anything expired, and alarms on a membership
+  in neither. The scheduler is the normal path; the sweeper is what catches a
   failed schedule and a membership the tool did not create.
-- **Expected means active grant or grandfathered standing member.** Defined
-  above; it is the whole basis for deciding what is drift.
+- **Expected means an active grant or an entry on the grandfather allowlist.**
+  Defined under "Existing members and the grandfather allowlist"; it is the
+  whole basis for deciding what is drift.
 - **Idempotent revoke.** `DeleteGroupMembership` on a non-member is a no-op
   worth tolerating, and the grant record's state makes a double revoke harmless.
   Both the scheduler and the sweeper may fire for the same grant.
@@ -608,10 +615,10 @@ rather than staying open.
    audit log. A trail nobody can read is not an audit; a trail everyone can read
    is a data-exposure problem. This is step 1 and no longer blocks the runtime,
    so the gap is known and time-boxed rather than a prerequisite.
-8. **The grandfathering residual ambiguity.** Whether existing `Admins` members
-   keep standing access indefinitely (this document's reading, and the one
-   implemented) or are removed by the sweeper's first pass. See the note under
-   "Existing members".
+8. ~~**The grandfathering residual ambiguity.**~~ **Settled by the engineer:**
+   existing `Admins` members stay and are not removed by the sweeper; they will
+   be removed manually in a follow-up PR, which also empties the grandfather
+   allowlist. See "Existing members and the grandfather allowlist".
 
 ## Implementation plan
 
@@ -657,8 +664,9 @@ The Progress list is the checklist; this is the detail behind each step.
    post on revoke. The sweeper from step 4 is the backstop.
 
 There is no separate step to retire `Admins`; it is repurposed in place, and the
-grandfathered members are handled by the sweeper's definition of expected rather
-than by a migration.
+grandfathered members are handled by the grandfather allowlist rather than by a
+migration. Removing them, and emptying the allowlist, is a deliberate follow-up
+PR once the rest of the tool is working, not part of this plan's steps.
 
 ## Grounding: the files this touches
 
