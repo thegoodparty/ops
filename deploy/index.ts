@@ -6,6 +6,7 @@ import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createDelegateSwarmProdRead } from "./components/delegate-swarm-prod-read";
+import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -47,6 +48,7 @@ export = async () => {
   createCiRoles();
 
   createDelegateSwarmProdRead();
+  createInfraZoneDelegation();
 
   return {
     webhookUrl: webhook.url,
