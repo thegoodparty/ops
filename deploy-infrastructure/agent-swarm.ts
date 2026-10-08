@@ -77,12 +77,6 @@ export const userData = (dataVolumeId: string) => {
       `agent-swarm/ec2-user-data.sh has no ${DATA_VOLUME_PLACEHOLDER} placeholder`,
     );
   }
-  // `split`/`join` rather than the ES2021 `replaceAll`. Pulumi's TypeScript
-  // runtime compiles this program without the repo's tsconfig lib, so
-  // `replaceAll` is a type error there (TS2550) even though `tsc` at the repo
-  // root accepts it. That mismatch failed #245's `Deploy infrastructure` run
-  // and then this project's first preview. The placeholder is a literal with
-  // no regex metacharacters, so the ES5 spelling is an exact substitute.
   return script.split(DATA_VOLUME_PLACEHOLDER).join(dataVolumeId);
 };
 
