@@ -294,6 +294,26 @@ that omits `{ provider }` fails rather than landing in the management account,
 and the provider sets `allowedAccountIds`, so a provider resolving to the wrong
 credentials fails before any resource is touched.
 
+## DNS
+
+The account owns a Route 53 hosted zone, `infra.goodparty.org`, created in
+`deploy-infrastructure/dns.ts` and shared by every service here. The first
+name in it is `delegate-swarm.infra.goodparty.org`.
+
+The reason is the same boundary as everything else in this document.
+`goodparty.org` (`Z10392302OXMPNQLPO07K`) is the production zone and lives
+in the management account. A service here that needed a name in it would
+need write access to that zone, or a PR to the `ops` stack for every record.
+With a delegated subzone the account manages its own names and holds no
+access to the production zone at all.
+
+The delegation is one NS record in `goodparty.org`, managed by `deploy/`,
+naming the zone's four name servers (the `infraZoneNameServers` stack output)
+as constants. It is the only DNS change the management account makes for this
+account. The zone is `protect`ed because a recreated zone gets new name
+servers, and the NS record would then point every `infra.goodparty.org` name
+at servers that no longer answer for it.
+
 ## The deploy role
 
 `github-actions-infrastructure-deploy`, created by the `ops` stack, trusted

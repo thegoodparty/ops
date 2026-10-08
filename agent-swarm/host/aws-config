@@ -1,0 +1,5 @@
+[default]
+role_arn = arn:aws:iam::333022194791:role/delegate-swarm-prod-read
+credential_source = Ec2InstanceMetadata
+role_session_name = delegate-swarm
+region = us-west-2

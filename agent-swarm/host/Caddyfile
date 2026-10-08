@@ -1,0 +1,96 @@
+# delegate-swarm.infra.goodparty.org: serve the self-built dashboard SPA from
+# /srv/ui and reverse-proxy every API path to the api container.
+#
+# API prefixes (agent-swarm v1.163.0):
+#   /api/*          every REST route (src/http/*.ts: path: "/api/...")
+#   /p/*            public page views  (src/http/pages-public.ts:54,75)
+#   /@swarm/*       page SDK + proxy    (src/http/page-proxy.ts:37, realtime.ts)
+#   /mcp            swarm MCP endpoint  (src/http/mcp.ts:158)
+#   /mcp-user       user-token MCP      (src/http/mcp-user.ts:46, core.ts:454)
+#   /health /openapi.json /docs         (src/http/core.ts:416,434,442)
+#   /status         (src/http/status.ts:766)
+#   /ping /close    (src/http/core.ts:356,378)
+#   /x/*            (src/http/x.ts)
+# None of these collide with SPA routes (apps/ui/src/app/router.tsx:129-211:
+# /agents /tasks /sessions /chat /services /schedules /workflows /workflow-runs
+# /connections /scripts /script-runs /approval-requests /usage /settings
+# /templates /mcp-servers /skills /repos /people /memory /pages /apps /file
+# /setup /integrations).
+#
+# SWARM_AUTH (set by render-env.sh, passed to the caddy container) picks the
+# snippet: "open" (bearer auth only) or "sso" (Google login via oauth2-proxy
+# in front of everything except machine callers).
+
+(spa) {
+	root * /srv/ui
+
+	# index.html and version.json carry the build id the SPA polls to
+	# prompt a reload (apps/ui/vite.config.ts buildVersionManifest), so
+	# they must never be cached. Hashed assets are immutable.
+	@nocache path / /index.html /version.json
+	header @nocache Cache-Control "no-cache"
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	try_files {path} /index.html
+	file_server
+}
+
+(open) {
+	@api path /api/* /p/* /@swarm/* /mcp /mcp-user /health /status /docs /docs/* /openapi.json /x/* /ping /close
+	handle @api {
+		reverse_proxy api:3013
+	}
+
+	handle {
+		import spa
+	}
+}
+
+(sso) {
+	# oauth2-proxy's own endpoints: login start, Google callback, sign out.
+	handle /oauth2/* {
+		reverse_proxy oauth2-proxy:4180 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Uri {uri}
+		}
+	}
+
+	# Machine callers with their own bearer or signature, and IdP callbacks
+	# that carry their own state: no browser cookie.
+	@noauth path /mcp /mcp-user /health /status /ping /api/github/webhook /api/gitlab/webhook /api/azure-devops/webhook /api/agentmail/webhook /api/integrations/kapso/webhook /api/mcp-oauth/callback /api/oauth/callback /api/oauth/*/callback
+	handle @noauth {
+		reverse_proxy api:3013
+	}
+
+	handle {
+		forward_auth oauth2-proxy:4180 {
+			uri /oauth2/auth
+			copy_headers X-Auth-Request-User X-Auth-Request-Email X-Auth-Request-Groups X-Forwarded-User X-Forwarded-Email
+
+			# Browser navigations go to the login page; fetches from the SPA
+			# get a plain 401 instead of a redirect into Google's HTML.
+			@error status 401 403
+			handle_response @error {
+				@navigation header Accept *text/html*
+				redir @navigation /oauth2/start?rd={http.request.uri_escaped} 302
+				respond 401
+			}
+		}
+
+		@api path /api/* /p/* /@swarm/* /docs /docs/* /openapi.json /x/* /close
+		handle @api {
+			reverse_proxy api:3013
+		}
+
+		handle {
+			import spa
+		}
+	}
+}
+
+delegate-swarm.infra.goodparty.org {
+	encode zstd gzip
+
+	import {$SWARM_AUTH:open}
+}

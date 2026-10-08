@@ -25,6 +25,8 @@ on:
       # The account id the provider assumes into. It lives outside this
       # project, so an edit to it must still re-apply this stack.
       - "utils/accounts.ts"
+      # The swarm host's files and first-boot script, synced by the stack.
+      - "agent-swarm/**"
 
 # Its own group: a different stack with a different S3 lock from the other
 # deploy workflows, so there is nothing to serialize between them.
@@ -46,7 +48,8 @@ jobs:
     runs-on: ubuntu-latest
     # Well above the expected runtime, far below the six hour default that
     # would let a wedged run hold the lock all day.
-    timeout-minutes: 15
+    # Must exceed the swarm association's waitForSuccessTimeoutSeconds (40m).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
 
