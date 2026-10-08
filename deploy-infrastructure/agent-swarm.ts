@@ -375,12 +375,18 @@ export const createAgentSwarm = (args: {
   // Runs once whenever the command changes, which is whenever any host file
   // does. `pulumi up` waits for it, so a host that fails to take a change
   // fails the deploy instead of drifting quietly.
+  //
+  // Targets the Name tag, not the instance id. An association created before
+  // its instance has registered with SSM never reaches it when it names the
+  // id: the first apply waited 40 minutes on an agent that kept reporting zero
+  // associations. Tag targets are re-evaluated as instances register, which
+  // also covers a replaced instance.
   new aws.ssm.Association(
     "delegateSwarmHostSync",
     {
       name: "AWS-RunShellScript",
       associationName: "delegate-swarm-host-sync",
-      targets: [{ key: "InstanceIds", values: [instance.id] }],
+      targets: [{ key: "tag:Name", values: [NAME] }],
       parameters: {
         commands: syncCommand(hash),
         executionTimeout: "3600",
@@ -396,6 +402,7 @@ export const createAgentSwarm = (args: {
       dependsOn: [
         ...objects,
         containerLogGroup,
+        instance,
         dataVolumeAttachment,
         hostPolicy,
         ssmCore,
