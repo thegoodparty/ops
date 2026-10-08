@@ -53,7 +53,7 @@ Swain's intent, in his words paraphrased from the kickoff on 2026-10-05:
 | Day-one access | GitHub (above), Grafana read-only, ClickUp. AWS: production read-only through `arn:aws:iam::333022194791:role/delegate-swarm-prod-read` | Swain | Agents assume the role through `host/aws-config`. The api container has no AWS access. |
 | Embeddings | Local `text-embeddings-inference` container (`nomic-embed-text-v1.5`, 512 dims) | Agent, after Swain asked "can we use AWS?" | Bedrock's OpenAI-compatible API has no `/v1/embeddings`. Summaries use the Anthropic key (Haiku fallback). Workflow LLM nodes still need OpenAI/OpenRouter; not configured. |
 | Dashboard | Self-hosted SPA at `delegate-swarm.infra.goodparty.org`, built from `apps/ui` | Swain: "I'd want the dashboards to be on our urls" | `app.agent-swarm.dev` still works as a fallback (CORS default left in place). |
-| Login in front | Not done. Recommended: `oauth2-proxy` with Google, domain `goodparty.org` | Swain asked for "our oauth"; agent recommended Google | Proposal in `docs/sso-proposal.md`. Needs a Google OAuth client from Swain. See section 8. |
+| Login in front | `oauth2-proxy` with Google, domain `goodparty.org`; built, off until the client exists | Swain asked for "our oauth"; agent recommended Google | The bypass list is the `sso` snippet in `host/Caddyfile`. Needs a Google OAuth client from Swain. See section 8. |
 | API exposure | Public 443 with bearer-key auth | Agent, same posture as delegate Lambda URL and BugBoss ALB | VPN-only restriction was offered as a stopgap; not applied. |
 | Home channel | `#swarm-testing` (`C0C6RUJ9VMK`) | Swain | Also `SLACK_ALERTS_CHANNEL`. Bot replies only where addressed. |
 | Access gate | `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org` | Agent | Requires the `users:read.email` bot scope; Swain added it by hand after the first message was denied. |
@@ -228,7 +228,7 @@ Not started, by choice:
 
 ## 9. Where everything the agent wrote lives
 
-- **This directory** (`agent-swarm/` on branch `feat/agent-swarm-host`, draft PR [#245](https://github.com/thegoodparty/ops/pull/245)): compose, Caddyfile, `aws-config`, scripts, systemd unit, Slack manifest, EC2 user-data, `fill-secrets.sh`, the soul files (`host/soul/`), `README.md` (procedures), this file, `docs/sso-proposal.md`, `iam/agent-swarm-aws-readonly.json` (the production read-only policy; `deploy/components/delegate-swarm-prod-read.ts` applies it). Nothing here is application code; it is config.
+- **This directory** (`agent-swarm/` on branch `feat/agent-swarm-host`, draft PR [#245](https://github.com/thegoodparty/ops/pull/245)): compose, Caddyfile, `aws-config`, scripts, systemd unit, Slack manifest, EC2 user-data, `fill-secrets.sh`, the soul files (`host/soul/`), `README.md` (procedures), this file, `iam/agent-swarm-aws-readonly.json` (the production read-only policy; `deploy/components/delegate-swarm-prod-read.ts` applies it). Nothing here is application code; it is config.
 - **On the host** `/opt/agent-swarm/`: the same files plus `.env` (rendered, never commit) and `ui-dist/`.
 - **Pilot guide for users** (Claude artifact, private, Swain owns it): https://claude.ai/artifact/S1oPLMimpwCfGuN2f5sEzu . Source HTML was in the job's tmp dir and is not in git; the content is a prose version of sections 1 to 7.
 - **Swain's Claude memory** (`~/.claude/projects/-Users-swain-Repos-thegoodparty-omni/memory/swarm-playground-2026-10.md`): a shorter record of the same facts for his future sessions. `memory/attic/agent-swarm-*.md` is the earlier attempt he asked not to be used.

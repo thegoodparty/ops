@@ -120,8 +120,8 @@ Off until the secret holds `OAUTH2_PROXY_CLIENT_ID`,
 none; `render-env.sh` refuses a partial set). Then `up.sh` starts
 `oauth2-proxy` and Caddy puts every browser path behind Google sign-in for
 `goodparty.org`. MCP, `/health`, webhooks and OAuth callbacks stay open
-because their callers carry their own credentials. Design and bypass list:
-`docs/sso-proposal.md`.
+because their callers carry their own credentials. The bypass list is the
+`sso` snippet in `host/Caddyfile`.
 
 To turn it on:
 

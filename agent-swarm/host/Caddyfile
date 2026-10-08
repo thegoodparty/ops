@@ -19,7 +19,7 @@
 #
 # SWARM_AUTH (set by render-env.sh, passed to the caddy container) picks the
 # snippet: "open" (bearer auth only) or "sso" (Google login via oauth2-proxy
-# in front of everything except machine callers; see docs/sso-proposal.md).
+# in front of everything except machine callers).
 
 (spa) {
 	root * /srv/ui
