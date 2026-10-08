@@ -223,8 +223,7 @@ containers can reach IMDS). The api container has no AWS access.
 
 ## Bringing it up
 
-The swarm starts with fresh state. Nothing carries over from the old host in
-the management account, which is torn down once this one is live. In order:
+The swarm starts with fresh state. In order:
 
 1. **Merge.** The deploy applies `deploy-infrastructure/`. The host installs
    `host/` and does not start the stack, because the secret has no value

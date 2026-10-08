@@ -44,7 +44,7 @@ Swain's intent, in his words paraphrased from the kickoff on 2026-10-05:
 | Decision | Chosen | By | Notes |
 | --- | --- | --- | --- |
 | Where it runs | EC2 in account `394495727159` (infrastructure), `us-west-2`, Pulumi in `deploy-infrastructure/`. Hostname `delegate-swarm.infra.goodparty.org` | Swain | It started as a hand-built host in `333022194791` (the management account) at `swarm.goodparty.org`. `docs/infrastructure-account.md` records why it lives in the infrastructure account. |
-| The move | Fresh state, no migration. The old host is torn down once the new one is live | Swain | `host/bootstrap.sh` rebuilds what the repo defines; schedules, apps, pages and memory start empty. |
+| The move | Fresh state, no migration | Swain | `host/bootstrap.sh` rebuilds what the repo defines; schedules, apps, pages and memory start empty. |
 | State | Docker's whole state on a separate EBS data volume at `/var/lib/docker` | Swain | A replacement instance mounts it and keeps the swarm. `ec2-user-data.sh` formats it only if blank. |
 | Slack identity | The existing Delegate app, Socket Mode, without `chat:write.customize` | Swain | Replaces the Swarm app and the delegate bot's use of the Delegate app. Without the scope Slack ignores the per-agent username and emoji agent-swarm sends (the lead's would be a crown), so every message is the Delegate app's own name and icon. |
 | Model provider | Anthropic API key in a dedicated Anthropic workspace `agent-swarm` with a spend limit | Swain | No Bedrock. No Claude Code OAuth token (incompatible with multi-worker use). |
@@ -78,24 +78,11 @@ instance, volume and address ids are in the stack outputs and the EC2 console.
 | DNS | A record `delegate-swarm.infra.goodparty.org` → the Elastic IP, in the infrastructure account's own zone `infra.goodparty.org` (`deploy-infrastructure/dns.ts`). The `goodparty.org` zone (`Z10392302OXMPNQLPO07K`) in the management account delegates it with one NS record in `deploy/`, added by a follow-up PR (section 8). |
 | Access | `aws ssm start-session` with a profile for the infrastructure account (README, "Connect") |
 
-### Old home: account 333022194791, to tear down
-
-Nothing on it is kept. Once the new host is live, delete: instance
-`i-04cc03c17787f5d59`, Elastic IP `52.10.75.185`
-(`eipalloc-0041bc8ffac0a5efd`), security group `sg-075cb6173b8b55291`, role
-and instance profile `agent-swarm-host`, secret `AGENT_SWARM`, log group
-`/agent-swarm/containers`, config bucket `agent-swarm-config-333022194791`,
-DLM policy `agent-swarm-snapshots` and its snapshots, the old hostname's A
-record in the `goodparty.org` zone, the Slack app Swarm, and the pilot's
-Grafana service account `agent-swarm`.
-
 ### Not in AWS
 
-- Slack: the existing **Delegate** app, reconfigured from `slack-manifest.json`
-  (Socket Mode). The old app **Swarm** (`A0C7RNR4N4Q`, bot user
-  `U0C6ZA542JD`, workspace `TG1ARMPK5`) goes with the old host. Slash
-  commands `/agent-swarm-status` and `/agent-swarm-help` are hardcoded in
-  agent-swarm.
+- Slack: the existing **delegate** app, reconfigured from `slack-manifest.json`
+  (Socket Mode). Slash commands `/agent-swarm-status` and `/agent-swarm-help`
+  are hardcoded in agent-swarm.
 - Anthropic workspace `agent-swarm` (Swain created it; spend limit set by him).
 - Grafana service account `delegate` (Viewer), token without expiry.
 - ClickUp: a service seat's personal API token as `CLICKUP_API_TOKEN`, plus the
@@ -127,7 +114,6 @@ Key env (names only; see `render-env.sh` and the compose file for the full set):
 - Agents (shared `x-worker-env` anchor): `HARNESS_PROVIDER=pi`, `ANTHROPIC_API_KEY`, `MODEL_OVERRIDE` **provider-prefixed** (`anthropic/claude-opus-5-5` lead, `anthropic/claude-sonnet-5-5` workers), `MCP_BASE_URL=http://api:3013`, `APP_URL`, `GITHUB_TOKEN`, `GITHUB_NAME=delegate`, `GITHUB_EMAIL` (delegate-gp-bot's noreply address), `CLICKUP_API_TOKEN` and `CLICKUP_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `GRAFANA_URL`, `AWS_CONFIG_FILE`, `AWS_SDK_LOAD_CONFIG=1`. The lead also has `AGENT_NAME=delegate`. Agent ids are pinned in env so they survive recreation. Agent-scope `HARNESS_PROVIDER` and `MODEL_OVERRIDE` rows in the swarm's config win over these env values.
 - `grafana-mcp`: pinned by digest; `-t streamable-http --address 0.0.0.0:8000 --allowed-hosts grafana-mcp:8000,grafana-mcp` (it rejects non-loopback Host headers otherwise). It has **no caller auth**; only the compose network reaches it.
 
-Resource use on the old host on 2026-10-07: 15 GB of 120 GB disk, 2.9 GB of 15.6 GB RAM. TEI holds about 1.85 GB.
 
 ## 5. State inside the swarm (SQLite, not in git)
 
@@ -179,47 +165,39 @@ Verified in the v1.163.0 source; cite `src/...` paths from a checkout of the tag
 - **Models**: `MODEL_OVERRIDE` is passed verbatim to `claude --model` on the claude harness; pi wants a provider-prefixed id (`anthropic/...`). Only the worker reads it (`src/commands/runner.ts`); the API never does. Workflow LLM nodes take the node's own model or a default per credential kind (`src/workflows/executors/workflow-llm.ts`). `modelTier` (`smol|regular|smart|ultra`) via `MODEL_TIER_MAP` is the provider-agnostic alternative. Session summaries/memory rating use OpenRouter → Anthropic → OpenAI in that precedence; workflow LLM nodes accept only `openrouter`/`openai`.
 - **Images**: worker is 5.4 GB unpacked (full toolchain + Playwright). `pull_policy: always` was removed since the tag is pinned.
 
-## 8. Productionization status (updated 2026-10-07)
+## 8. Productionization status (updated 2026-10-08)
 
-Done, in the PR that moves the host:
+Live at `delegate-swarm.infra.goodparty.org` in account `394495727159`,
+answering in Slack as delegate.
 
-1. **Infrastructure as code** in `deploy-infrastructure/`, account
-   `394495727159`. Host files reach the host through S3 and an SSM
-   association on every deploy; `pulumi up` waits for it. The secret is
-   created empty and filled by hand. A new host installs its files and waits
-   for the secret before it starts anything.
+1. **Infrastructure as code** in `deploy-infrastructure/`. Host files reach
+   the host through S3 and an SSM association on every deploy; `pulumi up`
+   waits for it. The secret is created empty and filled by hand. A new host
+   installs its files and waits for the secret before it starts anything.
 2. **State on its own volume** at `/var/lib/docker`, so a replacement
    instance keeps the swarm. Backups are snapshots of that volume.
 3. **Fresh state from the repo**: `host/bootstrap.sh` rebuilds the setup
-   script, MCP servers, lead soul and agent runtimes. No migration from the
-   old host.
+   script, MCP servers (grafana; clickup once connected), lead soul and
+   agent runtimes.
 4. **Production access** read-only through `delegate-swarm-prod-read`.
-5. **Delegate name**: Slack app, lead name, hostname.
-6. **pi harness** for every agent.
-7. **`grafana/mcp-grafana` pinned** to a digest.
+5. **Identity**: the delegate Slack app in Socket Mode, the lead named
+   delegate, GitHub as `delegate-gp-bot`, ClickUp as the delegate seat,
+   Grafana as service account `delegate`.
+6. **DNS**: `infra.goodparty.org` is delegated to the infrastructure
+   account's zone; every name for that account lives there.
+7. **pi harness** for every agent; `grafana/mcp-grafana` pinned to a digest.
 8. **Version bumps** are a one-line PR (README, "Upgrade agent-swarm"); the
    dashboard rebuilds itself when the version changes.
 
-Open, waiting on Swain (README, "Bringing it up", has the order):
+Open:
 
-1. **GitHub service user**: the account, its PAT, and its real login and
-   email in `host/render-env.sh` (now placeholders).
-2. **ClickUp service seat** and its token; then connect the clickup MCP
-   server as that seat.
-3. **Grafana service account** `delegate` and its token.
-4. **DNS delegation**: after the first apply, a one-time PR in `deploy/`
-   adds the NS record for `infra.goodparty.org` with the four
-   `infraZoneNameServers` stack outputs as constants. That is the last DNS
-   change the management account ever needs for this account; the
-   `delegate-swarm` A record and every later one live in the zone in the
-   infrastructure account.
-5. **Delegate Slack switch**: manifest, Socket Mode, reinstall, invite the
-   bot to its channels.
-6. **Google OAuth client** for login. oauth2-proxy and the SSO Caddy routes
+1. **Google OAuth client** for login. oauth2-proxy and the SSO Caddy routes
    switch on when the secret holds the three `OAUTH2_PROXY_*` keys (README,
    "Google login").
-7. **Schedules**: none exist. Swain decides which to add.
-8. **Old host teardown** once the new one is live (section 3).
+2. **Schedules**: none exist. Swain decides which to add.
+3. **PR previews** for `deploy-infrastructure/` (step 11 of
+   `docs/infrastructure-account.md`). Until then its first real compile and
+   plan is the apply on main.
 
 Not started, by choice:
 
