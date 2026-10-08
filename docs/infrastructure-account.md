@@ -142,9 +142,16 @@ starting the work, not after. Make `who` name the *session*, not the model.
       `deploy.yml`, and the merge's `Deploy` run is the read-back: green, the
       `AdministratorAccess` set provisioned into `394495727159` for the Admins
       group.
-- [ ] 9. Harden the account's root user, in the console: todo. Enable MFA,
-      remove any root access keys, and set the alternate contacts. The group
-      alias from step 1 is the recovery path, not the daily driver.
+- [x] 9. Harden the account's root user, in the console: done (2026-10-07,
+      jeff), and corrected from what this step first said. New Organizations
+      accounts are created with no root user credentials, and root access for
+      member accounts is centralized in the management account, so there is no
+      child root password, MFA or access key to configure or remove. The
+      management account's root has MFA, and its Root access management is
+      where a privileged action on this account, or an "Allow password
+      recovery", would happen. The group alias from step 1 is the root-email
+      recovery path. Alternate contacts are separate from root credentials and
+      are not covered here.
 - [x] 10. Spend threshold alerts by email: done (2026-10-07, pi-infra-step10).
       One `aws.budgets.Budget` in `deploy-infrastructure/`, taking the explicit
       provider, with four notifications by email to the step 1 group alias
@@ -157,7 +164,14 @@ starting the work, not after. Make `who` name the *session*, not the model.
       green apply shows the budget and its subscribers exist, not that an email
       arrives — delivery can only be proven by a real crossing.
 - [ ] 11. Extend the PR preview role and workflow to cover the new project:
-      doing (pi-infra-step11, 2026-10-07). Design in "PR previews" below.
+      doing (pi-infra-step11, 2026-10-07). Design in "PR previews" below. Two
+      PRs, not one, for the ordering that section states: the management-side
+      grant and the provider's `providerRoleName` config land first, applied by
+      `deploy.yml` and `deploy-infrastructure.yml`, and the `pulumi-preview.yml`
+      change follows once the grant has applied. The split is load bearing for
+      a second reason: the preview workflow calls `deploy.sh` with `CI=true`,
+      so until the script learned `PULUMI_MODE` it would have run `pulumi up`
+      on a PR. The in-account `pulumi-preview` role already exists from step 7.
 - [ ] 12. Document how an admin reaches the account, and whether the container
       gets a profile for it: todo.
 

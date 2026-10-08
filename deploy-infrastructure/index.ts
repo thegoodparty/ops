@@ -1,3 +1,4 @@
+import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
@@ -21,12 +22,12 @@ import { createPreviewRole } from "./preview-role";
 /**
  * The way into the account.
  *
- * Step 7's cutover: the provider assumes `pulumi-deploy`, the role this same
- * stack creates in `deploy-role.ts`, which makes this file self-referential
- * in a way worth stating plainly. The apply runs as the role the apply
- * manages. That works because the role is administrator, including over
- * itself; `protect` on the role and its attachment is what keeps an edit from
- * locking CI out of the account, and the step 8 Admins Identity Center
+ * Step 7's cutover: the provider assumes `pulumi-deploy` on an apply, the role
+ * this same stack creates in `deploy-role.ts`, which makes this file
+ * self-referential in a way worth stating plainly. The apply runs as the role
+ * the apply manages. That works because the role is administrator, including
+ * over itself; `protect` on the role and its attachment is what keeps an edit
+ * from locking CI out of the account, and the step 8 Admins Identity Center
  * assignment is the recovery path once it lands.
  *
  * Until the cutover this assumed `OrganizationAccountAccessRole`, the
@@ -45,15 +46,33 @@ import { createPreviewRole } from "./preview-role";
  * provider resolving to credentials in some other account, before any
  * resource is touched.
  */
+/**
+ * The role the provider assumes into this account.
+ *
+ * Apply uses the admin deploy role. Preview mode sets this to the read-only
+ * `pulumi-preview` in `deploy.sh`, so a PR preview never holds admin here.
+ * `deploy.sh` sets it explicitly either way rather than leaving it to the
+ * default, so a local preview followed by a local apply cannot leave the
+ * preview role in the stack's config and repoint an apply at it.
+ *
+ * The default is the deploy role, so an apply that predates this config is
+ * identical to the hardcoded ARN it replaced. The cascade check is step 7's
+ * cutover, where the same `roleArn` edit was an in-place provider update, not
+ * a replacement of the resources behind it.
+ */
+const config = new pulumi.Config();
+const providerRoleName = config.get("providerRoleName") ?? DEPLOY_ROLE_NAME;
+
 const provider = new aws.Provider("infrastructure", {
   region: "us-west-2",
   assumeRoles: [
     {
-      // DEPLOY_ROLE_NAME rather than a literal: the grant in
-      // deploy/components/ci-roles/policies.ts and the trust in
-      // deploy-role.ts spell the same ARN out, and a drift between the three
-      // is an assume failure that reads as a trust problem.
-      roleArn: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${DEPLOY_ROLE_NAME}`,
+      // The role name comes from config: `pulumi-deploy` for an apply,
+      // `pulumi-preview` for a preview, both set in deploy.sh. The name is
+      // also spelled in the two role files and in the grants in
+      // deploy/components/ci-roles/policies.ts, and a drift between them is an
+      // assume failure that reads as a trust problem.
+      roleArn: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${providerRoleName}`,
       // The session name in this account's CloudTrail. It separates a CI
       // apply from a human who assumed the same role by hand.
       sessionName: "pulumi-deploy-infrastructure",

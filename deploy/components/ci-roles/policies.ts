@@ -889,10 +889,11 @@ export const githubActionsInfrastructureDeploy: PolicyDocument = {
 };
 
 /**
- * The whole grant for the PR preview role. Read-only, and only the three
- * projects a PR can preview. The one exception is `sts:AssumeRole` on the
- * workbench preview role, which is how a preview reaches that account without
- * the admin apply role; the role it reaches holds no permissions.
+ * The whole grant for the PR preview role. Read-only, and only the four
+ * projects a PR can preview. The one exception is `sts:AssumeRole`, on the
+ * workbench and infrastructure preview roles, which is how a preview reaches
+ * those accounts without the admin apply role; each role it reaches holds no
+ * permissions.
  *
  * Widened only by observed failures. `ecs:DescribeTaskDefinition` cannot be
  * resource-scoped; it exists so preview mode can resolve the currently
@@ -903,7 +904,12 @@ export const githubActionsInfrastructureDeploy: PolicyDocument = {
 export const githubActionsPulumiPreview: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
-    ...pulumiBackendReadStatements(["ops", "org", "workbench"]),
+    ...pulumiBackendReadStatements([
+      "ops",
+      "org",
+      "workbench",
+      "infrastructure",
+    ]),
     {
       Sid: "RuntimeSecretMetadata",
       Effect: "Allow",
@@ -938,6 +944,17 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       // does not renumber the statements above in every later diff.
       Action: ["sts:AssumeRole"],
       Resource: `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-preview`,
+    },
+    {
+      Sid: "AssumeInfrastructurePreviewRole",
+      Effect: "Allow",
+      // The infrastructure stack reaches its account by assuming a role into
+      // 394495727159, and a preview must not use the admin apply role. This
+      // is the management-side half; the trust on the other side is in
+      // deploy-infrastructure/preview-role.ts. Same shape as the workbench
+      // assume above, and last for the same reason.
+      Action: ["sts:AssumeRole"],
+      Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/pulumi-preview`,
     },
   ],
 };
