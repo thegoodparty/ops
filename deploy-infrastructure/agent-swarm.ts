@@ -77,7 +77,7 @@ export const userData = (dataVolumeId: string) => {
       `agent-swarm/ec2-user-data.sh has no ${DATA_VOLUME_PLACEHOLDER} placeholder`,
     );
   }
-  return script.replaceAll(DATA_VOLUME_PLACEHOLDER, dataVolumeId);
+  return script.split(DATA_VOLUME_PLACEHOLDER).join(dataVolumeId);
 };
 
 export const createAgentSwarm = (args: {
