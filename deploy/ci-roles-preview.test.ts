@@ -41,7 +41,7 @@ describe("githubActionsPulumiPreview", () => {
   // cannot slip in without failing here.
   it("grants read-only actions and nothing else", () => {
     // `sts:AssumeRole` is the one non-read action; it only reaches the
-    // workbench preview role, asserted separately below.
+    // workbench and infrastructure preview roles, asserted separately below.
     const readOnly =
       /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|sts:AssumeRole)/;
     for (const action of actions()) {
@@ -49,28 +49,29 @@ describe("githubActionsPulumiPreview", () => {
     }
   });
 
-  it("reaches the workbench preview role by assume, and nothing else there", () => {
-    const assume = githubActionsPulumiPreview.Statement.find((s) =>
+  it("reaches the workbench and infrastructure preview roles by assume", () => {
+    const assumes = githubActionsPulumiPreview.Statement.filter((s) =>
       (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(
         "sts:AssumeRole"
       )
     );
-    assert.ok(assume);
-    assert.equal(
-      assume.Resource,
-      "arn:aws:iam::024901689212:role/pulumi-preview"
-    );
+    const arns = assumes.map((s) => s.Resource).sort();
+    assert.deepEqual(arns, [
+      "arn:aws:iam::024901689212:role/pulumi-preview",
+      "arn:aws:iam::394495727159:role/pulumi-preview",
+    ]);
   });
 
   it("never grants GetSecretValue", () => {
     assert.equal(actions().includes("secretsmanager:GetSecretValue"), false);
   });
 
-  it("scopes state objects to ops, org and workbench, and nothing else", () => {
+  it("scopes state objects to ops, org, workbench and infrastructure, and nothing else", () => {
     const stacks = resources()
       .filter((r) => r.includes("/.pulumi/stacks/"))
       .sort();
     assert.deepEqual(stacks, [
+      "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/infrastructure/*",
       "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/ops/*",
       "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/org/*",
       "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/workbench/*",
