@@ -84,6 +84,7 @@ SWARM_API_DOMAIN=delegate-swarm.infra.goodparty.org
 MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org
 PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org
 APP_URL=https://delegate-swarm.infra.goodparty.org
+CORS_ALLOWED_ORIGINS=https://delegate-swarm.infra.goodparty.org
 API_DRAIN_MAX_MS=30000
 
 EMBEDDING_API_BASE_URL=http://tei:80/v1
