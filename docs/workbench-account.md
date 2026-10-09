@@ -391,9 +391,9 @@ Facts discovered during implementation go here as they are learned:
 - **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
   list imported by both the IAM policy that permits them and the script that
   subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5-5`,
-  `anthropic.claude-sonnet-5-5`, `xai.grok-4.6`, `openai.gpt-5.6-sol`,
-  `openai.gpt-5.6-terra` and `moonshotai.kimi-k3`, plus `zai.glm-5` and
-  `deepseek.v3.2` kept region-pinned by choice. Sonnet 5.5 was the one
+  `anthropic.claude-sonnet-5-5`, `openai.gpt-6.1-sol`,
+  `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3` and
+  `moonshotai.kimi-k3`, plus `deepseek.v3.2` kept region-pinned by choice. Sonnet 5.5 was the one
   exception — it launched with only a `global.` profile, which routes outside
   US geography — until AWS added `us.anthropic.claude-sonnet-5-5` on
   2026-10-01. The entry moved to the geo profile; the `global.` ARN stays
