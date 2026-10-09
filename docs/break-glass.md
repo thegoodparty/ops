@@ -400,11 +400,17 @@ granting ──expired, member present───▶ orphaned (revoke + alarm)
 
 `granting` is the state between "the approver said yes" and "the membership
 exists and its revoke is scheduled". The record is written before the membership
-so the state is never invisible, and the sweeper resolves it: member absent
-means the grant never completed (`failed`), member present means the grant is
-live (the sweeper schedules the revoke if the crash happened before that step),
-and member present past expiry means the normal path did not finish (`orphaned`,
-revoke and alarm).
+so the state is never invisible, and the sweeper resolves it:
+
+- **member absent**: the grant never completed; the record goes to `failed`.
+- **member present**: the grant is live. The `granting` record has no stored
+  `membershipId`, because the crash happened before the flip, so the sweeper
+  first calls `ListGroupMembershipsForMember` to resolve the existing
+  membership's `MembershipId` (matching on the `Admins` group), writes it onto
+  the record, and flips the record to `granted`. It then schedules the revoke if
+  the schedule is missing.
+- **member present past expiry**: the normal path did not finish. The sweeper
+  resolves the `MembershipId` the same way, then revokes and alarms (`orphaned`).
 
 DynamoDB is a single table: request items, grant items, and per-user rate
 counters. The grant item carries a **`state`** (`granting` or `granted`), the
@@ -417,7 +423,9 @@ resolved with `ListGroupMembershipsForMember` when that call returns
 `ConflictException` because the member already existed) when the record becomes
 `granted`. The record is written in the `granting` state **before** the
 membership is created, which is what guarantees that a membership the tool
-created always has a grant record behind it; see "Never leave a grant open".
+created always has a grant record behind it; see "Never leave a grant open". A
+`granting` record the sweeper recovers has its `membershipId` backfilled with
+`ListGroupMembershipsForMember` before it flips to `granted`.
 
 **TTL is for retention only.** DynamoDB TTL deletion can lag by up to 48 hours,
 so it must never be the mechanism that ends a grant. Revocation is the scheduler
@@ -443,10 +451,12 @@ already exists. It is the role that lets the tool add and remove memberships.
   `identitystore:DeleteGroupMembership`, `identitystore:ListGroupMemberships`,
   `identitystore:ListGroupMembershipsForMember`, `identitystore:DescribeGroup`,
   `identitystore:ListUsers`, `identitystore:DescribeUser`.
-  `ListGroupMembershipsForMember` is needed to resolve the `MembershipId` of a
-  pre-existing member when `CreateGroupMembership` returns `ConflictException`.
-  The exact resource ARN form is confirmed at implementation; the point is that
-  it names the one group and the one identity store, not `*`.
+  `ListGroupMembershipsForMember` is needed in two places: to resolve the
+  `MembershipId` of a pre-existing member when `CreateGroupMembership` returns
+  `ConflictException`, and to resolve it for a `granting` record that the
+  sweeper or the revoke handler recovers, which has no stored id. The exact
+  resource ARN form is confirmed at implementation; the point is that it names
+  the one group and the one identity store, not `*`.
 - **Not granted**: any `sso:*`, `CreateAccountAssignment`,
   `CreatePermissionSet`, `sso-directory:AddMemberToGroup`, or anything that
   could grant admin outside `Admins`. `sso-directory` is worth naming
@@ -521,8 +531,10 @@ There are two signals, and they are deliberately different in loudness:
   can see their approval took effect.
 - **The loud alarm is on `membership.orphaned`**: an expired grant, in either
   the `granting` or `granted` state, whose member is still in the group, which
-  is the signal that the normal revoke path did not run. Only that pages. A
-  membership with no grant record in any state emits `membership.unmanaged` at
+  is the signal that the normal revoke path did not run. When the record is
+  `granting` and has no stored `MembershipId`, the sweeper resolves it with
+  `ListGroupMembershipsForMember` before revoking. Only that pages. A membership
+  with no grant record in any state emits `membership.unmanaged` at
   informational level and does not page; see "Existing members".
 
 Metric filters turn those events into metrics. This layer answers *who asked,
@@ -583,15 +595,21 @@ tool's own records are structured for export and retention from day one.
   Scheduler one-shot at the exact expiry, with retries and a dead-letter queue,
   and a periodic reconciliation sweeper. The sweeper reconciles the tool's own
   grant records, in both the `granting` and `granted` states, against the
-  group's current memberships. An expired grant whose member is still in the
-  group is an **orphaned grant**: it revokes it and alarms, because the normal
-  revoke path did not run. An active grant is left alone. A `granting` record
-  whose member is absent is a grant that never completed: it is marked `failed`,
-  with no alarm. A membership with **no grant record at all** is left alone and
-  logged informationally; the sweeper never removes it, because that is the only
-  shape a pre-existing standing member can take. The scheduler is the normal
-  path; the sweeper is what catches a failed schedule or a grant path that
-  stopped partway.
+  group's current memberships. For a `granting` record it must resolve the
+  membership before it can act, because the record has no stored `membershipId`:
+  it calls `ListGroupMembershipsForMember` to find the member's membership in
+  the `Admins` group, writes that `MembershipId` onto the record, and flips the
+  record to `granted`. If the member is absent, the grant never completed and
+  the record goes to `failed`, with no alarm. If the member is present, the
+  grant is live: the sweeper schedules the revoke if the schedule is missing. If
+  the member is present past expiry, it is an **orphaned grant**: the sweeper
+  revokes it (with the resolved `MembershipId`) and alarms, because the normal
+  revoke path did not run. An active `granted` record is left alone. A
+  membership with **no grant record at all** is left alone and logged
+  informationally; the sweeper never removes it, because that is the only shape
+  a pre-existing standing member can take. The scheduler is the normal path; the
+  sweeper is what catches a failed schedule or a grant path that stopped
+  partway.
 - **The grant record exists before the membership can.** The grant path writes a
   `granting` record first, then calls `CreateGroupMembership`, then flips the
   record to `granted`. If the Lambda dies between the call and the flip, the
@@ -603,19 +621,22 @@ tool's own records are structured for export and retention from day one.
   member before the tool existed.
 - **Idempotent revoke.** At grant time the `MembershipId` returned by
   `CreateGroupMembership` is stored on the grant record. At revoke time
-  `DeleteGroupMembership(MembershipId)` is called. If the `MembershipId` is not
-  found because the membership is already gone, the API throws
-  `ResourceNotFoundException`; the revoke handler treats that as success and
-  marks the grant revoked. Both the scheduler and the sweeper use this path, so
-  a double revoke is harmless.
+  `DeleteGroupMembership(MembershipId)` is called. If the grant record has no
+  stored `membershipId` (a `granting` record the sweeper is recovering), the
+  revoke handler first resolves it with `ListGroupMembershipsForMember`, and a
+  missing membership is the already-gone case. If `DeleteGroupMembership`
+  throws `ResourceNotFoundException` because the membership is already gone, the
+  handler treats that as success and marks the grant revoked. Both the scheduler
+  and the sweeper use this path, so a double revoke is harmless.
 - **Fail closed on grant, not on revoke.** If the approval checks fail, or
   `CreateGroupMembership` fails with anything other than the `ConflictException`
   that means "already a member", no access is granted and the request goes to
   `failed`. If a revoke fails for any reason other than
   `ResourceNotFoundException`, retry and alarm; never leave it.
 - **The sweeper is read-heavy and cheap.** It is a periodic
-  `ListGroupMemberships` on the one group plus a DynamoDB query. It should run
-  often enough that drift is measured in minutes, not hours.
+  `ListGroupMemberships` on the one group, a `ListGroupMembershipsForMember` for
+  each `granting` record it recovers, plus a DynamoDB query. It should run often
+  enough that drift is measured in minutes, not hours.
 
 ## Rejected alternatives
 
