@@ -467,14 +467,25 @@ already exists. It is the role that lets the tool add and remove memberships.
 - **Inline policy, scoped by resource**, to the identity store id and the
   `Admins` group id: `identitystore:CreateGroupMembership`,
   `identitystore:DeleteGroupMembership`, `identitystore:ListGroupMemberships`,
-  `identitystore:ListGroupMembershipsForMember`, `identitystore:DescribeGroup`,
-  `identitystore:ListUsers`, `identitystore:DescribeUser`.
+  `identitystore:ListGroupMembershipsForMember`, `identitystore:DescribeGroup`.
   `ListGroupMembershipsForMember` is needed in two places: to resolve the
   `MembershipId` of a pre-existing member when `CreateGroupMembership` returns
   `ConflictException`, and to resolve it for a `granting` record that the
   sweeper or the revoke handler recovers, which has no stored id. The exact
   resource ARN form is confirmed at implementation; the point is that it names
   the one group and the one identity store, not `*`.
+
+  Deliberately absent: `identitystore:ListUsers` and
+  `identitystore:DescribeUser`. No described operation reads directory users.
+  Grant, revoke, `ConflictException` resolution and sweeper recovery are all
+  membership-scoped, and `ListUsers` would allow enumerating every user in the
+  identity store, which is more than the tool's "toggle membership in the one
+  `Admins` group" rule allows. Whether any user lookup is needed at all is the
+  identity-mapping decision in open question 3; if that settles on an API
+  lookup rather than a maintained table, the narrowest permission that answers
+  it (for example `identitystore:GetUserId`, which resolves a user from an
+  alternate identifier, rather than `ListUsers`) is added then, scoped by
+  resource. Do not pre-grant directory enumeration for an unsettled decision.
 - **Not granted**: any `sso:*`, `CreateAccountAssignment`,
   `CreatePermissionSet`, `sso-directory:AddMemberToGroup`, or anything that
   could grant admin outside `Admins`. `sso-directory` is worth naming
@@ -712,7 +723,12 @@ rather than staying open.
    needed only for the **requester**, at grant time. If the directory is
    SCIM-provisioned from an IdP, the mapping may already exist; if not, a
    maintained mapping is a prerequisite for step 3. Nothing in this repo records
-   SCIM today, so this is a check to run before building.
+   SCIM today, so this is a check to run before building. This decision also
+   sets the tool's permissions: a maintained Slack-to-userId table needs no
+   identity-store user read at all, while an API lookup adds the narrowest read
+   that answers it (`identitystore:GetUserId`, not `ListUsers`), scoped by
+   resource. The proposed inline policy deliberately omits both `ListUsers` and
+   `DescribeUser` until this settles.
 4. ~~**Account scope for phase one.**~~ **Settled in review:** single global
    escalation. One membership grants admin in all three accounts; there is no
    per-account scope and no per-account group.
