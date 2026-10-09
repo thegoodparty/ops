@@ -94,6 +94,30 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     crossRegion: true,
     note: "no in-region support in any region, so the geo profile is mandatory",
   },
+  {
+    id: "openai.gpt-6.1-sol",
+    invokeId: "us.openai.gpt-6.1-sol",
+    crossRegion: true,
+    note: "Marketplace product prod-qco655ut2vn54; replaces gpt-5.6-sol and gpt-5.6-terra in gp-pi, which stay permitted until that ships",
+  },
+  {
+    id: "anthropic.claude-haiku-5-5",
+    invokeId: "us.anthropic.claude-haiku-5-5",
+    crossRegion: true,
+    note: "Marketplace product prod-6cyn7tgqazjhu",
+  },
+  {
+    id: "xai.grok-4.7",
+    invokeId: "us.xai.grok-4.7",
+    crossRegion: true,
+    note: "not sold through Marketplace, IAM only; replaces grok-4.6, which stays permitted until gp-pi ships",
+  },
+  {
+    id: "zai.glm-5.3",
+    invokeId: "us.zai.glm-5.3",
+    crossRegion: true,
+    note: "us. profile only; access in this account is unverified when granted; replaces glm-5, which stays permitted until gp-pi ships",
+  },
   { id: "zai.glm-5", invokeId: "zai.glm-5", crossRegion: false },
   {
     id: "deepseek.v3.2",
