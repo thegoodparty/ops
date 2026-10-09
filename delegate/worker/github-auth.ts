@@ -30,15 +30,10 @@ export const setupGitHubAuth = async () => {
 // Mints an installation token for the *reviewer* GitHub App — a separate App
 // from the delegate App so that pr-reviewer's approvals come from a distinct
 // identity (avoids the self-approval block on PRs authored by delegate[bot]).
-// No-op when the private key isn't provisioned, so the worker still boots
-// before the secret lands.
 export const setupReviewerGitHubAuth = async () => {
   const raw = process.env.REVIEWER_APP_PRIVATE_KEY;
   if (!raw) {
-    console.log(
-      "REVIEWER_APP_PRIVATE_KEY not set; skipping reviewer GitHub auth",
-    );
-    return;
+    throw new Error("REVIEWER_APP_PRIVATE_KEY environment variable not set");
   }
 
   const auth = createAppAuth({

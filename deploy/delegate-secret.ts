@@ -19,13 +19,12 @@ export const DELEGATE_SECRET_KEYS = [
   "SLACK_BOT_TOKEN",
   "SLACK_SIGNING_SECRET",
 
-  // GitHub App (delegate[bot])
-  "GITHUB_APP_PRIVATE_KEY",
+  // Verifies GitHub webhook deliveries in the Lambda.
   "GITHUB_WEBHOOK_SECRET",
 
-  // GitHub App (reviewer[bot]) — a separate App so pr-reviewer's approvals
-  // come from a different identity than delegate[bot]. Read by
-  // `worker/github-auth.ts`; pr-reviewer exits at boot without it.
+  // GitHub App (delegate-reviewer). pr-reviewer runs entirely as this App:
+  // checkout, review, and status. Read by `worker/github-auth.ts`;
+  // pr-reviewer exits at boot without it.
   "REVIEWER_APP_PRIVATE_KEY",
 
   // ClickUp. `CLICKUP_API_TOKEN` is what the worker reads. `CLICKUP_TOKEN` is
@@ -39,10 +38,8 @@ export const DELEGATE_SECRET_KEYS = [
   "GRAFANA_WEBHOOK_SECRET",
   "SENTRY_AUTH_TOKEN",
 
-  // Not referenced in this repo. `GITHUB_TOKEN` is overwritten at boot by
-  // `setupGitHubAuth`. All of these were supplied by the live secret, so they
-  // stay to keep the task definition unchanged.
-  "GITHUB_TOKEN",
+  // Not referenced in this repo. Supplied by the live secret, so it stays to
+  // keep the task definition unchanged.
   "WORKFLOW_USERS",
 ] as const;
 
