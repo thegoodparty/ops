@@ -118,8 +118,7 @@ Then detach and delete the restored volume.
 Off until the secret holds `OAUTH2_PROXY_CLIENT_ID`,
 `OAUTH2_PROXY_CLIENT_SECRET` and `OAUTH2_PROXY_COOKIE_SECRET` (all three or
 none; `render-env.sh` refuses a partial set). Then `up.sh` starts
-`oauth2-proxy` and Caddy puts every browser path behind Google sign-in for
-`goodparty.org`. MCP, `/health`, webhooks and OAuth callbacks stay open
+`oauth2-proxy` and Caddy puts every browser path behind Google sign-in. MCP, `/health`, webhooks and OAuth callbacks stay open
 because their callers carry their own credentials. The bypass list is the
 `sso` snippet in `host/Caddyfile`.
 
@@ -135,6 +134,14 @@ To turn it on:
    secret.
 3. On the host, `sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh`
    (or merge any host change).
+
+Only the addresses in `host/allowed-emails.txt`, one per line, get past
+the sign-in. Grant or revoke access with a PR to that file; the deploy
+rewrites it in place and oauth2-proxy picks the change up without a
+restart. A removed address loses access at its next hourly session
+refresh (`OAUTH2_PROXY_COOKIE_REFRESH`), so also revoke that person's
+`aswt_` token. Google group membership would need a Workspace service
+account with domain-wide delegation, which we chose not to create.
 
 Login only gates. The API reads no identity from it, so people still paste
 a bearer into the dashboard's setup page: the shared `API_KEY`, or better a
