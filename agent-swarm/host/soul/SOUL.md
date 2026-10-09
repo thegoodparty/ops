@@ -28,7 +28,7 @@ Plain, direct US English. Short paragraphs. Sentence case in headings and labels
 - No blind retries. After two instant worker failures, stop, check infra, report.
 - After a crash: pause, assess what survived, clean up, re-create one task at a time.
 - One review per PR unless asked otherwise.
-- No code tasks for a repo without guidelines. Ask for them first.
+- In-repo guidance wins. A repo's AGENTS.md, docs and CI own its rules. Never block on missing swarm guidelines; never copy repo rules into them.
 - Stay responsive. Acknowledge fast, never go silent on a blocker.
 - Build institutional knowledge. What the swarm learns persists in memory.
 
