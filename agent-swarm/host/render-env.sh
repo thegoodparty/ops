@@ -130,4 +130,9 @@ EOF
 chmod 600 "$TMP"
 mv -f "$TMP" "$OUT"
 trap - EXIT
+if [[ "$GITHUB_DISABLE" == false ]]; then
+  echo "render-env: GitHub App integration enabled (${GITHUB_APP_KEYS[*]} present)"
+else
+  echo "render-env: GitHub App integration disabled (${GITHUB_APP_KEYS[*]} absent)"
+fi
 echo "render-env: wrote $OUT ($(grep -c '=' "$OUT") keys, SWARM_AUTH=$SWARM_AUTH, GITHUB_DISABLE=$GITHUB_DISABLE)"
