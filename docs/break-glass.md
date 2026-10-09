@@ -467,25 +467,28 @@ already exists. It is the role that lets the tool add and remove memberships.
 - **Inline policy, scoped by resource**, to the identity store id and the
   `Admins` group id: `identitystore:CreateGroupMembership`,
   `identitystore:DeleteGroupMembership`, `identitystore:ListGroupMemberships`,
-  `identitystore:ListGroupMembershipsForMember`, `identitystore:DescribeGroup`.
-  `ListGroupMembershipsForMember` is needed in two places: to resolve the
-  `MembershipId` of a pre-existing member when `CreateGroupMembership` returns
-  `ConflictException`, and to resolve it for a `granting` record that the
-  sweeper or the revoke handler recovers, which has no stored id. The exact
+  `identitystore:ListGroupMembershipsForMember`. Each maps to a described
+  operation: `CreateGroupMembership` and `DeleteGroupMembership` are the grant
+  and the revoke, `ListGroupMembershipsForMember` resolves the `MembershipId` of
+  a pre-existing member when `CreateGroupMembership` returns `ConflictException`
+  and of a `granting` record that the sweeper or the revoke handler recovers,
+  and `ListGroupMemberships` is the sweeper's full-group scan. The exact
   resource ARN form is confirmed at implementation; the point is that it names
   the one group and the one identity store, not `*`.
 
-  Deliberately absent: `identitystore:ListUsers` and
-  `identitystore:DescribeUser`. No described operation reads directory users.
-  Grant, revoke, `ConflictException` resolution and sweeper recovery are all
-  membership-scoped, and `ListUsers` would allow enumerating every user in the
-  identity store, which is more than the tool's "toggle membership in the one
-  `Admins` group" rule allows. Whether any user lookup is needed at all is the
-  identity-mapping decision in open question 3; if that settles on an API
-  lookup rather than a maintained table, the narrowest permission that answers
-  it (for example `identitystore:GetUserId`, which resolves a user from an
-  alternate identifier, rather than `ListUsers`) is added then, scoped by
-  resource. Do not pre-grant directory enumeration for an unsettled decision.
+  Deliberately absent: `identitystore:DescribeGroup`,
+  `identitystore:ListUsers` and `identitystore:DescribeUser`. No described
+  operation reads group or user metadata. The `Admins` group id is a static
+  literal from `deploy/components/identity-center.ts`, so no runtime
+  group-existence check is needed, and every call the tool makes is
+  membership-scoped. `ListUsers` in particular would allow enumerating every
+  user in the identity store, which is more than the tool's "toggle membership
+  in the one `Admins` group" rule allows. Whether any user lookup is needed at
+  all is the identity-mapping decision in open question 3; if that settles on an
+  API lookup rather than a maintained table, the narrowest permission that
+  answers it (for example `identitystore:GetUserId`, which resolves a user from
+  an alternate identifier, rather than `ListUsers`) is added then, scoped by
+  resource. Do not pre-grant directory reads for an unsettled decision.
 - **Not granted**: any `sso:*`, `CreateAccountAssignment`,
   `CreatePermissionSet`, `sso-directory:AddMemberToGroup`, or anything that
   could grant admin outside `Admins`. `sso-directory` is worth naming
