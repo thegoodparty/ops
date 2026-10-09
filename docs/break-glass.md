@@ -387,7 +387,7 @@ code, changed only by a reviewed PR.
 ### States
 
 ```
-requested ──approve──▶ approved ──▶ granting ──▶ granted ──expiry──▶ revoked
+requested ──approve──▶ granting ──▶ granted ──expiry──▶ revoked
     │
     ├──deny───────────▶ denied
     ├──timeout────────▶ expired-unapproved
