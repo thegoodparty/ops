@@ -116,7 +116,16 @@ services:
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
       - SLACK_ALLOWED_EMAIL_DOMAINS=${SLACK_ALLOWED_EMAIL_DOMAINS:-goodparty.org}
       - SLACK_ALERTS_CHANNEL=${SLACK_ALERTS_CHANNEL:-C0C6RUJ9VMK}
+      # Inbound GitHub App webhooks. render-env.sh sets GITHUB_DISABLE=false
+      # only when the secret holds the App keys. GITHUB_APP_PRIVATE_KEY is
+      # base64 of the .pem (the API accepts base64 or raw PEM; a multi-line
+      # PEM does not survive .env).
       - GITHUB_DISABLE=${GITHUB_DISABLE:-true}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
+      - GITHUB_APP_ID=${GITHUB_APP_ID:-}
+      - GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
+      - GITHUB_BOT_NAME=${GITHUB_BOT_NAME:-}
+      - GITHUB_BOT_ALIASES=${GITHUB_BOT_ALIASES:-}
       # grafana-mcp is a compose-internal hostname; the MCP wrapper refuses
       # private-network URLs in production unless this is set.
       - ALLOW_PRIVATE_NETWORK_URLS=true

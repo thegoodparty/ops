@@ -4,6 +4,7 @@
 #
 #   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh        the five services, and the swarm's own keys
 #   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --sso  Google login (optional)
+#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --github-app  GitHub App webhooks (optional)
 #
 # Until there is an SSO profile for the infrastructure account, assume
 # OrganizationAccountAccessRole from a management admin session. Add this to
@@ -41,7 +42,8 @@ MODE=services
 case "${1:-}" in
   "") ;;
   --sso) MODE=sso ;;
-  *) echo "usage: $0 [--sso]"; exit 1 ;;
+  --github-app) MODE=github-app ;;
+  *) echo "usage: $0 [--sso|--github-app]"; exit 1 ;;
 esac
 
 account="$(aws sts get-caller-identity --query Account --output text)" \
@@ -70,6 +72,54 @@ OAUTH2_PROXY_COOKIE_SECRET="$(openssl rand -base64 32 | tr -- '+/' '-_')"
 export OAUTH2_PROXY_COOKIE_SECRET
 WRITE_KEYS+=(OAUTH2_PROXY_COOKIE_SECRET)
 echo "  cookie secret generated"
+
+elif [[ $MODE == github-app ]]; then
+
+bold "GitHub App (inbound @-mentions and reactions)"
+cat <<'EOF'
+  Create the App at https://github.com/organizations/thegoodparty/settings/apps/new
+  a. Webhook: Active, URL https://delegate-swarm.infra.goodparty.org/api/github/webhook,
+     secret = GITHUB_WEBHOOK_SECRET (see below).
+  b. Permissions: Issues and Pull requests Read and write (comments, reactions);
+     Metadata Read-only. Subscribe to events: Issue comment, Pull request review,
+     Pull request review comment, Issues, Pull request.
+  c. After creating: note the App ID, then Generate a private key (.pem download).
+     Install the App on omni and ops.
+  GITHUB_WEBHOOK_SECRET: leave blank to generate one when none exists yet. It is
+  never printed, so read it from the secret and paste it into the App's webhook
+  settings. GITHUB_BOT_ALIASES is set to delegate-gp-bot.
+EOF
+ask GITHUB_WEBHOOK_SECRET ""
+if ! [[ " ${WRITE_KEYS[*]:-} " == *" GITHUB_WEBHOOK_SECRET "* ]]; then
+  has_secret="$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
+    --query SecretString --output text 2>/dev/null | jq -r 'has("GITHUB_WEBHOOK_SECRET")' 2>/dev/null || echo false)"
+  if [[ "$has_secret" != true ]]; then
+    GITHUB_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+    export GITHUB_WEBHOOK_SECRET
+    WRITE_KEYS+=(GITHUB_WEBHOOK_SECRET)
+    echo "  webhook secret generated. After this run, read GITHUB_WEBHOOK_SECRET from"
+    echo "  the secret and paste it into the App's webhook settings."
+  fi
+fi
+ask GITHUB_APP_ID ""
+while true; do
+  printf 'Path to the App private key .pem (Enter to keep current): '
+  IFS= read -r pem_path
+  if [[ -z "$pem_path" ]]; then echo "  keeping current value"; break; fi
+  pem_path="${pem_path/#\~/$HOME}"
+  if [[ ! -r "$pem_path" ]] || ! grep -q -- '-----BEGIN' "$pem_path"; then
+    echo "  not a readable PEM file, try again"; continue
+  fi
+  # One-line base64: a multi-line PEM does not survive .env. The API accepts either.
+  GITHUB_APP_PRIVATE_KEY="$(base64 < "$pem_path" | tr -d '\n')"
+  export GITHUB_APP_PRIVATE_KEY; WRITE_KEYS+=(GITHUB_APP_PRIVATE_KEY)
+  echo "  ok (${#GITHUB_APP_PRIVATE_KEY} chars base64)"; break
+done
+echo "  GITHUB_BOT_NAME is the App's slug, the name people @-mention."
+ask GITHUB_BOT_NAME ""
+GITHUB_BOT_ALIASES=delegate-gp-bot
+export GITHUB_BOT_ALIASES
+WRITE_KEYS+=(GITHUB_BOT_ALIASES)
 
 else
 
@@ -177,6 +227,11 @@ if [[ "$sso_count" != 0 && "$sso_count" != 3 ]]; then
   echo "Not writing: SSO needs all three of client id, client secret and cookie secret."
   exit 1
 fi
+gh_count=$(jq '[has("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY") | select(.)] | length' "$TMP")
+if [[ "$gh_count" != 0 && "$gh_count" != 3 ]]; then
+  echo "Not writing: the GitHub App needs all three of webhook secret, App id and private key."
+  exit 1
+fi
 aws secretsmanager put-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
   --secret-string "file://$TMP" --query VersionId --output text >/dev/null
 
@@ -191,6 +246,9 @@ missing=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region 
 echo
 if [[ -n "$missing" ]]; then
   echo "Still missing before the stack can start: $missing"
+elif [[ $MODE == github-app ]]; then
+  echo "Done. GitHub webhooks turn on the next time up.sh runs on the host (it re-renders .env):"
+  echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
 elif [[ $MODE == sso ]]; then
   echo "Done. SSO turns on the next time up.sh runs on the host (it re-renders .env):"
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"

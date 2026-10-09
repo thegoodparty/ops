@@ -143,6 +143,28 @@ per-user `aswt_` token an admin mints with
 `?apiKey=` link: an unauthenticated visit carries the whole link through
 Google's sign-in.
 
+## GitHub App
+
+Off until the secret holds `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` (all three or none; `render-env.sh` refuses a partial
+set). Then it renders `GITHUB_DISABLE=false` and the API accepts GitHub App
+webhooks at `/api/github/webhook`: `@`-mentions of the bot start tasks and
+the bot reacts to the comment. Agents still push with the service user's
+PAT; the App is inbound only. The webhook path is open in both Caddy modes
+(the signature is the credential).
+
+1. Create the App in the thegoodparty org with webhook URL
+   `https://delegate-swarm.infra.goodparty.org/api/github/webhook`, Issues and
+   Pull requests Read and write, and the comment, review, issue and pull
+   request events. Install it on `omni` and `ops`. Download a private key.
+2. `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --github-app` from this
+   directory. It generates the webhook secret if the secret has none (read it
+   from Secrets Manager and paste it into the App), asks for the App id,
+   takes the path to the `.pem` and stores it base64 on one line (the API
+   accepts base64 or raw PEM; raw does not survive `.env`), and asks for the
+   bot name (the App slug). `GITHUB_BOT_ALIASES` is set to `delegate-gp-bot`.
+3. On the host, `sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh`.
+
 ## Changing agent behaviour
 
 What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`

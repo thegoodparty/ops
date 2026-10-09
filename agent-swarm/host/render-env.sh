@@ -55,6 +55,29 @@ else
   exit 1
 fi
 
+# GitHub App webhooks (@-mentions, reactions). All three or none; the API
+# needs the webhook secret to accept events and the App id and key to react.
+GITHUB_APP_KEYS=(
+  GITHUB_WEBHOOK_SECRET
+  GITHUB_APP_ID
+  GITHUB_APP_PRIVATE_KEY
+)
+
+gh_present=0
+for k in "${GITHUB_APP_KEYS[@]}"; do
+  if jq -e --arg k "$k" 'has($k)' <<<"$SECRET_JSON" >/dev/null; then
+    gh_present=$((gh_present + 1))
+  fi
+done
+if ((gh_present == ${#GITHUB_APP_KEYS[@]})); then
+  GITHUB_DISABLE=false
+elif ((gh_present == 0)); then
+  GITHUB_DISABLE=true
+else
+  echo "render-env: secret $SECRET_ID has some but not all of: ${GITHUB_APP_KEYS[*]}" >&2
+  exit 1
+fi
+
 todo="$(jq -r 'to_entries[] | select((.value|tostring) == "TODO" or (.value|tostring) == "") | .key' <<<"$SECRET_JSON")"
 if [[ -n "$todo" ]]; then
   echo "render-env: secret $SECRET_ID still has TODO/empty values for:" >&2
@@ -94,7 +117,6 @@ EMBEDDING_MODEL=nomic-embed-text-v1.5
 SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org
 SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK
 
-GITHUB_DISABLE=true
 GITHUB_NAME=delegate
 GITHUB_EMAIL=339843712+delegate-gp-bot@users.noreply.github.com
 
@@ -102,9 +124,10 @@ GRAFANA_URL=https://goodparty.grafana.net
 EOF
   echo
   echo "SWARM_AUTH=$SWARM_AUTH"
+  echo "GITHUB_DISABLE=$GITHUB_DISABLE"
 } >"$TMP"
 
 chmod 600 "$TMP"
 mv -f "$TMP" "$OUT"
 trap - EXIT
-echo "render-env: wrote $OUT ($(grep -c '=' "$OUT") keys, SWARM_AUTH=$SWARM_AUTH)"
+echo "render-env: wrote $OUT ($(grep -c '=' "$OUT") keys, SWARM_AUTH=$SWARM_AUTH, GITHUB_DISABLE=$GITHUB_DISABLE)"
