@@ -146,6 +146,18 @@ that group.
   the member is in the group regardless of who added them. Either way the grant
   is recorded with its expiry and its `MembershipId`. Any other error sends the
   request to `failed`.
+- **At most one active grant per user**: before it writes the `granting` record
+  or calls `CreateGroupMembership`, the Lambda checks for an existing
+  `granting` or `granted` record for the requester, and rejects the approval
+  with an ephemeral message to the approver ("a grant for this user is already
+  active") if one exists. This is what stops two approved requests from
+  collapsing onto one membership: the second `CreateGroupMembership` would
+  return `ConflictException`, both grants would resolve the same
+  `MembershipId`, and the first expiry would silently end the second grant
+  early. The guard is race-safe, not a read-then-write: it is a conditional
+  DynamoDB write keyed by the requester (an `attribute_not_exists` condition, or
+  a transaction), so two concurrent approvals cannot both write a `granting`
+  record. A new grant is allowed once the active one is revoked or expires.
 - **Revoke**: `identitystore:DeleteGroupMembership` removes the requester,
   unconditionally at expiry, by the `MembershipId` stored on the grant. It does
   not check whether the tool was the thing that added them. A standing admin who
@@ -368,10 +380,13 @@ code, changed only by a reviewed PR.
    not the requester. Anyone else gets an ephemeral "not an approver".
 5. On **Deny**: write `denied`, post the outcome to the channel, done.
 6. On **Approve**: enforce the remaining checks (duration within cap, per-user
-   rate limit, request not already decided), then assume `break-glass-grant` and
-   **write the grant record first, in a `granting` state**, carrying the request
-   id, requester, approver, group id, and the computed expires-at (granted-at
-   plus the requested duration). Only then call `CreateGroupMembership`. A
+   rate limit, request not already decided, and **no other active grant for the
+   requester**, enforced with the conditional write described under "The
+   decision"). If any check fails, post the reason to the approver and write no
+   grant. Then assume `break-glass-grant` and **write the grant record first, in
+   a `granting` state**, carrying the request id, requester, approver, group id,
+   and the computed expires-at (granted-at plus the requested duration). Only
+   then call `CreateGroupMembership`. A
    `ConflictException` means the requester is already a member, so the Lambda
    resolves the existing `MembershipId` with `ListGroupMembershipsForMember` and
    continues; any other error sends the request to `failed`. It then flips the
@@ -425,7 +440,10 @@ resolved with `ListGroupMembershipsForMember` when that call returns
 membership is created, which is what guarantees that a membership the tool
 created always has a grant record behind it; see "Never leave a grant open". A
 `granting` record the sweeper recovers has its `membershipId` backfilled with
-`ListGroupMembershipsForMember` before it flips to `granted`.
+`ListGroupMembershipsForMember` before it flips to `granted`. The at-most-one
+active-grant guard keys on the requester, so the table also holds a per-user
+item (or a key on the grant item) whose conditional write is what makes that
+rule race-safe; see "The decision".
 
 **TTL is for retention only.** DynamoDB TTL deletion can lag by up to 48 hours,
 so it must never be the mechanism that ends a grant. Revocation is the scheduler
@@ -587,7 +605,9 @@ tool's own records are structured for export and retention from day one.
   outage that escalates. **Open** (open question 6).
 - **Rate limit.** A per-user cap on requests per day, and a global cap on
   concurrent grants, both enforced before the grant call. The exact numbers are
-  **open**.
+  **open**. These are separate from the hard **one active grant per user** rule,
+  which is decided rather than open and is enforced with a conditional write;
+  see "The decision".
 
 ## Reliability invariants
 
@@ -615,6 +635,12 @@ tool's own records are structured for export and retention from day one.
   record to `granted`. If the Lambda dies between the call and the flip, the
   `granting` record is what the sweeper reconciles, so the partial-grant case (a
   member added with no record and no scheduled revoke) cannot occur.
+- **At most one active grant per user.** The grant path refuses to write a new
+  `granting` record while the requester has a `granting` or `granted` one, and
+  the check is a conditional DynamoDB write rather than a read-then-write, so
+  two concurrent approvals cannot both pass it. Without this, the second grant
+  would share the first's `MembershipId` and lose access at the first expiry.
+  A new grant is allowed once the active one is revoked or expires.
 - **Expected is defined by the tool's own grant records, not by a baseline.**
   The tool manages only what it granted, so there is no second source of truth.
   Drift is an orphaned grant, which is actionable without knowing who was a
