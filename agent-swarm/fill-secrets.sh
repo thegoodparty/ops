@@ -37,6 +37,24 @@ ask() {
   done
 }
 
+# Multi-line private key: read until a blank line, store base64 (one line) so it
+# survives the secret JSON and the .env file.
+ask_ssh_key() {
+  local var=GIT_SSH_PRIVATE_KEY_B64 line key="" first=1
+  echo "$var: paste the whole private key (-----BEGIN ... END-----), then a blank line."
+  echo "  Enter on an empty first line keeps the current value."
+  while IFS= read -rs line; do
+    if [[ -z "$line" ]]; then break; fi
+    key+="$line"$'\n'; first=0
+  done
+  if ((first)); then echo "  keeping current value"; return; fi
+  if [[ "$key" != "-----BEGIN OPENSSH PRIVATE KEY-----"* ]]; then
+    echo "  that is not an OpenSSH private key (ssh-keygen -t ed25519), skipping"; return
+  fi
+  export "$var=$(printf '%s' "$key" | base64 | tr -d '\n')"; WRITE_KEYS+=("$var")
+  echo "  ok"
+}
+
 MODE=services
 case "${1:-}" in
   "") ;;
@@ -108,10 +126,21 @@ cat <<'EOF'
   e. Generate token, copy the github_pat_ token. If the org requires approval, an
      owner approves it in github.com/organizations/thegoodparty/settings ->
      Personal access tokens -> Pending requests.
-  Commits use GITHUB_NAME and GITHUB_EMAIL from host/render-env.sh; set them to
-  this user's login and email there (README, TODO under "Where it runs").
+  The PAT is for the gh API (PRs, reviews, checks). Pushes and commit signing
+  use the SSH key in the next step. Commits use GITHUB_NAME and GITHUB_EMAIL
+  from host/render-env.sh (eng-admin+delegate@goodparty.org).
 EOF
 ask GITHUB_TOKEN github_pat_
+
+bold "3b   GitHub SSH key (push + commit signing)"
+cat <<'EOF'
+  Generate locally: ssh-keygen -t ed25519 -C eng-admin+delegate@goodparty.org -f delegate-gp-bot
+  On delegate-gp-bot (https://github.com/settings/keys): add delegate-gp-bot.pub
+  as an Authentication key AND as a Signing key, and verify the email address.
+  Paste the private key (the file without .pub) below, then a blank line.
+  Delete the local files afterwards.
+EOF
+ask_ssh_key
 
 bold "4/5  ClickUp personal API token (service seat)"
 cat <<'EOF'
@@ -188,7 +217,7 @@ aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" 
 | jq -r 'to_entries[] | "  \(.key): \(.value | length)\(if .value == "TODO" then "  <- still TODO" else "" end)"'
 missing=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
   --query SecretString --output text \
-| jq -r '["ANTHROPIC_API_KEY","API_KEY","CLICKUP_API_TOKEN","GITHUB_TOKEN","GRAFANA_SERVICE_ACCOUNT_TOKEN","SECRETS_ENCRYPTION_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"] - keys | join(" ")')
+| jq -r '["ANTHROPIC_API_KEY","API_KEY","CLICKUP_API_TOKEN","GIT_SSH_PRIVATE_KEY_B64","GITHUB_TOKEN","GRAFANA_SERVICE_ACCOUNT_TOKEN","SECRETS_ENCRYPTION_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"] - keys | join(" ")')
 echo
 if [[ -n "$missing" ]]; then
   echo "Still missing before the stack can start: $missing"

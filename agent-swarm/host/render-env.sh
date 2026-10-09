@@ -16,6 +16,7 @@ REQUIRED_KEYS=(
   ANTHROPIC_API_KEY
   API_KEY
   CLICKUP_API_TOKEN
+  GIT_SSH_PRIVATE_KEY_B64
   GITHUB_TOKEN
   GRAFANA_SERVICE_ACCOUNT_TOKEN
   SECRETS_ENCRYPTION_KEY
@@ -58,7 +59,7 @@ fi
 todo="$(jq -r 'to_entries[] | select((.value|tostring) == "TODO" or (.value|tostring) == "") | .key' <<<"$SECRET_JSON")"
 if [[ -n "$todo" ]]; then
   echo "render-env: secret $SECRET_ID still has TODO/empty values for:" >&2
-  printf '  %s\n' $todo >&2
+  printf '  %s\n' "${todo//$'\n'/$'\n'  }" >&2
   exit 1
 fi
 
@@ -95,7 +96,7 @@ SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK
 
 GITHUB_DISABLE=true
 GITHUB_NAME=delegate
-GITHUB_EMAIL=delegate@goodparty.org
+GITHUB_EMAIL=eng-admin+delegate@goodparty.org
 
 GRAFANA_URL=https://goodparty.grafana.net
 EOF
