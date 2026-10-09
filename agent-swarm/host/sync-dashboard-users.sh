@@ -58,7 +58,7 @@ while IFS= read -r email; do
     continue
   fi
 
-  read -r token tokenid < <(awk -v e="$email" '$1 == e { print $2, $4 }' "$OUT") || true
+  read -r token tokenid < <(awk -v e="$email" '$4 == e { print $2, $5 }' "$OUT") || true
   current=""
   if [[ -n "${token:-}" ]]; then
     printf 'Authorization: Bearer %s\n' "$token" >"$TRY"
@@ -74,7 +74,10 @@ while IFS= read -r email; do
   else
     echo "dashboard users: $email kept its dashboard token"
   fi
-  printf '\t%s %s # %s\n' "$email" "$token" "$current" >>"$NEW"
+  # oauth2-proxy passes the address in Google's case and matches the
+  # allowlist ignoring case, so the map key is a case-insensitive regexp.
+  printf '\t~(?i)^%s$ %s # %s %s\n' "$(sed 's/[^A-Za-z0-9@_-]/\\&/g' <<<"$email")" \
+    "$token" "$email" "$current" >>"$NEW"
   kept+=("$current")
   token=""
   tokenid=""

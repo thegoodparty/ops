@@ -157,7 +157,8 @@ The API reads no identity from the login and only takes bearers, so:
 - The tokens live only in `/opt/agent-swarm/dashboard-tokens.caddy`
   (owner-only, not in git or the config bucket), as Caddy `map` entries.
 - Caddy maps the signed-in address (`X-Auth-Request-Email` from
-  oauth2-proxy; any copy the client sends is dropped) to that token and
+  oauth2-proxy, ignoring case; any copy the client sends is dropped) to
+  that token and
   sends it as the `Authorization` header on the login-gated API paths. A
   signed-in address with no token gets a 403.
 - `build-ui.sh` builds the dashboard locked to this API with a placeholder
