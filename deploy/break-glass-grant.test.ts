@@ -16,6 +16,15 @@ const statements = breakGlassGrantPolicy.Statement;
 const ADMINS_GROUP_ARN =
   "arn:aws:identitystore:::group/88c1b330-a001-707a-06ca-94e289013bf5";
 
+const IDENTITY_STORE_ARN =
+  "arn:aws:identitystore::333022194791:identitystore/d-9267e5cf96";
+
+// Unavoidable: the requester's user id and the returned membership id do not
+// exist when the policy is written, so they are wildcards scoped to their
+// resource type. See the policy comment.
+const USER_ARN = "arn:aws:identitystore:::user/*";
+const MEMBERSHIP_ARN = "arn:aws:identitystore:::membership/*";
+
 describe("breakGlassGrantTrust", () => {
   // The account root is the principal only because the Lambda's role may not
   // exist when this applies; the condition is what narrows it to that role.
@@ -88,13 +97,39 @@ describe("breakGlassGrantPolicy", () => {
     }
   });
 
-  it("names the one Admins group, the membership set and the one identity store", () => {
+  it("names the one Admins group, the one identity store and the two unavoidable wildcards", () => {
     assert.ok(allResources.includes(ADMINS_GROUP_ARN));
-    assert.ok(allResources.includes("arn:aws:identitystore:::membership/*"));
-    assert.ok(
-      allResources.some((r) => r.includes(":identitystore/")),
-      "no identity store ARN",
+    assert.ok(allResources.includes(IDENTITY_STORE_ARN));
+    assert.ok(allResources.includes(USER_ARN));
+    assert.ok(allResources.includes(MEMBERSHIP_ARN));
+  });
+
+  // The exact scope per action, from the accepted answer for this problem: the
+  // user and membership ids do not exist at apply time, so those two are
+  // wildcards scoped to their type, and everything else is a literal.
+  it("scopes each action to the narrowest set that authorizes it", () => {
+    const bySid = Object.fromEntries(
+      statements.map((s) => [s.Sid, [...asList(s.Resource)].sort()]),
     );
+    assert.deepEqual(bySid.GrantMembership, [
+      ADMINS_GROUP_ARN,
+      IDENTITY_STORE_ARN,
+      USER_ARN,
+    ].sort());
+    assert.deepEqual(bySid.RevokeMembership, [
+      ADMINS_GROUP_ARN,
+      IDENTITY_STORE_ARN,
+      USER_ARN,
+      MEMBERSHIP_ARN,
+    ].sort());
+    assert.deepEqual(bySid.ListGroupMemberships, [
+      ADMINS_GROUP_ARN,
+      IDENTITY_STORE_ARN,
+    ].sort());
+    assert.deepEqual(bySid.ListMembershipsForMember, [
+      IDENTITY_STORE_ARN,
+      USER_ARN,
+    ].sort());
   });
 
   // The group id is a literal duplicated from identity-center.ts because step

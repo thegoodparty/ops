@@ -38,6 +38,12 @@ const GROUP_ARN =
 // one identity store.
 const MEMBERSHIP_ARN = "arn:aws:identitystore:::membership/*";
 
+// The member id is likewise unknown at policy time: `CreateGroupMembership`
+// and `DeleteGroupMembership` take it as an argument, and
+// `ListGroupMembershipsForMember` takes it to look one up. Scoped to the user
+// type, not `*`.
+const USER_ARN = "arn:aws:identitystore:::user/*";
+
 // The account root with a `PrincipalArn` condition rather than the Lambda's
 // role as the principal: this stack and the infrastructure stack apply
 // concurrently, and IAM rejects a trust naming a role that does not exist yet.
@@ -75,6 +81,16 @@ export const breakGlassGrantTrust = {
 // also absent until open question 3 settles whether the requester mapping is a
 // maintained table or an API lookup.
 //
+// Two of the four resource forms are wildcards and they are unavoidable: the
+// requester's user id and the returned membership id do not exist when the
+// policy is written, so a policy that named them would deny the tool's own
+// calls. The accepted answer for this exact problem (AWS re:Post, "How to
+// limit access to specific Identity Center groups") lists all four resource
+// forms for that reason. This is the doc's "names the one group and the one
+// identity store, not `*`" applied as narrowly as the API allows: the group
+// and identity store are literals, and the user and membership wildcards are
+// scoped to their resource types rather than left as `*`.
+//
 // The actions are split one per statement so each statement's `Resource` list
 // contains only types the action supports: `ListGroupMembershipsForMember` has
 // no Group resource type, so it cannot name the group ARN.
@@ -84,22 +100,23 @@ export const breakGlassGrantPolicy: PolicyDocument = {
     {
       Sid: "GrantMembership",
       Effect: "Allow",
-      // CreateGroupMembership supports the Group and Identitystore resource
-      // types; it does not support GroupMembership, which is why this is not
-      // folded into the revoke statement below.
+      // CreateGroupMembership supports the Group, Identitystore and User
+      // resource types; it does not support GroupMembership, which is why the
+      // membership wildcard is absent here and this is not folded into the
+      // revoke statement below.
       Action: ["identitystore:CreateGroupMembership"],
-      Resource: [GROUP_ARN, IDENTITY_STORE_ARN],
+      Resource: [GROUP_ARN, IDENTITY_STORE_ARN, USER_ARN],
     },
     {
       Sid: "RevokeMembership",
       Effect: "Allow",
       // DeleteGroupMembership supports Group, GroupMembership, Identitystore
-      // and User. The group ARN is kept even though the API takes only the
-      // identity store and membership, because AWS lists Group as a supported
-      // type for this action and omitting it risks an evaluation that does not
-      // match.
+      // and User, and the API passes the identity store, the membership id and
+      // the member id. All four appear here. The group ARN is kept because AWS
+      // lists Group as a supported type for this action and omitting it risks
+      // an evaluation that does not match.
       Action: ["identitystore:DeleteGroupMembership"],
-      Resource: [GROUP_ARN, MEMBERSHIP_ARN, IDENTITY_STORE_ARN],
+      Resource: [GROUP_ARN, IDENTITY_STORE_ARN, USER_ARN, MEMBERSHIP_ARN],
     },
     {
       Sid: "ListGroupMemberships",
@@ -110,11 +127,10 @@ export const breakGlassGrantPolicy: PolicyDocument = {
     {
       Sid: "ListMembershipsForMember",
       Effect: "Allow",
-      // No Group resource type for this action. The user resource is the
-      // member id, which is dynamic and unknown at policy time; the doc scopes
-      // this to the one identity store rather than granting `user/*`.
+      // No Group resource type for this action, so the identity store and the
+      // user are the scope. The user id is dynamic, hence the wildcard.
       Action: ["identitystore:ListGroupMembershipsForMember"],
-      Resource: [IDENTITY_STORE_ARN],
+      Resource: [IDENTITY_STORE_ARN, USER_ARN],
     },
   ],
 };
