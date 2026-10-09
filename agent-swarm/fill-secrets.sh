@@ -108,8 +108,7 @@ cat <<'EOF'
   e. Generate token, copy the github_pat_ token. If the org requires approval, an
      owner approves it in github.com/organizations/thegoodparty/settings ->
      Personal access tokens -> Pending requests.
-  Commits use GITHUB_NAME and GITHUB_EMAIL from host/render-env.sh; set them to
-  this user's login and email there (README, TODO under "Where it runs").
+  Commit name and email come from host/render-env.sh (README, "Where it runs").
 EOF
 ask GITHUB_TOKEN github_pat_
 

@@ -47,10 +47,10 @@ host; the next deploy overwrites them.
   `OAUTH2_PROXY_*` keys that turn on Google login
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
-- GitHub identity: a service user's fine-grained PAT. TODO: `GITHUB_NAME`
-  and `GITHUB_EMAIL` in `host/render-env.sh` are the placeholders
-  `delegate` and `delegate@goodparty.org`; set them to the service user's
-  real login and email once it exists.
+- GitHub identity: the service user
+  [delegate-gp-bot](https://github.com/delegate-gp-bot) and its fine-grained
+  PAT. Commits are authored as `delegate` with the user's noreply address
+  (`339843712+delegate-gp-bot@users.noreply.github.com`, in `host/render-env.sh`), so GitHub links them to the account.
 
 `fill-secrets.sh` is the interactive way to fill the secret from a laptop.
 After a secret change, re-run `up.sh` on the host (or merge any host change).
@@ -223,8 +223,7 @@ containers can reach IMDS). The api container has no AWS access.
 
 ## Bringing it up
 
-The swarm starts with fresh state. Nothing carries over from the old host in
-the management account, which is torn down once this one is live. In order:
+The swarm starts with fresh state. In order:
 
 1. **Merge.** The deploy applies `deploy-infrastructure/`. The host installs
    `host/` and does not start the stack, because the secret has no value
