@@ -87,7 +87,7 @@ EOF'
 # containers, and docker restarts them on start. Their bind-mount sources must
 # exist by then, or docker creates root-owned directories in their place.
 step "mkdir /opt/agent-swarm" mkdir -p /opt/agent-swarm/ui-dist
-step "placeholder bind-mount files" touch /opt/agent-swarm/Caddyfile /opt/agent-swarm/aws-config /opt/agent-swarm/allowed-emails.txt
+step "placeholder bind-mount files" touch /opt/agent-swarm/Caddyfile /opt/agent-swarm/aws-config /opt/agent-swarm/allowed-emails.txt /opt/agent-swarm/dashboard-tokens.caddy
 step "chown /opt/agent-swarm" chown -R ec2-user:ec2-user /opt/agent-swarm
 
 if step "mount data volume at /var/lib/docker" mount_data_volume; then
