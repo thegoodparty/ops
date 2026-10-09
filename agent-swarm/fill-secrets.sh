@@ -123,7 +123,7 @@ WRITE_KEYS+=(GITHUB_BOT_ALIASES)
 
 else
 
-bold "1/5  Delegate Slack app tokens"
+bold "1/4  Delegate Slack app tokens"
 cat <<'EOF'
   Neither step changes how the Delegate app behaves today. The switch to the
   swarm (manifest, Socket Mode, reinstall) comes later: README, "Bringing it
@@ -137,7 +137,7 @@ EOF
 ask SLACK_APP_TOKEN xapp-
 ask SLACK_BOT_TOKEN xoxb-
 
-bold "2/5  Anthropic key"
+bold "2/4  Anthropic key"
 cat <<'EOF'
   https://console.anthropic.com -> Settings -> API keys. Pick the existing
   "agent-swarm" workspace (it carries the spend limit), Create Key, name
@@ -145,31 +145,14 @@ cat <<'EOF'
 EOF
 ask ANTHROPIC_API_KEY sk-ant-
 
-bold "3/5  GitHub fine-grained PAT (service user)"
-cat <<'EOF'
-  Signed in to GitHub as the Delegate service user:
-  https://github.com/settings/personal-access-tokens/new
-  a. Token name "delegate-swarm". Resource owner: thegoodparty.
-  b. Expiration: the longest the org allows (No expiration if offered, else Custom
-     with the latest date).
-  c. Repository access: Only select repositories -> omni, ops.
-  d. Repository permissions: Contents Read and write, Pull requests Read and write,
-     Issues Read and write, Actions Read-only. Metadata Read-only is added for you.
-  e. Generate token, copy the github_pat_ token. If the org requires approval, an
-     owner approves it in github.com/organizations/thegoodparty/settings ->
-     Personal access tokens -> Pending requests.
-  Commit name and email come from host/render-env.sh (README, "Where it runs").
-EOF
-ask GITHUB_TOKEN github_pat_
-
-bold "4/5  ClickUp personal API token (service seat)"
+bold "3/4  ClickUp personal API token (service seat)"
 cat <<'EOF'
   Signed in to ClickUp as the Delegate service seat: avatar (top right) ->
   Settings -> Apps -> API Token -> Generate (or Regenerate). Copy the pk_ token.
 EOF
 ask CLICKUP_API_TOKEN pk_
 
-bold "5/5  Grafana read-only service account"
+bold "4/4  Grafana read-only service account"
 cat <<'EOF'
   https://goodparty.grafana.net/org/serviceaccounts -> Add service account.
   Display name "delegate", role Viewer, Create. Then Add service account token,
@@ -242,7 +225,7 @@ aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" 
 | jq -r 'to_entries[] | "  \(.key): \(.value | length)\(if .value == "TODO" then "  <- still TODO" else "" end)"'
 missing=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
   --query SecretString --output text \
-| jq -r '["ANTHROPIC_API_KEY","API_KEY","CLICKUP_API_TOKEN","GITHUB_TOKEN","GRAFANA_SERVICE_ACCOUNT_TOKEN","SECRETS_ENCRYPTION_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"] - keys | join(" ")')
+| jq -r '["ANTHROPIC_API_KEY","API_KEY","CLICKUP_API_TOKEN","GRAFANA_SERVICE_ACCOUNT_TOKEN","SECRETS_ENCRYPTION_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"] - keys | join(" ")')
 echo
 if [[ -n "$missing" ]]; then
   echo "Still missing before the stack can start: $missing"

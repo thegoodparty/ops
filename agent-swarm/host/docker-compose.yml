@@ -41,9 +41,12 @@ x-worker-env: &worker-env
   MCP_BASE_URL: http://api:3013
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
   YOLO: "true"
-  GITHUB_TOKEN: ${GITHUB_TOKEN}
-  GITHUB_NAME: ${GITHUB_NAME:-delegate}
-  GITHUB_EMAIL: ${GITHUB_EMAIL:-339843712+delegate-gp-bot@users.noreply.github.com}
+  # Git and gh authenticate as the GitHub App (delegate-gp[bot]) through the
+  # gh-app-token helper that global-setup-script.sh installs.
+  GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+  GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+  GITHUB_NAME: ${GITHUB_NAME:-delegate-gp[bot]}
+  GITHUB_EMAIL: ${GITHUB_EMAIL:-268660869+delegate-gp[bot]@users.noreply.github.com}
   CLICKUP_API_TOKEN: ${CLICKUP_API_TOKEN}
   CLICKUP_API_KEY: ${CLICKUP_API_TOKEN}
   GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_SERVICE_ACCOUNT_TOKEN}
