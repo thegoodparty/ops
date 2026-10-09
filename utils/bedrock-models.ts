@@ -77,17 +77,6 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     crossRegion: true,
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and the geo profile is mandatory",
   },
-  { id: "xai.grok-4.6", invokeId: "us.xai.grok-4.6", crossRegion: true },
-  {
-    id: "openai.gpt-5.6-sol",
-    invokeId: "us.openai.gpt-5.6-sol",
-    crossRegion: true,
-  },
-  {
-    id: "openai.gpt-5.6-terra",
-    invokeId: "us.openai.gpt-5.6-terra",
-    crossRegion: true,
-  },
   {
     id: "moonshotai.kimi-k3",
     invokeId: "us.moonshotai.kimi-k3",
@@ -98,7 +87,7 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     id: "openai.gpt-6.1-sol",
     invokeId: "us.openai.gpt-6.1-sol",
     crossRegion: true,
-    note: "Marketplace product prod-qco655ut2vn54; replaces gpt-5.6-sol and gpt-5.6-terra in gp-pi, which stay permitted until that ships",
+    note: "Marketplace product prod-qco655ut2vn54; replaced gpt-5.6-sol and gpt-5.6-terra",
   },
   {
     id: "anthropic.claude-haiku-5-5",
@@ -110,15 +99,14 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     id: "xai.grok-4.7",
     invokeId: "us.xai.grok-4.7",
     crossRegion: true,
-    note: "not sold through Marketplace, IAM only; replaces grok-4.6, which stays permitted until gp-pi ships",
+    note: "not sold through Marketplace, IAM only; replaced grok-4.6",
   },
   {
     id: "zai.glm-5.3",
     invokeId: "us.zai.glm-5.3",
     crossRegion: true,
-    note: "us. profile only; access in this account is unverified when granted; replaces glm-5, which stays permitted until gp-pi ships",
+    note: "us. profile only; access in this account is unverified when granted; replaced glm-5",
   },
-  { id: "zai.glm-5", invokeId: "zai.glm-5", crossRegion: false },
   {
     id: "deepseek.v3.2",
     invokeId: "deepseek.v3.2",
