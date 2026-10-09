@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { getAgent, runAgent } from "../framework";
 import { buildReviewPrompt } from "../agents/pr-reviewer";
+import { promptDiff } from "./prompt-diff";
 import { parseDiffAnchors, placeFindings } from "./anchors";
 import { renderBody, renderFailureBody } from "./body";
 import { buildBundle, priorFindingsFrom } from "./bundle";
@@ -391,9 +392,19 @@ export const runReview = async (args: {
     return record;
   };
 
+  // Under .git/ so it is inside the checkout for the path guard but never
+  // shows up in the working tree the agent is reviewing.
+  let diffPath: string | undefined;
+  if (promptDiff(bundle.diff).oversized) {
+    const dir = resolve(reviewDir, ".git", "delegate-review");
+    mkdirSync(dir, { recursive: true });
+    diffPath = resolve(dir, "diff.patch");
+    writeFileSync(diffPath, promptDiff(bundle.diff).inline);
+  }
+
   let result: Awaited<ReturnType<typeof runAgent>>;
   try {
-    result = await runAgent(config, buildReviewPrompt(bundle), {
+    result = await runAgent(config, buildReviewPrompt(bundle, { diffPath }), {
       cwd: reviewDir,
       abortController: args.abortController,
       mcpServers: { git: createGitTool(reviewDir) },
