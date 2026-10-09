@@ -214,6 +214,7 @@ services:
         condition: service_healthy
     environment:
       - SWARM_AUTH=${SWARM_AUTH:-open}
+      - SWARM_API_KEY=${API_KEY}
     ports:
       - "80:80"
       - "443:443"

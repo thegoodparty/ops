@@ -4,8 +4,9 @@ cd /opt/agent-swarm
 ./render-env.sh
 
 version="$(sed -n 's/^AGENT_SWARM_VERSION=//p' .env)"
+auth="$(sed -n 's/^SWARM_AUTH=//p' .env)"
 built="$(cat ui-dist/.agent-swarm-version 2>/dev/null || true)"
-if [[ "$built" != "$version" ]]; then
+if [[ "$built" != "$version+$auth" ]]; then
   ./build-ui.sh
 fi
 

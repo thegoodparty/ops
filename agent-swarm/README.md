@@ -143,12 +143,16 @@ refresh (`OAUTH2_PROXY_COOKIE_REFRESH`), so also revoke that person's
 `aswt_` token. Google group membership would need a Workspace service
 account with domain-wide delegation, which we chose not to create.
 
-Login only gates. The API reads no identity from it, so people still paste
-a bearer into the dashboard's setup page: the shared `API_KEY`, or better a
-per-user `aswt_` token an admin mints with
-`POST /api/users/{id}/mcp-tokens`. Hand the token out on its own, not inside a
-`?apiKey=` link: an unauthenticated visit carries the whole link through
-Google's sign-in.
+With login on, nobody pastes a key. `build-ui.sh` builds the dashboard
+locked to this API with a placeholder key (`VITE_API_URL`, `VITE_API_KEY`),
+and Caddy replaces the `Authorization` header on the login-gated API paths
+with the real `API_KEY` (`SWARM_API_KEY` in the caddy container). The real
+key never reaches a browser. Everyone past the login acts as the operator;
+agent-swarm has no roles to assign and reads no identity from the login, so
+per-person attribution is not available. The dashboard is rebuilt whenever
+the login mode changes (`ui-dist/.agent-swarm-version` records version and
+mode). Machine clients on the bypass paths (`/mcp`, webhooks) keep their own
+bearer.
 
 ## GitHub App
 

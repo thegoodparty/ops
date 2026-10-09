@@ -78,9 +78,13 @@
 			}
 		}
 
+		# The dashboard is built with a placeholder key (build-ui.sh); only
+		# people past the login above get here, so they act as the operator.
 		@api path /api/* /p/* /@swarm/* /docs /docs/* /openapi.json /x/* /close
 		handle @api {
-			reverse_proxy api:3013
+			reverse_proxy api:3013 {
+				header_up Authorization "Bearer {$SWARM_API_KEY}"
+			}
 		}
 
 		handle {
