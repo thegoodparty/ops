@@ -110,7 +110,7 @@ instance, volume and address ids are in the stack outputs and the EC2 console.
 
 Key env (names only; see `render-env.sh` and the compose file for the full set):
 
-- API: `NODE_ENV=production` (Bun defaults to `development`, which **silently blocks Slack Socket Mode**), `CAPABILITIES` unset (defaults include scheduling, pages, slack, mcp, kv, memory, repo), `ALLOW_PRIVATE_NETWORK_URLS=true` (needed to register `http://grafana-mcp:8000/mcp`), `GITHUB_DISABLE=true` (no inbound GitHub webhooks), `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org`, `SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK`, `APP_URL=https://delegate-swarm.infra.goodparty.org`, `MCP_BASE_URL` and `PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org`, `EMBEDDING_API_BASE_URL=http://tei:80/v1`, `EMBEDDING_API_KEY=local`, `EMBEDDING_MODEL=nomic-embed-text-v1.5`, `API_DRAIN_MAX_MS=30000`, `SECRETS_ENCRYPTION_KEY` via env (not a file secret). No `MODEL_OVERRIDE`: the API reads none.
+- API: `NODE_ENV=production` (Bun defaults to `development`, which **silently blocks Slack Socket Mode**), `CAPABILITIES` unset (defaults include scheduling, pages, slack, mcp, kv, memory, repo), `ALLOW_PRIVATE_NETWORK_URLS=true` (needed to register `http://grafana-mcp:8000/mcp`), `GITHUB_DISABLE` (rendered by `render-env.sh`: `true`, no inbound GitHub webhooks, until the secret holds `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY`, then `false`; README, "GitHub App"), `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org`, `SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK`, `APP_URL=https://delegate-swarm.infra.goodparty.org`, `MCP_BASE_URL` and `PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org`, `EMBEDDING_API_BASE_URL=http://tei:80/v1`, `EMBEDDING_API_KEY=local`, `EMBEDDING_MODEL=nomic-embed-text-v1.5`, `API_DRAIN_MAX_MS=30000`, `SECRETS_ENCRYPTION_KEY` via env (not a file secret). No `MODEL_OVERRIDE`: the API reads none.
 - Agents (shared `x-worker-env` anchor): `HARNESS_PROVIDER=pi`, `ANTHROPIC_API_KEY`, `MODEL_OVERRIDE` **provider-prefixed** (`anthropic/claude-opus-5-5` lead, `anthropic/claude-sonnet-5-5` workers), `MCP_BASE_URL=http://api:3013`, `APP_URL`, `GITHUB_TOKEN`, `GITHUB_NAME=delegate`, `GITHUB_EMAIL` (delegate-gp-bot's noreply address), `CLICKUP_API_TOKEN` and `CLICKUP_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `GRAFANA_URL`, `AWS_CONFIG_FILE`, `AWS_SDK_LOAD_CONFIG=1`. The lead also has `AGENT_NAME=delegate`. Agent ids are pinned in env so they survive recreation. Agent-scope `HARNESS_PROVIDER` and `MODEL_OVERRIDE` rows in the swarm's config win over these env values.
 - `grafana-mcp`: pinned by digest; `-t streamable-http --address 0.0.0.0:8000 --allowed-hosts grafana-mcp:8000,grafana-mcp` (it rejects non-loopback Host headers otherwise). It has **no caller auth**; only the compose network reaches it.
 
@@ -191,6 +191,7 @@ answering in Slack as delegate.
 
 Open:
 
+0. **GitHub App** for inbound @-mentions and reactions. The compose and `render-env.sh` side is built; it switches on when the secret holds the three App keys (README, "GitHub App", `fill-secrets.sh --github-app`).
 1. **Google OAuth client** for login. oauth2-proxy and the SSO Caddy routes
    switch on when the secret holds the three `OAUTH2_PROXY_*` keys (README,
    "Google login").
