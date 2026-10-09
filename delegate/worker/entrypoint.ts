@@ -95,8 +95,16 @@ const main = async () => {
   }, deadlineMs);
   deadline.unref();
 
-  await setupGitHubAuth();
-  await setupReviewerGitHubAuth();
+  // pr-reviewer runs entirely as the reviewer App, including the gh/git
+  // checkout below, so it boots without the delegate App's key.
+  if (job.agent === "pr-reviewer") {
+    await setupReviewerGitHubAuth();
+    process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
+    process.env.GH_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
+  } else {
+    await setupGitHubAuth();
+    await setupReviewerGitHubAuth();
+  }
 
   // Working directory handed to the agent. The deterministic per-agent
   // checkouts below set this so the agent boots with the repo already on disk
