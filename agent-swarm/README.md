@@ -42,15 +42,24 @@ host; the next deploy overwrites them.
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
   with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
-  `GITHUB_TOKEN`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
+  `GIT_SSH_PRIVATE_KEY_B64`, `GITHUB_TOKEN`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
   `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and optionally the three
   `OAUTH2_PROXY_*` keys that turn on Google login
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
-- GitHub identity: a service user's fine-grained PAT. TODO: `GITHUB_NAME`
-  and `GITHUB_EMAIL` in `host/render-env.sh` are the placeholders
-  `delegate` and `delegate@goodparty.org`; set them to the service user's
-  real login and email once it exists.
+- GitHub identity: the `delegate-gp-bot` account. `gh` uses its fine-grained
+  PAT (`GITHUB_TOKEN`) for API work. `git push` goes over SSH and commits are
+  SSH-signed, both with one ed25519 key (`GIT_SSH_PRIVATE_KEY_B64`, the
+  base64-encoded private key). `host/global-setup-script.sh` installs the key
+  and git config at every worker start. Commits are authored as `delegate` /
+  `eng-admin+delegate@goodparty.org`. One-time human steps:
+  1. `ssh-keygen -t ed25519 -C eng-admin+delegate@goodparty.org -f delegate-gp-bot`
+  2. On `delegate-gp-bot`, add `eng-admin+delegate@goodparty.org` and verify it.
+  3. At github.com/settings/keys add `delegate-gp-bot.pub` twice: once as an
+     Authentication key, once as a Signing key.
+  4. Run `fill-secrets.sh`, paste the private key at the SSH key prompt, end
+     with a blank line, then delete the local key files.
+  5. Re-run `up.sh` on the host, then `bootstrap.sh`, and restart the agents.
 
 `fill-secrets.sh` is the interactive way to fill the secret from a laptop.
 After a secret change, re-run `up.sh` on the host (or merge any host change).
