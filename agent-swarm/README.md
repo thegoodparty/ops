@@ -143,10 +143,15 @@ refresh (`OAUTH2_PROXY_COOKIE_REFRESH`), so also revoke that person's
 `aswt_` token. Google group membership would need a Workspace service
 account with domain-wide delegation, which we chose not to create.
 
-Login only gates. The API reads no identity from it, so people still paste
-a bearer into the dashboard's setup page: the shared `API_KEY`, or better a
-per-user `aswt_` token an admin mints with
-`POST /api/users/{id}/mcp-tokens`. Hand the token out on its own, not inside a
+Login only gates. The API reads no identity from it, so the dashboard is
+built with `VITE_API_URL` (the public origin) and `VITE_API_KEY` (the shared
+`API_KEY`, read from `.env` at build time by `build-ui.sh`) and nobody pastes
+a bearer into the setup page. That key is readable in the bundle by anyone who
+passes the sign-in, so everyone on `allowed-emails.txt` is effectively an
+operator, and `build-ui.sh` refuses to build unless `SWARM_AUTH=sso`.
+`up.sh` rebuilds the UI when `API_KEY` changes. Per-user `aswt_` tokens
+(`POST /api/users/{id}/mcp-tokens`) still work for clients outside the
+dashboard. Hand the token out on its own, not inside a
 `?apiKey=` link: an unauthenticated visit carries the whole link through
 Google's sign-in.
 

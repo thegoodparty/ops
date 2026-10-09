@@ -106,7 +106,7 @@ instance, volume and address ids are in the stack outputs and the EC2 console.
 | `global-setup-script.sh` | agent-swarm's admin `SETUP_SCRIPT` global config. Runs as root at every agent container start. Installs AWS CLI v2 once into the persistent `swarm_shared` volume and relinks `/usr/local/bin/aws`. Edit the script, merge, run `bootstrap.sh`, restart the agents. |
 | `bootstrap.sh` | Run as root after the stack is up; idempotent. Rebuilds the SQLite state the repo defines (section 5) through the API on `127.0.0.1:3013`, reading `API_KEY` from `.env` without printing it. |
 | `soul/` | The lead's `SOUL.md` and `IDENTITY.md`, which `bootstrap.sh` installs. |
-| `ui-dist/` (host only) | Built dashboard. Mounted read-only into caddy at `/srv/ui`. `build-ui.sh` rebuilds it when `ui-dist/.agent-swarm-version` differs from `AGENT_SWARM_VERSION`. |
+| `ui-dist/` (host only) | Built dashboard. Mounted read-only into caddy at `/srv/ui`. Built with `VITE_API_URL` and `VITE_API_KEY` (= `API_KEY` from `.env`, SSO only). `up.sh` rebuilds it when `ui-dist/.agent-swarm-version` differs from `AGENT_SWARM_VERSION` or `ui-dist/.api-key-sha` differs from the digest of `API_KEY`. |
 
 Key env (names only; see `render-env.sh` and the compose file for the full set):
 

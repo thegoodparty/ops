@@ -5,7 +5,8 @@ cd /opt/agent-swarm
 
 version="$(sed -n 's/^AGENT_SWARM_VERSION=//p' .env)"
 built="$(cat ui-dist/.agent-swarm-version 2>/dev/null || true)"
-if [[ "$built" != "$version" ]]; then
+key_sha="$(sed -n 's/^API_KEY=//p' .env | tr -d '\n' | sha256sum | cut -d' ' -f1)"
+if [[ "$built" != "$version" || "$(cat ui-dist/.api-key-sha 2>/dev/null || true)" != "$key_sha" ]]; then
   ./build-ui.sh
 fi
 
