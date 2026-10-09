@@ -84,7 +84,7 @@ const permissionSets = {
   administrator: {
     id: "ps-ab3b34dd2d6db1b8",
     name: "AdministratorAccess",
-    sessionDuration: "PT8H",
+    sessionDuration: "PT1H",
     managedPolicies: ["arn:aws:iam::aws:policy/AdministratorAccess"],
     // The one set that must never carry the guardrails. This is the
     // break-glass path ci-roles.ts names as the recovery route that does not

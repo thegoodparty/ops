@@ -55,7 +55,8 @@ see "The CloudTrail gap" and open question 7.
       permission set's `sessionDuration` from `PT8H` to `PT1H` in
       `deploy/components/identity-center.ts`, and add the management-account
       `break-glass-grant` role and its scoped inline policy in `deploy/`. No new
-      permission set and no new group; see "Core mechanism". `todo`
+      permission set and no new group; see "Core mechanism".
+      `doing (break-glass-step2, 2026-10-09)`
 - [ ] 3. The Lambda, dry: a separate Slack app, its own signing secret and bot
       token in the infrastructure account, a new Lambda in
       `deploy-infrastructure/`, the slash command and modal, a DynamoDB request
