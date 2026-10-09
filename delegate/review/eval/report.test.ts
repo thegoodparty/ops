@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { summarize, renderMarkdown, renderPrComment } from "./report";
+import { summarize, renderMarkdown, renderPrComment, qualityVerdict, costVerdict } from "./report";
 import type { PairVerdict } from "./judge";
 import type { Result } from "./replay";
 
@@ -128,93 +128,51 @@ const prCommentOpts = (overrides: Partial<Parameters<typeof renderPrComment>[2]>
   ...overrides,
 });
 
-test("renderPrComment starts with the delegate-eval marker", () => {
-  const verdicts = [verdict("a"), verdict("b")];
+test("renderPrComment leads with the two verdicts a reader acts on", () => {
+  const verdicts = Array.from({ length: 8 }, () => verdict("b"));
   const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts());
-  assert.ok(md.startsWith("<!-- delegate-eval -->"), `should start with marker, got: ${md.slice(0, 40)}`);
+  const resultsA = verdicts.map((v) => makeResult(v.caseId, { costUsd: 2 }));
+  const resultsB = verdicts.map((v) => makeResult(v.caseId, { costUsd: 1 }));
+  const md = renderPrComment(summary, verdicts, prCommentOpts({ casesCount: 8, resultsA, resultsB }));
+  const visible = md.split("<details>")[0];
+  assert.ok(md.startsWith("<!-- delegate-eval -->"));
+  assert.ok(visible.includes("**Quality: Better**"));
+  assert.ok(visible.includes("**Cost: Better** — $2.00 → $1.00 per review (prod → pr-abc1234)"));
+  assert.ok(md.includes("[Workflow run](https://github.com/thegoodparty/ops/actions/runs/1234)"));
+  assert.ok(md.includes("<details><summary>Per-case results</summary>"));
+  assert.ok(visible.split(/\s+/).length < 80);
 });
 
-test("renderPrComment includes heading with labelB vs labelA", () => {
+test("qualityVerdict is Can't tell unless the sign test is significant", () => {
+  assert.equal(qualityVerdict(summarize([verdict("b"), verdict("a"), verdict("tie")])), "Can't tell");
+  assert.equal(qualityVerdict(summarize(Array.from({ length: 7 }, () => verdict("b")))), "Better");
+  assert.equal(qualityVerdict(summarize(Array.from({ length: 7 }, () => verdict("a")))), "Worse");
+});
+
+test("costVerdict calls under 10% a wash", () => {
+  assert.equal(costVerdict(1.0, 1.05), "Same");
+  assert.equal(costVerdict(1.0, 0.8), "Better");
+  assert.equal(costVerdict(1.0, 1.3), "Worse");
+  assert.equal(costVerdict(null, 1.0), "Can't tell");
+});
+
+test("renderPrComment names failures and unjudged cases", () => {
   const verdicts = [verdict("a")];
-  const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts());
-  assert.ok(md.includes("### Delegate eval: pr-abc1234 vs prod"));
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, unjudgedCount: 2, replayFailures: 2 }));
+  assert.ok(md.includes("over 1 of 3 cases"));
+  assert.ok(md.includes("2 not judged"));
+  assert.ok(md.includes("2 replay failure(s)"));
+  assert.ok(md.includes("**Cost: Can't tell**"));
 });
 
-test("renderPrComment visible part is under 250 words", () => {
-  const verdicts = Array.from({ length: 12 }, (_, i) => verdict(i % 3 === 0 ? "b" : "a"));
-  const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts({ replayFailures: 1 }));
-  const visiblePart = md.replace(/<details[\s\S]*?<\/details>/g, "");
-  const wordCount = visiblePart.trim().split(/\s+/).length;
-  assert.ok(wordCount < 250, `visible part has ${wordCount} words, expected < 250`);
-});
-
-test("renderPrComment includes details sections", () => {
-  const verdicts = [verdict("a"), verdict("b")];
-  const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts());
-  assert.ok(md.includes("<details>"), "should include details open tag");
-  assert.ok(md.includes("</details>"), "should include details close tag");
-  assert.ok(md.includes("Per-case results"), "should include per-case summary");
-});
-
-test("renderPrComment includes what each side said when results provided", () => {
-  const v = verdict("b", "thegoodparty/gp-webapp", 99);
-  const summary = summarize([v]);
-  const rA = makeResult(v.caseId, { output: { status: "complete", findings: [], summary: "A summary" } });
-  const rB = makeResult(v.caseId, { output: { status: "complete", findings: [], summary: "B summary" } });
-  const md = renderPrComment(summary, [v], prCommentOpts({ resultsA: [rA], resultsB: [rB] }));
-  assert.ok(md.includes("What each side said"), "should include second details section");
-  assert.ok(md.includes("A summary"), "should include A output summary");
-  assert.ok(md.includes("B summary"), "should include B output summary");
-});
-
-test("renderPrComment shows sign test p-value in visible text", () => {
-  const verdicts = [verdict("a"), verdict("b")];
-  const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts());
-  const visiblePart = md.replace(/<details[\s\S]*?<\/details>/g, "");
-  assert.ok(visiblePart.includes("p="), "should include p-value in visible text");
-});
-
-test("renderPrComment includes run URL at the footer", () => {
-  const verdicts = [verdict("a")];
-  const summary = summarize(verdicts);
-  const runUrl = "https://github.com/thegoodparty/ops/actions/runs/9999";
-  const md = renderPrComment(summary, verdicts, prCommentOpts({ runUrl }));
-  assert.ok(md.includes(runUrl), "should include run URL");
-});
-
-test("renderPrComment shows not distinguishable from noise when p >= 0.05 with few cases", () => {
-  const verdicts = [verdict("a"), verdict("b"), verdict("tie")];
-  const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts());
-  const visiblePart = md.replace(/<details[\s\S]*?<\/details>/g, "");
-  assert.ok(visiblePart.includes("not distinguishable from noise"));
-});
-
-test("renderPrComment shows replay failures and cost", () => {
-  const verdicts = [verdict("a")];
-  const summary = summarize(verdicts);
-  const md = renderPrComment(summary, verdicts, prCommentOpts({ replayFailures: 2, replayCost: 3.14 }));
-  const visiblePart = md.replace(/<details[\s\S]*?<\/details>/g, "");
-  assert.ok(visiblePart.includes("2 replay(s) failed"));
-  assert.ok(visiblePart.includes("$3.14"));
-});
-
-test("renderPrComment names cases that could not be judged", () => {
-  const verdicts = [verdict("a")];
-  const summary = summarize(verdicts);
-  const out = renderPrComment(summary, verdicts, {
-    labelA: "prod",
-    labelB: "pr",
-    casesCount: 3,
-    unjudgedCount: 2,
-    replayCost: 1,
-    replayFailures: 2,
-    runUrl: "https://example.com/run",
-  });
-  assert.ok(out.includes("3 cases, 1 judged (2 missing a result on one side)"));
+test("cost is averaged over cases priced on both sides only", () => {
+  const verdicts = [verdict("a"), verdict("a"), verdict("a")];
+  const resultsA = verdicts.map((v) => makeResult(v.caseId, { costUsd: 1 }));
+  const resultsB = [
+    makeResult(verdicts[0].caseId, { costUsd: 1 }),
+    makeResult(verdicts[1].caseId, { costUsd: 1 }),
+    makeResult(verdicts[2].caseId, { costUsd: null, error: "checkout failed", output: null }),
+  ];
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, resultsA, resultsB }));
+  assert.ok(md.includes("**Cost: Same** — $1.00 → $1.00 per review"));
 });

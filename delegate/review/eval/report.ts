@@ -87,15 +87,6 @@ export interface PrCommentOptions {
   resultsB?: Result[];
 }
 
-const signTestInterpretation = (
-  summary: Summary,
-  labelA: string,
-  labelB: string,
-): string => {
-  if (summary.signTestP >= 0.05) return "not distinguishable from noise";
-  return summary.b > summary.a ? `${labelB} is better` : `${labelB} is worse`;
-};
-
 const renderPerCaseTable = (
   verdicts: PairVerdict[],
   labelA: string,
@@ -157,48 +148,63 @@ const renderWhatEachSideSaid = (
   return sections.join("\n\n");
 };
 
+// Two verdicts a reader can act on, then a link for the rest.
+export const qualityVerdict = (summary: Summary): "Better" | "Worse" | "Can't tell" => {
+  if (summary.signTestP >= 0.05 || summary.a === summary.b) return "Can't tell";
+  return summary.b > summary.a ? "Better" : "Worse";
+};
+
+// Same cases on both sides, or a replay that failed on one side moves the
+// headline without any review having changed price.
+const pairedAvgCost = (a: Result[], b: Result[]): [number | null, number | null] => {
+  const bById = new Map(b.map((r) => [r.caseId, r]));
+  const pairs = a
+    .map((ra) => [ra, bById.get(ra.caseId)] as const)
+    .filter((p): p is readonly [Result, Result] =>
+      p[1] !== undefined && typeof p[0].costUsd === "number" && typeof p[1].costUsd === "number",
+    );
+  if (pairs.length === 0) return [null, null];
+  const avg = (pick: (p: readonly [Result, Result]) => number) =>
+    pairs.reduce((sum, p) => sum + pick(p), 0) / pairs.length;
+  return [avg((p) => p[0].costUsd ?? 0), avg((p) => p[1].costUsd ?? 0)];
+};
+
+export const costVerdict = (
+  before: number | null,
+  after: number | null,
+): "Better" | "Worse" | "Same" | "Can't tell" => {
+  if (before === null || after === null || before === 0) return "Can't tell";
+  const change = (after - before) / before;
+  if (Math.abs(change) < 0.1) return "Same";
+  return change < 0 ? "Better" : "Worse";
+};
+
 export const renderPrComment = (
   summary: Summary,
   verdicts: PairVerdict[],
   opts: PrCommentOptions,
 ): string => {
-  const { labelA, labelB, casesCount, unjudgedCount = 0, replayCost, replayFailures, runUrl, resultsA = [], resultsB = [] } = opts;
-  const lines: string[] = [];
+  const { labelA, labelB, casesCount, unjudgedCount = 0, replayFailures, runUrl, resultsA = [], resultsB = [] } = opts;
+  const [before, after] = pairedAvgCost(resultsA, resultsB);
+  const money = (n: number | null) => (n === null ? "n/a" : `$${n.toFixed(2)}`);
+  const judged = casesCount - unjudgedCount;
+  const unjudgedNote = unjudgedCount ? `, ${unjudgedCount} not judged` : "";
+  const failureNote = replayFailures ? `, ${replayFailures} replay failure(s)` : "";
 
-  lines.push("<!-- delegate-eval -->");
-  lines.push("");
-  lines.push(`### Delegate eval: ${labelB} vs ${labelA}`);
-  lines.push("");
-
-  const interpretation = signTestInterpretation(summary, labelA, labelB);
-  const pStr = summary.signTestP.toFixed(4);
-  const failureNote = replayFailures > 0 ? ` ${replayFailures} replay(s) failed.` : "";
-  const costNote = replayCost > 0 ? ` Replay cost: $${replayCost.toFixed(2)}.` : "";
-
-  lines.push(
-    `${casesCount} cases, ${casesCount - unjudgedCount} judged${unjudgedCount ? ` (${unjudgedCount} missing a result on one side)` : ""}. ${labelA} won ${summary.a}, ${labelB} won ${summary.b}, ` +
-    `${summary.ties + summary.unstable} tied or unstable. ` +
-    `Sign-test p=${pStr} (${interpretation}).${failureNote}${costNote}`,
-  );
-  lines.push("");
-
-  lines.push("<details><summary>Per-case results</summary>");
-  lines.push("");
-  lines.push(renderPerCaseTable(verdicts, labelA, labelB));
-  lines.push("");
-  lines.push("</details>");
-  lines.push("");
-
-  if (resultsA.length > 0 || resultsB.length > 0) {
-    lines.push("<details><summary>What each side said</summary>");
-    lines.push("");
-    lines.push(renderWhatEachSideSaid(verdicts, resultsA, resultsB, labelA, labelB));
-    lines.push("");
-    lines.push("</details>");
-    lines.push("");
-  }
-
-  lines.push(`[View workflow run](${runUrl})`);
-
-  return lines.join("\n");
+  return [
+    "<!-- delegate-eval -->",
+    `### Delegate eval: ${labelB} vs ${labelA}`,
+    "",
+    `**Quality: ${qualityVerdict(summary)}** — ${labelB} won ${summary.b}, ${labelA} won ${summary.a}, ${summary.ties + summary.unstable} tied or unstable, over ${judged} of ${casesCount} cases (p=${summary.signTestP.toFixed(2)})${unjudgedNote}${failureNote}.`,
+    "",
+    `**Cost: ${costVerdict(before, after)}** — ${money(before)} → ${money(after)} per review (${labelA} → ${labelB}).`,
+    "",
+    "<details><summary>Per-case results</summary>",
+    "",
+    renderPerCaseTable(verdicts, labelA, labelB),
+    "",
+    "</details>",
+    "",
+    `[Workflow run](${runUrl}) has every result as an artifact.`,
+  ].join("\n");
 };
