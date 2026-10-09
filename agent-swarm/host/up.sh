@@ -4,9 +4,16 @@ cd /opt/agent-swarm
 ./render-env.sh
 
 version="$(sed -n 's/^AGENT_SWARM_VERSION=//p' .env)"
+auth="$(sed -n 's/^SWARM_AUTH=//p' .env)"
 built="$(cat ui-dist/.agent-swarm-version 2>/dev/null || true)"
-if [[ "$built" != "$version" ]]; then
+if [[ "$built" != "$version+$auth" ]]; then
   ./build-ui.sh
+fi
+
+# Bind-mounted into caddy; it must exist before compose starts it, or docker
+# creates a directory in its place.
+if [[ ! -e dashboard-tokens.caddy ]]; then
+  install -m 600 /dev/null dashboard-tokens.caddy
 fi
 
 # The profile set must be identical on every call, or --remove-orphans can
@@ -17,6 +24,10 @@ if grep -q '^OAUTH2_PROXY_CLIENT_ID=.' .env; then
 fi
 
 docker compose "${profiles[@]}" up -d --remove-orphans
+
+if [[ "$auth" == "sso" ]]; then
+  ./sync-dashboard-users.sh
+fi
 
 # up -d does not recreate caddy when only the Caddyfile changed. Retry because
 # a freshly created caddy may not have its admin endpoint listening yet.

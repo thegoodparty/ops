@@ -48,6 +48,15 @@
 }
 
 (sso) {
+	# The API reads no identity from the login, so the signed-in address picks
+	# that person's own aswt_ token (sync-dashboard-users.sh writes the
+	# entries). Only oauth2-proxy may set the address: drop any client copy.
+	request_header -X-Auth-Request-Email
+	map {http.request.header.X-Auth-Request-Email} {swarm_user_token} {
+		import /etc/caddy/dashboard-tokens.caddy
+		default ""
+	}
+
 	# oauth2-proxy's own endpoints: login start, Google callback, sign out.
 	handle /oauth2/* {
 		reverse_proxy oauth2-proxy:4180 {
@@ -78,9 +87,15 @@
 			}
 		}
 
+		# The dashboard is built with a placeholder key (build-ui.sh); the API
+		# gets the signed-in person's token instead.
 		@api path /api/* /p/* /@swarm/* /docs /docs/* /openapi.json /x/* /close
 		handle @api {
-			reverse_proxy api:3013
+			@unprovisioned vars {swarm_user_token} ""
+			respond @unprovisioned "Signed in, but this address has no dashboard token (allowed-emails.txt, sync-dashboard-users.sh)" 403
+			reverse_proxy api:3013 {
+				header_up Authorization "Bearer {swarm_user_token}"
+			}
 		}
 
 		handle {

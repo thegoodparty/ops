@@ -220,6 +220,8 @@ services:
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Per-person dashboard tokens, written by sync-dashboard-users.sh.
+      - ./dashboard-tokens.caddy:/etc/caddy/dashboard-tokens.caddy:ro
       - /opt/agent-swarm/ui-dist:/srv/ui:ro
       - caddy_data:/data
       - caddy_config:/config

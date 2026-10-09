@@ -20,7 +20,8 @@ Everything in `host/` is the contents of `/opt/agent-swarm/` on the host
 association runs `host/install.sh` on the instance whenever any file
 changed. `install.sh` copies the files in place, installs the systemd unit,
 and runs `up.sh`, which renders `.env` from the secret, rebuilds the
-dashboard if the version changed, and runs `docker compose up -d`. Compose
+dashboard if the version or login mode changed, runs `docker compose up -d`
+and, with Google login on, syncs the dashboard users (below). Compose
 only recreates the containers whose definition changed. `pulumi up` waits
 for the association, so a host that fails to take a change fails the
 deploy. `install.sh` never stops the stack.
@@ -138,17 +139,43 @@ To turn it on:
 Only the addresses in `host/allowed-emails.txt`, one per line, get past
 the sign-in. Grant or revoke access with a PR to that file; the deploy
 rewrites it in place and oauth2-proxy picks the change up without a
-restart. A removed address loses access at its next hourly session
-refresh (`OAUTH2_PROXY_COOKIE_REFRESH`), so also revoke that person's
-`aswt_` token. Google group membership would need a Workspace service
+restart. A removed address loses the dashboard as soon as the deploy
+revokes its token (below), and the login itself at its next hourly session
+refresh (`OAUTH2_PROXY_COOKIE_REFRESH`). Revoke any other `aswt_` token that
+person holds by hand. Google group membership would need a Workspace service
 account with domain-wide delegation, which we chose not to create.
 
-Login only gates. The API reads no identity from it, so people still paste
-a bearer into the dashboard's setup page: the shared `API_KEY`, or better a
-per-user `aswt_` token an admin mints with
-`POST /api/users/{id}/mcp-tokens`. Hand the token out on its own, not inside a
-`?apiKey=` link: an unauthenticated visit carries the whole link through
-Google's sign-in.
+With login on, nobody pastes a key, and each person acts as themselves.
+The API reads no identity from the login and only takes bearers, so:
+
+- `up.sh` runs `sync-dashboard-users.sh` once the API is healthy. For each
+  address in `allowed-emails.txt` it finds the agent-swarm user with that
+  email (or alias), creating one if needed, and mints that user an `aswt_`
+  token labelled `dashboard-sso`. It keeps a token that still works and
+  revokes the `dashboard-sso` tokens of anyone no longer listed. A suspended
+  user gets none.
+- The tokens live only in `/opt/agent-swarm/dashboard-tokens.caddy`
+  (owner-only, not in git or the config bucket), as Caddy `map` entries.
+- Caddy maps the signed-in address (`X-Auth-Request-Email` from
+  oauth2-proxy; any copy the client sends is dropped) to that token and
+  sends it as the `Authorization` header on the login-gated API paths. A
+  signed-in address with no token gets a 403.
+- `build-ui.sh` builds the dashboard locked to this API with a placeholder
+  key (`VITE_API_URL`, `VITE_API_KEY=aswt_sso_gateway`). The `aswt_` prefix
+  makes the dashboard read its identity from `/api/whoami` instead of asking
+  who you are. It is rebuilt whenever the login mode changes
+  (`ui-dist/.agent-swarm-version` records version and mode).
+
+Machine clients on the bypass paths (`/mcp`, `/mcp-user`, webhooks) keep
+their own bearer.
+
+What a person can do is what agent-swarm lets a user token do. New users get
+the built-in `admin` role, so that is nearly everything the operator key can
+do, with tasks, config and token changes attributed to them. On v1.163.0 a
+user token cannot create or edit swarm-scope MCP servers (lead only),
+steer a task someone else requested, refresh the model catalog, or read the
+asset key audit. Do those with `API_KEY` from the host (as `bootstrap.sh`
+does).
 
 ## GitHub App
 
