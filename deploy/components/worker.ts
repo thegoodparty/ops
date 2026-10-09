@@ -20,39 +20,6 @@ export const createWorker = (config: WorkerConfig) => {
     retentionInDays: 30,
   });
 
-  new aws.cloudwatch.LogMetricFilter("workflowPhaseCompleted", {
-    name: "workflow-phase-completed",
-    logGroupName: logGroup.name,
-    pattern: '{ $.event = "workflow_phase_completed" }',
-    metricTransformation: {
-      namespace: "Delegate/Workflow",
-      name: "PhaseCompleted",
-      value: "1",
-      dimensions: {
-        phase: "$.phase",
-        outcome: "$.outcome",
-      },
-    },
-  });
-
-  // Cost is dimensioned by both phase AND outcome so we can chart cost-of-
-  // failures separately — a high cost-on-error trend is the early-warning
-  // signal for an agent looping in its error path.
-  new aws.cloudwatch.LogMetricFilter("workflowPhaseCost", {
-    name: "workflow-phase-cost",
-    logGroupName: logGroup.name,
-    pattern: '{ $.event = "workflow_phase_completed" }',
-    metricTransformation: {
-      namespace: "Delegate/Workflow",
-      name: "PhaseCostUsd",
-      value: "$.costUsd",
-      dimensions: {
-        phase: "$.phase",
-        outcome: "$.outcome",
-      },
-    },
-  });
-
   const executionRole = new aws.iam.Role("agentExecutionRole", {
     name: "delegate-execution-role",
     assumeRolePolicy: JSON.stringify({
@@ -123,13 +90,6 @@ export const createWorker = (config: WorkerConfig) => {
         },
       ],
     }),
-    managedPolicyArns: [
-      "arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess",
-      "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-      "arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess",
-      "arn:aws:iam::aws:policy/AWSSSOReadOnly",
-      "arn:aws:iam::aws:policy/AWSSSODirectoryReadOnly",
-    ],
     inlinePolicies: [
       {
         name: "inline",
@@ -147,31 +107,6 @@ export const createWorker = (config: WorkerConfig) => {
               Resource: ["*"],
             },
             {
-              Effect: "Allow",
-              Action: ["ecs:Describe*", "ecs:List*"],
-              Resource: ["*"],
-            },
-            {
-              Sid: "IAMRoleAndPolicyLookups",
-              Effect: "Allow",
-              Action: [
-                "iam:GetRole",
-                "iam:ListRoles",
-                "iam:GetRolePolicy",
-                "iam:ListRolePolicies",
-                "iam:ListAttachedRolePolicies",
-                "iam:GetPolicy",
-                "iam:ListPolicies",
-                "iam:GetPolicyVersion",
-                "iam:ListPolicyVersions",
-                "iam:ListEntitiesForPolicy",
-                "iam:GetInstanceProfile",
-                "iam:ListInstanceProfiles",
-                "iam:ListInstanceProfilesForRole",
-              ],
-              Resource: ["*"],
-            },
-            {
               Sid: "ReviewBucketObjects",
               Effect: "Allow",
               Action: ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"],
@@ -182,24 +117,6 @@ export const createWorker = (config: WorkerConfig) => {
               Effect: "Allow",
               Action: ["s3:ListBucket"],
               Resource: ["arn:aws:s3:::delegate-reviews"],
-            },
-            {
-              Sid: "LambdaMetadataNoEnvVars",
-              Effect: "Allow",
-              Action: [
-                "lambda:ListEventSourceMappings",
-                "lambda:GetEventSourceMapping",
-                "lambda:GetPolicy",
-                "lambda:ListAliases",
-                "lambda:GetAccountSettings",
-                "lambda:ListLayers",
-                "lambda:ListLayerVersions",
-                "lambda:GetLayerVersion",
-                "lambda:ListTags",
-                "lambda:ListFunctionUrlConfigs",
-                "lambda:GetFunctionUrlConfig",
-              ],
-              Resource: ["*"],
             },
           ],
         }),

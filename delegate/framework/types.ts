@@ -2,11 +2,6 @@ import type { HookCallback, Options } from "@anthropic-ai/claude-agent-sdk";
 
 export type McpServerConfig = NonNullable<Options["mcpServers"]>[string];
 
-export type CallbackTarget =
-  | { type: "slack"; channel: string; threadTs?: string }
-  | { type: "github"; repo: string; issueNumber: number }
-  | { type: "github-pr"; repo: string; prNumber: number };
-
 export type AgentConfig = {
   name: string;
   systemPrompt: string;
@@ -17,8 +12,6 @@ export type AgentConfig = {
   maxBudgetUsd?: number;
   permissionMode?: Options["permissionMode"];
   agents?: Options["agents"];
-  plugins?: Options["plugins"];
-  settingSources?: Options["settingSources"];
   tools?: Options["tools"];
   outputFormat?: Options["outputFormat"];
 };
@@ -34,8 +27,6 @@ export type RunOverrides = {
 export type AgentJob = {
   agent: string;
   message: string;
-  callback?: CallbackTarget;
-  cwd?: string;
   metadata?: Record<string, string>;
 };
 
