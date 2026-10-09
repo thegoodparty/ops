@@ -57,7 +57,7 @@ echo "agents: lead, coder and reviewer registered"
 
 jq -n --rawfile v global-setup-script.sh \
   '{scope: "global", key: "SETUP_SCRIPT", value: $v,
-    description: "Root hook: AWS CLI v2 on /workspace/shared, linked into /usr/local/bin"}' \
+    description: "Root hook: AWS CLI v2, GitHub App token helper for git and gh"}' \
   | api PUT /api/config -d @- \
   | jq -r '"setup script: saved as global config \(.id)"'
 

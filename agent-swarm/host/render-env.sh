@@ -117,8 +117,8 @@ EMBEDDING_MODEL=nomic-embed-text-v1.5
 SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org
 SLACK_ALERTS_CHANNEL=C0C6RUJ9VMK
 
-GITHUB_NAME=delegate
-GITHUB_EMAIL=339843712+delegate-gp-bot@users.noreply.github.com
+GITHUB_NAME=delegate-gp[bot]
+GITHUB_EMAIL=268660869+delegate-gp[bot]@users.noreply.github.com
 
 GRAFANA_URL=https://goodparty.grafana.net
 EOF

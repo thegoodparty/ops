@@ -49,8 +49,8 @@ host; the next deploy overwrites them.
   per container. `docker compose logs` on the host still works.
 - GitHub identity: the service user
   [delegate-gp-bot](https://github.com/delegate-gp-bot) and its fine-grained
-  PAT. Commits are authored as `delegate` with the user's noreply address
-  (`339843712+delegate-gp-bot@users.noreply.github.com`, in `host/render-env.sh`), so GitHub links them to the account.
+  PAT, now only the fallback. Commits and PRs are authored by the
+  `delegate-gp[bot]` App (see "Git identity").
 
 `fill-secrets.sh` is the interactive way to fill the secret from a laptop.
 After a secret change, re-run `up.sh` on the host (or merge any host change).
@@ -156,8 +156,8 @@ Off until the secret holds `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_ID` and
 `GITHUB_APP_PRIVATE_KEY` (all three or none; `render-env.sh` refuses a partial
 set). Then it renders `GITHUB_DISABLE=false` and the API accepts GitHub App
 webhooks at `/api/github/webhook`: `@`-mentions of the bot start tasks and
-the bot reacts to the comment. Agents still push with the service user's
-PAT; the App is inbound only. The webhook path is open in both Caddy modes
+the bot reacts to the comment. The same App keys also let agents push and
+open PRs as `delegate-gp[bot]` (see "Git identity" below). The webhook path is open in both Caddy modes
 (the signature is the credential).
 
 1. Create the App in the thegoodparty org with webhook URL
@@ -171,6 +171,29 @@ PAT; the App is inbound only. The webhook path is open in both Caddy modes
    accepts base64 or raw PEM; raw does not survive `.env`), and asks for the
    bot name (the App slug). `GITHUB_BOT_ALIASES` is set to `delegate-gp-bot`.
 3. On the host, `sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh`.
+
+### Git identity
+
+With the App keys in the secret, workers author git pushes and `gh` calls as
+`delegate-gp[bot]`. The agent containers receive `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY`; `host/global-setup-script.sh` (root, every container
+start) installs `/usr/local/bin/gh-app-token`, a system git credential helper
+for `github.com` and a `gh` wrapper that sets `GH_TOKEN`. The helper signs an
+App JWT with openssl, resolves the installation for the repo owner, mints a
+~1h installation token and caches it per owner under `~/.cache/gh-app-token`
+(refreshed within 5 minutes of expiry). If anything fails (no installation for
+that owner, bad key, GitHub down) it prints a one-line note on stderr, never a
+secret, and falls back to the static `GITHUB_TOKEN` PAT. Commits are authored
+`delegate-gp[bot] <268660869+delegate-gp[bot]@users.noreply.github.com>`
+(268660869 is the bot user id, not the App id; GitHub links the email to the
+App by user id). Keep the PAT in the secret as the fallback. The App only
+reaches repos it is installed on (`omni`, `ops`).
+
+After merging: run `sudo /opt/agent-swarm/install.sh` (or the deploy
+workflow) so `render-env.sh` and compose are refreshed, then
+`sudo /opt/agent-swarm/bootstrap.sh` to push the new `SETUP_SCRIPT`, then
+restart the agents (`up.sh`). Check from a worker: `gh-app-token >/dev/null`
+prints no note, and `gh api repos/thegoodparty/ops --jq .full_name` works.
 
 ## Changing agent behaviour
 
