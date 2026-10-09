@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM public.ecr.aws/docker/library/node:22-alpine
 
 RUN apk add --no-cache git curl github-cli uv bash aws-cli jq ripgrep
 RUN curl -sL https://sentry.io/get-cli/ | sh
