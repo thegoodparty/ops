@@ -78,7 +78,7 @@ done
 echo "grafana mcp: installed on lead, coder and reviewer"
 
 # An agent session that meets clickup before it is authorized skips it for
-# days (HANDOFF, gotchas), so it is installed only once it is connected.
+# days, so it is installed only once it is connected.
 clickup="$(api GET '/api/mcp-servers?scope=swarm' | jq -r '[.servers[] | select(.name == "clickup")][0].id // ""')"
 if [[ -n "$clickup" ]]; then
   echo "clickup mcp: already registered as $clickup"

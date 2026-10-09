@@ -10,8 +10,7 @@ import {
 import { INFRA_ZONE_NAME } from "./dns";
 
 // The Delegate swarm host: one EC2 instance running agent-swarm in Docker
-// Compose. Operating procedures are in agent-swarm/README.md, history and
-// decisions in agent-swarm/HANDOFF.md.
+// Compose. Operating procedures are in agent-swarm/README.md.
 
 const NAME = "delegate-swarm";
 export const SWARM_HOSTNAME = `${NAME}.${INFRA_ZONE_NAME}`;
