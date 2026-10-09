@@ -139,14 +139,19 @@ that group.
 ### The decision
 
 - **Grant**: `identitystore:CreateGroupMembership` adds the requester to
-  `Admins`. The call is idempotent, so a requester who is already a member is a
-  no-op, and the grant is still recorded with its expiry.
+  `Admins` and returns the new `MembershipId`. If the requester is already a
+  member, AWS returns a `ConflictException` rather than succeeding; the Lambda
+  catches it, resolves the existing `MembershipId` with
+  `ListGroupMembershipsForMember`, and treats the grant as successful, because
+  the member is in the group regardless of who added them. Either way the grant
+  is recorded with its expiry and its `MembershipId`. Any other error sends the
+  request to `failed`.
 - **Revoke**: `identitystore:DeleteGroupMembership` removes the requester,
-  unconditionally at expiry. It does not check whether the tool was the thing
-  that added them. A standing admin who drives a request through the tool
-  therefore loses their standing membership when the grant ends; the engineer
-  accepts this, and it is what keeps the tool's grant set and the group's
-  membership set in agreement without a baseline.
+  unconditionally at expiry, by the `MembershipId` stored on the grant. It does
+  not check whether the tool was the thing that added them. A standing admin who
+  drives a request through the tool therefore loses their standing membership
+  when the grant ends; the engineer accepts this, and it is what keeps the tool's
+  grant set and the group's membership set in agreement without a baseline.
 - The `Admins` group is already assigned `AdministratorAccess` in the
   management, workbench and infrastructure accounts
   (`deploy/components/identity-center.ts`), so one membership grants admin in
@@ -266,10 +271,12 @@ promotes the no-grant-record case from informational to an alarm, at which point
 any membership the tool cannot explain is genuinely suspicious.
 
 A standing member who drives a request through the tool is not special. The
-grant is recorded and the membership is added (a no-op, since they are already a
-member), and at expiry the revoke removes them like anyone else. They lose the
-standing membership when their grant ends; the engineer accepts this, and it is
-the point of managing only what the tool granted.
+grant is recorded, and `CreateGroupMembership` returns a `ConflictException`
+because they are already a member; the Lambda catches it, resolves the existing
+`MembershipId`, and records the grant. At expiry the revoke removes them by that
+`MembershipId` like anyone else. They lose the standing membership when their
+grant ends; the engineer accepts this, and it is the point of managing only what
+the tool granted.
 
 The invariant is two-phase, and the transition is ended by a manual cleanup plus
 a one-line change to the sweeper's treatment of no-grant memberships, not by
@@ -358,13 +365,18 @@ code, changed only by a reviewed PR.
    not the requester. Anyone else gets an ephemeral "not an approver".
 5. On **Deny**: write `denied`, post the outcome to the channel, done.
 6. On **Approve**: enforce the remaining checks (duration within cap, per-user
-   rate limit, request not already decided), then assume `break-glass-grant`,
-   call `CreateGroupMembership`, write the grant with its expiry, schedule the
-   one-shot revoke, and post the SSO portal link and the expiry, with the
-   session caveat, to the channel and to the requester.
+   rate limit, request not already decided), then assume `break-glass-grant` and
+   call `CreateGroupMembership`. A `ConflictException` means the requester is
+   already a member, so the Lambda resolves the existing `MembershipId` with
+   `ListGroupMembershipsForMember` and continues; any other error sends the
+   request to `failed`. It then writes the grant with its expiry and
+   `MembershipId`, schedules the one-shot revoke, and posts the SSO portal link
+   and the expiry, with the session caveat, to the channel and to the requester.
 7. At expiry, EventBridge Scheduler invokes the same Lambda with a `revoke`
-   event. It calls `DeleteGroupMembership` unconditionally, writes `revoked`,
-   and posts to the channel.
+   event. It calls `DeleteGroupMembership` with the grant's `MembershipId`,
+   unconditionally. A `ResourceNotFoundException` means the membership is
+   already gone, so it is treated as success; either way the grant is written
+   `revoked` and the channel is posted.
 
 ### States
 
@@ -380,8 +392,11 @@ any state ──error────▶ failed
 DynamoDB is a single table: request items, active-grant items, and per-user rate
 counters. The grant item carries the request id, the group id (`Admins`, which
 implies all three accounts), the requester, the approver, the granted-at and
-expires-at timestamps, and the scheduler's schedule name so the revoke can be
-idempotent.
+expires-at timestamps, the scheduler's schedule name, and **`membershipId` as a
+required field**, because `DeleteGroupMembership` takes the opaque membership id
+and nothing else. The `membershipId` is the one returned by
+`CreateGroupMembership`, or resolved with `ListGroupMembershipsForMember` when
+that call returns `ConflictException` because the member already existed.
 
 **TTL is for retention only.** DynamoDB TTL deletion can lag by up to 48 hours,
 so it must never be the mechanism that ends a grant. Revocation is the scheduler
@@ -405,10 +420,12 @@ already exists. It is the role that lets the tool add and remove memberships.
 - **Inline policy, scoped by resource**, to the identity store id and the
   `Admins` group id: `identitystore:CreateGroupMembership`,
   `identitystore:DeleteGroupMembership`, `identitystore:ListGroupMemberships`,
-  `identitystore:DescribeGroup`, `identitystore:ListUsers`,
-  `identitystore:DescribeUser`. The exact resource ARN form is confirmed at
-  implementation; the point is that it names the one group and the one identity
-  store, not `*`.
+  `identitystore:ListGroupMembershipsForMember`, `identitystore:DescribeGroup`,
+  `identitystore:ListUsers`, `identitystore:DescribeUser`.
+  `ListGroupMembershipsForMember` is needed to resolve the `MembershipId` of a
+  pre-existing member when `CreateGroupMembership` returns `ConflictException`.
+  The exact resource ARN form is confirmed at implementation; the point is that
+  it names the one group and the one identity store, not `*`.
 - **Not granted**: any `sso:*`, `CreateAccountAssignment`,
   `CreatePermissionSet`, `sso-directory:AddMemberToGroup`, or anything that
   could grant admin outside `Admins`. `sso-directory` is worth naming
@@ -554,12 +571,18 @@ tool's own records are structured for export and retention from day one.
   The tool manages only what it granted, so there is no second source of truth.
   Drift is an orphaned grant, which is actionable without knowing who was a
   member before the tool existed.
-- **Idempotent revoke.** `DeleteGroupMembership` on a non-member is a no-op
-  worth tolerating, and the grant record's state makes a double revoke harmless.
-  Both the scheduler and the sweeper may fire for the same grant.
-- **Fail closed on grant, not on revoke.** If the approval checks or the
-  `CreateGroupMembership` call fail, no access is granted and the request goes
-  to `failed`. If a revoke fails, retry and alarm; never leave it.
+- **Idempotent revoke.** At grant time the `MembershipId` returned by
+  `CreateGroupMembership` is stored on the grant record. At revoke time
+  `DeleteGroupMembership(MembershipId)` is called. If the `MembershipId` is not
+  found because the membership is already gone, the API throws
+  `ResourceNotFoundException`; the revoke handler treats that as success and
+  marks the grant revoked. Both the scheduler and the sweeper use this path, so
+  a double revoke is harmless.
+- **Fail closed on grant, not on revoke.** If the approval checks fail, or
+  `CreateGroupMembership` fails with anything other than the `ConflictException`
+  that means "already a member", no access is granted and the request goes to
+  `failed`. If a revoke fails for any reason other than
+  `ResourceNotFoundException`, retry and alarm; never leave it.
 - **The sweeper is read-heavy and cheap.** It is a periodic
   `ListGroupMemberships` on the one group plus a DynamoDB query. It should run
   often enough that drift is measured in minutes, not hours.
