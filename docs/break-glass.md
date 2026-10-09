@@ -262,13 +262,16 @@ place, so those members stay and there is no migration step. The tool manages
 **only the memberships it granted**; it keeps no second source of truth about
 who was already a member.
 
-An existing member is therefore just a membership with no grant record, and the
-sweeper leaves it alone and logs it at informational level. During the
-transition that is the expected state for a standing admin, so it is not
-suspicious and must not page. The engineer will remove the remaining standing
-members manually once the rest of the tool is working; a follow-up PR then
-promotes the no-grant-record case from informational to an alarm, at which point
-any membership the tool cannot explain is genuinely suspicious.
+An existing member is therefore just a membership with no grant record in any
+state, and the sweeper leaves it alone and logs it at informational level. A
+grant record in the `granting` state is still a record, so a member the tool is
+mid-way through adding is reconciled by "Never leave a grant open", not mistaken
+for a pre-existing member. During the transition that is the expected state for
+a standing admin, so it is not suspicious and must not page. The engineer will
+remove the remaining standing members manually once the rest of the tool is
+working; a follow-up PR then promotes the no-grant-record case from
+informational to an alarm, at which point any membership the tool cannot explain
+is genuinely suspicious.
 
 A standing member who drives a request through the tool is not special. The
 grant is recorded, and `CreateGroupMembership` returns a `ConflictException`
@@ -366,12 +369,15 @@ code, changed only by a reviewed PR.
 5. On **Deny**: write `denied`, post the outcome to the channel, done.
 6. On **Approve**: enforce the remaining checks (duration within cap, per-user
    rate limit, request not already decided), then assume `break-glass-grant` and
-   call `CreateGroupMembership`. A `ConflictException` means the requester is
-   already a member, so the Lambda resolves the existing `MembershipId` with
-   `ListGroupMembershipsForMember` and continues; any other error sends the
-   request to `failed`. It then writes the grant with its expiry and
-   `MembershipId`, schedules the one-shot revoke, and posts the SSO portal link
-   and the expiry, with the session caveat, to the channel and to the requester.
+   **write the grant record first, in a `granting` state**, carrying the request
+   id, requester, approver, group id, and the computed expires-at (granted-at
+   plus the requested duration). Only then call `CreateGroupMembership`. A
+   `ConflictException` means the requester is already a member, so the Lambda
+   resolves the existing `MembershipId` with `ListGroupMembershipsForMember` and
+   continues; any other error sends the request to `failed`. It then flips the
+   record to `granted` with the `membershipId`, schedules the one-shot revoke,
+   and posts the SSO portal link and the expiry, with the session caveat, to the
+   channel and to the requester.
 7. At expiry, EventBridge Scheduler invokes the same Lambda with a `revoke`
    event. It calls `DeleteGroupMembership` with the grant's `MembershipId`,
    unconditionally. A `ResourceNotFoundException` means the membership is
@@ -381,22 +387,37 @@ code, changed only by a reviewed PR.
 ### States
 
 ```
-requested ──approve──▶ approved ──grant──▶ granted ──expiry──▶ revoked
-    │                                            │
-    ├──deny───────────▶ denied                   └──expired (sweeper found it)
-    └──timeout────────▶ expired-unapproved
+requested ──approve──▶ approved ──▶ granting ──▶ granted ──expiry──▶ revoked
+    │
+    ├──deny───────────▶ denied
+    ├──timeout────────▶ expired-unapproved
+    └──(any state)────▶ failed
 
-any state ──error────▶ failed
+granting ──member absent────────────▶ failed
+granting ──member present───────────▶ granted (sweeper schedules the revoke)
+granting ──expired, member present───▶ orphaned (revoke + alarm)
 ```
 
-DynamoDB is a single table: request items, active-grant items, and per-user rate
-counters. The grant item carries the request id, the group id (`Admins`, which
-implies all three accounts), the requester, the approver, the granted-at and
-expires-at timestamps, the scheduler's schedule name, and **`membershipId` as a
-required field**, because `DeleteGroupMembership` takes the opaque membership id
-and nothing else. The `membershipId` is the one returned by
-`CreateGroupMembership`, or resolved with `ListGroupMembershipsForMember` when
-that call returns `ConflictException` because the member already existed.
+`granting` is the state between "the approver said yes" and "the membership
+exists and its revoke is scheduled". The record is written before the membership
+so the state is never invisible, and the sweeper resolves it: member absent
+means the grant never completed (`failed`), member present means the grant is
+live (the sweeper schedules the revoke if the crash happened before that step),
+and member present past expiry means the normal path did not finish (`orphaned`,
+revoke and alarm).
+
+DynamoDB is a single table: request items, grant items, and per-user rate
+counters. The grant item carries a **`state`** (`granting` or `granted`), the
+request id, the group id (`Admins`, which implies all three accounts), the
+requester, the approver, the granted-at and expires-at timestamps, and the
+scheduler's schedule name. It also carries **`membershipId`**, the opaque
+membership id `DeleteGroupMembership` requires, which is absent while the record
+is `granting` and set to the value returned by `CreateGroupMembership` (or
+resolved with `ListGroupMembershipsForMember` when that call returns
+`ConflictException` because the member already existed) when the record becomes
+`granted`. The record is written in the `granting` state **before** the
+membership is created, which is what guarantees that a membership the tool
+created always has a grant record behind it; see "Never leave a grant open".
 
 **TTL is for retention only.** DynamoDB TTL deletion can lag by up to 48 hours,
 so it must never be the mechanism that ends a grant. Revocation is the scheduler
@@ -498,11 +519,11 @@ There are two signals, and they are deliberately different in loudness:
   reconstructs the history from, and it is what makes the time-boxed gap while
   CloudTrail is absent survivable. It also posts to the channel so the approver
   can see their approval took effect.
-- **The loud alarm is on `membership.orphaned`**: an expired grant whose member
-  is still in the group, which is the signal that the normal revoke path did not
-  run. Only that pages. A membership with no grant record emits
-  `membership.unmanaged` at informational level and does not page; see
-  "Existing members".
+- **The loud alarm is on `membership.orphaned`**: an expired grant, in either
+  the `granting` or `granted` state, whose member is still in the group, which
+  is the signal that the normal revoke path did not run. Only that pages. A
+  membership with no grant record in any state emits `membership.unmanaged` at
+  informational level and does not page; see "Existing members".
 
 Metric filters turn those events into metrics. This layer answers *who asked,
 who approved, why, how long*.
@@ -560,13 +581,22 @@ tool's own records are structured for export and retention from day one.
 
 - **Never leave a grant open.** Two independent mechanisms: an EventBridge
   Scheduler one-shot at the exact expiry, with retries and a dead-letter queue,
-  and a periodic reconciliation sweeper. The sweeper reconciles only the tool's
-  own grants against the group's current memberships. An expired grant whose
-  member is still in the group is an **orphaned grant**: it revokes it and
-  alarms, because the normal revoke path did not run. An active grant is left
-  alone. A membership with **no grant record** is left alone and logged
-  informationally; the sweeper never removes it. The scheduler is the normal
-  path; the sweeper is what catches a failed schedule.
+  and a periodic reconciliation sweeper. The sweeper reconciles the tool's own
+  grant records, in both the `granting` and `granted` states, against the
+  group's current memberships. An expired grant whose member is still in the
+  group is an **orphaned grant**: it revokes it and alarms, because the normal
+  revoke path did not run. An active grant is left alone. A `granting` record
+  whose member is absent is a grant that never completed: it is marked `failed`,
+  with no alarm. A membership with **no grant record at all** is left alone and
+  logged informationally; the sweeper never removes it, because that is the only
+  shape a pre-existing standing member can take. The scheduler is the normal
+  path; the sweeper is what catches a failed schedule or a grant path that
+  stopped partway.
+- **The grant record exists before the membership can.** The grant path writes a
+  `granting` record first, then calls `CreateGroupMembership`, then flips the
+  record to `granted`. If the Lambda dies between the call and the flip, the
+  `granting` record is what the sweeper reconciles, so the partial-grant case (a
+  member added with no record and no scheduled revoke) cannot occur.
 - **Expected is defined by the tool's own grant records, not by a baseline.**
   The tool manages only what it granted, so there is no second source of truth.
   Drift is an orphaned grant, which is actionable without knowing who was a
@@ -688,12 +718,14 @@ The Progress list is the checklist; this is the detail behind each step.
    identity mapping has to be settled (open question 3), and where the flow
    becomes reviewable by people who will never read the IAM policy.
 
-4. **Approval wired to a real grant.** Assume `break-glass-grant`, call
-   `CreateGroupMembership`, write the grant, post the SSO link and the session
-   caveat to the channel. Add the application audit log, the reconciliation
-   sweeper, and the alarm on an unexpected membership. The sweeper ships in the
-   same step as the first grant, not after it: the thing that cleans up must
-   exist before the thing that creates.
+4. **Approval wired to a real grant.** Assume `break-glass-grant`, write the
+   grant record in the `granting` state, call `CreateGroupMembership`, flip the
+   record to `granted`, and post the SSO link and the session caveat to the
+   channel. Add the application audit log, the reconciliation sweeper, and the
+   alarm on an unexpected membership. The sweeper ships in the same step as the
+   first grant, not after it: the thing that cleans up must exist before the
+   thing that creates, and it reconciles `granting` records so a crash mid-grant
+   cannot strand a membership.
 
 5. **Scheduled revocation.** EventBridge Scheduler one-shot at expiry, invoking
    the same Lambda with a `revoke` event, retries and a DLQ, and the channel
