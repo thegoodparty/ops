@@ -19,14 +19,15 @@ ln -sf "$AWS_DIR/v2/current/bin/aws" /usr/local/bin/aws
 ln -sf "$AWS_DIR/v2/current/bin/aws_completer" /usr/local/bin/aws_completer
 
 # GitHub App identity for git and gh. Workers mint a ~1h installation token
-# for delegate-gp[bot] from GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY and fall back
-# to the static GITHUB_TOKEN PAT when minting fails. Skipped without the App keys.
+# for delegate-gp[bot] from GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY. There is no
+# fallback, when minting fails the helper prints a note and no token. Skipped
+# without the App keys.
 if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ]; then
   cat >/usr/local/bin/gh-app-token <<'HELPER'
 #!/usr/bin/env bash
 # gh-app-token [owner]           print an installation token for owner
 # gh-app-token credential get    git credential helper protocol (github.com only)
-# Needs openssl, curl, jq. Falls back to $GITHUB_TOKEN with a stderr note. Never prints secrets except the token on stdout.
+# Needs openssl, curl, jq. On failure prints a stderr note and exits 1. Never prints secrets except the token on stdout.
 set -u
 umask 077
 API=https://api.github.com
@@ -36,20 +37,15 @@ work=
 note() { echo "gh-app-token: $*" >&2; }
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 
-fallback() {
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    note "$1; falling back to GITHUB_TOKEN (PAT)"
-    printf '%s' "$GITHUB_TOKEN"
-    return 0
-  fi
-  note "$1; no GITHUB_TOKEN fallback"
+fail() {
+  note "$1"
   return 1
 }
 
 mint() {
   local owner=$1 key now jwt hdr pay sig code inst tok exp
-  [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ] || { fallback "GitHub App env not set"; return; }
-  work=$(mktemp -d) || { fallback "mktemp failed"; return; }
+  [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_PRIVATE_KEY:-}" ] || { fail "GitHub App env not set"; return; }
+  work=$(mktemp -d) || { fail "mktemp failed"; return; }
   trap 'rm -rf "$work"' EXIT
   key=$work/key.pem
   # Accepts raw PEM or base64 of the PEM.
@@ -62,7 +58,7 @@ mint() {
   hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
   pay=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$GITHUB_APP_ID" | b64url)
   sig=$(printf '%s.%s' "$hdr" "$pay" | openssl dgst -sha256 -sign "$key" 2>/dev/null | b64url)
-  [ -n "$sig" ] || { fallback "could not sign App JWT (bad private key?)"; return; }
+  [ -n "$sig" ] || { fail "could not sign App JWT (bad private key?)"; return; }
   jwt=$hdr.$pay.$sig
 
   gh_call() { # method url -> body in $work/out, prints http code
@@ -71,13 +67,13 @@ mint() {
   }
   code=$(gh_call GET "$API/orgs/$owner/installation")
   [ "$code" = 200 ] || code=$(gh_call GET "$API/users/$owner/installation")
-  [ "$code" = 200 ] || { fallback "no App installation for '$owner' (HTTP $code)"; return; }
+  [ "$code" = 200 ] || { fail "no App installation for '$owner' (HTTP $code)"; return; }
   inst=$(jq -r .id "$work/out")
   code=$(gh_call POST "$API/app/installations/$inst/access_tokens")
-  [ "$code" = 201 ] || { fallback "token mint failed (HTTP $code)"; return; }
+  [ "$code" = 201 ] || { fail "token mint failed (HTTP $code)"; return; }
   tok=$(jq -r .token "$work/out")
   exp=$(date -u -d "$(jq -r .expires_at "$work/out")" +%s 2>/dev/null || echo $((now + 3000)))
-  [ -n "$tok" ] && [ "$tok" != null ] || { fallback "token response had no token"; return; }
+  [ -n "$tok" ] && [ "$tok" != null ] || { fail "token response had no token"; return; }
   printf '%s %s' "$exp" "$tok" >"$CACHE"
   printf '%s' "$tok"
 }

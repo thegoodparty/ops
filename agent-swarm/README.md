@@ -42,15 +42,13 @@ host; the next deploy overwrites them.
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
   with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
-  `GITHUB_TOKEN`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
+  `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
   `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and optionally the three
   `OAUTH2_PROXY_*` keys that turn on Google login
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
-- GitHub identity: the service user
-  [delegate-gp-bot](https://github.com/delegate-gp-bot) and its fine-grained
-  PAT, now only the fallback. Commits and PRs are authored by the
-  `delegate-gp[bot]` App (see "Git identity").
+- GitHub identity: commits and PRs are authored by the `delegate-gp[bot]`
+  App (see "Git identity"). There is no PAT.
 
 `fill-secrets.sh` is the interactive way to fill the secret from a laptop.
 After a secret change, re-run `up.sh` on the host (or merge any host change).
@@ -183,10 +181,10 @@ App JWT with openssl, resolves the installation for the repo owner, mints a
 ~1h installation token and caches it per owner under `~/.cache/gh-app-token`
 (refreshed within 5 minutes of expiry). If anything fails (no installation for
 that owner, bad key, GitHub down) it prints a one-line note on stderr, never a
-secret, and falls back to the static `GITHUB_TOKEN` PAT. Commits are authored
+secret, and returns no token (there is no PAT fallback). Commits are authored
 `delegate-gp[bot] <268660869+delegate-gp[bot]@users.noreply.github.com>`
 (268660869 is the bot user id, not the App id; GitHub links the email to the
-App by user id). Keep the PAT in the secret as the fallback. The App only
+App by user id). The App only
 reaches repos it is installed on (`omni`, `ops`).
 
 After merging: run `sudo /opt/agent-swarm/install.sh` (or the deploy
