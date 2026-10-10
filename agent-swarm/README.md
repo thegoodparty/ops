@@ -5,8 +5,7 @@
 The deployment of [agent-swarm](https://github.com/desplega-ai/agent-swarm)
 v1.163.0 that shows up in Slack as **Delegate** and serves its dashboard at
 https://delegate-swarm.infra.goodparty.org. One EC2 host in the infrastructure
-account runs the whole stack in Docker Compose. State, decisions and history are in
-`HANDOFF.md`; this file is how to operate it.
+account runs the whole stack in Docker Compose. This file is how to operate it.
 
 ## How it deploys
 
@@ -338,7 +337,7 @@ The swarm starts with fresh state. In order:
    three agents, and
    `cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-reviewer`.
    Connect before install: an agent session that meets the server before it
-   is authorized skips it for days (`HANDOFF.md`, gotchas).
+   is authorized skips it for days.
 7. **Switch Slack.** Saving the manifest moves the Delegate app to Socket
    Mode: from then on the old delegate bot gets no Slack events and the
    swarm answers instead.
