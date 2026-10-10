@@ -44,25 +44,41 @@ jobs:
       #
       # `.github/CODEOWNERS` lets its opted-out paths merge on a bot approval,
       # so this ordering is what keeps a bot-approved merge from reaching the
-      # deploy role. Nothing below needs AWS except the ECR push and the
-      # deploy itself.
+      # deploy role. Nothing below needs AWS except the docker build's ECR
+      # Public login, the ECR push and the deploy itself.
       - run: npm ci
       - run: npm test
       - run: npm run build
 
-      # No AWS credentials on pull_request. The docker build uses the public
-      # `node:22-alpine` base image, and both the ECR push and the deploy are
-      # already skipped, so nothing before `main` needs the deploy role. This
-      # role is near-admin (`sso:*`, `iam:*Role*`, `s3:*`,
-      # `secretsmanager:*`), and a PR run executes PR-authored code, so it must
-      # not be reachable from an unreviewed branch. See `docs/pr-previews.md`,
-      # steps 6 and 7.
+      # No deploy role on pull_request. Both the ECR push and the deploy are
+      # skipped there, so nothing before `main` needs it. This role is
+      # near-admin (`sso:*`, `iam:*Role*`, `s3:*`, `secretsmanager:*`), and a
+      # PR run executes PR-authored code, so it must not be reachable from an
+      # unreviewed branch. See `docs/pr-previews.md`, steps 6 and 7.
+      #
+      # The docker build still logs in to ECR Public on every run. Anonymous
+      # pulls of the base image are limited per IP and shared runners hit
+      # 429s; logged in, the limit is per account. A PR run gets
+      # `github-actions-ecr-public-login` for that, which can mint the ECR
+      # Public login token and nothing else.
+      - name: Configure AWS Credentials (ECR Public login)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-ecr-public-login
+          aws-region: us-west-2
+
       - name: Configure AWS Credentials
         if: ${{ github.event_name != 'pull_request' }}
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-pulumi-deploy
           aws-region: us-west-2
+
+      - name: Login to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Login to Amazon ECR
         if: ${{ github.event_name != 'pull_request' }}
