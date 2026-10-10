@@ -30,28 +30,28 @@ npm run script poll-problem <arg>
 
 ## Delegate
 
-The delegate system runs AI agents (powered by [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)) on-demand in response to webhooks. When someone @-mentions the bot in Slack, a Lambda receives the webhook, dispatches an ECS Fargate task, and the agent investigates/responds in the thread.
+The delegate system runs the `pr-reviewer` agent (powered by [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)) on GitHub webhooks. A Lambda receives the webhook, dispatches an ECS Fargate task, and the task reviews the PR. The Delegate Slack bot is the self-hosted agent-swarm in [`agent-swarm/`](./agent-swarm).
 
 ### Architecture
 
 ```
-Slack @mention
+GitHub webhook
   → Lambda Function URL (signature verification, routing)
     → ECS Fargate task (ephemeral, 1 vCPU / 4GB RAM)
-      → Claude Agent SDK with MCP servers + CLI tools
-        → Posts result back to Slack thread
+      → Claude Agent SDK
+        → Posts the review to the PR
 ```
 
 ### Key directories
 
 | Directory             | Purpose                                                           |
 | --------------------- | ----------------------------------------------------------------- |
-| `delegate/framework/` | Agent registry, execution engine, callback delivery, MCP config   |
-| `delegate/agents/`    | Agent definitions (currently: `slack-responder`)                  |
-| `delegate/lambdas/`   | Lambda webhook handler, ECS dispatch, secrets, Slack verification |
-| `delegate/worker/`    | Fargate entrypoint, GitHub App auth, Dockerfile                   |
-| `delegate/tools/`     | CLI tools available to agents (Databricks Genie)                  |
-| `deploy/`             | Pulumi infrastructure (ECS cluster, Lambda, IAM, CloudWatch)      |
+| `delegate/framework/` | Agent registry and execution engine                                |
+| `delegate/agents/`    | Agent definitions (currently: `pr-reviewer`)                       |
+| `delegate/lambdas/`   | Lambda webhook handler, ECS dispatch, secrets, GitHub verification |
+| `delegate/review/`    | The deterministic half of `pr-reviewer`, plus its evals            |
+| `delegate/worker/`    | Fargate entrypoint, GitHub App auth, Dockerfile                    |
+| `deploy/`             | Pulumi infrastructure (ECS cluster, Lambda, IAM, CloudWatch)       |
 
 ### Deployment
 

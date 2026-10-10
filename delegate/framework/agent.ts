@@ -4,9 +4,6 @@ import type { AgentConfig, AgentResult, RunOverrides } from "./types";
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
 
-const phaseFromAgentName = (name: string): string | null =>
-  name.endsWith("-agent") ? name.replace(/-agent$/, "") : null;
-
 // Force every Task spawn to be synchronous. Background-mode Task lets the
 // model proceed before subagents finish — for pr-reviewer this caused
 // reviews to publish on partial specialist results, dropping late blockers
@@ -41,13 +38,8 @@ const forceSynchronousTaskHook = async (input: unknown) => {
 export const runAgent = async (
   config: AgentConfig,
   message: string,
-  cwdOrOverrides?: string | RunOverrides,
-  legacyAbortController?: AbortController,
+  overrides: RunOverrides = {},
 ): Promise<AgentResult> => {
-  const overrides: RunOverrides =
-    typeof cwdOrOverrides === "string" || cwdOrOverrides === undefined
-      ? { cwd: cwdOrOverrides, abortController: legacyAbortController }
-      : cwdOrOverrides;
   const { cwd, abortController } = overrides;
   const start = Date.now();
   let output = "";
@@ -72,8 +64,6 @@ export const runAgent = async (
       tools: config.tools,
       outputFormat: config.outputFormat,
       agents: config.agents,
-      plugins: config.plugins,
-      settingSources: config.settingSources,
       allowedTools: config.allowedTools ?? [
         "mcp__*",
         "Read",
@@ -209,19 +199,6 @@ export const runAgent = async (
         durationApiMs: msg.duration_api_ms,
         usage: msg.usage,
       });
-      const phase = phaseFromAgentName(config.name);
-      if (phase) {
-        console.log(
-          JSON.stringify({
-            event: "workflow_phase_completed",
-            phase,
-            outcome: "success",
-            durationMs: msg.duration_ms,
-            costUsd: msg.total_cost_usd ?? 0,
-            sessionId,
-          }),
-        );
-      }
     }
 
     if (msg.type === "result" && msg.subtype !== "success") {
@@ -241,19 +218,6 @@ export const runAgent = async (
         turns: err.num_turns,
         costUsd: err.total_cost_usd,
       });
-      const phase = phaseFromAgentName(config.name);
-      if (phase) {
-        console.log(
-          JSON.stringify({
-            event: "workflow_phase_completed",
-            phase,
-            outcome: "error",
-            durationMs: Date.now() - start,
-            costUsd: err.total_cost_usd ?? 0,
-            sessionId,
-          }),
-        );
-      }
     }
   }
 

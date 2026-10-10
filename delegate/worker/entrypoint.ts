@@ -1,36 +1,8 @@
 import "../agents";
 import { execFileSync } from "node:child_process";
-import { WebClient } from "@slack/web-api";
-import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
-import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
+import { setupReviewerGitHubAuth } from "./github-auth";
 import { runReview } from "../review/run";
-
-// Workflow agents (PRD-to-code) need the runbooks repo on disk and the
-// ClickUp credentials in env. Framework agents (slack-responder, pr-reviewer)
-// don't — they should keep working even if those secrets are unset.
-const isWorkflowAgent = (name: string): boolean => name.endsWith("-agent");
-
-const CLICKUP_TEAM_ID = "90132012119";
-
-// Best-effort Slack post used to surface a fatal failure back to the user's
-// thread. Returns silently on any failure — the process is going to exit
-// anyway.
-const reportFatal = async (job: AgentJob | undefined, message: string) => {
-  if (!job?.callback || job.callback.type !== "slack") return;
-  const token = process.env.SLACK_BOT_TOKEN;
-  if (!token) return;
-  try {
-    const slack = new WebClient(token);
-    await slack.chat.postMessage({
-      channel: job.callback.channel,
-      thread_ts: job.callback.threadTs,
-      text: `:warning: ${message}. Re-mention me to retry.`,
-    });
-  } catch {
-    // intentionally silent — we're already exiting
-  }
-};
 
 // The lambda posts :eyes: as the reviewer App when a `delegate review`
 // comment fires; delete it once the review lands so the comment stops
@@ -64,12 +36,14 @@ const parseJob = (): AgentJob | undefined => {
 };
 
 const main = async () => {
-  // Parse the job first so any subsequent fatal can be surfaced to the
-  // originating Slack thread instead of leaving the user with :eyes: and
-  // silence.
   const job = parseJob();
   if (!job) {
     console.error("AGENT_JOB environment variable not set or invalid JSON");
+    process.exit(1);
+  }
+
+  if (job.agent !== "pr-reviewer") {
+    console.error(`Unknown agent "${job.agent}"; only pr-reviewer runs here`);
     process.exit(1);
   }
 
@@ -85,52 +59,15 @@ const main = async () => {
   const deadline = setTimeout(() => {
     console.error(`Agent exceeded ${deadlineMs}ms deadline — aborting`);
     abortController.abort();
-    void reportFatal(
-      job,
-      `agent exceeded its ${Math.round(
-        deadlineMs / 60000,
-      )}-minute deadline and was stopped`,
-    );
     setTimeout(() => process.exit(1), 10_000).unref();
   }, deadlineMs);
   deadline.unref();
 
   // pr-reviewer runs entirely as the reviewer App, including the gh/git
-  // checkout below, so it boots without the delegate App's key.
-  if (job.agent === "pr-reviewer") {
-    await setupReviewerGitHubAuth();
-    process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
-    process.env.GH_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
-  } else {
-    await setupGitHubAuth();
-    await setupReviewerGitHubAuth();
-  }
-
-  // Working directory handed to the agent. The deterministic per-agent
-  // checkouts below set this so the agent boots with the repo already on disk
-  // — no mid-run clone latency, and (for pr-reviewer) every specialist reads
-  // the exact tree the review is reported against.
-  let cwd = job.cwd;
-
-  // slack-responder: full shallow checkout of omni@main so the bot can read
-  // and grep the whole codebase immediately. main is omni's default branch,
-  // so a depth-1 clone is "latest main" for free. Best-effort — a clone
-  // failure still lets the bot answer non-code (Grafana/Sentry/Vercel)
-  // questions, so we log and continue rather than aborting the task.
-  if (job.agent === "slack-responder") {
-    const omniDir = process.env.OMNI_DIR ?? "/app/omni";
-    try {
-      execFileSync(
-        "gh",
-        ["repo", "clone", "thegoodparty/omni", omniDir, "--", "--depth=1"],
-        { stdio: "inherit", timeout: 180_000 },
-      );
-      cwd = omniDir;
-      console.log(`omni checked out at ${omniDir} (latest main)`);
-    } catch (err) {
-      console.error("Failed to clone omni for slack-responder:", err);
-    }
-  }
+  // checkout below.
+  await setupReviewerGitHubAuth();
+  process.env.GITHUB_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
+  process.env.GH_TOKEN = process.env.REVIEWER_GITHUB_TOKEN;
 
   // pr-reviewer: deterministic checkout of the PR's repo at the exact reviewed
   // head SHA, so the reviewer and its specialists read one consistent tree
@@ -138,310 +75,143 @@ const main = async () => {
   // The opened/ready dispatch carries headSha; the `delegate review`
   // re-review path omits it, so resolve the live head here. A failed checkout
   // is fatal — the reviewer cannot review code it doesn't have.
-  if (job.agent === "pr-reviewer") {
-    const repoFullName = job.metadata?.repo;
-    const prNumber = job.metadata?.prNumber;
-    if (!repoFullName || !prNumber) {
-      console.error(
-        "pr-reviewer job missing repo/prNumber metadata; cannot check out",
-      );
-      process.exit(1);
-    }
-
-    const reviewDir = process.env.REVIEW_DIR ?? "/app/review";
-    // Dispatch-time SHA is only a fallback for the failure-status post below.
-    // The checkout itself pins to the *live* PR head resolved at boot — a
-    // stale or force-pushed-away dispatch SHA isn't reachable from
-    // refs/pull/<n>/head and would fail to check out.
-    let headSha = job.metadata?.headSha;
-    try {
-      // Resolve the live PR head and make it the single authoritative SHA for
-      // the whole run: the tree is checked out to it, and the agent pins its
-      // diff, status posts, and review commit_id to it (via REVIEW_HEAD_SHA).
-      // Keeping the reviewed tree, the diff, and the posted verdict on one
-      // commit is what stops a mid-run push from landing an approval on
-      // commits nobody reviewed.
-      headSha = execFileSync(
-        "gh",
-        [
-          "pr",
-          "view",
-          prNumber,
-          "--repo",
-          repoFullName,
-          "--json",
-          "headRefOid",
-          "--jq",
-          ".headRefOid",
-        ],
-        { timeout: 30_000 },
-      )
-        .toString()
-        .trim();
-
-      // Shallow-clone the base repo, fetch the PR head ref, then check out the
-      // exact SHA. Going through refs/pull/<n>/head is reliable even for fork
-      // PRs, whose head commit isn't on any base-repo branch. Submodules
-      // (e.g. the ai-rules submodule the deep-reviewer needs) are synced after
-      // the checkout so they match the PR's pinned state.
-      execFileSync(
-        "gh",
-        ["repo", "clone", repoFullName, reviewDir, "--", "--depth=50"],
-        { stdio: "inherit", timeout: 180_000 },
-      );
-      execFileSync(
-        "git",
-        [
-          "-C",
-          reviewDir,
-          "fetch",
-          "--depth=50",
-          "origin",
-          `refs/pull/${prNumber}/head`,
-        ],
-        { stdio: "inherit", timeout: 120_000 },
-      );
-      execFileSync("git", ["-C", reviewDir, "checkout", headSha], {
-        stdio: "inherit",
-        timeout: 60_000,
-      });
-      execFileSync(
-        "git",
-        ["-C", reviewDir, "submodule", "update", "--init", "--recursive"],
-        { stdio: "inherit", timeout: 120_000 },
-      );
-      cwd = reviewDir;
-      console.log(
-        `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,
-      );
-    } catch (err) {
-      console.error("Failed to check out PR for pr-reviewer:", err);
-      // The re-review lambda already flipped the pr-reviewer check to pending;
-      // exiting silently would leave it stuck. Post a best-effort error status
-      // (state=error — a boot/infra failure, not a review verdict) so the
-      // check resolves. Prefer the reviewer App token (it owns the pending
-      // status); fall back to the delegate token.
-      const token =
-        process.env.REVIEWER_GITHUB_TOKEN ?? process.env.GITHUB_TOKEN;
-      if (headSha && token) {
-        try {
-          await fetch(
-            `https://api.github.com/repos/${repoFullName}/statuses/${headSha}`,
-            {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${token}`,
-                Accept: "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                state: "error",
-                context: "pr-reviewer",
-                description: "Review boot failed: could not check out the PR",
-              }),
-            },
-          );
-        } catch (statusErr) {
-          console.error("Failed to post checkout-failure status:", statusErr);
-        }
-      }
-      process.exit(1);
-    }
-
-    // The review runs through the deterministic layer, not the generic
-    // runAgent + callback path: it builds the agent's input, strips every
-    // credential from the agent's environment, validates the structured
-    // output, and is the only thing that touches GitHub.
-    const reviewerToken = process.env.REVIEWER_GITHUB_TOKEN;
-    if (!reviewerToken) {
-      console.error("REVIEWER_GITHUB_TOKEN missing; pr-reviewer cannot post");
-      process.exit(1);
-    }
-    const taskArn = await fetch(`${process.env.ECS_CONTAINER_METADATA_URI_V4}/task`)
-      .then((r) => r.json() as Promise<{ TaskARN?: string }>)
-      .then((t) => t.TaskARN)
-      .catch(() => undefined);
-    const logsUrl = taskArn
-      ? `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskArn.split("/").pop()}`
-      : undefined;
-
-    try {
-      await runReview({
-        repo: repoFullName,
-        prNumber: Number(prNumber),
-        reviewDir,
-        trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
-        token: reviewerToken,
-        abortController,
-        logsUrl,
-      });
-    } finally {
-      clearTimeout(deadline);
-      await removeGitHubReaction(job, reviewerToken);
-    }
-    return;
-  }
-
-  const needsRunbooks = isWorkflowAgent(job.agent);
-  // Runbooks now live in omni at packages/runbooks. Clone omni with a
-  // partial + sparse checkout so only that subtree materializes — boot stays
-  // fast. The fresh clone each boot preserves the "edit a command, propagates
-  // next run, no ops redeploy" property.
-  const omniDir = process.env.OMNI_DIR ?? "/app/omni";
-  const runbooksDir = `${omniDir}/packages/runbooks`;
-
-  if (needsRunbooks) {
-    try {
-      execFileSync(
-        "gh",
-        [
-          "repo",
-          "clone",
-          "thegoodparty/omni",
-          omniDir,
-          "--",
-          "--filter=blob:none",
-          "--sparse",
-          "--depth=1",
-        ],
-        { stdio: "inherit", timeout: 120_000 },
-      );
-      execFileSync(
-        "git",
-        ["-C", omniDir, "sparse-checkout", "set", "packages/runbooks"],
-        { stdio: "inherit", timeout: 60_000 },
-      );
-      const sha = execFileSync(
-        "git",
-        ["-C", omniDir, "rev-parse", "--short", "HEAD"],
-        { timeout: 30_000 },
-      )
-        .toString()
-        .trim();
-      process.env.RUNBOOKS_DIR = runbooksDir;
-      process.env.RUNBOOKS_SHA = sha;
-      console.log(`Runbooks cloned at ${runbooksDir} (omni SHA ${sha})`);
-    } catch (err) {
-      console.error("Failed to clone omni:", err);
-      await reportFatal(
-        job,
-        "Boot failure: could not clone `thegoodparty/omni`. Verify the GitHub App is installed on that repo",
-      );
-      process.exit(1);
-    }
-
-    if (!process.env.CLICKUP_API_TOKEN) {
-      console.error("CLICKUP_API_TOKEN environment variable not set");
-      await reportFatal(
-        job,
-        "Boot failure: `CLICKUP_API_TOKEN` is missing from the DELEGATES secret",
-      );
-      process.exit(1);
-    }
-    if (!process.env.CLICKUP_API_KEY) {
-      process.env.CLICKUP_API_KEY = process.env.CLICKUP_API_TOKEN;
-    }
-    if (!process.env.CLICKUP_TEAM_ID) {
-      process.env.CLICKUP_TEAM_ID = CLICKUP_TEAM_ID;
-    }
-  }
-
-  console.log(`Starting agent: ${job.agent}`);
-  if (job.metadata) console.log("Metadata:", job.metadata);
-
-  const config = getAgent(job.agent);
-
-  const slack =
-    job.metadata?.source === "slack"
-      ? new WebClient(process.env.SLACK_BOT_TOKEN)
-      : undefined;
-
-  let message = job.message;
-  if (slack && job.metadata?.source === "slack") {
-    const threadTs =
-      job.callback?.type === "slack" ? job.callback.threadTs : undefined;
-
-    if (threadTs) {
-      const replies = await slack.conversations.replies({
-        channel: job.metadata.channel,
-        ts: threadTs,
-        limit: 50,
-      });
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const formatMessage = (m: any) => {
-        const parts: string[] = [];
-        if (m.text) parts.push(m.text);
-        if (m.attachments) {
-          for (const a of m.attachments) {
-            if (a.pretext) parts.push(a.pretext);
-            if (a.title) parts.push(a.title);
-            if (a.text) parts.push(a.text);
-            if (a.fallback && !a.text && !a.title) parts.push(a.fallback);
-          }
-        }
-        if (m.blocks) {
-          for (const block of m.blocks as Array<{
-            type: string;
-            text?: { text?: string };
-            elements?: Array<{ elements?: Array<{ text?: string }> }>;
-          }>) {
-            if (block.type === "section" && block.text?.text)
-              parts.push(block.text.text);
-            if (block.type === "rich_text" && block.elements) {
-              for (const el of block.elements) {
-                if (el.elements) {
-                  for (const inner of el.elements) {
-                    if (inner.text) parts.push(inner.text);
-                  }
-                }
-              }
-            }
-          }
-        }
-        return parts.join("\n");
-      };
-
-      const threadMessages = (replies.messages ?? [])
-        .map((m) => {
-          const content = formatMessage(m);
-          return `<message user="${m.user ?? m.bot_id ?? "unknown"}" ts="${m.ts}">\n${content}\n</message>`;
-        })
-        .join("\n");
-
-      console.log("Thread context:", threadMessages.slice(0, 2000));
-      message = `<slack-thread channel="${job.metadata.channel}" thread_ts="${threadTs}">\n${threadMessages}\n</slack-thread>\n\n${message}`;
-    } else {
-      message = `<slack-context channel="${job.metadata.channel}">You were mentioned in this Slack channel.</slack-context>\n\n${message}`;
-    }
-  }
-
-  const result = await runAgent(config, message, cwd, abortController);
-  clearTimeout(deadline);
-
-  console.log(`Agent completed in ${(result.durationMs / 1000).toFixed(1)}s`);
-  console.log("Output:", result.output);
-
-  const callbacks: Promise<unknown>[] = [];
-
-  if (job.callback) {
-    console.log(`Sending callback to ${job.callback.type}...`);
-    callbacks.push(sendCallback(job.callback, result));
-  }
-
-  if (slack && job.metadata?.source === "slack" && job.metadata.reactionTs) {
-    callbacks.push(
-      slack.reactions.remove({
-        channel: job.metadata.channel,
-        timestamp: job.metadata.reactionTs,
-        name: "eyes",
-      }),
+  const repoFullName = job.metadata?.repo;
+  const prNumber = job.metadata?.prNumber;
+  if (!repoFullName || !prNumber) {
+    console.error(
+      "pr-reviewer job missing repo/prNumber metadata; cannot check out",
     );
+    process.exit(1);
   }
 
-  await Promise.all(callbacks);
-  if (job.callback) console.log("Callback sent");
+  const reviewDir = process.env.REVIEW_DIR ?? "/app/review";
+  // Dispatch-time SHA is only a fallback for the failure-status post below.
+  // The checkout itself pins to the *live* PR head resolved at boot — a
+  // stale or force-pushed-away dispatch SHA isn't reachable from
+  // refs/pull/<n>/head and would fail to check out.
+  let headSha = job.metadata?.headSha;
+  try {
+    // Resolve the live PR head and make it the single authoritative SHA for
+    // the whole run: the tree is checked out to it, and the agent pins its
+    // diff, status posts, and review commit_id to it (via REVIEW_HEAD_SHA).
+    // Keeping the reviewed tree, the diff, and the posted verdict on one
+    // commit is what stops a mid-run push from landing an approval on
+    // commits nobody reviewed.
+    headSha = execFileSync(
+      "gh",
+      [
+        "pr",
+        "view",
+        prNumber,
+        "--repo",
+        repoFullName,
+        "--json",
+        "headRefOid",
+        "--jq",
+        ".headRefOid",
+      ],
+      { timeout: 30_000 },
+    )
+      .toString()
+      .trim();
+
+    // Shallow-clone the base repo, fetch the PR head ref, then check out the
+    // exact SHA. Going through refs/pull/<n>/head is reliable even for fork
+    // PRs, whose head commit isn't on any base-repo branch. Submodules
+    // (e.g. the ai-rules submodule the deep-reviewer needs) are synced after
+    // the checkout so they match the PR's pinned state.
+    execFileSync(
+      "gh",
+      ["repo", "clone", repoFullName, reviewDir, "--", "--depth=50"],
+      { stdio: "inherit", timeout: 180_000 },
+    );
+    execFileSync(
+      "git",
+      [
+        "-C",
+        reviewDir,
+        "fetch",
+        "--depth=50",
+        "origin",
+        `refs/pull/${prNumber}/head`,
+      ],
+      { stdio: "inherit", timeout: 120_000 },
+    );
+    execFileSync("git", ["-C", reviewDir, "checkout", headSha], {
+      stdio: "inherit",
+      timeout: 60_000,
+    });
+    execFileSync(
+      "git",
+      ["-C", reviewDir, "submodule", "update", "--init", "--recursive"],
+      { stdio: "inherit", timeout: 120_000 },
+    );
+    console.log(
+      `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,
+    );
+  } catch (err) {
+    console.error("Failed to check out PR for pr-reviewer:", err);
+    // The re-review lambda already flipped the pr-reviewer check to pending;
+    // exiting silently would leave it stuck. Post a best-effort error status
+    // (state=error — a boot/infra failure, not a review verdict) so the
+    // check resolves, as the reviewer App that owns the pending status.
+    const token = process.env.REVIEWER_GITHUB_TOKEN;
+    if (headSha && token) {
+      try {
+        await fetch(
+          `https://api.github.com/repos/${repoFullName}/statuses/${headSha}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              state: "error",
+              context: "pr-reviewer",
+              description: "Review boot failed: could not check out the PR",
+            }),
+          },
+        );
+      } catch (statusErr) {
+        console.error("Failed to post checkout-failure status:", statusErr);
+      }
+    }
+    process.exit(1);
+  }
+
+  // The review runs through the deterministic layer: it builds the agent's
+  // input, strips every credential from the agent's environment, validates
+  // the structured output, and is the only thing that touches GitHub.
+  const reviewerToken = process.env.REVIEWER_GITHUB_TOKEN;
+  if (!reviewerToken) {
+    console.error("REVIEWER_GITHUB_TOKEN missing; pr-reviewer cannot post");
+    process.exit(1);
+  }
+  const taskArn = await fetch(`${process.env.ECS_CONTAINER_METADATA_URI_V4}/task`)
+    .then((r) => r.json() as Promise<{ TaskARN?: string }>)
+    .then((t) => t.TaskARN)
+    .catch(() => undefined);
+  const logsUrl = taskArn
+    ? `https://us-west-2.console.aws.amazon.com/cloudwatch/home?region=us-west-2#logsV2:log-groups/log-group/$252Faws$252Fecs$252Fdelegate/log-events/agent$252Fagent$252F${taskArn.split("/").pop()}`
+    : undefined;
+
+  try {
+    await runReview({
+      repo: repoFullName,
+      prNumber: Number(prNumber),
+      reviewDir,
+      trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
+      token: reviewerToken,
+      abortController,
+      logsUrl,
+    });
+  } finally {
+    clearTimeout(deadline);
+    await removeGitHubReaction(job, reviewerToken);
+  }
 };
 
 main().catch((err) => {

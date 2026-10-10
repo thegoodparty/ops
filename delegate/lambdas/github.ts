@@ -3,8 +3,6 @@ import { getReviewerInstallationToken } from "./github-auth";
 import { getSecrets } from "./secrets";
 import { verifyGithubWebhook } from "./verify";
 
-// Distinct from delegate/framework/repos.ts:WRITE_REPOS (bot-write scope).
-// Update both lists when adding a repo.
 const REVIEW_REPOS = new Set([
   "omni",
   "gp-api",
@@ -22,7 +20,7 @@ const REVIEW_REPOS = new Set([
   "gp-terraform-dataplatform",
   "candidate-sites",
   "gp-marketing",
-  // ops: review scope only (not in WRITE_REPOS), but an approval here can
+  // ops: an approval here can
   // merge. .github/CODEOWNERS owns every path by default and names a short
   // opt-out list; a PR touching only opted-out paths satisfies the code-owner
   // requirement vacuously, so the bot's approval is the one approval the
