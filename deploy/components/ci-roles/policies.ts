@@ -1205,3 +1205,59 @@ export const githubActionsPulumiPlan: PolicyDocument = {
     },
   ],
 };
+
+// ---------------------------------------------------------------------------
+// The ECR Public login role
+//
+// CI pulls its base images from ECR Public (`public.ecr.aws/docker/library/`)
+// instead of Docker Hub. Anonymous pulls from either get 429s on GitHub-hosted
+// runners, because the limits are per IP and runners share IPs. Logged-in
+// pulls from ECR Public are limited per AWS account instead, so every docker
+// build logs in first, pull request runs included, and a pull request run must
+// not hold the deploy role. This role is what a pull request run gets instead.
+//
+// It is safe to hand to PR-authored code because of what it cannot do, not
+// because of who may assume it. It can mint an ECR Public login token and
+// nothing else. Pulling public images needs no further permission, and the
+// role has none: no push, no private ECR, no other service. The worst a
+// malicious pull request can do with it is pull public images under our
+// account's rate limit. That is also why the trust is `:*` rather than
+// `pull_request` only: a run on any other ref gains nothing from it worth
+// guarding.
+
+export const githubActionsEcrPublicLoginTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        },
+        StringLike: {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:thegoodparty/ops:*",
+            "repo:thegoodparty/omni:*",
+          ],
+        },
+      },
+    },
+  ],
+};
+
+export const githubActionsEcrPublicLogin: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      // `docker login public.ecr.aws`. Neither action is resource-scopable.
+      Sid: "EcrPublicLogin",
+      Effect: "Allow",
+      Action: ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"],
+      Resource: "*",
+    },
+  ],
+};

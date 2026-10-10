@@ -501,6 +501,32 @@ validate the Dockerfile and discards it, so it needs
 **`omni/election-api.yml`.** Declares `id-token: write` and never assumes a
 role. Stray permission, no effect, remove it.
 
+## `github-actions-ecr-public-login`
+
+Outside the numbered steps, because it narrows nothing: it exists so pull
+request docker builds can keep holding no deploy credentials once they log in
+to pull base images.
+
+Base images come from ECR Public, as
+`public.ecr.aws/docker/library/<image>:<tag>`. Anonymous pulls from it, as
+from Docker Hub, are limited per IP and get 429s on shared GitHub runners.
+Logged-in pulls are limited per AWS account, so every build logs in first,
+pull requests included.
+
+The role is trusted by `repo:thegoodparty/ops:*` and `repo:thegoodparty/omni:*`
+and can only mint an ECR Public login token (`ecr-public:GetAuthorizationToken`,
+`sts:GetServiceBearerToken`). Pulling public images needs nothing more, so it
+has no push, no private ECR and no other service;
+`deploy/ci-roles-ecr-public-login.test.ts` holds that allowlist.
+
+Main-branch builds keep `github-actions-pulumi-deploy` (ops `deploy.yml`, and
+omni through `vars.AWS_ROLE_ARN`), which can log in through its
+`AdministratorAccess` attachment and needs no new grant.
+
+The role has to exist before a pull request workflow assumes it, so it lands
+and applies first, and the workflow and `FROM` changes in ops and omni follow
+separately.
+
 ## Ordering
 
 The rule from `workbench-account.md` applies, with one addition. Cross-repo

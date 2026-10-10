@@ -14,6 +14,8 @@ import {
   githubActionsInfrastructureDeployTrust,
   githubActionsDelegateEval,
   githubActionsDelegateEvalTrust,
+  githubActionsEcrPublicLogin,
+  githubActionsEcrPublicLoginTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -236,6 +238,23 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsDelegateEval),
   });
 
+  // ECR Public login only, for docker builds on pull_request runs in ops and
+  // omni, which get no other AWS credentials. See
+  // `githubActionsEcrPublicLogin` for why that is safe.
+  const ecrPublicLoginRole = new aws.iam.Role("githubActionsEcrPublicLogin", {
+    name: "github-actions-ecr-public-login",
+    description:
+      "ECR Public login only, so docker builds in thegoodparty/ops and thegoodparty/omni, including pull_request runs, pull base images under our account's rate limit.",
+    assumeRolePolicy: JSON.stringify(githubActionsEcrPublicLoginTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsEcrPublicLoginPolicy", {
+    name: "EcrPublicLogin",
+    role: ecrPublicLoginRole.id,
+    policy: JSON.stringify(githubActionsEcrPublicLogin),
+  });
+
   return {
     deployRole,
     deployPolicy,
@@ -245,5 +264,6 @@ export const createCiRoles = () => {
     previewRole,
     planRole,
     delegateEvalRole,
+    ecrPublicLoginRole,
   };
 };
