@@ -1,8 +1,20 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { infrastructurePreviewRoleTrust } from "./preview-role";
+import {
+  infrastructurePreviewRolePolicy,
+  infrastructurePreviewRoleTrust,
+  PREVIEW_BREAK_GLASS_TABLE_NAME,
+} from "./preview-role";
+import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 
 const MANAGEMENT_ACCOUNT_ID = "333022194791";
+
+const asList = (value: unknown): string[] =>
+  value === undefined
+    ? []
+    : Array.isArray(value)
+      ? (value as string[])
+      : [String(value)];
 
 describe("infrastructurePreviewRoleTrust", () => {
   it("admits the PR preview role and the human ReadOnlyAccess session only", () => {
@@ -30,5 +42,44 @@ describe("infrastructurePreviewRoleTrust", () => {
       human.Condition?.ArnLike["aws:PrincipalArn"],
       `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_ReadOnlyAccess_*`
     );
+  });
+});
+
+describe("infrastructurePreviewRolePolicy", () => {
+  const actions = infrastructurePreviewRolePolicy.Statement.flatMap((s) =>
+    asList(s.Action)
+  );
+
+  it("grants exactly the reads the provider makes on a table read", () => {
+    assert.deepEqual([...actions].sort(), [
+      "dynamodb:DescribeContinuousBackups",
+      "dynamodb:DescribeTable",
+      "dynamodb:DescribeTimeToLive",
+      "dynamodb:ListTagsOfResource",
+    ]);
+  });
+
+  // The point of the grant is metadata only. A data action slipping in would
+  // make a PR-authored preview able to read request records and reasons.
+  it("grants no data reads and no writes", () => {
+    for (const action of actions) {
+      assert.doesNotMatch(
+        action,
+        /:(Get|Put|Update|Delete|Query|Scan|Batch|Transact)/,
+        action
+      );
+    }
+  });
+
+  it("scopes to the one break-glass table, never a bare wildcard", () => {
+    for (const statement of infrastructurePreviewRolePolicy.Statement) {
+      const resources = asList(statement.Resource);
+      assert.equal(resources.length, 1);
+      assert.equal(
+        resources[0],
+        `arn:aws:dynamodb:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:table/${PREVIEW_BREAK_GLASS_TABLE_NAME}`
+      );
+      assert.notEqual(resources[0], "*");
+    }
   });
 });

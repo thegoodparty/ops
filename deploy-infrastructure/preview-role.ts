@@ -1,6 +1,9 @@
 import * as aws from "@pulumi/aws";
 
-import { MANAGEMENT_ACCOUNT_ID } from "../utils/accounts";
+import {
+  INFRASTRUCTURE_ACCOUNT_ID,
+  MANAGEMENT_ACCOUNT_ID,
+} from "../utils/accounts";
 
 /**
  * The read-only preview role. Item 1 of "PR previews" in
@@ -11,9 +14,26 @@ import { MANAGEMENT_ACCOUNT_ID } from "../utils/accounts";
  * front door for applies, this one is what a `pulumi preview` will use so a
  * PR never holds admin in this account.
  *
- * What it may do: nothing. The program's only invoke is
- * `aws.getCallerIdentityOutput`, which needs no grant. Add a policy when a
- * real preview fails closed and names an action.
+ * What it may do: read DynamoDB table metadata, and only for the break-glass
+ * request table. The program's only invoke is `aws.getCallerIdentityOutput`,
+ * which needs no grant, so the role started empty. This is its first
+ * widening, added after a real preview failed closed and named an action; add
+ * the next one the same way.
+ *
+ * Why that table. `aws:dynamodb/table:Table` reads with `DescribeTable`,
+ * `DescribeContinuousBackups` and `DescribeTimeToLive`, and the provider's
+ * tag read adds `ListTagsOfResource`. Without them the infrastructure preview
+ * of `break-glass-lambda.ts` (step 3 of `docs/break-glass.md`) fails with
+ * AccessDenied while diffing the table — even before the table exists, because
+ * IAM denies the call before DynamoDB can answer `ResourceNotFound`. Scoped to
+ * the one table by name rather than `table/*`, so the next table fails closed
+ * the same way and earns its own reviewed line.
+ *
+ * The table name is repeated rather than imported from
+ * `break-glass-lambda.ts` because this policy is applied by
+ * `deploy-infrastructure.yml` on `main`, and that module does not exist there
+ * until the break-glass step 3 PR merges. A follow-up can import it once both
+ * are in.
  *
  * Created now, ahead of anything that assumes it, because the management-side
  * grant and the workflow change (step 11) can only land safely once the role
@@ -68,6 +88,38 @@ export const infrastructurePreviewRoleTrust: {
   ],
 };
 
+const REGION = "us-west-2";
+
+/** The one table this role may read, from `break-glass-lambda.ts`. */
+export const PREVIEW_BREAK_GLASS_TABLE_NAME = "break-glass";
+
+/**
+ * The role's whole grant. Exported so `preview-role.test.ts` can pin the
+ * actions and the scope without standing up a Pulumi resource.
+ *
+ * The four actions are the reads the provider makes on a table read, named
+ * rather than `dynamodb:Describe*` so a future widening is a visible diff:
+ * `DescribeTable` is what the preview failed on, and the other three follow it
+ * on the same read path. No data action (`GetItem`, `Query`, `Scan`) appears
+ * here, and a test asserts none does.
+ */
+export const infrastructurePreviewRolePolicy = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "BreakGlassTableRead",
+      Effect: "Allow",
+      Action: [
+        "dynamodb:DescribeTable",
+        "dynamodb:DescribeContinuousBackups",
+        "dynamodb:DescribeTimeToLive",
+        "dynamodb:ListTagsOfResource",
+      ],
+      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${PREVIEW_BREAK_GLASS_TABLE_NAME}`,
+    },
+  ],
+} as const;
+
 export const createPreviewRole = (args: { provider: aws.Provider }) => {
   const role = new aws.iam.Role(
     "previewRole",
@@ -77,6 +129,19 @@ export const createPreviewRole = (args: { provider: aws.Provider }) => {
         "Read-only role for infrastructure previews. Assumed by github-actions-pulumi-preview for PR previews and by management-account ReadOnlyAccess sessions for local previews. Step 7 of docs/infrastructure-account.md.",
       assumeRolePolicy: JSON.stringify(infrastructurePreviewRoleTrust),
       maxSessionDuration: 3600,
+    },
+    { provider: args.provider },
+  );
+
+  // Inline, matching the other scoped roles: the deploy role cannot manage new
+  // managed policies, and an inline document is covered by the `iam:PutRolePolicy`
+  // it already holds.
+  new aws.iam.RolePolicy(
+    "previewRolePolicy",
+    {
+      name: PREVIEW_ROLE_NAME,
+      role: role.name,
+      policy: JSON.stringify(infrastructurePreviewRolePolicy),
     },
     { provider: args.provider },
   );
