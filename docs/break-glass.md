@@ -306,7 +306,7 @@ standing admin"; after that it is the original "no standing admin".
    ───────────────────────────────      ────────────────────────────────────────
  /breakglass ──┐
  modal        │  signed with the       ┌────────────────────────────────────────┐
- Approve/Deny ├──break-glass secret───▶│ break-glass Lambda (Function URL)      │
+ Approve/Deny ├──sheriff secret───────▶│ break-glass Lambda (Function URL)      │
  (in channel) │                        │ patterns from delegate/lambdas         │
               │                        └───────────────┬────────────────────────┘
               │                                        │
@@ -376,7 +376,7 @@ code, changed only by a reviewed PR.
    interactivity as `application/x-www-form-urlencoded` with a `payload=<json>`
    field rather than the JSON body the delegate events route parses, so the
    route decodes that before reading the action.
-4. The handler re-verifies the Slack signature with the break-glass secret and
+4. The handler re-verifies the Slack signature with the sheriff secret and
    checks that the clicking user is on the hardcoded approver list **and** is
    not the requester. Anyone else gets an ephemeral "not an approver".
 5. On **Deny**: write `denied`, post the outcome to the channel, done.
@@ -828,7 +828,7 @@ For a reviewer checking the plan against the repo:
   workload's services and denies CloudTrail tampering.
 - `deploy-infrastructure/break-glass-lambda.ts` — the runtime Pulumi
   resources: the Lambda, its execution role and inline policy, the DynamoDB
-  table, the log group, the Function URL and the break-glass Slack secret. The
+  table, the log group, the Function URL and the sheriff Slack secret. The
   explicit-provider rule and `allowedAccountIds` are in
   `deploy-infrastructure/index.ts`.
 - `deploy-infrastructure/break-glass/` — the handler itself (`handler.ts`,
@@ -853,12 +853,12 @@ and are deliberately neither created by Pulumi nor committed:
    the app is not a member of the configured channel. No Events API
    subscription is needed; interactivity arrives on the same function.
 2. **The secret.** The stack creates an empty Secrets Manager secret named
-   `break-glass` in the infrastructure account (394495727159). Populate it by
+   `sheriff` in the infrastructure account (394495727159). Populate it by
    hand, never from Pulumi and never in the repo:
 
    ```sh
    aws secretsmanager put-secret-value \
-     --secret-id break-glass \
+     --secret-id sheriff \
      --secret-string '{"SLACK_SIGNING_SECRET":"...","SLACK_BOT_TOKEN":"..."}'
    ```
 

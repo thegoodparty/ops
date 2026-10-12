@@ -6,8 +6,8 @@ import * as path from "node:path";
 
 import {
   BREAK_GLASS_ROLE_NAME,
-  BREAK_GLASS_SECRET_NAME,
   BREAK_GLASS_TABLE_NAME,
+  SHERIFF_SECRET_NAME,
   breakGlassLambdaPolicy,
   breakGlassLambdaTrust,
 } from "./break-glass-lambda";
@@ -118,7 +118,7 @@ describe("breakGlassLambdaPolicy", () => {
       (s) => s.Sid === "ReadOwnSecret",
     );
     assert.ok(secretStatement);
-    assert.match(asList(secretStatement.Resource)[0], /:secret:break-glass-\*/);
+    assert.match(asList(secretStatement.Resource)[0], /:secret:sheriff-\*/);
     assert.ok(!JSON.stringify(breakGlassLambdaPolicy).includes("DELEGATES"));
   });
 
@@ -147,9 +147,17 @@ describe("break-glass role name", () => {
     assert.match(source, /:role\/break-glass`/);
   });
 
-  it("names the secret and table consistently", () => {
-    assert.equal(BREAK_GLASS_SECRET_NAME, "break-glass");
+  it("pins the app-scoped secret name", () => {
+    assert.equal(SHERIFF_SECRET_NAME, "sheriff");
+  });
+
+  it("keeps the workflow-scoped table name distinct from the app secret", () => {
+    // The secret holds the `@sheriff` Slack app's credentials and is
+    // app-scoped, because the app is expected to grow beyond break-glass. The
+    // table holds the break-glass workflow's request records and stays
+    // workflow-scoped, so the two names are deliberately different.
     assert.equal(BREAK_GLASS_TABLE_NAME, "break-glass");
+    assert.notEqual(SHERIFF_SECRET_NAME, BREAK_GLASS_TABLE_NAME);
   });
 });
 

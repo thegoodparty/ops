@@ -5,7 +5,7 @@
  * plan is explicit about why: every delegate worker holds `DELEGATES` while
  * processing untrusted text, and function-URL auth is signature-only, so that
  * secret is enough to forge an approval. This function reads its own secret,
- * `break-glass`, and nothing else. It follows the signing and secret-reading
+ * `sheriff`, and nothing else. It follows the signing and secret-reading
  * code *patterns* from `delegate/lambdas/verify.ts` and
  * `delegate/lambdas/secrets.ts` in local modules (`verify.ts`, `secrets.ts`)
  * rather than importing them, so the bundle has no dependency on the delegate
@@ -395,7 +395,7 @@ export const handler = async (
   const botToken = secrets["SLACK_BOT_TOKEN"];
   if (!signingSecret || !botToken) {
     throw new Error(
-      "The break-glass secret must hold SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN",
+      "The sheriff secret must hold SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN",
     );
   }
 

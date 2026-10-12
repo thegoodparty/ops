@@ -4,7 +4,7 @@ import {
 } from "@aws-sdk/client-secrets-manager";
 
 /**
- * Reads the break-glass Slack secret, following the pattern in
+ * Reads the sheriff Slack secret, following the pattern in
  * `delegate/lambdas/secrets.ts`: a cached module-level read of the JSON secret
  * named by `SECRET_ARN`.
  *

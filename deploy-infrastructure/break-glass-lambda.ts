@@ -30,7 +30,11 @@ const REGION = "us-west-2";
 export const BREAK_GLASS_ROLE_NAME = NAME;
 
 export const BREAK_GLASS_TABLE_NAME = "break-glass";
-export const BREAK_GLASS_SECRET_NAME = "break-glass";
+// The Slack app is `@sheriff`, expected to grow beyond break-glass to other
+// privileged ops, so its credentials secret is app-scoped (`sheriff`). The
+// table below is the break-glass workflow's request records and stays
+// workflow-scoped.
+export const SHERIFF_SECRET_NAME = "sheriff";
 export const BREAK_GLASS_LOG_GROUP = `/aws/lambda/${NAME}`;
 
 const TAGS = { Name: NAME, Project: NAME };
@@ -74,7 +78,7 @@ export const breakGlassLambdaPolicy = {
       // Secrets Manager appends a random six-character suffix to the ARN, so
       // the name has to be a wildcard. It is scoped to this one secret name
       // and this account, not `*`.
-      Resource: `arn:aws:secretsmanager:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:secret:${BREAK_GLASS_SECRET_NAME}-*`,
+      Resource: `arn:aws:secretsmanager:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:secret:${SHERIFF_SECRET_NAME}-*`,
     },
     {
       Sid: "RequestTable",
@@ -135,9 +139,9 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   const secret = new aws.secretsmanager.Secret(
     "breakGlassSlackSecret",
     {
-      name: BREAK_GLASS_SECRET_NAME,
+      name: SHERIFF_SECRET_NAME,
       description:
-        "Break-glass Slack app credentials (SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN). Filled by hand; never by Pulumi.",
+        "Sheriff Slack app credentials (SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN). Filled by hand; never by Pulumi.",
       tags: TAGS,
     },
     { provider, protect: true },
@@ -225,7 +229,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   );
 
   // Signature-only auth, exactly like the delegate webhook: every request is
-  // verified against the break-glass signing secret before anything happens.
+  // verified against the sheriff signing secret before anything happens.
   const functionUrl = new aws.lambda.FunctionUrl(
     "breakGlassUrl",
     {
