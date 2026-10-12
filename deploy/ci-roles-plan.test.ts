@@ -185,4 +185,18 @@ describe("githubActionsPulumiPlan", () => {
     assert.ok(asList(statement("TerraformStateObjects").Resource).includes(lock));
     assert.ok(asList(statement("DenyOtherS3Objects").NotResource).includes(lock));
   });
+
+  it("logs in to ECR Public and can push nothing there", () => {
+    const login = statement("EcrPublicLogin");
+    assert.equal(login.Effect, "Allow");
+    assert.ok("Action" in login);
+    assert.deepEqual(login.Action, [
+      "ecr-public:GetAuthorizationToken",
+      "sts:GetServiceBearerToken",
+    ]);
+    const ecr = githubActionsPulumiPlan.Statement.flatMap((s) =>
+      "Action" in s ? asList(s.Action) : []
+    ).filter((a) => a.startsWith("ecr"));
+    assert.deepEqual(ecr, ["ecr-public:GetAuthorizationToken"]);
+  });
 });

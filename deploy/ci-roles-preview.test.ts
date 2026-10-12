@@ -42,8 +42,9 @@ describe("githubActionsPulumiPreview", () => {
   it("grants read-only actions and nothing else", () => {
     // `sts:AssumeRole` is the one non-read action; it only reaches the
     // workbench and infrastructure preview roles, asserted separately below.
+    // The ECR Public login token reads nothing and pushes nothing.
     const readOnly =
-      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|sts:AssumeRole)/;
+      /^(s3:(Get|List)|ssm:Get|secretsmanager:(Describe|GetResourcePolicy)|ecs:Describe|sts:AssumeRole$|ecr-public:GetAuthorizationToken$|sts:GetServiceBearerToken$)/;
     for (const action of actions()) {
       assert.match(action, readOnly, `${action} is not read-only`);
     }
@@ -99,5 +100,18 @@ describe("githubActionsPulumiPreview", () => {
     assert.deepEqual(resources, [
       "arn:aws:secretsmanager:us-west-2:333022194791:secret:DELEGATES-??????",
     ]);
+  });
+
+  it("logs in to ECR Public and can push nothing there", () => {
+    const login = githubActionsPulumiPreview.Statement.find(
+      (s) => s.Sid === "EcrPublicLogin"
+    );
+    assert.ok(login && "Action" in login);
+    assert.deepEqual(login.Action, [
+      "ecr-public:GetAuthorizationToken",
+      "sts:GetServiceBearerToken",
+    ]);
+    const ecr = actions().filter((a) => a.startsWith("ecr"));
+    assert.deepEqual(ecr, ["ecr-public:GetAuthorizationToken"]);
   });
 });

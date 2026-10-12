@@ -976,6 +976,19 @@ export const githubActionsPulumiPreview: PolicyDocument = {
       Action: ["sts:AssumeRole"],
       Resource: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/pulumi-preview`,
     },
+    {
+      Sid: "EcrPublicLogin",
+      Effect: "Allow",
+      // Not for previews. `deploy.yml` assumes this role on pull_request runs
+      // to log in to ECR Public before building the worker image: anonymous
+      // pulls there are limited per IP and shared runners hit 429s, logged-in
+      // pulls are limited per account. A login token reads nothing and pushes
+      // nothing (pulling public images needs no permission at all), and
+      // neither action can be resource-scoped. Last, for the same reason as
+      // the assumes above.
+      Action: ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"],
+      Resource: "*",
+    },
   ],
 };
 
@@ -1201,6 +1214,20 @@ export const githubActionsPulumiPlan: PolicyDocument = {
         "ssm:GetParametersByPath",
         "ssm:GetParameterHistory",
       ],
+      Resource: "*",
+    },
+    {
+      Sid: "EcrPublicLogin",
+      Effect: "Allow",
+      // Not for plans. omni's `gp-ai.yml` assumes this role in its pull
+      // request image builds to log in to ECR Public: anonymous pulls there
+      // are limited per IP and shared runners hit 429s, logged-in pulls are
+      // limited per account. A login token reads nothing and pushes nothing
+      // (pulling public images needs no permission at all), and neither
+      // action can be resource-scoped. Any omni pull request can already
+      // assume this role by editing gp-ai.yml, so handing it to the build job
+      // exposes nothing new.
+      Action: ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"],
       Resource: "*",
     },
   ],
