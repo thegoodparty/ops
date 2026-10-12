@@ -4,6 +4,7 @@ import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 import { createPreviewRole } from "./preview-role";
 import { createAgentSwarm } from "./agent-swarm";
+import { createBreakGlass } from "./break-glass-lambda";
 import { createInfraZone } from "./dns";
 
 /**
@@ -180,3 +181,12 @@ const agentSwarm = createAgentSwarm({ provider, zone: infraZone });
 
 export const delegateSwarmInstanceId = agentSwarm.instance.id;
 export const delegateSwarmPublicIp = agentSwarm.eip.publicIp;
+
+// The break-glass Lambda, step 3 (dry) of docs/break-glass.md. The function
+// URL is the endpoint the separate break-glass Slack app points its slash
+// command and interactivity URLs at.
+const breakGlass = createBreakGlass({ provider });
+
+export const breakGlassFunctionUrl = breakGlass.url;
+export const breakGlassSecretArn = breakGlass.secret.arn;
+export const breakGlassTableName = breakGlass.table.name;
