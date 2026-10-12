@@ -51,19 +51,19 @@ see "The CloudTrail gap" and open question 7.
       management-account) trail to an S3 bucket with Object Lock and a
       restricted reader. Not a blocker; can land in parallel with or after the
       runtime. `todo`
-- [ ] 2. Definitions only, no runtime: shorten the existing `administrator`
+- [x] 2. Definitions only, no runtime: shorten the existing `administrator`
       permission set's `sessionDuration` from `PT8H` to `PT1H` in
       `deploy/components/identity-center.ts`, and add the management-account
-      `break-glass-grant` role and its scoped inline policy in `deploy/`. No new
+      `sheriff-grant` role and its scoped inline policy in `deploy/`. No new
       permission set and no new group; see "Core mechanism".
-      `doing (break-glass-step2, 2026-10-09)`
+      `done (2026-10-12, break-glass-step2, PR #280, Deploy run 38252435639)`
 - [ ] 3. The Lambda, dry: a separate Slack app, its own signing secret and bot
       token in the infrastructure account, a new Lambda in
       `deploy-infrastructure/`, the slash command and modal, a DynamoDB request
       record, the approval post and the button handler, all the way to the
       approval decision, but no grant. This makes the flow visible before
-      anything can be escalated. `todo`
-- [ ] 4. Wire approval to a real grant: assume `break-glass-grant`, call
+      anything can be escalated. `doing (break-glass-step3, 2026-10-12)`
+- [ ] 4. Wire approval to a real grant: assume `sheriff-grant`, call
       `identitystore:CreateGroupMembership`, write the grant, post the SSO link.
       Add the application audit log, the reconciliation sweeper, and the alarm
       on an unexpected membership. `todo`
@@ -101,7 +101,7 @@ repo today.
 | Identity Center is fully code-owned | `deploy/components/identity-center.ts`, applied by `github-actions-pulumi-deploy` (which holds `sso:*`) | The existing `administrator` permission set (shortened) and the existing `Admins` group and its three `AccountAssignment`s. No new resources. |
 | `Admins` already holds admin in all three accounts | `deploy/components/identity-center.ts`: `main`, `workbench` and `infrastructure` all map `Admins` to `administrator` | The escalation target itself. The grant is a group membership, not a new assignment. |
 | Slack signing and secret handling | `delegate/lambdas/verify.ts` (`verifySlackWebhook`), `delegate/lambdas/secrets.ts` (`getSecrets`) | The **code patterns** only. The deployed delegate function and its `DELEGATES` secret are not reused; see below. |
-| A cross-account assume into the management account | `deploy/components/delegate-swarm-prod-read.ts` (trust by account root plus a `PrincipalArn` condition), assumed from the infrastructure account in `deploy-infrastructure/agent-swarm.ts` | The `break-glass-grant` role is the same pattern with a much narrower policy. |
+| A cross-account assume into the management account | `deploy/components/delegate-swarm-prod-read.ts` (trust by account root plus a `PrincipalArn` condition), assumed from the infrastructure account in `deploy-infrastructure/agent-swarm.ts` | The `sheriff-grant` role is the same pattern with a much narrower policy. |
 | The infrastructure account and its guardrails | `deploy-infrastructure/`, the `Infrastructure` SCP in `deploy-org/policies.ts` | The new Lambda, DynamoDB, scheduler and alarms land there, under that SCP. |
 
 Three things worth stating plainly, because the first revision got them wrong:
@@ -306,7 +306,7 @@ standing admin"; after that it is the original "no standing admin".
    ───────────────────────────────      ────────────────────────────────────────
  /breakglass ──┐
  modal        │  signed with the       ┌────────────────────────────────────────┐
- Approve/Deny ├──break-glass secret───▶│ break-glass Lambda (Function URL)      │
+ Approve/Deny ├──sheriff secret───────▶│ break-glass Lambda (Function URL)      │
  (in channel) │                        │ patterns from delegate/lambdas         │
               │                        └───────────────┬────────────────────────┘
               │                                        │
@@ -319,7 +319,7 @@ standing admin"; after that it is the original "no standing admin".
               │                                        │
               ▼                                        └── both call the same revoke
    #devs-only post  ◀── sts:AssumeRole ──▶ management account 333022194791
-                                            role: break-glass-grant
+                                            role: sheriff-grant
                                             identitystore:CreateGroupMembership
                                             identitystore:DeleteGroupMembership
                                             scoped to the Admins group id
@@ -332,14 +332,14 @@ state:
   shortened to `PT1H`, in `deploy/components/identity-center.ts`. Nothing else
   in that file changes: the `Admins` group and its three assignments already
   exist.
-- The management-account `break-glass-grant` role and its inline policy, in
+- The management-account `sheriff-grant` role and its inline policy, in
   `deploy/`.
 
 **Pulumi (the `infrastructure` stack) owns the runtime**, in
 `deploy-infrastructure/`: the new break-glass Lambda and its execution role, its
 own Slack secret in Secrets Manager, the DynamoDB table, the EventBridge
 Scheduler group, the log group, metric filters and alarms. The Lambda's role
-gets `sts:AssumeRole` on exactly one ARN (`break-glass-grant`), plus DynamoDB,
+gets `sts:AssumeRole` on exactly one ARN (`sheriff-grant`), plus DynamoDB,
 logs, scheduler and its own secret, and nothing else. It is still under the
 `Infrastructure` SCP.
 
@@ -376,7 +376,7 @@ code, changed only by a reviewed PR.
    interactivity as `application/x-www-form-urlencoded` with a `payload=<json>`
    field rather than the JSON body the delegate events route parses, so the
    route decodes that before reading the action.
-4. The handler re-verifies the Slack signature with the break-glass secret and
+4. The handler re-verifies the Slack signature with the sheriff secret and
    checks that the clicking user is on the hardcoded approver list **and** is
    not the requester. Anyone else gets an ephemeral "not an approver".
 5. On **Deny**: write `denied`, post the outcome to the channel, done.
@@ -384,7 +384,7 @@ code, changed only by a reviewed PR.
    rate limit, request not already decided, and **no other active grant for the
    requester**, enforced with the conditional write described under "The
    decision"). If any check fails, post the reason to the approver and write no
-   grant. Then assume `break-glass-grant` and **write the grant record first, in
+   grant. Then assume `sheriff-grant` and **write the grant record first, in
    a `granting` state**, carrying the request id, requester, approver, group id,
    and the computed expires-at (granted-at plus the requested duration). Only
    then call `CreateGroupMembership`. A
@@ -455,7 +455,7 @@ plus the sweeper; TTL only cleans up records nobody needs to read anymore.
 The most sensitive object this plan creates is not the permission set, which
 already exists. It is the role that lets the tool add and remove memberships.
 
-### `break-glass-grant`, in the management account
+### `sheriff-grant`, in the management account
 
 - **Trust**: only the break-glass Lambda execution role ARN in the
   infrastructure account, following the `delegate-swarm-prod-read` pattern
@@ -463,7 +463,7 @@ already exists. It is the role that lets the tool add and remove memberships.
   because IAM rejects a trust naming a role that may not exist at apply time).
   Nothing else can assume it.
 - **A fixed `sts:AssumeRole` session name** (for example
-  `break-glass-grant-tool`) so CloudTrail records every assume under one
+  `sheriff-grant-tool`) so CloudTrail records every assume under one
   distinguishable name rather than `AWS-Reserved-Session` or a random string.
 - **Inline policy, scoped by resource**, to the identity store id and the
   `Admins` group id: `identitystore:CreateGroupMembership`,
@@ -484,12 +484,9 @@ already exists. It is the role that lets the tool add and remove memberships.
   group-existence check is needed, and every call the tool makes is
   membership-scoped. `ListUsers` in particular would allow enumerating every
   user in the identity store, which is more than the tool's "toggle membership
-  in the one `Admins` group" rule allows. Whether any user lookup is needed at
-  all is the identity-mapping decision in open question 3; if that settles on an
-  API lookup rather than a maintained table, the narrowest permission that
-  answers it (for example `identitystore:GetUserId`, which resolves a user from
-  an alternate identifier, rather than `ListUsers`) is added then, scoped by
-  resource. Do not pre-grant directory reads for an unsettled decision.
+  in the one `Admins` group" rule allows. Open question 3 is settled in favour
+  of the hard-coded Slack-to-Identity-Store map, so no user lookup is needed
+  and none of these is added; the grant role's policy is unchanged from step 2.
 - **Not granted**: any `sso:*`, `CreateAccountAssignment`,
   `CreatePermissionSet`, `sso-directory:AddMemberToGroup`, or anything that
   could grant admin outside `Admins`. `sso-directory` is worth naming
@@ -512,7 +509,7 @@ here so the class of bug cannot come back.
 
 ### The Lambda's role, in the infrastructure account
 
-`sts:AssumeRole` on the one `break-glass-grant` ARN, plus DynamoDB on the one
+`sts:AssumeRole` on the one `sheriff-grant` ARN, plus DynamoDB on the one
 table, CloudWatch Logs on the one group, EventBridge Scheduler on the one
 schedule group, and a read of the tool's **own** secret for the Slack token and
 signing secret. It does **not** read `DELEGATES`. Nothing else. It is still
@@ -577,7 +574,7 @@ who approved, why, how long*.
 
 CloudTrail. `CreateGroupMembership` and `DeleteGroupMembership` are management
 events in the **management account**, because that is where the identity store
-lives, and `sts:AssumeRole` into `break-glass-grant` is a management event there
+lives, and `sts:AssumeRole` into `sheriff-grant` is a management event there
 too. This layer answers *what did the tool actually do to AWS*, independently of
 the tool's own logs, and it is the layer a compromised tool cannot rewrite.
 
@@ -722,17 +719,15 @@ rather than staying open.
    its own signing secret and bot token, stored in Secrets Manager in the
    infrastructure account, served by a new Lambda in the infrastructure account.
    The delegate app, function and `DELEGATES` secret are not reused.
-3. **Identity mapping for the requester.** How does a Slack user map to an
-   Identity Store user id? The approver is now a hardcoded Slack ID, so this is
-   needed only for the **requester**, at grant time. If the directory is
-   SCIM-provisioned from an IdP, the mapping may already exist; if not, a
-   maintained mapping is a prerequisite for step 3. Nothing in this repo records
-   SCIM today, so this is a check to run before building. This decision also
-   sets the tool's permissions: a maintained Slack-to-userId table needs no
-   identity-store user read at all, while an API lookup adds the narrowest read
-   that answers it (`identitystore:GetUserId`, not `ListUsers`), scoped by
-   resource. The proposed inline policy deliberately omits both `ListUsers` and
-   `DescribeUser` until this settles.
+3. ~~**Identity mapping for the requester.**~~ **Settled by the engineer:** a
+   hard-coded map in the Lambda code from Slack user id to Identity Store user
+   id, in `deploy-infrastructure/sheriff/config.ts`. This is the deliberate
+   temporary option, with a refactor planned once the directory mapping is
+   known. Because the map is maintained in code, the tool performs **no
+   directory read at all**, so the `sheriff-grant` role's inline policy
+   needs no `identitystore:GetUserId`, `ListUsers` or `DescribeUser` and is
+   unchanged from step 2. The map holds an obvious placeholder until real ids
+   are available.
 4. ~~**Account scope for phase one.**~~ **Settled in review:** single global
    escalation. One membership grants admin in all three accounts; there is no
    per-account scope and no per-account group.
@@ -768,7 +763,7 @@ The Progress list is the checklist; this is the detail behind each step.
    change the existing `administrator` permission set's `sessionDuration` from
    `PT8H` to `PT1H`. That is the only change in that file: the `Admins` group
    and its three `AccountAssignment`s already exist and are untouched. In
-   `deploy/`, add the `break-glass-grant` role and its scoped inline policy. The
+   `deploy/`, add the `sheriff-grant` role and its scoped inline policy. The
    policy names the existing identity store id and the existing `Admins` group
    id, both literals; record the identity store id in the repo the way
    `utils/accounts.ts` records account ids. No new group resources, so the
@@ -781,11 +776,12 @@ The Progress list is the checklist; this is the detail behind each step.
    `deploy-infrastructure/`. Slash command, modal (duration, reason, ticket; no
    account), DynamoDB request records, the channel post and the button handler,
    the hardcoded approver check, the state machine up to and including the
-   decision, but no `CreateGroupMembership`. This is where the requester
-   identity mapping has to be settled (open question 3), and where the flow
-   becomes reviewable by people who will never read the IAM policy.
+   decision, but no `CreateGroupMembership`. The requester identity mapping is
+   settled (open question 3): a hard-coded Slack-to-Identity-Store map in the
+   Lambda, the temporary option, with a refactor planned. This is where the
+   flow becomes reviewable by people who will never read the IAM policy.
 
-4. **Approval wired to a real grant.** Assume `break-glass-grant`, write the
+4. **Approval wired to a real grant.** Assume `sheriff-grant`, write the
    grant record in the `granting` state, call `CreateGroupMembership`, flip the
    record to `granted`, and post the SSO link and the session caveat to the
    channel. Add the application audit log, the reconciliation sweeper, and the
@@ -830,6 +826,14 @@ For a reviewer checking the plan against the repo:
   explicit-provider rule.
 - `deploy-org/policies.ts` — the `Infrastructure` SCP, which permits this
   workload's services and denies CloudTrail tampering.
+- `deploy-infrastructure/sheriff-lambda.ts` — the runtime Pulumi
+  resources: the Lambda, its execution role and inline policy, the DynamoDB
+  table, the log group, the Function URL and the sheriff Slack secret. The
+  explicit-provider rule and `allowedAccountIds` are in
+  `deploy-infrastructure/index.ts`.
+- `deploy-infrastructure/sheriff/` — the handler itself (`handler.ts`,
+  `policy.ts`, `blocks.ts`, `store.ts`, `config.ts`), including the hard-coded
+  approver list and Slack-to-Identity-Store map.
 - `utils/accounts.ts` — `MANAGEMENT_ACCOUNT_ID`, `WORKBENCH_ACCOUNT_ID`,
   `INFRASTRUCTURE_ACCOUNT_ID`, and the pattern for recording the identity store
   id.
@@ -837,7 +841,33 @@ For a reviewer checking the plan against the repo:
   organization-wide CloudTrail and on what temporary privilege escalation
   assumes into.
 
-A new Slack app is a configuration artifact outside the repo; it needs its
-signing secret and bot token placed in Secrets Manager in the infrastructure
-account, and its interactivity and slash-command request URLs pointed at the new
-function.
+### Step 3 manual setup (out of band)
+
+The code and the infrastructure are in this repo, but three things are manual
+and are deliberately neither created by Pulumi nor committed:
+
+1. **The Slack app.** Create a separate break-glass app, not the delegate app.
+   Add a `/breakglass` slash command and an interactivity request URL, both
+   pointed at the `sheriffFunctionUrl` output of the `infrastructure` stack.
+   The bot token needs `commands` and `chat:write`, plus `chat:write.public` if
+   the app is not a member of the configured channel. No Events API
+   subscription is needed; interactivity arrives on the same function.
+2. **The secret.** The stack creates an empty Secrets Manager secret named
+   `sheriff` in the infrastructure account (394495727159). Populate it by
+   hand, never from Pulumi and never in the repo:
+
+   ```sh
+   aws secretsmanager put-secret-value \
+     --secret-id sheriff \
+     --secret-string '{"SLACK_SIGNING_SECRET":"...","SLACK_BOT_TOKEN":"..."}'
+   ```
+
+3. **The two hard-coded lists.** `deploy-infrastructure/sheriff/config.ts`
+   holds the approver Slack user ids and the Slack-to-Identity-Store map. Both
+   ship with an obvious placeholder; replace them with real ids in a reviewed
+   PR before the flow can approve anything. Until then the approver check
+   rejects every click and the requester map rejects every submission, which is
+   the honest dry-run behaviour.
+
+The configured channel is `#devs-only` by default, overridable with the
+`APPROVAL_CHANNEL` environment variable on the function.

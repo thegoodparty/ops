@@ -4,6 +4,7 @@ import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 import { createPreviewRole } from "./preview-role";
 import { createAgentSwarm } from "./agent-swarm";
+import { createSheriff } from "./sheriff-lambda";
 import { createInfraZone } from "./dns";
 
 /**
@@ -180,3 +181,12 @@ const agentSwarm = createAgentSwarm({ provider, zone: infraZone });
 
 export const delegateSwarmInstanceId = agentSwarm.instance.id;
 export const delegateSwarmPublicIp = agentSwarm.eip.publicIp;
+
+// The break-glass Lambda, step 3 (dry) of docs/sheriff.md. The function
+// URL is the endpoint the separate break-glass Slack app points its slash
+// command and interactivity URLs at.
+const sheriff = createSheriff({ provider });
+
+export const sheriffFunctionUrl = sheriff.url;
+export const sheriffSecretArn = sheriff.secret.arn;
+export const sheriffTableName = sheriff.table.name;
