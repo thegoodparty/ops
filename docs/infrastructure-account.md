@@ -176,9 +176,12 @@ starting the work, not after. Make `who` name the *session*, not the model.
       `deploy-infrastructure/**` to the `pulumi-preview.yml` path filter and the
       `{ project: "infrastructure", dir: "deploy-infrastructure", build: false }`
       matrix entry. The in-account `pulumi-preview` role already existed from
-      step 7 and holds no permissions; if the first real preview fails closed
-      it names an action, and that action gets added then, as the role's header
-      says.
+      step 7 and started with no permissions, as the role's header says. The
+      first real preview failed closed as designed: #293's break-glass preview
+      named `dynamodb:DescribeTable`, and PR #294 added the four reads the
+      provider makes on a table read (`DescribeTable`,
+      `DescribeContinuousBackups`, `DescribeTimeToLive`,
+      `ListTagsOfResource`), scoped to the one `break-glass` table.
 - [x] 12. Document how an admin reaches the account, and whether the container
       gets a profile for it: done (2026-10-08, pi-infra-step12). The human
       path is Identity Center: a member of `Admins` signs in and picks
@@ -475,8 +478,10 @@ Three changes, and the ordering between them matters:
    `deploy-infrastructure/preview-role.ts`, trusted by
    `github-actions-pulumi-preview` in the management account and by the
    management account's `ReadOnlyAccess` SSO session for local previews. It
-   starts with no permissions, because the program's only AWS call is
-   `sts:GetCallerIdentity`. Applied by `deploy-infrastructure.yml` at step 7.
+   started with no permissions, because the program's only AWS call is
+   `sts:GetCallerIdentity`, and is widened only by observed failures. Its first
+   grant is the DynamoDB table read the break-glass preview needed (PR #294,
+   recorded under step 11). Applied by `deploy-infrastructure.yml` at step 7.
 2. **Management-account grant** — `AssumeInfrastructurePreviewRole` on
    `github-actions-pulumi-preview`, plus `"infrastructure"` in its
    `pulumiBackendReadStatements` list. Applied by `deploy.yml`.
