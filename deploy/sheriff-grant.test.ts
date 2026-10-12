@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-  breakGlassGrantPolicy,
-  breakGlassGrantTrust,
+  sheriffGrantPolicy,
+  sheriffGrantTrust,
 } from "./components/sheriff-grant";
 
 const asList = (value: string | string[] | undefined): string[] =>
   value === undefined ? [] : Array.isArray(value) ? value : [value];
 
-const statements = breakGlassGrantPolicy.Statement;
+const statements = sheriffGrantPolicy.Statement;
 
 // The one group id `deploy/components/identity-center.ts` records for Admins.
 const ADMINS_GROUP_ARN =
@@ -25,11 +25,11 @@ const IDENTITY_STORE_ARN =
 const USER_ARN = "arn:aws:identitystore:::user/*";
 const MEMBERSHIP_ARN = "arn:aws:identitystore:::membership/*";
 
-describe("breakGlassGrantTrust", () => {
+describe("sheriffGrantTrust", () => {
   // The account root is the principal only because the Lambda's role may not
   // exist when this applies; the condition is what narrows it to that role.
   it("admits only the sheriff Lambda role in the infrastructure account", () => {
-    assert.deepEqual(breakGlassGrantTrust.Statement, [
+    assert.deepEqual(sheriffGrantTrust.Statement, [
       {
         Effect: "Allow",
         Principal: { AWS: "arn:aws:iam::394495727159:root" },
@@ -44,7 +44,7 @@ describe("breakGlassGrantTrust", () => {
   });
 });
 
-describe("breakGlassGrantPolicy", () => {
+describe("sheriffGrantPolicy", () => {
   const ALLOWED = [
     "identitystore:CreateGroupMembership",
     "identitystore:DeleteGroupMembership",

@@ -48,7 +48,7 @@ const USER_ARN = "arn:aws:identitystore:::user/*";
 // role as the principal: this stack and the infrastructure stack apply
 // concurrently, and IAM rejects a trust naming a role that does not exist yet.
 // The condition is what narrows it to the one role.
-export const breakGlassGrantTrust = {
+export const sheriffGrantTrust = {
   Version: "2012-10-17",
   Statement: [
     {
@@ -94,7 +94,7 @@ export const breakGlassGrantTrust = {
 // The actions are split one per statement so each statement's `Resource` list
 // contains only types the action supports: `ListGroupMembershipsForMember` has
 // no Group resource type, so it cannot name the group ARN.
-export const breakGlassGrantPolicy: PolicyDocument = {
+export const sheriffGrantPolicy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     {
@@ -135,21 +135,21 @@ export const breakGlassGrantPolicy: PolicyDocument = {
   ],
 };
 
-export const createBreakGlassGrant = () => {
+export const createSheriffGrant = () => {
   const tags = { Environment: "infra", Project: "sheriff" };
 
-  const role = new aws.iam.Role("breakGlassGrant", {
+  const role = new aws.iam.Role("sheriffGrant", {
     name: "sheriff-grant",
     description:
       "Grants and revokes membership in the Admins Identity Store group for the sheriff Lambda in the infrastructure account.",
-    assumeRolePolicy: JSON.stringify(breakGlassGrantTrust),
+    assumeRolePolicy: JSON.stringify(sheriffGrantTrust),
     tags,
   });
 
-  new aws.iam.RolePolicy("breakGlassGrantPolicy", {
+  new aws.iam.RolePolicy("sheriffGrantPolicy", {
     name: "sheriff-grant",
     role: role.name,
-    policy: JSON.stringify(breakGlassGrantPolicy),
+    policy: JSON.stringify(sheriffGrantPolicy),
   });
 
   return role;

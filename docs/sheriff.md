@@ -848,7 +848,7 @@ and are deliberately neither created by Pulumi nor committed:
 
 1. **The Slack app.** Create a separate break-glass app, not the delegate app.
    Add a `/breakglass` slash command and an interactivity request URL, both
-   pointed at the `breakGlassFunctionUrl` output of the `infrastructure` stack.
+   pointed at the `sheriffFunctionUrl` output of the `infrastructure` stack.
    The bot token needs `commands` and `chat:write`, plus `chat:write.public` if
    the app is not a member of the configured channel. No Events API
    subscription is needed; interactivity arrives on the same function.
