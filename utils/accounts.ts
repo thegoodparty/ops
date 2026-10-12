@@ -37,3 +37,28 @@ export const WORKBENCH_ACCOUNT_ID = "024901689212";
  * those consumers would otherwise each carry.
  */
 export const INFRASTRUCTURE_ACCOUNT_ID = "394495727159";
+
+/**
+ * The management account's Identity Center identity store id.
+ *
+ * Supplied by the engineer: the container's `WorkbenchAccess` credentials
+ * cannot read it (`sso:ListInstances` is denied) and it is not recorded
+ * anywhere else in the repo.
+ *
+ * A literal rather than a Pulumi lookup, for the same reason as the account
+ * ids above: the `break-glass-grant` policy references it and there is no
+ * Pulumi resource to read it from, so an Output would buy nothing. Recorded
+ * here rather than in the policy file so it sits beside the account ids it is
+ * scoped with; see "The tool's own privilege" in `docs/break-glass.md`.
+ */
+export const IDENTITY_STORE_ID = "d-9267e5cf96";
+
+/**
+ * The identity store ARN, in the form
+ * `arn:aws:identitystore::<account>:identitystore/<id>`.
+ *
+ * Note the empty region field: Identity Store is a global service and its ARNs
+ * carry no region. Derived here so the policy names the same literal a reader
+ * would look up, rather than re-deriving the string at each use.
+ */
+export const IDENTITY_STORE_ARN = `arn:aws:identitystore::${MANAGEMENT_ACCOUNT_ID}:identitystore/${IDENTITY_STORE_ID}`;

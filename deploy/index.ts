@@ -6,6 +6,7 @@ import { createPlaywrightReportsBucket } from "./components/playwright-reports";
 import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createDelegateSwarmProdRead } from "./components/delegate-swarm-prod-read";
+import { createBreakGlassGrant } from "./components/break-glass-grant";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
@@ -48,6 +49,7 @@ export = async () => {
   createCiRoles();
 
   createDelegateSwarmProdRead();
+  createBreakGlassGrant();
   createInfraZoneDelegation();
 
   return {
