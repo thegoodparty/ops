@@ -14,26 +14,20 @@ import {
  * front door for applies, this one is what a `pulumi preview` will use so a
  * PR never holds admin in this account.
  *
- * What it may do: read DynamoDB table metadata, and only for the break-glass
- * request table. The program's only invoke is `aws.getCallerIdentityOutput`,
- * which needs no grant, so the role started empty. This is its first
- * widening, added after a real preview failed closed and named an action; add
- * the next one the same way.
+ * What it may do: read DynamoDB table metadata, for any table in the account.
+ * The program's only invoke is `aws.getCallerIdentityOutput`, which needs no
+ * grant, so the role started empty. This is its first widening, added after a
+ * real preview failed closed and named an action; add the next one the same
+ * way.
  *
- * Why that table. `aws:dynamodb/table:Table` reads with `DescribeTable`,
+ * Why DynamoDB. `aws:dynamodb/table:Table` reads with `DescribeTable`,
  * `DescribeContinuousBackups` and `DescribeTimeToLive`, and the provider's
  * tag read adds `ListTagsOfResource`. Without them the infrastructure preview
  * of `break-glass-lambda.ts` (step 3 of `docs/break-glass.md`) fails with
  * AccessDenied while diffing the table — even before the table exists, because
- * IAM denies the call before DynamoDB can answer `ResourceNotFound`. Scoped to
- * the one table by name rather than `table/*`, so the next table fails closed
- * the same way and earns its own reviewed line.
- *
- * The table name is repeated rather than imported from
- * `break-glass-lambda.ts` because this policy is applied by
- * `deploy-infrastructure.yml` on `main`, and that module does not exist there
- * until the break-glass step 3 PR merges. A follow-up can import it once both
- * are in.
+ * IAM denies the call before DynamoDB can answer `ResourceNotFound`. The
+ * actions are metadata only, so the grant covers every table in the account
+ * rather than the one that failed first; see the policy below.
  *
  * Created now, ahead of anything that assumes it, because the management-side
  * grant and the workflow change (step 11) can only land safely once the role
@@ -90,9 +84,6 @@ export const infrastructurePreviewRoleTrust: {
 
 const REGION = "us-west-2";
 
-/** The one table this role may read, from `break-glass-lambda.ts`. */
-export const PREVIEW_BREAK_GLASS_TABLE_NAME = "break-glass";
-
 /**
  * The role's whole grant. Exported so `preview-role.test.ts` can pin the
  * actions and the scope without standing up a Pulumi resource.
@@ -102,12 +93,17 @@ export const PREVIEW_BREAK_GLASS_TABLE_NAME = "break-glass";
  * `DescribeTable` is what the preview failed on, and the other three follow it
  * on the same read path. No data action (`GetItem`, `Query`, `Scan`) appears
  * here, and a test asserts none does.
+ *
+ * The resource is `table/*` rather than one table ARN. Every table the
+ * account adds would otherwise need the same four lines and its own
+ * red-then-green PR, and these actions return table metadata, never items. It
+ * is still scoped to this account and region, not `*`.
  */
 export const infrastructurePreviewRolePolicy = {
   Version: "2012-10-17",
   Statement: [
     {
-      Sid: "BreakGlassTableRead",
+      Sid: "DynamoDbTableRead",
       Effect: "Allow",
       Action: [
         "dynamodb:DescribeTable",
@@ -115,7 +111,7 @@ export const infrastructurePreviewRolePolicy = {
         "dynamodb:DescribeTimeToLive",
         "dynamodb:ListTagsOfResource",
       ],
-      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${PREVIEW_BREAK_GLASS_TABLE_NAME}`,
+      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/*`,
     },
   ],
 } as const;

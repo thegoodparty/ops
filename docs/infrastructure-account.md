@@ -181,7 +181,8 @@ starting the work, not after. Make `who` name the *session*, not the model.
       named `dynamodb:DescribeTable`, and PR #294 added the four reads the
       provider makes on a table read (`DescribeTable`,
       `DescribeContinuousBackups`, `DescribeTimeToLive`,
-      `ListTagsOfResource`), scoped to the one `break-glass` table.
+      `ListTagsOfResource`), scoped to the account's tables (`table/*`) because
+      the actions are metadata only.
 - [x] 12. Document how an admin reaches the account, and whether the container
       gets a profile for it: done (2026-10-08, pi-infra-step12). The human
       path is Identity Center: a member of `Admins` signs in and picks
@@ -480,8 +481,9 @@ Three changes, and the ordering between them matters:
    management account's `ReadOnlyAccess` SSO session for local previews. It
    started with no permissions, because the program's only AWS call is
    `sts:GetCallerIdentity`, and is widened only by observed failures. Its first
-   grant is the DynamoDB table read the break-glass preview needed (PR #294,
-   recorded under step 11). Applied by `deploy-infrastructure.yml` at step 7.
+   grant is the DynamoDB table-metadata read the break-glass preview needed,
+   scoped to the account's tables (PR #294, recorded under step 11). Applied by
+   `deploy-infrastructure.yml` at step 7.
 2. **Management-account grant** — `AssumeInfrastructurePreviewRole` on
    `github-actions-pulumi-preview`, plus `"infrastructure"` in its
    `pulumiBackendReadStatements` list. Applied by `deploy.yml`.

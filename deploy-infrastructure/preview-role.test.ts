@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   infrastructurePreviewRolePolicy,
   infrastructurePreviewRoleTrust,
-  PREVIEW_BREAK_GLASS_TABLE_NAME,
 } from "./preview-role";
 import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 
@@ -71,13 +70,13 @@ describe("infrastructurePreviewRolePolicy", () => {
     }
   });
 
-  it("scopes to the one break-glass table, never a bare wildcard", () => {
+  it("scopes to this account's tables, never a bare wildcard", () => {
     for (const statement of infrastructurePreviewRolePolicy.Statement) {
       const resources = asList(statement.Resource);
       assert.equal(resources.length, 1);
       assert.equal(
         resources[0],
-        `arn:aws:dynamodb:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:table/${PREVIEW_BREAK_GLASS_TABLE_NAME}`
+        `arn:aws:dynamodb:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:table/*`
       );
       assert.notEqual(resources[0], "*");
     }
