@@ -5,7 +5,7 @@
  * Step 3 stops at the decision. The record written on approval is `approved`,
  * not `granting`: it records that a human said yes and nothing more. Step 4
  * replaces that transition with `granting` -> `granted` and the
- * `CreateGroupMembership` call. `docs/break-glass.md`, "States", is the
+ * `CreateGroupMembership` call. `docs/sheriff.md`, "States", is the
  * authoritative machine.
  */
 import { randomUUID } from "node:crypto";

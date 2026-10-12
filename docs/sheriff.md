@@ -721,7 +721,7 @@ rather than staying open.
    The delegate app, function and `DELEGATES` secret are not reused.
 3. ~~**Identity mapping for the requester.**~~ **Settled by the engineer:** a
    hard-coded map in the Lambda code from Slack user id to Identity Store user
-   id, in `deploy-infrastructure/break-glass/config.ts`. This is the deliberate
+   id, in `deploy-infrastructure/sheriff/config.ts`. This is the deliberate
    temporary option, with a refactor planned once the directory mapping is
    known. Because the map is maintained in code, the tool performs **no
    directory read at all**, so the `break-glass-grant` role's inline policy
@@ -826,12 +826,12 @@ For a reviewer checking the plan against the repo:
   explicit-provider rule.
 - `deploy-org/policies.ts` — the `Infrastructure` SCP, which permits this
   workload's services and denies CloudTrail tampering.
-- `deploy-infrastructure/break-glass-lambda.ts` — the runtime Pulumi
+- `deploy-infrastructure/sheriff-lambda.ts` — the runtime Pulumi
   resources: the Lambda, its execution role and inline policy, the DynamoDB
   table, the log group, the Function URL and the sheriff Slack secret. The
   explicit-provider rule and `allowedAccountIds` are in
   `deploy-infrastructure/index.ts`.
-- `deploy-infrastructure/break-glass/` — the handler itself (`handler.ts`,
+- `deploy-infrastructure/sheriff/` — the handler itself (`handler.ts`,
   `policy.ts`, `blocks.ts`, `store.ts`, `config.ts`), including the hard-coded
   approver list and Slack-to-Identity-Store map.
 - `utils/accounts.ts` — `MANAGEMENT_ACCOUNT_ID`, `WORKBENCH_ACCOUNT_ID`,
@@ -862,7 +862,7 @@ and are deliberately neither created by Pulumi nor committed:
      --secret-string '{"SLACK_SIGNING_SECRET":"...","SLACK_BOT_TOKEN":"..."}'
    ```
 
-3. **The two hard-coded lists.** `deploy-infrastructure/break-glass/config.ts`
+3. **The two hard-coded lists.** `deploy-infrastructure/sheriff/config.ts`
    holds the approver Slack user ids and the Slack-to-Identity-Store map. Both
    ship with an obvious placeholder; replace them with real ids in a reviewed
    PR before the flow can approve anything. Until then the approver check

@@ -4,10 +4,10 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 
 import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
-import { DEFAULT_APPROVAL_CHANNEL } from "./break-glass/config";
+import { DEFAULT_APPROVAL_CHANNEL } from "./sheriff/config";
 
 /**
- * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/break-glass.md`,
+ * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/sheriff.md`,
  * in the infrastructure account.
  *
  * Everything here takes the explicit provider from `index.ts`; the default
@@ -19,7 +19,7 @@ import { DEFAULT_APPROVAL_CHANNEL } from "./break-glass/config";
  * `identitystore` permission. Step 4 wires the real grant. The execution role
  * is deliberately named `break-glass` because that is the exact role ARN the
  * management-account grant role trusts
- * (`deploy/components/break-glass-grant.ts`); renaming it is an AccessDenied at
+ * (`deploy/components/sheriff-grant.ts`); renaming it is an AccessDenied at
  * the first real grant in step 4, not an apply-time error.
  */
 
@@ -113,7 +113,7 @@ export const breakGlassLambdaPolicy = {
  */
 export const buildBreakGlassCode = (): pulumi.asset.AssetArchive => {
   const result = esbuild.buildSync({
-    entryPoints: [path.join(__dirname, "break-glass/handler.ts")],
+    entryPoints: [path.join(__dirname, "sheriff/handler.ts")],
     bundle: true,
     platform: "node",
     target: "node22",
@@ -134,7 +134,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   const { provider } = args;
 
   // Created empty, filled out of band: see the manual steps in
-  // `docs/break-glass.md`. No secret value is ever committed or set by
+  // `docs/sheriff.md`. No secret value is ever committed or set by
   // Pulumi, matching the `DELEGATE_SWARM` secret's handling.
   const secret = new aws.secretsmanager.Secret(
     "breakGlassSlackSecret",
@@ -160,7 +160,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
         { name: "pk", type: "S" },
         { name: "sk", type: "S" },
       ],
-      // Retention only; TTL never ends a grant (`docs/break-glass.md`).
+      // Retention only; TTL never ends a grant (`docs/sheriff.md`).
       ttl: { attributeName: "ttl", enabled: true },
       tags: TAGS,
     },

@@ -10,20 +10,20 @@ import {
   SHERIFF_SECRET_NAME,
   breakGlassLambdaPolicy,
   breakGlassLambdaTrust,
-} from "./break-glass-lambda";
+} from "./sheriff-lambda";
 import {
   APPROVER_SLACK_USER_IDS,
   DURATION_OPTIONS,
   MAX_DURATION_SECONDS,
   MAX_REQUESTS_PER_DAY,
   SLACK_TO_IDENTITY_STORE_USER_ID,
-} from "./break-glass/config";
+} from "./sheriff/config";
 import {
   buildApprovalBlocks,
   buildDecidedBlocks,
   buildDecisionOutcomeText,
   buildRequestModal,
-} from "./break-glass/blocks";
+} from "./sheriff/blocks";
 import {
   decodeSlackPayload,
   durationSecondsFor,
@@ -36,9 +36,9 @@ import {
   utcDate,
   withinDurationCap,
   type RequestRecord,
-} from "./break-glass/policy";
-import { readSubmittedValues } from "./break-glass/handler";
-import { verifySlackWebhook } from "./break-glass/verify";
+} from "./sheriff/policy";
+import { readSubmittedValues } from "./sheriff/handler";
+import { verifySlackWebhook } from "./sheriff/verify";
 
 const asList = (value: unknown): string[] =>
   value === undefined ? [] : Array.isArray(value) ? (value as string[]) : [String(value)];
@@ -135,13 +135,13 @@ describe("breakGlassLambdaPolicy", () => {
 });
 
 describe("break-glass role name", () => {
-  // `deploy/components/break-glass-grant.ts` trusts exactly
+  // `deploy/components/sheriff-grant.ts` trusts exactly
   // arn:aws:iam::394495727159:role/break-glass. The execution role must carry
   // that name or step 4's first AssumeRole fails as a trust problem.
   it("is the role the grant trust names", () => {
     assert.equal(BREAK_GLASS_ROLE_NAME, "break-glass");
     const source = fs.readFileSync(
-      path.resolve(__dirname, "../deploy/components/break-glass-grant.ts"),
+      path.resolve(__dirname, "../deploy/components/sheriff-grant.ts"),
       "utf8",
     );
     assert.match(source, /:role\/break-glass`/);

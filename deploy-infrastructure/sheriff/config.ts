@@ -1,6 +1,6 @@
 /**
  * Policy inputs for the break-glass dry run, step 3 ("the Lambda, dry") of
- * `docs/break-glass.md`.
+ * `docs/sheriff.md`.
  *
  * Two of these are deliberately hard-coded in the tool's code rather than
  * resources in AWS, and both change only by a reviewed PR:
@@ -12,7 +12,7 @@
  *   Open question 3 was settled by the engineer in favour of this map, as the
  *   deliberate temporary option, with a refactor planned. Because the mapping
  *   is maintained here, the `break-glass-grant` role needs no directory read
- *   at all; see `deploy/components/break-glass-grant.ts`, which step 3 does
+ *   at all; see `deploy/components/sheriff-grant.ts`, which step 3 does
  *   not change.
  *
  * PLACEHOLDERS. No real Slack user ids or Identity Store user ids were
@@ -76,7 +76,7 @@ export const DURATION_OPTIONS: readonly {
 export const MAX_REQUESTS_PER_DAY = 5;
 
 /**
- * DynamoDB TTL, retention only. It never ends a grant (`docs/break-glass.md`,
+ * DynamoDB TTL, retention only. It never ends a grant (`docs/sheriff.md`,
  * "States"): revocation is the scheduler plus the sweeper in step 4/5. 90 days
  * keeps the application audit readable for a quarter without a second store.
  */

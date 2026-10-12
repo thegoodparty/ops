@@ -5,7 +5,7 @@ import * as path from "node:path";
 import {
   breakGlassGrantPolicy,
   breakGlassGrantTrust,
-} from "./components/break-glass-grant";
+} from "./components/sheriff-grant";
 
 const asList = (value: string | string[] | undefined): string[] =>
   value === undefined ? [] : Array.isArray(value) ? value : [value];

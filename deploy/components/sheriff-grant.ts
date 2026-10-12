@@ -6,7 +6,7 @@ import {
 import type { PolicyDocument } from "./identity-center/policies";
 
 // The management-account role the break-glass Lambda (infrastructure account,
-// step 3 of `docs/break-glass.md`) assumes to toggle membership in the one
+// step 3 of `docs/sheriff.md`) assumes to toggle membership in the one
 // `Admins` Identity Store group. It is the crown jewels of the plan: the
 // Lambda's own role gets `sts:AssumeRole` on this ARN and nothing else in the
 // management account, and this role's inline policy is what keeps "the tool
@@ -28,7 +28,7 @@ const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/break-g
 // A literal rather than an import because that file does not export its group
 // map, and step 2 is scoped to changing one field in it. A change to the group
 // there without one here is a policy that grants nothing, which
-// `deploy/break-glass-grant.test.ts` pins by reading that file's literal.
+// `deploy/sheriff-grant.test.ts` pins by reading that file's literal.
 const GROUP_ARN =
   "arn:aws:identitystore:::group/88c1b330-a001-707a-06ca-94e289013bf5";
 
@@ -69,7 +69,7 @@ export const breakGlassGrantTrust = {
 // a pre-existing member when `CreateGroupMembership` returns
 // `ConflictException`, and of a `granting` record the sweeper recovers.
 //
-// Deliberately absent, per "The tool's own privilege" in `docs/break-glass.md`:
+// Deliberately absent, per "The tool's own privilege" in `docs/sheriff.md`:
 // every `sso:*`, `sso-directory:*` and `sso-oauth:*` action (the
 // `adminReservedActions` note records that `sso-directory` carries its own
 // `AddMemberToGroup`, a second path to the same directory mutation), plus
