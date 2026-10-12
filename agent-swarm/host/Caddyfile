@@ -67,7 +67,7 @@
 
 	# Machine callers with their own bearer or signature, and IdP callbacks
 	# that carry their own state: no browser cookie.
-	@noauth path /mcp /mcp-user /health /status /ping /api/github/webhook /api/gitlab/webhook /api/azure-devops/webhook /api/agentmail/webhook /api/integrations/kapso/webhook /api/mcp-oauth/callback /api/oauth/callback /api/oauth/*/callback
+	@noauth path /mcp /mcp-user /health /status /ping /api/webhooks/* /api/github/webhook /api/gitlab/webhook /api/azure-devops/webhook /api/agentmail/webhook /api/integrations/kapso/webhook /api/mcp-oauth/callback /api/oauth/callback /api/oauth/*/callback
 	handle @noauth {
 		reverse_proxy api:3013
 	}
