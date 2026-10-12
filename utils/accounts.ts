@@ -46,10 +46,10 @@ export const INFRASTRUCTURE_ACCOUNT_ID = "394495727159";
  * anywhere else in the repo.
  *
  * A literal rather than a Pulumi lookup, for the same reason as the account
- * ids above: the `break-glass-grant` policy references it and there is no
+ * ids above: the `sheriff-grant` policy references it and there is no
  * Pulumi resource to read it from, so an Output would buy nothing. Recorded
  * here rather than in the policy file so it sits beside the account ids it is
- * scoped with; see "The tool's own privilege" in `docs/break-glass.md`.
+ * scoped with; see "The tool's own privilege" in `docs/sheriff.md`.
  */
 export const IDENTITY_STORE_ID = "d-9267e5cf96";
 

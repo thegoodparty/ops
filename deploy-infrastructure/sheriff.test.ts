@@ -5,25 +5,25 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import {
-  BREAK_GLASS_ROLE_NAME,
-  BREAK_GLASS_TABLE_NAME,
+  SHERIFF_ROLE_NAME,
+  SHERIFF_TABLE_NAME,
   SHERIFF_SECRET_NAME,
-  breakGlassLambdaPolicy,
-  breakGlassLambdaTrust,
-} from "./break-glass-lambda";
+  sheriffLambdaPolicy,
+  sheriffLambdaTrust,
+} from "./sheriff-lambda";
 import {
   APPROVER_SLACK_USER_IDS,
   DURATION_OPTIONS,
   MAX_DURATION_SECONDS,
   MAX_REQUESTS_PER_DAY,
   SLACK_TO_IDENTITY_STORE_USER_ID,
-} from "./break-glass/config";
+} from "./sheriff/config";
 import {
   buildApprovalBlocks,
   buildDecidedBlocks,
   buildDecisionOutcomeText,
   buildRequestModal,
-} from "./break-glass/blocks";
+} from "./sheriff/blocks";
 import {
   decodeSlackPayload,
   durationSecondsFor,
@@ -36,9 +36,9 @@ import {
   utcDate,
   withinDurationCap,
   type RequestRecord,
-} from "./break-glass/policy";
-import { readSubmittedValues } from "./break-glass/handler";
-import { verifySlackWebhook } from "./break-glass/verify";
+} from "./sheriff/policy";
+import { readSubmittedValues } from "./sheriff/handler";
+import { verifySlackWebhook } from "./sheriff/verify";
 
 const asList = (value: unknown): string[] =>
   value === undefined ? [] : Array.isArray(value) ? (value as string[]) : [String(value)];
@@ -59,9 +59,9 @@ const record = (
   ...overrides,
 });
 
-describe("breakGlassLambdaTrust", () => {
+describe("sheriffLambdaTrust", () => {
   it("is assumable only by Lambda", () => {
-    assert.deepEqual(breakGlassLambdaTrust.Statement, [
+    assert.deepEqual(sheriffLambdaTrust.Statement, [
       {
         Effect: "Allow",
         Principal: { Service: "lambda.amazonaws.com" },
@@ -71,8 +71,8 @@ describe("breakGlassLambdaTrust", () => {
   });
 });
 
-describe("breakGlassLambdaPolicy", () => {
-  const actions = breakGlassLambdaPolicy.Statement.flatMap((s) =>
+describe("sheriffLambdaPolicy", () => {
+  const actions = sheriffLambdaPolicy.Statement.flatMap((s) =>
     asList(s.Action),
   );
 
@@ -99,7 +99,7 @@ describe("breakGlassLambdaPolicy", () => {
   });
 
   it("scopes every resource and never uses a bare wildcard", () => {
-    for (const statement of breakGlassLambdaPolicy.Statement) {
+    for (const statement of sheriffLambdaPolicy.Statement) {
       const resources = asList(statement.Resource);
       assert.ok(resources.length > 0, `${statement.Sid} has no Resource`);
       for (const resource of resources) {
@@ -114,50 +114,50 @@ describe("breakGlassLambdaPolicy", () => {
   });
 
   it("reads only its own secret, not DELEGATES", () => {
-    const secretStatement = breakGlassLambdaPolicy.Statement.find(
+    const secretStatement = sheriffLambdaPolicy.Statement.find(
       (s) => s.Sid === "ReadOwnSecret",
     );
     assert.ok(secretStatement);
     assert.match(asList(secretStatement.Resource)[0], /:secret:sheriff-\*/);
-    assert.ok(!JSON.stringify(breakGlassLambdaPolicy).includes("DELEGATES"));
+    assert.ok(!JSON.stringify(sheriffLambdaPolicy).includes("DELEGATES"));
   });
 
   it("names the one request table", () => {
-    const tableStatement = breakGlassLambdaPolicy.Statement.find(
+    const tableStatement = sheriffLambdaPolicy.Statement.find(
       (s) => s.Sid === "RequestTable",
     );
     assert.ok(tableStatement);
     assert.equal(
       asList(tableStatement.Resource)[0],
-      `arn:aws:dynamodb:us-west-2:394495727159:table/${BREAK_GLASS_TABLE_NAME}`,
+      `arn:aws:dynamodb:us-west-2:394495727159:table/${SHERIFF_TABLE_NAME}`,
     );
   });
 });
 
-describe("break-glass role name", () => {
-  // `deploy/components/break-glass-grant.ts` trusts exactly
-  // arn:aws:iam::394495727159:role/break-glass. The execution role must carry
+describe("sheriff role name", () => {
+  // `deploy/components/sheriff-grant.ts` trusts exactly
+  // arn:aws:iam::394495727159:role/sheriff. The execution role must carry
   // that name or step 4's first AssumeRole fails as a trust problem.
   it("is the role the grant trust names", () => {
-    assert.equal(BREAK_GLASS_ROLE_NAME, "break-glass");
+    assert.equal(SHERIFF_ROLE_NAME, "sheriff");
     const source = fs.readFileSync(
-      path.resolve(__dirname, "../deploy/components/break-glass-grant.ts"),
+      path.resolve(__dirname, "../deploy/components/sheriff-grant.ts"),
       "utf8",
     );
-    assert.match(source, /:role\/break-glass`/);
+    assert.match(source, /:role\/sheriff`/);
   });
 
   it("pins the app-scoped secret name", () => {
     assert.equal(SHERIFF_SECRET_NAME, "sheriff");
   });
 
-  it("keeps the workflow-scoped table name distinct from the app secret", () => {
-    // The secret holds the `@sheriff` Slack app's credentials and is
-    // app-scoped, because the app is expected to grow beyond break-glass. The
-    // table holds the break-glass workflow's request records and stays
-    // workflow-scoped, so the two names are deliberately different.
-    assert.equal(BREAK_GLASS_TABLE_NAME, "break-glass");
-    assert.notEqual(SHERIFF_SECRET_NAME, BREAK_GLASS_TABLE_NAME);
+  it("names the table after the app, sharing the secret's name", () => {
+    // The secret holds the `@sheriff` Slack app's credentials and the table
+    // holds the break-glass workflow's request records. Both are now named
+    // `sheriff`; that is deliberate, and safe because Secrets Manager and
+    // DynamoDB are separate namespaces.
+    assert.equal(SHERIFF_TABLE_NAME, "sheriff");
+    assert.equal(SHERIFF_SECRET_NAME, SHERIFF_TABLE_NAME);
   });
 });
 

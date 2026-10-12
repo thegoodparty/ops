@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 // `permissionSets` is private to the component, and step 2 of
-// `docs/break-glass.md` is scoped to changing one field in it, so this reads
+// `docs/sheriff.md` is scoped to changing one field in it, so this reads
 // the source rather than adding an export just for the test. The duration is
 // the whole point of the change: without this, a revert to a longer session is
 // invisible until someone notices an admin session outliving its grant.

@@ -4,10 +4,10 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 
 import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
-import { DEFAULT_APPROVAL_CHANNEL } from "./break-glass/config";
+import { DEFAULT_APPROVAL_CHANNEL } from "./sheriff/config";
 
 /**
- * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/break-glass.md`,
+ * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/sheriff.md`,
  * in the infrastructure account.
  *
  * Everything here takes the explicit provider from `index.ts`; the default
@@ -15,34 +15,35 @@ import { DEFAULT_APPROVAL_CHANNEL } from "./break-glass/config";
  * fails the apply rather than landing in the management account.
  *
  * Step 3 is dry: the Lambda writes request records and posts to Slack, but it
- * gets **no** `sts:AssumeRole` on `break-glass-grant` and **no**
+ * gets **no** `sts:AssumeRole` on `sheriff-grant` and **no**
  * `identitystore` permission. Step 4 wires the real grant. The execution role
- * is deliberately named `break-glass` because that is the exact role ARN the
- * management-account grant role trusts
- * (`deploy/components/break-glass-grant.ts`); renaming it is an AccessDenied at
- * the first real grant in step 4, not an apply-time error.
+ * is named `sheriff`, matching the exact role ARN the management-account
+ * grant role trusts (`deploy/components/sheriff-grant.ts`); the two names must
+ * stay in lockstep or step 4's first AssumeRole is an AccessDenied, not an
+ * apply-time error.
  */
 
-const NAME = "break-glass";
+const NAME = "sheriff";
 const REGION = "us-west-2";
 
-/** Matches the `PrincipalArn` condition on the `break-glass-grant` role. */
-export const BREAK_GLASS_ROLE_NAME = NAME;
+/** Matches the `PrincipalArn` condition on the `sheriff-grant` role. */
+export const SHERIFF_ROLE_NAME = NAME;
 
-export const BREAK_GLASS_TABLE_NAME = "break-glass";
+export const SHERIFF_TABLE_NAME = "sheriff";
 // The Slack app is `@sheriff`, expected to grow beyond break-glass to other
 // privileged ops, so its credentials secret is app-scoped (`sheriff`). The
-// table below is the break-glass workflow's request records and stays
-// workflow-scoped.
+// table below is the break-glass workflow's request records and now shares the
+// app's name; that is deliberate, and safe because Secrets Manager and
+// DynamoDB are separate namespaces.
 export const SHERIFF_SECRET_NAME = "sheriff";
-export const BREAK_GLASS_LOG_GROUP = `/aws/lambda/${NAME}`;
+export const SHERIFF_LOG_GROUP = `/aws/lambda/${NAME}`;
 
 const TAGS = { Name: NAME, Project: NAME };
 
 /**
  * Lambda only. Exported so the test can pin it without standing up Pulumi.
  */
-export const breakGlassLambdaTrust = {
+export const sheriffLambdaTrust = {
   Version: "2012-10-17",
   Statement: [
     {
@@ -59,7 +60,7 @@ export const breakGlassLambdaTrust = {
  *
  * Deliberately absent, and asserted by the test:
  *
- * - `sts:AssumeRole` on `break-glass-grant` (step 4 adds it, on exactly that
+ * - `sts:AssumeRole` on `sheriff-grant` (step 4 adds it, on exactly that
  *   one ARN).
  * - every `identitystore:*` action (step 4).
  * - `DELEGATES` or any secret but the tool's own.
@@ -68,7 +69,7 @@ export const breakGlassLambdaTrust = {
  * puts and conditionally updates request records and rate counters. Step 4
  * adds `Query` when it looks up active grants.
  */
-export const breakGlassLambdaPolicy = {
+export const sheriffLambdaPolicy = {
   Version: "2012-10-17",
   Statement: [
     {
@@ -88,14 +89,14 @@ export const breakGlassLambdaPolicy = {
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
       ],
-      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${BREAK_GLASS_TABLE_NAME}`,
+      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${SHERIFF_TABLE_NAME}`,
     },
     {
       Sid: "OwnLogs",
       Effect: "Allow",
       Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
       // The log group is created below, so no `logs:CreateLogGroup` is needed.
-      Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:${BREAK_GLASS_LOG_GROUP}:*`,
+      Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:${SHERIFF_LOG_GROUP}:*`,
     },
   ],
 } as const;
@@ -111,9 +112,9 @@ export const breakGlassLambdaPolicy = {
  * and the archive's hash follows the source, so a code change shows up in
  * `pulumi preview` without a workflow change.
  */
-export const buildBreakGlassCode = (): pulumi.asset.AssetArchive => {
+export const buildSheriffCode = (): pulumi.asset.AssetArchive => {
   const result = esbuild.buildSync({
-    entryPoints: [path.join(__dirname, "break-glass/handler.ts")],
+    entryPoints: [path.join(__dirname, "sheriff/handler.ts")],
     bundle: true,
     platform: "node",
     target: "node22",
@@ -130,14 +131,14 @@ export const buildBreakGlassCode = (): pulumi.asset.AssetArchive => {
   });
 };
 
-export const createBreakGlass = (args: { provider: aws.Provider }) => {
+export const createSheriff = (args: { provider: aws.Provider }) => {
   const { provider } = args;
 
   // Created empty, filled out of band: see the manual steps in
-  // `docs/break-glass.md`. No secret value is ever committed or set by
+  // `docs/sheriff.md`. No secret value is ever committed or set by
   // Pulumi, matching the `DELEGATE_SWARM` secret's handling.
   const secret = new aws.secretsmanager.Secret(
-    "breakGlassSlackSecret",
+    "sheriffSlackSecret",
     {
       name: SHERIFF_SECRET_NAME,
       description:
@@ -150,9 +151,9 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   // Single table for step 3: request records and per-user rate counters. Step
   // 4 adds grant items under a different key prefix, no migration.
   const table = new aws.dynamodb.Table(
-    "breakGlassRequests",
+    "sheriffRequests",
     {
-      name: BREAK_GLASS_TABLE_NAME,
+      name: SHERIFF_TABLE_NAME,
       billingMode: "PAY_PER_REQUEST",
       hashKey: "pk",
       rangeKey: "sk",
@@ -160,7 +161,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
         { name: "pk", type: "S" },
         { name: "sk", type: "S" },
       ],
-      // Retention only; TTL never ends a grant (`docs/break-glass.md`).
+      // Retention only; TTL never ends a grant (`docs/sheriff.md`).
       ttl: { attributeName: "ttl", enabled: true },
       tags: TAGS,
     },
@@ -170,9 +171,9 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   );
 
   const logGroup = new aws.cloudwatch.LogGroup(
-    "breakGlassLogs",
+    "sheriffLogs",
     {
-      name: BREAK_GLASS_LOG_GROUP,
+      name: SHERIFF_LOG_GROUP,
       // Long enough to reconstruct a quarter of decisions; the durable
       // CloudTrail archive is step 1.
       retentionInDays: 90,
@@ -182,35 +183,35 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   );
 
   const role = new aws.iam.Role(
-    "breakGlassLambdaRole",
+    "sheriffLambdaRole",
     {
-      name: BREAK_GLASS_ROLE_NAME,
+      name: SHERIFF_ROLE_NAME,
       description:
-        "Break-glass Lambda execution role. Step 3 (dry) holds only DynamoDB, logs and its own secret; step 4 adds sts:AssumeRole on break-glass-grant.",
-      assumeRolePolicy: JSON.stringify(breakGlassLambdaTrust),
+        "Sheriff Lambda execution role. Step 3 (dry) holds only DynamoDB, logs and its own secret; step 4 adds sts:AssumeRole on sheriff-grant.",
+      assumeRolePolicy: JSON.stringify(sheriffLambdaTrust),
       tags: TAGS,
     },
     { provider },
   );
 
   const lambdaPolicy = new aws.iam.RolePolicy(
-    "breakGlassLambdaPolicy",
+    "sheriffLambdaPolicy",
     {
       name: NAME,
       role: role.name,
-      policy: JSON.stringify(breakGlassLambdaPolicy),
+      policy: JSON.stringify(sheriffLambdaPolicy),
     },
     { provider },
   );
 
   const fn = new aws.lambda.Function(
-    "breakGlass",
+    "sheriff",
     {
       name: NAME,
       role: role.arn,
       runtime: aws.lambda.Runtime.NodeJS22dX,
       handler: "handler.handler",
-      code: buildBreakGlassCode(),
+      code: buildSheriffCode(),
       timeout: 30,
       memorySize: 256,
       environment: {
@@ -231,7 +232,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   // Signature-only auth, exactly like the delegate webhook: every request is
   // verified against the sheriff signing secret before anything happens.
   const functionUrl = new aws.lambda.FunctionUrl(
-    "breakGlassUrl",
+    "sheriffUrl",
     {
       functionName: fn.name,
       authorizationType: "NONE",

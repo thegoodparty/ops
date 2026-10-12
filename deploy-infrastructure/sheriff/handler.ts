@@ -1,5 +1,5 @@
 /**
- * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/break-glass.md`.
+ * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/sheriff.md`.
  *
  * A separate Slack app and a separate function from the delegate webhook. The
  * plan is explicit about why: every delegate worker holds `DELEGATES` while

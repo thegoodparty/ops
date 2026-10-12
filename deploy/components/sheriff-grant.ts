@@ -6,7 +6,7 @@ import {
 import type { PolicyDocument } from "./identity-center/policies";
 
 // The management-account role the break-glass Lambda (infrastructure account,
-// step 3 of `docs/break-glass.md`) assumes to toggle membership in the one
+// step 3 of `docs/sheriff.md`) assumes to toggle membership in the one
 // `Admins` Identity Store group. It is the crown jewels of the plan: the
 // Lambda's own role gets `sts:AssumeRole` on this ARN and nothing else in the
 // management account, and this role's inline policy is what keeps "the tool
@@ -18,17 +18,17 @@ import type { PolicyDocument } from "./identity-center/policies";
 // `delegate-swarm-prod-read` pattern: IAM rejects a trust that names a role
 // that does not exist yet.
 
-// The future break-glass Lambda execution role in the infrastructure account.
-// Step 3 creates it under exactly this name; the trust below is the seam, and
-// renaming the role without this constant is an AccessDenied at the first
-// grant, not an apply-time error.
-const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/break-glass`;
+// The sheriff Lambda execution role in the infrastructure account. Step 3
+// creates it under exactly this name; the trust below is the seam, and the two
+// names must stay in lockstep or step 4's first AssumeRole is an AccessDenied,
+// not an apply-time error.
+const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/sheriff`;
 
 // The `Admins` group id, mirrored from `deploy/components/identity-center.ts`.
 // A literal rather than an import because that file does not export its group
 // map, and step 2 is scoped to changing one field in it. A change to the group
 // there without one here is a policy that grants nothing, which
-// `deploy/break-glass-grant.test.ts` pins by reading that file's literal.
+// `deploy/sheriff-grant.test.ts` pins by reading that file's literal.
 const GROUP_ARN =
   "arn:aws:identitystore:::group/88c1b330-a001-707a-06ca-94e289013bf5";
 
@@ -48,7 +48,7 @@ const USER_ARN = "arn:aws:identitystore:::user/*";
 // role as the principal: this stack and the infrastructure stack apply
 // concurrently, and IAM rejects a trust naming a role that does not exist yet.
 // The condition is what narrows it to the one role.
-export const breakGlassGrantTrust = {
+export const sheriffGrantTrust = {
   Version: "2012-10-17",
   Statement: [
     {
@@ -69,7 +69,7 @@ export const breakGlassGrantTrust = {
 // a pre-existing member when `CreateGroupMembership` returns
 // `ConflictException`, and of a `granting` record the sweeper recovers.
 //
-// Deliberately absent, per "The tool's own privilege" in `docs/break-glass.md`:
+// Deliberately absent, per "The tool's own privilege" in `docs/sheriff.md`:
 // every `sso:*`, `sso-directory:*` and `sso-oauth:*` action (the
 // `adminReservedActions` note records that `sso-directory` carries its own
 // `AddMemberToGroup`, a second path to the same directory mutation), plus
@@ -94,7 +94,7 @@ export const breakGlassGrantTrust = {
 // The actions are split one per statement so each statement's `Resource` list
 // contains only types the action supports: `ListGroupMembershipsForMember` has
 // no Group resource type, so it cannot name the group ARN.
-export const breakGlassGrantPolicy: PolicyDocument = {
+export const sheriffGrantPolicy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     {
@@ -135,21 +135,21 @@ export const breakGlassGrantPolicy: PolicyDocument = {
   ],
 };
 
-export const createBreakGlassGrant = () => {
-  const tags = { Environment: "infra", Project: "break-glass" };
+export const createSheriffGrant = () => {
+  const tags = { Environment: "infra", Project: "sheriff" };
 
-  const role = new aws.iam.Role("breakGlassGrant", {
-    name: "break-glass-grant",
+  const role = new aws.iam.Role("sheriffGrant", {
+    name: "sheriff-grant",
     description:
-      "Grants and revokes membership in the Admins Identity Store group for the break-glass Lambda in the infrastructure account.",
-    assumeRolePolicy: JSON.stringify(breakGlassGrantTrust),
+      "Grants and revokes membership in the Admins Identity Store group for the sheriff Lambda in the infrastructure account.",
+    assumeRolePolicy: JSON.stringify(sheriffGrantTrust),
     tags,
   });
 
-  new aws.iam.RolePolicy("breakGlassGrantPolicy", {
-    name: "break-glass-grant",
+  new aws.iam.RolePolicy("sheriffGrantPolicy", {
+    name: "sheriff-grant",
     role: role.name,
-    policy: JSON.stringify(breakGlassGrantPolicy),
+    policy: JSON.stringify(sheriffGrantPolicy),
   });
 
   return role;
