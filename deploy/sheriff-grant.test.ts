@@ -28,7 +28,7 @@ const MEMBERSHIP_ARN = "arn:aws:identitystore:::membership/*";
 describe("breakGlassGrantTrust", () => {
   // The account root is the principal only because the Lambda's role may not
   // exist when this applies; the condition is what narrows it to that role.
-  it("admits only the break-glass Lambda role in the infrastructure account", () => {
+  it("admits only the sheriff Lambda role in the infrastructure account", () => {
     assert.deepEqual(breakGlassGrantTrust.Statement, [
       {
         Effect: "Allow",
@@ -36,7 +36,7 @@ describe("breakGlassGrantTrust", () => {
         Action: "sts:AssumeRole",
         Condition: {
           ArnEquals: {
-            "aws:PrincipalArn": "arn:aws:iam::394495727159:role/break-glass",
+            "aws:PrincipalArn": "arn:aws:iam::394495727159:role/sheriff",
           },
         },
       },

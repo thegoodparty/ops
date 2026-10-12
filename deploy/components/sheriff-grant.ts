@@ -18,11 +18,11 @@ import type { PolicyDocument } from "./identity-center/policies";
 // `delegate-swarm-prod-read` pattern: IAM rejects a trust that names a role
 // that does not exist yet.
 
-// The future break-glass Lambda execution role in the infrastructure account.
-// Step 3 creates it under exactly this name; the trust below is the seam, and
-// renaming the role without this constant is an AccessDenied at the first
-// grant, not an apply-time error.
-const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/break-glass`;
+// The sheriff Lambda execution role in the infrastructure account. Step 3
+// creates it under exactly this name; the trust below is the seam, and the two
+// names must stay in lockstep or step 4's first AssumeRole is an AccessDenied,
+// not an apply-time error.
+const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/sheriff`;
 
 // The `Admins` group id, mirrored from `deploy/components/identity-center.ts`.
 // A literal rather than an import because that file does not export its group
@@ -136,18 +136,18 @@ export const breakGlassGrantPolicy: PolicyDocument = {
 };
 
 export const createBreakGlassGrant = () => {
-  const tags = { Environment: "infra", Project: "break-glass" };
+  const tags = { Environment: "infra", Project: "sheriff" };
 
   const role = new aws.iam.Role("breakGlassGrant", {
-    name: "break-glass-grant",
+    name: "sheriff-grant",
     description:
-      "Grants and revokes membership in the Admins Identity Store group for the break-glass Lambda in the infrastructure account.",
+      "Grants and revokes membership in the Admins Identity Store group for the sheriff Lambda in the infrastructure account.",
     assumeRolePolicy: JSON.stringify(breakGlassGrantTrust),
     tags,
   });
 
   new aws.iam.RolePolicy("breakGlassGrantPolicy", {
-    name: "break-glass-grant",
+    name: "sheriff-grant",
     role: role.name,
     policy: JSON.stringify(breakGlassGrantPolicy),
   });

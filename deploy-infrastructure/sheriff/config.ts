@@ -11,7 +11,7 @@
  * - **The Slack-user-id to Identity Store-user-id map for the requester.**
  *   Open question 3 was settled by the engineer in favour of this map, as the
  *   deliberate temporary option, with a refactor planned. Because the mapping
- *   is maintained here, the `break-glass-grant` role needs no directory read
+ *   is maintained here, the `sheriff-grant` role needs no directory read
  *   at all; see `deploy/components/sheriff-grant.ts`, which step 3 does
  *   not change.
  *

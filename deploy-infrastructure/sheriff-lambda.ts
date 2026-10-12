@@ -15,27 +15,28 @@ import { DEFAULT_APPROVAL_CHANNEL } from "./sheriff/config";
  * fails the apply rather than landing in the management account.
  *
  * Step 3 is dry: the Lambda writes request records and posts to Slack, but it
- * gets **no** `sts:AssumeRole` on `break-glass-grant` and **no**
+ * gets **no** `sts:AssumeRole` on `sheriff-grant` and **no**
  * `identitystore` permission. Step 4 wires the real grant. The execution role
- * is deliberately named `break-glass` because that is the exact role ARN the
- * management-account grant role trusts
- * (`deploy/components/sheriff-grant.ts`); renaming it is an AccessDenied at
- * the first real grant in step 4, not an apply-time error.
+ * is named `sheriff`, matching the exact role ARN the management-account
+ * grant role trusts (`deploy/components/sheriff-grant.ts`); the two names must
+ * stay in lockstep or step 4's first AssumeRole is an AccessDenied, not an
+ * apply-time error.
  */
 
-const NAME = "break-glass";
+const NAME = "sheriff";
 const REGION = "us-west-2";
 
-/** Matches the `PrincipalArn` condition on the `break-glass-grant` role. */
-export const BREAK_GLASS_ROLE_NAME = NAME;
+/** Matches the `PrincipalArn` condition on the `sheriff-grant` role. */
+export const SHERIFF_ROLE_NAME = NAME;
 
-export const BREAK_GLASS_TABLE_NAME = "break-glass";
+export const SHERIFF_TABLE_NAME = "sheriff";
 // The Slack app is `@sheriff`, expected to grow beyond break-glass to other
 // privileged ops, so its credentials secret is app-scoped (`sheriff`). The
-// table below is the break-glass workflow's request records and stays
-// workflow-scoped.
+// table below is the break-glass workflow's request records and now shares the
+// app's name; that is deliberate, and safe because Secrets Manager and
+// DynamoDB are separate namespaces.
 export const SHERIFF_SECRET_NAME = "sheriff";
-export const BREAK_GLASS_LOG_GROUP = `/aws/lambda/${NAME}`;
+export const SHERIFF_LOG_GROUP = `/aws/lambda/${NAME}`;
 
 const TAGS = { Name: NAME, Project: NAME };
 
@@ -59,7 +60,7 @@ export const breakGlassLambdaTrust = {
  *
  * Deliberately absent, and asserted by the test:
  *
- * - `sts:AssumeRole` on `break-glass-grant` (step 4 adds it, on exactly that
+ * - `sts:AssumeRole` on `sheriff-grant` (step 4 adds it, on exactly that
  *   one ARN).
  * - every `identitystore:*` action (step 4).
  * - `DELEGATES` or any secret but the tool's own.
@@ -88,14 +89,14 @@ export const breakGlassLambdaPolicy = {
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
       ],
-      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${BREAK_GLASS_TABLE_NAME}`,
+      Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${SHERIFF_TABLE_NAME}`,
     },
     {
       Sid: "OwnLogs",
       Effect: "Allow",
       Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
       // The log group is created below, so no `logs:CreateLogGroup` is needed.
-      Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:${BREAK_GLASS_LOG_GROUP}:*`,
+      Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:${SHERIFF_LOG_GROUP}:*`,
     },
   ],
 } as const;
@@ -152,7 +153,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   const table = new aws.dynamodb.Table(
     "breakGlassRequests",
     {
-      name: BREAK_GLASS_TABLE_NAME,
+      name: SHERIFF_TABLE_NAME,
       billingMode: "PAY_PER_REQUEST",
       hashKey: "pk",
       rangeKey: "sk",
@@ -172,7 +173,7 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   const logGroup = new aws.cloudwatch.LogGroup(
     "breakGlassLogs",
     {
-      name: BREAK_GLASS_LOG_GROUP,
+      name: SHERIFF_LOG_GROUP,
       // Long enough to reconstruct a quarter of decisions; the durable
       // CloudTrail archive is step 1.
       retentionInDays: 90,
@@ -184,9 +185,9 @@ export const createBreakGlass = (args: { provider: aws.Provider }) => {
   const role = new aws.iam.Role(
     "breakGlassLambdaRole",
     {
-      name: BREAK_GLASS_ROLE_NAME,
+      name: SHERIFF_ROLE_NAME,
       description:
-        "Break-glass Lambda execution role. Step 3 (dry) holds only DynamoDB, logs and its own secret; step 4 adds sts:AssumeRole on break-glass-grant.",
+        "Sheriff Lambda execution role. Step 3 (dry) holds only DynamoDB, logs and its own secret; step 4 adds sts:AssumeRole on sheriff-grant.",
       assumeRolePolicy: JSON.stringify(breakGlassLambdaTrust),
       tags: TAGS,
     },
