@@ -1,4 +1,4 @@
-# agent-swarm 1.163.0 on delegate-swarm.infra.goodparty.org
+# agent-swarm 1.171.0 on delegate-swarm.infra.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
 # render-env.sh from Secrets Manager:DELEGATE_SWARM; never edit .env by hand.
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
@@ -35,6 +35,7 @@ x-agent-entrypoint: &agent-entrypoint
   - --
 
 x-worker-env: &worker-env
+  ANONYMIZED_TELEMETRY: "false"
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   API_KEY: ${API_KEY}
@@ -60,7 +61,7 @@ x-worker-env: &worker-env
   AWS_SDK_LOAD_CONFIG: "1"
 
 x-worker-base: &worker-base
-  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.163.0}"
+  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}"
   entrypoint: *agent-entrypoint
   platform: linux/amd64
   stop_grace_period: 60s
@@ -88,7 +89,7 @@ services:
     logging: *logging
 
   api:
-    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.163.0}"
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.171.0}"
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024
@@ -98,6 +99,9 @@ services:
     environment:
       - NODE_ENV=${NODE_ENV:-production}
       - API_KEY=${API_KEY}
+      # agent-swarm sends usage events to desplega by default, tagged with the
+      # org name and the admin's email domain.
+      - ANONYMIZED_TELEMETRY=false
       - RBAC_ENABLED=${RBAC_ENABLED:-true}
       - SECRETS_ENCRYPTION_KEY=${SECRETS_ENCRYPTION_KEY}
       - MCP_BASE_URL=${MCP_BASE_URL}
