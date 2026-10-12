@@ -57,7 +57,6 @@ import {
   getRequest,
   incrementRateCount,
   putRequest,
-  readRateCount,
   setRequestMessageRef,
 } from "./store";
 
@@ -299,16 +298,15 @@ const handleBlockActions = async (
     return OK;
   }
 
-  // The per-user rate limit, re-checked at the decision as the plan lists it.
-  // The request's own submission already incremented today's counter, so this
-  // only rejects when the requester is over the cap, not at it.
-  const count = await readRateCount(request.requesterSlackId, utcDate());
-  if (rateLimitExceeded(count)) {
-    await ephemeral(
-      `Rate limit exceeded: at most ${MAX_REQUESTS_PER_DAY} break-glass requests per user per day.`,
-    );
-    return OK;
-  }
+  // No rate-limit re-check here. The per-user cap is enforced at submission
+  // (`incrementRateCount` + `rateLimitExceeded` in `handleViewSubmission`),
+  // which is the only point that can accept a request, so every `requested`
+  // record already sits at or under the cap. Re-reading the live counter here
+  // would be a false positive: the counter deliberately keeps counting past
+  // the cap so a burst is visible, and a single rejected over-cap submission
+  // would otherwise block approval of every valid request the user queued that
+  // day. Step 4's decision-time guard is the at-most-one-active-grant rule,
+  // not this counter.
 
   const decision: Decision | null =
     actionId === APPROVE_ACTION_ID

@@ -141,16 +141,3 @@ export const incrementRateCount = async (
   );
   return Number(result.Attributes?.count ?? 0);
 };
-
-export const readRateCount = async (
-  slackUserId: string,
-  date: string,
-): Promise<number> => {
-  const result = await documentClient.send(
-    new GetCommand({
-      TableName: tableName(),
-      Key: { pk: ratePk(slackUserId, date), sk: RECORD_SK },
-    }),
-  );
-  return Number(result.Item?.count ?? 0);
-};
