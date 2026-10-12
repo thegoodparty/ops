@@ -38,6 +38,19 @@ export const SHERIFF_TABLE_NAME = "sheriff";
 export const SHERIFF_SECRET_NAME = "sheriff";
 export const SHERIFF_LOG_GROUP = `/aws/lambda/${NAME}`;
 
+/**
+ * The id the secret's one-time `import` option adopts it by.
+ *
+ * The AWS provider's importer for `aws:secretsmanager/secret:Secret` requires
+ * an ARN, not the bare name: it parses the id as an ARN before the read. It is
+ * the *partial* ARN, without the six random characters Secrets Manager appends
+ * to a name, because that suffix does not exist until the secret does and must
+ * not be committed. Secrets Manager resolves a partial ARN to the one secret
+ * with that name (the name does not end in a hyphen plus six characters), so
+ * the suffix never has to be known here.
+ */
+export const SHERIFF_SECRET_IMPORT_ID = `arn:aws:secretsmanager:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:secret:${SHERIFF_SECRET_NAME}`;
+
 const TAGS = { Name: NAME, Project: NAME };
 
 /**
@@ -137,6 +150,16 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
   // Created empty, filled out of band: see the manual steps in
   // `docs/sheriff.md`. No secret value is ever committed or set by
   // Pulumi, matching the `DELEGATE_SWARM` secret's handling.
+  //
+  // `import` is a one-time adoption: the secret was created by hand before
+  // this resource first applied, so `CreateSecret` collided with it. Importing
+  // the container adopts it in place without reading or overwriting its value.
+  // Once the resource is in state the option is inert -- Pulumi ignores it for
+  // a resource it already manages -- so it can stay as the record of the
+  // adoption. See the ordering note in `docs/sheriff.md`.
+  //
+  // No `protect`: Pulumi owns the secret's whole lifecycle from here on. Only
+  // its value is set out of band, by hand, and never by Pulumi.
   const secret = new aws.secretsmanager.Secret(
     "sheriffSlackSecret",
     {
@@ -145,7 +168,7 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
         "Sheriff Slack app credentials (SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN). Filled by hand; never by Pulumi.",
       tags: TAGS,
     },
-    { provider, protect: true },
+    { provider, import: SHERIFF_SECRET_IMPORT_ID },
   );
 
   // Single table for step 3: request records and per-user rate counters. Step

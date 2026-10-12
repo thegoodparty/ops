@@ -862,6 +862,18 @@ and are deliberately neither created by Pulumi nor committed:
      --secret-string '{"SLACK_SIGNING_SECRET":"...","SLACK_BOT_TOKEN":"..."}'
    ```
 
+   **Let the stack create it; do not create it first.** A secret that already
+   exists when the resource first applies makes `CreateSecret` fail with
+   `ResourceExistsException`, and the resource never enters Pulumi state, so
+   every later apply fails the same way. `sheriffSlackSecret` carries an
+   `import` option for exactly that case: an apply adopts the existing secret
+   in place instead of creating a second one, and because the import reads the
+   container's metadata and never its value, the credentials stay untouched.
+   The option is a one-time adoption -- once the resource is in state Pulumi
+   ignores it -- but creating the secret with the stack is still the clean
+   path. If you do create one by hand, expect the next apply to adopt it and
+   diff only its description and tags against the declaration.
+
 3. **The two hard-coded lists.** `deploy-infrastructure/sheriff/config.ts`
    holds the approver Slack user ids and the Slack-to-Identity-Store map. Both
    ship with an obvious placeholder; replace them with real ids in a reviewed
