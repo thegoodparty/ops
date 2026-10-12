@@ -501,6 +501,20 @@ validate the Dockerfile and discards it, so it needs
 **`omni/election-api.yml`.** Declares `id-token: write` and never assumes a
 role. Stray permission, no effect, remove it.
 
+## ECR Public login on pull request builds
+
+Docker builds in ops and omni pull their base images from ECR Public and log
+in first, because anonymous pulls are limited per IP and shared runners hit
+429s, while logged-in pulls are limited per account. Pull request builds get
+no deploy role, so each borrows the PR-only role its repository already has:
+ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni `gp-ai.yml`
+assumes `github-actions-pulumi-plan`. Both carry one extra statement,
+`EcrPublicLogin` (`ecr-public:GetAuthorizationToken`,
+`sts:GetServiceBearerToken`), which mints a login token and reads or pushes
+nothing. Any pull request in those repositories can already assume its role
+by editing the workflow, so the build job holding it exposes nothing new.
+Main builds log in with `github-actions-pulumi-deploy`.
+
 ## Ordering
 
 The rule from `workbench-account.md` applies, with one addition. Cross-repo
