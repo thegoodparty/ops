@@ -103,6 +103,17 @@ export const REQUEST_TTL_SECONDS = 90 * 24 * 60 * 60;
 export const RATE_TTL_SECONDS = 2 * 24 * 60 * 60;
 
 /**
+ * How long a `granting` record is left alone by the sweeper before it is
+ * reconciled. The approve path is a cross-account AssumeRole, one
+ * `CreateGroupMembership` and a few DynamoDB writes, which completes in
+ * seconds; five minutes is comfortably longer, and the sweeper runs every five
+ * minutes anyway. Without this, a sweep that observes the record between
+ * `putGrant` and the membership write would mark it `failed` while the
+ * membership lands afterwards, stranding an untracked standing admin.
+ */
+export const SWEEP_GRANTING_GRACE_MS = 5 * 60 * 1000;
+
+/**
  * The permission set's session duration, in the Slack copy only.
  *
  * `deploy/components/identity-center.ts` shortens the `administrator` set to

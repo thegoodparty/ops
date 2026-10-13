@@ -132,20 +132,48 @@ export const createStore = (
     }
   };
 
-  /** Follows a request through the grant lifecycle (`granted`, `revoked`, `failed`). */
+  /**
+   * Follows a request through the grant lifecycle (`granted`, `revoked`,
+   * `failed`).
+   *
+   * `fromState` makes the write conditional, so a sweeper that computed its
+   * plan against an older state cannot clobber a record that changed in the
+   * meantime. Returns false when the condition failed; the caller treats that
+   * as "someone else moved it" and skips the rest of its transition.
+   */
   const setRequestState = async (
     id: string,
     state: RequestState,
-  ): Promise<void> => {
-    await client.send(
-      new UpdateCommand({
-        TableName: tableName(),
-        Key: { pk: requestPk(id), sk: RECORD_SK },
-        UpdateExpression: "SET #state = :state",
-        ExpressionAttributeNames: { "#state": "state" },
-        ExpressionAttributeValues: { ":state": state },
-      }),
-    );
+    fromState?: RequestState | RequestState[],
+  ): Promise<boolean> => {
+    const names: Record<string, string> = { "#state": "state" };
+    const values: Record<string, string> = { ":state": state };
+    let condition = "attribute_exists(pk)";
+    if (fromState) {
+      const froms = Array.isArray(fromState) ? fromState : [fromState];
+      froms.forEach((from, index) => {
+        values[`:from${index}`] = from;
+      });
+      condition = `#state IN (${froms
+        .map((_from, index) => `:from${index}`)
+        .join(", ")})`;
+    }
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: requestPk(id), sk: RECORD_SK },
+          UpdateExpression: "SET #state = :state",
+          ConditionExpression: condition,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
   };
 
   /**
@@ -265,12 +293,19 @@ export const createStore = (
     );
   };
 
-  /** Flips a grant record's state, optionally recording the `membershipId`. */
+  /**
+   * Flips a grant record's state, optionally recording the `membershipId`.
+   *
+   * `fromState` is the conditional guard the sweeper uses so it cannot clobber
+   * a record the approve path moved after the plan was computed. Returns false
+   * when the condition failed.
+   */
   const setGrantState = async (args: {
     requestId: string;
     state: GrantState;
     membershipId?: string;
-  }): Promise<void> => {
+    fromState?: GrantState | GrantState[];
+  }): Promise<boolean> => {
     const names: Record<string, string> = { "#state": "state" };
     const values: Record<string, string> = {
       ":state": args.state,
@@ -281,15 +316,34 @@ export const createStore = (
       sets.push("membershipId = :membershipId");
       values[":membershipId"] = args.membershipId;
     }
-    await client.send(
-      new UpdateCommand({
-        TableName: tableName(),
-        Key: { pk: GRANT_PK, sk: grantSk(args.requestId) },
-        UpdateExpression: `SET ${sets.join(", ")}`,
-        ExpressionAttributeNames: names,
-        ExpressionAttributeValues: values,
-      }),
-    );
+    let condition = "attribute_exists(pk)";
+    if (args.fromState) {
+      const froms = Array.isArray(args.fromState)
+        ? args.fromState
+        : [args.fromState];
+      froms.forEach((from, index) => {
+        values[`:from${index}`] = from;
+      });
+      condition = `#state IN (${froms
+        .map((_from, index) => `:from${index}`)
+        .join(", ")})`;
+    }
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: GRANT_PK, sk: grantSk(args.requestId) },
+          UpdateExpression: `SET ${sets.join(", ")}`,
+          ConditionExpression: condition,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
   };
 
   /** Every grant record, for the sweeper. Paginated. */

@@ -34,6 +34,7 @@ import {
   buildRequestModal,
 } from "./sheriff/blocks";
 import {
+  activeGrantDecision,
   activePk,
   decodeSlackPayload,
   durationSecondsFor,
@@ -126,11 +127,24 @@ describe("sheriffLambdaPolicy", () => {
       "dynamodb:PutItem",
       "dynamodb:Query",
       "dynamodb:UpdateItem",
+      "lambda:InvokeFunction",
       "logs:CreateLogStream",
       "logs:PutLogEvents",
       "secretsmanager:GetSecretValue",
       "sts:AssumeRole",
     ]);
+  });
+
+  it("self-invokes only its own function", () => {
+    const self = sheriffLambdaPolicy.Statement.find(
+      (s) => s.Sid === "SelfInvoke",
+    );
+    assert.ok(self);
+    assert.equal(self.Action, "lambda:InvokeFunction");
+    assert.equal(
+      asList(self.Resource)[0],
+      "arn:aws:lambda:us-west-2:394495727159:function:sheriff",
+    );
   });
 
   // Step 4 wires the grant through `sheriff-grant`. The Lambda may assume
@@ -385,6 +399,17 @@ describe("evaluateDecision", () => {
     assert.equal(result.ok, false);
   });
 
+  it("treats a request already in the grant path as decided (async idempotency)", () => {
+    // A Slack retry or a duplicate async delivery re-runs this check and must
+    // stop rather than start a second grant.
+    const result = evaluateDecision({
+      request: record({ state: "granting" }),
+      clickerSlackId: approver,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? "" : result.reason, /already granting/);
+  });
+
   it("accepts a valid approver on an undecided, in-cap request", () => {
     assert.deepEqual(
       evaluateDecision({ request: record(), clickerSlackId: approver }),
@@ -460,10 +485,11 @@ describe("requester eligibility gate", () => {
 describe("reconcileSweep", () => {
   const now = Date.parse("2026-10-13T02:00:00.000Z");
   const members = [{ userId: "user-1", membershipId: "m-1" }];
+  const noGrace = { now, grantingGraceMs: 0 };
 
   it("marks a granting record failed when the member is absent", () => {
     const plan = reconcileSweep({
-      now,
+      ...noGrace,
       grants: [grant({ state: "granting" })],
       memberships: [],
     });
@@ -475,7 +501,7 @@ describe("reconcileSweep", () => {
 
   it("backfills and grants a granting record with a present member", () => {
     const plan = reconcileSweep({
-      now,
+      ...noGrace,
       grants: [
         grant({ state: "granting", expiresAt: "2026-10-13T03:00:00.000Z" }),
       ],
@@ -489,7 +515,7 @@ describe("reconcileSweep", () => {
 
   it("grants and then revokes an expired granting record with a present member", () => {
     const plan = reconcileSweep({
-      now,
+      ...noGrace,
       grants: [grant({ state: "granting" })],
       memberships: members,
     });
@@ -497,9 +523,43 @@ describe("reconcileSweep", () => {
     assert.deepEqual(plan.revoke.map((r) => r.membershipId), ["m-1"]);
   });
 
-  it("leaves an unexpired granted record alone", () => {
+  it("leaves a granting record inside the grace window alone", () => {
+    // The approve path may still be running; failing it now would strand the
+    // membership that lands afterwards.
+    const inFlight = grant({
+      state: "granting",
+      grantedAt: new Date(now - 30 * 1000).toISOString(),
+    });
     const plan = reconcileSweep({
       now,
+      grantingGraceMs: 5 * 60 * 1000,
+      grants: [inFlight],
+      memberships: [],
+    });
+    assert.equal(plan.failed.length, 0);
+    assert.equal(plan.granted.length, 0);
+    assert.equal(plan.revoke.length, 0);
+    // The requester is still "active", so a present member is not unmanaged.
+    assert.equal(plan.unmanaged.length, 0);
+  });
+
+  it("reconciles a granting record once it is older than the grace window", () => {
+    const stale = grant({
+      state: "granting",
+      grantedAt: new Date(now - 10 * 60 * 1000).toISOString(),
+    });
+    const plan = reconcileSweep({
+      now,
+      grantingGraceMs: 5 * 60 * 1000,
+      grants: [stale],
+      memberships: [],
+    });
+    assert.deepEqual(plan.failed.map((g) => g.requestId), ["req-1"]);
+  });
+
+  it("leaves an unexpired granted record alone", () => {
+    const plan = reconcileSweep({
+      ...noGrace,
       grants: [
         grant({
           state: "granted",
@@ -516,7 +576,7 @@ describe("reconcileSweep", () => {
 
   it("revokes an expired granted record", () => {
     const plan = reconcileSweep({
-      now,
+      ...noGrace,
       grants: [grant({ state: "granted", membershipId: "m-1" })],
       memberships: members,
     });
@@ -525,7 +585,7 @@ describe("reconcileSweep", () => {
 
   it("logs an unmanaged membership that no active grant explains", () => {
     const plan = reconcileSweep({
-      now,
+      ...noGrace,
       grants: [],
       memberships: [{ userId: "standing-admin", membershipId: "m-9" }],
     });
@@ -536,12 +596,53 @@ describe("reconcileSweep", () => {
 
   it("does not treat a revoked record's member as managed", () => {
     const plan = reconcileSweep({
-      now,
+      ...noGrace,
       grants: [grant({ state: "revoked", membershipId: "m-1" })],
       memberships: members,
     });
     assert.equal(plan.revoke.length, 0);
     assert.deepEqual(plan.unmanaged, members);
+  });
+});
+
+describe("activeGrantDecision", () => {
+  it("proceeds when there is no active lock", () => {
+    assert.equal(
+      activeGrantDecision({ active: null, requestId: "req-1" }),
+      "proceed",
+    );
+  });
+
+  it("treats the same request's lock as our own retry", () => {
+    // Slack retries a timed-out click; the second async delivery must be
+    // silent, not post a confusing "already active" message.
+    assert.equal(
+      activeGrantDecision({
+        active: { state: "active", requestId: "req-1" },
+        requestId: "req-1",
+      }),
+      "own-retry",
+    );
+  });
+
+  it("blocks a different request while a grant is active", () => {
+    assert.equal(
+      activeGrantDecision({
+        active: { state: "active", requestId: "req-other" },
+        requestId: "req-1",
+      }),
+      "other-active",
+    );
+  });
+
+  it("proceeds when the lock was released", () => {
+    assert.equal(
+      activeGrantDecision({
+        active: { state: "released", requestId: "req-other" },
+        requestId: "req-1",
+      }),
+      "proceed",
+    );
   });
 });
 
@@ -615,15 +716,68 @@ describe("grant store", () => {
       captured = command as { input?: any };
       return {};
     });
-    await store.setGrantState({
+    const applied = await store.setGrantState({
       requestId: "req-1",
       state: "granted",
       membershipId: "m-1",
     });
+    assert.equal(applied, true);
     assert.match(String(captured?.input?.UpdateExpression), /membershipId/);
     assert.equal(
       captured?.input?.ExpressionAttributeValues?.[":membershipId"],
       "m-1",
+    );
+  });
+
+  it("conditions the grant transition on the state the plan saw", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return {};
+    });
+    await store.setGrantState({
+      requestId: "req-1",
+      state: "failed",
+      fromState: "granting",
+    });
+    assert.equal(
+      captured?.input?.ConditionExpression,
+      "#state IN (:from0)",
+    );
+    assert.equal(captured?.input?.ExpressionAttributeValues?.[":from0"], "granting");
+  });
+
+  it("reports a skipped grant transition when the state moved", async () => {
+    const store = fakeStore(async () => {
+      throw new ConditionalCheckFailedException({
+        message: "conditional",
+        $metadata: {},
+      });
+    });
+    assert.equal(
+      await store.setGrantState({
+        requestId: "req-1",
+        state: "failed",
+        fromState: "granting",
+      }),
+      false,
+    );
+  });
+
+  it("conditions the request transition too", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return {};
+    });
+    const applied = await store.setRequestState("req-1", "revoked", [
+      "granting",
+      "granted",
+    ]);
+    assert.equal(applied, true);
+    assert.equal(
+      captured?.input?.ConditionExpression,
+      "#state IN (:from0, :from1)",
     );
   });
 });

@@ -39,6 +39,9 @@ export const SHERIFF_ROLE_NAME = NAME;
 /** The one management-account role the Lambda may assume. */
 export const SHERIFF_GRANT_ROLE_ARN = `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/sheriff-grant`;
 
+/** The function's own ARN, for the async self-invocation. */
+export const SHERIFF_FUNCTION_ARN = `arn:aws:lambda:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:function:${NAME}`;
+
 /**
  * Where the orphaned-membership alarm goes. The budget alerts in `index.ts`
  * use the same address. The SNS subscription is created here but stays
@@ -134,6 +137,14 @@ export const sheriffLambdaPolicy = {
         "dynamodb:Query",
       ],
       Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${SHERIFF_TABLE_NAME}`,
+    },
+    {
+      Sid: "SelfInvoke",
+      Effect: "Allow",
+      // Slack's 3-second ack window: the submission post and the approve/deny
+      // path hand their slow work to an async invocation of this same function.
+      Action: "lambda:InvokeFunction",
+      Resource: SHERIFF_FUNCTION_ARN,
     },
     {
       Sid: "OwnLogs",

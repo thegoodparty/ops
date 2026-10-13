@@ -282,16 +282,20 @@ export type SweepPlan = {
  * Decide what the sweeper should do. Never removes a membership the tool has no
  * active grant record for, so pre-existing `Admins` members are untouched.
  *
- * A `granting` record past expiry that still has a member is first flipped to
- * `granted` (so its `membershipId` is recorded) and then revoked; whether that
- * revoke succeeds is an AWS call the handler makes, and only a failed revoke is
- * an orphan.
+ * A `granting` record younger than `grantingGraceMs` is left alone: the approve
+ * path may still be running, and failing it now would strand a membership that
+ * lands after the sweep. Once it is old enough, a `granting` record past expiry
+ * that still has a member is first flipped to `granted` (so its `membershipId`
+ * is recorded) and then revoked; whether that revoke succeeds is an AWS call
+ * the handler makes, and only a failed revoke is an orphan.
  */
 export const reconcileSweep = (args: {
   /** Epoch milliseconds. */
   now: number;
   grants: GrantRecord[];
   memberships: { userId: string; membershipId: string }[];
+  /** How long a `granting` record is treated as in-flight. */
+  grantingGraceMs: number;
 }): SweepPlan => {
   const byUser = new Map(
     args.memberships.map((member) => [member.userId, member.membershipId]),
@@ -306,6 +310,13 @@ export const reconcileSweep = (args: {
 
   for (const grant of args.grants) {
     if (grant.state === "granting") {
+      // In-flight: the approve path cannot have finished yet, so do not judge
+      // it. A record that is genuinely stuck ages past this and is reconciled
+      // on a later sweep.
+      if (args.now - Date.parse(grant.grantedAt) < args.grantingGraceMs) {
+        activeUsers.add(grant.requesterIdentityStoreId);
+        continue;
+      }
       const membershipId = byUser.get(grant.requesterIdentityStoreId);
       if (!membershipId) {
         // The grant path stopped before the membership existed. No access, no
@@ -335,4 +346,25 @@ export const reconcileSweep = (args: {
   }
 
   return plan;
+};
+
+/**
+ * What an async approval should do about the per-requester active-grant lock.
+ *
+ * Slack retries a timed-out `block_actions`, so the same approve can be
+ * delivered twice. The lock's conditional write already prevents a double
+ * grant; this distinguishes our own retry from a genuinely different active
+ * grant, so the retry is silent rather than posting a confusing "already
+ * active" message. Pure so the tests cover it without AWS.
+ */
+export const activeGrantDecision = (args: {
+  active: { requestId?: string; state?: string } | null;
+  requestId: string;
+}): "proceed" | "own-retry" | "other-active" => {
+  if (args.active?.state === "active" && args.active.requestId) {
+    return args.active.requestId === args.requestId
+      ? "own-retry"
+      : "other-active";
+  }
+  return "proceed";
 };
