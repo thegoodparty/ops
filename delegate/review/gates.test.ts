@@ -21,4 +21,16 @@ describe("decide", () => {
     const d = decide({ status: "complete", findings: [finding], summary: "one bug" });
     assert.deepEqual(d, { verdict: "comment", action: "comment", gates: [] });
   });
+
+  it("does not approve when findings were dropped as unparseable", () => {
+    const d = decide(
+      { status: "complete", findings: [], summary: "one finding was dropped" },
+      { unparseableCount: 1 },
+    );
+    assert.deepEqual(d, {
+      verdict: "comment",
+      action: "comment",
+      gates: ["unparseable_findings"],
+    });
+  });
 });

@@ -4,7 +4,7 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { getAgent, runAgent } from "../framework";
-import { buildReviewPrompt } from "../agents/pr-reviewer";
+import { buildRepairPrompt, buildReviewPrompt } from "../agents/pr-reviewer";
 import { promptDiff } from "./prompt-diff";
 import { parseDiffAnchors, placeFindings } from "./anchors";
 import { renderBody, renderFailureBody } from "./body";
@@ -12,9 +12,12 @@ import { buildBundle, priorFindingsFrom } from "./bundle";
 import { decide } from "./gates";
 import { createGitTool } from "./git-tool";
 import { createGitHub } from "./github";
+import { matchPriorFindings } from "./match";
 import {
+  FindingSchema,
   ReviewOutputSchema,
   type Bundle,
+  type Finding,
   type PostedFinding,
   type ReviewOutput,
   type ReviewRecord,
@@ -108,7 +111,7 @@ const statusForRecord = (
   if (record.action === "skipped") {
     return { state: "success", description: `Superseded by ${(record.tipMovedTo ?? "").slice(0, 7)}; review not posted`, targetUrl };
   }
-  return { state: "error", description: "Review failed", targetUrl };
+  return { state: "error", description: "Reviewer failed: no verdict", targetUrl };
 };
 
 export const latestCompletedRecord = (records: ReviewRecord[]): ReviewRecord | undefined =>
@@ -158,26 +161,87 @@ const extractJsonObjects = (text: string): unknown[] => {
   return found;
 };
 
+// A tolerant parse of one candidate object. Findings are validated one at a
+// time so a single malformed finding cannot throw away the whole review: the
+// bad one is counted and dropped, the rest survive. Returns undefined only
+// when the candidate is genuinely unusable (no status, no valid finding and
+// no summary, or a failed branch with no reason).
+export type ParsedReviewOutput =
+  | { output: ReviewOutput; droppedFindingCount: number }
+  | { error: string };
+
+const parseCandidate = (candidate: unknown): ParsedReviewOutput | undefined => {
+  if (candidate === null || typeof candidate !== "object") return undefined;
+  const obj = candidate as Record<string, unknown>;
+
+  if (obj.status === "failed") {
+    const reason = typeof obj.reason === "string" ? obj.reason.trim() : "";
+    if (!reason) return undefined;
+    return { output: { status: "failed", reason }, droppedFindingCount: 0 };
+  }
+  if (obj.status !== "complete") return undefined;
+
+  const findings: Finding[] = [];
+  let droppedFindingCount = 0;
+  if (Array.isArray(obj.findings)) {
+    for (const raw of obj.findings) {
+      const parsed = FindingSchema.safeParse(raw);
+      if (parsed.success) findings.push(parsed.data);
+      else droppedFindingCount++;
+    }
+  } else if (obj.findings !== undefined) {
+    // A findings value that is not an array is itself a malformed finding:
+    // count it so it blocks approval rather than vanishing.
+    droppedFindingCount++;
+  }
+
+  const summary = typeof obj.summary === "string" ? obj.summary.trim() : "";
+  if (findings.length === 0 && summary === "") return undefined;
+
+  return {
+    output: {
+      status: "complete",
+      findings,
+      summary: summary || "The reviewer returned findings without a summary.",
+    },
+    droppedFindingCount,
+  };
+};
+
+const strictParse = (candidate: unknown): ParsedReviewOutput | undefined => {
+  const parsed = ReviewOutputSchema.safeParse(candidate);
+  return parsed.success ? { output: parsed.data, droppedFindingCount: 0 } : undefined;
+};
+
 export const parseReviewOutput = (
   result: { structuredOutput?: unknown; output: string },
-): ReviewOutput | { error: string } => {
+): ParsedReviewOutput => {
+  // Structured output is the contract when the SDK supplies it. Fall through
+  // to the text result only if it is genuinely unusable.
   if (result.structuredOutput !== undefined) {
-    const parsed = ReviewOutputSchema.safeParse(result.structuredOutput);
-    if (parsed.success) return parsed.data;
-    return { error: `agent output failed schema: ${parsed.error.message.slice(0, 500)}` };
+    const strict = strictParse(result.structuredOutput);
+    if (strict) return strict;
+    const tolerant = parseCandidate(result.structuredOutput);
+    if (tolerant) return tolerant;
+    const validation = ReviewOutputSchema.safeParse(result.structuredOutput);
+    const message = validation.success ? "no usable review object" : validation.error.message;
+    return { error: `agent output failed schema: ${message}` };
   }
+
   const candidates = extractJsonObjects(result.output);
   if (candidates.length === 0) {
     return { error: `agent returned no JSON: ${result.output.slice(0, 300)}` };
   }
+  let lastError = "no usable review object";
   for (const candidate of [...candidates].reverse()) {
-    const parsed = ReviewOutputSchema.safeParse(candidate);
-    if (parsed.success) return parsed.data;
+    const strict = strictParse(candidate);
+    if (strict) return strict;
+    const validation = ReviewOutputSchema.safeParse(candidate);
+    if (!validation.success) lastError = validation.error.message;
+    const tolerant = parseCandidate(candidate);
+    if (tolerant) return tolerant;
   }
-  const last = ReviewOutputSchema.safeParse(candidates[candidates.length - 1]);
-  return {
-    error: `agent output failed schema: ${last.success ? "" : last.error.message.slice(0, 500)}`,
-  };
+  return { error: `agent output failed schema: ${lastError}` };
 };
 
 const commentUrl = (repo: string, prNumber: number, commentId: number) =>
@@ -360,14 +424,14 @@ export const runReview = async (args: {
       .postReview(repo, prNumber, {
         commitId: headSha,
         event: "COMMENT",
-        body: renderFailureBody({ runId, headSha, reason }),
+        body: renderFailureBody({ runId, headSha, logsUrl: args.logsUrl }),
         comments: [],
       })
       .catch((err: unknown) => console.error("failure comment failed:", err));
     await github
       .postStatus(repo, headSha, {
         state: "error",
-        description: "Review failed",
+        description: "Reviewer failed: no verdict",
         targetUrl: args.logsUrl,
       })
       .catch((err: unknown) => console.error("error status failed:", err));
@@ -421,16 +485,61 @@ export const runReview = async (args: {
     });
   }
 
-  const output = parseReviewOutput(result);
-  if ("error" in output) {
-    return fail(output.error, { costUsd: result.costUsd });
-  }
-  if (output.status === "failed") {
-    return fail(output.reason, { output, costUsd: result.costUsd });
+  let parsed = parseReviewOutput(result);
+  let costUsd = result.costUsd;
+
+  // One bounded repair turn. A schema failure must not throw away a review
+  // that was otherwise complete: resume the session with the specific
+  // validation error and ask for the corrected object. Attempted once, never
+  // looped, and never allowed to fail the review on its own.
+  if ("error" in parsed && result.sessionId) {
+    const previous =
+      result.structuredOutput !== undefined
+        ? JSON.stringify(result.structuredOutput)
+        : result.output;
+    try {
+      const repair = await runAgent(
+        { ...config, maxTurns: 3 },
+        buildRepairPrompt({ validationError: parsed.error, previous }),
+        {
+          cwd: reviewDir,
+          abortController: args.abortController,
+          mcpServers: { git: createGitTool(reviewDir) },
+          env: agentEnv(),
+          preToolUseHooks: [pathGuardHook(reviewDir)],
+          resume: result.sessionId,
+        },
+      );
+      costUsd = (costUsd ?? 0) + (repair.costUsd ?? 0);
+      if (repair.errorSubtype) {
+        console.error(
+          `repair pass errored (${repair.errorSubtype}): ${repair.output.slice(0, 300)}`,
+        );
+      } else {
+        const repaired = parseReviewOutput(repair);
+        if ("error" in repaired) {
+          console.error(`repair pass still failed schema: ${repaired.error}`);
+        } else {
+          console.log("review repaired after one re-prompt");
+          parsed = repaired;
+        }
+      }
+    } catch (err) {
+      console.error("repair pass crashed:", err);
+    }
+  } else if ("error" in parsed) {
+    console.error("repair pass skipped: no session id to resume");
   }
 
-  const decision = decide(output);
-  const priorById = new Map((prior?.findings ?? []).map((f) => [f.id, f]));
+  if ("error" in parsed) {
+    return fail(parsed.error, { costUsd });
+  }
+  const output = parsed.output;
+  if (output.status === "failed") {
+    return fail(output.reason, { output, costUsd });
+  }
+
+  const decision = decide(output, { unparseableCount: parsed.droppedFindingCount });
   const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
 
   const dropped = placed.filter((p) => "unplaceable" in p).map((p) => p.finding);
@@ -438,13 +547,21 @@ export const runReview = async (args: {
     console.warn(`finding dropped, path not in diff: ${f.path}:${f.line}`);
   }
 
+  // Identity is the harness's job. Reconcile each placeable finding to the
+  // prior finding it continues by path, category and line; a prior is claimed
+  // at most once, so a match can never thread two findings onto one comment.
+  const placeable = placed.filter(
+    (p): p is { finding: Finding; adjusted: boolean } => !("unplaceable" in p),
+  );
+  const priorMatches = matchPriorFindings(
+    placeable.map((p) => p.finding),
+    prior?.findings ?? [],
+  );
+
   const carried: PostedFinding[] = [];
   const fresh: PostedFinding[] = [];
-  for (const p of placed) {
-    if ("unplaceable" in p) continue;
-    const priorFinding = p.finding.priorFindingId
-      ? priorById.get(p.finding.priorFindingId)
-      : undefined;
+  placeable.forEach((p, i) => {
+    const priorFinding = priorMatches[i];
     if (priorFinding) {
       carried.push({
         ...p.finding,
@@ -456,7 +573,7 @@ export const runReview = async (args: {
     } else {
       fresh.push({ ...p.finding, id: randomUUID(), anchorAdjusted: p.adjusted });
     }
-  }
+  });
 
   const body = renderBody({
     decision,
@@ -465,6 +582,7 @@ export const runReview = async (args: {
     headSha,
     inlineCount: fresh.length,
     droppedCount: dropped.length,
+    unparseableCount: parsed.droppedFindingCount,
     carriedForward: carried.map((f) => ({
       id: f.id,
       path: f.path,

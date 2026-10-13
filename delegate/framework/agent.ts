@@ -48,7 +48,7 @@ export const runAgent = async (
     typeof cwdOrOverrides === "string" || cwdOrOverrides === undefined
       ? { cwd: cwdOrOverrides, abortController: legacyAbortController }
       : cwdOrOverrides;
-  const { cwd, abortController } = overrides;
+  const { cwd, abortController, resume } = overrides;
   const start = Date.now();
   let output = "";
   let sessionId: string | undefined;
@@ -62,6 +62,7 @@ export const runAgent = async (
     prompt: message,
     options: {
       abortController,
+      resume,
       systemPrompt: config.systemPrompt,
       model: config.model,
       mcpServers:

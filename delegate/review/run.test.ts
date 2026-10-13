@@ -87,14 +87,20 @@ test("parseReviewOutput prefers structured output", () => {
     structuredOutput: { status: "complete", findings: [], summary: "clean" },
     output: "not json",
   });
-  assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
+  assert.deepEqual(out, {
+    output: { status: "complete", findings: [], summary: "clean" },
+    droppedFindingCount: 0,
+  });
 });
 
 test("parseReviewOutput falls back to the text result", () => {
   const out = parseReviewOutput({
     output: JSON.stringify({ status: "failed", reason: "scout failed" }),
   });
-  assert.deepEqual(out, { status: "failed", reason: "scout failed" });
+  assert.deepEqual(out, {
+    output: { status: "failed", reason: "scout failed" },
+    droppedFindingCount: 0,
+  });
 });
 
 test("parseReviewOutput rejects a verdict the agent is not allowed to emit", () => {
@@ -117,9 +123,12 @@ test("parseReviewOutput finds the JSON when the model wraps it in prose", () => 
 Done.`,
   });
   assert.deepEqual(out, {
-    status: "complete",
-    findings: [],
-    summary: 'Reviewed the "diff"; clean.',
+    output: {
+      status: "complete",
+      findings: [],
+      summary: 'Reviewed the "diff"; clean.',
+    },
+    droppedFindingCount: 0,
   });
 });
 
@@ -127,7 +136,10 @@ test("parseReviewOutput ignores an unmatched quote in the prose", () => {
   const out = parseReviewOutput({
     output: `Here's the "result:\n{"status":"complete","findings":[],"summary":"clean"}`,
   });
-  assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
+  assert.deepEqual(out, {
+    output: { status: "complete", findings: [], summary: "clean" },
+    droppedFindingCount: 0,
+  });
 });
 
 test("parseReviewOutput survives an unmatched brace in the prose", () => {
@@ -135,12 +147,87 @@ test("parseReviewOutput survives an unmatched brace in the prose", () => {
     output: "the handler `function f() {` returns early, so no finding.\n\n" +
       '{"status":"complete","findings":[],"summary":"clean"}',
   });
-  assert.deepEqual(out, { status: "complete", findings: [], summary: "clean" });
+  assert.deepEqual(out, {
+    output: { status: "complete", findings: [], summary: "clean" },
+    droppedFindingCount: 0,
+  });
 });
 
 test("parseReviewOutput reports non-JSON text", () => {
   const out = parseReviewOutput({ output: "I approve this PR." });
   assert.ok("error" in out);
   assert.match(out.error, /no JSON/);
+});
+
+const goodFinding = {
+  path: "src/a.ts",
+  line: 3,
+  body: "A real bug.",
+  category: "bugs",
+  confidence: "high",
+};
+
+test("parseReviewOutput drops one bad finding instead of the whole review", () => {
+  const out = parseReviewOutput({
+    structuredOutput: {
+      status: "complete",
+      findings: [goodFinding, { path: "src/b.ts", line: -1, category: "nope" }],
+      summary: "One real issue.",
+    },
+    output: "",
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.droppedFindingCount, 1);
+  assert.equal(out.output.status, "complete");
+  if (out.output.status === "complete") {
+    assert.equal(out.output.findings.length, 1);
+    assert.equal(out.output.findings[0].path, "src/a.ts");
+  }
+});
+
+test("parseReviewOutput keeps a summary with no valid findings", () => {
+  const out = parseReviewOutput({
+    structuredOutput: {
+      status: "complete",
+      findings: [{ path: "src/b.ts", line: -1 }],
+      summary: "Reviewed and found nothing to post.",
+    },
+    output: "",
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.droppedFindingCount, 1);
+  assert.deepEqual(out.output, {
+    status: "complete",
+    findings: [],
+    summary: "Reviewed and found nothing to post.",
+  });
+});
+
+test("parseReviewOutput fails only when there is no finding and no summary", () => {
+  const out = parseReviewOutput({
+    structuredOutput: { status: "complete", findings: [{ path: "a.ts" }] },
+    output: "",
+  });
+  assert.ok("error" in out);
+});
+
+test("parseReviewOutput accepts valid findings without a summary", () => {
+  const out = parseReviewOutput({
+    structuredOutput: { status: "complete", findings: [goodFinding] },
+    output: "",
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.output.status, "complete");
+  if (out.output.status === "complete") assert.equal(out.output.findings.length, 1);
+});
+
+test("parseReviewOutput counts a non-array findings value as one bad finding", () => {
+  const out = parseReviewOutput({
+    structuredOutput: { status: "complete", findings: "oops", summary: "clean" },
+    output: "",
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.droppedFindingCount, 1);
+  assert.deepEqual(out.output, { status: "complete", findings: [], summary: "clean" });
 });
 

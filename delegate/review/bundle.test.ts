@@ -42,7 +42,6 @@ describe("priorFindingsFrom", () => {
     const result = priorFindingsFrom(record);
     assert.equal(result.length, 2);
     assert.deepEqual(result[0], {
-      id: "00000000-0000-0000-0000-000000000001",
       path: "src/foo.ts",
       line: 10,
       body: "A bug",
@@ -50,7 +49,6 @@ describe("priorFindingsFrom", () => {
       headSha: "abc123",
     });
     assert.deepEqual(result[1], {
-      id: "00000000-0000-0000-0000-000000000002",
       path: "src/bar.ts",
       line: 20,
       body: "Security issue",
@@ -158,7 +156,6 @@ describe("buildBundle", () => {
   it("passes priorFindings through to bundle", async () => {
     const priorFindings = [
       {
-        id: "00000000-0000-0000-0000-000000000099",
         path: "src/old.ts",
         line: 5,
         body: "old finding",

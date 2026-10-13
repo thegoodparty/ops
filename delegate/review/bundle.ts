@@ -7,7 +7,6 @@ const EXEC_OPTS = { timeout: 60_000, maxBuffer: 50 * 1024 * 1024 } as const;
 export const priorFindingsFrom = (record: ReviewRecord | undefined): PriorFinding[] => {
   if (!record) return [];
   return record.findings.map((f) => ({
-    id: f.id,
     path: f.path,
     line: f.line,
     body: f.body,

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildReviewPrompt, REVIEW_OUTPUT_JSON_SCHEMA } from "./pr-reviewer";
-import type { Bundle } from "../review/schema";
+import { buildRepairPrompt, buildReviewPrompt, REVIEW_OUTPUT_JSON_SCHEMA } from "./pr-reviewer";
+import { FindingSchema, type Bundle } from "../review/schema";
 
 const baseBundle: Bundle = {
   repo: "thegoodparty/gp-api",
@@ -38,12 +38,11 @@ describe("buildReviewPrompt", () => {
     );
   });
 
-  it("includes prior findings as <finding> elements", () => {
+  it("includes prior findings as <finding> elements with no id", () => {
     const bundle: Bundle = {
       ...baseBundle,
       priorFindings: [
         {
-          id: "11111111-1111-1111-1111-111111111111",
           path: "src/foo.ts",
           line: 10,
           body: "Null not handled here.",
@@ -54,10 +53,6 @@ describe("buildReviewPrompt", () => {
     };
     const prompt = buildReviewPrompt(bundle);
     assert.ok(
-      prompt.includes('id="11111111-1111-1111-1111-111111111111"'),
-      "prior finding id must appear",
-    );
-    assert.ok(
       prompt.includes('path="src/foo.ts"'),
       "prior finding path must appear",
     );
@@ -65,6 +60,17 @@ describe("buildReviewPrompt", () => {
       prompt.includes("Null not handled here."),
       "prior finding body must appear",
     );
+    assert.ok(!prompt.includes("id="), "prior findings must not carry an id");
+    assert.ok(
+      !prompt.includes("priorFindingId"),
+      "the model must never be told about priorFindingId",
+    );
+  });
+
+  it("never asks the model to carry identity in its output contract", () => {
+    const prompt = buildReviewPrompt(baseBundle);
+    assert.ok(!prompt.includes("priorFindingId"));
+    assert.ok(!("priorFindingId" in FindingSchema.shape));
   });
 
   it("emits empty <prior_findings> block when there are none", () => {
@@ -137,4 +143,22 @@ it("a </diff> inside the patch cannot close the diff element", () => {
   assert.ok(open > 0 && close > open);
   assert.ok(prompt.indexOf("injected") > open && prompt.indexOf("injected") < close);
   assert.equal(prompt.split('boundary="tok"').length, 3);
+});
+
+describe("buildRepairPrompt", () => {
+  it("carries the validation error and asks for the corrected object once", () => {
+    const prompt = buildRepairPrompt({
+      validationError: "findings.0.priorFindingId: Invalid UUID",
+      previous: '{"status":"complete","findings":[]}',
+    });
+    assert.ok(prompt.includes("findings.0.priorFindingId: Invalid UUID"));
+    assert.ok(prompt.includes('{"status":"complete","findings":[]}'));
+    assert.ok(prompt.includes("Do not call any tools"));
+    assert.ok(prompt.includes("Return ONLY the corrected JSON object"));
+  });
+
+  it("bounds the previous output it echoes back", () => {
+    const prompt = buildRepairPrompt({ validationError: "e", previous: "x".repeat(10_000) });
+    assert.ok(prompt.length < 5_000);
+  });
 });

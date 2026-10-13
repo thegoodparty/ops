@@ -155,7 +155,7 @@ export const replayCase = async (
     return makeResult(null, agentResult.costUsd ?? null, parsed.error);
   }
 
-  return makeResult(parsed, agentResult.costUsd ?? null);
+  return makeResult(parsed.output, agentResult.costUsd ?? null);
 };
 
 export interface ReplayAllOptions {

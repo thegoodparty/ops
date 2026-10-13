@@ -18,7 +18,6 @@ export const FindingSchema = z.object({
     "thematic",
   ]),
   confidence: z.enum(["high", "medium"]),
-  priorFindingId: z.string().uuid().optional(),
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
@@ -35,10 +34,11 @@ export const ReviewOutputSchema = z.discriminatedUnion("status", [
 ]);
 export type ReviewOutput = z.infer<typeof ReviewOutputSchema>;
 
-// A prior finding as the agent sees it on re-review: its id (so it can be
-// carried forward via priorFindingId) and where it was posted.
+// A prior finding as the agent sees it on re-review: where it was posted and
+// what it said. Deliberately carries no id — the agent re-emits every finding
+// it still sees, and the harness reconciles them to prior findings by
+// path/category/line. Identity is not the model's job.
 export const PriorFindingSchema = z.object({
-  id: z.string().uuid(),
   path: z.string(),
   line: z.number().int(),
   body: z.string(),
