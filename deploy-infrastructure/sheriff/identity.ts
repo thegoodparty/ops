@@ -121,22 +121,35 @@ export const isEngineersMember = async (
   );
 };
 
-/** The `Admins` membership of a user, or null when they are not a member. */
+/**
+ * The `Admins` membership of a user, or null when they are not a member.
+ *
+ * Paginated: `ListGroupMembershipsForMember` returns a page at a time, and a
+ * user in many groups can have their `Admins` membership past the first page.
+ * A single-page read would miss it on the `ConflictException` recovery path and
+ * fail the grant closed for exactly the users most likely to be standing
+ * admins.
+ */
 export const resolveAdminsMembershipId = async (
   client: IdentitystoreClient,
   identityStoreUserId: string,
 ): Promise<string | null> => {
-  const result = await client.send(
-    new ListGroupMembershipsForMemberCommand({
-      IdentityStoreId: IDENTITY_STORE_ID,
-      MemberId: { UserId: identityStoreUserId },
-    }),
-  );
-  return (
-    result.GroupMemberships?.find(
+  let nextToken: string | undefined;
+  do {
+    const result = await client.send(
+      new ListGroupMembershipsForMemberCommand({
+        IdentityStoreId: IDENTITY_STORE_ID,
+        MemberId: { UserId: identityStoreUserId },
+        ...(nextToken ? { NextToken: nextToken } : {}),
+      }),
+    );
+    const match = result.GroupMemberships?.find(
       (membership) => membership.GroupId === ADMINS_GROUP_ID,
-    )?.MembershipId ?? null
-  );
+    );
+    if (match?.MembershipId) return match.MembershipId;
+    nextToken = result.NextToken;
+  } while (nextToken);
+  return null;
 };
 
 /**

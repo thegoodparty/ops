@@ -53,6 +53,7 @@ import {
   type RequestRecord,
 } from "./sheriff/policy";
 import { readSubmittedValues } from "./sheriff/handler";
+import { resolveAdminsMembershipId } from "./sheriff/identity";
 import { createStore } from "./sheriff/store";
 import { verifySlackWebhook } from "./sheriff/verify";
 
@@ -620,6 +621,36 @@ describe("grant store", () => {
       captured?.input?.ExpressionAttributeValues?.[":membershipId"],
       "m-1",
     );
+  });
+});
+
+describe("resolveAdminsMembershipId", () => {
+  it("finds the Admins membership on a later page", async () => {
+    // A user in many groups can have their Admins membership past the first
+    // page; the ConflictException recovery path must paginate or it fails the
+    // grant closed for exactly the users most likely to be standing admins.
+    const pages = [
+      {
+        GroupMemberships: [{ GroupId: "other", MembershipId: "m-other" }],
+        NextToken: "t1",
+      },
+      {
+        GroupMemberships: [
+          { GroupId: ADMINS_GROUP_ID, MembershipId: "m-admins" },
+        ],
+      },
+    ];
+    let call = 0;
+    const client = { send: async () => pages[call++] } as any;
+    assert.equal(await resolveAdminsMembershipId(client, "user-1"), "m-admins");
+    assert.equal(call, 2);
+  });
+
+  it("returns null when the user is not an Admins member", async () => {
+    const client = {
+      send: async () => ({ GroupMemberships: [] }),
+    } as any;
+    assert.equal(await resolveAdminsMembershipId(client, "user-1"), null);
   });
 });
 
