@@ -22,6 +22,7 @@ const REVIEW_REPOS = new Set([
   "gp-terraform-dataplatform",
   "candidate-sites",
   "gp-marketing",
+  "gp-pi",
   // ops: review scope only (not in WRITE_REPOS), but an approval here can
   // merge. .github/CODEOWNERS owns every path by default and names a short
   // opt-out list; a PR touching only opted-out paths satisfies the code-owner

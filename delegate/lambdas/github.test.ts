@@ -50,6 +50,14 @@ describe("REVIEW_REPOS scope", () => {
     );
   });
 
+  it("dispatches reviews for gp-pi PRs", () => {
+    assert.equal(shouldDispatch("pull_request", prPayload("gp-pi")), true);
+    assert.equal(
+      shouldDispatchReReview("issue_comment", commentPayload("gp-pi")),
+      true,
+    );
+  });
+
   it("does not dispatch for repos outside the review scope", () => {
     assert.equal(shouldDispatch("pull_request", prPayload("not-a-repo")), false);
     assert.equal(
