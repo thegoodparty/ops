@@ -1,11 +1,11 @@
 # Break glass: just-in-time admin access
 
-> **Status: proposal, revised after review.** This is a design draft, not an
-> accepted plan, and nothing below is built. Most of the decisions in it were
-> settled in review of the first revision and now read as decisions rather than
-> options; the few that remain open are marked **open**, and one residual
-> ambiguity from review is called out explicitly under "Existing members". It
-> is still written to be reviewed line by line.
+> **Status: proposal, revised after review.** Steps 2 through 5 are built and
+> deployed; step 1 (CloudTrail) is not, and is a known and time-boxed gap. Most
+> of the decisions in it were settled in review of the first revision and now
+> read as decisions rather than options; the few that remain open are marked
+> **open**, and one residual ambiguity from review is called out explicitly
+> under "Existing members". It is still written to be reviewed line by line.
 
 The goal is that admin in AWS is granted just in time rather than held. An
 engineer who needs it requests it in Slack, a designated approver approves, and
@@ -28,9 +28,8 @@ and that decision is recorded.
 ## Progress
 
 One step at a time, one pull request per step. Statuses are `todo`,
-`doing (who, date)`, and `done (date, evidence)`. Since this is a proposal with
-no implementation, every step is `todo`. Make `who` name the session, not the
-model.
+`doing (who, date)`, and `done (date, evidence)`. Steps 2 through 5 are done;
+step 1 remains `todo`. Make `who` name the session, not the model.
 
 Bookkeeping rides in the implementation PR. The convention in
 [`workbench-account.md`](./workbench-account.md) is to push a `doing` status
@@ -64,12 +63,14 @@ see "The CloudTrail gap" and open question 7.
       approval decision, but no grant. This makes the flow visible before
       anything can be escalated.
       `done (2026-10-13, break-glass-step3, PRs #293/#294/#297/#298/#299, Deploy infrastructure green on #298)`
-- [ ] 4. Wire approval to a real grant: assume `sheriff-grant`, call
+- [x] 4. Wire approval to a real grant: assume `sheriff-grant`, call
       `identitystore:CreateGroupMembership`, write the grant, post the SSO link.
       Add the application audit log, the reconciliation sweeper, and the alarm
-      on an unexpected membership. `doing (sheriff-step4, 2026-10-13)`
-- [ ] 5. EventBridge Scheduler revocation at expiry, with retries and a DLQ, on
-      top of the sweeper from step 4. `todo`
+      on an unexpected membership.
+      `done (2026-10-13, sheriff-step4, PR #302, Deploy infrastructure run 38447135678; PR #306 fixes the listing policy and is pending merge)`
+- [x] 5. EventBridge Scheduler revocation at expiry, with retries and a DLQ, on
+      top of the sweeper from step 4.
+      `done (2026-10-13, sheriff-step5, PR #310, Deploy infrastructure on merge)`
 
 ## Goal
 
@@ -822,8 +823,8 @@ The Progress list is the checklist; this is the detail behind each step.
    reconciliation sweeper, and the alarm on an unexpected membership. The
    sweeper ships in the same step as the first grant, not after it: the thing
    that cleans up must exist before the thing that creates, and it reconciles
-   `granting` records so a crash mid-grant cannot strand a membership. With no
-   one-shot scheduler yet (step 5), the sweeper is the revoke path.
+   `granting` records so a crash mid-grant cannot strand a membership. Step 5
+   adds the one-shot scheduler on top; the sweeper remains the backstop.
 
 5. **Scheduled revocation.** EventBridge Scheduler one-shot at expiry, invoking
    the same Lambda with a `revoke` event, retries and a DLQ, and the channel
