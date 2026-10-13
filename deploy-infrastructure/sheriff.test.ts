@@ -26,6 +26,7 @@ import {
   MAX_DURATION_SECONDS,
   MAX_REQUESTS_PER_DAY,
   SSO_PORTAL_URL,
+  SWEEP_GRANTING_GRACE_MS,
 } from "./sheriff/config";
 import {
   buildApprovalBlocks,
@@ -324,6 +325,33 @@ describe("break-glass config", () => {
       ["PT1H", "PT2H", "PT3H", "PT4H"],
     );
     assert.equal(MAX_DURATION_SECONDS, 4 * 60 * 60);
+  });
+
+  it("keeps the sweeper grace window comfortably longer than the grant path", () => {
+    // The async approve path is a few seconds; five minutes means a sweep can
+    // never fail a grant that is still running.
+    assert.equal(SWEEP_GRANTING_GRACE_MS, 5 * 60 * 1000);
+  });
+});
+
+describe("async ack path", () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "sheriff/handler.ts"),
+    "utf8",
+  );
+
+  it("self-invokes asynchronously and routes the async actions", () => {
+    assert.match(source, /InvocationType: "Event"/);
+    assert.match(source, /event\.action === "post-request"/);
+    assert.match(source, /event\.action === "decide"/);
+  });
+
+  it("does not require a Slack signature on the async events", () => {
+    assert.match(
+      source,
+      /const isAsync = event\.action === "post-request" \|\| event\.action === "decide"/,
+    );
+    assert.match(source, /if \(\s*!isAsync &&/);
   });
 });
 
