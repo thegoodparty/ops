@@ -33,8 +33,16 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          n=$(printf '%s' "$COMMENT_BODY" | sed -n 's/^delegate eval[[:space:]]*\([0-9]*\).*/\1/p')
-          echo "cases=${n:-12}" >> "$GITHUB_OUTPUT"
+          rest=$(printf '%s' "$COMMENT_BODY" | head -n1 | tr -d '\r' | sed -e 's/^delegate eval//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          if [ -z "$rest" ]; then
+            suite=core
+          elif printf '%s' "$rest" | grep -qE '^[a-z0-9-]+$'; then
+            suite=$rest
+          else
+            echo "::error::Unrecognized trigger. Comment 'delegate eval' or 'delegate eval <suite>'."
+            exit 1
+          fi
+          echo "suite=${suite}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: React with eyes
@@ -93,24 +101,27 @@ jobs:
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
           owner: thegoodparty
 
-      - name: Snapshot cases
+      # The scenario list is fixed, so every eval replays the same cases. The
+      # PR's own manifest wins when it has one, so a PR that adds a scenario
+      # is evaluated on it.
+      - name: Load scenarios
+        id: scenarios
         env:
           REVIEW_BUCKET: delegate-reviews
+          SUITE: ${{ steps.parse.outputs.suite }}
         run: |
-          npm run -s review:eval -- cases snapshot \
+          manifest=delegate/review/eval/scenarios.json
+          if [ -f "pr/$manifest" ]; then manifest="pr/$manifest"; fi
+          echo "manifest=${manifest}" >> "$GITHUB_OUTPUT"
+          npm run -s review:eval -- cases scenarios \
+            --manifest "$manifest" \
             --out ./eval/cases \
-            --limit ${{ steps.parse.outputs.cases }} \
-            --only-complete
+            --suite "$SUITE"
 
-      - name: Build prod baseline from cases
-        env:
-          REVIEW_BUCKET: delegate-reviews
-        run: |
-          npm run -s review:eval -- results from-cases \
-            --cases ./eval/cases \
-            --out ./eval/results-prod
-
-      - name: Replay from PR head
+      # Both sides are replayed on the same scenarios: what production posted
+      # at the time came from whatever agent version was live, and a failed
+      # run posted nothing to compare against.
+      - name: Replay main and PR head
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
@@ -118,12 +129,26 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          cd pr && npm run -s review:eval -- replay \
+          main_sha7=$(git rev-parse --short=7 HEAD)
+          echo "main_sha7=${main_sha7}" >> "$GITHUB_ENV"
+          npm run -s review:eval -- replay \
+            --cases ./eval/cases \
+            --out ./eval/results-main \
+            --variant main-${main_sha7} \
+            --concurrency 4 \
+            --work-dir ${{ runner.temp }}/work-main &
+          main_pid=$!
+          (cd pr && npm run -s review:eval -- replay \
             --cases ../eval/cases \
             --out ../eval/results-pr \
             --variant pr-${{ steps.pr.outputs.sha7 }} \
             --concurrency 4 \
-            --work-dir ${{ runner.temp }}/work
+            --work-dir ${{ runner.temp }}/work-pr) &
+          pr_pid=$!
+          main_status=0; pr_status=0
+          wait $main_pid || main_status=$?
+          wait $pr_pid || pr_status=$?
+          if [ $main_status -ne 0 ] || [ $pr_status -ne 0 ]; then exit 1; fi
 
       - name: Judge
         env:
@@ -134,12 +159,13 @@ jobs:
         run: |
           npm run -s review:eval -- judge \
             --cases ./eval/cases \
-            --a ./eval/results-prod \
+            --a ./eval/results-main \
             --b ./eval/results-pr \
-            --label-a prod \
+            --label-a main-${main_sha7} \
             --label-b pr-${{ steps.pr.outputs.sha7 }} \
             --passes 4 \
             --concurrency 6 \
+            --manifest ${{ steps.scenarios.outputs.manifest }} \
             --out ./eval/report.md \
             --pr-comment ./eval/comment.md \
             --run-url https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

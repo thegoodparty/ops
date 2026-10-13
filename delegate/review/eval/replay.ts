@@ -1,13 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
 import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { createGitTool } from "../git-tool";
-import { agentEnv, parseReviewOutput } from "../run";
+import { promptDiff } from "../prompt-diff";
+import { agentEnv, parseReviewOutput, pathGuardHook } from "../run";
 import type { Bundle, ReviewOutput, ReviewRecord } from "../schema";
 
 export interface Result {
@@ -41,6 +43,7 @@ export type RunAgentImpl = (
     cwd: string;
     mcpServers: Record<string, McpServerConfig>;
     env: Record<string, string | undefined>;
+    preToolUseHooks?: HookCallback[];
   },
 ) => Promise<AgentResult>;
 
@@ -126,16 +129,23 @@ export const replayCase = async (
   }
 
   const config = getAgent("pr-reviewer");
-  const prompt = buildReviewPrompt(bundle);
-  const gitTool = createGitTool(repoDir);
-  const env = agentEnv();
+  // Same as production: a diff too large for the first message goes to a
+  // file under .git/ for the agent to read in parts.
+  let diffPath: string | undefined;
+  if (promptDiff(bundle.diff).oversized) {
+    const dir = resolve(repoDir, ".git", "delegate-review");
+    mkdirSync(dir, { recursive: true });
+    diffPath = resolve(dir, "diff.patch");
+    writeFileSync(diffPath, promptDiff(bundle.diff).inline);
+  }
 
   let agentResult: AgentResult;
   try {
-    agentResult = await runAgentImpl(config, prompt, {
+    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath }), {
       cwd: repoDir,
-      mcpServers: { git: gitTool },
-      env,
+      mcpServers: { git: createGitTool(repoDir) },
+      env: agentEnv(),
+      preToolUseHooks: [pathGuardHook(repoDir)],
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

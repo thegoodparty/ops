@@ -31,12 +31,15 @@ export const summarize = (verdicts: PairVerdict[]): Summary => {
   return { a, b, ties, unstable, n: verdicts.length, signTestP: signTestP(a, b) };
 };
 
+const caseName = (v: PairVerdict, names?: Map<string, string>): string =>
+  names?.get(v.caseId) ?? v.caseId;
+
 export const renderMarkdown = (
   summary: Summary,
   verdicts: PairVerdict[],
-  labels: { labelA: string; labelB: string },
+  labels: { labelA: string; labelB: string; names?: Map<string, string> },
 ): string => {
-  const { labelA, labelB } = labels;
+  const { labelA, labelB, names } = labels;
   const lines: string[] = [];
 
   lines.push("# PR-reviewer eval report");
@@ -56,7 +59,7 @@ export const renderMarkdown = (
   lines.push("");
   lines.push("## Per-case results");
   lines.push("");
-  lines.push("| Case ID | Repo#PR | Winner | Deciding criterion |");
+  lines.push("| Case | Repo#PR | Winner | Deciding criterion |");
   lines.push("| --- | --- | --- | --- |");
 
   for (const v of verdicts) {
@@ -68,7 +71,7 @@ export const renderMarkdown = (
           : v.winner;
     const criterion = v.passes.find((p) => p.deciding_criterion)?.deciding_criterion ?? "";
     lines.push(
-      `| ${v.caseId} | ${v.repo}#${v.prNumber} | ${winnerLabel} | ${criterion} |`,
+      `| ${caseName(v, names)} | ${v.repo}#${v.prNumber} | ${winnerLabel} | ${criterion} |`,
     );
   }
 
@@ -76,6 +79,7 @@ export const renderMarkdown = (
 };
 
 export interface PrCommentOptions {
+  names?: Map<string, string>;
   labelA: string;
   labelB: string;
   casesCount: number;
@@ -91,16 +95,17 @@ const renderPerCaseTable = (
   verdicts: PairVerdict[],
   labelA: string,
   labelB: string,
+  names?: Map<string, string>,
 ): string => {
   const rows = verdicts.map((v) => {
     const winnerLabel =
       v.winner === "a" ? labelA : v.winner === "b" ? labelB : v.winner;
     const criterion =
       v.passes.find((p) => p.deciding_criterion)?.deciding_criterion ?? "";
-    return `| ${v.caseId} | ${v.repo}#${v.prNumber} | ${winnerLabel} | ${criterion} |`;
+    return `| ${caseName(v, names)} | ${v.repo}#${v.prNumber} | ${winnerLabel} | ${criterion} |`;
   });
   return [
-    "| Case ID | Repo#PR | Winner | Deciding criterion |",
+    "| Case | Repo#PR | Winner | Deciding criterion |",
     "| --- | --- | --- | --- |",
     ...rows,
   ].join("\n");
@@ -184,12 +189,12 @@ export const renderPrComment = (
   verdicts: PairVerdict[],
   opts: PrCommentOptions,
 ): string => {
-  const { labelA, labelB, casesCount, unjudgedCount = 0, replayFailures, runUrl, resultsA = [], resultsB = [] } = opts;
+  const { labelA, labelB, casesCount, unjudgedCount = 0, replayFailures, runUrl, resultsA = [], resultsB = [], names } = opts;
   const [before, after] = pairedAvgCost(resultsA, resultsB);
   const money = (n: number | null) => (n === null ? "n/a" : `$${n.toFixed(2)}`);
   const judged = casesCount - unjudgedCount;
   const unjudgedNote = unjudgedCount ? `, ${unjudgedCount} not judged` : "";
-  const failureNote = replayFailures ? `, ${replayFailures} replay failure(s)` : "";
+  const failureNote = replayFailures ? `, ${replayFailures} replay failure(s) across both sides` : "";
 
   return [
     "<!-- delegate-eval -->",
@@ -201,7 +206,7 @@ export const renderPrComment = (
     "",
     "<details><summary>Per-case results</summary>",
     "",
-    renderPerCaseTable(verdicts, labelA, labelB),
+    renderPerCaseTable(verdicts, labelA, labelB, names),
     "",
     "</details>",
     "",

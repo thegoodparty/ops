@@ -4,15 +4,16 @@ Replay recorded production reviews against the agent code in any checkout and co
 
 ## From a PR
 
-Comment `delegate eval` on any ops PR (or `delegate eval 20` to use 20 cases instead of the default 12). The workflow:
+Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval <suite>` (for example `delegate eval re-review`) to run another suite from `scenarios.json`. The workflow:
 
-1. Takes a snapshot of the N most recent completed production review cases from S3.
-2. Uses what production posted as the baseline side.
-3. Replays the cases using the agent code from your PR head.
-4. Judges the two sides pairwise and posts a single comment to the PR with two verdicts: **Quality** (Better / Worse / Can't tell, from the sign test over the judged pairs) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). Per-case results sit in a drop-down; every raw result is on the workflow run as an artifact.
-5. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
+1. Loads the suite's scenarios from `scenarios.json`: fixed production review records in S3, so every eval runs the same cases. If your PR changes `scenarios.json`, its copy is used.
+2. Replays every scenario twice in parallel, once with main's agent code and once with your PR head's.
+3. Judges the two sides pairwise and posts a single comment to the PR with two verdicts: **Quality** (Better / Worse / Can't tell, from the sign test over the judged pairs) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). Per-case results sit in a drop-down; every raw result is on the workflow run as an artifact.
+4. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
 
-**Cost and time:** each replay is a full `claude-opus-4-6` agent run at roughly $1.50 per case. 12 cases at concurrency 4 takes about 15 minutes and costs around $18 in replay plus a few dollars for judging.
+**Cost and time:** each replay is a full `claude-opus-4-6` agent run at roughly $1.50 per case, and both sides are replayed. The 12-case `core` suite takes about 20 minutes and costs around $36 in replay plus a few dollars for judging.
+
+**Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the S3 `key` of the record, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
 
 **Repo settings the workflow needs:**
 
