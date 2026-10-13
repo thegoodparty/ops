@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import type { Bundle, PriorFinding, ReviewRecord } from "./schema";
+import type { Bundle, PriorFinding, ReviewRecord, SettledFinding } from "./schema";
 import type { createGitHub } from "./github";
 
 const EXEC_OPTS = { timeout: 60_000, maxBuffer: 50 * 1024 * 1024 } as const;
@@ -16,12 +16,25 @@ export const priorFindingsFrom = (record: ReviewRecord | undefined): PriorFindin
   }));
 };
 
+// Every finding withdrawn by a reconsideration on this PR, once each, oldest
+// first. A re-raised concern gets a new id, so it does not unsettle these.
+export const settledFindingsFrom = (records: ReviewRecord[]): SettledFinding[] => {
+  const byId = new Map<string, SettledFinding>();
+  for (const r of records) {
+    for (const f of r.settledFindings ?? []) {
+      if (!byId.has(f.id)) byId.set(f.id, f);
+    }
+  }
+  return [...byId.values()];
+};
+
 export const buildBundle = async (args: {
   repo: string;
   prNumber: number;
   reviewDir: string;
   github: ReturnType<typeof createGitHub>;
   priorFindings: PriorFinding[];
+  settledFindings?: SettledFinding[];
 }): Promise<Bundle> => {
   const pull = await args.github.getPull(args.repo, args.prNumber);
 
@@ -96,5 +109,6 @@ export const buildBundle = async (args: {
     diff,
     changedFiles,
     priorFindings: args.priorFindings,
+    ...(args.settledFindings?.length ? { settledFindings: args.settledFindings } : {}),
   };
 };

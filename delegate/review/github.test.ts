@@ -276,6 +276,93 @@ describe("createGitHub", () => {
     assert.equal(threads[0].firstComment.databaseId, 500);
     assert.equal(threads[0].firstComment.path, "src/x.ts");
     assert.equal(threads[0].firstComment.line, 10);
+    assert.deepEqual(threads[0].replies, []);
+  });
+
+  it("listReviewThreads returns the replies after the first comment with their author", async () => {
+    const { mockFetch } = createMockFetch([
+      {
+        status: 200,
+        body: {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    {
+                      id: "thread1",
+                      isResolved: false,
+                      isOutdated: false,
+                      comments: {
+                        nodes: [
+                          { databaseId: 500, body: "a bug", path: "src/x.ts", line: 10 },
+                          {
+                            databaseId: 501,
+                            body: "tests pass, see run 123",
+                            path: "src/x.ts",
+                            line: 10,
+                            createdAt: "2026-10-12T10:00:00Z",
+                            authorAssociation: "MEMBER",
+                            viewerDidAuthor: false,
+                            author: { login: "dev", __typename: "User" },
+                          },
+                          {
+                            databaseId: 502,
+                            body: "Still blocking",
+                            path: "src/x.ts",
+                            line: 10,
+                            createdAt: "2026-10-12T11:00:00Z",
+                            authorAssociation: "NONE",
+                            viewerDidAuthor: true,
+                            author: { login: "delegate-reviewer", __typename: "Bot" },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+    ]);
+
+    const gh = createGitHub(TOKEN, mockFetch);
+    const [thread] = await gh.listReviewThreads("acme/my-repo", 7);
+    assert.deepEqual(thread.replies, [
+      {
+        databaseId: 501,
+        body: "tests pass, see run 123",
+        createdAt: "2026-10-12T10:00:00Z",
+        authorAssociation: "MEMBER",
+        byViewer: false,
+        authorLogin: "dev",
+        authorIsUser: true,
+      },
+      {
+        databaseId: 502,
+        body: "Still blocking",
+        createdAt: "2026-10-12T11:00:00Z",
+        authorAssociation: "NONE",
+        byViewer: true,
+        authorLogin: "delegate-reviewer",
+        authorIsUser: false,
+      },
+    ]);
+  });
+
+  it("replyToReviewComment posts to the thread's replies endpoint", async () => {
+    const { mockFetch, calls } = createMockFetch([{ status: 201, body: { id: 9 } }]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    await gh.replyToReviewComment(REPO, PR, 500, "Withdrawn: reason");
+    assert.equal(calls[0].method, "POST");
+    assert.equal(
+      calls[0].url,
+      `https://api.github.com/repos/${REPO}/pulls/${PR}/comments/500/replies`,
+    );
+    assert.deepEqual(calls[0].body, { body: "Withdrawn: reason" });
   });
 
   it("listReviewThreads paginates via pageInfo", async () => {

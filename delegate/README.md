@@ -106,7 +106,7 @@ Continuation verbs are routed by parsing the most recent bot post's `[phase=...]
 
 ## PR reviewer
 
-`pr-reviewer` reviews a PR in a `REVIEW_REPOS` repo when it is opened or marked ready, and reviews a later push only when someone comments `delegate review`. The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else.
+`pr-reviewer` reviews a PR in a `REVIEW_REPOS` repo when it is opened or marked ready, and reviews a later push only when someone comments `delegate review`. When a finding is wrong or not worth fixing, answer it in its thread and comment `delegate reconsider`; see [Reconsidering findings](#reconsidering-findings). The agent reads the checkout and emits a structured review; `delegate/review/run.ts` does everything else.
 
 ### Before and after
 
@@ -152,6 +152,26 @@ Rules that hold regardless of what the model says:
 - A schema or subagent failure posts `Review failed: <reason>`, sets the status to `error`, and writes a record with `action: failed`.
 
 Every run writes `s3://delegate-reviews/reviews/<repo>/<pr>/<sha>/<runId>.json` with the full input bundle, the agent output, the posted action, cost and `agentVersion` (the ops commit of the image).
+
+### Reconsidering findings
+
+A finding blocks merge until the code changes or the bot withdraws it. To dispute one without changing the code:
+
+1. Reply in the finding's thread with the evidence or reasoning: the test you ran and what it showed, the query result, the constraint the finding missed, or the trade-off and the follow-up that covers it.
+2. Comment `delegate reconsider` on the PR, on its own line.
+
+The bot weighs the answered findings on the commit it last reviewed, replies in each thread with **Withdrawn.** or **Still blocking.** and the reason, resolves the withdrawn threads, and posts a new review. When every finding is withdrawn, that review is an approval and the `pr-reviewer` check reads "Approved after reconsideration".
+
+Rules:
+
+- Only a person with write access can trigger it (`OWNER`, `MEMBER` or `COLLABORATOR`), and only their replies count. Replies from bots, including delegate's own coding agents, and from outside commenters are ignored, so an agent cannot argue its own findings away.
+- It reconsiders the latest completed review of the PR's current head. If you have pushed since, comment `delegate review` first.
+- It can only withdraw findings. It does not look for new ones, and a finding nobody answered stays open. Findings that pointed outside the diff have no thread and keep blocking.
+- Each round needs a new reply. If the bot maintains a finding, reply again and comment `delegate reconsider` again. A comment with no new reply gets a one-line answer and runs nothing.
+- A run that fails, or finds the tip moved, posts nothing but a comment and leaves the previous verdict in place; comment again to retry.
+- A withdrawn finding is settled for the rest of the PR. Later reviews see it with its reason and do not raise the same concern on the same code unless a change makes the reason stop holding.
+
+Each reconsideration writes a record with `trigger: reconsider`, the disputes it was given, and its decisions. Eval snapshots skip these records.
 
 ## Operator: bot got stuck
 

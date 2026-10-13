@@ -47,6 +47,13 @@ export const PriorFindingSchema = z.object({
 });
 export type PriorFinding = z.infer<typeof PriorFindingSchema>;
 
+// A finding the bot withdrew after a human answered it in its thread. Later
+// reviews of the PR see it so they do not raise the same concern again.
+export const SettledFindingSchema = PriorFindingSchema.extend({
+  reason: z.string(),
+});
+export type SettledFinding = z.infer<typeof SettledFindingSchema>;
+
 // Everything the agent is allowed to know. Built deterministically before
 // the agent runs; the agent has no network and no GitHub token, so if it is
 // not here the agent cannot see it. The bundle is persisted on the record so
@@ -63,8 +70,53 @@ export const BundleSchema = z.object({
   diff: z.string(),
   changedFiles: z.array(z.string()),
   priorFindings: z.array(PriorFindingSchema),
+  settledFindings: z.array(SettledFindingSchema).optional(),
 });
 export type Bundle = z.infer<typeof BundleSchema>;
+
+// `delegate reconsider`: the agent's input is the open findings a human has
+// answered in their threads, and its whole deliverable is one decision per
+// finding. It cannot add a finding; a reconsideration only ever removes them.
+export const ThreadReplySchema = z.object({
+  role: z.enum(["human", "reviewer"]),
+  login: z.string(),
+  body: z.string(),
+  createdAt: z.string(),
+});
+export type ThreadReply = z.infer<typeof ThreadReplySchema>;
+
+export const DisputeSchema = z.object({
+  finding: PriorFindingSchema,
+  replies: z.array(ThreadReplySchema),
+});
+export type Dispute = z.infer<typeof DisputeSchema>;
+
+export const ReconsiderOutputSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("complete"),
+    decisions: z.array(
+      z.object({
+        findingId: z.string().uuid(),
+        decision: z.enum(["withdraw", "maintain"]),
+        reason: z.string().min(1),
+      }),
+    ),
+    summary: z.string().min(1),
+  }),
+  z.object({
+    status: z.literal("failed"),
+    reason: z.string().min(1),
+  }),
+]);
+export type ReconsiderOutput = z.infer<typeof ReconsiderOutputSchema>;
+
+export const ReconsiderationSchema = z.object({
+  reconsideredRunId: z.string().uuid(),
+  triggeredBy: z.string().optional(),
+  disputes: z.array(DisputeSchema),
+  output: ReconsiderOutputSchema,
+});
+export type Reconsideration = z.infer<typeof ReconsiderationSchema>;
 
 export const PostedFindingSchema = FindingSchema.extend({
   id: z.string().uuid(),
@@ -81,7 +133,7 @@ export const ReviewRecordSchema = z.object({
   prNumber: z.number().int(),
   baseSha: z.string(),
   headSha: z.string(),
-  trigger: z.enum(["webhook", "re-review", "eval"]),
+  trigger: z.enum(["webhook", "re-review", "reconsider", "eval"]),
   agentVersion: z.string(),
   model: z.string(),
   startedAt: z.string(),
@@ -95,6 +147,8 @@ export const ReviewRecordSchema = z.object({
   gates: z.array(z.string()),
   findings: z.array(PostedFindingSchema),
   droppedFindings: z.array(FindingSchema).default([]),
+  settledFindings: z.array(SettledFindingSchema).optional(),
+  reconsideration: ReconsiderationSchema.optional(),
   reviewId: z.number().int().optional(),
   tipMovedTo: z.string().optional(),
   error: z.string().optional(),
@@ -104,5 +158,15 @@ export type ReviewRecord = z.infer<typeof ReviewRecordSchema>;
 export const recordKey = (repo: string, prNumber: number, headSha: string, runId: string) =>
   `reviews/${repo}/${prNumber}/${headSha}/${runId}.json`;
 
-export const lockKey = (repo: string, prNumber: number, headSha: string) =>
-  `reviews/${repo}/${prNumber}/${headSha}/lock`;
+// A reconsideration locks on the record it reconsiders, so a duplicate
+// comment cannot run it twice, but a later round (after the bot answers and
+// a human replies again) can. Both keys end in /lock so listRecords skips them.
+export const lockKey = (
+  repo: string,
+  prNumber: number,
+  headSha: string,
+  reconsideredRunId?: string,
+) =>
+  reconsideredRunId
+    ? `reviews/${repo}/${prNumber}/${headSha}/reconsider/${reconsideredRunId}/lock`
+    : `reviews/${repo}/${prNumber}/${headSha}/lock`;

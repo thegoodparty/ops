@@ -7,6 +7,19 @@ const parseLinkNext = (header: string | null): string | undefined => {
   return match?.[1];
 };
 
+// One reply in a review thread. `byViewer` is true for comments the reviewer
+// App itself posted, which is how the bot's own answers are told apart from
+// other bots without hard-coding its login.
+export type ThreadComment = {
+  databaseId: number;
+  body: string;
+  createdAt: string;
+  authorAssociation: string;
+  byViewer: boolean;
+  authorLogin: string;
+  authorIsUser: boolean;
+};
+
 type FetchFn = (url: string | URL, init?: RequestInit) => Promise<Response>;
 
 export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
@@ -195,6 +208,10 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
           body: string;
           path: string;
           line: number | null;
+          createdAt: string;
+          authorAssociation: string;
+          viewerDidAuthor: boolean;
+          author: { login: string; __typename: string } | null;
         }>;
       };
     };
@@ -218,8 +235,11 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
               pageInfo { hasNextPage endCursor }
               nodes {
                 id isResolved isOutdated
-                comments(first: 1) {
-                  nodes { databaseId body path line }
+                comments(first: 100) {
+                  nodes {
+                    databaseId body path line createdAt authorAssociation viewerDidAuthor
+                    author { login __typename }
+                  }
                 }
               }
             }
@@ -233,6 +253,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
       isResolved: boolean;
       isOutdated: boolean;
       firstComment: { databaseId: number; body: string; path: string; line: number | null };
+      replies: ThreadComment[];
     }> = [];
 
     let after: string | null = null;
@@ -254,6 +275,15 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
               path: first.path,
               line: first.line,
             },
+            replies: t.comments.nodes.slice(1).map((c) => ({
+              databaseId: c.databaseId,
+              body: c.body,
+              createdAt: c.createdAt,
+              authorAssociation: c.authorAssociation,
+              byViewer: c.viewerDidAuthor,
+              authorLogin: c.author?.login ?? "ghost",
+              authorIsUser: c.author?.__typename === "User",
+            })),
           });
         }
       }
@@ -262,6 +292,21 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     }
 
     return threads;
+  };
+
+  // Posted as the reviewer App, so the reply shows up in the finding's own
+  // thread rather than as a new top-level comment.
+  const replyToReviewComment = async (
+    repo: string,
+    prNumber: number,
+    commentId: number,
+    body: string,
+  ): Promise<void> => {
+    await doFetch(
+      "POST",
+      `${BASE_URL}/repos/${repo}/pulls/${prNumber}/comments/${commentId}/replies`,
+      { body },
+    );
   };
 
   const resolveThread = async (threadId: string): Promise<void> => {
@@ -297,6 +342,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     postReview,
     dismissReview,
     listReviewThreads,
+    replyToReviewComment,
     resolveThread,
     unresolveThread,
     findThreadIdByCommentId,

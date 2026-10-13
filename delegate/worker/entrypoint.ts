@@ -5,6 +5,7 @@ import { getAgent, runAgent, sendCallback } from "../framework";
 import type { AgentJob } from "../framework";
 import { setupGitHubAuth, setupReviewerGitHubAuth } from "./github-auth";
 import { runReview } from "../review/run";
+import { runReconsider } from "../review/reconsider";
 
 // Workflow agents (PRD-to-code) need the runbooks repo on disk and the
 // ClickUp credentials in env. Framework agents (slack-responder, pr-reviewer)
@@ -267,15 +268,27 @@ const main = async () => {
       : undefined;
 
     try {
-      await runReview({
-        repo: repoFullName,
-        prNumber: Number(prNumber),
-        reviewDir,
-        trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
-        token: reviewerToken,
-        abortController,
-        logsUrl,
-      });
+      if (job.metadata?.reconsider === "true") {
+        await runReconsider({
+          repo: repoFullName,
+          prNumber: Number(prNumber),
+          reviewDir,
+          token: reviewerToken,
+          abortController,
+          triggeredBy: job.metadata?.triggeredBy,
+          logsUrl,
+        });
+      } else {
+        await runReview({
+          repo: repoFullName,
+          prNumber: Number(prNumber),
+          reviewDir,
+          trigger: job.metadata?.reReview === "true" ? "re-review" : "webhook",
+          token: reviewerToken,
+          abortController,
+          logsUrl,
+        });
+      }
     } finally {
       clearTimeout(deadline);
       await removeGitHubReaction(job, reviewerToken);

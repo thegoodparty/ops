@@ -22,13 +22,14 @@ export const createStore = (client: S3Client = new S3Client({})) => {
   const acquireLock = async (
     repo: string,
     prNumber: number,
-    headSha: string
+    headSha: string,
+    reconsideredRunId?: string
   ): Promise<boolean> => {
     try {
       await client.send(
         new PutObjectCommand({
           Bucket: BUCKET,
-          Key: lockKey(repo, prNumber, headSha),
+          Key: lockKey(repo, prNumber, headSha, reconsideredRunId),
           Body: JSON.stringify({ acquiredAt: new Date().toISOString() }),
           IfNoneMatch: "*",
         })
@@ -42,20 +43,32 @@ export const createStore = (client: S3Client = new S3Client({})) => {
     }
   };
 
-  const releaseLock = async (repo: string, prNumber: number, headSha: string): Promise<void> => {
+  const releaseLock = async (
+    repo: string,
+    prNumber: number,
+    headSha: string,
+    reconsideredRunId?: string
+  ): Promise<void> => {
     await client.send(
-      new DeleteObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+      new DeleteObjectCommand({
+        Bucket: BUCKET,
+        Key: lockKey(repo, prNumber, headSha, reconsideredRunId),
+      })
     );
   };
 
   const lockAcquiredAt = async (
     repo: string,
     prNumber: number,
-    headSha: string
+    headSha: string,
+    reconsideredRunId?: string
   ): Promise<Date | undefined> => {
     try {
       const res = await client.send(
-        new GetObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+        new GetObjectCommand({
+          Bucket: BUCKET,
+          Key: lockKey(repo, prNumber, headSha, reconsideredRunId),
+        })
       );
       const parsed = JSON.parse(await readBody(res.Body)) as { acquiredAt?: string };
       return parsed.acquiredAt ? new Date(parsed.acquiredAt) : undefined;
