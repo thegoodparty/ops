@@ -976,20 +976,22 @@ export const handleSweep = async (
           "revoked",
           ["granting", "granted", "failed"],
         );
+        // Only when the transition actually applied: a concurrent sweep that
+        // already moved the record must not emit a second `grant.revoked`.
+        audit("grant.revoked", {
+          requestId: grant.requestId,
+          requester: grant.requesterSlackId,
+          requesterEmail: grant.requesterEmail,
+          approver: grant.approverSlackId,
+          group: grant.groupId,
+          membershipId,
+          reason: grant.reason,
+          ticket: grant.ticket,
+          grantedAt: grant.grantedAt,
+          expiresAt: grant.expiresAt,
+          source: "sweep",
+        });
       }
-      audit("grant.revoked", {
-        requestId: grant.requestId,
-        requester: grant.requesterSlackId,
-        requesterEmail: grant.requesterEmail,
-        approver: grant.approverSlackId,
-        group: grant.groupId,
-        membershipId,
-        reason: grant.reason,
-        ticket: grant.ticket,
-        grantedAt: grant.grantedAt,
-        expiresAt: grant.expiresAt,
-        source: "sweep",
-      });
     } finally {
       await sweepStore.releaseActiveGrant(grant.requesterIdentityStoreId);
     }

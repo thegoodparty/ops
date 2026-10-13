@@ -653,6 +653,7 @@ describe("handleSweep imperative paths", () => {
       state: string,
       from?: string | string[],
     ) => Promise<boolean>;
+    setGrantState?: (stateArgs: { state: string }) => Promise<boolean>;
     deleteMembership?: (client: unknown, id: string) => Promise<boolean>;
     calls?: string[];
   }) => {
@@ -660,6 +661,7 @@ describe("handleSweep imperative paths", () => {
     const store = {
       listGrants: async () => args.grants,
       setGrantState: async (stateArgs: { state: string }) => {
+        if (args.setGrantState) return args.setGrantState(stateArgs);
         calls.push(`setGrantState:${stateArgs.state}`);
         return true;
       },
@@ -755,6 +757,21 @@ describe("handleSweep imperative paths", () => {
     await handleSweep(deps);
     assert.ok(calls.includes("setGrantState:revoked"));
     assert.ok(calls.includes("releaseActiveGrant:user-1"));
+  });
+
+  it("skips the rest of the transition when the conditional write is a no-op", async () => {
+    // A concurrent sweep moved the record; this sweep must not clobber it and
+    // must not release the lock.
+    const calls: string[] = [];
+    const deps = sweepDeps({
+      grants: [oldGranting()],
+      memberships: [],
+      setGrantState: async () => false,
+      calls,
+    });
+    await handleSweep(deps);
+    assert.ok(!calls.some((call) => call.startsWith("setRequestState")));
+    assert.ok(!calls.includes("releaseActiveGrant:user-1"));
   });
 });
 
