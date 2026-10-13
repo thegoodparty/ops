@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   commitSyntheticHead,
+  scoreDir,
   readBundleFile,
   readManifest,
   renderExpectReport,
@@ -131,4 +132,16 @@ test("the report counts a case as passed only when every run passed", () => {
   assert.match(report, /\*\*1\/2 cases passed\*\*/);
   assert.match(report, /\| 2\/2 \| \$1\.50 \|/);
   assert.match(report, /run 2: FAIL, approved/);
+});
+
+test("scoreDir fails a case the replay left no results for", () => {
+  const [approveCase] = readManifest(MANIFEST).filter((c) => c.expect.verdict === "approve");
+  const out = mkdtempSync(join(tmpdir(), "expect-out-"));
+  const report = renderExpectReport(scoreDir([approveCase], out), "v");
+  assert.match(report, /\*\*0\/1 cases passed\*\*/);
+  assert.match(report, /FAIL, no results/);
+
+  mkdirSync(join(out, approveCase.id));
+  writeFileSync(join(out, approveCase.id, "run-1.json"), JSON.stringify(result()));
+  assert.match(renderExpectReport(scoreDir([approveCase], out), "v"), /\*\*1\/1 cases passed\*\*/);
 });

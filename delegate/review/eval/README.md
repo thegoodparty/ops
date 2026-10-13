@@ -21,7 +21,7 @@ Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval
 - Secret `DELEGATE_EVAL_APP_PRIVATE_KEY`: the private key for that GitHub App.
 - Secret `ANTHROPIC_API_KEY`: standard Anthropic API key for agent replay and judging.
 
-The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLABORATOR` association on the repository.
+The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLABORATOR` association on the repository, and only on PRs whose branch is in this repo. It runs the PR's code with live credentials, so a fork PR is refused.
 
 ## Concepts
 
@@ -102,7 +102,7 @@ cat report.md
 
 Five cases with a known right answer, listed in `expected/manifest.json`. Each is scored on the outcome alone, with no judge: a block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. Every case runs several times, and a case passes only when every run does.
 
-Every `delegate eval` comment also runs this suite against the PR head, 3 runs per case, as a parallel job, and posts the result as its own PR comment. It adds about $15 and no wall time.
+Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $15 and no wall time.
 
 ```sh
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--out ./eval-expected] [--work-dir /tmp/review-expect]

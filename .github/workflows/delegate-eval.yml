@@ -59,6 +59,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          head_repo=$(gh api repos/${{ github.repository }}/pulls/${{ steps.parse.outputs.pr_number }} --jq '.head.repo.full_name')
+          if [ "$head_repo" != "${{ github.repository }}" ]; then
+            echo "::error::delegate eval runs the PR's code with live credentials, so it only runs on branches in this repo, not forks."
+            exit 1
+          fi
           sha=$(gh api repos/${{ github.repository }}/pulls/${{ steps.parse.outputs.pr_number }} --jq '.head.sha')
           echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
@@ -176,8 +181,8 @@ jobs:
         run: |
           body=$(cat ./eval/comment.md)
           pr=${{ steps.parse.outputs.pr_number }}
-          existing_id=$(gh api repos/${{ github.repository }}/issues/${pr}/comments \
-            --jq '[.[] | select(.body | startswith("<!-- delegate-eval -->"))] | first | .id // empty')
+          existing_id=$(gh api --paginate repos/${{ github.repository }}/issues/${pr}/comments \
+            --jq '.[] | select(.body | startswith("<!-- delegate-eval -->")) | .id' | sed -n 1p)
           if [ -n "$existing_id" ]; then
             gh api --method PATCH repos/${{ github.repository }}/issues/comments/${existing_id} \
               -f body="$body"
@@ -224,22 +229,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
+          head_repo=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.repo.full_name')
+          if [ "$head_repo" != "${{ github.repository }}" ]; then
+            echo "::error::delegate eval runs the PR's code with live credentials, so it only runs on branches in this repo, not forks."
+            exit 1
+          fi
           sha=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.sha')
           echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main (cases and scoring)
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: .
 
       - name: Checkout PR head (agent under test)
         uses: actions/checkout@v6
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
+          path: pr/
 
       - uses: actions/setup-node@v6
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - name: Install deps
+      - name: Install deps (main)
         run: npm ci
+
+      - name: Install deps (pr)
+        run: npm ci
+        working-directory: pr/
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -263,12 +284,21 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          npm run -s review:expect -- \
+          cd pr && npm run -s review:expect -- \
+            --mode replay \
+            --manifest ../delegate/review/eval/expected/manifest.json \
             --runs 3 \
             --concurrency 5 \
             --variant pr-${{ steps.pr.outputs.sha7 }} \
-            --out ./eval-expected \
+            --out ../eval-expected \
             --work-dir ${{ runner.temp }}/work-expected
+
+      - name: Score against main's expectations
+        run: |
+          npm run -s review:expect -- \
+            --mode score \
+            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --out ./eval-expected
 
       - name: Post or update PR comment
         env:
@@ -277,8 +307,8 @@ jobs:
         run: |
           body=$(printf '<!-- delegate-eval-expected -->\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
             "$(cat ./eval-expected/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
-          existing_id=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
-            --jq '[.[] | select(.body | startswith("<!-- delegate-eval-expected -->"))] | first | .id // empty')
+          existing_id=$(gh api --paginate repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq '.[] | select(.body | startswith("<!-- delegate-eval-expected -->")) | .id' | sed -n 1p)
           if [ -n "$existing_id" ]; then
             gh api --method PATCH repos/${{ github.repository }}/issues/comments/${existing_id} -f body="$body"
           else

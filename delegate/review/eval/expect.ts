@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
@@ -160,7 +160,7 @@ const describeExpect = (e: Expect): string => {
 };
 
 export const renderExpectReport = (reports: CaseReport[], variant: string): string => {
-  const casePasses = reports.filter((r) => r.scores.every((s) => s.pass)).length;
+  const casePasses = reports.filter((r) => r.scores.length > 0 && r.scores.every((s) => s.pass)).length;
   const money = (costs: (number | null)[]) => {
     const known = costs.filter((c): c is number => c !== null);
     return known.length === 0 ? "n/a" : `$${(known.reduce((a, b) => a + b, 0) / known.length).toFixed(2)}`;
@@ -182,6 +182,7 @@ export const renderExpectReport = (reports: CaseReport[], variant: string): stri
   ];
   for (const r of reports) {
     lines.push(`**${r.c.id}**: ${r.c.tests}`, "");
+    if (r.scores.length === 0) lines.push("- FAIL, no results");
     r.scores.forEach((s, i) => lines.push(`- run ${i + 1}: ${s.pass ? "pass" : "FAIL"}, ${s.outcome}`));
     lines.push("");
   }
@@ -200,8 +201,23 @@ const parseFlags = (args: string[]): Record<string, string> => {
   return flags;
 };
 
+// Scores whatever run-<n>.json files a replay left under <out>/<case>/. A case
+// with no results fails, so a replay that skipped or dropped a case can't
+// pass by omission.
+export const scoreDir = (cases: ExpectedCase[], out: string): CaseReport[] =>
+  cases.map((c) => {
+    const dir = join(out, c.id);
+    const files = existsSync(dir) ? readdirSync(dir).filter((f) => /^run-\d+\.json$/.test(f)).sort() : [];
+    const rs = files.map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")) as Result);
+    return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
+  });
+
+// --mode replay runs the agent and writes results; --mode score reads them
+// and writes the report. CI runs replay from the PR head and score from main,
+// so a PR cannot change the cases or the scoring it is graded on.
 const main = async () => {
   const flags = parseFlags(process.argv.slice(2));
+  const mode = flags.mode ?? "all";
   const manifestPath = resolve(flags.manifest ?? DEFAULT_MANIFEST);
   const runs = Number(flags.runs ?? 3);
   const concurrency = Number(flags.concurrency ?? 5);
@@ -213,42 +229,40 @@ const main = async () => {
   const cases = flags.case ? all.filter((c) => c.id === flags.case) : all;
   if (cases.length === 0) throw new Error(`no case named ${flags.case}`);
 
-  const client = new S3Client({});
-  const records = new Map<string, ReviewRecord>();
-  for (const c of cases) records.set(c.id, await loadRecord(c, manifestPath, client));
-  const synthetic = new Set(
-    cases.filter((c) => c.bundle).map((c) => records.get(c.id)!.bundle.headSha),
-  );
-  const checkout = checkoutFor(synthetic);
+  if (mode === "replay" || mode === "all") {
+    const client = new S3Client({});
+    const records = new Map<string, ReviewRecord>();
+    for (const c of cases) records.set(c.id, await loadRecord(c, manifestPath, client));
+    const synthetic = new Set(
+      cases.filter((c) => c.bundle).map((c) => records.get(c.id)!.bundle.headSha),
+    );
+    const checkout = checkoutFor(synthetic);
 
-  const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: i + 1 })));
-  const results = new Map<string, Result>();
-  let next = 0;
-  const worker = async () => {
-    while (next < tasks.length) {
-      const { c, run } = tasks[next++];
-      const result = await replayCase(
-        records.get(c.id)!,
-        { workDir: join(workDir, `run-${run}`), variant },
-        undefined,
-        checkout,
-      );
-      results.set(`${c.id}/${run}`, result);
-      rmSync(join(workDir, `run-${run}`, c.id), { recursive: true, force: true });
-      mkdirSync(join(out, c.id), { recursive: true });
-      writeFileSync(join(out, c.id, `run-${run}.json`), JSON.stringify(result, null, 2));
-      console.error(`  ${c.id} run ${run}: ${scoreRun(c.expect, result).outcome}`);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+    const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: i + 1 })));
+    let next = 0;
+    const worker = async () => {
+      while (next < tasks.length) {
+        const { c, run } = tasks[next++];
+        const result = await replayCase(
+          records.get(c.id)!,
+          { workDir: join(workDir, `run-${run}`), variant },
+          undefined,
+          checkout,
+        );
+        rmSync(join(workDir, `run-${run}`, c.id), { recursive: true, force: true });
+        mkdirSync(join(out, c.id), { recursive: true });
+        writeFileSync(join(out, c.id, `run-${run}.json`), JSON.stringify(result, null, 2));
+        console.error(`  ${c.id} run ${run}: ${scoreRun(c.expect, result).outcome}`);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  }
 
-  const reports: CaseReport[] = cases.map((c) => {
-    const rs = Array.from({ length: runs }, (_, i) => results.get(`${c.id}/${i + 1}`)!);
-    return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
-  });
-  const report = renderExpectReport(reports, variant ?? results.values().next().value?.variant ?? "unknown");
-  writeFileSync(join(out, "report.md"), report);
-  console.log(report);
+  if (mode === "score" || mode === "all") {
+    const report = renderExpectReport(scoreDir(cases, out), variant ?? "unknown");
+    writeFileSync(join(out, "report.md"), report);
+    console.log(report);
+  }
 };
 
 if (require.main === module) {
