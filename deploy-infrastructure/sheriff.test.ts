@@ -810,6 +810,41 @@ describe("grant store", () => {
   });
 });
 
+describe("approval post claim", () => {
+  it("claims the post only once", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return {};
+    });
+    assert.equal(await store.claimRequestPost("req-1"), true);
+    assert.match(
+      String(captured?.input?.ConditionExpression),
+      /attribute_not_exists/,
+    );
+  });
+
+  it("reports a duplicate delivery as already claimed", async () => {
+    const store = fakeStore(async () => {
+      throw new ConditionalCheckFailedException({
+        message: "conditional",
+        $metadata: {},
+      });
+    });
+    assert.equal(await store.claimRequestPost("req-1"), false);
+  });
+
+  it("clears the claim after a failed post so a retry can post", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return {};
+    });
+    await store.releaseRequestPost("req-1");
+    assert.match(String(captured?.input?.UpdateExpression), /REMOVE/);
+  });
+});
+
 describe("resolveAdminsMembershipId", () => {
   it("finds the Admins membership on a later page", async () => {
     // A user in many groups can have their Admins membership past the first

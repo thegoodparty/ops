@@ -84,6 +84,7 @@ import {
 } from "./policy";
 import {
   beginActiveGrant,
+  claimRequestPost,
   decideRequest,
   getActiveGrant,
   getRequest,
@@ -92,6 +93,7 @@ import {
   putGrant,
   putRequest,
   releaseActiveGrant,
+  releaseRequestPost,
   setGrantState,
   setRequestMessageRef,
   setRequestState,
@@ -368,7 +370,11 @@ const handleViewSubmission = async (
     });
   } catch (err) {
     console.error("post-request invoke failed; posting inline", err);
-    await postApprovalMessage(slack, request, channel);
+    // Claim the post first: if the invoke actually succeeded and only its
+    // response was lost, the async path has the claim and this does not double
+    // post.
+    const claimed = await claimRequestPost(request.id);
+    if (claimed) await postApprovalMessage(slack, request, channel);
   }
 
   audit("request.created", {
@@ -385,7 +391,14 @@ const handleViewSubmission = async (
   return json({ response_action: "clear" });
 };
 
-/** The async half of a submission: the channel post and its message ref. */
+/**
+ * The async half of a submission: the channel post and its message ref.
+ *
+ * At-most-once: the async invocation is at-least-once, so a conditional claim
+ * stops a duplicate delivery from posting a second message with live buttons.
+ * A failed post clears the claim and rethrows, so Lambda's async retry can try
+ * again.
+ */
 const handlePostRequest = async (
   event: SheriffEvent,
   slack: WebClient,
@@ -394,9 +407,20 @@ const handlePostRequest = async (
   if (!requestId) return OK;
   const request = await getRequest(requestId);
   if (!request) return OK;
+  const claimed = await claimRequestPost(requestId);
+  if (!claimed) return OK;
   const channel =
     event.channel ?? process.env.APPROVAL_CHANNEL ?? DEFAULT_APPROVAL_CHANNEL;
-  await postApprovalMessage(slack, request, channel);
+  try {
+    await postApprovalMessage(slack, request, channel);
+  } catch (err) {
+    try {
+      await releaseRequestPost(requestId);
+    } catch (releaseErr) {
+      console.error("failed to clear the post claim", releaseErr);
+    }
+    throw err;
+  }
   return OK;
 };
 
@@ -532,9 +556,15 @@ const handleApprove = async (
   try {
     await putGrant(grant);
   } catch (err) {
-    // The grant record never landed, so release the lock. Once it exists the
-    // sweeper can reconcile it, and the lock stays claimed.
-    await releaseActiveGrant(request.requesterIdentityStoreId);
+    // The grant record never landed. Move the request back to `requested` so a
+    // retry can proceed (the sweeper only reconciles grant items, so a request
+    // stranded in `granting` with no grant record would be stuck), then release
+    // the lock in `finally`.
+    try {
+      await setRequestState(requestId, "requested", "granting");
+    } finally {
+      await releaseActiveGrant(request.requesterIdentityStoreId);
+    }
     throw err;
   }
 
@@ -1014,6 +1044,10 @@ export const handler = async (
     }
   } catch (err) {
     console.error("break-glass handler error", err);
+    // An async invocation only retries on a thrown error, timeout or crash;
+    // returning 500 would look like success and silently drop the work. The
+    // HTTP routes still answer 500.
+    if (isAsync) throw err;
     return { statusCode: 500, body: "internal error" };
   }
 };

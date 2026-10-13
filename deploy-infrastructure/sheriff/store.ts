@@ -346,6 +346,43 @@ export const createStore = (
     }
   };
 
+  /**
+   * Claims the one approval-message post for a request. The async
+   * `post-request` invocation is at-least-once, so this conditional write makes
+   * the post at-most-once: a duplicate delivery sees the claim and returns
+   * without posting a second message with live buttons.
+   */
+  const claimRequestPost = async (id: string): Promise<boolean> => {
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: requestPk(id), sk: RECORD_SK },
+          UpdateExpression: "SET #postClaimed = :true",
+          ConditionExpression: "attribute_not_exists(#postClaimed)",
+          ExpressionAttributeNames: { "#postClaimed": "postClaimed" },
+          ExpressionAttributeValues: { ":true": true },
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
+  };
+
+  /** Clears the post claim after a failed post, so an async retry can post. */
+  const releaseRequestPost = async (id: string): Promise<void> => {
+    await client.send(
+      new UpdateCommand({
+        TableName: tableName(),
+        Key: { pk: requestPk(id), sk: RECORD_SK },
+        UpdateExpression: "REMOVE #postClaimed",
+        ExpressionAttributeNames: { "#postClaimed": "postClaimed" },
+      }),
+    );
+  };
+
   /** Every grant record, for the sweeper. Paginated. */
   const listGrants = async (): Promise<GrantRecord[]> => {
     const grants: GrantRecord[] = [];
@@ -381,6 +418,8 @@ export const createStore = (
     putGrant,
     setGrantState,
     listGrants,
+    claimRequestPost,
+    releaseRequestPost,
   };
 };
 
@@ -399,4 +438,6 @@ export const {
   putGrant,
   setGrantState,
   listGrants,
+  claimRequestPost,
+  releaseRequestPost,
 } = store;
