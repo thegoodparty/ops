@@ -172,8 +172,9 @@ const main = async () => {
     }
 
     if (prCommentFile) {
-      const replayCost = resultsB.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
-      const replayFailures = resultsB.filter((r) => r.error).length;
+      const both = [...resultsA, ...resultsB];
+      const replayCost = both.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+      const replayFailures = both.filter((r) => r.error).length;
       const comment = renderPrComment(summary, verdicts, {
         labelA,
         labelB,

@@ -194,7 +194,7 @@ export const renderPrComment = (
   const money = (n: number | null) => (n === null ? "n/a" : `$${n.toFixed(2)}`);
   const judged = casesCount - unjudgedCount;
   const unjudgedNote = unjudgedCount ? `, ${unjudgedCount} not judged` : "";
-  const failureNote = replayFailures ? `, ${replayFailures} replay failure(s)` : "";
+  const failureNote = replayFailures ? `, ${replayFailures} replay failure(s) across both sides` : "";
 
   return [
     "<!-- delegate-eval -->",

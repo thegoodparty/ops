@@ -33,8 +33,16 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          suite=$(printf '%s' "$COMMENT_BODY" | head -n1 | sed -n 's/^delegate eval[[:space:]]*\([a-z0-9-]*\).*/\1/p')
-          echo "suite=${suite:-core}" >> "$GITHUB_OUTPUT"
+          rest=$(printf '%s' "$COMMENT_BODY" | head -n1 | tr -d '\r' | sed -e 's/^delegate eval//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          if [ -z "$rest" ]; then
+            suite=core
+          elif printf '%s' "$rest" | grep -qE '^[a-z0-9-]+$'; then
+            suite=$rest
+          else
+            echo "::error::Unrecognized trigger. Comment 'delegate eval' or 'delegate eval <suite>'."
+            exit 1
+          fi
+          echo "suite=${suite}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: React with eyes
