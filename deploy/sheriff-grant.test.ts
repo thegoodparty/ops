@@ -117,9 +117,12 @@ describe("sheriffGrantPolicy", () => {
 
   // The exact scope per action, from the accepted answer for this problem: the
   // user and membership ids do not exist at apply time, so those two are
-  // wildcards scoped to their type, and everything else is a literal. The two
-  // new actions name the identity store and the user; `IsMemberInGroups` also
-  // names the `Engineers` group it queries.
+  // wildcards scoped to their type, and everything else is a literal. Each
+  // statement names exactly the resource types the Service Authorization
+  // Reference marks required for its action: `IsMemberInGroups` and the two
+  // listing actions include the membership wildcard, `IsMemberInGroups` also
+  // names the `Engineers` group it queries, and the listing actions name only
+  // the `Admins` group (not both).
   it("scopes each action to the narrowest set that authorizes it", () => {
     const bySid = Object.fromEntries(
       statements.map((s) => [s.Sid, [...asList(s.Resource)].sort()]),
@@ -148,11 +151,34 @@ describe("sheriffGrantPolicy", () => {
     assert.deepEqual(bySid.ListGroupMemberships, [
       ADMINS_GROUP_ARN,
       IDENTITY_STORE_ARN,
+      MEMBERSHIP_ARN,
     ].sort());
     assert.deepEqual(bySid.ListMembershipsForMember, [
       IDENTITY_STORE_ARN,
       USER_ARN,
+      MEMBERSHIP_ARN,
     ].sort());
+  });
+
+  // Regression: the listing actions are evaluated against the group-membership
+  // resource, not the group or identity store the call names, so a policy that
+  // scopes them to the group and identity store alone is an AccessDenied at the
+  // first sweep. The Service Authorization Reference marks AllGroupMemberships
+  // as a required resource type for both `ListGroupMemberships` and
+  // `ListGroupMembershipsForMember`, so dropping the membership wildcard from
+  // either statement must fail here.
+  it("keeps the membership resource on both listing actions", () => {
+    const bySid = Object.fromEntries(
+      statements.map((s) => [s.Sid, asList(s.Resource)]),
+    );
+    assert.ok(
+      bySid.ListGroupMemberships.includes(MEMBERSHIP_ARN),
+      "ListGroupMemberships must name the membership resource",
+    );
+    assert.ok(
+      bySid.ListMembershipsForMember.includes(MEMBERSHIP_ARN),
+      "ListGroupMembershipsForMember must name the membership resource",
+    );
   });
 
   // The group id is a literal duplicated from identity-center.ts because step
