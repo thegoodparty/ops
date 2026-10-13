@@ -317,7 +317,7 @@ standing admin"; after that it is the original "no standing admin".
               │                  DynamoDB         EventBridge     CloudWatch Logs
               │                  requests,        sweep rule      structured audit
               │                  grants,          + Scheduler     + metric filters
-              │                  rate counters    (step 5)        + alarms
+              │                  rate counters    one-shot        + alarms
               │                                        │
               ▼                                        └── both call the same revoke
    #devs-only post  ◀── sts:AssumeRole ──▶ management account 333022194791
@@ -340,8 +340,9 @@ state:
 **Pulumi (the `infrastructure` stack) owns the runtime**, in
 `deploy-infrastructure/`: the new break-glass Lambda and its execution role, its
 own Slack secret in Secrets Manager, the DynamoDB table, the step-4 EventBridge
-sweep rule, the log group, metric filters and the orphaned-membership alarm
-(step 5 adds the Scheduler one-shot). The Lambda's role
+sweep rule, the step-5 Scheduler one-shot with its schedule group, DLQ and
+schedule-execution role, the log group, metric filters and the
+orphaned-membership alarm. The Lambda's role
 gets `sts:AssumeRole` on exactly one ARN (`sheriff-grant`), plus DynamoDB,
 logs, scheduler and its own secret, and nothing else. It is still under the
 `Infrastructure` SCP.
@@ -400,15 +401,15 @@ code, changed only by a reviewed PR.
    resolves the existing `MembershipId` with `ListGroupMembershipsForMember` and
    continues; any other error sends the request to `failed`. It then flips the
    record to `granted` with the `membershipId` and posts the SSO portal link and
-   the expiry, with the session caveat, to the channel and to the requester. In
-   step 4 the periodic sweeper is the revoke path; step 5 adds the one-shot
-   scheduler on top of it.
+   the expiry, with the session caveat, to the channel and to the requester. The
+   one-shot scheduler created with the grant is the revoke path; the periodic
+   sweeper is the backstop.
 7. At expiry, the revocation path calls `DeleteGroupMembership` with the
    grant's `MembershipId`, unconditionally. A `ResourceNotFoundException` means
    the membership is already gone, so it is treated as success; either way the
-   grant is written `revoked`. Step 5 fires this from an EventBridge Scheduler
-   one-shot with retries and a DLQ; until then, and as the backstop afterwards,
-   the step-4 sweeper does it on its next pass.
+   grant is written `revoked`. The one-shot fires this from an EventBridge
+   Scheduler schedule with retries and a DLQ; the sweeper does it on its next
+   pass as the backstop.
 
 ### States
 
@@ -446,7 +447,7 @@ DynamoDB is a single table: request items, grant items, per-user active-grant
 locks and per-user rate counters. The grant item carries a **`state`**
 (`granting`, `granted`, `revoked` or `failed`), the request id, the group id
 (`Admins`, which implies all three accounts), the requester, the approver, the
-granted-at and expires-at timestamps, and (from step 5) the scheduler's
+granted-at and expires-at timestamps, and the scheduler's
 schedule name. It also carries **`membershipId`**, the opaque
 membership id `DeleteGroupMembership` requires, which is absent while the record
 is `granting` and set to the value returned by `CreateGroupMembership` (or
@@ -646,11 +647,12 @@ tool's own records are structured for export and retention from day one.
 
 ## Reliability invariants
 
-- **Never leave a grant open.** Step 4 has one mechanism, a periodic
-  reconciliation sweeper; step 5 adds the EventBridge Scheduler one-shot at the
-  exact expiry, with retries and a dead-letter queue, as the normal path. Until
-  then the sweeper **is** the revoke path: every expired grant is revoked on its
-  next pass. The sweeper reconciles the tool's own grant records, in both the
+- **Never leave a grant open.** Step 5 has two mechanisms. The EventBridge
+  Scheduler one-shot at the exact expiry, with retries and a dead-letter queue,
+  is the normal path; the periodic reconciliation sweeper is the backstop, so
+  if the schedule fails or the grant path stopped partway, every expired grant
+  is still revoked on the sweeper's next pass. The sweeper reconciles the tool's
+  own grant records, in both the
   `granting` and `granted` states, against the group's current memberships. For
   a `granting` record it must resolve the membership before it can act, because
   the record has no stored `membershipId`: it calls
@@ -665,9 +667,8 @@ tool's own records are structured for export and retention from day one.
   and the alarm. An active `granted` record is left alone. A membership with
   **no grant record at all** is left alone and logged informationally; the
   sweeper never removes it, because that is the only shape a pre-existing
-  standing member can take. Once step 5 lands, the scheduler is the normal path
-  and the sweeper is what catches a failed schedule or a grant path that stopped
-  partway.
+  standing member can take. The scheduler is the normal path and the sweeper is
+  what catches a failed schedule or a grant path that stopped partway.
 - **The grant record exists before the membership can.** The grant path writes a
   `granting` record first, then calls `CreateGroupMembership`, then flips the
   record to `granted`. If the Lambda dies between the call and the flip, the
@@ -690,8 +691,9 @@ tool's own records are structured for export and retention from day one.
   revoke handler first resolves it with `ListGroupMembershipsForMember`, and a
   missing membership is the already-gone case. If `DeleteGroupMembership`
   throws `ResourceNotFoundException` because the membership is already gone, the
-  handler treats that as success and marks the grant revoked. The sweeper (and,
-  from step 5, the scheduler) uses this path, so a double revoke is harmless.
+  handler treats that as success and marks the grant revoked. The sweeper and
+  the scheduler both use this path, so a double revoke is harmless; the revoke
+  post is claimed with a conditional write, so exactly one revoker posts.
 - **Fail closed on grant, not on revoke.** If the approval checks fail, or
   `CreateGroupMembership` fails with anything other than the `ConflictException`
   that means "already a member", no access is granted and the request goes to
