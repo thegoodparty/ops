@@ -6,22 +6,21 @@ import {
 import type { PolicyDocument } from "./identity-center/policies";
 
 // The management-account role the break-glass Lambda (infrastructure account,
-// step 3 of `docs/sheriff.md`) assumes to toggle membership in the one
-// `Admins` Identity Store group. It is the crown jewels of the plan: the
-// Lambda's own role gets `sts:AssumeRole` on this ARN and nothing else in the
-// management account, and this role's inline policy is what keeps "the tool
-// can only toggle membership in the one Admins group" true.
+// step 4 of `docs/sheriff.md`) assumes to resolve a requester and toggle
+// membership in the one `Admins` Identity Store group. It is the crown jewels
+// of the plan: the Lambda's own role gets `sts:AssumeRole` on this ARN and
+// nothing else in the management account, and this role's inline policy is what
+// keeps "the tool can only touch the directory it names" true.
 //
-// Definitions only in step 2: nothing assumes this role yet, and the
-// `aws:PrincipalArn` it trusts names a role that does not exist until step 3.
-// That is why the trust is the account root plus a condition, the
-// `delegate-swarm-prod-read` pattern: IAM rejects a trust that names a role
-// that does not exist yet.
+// The `aws:PrincipalArn` it trusts names a role that did not exist when this
+// was first written, which is why the trust is the account root plus a
+// condition, the `delegate-swarm-prod-read` pattern: IAM rejects a trust that
+// names a role that does not exist yet.
 
-// The sheriff Lambda execution role in the infrastructure account. Step 3
-// creates it under exactly this name; the trust below is the seam, and the two
-// names must stay in lockstep or step 4's first AssumeRole is an AccessDenied,
-// not an apply-time error.
+// The sheriff Lambda execution role in the infrastructure account. It is
+// created under exactly this name; the trust below is the seam, and the two
+// names must stay in lockstep or the first AssumeRole is an AccessDenied, not
+// an apply-time error.
 const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/sheriff`;
 
 // The `Admins` group id, mirrored from `deploy/components/identity-center.ts`.
@@ -31,6 +30,14 @@ const GRANTEE_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/sheriff
 // `deploy/sheriff-grant.test.ts` pins by reading that file's literal.
 const GROUP_ARN =
   "arn:aws:identitystore:::group/88c1b330-a001-707a-06ca-94e289013bf5";
+
+// The `Engineers` group id, mirrored from
+// `deploy-infrastructure/sheriff/config.ts`. The requester gate checks
+// membership in this group, so `IsMemberInGroups` names it. A literal for the
+// same reason as the `Admins` id above: it is a stable Identity Center id and
+// there is no Pulumi resource to reference.
+const ENGINEERS_GROUP_ARN =
+  "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378";
 
 // `DeleteGroupMembership` takes a `MembershipId` that does not exist when the
 // policy is written, so the membership resource has to be a wildcard. It is
@@ -60,7 +67,7 @@ export const sheriffGrantTrust = {
   ],
 };
 
-// Four actions, each the narrowest resource list that authorizes the call.
+// Six actions, each the narrowest resource list that authorizes the call.
 //
 // `identitystore:CreateGroupMembership` is the grant and
 // `identitystore:DeleteGroupMembership` is the revoke.
@@ -69,34 +76,62 @@ export const sheriffGrantTrust = {
 // a pre-existing member when `CreateGroupMembership` returns
 // `ConflictException`, and of a `granting` record the sweeper recovers.
 //
+// `identitystore:GetUserId` resolves the requester from their Slack email
+// (open question 3, settled by the engineer in favour of email mapping), and
+// `identitystore:IsMemberInGroups` is the `Engineers` gate. Both were absent in
+// step 3, when the requester mapping was a maintained table and the tool did no
+// directory read at all; the policy is no longer "unchanged from step 2".
+//
 // Deliberately absent, per "The tool's own privilege" in `docs/sheriff.md`:
 // every `sso:*`, `sso-directory:*` and `sso-oauth:*` action (the
 // `adminReservedActions` note records that `sso-directory` carries its own
 // `AddMemberToGroup`, a second path to the same directory mutation), plus
 // `identitystore:DescribeGroup`, `identitystore:ListUsers` and
 // `identitystore:DescribeUser`. No described operation reads group or user
-// metadata: the `Admins` group id is a static literal, so there is no runtime
+// metadata: the group ids are static literals, so there is no runtime
 // group-existence check, and `ListUsers` would enumerate the whole identity
-// store, which the plan's rule does not allow. `identitystore:GetUserId` is
-// also absent until open question 3 settles whether the requester mapping is a
-// maintained table or an API lookup.
+// store, which the plan's rule does not allow.
 //
-// Two of the four resource forms are wildcards and they are unavoidable: the
+// Two of the resource forms are wildcards and they are unavoidable: the
 // requester's user id and the returned membership id do not exist when the
 // policy is written, so a policy that named them would deny the tool's own
 // calls. The accepted answer for this exact problem (AWS re:Post, "How to
 // limit access to specific Identity Center groups") lists all four resource
 // forms for that reason. This is the doc's "names the one group and the one
-// identity store, not `*`" applied as narrowly as the API allows: the group
+// identity store, not `*`" applied as narrowly as the API allows: the groups
 // and identity store are literals, and the user and membership wildcards are
 // scoped to their resource types rather than left as `*`.
 //
 // The actions are split one per statement so each statement's `Resource` list
 // contains only types the action supports: `ListGroupMembershipsForMember` has
-// no Group resource type, so it cannot name the group ARN.
+// no Group resource type, so it cannot name the group ARN, and `GetUserId` has
+// no Group resource type either, so it names only the identity store and the
+// user.
 export const sheriffGrantPolicy: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
+    {
+      Sid: "ResolveRequester",
+      Effect: "Allow",
+      // GetUserId supports the Identitystore and User resource types; the
+      // looked-up user is the dynamic one, hence the wildcard.
+      Action: ["identitystore:GetUserId"],
+      Resource: [IDENTITY_STORE_ARN, USER_ARN],
+    },
+    {
+      Sid: "RequesterIsEngineer",
+      Effect: "Allow",
+      // IsMemberInGroups supports Group, GroupMembership, Identitystore and
+      // User. Only the `Engineers` group is ever queried, so the group ARN is
+      // that one, not `Admins`.
+      Action: ["identitystore:IsMemberInGroups"],
+      Resource: [
+        ENGINEERS_GROUP_ARN,
+        IDENTITY_STORE_ARN,
+        USER_ARN,
+        MEMBERSHIP_ARN,
+      ],
+    },
     {
       Sid: "GrantMembership",
       Effect: "Allow",

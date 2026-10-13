@@ -1,5 +1,6 @@
 /**
- * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/sheriff.md`.
+ * The break-glass Lambda, step 4 ("approval wired to a real grant") of
+ * `docs/sheriff.md`.
  *
  * A separate Slack app and a separate function from the delegate webhook. The
  * plan is explicit about why: every delegate worker holds `DELEGATES` while
@@ -14,12 +15,15 @@
  * Routes, both on the one Function URL:
  *
  *   POST /breakglass     the slash command; opens the modal.
- *   POST /interactivity  `view_submission` (write the request, post to the
- *                        channel) and `block_actions` (Approve/Deny).
+ *   POST /interactivity  `view_submission` (resolve the requester, gate on
+ *                        `Engineers`, write the request, post to the channel)
+ *                        and `block_actions` (Approve/Deny).
  *
- * Step 3 stops at the decision: it writes `approved` or `denied` and posts the
- * result, but it never calls `CreateGroupMembership` and never writes a
- * `granting`/`granted` record. Every surface says so.
+ * The same function is invoked by the sweeper's EventBridge rule with a
+ * `{ action: "sweep" }` event; that path assumes `sheriff-grant`, reconciles the
+ * group against the tool's grant records, and returns. It does not read Slack
+ * secrets and does not verify a Slack signature, because it is not a Slack
+ * request.
  */
 import { WebClient } from "@slack/web-api";
 import type { Block, KnownBlock } from "@slack/types";
@@ -35,29 +39,48 @@ import {
   buildRequestModal,
 } from "./blocks";
 import {
+  ADMINS_GROUP_ID,
   DEFAULT_APPROVAL_CHANNEL,
   MAX_REQUESTS_PER_DAY,
   RATE_TTL_SECONDS,
   REQUEST_TTL_SECONDS,
-  SLACK_TO_IDENTITY_STORE_USER_ID,
 } from "./config";
+import {
+  assumeGrantRole,
+  createAdminsMembership,
+  deleteAdminsMembership,
+  isEngineersMember,
+  listAdminsMemberships,
+  lookupIdentityStoreUserId,
+} from "./identity";
 import {
   decodeSlackPayload,
   durationSecondsFor,
+  eligibilityErrorMessage,
   evaluateDecision,
+  evaluateEligibility,
+  grantExpiresAt,
   isHttpUrl,
   newRequestId,
   rateLimitExceeded,
+  reconcileSweep,
   utcDate,
   type Decision,
+  type GrantRecord,
   type RequestRecord,
 } from "./policy";
 import {
+  beginActiveGrant,
   decideRequest,
   getRequest,
   incrementRateCount,
+  listGrants,
+  putGrant,
   putRequest,
+  releaseActiveGrant,
+  setGrantState,
   setRequestMessageRef,
+  setRequestState,
 } from "./store";
 
 type FunctionUrlEvent = {
@@ -66,6 +89,9 @@ type FunctionUrlEvent = {
   isBase64Encoded?: boolean;
   headers?: Record<string, string>;
 };
+
+/** The EventBridge sweep invocation shares the function but not the shape. */
+type SheriffEvent = FunctionUrlEvent & { action?: string };
 
 type LambdaResponse = {
   statusCode: number;
@@ -178,6 +204,10 @@ const handleSlashCommand = async (
   return OK;
 };
 
+/** A `view_submission` error, keyed to `reason_block` (the modal's only block). */
+const submissionError = (message: string): LambdaResponse =>
+  json({ response_action: "errors", errors: { reason_block: message } });
+
 const handleViewSubmission = async (
   payload: Record<string, unknown>,
   slack: WebClient,
@@ -185,25 +215,7 @@ const handleViewSubmission = async (
   const user = asRecord(payload.user);
   const requesterSlackId = stringField(user, "id");
   if (!requesterSlackId) {
-    return json({
-      response_action: "errors",
-      errors: { reason_block: "Could not identify the requesting Slack user." },
-    });
-  }
-
-  // Open question 3, settled: a hardcoded Slack -> Identity Store map. A
-  // requester not in it cannot be granted anything in step 4, so the dry flow
-  // rejects the submission now rather than recording an unmappable request.
-  const requesterIdentityStoreId =
-    SLACK_TO_IDENTITY_STORE_USER_ID[requesterSlackId];
-  if (!requesterIdentityStoreId) {
-    return json({
-      response_action: "errors",
-      errors: {
-        reason_block:
-          "Your Slack account is not mapped to an Identity Store user. Ask an engineer to add you to the break-glass map.",
-      },
-    });
+    return submissionError("Could not identify the requesting Slack user.");
   }
 
   const parsed = readSubmittedValues(payload);
@@ -219,6 +231,41 @@ const handleViewSubmission = async (
     });
   }
 
+  // Step 4's request-time gate: the requester's Slack email resolves to an
+  // Identity Store user, and that user must be in `Engineers`. Each miss gets
+  // its own actionable message. The Identity Store calls go through the
+  // `sheriff-grant` role; the Lambda's own role holds no `identitystore`
+  // action.
+  let slackEmail: string | undefined;
+  try {
+    const info = await slack.users.info({ user: requesterSlackId });
+    slackEmail = info.user?.profile?.email ?? undefined;
+  } catch (err) {
+    console.error("users.info failed", err);
+  }
+
+  let identityStoreUserId: string | undefined;
+  let engineersMember: boolean | undefined;
+  if (slackEmail) {
+    const client = await assumeGrantRole();
+    identityStoreUserId =
+      (await lookupIdentityStoreUserId(client, slackEmail)) ?? undefined;
+    if (identityStoreUserId) {
+      engineersMember = await isEngineersMember(client, identityStoreUserId);
+    }
+  }
+
+  const eligibility = evaluateEligibility({
+    slackEmail,
+    identityStoreUserId,
+    isEngineersMember: engineersMember,
+  });
+  if (!eligibility.ok) {
+    return submissionError(
+      eligibilityErrorMessage(eligibility.failure, eligibility.email),
+    );
+  }
+
   const today = utcDate();
   const count = await incrementRateCount(
     requesterSlackId,
@@ -226,25 +273,22 @@ const handleViewSubmission = async (
     RATE_TTL_SECONDS,
   );
   if (rateLimitExceeded(count)) {
-    return json({
-      response_action: "errors",
-      errors: {
-        reason_block: `Rate limit reached: at most ${MAX_REQUESTS_PER_DAY} break-glass requests per user per day.`,
-      },
-    });
+    return submissionError(
+      `Rate limit reached: at most ${MAX_REQUESTS_PER_DAY} break-glass requests per user per day.`,
+    );
   }
 
   const request: RequestRecord = {
     id: newRequestId(),
     state: "requested",
     requesterSlackId,
-    requesterIdentityStoreId,
+    requesterIdentityStoreId: eligibility.identityStoreUserId,
+    requesterEmail: eligibility.email,
     reason: reason!,
     ticket: ticket!,
     durationValue: durationValue!,
     durationSeconds,
     createdAt: new Date().toISOString(),
-    dryRun: true,
     ttl: Math.floor(Date.now() / 1000) + REQUEST_TTL_SECONDS,
   };
 
@@ -263,11 +307,209 @@ const handleViewSubmission = async (
   audit("request.created", {
     requestId: request.id,
     requester: requesterSlackId,
+    requesterEmail: request.requesterEmail,
+    identityStoreUserId: request.requesterIdentityStoreId,
     durationSeconds,
-    dryRun: true,
+    reason: request.reason,
+    ticket: request.ticket,
+    createdAt: request.createdAt,
   });
 
   return json({ response_action: "clear" });
+};
+
+/** Replaces the original post's buttons with the decided copy. */
+const updateDecidedMessage = async (
+  slack: WebClient,
+  args: {
+    channel: string;
+    messageTs: string | undefined;
+    request: RequestRecord;
+    decision: Decision;
+    decidedBy: string;
+    grant?: GrantRecord;
+  },
+): Promise<void> => {
+  if (!args.messageTs) return;
+  await slack.chat.update({
+    channel: args.channel,
+    ts: args.messageTs,
+    text: `Break-glass request ${args.decision}`,
+    blocks: buildDecidedBlocks(
+      args.request,
+      args.decision,
+      args.decidedBy,
+      args.grant,
+    ) as unknown as MessageBlocks,
+  });
+};
+
+/**
+ * The real grant path. The caller has already passed `evaluateDecision`.
+ *
+ * Order is load-bearing: the at-most-one active-grant lock is claimed first,
+ * then the request is moved to `granting`, then the grant record is written in
+ * `granting`, and only then is `CreateGroupMembership` called. The record
+ * exists before the membership can, so a crash between the two is reconciled by
+ * the sweeper rather than stranding an unrecorded membership.
+ */
+const handleApprove = async (
+  args: {
+    request: RequestRecord;
+    requestId: string;
+    approverSlackId: string;
+    channel: string;
+    messageTs: string | undefined;
+  },
+  slack: WebClient,
+): Promise<LambdaResponse> => {
+  const { request, requestId, approverSlackId, channel, messageTs } = args;
+  const ephemeral = (text: string) =>
+    slack.chat.postEphemeral({ channel, user: approverSlackId, text });
+
+  // Race-safe at-most-one-active-grant guard. A read-then-write would let two
+  // concurrent approvals both pass; this is a conditional write, so it cannot.
+  const claimed = await beginActiveGrant(
+    request.requesterIdentityStoreId,
+    requestId,
+  );
+  if (!claimed) {
+    await ephemeral(
+      "A grant for this user is already active. Revoke it or wait for it to expire before approving another request.",
+    );
+    return OK;
+  }
+
+  const decidedAt = new Date().toISOString();
+  const decided = await decideRequest({
+    id: requestId,
+    decision: "approved",
+    approverSlackId,
+    decidedAt,
+  });
+  if (!decided) {
+    await releaseActiveGrant(request.requesterIdentityStoreId);
+    await ephemeral("That request was already decided.");
+    return OK;
+  }
+
+  audit("request.approved", {
+    requestId,
+    requester: request.requesterSlackId,
+    requesterEmail: request.requesterEmail,
+    approver: approverSlackId,
+    group: ADMINS_GROUP_ID,
+    reason: request.reason,
+    ticket: request.ticket,
+    durationSeconds: request.durationSeconds,
+    decidedAt,
+  });
+
+  const grantedAt = new Date().toISOString();
+  const grant: GrantRecord = {
+    requestId,
+    state: "granting",
+    requesterSlackId: request.requesterSlackId,
+    requesterIdentityStoreId: request.requesterIdentityStoreId,
+    requesterEmail: request.requesterEmail,
+    approverSlackId,
+    groupId: ADMINS_GROUP_ID,
+    reason: request.reason,
+    ticket: request.ticket,
+    durationSeconds: request.durationSeconds,
+    grantedAt,
+    expiresAt: grantExpiresAt(grantedAt, request.durationSeconds),
+    ttl: Math.floor(Date.now() / 1000) + REQUEST_TTL_SECONDS,
+  };
+  await putGrant(grant);
+
+  let membershipId: string;
+  try {
+    const client = await assumeGrantRole();
+    membershipId = await createAdminsMembership(
+      client,
+      request.requesterIdentityStoreId,
+    );
+  } catch (err) {
+    console.error("break-glass grant failed", err);
+    const failedGrant: GrantRecord = { ...grant, state: "failed" };
+    await setGrantState({ requestId, state: "failed" });
+    await setRequestState(requestId, "failed");
+    await releaseActiveGrant(request.requesterIdentityStoreId);
+    await updateDecidedMessage(slack, {
+      channel,
+      messageTs,
+      request,
+      decision: "approved",
+      decidedBy: approverSlackId,
+      grant: failedGrant,
+    });
+    await slack.chat.postMessage({
+      channel,
+      ...(messageTs ? { thread_ts: messageTs } : {}),
+      text: buildDecisionOutcomeText(
+        request,
+        "approved",
+        approverSlackId,
+        failedGrant,
+      ),
+    });
+    audit("grant.failed", {
+      requestId,
+      requester: request.requesterSlackId,
+      requesterEmail: request.requesterEmail,
+      approver: approverSlackId,
+      group: ADMINS_GROUP_ID,
+      reason: request.reason,
+      ticket: request.ticket,
+      grantedAt,
+      expiresAt: grant.expiresAt,
+    });
+    return OK;
+  }
+
+  const grantedGrant: GrantRecord = {
+    ...grant,
+    state: "granted",
+    membershipId,
+  };
+  await setGrantState({ requestId, state: "granted", membershipId });
+  await setRequestState(requestId, "granted");
+  await updateDecidedMessage(slack, {
+    channel,
+    messageTs,
+    request,
+    decision: "approved",
+    decidedBy: approverSlackId,
+    grant: grantedGrant,
+  });
+  await slack.chat.postMessage({
+    channel,
+    ...(messageTs ? { thread_ts: messageTs } : {}),
+    text: buildDecisionOutcomeText(
+      request,
+      "approved",
+      approverSlackId,
+      grantedGrant,
+    ),
+  });
+
+  // Informational, not paging: the durable record of the grant. The loud alarm
+  // is on `membership.orphaned`.
+  audit("grant.created", {
+    requestId,
+    requester: request.requesterSlackId,
+    requesterEmail: request.requesterEmail,
+    approver: approverSlackId,
+    group: ADMINS_GROUP_ID,
+    membershipId,
+    reason: request.reason,
+    ticket: request.ticket,
+    grantedAt,
+    expiresAt: grant.expiresAt,
+  });
+
+  return OK;
 };
 
 const handleBlockActions = async (
@@ -305,8 +547,7 @@ const handleBlockActions = async (
   // would be a false positive: the counter deliberately keeps counting past
   // the cap so a burst is visible, and a single rejected over-cap submission
   // would otherwise block approval of every valid request the user queued that
-  // day. Step 4's decision-time guard is the at-most-one-active-grant rule,
-  // not this counter.
+  // day. The decision-time guard is the at-most-one-active-grant rule.
 
   const decision: Decision | null =
     actionId === APPROVE_ACTION_ID
@@ -316,10 +557,17 @@ const handleBlockActions = async (
         : null;
   if (!decision) return OK;
 
+  if (decision === "approved") {
+    return handleApprove(
+      { request, requestId, approverSlackId: clickerSlackId, channel, messageTs },
+      slack,
+    );
+  }
+
   const decidedAt = new Date().toISOString();
   const decided = await decideRequest({
     id: requestId,
-    decision,
+    decision: "denied",
     approverSlackId: clickerSlackId,
     decidedAt,
   });
@@ -330,36 +578,31 @@ const handleBlockActions = async (
 
   const decidedRequest: RequestRecord = {
     ...request,
-    state: decision,
+    state: "denied",
     approverSlackId: clickerSlackId,
     decidedAt,
-    dryRun: true,
   };
-
-  if (messageTs) {
-    await slack.chat.update({
-      channel,
-      ts: messageTs,
-      text: `Break-glass request ${decision}`,
-      blocks: buildDecidedBlocks(
-        decidedRequest,
-        decision,
-        clickerSlackId,
-      ) as unknown as MessageBlocks,
-    });
-  }
+  await updateDecidedMessage(slack, {
+    channel,
+    messageTs,
+    request: decidedRequest,
+    decision: "denied",
+    decidedBy: clickerSlackId,
+  });
   await slack.chat.postMessage({
     channel,
     ...(messageTs ? { thread_ts: messageTs } : {}),
-    text: buildDecisionOutcomeText(decidedRequest, decision, clickerSlackId),
+    text: buildDecisionOutcomeText(decidedRequest, "denied", clickerSlackId),
   });
 
-  audit(`request.${decision}`, {
+  audit("request.denied", {
     requestId,
     requester: request.requesterSlackId,
+    requesterEmail: request.requesterEmail,
     approver: clickerSlackId,
-    durationSeconds: request.durationSeconds,
-    dryRun: true,
+    reason: request.reason,
+    ticket: request.ticket,
+    decidedAt,
   });
 
   return OK;
@@ -382,9 +625,144 @@ const handleInteractivity = async (
   }
 };
 
+/**
+ * The reconciliation sweeper, invoked by the EventBridge rule with
+ * `{ action: "sweep" }`.
+ *
+ * Step 4 has no one-shot scheduler (that is step 5), so this is the revoke
+ * path: every expired grant is revoked here. It scans `Admins` and the tool's
+ * grant records, and:
+ *
+ * - a `granting` record with no member is `failed`, no alarm;
+ * - a `granting` record with a member gets its `membershipId` backfilled and is
+ *   flipped to `granted` (and revoked if already expired);
+ * - an expired `granted` record is revoked and marked `revoked`;
+ * - a member with no active grant record is left alone and logged
+ *   `membership.unmanaged` informationally, because that is the only shape a
+ *   pre-existing standing member can take;
+ * - only a revoke that fails for an expired grant is `membership.orphaned` and
+ *   pages.
+ */
+export const handleSweep = async (): Promise<LambdaResponse> => {
+  const client = await assumeGrantRole();
+  const [memberships, grants] = await Promise.all([
+    listAdminsMemberships(client),
+    listGrants(),
+  ]);
+
+  const plan = reconcileSweep({
+    now: Date.now(),
+    grants,
+    memberships,
+  });
+
+  for (const grant of plan.failed) {
+    await setGrantState({ requestId: grant.requestId, state: "failed" });
+    await setRequestState(grant.requestId, "failed");
+    await releaseActiveGrant(grant.requesterIdentityStoreId);
+    audit("grant.failed", {
+      requestId: grant.requestId,
+      requester: grant.requesterSlackId,
+      requesterEmail: grant.requesterEmail,
+      approver: grant.approverSlackId,
+      group: grant.groupId,
+      reason: grant.reason,
+      ticket: grant.ticket,
+      grantedAt: grant.grantedAt,
+      expiresAt: grant.expiresAt,
+      source: "sweep",
+    });
+  }
+
+  for (const { grant, membershipId } of plan.granted) {
+    await setGrantState({
+      requestId: grant.requestId,
+      state: "granted",
+      membershipId,
+    });
+    await setRequestState(grant.requestId, "granted");
+    audit("grant.created", {
+      requestId: grant.requestId,
+      requester: grant.requesterSlackId,
+      requesterEmail: grant.requesterEmail,
+      approver: grant.approverSlackId,
+      group: grant.groupId,
+      membershipId,
+      reason: grant.reason,
+      ticket: grant.ticket,
+      grantedAt: grant.grantedAt,
+      expiresAt: grant.expiresAt,
+      recovered: true,
+      source: "sweep",
+    });
+  }
+
+  for (const { grant, membershipId } of plan.revoke) {
+    try {
+      await deleteAdminsMembership(client, membershipId);
+      await setGrantState({
+        requestId: grant.requestId,
+        state: "revoked",
+        membershipId,
+      });
+      await setRequestState(grant.requestId, "revoked");
+      await releaseActiveGrant(grant.requesterIdentityStoreId);
+      audit("grant.revoked", {
+        requestId: grant.requestId,
+        requester: grant.requesterSlackId,
+        requesterEmail: grant.requesterEmail,
+        approver: grant.approverSlackId,
+        group: grant.groupId,
+        membershipId,
+        reason: grant.reason,
+        ticket: grant.ticket,
+        grantedAt: grant.grantedAt,
+        expiresAt: grant.expiresAt,
+        source: "sweep",
+      });
+    } catch (err) {
+      // The revoke failed or the state is stuck: this is the orphan the alarm
+      // exists for. A normal sweep-and-revoke never reaches here.
+      console.error("break-glass revoke failed", err);
+      audit("membership.orphaned", {
+        requestId: grant.requestId,
+        requester: grant.requesterSlackId,
+        requesterEmail: grant.requesterEmail,
+        approver: grant.approverSlackId,
+        group: grant.groupId,
+        membershipId,
+        reason: grant.reason,
+        ticket: grant.ticket,
+        grantedAt: grant.grantedAt,
+        expiresAt: grant.expiresAt,
+        source: "sweep",
+      });
+    }
+  }
+
+  for (const member of plan.unmanaged) {
+    // Informational only: a pre-existing `Admins` member has no grant record,
+    // and the sweeper never removes a membership it did not grant.
+    audit("membership.unmanaged", {
+      userId: member.userId,
+      membershipId: member.membershipId,
+      group: ADMINS_GROUP_ID,
+      source: "sweep",
+    });
+  }
+
+  return OK;
+};
+
 export const handler = async (
-  event: FunctionUrlEvent,
+  event: SheriffEvent,
 ): Promise<LambdaResponse> => {
+  // The EventBridge sweep invocation is not a Slack request: no signature, no
+  // secret, no Slack client.
+  if (event.action === "sweep") {
+    return handleSweep();
+  }
+
   const body = event.isBase64Encoded
     ? Buffer.from(event.body ?? "", "base64").toString("utf8")
     : (event.body ?? "");

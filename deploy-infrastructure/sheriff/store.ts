@@ -1,9 +1,15 @@
 /**
- * DynamoDB access for the break-glass dry run, single table.
+ * DynamoDB access for the break-glass tool, single table.
  *
- * Step 3 writes request records and per-user rate counters only. Grant items
- * (the `granting`/`granted` records with a `membershipId`) arrive in step 4;
- * the key prefixes here leave room for them without a migration.
+ * Request items, grant items, per-user active-grant locks and per-user rate
+ * counters share the table. Grants live under a fixed partition (`GRANT`) so
+ * the sweeper can `Query` them all; the active-grant lock is a per-requester
+ * item whose conditional write is the race-safe "at most one active grant"
+ * guard.
+ *
+ * The client is injected so the tests can drive the conditional write and the
+ * key shapes with a fake, the same `createStore` pattern
+ * `delegate/review/store.ts` uses.
  */
 import {
   ConditionalCheckFailedException,
@@ -13,15 +19,22 @@ import {
   DynamoDBDocumentClient,
   GetCommand,
   PutCommand,
+  QueryCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 
 import {
+  activePk,
+  GRANT_PK,
+  grantSk,
   ratePk,
   RECORD_SK,
   requestPk,
   type Decision,
+  type GrantRecord,
+  type GrantState,
   type RequestRecord,
+  type RequestState,
 } from "./policy";
 
 const documentClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -32,112 +45,304 @@ const tableName = (): string => {
   return name;
 };
 
-export const putRequest = async (request: RequestRecord): Promise<void> => {
-  await documentClient.send(
-    new PutCommand({
-      TableName: tableName(),
-      Item: { pk: requestPk(request.id), sk: RECORD_SK, ...request },
-      // A request id is a fresh UUID; a collision means a bug, not a retry.
-      ConditionExpression: "attribute_not_exists(pk)",
-    }),
-  );
-};
+export const createStore = (
+  client: DynamoDBDocumentClient = documentClient,
+) => {
+  const putRequest = async (request: RequestRecord): Promise<void> => {
+    await client.send(
+      new PutCommand({
+        TableName: tableName(),
+        Item: { pk: requestPk(request.id), sk: RECORD_SK, ...request },
+        // A request id is a fresh UUID; a collision means a bug, not a retry.
+        ConditionExpression: "attribute_not_exists(pk)",
+      }),
+    );
+  };
 
-export const getRequest = async (
-  id: string,
-): Promise<RequestRecord | null> => {
-  const result = await documentClient.send(
-    new GetCommand({
-      TableName: tableName(),
-      Key: { pk: requestPk(id), sk: RECORD_SK },
-    }),
-  );
-  if (!result.Item) return null;
-  const { pk: _pk, sk: _sk, ...request } = result.Item;
-  return request as RequestRecord;
-};
+  const getRequest = async (id: string): Promise<RequestRecord | null> => {
+    const result = await client.send(
+      new GetCommand({
+        TableName: tableName(),
+        Key: { pk: requestPk(id), sk: RECORD_SK },
+      }),
+    );
+    if (!result.Item) return null;
+    const { pk: _pk, sk: _sk, ...request } = result.Item;
+    return request as RequestRecord;
+  };
 
-/** Stamped after the approval post so a decision can update that message. */
-export const setRequestMessageRef = async (
-  id: string,
-  channel: string,
-  messageTs: string,
-): Promise<void> => {
-  await documentClient.send(
-    new UpdateCommand({
-      TableName: tableName(),
-      Key: { pk: requestPk(id), sk: RECORD_SK },
-      UpdateExpression: "SET #channel = :channel, #messageTs = :messageTs",
-      ExpressionAttributeNames: {
-        "#channel": "channel",
-        "#messageTs": "messageTs",
-      },
-      ExpressionAttributeValues: {
-        ":channel": channel,
-        ":messageTs": messageTs,
-      },
-    }),
-  );
-};
-
-/**
- * Records the decision with a conditional write on `state = requested`, so two
- * concurrent clicks cannot both decide. Returns false when the condition
- * failed, which the caller reports as "already decided".
- */
-export const decideRequest = async (args: {
-  id: string;
-  decision: Decision;
-  approverSlackId: string;
-  decidedAt: string;
-}): Promise<boolean> => {
-  try {
-    await documentClient.send(
+  /** Stamped after the approval post so a decision can update that message. */
+  const setRequestMessageRef = async (
+    id: string,
+    channel: string,
+    messageTs: string,
+  ): Promise<void> => {
+    await client.send(
       new UpdateCommand({
         TableName: tableName(),
-        Key: { pk: requestPk(args.id), sk: RECORD_SK },
-        UpdateExpression:
-          "SET #state = :state, approverSlackId = :approver, decidedAt = :decidedAt, dryRun = :dryRun",
-        ConditionExpression: "#state = :requested",
-        ExpressionAttributeNames: { "#state": "state" },
+        Key: { pk: requestPk(id), sk: RECORD_SK },
+        UpdateExpression: "SET #channel = :channel, #messageTs = :messageTs",
+        ExpressionAttributeNames: {
+          "#channel": "channel",
+          "#messageTs": "messageTs",
+        },
         ExpressionAttributeValues: {
-          ":state": args.decision,
-          ":approver": args.approverSlackId,
-          ":decidedAt": args.decidedAt,
-          ":dryRun": true,
-          ":requested": "requested",
+          ":channel": channel,
+          ":messageTs": messageTs,
         },
       }),
     );
-    return true;
-  } catch (err) {
-    if (err instanceof ConditionalCheckFailedException) return false;
-    throw err;
-  }
+  };
+
+  /**
+   * Records the decision with a conditional write on `state = requested`, so
+   * two concurrent clicks cannot both decide. An approval moves the request to
+   * `granting`, not to the dry-run `approved`. Returns false when the condition
+   * failed, which the caller reports as "already decided".
+   */
+  const decideRequest = async (args: {
+    id: string;
+    decision: Decision;
+    approverSlackId: string;
+    decidedAt: string;
+  }): Promise<boolean> => {
+    const state: RequestState =
+      args.decision === "approved" ? "granting" : "denied";
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: requestPk(args.id), sk: RECORD_SK },
+          UpdateExpression:
+            "SET #state = :state, approverSlackId = :approver, decidedAt = :decidedAt",
+          ConditionExpression: "#state = :requested",
+          ExpressionAttributeNames: { "#state": "state" },
+          ExpressionAttributeValues: {
+            ":state": state,
+            ":approver": args.approverSlackId,
+            ":decidedAt": args.decidedAt,
+            ":requested": "requested",
+          },
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
+  };
+
+  /** Follows a request through the grant lifecycle (`granted`, `revoked`, `failed`). */
+  const setRequestState = async (
+    id: string,
+    state: RequestState,
+  ): Promise<void> => {
+    await client.send(
+      new UpdateCommand({
+        TableName: tableName(),
+        Key: { pk: requestPk(id), sk: RECORD_SK },
+        UpdateExpression: "SET #state = :state",
+        ExpressionAttributeNames: { "#state": "state" },
+        ExpressionAttributeValues: { ":state": state },
+      }),
+    );
+  };
+
+  /**
+   * Increments the requester's counter for the UTC day and returns the new
+   * value. The increment happens even when the result is over the cap, so a
+   * burst is visible in the counter rather than hidden by the rejection.
+   */
+  const incrementRateCount = async (
+    slackUserId: string,
+    date: string,
+    ttlSeconds: number,
+  ): Promise<number> => {
+    const result = await client.send(
+      new UpdateCommand({
+        TableName: tableName(),
+        Key: { pk: ratePk(slackUserId, date), sk: RECORD_SK },
+        UpdateExpression: "ADD #count :one SET #ttl = :ttl",
+        ExpressionAttributeNames: { "#count": "count", "#ttl": "ttl" },
+        ExpressionAttributeValues: {
+          ":one": 1,
+          ":ttl": Math.floor(Date.now() / 1000) + ttlSeconds,
+        },
+        ReturnValues: "UPDATED_NEW",
+      }),
+    );
+    return Number(result.Attributes?.count ?? 0);
+  };
+
+  /**
+   * The at-most-one-active-grant guard.
+   *
+   * One per-requester item, claimed with `attribute_not_exists(pk) OR state =
+   * released`. The `OR` lets a new grant reuse the key after a revoke or a
+   * failure without deleting the item. The condition is evaluated by DynamoDB
+   * atomically, so two concurrent approvals for the same requester cannot both
+   * pass: without this the second `CreateGroupMembership` would return
+   * `ConflictException`, both grants would resolve the same `MembershipId`, and
+   * the first expiry would silently end the second grant early.
+   */
+  const beginActiveGrant = async (
+    identityStoreUserId: string,
+    requestId: string,
+  ): Promise<boolean> => {
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: activePk(identityStoreUserId), sk: RECORD_SK },
+          UpdateExpression:
+            "SET #state = :active, requestId = :requestId, updatedAt = :now",
+          ConditionExpression:
+            "attribute_not_exists(pk) OR #state = :released",
+          ExpressionAttributeNames: { "#state": "state" },
+          ExpressionAttributeValues: {
+            ":active": "active",
+            ":released": "released",
+            ":requestId": requestId,
+            ":now": new Date().toISOString(),
+          },
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
+  };
+
+  /** Marks the active-grant lock released so a new grant may claim it. */
+  const releaseActiveGrant = async (
+    identityStoreUserId: string,
+  ): Promise<void> => {
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: activePk(identityStoreUserId), sk: RECORD_SK },
+          UpdateExpression: "SET #state = :released, updatedAt = :now",
+          ConditionExpression: "attribute_exists(pk)",
+          ExpressionAttributeNames: { "#state": "state" },
+          ExpressionAttributeValues: {
+            ":released": "released",
+            ":now": new Date().toISOString(),
+          },
+        }),
+      );
+    } catch (err) {
+      // Nothing to release is the already-released case.
+      if (err instanceof ConditionalCheckFailedException) return;
+      throw err;
+    }
+  };
+
+  const getActiveGrant = async (
+    identityStoreUserId: string,
+  ): Promise<{ requestId?: string; state?: string } | null> => {
+    const result = await client.send(
+      new GetCommand({
+        TableName: tableName(),
+        Key: { pk: activePk(identityStoreUserId), sk: RECORD_SK },
+      }),
+    );
+    return result.Item ?? null;
+  };
+
+  /**
+   * Writes the grant record in its `granting` state, before the membership
+   * exists. The request id is fresh, so the condition only guards a bug.
+   */
+  const putGrant = async (grant: GrantRecord): Promise<void> => {
+    await client.send(
+      new PutCommand({
+        TableName: tableName(),
+        Item: { pk: GRANT_PK, sk: grantSk(grant.requestId), ...grant },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }),
+    );
+  };
+
+  /** Flips a grant record's state, optionally recording the `membershipId`. */
+  const setGrantState = async (args: {
+    requestId: string;
+    state: GrantState;
+    membershipId?: string;
+  }): Promise<void> => {
+    const names: Record<string, string> = { "#state": "state" };
+    const values: Record<string, string> = {
+      ":state": args.state,
+      ":updatedAt": new Date().toISOString(),
+    };
+    const sets = ["#state = :state", "updatedAt = :updatedAt"];
+    if (args.membershipId) {
+      sets.push("membershipId = :membershipId");
+      values[":membershipId"] = args.membershipId;
+    }
+    await client.send(
+      new UpdateCommand({
+        TableName: tableName(),
+        Key: { pk: GRANT_PK, sk: grantSk(args.requestId) },
+        UpdateExpression: `SET ${sets.join(", ")}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }),
+    );
+  };
+
+  /** Every grant record, for the sweeper. Paginated. */
+  const listGrants = async (): Promise<GrantRecord[]> => {
+    const grants: GrantRecord[] = [];
+    let startKey: Record<string, unknown> | undefined;
+    do {
+      const result = await client.send(
+        new QueryCommand({
+          TableName: tableName(),
+          KeyConditionExpression: "pk = :pk",
+          ExpressionAttributeValues: { ":pk": GRANT_PK },
+          ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+        }),
+      );
+      for (const item of result.Items ?? []) {
+        const { pk: _pk, sk: _sk, ...grant } = item;
+        grants.push(grant as GrantRecord);
+      }
+      startKey = result.LastEvaluatedKey;
+    } while (startKey);
+    return grants;
+  };
+
+  return {
+    putRequest,
+    getRequest,
+    setRequestMessageRef,
+    decideRequest,
+    setRequestState,
+    incrementRateCount,
+    beginActiveGrant,
+    releaseActiveGrant,
+    getActiveGrant,
+    putGrant,
+    setGrantState,
+    listGrants,
+  };
 };
 
-/**
- * Increments the requester's counter for the UTC day and returns the new
- * value. The increment happens even when the result is over the cap, so a
- * burst is visible in the counter rather than hidden by the rejection.
- */
-export const incrementRateCount = async (
-  slackUserId: string,
-  date: string,
-  ttlSeconds: number,
-): Promise<number> => {
-  const result = await documentClient.send(
-    new UpdateCommand({
-      TableName: tableName(),
-      Key: { pk: ratePk(slackUserId, date), sk: RECORD_SK },
-      UpdateExpression: "ADD #count :one SET #ttl = :ttl",
-      ExpressionAttributeNames: { "#count": "count", "#ttl": "ttl" },
-      ExpressionAttributeValues: {
-        ":one": 1,
-        ":ttl": Math.floor(Date.now() / 1000) + ttlSeconds,
-      },
-      ReturnValues: "UPDATED_NEW",
-    }),
-  );
-  return Number(result.Attributes?.count ?? 0);
-};
+export const store = createStore();
+
+export const {
+  putRequest,
+  getRequest,
+  setRequestMessageRef,
+  decideRequest,
+  setRequestState,
+  incrementRateCount,
+  beginActiveGrant,
+  releaseActiveGrant,
+  getActiveGrant,
+  putGrant,
+  setGrantState,
+  listGrants,
+} = store;
