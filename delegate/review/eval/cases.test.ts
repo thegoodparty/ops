@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { S3Client } from "@aws-sdk/client-s3";
-import { loadCases, saveCases } from "./cases";
+import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
+import type { Scenario } from "./cases";
 import type { ReviewRecord } from "../schema";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
@@ -197,4 +198,49 @@ test("loadCases from S3 skips invalid records with a warn", async () => {
 
   const records = await loadCases({ from: "s3" }, fakeClient);
   assert.equal(records.length, 0);
+});
+
+test("the checked-in scenario manifest parses and core has 12 cases", () => {
+  const scenarios = readManifest(join(__dirname, "scenarios.json"));
+  assert.equal(scenarios.filter((s) => s.suite === "core").length, 12);
+});
+
+const scenario = (id: string, suite: string, runId: string): Scenario => ({
+  id,
+  suite,
+  key: `reviews/thegoodparty/ops/42/bbbbbb/${runId}.json`,
+  tests: "t",
+});
+
+const clientFor = (records: Map<string, unknown>) =>
+  ({
+    send: async (cmd: { input: { Key: string } }) => {
+      const body = Buffer.from(JSON.stringify(records.get(cmd.input.Key)));
+      return { Body: (async function* () { yield body; })() };
+    },
+  }) as unknown as S3Client;
+
+test("loadScenarios loads only the named suite", async () => {
+  const a = makeRecord();
+  const b = makeRecord();
+  const scenarios = [scenario("a", "core", a.runId), scenario("b", "re-review", b.runId)];
+  const client = clientFor(new Map([[scenarios[0].key, a], [scenarios[1].key, b]]));
+
+  const loaded = await loadScenarios(scenarios, { suite: "core" }, client);
+  assert.deepEqual(loaded.map((l) => l.record.runId), [a.runId]);
+});
+
+test("loadScenarios refuses an empty suite and an invalid record", async () => {
+  const a = makeRecord();
+  const scenarios = [scenario("a", "core", a.runId)];
+  await assert.rejects(loadScenarios(scenarios, { suite: "nope" }, clientFor(new Map())), /no scenarios/);
+  await assert.rejects(
+    loadScenarios(scenarios, {}, clientFor(new Map([[scenarios[0].key, { bad: true }]]))),
+    /scenario a: invalid ReviewRecord/,
+  );
+});
+
+test("scenarioNames maps a run id to its scenario id", () => {
+  const names = scenarioNames([scenario("omni-1-x", "core", "run-123")]);
+  assert.equal(names.get("run-123"), "omni-1-x");
 });

@@ -5,6 +5,7 @@ import {
   ListObjectsV2Command,
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
+import { z } from "zod";
 import { ReviewRecordSchema } from "../schema";
 import type { ReviewRecord } from "../schema";
 
@@ -112,6 +113,51 @@ export const loadCases = async (
   const records =
     opts.from === "s3" ? await loadFromS3(client) : loadFromDir(opts.from);
   return applyFilters(records, opts);
+};
+
+// A scenario is a recorded production run picked on purpose: its bundle is
+// the fixed input, so every eval replays the same cases. The manifest holds
+// pointers only; the records (and the diffs inside them) stay in S3.
+export const ScenarioSchema = z.object({
+  id: z.string().regex(/^[a-z0-9-]+$/),
+  suite: z.string().regex(/^[a-z0-9-]+$/),
+  key: z.string().startsWith("reviews/").endsWith(".json"),
+  tests: z.string().min(1),
+});
+export type Scenario = z.infer<typeof ScenarioSchema>;
+
+export const ScenarioManifestSchema = z
+  .array(ScenarioSchema)
+  .refine((s) => new Set(s.map((x) => x.id)).size === s.length, "scenario ids must be unique");
+
+export const readManifest = (path: string): Scenario[] =>
+  ScenarioManifestSchema.parse(JSON.parse(readFileSync(path, "utf-8")));
+
+// The report names a case by its scenario id rather than its run id.
+export const scenarioNames = (scenarios: Scenario[]): Map<string, string> =>
+  new Map(scenarios.map((s) => [s.key.split("/").pop()!.replace(/\.json$/, ""), s.id]));
+
+// Fails loudly on a missing or invalid scenario: a suite that silently
+// shrinks is the moving-corpus problem this replaces.
+export const loadScenarios = async (
+  scenarios: Scenario[],
+  opts: { suite?: string } = {},
+  client: S3Client = new S3Client({}),
+): Promise<{ scenario: Scenario; record: ReviewRecord }[]> => {
+  const selected = opts.suite ? scenarios.filter((s) => s.suite === opts.suite) : scenarios;
+  if (selected.length === 0) {
+    throw new Error(`no scenarios${opts.suite ? ` in suite "${opts.suite}"` : ""}`);
+  }
+  const loaded: { scenario: Scenario; record: ReviewRecord }[] = [];
+  for (const scenario of selected) {
+    const res = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: scenario.key }));
+    const parsed = ReviewRecordSchema.safeParse(JSON.parse(await readBody(res.Body)));
+    if (!parsed.success) {
+      throw new Error(`scenario ${scenario.id}: invalid ReviewRecord at ${scenario.key}: ${parsed.error.message}`);
+    }
+    loaded.push({ scenario, record: parsed.data });
+  }
+  return loaded;
 };
 
 export const saveCases = (records: ReviewRecord[], dir: string): void => {
