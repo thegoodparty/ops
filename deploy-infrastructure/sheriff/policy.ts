@@ -336,6 +336,16 @@ export const reconcileSweep = (args: {
       if (membershipId && Date.parse(grant.expiresAt) <= args.now) {
         plan.revoke.push({ grant, membershipId });
       }
+    } else if (grant.state === "failed") {
+      // A failed grant whose member is present is untracked access: the
+      // membership write succeeded but the record could not resolve it (for
+      // example, both the member-scoped and group listings lagged the write).
+      // Revoke it; a failed revoke is an orphan and alarms.
+      const membershipId = byUser.get(grant.requesterIdentityStoreId);
+      if (membershipId) {
+        activeUsers.add(grant.requesterIdentityStoreId);
+        plan.revoke.push({ grant, membershipId });
+      }
     }
   }
 

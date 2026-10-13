@@ -36,6 +36,7 @@
  */
 import { WebClient } from "@slack/web-api";
 import type { Block, KnownBlock } from "@slack/types";
+import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 
 import { getSecrets } from "./secrets";
@@ -89,7 +90,6 @@ import {
   getActiveGrant,
   getRequest,
   incrementRateCount,
-  listGrants,
   putGrant,
   putRequest,
   releaseActiveGrant,
@@ -97,6 +97,7 @@ import {
   setGrantState,
   setRequestMessageRef,
   setRequestState,
+  store as defaultStore,
 } from "./store";
 
 type FunctionUrlEvent = {
@@ -556,16 +557,21 @@ const handleApprove = async (
   try {
     await putGrant(grant);
   } catch (err) {
-    // The grant record never landed. Move the request back to `requested` so a
-    // retry can proceed (the sweeper only reconciles grant items, so a request
-    // stranded in `granting` with no grant record would be stuck), then release
-    // the lock in `finally`.
-    try {
-      await setRequestState(requestId, "requested", "granting");
-    } finally {
-      await releaseActiveGrant(request.requesterIdentityStoreId);
+    if (err instanceof ConditionalCheckFailedException) {
+      // The record already exists: a retry whose earlier response was lost.
+      // Continue; the membership call and the flips below are idempotent.
+    } else {
+      // The grant record never landed. Move the request back to `requested` so
+      // a retry can proceed (the sweeper only reconciles grant items, so a
+      // request stranded in `granting` with no grant record would be stuck),
+      // then release the lock in `finally`.
+      try {
+        await setRequestState(requestId, "requested", "granting");
+      } finally {
+        await releaseActiveGrant(request.requesterIdentityStoreId);
+      }
+      throw err;
     }
-    throw err;
   }
 
   let membershipId: string;
@@ -844,11 +850,31 @@ const handleInteractivity = async (
  * Every state transition is conditional on the state the plan saw, so a record
  * the approve path moved mid-sweep is not clobbered.
  */
-export const handleSweep = async (): Promise<LambdaResponse> => {
-  const client = await assumeGrantRole();
+/**
+ * The sweeper's collaborators, injectable so the imperative paths (the
+ * `finally` lock release, the revoke-failure alarm) are testable without AWS.
+ * Production calls `handleSweep()` and gets the real store and role.
+ */
+export type SweepDeps = {
+  store: typeof defaultStore;
+  assumeGrantRole: typeof assumeGrantRole;
+  listAdminsMemberships: typeof listAdminsMemberships;
+  deleteAdminsMembership: typeof deleteAdminsMembership;
+};
+
+export const handleSweep = async (
+  deps?: Partial<SweepDeps>,
+): Promise<LambdaResponse> => {
+  const sweepStore = deps?.store ?? defaultStore;
+  const assume = deps?.assumeGrantRole ?? assumeGrantRole;
+  const listMemberships = deps?.listAdminsMemberships ?? listAdminsMemberships;
+  const deleteMembership =
+    deps?.deleteAdminsMembership ?? deleteAdminsMembership;
+
+  const client = await assume();
   const [memberships, grants] = await Promise.all([
-    listAdminsMemberships(client),
-    listGrants(),
+    listMemberships(client),
+    sweepStore.listGrants(),
   ]);
 
   const plan = reconcileSweep({
@@ -859,7 +885,7 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
   });
 
   for (const grant of plan.failed) {
-    const applied = await setGrantState({
+    const applied = await sweepStore.setGrantState({
       requestId: grant.requestId,
       state: "failed",
       fromState: "granting",
@@ -868,9 +894,9 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
     // Release in `finally` so a failed request-state write cannot leave the
     // lock stuck.
     try {
-      await setRequestState(grant.requestId, "failed", "granting");
+      await sweepStore.setRequestState(grant.requestId, "failed", "granting");
     } finally {
-      await releaseActiveGrant(grant.requesterIdentityStoreId);
+      await sweepStore.releaseActiveGrant(grant.requesterIdentityStoreId);
     }
     audit("grant.failed", {
       requestId: grant.requestId,
@@ -887,14 +913,14 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
   }
 
   for (const { grant, membershipId } of plan.granted) {
-    const applied = await setGrantState({
+    const applied = await sweepStore.setGrantState({
       requestId: grant.requestId,
       state: "granted",
       membershipId,
       fromState: "granting",
     });
     if (!applied) continue;
-    await setRequestState(grant.requestId, "granted", "granting");
+    await sweepStore.setRequestState(grant.requestId, "granted", "granting");
     audit("grant.created", {
       requestId: grant.requestId,
       requester: grant.requesterSlackId,
@@ -913,7 +939,7 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
 
   for (const { grant, membershipId } of plan.revoke) {
     try {
-      await deleteAdminsMembership(client, membershipId);
+      await deleteMembership(client, membershipId);
     } catch (err) {
       // The revoke failed or the state is stuck: this is the orphan the alarm
       // exists for. A normal sweep-and-revoke never reaches here. The lock
@@ -938,17 +964,17 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
     // The membership is gone; release the lock in `finally` even if a state
     // write fails, so a terminal grant cannot leave it stuck.
     try {
-      const applied = await setGrantState({
+      const applied = await sweepStore.setGrantState({
         requestId: grant.requestId,
         state: "revoked",
         membershipId,
-        fromState: ["granting", "granted"],
+        fromState: ["granting", "granted", "failed"],
       });
       if (applied) {
-        await setRequestState(
+        await sweepStore.setRequestState(
           grant.requestId,
           "revoked",
-          ["granting", "granted"],
+          ["granting", "granted", "failed"],
         );
       }
       audit("grant.revoked", {
@@ -965,7 +991,7 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
         source: "sweep",
       });
     } finally {
-      await releaseActiveGrant(grant.requesterIdentityStoreId);
+      await sweepStore.releaseActiveGrant(grant.requesterIdentityStoreId);
     }
   }
 

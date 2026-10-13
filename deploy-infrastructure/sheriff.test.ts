@@ -55,7 +55,7 @@ import {
   type GrantRecord,
   type RequestRecord,
 } from "./sheriff/policy";
-import { readSubmittedValues } from "./sheriff/handler";
+import { handleSweep, readSubmittedValues } from "./sheriff/handler";
 import {
   createAdminsMembership,
   resolveAdminsMembershipId,
@@ -622,6 +622,17 @@ describe("reconcileSweep", () => {
     ]);
   });
 
+  it("revokes a failed record whose member is present (untracked access)", () => {
+    const plan = reconcileSweep({
+      ...noGrace,
+      grants: [grant({ state: "failed" })],
+      memberships: members,
+    });
+    assert.deepEqual(plan.revoke.map((r) => r.membershipId), ["m-1"]);
+    // It is managed (being revoked), not unmanaged.
+    assert.equal(plan.unmanaged.length, 0);
+  });
+
   it("does not treat a revoked record's member as managed", () => {
     const plan = reconcileSweep({
       ...noGrace,
@@ -630,6 +641,120 @@ describe("reconcileSweep", () => {
     });
     assert.equal(plan.revoke.length, 0);
     assert.deepEqual(plan.unmanaged, members);
+  });
+});
+
+describe("handleSweep imperative paths", () => {
+  const sweepDeps = (args: {
+    grants: GrantRecord[];
+    memberships?: { userId: string; membershipId: string }[];
+    setRequestState?: (
+      id: string,
+      state: string,
+      from?: string | string[],
+    ) => Promise<boolean>;
+    deleteMembership?: (client: unknown, id: string) => Promise<boolean>;
+    calls?: string[];
+  }) => {
+    const calls = args.calls ?? [];
+    const store = {
+      listGrants: async () => args.grants,
+      setGrantState: async (stateArgs: { state: string }) => {
+        calls.push(`setGrantState:${stateArgs.state}`);
+        return true;
+      },
+      setRequestState: async (
+        id: string,
+        state: string,
+        from?: string | string[],
+      ) => {
+        if (args.setRequestState) return args.setRequestState(id, state, from);
+        calls.push(`setRequestState:${state}`);
+        return true;
+      },
+      releaseActiveGrant: async (id: string) => {
+        calls.push(`releaseActiveGrant:${id}`);
+      },
+    };
+    return {
+      store: store as any,
+      assumeGrantRole: (async () => ({})) as any,
+      listAdminsMemberships: (async () => args.memberships ?? []) as any,
+      deleteAdminsMembership: (args.deleteMembership ??
+        (async () => true)) as any,
+      calls,
+    };
+  };
+
+  const oldGranting = () =>
+    grant({
+      state: "granting",
+      grantedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    });
+
+  it("releases the lock even when the request-state write throws", async () => {
+    const calls: string[] = [];
+    const deps = sweepDeps({
+      grants: [oldGranting()],
+      memberships: [],
+      setRequestState: async () => {
+        throw new Error("dynamo");
+      },
+      calls,
+    });
+    await assert.rejects(() => handleSweep(deps));
+    assert.ok(calls.includes("releaseActiveGrant:user-1"));
+  });
+
+  it("revokes and releases the lock on a successful revoke", async () => {
+    const calls: string[] = [];
+    const deps = sweepDeps({
+      grants: [
+        grant({
+          state: "granted",
+          membershipId: "m-1",
+          expiresAt: new Date(Date.now() - 60 * 1000).toISOString(),
+        }),
+      ],
+      memberships: [{ userId: "user-1", membershipId: "m-1" }],
+      calls,
+    });
+    await handleSweep(deps);
+    assert.ok(calls.includes("setGrantState:revoked"));
+    assert.ok(calls.includes("releaseActiveGrant:user-1"));
+  });
+
+  it("keeps the lock and skips the revoke write when the revoke fails", async () => {
+    const calls: string[] = [];
+    const deps = sweepDeps({
+      grants: [
+        grant({
+          state: "granted",
+          membershipId: "m-1",
+          expiresAt: new Date(Date.now() - 60 * 1000).toISOString(),
+        }),
+      ],
+      memberships: [{ userId: "user-1", membershipId: "m-1" }],
+      deleteMembership: async () => {
+        throw new Error("access denied");
+      },
+      calls,
+    });
+    await handleSweep(deps);
+    assert.ok(!calls.includes("setGrantState:revoked"));
+    assert.ok(!calls.includes("releaseActiveGrant:user-1"));
+  });
+
+  it("revokes a failed grant whose member is still present", async () => {
+    const calls: string[] = [];
+    const deps = sweepDeps({
+      grants: [grant({ state: "failed" })],
+      memberships: [{ userId: "user-1", membershipId: "m-1" }],
+      calls,
+    });
+    await handleSweep(deps);
+    assert.ok(calls.includes("setGrantState:revoked"));
+    assert.ok(calls.includes("releaseActiveGrant:user-1"));
   });
 });
 
