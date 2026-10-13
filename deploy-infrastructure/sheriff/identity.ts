@@ -183,6 +183,16 @@ export const createAdminsMembership = async (
         identityStoreUserId,
       );
       if (existing) return existing;
+      // Eventual consistency: the conflict says the user is already a member,
+      // but the member-scoped listing can lag the membership write. Fall back
+      // to the group listing before giving up, so a grant is not marked failed
+      // while the membership actually exists, which would leave untracked
+      // Admins access the sweeper never revokes.
+      const members = await listAdminsMemberships(client);
+      const fromGroup = members.find(
+        (member) => member.userId === identityStoreUserId,
+      );
+      if (fromGroup) return fromGroup.membershipId;
     }
     throw err;
   }

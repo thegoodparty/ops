@@ -433,9 +433,14 @@ const handleApprove = async (
   } catch (err) {
     console.error("break-glass grant failed", err);
     const failedGrant: GrantRecord = { ...grant, state: "failed" };
-    await setGrantState({ requestId, state: "failed" });
-    await setRequestState(requestId, "failed");
-    await releaseActiveGrant(request.requesterIdentityStoreId);
+    // Release in `finally`: a terminal grant must not leave the at-most-one
+    // lock stuck if a state write fails after the grant is failed.
+    try {
+      await setGrantState({ requestId, state: "failed" });
+      await setRequestState(requestId, "failed");
+    } finally {
+      await releaseActiveGrant(request.requesterIdentityStoreId);
+    }
     await updateDecidedMessage(slack, {
       channel,
       messageTs,
@@ -657,9 +662,13 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
   });
 
   for (const grant of plan.failed) {
-    await setGrantState({ requestId: grant.requestId, state: "failed" });
-    await setRequestState(grant.requestId, "failed");
-    await releaseActiveGrant(grant.requesterIdentityStoreId);
+    // Release in `finally` so a failed state write cannot leave the lock stuck.
+    try {
+      await setGrantState({ requestId: grant.requestId, state: "failed" });
+      await setRequestState(grant.requestId, "failed");
+    } finally {
+      await releaseActiveGrant(grant.requesterIdentityStoreId);
+    }
     audit("grant.failed", {
       requestId: grant.requestId,
       requester: grant.requesterSlackId,
@@ -700,29 +709,11 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
   for (const { grant, membershipId } of plan.revoke) {
     try {
       await deleteAdminsMembership(client, membershipId);
-      await setGrantState({
-        requestId: grant.requestId,
-        state: "revoked",
-        membershipId,
-      });
-      await setRequestState(grant.requestId, "revoked");
-      await releaseActiveGrant(grant.requesterIdentityStoreId);
-      audit("grant.revoked", {
-        requestId: grant.requestId,
-        requester: grant.requesterSlackId,
-        requesterEmail: grant.requesterEmail,
-        approver: grant.approverSlackId,
-        group: grant.groupId,
-        membershipId,
-        reason: grant.reason,
-        ticket: grant.ticket,
-        grantedAt: grant.grantedAt,
-        expiresAt: grant.expiresAt,
-        source: "sweep",
-      });
     } catch (err) {
       // The revoke failed or the state is stuck: this is the orphan the alarm
-      // exists for. A normal sweep-and-revoke never reaches here.
+      // exists for. A normal sweep-and-revoke never reaches here. The lock
+      // stays claimed on purpose: the membership still exists, so a second
+      // grant for this requester must stay blocked.
       console.error("break-glass revoke failed", err);
       audit("membership.orphaned", {
         requestId: grant.requestId,
@@ -737,6 +728,32 @@ export const handleSweep = async (): Promise<LambdaResponse> => {
         expiresAt: grant.expiresAt,
         source: "sweep",
       });
+      continue;
+    }
+    // The membership is gone; release the lock in `finally` even if a state
+    // write fails, so a terminal grant cannot leave it stuck.
+    try {
+      await setGrantState({
+        requestId: grant.requestId,
+        state: "revoked",
+        membershipId,
+      });
+      await setRequestState(grant.requestId, "revoked");
+      audit("grant.revoked", {
+        requestId: grant.requestId,
+        requester: grant.requesterSlackId,
+        requesterEmail: grant.requesterEmail,
+        approver: grant.approverSlackId,
+        group: grant.groupId,
+        membershipId,
+        reason: grant.reason,
+        ticket: grant.ticket,
+        grantedAt: grant.grantedAt,
+        expiresAt: grant.expiresAt,
+        source: "sweep",
+      });
+    } finally {
+      await releaseActiveGrant(grant.requesterIdentityStoreId);
     }
   }
 

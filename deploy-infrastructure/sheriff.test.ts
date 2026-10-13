@@ -4,6 +4,7 @@ import { createHmac } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
+import { ConflictException } from "@aws-sdk/client-identitystore";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
 import {
@@ -53,7 +54,10 @@ import {
   type RequestRecord,
 } from "./sheriff/policy";
 import { readSubmittedValues } from "./sheriff/handler";
-import { resolveAdminsMembershipId } from "./sheriff/identity";
+import {
+  createAdminsMembership,
+  resolveAdminsMembershipId,
+} from "./sheriff/identity";
 import { createStore } from "./sheriff/store";
 import { verifySlackWebhook } from "./sheriff/verify";
 
@@ -651,6 +655,50 @@ describe("resolveAdminsMembershipId", () => {
       send: async () => ({ GroupMemberships: [] }),
     } as any;
     assert.equal(await resolveAdminsMembershipId(client, "user-1"), null);
+  });
+
+  it("recovers from ConflictException via the member listing", async () => {
+    // CreateGroupMembership conflicts, then the member listing resolves the
+    // existing Admins membership in one call.
+    const responses = [
+      () => {
+        throw new ConflictException({ message: "exists", $metadata: {} });
+      },
+      () => ({
+        GroupMemberships: [
+          { GroupId: ADMINS_GROUP_ID, MembershipId: "m-admins" },
+        ],
+      }),
+    ];
+    let call = 0;
+    const client = { send: async () => responses[call++]() } as any;
+    assert.equal(await createAdminsMembership(client, "user-1"), "m-admins");
+    assert.equal(call, 2);
+  });
+
+  it("falls back to the group listing when the member listing lags", async () => {
+    const responses = [
+      () => {
+        throw new ConflictException({ message: "exists", $metadata: {} });
+      },
+      () => ({ GroupMemberships: [] }),
+      () => ({
+        GroupMemberships: [
+          {
+            GroupId: ADMINS_GROUP_ID,
+            MemberId: { UserId: "user-1" },
+            MembershipId: "m-from-group",
+          },
+        ],
+      }),
+    ];
+    let call = 0;
+    const client = { send: async () => responses[call++]() } as any;
+    assert.equal(
+      await createAdminsMembership(client, "user-1"),
+      "m-from-group",
+    );
+    assert.equal(call, 3);
   });
 });
 
