@@ -10,6 +10,7 @@ export const renderBody = (args: {
   headSha: string;
   inlineCount: number;
   droppedCount?: number;
+  unparseableCount?: number;
   carriedForward: Array<{ id: string; path: string; line: number; url?: string }>;
 }): string => {
   const parts: string[] = [];
@@ -30,6 +31,12 @@ export const renderBody = (args: {
     );
   }
 
+  if (args.unparseableCount) {
+    parts.push(
+      `${args.unparseableCount} finding(s) in the reviewer's output did not match the review schema and could not be posted. This is a reviewer defect, not a clean result; they count against approval. The run logs have the validation error.`,
+    );
+  }
+
   if (args.carriedForward.length > 0) {
     const n = args.carriedForward.length;
     const bullets = args.carriedForward.map((cf) => {
@@ -44,12 +51,22 @@ export const renderBody = (args: {
   return parts.join("\n\n");
 };
 
+// A reviewer failure is not a verdict. The body is deliberately short and
+// free of raw model or Zod output: the validation error goes to the logs, and
+// the check stays non-success so a failed review can never read as approval.
 export const renderFailureBody = (args: {
   runId: string;
   headSha: string;
-  reason: string;
+  logsUrl?: string;
 }): string => {
   const sha7 = args.headSha.slice(0, 7);
   const footer = `_run ${args.runId} · ${sha7}_`;
-  return `Review failed: ${args.reason}. Push a new commit, then comment \`delegate review\`.\n\n${footer}`;
+  const logs = args.logsUrl
+    ? ` The full validation error is in the [run logs](${args.logsUrl}).`
+    : " The full validation error is in the run logs.";
+  return [
+    `**Review failed.** The reviewer hit an internal error on \`${sha7}\` and did not produce a verdict. This is a reviewer failure, not an approval or a clean result; the \`pr-reviewer\` check is marked as an error.`,
+    `Push a new commit, then comment \`delegate review\` to retry.${logs}`,
+    footer,
+  ].join("\n\n");
 };
