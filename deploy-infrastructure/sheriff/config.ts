@@ -1,48 +1,61 @@
 /**
- * Policy inputs for the break-glass dry run, step 3 ("the Lambda, dry") of
- * `docs/sheriff.md`.
+ * Policy inputs for the break-glass tool, step 4 ("approval wired to a real
+ * grant") of `docs/sheriff.md`.
  *
- * Two of these are deliberately hard-coded in the tool's code rather than
- * resources in AWS, and both change only by a reviewed PR:
+ * The approver list is deliberately hard-coded in the tool's code rather than a
+ * resource in AWS; it changes only by a reviewed PR. "Approval policy" settles
+ * this: no Identity Store approver group and no Slack mirror. One approver per
+ * request, and the approver must not be the requester.
  *
- * - **The approver list.** "Approval policy" settles this: no Identity Store
- *   approver group and no Slack mirror. One approver per request, and the
- *   approver must not be the requester.
- * - **The Slack-user-id to Identity Store-user-id map for the requester.**
- *   Open question 3 was settled by the engineer in favour of this map, as the
- *   deliberate temporary option, with a refactor planned. Because the mapping
- *   is maintained here, the `sheriff-grant` role needs no directory read
- *   at all; see `deploy/components/sheriff-grant.ts`, which step 3 does
- *   not change.
+ * The requester mapping is no longer hard-coded. Open question 3 was settled by
+ * the engineer in favour of resolving the requester at request time from their
+ * Slack email (`users.info` -> `identitystore:GetUserId` on
+ * `emails.value`), gated on membership in the `Engineers` Identity Store group.
+ * That is why the `sheriff-grant` role's inline policy now carries
+ * `GetUserId` and `IsMemberInGroups`; see `deploy/components/sheriff-grant.ts`.
  *
- * PLACEHOLDERS. No real Slack user ids or Identity Store user ids were
- * available when this landed, so both maps hold an obvious placeholder. A real
- * rollout replaces them in a reviewed PR. The approver placeholder means every
- * click currently gets the "not an approver" ephemeral, which is the honest
- * dry-run behaviour, and every requester is rejected at submission with the
- * "not mapped" error.
+ * The list is deliberately short and hard-coded: changed only by a reviewed PR,
+ * per "Approval policy" in `docs/sheriff.md`.
  */
-
-/** The hardcoded approver list. One approver per request. */
-export const APPROVER_SLACK_USER_IDS: readonly string[] = [
-  // PLACEHOLDER: replace with real Slack user ids before enabling.
-  "U0000000000",
-];
+import { IDENTITY_STORE_ID } from "../../utils/accounts";
 
 /**
- * Slack user id -> Identity Store user id.
+ * The hardcoded approver list. One approver per request, and the approver must
+ * not be the requester.
  *
- * PLACEHOLDER: replace with the real mapping before enabling. The plan's open
- * question 3 settled on this map as the temporary mechanism; it is read only
- * to stamp the requester's Identity Store id on the request record so step 4
- * can call `CreateGroupMembership` without a directory read.
+ * `U0BMU0DPS9Y` is Jeff Jagoda (`jeff@goodparty.org`), the engineer. He is
+ * deliberately the only approver for now; adding another is a reviewed PR.
  */
-export const SLACK_TO_IDENTITY_STORE_USER_ID: Readonly<
-  Record<string, string>
-> = {
-  // PLACEHOLDER: replace with real Slack and Identity Store user ids.
-  U0000000000: "00000000-0000-0000-0000-000000000000",
-};
+export const APPROVER_SLACK_USER_IDS: readonly string[] = ["U0BMU0DPS9Y"];
+
+/**
+ * The `Admins` Identity Store group id, mirrored from
+ * `deploy/components/identity-center.ts`. It is the group a grant adds the
+ * requester to. A literal rather than an import because that file does not
+ * export its group map; `deploy/sheriff-grant.test.ts` reads the literal in
+ * that file so the two cannot drift silently.
+ */
+export const ADMINS_GROUP_ID = "88c1b330-a001-707a-06ca-94e289013bf5";
+
+/**
+ * The `Engineers` Identity Store group id. Step 4's requester gate: only a
+ * member of this group may submit a break-glass request, checked at request
+ * time so an ineligible requester gets immediate feedback rather than a request
+ * that can never be granted.
+ */
+export const ENGINEERS_GROUP_ID = "383193a0-7001-70d9-a321-ffe6d8af7378";
+
+/**
+ * The default AWS access portal URL, derived from the identity store id.
+ *
+ * Identity Center shows this URL in the console and it is the address a user
+ * signs in to. The built-in directory's portal URL is
+ * `https://<identity-store-id>.awsapps.com/start`; a customized URL would
+ * differ, and if this organization has one this constant is the one line to
+ * change. The Slack grant copy links it and tells the user to sign out and back
+ * in, because a membership change is not visible in an already-open session.
+ */
+export const SSO_PORTAL_URL = `https://${IDENTITY_STORE_ID}.awsapps.com/start`;
 
 /** Where the request and every outcome are posted. No DMs. */
 export const DEFAULT_APPROVAL_CHANNEL = "#devs-only";
@@ -70,15 +83,16 @@ export const DURATION_OPTIONS: readonly {
 
 /**
  * The per-user cap on requests per day. The exact number is an open question
- * in the plan ("Rate limit"); 5/day is the placeholder the dry flow enforces,
- * it is one line to change, and the PR body calls it out.
+ * in the plan ("Rate limit"); 5/day is the placeholder the flow enforces, it is
+ * one line to change, and the PR body calls it out.
  */
 export const MAX_REQUESTS_PER_DAY = 5;
 
 /**
  * DynamoDB TTL, retention only. It never ends a grant (`docs/sheriff.md`,
- * "States"): revocation is the scheduler plus the sweeper in step 4/5. 90 days
- * keeps the application audit readable for a quarter without a second store.
+ * "States"): revocation is the sweeper in step 4 and the one-shot scheduler in
+ * step 5. 90 days keeps the application audit readable for a quarter without a
+ * second store.
  */
 export const REQUEST_TTL_SECONDS = 90 * 24 * 60 * 60;
 
@@ -87,3 +101,26 @@ export const REQUEST_TTL_SECONDS = 90 * 24 * 60 * 60;
  * count. Two days of slack covers clock skew across a day boundary.
  */
 export const RATE_TTL_SECONDS = 2 * 24 * 60 * 60;
+
+/**
+ * How long a `granting` record is left alone by the sweeper before it is
+ * reconciled. The approve path is a cross-account AssumeRole, one
+ * `CreateGroupMembership` and a few DynamoDB writes, which completes in
+ * seconds; five minutes is comfortably longer, and the sweeper runs every five
+ * minutes anyway. Without this, a sweep that observes the record between
+ * `putGrant` and the membership write would mark it `failed` while the
+ * membership lands afterwards, stranding an untracked standing admin.
+ */
+export const SWEEP_GRANTING_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * The permission set's session duration, in the Slack copy only.
+ *
+ * `deploy/components/identity-center.ts` shortens the `administrator` set to
+ * `PT1H`. A revoke removes the membership but does not end a session that is
+ * already open, so the honest worst case is the requested duration plus the
+ * remaining session. The copy says "up to 1 hour more" rather than implying a
+ * hard cutoff; this constant is that 1 hour, named so the copy and the
+ * permission set can be reconciled by a reader.
+ */
+export const SESSION_DURATION_SECONDS = 60 * 60;
