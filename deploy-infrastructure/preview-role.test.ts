@@ -44,13 +44,25 @@ describe("infrastructurePreviewRoleTrust", () => {
   });
 });
 
+// Minimal IAM ARN wildcard matcher: `*` and `?` are the only wildcards IAM
+// honours. Used to prove the chosen scope matches the suffix-less partial ARN
+// the failing preview named.
+const iamArnMatches = (pattern: string, arn: string): boolean =>
+  new RegExp(
+    `^${pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".")}$`
+  ).test(arn);
+
 describe("infrastructurePreviewRolePolicy", () => {
-  const actions = infrastructurePreviewRolePolicy.Statement.flatMap((s) =>
-    asList(s.Action)
-  );
+  const statements = infrastructurePreviewRolePolicy.Statement;
+  const actions = statements.flatMap((s) => asList(s.Action));
+  const actionsFor = (sid: string) =>
+    statements.filter((s) => s.Sid === sid).flatMap((s) => asList(s.Action));
 
   it("grants exactly the reads the provider makes on a table read", () => {
-    assert.deepEqual([...actions].sort(), [
+    assert.deepEqual([...actionsFor("DynamoDbTableRead")].sort(), [
       "dynamodb:DescribeContinuousBackups",
       "dynamodb:DescribeTable",
       "dynamodb:DescribeTimeToLive",
@@ -58,10 +70,26 @@ describe("infrastructurePreviewRolePolicy", () => {
     ]);
   });
 
+  // `resourceSecretRead` calls DescribeSecret; `resourceSecretFlatten` then
+  // reads the resource policy and the tags. These three, and nothing else.
+  it("grants exactly the reads the provider makes on a secret read", () => {
+    assert.deepEqual([...actionsFor("SecretsManagerSecretRead")].sort(), [
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:GetResourcePolicy",
+      "secretsmanager:ListTagsForResource",
+    ]);
+  });
+
   // The point of the grant is metadata only. A data action slipping in would
-  // make a PR-authored preview able to read request records and reasons.
+  // make a PR-authored preview able to read request records and reasons, or
+  // the contents of a secret.
   it("grants no data reads and no writes", () => {
     for (const action of actions) {
+      // `GetResourcePolicy` is a metadata read on the secret read path, not a
+      // value read; every other `Get`/`Put`/... action is out of bounds.
+      if (action === "secretsmanager:GetResourcePolicy") {
+        continue;
+      }
       assert.doesNotMatch(
         action,
         /:(Get|Put|Update|Delete|Query|Scan|Batch|Transact)/,
@@ -70,15 +98,59 @@ describe("infrastructurePreviewRolePolicy", () => {
     }
   });
 
-  it("scopes to this account's tables, never a bare wildcard", () => {
-    for (const statement of infrastructurePreviewRolePolicy.Statement) {
-      const resources = asList(statement.Resource);
-      assert.equal(resources.length, 1);
-      assert.equal(
-        resources[0],
-        `arn:aws:dynamodb:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:table/*`
+  // Mirror of the data-read assertion above, named for the action that would
+  // matter most here: the secret value is what the preview must never see.
+  it("does not grant secretsmanager:GetSecretValue or any value action", () => {
+    for (const action of actionsFor("SecretsManagerSecretRead")) {
+      assert.doesNotMatch(
+        action,
+        /^secretsmanager:(GetSecretValue|BatchGetSecretValue|ListSecretVersionIds|GetRandomPassword)$/,
+        action
       );
-      assert.notEqual(resources[0], "*");
     }
+    assert.ok(!actions.includes("secretsmanager:GetSecretValue"));
+    assert.ok(!actions.includes("secretsmanager:BatchGetSecretValue"));
+  });
+
+  it("scopes every statement to this account and region, never a bare wildcard", () => {
+    const scopes = statements.flatMap((s) => asList(s.Resource));
+    assert.deepEqual([...scopes].sort(), [
+      `arn:aws:dynamodb:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:table/*`,
+      `arn:aws:secretsmanager:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:secret:*`,
+    ]);
+    for (const scope of scopes) {
+      assert.notEqual(scope, "*");
+      assert.match(scope, /^arn:aws:[a-z0-9-]+:us-west-2:\d+:/);
+    }
+  });
+
+  it("scopes the secret grant so the import's partial ARN matches", () => {
+    const statement = statements.find(
+      (s) => s.Sid === "SecretsManagerSecretRead"
+    );
+    assert.ok(statement);
+    const scope = statement.Resource;
+    assert.equal(
+      scope,
+      `arn:aws:secretsmanager:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:secret:*`
+    );
+    // The import names the suffix-less partial ARN, because the six random
+    // characters Secrets Manager appends do not exist until the secret does.
+    assert.equal(
+      iamArnMatches(
+        scope,
+        "arn:aws:secretsmanager:us-west-2:394495727159:secret:sheriff"
+      ),
+      true
+    );
+    // The obvious tighter scope would not match that ARN, which is why the
+    // grant is `secret:*` rather than `secret:sheriff-*`.
+    assert.equal(
+      iamArnMatches(
+        "arn:aws:secretsmanager:us-west-2:394495727159:secret:sheriff-*",
+        "arn:aws:secretsmanager:us-west-2:394495727159:secret:sheriff"
+      ),
+      false
+    );
   });
 });
