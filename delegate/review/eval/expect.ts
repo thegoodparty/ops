@@ -166,7 +166,7 @@ export const renderExpectReport = (reports: CaseReport[], variant: string): stri
     return known.length === 0 ? "n/a" : `$${(known.reduce((a, b) => a + b, 0) / known.length).toFixed(2)}`;
   };
   const lines = [
-    "# Expected-result eval",
+    "### Expected-result eval",
     "",
     `**${casePasses}/${reports.length} cases passed** on \`${variant}\`. A case passes only when every run gets the expected result.`,
     "",
@@ -234,6 +234,7 @@ const main = async () => {
         checkout,
       );
       results.set(`${c.id}/${run}`, result);
+      rmSync(join(workDir, `run-${run}`, c.id), { recursive: true, force: true });
       mkdirSync(join(out, c.id), { recursive: true });
       writeFileSync(join(out, c.id, `run-${run}.json`), JSON.stringify(result, null, 2));
       console.error(`  ${c.id} run ${run}: ${scoreRun(c.expect, result).outcome}`);

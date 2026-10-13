@@ -102,6 +102,8 @@ cat report.md
 
 Five cases with a known right answer, listed in `expected/manifest.json`. Each is scored on the outcome alone, with no judge: a block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. Every case runs several times, and a case passes only when every run does.
 
+Every `delegate eval` comment also runs this suite against the PR head, 3 runs per case, as a parallel job, and posts the result as its own PR comment. It adds about $15 and no wall time.
+
 ```sh
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--out ./eval-expected] [--work-dir /tmp/review-expect]
 ```

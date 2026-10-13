@@ -205,3 +205,89 @@ jobs:
             gh api --method DELETE \
               repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id}
           fi
+
+  # The known-answer cases in expected/manifest.json, run against the PR head
+  # on their own runner so they add no wall time. Scored on outcome alone and
+  # posted as a separate comment.
+  expected:
+    if: |
+      github.event.issue.pull_request != null &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      startsWith(github.event.comment.body, 'delegate eval')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Resolve PR head sha
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          sha=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.sha')
+          echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head (agent under test)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Run expected-result cases
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          npm run -s review:expect -- \
+            --runs 3 \
+            --concurrency 5 \
+            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --out ./eval-expected \
+            --work-dir ${{ runner.temp }}/work-expected
+
+      - name: Post or update PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          body=$(printf '<!-- delegate-eval-expected -->\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
+            "$(cat ./eval-expected/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
+          existing_id=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq '[.[] | select(.body | startswith("<!-- delegate-eval-expected -->"))] | first | .id // empty')
+          if [ -n "$existing_id" ]; then
+            gh api --method PATCH repos/${{ github.repository }}/issues/comments/${existing_id} -f body="$body"
+          else
+            gh api --method POST repos/${{ github.repository }}/issues/${PR_NUMBER}/comments -f body="$body"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-expected-${{ steps.pr.outputs.sha7 }}
+          path: ./eval-expected/
