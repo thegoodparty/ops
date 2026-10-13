@@ -117,6 +117,8 @@ A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`)
 
 ## Statistical interpretation
 
+A PR that changes no agent code compares main with itself, so every difference it reports is run-to-run noise. Run one after changing the scenario list to see how much a real result has to beat.
+
 The report includes a two-sided binomial sign test (p=0.5, ties and unstable verdicts excluded). Rule of thumb:
 
 - 12 cases → 10+ wins one way is p<0.05
