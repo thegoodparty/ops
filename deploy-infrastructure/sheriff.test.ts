@@ -5,18 +5,32 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { ConflictException } from "@aws-sdk/client-identitystore";
+import {
+  ConflictException as SchedulerConflictException,
+  ResourceNotFoundException as SchedulerResourceNotFoundException,
+} from "@aws-sdk/client-scheduler";
+import type { SchedulerClient } from "@aws-sdk/client-scheduler";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
 import {
   ORPHANED_AUDIT_EVENT,
   SHERIFF_ALERT_EMAIL,
+  SHERIFF_FUNCTION_ARN,
   SHERIFF_GRANT_ROLE_ARN,
   SHERIFF_ROLE_NAME,
+  SHERIFF_SCHEDULER_DLQ_ARN,
+  SHERIFF_SCHEDULER_DLQ_NAME,
+  SHERIFF_SCHEDULER_ROLE_ARN,
+  SHERIFF_SCHEDULER_ROLE_NAME,
+  SHERIFF_SCHEDULE_ARN_PREFIX,
+  SHERIFF_SCHEDULE_GROUP,
   SHERIFF_TABLE_NAME,
   SHERIFF_SECRET_NAME,
   SHERIFF_SECRET_IMPORT_ID,
   sheriffLambdaPolicy,
   sheriffLambdaTrust,
+  sheriffSchedulerPolicy,
+  sheriffSchedulerTrust,
 } from "./sheriff-lambda";
 import {
   ADMINS_GROUP_ID,
@@ -25,6 +39,8 @@ import {
   ENGINEERS_GROUP_ID,
   MAX_DURATION_SECONDS,
   MAX_REQUESTS_PER_DAY,
+  SCHEDULE_MAX_EVENT_AGE_SECONDS,
+  SCHEDULE_MAX_RETRY_ATTEMPTS,
   SSO_PORTAL_URL,
   SWEEP_GRANTING_GRACE_MS,
 } from "./sheriff/config";
@@ -33,6 +49,8 @@ import {
   buildDecidedBlocks,
   buildDecisionOutcomeText,
   buildRequestModal,
+  buildRevokedBlocks,
+  buildRevokeOutcomeText,
 } from "./sheriff/blocks";
 import {
   activeGrantDecision,
@@ -42,8 +60,10 @@ import {
   eligibilityErrorMessage,
   evaluateDecision,
   evaluateEligibility,
+  expiryScheduleName,
   grantExpiresAt,
   grantSk,
+  scheduleAtExpression,
   isApprover,
   isHttpUrl,
   rateLimitExceeded,
@@ -55,7 +75,13 @@ import {
   type GrantRecord,
   type RequestRecord,
 } from "./sheriff/policy";
-import { handleSweep, readSubmittedValues } from "./sheriff/handler";
+import {
+  handleRevoke,
+  handleSweep,
+  readSubmittedValues,
+  revokeGrant,
+} from "./sheriff/handler";
+import { createScheduler } from "./sheriff/scheduler";
 import {
   createAdminsMembership,
   resolveAdminsMembershipId,
@@ -66,6 +92,13 @@ import { verifySlackWebhook } from "./sheriff/verify";
 // The store resolves the table name from the environment; the fake client
 // never talks to DynamoDB, but the name must exist for the commands to build.
 process.env.REQUEST_TABLE = "sheriff";
+// The scheduler reads its target from the environment; the fake client never
+// talks to EventBridge Scheduler, but the names must exist for the commands to
+// build. The values mirror what `sheriff-lambda.ts` sets on the function.
+process.env.SCHEDULE_GROUP = SHERIFF_SCHEDULE_GROUP;
+process.env.SCHEDULE_ROLE_ARN = SHERIFF_SCHEDULER_ROLE_ARN;
+process.env.SCHEDULE_DLQ_ARN = SHERIFF_SCHEDULER_DLQ_ARN;
+process.env.FUNCTION_ARN = SHERIFF_FUNCTION_ARN;
 
 const asList = (value: unknown): string[] =>
   value === undefined ? [] : Array.isArray(value) ? (value as string[]) : [String(value)];
@@ -122,18 +155,55 @@ describe("sheriffLambdaPolicy", () => {
     asList(s.Action),
   );
 
-  it("allows exactly the step-4 actions", () => {
+  it("allows exactly the step-5 actions", () => {
     assert.deepEqual([...actions].sort(), [
       "dynamodb:GetItem",
       "dynamodb:PutItem",
       "dynamodb:Query",
       "dynamodb:UpdateItem",
+      "iam:PassRole",
       "lambda:InvokeFunction",
       "logs:CreateLogStream",
       "logs:PutLogEvents",
+      "scheduler:CreateSchedule",
+      "scheduler:DeleteSchedule",
+      "scheduler:GetSchedule",
       "secretsmanager:GetSecretValue",
       "sts:AssumeRole",
     ]);
+  });
+
+  it("scopes scheduler management to the one schedule group", () => {
+    const scheduler = sheriffLambdaPolicy.Statement.find(
+      (s) => s.Sid === "ManageExpirySchedules",
+    );
+    assert.ok(scheduler);
+    assert.deepEqual(asList(scheduler.Action).sort(), [
+      "scheduler:CreateSchedule",
+      "scheduler:DeleteSchedule",
+      "scheduler:GetSchedule",
+    ]);
+    assert.deepEqual(asList(scheduler.Resource), [
+      `${SHERIFF_SCHEDULE_ARN_PREFIX}*`,
+    ]);
+    // Never the default group and never a bare `*`.
+    assert.ok(!asList(scheduler.Resource).includes("*"));
+    assert.doesNotMatch(
+      String(asList(scheduler.Resource)[0]),
+      /schedule\/default/,
+    );
+  });
+
+  it("passes only the one scheduler role, only to the scheduler service", () => {
+    const passRole = sheriffLambdaPolicy.Statement.find(
+      (s) => s.Sid === "PassSchedulerRole",
+    );
+    assert.ok(passRole);
+    assert.equal(passRole.Action, "iam:PassRole");
+    assert.deepEqual(asList(passRole.Resource), [SHERIFF_SCHEDULER_ROLE_ARN]);
+    assert.deepEqual(passRole.Condition, {
+      StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" },
+    });
   });
 
   it("self-invokes only its own function", () => {
@@ -305,6 +375,64 @@ describe("sweeper and alarm infrastructure", () => {
   });
 });
 
+describe("scheduled revocation infrastructure", () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "sheriff-lambda.ts"),
+    "utf8",
+  );
+
+  it("trusts only the scheduler service for this account and schedule group", () => {
+    const statement = sheriffSchedulerTrust.Statement[0];
+    assert.deepEqual(statement.Principal, {
+      Service: "scheduler.amazonaws.com",
+    });
+    assert.equal(statement.Action, "sts:AssumeRole");
+    assert.deepEqual(statement.Condition, {
+      StringEquals: { "aws:SourceAccount": "394495727159" },
+      ArnLike: { "aws:SourceArn": `${SHERIFF_SCHEDULE_ARN_PREFIX}*` },
+    });
+  });
+
+  it("lets the execution role invoke only the one function and write only the one DLQ", () => {
+    const statements = sheriffSchedulerPolicy.Statement;
+    assert.deepEqual(
+      statements.map((s) => s.Sid).sort(),
+      ["DeadLetterQueue", "InvokeSheriff"],
+    );
+    const invoke = statements.find((s) => s.Sid === "InvokeSheriff");
+    assert.equal(invoke?.Action, "lambda:InvokeFunction");
+    assert.deepEqual(asList(invoke?.Resource), [SHERIFF_FUNCTION_ARN]);
+    const dlq = statements.find((s) => s.Sid === "DeadLetterQueue");
+    assert.equal(dlq?.Action, "sqs:SendMessage");
+    assert.deepEqual(asList(dlq?.Resource), [SHERIFF_SCHEDULER_DLQ_ARN]);
+  });
+
+  it("names the group, role and DLQ consistently", () => {
+    assert.equal(SHERIFF_SCHEDULE_GROUP, "sheriff");
+    assert.equal(SHERIFF_SCHEDULER_ROLE_NAME, "sheriff-scheduler");
+    assert.equal(SHERIFF_SCHEDULER_DLQ_NAME, "sheriff-scheduler-dlq");
+    assert.equal(
+      SHERIFF_SCHEDULER_ROLE_ARN,
+      "arn:aws:iam::394495727159:role/sheriff-scheduler",
+    );
+    assert.equal(
+      SHERIFF_SCHEDULER_DLQ_ARN,
+      "arn:aws:sqs:us-west-2:394495727159:sheriff-scheduler-dlq",
+    );
+  });
+
+  it("creates the group, DLQ, execution role and env wiring in Pulumi", () => {
+    assert.match(source, /aws\.scheduler\.ScheduleGroup/);
+    assert.match(source, /aws\.sqs\.Queue/);
+    assert.match(source, /sheriffSchedulerTrust/);
+    assert.match(source, /sheriffSchedulerPolicy/);
+    assert.match(source, /SCHEDULE_GROUP: SHERIFF_SCHEDULE_GROUP/);
+    assert.match(source, /SCHEDULE_ROLE_ARN: SHERIFF_SCHEDULER_ROLE_ARN/);
+    assert.match(source, /SCHEDULE_DLQ_ARN: SHERIFF_SCHEDULER_DLQ_ARN/);
+    assert.match(source, /FUNCTION_ARN: SHERIFF_FUNCTION_ARN/);
+  });
+});
+
 describe("break-glass config", () => {
   it("has the engineer as the only approver", () => {
     assert.deepEqual([...APPROVER_SLACK_USER_IDS], ["U0BMU0DPS9Y"]);
@@ -347,10 +475,10 @@ describe("async ack path", () => {
   });
 
   it("does not require a Slack signature on the async events", () => {
-    assert.match(
-      source,
-      /const isAsync = event\.action === "post-request" \|\| event\.action === "decide"/,
-    );
+    assert.match(source, /const isAsync =/);
+    assert.match(source, /event\.action === "post-request"/);
+    assert.match(source, /event\.action === "decide"/);
+    assert.match(source, /event\.action === "revoke"/);
     assert.match(source, /if \(\s*!isAsync &&/);
   });
 });
@@ -378,6 +506,21 @@ describe("duration", () => {
     assert.equal(
       grantExpiresAt("2026-10-13T00:00:00.000Z", 3600),
       "2026-10-13T01:00:00.000Z",
+    );
+  });
+});
+
+describe("expiry schedule naming", () => {
+  it("names the schedule deterministically from the request id", () => {
+    assert.equal(expiryScheduleName("abc"), "sheriff-abc");
+  });
+
+  it("formats the one-shot at() expression in UTC without milliseconds", () => {
+    // EventBridge Scheduler's at() form is at(yyyy-mm-ddThh:mm:ss); the ISO
+    // milliseconds and trailing Z are rejected.
+    assert.equal(
+      scheduleAtExpression("2026-10-13T21:00:00.000Z"),
+      "at(2026-10-13T21:00:00)",
     );
   });
 });
@@ -684,6 +827,13 @@ describe("handleSweep imperative paths", () => {
       listAdminsMemberships: (async () => args.memberships ?? []) as any,
       deleteAdminsMembership: (args.deleteMembership ??
         (async () => true)) as any,
+      createExpirySchedule: (async (grant: GrantRecord) => {
+        calls.push(`createExpirySchedule:${grant.requestId}`);
+        return grant.scheduleName ?? `sheriff-${grant.requestId}`;
+      }) as any,
+      deleteExpirySchedule: (async (grant: GrantRecord) => {
+        calls.push(`deleteExpirySchedule:${grant.requestId}`);
+      }) as any,
       calls,
     };
   };
@@ -974,6 +1124,392 @@ describe("grant store", () => {
   });
 });
 
+const fakeScheduler = (send: (command: any) => Promise<unknown>) =>
+  createScheduler({ send } as unknown as SchedulerClient);
+
+describe("expiry schedule client", () => {
+  it("creates a one-shot at the grant's expiry with retries and a DLQ", async () => {
+    const commands: Array<{ constructor: { name: string }; input: any }> = [];
+    const scheduler = fakeScheduler(async (command) => {
+      commands.push(command as never);
+      if (command.constructor.name === "GetScheduleCommand") {
+        throw new SchedulerResourceNotFoundException({
+          message: "missing",
+          Message: "missing",
+          $metadata: {},
+        });
+      }
+      return {};
+    });
+    const name = await scheduler.createExpirySchedule(
+      grant({
+        scheduleName: "sheriff-req-1",
+        expiresAt: "2026-10-13T21:00:00.000Z",
+      }),
+    );
+    assert.equal(name, "sheriff-req-1");
+    const create = commands.find((c) => c.constructor.name === "CreateScheduleCommand");
+    assert.ok(create);
+    assert.equal(create.input.Name, "sheriff-req-1");
+    assert.equal(create.input.GroupName, "sheriff");
+    assert.equal(create.input.ScheduleExpression, "at(2026-10-13T21:00:00)");
+    assert.equal(create.input.ScheduleExpressionTimezone, "UTC");
+    assert.equal(create.input.FlexibleTimeWindow.Mode, "OFF");
+    assert.equal(create.input.ActionAfterCompletion, "DELETE");
+    assert.equal(create.input.Target.Arn, SHERIFF_FUNCTION_ARN);
+    assert.equal(create.input.Target.RoleArn, SHERIFF_SCHEDULER_ROLE_ARN);
+    assert.deepEqual(JSON.parse(create.input.Target.Input), {
+      action: "revoke",
+      requestId: "req-1",
+    });
+    assert.deepEqual(create.input.Target.RetryPolicy, {
+      MaximumEventAgeInSeconds: SCHEDULE_MAX_EVENT_AGE_SECONDS,
+      MaximumRetryAttempts: SCHEDULE_MAX_RETRY_ATTEMPTS,
+    });
+    assert.deepEqual(create.input.Target.DeadLetterConfig, {
+      Arn: SHERIFF_SCHEDULER_DLQ_ARN,
+    });
+  });
+
+  it("does not create a schedule that already exists", async () => {
+    const commands: string[] = [];
+    const scheduler = fakeScheduler(async (command) => {
+      commands.push(command.constructor.name);
+      return {};
+    });
+    await scheduler.createExpirySchedule(
+      grant({ scheduleName: "sheriff-req-1" }),
+    );
+    assert.deepEqual(commands, ["GetScheduleCommand"]);
+  });
+
+  it("tolerates a concurrent create that won the race", async () => {
+    const scheduler = fakeScheduler(async (command) => {
+      if (command.constructor.name === "GetScheduleCommand") {
+        throw new SchedulerResourceNotFoundException({
+          message: "missing",
+          Message: "missing",
+          $metadata: {},
+        });
+      }
+      throw new SchedulerConflictException({
+        message: "exists",
+        Message: "exists",
+        $metadata: {},
+      });
+    });
+    const name = await scheduler.createExpirySchedule(
+      grant({ scheduleName: "sheriff-req-1" }),
+    );
+    assert.equal(name, "sheriff-req-1");
+  });
+
+  it("deletes the schedule and treats already-gone as success", async () => {
+    let deleted = false;
+    const scheduler = fakeScheduler(async (command) => {
+      if (command.constructor.name === "DeleteScheduleCommand") {
+        deleted = true;
+        throw new SchedulerResourceNotFoundException({
+          message: "missing",
+          Message: "missing",
+          $metadata: {},
+        });
+      }
+      return {};
+    });
+    await scheduler.deleteExpirySchedule(
+      grant({ scheduleName: "sheriff-req-1" }),
+    );
+    assert.equal(deleted, true);
+  });
+});
+
+describe("revoke store", () => {
+  it("reads a grant by request id", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return { Item: { pk: "GRANT", sk: grantSk("req-1"), ...grant() } };
+    });
+    const result = await store.getGrant("req-1");
+    assert.equal(captured?.input?.Key.pk, "GRANT");
+    assert.equal(captured?.input?.Key.sk, grantSk("req-1"));
+    assert.equal(result?.requestId, "req-1");
+  });
+
+  it("claims the revoke post with a conditional write on the grant item", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return {};
+    });
+    assert.equal(await store.claimRevokePost("req-1"), true);
+    assert.equal(captured?.input?.Key.pk, "GRANT");
+    assert.match(
+      String(captured?.input?.ConditionExpression),
+      /attribute_not_exists/,
+    );
+  });
+
+  it("reports a duplicate revoke post as already claimed", async () => {
+    const store = fakeStore(async () => {
+      throw new ConditionalCheckFailedException({
+        message: "conditional",
+        $metadata: {},
+      });
+    });
+    assert.equal(await store.claimRevokePost("req-1"), false);
+  });
+
+  it("clears the revoke post claim after a failed post", async () => {
+    let captured: { input?: any } | undefined;
+    const store = fakeStore(async (command) => {
+      captured = command as { input?: any };
+      return {};
+    });
+    await store.releaseRevokePost("req-1");
+    assert.match(String(captured?.input?.UpdateExpression), /REMOVE/);
+  });
+});
+
+describe("revokeGrant", () => {
+  it("releases the lock and deletes the schedule even when the transition was a no-op", async () => {
+    const calls: string[] = [];
+    const store = {
+      setGrantState: async () => false,
+      setRequestState: async () => true,
+      releaseActiveGrant: async (id: string) => calls.push(`release:${id}`),
+    };
+    const applied = await revokeGrant({
+      client: {} as never,
+      grant: grant({
+        state: "granted",
+        membershipId: "m-1",
+        scheduleName: "sheriff-req-1",
+      }),
+      membershipId: "m-1",
+      deps: {
+        store: store as never,
+        deleteAdminsMembership: async () => true,
+        deleteExpirySchedule: async () => {
+          calls.push("deleteSchedule");
+        },
+      },
+    });
+    assert.equal(applied, false);
+    assert.ok(calls.includes("release:user-1"));
+    assert.ok(calls.includes("deleteSchedule"));
+  });
+
+  it("does not release the lock or delete the schedule when the membership delete fails", async () => {
+    const calls: string[] = [];
+    const store = {
+      setGrantState: async () => {
+        calls.push("setGrantState");
+        return true;
+      },
+      setRequestState: async () => true,
+      releaseActiveGrant: async (id: string) => calls.push(`release:${id}`),
+    };
+    await assert.rejects(() =>
+      revokeGrant({
+        client: {} as never,
+        grant: grant({ state: "granted", membershipId: "m-1" }),
+        membershipId: "m-1",
+        deps: {
+          store: store as never,
+          deleteAdminsMembership: async () => {
+            throw new Error("access denied");
+          },
+          deleteExpirySchedule: async () => {
+            calls.push("deleteSchedule");
+          },
+        },
+      }),
+    );
+    assert.deepEqual(calls, []);
+  });
+});
+
+const revokeDeps = (args: {
+  grant: GrantRecord | null;
+  request?: RequestRecord | null;
+  resolve?: (client: unknown, userId: string) => Promise<string | null>;
+  deleteMembership?: (client: unknown, id: string) => Promise<boolean>;
+  claim?: () => Promise<boolean>;
+  calls?: string[];
+}) => {
+  const calls = args.calls ?? [];
+  const store = {
+    getGrant: async () => args.grant,
+    getRequest: async () => args.request ?? null,
+    claimRevokePost: async () => {
+      calls.push("claimRevokePost");
+      return args.claim ? await args.claim() : true;
+    },
+    releaseRevokePost: async () => calls.push("releaseRevokePost"),
+    setGrantState: async (stateArgs: { state: string }) => {
+      calls.push(`setGrantState:${stateArgs.state}`);
+      return true;
+    },
+    setRequestState: async (_id: string, state: string) => {
+      calls.push(`setRequestState:${state}`);
+      return true;
+    },
+    releaseActiveGrant: async (id: string) => {
+      calls.push(`releaseActiveGrant:${id}`);
+    },
+  };
+  return {
+    store: store as never,
+    assumeGrantRole: (async () => ({})) as never,
+    resolveAdminsMembershipId: (args.resolve ??
+      (async () => null)) as never,
+    deleteAdminsMembership: (args.deleteMembership ??
+      (async () => true)) as never,
+    deleteExpirySchedule: (async () => {
+      calls.push("deleteExpirySchedule");
+    }) as never,
+    calls,
+  };
+};
+
+const fakeSlack = (posts: unknown[]) =>
+  ({
+    chat: {
+      postMessage: async (message: unknown) => {
+        posts.push(message);
+        return { ok: true };
+      },
+    },
+  }) as never;
+
+describe("handleRevoke", () => {
+  const activeGrant = () =>
+    grant({
+      state: "granted",
+      membershipId: "m-1",
+      scheduleName: "sheriff-req-1",
+    });
+
+  it("revokes, deletes the schedule and posts once", async () => {
+    const posts: unknown[] = [];
+    const calls: string[] = [];
+    const deps = revokeDeps({ grant: activeGrant(), request: record(), calls });
+    await handleRevoke(
+      { action: "revoke", requestId: "req-1" } as never,
+      fakeSlack(posts),
+      deps,
+    );
+    assert.ok(calls.includes("setGrantState:revoked"));
+    assert.ok(calls.includes("claimRevokePost"));
+    assert.ok(calls.includes("deleteExpirySchedule"));
+    assert.equal(posts.length, 1);
+    assert.match(JSON.stringify(posts[0]), /revoked/);
+  });
+
+  it("does not revoke or post again when the grant is already revoked and notified", async () => {
+    const posts: unknown[] = [];
+    const calls: string[] = [];
+    const deps = revokeDeps({
+      grant: grant({ state: "revoked", membershipId: "m-1" }),
+      request: record(),
+      claim: async () => false,
+      calls,
+    });
+    await handleRevoke(
+      { action: "revoke", requestId: "req-1" } as never,
+      fakeSlack(posts),
+      deps,
+    );
+    assert.ok(!calls.includes("setGrantState:revoked"));
+    assert.equal(posts.length, 0);
+  });
+
+  it("posts on a retry after a failed post, when the grant is already revoked", async () => {
+    const posts: unknown[] = [];
+    const calls: string[] = [];
+    const deps = revokeDeps({
+      grant: grant({ state: "revoked", membershipId: "m-1" }),
+      request: record(),
+      calls,
+    });
+    await handleRevoke(
+      { action: "revoke", requestId: "req-1" } as never,
+      fakeSlack(posts),
+      deps,
+    );
+    assert.equal(posts.length, 1);
+    assert.ok(calls.includes("claimRevokePost"));
+  });
+
+  it("resolves the membership for a granting record before revoking", async () => {
+    const posts: unknown[] = [];
+    const calls: string[] = [];
+    let deleted: string | undefined;
+    const deps = revokeDeps({
+      grant: grant({
+        state: "granting",
+        membershipId: undefined,
+        scheduleName: "sheriff-req-1",
+      }),
+      request: record(),
+      resolve: async () => "m-resolved",
+      deleteMembership: async (_client, id) => {
+        deleted = id;
+        return true;
+      },
+      calls,
+    });
+    await handleRevoke(
+      { action: "revoke", requestId: "req-1" } as never,
+      fakeSlack(posts),
+      deps,
+    );
+    assert.equal(deleted, "m-resolved");
+    assert.ok(calls.includes("setGrantState:revoked"));
+  });
+
+  it("fails a granting record with no membership and drops the schedule", async () => {
+    const posts: unknown[] = [];
+    const calls: string[] = [];
+    const deps = revokeDeps({
+      grant: grant({ state: "granting", membershipId: undefined }),
+      request: record(),
+      resolve: async () => null,
+      calls,
+    });
+    await handleRevoke(
+      { action: "revoke", requestId: "req-1" } as never,
+      fakeSlack(posts),
+      deps,
+    );
+    assert.ok(calls.includes("setGrantState:failed"));
+    assert.ok(calls.includes("releaseActiveGrant:user-1"));
+    assert.ok(calls.includes("deleteExpirySchedule"));
+    assert.equal(posts.length, 0);
+  });
+
+  it("rethrows a failed revoke so the schedule retries and dead-letters", async () => {
+    const posts: unknown[] = [];
+    const deps = revokeDeps({
+      grant: activeGrant(),
+      request: record(),
+      deleteMembership: async () => {
+        throw new Error("access denied");
+      },
+    });
+    await assert.rejects(() =>
+      handleRevoke(
+        { action: "revoke", requestId: "req-1" } as never,
+        fakeSlack(posts),
+        deps,
+      ),
+    );
+    assert.equal(posts.length, 0);
+  });
+});
+
 describe("approval post claim", () => {
   it("claims the post only once", async () => {
     let captured: { input?: any } | undefined;
@@ -1211,6 +1747,20 @@ describe("decided post", () => {
     );
     assert.match(outcome, /denied/);
     assert.match(outcome, /No access was granted/);
+  });
+});
+
+describe("revoke post", () => {
+  it("names the requester and request and repeats the session caveat", () => {
+    const revoked = grant({ state: "revoked", membershipId: "m-1" });
+    const blocks = buildRevokedBlocks(revoked, "2026-10-13T01:00:00.000Z");
+    const serialized = JSON.stringify(blocks);
+    assert.match(serialized, /revoked/);
+    assert.match(serialized, /UREQUESTER/);
+    assert.match(serialized, /req-1/);
+    assert.match(serialized, /already open/);
+    const text = buildRevokeOutcomeText(revoked, "2026-10-13T01:00:00.000Z");
+    assert.match(text, /AdministratorAccess/);
   });
 });
 

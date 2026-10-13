@@ -293,6 +293,19 @@ export const createStore = (
     );
   };
 
+  /** One grant record by request id, for the scheduler's revoke action. */
+  const getGrant = async (requestId: string): Promise<GrantRecord | null> => {
+    const result = await client.send(
+      new GetCommand({
+        TableName: tableName(),
+        Key: { pk: GRANT_PK, sk: grantSk(requestId) },
+      }),
+    );
+    if (!result.Item) return null;
+    const { pk: _pk, sk: _sk, ...grant } = result.Item;
+    return grant as GrantRecord;
+  };
+
   /**
    * Flips a grant record's state, optionally recording the `membershipId`.
    *
@@ -383,6 +396,45 @@ export const createStore = (
     );
   };
 
+  /**
+   * Claims the one revoke post for a grant. The scheduler fires once but
+   * retries on failure, and the sweeper can revoke the same grant concurrently,
+   * so the state transition alone cannot make the post at-most-once: whichever
+   * revoker wins the transition would otherwise be the only one allowed to
+   * post, and a sweeper win would silence the channel. This claim is separate,
+   * so exactly one revoker posts regardless of who moved the state.
+   */
+  const claimRevokePost = async (requestId: string): Promise<boolean> => {
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: tableName(),
+          Key: { pk: GRANT_PK, sk: grantSk(requestId) },
+          UpdateExpression: "SET #revokeNotified = :true",
+          ConditionExpression: "attribute_not_exists(#revokeNotified)",
+          ExpressionAttributeNames: { "#revokeNotified": "revokeNotified" },
+          ExpressionAttributeValues: { ":true": true },
+        }),
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ConditionalCheckFailedException) return false;
+      throw err;
+    }
+  };
+
+  /** Clears the revoke post claim after a failed post, so a retry can post. */
+  const releaseRevokePost = async (requestId: string): Promise<void> => {
+    await client.send(
+      new UpdateCommand({
+        TableName: tableName(),
+        Key: { pk: GRANT_PK, sk: grantSk(requestId) },
+        UpdateExpression: "REMOVE #revokeNotified",
+        ExpressionAttributeNames: { "#revokeNotified": "revokeNotified" },
+      }),
+    );
+  };
+
   /** Every grant record, for the sweeper. Paginated. */
   const listGrants = async (): Promise<GrantRecord[]> => {
     const grants: GrantRecord[] = [];
@@ -416,10 +468,13 @@ export const createStore = (
     releaseActiveGrant,
     getActiveGrant,
     putGrant,
+    getGrant,
     setGrantState,
     listGrants,
     claimRequestPost,
     releaseRequestPost,
+    claimRevokePost,
+    releaseRevokePost,
   };
 };
 
@@ -436,8 +491,11 @@ export const {
   releaseActiveGrant,
   getActiveGrant,
   putGrant,
+  getGrant,
   setGrantState,
   listGrants,
   claimRequestPost,
   releaseRequestPost,
+  claimRevokePost,
+  releaseRevokePost,
 } = store;

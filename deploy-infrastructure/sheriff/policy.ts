@@ -15,6 +15,7 @@ import {
   DURATION_OPTIONS,
   MAX_DURATION_SECONDS,
   MAX_REQUESTS_PER_DAY,
+  SCHEDULE_NAME_PREFIX,
 } from "./config";
 
 /**
@@ -84,6 +85,12 @@ export type GrantRecord = {
   expiresAt: string;
   /** Set once the membership exists; absent while the record is `granting`. */
   membershipId?: string;
+  /**
+   * The EventBridge Scheduler one-shot that revokes this grant at `expiresAt`
+   * (step 5). Named deterministically from the request id so it is known
+   * before the schedule is created and a retry addresses the same schedule.
+   */
+  scheduleName?: string;
   updatedAt?: string;
   /** DynamoDB TTL, retention only. */
   ttl?: number;
@@ -148,6 +155,25 @@ export const grantExpiresAt = (
   durationSeconds: number,
 ): string =>
   new Date(Date.parse(grantedAt) + durationSeconds * 1000).toISOString();
+
+/**
+ * The deterministic EventBridge Scheduler name for a grant's expiry one-shot.
+ * Deterministic so the grant record can carry it from the moment it is written,
+ * before the schedule exists, and so a retry or a sweep recovery addresses the
+ * same schedule rather than creating a second one.
+ */
+export const expiryScheduleName = (requestId: string): string =>
+  `${SCHEDULE_NAME_PREFIX}${requestId}`;
+
+/**
+ * EventBridge Scheduler's one-shot `at()` expression for a grant's expiry.
+ *
+ * The form is `at(yyyy-mm-ddThh:mm:ss)` evaluated in the schedule's timezone;
+ * the create call sets that to UTC. The ISO milliseconds and trailing `Z` are
+ * not accepted, so they are stripped rather than passed through.
+ */
+export const scheduleAtExpression = (iso: string): string =>
+  `at(${new Date(iso).toISOString().replace(/\.\d{3}Z$/, "")})`;
 
 /**
  * Slack sends interactivity as `application/x-www-form-urlencoded` with a

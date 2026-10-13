@@ -124,3 +124,22 @@ export const SWEEP_GRANTING_GRACE_MS = 5 * 60 * 1000;
  * permission set can be reconciled by a reader.
  */
 export const SESSION_DURATION_SECONDS = 60 * 60;
+
+/**
+ * Step 5's EventBridge Scheduler one-shot, one per grant, fired at the grant's
+ * `expiresAt`. The name is `sheriff-<requestId>`: deterministic, so it can be
+ * stored on the grant record before the schedule exists and a retry addresses
+ * the same schedule instead of creating a second one.
+ */
+export const SCHEDULE_NAME_PREFIX = "sheriff-";
+
+/**
+ * The retry policy on the expiry schedule. EventBridge Scheduler retries the
+ * target on a thrown error, then dead-letters the event once the attempts are
+ * exhausted. The sweeper is the backstop either way, so these are bounded
+ * rather than infinite: three attempts within an hour is enough for a
+ * transient AWS or Slack error, and a grant stuck longer than that is the
+ * sweeper's problem and an alarm.
+ */
+export const SCHEDULE_MAX_RETRY_ATTEMPTS = 3;
+export const SCHEDULE_MAX_EVENT_AGE_SECONDS = 60 * 60;
