@@ -13,9 +13,9 @@ import { decide } from "./gates";
 import { createGitTool } from "./git-tool";
 import { createGitHub } from "./github";
 import {
-  carryForwardUnmatchedPriors,
   dismissablePriorFindings,
   matchPriorFindings,
+  planCarriedFindings,
 } from "./match";
 import {
   FindingSchema,
@@ -598,15 +598,19 @@ export const runReview = async (args: {
 
   // A dropped finding may have been a prior finding re-emitted with one bad
   // field, so it is indistinguishable from a fixed one. When anything was
-  // dropped, carry every unmatched prior forward: it stays on this run's
-  // record (so the next run still sees it) and its thread stays open.
-  if (parsed.droppedFindingCount > 0 && prior) {
-    const added = carryForwardUnmatchedPriors(prior.findings, carried);
-    if (added > 0) {
-      console.warn(
-        `carried ${added} prior finding(s) forward because ${parsed.droppedFindingCount} finding(s) were dropped as unparseable`,
-      );
-    }
+  // dropped, retain every unmatched prior on the record so the next run still
+  // sees it. These are kept apart from `carried`: they were not re-emitted,
+  // so their threads are left exactly as they are — a resolved thread is not
+  // reopened by a lossy run.
+  const { retained, all: allCarried, reconcilable } = planCarriedFindings(
+    carried,
+    prior?.findings ?? [],
+    parsed.droppedFindingCount,
+  );
+  if (retained.length > 0) {
+    console.warn(
+      `retained ${retained.length} prior finding(s) because ${parsed.droppedFindingCount} finding(s) were dropped as unparseable`,
+    );
   }
 
   const body = renderBody({
@@ -617,7 +621,7 @@ export const runReview = async (args: {
     inlineCount: fresh.length,
     droppedCount: dropped.length,
     unparseableCount: parsed.droppedFindingCount,
-    carriedForward: carried.map((f) => ({
+    carriedForward: allCarried.map((f) => ({
       id: f.id,
       path: f.path,
       line: f.line,
@@ -642,7 +646,7 @@ export const runReview = async (args: {
       verdict: decision.verdict,
       action: "skipped",
       gates: decision.gates,
-      findings: [...fresh, ...carried],
+      findings: [...fresh, ...allCarried],
       droppedFindings: dropped,
       tipMovedTo: liveBeforePost,
       costUsd,
@@ -704,7 +708,7 @@ export const runReview = async (args: {
         console.error("listReviewThreads failed:", err);
         return [];
       });
-    const carriedIds = new Set(carried.map((f) => f.id));
+    const carriedIds = new Set(allCarried.map((f) => f.id));
 
     for (const finding of inline) {
       if (finding.commentId) {
@@ -712,7 +716,7 @@ export const runReview = async (args: {
       }
     }
 
-    for (const f of carried) {
+    for (const f of reconcilable) {
       if (!f.threadId) continue;
       const thread = threads.find((t) => t.id === f.threadId);
       if (thread?.isResolved) {
@@ -778,7 +782,7 @@ export const runReview = async (args: {
     }
   }
 
-  const findingCount = fresh.length + carried.length;
+  const findingCount = fresh.length + allCarried.length;
   await github
     .postStatus(repo, headSha, {
       state: "success",
@@ -797,7 +801,7 @@ export const runReview = async (args: {
     verdict: decision.verdict,
     action: decision.action === "approve" ? "approved" : "commented",
     gates: decision.gates,
-    findings: [...fresh, ...carried],
+    findings: [...fresh, ...allCarried],
     droppedFindings: dropped,
     reviewId: posted.reviewId,
     tipMovedTo,
@@ -815,7 +819,7 @@ export const runReview = async (args: {
     action: record.action,
     gates: decision.gates,
     findings_new: fresh.length,
-    findings_carried: carried.length,
+    findings_carried: allCarried.length,
     findings_adjusted: fresh.filter((f) => f.anchorAdjusted).length,
     findings_dropped: dropped.length,
     tip_moved: Boolean(tipMovedTo),

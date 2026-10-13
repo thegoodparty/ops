@@ -5,6 +5,7 @@ import {
   dismissablePriorFindings,
   matchPriorFinding,
   matchPriorFindings,
+  planCarriedFindings,
   PRIOR_MATCH_WINDOW,
 } from "./match";
 import type { Finding, PostedFinding } from "./schema";
@@ -129,11 +130,31 @@ test("a dropped finding leaves every unmatched prior open", () => {
   assert.deepEqual(dismissablePriorFindings([a, b], new Set([a.id]), 0), [b]);
 });
 
-test("carryForwardUnmatchedPriors retains every prior not already carried", () => {
+test("carryForwardUnmatchedPriors returns every prior not already carried", () => {
   const a = prior({ id: "00000000-0000-0000-0000-000000000001" });
   const b = prior({ id: "00000000-0000-0000-0000-000000000002" });
-  const carried = [a];
-  assert.equal(carryForwardUnmatchedPriors([a, b], carried), 1);
-  assert.deepEqual(carried, [a, b]);
-  assert.equal(carryForwardUnmatchedPriors([a, b], carried), 0);
+  // Returned separately from `carried`, so the posting path can leave these
+  // threads alone rather than reopening them.
+  assert.deepEqual(carryForwardUnmatchedPriors([a, b], [a]), [b]);
+  assert.deepEqual(carryForwardUnmatchedPriors([a, b], [a, b]), []);
+});
+
+test("a retained prior lands on the record but is not reconciled", () => {
+  const matched = prior({ id: "00000000-0000-0000-0000-000000000001" });
+  const kept = prior({ id: "00000000-0000-0000-0000-000000000002" });
+  const plan = planCarriedFindings([matched], [matched, kept], 1);
+  assert.deepEqual(plan.retained, [kept]);
+  assert.deepEqual(plan.all, [matched, kept]);
+  // The reconcile list drives unresolve/resolve; a retained prior must not be
+  // in it, so an already-resolved thread is not reopened by a lossy run.
+  assert.deepEqual(plan.reconcilable, [matched]);
+});
+
+test("no drop retains nothing and reconciles only the matched findings", () => {
+  const a = prior({ id: "00000000-0000-0000-0000-000000000001" });
+  const b = prior({ id: "00000000-0000-0000-0000-000000000002" });
+  const plan = planCarriedFindings([a], [a, b], 0);
+  assert.deepEqual(plan.retained, []);
+  assert.deepEqual(plan.all, [a]);
+  assert.deepEqual(plan.reconcilable, [a]);
 });

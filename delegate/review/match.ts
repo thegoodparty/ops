@@ -69,22 +69,51 @@ export const dismissablePriorFindings = (
 ): PostedFinding[] =>
   droppedFindingCount > 0 ? [] : priorFindings.filter((f) => !carriedIds.has(f.id));
 
-// Append every prior finding not already carried into `carried`, so a run
-// that dropped a finding retains all of them on its record and the next run's
-// prior findings still include them. Returns how many were added.
+// Prior findings not already carried, retained on the record so a run that
+// dropped a finding keeps them for the next run. Returned separately from
+// `carried` because these were not re-emitted: they belong on the record and
+// in the body, but the posting path must not touch their threads (a resolved
+// thread stays resolved rather than being reopened by a lossy run).
 export const carryForwardUnmatchedPriors = (
   priorFindings: readonly PostedFinding[],
-  carried: PostedFinding[],
-): number => {
+  carried: readonly PostedFinding[],
+): PostedFinding[] => {
   const carriedIds = new Set(carried.map((f) => f.id));
-  let added = 0;
+  const added: PostedFinding[] = [];
   for (const prior of priorFindings) {
     if (carriedIds.has(prior.id)) continue;
-    carried.push(prior);
+    added.push(prior);
     carriedIds.add(prior.id);
-    added++;
   }
   return added;
+};
+
+export interface CarriedPlan {
+  // Priors kept on the record only because a drop made "not re-emitted"
+  // ambiguous. Not re-emitted.
+  retained: PostedFinding[];
+  // Everything that belongs on the record and in the body.
+  all: PostedFinding[];
+  // Findings whose threads the run may reconcile. Deliberately excludes the
+  // retained priors, so a resolved thread is never reopened by a lossy run.
+  reconcilable: PostedFinding[];
+}
+
+// Decide how the matched findings and the prior findings combine for a run.
+// The one invariant that matters: `reconcilable` never contains a retained
+// prior, while `all` always does.
+export const planCarriedFindings = (
+  carried: readonly PostedFinding[],
+  priorFindings: readonly PostedFinding[],
+  droppedFindingCount: number,
+): CarriedPlan => {
+  const retained =
+    droppedFindingCount > 0 ? carryForwardUnmatchedPriors(priorFindings, carried) : [];
+  return {
+    retained,
+    all: [...carried, ...retained],
+    reconcilable: [...carried],
+  };
 };
 
 // Assign each re-emitted finding to at most one prior finding, and each prior
