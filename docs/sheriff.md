@@ -638,10 +638,11 @@ tool's own records are structured for export and retention from day one.
   timeout.** A timeout that grants access is not an approval policy; it is an
   outage that escalates. **Open** (open question 6).
 - **Rate limit.** A per-user cap on requests per day, and a global cap on
-  concurrent grants, both enforced before the grant call. The exact numbers are
-  **open**. These are separate from the hard **one active grant per user** rule,
-  which is decided rather than open and is enforced with a conditional write;
-  see "The decision".
+  concurrent grants, both enforced before the grant call. The current enforced
+  per-user value is **20 per UTC day**; the global concurrent-grant cap and
+  whether these numbers are final are still **open**. These are separate from the
+  hard **one active grant per user** rule, which is decided rather than open and
+  is enforced with a conditional write; see "The decision".
 
 ## Reliability invariants
 

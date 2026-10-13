@@ -82,11 +82,11 @@ export const DURATION_OPTIONS: readonly {
 ];
 
 /**
- * The per-user cap on requests per day. The exact number is an open question
- * in the plan ("Rate limit"); 5/day is the placeholder the flow enforces, it is
- * one line to change, and the PR body calls it out.
+ * The per-user cap on requests per day. 20/day is the value the flow currently
+ * enforces; whether it is final is still open in the plan ("Rate limit"), and
+ * it is one line to change.
  */
-export const MAX_REQUESTS_PER_DAY = 5;
+export const MAX_REQUESTS_PER_DAY = 20;
 
 /**
  * DynamoDB TTL, retention only. It never ends a grant (`docs/sheriff.md`,
