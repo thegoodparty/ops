@@ -759,7 +759,7 @@ describe("handleSweep imperative paths", () => {
     assert.ok(calls.includes("releaseActiveGrant:user-1"));
   });
 
-  it("skips the rest of the transition when the conditional write is a no-op", async () => {
+  it("skips the rest of the failed transition when the conditional write is a no-op", async () => {
     // A concurrent sweep moved the record; this sweep must not clobber it and
     // must not release the lock.
     const calls: string[] = [];
@@ -772,6 +772,28 @@ describe("handleSweep imperative paths", () => {
     await handleSweep(deps);
     assert.ok(!calls.some((call) => call.startsWith("setRequestState")));
     assert.ok(!calls.includes("releaseActiveGrant:user-1"));
+  });
+
+  it("skips the request write on a revoke no-op but still releases the lock", async () => {
+    // The membership was deleted, so the lock must be released even though a
+    // concurrent sweep already moved the record and the state write was a
+    // no-op.
+    const calls: string[] = [];
+    const deps = sweepDeps({
+      grants: [
+        grant({
+          state: "granted",
+          membershipId: "m-1",
+          expiresAt: new Date(Date.now() - 60 * 1000).toISOString(),
+        }),
+      ],
+      memberships: [{ userId: "user-1", membershipId: "m-1" }],
+      setGrantState: async () => false,
+      calls,
+    });
+    await handleSweep(deps);
+    assert.ok(!calls.some((call) => call.startsWith("setRequestState")));
+    assert.ok(calls.includes("releaseActiveGrant:user-1"));
   });
 });
 

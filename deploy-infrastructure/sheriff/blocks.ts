@@ -116,7 +116,7 @@ const grantContext = (grant: GrantRecord): string =>
     SESSION_DURATION_SECONDS,
   )} minutes more). The honest worst case is roughly twice the requested duration.`;
 
-const grantFailedContext = (request: RequestRecord): string =>
+const grantFailedContext = (): string =>
   `:x: The approval was recorded but the grant failed, so no access was granted. The failure is logged. If it persists, ask an engineer to check the \`sheriff-grant\` role and the Identity Center directory.`;
 
 /** The approval post, with Approve/Deny bound to the request id. */
@@ -179,7 +179,7 @@ export const buildDecidedBlocks = (
       ? grant && grant.state === "granted"
         ? grantContext(grant)
         : grant && grant.state === "failed"
-          ? grantFailedContext(request)
+          ? grantFailedContext()
           : "The approval is recorded; the grant is in progress."
       : "No access was granted.";
   return [
