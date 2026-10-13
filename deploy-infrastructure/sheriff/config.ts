@@ -58,7 +58,7 @@ export const ENGINEERS_GROUP_ID = "383193a0-7001-70d9-a321-ffe6d8af7378";
 export const SSO_PORTAL_URL = `https://${IDENTITY_STORE_ID}.awsapps.com/start`;
 
 /** Where the request and every outcome are posted. No DMs. */
-export const DEFAULT_APPROVAL_CHANNEL = "#devs-only";
+export const DEFAULT_APPROVAL_CHANNEL = "#sensitive-access-requests";
 
 /**
  * Duration cap, settled in review (open question 5): default `PT1H`, max

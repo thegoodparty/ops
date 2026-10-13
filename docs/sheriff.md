@@ -320,7 +320,7 @@ standing admin"; after that it is the original "no standing admin".
               │                  rate counters    (step 5)        + alarms
               │                                        │
               ▼                                        └── both call the same revoke
-   #devs-only post  ◀── sts:AssumeRole ──▶ management account 333022194791
+   #sensitive-access-requests post  ◀── sts:AssumeRole ──▶ management account 333022194791
                                             role: sheriff-grant
                                             identitystore:CreateGroupMembership
                                             identitystore:DeleteGroupMembership
@@ -375,7 +375,7 @@ code, changed only by a reviewed PR.
    `IsMemberInGroups`. A miss is an inline modal error keyed to `reason_block`
    and no record is written. Only then does it write a `requested` record and
    post a Block Kit message to a configured channel, defaulting to
-   `#devs-only`, with **Approve** and **Deny** buttons bound to the request id.
+   `#sensitive-access-requests`, with **Approve** and **Deny** buttons bound to the request id.
    Outcomes go to the same channel. There are no DMs; transparency is the point.
    If an approver ping is wanted, it is an in-channel user-group mention, not a
    DM.
@@ -628,7 +628,7 @@ tool's own records are structured for export and retention from day one.
   second approver is tempting, but review settled on one for now; two-person
   approval is a usability cost that should be added deliberately if it is
   wanted, not assumed.
-- **Notifications.** A configured channel, default `#devs-only`. The request and
+- **Notifications.** A configured channel, default `#sensitive-access-requests`. The request and
   every outcome are posted there. No DMs. An optional in-channel user-group
   mention can serve as the ping.
 - **Availability fallback.** If no approver is online the flow stalls. The
@@ -920,5 +920,5 @@ and are deliberately neither created by Pulumi nor committed:
    then the orphaned-membership alarm fires into a topic with no confirmed
    subscriber.
 
-The configured channel is `#devs-only` by default, overridable with the
+The configured channel is `#sensitive-access-requests` by default, overridable with the
 `APPROVAL_CHANNEL` environment variable on the function.
