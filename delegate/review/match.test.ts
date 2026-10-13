@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { matchPriorFinding, matchPriorFindings, PRIOR_MATCH_WINDOW } from "./match";
+import {
+  carryForwardUnmatchedPriors,
+  dismissablePriorFindings,
+  matchPriorFinding,
+  matchPriorFindings,
+  PRIOR_MATCH_WINDOW,
+} from "./match";
 import type { Finding, PostedFinding } from "./schema";
 
 const finding = (overrides: Partial<Finding> = {}): Finding => ({
@@ -112,4 +118,22 @@ test("a finding with no candidate stays fresh", () => {
     [p],
   );
   assert.deepEqual(matches, [undefined]);
+});
+
+test("a dropped finding leaves every unmatched prior open", () => {
+  const a = prior({ id: "00000000-0000-0000-0000-000000000001" });
+  const b = prior({ id: "00000000-0000-0000-0000-000000000002" });
+  // One prior was matched and carried; with a drop, the other must not be
+  // dismissed even though the model did not re-emit it.
+  assert.deepEqual(dismissablePriorFindings([a, b], new Set([a.id]), 1), []);
+  assert.deepEqual(dismissablePriorFindings([a, b], new Set([a.id]), 0), [b]);
+});
+
+test("carryForwardUnmatchedPriors retains every prior not already carried", () => {
+  const a = prior({ id: "00000000-0000-0000-0000-000000000001" });
+  const b = prior({ id: "00000000-0000-0000-0000-000000000002" });
+  const carried = [a];
+  assert.equal(carryForwardUnmatchedPriors([a, b], carried), 1);
+  assert.deepEqual(carried, [a, b]);
+  assert.equal(carryForwardUnmatchedPriors([a, b], carried), 0);
 });

@@ -12,7 +12,11 @@ import { buildBundle, priorFindingsFrom } from "./bundle";
 import { decide } from "./gates";
 import { createGitTool } from "./git-tool";
 import { createGitHub } from "./github";
-import { matchPriorFindings } from "./match";
+import {
+  carryForwardUnmatchedPriors,
+  dismissablePriorFindings,
+  matchPriorFindings,
+} from "./match";
 import {
   FindingSchema,
   ReviewOutputSchema,
@@ -189,9 +193,10 @@ const parseCandidate = (candidate: unknown): ParsedReviewOutput | undefined => {
       if (parsed.success) findings.push(parsed.data);
       else droppedFindingCount++;
     }
-  } else if (obj.findings !== undefined) {
-    // A findings value that is not an array is itself a malformed finding:
-    // count it so it blocks approval rather than vanishing.
+  } else {
+    // A missing findings key is not an explicit empty list, and a non-array
+    // value is not a list at all. Both are counted so a complete-with-summary
+    // object cannot silently approve.
     droppedFindingCount++;
   }
 
@@ -213,6 +218,11 @@ const strictParse = (candidate: unknown): ParsedReviewOutput | undefined => {
   return parsed.success ? { output: parsed.data, droppedFindingCount: 0 } : undefined;
 };
 
+const hasFindingsArray = (candidate: unknown): boolean =>
+  candidate !== null &&
+  typeof candidate === "object" &&
+  Array.isArray((candidate as Record<string, unknown>).findings);
+
 export const parseReviewOutput = (
   result: { structuredOutput?: unknown; output: string },
 ): ParsedReviewOutput => {
@@ -232,16 +242,27 @@ export const parseReviewOutput = (
   if (candidates.length === 0) {
     return { error: `agent returned no JSON: ${result.output.slice(0, 300)}` };
   }
+
+  // Prefer the strongest object, not merely the last one. A strict parse beats
+  // a tolerant one, and among tolerant ones an explicit findings array beats a
+  // bare summary. Ties go to the later object. Without this a trailing
+  // summary-only object hides an earlier object that carried the findings.
+  let best: { parsed: ParsedReviewOutput; rank: number } | undefined;
   let lastError = "no usable review object";
-  for (const candidate of [...candidates].reverse()) {
+  for (const candidate of candidates) {
     const strict = strictParse(candidate);
-    if (strict) return strict;
+    if (strict) {
+      best = { parsed: strict, rank: 2 };
+      continue;
+    }
     const validation = ReviewOutputSchema.safeParse(candidate);
     if (!validation.success) lastError = validation.error.message;
     const tolerant = parseCandidate(candidate);
-    if (tolerant) return tolerant;
+    if (!tolerant) continue;
+    const rank = hasFindingsArray(candidate) ? 1 : 0;
+    if (best === undefined || rank >= best.rank) best = { parsed: tolerant, rank };
   }
-  return { error: `agent output failed schema: ${lastError}` };
+  return best?.parsed ?? { error: `agent output failed schema: ${lastError}` };
 };
 
 const commentUrl = (repo: string, prNumber: number, commentId: number) =>
@@ -575,6 +596,19 @@ export const runReview = async (args: {
     }
   });
 
+  // A dropped finding may have been a prior finding re-emitted with one bad
+  // field, so it is indistinguishable from a fixed one. When anything was
+  // dropped, carry every unmatched prior forward: it stays on this run's
+  // record (so the next run still sees it) and its thread stays open.
+  if (parsed.droppedFindingCount > 0 && prior) {
+    const added = carryForwardUnmatchedPriors(prior.findings, carried);
+    if (added > 0) {
+      console.warn(
+        `carried ${added} prior finding(s) forward because ${parsed.droppedFindingCount} finding(s) were dropped as unparseable`,
+      );
+    }
+  }
+
   const body = renderBody({
     decision,
     summary: output.summary,
@@ -611,7 +645,7 @@ export const runReview = async (args: {
       findings: [...fresh, ...carried],
       droppedFindings: dropped,
       tipMovedTo: liveBeforePost,
-      costUsd: result.costUsd,
+      costUsd,
     });
     await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
     emit("review_skipped", {
@@ -621,7 +655,7 @@ export const runReview = async (args: {
       run_id: runId,
       reason: "superseded",
       tip: liveBeforePost,
-      cost_usd: result.costUsd ?? null,
+      cost_usd: costUsd ?? null,
     });
     return record;
   }
@@ -648,7 +682,7 @@ export const runReview = async (args: {
   } catch (err) {
     return fail(
       `posting the review failed: ${err instanceof Error ? err.message : String(err)}`,
-      { output, costUsd: result.costUsd },
+      { output, costUsd },
     );
   }
 
@@ -695,8 +729,11 @@ export const runReview = async (args: {
       });
     }
 
-    for (const pf of prior.findings) {
-      if (carriedIds.has(pf.id)) continue;
+    for (const pf of dismissablePriorFindings(
+      prior.findings,
+      carriedIds,
+      parsed.droppedFindingCount,
+    )) {
       if (pf.threadId) {
         const thread = threads.find((t) => t.id === pf.threadId);
         if (thread && !thread.isResolved) {
@@ -764,7 +801,7 @@ export const runReview = async (args: {
     droppedFindings: dropped,
     reviewId: posted.reviewId,
     tipMovedTo,
-    costUsd: result.costUsd,
+    costUsd,
   });
   await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
 
@@ -782,7 +819,7 @@ export const runReview = async (args: {
     findings_adjusted: fresh.filter((f) => f.anchorAdjusted).length,
     findings_dropped: dropped.length,
     tip_moved: Boolean(tipMovedTo),
-    cost_usd: result.costUsd ?? null,
+    cost_usd: costUsd ?? null,
     wall_time_ms: record.wallTimeMs,
   });
   for (const finding of fresh) {

@@ -57,6 +57,36 @@ export const matchPriorFinding = (
   return best?.prior;
 };
 
+// Prior findings a completed review may treat as fixed. A run that dropped
+// any finding cannot say a prior finding is fixed: the dropped finding may
+// have been that prior one re-emitted with a bad field, and the model may
+// simply not have emitted the rest. Return none in that case so the caller
+// leaves every thread open and carries the priors forward.
+export const dismissablePriorFindings = (
+  priorFindings: readonly PostedFinding[],
+  carriedIds: ReadonlySet<string>,
+  droppedFindingCount: number,
+): PostedFinding[] =>
+  droppedFindingCount > 0 ? [] : priorFindings.filter((f) => !carriedIds.has(f.id));
+
+// Append every prior finding not already carried into `carried`, so a run
+// that dropped a finding retains all of them on its record and the next run's
+// prior findings still include them. Returns how many were added.
+export const carryForwardUnmatchedPriors = (
+  priorFindings: readonly PostedFinding[],
+  carried: PostedFinding[],
+): number => {
+  const carriedIds = new Set(carried.map((f) => f.id));
+  let added = 0;
+  for (const prior of priorFindings) {
+    if (carriedIds.has(prior.id)) continue;
+    carried.push(prior);
+    carriedIds.add(prior.id);
+    added++;
+  }
+  return added;
+};
+
 // Assign each re-emitted finding to at most one prior finding, and each prior
 // to at most one finding. Candidates are matched globally: the closest pair
 // claims first, so two new findings can never thread onto the same comment —

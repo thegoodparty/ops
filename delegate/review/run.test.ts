@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, latestCompletedRecord, parseReviewOutput, pathGuardHook } from "./run";
@@ -229,5 +229,56 @@ test("parseReviewOutput counts a non-array findings value as one bad finding", (
   assert.ok(!("error" in out));
   assert.equal(out.droppedFindingCount, 1);
   assert.deepEqual(out.output, { status: "complete", findings: [], summary: "clean" });
+});
+
+test("parseReviewOutput does not approve when findings is missing", () => {
+  const out = parseReviewOutput({
+    structuredOutput: { status: "complete", summary: "looks clean to me" },
+    output: "",
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.droppedFindingCount, 1);
+  assert.deepEqual(out.output, {
+    status: "complete",
+    findings: [],
+    summary: "looks clean to me",
+  });
+});
+
+test("parseReviewOutput prefers an earlier strict object over a trailing summary-only one", () => {
+  const out = parseReviewOutput({
+    output: `{"status":"complete","findings":[${JSON.stringify(goodFinding)}],"summary":"one bug"}\n{"status":"complete","summary":"clean"}`,
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.droppedFindingCount, 0);
+  assert.equal(out.output.status, "complete");
+  if (out.output.status === "complete") {
+    assert.equal(out.output.findings.length, 1);
+    assert.equal(out.output.findings[0].path, "src/a.ts");
+    assert.equal(out.output.summary, "one bug");
+  }
+});
+
+test("parseReviewOutput prefers a findings array over a trailing bare summary", () => {
+  const malformed = { ...goodFinding, line: -1 };
+  const out = parseReviewOutput({
+    output: `{"status":"complete","findings":[${JSON.stringify(malformed)}],"summary":"lossy"}\n{"status":"complete","summary":"clean"}`,
+  });
+  assert.ok(!("error" in out));
+  assert.equal(out.droppedFindingCount, 1);
+  assert.equal(out.output.status, "complete");
+  if (out.output.status === "complete") assert.equal(out.output.summary, "lossy");
+});
+
+// The repair turn adds its spend to the local `costUsd`. Every path after the
+// repair block must use that accumulated value, not the first session's cost,
+// or a repaired run records an understated cost. Guard the source directly.
+test("no callsite after the repair pass reads result.costUsd", () => {
+  const source = readFileSync(join(__dirname, "run.ts"), "utf-8");
+  const marker = "let costUsd = result.costUsd;";
+  const start = source.indexOf(marker);
+  assert.ok(start !== -1, "expected the repair cost accumulator");
+  const after = source.slice(start + marker.length);
+  assert.equal(after.includes("result.costUsd"), false);
 });
 
