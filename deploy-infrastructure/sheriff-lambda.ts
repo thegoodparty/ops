@@ -121,9 +121,15 @@ export const sheriffLambdaTrust = {
 
 /**
  * EventBridge Scheduler's trust for the schedule-execution role. The
- * `aws:SourceAccount` and `aws:SourceArn` conditions confine it to schedules
- * this account creates in the one schedule group, so a schedule elsewhere
- * cannot borrow the role to invoke the function or write the DLQ.
+ * `aws:SourceAccount` and `aws:SourceArn` conditions confine it to this
+ * account's schedules, so a schedule elsewhere cannot borrow the role to
+ * invoke the function or write the DLQ.
+ *
+ * `aws:SourceArn` must be the schedule **group** ARN, not a schedule ARN or a
+ * name prefix: AWS's confused-deputy guidance is explicit that Scheduler
+ * presents the group ARN at AssumeRole time, and a schedule-scoped condition
+ * is rejected. The group is dedicated to this tool, so scoping to it is as
+ * narrow as the condition allows.
  */
 export const sheriffSchedulerTrust = {
   Version: "2012-10-17",
@@ -133,8 +139,10 @@ export const sheriffSchedulerTrust = {
       Principal: { Service: "scheduler.amazonaws.com" },
       Action: "sts:AssumeRole",
       Condition: {
-        StringEquals: { "aws:SourceAccount": INFRASTRUCTURE_ACCOUNT_ID },
-        ArnLike: { "aws:SourceArn": `${SHERIFF_SCHEDULE_ARN_PREFIX}*` },
+        StringEquals: {
+          "aws:SourceAccount": INFRASTRUCTURE_ACCOUNT_ID,
+          "aws:SourceArn": SHERIFF_SCHEDULE_GROUP_ARN,
+        },
       },
     },
   ],

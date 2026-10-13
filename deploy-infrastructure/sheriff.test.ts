@@ -24,6 +24,7 @@ import {
   SHERIFF_SCHEDULER_ROLE_NAME,
   SHERIFF_SCHEDULE_ARN_PREFIX,
   SHERIFF_SCHEDULE_GROUP,
+  SHERIFF_SCHEDULE_GROUP_ARN,
   SHERIFF_TABLE_NAME,
   SHERIFF_SECRET_NAME,
   SHERIFF_SECRET_IMPORT_ID,
@@ -387,10 +388,15 @@ describe("scheduled revocation infrastructure", () => {
       Service: "scheduler.amazonaws.com",
     });
     assert.equal(statement.Action, "sts:AssumeRole");
+    // `aws:SourceArn` must be the schedule group ARN, not a schedule ARN or a
+    // name prefix: Scheduler presents the group ARN at AssumeRole time.
     assert.deepEqual(statement.Condition, {
-      StringEquals: { "aws:SourceAccount": "394495727159" },
-      ArnLike: { "aws:SourceArn": `${SHERIFF_SCHEDULE_ARN_PREFIX}*` },
+      StringEquals: {
+        "aws:SourceAccount": "394495727159",
+        "aws:SourceArn": SHERIFF_SCHEDULE_GROUP_ARN,
+      },
     });
+    assert.match(SHERIFF_SCHEDULE_GROUP_ARN, /:schedule-group\/sheriff$/);
   });
 
   it("lets the execution role invoke only the one function and write only the one DLQ", () => {
