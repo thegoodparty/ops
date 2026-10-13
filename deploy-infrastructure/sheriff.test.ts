@@ -8,6 +8,7 @@ import {
   SHERIFF_ROLE_NAME,
   SHERIFF_TABLE_NAME,
   SHERIFF_SECRET_NAME,
+  SHERIFF_SECRET_IMPORT_ID,
   sheriffLambdaPolicy,
   sheriffLambdaTrust,
 } from "./sheriff-lambda";
@@ -158,6 +159,41 @@ describe("sheriff role name", () => {
     // DynamoDB are separate namespaces.
     assert.equal(SHERIFF_TABLE_NAME, "sheriff");
     assert.equal(SHERIFF_SECRET_NAME, SHERIFF_TABLE_NAME);
+  });
+});
+
+describe("sheriff secret adoption", () => {
+  const source = fs.readFileSync(
+    path.resolve(__dirname, "sheriff-lambda.ts"),
+    "utf8",
+  );
+
+  it("imports the secret by its partial ARN, not the bare name", () => {
+    // The provider's importer parses the id as an ARN, so the bare name would
+    // fail. The partial ARN omits the six random characters Secrets Manager
+    // appends, which do not exist until the secret does; AWS resolves it to
+    // the one secret with this name.
+    assert.equal(
+      SHERIFF_SECRET_IMPORT_ID,
+      `arn:aws:secretsmanager:us-west-2:394495727159:secret:${SHERIFF_SECRET_NAME}`,
+    );
+    const secretBlock = source.slice(
+      source.indexOf("new aws.secretsmanager.Secret("),
+      source.indexOf("new aws.dynamodb.Table("),
+    );
+    assert.match(secretBlock, /import:\s*SHERIFF_SECRET_IMPORT_ID/);
+    assert.doesNotMatch(secretBlock, /protect:\s*true/);
+  });
+
+  it("keeps protect on the request table", () => {
+    // The table is the application audit record; a casual `pulumi destroy`
+    // must not take it. The secret is deliberately not protected, because
+    // Pulumi owns its full lifecycle.
+    const tableBlock = source.slice(
+      source.indexOf("new aws.dynamodb.Table("),
+      source.indexOf("new aws.cloudwatch.LogGroup("),
+    );
+    assert.match(tableBlock, /protect:\s*true/);
   });
 });
 
