@@ -3,24 +3,31 @@ import * as esbuild from "esbuild";
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 
-import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
+import {
+  INFRASTRUCTURE_ACCOUNT_ID,
+  MANAGEMENT_ACCOUNT_ID,
+} from "../utils/accounts";
 import { DEFAULT_APPROVAL_CHANNEL } from "./sheriff/config";
 
 /**
- * The break-glass Lambda, step 3 ("the Lambda, dry") of `docs/sheriff.md`,
- * in the infrastructure account.
+ * The break-glass Lambda, step 4 ("approval wired to a real grant") of
+ * `docs/sheriff.md`, in the infrastructure account.
  *
  * Everything here takes the explicit provider from `index.ts`; the default
  * provider is disabled in `deploy.sh`, so a resource that omits `{ provider }`
  * fails the apply rather than landing in the management account.
  *
- * Step 3 is dry: the Lambda writes request records and posts to Slack, but it
- * gets **no** `sts:AssumeRole` on `sheriff-grant` and **no**
- * `identitystore` permission. Step 4 wires the real grant. The execution role
- * is named `sheriff`, matching the exact role ARN the management-account
- * grant role trusts (`deploy/components/sheriff-grant.ts`); the two names must
- * stay in lockstep or step 4's first AssumeRole is an AccessDenied, not an
- * apply-time error.
+ * Step 4 assumes `sheriff-grant` and toggles `Admins` membership. The Lambda's
+ * own role gets `sts:AssumeRole` on exactly that one ARN and **no**
+ * `identitystore` action: every directory call goes through the assumed role,
+ * which is the scoped one. The execution role is named `sheriff`, matching the
+ * exact role ARN the management-account grant role trusts
+ * (`deploy/components/sheriff-grant.ts`); the two names must stay in lockstep
+ * or the first AssumeRole is an AccessDenied, not an apply-time error.
+ *
+ * This file also owns the step-4 sweeper's trigger and the orphaned-membership
+ * alarm, and step 5's one-shot expiry scheduler: the schedule group, the
+ * schedule-execution role and its DLQ. The sweeper stays as the backstop.
  */
 
 const NAME = "sheriff";
@@ -28,6 +35,51 @@ const REGION = "us-west-2";
 
 /** Matches the `PrincipalArn` condition on the `sheriff-grant` role. */
 export const SHERIFF_ROLE_NAME = NAME;
+
+/** The one management-account role the Lambda may assume. */
+export const SHERIFF_GRANT_ROLE_ARN = `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/sheriff-grant`;
+
+/** The function's own ARN, for the async self-invocation. */
+export const SHERIFF_FUNCTION_ARN = `arn:aws:lambda:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:function:${NAME}`;
+
+/**
+ * Step 5's one-shot revocation. Every schedule lives in one dedicated group so
+ * the Lambda's `scheduler:*` permission can be scoped to it rather than to the
+ * default group's whole namespace.
+ */
+export const SHERIFF_SCHEDULE_GROUP = "sheriff";
+export const SHERIFF_SCHEDULE_GROUP_ARN = `arn:aws:scheduler:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:schedule-group/${SHERIFF_SCHEDULE_GROUP}`;
+
+/**
+ * Every schedule the Lambda manages lives in the one group. The trailing
+ * slash makes this a prefix, so the `scheduler:*` statements can name the
+ * group and a wildcard rather than the default group or `*`.
+ */
+export const SHERIFF_SCHEDULE_ARN_PREFIX = `arn:aws:scheduler:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:schedule/${SHERIFF_SCHEDULE_GROUP}/`;
+
+/**
+ * The schedule-execution role EventBridge Scheduler assumes to invoke the
+ * function and write the DLQ. The Lambda may `iam:PassRole` this one role and
+ * nothing else; the role may invoke the one function and send to the one
+ * queue.
+ */
+export const SHERIFF_SCHEDULER_ROLE_NAME = `${NAME}-scheduler`;
+export const SHERIFF_SCHEDULER_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${SHERIFF_SCHEDULER_ROLE_NAME}`;
+
+/** The dead-letter queue for a schedule invocation that exhausts its retries. */
+export const SHERIFF_SCHEDULER_DLQ_NAME = `${NAME}-scheduler-dlq`;
+export const SHERIFF_SCHEDULER_DLQ_ARN = `arn:aws:sqs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:${SHERIFF_SCHEDULER_DLQ_NAME}`;
+
+/**
+ * Where the orphaned-membership alarm goes. The budget alerts in `index.ts`
+ * use the same address. The SNS subscription is created here but stays
+ * unconfirmed until someone accepts the AWS email; that is a manual step, the
+ * same as the Slack secret's.
+ */
+export const SHERIFF_ALERT_EMAIL = "aws-infrastructure@goodparty.org";
+
+/** The audit event the alarm watches for. `handler.ts` emits it. */
+export const ORPHANED_AUDIT_EVENT = "membership.orphaned";
 
 export const SHERIFF_TABLE_NAME = "sheriff";
 // The Slack app is `@sheriff`, expected to grow beyond break-glass to other
@@ -37,6 +89,19 @@ export const SHERIFF_TABLE_NAME = "sheriff";
 // DynamoDB are separate namespaces.
 export const SHERIFF_SECRET_NAME = "sheriff";
 export const SHERIFF_LOG_GROUP = `/aws/lambda/${NAME}`;
+
+/**
+ * The id the secret's one-time `import` option adopts it by.
+ *
+ * The AWS provider's importer for `aws:secretsmanager/secret:Secret` requires
+ * an ARN, not the bare name: it parses the id as an ARN before the read. It is
+ * the *partial* ARN, without the six random characters Secrets Manager appends
+ * to a name, because that suffix does not exist until the secret does and must
+ * not be committed. Secrets Manager resolves a partial ARN to the one secret
+ * with that name (the name does not end in a hyphen plus six characters), so
+ * the suffix never has to be known here.
+ */
+export const SHERIFF_SECRET_IMPORT_ID = `arn:aws:secretsmanager:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:secret:${SHERIFF_SECRET_NAME}`;
 
 const TAGS = { Name: NAME, Project: NAME };
 
@@ -55,19 +120,69 @@ export const sheriffLambdaTrust = {
 } as const;
 
 /**
- * The whole grant for the dry flow, and nothing else: read its own secret,
- * read/write the one request table, write its own log group.
+ * EventBridge Scheduler's trust for the schedule-execution role. The
+ * `aws:SourceAccount` and `aws:SourceArn` conditions confine it to this
+ * account's schedules, so a schedule elsewhere cannot borrow the role to
+ * invoke the function or write the DLQ.
+ *
+ * `aws:SourceArn` must be the schedule **group** ARN, not a schedule ARN or a
+ * name prefix: AWS's confused-deputy guidance is explicit that Scheduler
+ * presents the group ARN at AssumeRole time, and a schedule-scoped condition
+ * is rejected. The group is dedicated to this tool, so scoping to it is as
+ * narrow as the condition allows.
+ */
+export const sheriffSchedulerTrust = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: { Service: "scheduler.amazonaws.com" },
+      Action: "sts:AssumeRole",
+      Condition: {
+        StringEquals: {
+          "aws:SourceAccount": INFRASTRUCTURE_ACCOUNT_ID,
+          "aws:SourceArn": SHERIFF_SCHEDULE_GROUP_ARN,
+        },
+      },
+    },
+  ],
+} as const;
+
+/**
+ * What the schedule-execution role may do: invoke the one sheriff function,
+ * and send a failed invocation to the one DLQ. Nothing else.
+ */
+export const sheriffSchedulerPolicy = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "InvokeSheriff",
+      Effect: "Allow",
+      Action: "lambda:InvokeFunction",
+      Resource: SHERIFF_FUNCTION_ARN,
+    },
+    {
+      Sid: "DeadLetterQueue",
+      Effect: "Allow",
+      Action: "sqs:SendMessage",
+      Resource: SHERIFF_SCHEDULER_DLQ_ARN,
+    },
+  ],
+} as const;
+
+/**
+ * The whole grant for step 4, and nothing else: read its own secret, assume
+ * the one grant role, read/write the one request table, write its own log
+ * group.
  *
  * Deliberately absent, and asserted by the test:
  *
- * - `sts:AssumeRole` on `sheriff-grant` (step 4 adds it, on exactly that
- *   one ARN).
- * - every `identitystore:*` action (step 4).
+ * - every `identitystore:*` action. The Lambda has no directory permission of
+ *   its own; `sheriff-grant` is the scoped role and `sts:AssumeRole` on it is
+ *   the only management-account reach.
  * - `DELEGATES` or any secret but the tool's own.
- *
- * `dynamodb:Query` and `dynamodb:Scan` are absent too: step 3 only gets,
- * puts and conditionally updates request records and rate counters. Step 4
- * adds `Query` when it looks up active grants.
+ * - `dynamodb:Scan`. `Query` on the fixed `GRANT` partition is the sweeper's
+ *   grant scan; a full-table scan is not needed and not granted.
  */
 export const sheriffLambdaPolicy = {
   Version: "2012-10-17",
@@ -82,14 +197,59 @@ export const sheriffLambdaPolicy = {
       Resource: `arn:aws:secretsmanager:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:secret:${SHERIFF_SECRET_NAME}-*`,
     },
     {
+      Sid: "AssumeSheriffGrant",
+      Effect: "Allow",
+      Action: "sts:AssumeRole",
+      // Exactly one ARN. The management-account role's own inline policy is
+      // the scoping that matters; this is the only door to it.
+      Resource: SHERIFF_GRANT_ROLE_ARN,
+    },
+    {
       Sid: "RequestTable",
       Effect: "Allow",
       Action: [
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
+        // The sweeper queries every grant record by the fixed `GRANT`
+        // partition. Not `Scan`: the query is bounded by the partition key.
+        "dynamodb:Query",
       ],
       Resource: `arn:aws:dynamodb:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:table/${SHERIFF_TABLE_NAME}`,
+    },
+    {
+      Sid: "SelfInvoke",
+      Effect: "Allow",
+      // Slack's 3-second ack window: the submission post and the approve/deny
+      // path hand their slow work to an async invocation of this same function.
+      Action: "lambda:InvokeFunction",
+      Resource: SHERIFF_FUNCTION_ARN,
+    },
+    {
+      Sid: "ManageExpirySchedules",
+      Effect: "Allow",
+      // Step 5 creates one one-shot per grant, checks it before creating so a
+      // retry is idempotent, and deletes it when the grant ends. Scoped to the
+      // one schedule group; never the default group and never `*`.
+      Action: [
+        "scheduler:CreateSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:DeleteSchedule",
+      ],
+      Resource: `${SHERIFF_SCHEDULE_ARN_PREFIX}*`,
+    },
+    {
+      Sid: "PassSchedulerRole",
+      Effect: "Allow",
+      // `CreateSchedule` passes the target's role, and AWS requires
+      // `iam:PassRole` for it. Scoped to the one schedule-execution role and
+      // conditioned on the scheduler service, so a compromised function
+      // cannot pass the role to anything else.
+      Action: "iam:PassRole",
+      Resource: SHERIFF_SCHEDULER_ROLE_ARN,
+      Condition: {
+        StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" },
+      },
     },
     {
       Sid: "OwnLogs",
@@ -137,6 +297,16 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
   // Created empty, filled out of band: see the manual steps in
   // `docs/sheriff.md`. No secret value is ever committed or set by
   // Pulumi, matching the `DELEGATE_SWARM` secret's handling.
+  //
+  // `import` is a one-time adoption: the secret was created by hand before
+  // this resource first applied, so `CreateSecret` collided with it. Importing
+  // the container adopts it in place without reading or overwriting its value.
+  // Once the resource is in state the option is inert -- Pulumi ignores it for
+  // a resource it already manages -- so it can stay as the record of the
+  // adoption. See the ordering note in `docs/sheriff.md`.
+  //
+  // No `protect`: Pulumi owns the secret's whole lifecycle from here on. Only
+  // its value is set out of band, by hand, and never by Pulumi.
   const secret = new aws.secretsmanager.Secret(
     "sheriffSlackSecret",
     {
@@ -145,11 +315,12 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
         "Sheriff Slack app credentials (SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN). Filled by hand; never by Pulumi.",
       tags: TAGS,
     },
-    { provider, protect: true },
+    { provider, import: SHERIFF_SECRET_IMPORT_ID },
   );
 
-  // Single table for step 3: request records and per-user rate counters. Step
-  // 4 adds grant items under a different key prefix, no migration.
+  // Single table: request records, grant records, per-user active-grant locks
+  // and per-user rate counters. Grants share a fixed `GRANT` partition so the
+  // sweeper can query them; the lock items are per-requester.
   const table = new aws.dynamodb.Table(
     "sheriffRequests",
     {
@@ -187,7 +358,7 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
     {
       name: SHERIFF_ROLE_NAME,
       description:
-        "Sheriff Lambda execution role. Step 3 (dry) holds only DynamoDB, logs and its own secret; step 4 adds sts:AssumeRole on sheriff-grant.",
+        "Sheriff Lambda execution role: DynamoDB, logs, its own secret, and sts:AssumeRole on sheriff-grant. No identitystore action directly.",
       assumeRolePolicy: JSON.stringify(sheriffLambdaTrust),
       tags: TAGS,
     },
@@ -200,6 +371,57 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
       name: NAME,
       role: role.name,
       policy: JSON.stringify(sheriffLambdaPolicy),
+    },
+    { provider },
+  );
+
+  // -------------------------------------------------------------------------
+  // Step 5's scheduled revocation.
+  //
+  // A dedicated schedule group scopes the Lambda's `scheduler:*` permission
+  // and the execution role's trust to one namespace. The queue captures a
+  // schedule invocation that exhausts its retry policy; the execution role
+  // writes it, and the role's policy uses the literal function ARN so the
+  // role and the function do not depend on each other.
+  const scheduleGroup = new aws.scheduler.ScheduleGroup(
+    "sheriffSchedules",
+    {
+      name: SHERIFF_SCHEDULE_GROUP,
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  const schedulerDlq = new aws.sqs.Queue(
+    "sheriffSchedulerDlq",
+    {
+      name: SHERIFF_SCHEDULER_DLQ_NAME,
+      // Failed revokes are worth keeping long enough to investigate, not
+      // forever. Fourteen days is the SQS maximum.
+      messageRetentionSeconds: 14 * 24 * 60 * 60,
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  const schedulerRole = new aws.iam.Role(
+    "sheriffSchedulerRole",
+    {
+      name: SHERIFF_SCHEDULER_ROLE_NAME,
+      description:
+        "EventBridge Scheduler execution role: invokes the sheriff function and writes its DLQ. Assumed only by scheduler.amazonaws.com for schedules in the sheriff group.",
+      assumeRolePolicy: JSON.stringify(sheriffSchedulerTrust),
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  new aws.iam.RolePolicy(
+    "sheriffSchedulerPolicy",
+    {
+      name: SHERIFF_SCHEDULER_ROLE_NAME,
+      role: schedulerRole.name,
+      policy: JSON.stringify(sheriffSchedulerPolicy),
     },
     { provider },
   );
@@ -219,6 +441,13 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
           SECRET_ARN: secret.arn,
           REQUEST_TABLE: table.name,
           APPROVAL_CHANNEL: DEFAULT_APPROVAL_CHANNEL,
+          // Step 5's schedule target. The role ARN is the literal, not
+          // `schedulerRole.arn`, so the role's policy and the function do not
+          // form a dependency cycle.
+          SCHEDULE_GROUP: SHERIFF_SCHEDULE_GROUP,
+          SCHEDULE_ROLE_ARN: SHERIFF_SCHEDULER_ROLE_ARN,
+          SCHEDULE_DLQ_ARN: SHERIFF_SCHEDULER_DLQ_ARN,
+          FUNCTION_ARN: SHERIFF_FUNCTION_ARN,
         },
       },
       tags: TAGS,
@@ -240,5 +469,157 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
     { provider },
   );
 
-  return { fn, url: functionUrl.functionUrl, secret, table, logGroup };
+  // -------------------------------------------------------------------------
+  // The reconciliation sweeper.
+  //
+  // Step 5's one-shot schedule is the normal revoke path; this periodic rule
+  // is the backstop for a failed schedule or a grant path that stopped
+  // partway. A plain EventBridge rule rather than EventBridge Scheduler, so
+  // the two mechanisms stay distinct. The `input` is the marker the handler
+  // branches on; the event never reaches the Slack signature check.
+  const sweepRule = new aws.cloudwatch.EventRule(
+    "sheriffSweepRule",
+    {
+      name: `${NAME}-sweep`,
+      description:
+        "Periodic reconciliation sweep for break-glass grants. Step 4's revoke path until step 5's one-shot scheduler lands.",
+      scheduleExpression: "rate(5 minutes)",
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  new aws.cloudwatch.EventTarget(
+    "sheriffSweepTarget",
+    {
+      rule: sweepRule.name,
+      arn: fn.arn,
+      input: JSON.stringify({ action: "sweep" }),
+    },
+    { provider },
+  );
+
+  // EventBridge needs explicit permission to invoke the function; the
+  // Function URL's auth does not cover the events service.
+  new aws.lambda.Permission(
+    "sheriffSweepPermission",
+    {
+      action: "lambda:InvokeFunction",
+      function: fn.name,
+      principal: "events.amazonaws.com",
+      sourceArn: sweepRule.arn,
+    },
+    { provider },
+  );
+
+  // -------------------------------------------------------------------------
+  // The orphaned-membership alarm.
+  //
+  // Only `membership.orphaned` pages: an expired grant whose member is still
+  // present after the sweeper's revoke attempt, i.e. the revoke failed or the
+  // state is stuck. A normal sweep-and-revoke is silent, and every grant is
+  // informational, so the channel does not train people to ignore it.
+  new aws.cloudwatch.LogMetricFilter(
+    "sheriffOrphanedFilter",
+    {
+      name: `${NAME}-membership-orphaned`,
+      logGroupName: logGroup.name,
+      pattern: `{ $.audit = "${ORPHANED_AUDIT_EVENT}" }`,
+      metricTransformation: {
+        namespace: "Sheriff",
+        name: "MembershipOrphaned",
+        value: "1",
+      },
+    },
+    { provider, dependsOn: [logGroup] },
+  );
+
+  const alertTopic = new aws.sns.Topic(
+    "sheriffAlerts",
+    {
+      name: `${NAME}-alerts`,
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  // The subscription exists but stays unconfirmed until someone accepts the
+  // AWS email. That is the same manual step as filling the Slack secret, and
+  // it is called out in the PR body.
+  new aws.sns.TopicSubscription(
+    "sheriffAlertsEmail",
+    {
+      topic: alertTopic.arn,
+      protocol: "email",
+      endpoint: SHERIFF_ALERT_EMAIL,
+    },
+    { provider },
+  );
+
+  // CloudWatch publishes alarm actions to the topic as the CloudWatch service
+  // principal, which the default topic policy does not admit. The condition is
+  // the account, not the alarm ARN: naming the alarm would make the topic
+  // policy and the alarm depend on each other.
+  new aws.sns.TopicPolicy(
+    "sheriffAlertsPolicy",
+    {
+      arn: alertTopic.arn,
+      policy: alertTopic.arn.apply((topicArn) =>
+        JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Sid: "CloudWatchAlarms",
+              Effect: "Allow",
+              Principal: { Service: "cloudwatch.amazonaws.com" },
+              Action: "SNS:Publish",
+              Resource: topicArn,
+              Condition: {
+                StringEquals: {
+                  "aws:SourceAccount": INFRASTRUCTURE_ACCOUNT_ID,
+                },
+              },
+            },
+          ],
+        }),
+      ),
+    },
+    { provider },
+  );
+
+  const orphanedAlarm = new aws.cloudwatch.MetricAlarm(
+    "sheriffOrphanedAlarm",
+    {
+      name: `${NAME}-membership-orphaned`,
+      alarmDescription:
+        "A break-glass grant expired but its Admins membership is still present after the sweeper's revoke attempt. Admin access may be standing.",
+      namespace: "Sheriff",
+      metricName: "MembershipOrphaned",
+      statistic: "Sum",
+      period: 300,
+      evaluationPeriods: 1,
+      threshold: 1,
+      comparisonOperator: "GreaterThanOrEqualToThreshold",
+      // The metric does not exist until the first orphan, so treat no data as
+      // not breaching rather than alarming on an empty account.
+      treatMissingData: "notBreaching",
+      alarmActions: [alertTopic.arn],
+      tags: TAGS,
+    },
+    { provider, dependsOn: [alertTopic] },
+  );
+
+  return {
+    fn,
+    url: functionUrl.functionUrl,
+    secret,
+    table,
+    logGroup,
+    sweepRule,
+    orphanedAlarm,
+    alertTopic,
+    scheduleGroup,
+    schedulerDlq,
+    schedulerRole,
+  };
 };

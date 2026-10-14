@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadCases, saveCases } from "./cases";
+import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
 import { replayAll, resultFromRecord } from "./replay";
 import type { Result } from "./replay";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
@@ -41,10 +41,11 @@ const usage = () => {
   console.error(
     [
       "Usage:",
+      "  review:eval cases scenarios --manifest <scenarios.json> --out <dir> [--suite <name>]",
       "  review:eval cases snapshot --out <dir> [--repo <r>] [--limit <n>] [--only-complete]",
       "  review:eval results from-cases --cases <dir|s3> --out <dir>",
       "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--force]",
-      "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
+      "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
   );
   process.exit(1);
@@ -53,6 +54,20 @@ const usage = () => {
 const main = async () => {
   const argv = process.argv.slice(2);
   const command = argv[0];
+
+  if (command === "cases" && argv[1] === "scenarios") {
+    const flags = parseFlags(argv.slice(2));
+    const manifest = flag(flags, "manifest");
+    const out = flag(flags, "out");
+    if (!manifest || !out) { console.error("--manifest and --out are required"); process.exit(1); }
+    const loaded = await loadScenarios(readManifest(manifest), { suite: flag(flags, "suite") });
+    saveCases(loaded.map((l) => l.record), out);
+    for (const { scenario, record } of loaded) {
+      console.error(`  ${scenario.id} (${scenario.suite}) ${record.repo}#${record.prNumber} ${record.runId}`);
+    }
+    console.error(`Saved ${loaded.length} scenario case(s) to ${out}`);
+    return;
+  }
 
   if (command === "cases") {
     const subcommand = argv[1];
@@ -135,6 +150,8 @@ const main = async () => {
     const outFile = flag(flags, "out");
     const prCommentFile = flag(flags, "pr-comment");
     const runUrl = flag(flags, "run-url") ?? "";
+    const manifest = flag(flags, "manifest");
+    const names = manifest ? scenarioNames(readManifest(manifest)) : undefined;
 
     const records = await loadCases({ from: casesFrom });
     const resultsA = loadResultsFromDir(aDirArg);
@@ -146,7 +163,7 @@ const main = async () => {
     const verdicts = await judgeAll(records, resultsA, resultsB, model, passes, concurrency);
 
     const summary = summarize(verdicts);
-    const report = renderMarkdown(summary, verdicts, { labelA, labelB });
+    const report = renderMarkdown(summary, verdicts, { labelA, labelB, names });
 
     console.log(report);
     if (outFile) {
@@ -155,8 +172,9 @@ const main = async () => {
     }
 
     if (prCommentFile) {
-      const replayCost = resultsB.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
-      const replayFailures = resultsB.filter((r) => r.error).length;
+      const both = [...resultsA, ...resultsB];
+      const replayCost = both.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+      const replayFailures = both.filter((r) => r.error).length;
       const comment = renderPrComment(summary, verdicts, {
         labelA,
         labelB,
@@ -167,6 +185,7 @@ const main = async () => {
         runUrl,
         resultsA,
         resultsB,
+        names,
       });
       writeFileSync(prCommentFile, comment);
       console.error(`PR comment written to ${prCommentFile}`);

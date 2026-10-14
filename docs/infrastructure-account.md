@@ -182,7 +182,12 @@ starting the work, not after. Make `who` name the *session*, not the model.
       provider makes on a table read (`DescribeTable`,
       `DescribeContinuousBackups`, `DescribeTimeToLive`,
       `ListTagsOfResource`), scoped to the account's tables (`table/*`) because
-      the actions are metadata only.
+      the actions are metadata only. A later preview, of the PR that imports
+      the existing `sheriff` secret, failed the same way and named
+      `secretsmanager:DescribeSecret`; a follow-up PR added the three reads the
+      provider makes on a secret read (`DescribeSecret`, `GetResourcePolicy`,
+      `ListTagsForResource`), scoped to the account's secrets (`secret/*`) on
+      the same metadata-only grounds.
 - [x] 12. Document how an admin reaches the account, and whether the container
       gets a profile for it: done (2026-10-08, pi-infra-step12). The human
       path is Identity Center: a member of `Admins` signs in and picks
@@ -482,8 +487,10 @@ Three changes, and the ordering between them matters:
    started with no permissions, because the program's only AWS call is
    `sts:GetCallerIdentity`, and is widened only by observed failures. Its first
    grant is the DynamoDB table-metadata read the break-glass preview needed,
-   scoped to the account's tables (PR #294, recorded under step 11). Applied by
-   `deploy-infrastructure.yml` at step 7.
+   scoped to the account's tables (PR #294, recorded under step 11); the
+   secret-import preview later added the Secrets Manager secret-metadata read,
+   scoped to the account's secrets. Applied by `deploy-infrastructure.yml` at
+   step 7.
 2. **Management-account grant** — `AssumeInfrastructurePreviewRole` on
    `github-actions-pulumi-preview`, plus `"infrastructure"` in its
    `pulumiBackendReadStatements` list. Applied by `deploy.yml`.

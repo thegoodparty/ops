@@ -40,7 +40,7 @@ try {
 
 type DevName = keyof typeof USERMAP;
 
-const DEVS = Object.keys(USERMAP).sort() as DevName[];
+const DEVS = Object.keys(USERMAP) as DevName[];
 if (DEVS.length === 0) {
   throw new Error("USERMAP_JSON must contain at least 1 dev");
 }

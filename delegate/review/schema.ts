@@ -18,7 +18,6 @@ export const FindingSchema = z.object({
     "thematic",
   ]),
   confidence: z.enum(["high", "medium"]),
-  priorFindingId: z.string().uuid().optional(),
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
@@ -35,10 +34,11 @@ export const ReviewOutputSchema = z.discriminatedUnion("status", [
 ]);
 export type ReviewOutput = z.infer<typeof ReviewOutputSchema>;
 
-// A prior finding as the agent sees it on re-review: its id (so it can be
-// carried forward via priorFindingId) and where it was posted.
+// A prior finding as the agent sees it on re-review: where it was posted and
+// what it said. Deliberately carries no id — the agent re-emits every finding
+// it still sees, and the harness reconciles them to prior findings by
+// path/category/line. Identity is not the model's job.
 export const PriorFindingSchema = z.object({
-  id: z.string().uuid(),
   path: z.string(),
   line: z.number().int(),
   body: z.string(),
@@ -47,9 +47,17 @@ export const PriorFindingSchema = z.object({
 });
 export type PriorFinding = z.infer<typeof PriorFindingSchema>;
 
+// A posted finding with its id, for the harness paths that act on one
+// specific finding: a reconsideration decides it by id, and settled findings
+// are kept once each by id. The reviewer never sees the id.
+export const IdentifiedFindingSchema = PriorFindingSchema.extend({
+  id: z.string().uuid(),
+});
+export type IdentifiedFinding = z.infer<typeof IdentifiedFindingSchema>;
+
 // A finding the bot withdrew after a human answered it in its thread. Later
 // reviews of the PR see it so they do not raise the same concern again.
-export const SettledFindingSchema = PriorFindingSchema.extend({
+export const SettledFindingSchema = IdentifiedFindingSchema.extend({
   reason: z.string(),
 });
 export type SettledFinding = z.infer<typeof SettledFindingSchema>;
@@ -86,7 +94,7 @@ export const ThreadReplySchema = z.object({
 export type ThreadReply = z.infer<typeof ThreadReplySchema>;
 
 export const DisputeSchema = z.object({
-  finding: PriorFindingSchema,
+  finding: IdentifiedFindingSchema,
   replies: z.array(ThreadReplySchema),
 });
 export type Dispute = z.infer<typeof DisputeSchema>;

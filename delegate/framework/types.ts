@@ -29,6 +29,9 @@ export type RunOverrides = {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   preToolUseHooks?: HookCallback[];
+  // Resume a previous session (a bounded repair turn) instead of starting a
+  // fresh conversation. The prompt is then the follow-up user message.
+  resume?: string;
 };
 
 export type AgentJob = {

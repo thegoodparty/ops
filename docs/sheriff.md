@@ -1,11 +1,11 @@
 # Break glass: just-in-time admin access
 
-> **Status: proposal, revised after review.** This is a design draft, not an
-> accepted plan, and nothing below is built. Most of the decisions in it were
-> settled in review of the first revision and now read as decisions rather than
-> options; the few that remain open are marked **open**, and one residual
-> ambiguity from review is called out explicitly under "Existing members". It
-> is still written to be reviewed line by line.
+> **Status: proposal, revised after review.** Steps 2 through 5 are built and
+> deployed; step 1 (CloudTrail) is not, and is a known and time-boxed gap. Most
+> of the decisions in it were settled in review of the first revision and now
+> read as decisions rather than options; the few that remain open are marked
+> **open**, and one residual ambiguity from review is called out explicitly
+> under "Existing members". It is still written to be reviewed line by line.
 
 The goal is that admin in AWS is granted just in time rather than held. An
 engineer who needs it requests it in Slack, a designated approver approves, and
@@ -28,9 +28,8 @@ and that decision is recorded.
 ## Progress
 
 One step at a time, one pull request per step. Statuses are `todo`,
-`doing (who, date)`, and `done (date, evidence)`. Since this is a proposal with
-no implementation, every step is `todo`. Make `who` name the session, not the
-model.
+`doing (who, date)`, and `done (date, evidence)`. Steps 2 through 5 are done;
+step 1 remains `todo`. Make `who` name the session, not the model.
 
 Bookkeeping rides in the implementation PR. The convention in
 [`workbench-account.md`](./workbench-account.md) is to push a `doing` status
@@ -57,18 +56,21 @@ see "The CloudTrail gap" and open question 7.
       `sheriff-grant` role and its scoped inline policy in `deploy/`. No new
       permission set and no new group; see "Core mechanism".
       `done (2026-10-12, break-glass-step2, PR #280, Deploy run 38252435639)`
-- [ ] 3. The Lambda, dry: a separate Slack app, its own signing secret and bot
+- [x] 3. The Lambda, dry: a separate Slack app, its own signing secret and bot
       token in the infrastructure account, a new Lambda in
       `deploy-infrastructure/`, the slash command and modal, a DynamoDB request
       record, the approval post and the button handler, all the way to the
       approval decision, but no grant. This makes the flow visible before
-      anything can be escalated. `doing (break-glass-step3, 2026-10-12)`
-- [ ] 4. Wire approval to a real grant: assume `sheriff-grant`, call
+      anything can be escalated.
+      `done (2026-10-13, break-glass-step3, PRs #293/#294/#297/#298/#299, Deploy infrastructure green on #298)`
+- [x] 4. Wire approval to a real grant: assume `sheriff-grant`, call
       `identitystore:CreateGroupMembership`, write the grant, post the SSO link.
       Add the application audit log, the reconciliation sweeper, and the alarm
-      on an unexpected membership. `todo`
-- [ ] 5. EventBridge Scheduler revocation at expiry, with retries and a DLQ, on
-      top of the sweeper from step 4. `todo`
+      on an unexpected membership.
+      `done (2026-10-13, sheriff-step4, PR #302, Deploy infrastructure run 38447135678; PR #306 fixes the listing policy and is pending merge)`
+- [x] 5. EventBridge Scheduler revocation at expiry, with retries and a DLQ, on
+      top of the sweeper from step 4.
+      `done (2026-10-13, sheriff-step5, PR #310, Deploy infrastructure on merge)`
 
 ## Goal
 
@@ -82,7 +84,8 @@ Stated as an invariant rather than a feature:
   members manually and a follow-up PR promotes the sweeper's no-grant-record
   case from informational to an alarm, after which the invariant is the
   original one. See "Existing members".
-- Any engineer can request admin, for a bounded duration, with a stated reason.
+- Any member of `Engineers` can request admin, for a bounded duration, with a
+  stated reason.
 - A designated human approver, not the requester, must approve it.
 - The grant is time-boxed and revoked without anyone remembering to revoke it.
 - Who asked, who approved, why, what was granted, and when it ended are all
@@ -313,12 +316,12 @@ standing admin"; after that it is the original "no standing admin".
               │                        ┌───────────────┼───────────────┐
               │                        ▼               ▼               ▼
               │                  DynamoDB         EventBridge     CloudWatch Logs
-              │                  requests,        Scheduler       structured audit
-              │                  grants,          one-shot        + metric filters
-              │                  rate counters    revoke          + alarms
+              │                  requests,        sweep rule      structured audit
+              │                  grants,          + Scheduler     + metric filters
+              │                  rate counters    one-shot        + alarms
               │                                        │
               ▼                                        └── both call the same revoke
-   #devs-only post  ◀── sts:AssumeRole ──▶ management account 333022194791
+   #sensitive-access-requests post  ◀── sts:AssumeRole ──▶ management account 333022194791
                                             role: sheriff-grant
                                             identitystore:CreateGroupMembership
                                             identitystore:DeleteGroupMembership
@@ -337,8 +340,10 @@ state:
 
 **Pulumi (the `infrastructure` stack) owns the runtime**, in
 `deploy-infrastructure/`: the new break-glass Lambda and its execution role, its
-own Slack secret in Secrets Manager, the DynamoDB table, the EventBridge
-Scheduler group, the log group, metric filters and alarms. The Lambda's role
+own Slack secret in Secrets Manager, the DynamoDB table, the step-4 EventBridge
+sweep rule, the step-5 Scheduler one-shot with its schedule group, DLQ and
+schedule-execution role, the log group, metric filters and the
+orphaned-membership alarm. The Lambda's role
 gets `sts:AssumeRole` on exactly one ARN (`sheriff-grant`), plus DynamoDB,
 logs, scheduler and its own secret, and nothing else. It is still under the
 `Infrastructure` SCP.
@@ -366,11 +371,16 @@ code, changed only by a reviewed PR.
    **reason** (free text, required), and an **incident or ticket link**
    (required, so a grant is always attached to something). There is no account
    field: the escalation is global by design.
-2. On submit, the Lambda writes a `requested` record and posts a Block Kit
-   message to a configured channel, defaulting to `#devs-only`, with **Approve**
-   and **Deny** buttons bound to the request id. Outcomes go to the same
-   channel. There are no DMs; transparency is the point. If an approver ping is
-   wanted, it is an in-channel user-group mention, not a DM.
+2. On submit, the Lambda first runs the requester gate: it resolves the
+   requester's Slack email with `users.info`, maps it to an Identity Store user
+   with `GetUserId(emails.value)`, and checks the `Engineers` membership with
+   `IsMemberInGroups`. A miss is an inline modal error keyed to `reason_block`
+   and no record is written. Only then does it write a `requested` record and
+   post a Block Kit message to a configured channel, defaulting to
+   `#sensitive-access-requests`, with **Approve** and **Deny** buttons bound to the request id.
+   Outcomes go to the same channel. There are no DMs; transparency is the point.
+   If an approver ping is wanted, it is an in-channel user-group mention, not a
+   DM.
 3. The interactivity endpoint is a route on the new break-glass function, which
    uses the same verification pattern as the delegate handler. Slack sends
    interactivity as `application/x-www-form-urlencoded` with a `payload=<json>`
@@ -391,14 +401,16 @@ code, changed only by a reviewed PR.
    `ConflictException` means the requester is already a member, so the Lambda
    resolves the existing `MembershipId` with `ListGroupMembershipsForMember` and
    continues; any other error sends the request to `failed`. It then flips the
-   record to `granted` with the `membershipId`, schedules the one-shot revoke,
-   and posts the SSO portal link and the expiry, with the session caveat, to the
-   channel and to the requester.
-7. At expiry, EventBridge Scheduler invokes the same Lambda with a `revoke`
-   event. It calls `DeleteGroupMembership` with the grant's `MembershipId`,
-   unconditionally. A `ResourceNotFoundException` means the membership is
-   already gone, so it is treated as success; either way the grant is written
-   `revoked` and the channel is posted.
+   record to `granted` with the `membershipId` and posts the SSO portal link and
+   the expiry, with the session caveat, to the channel and to the requester. The
+   one-shot scheduler created with the grant is the revoke path; the periodic
+   sweeper is the backstop.
+7. At expiry, the revocation path calls `DeleteGroupMembership` with the
+   grant's `MembershipId`, unconditionally. A `ResourceNotFoundException` means
+   the membership is already gone, so it is treated as success; either way the
+   grant is written `revoked`. The one-shot fires this from an EventBridge
+   Scheduler schedule with retries and a DLQ; the sweeper does it on its next
+   pass as the backstop.
 
 ### States
 
@@ -410,29 +422,34 @@ requested ──approve──▶ granting ──▶ granted ──expiry──�
     └──(any state)────▶ failed
 
 granting ──member absent────────────▶ failed
-granting ──member present───────────▶ granted (sweeper schedules the revoke)
-granting ──expired, member present───▶ orphaned (revoke + alarm)
+granting ──member present───────────▶ granted (sweeper revokes at expiry)
+granting ──expired, member present───▶ granted, then revoked
+granted ──expired, revoke fails──────▶ orphaned (alarm)
 ```
 
 `granting` is the state between "the approver said yes" and "the membership
-exists and its revoke is scheduled". The record is written before the membership
-so the state is never invisible, and the sweeper resolves it:
+exists". The record is written before the membership so the state is never
+invisible, and the sweeper resolves it:
 
 - **member absent**: the grant never completed; the record goes to `failed`.
 - **member present**: the grant is live. The `granting` record has no stored
   `membershipId`, because the crash happened before the flip, so the sweeper
   first calls `ListGroupMembershipsForMember` to resolve the existing
   membership's `MembershipId` (matching on the `Admins` group), writes it onto
-  the record, and flips the record to `granted`. It then schedules the revoke if
-  the schedule is missing.
+  the record, and flips the record to `granted`.
 - **member present past expiry**: the normal path did not finish. The sweeper
-  resolves the `MembershipId` the same way, then revokes and alarms (`orphaned`).
+  resolves the `MembershipId` the same way and then revokes. A successful
+  sweep-and-revoke is expected and silent; only a revoke that **fails** leaves
+  the member present and is an orphan (`membership.orphaned`, alarm). That is
+  the whole definition of `orphaned` in step 4: an expired grant whose member is
+  still present *after* the sweeper's revoke attempt.
 
-DynamoDB is a single table: request items, grant items, and per-user rate
-counters. The grant item carries a **`state`** (`granting` or `granted`), the
-request id, the group id (`Admins`, which implies all three accounts), the
-requester, the approver, the granted-at and expires-at timestamps, and the
-scheduler's schedule name. It also carries **`membershipId`**, the opaque
+DynamoDB is a single table: request items, grant items, per-user active-grant
+locks and per-user rate counters. The grant item carries a **`state`**
+(`granting`, `granted`, `revoked` or `failed`), the request id, the group id
+(`Admins`, which implies all three accounts), the requester, the approver, the
+granted-at and expires-at timestamps, and the scheduler's
+schedule name. It also carries **`membershipId`**, the opaque
 membership id `DeleteGroupMembership` requires, which is absent while the record
 is `granting` and set to the value returned by `CreateGroupMembership` (or
 resolved with `ListGroupMembershipsForMember` when that call returns
@@ -465,28 +482,32 @@ already exists. It is the role that lets the tool add and remove memberships.
 - **A fixed `sts:AssumeRole` session name** (for example
   `sheriff-grant-tool`) so CloudTrail records every assume under one
   distinguishable name rather than `AWS-Reserved-Session` or a random string.
-- **Inline policy, scoped by resource**, to the identity store id and the
-  `Admins` group id: `identitystore:CreateGroupMembership`,
+- **Inline policy, scoped by resource**, to the identity store id, the
+  `Admins` group id and the `Engineers` group id:
+  `identitystore:CreateGroupMembership`,
   `identitystore:DeleteGroupMembership`, `identitystore:ListGroupMemberships`,
-  `identitystore:ListGroupMembershipsForMember`. Each maps to a described
-  operation: `CreateGroupMembership` and `DeleteGroupMembership` are the grant
-  and the revoke, `ListGroupMembershipsForMember` resolves the `MembershipId` of
-  a pre-existing member when `CreateGroupMembership` returns `ConflictException`
-  and of a `granting` record that the sweeper or the revoke handler recovers,
-  and `ListGroupMemberships` is the sweeper's full-group scan. The exact
-  resource ARN form is confirmed at implementation; the point is that it names
-  the one group and the one identity store, not `*`.
+  `identitystore:ListGroupMembershipsForMember`, plus step 4's
+  `identitystore:GetUserId` and `identitystore:IsMemberInGroups`. Each maps to a
+  described operation: `CreateGroupMembership` and `DeleteGroupMembership` are
+  the grant and the revoke, `ListGroupMembershipsForMember` resolves the
+  `MembershipId` of a pre-existing member when `CreateGroupMembership` returns
+  `ConflictException` and of a `granting` record that the sweeper or the revoke
+  handler recovers, and `ListGroupMemberships` is the sweeper's full-group scan.
+  `GetUserId` resolves the requester from their Slack email on `emails.value`,
+  and `IsMemberInGroups` is the `Engineers` gate. The exact resource ARN form is
+  confirmed at implementation; the point is that it names the one identity
+  store and the two groups it acts on, not `*`.
 
   Deliberately absent: `identitystore:DescribeGroup`,
   `identitystore:ListUsers` and `identitystore:DescribeUser`. No described
-  operation reads group or user metadata. The `Admins` group id is a static
-  literal from `deploy/components/identity-center.ts`, so no runtime
-  group-existence check is needed, and every call the tool makes is
-  membership-scoped. `ListUsers` in particular would allow enumerating every
-  user in the identity store, which is more than the tool's "toggle membership
-  in the one `Admins` group" rule allows. Open question 3 is settled in favour
-  of the hard-coded Slack-to-Identity-Store map, so no user lookup is needed
-  and none of these is added; the grant role's policy is unchanged from step 2.
+  operation reads group or user metadata. The group ids are static literals
+  from `deploy/components/identity-center.ts` and the runtime config, so no
+  runtime group-existence check is needed, and every call the tool makes is
+  membership- or requester-scoped. `ListUsers` in particular would allow
+  enumerating every user in the identity store, which is more than the tool's
+  rule allows. Open question 3 was settled by the engineer in favour of the
+  email lookup, so `GetUserId` and `IsMemberInGroups` are the two additions;
+  the policy is no longer "unchanged from step 2".
 - **Not granted**: any `sso:*`, `CreateAccountAssignment`,
   `CreatePermissionSet`, `sso-directory:AddMemberToGroup`, or anything that
   could grant admin outside `Admins`. `sso-directory` is worth naming
@@ -547,9 +568,10 @@ access, not about the tool, and it belongs in the threat model.
 
 A structured-JSON CloudWatch Logs group, written by the Lambda, with one event
 per transition: `request.created`, `request.approved`, `request.denied`,
-`grant.created`, `grant.revoked`, `grant.expired`, `grant.failed`,
-`membership.orphaned` and `membership.unmanaged` from the sweeper. Each carries
-the request id, requester, approver, group, reason, ticket link, and timestamps.
+`grant.created`, `grant.revoked`, `grant.failed`, `membership.orphaned` and
+`membership.unmanaged` from the sweeper. Each carries the request id, requester,
+approver, group, reason, ticket link, and timestamps. The expiry revoke emits
+`grant.revoked`; there is no separate `grant.expired` event.
 
 There are two signals, and they are deliberately different in loudness:
 
@@ -560,12 +582,14 @@ There are two signals, and they are deliberately different in loudness:
   CloudTrail is absent survivable. It also posts to the channel so the approver
   can see their approval took effect.
 - **The loud alarm is on `membership.orphaned`**: an expired grant, in either
-  the `granting` or `granted` state, whose member is still in the group, which
-  is the signal that the normal revoke path did not run. When the record is
-  `granting` and has no stored `MembershipId`, the sweeper resolves it with
-  `ListGroupMembershipsForMember` before revoking. Only that pages. A membership
-  with no grant record in any state emits `membership.unmanaged` at
-  informational level and does not page; see "Existing members".
+  the `granting` or `granted` state, whose member is **still** in the group
+  after the sweeper's revoke attempt, which is the signal that the normal
+  revoke path did not run or the state is stuck. When the record is `granting`
+  and has no stored `MembershipId`, the sweeper resolves it with
+  `ListGroupMembershipsForMember` before revoking. A successful sweep-and-revoke
+  is expected and does not page. A membership with no grant record in any state
+  emits `membership.unmanaged` at informational level and does not page; see
+  "Existing members".
 
 Metric filters turn those events into metrics. This layer answers *who asked,
 who approved, why, how long*.
@@ -606,7 +630,7 @@ tool's own records are structured for export and retention from day one.
   second approver is tempting, but review settled on one for now; two-person
   approval is a usability cost that should be added deliberately if it is
   wanted, not assumed.
-- **Notifications.** A configured channel, default `#devs-only`. The request and
+- **Notifications.** A configured channel, default `#sensitive-access-requests`. The request and
   every outcome are posted there. No DMs. An optional in-channel user-group
   mention can serve as the ping.
 - **Availability fallback.** If no approver is online the flow stalls. The
@@ -616,37 +640,41 @@ tool's own records are structured for export and retention from day one.
   timeout.** A timeout that grants access is not an approval policy; it is an
   outage that escalates. **Open** (open question 6).
 - **Rate limit.** A per-user cap on requests per day, and a global cap on
-  concurrent grants, both enforced before the grant call. The exact numbers are
-  **open**. These are separate from the hard **one active grant per user** rule,
-  which is decided rather than open and is enforced with a conditional write;
-  see "The decision".
+  concurrent grants, both enforced before the grant call. The current enforced
+  per-user value is **20 per UTC day**; the global concurrent-grant cap and
+  whether these numbers are final are still **open**. These are separate from the
+  hard **one active grant per user** rule, which is decided rather than open and
+  is enforced with a conditional write; see "The decision".
 
 ## Reliability invariants
 
-- **Never leave a grant open.** Two independent mechanisms: an EventBridge
+- **Never leave a grant open.** Step 5 has two mechanisms. The EventBridge
   Scheduler one-shot at the exact expiry, with retries and a dead-letter queue,
-  and a periodic reconciliation sweeper. The sweeper reconciles the tool's own
-  grant records, in both the `granting` and `granted` states, against the
-  group's current memberships. For a `granting` record it must resolve the
-  membership before it can act, because the record has no stored `membershipId`:
-  it calls `ListGroupMembershipsForMember` to find the member's membership in
-  the `Admins` group, writes that `MembershipId` onto the record, and flips the
+  is the normal path; the periodic reconciliation sweeper is the backstop, so
+  if the schedule fails or the grant path stopped partway, every expired grant
+  is still revoked on the sweeper's next pass. The sweeper reconciles the tool's
+  own grant records, in both the
+  `granting` and `granted` states, against the group's current memberships. For
+  a `granting` record it must resolve the membership before it can act, because
+  the record has no stored `membershipId`: it calls
+  `ListGroupMembershipsForMember` to find the member's membership in the
+  `Admins` group, writes that `MembershipId` onto the record, and flips the
   record to `granted`. If the member is absent, the grant never completed and
   the record goes to `failed`, with no alarm. If the member is present, the
-  grant is live: the sweeper schedules the revoke if the schedule is missing. If
-  the member is present past expiry, it is an **orphaned grant**: the sweeper
-  revokes it (with the resolved `MembershipId`) and alarms, because the normal
-  revoke path did not run. An active `granted` record is left alone. A
-  membership with **no grant record at all** is left alone and logged
-  informationally; the sweeper never removes it, because that is the only shape
-  a pre-existing standing member can take. The scheduler is the normal path; the
-  sweeper is what catches a failed schedule or a grant path that stopped
-  partway.
+  grant is live; if it is also past expiry the sweeper revokes it. A successful
+  sweep-and-revoke is expected and does not page. Only a revoke that fails, or a
+  state that stays stuck, leaves an **orphaned grant**: the member is still
+  present **after** the sweeper's revoke attempt, which is `membership.orphaned`
+  and the alarm. An active `granted` record is left alone. A membership with
+  **no grant record at all** is left alone and logged informationally; the
+  sweeper never removes it, because that is the only shape a pre-existing
+  standing member can take. The scheduler is the normal path and the sweeper is
+  what catches a failed schedule or a grant path that stopped partway.
 - **The grant record exists before the membership can.** The grant path writes a
   `granting` record first, then calls `CreateGroupMembership`, then flips the
   record to `granted`. If the Lambda dies between the call and the flip, the
   `granting` record is what the sweeper reconciles, so the partial-grant case (a
-  member added with no record and no scheduled revoke) cannot occur.
+  member added with no record and no revoke path) cannot occur.
 - **At most one active grant per user.** The grant path refuses to write a new
   `granting` record while the requester has a `granting` or `granted` one, and
   the check is a conditional DynamoDB write rather than a read-then-write, so
@@ -664,8 +692,9 @@ tool's own records are structured for export and retention from day one.
   revoke handler first resolves it with `ListGroupMembershipsForMember`, and a
   missing membership is the already-gone case. If `DeleteGroupMembership`
   throws `ResourceNotFoundException` because the membership is already gone, the
-  handler treats that as success and marks the grant revoked. Both the scheduler
-  and the sweeper use this path, so a double revoke is harmless.
+  handler treats that as success and marks the grant revoked. The sweeper and
+  the scheduler both use this path, so a double revoke is harmless; the revoke
+  post is claimed with a conditional write, so exactly one revoker posts.
 - **Fail closed on grant, not on revoke.** If the approval checks fail, or
   `CreateGroupMembership` fails with anything other than the `ConflictException`
   that means "already a member", no access is granted and the request goes to
@@ -719,15 +748,20 @@ rather than staying open.
    its own signing secret and bot token, stored in Secrets Manager in the
    infrastructure account, served by a new Lambda in the infrastructure account.
    The delegate app, function and `DELEGATES` secret are not reused.
-3. ~~**Identity mapping for the requester.**~~ **Settled by the engineer:** a
-   hard-coded map in the Lambda code from Slack user id to Identity Store user
-   id, in `deploy-infrastructure/sheriff/config.ts`. This is the deliberate
-   temporary option, with a refactor planned once the directory mapping is
-   known. Because the map is maintained in code, the tool performs **no
-   directory read at all**, so the `sheriff-grant` role's inline policy
-   needs no `identitystore:GetUserId`, `ListUsers` or `DescribeUser` and is
-   unchanged from step 2. The map holds an obvious placeholder until real ids
-   are available.
+3. ~~**Identity mapping for the requester.**~~ **Settled by the engineer,
+   differently from the first revision:** the requester is resolved at request
+   time from their Slack email. The Lambda calls `slack.users.info` for
+   `user.profile.email`, then `identitystore:GetUserId` on the
+   `emails.value` alternate identifier, and gates the request on the resolved
+   user being a member of the `Engineers` group
+   (`identitystore:IsMemberInGroups`). The hard-coded Slack-to-Identity-Store
+   map in `deploy-infrastructure/sheriff/config.ts` is gone, and the
+   `sheriff-grant` role's inline policy gains `GetUserId` and
+   `IsMemberInGroups`; it is no longer "unchanged from step 2". A requester with
+   no Slack email, no matching Identity Store user, or no `Engineers` membership
+   gets an immediate, distinct inline error, keyed to `reason_block`, before any
+   request is written. No negative cache: a user created after a failed request
+   works on the next one.
 4. ~~**Account scope for phase one.**~~ **Settled in review:** single global
    escalation. One membership grants admin in all three accounts; there is no
    per-account scope and no per-account group.
@@ -777,18 +811,20 @@ The Progress list is the checklist; this is the detail behind each step.
    account), DynamoDB request records, the channel post and the button handler,
    the hardcoded approver check, the state machine up to and including the
    decision, but no `CreateGroupMembership`. The requester identity mapping is
-   settled (open question 3): a hard-coded Slack-to-Identity-Store map in the
-   Lambda, the temporary option, with a refactor planned. This is where the
-   flow becomes reviewable by people who will never read the IAM policy.
+   settled (open question 3) as a hard-coded Slack-to-Identity-Store map in the
+   Lambda; step 4 replaces it with the email lookup. This is where the flow
+   becomes reviewable by people who will never read the IAM policy. `done`.
 
-4. **Approval wired to a real grant.** Assume `sheriff-grant`, write the
-   grant record in the `granting` state, call `CreateGroupMembership`, flip the
-   record to `granted`, and post the SSO link and the session caveat to the
-   channel. Add the application audit log, the reconciliation sweeper, and the
-   alarm on an unexpected membership. The sweeper ships in the same step as the
-   first grant, not after it: the thing that cleans up must exist before the
-   thing that creates, and it reconciles `granting` records so a crash mid-grant
-   cannot strand a membership.
+4. **Approval wired to a real grant.** Resolve the requester from their Slack
+   email and gate on the `Engineers` group at request time, then on approval
+   assume `sheriff-grant`, write the grant record in the `granting` state, call
+   `CreateGroupMembership`, flip the record to `granted`, and post the SSO link
+   and the session caveat to the channel. Add the application audit log, the
+   reconciliation sweeper, and the alarm on an unexpected membership. The
+   sweeper ships in the same step as the first grant, not after it: the thing
+   that cleans up must exist before the thing that creates, and it reconciles
+   `granting` records so a crash mid-grant cannot strand a membership. Step 5
+   adds the one-shot scheduler on top; the sweeper remains the backstop.
 
 5. **Scheduled revocation.** EventBridge Scheduler one-shot at expiry, invoking
    the same Lambda with a `revoke` event, retries and a DLQ, and the channel
@@ -828,12 +864,13 @@ For a reviewer checking the plan against the repo:
   workload's services and denies CloudTrail tampering.
 - `deploy-infrastructure/sheriff-lambda.ts` — the runtime Pulumi
   resources: the Lambda, its execution role and inline policy, the DynamoDB
-  table, the log group, the Function URL and the sheriff Slack secret. The
+  table, the log group, the Function URL, the sheriff Slack secret, and step
+  4's sweep rule, metric filter, SNS topic and orphaned-membership alarm. The
   explicit-provider rule and `allowedAccountIds` are in
   `deploy-infrastructure/index.ts`.
 - `deploy-infrastructure/sheriff/` — the handler itself (`handler.ts`,
-  `policy.ts`, `blocks.ts`, `store.ts`, `config.ts`), including the hard-coded
-  approver list and Slack-to-Identity-Store map.
+  `policy.ts`, `blocks.ts`, `store.ts`, `config.ts`, `identity.ts`), including
+  the hard-coded approver list and the `Engineers` gate group id.
 - `utils/accounts.ts` — `MANAGEMENT_ACCOUNT_ID`, `WORKBENCH_ACCOUNT_ID`,
   `INFRASTRUCTURE_ACCOUNT_ID`, and the pattern for recording the identity store
   id.
@@ -841,9 +878,9 @@ For a reviewer checking the plan against the repo:
   organization-wide CloudTrail and on what temporary privilege escalation
   assumes into.
 
-### Step 3 manual setup (out of band)
+### Manual setup (out of band)
 
-The code and the infrastructure are in this repo, but three things are manual
+The code and the infrastructure are in this repo, but a few things are manual
 and are deliberately neither created by Pulumi nor committed:
 
 1. **The Slack app.** Create a separate break-glass app, not the delegate app.
@@ -862,12 +899,29 @@ and are deliberately neither created by Pulumi nor committed:
      --secret-string '{"SLACK_SIGNING_SECRET":"...","SLACK_BOT_TOKEN":"..."}'
    ```
 
-3. **The two hard-coded lists.** `deploy-infrastructure/sheriff/config.ts`
-   holds the approver Slack user ids and the Slack-to-Identity-Store map. Both
-   ship with an obvious placeholder; replace them with real ids in a reviewed
-   PR before the flow can approve anything. Until then the approver check
-   rejects every click and the requester map rejects every submission, which is
-   the honest dry-run behaviour.
+   **Let the stack create it; do not create it first.** A secret that already
+   exists when the resource first applies makes `CreateSecret` fail with
+   `ResourceExistsException`, and the resource never enters Pulumi state, so
+   every later apply fails the same way. `sheriffSlackSecret` carries an
+   `import` option for exactly that case: an apply adopts the existing secret
+   in place instead of creating a second one, and because the import reads the
+   container's metadata and never its value, the credentials stay untouched.
+   The option is a one-time adoption -- once the resource is in state Pulumi
+   ignores it -- but creating the secret with the stack is still the clean
+   path. If you do create one by hand, expect the next apply to adopt it and
+   diff only its description and tags against the declaration.
 
-The configured channel is `#devs-only` by default, overridable with the
+3. **The approver list.** `deploy-infrastructure/sheriff/config.ts` holds the
+   approver Slack user ids, changed only by a reviewed PR per the approval
+   policy. It is set to the engineer (`U0BMU0DPS9Y`, Jeff Jagoda) as the only
+   approver for now; adding another is a reviewed PR. The requester mapping is
+   no longer a list: step 4 resolves the requester from their Slack email and
+   gates on the `Engineers` group.
+4. **The alarm email subscription.** The stack creates the `sheriff-alerts`
+   SNS topic and subscribes `aws-infrastructure@goodparty.org`, but the
+   subscription stays unconfirmed until someone accepts the AWS email. Until
+   then the orphaned-membership alarm fires into a topic with no confirmed
+   subscriber.
+
+The configured channel is `#sensitive-access-requests` by default, overridable with the
 `APPROVAL_CHANNEL` environment variable on the function.

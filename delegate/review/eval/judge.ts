@@ -114,9 +114,8 @@ const renderOutput = (result: Result): string => {
   if (output.findings.length > 0) {
     lines.push("Findings:");
     for (const f of output.findings) {
-      const carried = f.priorFindingId ? ` (carries prior ${f.priorFindingId})` : "";
       lines.push(
-        `- ${f.path}:${f.line} [${f.category}/${f.confidence}]${carried} ${f.body}`,
+        `- ${f.path}:${f.line} [${f.category}/${f.confidence}] ${f.body}`,
       );
       if (f.suggestion) lines.push(`  Suggestion: ${f.suggestion}`);
     }
@@ -154,7 +153,7 @@ const buildJudgePrompt = (
       ? [
           "## Prior findings (from the bot's previous run on this PR)",
           "A review that carries one of these forward claims the issue is still present; one that omits it claims it is fixed.",
-          ...bundle.priorFindings.map((f) => `- ${f.id} ${f.path}:${f.line} [${f.category}] ${f.body}`),
+          ...bundle.priorFindings.map((f) => `- ${f.path}:${f.line} [${f.category}] ${f.body}`),
           "",
         ]
       : []),

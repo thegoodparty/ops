@@ -44,6 +44,11 @@ describe("renderBody", () => {
     assert.ok(body.includes("2 finding(s) pointed at files outside the diff"));
   });
 
+  it("surfaces findings that could not be parsed from the output", () => {
+    const body = renderBody({ ...baseArgs, unparseableCount: 2 });
+    assert.ok(body.includes("2 finding(s) in the reviewer's output did not match the review schema"));
+  });
+
   it("lists prior findings still open with links when available", () => {
     const body = renderBody({
       ...baseArgs,
@@ -64,11 +69,24 @@ describe("renderBody", () => {
 });
 
 describe("renderFailureBody", () => {
-  it("names the reason and the run", () => {
-    const body = renderFailureBody({ runId: "r1", headSha: "abc1234567", reason: "agent crashed" });
-    assert.ok(body.startsWith("Review failed: agent crashed."));
+  it("names it as a reviewer failure and says how to retry", () => {
+    const body = renderFailureBody({ runId: "r1", headSha: "abc1234567" });
+    assert.ok(body.startsWith("**Review failed.**"));
+    assert.ok(body.includes("reviewer failure"));
+    assert.ok(body.includes("not an approval"));
     assert.ok(body.includes("Push a new commit, then comment `delegate review`"));
     assert.ok(body.endsWith("_run r1 · abc1234_"));
+  });
+
+  it("links the run logs when a url is given", () => {
+    const body = renderFailureBody({ runId: "r1", headSha: "abc1234567", logsUrl: "https://logs" });
+    assert.ok(body.includes("[run logs](https://logs)"));
+  });
+
+  it("never interpolates a raw validation error", () => {
+    const body = renderFailureBody({ runId: "r1", headSha: "abc1234567" });
+    assert.ok(!body.includes("invalid_format"));
+    assert.ok(!body.includes("uuid"));
   });
 });
 

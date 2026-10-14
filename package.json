@@ -11,15 +11,19 @@
   "scripts": {
     "script": "tsx --env-file-if-exists=scripts/.env run-script.ts",
     "build": "tsc && esbuild delegate/lambdas/handler.ts --bundle --platform=node --target=node22 --outfile=dist/lambda/handler.js",
-    "test": "tsx --test 'delegate/framework/*.test.ts' 'delegate/lambdas/*.test.ts' 'delegate/review/*.test.ts' 'delegate/review/eval/*.test.ts' 'delegate/agents/*.test.ts' 'deploy/*.test.ts' 'deploy-workbench/*.test.ts' 'deploy-infrastructure/*.test.ts'",
-    "review:eval": "tsx delegate/review/eval/cli.ts"
+    "test": "tsx --test 'delegate/framework/*.test.ts' 'delegate/lambdas/*.test.ts' 'delegate/review/*.test.ts' 'delegate/review/eval/*.test.ts' 'delegate/agents/*.test.ts' 'delegate/worker/*.test.ts' 'deploy/*.test.ts' 'deploy-workbench/*.test.ts' 'deploy-infrastructure/*.test.ts'",
+    "review:eval": "tsx delegate/review/eval/cli.ts",
+    "review:expect": "tsx delegate/review/eval/expect.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.72",
     "@aws-sdk/client-bedrock": "^3.1137.0",
     "@aws-sdk/client-dynamodb": "^3.1014.0",
     "@aws-sdk/client-ecs": "^3.700.0",
+    "@aws-sdk/client-identitystore": "^3.1150.0",
+    "@aws-sdk/client-lambda": "^3.1150.0",
     "@aws-sdk/client-s3": "^3.983.0",
+    "@aws-sdk/client-scheduler": "^3.1150.0",
     "@aws-sdk/client-secrets-manager": "^3.1005.0",
     "@aws-sdk/client-sqs": "^3.985.0",
     "@aws-sdk/client-sts": "^3.1137.0",

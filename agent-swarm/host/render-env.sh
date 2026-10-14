@@ -103,7 +103,9 @@ CODER_AGENT_ID=458bcd6d-4384-4366-83fa-63072ef55eab
 REVIEWER_AGENT_ID=a0799d09-6816-445a-957d-1339b672d38b
 
 SWARM_API_DOMAIN=delegate-swarm.infra.goodparty.org
-MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org
+# The API calls itself here (script tools, ctx.swarm, memory-rate). The
+# public host puts those calls behind the Google login, which 401s them.
+MCP_BASE_URL=http://api:3013
 PUBLIC_MCP_BASE_URL=https://delegate-swarm.infra.goodparty.org
 APP_URL=https://delegate-swarm.infra.goodparty.org
 CORS_ALLOWED_ORIGINS=https://delegate-swarm.infra.goodparty.org

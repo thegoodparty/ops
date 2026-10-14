@@ -16,6 +16,11 @@ const statements = sheriffGrantPolicy.Statement;
 const ADMINS_GROUP_ARN =
   "arn:aws:identitystore:::group/88c1b330-a001-707a-06ca-94e289013bf5";
 
+// The Engineers group the requester gate checks. Mirrored from
+// `deploy-infrastructure/sheriff/config.ts`.
+const ENGINEERS_GROUP_ARN =
+  "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378";
+
 const IDENTITY_STORE_ARN =
   "arn:aws:identitystore::333022194791:identitystore/d-9267e5cf96";
 
@@ -48,6 +53,8 @@ describe("sheriffGrantPolicy", () => {
   const ALLOWED = [
     "identitystore:CreateGroupMembership",
     "identitystore:DeleteGroupMembership",
+    "identitystore:GetUserId",
+    "identitystore:IsMemberInGroups",
     "identitystore:ListGroupMemberships",
     "identitystore:ListGroupMembershipsForMember",
   ];
@@ -55,7 +62,7 @@ describe("sheriffGrantPolicy", () => {
   const allActions = statements.flatMap((s) => asList(s.Action));
   const allResources = statements.flatMap((s) => asList(s.Resource));
 
-  it("allows exactly the four membership actions", () => {
+  it("allows exactly the six directory actions", () => {
     assert.deepEqual([...allActions].sort(), [...ALLOWED].sort());
   });
 
@@ -70,20 +77,23 @@ describe("sheriffGrantPolicy", () => {
   // Every prefix and action the plan names as deliberately absent. `sso-directory`
   // matters most: `adminReservedActions` records that it carries its own
   // `AddMemberToGroup`, so allowing it would be a second path to the same
-  // directory mutation.
+  // directory mutation. The regex must not reject `GetUserId`, which is now
+  // allowed; it forbids `Describe*` and `ListUsers` specifically.
   it("grants no forbidden prefix or action", () => {
     for (const action of allActions) {
       assert.doesNotMatch(action, /^(sso|sso-directory|sso-oauth):/, action);
-      assert.doesNotMatch(action, /(Describe|User)/, action);
+      assert.doesNotMatch(action, /(Describe|ListUsers)/, action);
     }
     for (const forbidden of [
       "identitystore:DescribeGroup",
       "identitystore:ListUsers",
       "identitystore:DescribeUser",
-      "identitystore:GetUserId",
     ]) {
       assert.ok(!allActions.includes(forbidden), forbidden);
     }
+    // The one `User`-containing action that is deliberately allowed, so the
+    // regex above is not accidentally over-broad.
+    assert.ok(allActions.includes("identitystore:GetUserId"));
   });
 
   it("scopes every resource, with no bare wildcard", () => {
@@ -97,8 +107,9 @@ describe("sheriffGrantPolicy", () => {
     }
   });
 
-  it("names the one Admins group, the one identity store and the two unavoidable wildcards", () => {
+  it("names the Admins and Engineers groups, the one identity store and the two unavoidable wildcards", () => {
     assert.ok(allResources.includes(ADMINS_GROUP_ARN));
+    assert.ok(allResources.includes(ENGINEERS_GROUP_ARN));
     assert.ok(allResources.includes(IDENTITY_STORE_ARN));
     assert.ok(allResources.includes(USER_ARN));
     assert.ok(allResources.includes(MEMBERSHIP_ARN));
@@ -106,11 +117,26 @@ describe("sheriffGrantPolicy", () => {
 
   // The exact scope per action, from the accepted answer for this problem: the
   // user and membership ids do not exist at apply time, so those two are
-  // wildcards scoped to their type, and everything else is a literal.
+  // wildcards scoped to their type, and everything else is a literal. Each
+  // statement names exactly the resource types the Service Authorization
+  // Reference marks required for its action: `IsMemberInGroups` and the two
+  // listing actions include the membership wildcard, `IsMemberInGroups` also
+  // names the `Engineers` group it queries, and the listing actions name only
+  // the `Admins` group (not both).
   it("scopes each action to the narrowest set that authorizes it", () => {
     const bySid = Object.fromEntries(
       statements.map((s) => [s.Sid, [...asList(s.Resource)].sort()]),
     );
+    assert.deepEqual(bySid.ResolveRequester, [
+      IDENTITY_STORE_ARN,
+      USER_ARN,
+    ].sort());
+    assert.deepEqual(bySid.RequesterIsEngineer, [
+      ENGINEERS_GROUP_ARN,
+      IDENTITY_STORE_ARN,
+      USER_ARN,
+      MEMBERSHIP_ARN,
+    ].sort());
     assert.deepEqual(bySid.GrantMembership, [
       ADMINS_GROUP_ARN,
       IDENTITY_STORE_ARN,
@@ -125,11 +151,34 @@ describe("sheriffGrantPolicy", () => {
     assert.deepEqual(bySid.ListGroupMemberships, [
       ADMINS_GROUP_ARN,
       IDENTITY_STORE_ARN,
+      MEMBERSHIP_ARN,
     ].sort());
     assert.deepEqual(bySid.ListMembershipsForMember, [
       IDENTITY_STORE_ARN,
       USER_ARN,
+      MEMBERSHIP_ARN,
     ].sort());
+  });
+
+  // Regression: the listing actions are evaluated against the group-membership
+  // resource, not the group or identity store the call names, so a policy that
+  // scopes them to the group and identity store alone is an AccessDenied at the
+  // first sweep. The Service Authorization Reference marks AllGroupMemberships
+  // as a required resource type for both `ListGroupMemberships` and
+  // `ListGroupMembershipsForMember`, so dropping the membership wildcard from
+  // either statement must fail here.
+  it("keeps the membership resource on both listing actions", () => {
+    const bySid = Object.fromEntries(
+      statements.map((s) => [s.Sid, asList(s.Resource)]),
+    );
+    assert.ok(
+      bySid.ListGroupMemberships.includes(MEMBERSHIP_ARN),
+      "ListGroupMemberships must name the membership resource",
+    );
+    assert.ok(
+      bySid.ListMembershipsForMember.includes(MEMBERSHIP_ARN),
+      "ListGroupMembershipsForMember must name the membership resource",
+    );
   });
 
   // The group id is a literal duplicated from identity-center.ts because step
@@ -142,5 +191,19 @@ describe("sheriffGrantPolicy", () => {
     );
     assert.match(source, /Admins: "88c1b330-a001-707a-06ca-94e289013bf5"/);
     assert.ok(allResources.includes(ADMINS_GROUP_ARN));
+  });
+
+  // The Engineers gate reads its group id from the runtime config. Read the
+  // source so the policy and the gate cannot drift.
+  it("mirrors the Engineers group id in the sheriff config", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../deploy-infrastructure/sheriff/config.ts"),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /ENGINEERS_GROUP_ID = "383193a0-7001-70d9-a321-ffe6d8af7378"/,
+    );
+    assert.ok(allResources.includes(ENGINEERS_GROUP_ARN));
   });
 });
