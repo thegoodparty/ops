@@ -57,5 +57,14 @@
       "verdict": "approve"
     },
     "tests": "A one-line documentation correction: quote a skill description so strict YAML parsers load it. Nothing to block."
+  },
+  {
+    "id": "gp-data-platform-1183-null-regex-guard",
+    "bundle": "gp-data-platform-1183.bundle.json",
+    "realHead": true,
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Recorded PR, replayed at its real head 43a641a with the earlier finding listed as prior. The reviewer wanted a `where: ... is not null` guard on a regex test over a nullable column. dbt_expectations returns failing rows with `where not(expression = true)`, and a null predicate is never returned: 0 failures over 218,051,528 voter rows with 8,725,708 null, and the same test already runs unguarded on `geocode_full`. Nothing to block."
   }
 ]

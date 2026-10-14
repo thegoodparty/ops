@@ -100,7 +100,7 @@ cat report.md
 
 ## Expected-result suite
 
-Five cases with a known right answer, listed in `expected/manifest.json`. Each is scored on the outcome alone, with no judge: a block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. Every case runs several times, and a case passes only when every run does.
+Six cases with a known right answer, listed in `expected/manifest.json`. Each is scored on the outcome alone, with no judge: a block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. Every case runs several times, and a case passes only when every run does.
 
 Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $15 and no wall time.
 
