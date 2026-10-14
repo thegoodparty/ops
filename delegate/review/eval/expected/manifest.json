@@ -57,5 +57,19 @@
       "verdict": "approve"
     },
     "tests": "A one-line documentation correction: quote a skill description so strict YAML parsers load it. Nothing to block."
+  },
+  {
+    "id": "gp-pi-57-multi-instance",
+    "bundle": "gp-pi-57-multi-instance.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "bin/gp-pi"
+      ],
+      "categories": [
+        "bugs"
+      ]
+    },
+    "tests": "Simulated from gp-pi #57 at 854028d (tree rebuilt on the pre-PR base; the real head is the same tree). Production approved. Sanjay's agent then reproduced bugs in bin/gp-pi that Jeff fixed in 7f76519: `recreate omni` destroys the container then dies on the overlap check, `rm --all` exits silently under set -e, a fixed host port collides across instances. Path match is loose: any bugs finding in bin/gp-pi passes."
   }
 ]
