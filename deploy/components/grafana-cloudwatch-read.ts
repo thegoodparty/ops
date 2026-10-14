@@ -12,7 +12,7 @@ const GRAFANA_ACCOUNT_ID = "008923505280";
 // Unique to our Grafana Cloud stack (goodparty, 1532096), from the CloudWatch
 // data source's Settings tab. Without it, any Grafana Cloud stack could
 // assume this role.
-export const GRAFANA_STACK_EXTERNAL_ID = "";
+export const GRAFANA_STACK_EXTERNAL_ID = "1532096";
 
 export const grafanaCloudwatchReadTrust = {
   Version: "2012-10-17",
