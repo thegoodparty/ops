@@ -156,16 +156,27 @@ export const sheriffGrantPolicy: PolicyDocument = {
     {
       Sid: "ListGroupMemberships",
       Effect: "Allow",
+      // ListGroupMemberships supports the GroupMembership, Group and
+      // Identitystore resource types, all required. The full-group scan is
+      // evaluated against the membership type (`arn:...:membership/*`), which
+      // is why the group ARN alone is not enough: the call that failed in
+      // production was authorized on the group and identity store and denied on
+      // the membership. All three appear here.
       Action: ["identitystore:ListGroupMemberships"],
-      Resource: [GROUP_ARN, IDENTITY_STORE_ARN],
+      Resource: [GROUP_ARN, IDENTITY_STORE_ARN, MEMBERSHIP_ARN],
     },
     {
       Sid: "ListMembershipsForMember",
       Effect: "Allow",
-      // No Group resource type for this action, so the identity store and the
-      // user are the scope. The user id is dynamic, hence the wildcard.
+      // ListGroupMembershipsForMember supports the GroupMembership, Identitystore
+      // and User resource types, all required. It has no Group resource type,
+      // so the `Admins` group ARN cannot appear, but the membership wildcard
+      // must: the action is evaluated against the membership it returns, the
+      // same way ListGroupMemberships is, so the identity store and user alone
+      // deny the `ConflictException` recovery path. The user id is dynamic,
+      // hence its wildcard.
       Action: ["identitystore:ListGroupMembershipsForMember"],
-      Resource: [IDENTITY_STORE_ARN, USER_ARN],
+      Resource: [IDENTITY_STORE_ARN, USER_ARN, MEMBERSHIP_ARN],
     },
   ],
 };
