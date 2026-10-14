@@ -209,3 +209,35 @@ export const buildDecisionOutcomeText = (
   }
   return `:white_check_mark: <@${decidedBy}> approved <@${request.requesterSlackId}>'s break-glass request (${request.durationValue}).`;
 };
+
+/**
+ * The revoke outcome, posted to the approval channel when the grant ends. The
+ * membership is gone, but a session that was already open keeps the role until
+ * it expires, so the same honest caveat as the grant copy applies.
+ */
+export const buildRevokedBlocks = (
+  grant: GrantRecord,
+  revokedAt: string,
+): Block[] => [
+  {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text:
+        `:lock: *Break-glass access revoked* for <@${grant.requesterSlackId}> ` +
+        `(request \`${grant.requestId}\`) at ${revokedAt}.\n` +
+        "`AdministratorAccess` via the `Admins` group is removed. " +
+        `A session that was already open can keep the role until it expires (up to ${minutes(
+          SESSION_DURATION_SECONDS,
+        )} minutes more).`,
+    },
+  },
+];
+
+/** The notification text for the revoke post, for clients that do not render blocks. */
+export const buildRevokeOutcomeText = (
+  grant: GrantRecord,
+  revokedAt: string,
+): string =>
+  `:lock: Break-glass access for <@${grant.requesterSlackId}> (request \`${grant.requestId}\`) was revoked at ${revokedAt}. ` +
+  "`AdministratorAccess` via the `Admins` group is removed.";

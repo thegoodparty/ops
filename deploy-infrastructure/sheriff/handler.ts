@@ -28,6 +28,7 @@
  *   { action: "post-request", requestId, channel }
  *   { action: "decide", requestId, decision, approverSlackId, channel, messageTs }
  *   { action: "sweep" }   the EventBridge reconciliation rule.
+ *   { action: "revoke", requestId }  the step-5 expiry one-shot's revoke event.
  *
  * The async paths are idempotent: the request moves `requested -> granting`
  * with a conditional write, and the per-requester active-grant lock is claimed
@@ -48,6 +49,8 @@ import {
   buildDecidedBlocks,
   buildDecisionOutcomeText,
   buildRequestModal,
+  buildRevokedBlocks,
+  buildRevokeOutcomeText,
 } from "./blocks";
 import {
   ADMINS_GROUP_ID,
@@ -65,7 +68,13 @@ import {
   isEngineersMember,
   listAdminsMemberships,
   lookupIdentityStoreUserId,
+  resolveAdminsMembershipId,
 } from "./identity";
+import {
+  createExpirySchedule,
+  deleteExpirySchedule,
+} from "./scheduler";
+import type { IdentitystoreClient } from "@aws-sdk/client-identitystore";
 import {
   activeGrantDecision,
   decodeSlackPayload,
@@ -73,6 +82,7 @@ import {
   eligibilityErrorMessage,
   evaluateDecision,
   evaluateEligibility,
+  expiryScheduleName,
   grantExpiresAt,
   isHttpUrl,
   newRequestId,
@@ -86,14 +96,17 @@ import {
 import {
   beginActiveGrant,
   claimRequestPost,
+  claimRevokePost,
   decideRequest,
   getActiveGrant,
+  getGrant,
   getRequest,
   incrementRateCount,
   putGrant,
   putRequest,
   releaseActiveGrant,
   releaseRequestPost,
+  releaseRevokePost,
   setGrantState,
   setRequestMessageRef,
   setRequestState,
@@ -112,7 +125,7 @@ type FunctionUrlEvent = {
  * not the Function URL shape.
  */
 type AsyncEvent = {
-  action: "sweep" | "post-request" | "decide";
+  action: "sweep" | "post-request" | "decide" | "revoke";
   requestId?: string;
   decision?: Decision;
   approverSlackId?: string;
@@ -552,6 +565,7 @@ const handleApprove = async (
     durationSeconds: request.durationSeconds,
     grantedAt,
     expiresAt: grantExpiresAt(grantedAt, request.durationSeconds),
+    scheduleName: expiryScheduleName(requestId),
     ttl: Math.floor(Date.now() / 1000) + REQUEST_TTL_SECONDS,
   };
   try {
@@ -673,6 +687,17 @@ const handleApprove = async (
     grantedAt,
     expiresAt: grant.expiresAt,
   });
+
+  // Step 5's one-shot revocation, created after the membership and the
+  // `granted` flip so a schedule never exists for a grant that never landed.
+  // A failure here does not fail the grant: the membership is real and
+  // time-boxed, and the sweeper is the backstop. The sweeper's recovery path
+  // recreates a missing schedule, so this is a degradation, not a loss.
+  try {
+    await createExpirySchedule(grantedGrant);
+  } catch (err) {
+    console.error("failed to create the break-glass expiry schedule", err);
+  }
 
   return OK;
 };
@@ -830,9 +855,10 @@ const handleInteractivity = async (
  * The reconciliation sweeper, invoked by the EventBridge rule with
  * `{ action: "sweep" }`.
  *
- * Step 4 has no one-shot scheduler (that is step 5), so this is the revoke
- * path: every expired grant is revoked here. It scans `Admins` and the tool's
- * grant records, and:
+ * Step 5's one-shot scheduler is the normal revoke path; this periodic sweep
+ * is the backstop for a failed schedule or a grant path that stopped partway.
+ * Every expired grant is revoked here on the next pass. It scans `Admins` and
+ * the tool's grant records, and:
  *
  * - a `granting` record younger than the grace window is left alone, because
  *   the async approve path may still be running;
@@ -851,6 +877,66 @@ const handleInteractivity = async (
  * the approve path moved mid-sweep is not clobbered.
  */
 /**
+ * The idempotent revoke core shared by the sweeper and the scheduler's revoke
+ * action.
+ *
+ * `DeleteGroupMembership` is the same call the sweeper already makes, and
+ * `identity.ts` already treats `ResourceNotFoundException` as success. This
+ * function deletes the membership, conditionally flips the grant and its
+ * request to `revoked`, releases the at-most-one lock and deletes the expiry
+ * schedule. It returns whether this call applied the terminal transition;
+ * callers audit only when it did, so two revokers cannot both emit
+ * `grant.revoked`.
+ *
+ * The membership delete is outside the `try`: if it fails, nothing is released
+ * and the schedule stays, so the scheduler can retry and the sweeper can
+ * alarm. Once the membership is gone, the `finally` releases the lock and
+ * removes the schedule even if a state write fails, because a terminal grant
+ * must not leave either stuck.
+ */
+export type RevokeGrantDeps = {
+  store: typeof defaultStore;
+  deleteAdminsMembership: typeof deleteAdminsMembership;
+  deleteExpirySchedule: typeof deleteExpirySchedule;
+};
+
+export const revokeGrant = async (args: {
+  client: IdentitystoreClient;
+  grant: GrantRecord;
+  membershipId: string;
+  deps?: Partial<RevokeGrantDeps>;
+}): Promise<boolean> => {
+  const revokeStore = args.deps?.store ?? defaultStore;
+  const deleteMembership =
+    args.deps?.deleteAdminsMembership ?? deleteAdminsMembership;
+  const removeSchedule =
+    args.deps?.deleteExpirySchedule ?? deleteExpirySchedule;
+
+  await deleteMembership(args.client, args.membershipId);
+
+  let applied = false;
+  try {
+    applied = await revokeStore.setGrantState({
+      requestId: args.grant.requestId,
+      state: "revoked",
+      membershipId: args.membershipId,
+      fromState: ["granting", "granted", "failed"],
+    });
+    if (applied) {
+      await revokeStore.setRequestState(
+        args.grant.requestId,
+        "revoked",
+        ["granting", "granted", "failed"],
+      );
+    }
+  } finally {
+    await revokeStore.releaseActiveGrant(args.grant.requesterIdentityStoreId);
+    await removeSchedule(args.grant);
+  }
+  return applied;
+};
+
+/**
  * The sweeper's collaborators, injectable so the imperative paths (the
  * `finally` lock release, the revoke-failure alarm) are testable without AWS.
  * Production calls `handleSweep()` and gets the real store and role.
@@ -860,6 +946,8 @@ export type SweepDeps = {
   assumeGrantRole: typeof assumeGrantRole;
   listAdminsMemberships: typeof listAdminsMemberships;
   deleteAdminsMembership: typeof deleteAdminsMembership;
+  createExpirySchedule: typeof createExpirySchedule;
+  deleteExpirySchedule: typeof deleteExpirySchedule;
 };
 
 export const handleSweep = async (
@@ -870,6 +958,8 @@ export const handleSweep = async (
   const listMemberships = deps?.listAdminsMemberships ?? listAdminsMemberships;
   const deleteMembership =
     deps?.deleteAdminsMembership ?? deleteAdminsMembership;
+  const createSchedule = deps?.createExpirySchedule ?? createExpirySchedule;
+  const removeSchedule = deps?.deleteExpirySchedule ?? deleteExpirySchedule;
 
   const client = await assume();
   const [memberships, grants] = await Promise.all([
@@ -877,8 +967,9 @@ export const handleSweep = async (
     sweepStore.listGrants(),
   ]);
 
+  const now = Date.now();
   const plan = reconcileSweep({
-    now: Date.now(),
+    now,
     grants,
     memberships,
     grantingGraceMs: SWEEP_GRANTING_GRACE_MS,
@@ -897,6 +988,18 @@ export const handleSweep = async (
       await sweepStore.setRequestState(grant.requestId, "failed", "granting");
     } finally {
       await sweepStore.releaseActiveGrant(grant.requesterIdentityStoreId);
+    }
+    // A `granting` record normally never has a schedule (it is created only
+    // after the `granted` flip), but delete one if a future ordering change
+    // leaves it, so a terminal grant never leaves a schedule behind. A
+    // schedule-delete failure is logged rather than aborting the sweep.
+    try {
+      await removeSchedule(grant);
+    } catch (err) {
+      console.error(
+        "failed to delete the expiry schedule for a failed grant",
+        err,
+      );
     }
     audit("grant.failed", {
       requestId: grant.requestId,
@@ -921,6 +1024,21 @@ export const handleSweep = async (
     });
     if (!applied) continue;
     await sweepStore.setRequestState(grant.requestId, "granted", "granting");
+    // The approve path creates the schedule after the `granted` flip; a crash
+    // between the two leaves a live grant with no schedule. Recreate it here,
+    // idempotently, unless the grant is already expired (then the revoke below
+    // handles it). This is what makes the sweeper recover a partial grant path
+    // rather than only backstop it.
+    if (Date.parse(grant.expiresAt) > now) {
+      try {
+        await createSchedule(grant);
+      } catch (err) {
+        console.error(
+          "failed to create the expiry schedule during sweep",
+          err,
+        );
+      }
+    }
     audit("grant.created", {
       requestId: grant.requestId,
       requester: grant.requesterSlackId,
@@ -939,7 +1057,33 @@ export const handleSweep = async (
 
   for (const { grant, membershipId } of plan.revoke) {
     try {
-      await deleteMembership(client, membershipId);
+      const applied = await revokeGrant({
+        client,
+        grant,
+        membershipId,
+        deps: {
+          store: sweepStore,
+          deleteAdminsMembership: deleteMembership,
+          deleteExpirySchedule: removeSchedule,
+        },
+      });
+      // Only when the transition actually applied: a concurrent revoker that
+      // already moved the record must not emit a second `grant.revoked`.
+      if (applied) {
+        audit("grant.revoked", {
+          requestId: grant.requestId,
+          requester: grant.requesterSlackId,
+          requesterEmail: grant.requesterEmail,
+          approver: grant.approverSlackId,
+          group: grant.groupId,
+          membershipId,
+          reason: grant.reason,
+          ticket: grant.ticket,
+          grantedAt: grant.grantedAt,
+          expiresAt: grant.expiresAt,
+          source: "sweep",
+        });
+      }
     } catch (err) {
       // The revoke failed or the state is stuck: this is the orphan the alarm
       // exists for. A normal sweep-and-revoke never reaches here. The lock
@@ -959,41 +1103,6 @@ export const handleSweep = async (
         expiresAt: grant.expiresAt,
         source: "sweep",
       });
-      continue;
-    }
-    // The membership is gone; release the lock in `finally` even if a state
-    // write fails, so a terminal grant cannot leave it stuck.
-    try {
-      const applied = await sweepStore.setGrantState({
-        requestId: grant.requestId,
-        state: "revoked",
-        membershipId,
-        fromState: ["granting", "granted", "failed"],
-      });
-      if (applied) {
-        await sweepStore.setRequestState(
-          grant.requestId,
-          "revoked",
-          ["granting", "granted", "failed"],
-        );
-        // Only when the transition actually applied: a concurrent sweep that
-        // already moved the record must not emit a second `grant.revoked`.
-        audit("grant.revoked", {
-          requestId: grant.requestId,
-          requester: grant.requesterSlackId,
-          requesterEmail: grant.requesterEmail,
-          approver: grant.approverSlackId,
-          group: grant.groupId,
-          membershipId,
-          reason: grant.reason,
-          ticket: grant.ticket,
-          grantedAt: grant.grantedAt,
-          expiresAt: grant.expiresAt,
-          source: "sweep",
-        });
-      }
-    } finally {
-      await sweepStore.releaseActiveGrant(grant.requesterIdentityStoreId);
     }
   }
 
@@ -1008,6 +1117,195 @@ export const handleSweep = async (
     });
   }
 
+  return OK;
+};
+
+/**
+ * The scheduler's revoke action, invoked by the one-shot expiry schedule with
+ * `{ action: "revoke", requestId }`.
+ *
+ * It reuses the sweeper's idempotent path: `DeleteGroupMembership` by the
+ * stored `MembershipId`, `ResourceNotFoundException` treated as success, and
+ * `ListGroupMembershipsForMember` to resolve the membership of a `granting`
+ * record the approve path never finished. On success it flips the grant to
+ * `revoked`, deletes the schedule and posts the outcome to the approval
+ * channel. On a failure other than "already gone" it audits the orphan and
+ * rethrows, so the schedule's retry policy and DLQ apply; the sweeper is the
+ * backstop and will alarm too.
+ *
+ * Idempotent: a double revoke (scheduler and sweeper) deletes the membership
+ * once and the losing state transition is a no-op, and the revoke post is
+ * claimed with a conditional write, so exactly one revoker posts. A retry after
+ * a failed post finds the grant already `revoked` and posts without revoking
+ * again.
+ */
+export type RevokeDeps = {
+  store: typeof defaultStore;
+  assumeGrantRole: typeof assumeGrantRole;
+  resolveAdminsMembershipId: typeof resolveAdminsMembershipId;
+  deleteAdminsMembership: typeof deleteAdminsMembership;
+  deleteExpirySchedule: typeof deleteExpirySchedule;
+};
+
+const postRevokeOutcome = async (
+  slack: WebClient,
+  grant: GrantRecord,
+  request: RequestRecord | undefined,
+): Promise<void> => {
+  const revokedAt = new Date().toISOString();
+  const channel =
+    request?.channel ??
+    process.env.APPROVAL_CHANNEL ??
+    DEFAULT_APPROVAL_CHANNEL;
+  await slack.chat.postMessage({
+    channel,
+    ...(request?.messageTs ? { thread_ts: request.messageTs } : {}),
+    text: buildRevokeOutcomeText(grant, revokedAt),
+    blocks: buildRevokedBlocks(grant, revokedAt) as unknown as MessageBlocks,
+  });
+};
+
+export const handleRevoke = async (
+  event: SheriffEvent,
+  slack: WebClient,
+  deps?: Partial<RevokeDeps>,
+): Promise<LambdaResponse> => {
+  const revokeStore = deps?.store ?? defaultStore;
+  const assume = deps?.assumeGrantRole ?? assumeGrantRole;
+  const resolveMembership =
+    deps?.resolveAdminsMembershipId ?? resolveAdminsMembershipId;
+  const deleteMembership =
+    deps?.deleteAdminsMembership ?? deleteAdminsMembership;
+  const removeSchedule = deps?.deleteExpirySchedule ?? deleteExpirySchedule;
+
+  const requestId = event.requestId;
+  if (!requestId) return OK;
+
+  const [grant, request] = await Promise.all([
+    revokeStore.getGrant(requestId),
+    revokeStore.getRequest(requestId),
+  ]);
+  if (!grant) return OK;
+
+  // The revoke post is claimed separately from the state transition, so a
+  // sweeper that won the transition does not silence the channel, and a retry
+  // after a failed post can still post.
+  const notify = async (): Promise<void> => {
+    const claimed = await revokeStore.claimRevokePost(requestId);
+    if (!claimed) return;
+    try {
+      await postRevokeOutcome(slack, grant, request ?? undefined);
+    } catch (err) {
+      await revokeStore.releaseRevokePost(requestId);
+      throw err;
+    }
+  };
+
+  if (grant.state === "revoked") {
+    // The sweeper won the transition, or this is the retry after the post
+    // failed. The membership is already gone; make sure no schedule is left
+    // (a sweeper that won the transition may have failed to delete it) and
+    // post if this grant has not been posted. A schedule-delete failure must
+    // not block the post, and the one-shot's own DELETE cleans it up anyway.
+    try {
+      await removeSchedule(grant);
+    } catch (err) {
+      console.error(
+        "failed to delete the expiry schedule on revoke retry",
+        err,
+      );
+    }
+    await notify();
+    return OK;
+  }
+
+  const client = await assume();
+  const membershipId =
+    grant.membershipId ??
+    (await resolveMembership(client, grant.requesterIdentityStoreId)) ??
+    undefined;
+
+  if (!membershipId) {
+    // The grant never completed: no membership exists, so there is nothing to
+    // revoke. Fail it closed, the same way the sweeper's `granting`-with-no-
+    // member case does, and drop the schedule.
+    const applied = await revokeStore.setGrantState({
+      requestId,
+      state: "failed",
+      fromState: "granting",
+    });
+    if (applied) {
+      try {
+        await revokeStore.setRequestState(requestId, "failed", "granting");
+      } finally {
+        await revokeStore.releaseActiveGrant(grant.requesterIdentityStoreId);
+      }
+      await removeSchedule(grant);
+      audit("grant.failed", {
+        requestId,
+        requester: grant.requesterSlackId,
+        requesterEmail: grant.requesterEmail,
+        approver: grant.approverSlackId,
+        group: grant.groupId,
+        reason: grant.reason,
+        ticket: grant.ticket,
+        grantedAt: grant.grantedAt,
+        expiresAt: grant.expiresAt,
+        source: "schedule",
+      });
+    }
+    return OK;
+  }
+
+  let applied: boolean;
+  try {
+    applied = await revokeGrant({
+      client,
+      grant,
+      membershipId,
+      deps: {
+        store: revokeStore,
+        deleteAdminsMembership: deleteMembership,
+        deleteExpirySchedule: removeSchedule,
+      },
+    });
+  } catch (err) {
+    // A revoke that fails for a reason other than "already gone" is the
+    // orphan the alarm exists for. Rethrow so the schedule retries and, after
+    // its attempts, dead-letters; the sweeper will alarm as well.
+    console.error("break-glass scheduled revoke failed", err);
+    audit("membership.orphaned", {
+      requestId,
+      requester: grant.requesterSlackId,
+      requesterEmail: grant.requesterEmail,
+      approver: grant.approverSlackId,
+      group: grant.groupId,
+      membershipId,
+      reason: grant.reason,
+      ticket: grant.ticket,
+      grantedAt: grant.grantedAt,
+      expiresAt: grant.expiresAt,
+      source: "schedule",
+    });
+    throw err;
+  }
+
+  if (applied) {
+    audit("grant.revoked", {
+      requestId,
+      requester: grant.requesterSlackId,
+      requesterEmail: grant.requesterEmail,
+      approver: grant.approverSlackId,
+      group: grant.groupId,
+      membershipId,
+      reason: grant.reason,
+      ticket: grant.ticket,
+      grantedAt: grant.grantedAt,
+      expiresAt: grant.expiresAt,
+      source: "schedule",
+    });
+  }
+  await notify();
   return OK;
 };
 
@@ -1034,9 +1332,13 @@ export const handler = async (
     : (event.body ?? "");
   const headers = lowerCaseHeaders(event.headers);
 
-  // The async self-invocations carry no Slack signature; the two HTTP routes
-  // do, and are verified before anything happens.
-  const isAsync = event.action === "post-request" || event.action === "decide";
+  // The async self-invocations and the scheduler's revoke event carry no Slack
+  // signature; the two HTTP routes do, and are verified before anything
+  // happens.
+  const isAsync =
+    event.action === "post-request" ||
+    event.action === "decide" ||
+    event.action === "revoke";
   if (
     !isAsync &&
     !verifySlackWebhook(
@@ -1057,6 +1359,9 @@ export const handler = async (
     }
     if (event.action === "decide") {
       return await handleDecide(event, slack);
+    }
+    if (event.action === "revoke") {
+      return await handleRevoke(event, slack);
     }
 
     switch (event.rawPath) {

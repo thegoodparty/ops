@@ -26,8 +26,8 @@ import { DEFAULT_APPROVAL_CHANNEL } from "./sheriff/config";
  * or the first AssumeRole is an AccessDenied, not an apply-time error.
  *
  * This file also owns the step-4 sweeper's trigger and the orphaned-membership
- * alarm. The one-shot expiry scheduler is step 5; until it lands the sweeper is
- * the revoke path.
+ * alarm, and step 5's one-shot expiry scheduler: the schedule group, the
+ * schedule-execution role and its DLQ. The sweeper stays as the backstop.
  */
 
 const NAME = "sheriff";
@@ -41,6 +41,34 @@ export const SHERIFF_GRANT_ROLE_ARN = `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:rol
 
 /** The function's own ARN, for the async self-invocation. */
 export const SHERIFF_FUNCTION_ARN = `arn:aws:lambda:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:function:${NAME}`;
+
+/**
+ * Step 5's one-shot revocation. Every schedule lives in one dedicated group so
+ * the Lambda's `scheduler:*` permission can be scoped to it rather than to the
+ * default group's whole namespace.
+ */
+export const SHERIFF_SCHEDULE_GROUP = "sheriff";
+export const SHERIFF_SCHEDULE_GROUP_ARN = `arn:aws:scheduler:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:schedule-group/${SHERIFF_SCHEDULE_GROUP}`;
+
+/**
+ * Every schedule the Lambda manages lives in the one group. The trailing
+ * slash makes this a prefix, so the `scheduler:*` statements can name the
+ * group and a wildcard rather than the default group or `*`.
+ */
+export const SHERIFF_SCHEDULE_ARN_PREFIX = `arn:aws:scheduler:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:schedule/${SHERIFF_SCHEDULE_GROUP}/`;
+
+/**
+ * The schedule-execution role EventBridge Scheduler assumes to invoke the
+ * function and write the DLQ. The Lambda may `iam:PassRole` this one role and
+ * nothing else; the role may invoke the one function and send to the one
+ * queue.
+ */
+export const SHERIFF_SCHEDULER_ROLE_NAME = `${NAME}-scheduler`;
+export const SHERIFF_SCHEDULER_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${SHERIFF_SCHEDULER_ROLE_NAME}`;
+
+/** The dead-letter queue for a schedule invocation that exhausts its retries. */
+export const SHERIFF_SCHEDULER_DLQ_NAME = `${NAME}-scheduler-dlq`;
+export const SHERIFF_SCHEDULER_DLQ_ARN = `arn:aws:sqs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:${SHERIFF_SCHEDULER_DLQ_NAME}`;
 
 /**
  * Where the orphaned-membership alarm goes. The budget alerts in `index.ts`
@@ -87,6 +115,57 @@ export const sheriffLambdaTrust = {
       Effect: "Allow",
       Principal: { Service: "lambda.amazonaws.com" },
       Action: "sts:AssumeRole",
+    },
+  ],
+} as const;
+
+/**
+ * EventBridge Scheduler's trust for the schedule-execution role. The
+ * `aws:SourceAccount` and `aws:SourceArn` conditions confine it to this
+ * account's schedules, so a schedule elsewhere cannot borrow the role to
+ * invoke the function or write the DLQ.
+ *
+ * `aws:SourceArn` must be the schedule **group** ARN, not a schedule ARN or a
+ * name prefix: AWS's confused-deputy guidance is explicit that Scheduler
+ * presents the group ARN at AssumeRole time, and a schedule-scoped condition
+ * is rejected. The group is dedicated to this tool, so scoping to it is as
+ * narrow as the condition allows.
+ */
+export const sheriffSchedulerTrust = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: { Service: "scheduler.amazonaws.com" },
+      Action: "sts:AssumeRole",
+      Condition: {
+        StringEquals: {
+          "aws:SourceAccount": INFRASTRUCTURE_ACCOUNT_ID,
+          "aws:SourceArn": SHERIFF_SCHEDULE_GROUP_ARN,
+        },
+      },
+    },
+  ],
+} as const;
+
+/**
+ * What the schedule-execution role may do: invoke the one sheriff function,
+ * and send a failed invocation to the one DLQ. Nothing else.
+ */
+export const sheriffSchedulerPolicy = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "InvokeSheriff",
+      Effect: "Allow",
+      Action: "lambda:InvokeFunction",
+      Resource: SHERIFF_FUNCTION_ARN,
+    },
+    {
+      Sid: "DeadLetterQueue",
+      Effect: "Allow",
+      Action: "sqs:SendMessage",
+      Resource: SHERIFF_SCHEDULER_DLQ_ARN,
     },
   ],
 } as const;
@@ -145,6 +224,32 @@ export const sheriffLambdaPolicy = {
       // path hand their slow work to an async invocation of this same function.
       Action: "lambda:InvokeFunction",
       Resource: SHERIFF_FUNCTION_ARN,
+    },
+    {
+      Sid: "ManageExpirySchedules",
+      Effect: "Allow",
+      // Step 5 creates one one-shot per grant, checks it before creating so a
+      // retry is idempotent, and deletes it when the grant ends. Scoped to the
+      // one schedule group; never the default group and never `*`.
+      Action: [
+        "scheduler:CreateSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:DeleteSchedule",
+      ],
+      Resource: `${SHERIFF_SCHEDULE_ARN_PREFIX}*`,
+    },
+    {
+      Sid: "PassSchedulerRole",
+      Effect: "Allow",
+      // `CreateSchedule` passes the target's role, and AWS requires
+      // `iam:PassRole` for it. Scoped to the one schedule-execution role and
+      // conditioned on the scheduler service, so a compromised function
+      // cannot pass the role to anything else.
+      Action: "iam:PassRole",
+      Resource: SHERIFF_SCHEDULER_ROLE_ARN,
+      Condition: {
+        StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" },
+      },
     },
     {
       Sid: "OwnLogs",
@@ -270,6 +375,57 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
     { provider },
   );
 
+  // -------------------------------------------------------------------------
+  // Step 5's scheduled revocation.
+  //
+  // A dedicated schedule group scopes the Lambda's `scheduler:*` permission
+  // and the execution role's trust to one namespace. The queue captures a
+  // schedule invocation that exhausts its retry policy; the execution role
+  // writes it, and the role's policy uses the literal function ARN so the
+  // role and the function do not depend on each other.
+  const scheduleGroup = new aws.scheduler.ScheduleGroup(
+    "sheriffSchedules",
+    {
+      name: SHERIFF_SCHEDULE_GROUP,
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  const schedulerDlq = new aws.sqs.Queue(
+    "sheriffSchedulerDlq",
+    {
+      name: SHERIFF_SCHEDULER_DLQ_NAME,
+      // Failed revokes are worth keeping long enough to investigate, not
+      // forever. Fourteen days is the SQS maximum.
+      messageRetentionSeconds: 14 * 24 * 60 * 60,
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  const schedulerRole = new aws.iam.Role(
+    "sheriffSchedulerRole",
+    {
+      name: SHERIFF_SCHEDULER_ROLE_NAME,
+      description:
+        "EventBridge Scheduler execution role: invokes the sheriff function and writes its DLQ. Assumed only by scheduler.amazonaws.com for schedules in the sheriff group.",
+      assumeRolePolicy: JSON.stringify(sheriffSchedulerTrust),
+      tags: TAGS,
+    },
+    { provider },
+  );
+
+  new aws.iam.RolePolicy(
+    "sheriffSchedulerPolicy",
+    {
+      name: SHERIFF_SCHEDULER_ROLE_NAME,
+      role: schedulerRole.name,
+      policy: JSON.stringify(sheriffSchedulerPolicy),
+    },
+    { provider },
+  );
+
   const fn = new aws.lambda.Function(
     "sheriff",
     {
@@ -285,6 +441,13 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
           SECRET_ARN: secret.arn,
           REQUEST_TABLE: table.name,
           APPROVAL_CHANNEL: DEFAULT_APPROVAL_CHANNEL,
+          // Step 5's schedule target. The role ARN is the literal, not
+          // `schedulerRole.arn`, so the role's policy and the function do not
+          // form a dependency cycle.
+          SCHEDULE_GROUP: SHERIFF_SCHEDULE_GROUP,
+          SCHEDULE_ROLE_ARN: SHERIFF_SCHEDULER_ROLE_ARN,
+          SCHEDULE_DLQ_ARN: SHERIFF_SCHEDULER_DLQ_ARN,
+          FUNCTION_ARN: SHERIFF_FUNCTION_ARN,
         },
       },
       tags: TAGS,
@@ -309,10 +472,10 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
   // -------------------------------------------------------------------------
   // The reconciliation sweeper.
   //
-  // Step 4 has no one-shot expiry scheduler (that is step 5), so this periodic
-  // rule is the revoke path: every expired grant is revoked on the next pass.
-  // A plain EventBridge rule rather than EventBridge Scheduler, to keep step 4
-  // and step 5's mechanism distinct. The `input` is the marker the handler
+  // Step 5's one-shot schedule is the normal revoke path; this periodic rule
+  // is the backstop for a failed schedule or a grant path that stopped
+  // partway. A plain EventBridge rule rather than EventBridge Scheduler, so
+  // the two mechanisms stay distinct. The `input` is the marker the handler
   // branches on; the event never reaches the Slack signature check.
   const sweepRule = new aws.cloudwatch.EventRule(
     "sheriffSweepRule",
@@ -455,5 +618,8 @@ export const createSheriff = (args: { provider: aws.Provider }) => {
     sweepRule,
     orphanedAlarm,
     alertTopic,
+    scheduleGroup,
+    schedulerDlq,
+    schedulerRole,
   };
 };
