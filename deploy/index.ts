@@ -8,6 +8,7 @@ import { createCiRoles } from "./components/ci-roles";
 import { createDelegateSwarmProdRead } from "./components/delegate-swarm-prod-read";
 import { createSheriffGrant } from "./components/sheriff-grant";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
+import { createGrafanaCloudwatchRead } from "./components/grafana-cloudwatch-read";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -51,6 +52,7 @@ export = async () => {
   createDelegateSwarmProdRead();
   createSheriffGrant();
   createInfraZoneDelegation();
+  createGrafanaCloudwatchRead();
 
   return {
     webhookUrl: webhook.url,
