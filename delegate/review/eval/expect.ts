@@ -33,9 +33,6 @@ const ExpectedCaseSchema = z
     id: z.string().regex(/^[a-z0-9-]+$/),
     key: z.string().startsWith("reviews/").endsWith(".json").optional(),
     bundle: z.string().endsWith(".json").optional(),
-    // The bundle describes a PR whose head exists on GitHub: check it out
-    // instead of rebuilding it from the diff.
-    realHead: z.boolean().optional(),
     expect: ExpectSchema,
     tests: z.string().min(1),
   })
@@ -237,7 +234,7 @@ const main = async () => {
     const records = new Map<string, ReviewRecord>();
     for (const c of cases) records.set(c.id, await loadRecord(c, manifestPath, client));
     const synthetic = new Set(
-      cases.filter((c) => c.bundle && !c.realHead).map((c) => records.get(c.id)!.bundle.headSha),
+      cases.filter((c) => c.bundle).map((c) => records.get(c.id)!.bundle.headSha),
     );
     const checkout = checkoutFor(synthetic);
 
