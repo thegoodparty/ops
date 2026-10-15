@@ -39,8 +39,12 @@ export const WORKBENCH_ZONE_DELEGATION_NAME = "workbench.goodparty.org";
  * That rule is about account ids, which are immutable and known before any
  * apply; a zone's name servers are neither. The ordering the rule warns
  * about still holds: `deploy-workbench` must be applied before `deploy`, or
- * `requireOutput` fails with a named-output error rather than creating an
- * empty NS record. That is the useful failure the section asks for.
+ * the record has no name servers to write. `getOutput` rather than
+ * `requireOutput` so a preview of this stack still renders while the
+ * workbench zone is pending: the two stacks are applied independently, and
+ * every PR previews `deploy/` whether or not `deploy-workbench/` has run. If
+ * the output is absent at apply time the value is empty and the record
+ * create fails, rather than leaving a delegation with no name servers.
  */
 export const createWorkbenchZoneDelegation = () => {
   const workbench = new pulumi.StackReference("workbenchStack", {
@@ -52,6 +56,6 @@ export const createWorkbenchZoneDelegation = () => {
     name: WORKBENCH_ZONE_DELEGATION_NAME,
     type: "NS",
     ttl: 3600,
-    records: workbench.requireOutput(WORKBENCH_ZONE_NAME_SERVERS_OUTPUT),
+    records: workbench.getOutput(WORKBENCH_ZONE_NAME_SERVERS_OUTPUT),
   });
 };
