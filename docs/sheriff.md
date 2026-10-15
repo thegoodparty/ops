@@ -914,9 +914,9 @@ and are deliberately neither created by Pulumi nor committed:
 3. **The approver list.** `deploy-infrastructure/sheriff/config.ts` holds the
    approver Slack user ids, changed only by a reviewed PR per the approval
    policy. It holds four approvers: the engineer (`U0BMU0DPS9Y`, Jeff Jagoda),
-   plus `U09HGPTHHAT`, `UKP6FPANN` and `U09T5BQQUTH`, added at the engineer's
-   request on 2026-10-15. Only Slack IDs were supplied for the three additions,
-   so they are recorded by ID. Adding or removing an approver is a reviewed PR.
+   plus `U09HGPTHHAT` (Swain Molster), `UKP6FPANN` (Tomer Almog) and
+   `U09T5BQQUTH` (Dan Ball), added at the engineer's request on 2026-10-15.
+   Adding or removing an approver is a reviewed PR.
    The requester mapping is no longer a list: step 4 resolves the requester from
    their Slack email and gates on the `Engineers` group.
 4. **The alarm email subscription.** The stack creates the `sheriff-alerts`
