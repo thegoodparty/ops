@@ -55,16 +55,30 @@ from review, not a preference:
    writer to the directory. v1 does not garbage-collect users at all. A user
    the job creates and later stops syncing is left in place, unassigned to
    this group; removing them is a human's job, not this Lambda's.
-2. **No nested-group flattening.** Google members of type `GROUP` (nested
-   groups) and `CUSTOMER` (external users) are filtered out. Only
-   `type == "USER"` members are synced. Every skipped member is logged with
-   its type and the reason; a nested group is not an error, it is out of
-   scope, and the log says so rather than silently producing a short list.
+2. **No nested-group flattening, and no silent drop of a domain-wide
+   membership.** The Directory API's `Member.type` is one of `USER`, `GROUP`,
+   `CUSTOMER` and `EXTERNAL`; the reference's own wording is that `CUSTOMER`
+   is "the member represents all users in a domain. An email address is not
+   returned and the ID returned is the customer ID", `EXTERNAL` is "a user or
+   group from outside the domain" (documented but not currently used),
+   `GROUP` is "another group", and `USER` is "a user". Only `type == "USER"`
+   members are synced. `GROUP` and `EXTERNAL` are skipped and logged with
+   their type and reason; a nested group is not an error, it is out of scope.
+   A `CUSTOMER` member is **not** skipped: it carries no email, so it cannot
+   be expanded into the source set, and dropping it would compute a source
+   set that omits the whole domain and then mass-remove the target. It aborts
+   the pair with `sync.aborted` (`reason: "domain-wide-membership"`) and
+   alarms. Refusing is the only handling that keeps the "never empty a group
+   by accident" property; expanding it would mean enumerating every user in
+   the domain, which is out of scope. A `USER` member can also be outside the
+   domain (the reference says a member "can be inside or outside of your
+   account's domains"), so an outside address is caught by the allowlist and
+   logged as `not-allowlisted`.
 3. **No SCIM.** Nothing is SCIM-provisioned today, so the job creates the
    Identity Center user objects it needs. **Adopting SCIM later conflicts with
    this job and is a migration concern**, not a config change: if SCIM starts
-   creating the same users, two writers race the same `userName`, and the
-   `ConflictException`-is-success path here will paper over the collision
+   creating the same users, two writers race the same unique attributes, and
+   the `ConflictException`-is-success path here will paper over the collision
    instead of surfacing it. Recorded under "Open questions" as a follow-up,
    and called out in the user-creation code comment.
 4. **One-way only.** Google is the source of truth. The job has read-only
@@ -78,11 +92,17 @@ from review, not a preference:
    strict mirror over `Admins` would revert every grant on its next poll. The
    denylist is the `Admins` group id today, and a new sheriff-managed group
    has to be added to it in the same PR that teaches sheriff about it.
-6. **User creation is idempotent and deduped on email, lowercased.** Before
-   creating, the job calls `identitystore:GetUserId` with the `userName`
-   alternate identifier (which is the email). `ResourceNotFoundException`
-   means "create it"; `ConflictException` on `CreateUser` means someone else
-   won the race and is treated as success, with a re-resolve to get the id.
+6. **User creation is idempotent and deduped on the user's email.** Before
+   creating, the job calls `identitystore:GetUserId` with the `emails.value`
+   alternate identifier — the path this repo already uses in
+   `deploy-infrastructure/sheriff/identity.ts`, and one of the two the API
+   documents as valid (`userName` and `emails.value`). `userName` is a
+   separate attribute and is not guaranteed to hold the email, so a
+   `userName` lookup would miss a real member and could create a duplicate.
+   `ResourceNotFoundException` means "create it"; `ConflictException` on
+   `CreateUser` means the attribute is already in use and is treated as
+   success, with a re-resolve. The zero/one/many-match rule is in "Resolve
+   source emails to Identity Store users".
 7. **Group existence is not this job's business.** The target group is owned
    by the identity-center program in `deploy/components/identity-center.ts`,
    which records its id and its account assignments; the group itself is
@@ -166,8 +186,10 @@ choice is one module, not a rewrite.
 
 Configuration is a Pulumi-managed list of pairs written to a single SSM
 Parameter Store parameter, and read by the Lambda at each run. Adding a pair
-is a one-line change to the list and an apply; it never needs a Lambda code
-change or a redeploy of the function.
+takes two changes, not one: the pair in the list, and the new target group's
+ARN in the management-account grant role's policy. It never needs a Lambda
+code change or a redeploy of the function. The steps are under "Adding a
+pair".
 
 ### Schema
 
@@ -258,6 +280,34 @@ are stable. If a future change makes the group Pulumi-created, the config must
 use an `Output<string>` so the engine orders the dependency, rather than
 recording a literal that needs a two-pass apply.
 
+### Adding a pair
+
+A pair is not config-only, and the earlier claim that it was is wrong. The
+assumed role scopes `CreateGroupMembership`, `DeleteGroupMembership` and
+`ListGroupMemberships` to the target group ARN, so a new group is not
+authorized until that ARN is in the policy. Adding a pair is:
+
+1. Add the `SyncPair` to `deploy-infrastructure/group-sync/config.ts`. The
+   `deploy-infrastructure` apply writes the updated JSON to SSM, and the
+   Lambda picks it up on its next run with no redeploy.
+2. Add the new target group's ARN to the `identity-group-sync-grant` inline
+   policy in `deploy/components/`, on the three membership actions. This is a
+   management-account (`deploy/`) change, applied by `deploy.yml` — a
+   different stack and workflow from the config.
+3. Ordering: the grant must finish applying before the Lambda first uses the
+   new pair. If the config lands first, the run fails closed with an
+   `AccessDenied` abort and changes no membership; that is safe but noisy, so
+   land the grant first.
+4. Start the pair in `dry-run` and follow "Rollout".
+
+No Lambda code change is needed for a new pair. What does not scale
+gracefully: the grant policy's group resource list grows one ARN per pair, and
+every pair shares the one role, so the role's reach is the union of all
+configured groups. If the number of pairs grows enough for that to matter,
+the follow-up is a role per pair (or per group family) rather than widening
+the one policy to `group/*`. That is a deliberate follow-up, not part of v1,
+and the current scoping stays as it is.
+
 ## The sync algorithm
 
 One invocation handles every configured pair, sequentially, each in its own
@@ -281,8 +331,12 @@ no config is indistinguishable from running with an empty one.
   config must not read as "the group is empty".
 - `members.list` with the `pageToken` loop, following `nextPageToken` until
   it is absent. Collect `{ email, type }`.
-- Filter `type == "USER"`. Log every `GROUP` and `CUSTOMER` member as
-  `member.skipped` with its type and reason; do not fail.
+- Partition by `Member.type`. `USER` members are kept. `GROUP` and `EXTERNAL`
+  members are logged as `member.skipped` with their type and reason; they are
+  out of scope and do not fail the run. A `CUSTOMER` member, or any member
+  with no email, aborts the pair with `sync.aborted`
+  (`reason: "domain-wide-membership"`) — see non-goal 2. The source set is
+  defined by email, so a member that has none cannot be represented in it.
 - Lowercase and dedupe the emails.
 - **Any error, any non-2xx, or a page chain that ends without exhausting the
   token aborts the pair with `sync.aborted` (`reason: "source-read-failed"`)
@@ -299,10 +353,30 @@ no config is indistinguishable from running with an empty one.
 
 ### 3. Resolve source emails to Identity Store users
 
-For each lowercased email, `GetUserId` with the `userName` alternate
-identifier. `ResourceNotFoundException` means the user does not exist yet and
-is a candidate for creation. **Any other error aborts the pair** — it is not
-"no user". The result is a list of `{ email, userId: string | null }`.
+For each lowercased email, `GetUserId` with the `emails.value` alternate
+identifier — the call `deploy-infrastructure/sheriff/identity.ts` already
+makes. `emails.value` is one of the two paths the API documents as valid for
+this lookup (`userName` and `emails.value`); `userName` is a distinct
+attribute and is not used. `GetUserId` returns a single user id or throws; it
+has no multi-match response, so the rule is:
+
+- **Zero matches** (`ResourceNotFoundException`): the user does not exist
+  yet, so the email is a candidate for creation.
+- **One match**: use that user id.
+- **More than one match**: `emails.value` is a declared unique attribute and
+  the built-in store holds one email per user (`User.Emails` is fixed to one
+  item), so this should not occur. The job cannot enumerate users to detect
+  it (`ListUsers` is deliberately not granted), so it is caught on the create
+  path: if `CreateUser` returns `ConflictException` for a uniqueness
+  violation but re-resolving the same email still finds no user, the pair
+  aborts with `sync.aborted` (`reason: "ambiguous-user"`) rather than adding
+  a duplicate. The email is lowercased before both the lookup and the create,
+  so case is normalized on this side; the identity store's own case handling
+  for `emails.value` is not documented, and the create-conflict abort is the
+  backstop if a mismatch ever slips through.
+
+**Any other error aborts the pair** — it is not "no user". The result is a
+list of `{ email, userId: string | null }`.
 
 ### 4. Fetch the target memberships
 
@@ -383,11 +457,14 @@ total and pure: same inputs, same diff, no clock, no I/O.
 
 ### 7. Apply, in order, idempotently
 
-1. **Create missing users.** `CreateUser` with `UserName` = the lowercased
-   email, `DisplayName`, `Name`, and `Emails` (primary, work). `GetUserId`
-   immediately before each create; `ConflictException` on the create is
-   success, and the handler re-resolves the id with `GetUserId`. Throttling is
-   retried with exponential backoff.
+1. **Create missing users.** `GetUserId` on `emails.value` immediately before
+   each create, so a user that appeared since step 3 is reused rather than
+   duplicated. `CreateUser` with `UserName` = the lowercased email,
+   `DisplayName`, `Name`, and `Emails` (one item, primary, work).
+   `ConflictException` on the create is success, and the handler re-resolves
+   the id with `GetUserId`; if the re-resolve still misses, the pair aborts
+   with `ambiguous-user` rather than proceeding. Throttling is retried with
+   exponential backoff.
 2. **Add memberships.** `CreateGroupMembership` for every entry in `add`
    (existing users and newly created ones). `ConflictException` means the
    member is already there and is success.
@@ -460,6 +537,10 @@ membership id do not exist when the policy is written, so those two are
 wildcards scoped to their resource types rather than `*`. The actions are
 split one per statement so each statement's `Resource` list contains only
 types that action supports.
+
+Because three of these statements name the target group ARN, a new pair is
+not authorized until that group's ARN is added here. That is why "Adding a
+pair" lists two changes rather than one: the config cannot widen the grant.
 
 **Deliberately absent, and asserted by a test:**
 
@@ -656,9 +737,13 @@ the email, which is called out in the PR body like the `sheriff` one.
 - **Unit, pure diff.** `node --test` with fixtures for: add only, remove only,
   both, no-op, empty source (all target removed, and the cap must trip on a
   non-empty target), empty target (all added), case and whitespace
-  normalization, dedupe, a nested `GROUP` member filtered, a `CUSTOMER` member
-  filtered, an allowlist skip, and a to-create member appearing in both
-  `toCreate` and `add`.
+  normalization, dedupe, a nested `GROUP` member skipped, an `EXTERNAL`
+  member skipped, a `CUSTOMER` member aborting the pair, a member with no
+  email aborting the pair, an allowlist skip, and a to-create member
+  appearing in both `toCreate` and `add`.
+- **Unit, email resolution.** `GetUserId` on `emails.value`: zero matches
+  creates, one match reuses, and a `ConflictException` on create followed by a
+  failed re-resolve aborts with `ambiguous-user` rather than duplicating.
 - **Unit, removal cap.** Both bounds, the boundary (`n == maxCount` passes,
   `n == maxCount + 1` trips), the fraction rounding, and the override path.
 - **Unit, incomplete-read abort.** Mock the Google client so the member
