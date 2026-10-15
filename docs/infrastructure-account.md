@@ -401,8 +401,9 @@ deliberate exclusions, rather than omissions:
   buckets in other accounts. If a narrower version is wanted later, scope it to
   the specific resource accounts automation must not reach rather than to "not
   us".
-- **No data-store deny.** The workbench denies `rds:*`, `dynamodb:*` and
-  `redshift:*` because nothing about running coding agents needs them. Build
+- **No data-store deny.** The workbench denies `dynamodb:*` and `redshift:*`
+  because nothing about running coding agents needs them; `rds:*` is permitted
+  there for the Bifrost gateway (`docs/bifrost-gateway.md`, PR #320). Build
   automation and maintenance jobs plausibly do — DynamoDB for locking and
   coordination, RDS for reporting. Denying them up front would be a guess, and
   the wrong guess breaks a job rather than a coding session.
