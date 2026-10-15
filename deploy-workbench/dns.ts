@@ -20,9 +20,11 @@ export const WORKBENCH_ZONE_NAME = "workbench.goodparty.org";
  * `protect` for the same reason the infrastructure zone carries it: a
  * recreated zone gets new name servers, and the NS record in `deploy/` would
  * still name the old ones, taking every name under this zone out of
- * resolution until that record was changed by hand. The delegation reads this
- * zone's name servers from the `workbenchZoneNameServers` stack output, so
- * the two move together only if both sides are applied.
+ * resolution until that record was changed by hand. The delegation is a
+ * staged follow-up (`docs/workbench-account.md`, "Cross-project
+ * dependencies"): it names the `workbenchZoneNameServers` output below as
+ * constants once this zone has been applied, the way `infra.goodparty.org`
+ * was delegated (`docs/infrastructure-account.md`, "DNS").
  */
 export const createWorkbenchZone = (args: { provider: aws.Provider }) =>
   new aws.route53.Zone(

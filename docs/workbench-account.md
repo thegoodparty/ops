@@ -1586,6 +1586,20 @@ the Identity Center instance ARN, and every permission set id.
 Revisit `StackReference` only if a consuming project comes to need upstream
 values that genuinely move.
 
+The workbench account's own DNS zone is the next staged case, and it is
+deliberately not delegated in the PR that creates it.
+`deploy-workbench/dns.ts` creates `workbench.goodparty.org` and exports its
+`workbenchZoneNameServers`; the NS record that delegates it from `goodparty.org`
+belongs in `deploy/`, and it is a follow-up PR. It cannot be written in the
+same PR without the cross-stack read this section rules out: the zone's name
+servers do not exist until `deploy-workbench` has been applied, so the record
+is added afterwards with the four name servers as constants, exactly as
+`infra.goodparty.org` was delegated (`docs/infrastructure-account.md`, "DNS").
+The follow-up can be opened as soon as the `deploy-workbench` apply that
+creates the zone has finished, and it must land before the phase 1 ACM
+certificate for `bifrost.workbench.goodparty.org` can validate; until then
+that name does not resolve.
+
 ## Implementation plan
 
 One step per pull request. Steps are staged so no cross-stack reads are ever

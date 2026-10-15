@@ -8,7 +8,6 @@ import { createCiRoles } from "./components/ci-roles";
 import { createDelegateSwarmProdRead } from "./components/delegate-swarm-prod-read";
 import { createSheriffGrant } from "./components/sheriff-grant";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
-import { createWorkbenchZoneDelegation } from "./components/workbench-zone-delegation";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -52,12 +51,6 @@ export = async () => {
   createDelegateSwarmProdRead();
   createSheriffGrant();
   createInfraZoneDelegation();
-
-  // The workbench account's zone, delegated from this one. Reads the name
-  // servers from the workbench stack's output, so it must be applied after
-  // `deploy-workbench`; see the component for why it is a stack reference
-  // rather than the constants the infrastructure delegation uses.
-  createWorkbenchZoneDelegation();
 
   return {
     webhookUrl: webhook.url,

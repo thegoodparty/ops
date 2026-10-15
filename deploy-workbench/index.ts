@@ -372,11 +372,12 @@ export const previewRoleArn = previewRole.arn;
 // ---------------------------------------------------------------------------
 // The account's own DNS zone: workbench.goodparty.org.
 //
-// Phase 0 item 2 of docs/bifrost-gateway.md. Delegated from the production
-// zone by an NS record in `deploy/`, which reads `workbenchZoneNameServers`
-// below. That record must be in place before the phase 1 ACM certificate for
-// `bifrost.workbench.goodparty.org` can validate; nothing else in this
-// account needs a name in the production zone.
+// Phase 0 item 2 of docs/bifrost-gateway.md. The delegation is a deliberate
+// follow-up PR in `deploy/`, naming `workbenchZoneNameServers` below as
+// constants once this zone has been applied; see "Cross-project dependencies"
+// in docs/workbench-account.md. That record must be in place before the phase
+// 1 ACM certificate for `bifrost.workbench.goodparty.org` can validate;
+// nothing else in this account needs a name in the production zone.
 const workbenchZone = createWorkbenchZone({ provider });
 
 export const workbenchZoneId = workbenchZone.zoneId;
