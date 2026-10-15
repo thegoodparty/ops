@@ -913,10 +913,8 @@ and are deliberately neither created by Pulumi nor committed:
 
 3. **The approver list.** `deploy-infrastructure/sheriff/config.ts` holds the
    approver Slack user ids, changed only by a reviewed PR per the approval
-   policy. It is set to the engineer (`U0BMU0DPS9Y`, Jeff Jagoda) as the only
-   approver for now; adding another is a reviewed PR. The requester mapping is
-   no longer a list: step 4 resolves the requester from their Slack email and
-   gates on the `Engineers` group.
+   policy. The requester mapping is no longer a list: step 4 resolves the
+   requester from their Slack email and gates on the `Engineers` group.
 4. **The alarm email subscription.** The stack creates the `sheriff-alerts`
    SNS topic and subscribes `aws-infrastructure@goodparty.org`, but the
    subscription stays unconfirmed until someone accepts the AWS email. Until
