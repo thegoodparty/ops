@@ -38,13 +38,13 @@ export const WORKBENCH_ZONE_DELEGATION_NAME = "workbench.goodparty.org";
  * `docs/workbench-account.md` "Cross-project dependencies" does not apply.
  * That rule is about account ids, which are immutable and known before any
  * apply; a zone's name servers are neither. The ordering the rule warns
- * about still holds: `deploy-workbench` must be applied before `deploy`, or
- * the record has no name servers to write. `getOutput` rather than
- * `requireOutput` so a preview of this stack still renders while the
- * workbench zone is pending: the two stacks are applied independently, and
- * every PR previews `deploy/` whether or not `deploy-workbench/` has run. If
- * the output is absent at apply time the value is empty and the record
- * create fails, rather than leaving a delegation with no name servers.
+ * about still holds, and it bites this PR: `deploy-workbench` must be applied
+ * before `deploy`, or `requireOutput` fails with the named-output error
+ * below. That is why the `ops` preview is red until the workbench zone
+ * exists — the two stacks are applied independently and a preview of this
+ * stack has no way to create the output it reads. `requireOutput` rather
+ * than `getOutput` so the failure names the missing output instead of
+ * surfacing as three provider argument errors.
  */
 export const createWorkbenchZoneDelegation = () => {
   const workbench = new pulumi.StackReference("workbenchStack", {
@@ -56,6 +56,6 @@ export const createWorkbenchZoneDelegation = () => {
     name: WORKBENCH_ZONE_DELEGATION_NAME,
     type: "NS",
     ttl: 3600,
-    records: workbench.getOutput(WORKBENCH_ZONE_NAME_SERVERS_OUTPUT),
+    records: workbench.requireOutput(WORKBENCH_ZONE_NAME_SERVERS_OUTPUT),
   });
 };
