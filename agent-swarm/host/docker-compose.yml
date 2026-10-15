@@ -139,6 +139,11 @@ services:
       # grafana-mcp is a compose-internal hostname; the MCP wrapper refuses
       # private-network URLs in production unless this is set.
       - ALLOW_PRIVATE_NETWORK_URLS=true
+      # Runtime pools (beta): the API starts extra workers on demand through
+      # swarm-controller. Pool workers reach the API on the compose network.
+      - RUNTIME_POOLS_ENABLED=true
+      - MULTI_RUNTIME_ENABLED=true
+      - RUNTIME_WORKER_API_URL=http://api:3013
     ports:
       - "127.0.0.1:3013:3013"
     volumes:
@@ -213,6 +218,36 @@ services:
     environment:
       - GRAFANA_URL=https://goodparty.grafana.net
       - GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_SERVICE_ACCOUNT_TOKEN}
+    restart: unless-stopped
+    logging: *logging
+
+  # Starts and stops runtime pool workers as sibling containers on this
+  # compose network. It holds the Docker socket so the internet-facing api
+  # does not. Only started once bootstrap.sh has minted its token into
+  # controller.env (owner-only, not in git or the config bucket).
+  swarm-controller:
+    image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}"
+    platform: linux/amd64
+    profiles: ["pools"]
+    entrypoint: ["/usr/local/bin/agent-swarm", "controller"]
+    command:
+      - --api-url
+      - http://api:3013
+      - --kind
+      - docker
+      - --docker-host
+      - unix:///var/run/docker.sock
+      - --docker-network
+      - agent-swarm_default
+    user: root
+    env_file: ./controller.env
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
     logging: *logging
 

@@ -22,6 +22,9 @@ profiles=(--profile tls)
 if grep -q '^OAUTH2_PROXY_CLIENT_ID=.' .env; then
   profiles+=(--profile sso)
 fi
+if [[ -s controller.env ]]; then
+  profiles+=(--profile pools)
+fi
 
 docker compose "${profiles[@]}" up -d --remove-orphans
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuilds the swarm state that lives only in SQLite: the global SETUP_SCRIPT,
-# the grafana and clickup MCP servers, the lead's soul, and each agent's
-# harness and model.
+# the grafana and clickup MCP servers, the lead's soul, each agent's
+# harness and model, and the runtime pool with its controller.
 # Run as root on the host once the stack is up. Safe to run again, but a rerun
 # replaces any edits the lead made to its own SOUL.md and IDENTITY.md with the
 # copies in soul/.
@@ -114,6 +114,104 @@ for pair in "lead:$LEAD:$LEAD_MODEL" "coder:$CODER:$WORKER_MODEL" "reviewer:$REV
     | api PATCH "/api/agents/$agent/runtime" -d @- >/dev/null
   echo "$name runtime: $HARNESS, $model"
 done
+
+# Runtime pools. Pool workers get none of the compose environment, so the
+# credentials they need are copied into secret global config (encrypted with
+# SECRETS_ENCRYPTION_KEY), which every worker exports at start. Rerun after
+# rotating any of them in the secret.
+for pair in ANTHROPIC_API_KEY:ANTHROPIC_API_KEY CLICKUP_API_TOKEN:CLICKUP_API_TOKEN \
+  CLICKUP_API_KEY:CLICKUP_API_TOKEN GRAFANA_SERVICE_ACCOUNT_TOKEN:GRAFANA_SERVICE_ACCOUNT_TOKEN \
+  GITHUB_APP_ID:GITHUB_APP_ID GITHUB_APP_PRIVATE_KEY:GITHUB_APP_PRIVATE_KEY; do
+  IFS=: read -r key from <<<"$pair"
+  value="$(sed -n "s/^$from=//p" .env)"
+  [[ -n "$value" ]] || continue
+  jq -n --arg k "$key" --arg v "$value" \
+    '{scope: "global", key: $k, value: $v, isSecret: true,
+      description: "From the DELEGATE_SWARM secret, for runtime pool workers"}' \
+    | api PUT /api/config -d @- >/dev/null
+  echo "pool credentials: $key saved as secret global config"
+done
+unset value
+
+if ! controllers="$(api GET /api/runtime-controllers 2>/dev/null)"; then
+  echo "runtime pools: disabled on the API, skipped"
+else
+  controller="$(jq -r '[.controllers[] | select(.name == "host-docker")][0].id // ""' <<<"$controllers")"
+  if [[ -z "$controller" ]]; then
+    controller="$(jq -n '{name: "host-docker", kind: "docker", placement: "remote",
+        config: {WORKER_API_URL: "http://api:3013"}}' \
+      | api POST /api/runtime-controllers -d @- | jq -r '.controller.id')"
+    echo "runtime controller: registered host-docker as $controller"
+  else
+    echo "runtime controller: host-docker already registered as $controller"
+  fi
+  status="$(api GET "/api/runtime-controllers/$controller" | jq -r '.controller.status')"
+  if [[ "$status" == online && -s controller.env ]]; then
+    echo "runtime controller: online"
+  else
+    # Minting revokes the previous token, so only when the controller is not
+    # connected. The token lives only in controller.env.
+    install -m 600 /dev/null controller.env.tmp
+    api POST "/api/runtime-controllers/$controller/token" \
+      | jq -r '"AGENT_SWARM_CONTROLLER_TOKEN=" + .plaintext' >controller.env.tmp
+    # up.sh runs compose as the owner of .env, which has to read this file.
+    chown --reference=.env controller.env.tmp
+    mv -f controller.env.tmp controller.env
+    profiles=(--profile tls --profile pools)
+    if grep -q '^OAUTH2_PROXY_CLIENT_ID=.' .env; then
+      profiles+=(--profile sso)
+    fi
+    docker compose "${profiles[@]}" up -d --force-recreate swarm-controller >/dev/null
+    echo "runtime controller: token minted into controller.env, swarm-controller (re)started"
+  fi
+
+  version="$(sed -n 's/^AGENT_SWARM_VERSION=//p' .env)"
+  pool_body="$(jq -n --arg c "$controller" --arg v "$version" --arg m "$WORKER_MODEL" \
+    --arg gn "$(sed -n 's/^GITHUB_NAME=//p' .env)" --arg ge "$(sed -n 's/^GITHUB_EMAIL=//p' .env)" '
+    {name: "workers", kind: "docker", placements: [$c],
+     image: ("ghcr.io/desplega-ai/agent-swarm-worker:" + $v),
+     delivery: "push", lifecycle: "idle", idleMinutes: 30,
+     slotsPerRuntime: 1, minRuntimes: 0, maxRuntimes: 2,
+     resources: {cpu: 1, memoryMb: 4096},
+     env: {
+       ANONYMIZED_TELEMETRY: "false", YOLO: "true",
+       MEMORY_RATERS: "implicit-citation,explicit-self",
+       MODEL_OVERRIDE: $m,
+       GITHUB_NAME: $gn, GITHUB_EMAIL: $ge,
+       GRAFANA_URL: "https://goodparty.grafana.net",
+       SWARM_URL: "delegate-swarm.infra.goodparty.org",
+       APP_URL: "https://delegate-swarm.infra.goodparty.org",
+       PUBLIC_MCP_BASE_URL: "https://delegate-swarm.infra.goodparty.org",
+       AWS_CONFIG_FILE: "/etc/delegate-swarm/aws-config",
+       AWS_SDK_LOAD_CONFIG: "1"}}')"
+  pool="$(api GET /api/runtime-pools | jq -r '[.pools[] | select(.name == "workers")][0].id // ""')"
+  if [[ -z "$pool" ]]; then
+    pool="$(api POST /api/runtime-pools -d "$pool_body" | jq -r '.pool.id')"
+    echo "runtime pool: created workers as $pool"
+  else
+    api PATCH "/api/runtime-pools/$pool" -d "$pool_body" >/dev/null
+    echo "runtime pool: workers ($pool) updated to $version"
+  fi
+
+  # Installing MCP servers on another agent is lead-only for dashboard users,
+  # so the researcher is set up here: same servers as the lead, pi harness.
+  researcher="$(api GET '/api/agents?fields=full' | jq -r '[.agents[] | select(.name == "Researcher")][0].id // ""')"
+  if [[ -z "$researcher" ]]; then
+    researcher="$(jq -n --arg h "$HARNESS" '{name: "Researcher", templateId: "official/researcher",
+        harnessProvider: $h, maxTasks: 1}' \
+      | api POST "/api/runtime-pools/$pool/agents" -d @- | jq -r '.agent.id')"
+    echo "researcher: created on the workers pool as $researcher"
+  else
+    echo "researcher: already exists as $researcher"
+  fi
+  jq -n --arg h "$HARNESS" --arg m "$WORKER_MODEL" '{harness_provider: $h, model: $m}' \
+    | api PATCH "/api/agents/$researcher/runtime" -d @- >/dev/null
+  for server in $(api GET "/api/agents/$LEAD/mcp-servers" | jq -r '.servers[] | select(.scope == "swarm") | .id'); do
+    jq -n --arg a "$researcher" '{agentId: $a}' \
+      | api POST "/api/mcp-servers/$server/install" -d @- >/dev/null
+  done
+  echo "researcher: $HARNESS, $WORKER_MODEL, the lead's swarm MCP servers installed"
+fi
 
 echo "done. Workers read the setup script and MCP servers at start:"
 echo "  cd /opt/agent-swarm && docker compose restart lead worker-coder worker-reviewer"

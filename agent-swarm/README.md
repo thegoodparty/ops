@@ -79,6 +79,8 @@ AWS_PROFILE=gp-infrastructure aws ssm start-session --region us-west-2 --target 
    superseded into a resume task on the same agent.
 3. Check: `/health` is 200, the three agents show idle in the dashboard, and
    Delegate answers a mention in `#swarm-testing`.
+4. On the host, `sudo /opt/agent-swarm/bootstrap.sh` so the runtime pool
+   starts workers from the new worker image too.
 
 Read the release notes for migrations before bumping; SQLite migrations are
 forward-only, so the way back is the latest snapshot.
@@ -225,8 +227,8 @@ prints no note, and `gh api repos/thegoodparty/ops --jq .full_name` works.
 What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`
 rebuilds the part that is in this repo: the global `SETUP_SCRIPT` from
 `host/global-setup-script.sh` (runs as root at every agent container start),
-the grafana and clickup MCP servers, the lead's soul from `host/soul/`, and
-each agent's harness and model from `.env`. To change one, edit the file,
+the grafana and clickup MCP servers, the lead's soul from `host/soul/`,
+each agent's harness and model from `.env`, and the runtime pool (below). To change one, edit the file,
 merge, then on the host:
 
 ```sh
@@ -264,6 +266,41 @@ claims it before it reconciles the new harness, about 10 seconds. Re-run it.
 
 `AGENT_NAME=delegate` on the lead only names a newly registered lead. The
 existing one is renamed with `PUT /api/agents/{id}/name`.
+
+## Runtime pools
+
+Beta in agent-swarm. Besides the three compose agents, the API starts
+workers on demand: when a task goes to a sleeping pool agent, the API asks
+the controller for a container, the container registers, works, and stops
+after 30 idle minutes.
+
+- `swarm-controller` (compose profile `pools`) holds the Docker socket and
+  starts pool workers as sibling containers on the compose network. The api
+  container never gets the socket, because Caddy exposes it to the internet
+  and the socket is root on the host.
+- Its token is in `/opt/agent-swarm/controller.env` (owner-only, not in git
+  or the config bucket). `bootstrap.sh` registers the controller as
+  `host-docker`, mints the token when the controller is not online, and
+  starts the container; `up.sh` keeps it running once the file exists.
+- `bootstrap.sh` also creates the `workers` pool (docker, push delivery, at
+  most 2 containers, 1 CPU and 4 GiB each, the current worker image) and
+  the `Researcher` agent on it with the `official/researcher` template, the
+  pi harness, the worker model and the lead's swarm-scope MCP servers.
+- Pool workers get none of the compose environment or mounts. Their
+  credentials (Anthropic, ClickUp, Grafana, GitHub App) are copied from
+  `.env` into secret global config, which every worker, compose or pool,
+  exports at start. That copy wins over the compose environment, so after
+  rotating any of those keys in the secret, run `bootstrap.sh` and restart
+  the agents. Pool workers write the prod-read AWS profile themselves
+  (`global-setup-script.sh`).
+- Pool worker logs are not in CloudWatch; read them with `docker logs` on
+  the host (containers are named `swarm-rt-<runtime id>`).
+
+To add another pool agent, use the dashboard (Settings, Runtime pools,
+workers, Create agent) and ask Delegate to install the MCP servers on it,
+since a dashboard user cannot install them on another agent. Pools and
+controllers can be edited in the dashboard; `bootstrap.sh` resets the
+`workers` pool to the values above.
 
 ## MCP servers
 

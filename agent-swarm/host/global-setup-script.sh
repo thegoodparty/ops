@@ -18,6 +18,20 @@ fi
 ln -sf "$AWS_DIR/v2/current/bin/aws" /usr/local/bin/aws
 ln -sf "$AWS_DIR/v2/current/bin/aws_completer" /usr/local/bin/aws_completer
 
+# Runtime pool workers get no compose mounts, so they write the prod-read
+# profile themselves. Keep in step with host/aws-config.
+if [ ! -e /etc/delegate-swarm/aws-config ]; then
+  mkdir -p /etc/delegate-swarm
+  cat >/etc/delegate-swarm/aws-config <<'AWSCONFIG'
+[default]
+role_arn = arn:aws:iam::333022194791:role/delegate-swarm-prod-read
+credential_source = Ec2InstanceMetadata
+role_session_name = delegate-swarm
+region = us-west-2
+AWSCONFIG
+  chmod 644 /etc/delegate-swarm/aws-config
+fi
+
 # GitHub App identity for git and gh. Workers mint a ~1h installation token
 # for delegate-gp[bot] from GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY. There is no
 # fallback, when minting fails the helper prints a note and no token. Skipped
