@@ -113,14 +113,17 @@ provider that project requires:
   `AmazonECSTaskExecutionRolePolicy` plus `secretsmanager:GetSecretValue` on
   the gateway secret, a separate task role, `secrets` injected from Secrets
   Manager, `awslogs` log configuration and `linuxParameters.initProcessEnabled`.
-  This mirrors `deploy/components/worker.ts`, the delegate's task definition,
+  It runs **two containers**: the Bifrost gateway on 8080 and the
+  `oauth2-proxy` sidecar on 4180 (see "Protecting the admin surface"). This
+  mirrors `deploy/components/worker.ts`, the delegate's task definition,
   which is the working example in this repo of the same shape.
 - **One `aws.ecs.Service`**, `desiredCount: 1`, `launchType: "FARGATE"`,
-  registered against the ALB target group, in the private subnets, with a
-  security group that accepts port 8080 only from the ALB security group.
-  The repo has no long-running ECS service yet — the delegate dispatches
-  ephemeral tasks — so this is the one genuinely new resource, and it should
-  follow the same role and secret patterns.
+  registered against both ALB target groups (Bifrost on 8080, oauth2-proxy on
+  4180), in the private subnets, with a security group that accepts 8080 and
+  4180 only from the ALB security group. The repo has no long-running ECS
+  service yet — the delegate dispatches ephemeral tasks — so this is the one
+  genuinely new resource, and it should follow the same role and secret
+  patterns.
 - **Sizing:** 0.5 vCPU / 1 GB (512/1024) to start, per the upstream ECS
   guide. Bifrost adds microseconds of overhead and the load is per-engineer;
   the task size is a one-line change if it needs to grow.
@@ -173,6 +176,7 @@ Cited so the next session can check them rather than trust this document:
 | Explicit provider, `allowedAccountIds`, default provider disabled | `deploy-workbench/index.ts`, `deploy-workbench/deploy.sh` |
 | SCP denies `rds`/`dynamodb`/`redshift` (`DenyDataStores`), non-`us-west-2`, cross-account S3 | `deploy-org/policies.ts`, `docs/workbench-account.md` "What the policy denies" |
 | ECS Fargate task-definition idiom (execution role, task role, secrets, awslogs) | `deploy/components/worker.ts`, `deploy/index.ts` |
+| oauth2-proxy + email-allowlist precedent | `agent-swarm/host/docker-compose.yml`, `agent-swarm/host/allowed-emails.txt`, `agent-swarm/README.md` "Google login" |
 | Account budget `workbench-monthly-spend` | `deploy-workbench/index.ts` |
 | Bedrock invocation logging, metadata only, 365-day retention | `deploy-workbench/index.ts` |
 | Identity Center `WorkbenchAccess`/`Engineers`, `AdministratorAccess`/`Admins` | `deploy/components/identity-center.ts`, `docs/workbench-account.md` |
@@ -211,7 +215,8 @@ denies do not interfere with any of it.
 
 - An internet-facing Application Load Balancer, HTTPS listener on 443 with an
   ACM certificate in `us-west-2`, and an HTTP listener that redirects to
-  HTTPS. Target group on port 8080, health check `/health`.
+  HTTPS. Two target groups: Bifrost on 8080 (health check `/health`) and
+  oauth2-proxy on 4180 (health check `/ping`).
 - A Route 53 alias record for `bifrost.workbench.goodparty.org` pointing at
   the ALB.
 - The workbench account owns no zone today, and review settled on giving it
@@ -267,7 +272,7 @@ it is "can someone get a virtual key", and the key is the control.
 
 Inference paths (`/v1/*`, `/anthropic/*`, `/openai/*`, `/genai/*`, `/health`,
 and `/metrics` if scraped) are open at the network layer and gated by virtual
-keys. The admin surface is not.
+keys. The admin surface is not: it sits behind `oauth2-proxy`.
 
 ### Protecting the admin surface
 
@@ -279,28 +284,101 @@ the ALB identity-aware-proxy integration are all Enterprise
 (`docs/enterprise/user-provisioning.mdx`,
 `docs/enterprise/auth-proxy/aws-alb.mdx`; the OSS
 `features/sso-with-google-github` page is a "Coming soon" stub). The decision
-is therefore to get SSO from the infrastructure in front of Bifrost, not from
-Bifrost:
+is to put `oauth2-proxy` in front of the admin paths, following the pattern
+`agent-swarm` already runs, rather than an ALB `authenticate-oidc` action.
 
-- An ALB listener rule for the admin paths (`/`, `/api/*`) carries an
-  `authenticate-oidc` action before the forward action, so an unauthenticated
-  request never reaches Bifrost. The inference paths are on a different rule
-  with no OIDC action, because harnesses cannot do a browser redirect.
-- Access is restricted to an admin group. ALB `authenticate-oidc`
-  authenticates but does not authorize by group, and Bifrost OSS cannot read
-  OIDC group claims, so the group restriction is enforced at the identity
-  provider by scoping the OAuth application to the admin group. The OSS admin
-  username/password stays as the second layer inside that.
-- **Caveat to settle at implementation:** ALB's OIDC action needs a
-  standards-compliant OIDC provider. AWS Identity Center is not itself an
-  ALB-compatible OIDC IdP — its OIDC/SAML support is for AWS access, and
-  there is no documented mapping of its endpoints to the ALB action (AWS's
-  own documentation and re:Post threads say as much). The practical IdP is
-  the one Identity Center already federates from (for example Google
-  Workspace) or Amazon Cognito brokering Identity Center. Which one is used is
-  an implementation question, not a blocker; what is decided is that the
-  admin surface sits behind OIDC restricted to admins, and that Enterprise
-  SSO is the alternative if the group enforcement proves awkward.
+**Shape: a sidecar in the Bifrost task, not a second ECS service.**
+`oauth2-proxy` runs as a second container in the same Fargate task, listening
+on 4180 while Bifrost listens on 8080. The ALB routes the admin paths to 4180
+and the inference paths to 8080. One task means one lifecycle, no second
+service to pay for, and no service discovery: the two containers share the
+task network namespace, so oauth2-proxy proxies to `http://127.0.0.1:8080`
+with no hop back through the ALB. A separate small ECS service buys nothing
+here, because the gateway is single-node OSS and the two containers restart
+together either way.
+
+**Routing.** The listener rules are:
+
+- `/oauth2/*` → oauth2-proxy (login start, Google callback, sign-out).
+- The inference prefixes (`/v1/*`, `/anthropic/*`, `/openai/*`, `/genai/*`),
+  `/health` and `/metrics` → Bifrost directly, so a harness never meets a
+  browser redirect. `/metrics` stays on Bifrost's own basic auth.
+- Everything else — the UI and `/api/*` — falls through to oauth2-proxy.
+
+**Configuration**, following `agent-swarm/host/docker-compose.yml`:
+
+- `OAUTH2_PROXY_PROVIDER: google`, with the Google Cloud OAuth consent screen
+  set **Internal**, so only `goodparty.org` accounts can sign in at all.
+- `OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: /etc/oauth2-proxy/allowed-emails.txt`,
+  backed by a file committed under `deploy-workbench/` (for example
+  `deploy-workbench/bifrost/allowed-emails.txt`), one address per line, the
+  same shape as `agent-swarm/host/allowed-emails.txt`. Granting and revoking
+  access is a PR to that file. The stock oauth2-proxy image has no inline
+  email-list flag — `--authenticated-emails-file` is the only form (upstream
+  issues #968 and #3391) — so the file reaches the container in a one-line
+  derived image: a Dockerfile under `deploy-workbench/bifrost/` whose `FROM`
+  is the same pinned digest `agent-swarm` uses
+  (`quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916`)
+  and whose `COPY` puts the allowlist at that path. CI builds and pushes it
+  beside the Bifrost mirror, and Pulumi references it by digest, so a change
+  to the list is a reviewed PR and a new digest.
+- `OAUTH2_PROXY_UPSTREAMS: http://127.0.0.1:8080` — the one setting that
+  differs from the swarm, which uses `static://202` because Caddy does the
+  forwarding. Here oauth2-proxy is the reverse proxy, so it points at Bifrost
+  in the same task.
+- The three secrets — `OAUTH2_PROXY_CLIENT_ID`,
+  `OAUTH2_PROXY_CLIENT_SECRET`, `OAUTH2_PROXY_COOKIE_SECRET` — go in Secrets
+  Manager and reach the sidecar as `secrets`, written out of band the way
+  `agent-swarm/host/fill-secrets.sh` writes the swarm's `DELEGATE_SWARM`
+  secret. The swarm's `render-env.sh` refuses a partial set; the task
+  definition should carry all three or none, and the deploy should fail
+  closed if the admin surface is enabled without them.
+- The rest of the swarm's settings carry over: `OAUTH2_PROXY_REVERSE_PROXY:
+  "true"`, `OAUTH2_PROXY_COOKIE_SECURE: "true"`,
+  `OAUTH2_PROXY_COOKIE_SAMESITE: lax`, `OAUTH2_PROXY_COOKIE_EXPIRE: 168h`,
+  `OAUTH2_PROXY_COOKIE_REFRESH: 1h`,
+  `OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"`,
+  `OAUTH2_PROXY_WHITELIST_DOMAINS: bifrost.workbench.goodparty.org`, and
+  `OAUTH2_PROXY_REDIRECT_URL:
+  https://bifrost.workbench.goodparty.org/oauth2/callback`.
+- The OSS admin username/password stays as the second layer inside
+  oauth2-proxy.
+
+**Prerequisite, manual.** A Google Cloud OAuth client of type Web
+application, consent screen Internal, redirect URI
+`https://bifrost.workbench.goodparty.org/oauth2/callback`. This is the same
+console step `agent-swarm/README.md` documents under "Google login", and it
+is the one part of this that cannot be a PR.
+
+**The tradeoff, stated plainly.** The allowlist is a **separate list** from
+the Identity Center `Admins` group. `sheriff` mutates `Admins` membership at
+runtime (`docs/sheriff.md`), so the two will drift: someone granted admin
+through sheriff is not automatically on the Bifrost list, and someone removed
+from `Admins` keeps Bifrost admin until the allowlist PR lands. The owner of
+the Bifrost admin list is **jagoda for now**, matching the virtual-key
+issuance owner; aligning it with `Admins` is a follow-up decision this plan
+deliberately does not make. See "Open questions".
+
+**Why not the alternatives.**
+
+- **ALB `authenticate-oidc`.** It authenticates but cannot authorize by
+group, and ALB listener rules cannot match claims; they only forward
+`x-amzn-oidc-data` and friends to the target, and Bifrost OSS cannot read
+those claims. Restricting to an admin group would have to happen at the IdP
+by scoping the OAuth app, a weaker and less visible control than a file in
+this repo.
+- **Google group membership** (`--google-group`) would need a Workspace
+service account with domain-wide delegation, which `agent-swarm` explicitly
+declined (`agent-swarm/README.md`, "Google login": "would need a Workspace
+service account with domain-wide delegation, which we chose not to create").
+The email allowlist is the pattern that avoids that.
+- **AWS Verified Access with Identity Center as the trust provider** *would*
+read the `Admins` group natively, which is the only option that removes the
+drift, but it costs roughly $0.27/hr per endpoint (about $200/month) plus
+per-GB processing. Kept as a documented future option rather than built.
+- **Reading Identity Center groups in oauth2-proxy** is not possible: there
+is no Identity Store provider and no generic external-authorizer hook, so the
+allowlist cannot be made to track `Admins` in place.
 
 ## Configuration as code
 
@@ -335,6 +413,11 @@ third holds secret values:
    written out of band with the same procedure `DELEGATE_SWARM` and
    `gp-pi/brave-search` use. Nothing secret is committed, and nothing secret
    appears in this document.
+
+The oauth2-proxy admin allowlist is a fourth repo file,
+`deploy-workbench/bifrost/allowed-emails.txt`, baked into the sidecar image
+rather than injected at runtime; it is described under "Protecting the admin
+surface".
 
 The `governance` block supports `value: "env.VK_ENGINEER"` on a virtual key
 (`docs/deployment-guides/config-json/governance.mdx`), which is what makes the
@@ -399,9 +482,9 @@ Virtual keys are Bifrost's primary governance entity
   temporary key is involved, and offboarding is "deactivate the virtual key",
   which is one action and does not touch a provider.
 - **Admin auth.** Enable `governance.auth_config` (admin username/password) so
-  the UI and governance API are not open, with the ALB OIDC rule in front of
-  it as described above. The admin credential is a gateway secret and belongs
-  in Secrets Manager, not in the repo.
+  the UI and governance API are not open, with oauth2-proxy in front of it as
+  described above. The admin credential is a gateway secret and belongs in
+  Secrets Manager, not in the repo.
 - **The encryption key is load-bearing.** Provider keys stored in the config
   store are encrypted with `encryption_key`
   (`env.BIFROST_ENCRYPTION_KEY`). Losing it means re-entering every provider
@@ -540,10 +623,12 @@ OSS over Enterprise clustering.
   Fargate task and a choke point for all coding. RDS Multi-AZ protects the
   database, not the app. Mitigated by break-glass, not eliminated.
 - **A public endpoint and an admin UI.** Inference is protected by virtual
-  keys; the admin surface is protected by ALB OIDC restricted to an admin
-  group plus the OSS admin password. The group restriction lives at the IdP,
-  not in Bifrost, so a misconfigured OAuth app is the most likely way the plan
-  causes an incident.
+  keys; the admin surface is protected by oauth2-proxy with a static email
+  allowlist plus the OSS admin password. The allowlist is separate from the
+  Identity Center `Admins` group that `sheriff` mutates, so the two drift; the
+  most likely incident is an admin who was removed from `Admins` but not from
+  the Bifrost list, or a new admin who cannot get in. The list is the control,
+  and its owner is named above.
 - **The SCP relaxation.** Removing `rds:*` from `DenyDataStores` widens what
   the workbench account can run. It is deliberate and reviewed, and the
   remaining denies (`dynamodb`, `redshift`, cross-account S3, non-`us-west-2`)
@@ -574,12 +659,13 @@ OSS over Enterprise clustering.
 
 Review settled most of the earlier questions. What genuinely remains:
 
-- **The admin OIDC IdP.** Which OIDC provider fronts the admin paths, and how
-  the admin group is enforced there. Identity Center is not itself an
-  ALB-compatible OIDC IdP, so the candidates are the IdP Identity Center
-  federates from (for example Google Workspace) or Cognito brokering it. The
-  decision is an implementation detail with a security consequence; pick it
-  before phase A exposes the admin surface.
+- **The Bifrost admin allowlist versus `Admins`.** The allowlist under
+  `deploy-workbench/` is maintained by hand (jagoda for now) and is a
+  different list from the Identity Center `Admins` group that `sheriff`
+  mutates. Decide whether to keep them separate, generate the Bifrost list
+  from `Admins` (which needs an Identity Store reader oauth2-proxy does not
+  have, so a small job would have to write the file), or move to Verified
+  Access, which reads `Admins` natively at roughly $200/month.
 - **RDS size and Multi-AZ.** Single-AZ with backups is defensible for the
   inner loop; Multi-AZ is the safe default if the budget allows. Also pick the
   instance class and storage size.
@@ -632,16 +718,20 @@ network or a permission can land before the item that creates it.
    repository in the workbench account, pinned by digest, following the
    delegate image's build/push pattern in `.github/workflows/deploy.yml`.
    Decide the digest upgrade cadence.
-4. **Pick the admin OIDC IdP** and confirm it can be scoped to an admin group
-   (see "Open questions"). This is a decision, not a PR.
+4. **Google OAuth client and the admin allowlist.** Create the Google Cloud
+   OAuth client (Web application, consent screen Internal, redirect URI
+   `https://bifrost.workbench.goodparty.org/oauth2/callback`) — a manual
+   console step, the same one `agent-swarm/README.md` documents — and commit
+   the initial `deploy-workbench/bifrost/allowed-emails.txt`. Neither is a
+   deploy; both block the phase 1 oauth2-proxy component.
 
 **Phase 1 — network and compute**
 
 5. Add the network to `deploy-workbench/`: VPC, two public subnets, two
    private subnets across two AZs, NAT (or VPC endpoints), route tables, the
    DB subnet group and the security groups.
-6. Add the ALB, target group, listeners, the ACM certificate and validation,
-   and the Route 53 alias, all taking the explicit provider.
+6. Add the ALB, its target groups and listeners, the ACM certificate and
+   validation, and the Route 53 alias, all taking the explicit provider.
 7. Add the RDS Postgres instance, private and encrypted, with automated
    backups and deletion protection, and its credentials in Secrets Manager.
 8. Add the ECS cluster, task definition and service, copying the task-definition
@@ -649,8 +739,11 @@ network or a permission can land before the item that creates it.
    ECS policy plus secrets read, a separate task role scoped to the Bedrock
    model list, `secrets` from Secrets Manager, `awslogs`, `initProcessEnabled`),
    and the CloudWatch log group.
-9. Add the admin-path ALB listener rule with the `authenticate-oidc` action
-   and the inference-path rule without it.
+9. Add the oauth2-proxy sidecar to the task definition and the admin/inference
+   ALB routing: the `/oauth2/*` and admin-path rules to the oauth2-proxy
+   target group on 4180, the inference-prefix rule to the Bifrost target group
+   on 8080, the derived oauth2-proxy image with the allowlist baked in, and
+   the three `OAUTH2_PROXY_*` secret containers.
 
 **Phase 2 — the gateway itself**
 
@@ -661,11 +754,12 @@ network or a permission can land before the item that creates it.
     the repo owns.
 11. Add the secret containers and the read grants, and write the secret
     values out of band (provider keys, `BIFROST_ENCRYPTION_KEY`, admin
-    credential, `VK_*`).
+    credential, `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,
+    `OAUTH2_PROXY_COOKIE_SECRET`, `VK_*`).
 12. Bring the service up and prove phase A: `/health` green through the ALB
     over TLS, inference succeeds with a virtual key and fails without one, a
     Bedrock request succeeds through the task role, and the admin path
-    redirects to the IdP and rejects a non-admin.
+    redirects to Google sign-in and rejects an address not on the allowlist.
 13. Confirm content logging is actually off end-to-end: make a request with a
     known marker string and show it is absent from the log store and any
     connector. The upstream docs are explicit that the layers compose, so this
