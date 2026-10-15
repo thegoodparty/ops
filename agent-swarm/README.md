@@ -285,6 +285,10 @@ Both are scope swarm, installed on all three agents, and registered by
   message shows the Delegate app's own name and icon.
 - Gate: `SLACK_ALLOWED_EMAIL_DOMAINS=goodparty.org`. This needs the
   `users:read.email` bot scope, which `slack-manifest.json` includes.
+- Channel threads: Delegate answers only when @mentioned
+  (`SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION=true` on the api service). Without
+  it, agent-swarm routes every untagged reply in a thread it was ever tagged
+  in back to the agent. DMs and the assistant pane do not need a mention.
 - Home channel and alerts channel: `#swarm-testing` (`C0C6RUJ9VMK`). The
   Delegate bot has to be a member to hear messages there.
 
