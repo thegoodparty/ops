@@ -3,6 +3,13 @@ import * as aws from "@pulumi/aws";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 import { createPreviewRole } from "./preview-role";
+import { createWorkbenchZone } from "./dns";
+import {
+  BIFROST_UPSTREAM_DIGEST,
+  BIFROST_UPSTREAM_REPOSITORY,
+  BIFROST_UPSTREAM_TAG,
+  createBifrostRepository,
+} from "./bifrost-image";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -361,3 +368,33 @@ const previewRole = createPreviewRole({ provider });
 
 /** Evidence for the step 8 entry: the apply log should show this ARN. */
 export const previewRoleArn = previewRole.arn;
+
+// ---------------------------------------------------------------------------
+// The account's own DNS zone: workbench.goodparty.org.
+//
+// Phase 0 item 2 of docs/bifrost-gateway.md. The delegation is a deliberate
+// follow-up PR in `deploy/`, naming `workbenchZoneNameServers` below as
+// constants once this zone has been applied; see "Cross-project dependencies"
+// in docs/workbench-account.md. That record must be in place before the phase
+// 1 ACM certificate for `bifrost.workbench.goodparty.org` can validate;
+// nothing else in this account needs a name in the production zone.
+const workbenchZone = createWorkbenchZone({ provider });
+
+export const workbenchZoneId = workbenchZone.zoneId;
+export const workbenchZoneNameServers = workbenchZone.nameServers;
+
+// ---------------------------------------------------------------------------
+// The ECR repository the Bifrost gateway image is mirrored into.
+//
+// Phase 0 item 3 of docs/bifrost-gateway.md. The image is upstream's, so this
+// stack only creates the repository; the mirror in
+// `.github/workflows/deploy-workbench.yml` pulls the pinned digest and pushes
+// it here. The pin and the upgrade cadence are documented in
+// `bifrost-image.ts`.
+const bifrostRepository = createBifrostRepository({ provider });
+
+/** The push target, for a human reading `pulumi stack output`. */
+export const bifrostRepositoryUrl = bifrostRepository.repositoryUrl;
+
+/** The pinned upstream reference the mirror copies from. */
+export const bifrostUpstreamImage = `${BIFROST_UPSTREAM_REPOSITORY}:${BIFROST_UPSTREAM_TAG}@${BIFROST_UPSTREAM_DIGEST}`;
