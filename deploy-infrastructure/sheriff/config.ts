@@ -21,19 +21,13 @@ import { IDENTITY_STORE_ID } from "../../utils/accounts";
 
 /**
  * The hardcoded approver list. One approver per request, and the approver must
- * not be the requester.
- *
- * `U0BMU0DPS9Y` is Jeff Jagoda (`jeff@goodparty.org`), the engineer.
- * `U09HGPTHHAT` is Swain Molster (`swain@goodparty.org`), `UKP6FPANN` is Tomer
- * Almog (`tomer@goodparty.org`) and `U09T5BQQUTH` is Dan Ball
- * (`dan@goodparty.org`); those three were added at the engineer's request on
- * 2026-10-15. Adding or removing an approver is a reviewed PR.
+ * not be the requester. Adding or removing an approver is a reviewed PR.
  */
 export const APPROVER_SLACK_USER_IDS: readonly string[] = [
-  "U0BMU0DPS9Y",
-  "U09HGPTHHAT",
-  "UKP6FPANN",
-  "U09T5BQQUTH",
+  "U0BMU0DPS9Y", // Jeff Jagoda (jeff@goodparty.org)
+  "U09HGPTHHAT", // Swain Molster (swain@goodparty.org)
+  "UKP6FPANN", // Tomer Almog (tomer@goodparty.org)
+  "U09T5BQQUTH", // Dan Ball (dan@goodparty.org)
 ];
 
 /**
