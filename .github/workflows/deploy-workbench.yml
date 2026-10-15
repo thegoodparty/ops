@@ -135,11 +135,26 @@ jobs:
       # as the source rather than the runner's OIDC token. It runs last, after
       # the apply, so the repository exists before anything is pushed to it,
       # and after the Bedrock step, which needs the first-hop session.
+      #
+      # `role-skip-session-tagging` because the trust grants only
+      # `sts:AssumeRole`: the action tags a chained assume by default, which
+      # needs `sts:TagSession` too, and neither side of this hop has it. See
+      # the input comment below.
       - name: Configure AWS Credentials (workbench)
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::024901689212:role/pulumi-deploy
           role-chaining: true
+          # The action adds session tags to a chained `AssumeRole` by default
+          # (`role-skip-session-tagging` defaults to false), and a tagged
+          # assume needs `sts:TagSession` in addition to `sts:AssumeRole`.
+          # Neither side grants it: `pulumi-deploy`'s trust names only
+          # `sts:AssumeRole` (deploy-workbench/deploy-role.ts) and
+          # `AssumeWorkbenchDeployRole` grants only `sts:AssumeRole`
+          # (deploy/components/ci-roles/policies.ts). Without this the hop is
+          # denied and the mirror never runs. Skipping the tags keeps the
+          # trust narrowed rather than widening it for metadata nothing reads.
+          role-skip-session-tagging: true
           aws-region: us-west-2
 
       - name: Login to Amazon ECR
