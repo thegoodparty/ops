@@ -51,6 +51,15 @@ permissions:
 
 env:
   AWS_REGION: us-west-2
+  # The Bifrost image mirror. The upstream reference is pinned by digest, and
+  # the tag comes from upstream's release; the two are duplicated from
+  # `deploy-workbench/bifrost-image.ts` because Actions cannot import a
+  # TypeScript module, and `bifrost-image.test.ts` fails if they drift. The
+  # upgrade cadence is deliberate and reviewed, not automatic; see that file.
+  BIFROST_UPSTREAM: maximhq/bifrost:v2.3.0@sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8fe96e2d9fcf6f0ef9098
+  BIFROST_REPOSITORY: bifrost
+  BIFROST_TAG: v2.3.0
+  BIFROST_IMAGE_URI: 024901689212.dkr.ecr.us-west-2.amazonaws.com/bifrost:v2.3.0
 
 jobs:
   deploy:
@@ -112,3 +121,43 @@ jobs:
       # The reviewed model list in the script is where that consent lives.
       - name: Enable Bedrock models
         run: APPLY=1 npm run script enable-bedrock-models
+
+      # Mirror the pinned Bifrost image into this account's ECR. The same
+      # shape as the delegate worker's build/push in deploy.yml -- configure
+      # credentials, log in to ECR, move the image -- with two differences:
+      # nothing is built (the image is pulled from Docker Hub), and the source
+      # is pinned by digest so the mirror is reproducible.
+      #
+      # The credentials are a second hop. The role configured above lives in
+      # the management account; the repository lives here, so this assumes
+      # `pulumi-deploy` the way deploy.sh and enable-bedrock-models.ts do.
+      # `role-chaining` makes the action use the session from the step above
+      # as the source rather than the runner's OIDC token. It runs last, after
+      # the apply, so the repository exists before anything is pushed to it,
+      # and after the Bedrock step, which needs the first-hop session.
+      - name: Configure AWS Credentials (workbench)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::024901689212:role/pulumi-deploy
+          role-chaining: true
+          aws-region: us-west-2
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Mirror the pinned Bifrost image
+        run: |
+          set -euo pipefail
+          # The repository is immutable and this workflow runs on every
+          # workbench change, not only on a digest bump, so a re-push of a tag
+          # that is already there is rejected. Upstream release tags do not
+          # move, so an existing tag means the same image is already mirrored.
+          if aws ecr describe-images \
+              --repository-name "$BIFROST_REPOSITORY" \
+              --image-ids imageTag="$BIFROST_TAG" >/dev/null 2>&1; then
+            echo "bifrost:$BIFROST_TAG is already mirrored; nothing to do."
+            exit 0
+          fi
+          docker pull --platform linux/amd64 "$BIFROST_UPSTREAM"
+          docker tag "maximhq/bifrost:$BIFROST_TAG" "$BIFROST_IMAGE_URI"
+          docker push "$BIFROST_IMAGE_URI"
