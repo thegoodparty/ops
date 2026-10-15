@@ -51,15 +51,17 @@ permissions:
 
 env:
   AWS_REGION: us-west-2
-  # The Bifrost image mirror. The upstream reference is pinned by digest, and
-  # the tag comes from upstream's release; the two are duplicated from
+  # The Bifrost image mirror. The upstream reference and the two literals the
+  # mirror step builds the ECR URI from are duplicated from
   # `deploy-workbench/bifrost-image.ts` because Actions cannot import a
-  # TypeScript module, and `bifrost-image.test.ts` fails if they drift. The
-  # upgrade cadence is deliberate and reviewed, not automatic; see that file.
+  # TypeScript module, and `bifrost-image.test.ts` fails if any of them drift.
+  # The ECR URI itself is deliberately not a fourth literal: the mirror step
+  # builds it from the ECR login registry plus BIFROST_REPOSITORY and
+  # BIFROST_TAG, so it cannot point at a stale tag or repository. The upgrade
+  # cadence is deliberate and reviewed, not automatic; see that file.
   BIFROST_UPSTREAM: maximhq/bifrost:v2.3.0@sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8fe96e2d9fcf6f0ef9098
   BIFROST_REPOSITORY: bifrost
   BIFROST_TAG: v2.3.0
-  BIFROST_IMAGE_URI: 024901689212.dkr.ecr.us-west-2.amazonaws.com/bifrost:v2.3.0
 
 jobs:
   deploy:
@@ -158,11 +160,17 @@ jobs:
           aws-region: us-west-2
 
       - name: Login to Amazon ECR
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Mirror the pinned Bifrost image
+        env:
+          # The registry the login step actually authenticated against, so the
+          # URI is derived rather than a literal that can drift from the tag.
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
           set -euo pipefail
+          image_uri="${ECR_REGISTRY}/${BIFROST_REPOSITORY}:${BIFROST_TAG}"
           # The repository is immutable and this workflow runs on every
           # workbench change, not only on a digest bump, so a re-push of a tag
           # that is already there is rejected. Upstream release tags do not
@@ -174,5 +182,5 @@ jobs:
             exit 0
           fi
           docker pull --platform linux/amd64 "$BIFROST_UPSTREAM"
-          docker tag "maximhq/bifrost:$BIFROST_TAG" "$BIFROST_IMAGE_URI"
-          docker push "$BIFROST_IMAGE_URI"
+          docker tag "maximhq/bifrost:$BIFROST_TAG" "$image_uri"
+          docker push "$image_uri"
