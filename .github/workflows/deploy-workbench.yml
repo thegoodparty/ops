@@ -182,5 +182,16 @@ jobs:
             exit 0
           fi
           docker pull --platform linux/amd64 "$BIFROST_UPSTREAM"
-          docker tag "maximhq/bifrost:$BIFROST_TAG" "$image_uri"
+          # `docker pull` of a reference that carries both a tag and a digest
+          # resolves the digest and records the image locally under the digest
+          # alone: the pull prints "Downloaded newer image for
+          # maximhq/bifrost@sha256:..." and no `maximhq/bifrost:$BIFROST_TAG`
+          # tag exists afterwards, so `docker tag maximhq/bifrost:$BIFROST_TAG`
+          # fails with "No such image" (deploy run 38812637149). Tag the digest
+          # reference the pull actually created. The tag is only the
+          # destination tag in ECR here; the digest is what pins the content.
+          upstream_repository="${BIFROST_UPSTREAM%@*}"
+          upstream_repository="${upstream_repository%:*}"
+          upstream_digest="${BIFROST_UPSTREAM##*@}"
+          docker tag "${upstream_repository}@${upstream_digest}" "$image_uri"
           docker push "$image_uri"

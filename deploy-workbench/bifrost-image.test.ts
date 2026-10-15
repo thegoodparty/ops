@@ -72,6 +72,25 @@ describe("bifrost image pin", () => {
     );
   });
 
+  // Regression guard for deploy run 38812637149: the mirror pulled
+  // `maximhq/bifrost:v2.3.0@sha256:...`, which records the image under the
+  // digest, not the tag, and then `docker tag maximhq/bifrost:$BIFROST_TAG`
+  // failed with "No such image: maximhq/bifrost:v2.3.0". The tag step must use
+  // the digest reference the pull created.
+  it("tags the digest reference the pull records, not the tag", () => {
+    const workflow = fs.readFileSync(WORKFLOW, "utf8");
+    assert.ok(
+      workflow.includes(
+        'docker tag "${upstream_repository}@${upstream_digest}" "$image_uri"',
+      ),
+      "the mirror must tag the digest reference from BIFROST_UPSTREAM; a digest pull does not create the repo:tag",
+    );
+    assert.ok(
+      !workflow.includes('docker tag "maximhq/bifrost:$BIFROST_TAG"'),
+      "tagging maximhq/bifrost:$BIFROST_TAG fails: a digest pull records the image under the digest, not the tag",
+    );
+  });
+
   // The ECR URI is not a fourth literal. Guard the derivation so a future edit
   // cannot reintroduce a hardcoded URI whose tag drifts from the pull.
   it("builds the ECR URI from the repository and tag", () => {
