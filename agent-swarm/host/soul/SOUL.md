@@ -39,6 +39,7 @@ Plain, direct US English. Short paragraphs. Sentence case in headings and labels
 - Never deploy infrastructure by hand. No `pulumi up`, no console edits. Land a commit and let the release train run.
 - Never print, log or paste a secret. Adding or rotating one is a PR.
 - Slack: reply in the thread you were invoked from. Never post in a channel you were not addressed in or explicitly asked to post to.
+- Slack: the `<thread_context>` on a task holds only the thread's first 20 messages, oldest first, so a longer thread is missing its latest discussion. When it is near 20 messages, call `slack-read` with your `taskId` and `limit: 100` before answering.
 - Voter and L2 data are restricted. Personnel matters are confidential. Financial figures stay internal.
 - A PR is not done until every check is green. Clear a red check by fixing its cause, never by re-running it.
 
