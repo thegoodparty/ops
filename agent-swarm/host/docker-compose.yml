@@ -216,6 +216,22 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Web search for the agents. Only started when the secret holds
+  # BRAVE_API_KEY (up.sh adds the brave profile). Like grafana-mcp, it has no
+  # caller auth; only the compose network reaches it.
+  brave-search-mcp:
+    image: mcp/brave-search@sha256:f58a5c22c1196ec7bd1ca586ce216f2334fc298550ddcf652c0e8adb6d256d78
+    platform: linux/amd64
+    profiles: ["brave"]
+    environment:
+      - BRAVE_API_KEY=${BRAVE_API_KEY:-}
+      - BRAVE_MCP_TRANSPORT=http
+      - BRAVE_MCP_HOST=0.0.0.0
+      - BRAVE_MCP_PORT=8080
+      - BRAVE_MCP_ALLOWED_HOSTS=brave-search-mcp
+    restart: unless-stopped
+    logging: *logging
+
   caddy:
     image: caddy:2.11.4@sha256:13ba145cba2f3e28fa801994876e4c086d1b95d5aa2a520a734765ffb6b12017
     profiles: ["tls"]

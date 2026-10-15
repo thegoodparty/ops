@@ -22,6 +22,9 @@ profiles=(--profile tls)
 if grep -q '^OAUTH2_PROXY_CLIENT_ID=.' .env; then
   profiles+=(--profile sso)
 fi
+if grep -q '^BRAVE_API_KEY=.' .env; then
+  profiles+=(--profile brave)
+fi
 
 docker compose "${profiles[@]}" up -d --remove-orphans
 

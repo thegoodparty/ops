@@ -44,7 +44,8 @@ host; the next deploy overwrites them.
   with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
   `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
   `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and optionally the three
-  `OAUTH2_PROXY_*` keys that turn on Google login
+  `OAUTH2_PROXY_*` keys that turn on Google login and `BRAVE_API_KEY`,
+  which turns on web search
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - GitHub identity: commits and PRs are authored by the `delegate-gp[bot]`
@@ -267,7 +268,7 @@ existing one is renamed with `PUT /api/agents/{id}/name`.
 
 ## MCP servers
 
-Both are scope swarm, installed on all three agents, and registered by
+All are scope swarm, installed on all three agents, and registered by
 `bootstrap.sh`.
 
 - grafana: the `grafana-mcp` sidecar at `http://grafana-mcp:8000/mcp`,
@@ -276,6 +277,15 @@ Both are scope swarm, installed on all three agents, and registered by
 - clickup: the hosted server at `https://mcp.clickup.com/mcp`, with OAuth.
   `bootstrap.sh` installs it only once it is connected (Bringing it up,
   step 6).
+- brave-search: web search through the Brave Search API, from the
+  `brave-search-mcp` sidecar at `http://brave-search-mcp:8080/mcp`, pinned
+  by digest. Like grafana-mcp it has no caller auth and Caddy does not route
+  to it. Off until the secret holds `BRAVE_API_KEY`; then `up.sh` starts the
+  sidecar (compose profile `brave`) and `bootstrap.sh` registers and
+  installs it. To turn it on: `AWS_PROFILE=gp-infrastructure
+  ./fill-secrets.sh --brave` from this directory, then on the host `up.sh`,
+  `bootstrap.sh` and a restart of the three agents (the script prints the
+  commands).
 
 ## Slack
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuilds the swarm state that lives only in SQLite: the global SETUP_SCRIPT,
-# the grafana and clickup MCP servers, the lead's soul, and each agent's
+# the grafana, clickup and brave-search MCP servers, the lead's soul, and each agent's
 # harness and model.
 # Run as root on the host once the stack is up. Safe to run again, but a rerun
 # replaces any edits the lead made to its own SOUL.md and IDENTITY.md with the
@@ -96,6 +96,26 @@ if api GET "/api/mcp-oauth/$clickup/status" | jq -e '.connected' >/dev/null; the
   echo "clickup mcp: connected, installed on lead, coder and reviewer"
 else
   echo "clickup mcp: not connected, not installed; Connect it in the dashboard (MCP servers, clickup), then run bootstrap.sh again"
+fi
+
+if grep -q '^BRAVE_API_KEY=.' .env; then
+  brave="$(api GET '/api/mcp-servers?scope=swarm' | jq -r '[.servers[] | select(.name == "brave-search")][0].id // ""')"
+  if [[ -n "$brave" ]]; then
+    echo "brave-search mcp: already registered as $brave"
+  else
+    brave="$(jq -n '{name: "brave-search", transport: "http", scope: "swarm",
+        url: "http://brave-search-mcp:8080/mcp",
+        description: "Web search (Brave Search API), through the brave-search-mcp sidecar"}' \
+      | api POST /api/mcp-servers -d @- | jq -r '.server.id')"
+    echo "brave-search mcp: registered as $brave"
+  fi
+  for agent in "$LEAD" "$CODER" "$REVIEWER"; do
+    jq -n --arg a "$agent" '{agentId: $a}' \
+      | api POST "/api/mcp-servers/$brave/install" -d @- >/dev/null
+  done
+  echo "brave-search mcp: installed on lead, coder and reviewer"
+else
+  echo "brave-search mcp: no BRAVE_API_KEY in the secret, skipped; run fill-secrets.sh --brave, up.sh, then bootstrap.sh again"
 fi
 
 if api GET "/api/agents/$LEAD" | jq -e --rawfile s soul/SOUL.md --rawfile i soul/IDENTITY.md \

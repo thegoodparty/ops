@@ -5,6 +5,7 @@
 #   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh        the five services, and the swarm's own keys
 #   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --sso  Google login (optional)
 #   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --github-app  GitHub App webhooks (optional)
+#   AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --brave  Brave Search API key, web search (optional)
 #
 # Until there is an SSO profile for the infrastructure account, assume
 # OrganizationAccountAccessRole from a management admin session. Add this to
@@ -43,7 +44,8 @@ case "${1:-}" in
   "") ;;
   --sso) MODE=sso ;;
   --github-app) MODE=github-app ;;
-  *) echo "usage: $0 [--sso|--github-app]"; exit 1 ;;
+  --brave) MODE=brave ;;
+  *) echo "usage: $0 [--sso|--github-app|--brave]"; exit 1 ;;
 esac
 
 account="$(aws sts get-caller-identity --query Account --output text)" \
@@ -72,6 +74,15 @@ OAUTH2_PROXY_COOKIE_SECRET="$(openssl rand -base64 32 | tr -- '+/' '-_')"
 export OAUTH2_PROXY_COOKIE_SECRET
 WRITE_KEYS+=(OAUTH2_PROXY_COOKIE_SECRET)
 echo "  cookie secret generated"
+
+elif [[ $MODE == brave ]]; then
+
+bold "Brave Search API key (web search for the agents)"
+cat <<'EOF'
+  https://api-dashboard.search.brave.com/app/keys, signed in to the GoodParty
+  account, on the Search plan. Add API key, name "delegate-swarm". Copy it.
+EOF
+ask BRAVE_API_KEY ""
 
 elif [[ $MODE == github-app ]]; then
 
@@ -232,6 +243,11 @@ if [[ -n "$missing" ]]; then
 elif [[ $MODE == github-app ]]; then
   echo "Done. GitHub webhooks turn on the next time up.sh runs on the host (it re-renders .env):"
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
+elif [[ $MODE == brave ]]; then
+  echo "Done. On the host, start the sidecar, then register and install the MCP server:"
+  echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
+  echo "  sudo /opt/agent-swarm/bootstrap.sh"
+  echo "  cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-reviewer"
 elif [[ $MODE == sso ]]; then
   echo "Done. SSO turns on the next time up.sh runs on the host (it re-renders .env):"
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
