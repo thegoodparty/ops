@@ -949,9 +949,13 @@ against what a person does.
 - `cloudtrail:StopLogging`, `DeleteTrail`, `UpdateTrail`,
   `PutEventSelectors`. There may be no trail in this account yet, which makes
   these inert today and correct the moment there is one.
-- `rds:*`, `dynamodb:*`, `redshift:*`. The data argument, made structural.
-  These are the stores that would make the account worth attacking, and
-  nothing about running coding agents needs them.
+- `dynamodb:*`, `redshift:*`. The data argument, made structural. These are
+  the stores that would make the account worth attacking, and nothing about
+  running coding agents needs them.
+- `rds:*` was on that list and is now permitted, deliberately. The Bifrost
+  gateway keeps its config and request logs in RDS Postgres
+  (`docs/bifrost-gateway.md`, PR #320), so the account may create and run one.
+  The relaxation is exactly `rds:*`; the rest of this list is unchanged.
 - S3 against buckets this account does not own, conditioned on
   `aws:ResourceAccount` not equal to 024901689212. See below: this replaces
   an earlier decision to leave S3 alone.
@@ -1939,6 +1943,12 @@ needed, and so the asynchronous parts have a human gap after them.
 
 ## Open questions
 
+- ~~**Allow RDS in the workbench account.**~~ Settled: `rds:*` is removed from
+  `DenyDataStores` in `deploy-org/policies.ts` so the Bifrost gateway's RDS
+  Postgres can run there. `dynamodb:*` and `redshift:*` stay denied, and no
+  other deny is touched. Reasoning and sequencing are in
+  `docs/bifrost-gateway.md` (PR #320); "What the policy denies" above is
+  updated to match.
 - ~~**Which permission set.**~~ Settled 2026-09-21 in step 8: a new
   `WorkbenchAccess` set for `Engineers`, plus the existing
   `AdministratorAccess` for `Admins` as a named break-glass path. Reasoning

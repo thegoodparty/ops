@@ -21,12 +21,14 @@ import { IDENTITY_STORE_ID } from "../../utils/accounts";
 
 /**
  * The hardcoded approver list. One approver per request, and the approver must
- * not be the requester.
- *
- * `U0BMU0DPS9Y` is Jeff Jagoda (`jeff@goodparty.org`), the engineer. He is
- * deliberately the only approver for now; adding another is a reviewed PR.
+ * not be the requester. Adding or removing an approver is a reviewed PR.
  */
-export const APPROVER_SLACK_USER_IDS: readonly string[] = ["U0BMU0DPS9Y"];
+export const APPROVER_SLACK_USER_IDS: readonly string[] = [
+  "U0BMU0DPS9Y", // Jeff Jagoda (jeff@goodparty.org)
+  "U09HGPTHHAT", // Swain Molster (swain@goodparty.org)
+  "UKP6FPANN", // Tomer Almog (tomer@goodparty.org)
+  "U09T5BQQUTH", // Dan Ball (dan@goodparty.org)
+];
 
 /**
  * The `Admins` Identity Store group id, mirrored from

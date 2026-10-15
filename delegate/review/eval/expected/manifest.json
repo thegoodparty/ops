@@ -59,6 +59,20 @@
     "tests": "A one-line documentation correction: quote a skill description so strict YAML parsers load it. Nothing to block."
   },
   {
+    "id": "gp-pi-57-multi-instance",
+    "bundle": "gp-pi-57-multi-instance.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "bin/gp-pi"
+      ],
+      "categories": [
+        "bugs"
+      ]
+    },
+    "tests": "Simulated from gp-pi #57 at 854028d (tree rebuilt on the pre-PR base; the real head is the same tree). Production approved. Sanjay's agent then reproduced bugs in bin/gp-pi that Jeff fixed in 7f76519: `recreate omni` destroys the container then dies on the overlap check, `rm --all` exits silently under set -e, a fixed host port collides across instances. Path match is loose: any bugs finding in bin/gp-pi passes. The reviewer has no Docker and only reads code. Sanjay's agent found most of these by running the launcher with Docker faked or a real daemon, and a few (the credential-guard bypass via --workspace ~/.config, up default mounting the cwd, docs that promise an rm confirmation) by comparing docs to code, so a pass means reading alone was enough."
+  },
+  {
     "id": "gp-data-platform-1183-null-regex-guard",
     "key": "reviews/thegoodparty/gp-data-platform/1183/43a641af7f4d4977eaa820765c345ba9ebff47f8/6334c17a-7fd8-478e-b3b6-7cd5c8066a29.json",
     "expect": {

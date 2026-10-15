@@ -134,6 +134,9 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          # gh clones with the app token, but the follow-up git fetch of the
+          # recorded sha needs it too, or private repos fail to check out.
+          gh auth setup-git
           main_sha7=$(git rev-parse --short=7 HEAD)
           echo "main_sha7=${main_sha7}" >> "$GITHUB_ENV"
           npm run -s review:eval -- replay \
@@ -284,6 +287,7 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          gh auth setup-git
           cd pr && npm run -s review:expect -- \
             --mode replay \
             --manifest ../delegate/review/eval/expected/manifest.json \

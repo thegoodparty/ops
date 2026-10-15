@@ -124,11 +124,13 @@ export const workbenchScp: PolicyDocument = {
     },
     {
       // The data argument, made structural. These are the stores that would
-      // make this account worth attacking, and nothing about running coding
-      // agents against Bedrock needs any of them.
+      // make this account worth attacking. RDS is permitted deliberately:
+      // the Bifrost gateway keeps its config and request logs there (see
+      // docs/bifrost-gateway.md). DynamoDB and Redshift stay denied, because
+      // nothing about running coding agents against Bedrock needs them.
       Sid: "DenyDataStores",
       Effect: "Deny",
-      Action: ["rds:*", "dynamodb:*", "redshift:*"],
+      Action: ["dynamodb:*", "redshift:*"],
       Resource: "*",
     },
     {

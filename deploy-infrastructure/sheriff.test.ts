@@ -440,8 +440,11 @@ describe("scheduled revocation infrastructure", () => {
 });
 
 describe("break-glass config", () => {
-  it("has the engineer as the only approver", () => {
-    assert.deepEqual([...APPROVER_SLACK_USER_IDS], ["U0BMU0DPS9Y"]);
+  it("pins the hardcoded approver list", () => {
+    assert.deepEqual(
+      [...APPROVER_SLACK_USER_IDS],
+      ["U0BMU0DPS9Y", "U09HGPTHHAT", "UKP6FPANN", "U09T5BQQUTH"],
+    );
   });
 
   it("pins the Engineers gate group and the Admins grant group", () => {
