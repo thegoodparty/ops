@@ -5,7 +5,7 @@
 > decisions below were settled in a design review and are recorded as
 > decisions rather than options; the few things still genuinely open are in
 > "Open questions" at the end and are marked **open**. The steps in
-> "Implementation plan" are all `todo`.
+> "Implementation plan" carry their own status; steps 1 and 2 are `done`.
 
 The job is small on purpose: one Lambda, on a schedule, that makes one IAM
 Identity Center group a strict mirror of one Google Workspace group. It adds
@@ -778,14 +778,14 @@ merge and finish applying before the Lambda that assumes it merges, because
 the Lambda's first run is an `AssumeRole` and a missing role is an
 `AccessDenied`, not an apply-time error.
 
-- [ ] 1. Definitions only, no runtime: the `identity-group-sync-grant` role
+- [x] 1. Definitions only, no runtime: the `identity-group-sync-grant` role
       and its inline policy in `deploy/components/`, registered in
       `deploy/index.ts` next to `createSheriffGrant()`, with the trust and
-      policy tests. No Lambda yet. `todo`
-- [ ] 2. The Google read adapter and the pure `diff`, with the unit tests for
+      policy tests. No Lambda yet. `done`
+- [x] 2. The Google read adapter and the pure `diff`, with the unit tests for
       the diff and the incomplete-read abort. No AWS resources, no schedule.
       This is where the correctness of the job lives and it is reviewable
-      without any infrastructure. `todo`
+      without any infrastructure. `done`
 - [ ] 3. The runtime in `deploy-infrastructure/group-sync-lambda.ts`: the
       Lambda, its execution role and inline policy, the SSM parameter, the
       secret container, the log group, the EventBridge rule with reserved
