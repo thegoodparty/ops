@@ -12,6 +12,7 @@ import {
 } from "./bifrost-image";
 import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
+import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -418,3 +419,29 @@ export const oauth2ProxyRepositoryUrl = oauth2ProxyRepository.repositoryUrl;
 // definition and service (item 8) are deliberately not here; each will
 // consume the object returned below, which is why it is bound to a name.
 const network = createWorkbenchNetwork({ provider });
+
+// ---------------------------------------------------------------------------
+// The ingress the gateway is reached through.
+//
+// Phase 1 item 6 of docs/bifrost-gateway.md: the internet-facing ALB, its two
+// target groups and listeners, the ACM certificate and its DNS validation, and
+// the Route 53 alias for `bifrost.workbench.goodparty.org`. It consumes the
+// network from item 5 and the zone from phase 0 item 2 rather than creating
+// either again.
+//
+// The listener rules that split inference from the admin surface belong to
+// item 9, not this item. The HTTPS listener has a default action because a
+// listener must have one, and it forwards to Bifrost so the gateway is
+// reachable as soon as item 8 registers the task; item 9 adds the oauth2-proxy
+// and inference rules on top. See the design record in `ingress.ts`.
+const ingress = createBifrostIngress({
+  provider,
+  zone: workbenchZone,
+  network,
+});
+
+/** The name harnesses and the certificate both use. */
+export const bifrostHostname = BIFROST_HOSTNAME;
+
+/** The ALB's own DNS name, for a human debugging the alias. */
+export const bifrostAlbDnsName = ingress.loadBalancer.dnsName;
