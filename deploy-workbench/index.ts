@@ -10,6 +10,7 @@ import {
   BIFROST_UPSTREAM_TAG,
   createBifrostRepository,
 } from "./bifrost-image";
+import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -398,3 +399,18 @@ export const bifrostRepositoryUrl = bifrostRepository.repositoryUrl;
 
 /** The pinned upstream reference the mirror copies from. */
 export const bifrostUpstreamImage = `${BIFROST_UPSTREAM_REPOSITORY}:${BIFROST_UPSTREAM_TAG}@${BIFROST_UPSTREAM_DIGEST}`;
+
+// ---------------------------------------------------------------------------
+// The ECR repository the derived oauth2-proxy image is built into.
+//
+// The image half of phase 1 item 9 of `docs/bifrost-gateway.md`. The stock
+// oauth2-proxy image has no inline email-list flag, so the admin allowlist is
+// baked into a derivative under `bifrost/`; the build and push live in
+// `.github/workflows/deploy-workbench.yml`. The pin and the content-addressed
+// tag are documented in `oauth2-proxy-image.ts`. A separate repository from
+// `bifrost` on purpose: this image is ours and rebuilt when the list changes,
+// while the Bifrost mirror is an upstream release pulled by digest.
+const oauth2ProxyRepository = createOauth2ProxyRepository({ provider });
+
+/** The push target, for a human reading `pulumi stack output`. */
+export const oauth2ProxyRepositoryUrl = oauth2ProxyRepository.repositoryUrl;

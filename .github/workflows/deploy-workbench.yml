@@ -62,6 +62,16 @@ env:
   BIFROST_UPSTREAM: maximhq/bifrost:v2.3.0@sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8fe96e2d9fcf6f0ef9098
   BIFROST_REPOSITORY: bifrost
   BIFROST_TAG: v2.3.0
+  # The derived oauth2-proxy image built below. The repository name and the
+  # upstream tag are duplicated from `deploy-workbench/oauth2-proxy-image.ts`
+  # because Actions cannot import a TypeScript module, and
+  # `oauth2-proxy-image.test.ts` fails if they drift. The tag itself is not a
+  # literal: the build step derives it from the committed allowlist's sha256,
+  # the same input the module hashes, so a changed list is a new tag and a new
+  # digest. The Dockerfile carries the upstream digest, guarded against the
+  # module by the same test.
+  OAUTH2_PROXY_REPOSITORY: bifrost-oauth2-proxy
+  OAUTH2_PROXY_UPSTREAM_TAG: v7.15.5
 
 jobs:
   deploy:
@@ -194,4 +204,35 @@ jobs:
           upstream_repository="${upstream_repository%:*}"
           upstream_digest="${BIFROST_UPSTREAM##*@}"
           docker tag "${upstream_repository}@${upstream_digest}" "$image_uri"
+          docker push "$image_uri"
+
+      # Build and push the derived oauth2-proxy image that bakes in the admin
+      # allowlist. Bifrost OSS has no OIDC, and the stock oauth2-proxy image
+      # has no inline email-list flag, so the list reaches the sidecar as a
+      # file in a one-line derivative (`deploy-workbench/bifrost/Dockerfile`).
+      # The Dockerfile carries the pinned upstream digest; this step only
+      # builds the context and pushes it.
+      #
+      # The tag is content-addressed on the allowlist, so the immutable
+      # repository accepts a push when the list changes and this step skips
+      # when the same list is already built. A fixed tag would make the second
+      # allowlist edit unpushable.
+      #
+      # Same second-hop credentials as the mirror step above: the ECR login
+      # authenticated against this account, so ECR_REGISTRY is its registry.
+      - name: Build and push the derived oauth2-proxy image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          allowlist_digest="$(sha256sum deploy-workbench/bifrost/allowed-emails.txt | cut -c1-12)"
+          image_tag="${OAUTH2_PROXY_UPSTREAM_TAG}-${allowlist_digest}"
+          image_uri="${ECR_REGISTRY}/${OAUTH2_PROXY_REPOSITORY}:${image_tag}"
+          if aws ecr describe-images \
+              --repository-name "$OAUTH2_PROXY_REPOSITORY" \
+              --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
+            echo "oauth2-proxy:$image_tag is already built; nothing to do."
+            exit 0
+          fi
+          docker build --platform linux/amd64 -t "$image_uri" deploy-workbench/bifrost
           docker push "$image_uri"
