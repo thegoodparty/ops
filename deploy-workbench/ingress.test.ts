@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_ZONE_NAME } from "./dns";
 import {
+  ALB_IDLE_TIMEOUT_SECONDS,
   BIFROST_ALB_NAME,
   BIFROST_HEALTH_CHECK_PATH,
   BIFROST_HOSTNAME,
@@ -36,6 +37,21 @@ const INDEX_SOURCE = fs.readFileSync(
   path.resolve(__dirname, "index.ts"),
   "utf8",
 );
+
+/**
+ * The source of one named resource's constructor call, from its logical-name
+ * literal to the next `new aws.` (or the end of the file). Enough to tell
+ * whether an argument belongs to that resource rather than a sibling, which a
+ * bare `includes` on the whole file cannot.
+ */
+const resourceBlock = (logicalName: string): string => {
+  const marker = `"${logicalName}"`;
+  const start = INGRESS_SOURCE.indexOf(marker);
+  assert.ok(start >= 0, `ingress.ts has no resource named ${logicalName}`);
+  const rest = INGRESS_SOURCE.slice(start);
+  const next = rest.indexOf("new aws.", 1);
+  return next >= 0 ? rest.slice(0, next) : rest;
+};
 
 describe("bifrost ingress", () => {
   it("names the gateway under the delegated workbench zone", () => {
@@ -90,6 +106,7 @@ describe("bifrost ingress", () => {
 
   it("keeps the ALB and target group names inside AWS's 32-character limit", () => {
     assert.ok(BIFROST_ALB_NAME.length <= 32, BIFROST_ALB_NAME);
+    assert.match(BIFROST_ALB_NAME, /^[a-zA-Z0-9-]+$/);
     for (const group of TARGET_GROUPS) {
       assert.ok(
         group.name.length <= 32,
@@ -97,6 +114,19 @@ describe("bifrost ingress", () => {
       );
       assert.match(group.name, /^[a-zA-Z0-9-]+$/);
     }
+  });
+
+  it("sets an ALB idle timeout long enough for time-to-first-token", () => {
+    // AWS's default is 60 seconds, which a thinking model can exceed before
+    // its first token; the ALB would then 504 the request.
+    assert.equal(ALB_IDLE_TIMEOUT_SECONDS, 3600);
+    assert.ok(ALB_IDLE_TIMEOUT_SECONDS > 60);
+    // The ALB's maximum, so a future edit cannot set something AWS rejects.
+    assert.ok(ALB_IDLE_TIMEOUT_SECONDS <= 4000);
+    assert.ok(
+      INGRESS_SOURCE.includes("idleTimeout: ALB_IDLE_TIMEOUT_SECONDS"),
+      "the ALB must set idleTimeout from ALB_IDLE_TIMEOUT_SECONDS",
+    );
   });
 
   it("raises the listener TLS floor above the provider default", () => {
@@ -118,14 +148,35 @@ describe("bifrost ingress", () => {
     );
   });
 
-  it("validates the certificate against the workbench zone", () => {
-    // The validation record is a CNAME in the zone this stack owns, so a
-    // missing zoneId (or a record created in the wrong zone) would leave the
-    // certificate pending forever.
+  it("fails closed: the HTTPS default action points at oauth2-proxy, not Bifrost", () => {
+    // Until item 9 adds the inference-prefix rule, the default reaches a
+    // target group with no registered targets (503) instead of exposing
+    // Bifrost's admin surface as soon as item 8 registers the ECS task.
+    const httpsBlock = resourceBlock("bifrostHttpsListener");
     assert.ok(
-      INGRESS_SOURCE.includes("zoneId: zone.zoneId"),
-      "ingress.ts does not create the validation record and alias in the workbench zone",
+      httpsBlock.includes("targetGroupArn: oauth2ProxyTargetGroup.arn"),
+      "the HTTPS listener default action must forward to oauth2-proxy",
     );
+    assert.ok(
+      !httpsBlock.includes("targetGroupArn: bifrostTargetGroup.arn"),
+      "the HTTPS listener default action must not forward to Bifrost before item 9 adds the inference rule",
+    );
+  });
+
+  it("pins both Route 53 records to the workbench zone", () => {
+    // Assert each named resource's own argument block, not a bare substring:
+    // a whole-file `includes` would still pass if the validation record dropped
+    // the zone and only the alias kept it, and a validation record in the wrong
+    // zone leaves the certificate pending forever.
+    for (const logicalName of [
+      "bifrostCertificateValidationRecord",
+      "bifrostAliasRecord",
+    ]) {
+      assert.ok(
+        resourceBlock(logicalName).includes("zoneId: zone.zoneId"),
+        `${logicalName} is not created in the workbench zone`,
+      );
+    }
     assert.ok(
       INGRESS_SOURCE.includes("validationRecordFqdns: [validationRecord.fqdn]"),
       "the certificate validation must reference the record's fqdn, or Pulumi can create the listener before ACM has validated",

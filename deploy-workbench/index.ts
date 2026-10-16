@@ -431,9 +431,12 @@ const network = createWorkbenchNetwork({ provider });
 //
 // The listener rules that split inference from the admin surface belong to
 // item 9, not this item. The HTTPS listener has a default action because a
-// listener must have one, and it forwards to Bifrost so the gateway is
-// reachable as soon as item 8 registers the task; item 9 adds the oauth2-proxy
-// and inference rules on top. See the design record in `ingress.ts`.
+// listener must have one, and it points at oauth2-proxy, the plan's catch-all:
+// until item 9 adds the inference-prefix rule, that target group has no
+// registered targets, so requests are a 503 rather than reaching Bifrost. The
+// interim state fails closed, and item 8 registering the ECS task cannot expose
+// the Bifrost admin surface ahead of oauth2-proxy. See the design record in
+// `ingress.ts`.
 const ingress = createBifrostIngress({
   provider,
   zone: workbenchZone,

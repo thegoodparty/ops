@@ -22,11 +22,13 @@ import {
  *   Route 53 alias for `bifrost.workbench.goodparty.org`.
  * - Does not own: the path rules that split inference from the admin surface
  *   (item 9). The HTTPS listener has a default action because a listener must
- *   have one; it forwards to Bifrost, the gateway target, so the endpoint is
- *   reachable as soon as item 8 registers the task. Item 9 adds the
- *   `/oauth2/*`, admin-path and inference-prefix rules on top, and is the item
- *   that decides whether the catch-all stays on Bifrost or moves to
- *   oauth2-proxy. Neither target group has targets until item 8.
+ *   have one, and it points at oauth2-proxy, the plan's catch-all, rather than
+ *   at Bifrost. Until item 9 adds the inference-prefix rule that default
+ *   reaches a target group with no registered targets and the request is a
+ *   503, so the interim state fails closed: item 8 registering the ECS task
+ *   cannot expose the Bifrost admin surface before oauth2-proxy is in front of
+ *   it. Item 9 then adds the `/oauth2/*` and admin-path rules to oauth2-proxy
+ *   and the inference-prefix rule to Bifrost, without re-pointing the default.
  *
  * Everything takes the explicit provider this project requires. The workbench
  * stack disables the default provider (`deploy.sh`), so a resource that omits
@@ -106,6 +108,26 @@ export const TARGET_GROUPS: TargetGroupSpec[] = [
  */
 export const TLS_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06";
 
+/**
+ * The ALB's idle timeout.
+ *
+ * AWS's default is 60 seconds, which is far too short for this endpoint. The
+ * ALB fronts a model gateway, and a thinking model can spend minutes before
+ * the first token, during which the connection carries no bytes at all; at 60
+ * seconds the ALB closes it with a 504 before any output arrives. The timeout
+ * has to cover time-to-first-token, not the whole response: once tokens stream
+ * the connection is not idle and the timer resets.
+ *
+ * One hour. `docs/bifrost-gateway.md` names no figure, so this is chosen to
+ * exceed any realistic time-to-first-token by an order of magnitude, while
+ * stopping short of the 4000-second ALB maximum, which would hold a dead
+ * connection for over an hour. It also matches the ALB's own `clientKeepAlive`
+ * default of 3600, so the keep-alive cadence and the idle limit are the same
+ * number. If a real request ever approaches it, it is a one-line change and
+ * the maximum is 4000.
+ */
+export const ALB_IDLE_TIMEOUT_SECONDS = 3600;
+
 export const createBifrostIngress = (args: {
   provider: aws.Provider;
   /** The workbench zone, phase 0 item 2; validation and the alias live in it. */
@@ -127,6 +149,8 @@ export const createBifrostIngress = (args: {
       name: BIFROST_ALB_NAME,
       loadBalancerType: "application",
       internal: false,
+      // Sized for a thinking model's time-to-first-token; see the constant.
+      idleTimeout: ALB_IDLE_TIMEOUT_SECONDS,
       securityGroups: [network.albSecurityGroup.id],
       subnets: network.publicSubnetIds,
       tags: { Name: BIFROST_ALB_NAME },
@@ -212,10 +236,14 @@ export const createBifrostIngress = (args: {
   );
 
   /**
-   * HTTPS. The default action forwards to Bifrost; the path rules that split
-   * inference from the admin surface are item 9's, and this is the target that
-   * makes the gateway reachable before those rules exist. See the module
-   * comment.
+   * HTTPS. The default action points at oauth2-proxy, the plan's catch-all
+   * ("everything else falls through to oauth2-proxy"), not at Bifrost. This is
+   * deliberately fail-closed: until item 9 adds the inference-prefix rule, the
+   * oauth2-proxy target group has no registered targets, so every request is a
+   * 503 rather than reaching Bifrost. That means item 8 registering the ECS
+   * task cannot put the Bifrost admin surface on the public internet ahead of
+   * oauth2-proxy. Item 9 adds the inference rule to Bifrost and the
+   * `/oauth2/*` and admin-path rules to oauth2-proxy without re-pointing this.
    */
   const httpsListener = new aws.lb.Listener(
     "bifrostHttpsListener",
@@ -228,7 +256,7 @@ export const createBifrostIngress = (args: {
       defaultActions: [
         {
           type: "forward",
-          targetGroupArn: bifrostTargetGroup.arn,
+          targetGroupArn: oauth2ProxyTargetGroup.arn,
         },
       ],
     },
