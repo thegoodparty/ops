@@ -10,6 +10,7 @@ import {
   BIFROST_UPSTREAM_TAG,
   createBifrostRepository,
 } from "./bifrost-image";
+import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 
 /**
@@ -74,14 +75,6 @@ import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
  * which is the same wrong-account create arriving by a different route. The
  * provider refuses to do anything rather than writing to the wrong place.
  */
-/**
- * Named rather than repeated. The provider needs it, and so does the
- * `aws:SourceArn` condition on the logging role's trust policy further down,
- * where a mismatch would not fail loudly: it would just refuse Bedrock the
- * assume and leave an enabled logging configuration writing nothing.
- */
-const REGION = "us-west-2";
-
 /**
  * The role the provider assumes into this account.
  *
@@ -401,6 +394,7 @@ export const bifrostRepositoryUrl = bifrostRepository.repositoryUrl;
 export const bifrostUpstreamImage = `${BIFROST_UPSTREAM_REPOSITORY}:${BIFROST_UPSTREAM_TAG}@${BIFROST_UPSTREAM_DIGEST}`;
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // The ECR repository the derived oauth2-proxy image is built into.
 //
 // The image half of phase 1 item 9 of `docs/bifrost-gateway.md`. The stock
@@ -414,3 +408,13 @@ const oauth2ProxyRepository = createOauth2ProxyRepository({ provider });
 
 /** The push target, for a human reading `pulumi stack output`. */
 export const oauth2ProxyRepositoryUrl = oauth2ProxyRepository.repositoryUrl;
+
+// ---------------------------------------------------------------------------
+// The network the gateway runs in.
+//
+// Phase 1 item 5 of docs/bifrost-gateway.md: the VPC, its public and private
+// subnets, NAT egress, route tables, the DB subnet group and the three
+// security groups. The ALB (item 6), RDS (item 7) and the ECS cluster, task
+// definition and service (item 8) are deliberately not here; each will
+// consume the object returned below, which is why it is bound to a name.
+const network = createWorkbenchNetwork({ provider });

@@ -7,7 +7,9 @@ import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createDelegateSwarmProdRead } from "./components/delegate-swarm-prod-read";
 import { createSheriffGrant } from "./components/sheriff-grant";
+import { createIdentityGroupSyncGrant } from "./components/identity-group-sync-grant";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
+import { createWorkbenchZoneDelegation } from "./components/workbench-zone-delegation";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -50,7 +52,9 @@ export = async () => {
 
   createDelegateSwarmProdRead();
   createSheriffGrant();
+  createIdentityGroupSyncGrant();
   createInfraZoneDelegation();
+  createWorkbenchZoneDelegation();
 
   return {
     webhookUrl: webhook.url,
