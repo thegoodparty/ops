@@ -10,6 +10,7 @@ import {
   BIFROST_UPSTREAM_TAG,
   createBifrostRepository,
 } from "./bifrost-image";
+import { createWorkbenchNetwork } from "./network";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -398,3 +399,13 @@ export const bifrostRepositoryUrl = bifrostRepository.repositoryUrl;
 
 /** The pinned upstream reference the mirror copies from. */
 export const bifrostUpstreamImage = `${BIFROST_UPSTREAM_REPOSITORY}:${BIFROST_UPSTREAM_TAG}@${BIFROST_UPSTREAM_DIGEST}`;
+
+// ---------------------------------------------------------------------------
+// The network the gateway runs in.
+//
+// Phase 1 item 5 of docs/bifrost-gateway.md: the VPC, its public and private
+// subnets, NAT egress, route tables, the DB subnet group and the three
+// security groups. The ALB (item 6), RDS (item 7) and the ECS cluster, task
+// definition and service (item 8) are deliberately not here; each will
+// consume the object returned below, which is why it is bound to a name.
+const network = createWorkbenchNetwork({ provider });
