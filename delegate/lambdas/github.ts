@@ -49,6 +49,16 @@ const DISPATCH_ACTIONS = new Set(["opened", "ready_for_review"]);
 const RE_REVIEW_TRIGGER =
   /^\s*(?:delegate[ \t]+review|\/delegate-review)\s*$/im;
 
+// Asks the bot to weigh the replies in its findings' threads and approve if
+// they answer every finding. Same line-anchoring as the review trigger.
+const RE_RECONSIDER_TRIGGER = /^\s*delegate[ \t]+reconsider\s*$/im;
+
+// A reconsideration can turn a blocked PR into an approved one on the strength
+// of what people wrote, so only a person with write access can ask for one.
+// Bots are excluded even when they have access: an agent that opened the PR
+// must not be able to argue its own findings away.
+const RECONSIDER_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
 const UNAUTHORIZED = { statusCode: 401, body: "unauthorized" };
 const OK = { statusCode: 200, body: "ok" };
 
@@ -82,7 +92,8 @@ type IssueCommentPayload = {
   comment: {
     id: number;
     body: string;
-    user: { login: string };
+    user: { login: string; type?: string };
+    author_association?: string;
   };
   repository: { name: string; full_name: string };
 };
@@ -112,6 +123,23 @@ export const shouldDispatchReReview = (
   if (!p.issue.pull_request) return false;
   if (p.issue.state !== "open") return false;
   if (!RE_REVIEW_TRIGGER.test(p.comment.body ?? "")) return false;
+  if (!REVIEW_REPOS.has(p.repository.name ?? "")) return false;
+  return true;
+};
+
+export const shouldDispatchReconsider = (
+  eventType: string | undefined,
+  payload: unknown,
+): payload is IssueCommentPayload => {
+  if (eventType !== "issue_comment") return false;
+  const p = payload as Partial<IssueCommentPayload>;
+  if (!p?.issue || !p?.comment || !p?.repository) return false;
+  if (p.action !== "created") return false;
+  if (!p.issue.pull_request) return false;
+  if (p.issue.state !== "open") return false;
+  if (!RE_RECONSIDER_TRIGGER.test(p.comment.body ?? "")) return false;
+  if (p.comment.user?.type !== "User") return false;
+  if (!RECONSIDER_ASSOCIATIONS.has(p.comment.author_association ?? "")) return false;
   if (!REVIEW_REPOS.has(p.repository.name ?? "")) return false;
   return true;
 };
@@ -306,6 +334,7 @@ const dispatchReReview = async (
   payload: IssueCommentPayload,
   deliveryId: string | undefined,
   reviewerPrivateKey: string | undefined,
+  mode: "re-review" | "reconsider" = "re-review",
 ) => {
   const { issue, comment } = payload;
   const repoFullName = payload.repository.full_name;
@@ -342,7 +371,7 @@ const dispatchReReview = async (
   <url>${esc(prUrl)}</url>
   <title>${esc(issue.title)}</title>
   <author>${esc(issue.user.login)}</author>
-  <reReview>true</reReview>
+  <reReview>true</reReview>${mode === "reconsider" ? "\n  <reconsider>true</reconsider>" : ""}
   <triggeredBy>${esc(comment.user.login)}</triggeredBy>
 </pr>`,
     metadata: {
@@ -352,6 +381,7 @@ const dispatchReReview = async (
       author: issue.user.login,
       triggeredBy: comment.user.login,
       reReview: "true",
+      ...(mode === "reconsider" ? { reconsider: "true" } : {}),
       reactionRepo: repoFullName,
       reactionCommentId: String(comment.id),
       ...(reactionId !== null ? { reactionId: String(reactionId) } : {}),
@@ -373,7 +403,10 @@ const dispatchReReview = async (
 
   console.log(
     JSON.stringify({
-      event: "github_webhook_re_review_dispatched",
+      event:
+        mode === "reconsider"
+          ? "github_webhook_reconsider_dispatched"
+          : "github_webhook_re_review_dispatched",
       repo: repoFullName,
       prNumber: issue.number,
       triggeredBy: comment.user.login,
@@ -407,6 +440,13 @@ export const handleGithub = async (
   try {
     if (shouldDispatch(eventType, payload)) {
       await dispatchPullRequest(payload, deliveryId);
+    } else if (shouldDispatchReconsider(eventType, payload)) {
+      await dispatchReReview(
+        payload,
+        deliveryId,
+        secrets["REVIEWER_APP_PRIVATE_KEY"],
+        "reconsider",
+      );
     } else if (shouldDispatchReReview(eventType, payload)) {
       await dispatchReReview(
         payload,

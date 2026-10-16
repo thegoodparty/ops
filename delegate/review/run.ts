@@ -3,12 +3,13 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
+import type { z } from "zod";
 import { getAgent, runAgent } from "../framework";
 import { buildRepairPrompt, buildReviewPrompt } from "../agents/pr-reviewer";
 import { promptDiff } from "./prompt-diff";
 import { parseDiffAnchors, placeFindings } from "./anchors";
 import { renderBody, renderFailureBody } from "./body";
-import { buildBundle, priorFindingsFrom } from "./bundle";
+import { buildBundle, priorFindingsFrom, settledFindingsFrom } from "./bundle";
 import { decide } from "./gates";
 import { createGitTool } from "./git-tool";
 import { createGitHub } from "./github";
@@ -102,9 +103,9 @@ export const pathGuardHook = (reviewDir: string): HookCallback => {
 };
 
 // Longer than the worker's wall-clock deadline (45 min) plus teardown.
-const STALE_LOCK_MS = 60 * 60 * 1000;
+export const STALE_LOCK_MS = 60 * 60 * 1000;
 
-const statusForRecord = (
+export const statusForRecord = (
   record: ReviewRecord,
   targetUrl?: string,
 ): { state: "success" | "error"; description: string; targetUrl?: string } => {
@@ -163,6 +164,32 @@ const extractJsonObjects = (text: string): unknown[] => {
     i = text.indexOf("{", i + 1);
   }
   return found;
+};
+
+// A strict parse against any schema, for agents whose output is small enough
+// that one bad field should fail the whole run. The reviewer uses the tolerant
+// parseReviewOutput below instead.
+export const parseAgentOutput = <T>(
+  result: { structuredOutput?: unknown; output: string },
+  schema: z.ZodType<T>,
+): T | { error: string } => {
+  if (result.structuredOutput !== undefined) {
+    const parsed = schema.safeParse(result.structuredOutput);
+    if (parsed.success) return parsed.data;
+    return { error: `agent output failed schema: ${parsed.error.message.slice(0, 500)}` };
+  }
+  const candidates = extractJsonObjects(result.output);
+  if (candidates.length === 0) {
+    return { error: `agent returned no JSON: ${result.output.slice(0, 300)}` };
+  }
+  for (const candidate of [...candidates].reverse()) {
+    const parsed = schema.safeParse(candidate);
+    if (parsed.success) return parsed.data;
+  }
+  const last = schema.safeParse(candidates[candidates.length - 1]);
+  return {
+    error: `agent output failed schema: ${last.success ? "" : last.error.message.slice(0, 500)}`,
+  };
 };
 
 // A tolerant parse of one candidate object. Findings are validated one at a
@@ -265,7 +292,7 @@ export const parseReviewOutput = (
   return best?.parsed ?? { error: `agent output failed schema: ${lastError}` };
 };
 
-const commentUrl = (repo: string, prNumber: number, commentId: number) =>
+export const commentUrl = (repo: string, prNumber: number, commentId: number) =>
   `https://github.com/${repo}/pull/${prNumber}#discussion_r${commentId}`;
 
 export const runReview = async (args: {
@@ -372,7 +399,7 @@ export const runReview = async (args: {
             repo,
             prNumber,
             latestForSha
-              ? `\`${headSha.slice(0, 7)}\` already has a review run (${latestForSha.action}). Each commit is reviewed once; push a new commit, then comment \`delegate review\`.`
+              ? `\`${headSha.slice(0, 7)}\` already has a review run (${latestForSha.action}). Each commit is reviewed once; push a new commit, then comment \`delegate review\`.${latestForSha.action === "commented" ? " To answer a finding instead of changing the code, reply in its thread, then comment \`delegate reconsider\`." : ""}`
               : `\`${headSha.slice(0, 7)}\` has a review run in progress.`,
           )
           .catch((err: unknown) => console.error("already-reviewed comment failed:", err));
@@ -396,13 +423,15 @@ export const runReview = async (args: {
         .catch((err: unknown) => console.error("pending status failed:", err));
     }
 
-    prior = latestCompletedRecord(await store.listRecords(repo, prNumber));
+    const records = await store.listRecords(repo, prNumber);
+    prior = latestCompletedRecord(records);
     bundle = await buildBundle({
       repo,
       prNumber,
       reviewDir,
       github,
       priorFindings: priorFindingsFrom(prior),
+      settledFindings: settledFindingsFrom(records),
     });
   } catch (err) {
     return abort(`could not build review input: ${err instanceof Error ? err.message : String(err)}`);

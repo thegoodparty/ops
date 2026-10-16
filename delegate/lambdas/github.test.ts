@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { shouldDispatch, shouldDispatchReReview } from "./github";
+import { shouldDispatch, shouldDispatchReconsider, shouldDispatchReReview } from "./github";
 
 const prPayload = (repo: string) => ({
   action: "opened",
@@ -62,6 +62,67 @@ describe("REVIEW_REPOS scope", () => {
     assert.equal(shouldDispatch("pull_request", prPayload("not-a-repo")), false);
     assert.equal(
       shouldDispatchReReview("issue_comment", commentPayload("not-a-repo")),
+      false,
+    );
+  });
+});
+
+const reconsiderPayload = (overrides: {
+  body?: string;
+  type?: string;
+  association?: string;
+  repo?: string;
+} = {}) => {
+  const base = commentPayload(overrides.repo ?? "ops");
+  return {
+    ...base,
+    comment: {
+      id: 2,
+      body: overrides.body ?? "delegate reconsider",
+      user: { login: "dev", type: overrides.type ?? "User" },
+      author_association: overrides.association ?? "MEMBER",
+    },
+  };
+};
+
+describe("reconsider trigger", () => {
+  it("dispatches for a person with write access", () => {
+    for (const association of ["OWNER", "MEMBER", "COLLABORATOR"]) {
+      assert.equal(
+        shouldDispatchReconsider("issue_comment", reconsiderPayload({ association })),
+        true,
+      );
+    }
+  });
+
+  it("does not dispatch for outside commenters or bots", () => {
+    for (const association of ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE"]) {
+      assert.equal(
+        shouldDispatchReconsider("issue_comment", reconsiderPayload({ association })),
+        false,
+      );
+    }
+    assert.equal(
+      shouldDispatchReconsider("issue_comment", reconsiderPayload({ type: "Bot" })),
+      false,
+    );
+  });
+
+  it("fires only on its own line and does not also fire a re-review", () => {
+    assert.equal(
+      shouldDispatchReconsider("issue_comment", reconsiderPayload({ body: "please delegate reconsider this" })),
+      false,
+    );
+    assert.equal(
+      shouldDispatchReconsider("issue_comment", reconsiderPayload({ body: "Tests pass.\n\nDelegate Reconsider\n" })),
+      true,
+    );
+    assert.equal(shouldDispatchReReview("issue_comment", reconsiderPayload()), false);
+  });
+
+  it("stays inside the review scope", () => {
+    assert.equal(
+      shouldDispatchReconsider("issue_comment", reconsiderPayload({ repo: "not-a-repo" })),
       false,
     );
   });

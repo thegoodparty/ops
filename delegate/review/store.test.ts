@@ -120,6 +120,21 @@ describe("acquireLock", () => {
     assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/lock");
     assert.equal(captured["IfNoneMatch"], "*");
   });
+
+  it("locks a reconsideration on the run it reconsiders, under a key listRecords skips", async () => {
+    let captured: Record<string, unknown> = {};
+    const fake = {
+      send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        captured = cmd.input;
+        return {};
+      },
+    } as unknown as S3Client;
+
+    const store = createStore(fake);
+    await store.acquireLock("thegoodparty/ops", 42, "bbbbbb", "run-1");
+    assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/reconsider/run-1/lock");
+    assert.equal(captured["IfNoneMatch"], "*");
+  });
 });
 
 describe("releaseLock and lockAcquiredAt", () => {

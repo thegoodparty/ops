@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderBody, renderFailureBody } from "./body";
+import { renderBody, renderFailureBody, renderReconsiderBody } from "./body";
 import type { Decision } from "./gates";
 
 const approveDecision: Decision = { verdict: "approve", action: "approve", gates: [] };
@@ -87,5 +87,41 @@ describe("renderFailureBody", () => {
     const body = renderFailureBody({ runId: "r1", headSha: "abc1234567" });
     assert.ok(!body.includes("invalid_format"));
     assert.ok(!body.includes("uuid"));
+  });
+});
+
+describe("renderReconsiderBody", () => {
+  const args = {
+    verdict: "approve" as const,
+    summary: "Both answers held up against the code.",
+    runId: "00000000-0000-0000-0000-000000000002",
+    reconsideredRunId: "00000000-0000-0000-0000-000000000001",
+    headSha: "abc1234567890def",
+    withdrawn: [{ path: "src/a.ts", line: 3, url: "https://x/1" }],
+    stillOpen: [] as Array<{ path: string; line: number; url?: string }>,
+    droppedCount: 0,
+  };
+
+  it("an approval lists what was withdrawn and names both runs", () => {
+    assert.deepEqual(renderReconsiderBody(args).split("\n\n"), [
+      "**Recommendation: approve**",
+      "Both answers held up against the code.",
+      "Withdrew 1 finding(s) after the replies in their threads:\n- [src/a.ts:3](https://x/1)",
+      "_reconsidered run 00000000-0000-0000-0000-000000000001 · run 00000000-0000-0000-0000-000000000002 · abc1234_",
+    ]);
+  });
+
+  it("says what is still open and how to move it", () => {
+    const body = renderReconsiderBody({
+      ...args,
+      verdict: "comment",
+      withdrawn: [],
+      stillOpen: [{ path: "src/b.ts", line: 9 }],
+      droppedCount: 1,
+    });
+    assert.ok(body.startsWith("**Recommendation: comment**"));
+    assert.ok(body.includes("1 finding(s) still open:\n- src/b.ts:9"));
+    assert.ok(body.includes("comment `delegate reconsider` again"));
+    assert.ok(body.includes("1 finding(s) pointed at files outside the diff"));
   });
 });

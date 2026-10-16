@@ -27,7 +27,9 @@ export interface LoadOptions {
 }
 
 const applyFilters = (records: ReviewRecord[], opts: LoadOptions): ReviewRecord[] => {
-  let result = records;
+  // A reconsideration replays nothing the reviewer produced: its record holds
+  // the original bundle but the decisions of a different agent.
+  let result = records.filter((r) => r.trigger !== "reconsider");
   if (opts.repo) result = result.filter((r) => r.repo === opts.repo);
   if (opts.onlyComplete) result = result.filter((r) => r.output?.status === "complete");
   if (opts.limit !== undefined) result = result.slice(0, opts.limit);

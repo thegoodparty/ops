@@ -1,10 +1,10 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { buildBundle, priorFindingsFrom } from "./bundle";
+import { buildBundle, priorFindingsFrom, settledFindingsFrom } from "./bundle";
 import type { createGitHub } from "./github";
 import type { ReviewRecord } from "./schema";
 
@@ -188,4 +188,30 @@ describe("buildBundle", () => {
 
     assert.deepEqual(bundle.priorFindings, priorFindings);
   });
+});
+
+test("settledFindingsFrom gathers withdrawn findings across records, once each", () => {
+  const settled = (id: string, reason: string) => ({
+    id,
+    path: "a.ts",
+    line: 1,
+    body: "b",
+    category: "bugs" as const,
+    headSha: "s",
+    reason,
+  });
+  const A = "11111111-1111-4111-8111-111111111111";
+  const B = "22222222-2222-4222-8222-222222222222";
+  const records = [
+    { settledFindings: undefined },
+    { settledFindings: [settled(A, "first")] },
+    { settledFindings: [settled(A, "again"), settled(B, "second")] },
+  ] as unknown as ReviewRecord[];
+  assert.deepEqual(
+    settledFindingsFrom(records).map((f) => [f.id, f.reason]),
+    [
+      [A, "first"],
+      [B, "second"],
+    ],
+  );
 });
