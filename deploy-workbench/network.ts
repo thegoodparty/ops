@@ -197,7 +197,17 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {
       subnetId: publicSubnets[0].id,
       tags: { Name: "workbench-nat" },
     },
-    { provider },
+    {
+      provider,
+      // Explicit rather than inferred. A public NAT gateway needs the
+      // internet gateway attached before it can be created, but nothing in
+      // the NAT's own inputs references the IGW, so Pulumi could order the
+      // create the other way and fail. The same ordering matters on destroy:
+      // without this the IGW can be detached while the NAT still exists.
+      // The route tables reference the IGW, but they are created after the
+      // NAT and do not order it.
+      dependsOn: [internetGateway],
+    },
   );
 
   /**

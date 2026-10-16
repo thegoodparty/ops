@@ -10,7 +10,7 @@ import {
   BIFROST_UPSTREAM_TAG,
   createBifrostRepository,
 } from "./bifrost-image";
-import { createWorkbenchNetwork } from "./network";
+import { createWorkbenchNetwork, REGION } from "./network";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -74,14 +74,6 @@ import { createWorkbenchNetwork } from "./network";
  * which is the same wrong-account create arriving by a different route. The
  * provider refuses to do anything rather than writing to the wrong place.
  */
-/**
- * Named rather than repeated. The provider needs it, and so does the
- * `aws:SourceArn` condition on the logging role's trust policy further down,
- * where a mismatch would not fail loudly: it would just refuse Bedrock the
- * assume and leave an enabled logging configuration writing nothing.
- */
-const REGION = "us-west-2";
-
 /**
  * The role the provider assumes into this account.
  *
