@@ -4,8 +4,16 @@ Bifrost OSS has no native OIDC/SSO, so the gateway's dashboard and management
 API are gated by [`oauth2-proxy`](https://oauth2-proxy.github.io/oauth2-proxy/)
 running as a sidecar in the same Fargate task (phase 1 item 9 of
 [`docs/bifrost-gateway.md`](../../docs/bifrost-gateway.md)). This directory
-holds the two sidecar-specific files that belong in review:
+holds the gateway's repo-owned configuration and the two sidecar-specific
+files that belong in review:
 
+- `config.json` — the non-secret Bifrost configuration (phase 2 item 10):
+  providers, client settings and the `governance` block. See
+  "`config.json`" below.
+- `config.test.ts` — the checks that keep `config.json` honest: valid JSON,
+  both providers, every `env.` reference filled by `fill-secrets.sh`, no
+  credential literal, and Bedrock's model list matching
+  `utils/bedrock-models.ts` (the list the task role's IAM is built from).
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
@@ -18,6 +26,60 @@ The ECS task definition, the sidecar container and the ALB routing rules are
 the other half of phase 1 item 9 and land in a later PR. The three
 `OAUTH2_PROXY_*` secrets are written to Secrets Manager out of band (phase 2
 item 11) with `fill-secrets.sh`, never committed; see "Secrets" below.
+
+## `config.json` (phase 2 item 10)
+
+`config.json` is the deployment's declarative Bifrost configuration, authored
+against `transports/config.schema.json` at the pinned upstream tag
+`maximhq/bifrost:v2.3.0` (`deploy-workbench/bifrost-image.ts`), not the docs at
+a later tag. It holds:
+
+- **Providers.** `fireworks`, with its key read from `env.FIREWORKS_API_KEY`
+  and an explicit model allowlist (not `*`), and `bedrock`, whose key carries
+  no credential at all: Bifrost inherits the ECS **task role** through the AWS
+  default credential chain, so `bedrock_key_config` sets only the region. The
+  Bedrock model list is the same set `utils/bedrock-models.ts` derives, which
+  is what the task role's IAM policy enumerates; the test fails if the two
+  drift, because a model in one and not the other is a 404 or an
+  `AccessDenied` at runtime.
+- **Client settings.** Inference auth is enforced
+  (`enforce_auth_on_inference: true`), direct provider keys are refused
+  (`allow_direct_keys: false`), content logging is off with no per-request
+  override, metadata logging is on with an explicit 90-day retention, and the
+  gateway's public origin is the only allowed CORS origin.
+- **Governance.** Admin username/password auth is on, with both values
+  referenced as `env.` names. The `engineering` team, its budget and the first
+  virtual keys are **item 14** and are deliberately absent, not empty: under
+  `source_of_truth: "config.json"` a present-but-empty section would prune
+  rows created later.
+- **`source_of_truth: "config.json"`** for the sections above, so a redeploy
+  converges to the repo instead of preserving UI drift. An omitted section is
+  left alone; an empty one prunes.
+
+**What is injected by env.** No secret is in the file. Every credential is an
+`env.NAME` reference, and the names are exactly the keys
+`fill-secrets.sh` writes: `BIFROST_ENCRYPTION_KEY`,
+`BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD` and `FIREWORKS_API_KEY`
+from `bifrost/gateway`. Bedrock has no entry because its credential is the
+role. `config.test.ts` parses the script's key arrays and fails on a
+reference to any name the script does not populate.
+
+**Not yet wired.** Pulumi storing this file as an SSM SecureString and
+injecting it as `BIFROST_CONFIG`, with the container entrypoint writing it to
+`/app/data/config.json`, is the other half of item 10 and arrives in its own
+PR; it edits the ECS task definition, which
+[#343](https://github.com/thegoodparty/ops/pull/343) currently owns. Two
+things follow from that, and neither is fixed here:
+
+- Nothing reads `config.json` until then, so changing this file alone changes
+  no running gateway.
+- `config_store` and `logs_store` are absent. Their host, port, user and
+  database are Pulumi outputs of `rds.ts`, not secrets, and no env name for
+  them exists yet; the gateway therefore falls back to its local SQLite store
+  until the injection PR adds the Postgres pair (and the task-definition env
+  that carries the non-password half, alongside the `PG_PASSWORD` secret that
+  is already injected). **Do not deploy this file as the gateway's complete
+  configuration.**
 
 ## The image
 

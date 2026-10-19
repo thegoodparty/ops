@@ -1,0 +1,63 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "source_of_truth": "config.json",
+  "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
+  "client": {
+    "enable_logging": true,
+    "disable_content_logging": true,
+    "allow_per_request_content_storage_override": false,
+    "log_retention_days": 90,
+    "enforce_auth_on_inference": true,
+    "allow_direct_keys": false,
+    "allowed_origins": ["https://bifrost.workbench.goodparty.org"]
+  },
+  "providers": {
+    "fireworks": {
+      "keys": [
+        {
+          "name": "fireworks-primary",
+          "value": "env.FIREWORKS_API_KEY",
+          "models": ["accounts/fireworks/models/deepseek-v4p1-flash"],
+          "weight": 1
+        }
+      ]
+    },
+    "bedrock": {
+      "keys": [
+        {
+          "name": "bedrock-task-role",
+          "value": "",
+          "models": [
+            "anthropic.claude-sonnet-5-5",
+            "us.anthropic.claude-sonnet-5-5",
+            "global.anthropic.claude-sonnet-5-5",
+            "anthropic.claude-opus-5-5",
+            "us.anthropic.claude-opus-5-5",
+            "moonshotai.kimi-k3",
+            "us.moonshotai.kimi-k3",
+            "openai.gpt-6.1-sol",
+            "us.openai.gpt-6.1-sol",
+            "anthropic.claude-haiku-5-5",
+            "us.anthropic.claude-haiku-5-5",
+            "xai.grok-4.7",
+            "us.xai.grok-4.7",
+            "zai.glm-5.3",
+            "us.zai.glm-5.3",
+            "deepseek.v3.2"
+          ],
+          "weight": 1,
+          "bedrock_key_config": {
+            "region": "us-west-2"
+          }
+        }
+      ]
+    }
+  },
+  "governance": {
+    "auth_config": {
+      "is_enabled": true,
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD"
+    }
+  }
+}
