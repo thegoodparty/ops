@@ -90,6 +90,31 @@ export const BIFROST_TASK_FAMILY = "bifrost";
 export const BIFROST_CONTAINER_NAME = "bifrost";
 
 /**
+ * The rolling-update bounds, and the one place a default would be wrong.
+ *
+ * ECS's defaults for a REPLICA service are `maximumPercent: 200` and
+ * `minimumHealthyPercent: 100`, which permits the scheduler to start a
+ * replacement task before draining the old one. With `desiredCount: 1` that is
+ * briefly **two** Bifrost processes, and OSS Bifrost is single-node by design:
+ * "One node, because OSS is one node" in `docs/bifrost-gateway.md` records
+ * that OSS keeps provider configs, keys, budgets and usage in memory and does
+ * not read them back from Postgres, which is why upstream does not support
+ * multi-node OSS at all. Two instances would hold divergent in-memory state
+ * against one database, and Bifrost runs its store migrations at startup, so
+ * the pair can also race the schema.
+ *
+ * `minimumHealthyPercent: 0` with `maximumPercent: 100` is the documented
+ * stop-before-start shape: the scheduler may not exceed `desiredCount`, so it
+ * drains the old task before starting the new one. The cost is a short gap
+ * between tasks rather than an overlapping pair, which is the trade the plan
+ * already makes everywhere else — a task replacement is a short outage — and
+ * it is the only shape that keeps the single-node invariant true during a
+ * deploy.
+ */
+export const DEPLOYMENT_MINIMUM_HEALTHY_PERCENT = 0;
+export const DEPLOYMENT_MAXIMUM_PERCENT = 100;
+
+/**
  * The log group. Named beside the delegate's `/aws/ecs/delegate` rather than
  * with it, because this is a different account and a different stack: the two
  * are only reachable separately, and a shared name would imply otherwise.
@@ -569,6 +594,11 @@ export const createBifrostEcs = (args: {
    * with no target registered, which is the safe direction: the ALB's default
    * action still answers 503, and the container cannot fail a health check it
    * is not being asked.
+   *
+   * The deployment percentages are set rather than left to the provider, because
+   * ECS's defaults would run two tasks at once during an update; see the
+   * constants above. This is not autoscaling and not a second task: it caps a
+   * deployment at the one instance OSS Bifrost supports.
    */
   const service = new aws.ecs.Service(
     "bifrostService",
@@ -578,6 +608,13 @@ export const createBifrostEcs = (args: {
       taskDefinition: taskDefinition.arn,
       desiredCount: 1,
       launchType: "FARGATE",
+      // The ECS API calls these `deploymentConfiguration.maximumPercent` and
+      // `minimumHealthyPercent`; the Pulumi provider models them as these two
+      // top-level arguments, and reserves `deploymentConfiguration` for the
+      // deployment *strategy* block (bake time, canary, blue/green). See the
+      // constants above for why they are not the defaults.
+      deploymentMinimumHealthyPercent: DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
+      deploymentMaximumPercent: DEPLOYMENT_MAXIMUM_PERCENT,
       networkConfiguration: {
         subnets: network.privateSubnetIds,
         securityGroups: [network.taskSecurityGroup.id],

@@ -757,10 +757,15 @@ network or a permission can land before the item that creates it.
    `initProcessEnabled`), and the CloudWatch log group.~~ **Done** in
    `deploy-workbench/ecs.ts`. One cluster with container insights; one Fargate
    task definition at 0.5 vCPU / 1 GB, `awsvpc`, x86_64 because the mirror pulls
-   `linux/amd64`; one task, `desiredCount: 1`; the `/aws/ecs/bifrost` log group
-   at 30 days. It consumes item 5's private subnets and task security group and
-   item 7's database secret, and declares neither again. It does **not** yet
-   name a target group; see the load-balancer note below.
+   `linux/amd64`; one task, `desiredCount: 1`, with
+   `minimumHealthyPercent: 0` / `maximumPercent: 100` so a deploy stops the old
+   task before starting the new one rather than briefly running two — ECS's
+   defaults (200/100) permit that overlap, and two OSS Bifrost processes against
+   one database is the multi-node configuration upstream does not support; the
+   `/aws/ecs/bifrost` log group at 30 days. It consumes item 5's private subnets
+   and task security group and item 7's database secret, and declares neither
+   again. It does **not** yet name a target group; see the load-balancer note
+   below.
 
    The task definition is `deploy/components/worker.ts`'s idiom, with two
    deliberate differences. The task role is a separate identity holding only

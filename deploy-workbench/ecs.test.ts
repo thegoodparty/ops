@@ -11,6 +11,8 @@ import {
   BIFROST_LOG_STREAM_PREFIX,
   BIFROST_SERVICE_NAME,
   BIFROST_TASK_FAMILY,
+  DEPLOYMENT_MAXIMUM_PERCENT,
+  DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
   ECS_EXECUTION_MANAGED_POLICY_ARN,
   EXECUTION_ROLE_NAME,
   EXECUTION_SECRET_ACTIONS,
@@ -207,9 +209,19 @@ describe("bifrost ecs", () => {
     // The failure this catches is an edit that "fixes" an AccessDenied by
     // widening to `bedrock:*` or `Resource: "*"`, which is exactly the broad
     // grant the plan rules out.
-    const executionPolicy = executionRoleSecretsPolicyDocument([
+    //
+    // Built with the same three ARN shapes `ecs.ts` grants — the two script-owned
+    // secret name patterns and the exact ARN item 7 returns for the RDS-managed
+    // master password — so the no-wildcard property is exercised over the RDS
+    // ARN too, not only over the two secret references.
+    const rdsSecretArn = `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-1a2b3c4d-5e6f-7890-abcd-ef1234567890`;
+    const executionSecretArns = [
       secretArnPattern(GATEWAY_SECRET_NAME),
-    ]);
+      secretArnPattern(OAUTH2_PROXY_SECRET_NAME),
+      rdsSecretArn,
+    ];
+    const executionPolicy =
+      executionRoleSecretsPolicyDocument(executionSecretArns);
     const taskPolicy = taskRolePolicyDocument(bedrockInvokeResources());
 
     for (const document of [executionPolicy, taskPolicy]) {
@@ -226,16 +238,34 @@ describe("bifrost ecs", () => {
       }
     }
 
-    // The execution role's resources are secret ARNs, and the only wildcard in
-    // one is the six random characters Secrets Manager appends.
-    for (const resource of executionPolicy.Statement.flatMap(
+    // The execution role's resources are the three secret ARNs it grants, in
+    // the shapes the module uses: the two script-owned names carry the six
+    // random characters Secrets Manager appends, wildcarded; the RDS-managed
+    // secret is granted by its exact ARN, which carries no wildcard at all.
+    // Neither shape may acquire a `*`, which is the property being pinned.
+    const executionResources = executionPolicy.Statement.flatMap(
       (statement) => statement.Resource,
-    )) {
+    );
+    assert.deepEqual(executionResources, executionSecretArns);
+    for (const resource of executionResources) {
       assert.match(
         resource,
-        /^arn:aws:secretsmanager:us-west-2:024901689212:secret:.+-\?\?\?\?\?\?$/,
+        /^arn:aws:secretsmanager:us-west-2:024901689212:secret:/,
+        resource,
+      );
+      assert.equal(
+        resource.split("*").length - 1,
+        0,
+        `a secret resource must not carry a wildcard: ${resource}`,
       );
     }
+    // The only wildcard anywhere in these ARNs is the six `?` characters of
+    // the script-owned name patterns; `?` is a single-character glob, not a
+    // rest-of-ARN wildcard, and it is not `*`.
+    for (const resource of executionResources.slice(0, 2)) {
+      assert.match(resource, /-\?\?\?\?\?\?$/, resource);
+    }
+    assert.equal(executionResources[2], rdsSecretArn);
 
     // The task role's are model ARNs. They carry exactly one wildcard, the
     // region, and that is deliberate: the destination set differs per model
@@ -487,6 +517,36 @@ describe("bifrost ecs", () => {
       "the log group name must be resolved through pulumi.all, not read in apply",
     );
     assert.ok(builder.includes("resolvedLogGroupName"));
+  });
+
+  it("stops the old task before starting the new one during a deploy", () => {
+    // ECS defaults are maximumPercent 200 / minimumHealthyPercent 100, which
+    // with desiredCount 1 lets a rolling update run two tasks at once. OSS
+    // Bifrost is single-node (it keeps provider configs, keys, budgets and
+    // usage in memory and does not re-read them) and runs store migrations at
+    // startup, so an overlapping pair is a state divergence and a migration
+    // race, not just double cost.
+    assert.equal(DEPLOYMENT_MINIMUM_HEALTHY_PERCENT, 0);
+    assert.equal(DEPLOYMENT_MAXIMUM_PERCENT, 100);
+
+    // Spelled the way the Pulumi provider spells them: the ECS API's
+    // `deploymentConfiguration` block is the deployment *strategy* in
+    // @pulumi/aws v7, and the two bounds are top-level arguments.
+    const service = resourceBlock("bifrostService");
+    assert.ok(
+      service.includes(
+        "deploymentMinimumHealthyPercent: DEPLOYMENT_MINIMUM_HEALTHY_PERCENT",
+      ),
+      service,
+    );
+    assert.ok(
+      service.includes(
+        "deploymentMaximumPercent: DEPLOYMENT_MAXIMUM_PERCENT",
+      ),
+      service,
+    );
+    // The cap is what makes stop-before-start: never above desiredCount.
+    assert.ok(DEPLOYMENT_MAXIMUM_PERCENT <= 100);
   });
 
   it("is one task, in a cluster with container insights", () => {
