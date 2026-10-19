@@ -749,12 +749,43 @@ network or a permission can land before the item that creates it.
    whose secret ARN is exported as `bifrostDatabaseSecretArn`. It consumes the
    DB subnet group and the task-only security group from item 5, which is not
    touched; the ECS task definition and the read grant on that secret arrive in
-   items 8 and 9, so the database is created and consumed by nothing until then.
-8. Add the ECS cluster, task definition and service, copying the task-definition
-   idiom in `deploy/components/worker.ts` (execution role with the managed
-   ECS policy plus secrets read, a separate task role scoped to the Bedrock
-   model list, `secrets` from Secrets Manager, `awslogs`, `initProcessEnabled`),
-   and the CloudWatch log group.
+   item 8, so the database is created and consumed by nothing until then.
+8. ~~Add the ECS cluster, task definition and service, copying the
+   task-definition idiom in `deploy/components/worker.ts` (execution role with
+   the managed ECS policy plus secrets read, a separate task role scoped to the
+   Bedrock model list, `secrets` from Secrets Manager, `awslogs`,
+   `initProcessEnabled`), and the CloudWatch log group.~~ **Done** in
+   `deploy-workbench/ecs.ts`. One cluster with container insights; one Fargate
+   task definition at 0.5 vCPU / 1 GB, `awsvpc`, x86_64 because the mirror pulls
+   `linux/amd64`; one task, `desiredCount: 1`; the `/aws/ecs/bifrost` log group
+   at 30 days. It consumes item 5's private subnets and task security group,
+   item 6's Bifrost target group and item 7's database secret, and declares
+   none of them again.
+
+   The task definition is `deploy/components/worker.ts`'s idiom, with two
+   deliberate differences. The task role is a separate identity holding only
+   `bedrock:Converse`, `bedrock:ConverseStream`, `bedrock:InvokeModel` and
+   `bedrock:InvokeModelWithResponseStream` on `bedrockInvokeResources()`
+   (`utils/bedrock-models.ts`), where the delegate's task role carries five
+   AWS-managed read policies and wildcard resources, because the gateway is a
+   proxy rather than an agent that explores the account. And the execution
+   role reads three secrets, not one: `bifrost/gateway`, `bifrost/oauth2-proxy`
+   (so item 9 is not also an IAM change) and the RDS-managed master secret,
+   which is the `PG_PASSWORD` item 7 handed over.
+
+   The two secret containers are **not** Pulumi resources. `fill-secrets.sh`
+   created them out of band and they hold real values, so a Pulumi-owned
+   container could be replaced and delete them. The task definition references
+   them by the names and JSON keys that script writes —
+   `bifrost/gateway`'s four into the Bifrost container — and `preview` reads
+   nothing from Secrets Manager at all, which is what keeps it working without
+   `secretsmanager:GetSecretValue`. The three `OAUTH2_PROXY_*` keys are named in
+   the module and read-granted but not injected: the sidecar that consumes them
+   is item 9. `BIFROST_CONFIG` and the rest of the runtime configuration are
+   item 10, so **the container cannot answer `/health` until then** and the
+   target group will report unhealthy in the meantime; the plan's staging, not
+   a defect. Nor does the service receive traffic yet: item 6's HTTPS default
+   action still points at oauth2-proxy, which has no targets until item 9.
 9. Add the oauth2-proxy sidecar to the task definition and the admin/inference
    ALB routing: the `/oauth2/*` and admin-path rules to the oauth2-proxy
    target group on 4180, the inference-prefix rule to the Bifrost target group
