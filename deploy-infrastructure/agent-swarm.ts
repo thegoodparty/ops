@@ -296,7 +296,7 @@ export const createAgentSwarm = (args: {
     "delegateSwarmInstance",
     {
       ami: "ami-0d53cc9bd365ad65b",
-      instanceType: "m6a.xlarge",
+      instanceType: "m6a.2xlarge",
       subnetId: SUBNET_ID,
       vpcSecurityGroupIds: [securityGroup.id],
       iamInstanceProfile: instanceProfile.name,
