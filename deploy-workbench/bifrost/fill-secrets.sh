@@ -162,6 +162,28 @@ file_mode() {
   fi
 }
 
+# A container Pulumi created but never wrote to has no AWSCURRENT version, so
+# get-secret-value reports ResourceNotFoundException for it exactly as it does
+# for a name that does not exist. describe-secret tells the two apart, which is
+# what keeps the first fill from calling create-secret on a name that is
+# already there.
+secret_exists() {
+  local id="$1" err
+  err="$(mktemp)"
+  if aws secretsmanager describe-secret --secret-id "$id" --region "$REGION" \
+      --query ARN --output text >/dev/null 2>"$err"; then
+    rm -f "$err"
+    return 0
+  fi
+  if grep -q ResourceNotFoundException "$err"; then
+    rm -f "$err"
+    return 1
+  fi
+  cat "$err" >&2
+  rm -f "$err"
+  die "Could not describe secret $id, so cannot tell whether it exists."
+}
+
 # A single JSON object per container. Sets CURRENT and CURRENT_EXISTS; a secret
 # Pulumi created with no value, or one that does not exist yet, is `{}`.
 fetch_current() {
@@ -172,8 +194,10 @@ fetch_current() {
     CURRENT_EXISTS=1
   else
     if grep -q ResourceNotFoundException "$err"; then
-      CURRENT_EXISTS=0
+      # No value, not necessarily no container: an empty container is created
+      # by Pulumi (phase 2 item 11) and reports the same error.
       out='{}'
+      if secret_exists "$id"; then CURRENT_EXISTS=1; else CURRENT_EXISTS=0; fi
     else
       cat "$err" >&2
       if grep -q AccessDenied "$err"; then
@@ -301,6 +325,10 @@ collect_human() {
       fi
     else
       if has_current "$key"; then ask "$key" "" "$hint" 1; else ask "$key" "" "$hint" 0; fi
+      # ask() records the value in SUPPLIED; commit() writes WRITE_KEYS. The
+      # env-file branch above enqueues it itself, and so must this one, or a
+      # prompted value is confirmed and then dropped.
+      if is_supplied "$key"; then WRITE_KEYS+=("$key"); fi
     fi
   done
 }
