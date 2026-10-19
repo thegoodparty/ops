@@ -1,7 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { withAdminReserved } from "./components/identity-center";
 import { engineerAccess } from "./components/identity-center/policies";
+import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 
 // `EngineerAccess` has guardrails on, so the document Pulumi serialises is
 // `adminReservedActions` prepended to `engineerAccess`, not the export on its
@@ -77,5 +80,96 @@ describe("EngineerAccess", () => {
         );
       }
     }
+  });
+});
+
+describe("EngineerAccess swarm host recovery", () => {
+  const statement = (sid: string) => {
+    const found = composed.Statement.find((s) => s.Sid === sid);
+    assert.ok(found, `no ${sid} statement`);
+    return found;
+  };
+
+  it("allows reboot, start and stop on infrastructure instances only", () => {
+    const recover = statement("RecoverInfrastructureInstances");
+    assert.equal(recover.Effect, "Allow");
+    assert.deepEqual(asList(recover.Action), [
+      "ec2:RebootInstances",
+      "ec2:StartInstances",
+      "ec2:StopInstances",
+    ]);
+    assert.deepEqual(asList(recover.Resource), [
+      `arn:aws:ec2:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:instance/*`,
+    ]);
+  });
+
+  // The README's `aws ssm start-session --target <id>` names no document, so
+  // the default shell document is the only one it needs.
+  it("allows a shell session on infrastructure instances only", () => {
+    const start = statement("StartInfrastructureShellSessions");
+    assert.equal(start.Effect, "Allow");
+    assert.deepEqual(asList(start.Action), ["ssm:StartSession"]);
+    assert.deepEqual(asList(start.Resource), [
+      `arn:aws:ec2:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:instance/*`,
+      `arn:aws:ssm:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:document/SSM-SessionManagerRunShell`,
+    ]);
+  });
+
+  // `${aws:username}` is absent for an Identity Center role session, so a
+  // session ARN built from it would match nothing. The session-id tag is AWS's
+  // documented method for federated callers.
+  it("lets a caller resume and end only their own sessions", () => {
+    const own = statement("ManageOwnInfrastructureSessions");
+    assert.equal(own.Effect, "Allow");
+    assert.deepEqual(asList(own.Action), [
+      "ssm:ResumeSession",
+      "ssm:TerminateSession",
+    ]);
+    assert.deepEqual(asList(own.Resource), [
+      `arn:aws:ssm:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:session/*`,
+    ]);
+    assert.deepEqual(own.Condition, {
+      StringLike: {
+        "ssm:resourceTag/aws:ssmmessages:session-id": "${aws:userid}*",
+      },
+    });
+  });
+
+  // The set is also assigned in the main account, where production runs. No
+  // statement may reach a session or an instance state change there.
+  it("grants session and instance state actions in no other account", () => {
+    const scoped =
+      /^(ssm:(StartSession|ResumeSession|TerminateSession)|ec2:(RebootInstances|StartInstances|StopInstances))$/;
+    for (const s of composed.Statement) {
+      if (s.Effect !== "Allow") continue;
+      if (!asList(s.Action).some((a) => scoped.test(a))) continue;
+      for (const resource of asList(s.Resource)) {
+        assert.ok(
+          resource.split(":")[4] === INFRASTRUCTURE_ACCOUNT_ID,
+          `${s.Sid ?? "(no Sid)"} reaches ${resource}`
+        );
+      }
+    }
+  });
+
+  it("is not denied by the admin guardrails", () => {
+    const denied = composed.Statement.filter((s) => s.Effect === "Deny")
+      .flatMap((s) => asList(s.Action))
+      .filter((a) => /^(ec2:|ssm:(\*|Start|Resume|Terminate))/.test(a));
+    assert.deepEqual(denied, []);
+  });
+
+  // `accounts` is private to the component, so this reads the source, the
+  // same way identity-center-administrator.test.ts does.
+  it("assigns EngineerAccess to Engineers in the infrastructure account", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "components/identity-center.ts"),
+      "utf8"
+    );
+    const infrastructure = source.match(
+      /infrastructure: \{\s*id: INFRASTRUCTURE_ACCOUNT_ID,[\s\S]*?assignments: \{([\s\S]*?)\}/
+    );
+    assert.ok(infrastructure, "no infrastructure account entry");
+    assert.match(infrastructure[1], /Engineers: \["engineer"\],/);
   });
 });

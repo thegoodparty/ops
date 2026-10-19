@@ -53,20 +53,61 @@ host; the next deploy overwrites them.
 `fill-secrets.sh` is the interactive way to fill the secret from a laptop.
 After a secret change, re-run `up.sh` on the host (or merge any host change).
 
-There is no SSO profile for the infrastructure account yet. Until there is,
-assume `OrganizationAccountAccessRole` from a management admin session; the
-top of `fill-secrets.sh` has the `~/.aws/config` profile
-(`gp-infrastructure`) every command below uses.
+Two `~/.aws/config` profiles reach the account:
+
+- `gp-infrastructure-engineer` (below), for anyone in the Identity Center
+  `Engineers` group. `EngineerAccess` there can open a shell on the host and
+  reboot, stop or start it, which covers recovering a hung host. It cannot
+  write the secret.
+- `gp-infrastructure`, for admins, which assumes
+  `OrganizationAccountAccessRole` from a management admin session. The top of
+  `fill-secrets.sh` has the profile. Every command below that writes the
+  secret uses it.
 
 ## Connect
 
+Add this to `~/.aws/config`, then
+`aws sso login --profile gp-infrastructure-engineer`:
+
+```ini
+[profile gp-infrastructure-engineer]
+sso_session = gp-infrastructure-engineer
+sso_account_id = 394495727159
+sso_role_name = EngineerAccess
+region = us-west-2
+
+[sso-session gp-infrastructure-engineer]
+sso_start_url = https://goodparty.awsapps.com/start
+sso_region = us-west-2
+sso_registration_scopes = sso:account:access
+```
+
 The instance id is the stack output `delegateSwarmInstanceId`
 (`pulumi stack output delegateSwarmInstanceId` in `deploy-infrastructure/`),
-or in the EC2 console of the infrastructure account (us-west-2).
+or:
 
 ```sh
-AWS_PROFILE=gp-infrastructure aws ssm start-session --region us-west-2 --target <instance id>
+AWS_PROFILE=gp-infrastructure-engineer aws ec2 describe-instances --region us-west-2 \
+  --filters Name=tag:Name,Values=delegate-swarm --query 'Reservations[].Instances[].InstanceId' --output text
 ```
+
+Open a shell (needs the Session Manager plugin for the AWS CLI):
+
+```sh
+AWS_PROFILE=gp-infrastructure-engineer aws ssm start-session --region us-west-2 --target <instance id>
+```
+
+If the host is hung and the shell does not connect, reboot it. The data
+volume and the stack come back on their own; `agent-swarm.service` starts
+the stack at boot.
+
+```sh
+AWS_PROFILE=gp-infrastructure-engineer aws ec2 reboot-instances --region us-west-2 --instance-ids <instance id>
+```
+
+If a reboot does not take, `aws ec2 stop-instances` and then
+`aws ec2 start-instances` with the same arguments move it to new hardware.
+The elastic IP stays attached, so DNS does not change.
 
 ## Upgrade agent-swarm
 
