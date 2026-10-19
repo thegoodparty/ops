@@ -1,11 +1,13 @@
 # Google Workspace → IAM Identity Center group sync
 
-> **Status: proposal.** This is a plan only. It describes a Lambda, its
-> configuration, its IAM and its guards, but none of it is built yet. The
-> decisions below were settled in a design review and are recorded as
+> **Status: built through step 3.** The management-account grant, the Google
+> read adapter, the pure diff and guards, and the runtime are all in the repo
+> and tested; the rollout in step 4 -- a dry run against the real group and the
+> reviewed change that flips the first pair to `apply` -- has not happened yet.
+> The decisions below were settled in a design review and are recorded as
 > decisions rather than options; the few things still genuinely open are in
 > "Open questions" at the end and are marked **open**. The steps in
-> "Implementation plan" carry their own status; steps 1 and 2 are `done`.
+> "Implementation plan" carry their own status; steps 1, 2 and 3 are `done`.
 
 The job is small on purpose: one Lambda, on a schedule, that makes one IAM
 Identity Center group a strict mirror of one Google Workspace group. It adds
@@ -169,8 +171,9 @@ that door, and its inline policy is the boundary.
 **Region.** The Identity Store API must be called in the Identity Center home
 region. `deploy-infrastructure/sheriff/identity.ts` uses `us-west-2` with a
 comment that Identity Center is global but the SDK needs a region to pick an
-endpoint; that is the value this job uses too. Confirm the home region matches
-before implementation (**open**).
+endpoint; that is the value this job uses too. The home region is `us-west-2`
+-- confirmed by the engineer when step 3 was built, and the runtime names it in
+one constant (`deploy-infrastructure/group-sync/identity.ts`).
 
 **Google API.** The plan is written against the Admin SDK Directory API
 (`admin.directory.group.member.readonly` and `admin.directory.group.readonly`,
@@ -179,8 +182,10 @@ delegated), because it is the API whose group-member listing carries the
 have enabled. If the organization's Workspace/Cloud Identity edition serves
 group membership only through the Cloud Identity API, the fetch layer changes
 and the rest of this document does not. Which API this org actually uses is
-**open**, and the design keeps the Google read behind a small adapter so the
-choice is one module, not a rewrite.
+still **open**, and the design keeps the Google read behind a small adapter so
+the choice is one module, not a rewrite. Step 3 implements the Admin SDK
+branch in `deploy-infrastructure/group-sync/google.ts`; it is the file to
+change if the answer is Cloud Identity.
 
 ## Configuration
 
@@ -233,13 +238,16 @@ type SyncConfig = {
 };
 ```
 
-The first pair, for concreteness, is the shape the engineer will fill in. The
-target group id is a literal from `deploy/components/identity-center.ts`:
+The first pair is the one the engineer named when step 3 was built: the
+`engineering@goodparty.org` Workspace group mirrors the `Engineers` Identity
+Center group. Its target group id is a literal from
+`deploy/components/identity-center.ts`, and the matching ARN is already in the
+merged grant:
 
 ```ts
 {
   id: "engineers-google",
-  sourceGroupEmail: "engineers@goodparty.org",
+  sourceGroupEmail: "engineering@goodparty.org",
   targetGroupId: "383193a0-7001-70d9-a321-ffe6d8af7378", // Engineers
   mode: "dry-run",
   removalCap: { maxCount: 5, maxFraction: 0.1 },
@@ -248,10 +256,13 @@ target group id is a literal from `deploy/components/identity-center.ts`:
 }
 ```
 
-`Engineers` is used above as a worked example only. The actual first pair is
-whatever group the engineer names, subject to the reserved-target invariant:
-it may not be `Admins` (`88c1b330-a001-707a-06ca-94e289013bf5`) or any future
-sheriff-managed group.
+The id keeps the plan's worked-example shape (`<target>-google`) rather than
+following the source group's spelling: the source is `engineering@` (the
+Workspace group's name) and the target is `Engineers` (the Identity Center
+group's name). The pair ships `dry-run`, per "Rollout"; the cap and the alert
+threshold are still the placeholders of open question 5. Any future pair is
+subject to the reserved-target invariant: it may not be `Admins`
+(`88c1b330-a001-707a-06ca-94e289013bf5`) or any future sheriff-managed group.
 
 ### Where it lives
 
@@ -272,6 +283,13 @@ sheriff-managed group.
   nothing. A test reads `deploy/components/identity-center.ts` and pins the
   `Admins` literal, the way `deploy/sheriff-grant.test.ts` pins it, so the two
   cannot drift silently.
+- **The runtime**: `deploy-infrastructure/group-sync-lambda.ts` (the function,
+  role, SSM parameter, secret, log group, schedule, metric filters and alarms)
+  and `deploy-infrastructure/group-sync/handler.ts`, which is the thin AWS
+  shell around `run.ts` (the algorithm), `identity.ts` (the assumed-role
+  Identity Store calls), `google.ts` (the read adapter's transport),
+  `metrics.ts` and `log.ts`. The tests are
+  `deploy-infrastructure/group-sync-runtime.test.ts`.
 
 The `targetGroupId` is a literal rather than a Pulumi `Output` for the same
 reason `sheriff-grant.ts` records: the group is created out of band, there is
@@ -589,7 +607,10 @@ cannot be code:
    domain-wide delegation for the two read-only scopes above.
 4. Create a dedicated impersonation admin account (not a personal admin
    account) whose only purpose is this delegation, so revoking it is one
-   account.
+   account. Its address is deployment state, not policy: the Lambda reads it
+   from `GOOGLE_IMPERSONATION_EMAIL`, which `deploy-infrastructure` fills from
+   the `googleImpersonationEmail` stack config key. Until the key is set the
+   handler aborts every pair with `source-read-failed` and writes nothing.
 5. Create the service account key, put it in the Secrets Manager secret below,
    and never commit it.
 
@@ -734,6 +755,13 @@ the email, which is called out in the PR body like the `sheriff` one.
 
 ### Tests
 
+The unit tests below live next to the code they exercise:
+`deploy-infrastructure/group-sync.test.ts` for the diff, the guards and the
+read adapter (step 2), `deploy-infrastructure/group-sync-runtime.test.ts` for
+the handler, the algorithm, the Identity Store idempotency and the Lambda's
+role and wiring (step 3). Both are `node --test` via `tsx`, picked up by
+`npm test`.
+
 - **Unit, pure diff.** `node --test` with fixtures for: add only, remove only,
   both, no-op, empty source (all target removed, and the cap must trip on a
   non-empty target), empty target (all added), case and whitespace
@@ -786,11 +814,15 @@ the Lambda's first run is an `AssumeRole` and a missing role is an
       the diff and the incomplete-read abort. No AWS resources, no schedule.
       This is where the correctness of the job lives and it is reviewable
       without any infrastructure. `done`
-- [ ] 3. The runtime in `deploy-infrastructure/group-sync-lambda.ts`: the
+- [x] 3. The runtime in `deploy-infrastructure/group-sync-lambda.ts`: the
       Lambda, its execution role and inline policy, the SSM parameter, the
       secret container, the log group, the EventBridge rule with reserved
       concurrency 1, the metric filters and the three alarms. Every pair ships
-      `dry-run`. `todo`
+      `dry-run`. `done`
+      (The alarms are the dead-man's heartbeat, the failures alarm on
+      `Aborted` and the removal-cap alarm, plus the plan's separate removals
+      alarm per pair, which the rollout leans on. The handler itself lives in
+      `deploy-infrastructure/group-sync/`, beside the step 2 modules.)
 - [ ] 4. The integration test and the rollout: dry-run against the real group,
       review the diff, then the Pulumi change that flips the first pair to
       `apply`. `todo`
@@ -809,7 +841,8 @@ above.
    `deploy-infrastructure/sheriff/identity.ts` uses and the value assumed
    here. Confirm it is the home region before implementation, because calling
    the Identity Store API in the wrong region fails in a way that reads as a
-   permissions problem.
+   permissions problem. **Resolved:** the engineer confirmed `us-west-2` when
+   step 3 was built, and the runtime names it in one constant.
 3. **User display names.** The job only reads group membership, so it has the
    email and not the person's name. Identity Store `CreateUser` needs a
    `DisplayName` and a `Name`. The default is to derive both from the email
@@ -817,21 +850,33 @@ above.
    to group reads only. The alternative is to add
    `admin.directory.user.readonly` and enrich from the Google profile, which
    is a wider scope for a cosmetic field. Which way is a decision, not a
-   default.
+   default. Step 3 implements the derived default
+   (`deriveDisplayName` in `deploy-infrastructure/group-sync/identity.ts`):
+   tokens split on `.`, `_` and `-`, capitalized, with `FamilyName` omitted
+   when the local part is a single token. Nothing is created while the pair is
+   `dry-run`, so the decision can still be revisited before the first apply.
 4. **The integration-test environment.** A scratch group in the existing
    identity store is cheap but not isolated; a dedicated test account is
    isolated but is a new account. Which one is acceptable is open.
 5. **The poll interval and the cap defaults.** The plan uses an interval
    expressed in the config and cap defaults of `maxCount: 5` and
    `maxFraction: 0.1`, with `removalAlertThreshold: 0`. The interval and the
-   numbers are placeholders until the first real group's size is known.
+   numbers are placeholders until the first real group's size is known. Step 3
+   ships the placeholders: a 15-minute interval
+   (`POLL_INTERVAL_SECONDS` in `deploy-infrastructure/group-sync/config.ts`,
+   with the function timeout and every alarm period derived from it) and the
+   plan's cap numbers unchanged. Nothing here is settled by having built it;
+   step 4's dry run is what should settle them.
 6. **SCIM adoption.** If SCIM is adopted later, this job's user creation
    conflicts with it (non-goal 3). The migration is to let SCIM own user
    creation and drop `CreateUser` from this job's role and code, which is a
    deliberate follow-up, not something this plan decides now.
 7. **The first pair's actual source and target.** This plan names no real
    group. The engineer picks the source Google group and the target Identity
-   Center group, subject to the reserved-target invariant.
+   Center group, subject to the reserved-target invariant. **Resolved:** the
+   `engineering@goodparty.org` Workspace group mirrors the `Engineers` Identity
+   Center group (`383193a0-7001-70d9-a321-ffe6d8af7378`), whose ARN is already
+   in the merged grant. The pair ships `dry-run`.
 
 ## Grounding: the files this touches
 
@@ -855,9 +900,14 @@ For a reviewer checking the plan against the repo:
   explicit provider, `aws.ssm.Parameter`/`aws.secretsmanager.Secret` created
   empty, log group, `aws.cloudwatch.EventRule`, `LogMetricFilter` and
   `MetricAlarm` with an SNS topic.
-- `deploy-infrastructure/index.ts` — where `createGroupSync` would be
-  registered, and the `allowedAccountIds` and explicit-provider rules every
-  resource must follow.
+- `deploy-infrastructure/group-sync-lambda.ts` and
+  `deploy-infrastructure/group-sync/` — the runtime step 3 built: the function
+  and its role, policy, parameter, secret, schedule, filters and alarms, plus
+  the handler, the algorithm, the Identity Store adapter and the Google
+  transport.
+- `deploy-infrastructure/index.ts` — where `createGroupSync` is registered,
+  and the `allowedAccountIds` and explicit-provider rules every resource must
+  follow.
 - `utils/accounts.ts` — `MANAGEMENT_ACCOUNT_ID`, `INFRASTRUCTURE_ACCOUNT_ID`,
   `IDENTITY_STORE_ID` and `IDENTITY_STORE_ARN`, which the policy names.
 - `deploy/sheriff-grant.test.ts` and `deploy-infrastructure/sheriff.test.ts` —
