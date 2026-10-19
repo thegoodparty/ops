@@ -120,9 +120,48 @@ describe("acquireLock", () => {
     assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/lock");
     assert.equal(captured["IfNoneMatch"], "*");
   });
+
+  it("uses a named lock key when given one", async () => {
+    let captured: Record<string, unknown> = {};
+    const fake = {
+      send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        captured = cmd.input;
+        return {};
+      },
+    } as unknown as S3Client;
+
+    const store = createStore(fake);
+    await store.acquireLock("thegoodparty/ops", 42, "bbbbbb", "lock-after-77");
+    assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77");
+    assert.equal(captured["IfNoneMatch"], "*");
+  });
 });
 
 describe("releaseLock and lockAcquiredAt", () => {
+  it("releaseLock and lockAcquiredAt address a named lock", async () => {
+    const keys: unknown[] = [];
+    const store = createStore({
+      send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        keys.push(cmd.input.Key);
+        if (cmd.constructor.name === "GetObjectCommand") {
+          return {
+            Body: (async function* () {
+              yield Buffer.from(JSON.stringify({ acquiredAt: "2024-01-01T00:00:00.000Z" }));
+            })(),
+          };
+        }
+        return {};
+      },
+    } as unknown as S3Client);
+    await store.releaseLock("thegoodparty/ops", 42, "bbbbbb", "lock-after-77");
+    const at = await store.lockAcquiredAt("thegoodparty/ops", 42, "bbbbbb", "lock-after-77");
+    assert.deepEqual(keys, [
+      "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77",
+      "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77",
+    ]);
+    assert.equal(at?.toISOString(), "2024-01-01T00:00:00.000Z");
+  });
+
   it("releaseLock deletes the lock key", async () => {
     const calls: Array<{ name: string; input: Record<string, unknown> }> = [];
     const store = createStore({
@@ -244,13 +283,14 @@ describe("listRecords", () => {
     assert.equal(records[1].finishedAt, "2024-01-02T00:01:00.000Z");
   });
 
-  it("skips keys ending in /lock", async () => {
+  it("skips lock keys", async () => {
     const fake = {
       send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
         if (cmd.constructor.name === "ListObjectsV2Command") {
           return {
             Contents: [
               { Key: "reviews/thegoodparty/ops/42/bbbbbb/lock" },
+              { Key: "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77" },
             ],
             NextContinuationToken: undefined,
           };

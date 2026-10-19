@@ -296,10 +296,11 @@ export const runReview = async (args: {
   // back when this run holds it: nothing was reviewed, so the next
   // `delegate review` must be able to run.
   let holdsLock = false;
+  let lockName: string | undefined;
   const abort = async (reason: string) => {
     console.error(`review aborted: ${reason}`);
     if (holdsLock) {
-      await store.releaseLock(repo, prNumber, headSha).catch((err: unknown) =>
+      await store.releaseLock(repo, prNumber, headSha, lockName).catch((err: unknown) =>
         console.error("releaseLock failed:", err),
       );
     }
@@ -339,14 +340,62 @@ export const runReview = async (args: {
   // One run per (pr, sha), whoever asked. The lock is the whole gate: a
   // second run would review the same tree twice and could land a second,
   // different verdict on it. A failed run stays failed until the author
-  // pushes. The one exception is a lock with no record behind it that is
-  // older than any run can live: the task died before writing, and the
-  // sha would otherwise be unreviewable forever.
+  // pushes. Two exceptions. A lock with no record behind it that is older
+  // than any run can live: the task died before writing, and the sha would
+  // otherwise be unreviewable forever. And an approval GitHub has since
+  // dismissed (a base retarget, or a human): no verdict stands on the sha,
+  // so a second one cannot contradict it, and nothing short of a push would
+  // otherwise ever clear the gate. Each dismissed review buys exactly one
+  // more run, through its own lock, so concurrent asks still get one run.
+  // That lock goes stale the same way the main one does. A rerun that
+  // writes a record moves latestForSha past the dismissed approval, so a
+  // stale named lock here can only mean its task died before writing.
   let locked = await store.acquireLock(repo, prNumber, headSha);
   if (!locked) {
     const latestForSha = (await store.listRecords(repo, prNumber))
       .filter((r) => r.headSha === headSha)
       .at(-1);
+    if (latestForSha?.action === "approved" && latestForSha.reviewId && trigger === "re-review") {
+      const state = await github
+        .getReviewState(repo, prNumber, latestForSha.reviewId)
+        .catch((err: unknown) => {
+          console.error("getReviewState failed:", err);
+          emit("review_state_unreadable", {
+            repo,
+            pr_number: prNumber,
+            head_sha: headSha,
+            run_id: runId,
+            review_id: latestForSha.reviewId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return undefined;
+        });
+      if (state === "DISMISSED") {
+        const name = `lock-after-${latestForSha.reviewId}`;
+        locked = await store.acquireLock(repo, prNumber, headSha, name);
+        // Stale-lock reclaim for the named lock; the !latestForSha branch
+        // below only ever covers the main lock.
+        if (!locked) {
+          const acquiredAt = await store
+            .lockAcquiredAt(repo, prNumber, headSha, name)
+            .catch(() => undefined);
+          if (acquiredAt && Date.now() - acquiredAt.getTime() > STALE_LOCK_MS) {
+            await store.releaseLock(repo, prNumber, headSha, name).catch(() => undefined);
+            locked = await store.acquireLock(repo, prNumber, headSha, name);
+          }
+        }
+        if (locked) {
+          lockName = name;
+          emit("review_rerun_after_dismissal", {
+            repo,
+            pr_number: prNumber,
+            head_sha: headSha,
+            run_id: runId,
+            review_id: latestForSha.reviewId,
+          });
+        }
+      }
+    }
     if (!latestForSha && trigger === "re-review") {
       const acquiredAt = await store.lockAcquiredAt(repo, prNumber, headSha).catch(() => undefined);
       if (acquiredAt && Date.now() - acquiredAt.getTime() > STALE_LOCK_MS) {

@@ -182,6 +182,12 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     );
   };
 
+  const getReviewState = async (repo: string, prNumber: number, reviewId: number): Promise<string> => {
+    const res = await doFetch("GET", `${BASE_URL}/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}`);
+    const review = (await res.json()) as { state: string };
+    return review.state;
+  };
+
   const listReviewThreads = async (repo: string, prNumber: number) => {
     const [owner, name] = repo.split("/") as [string, string];
 
@@ -296,6 +302,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     postStatus,
     postReview,
     dismissReview,
+    getReviewState,
     listReviewThreads,
     resolveThread,
     unresolveThread,
