@@ -5,6 +5,7 @@ import { createDeployRole, DEPLOY_ROLE_NAME } from "./deploy-role";
 import { createPreviewRole } from "./preview-role";
 import { createAgentSwarm } from "./agent-swarm";
 import { createSheriff } from "./sheriff-lambda";
+import { createGroupSync } from "./group-sync-lambda";
 import { createInfraZone } from "./dns";
 
 /**
@@ -190,3 +191,16 @@ const sheriff = createSheriff({ provider });
 export const sheriffFunctionUrl = sheriff.url;
 export const sheriffSecretArn = sheriff.secret.arn;
 export const sheriffTableName = sheriff.table.name;
+
+// The Google Workspace -> IAM Identity Center group sync, step 3 of
+// docs/google-group-sync.md. One scheduled function, one SSM parameter holding
+// the pair list and the empty secret whose value is filled by hand. It assumes
+// the management-account `identity-group-sync-grant` role from deploy/, which
+// must be applied first: a missing role is an AccessDenied at the first run,
+// not an apply-time error, which is why the plan orders those two steps.
+const groupSync = createGroupSync({ provider });
+
+export const groupSyncFunctionName = groupSync.fn.name;
+export const groupSyncParameterName = groupSync.parameter.name;
+export const groupSyncSecretArn = groupSync.secret.arn;
+export const groupSyncLogGroup = groupSync.logGroup.name;
