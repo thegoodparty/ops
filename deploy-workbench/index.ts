@@ -13,6 +13,7 @@ import {
 import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
+import { createBifrostDatabase } from "./rds";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -448,3 +449,30 @@ export const bifrostHostname = BIFROST_HOSTNAME;
 
 /** The ALB's own DNS name, for a human debugging the alias. */
 export const bifrostAlbDnsName = ingress.loadBalancer.dnsName;
+
+// ---------------------------------------------------------------------------
+// The Postgres instance the gateway keeps its config and request log in.
+//
+// Phase 1 item 7 of docs/bifrost-gateway.md: a private, encrypted, single-AZ
+// RDS Postgres with automated backups, deletion protection, and a master
+// password RDS generates and rotates in Secrets Manager. It consumes the DB
+// subnet group and the task-only security group from item 5 rather than
+// creating either again; those live in `network.ts`, which this item does not
+// touch.
+//
+// Nothing consumes it yet. The ECS task definition's `secrets` injection and
+// its read grant on `bifrostDatabaseSecretArn` are item 8's, and the oauth2
+// admin surface is item 9's, so this item's apply creates an instance and
+// leaves it idle. That is deliberate: the store is the plan's one expensive
+// irreversible resource, and creating it before the task that uses it means a
+// failed first boot is a task problem rather than a database one.
+const database = createBifrostDatabase({ provider, network });
+
+/**
+ * The secret RDS owns, for item 8 to inject and to grant read on. Exported as
+ * an output so `pulumi stack output` can show it without a console hunt.
+ */
+export const bifrostDatabaseSecretArn = database.secretArn;
+
+/** Where Bifrost's `config_store`/`logs_store` will point (item 8). */
+export const bifrostDatabaseEndpoint = database.endpoint;

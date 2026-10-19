@@ -499,14 +499,17 @@ Virtual keys are Bifrost's primary governance entity
 - **Store.** RDS for PostgreSQL, `config_store` and `logs_store` both
   `type: "postgres"` with `ssl_mode: "require"`. The instance is private, in
   the DB subnet group, encrypted at rest, with automated backups enabled and
-  deletion protection on. Master credentials live in Secrets Manager and reach
-  the task as `env.` references.
+  deletion protection on. The master credential is generated, stored and
+  rotated by RDS in Secrets Manager (`manageMasterUserPassword`), never
+  populated by hand, and reaches the task as an `env.` reference.
 - **Availability.** Multi-AZ is the robust choice and protects the database
   against an AZ failure, but it does not make the gateway highly available:
   the OSS app is a single Fargate task, and a task replacement is still a
   short outage. Multi-AZ is therefore a cost/benefit decision rather than an
-  HA claim; single-AZ with good backups is defensible for the inner loop, and
-  Multi-AZ is the safe default if the budget allows.
+  HA claim. **Settled in item 7: single-AZ**, which is defensible for the
+  inner loop; the DB subnet group already spans both private subnets, so
+  `multiAz: true` in `deploy-workbench/rds.ts` is the whole of that change if
+  the budget ever justifies it.
 - **Content.** `client.disable_content_logging: true` on the client, and audit
   every virtual key for `disable_content_logging: false`. Keep
   `client.allow_per_request_content_storage_override` at its default (`false`)
@@ -666,9 +669,15 @@ Review settled most of the earlier questions. What genuinely remains:
   from `Admins` (which needs an Identity Store reader oauth2-proxy does not
   have, so a small job would have to write the file), or move to Verified
   Access, which reads `Admins` natively at roughly $200/month.
-- **RDS size and Multi-AZ.** Single-AZ with backups is defensible for the
-  inner loop; Multi-AZ is the safe default if the budget allows. Also pick the
-  instance class and storage size.
+- ~~**RDS size and Multi-AZ.**~~ Settled in item 7, implemented in
+  `deploy-workbench/rds.ts`: **single-AZ**, `db.t4g.micro`, 20 GiB gp3 (RDS's
+  minimum), no storage autoscaling, 7-day automated backup retention, and a
+  master password RDS manages and rotates in Secrets Manager rather than one
+  a human types. PostgreSQL 16, which is the version upstream's installation
+  guide states as the minimum and the version its own guides run
+  (`postgres:16-alpine`); 17 is documented as supported but never exercised
+  upstream. What remains is not a decision but a test: item 23 rehearses the
+  restore.
 - **Model allowlist and Fireworks pricing.** Which models the fleet is allowed
   to reach, and whether Bifrost's catalog pricing for them is correct. Wrong
   pricing makes the budgets wrong.
@@ -732,8 +741,15 @@ network or a permission can land before the item that creates it.
    DB subnet group and the security groups.
 6. Add the ALB, its target groups and listeners, the ACM certificate and
    validation, and the Route 53 alias, all taking the explicit provider.
-7. Add the RDS Postgres instance, private and encrypted, with automated
-   backups and deletion protection, and its credentials in Secrets Manager.
+7. ~~Add the RDS Postgres instance, private and encrypted, with automated
+   backups and deletion protection, and its credentials in Secrets Manager.~~
+   **Done** in `deploy-workbench/rds.ts`. PostgreSQL 16, single-AZ
+   `db.t4g.micro`, 20 GiB gp3 with autoscaling off, 7-day automated backups,
+   deletion protection, no public access, and the RDS-managed master password
+   whose secret ARN is exported as `bifrostDatabaseSecretArn`. It consumes the
+   DB subnet group and the task-only security group from item 5, which is not
+   touched; the ECS task definition and the read grant on that secret arrive in
+   items 8 and 9, so the database is created and consumed by nothing until then.
 8. Add the ECS cluster, task definition and service, copying the task-definition
    idiom in `deploy/components/worker.ts` (execution role with the managed
    ECS policy plus secrets read, a separate task role scoped to the Bedrock
