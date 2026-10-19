@@ -435,11 +435,19 @@ Four notes for when this is done in a hurry:
   resource is a state problem, the ARN in the function's environment outlives the
   secret, and nothing recreates the value. Rotate by putting a new value, never by
   recreating the container.
-- `put-secret-value` leaves the old key retrievable in the previous version. If
-  the rotation is also a response to exposure, delete that version too, with
-  `aws secretsmanager list-secret-version-ids` and
-  `aws secretsmanager delete-secret-version-id`; the second is immediate and
-  cannot be undone.
+- `put-secret-value` leaves the old key in the previous version, still readable
+  under the `AWSPREVIOUS` label. There is no per-version delete: `aws
+  secretsmanager` has no such operation, and Secrets Manager exposes no call
+  that purges one version on demand. The only handle you have is the label:
+  `aws secretsmanager list-secret-version-ids` lists the versions, and
+  `aws secretsmanager update-secret-version-stage --secret-id
+  identity-group-sync/google-service-account --version-stage AWSPREVIOUS
+  --remove-from-version-id <old-version-id>` strips it from the old one. That
+  leaves the version deprecated and eligible for Secrets Manager to remove, but
+  it does not remove it, and purging every version means deleting the whole
+  secret, which the previous point rules out. The mitigation that actually ends
+  an exposure is on the Google side: delete key A, and the material left in the
+  secret authenticates nothing.
 - Deleting a key that is still the one in the secret breaks every run on the next
   poll, with `source-read-failed` and an `invalid_grant` at the token exchange. If
   it happens, create a key, put it in the secret, and confirm a run.
