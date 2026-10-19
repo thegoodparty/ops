@@ -801,8 +801,9 @@ into the `identity-group-sync/google-service-account` secret by hand (manual
 Google setup step 5); until it is, the read fails closed as
 `source-read-failed` and the heartbeat stays red, which is the designed signal,
 not a rollout step that was skipped. The scratch pair the integration test
-uses also needs its group ARN in the grant, and its ids in the environment
-variables described under "Tests".
+uses is read with the operator's own Identity Store credentials, so it needs
+no change to the production grant; its ids go in the environment variables
+described under "Tests".
 
 ### Tests
 
@@ -855,14 +856,20 @@ role and wiring (step 3). Both are `node --test` via `tsx`, picked up by
   file, which prints a `SKIPPED` line to stderr and a node skip reason unless
   `GROUP_SYNC_INTEGRATION=1`, because it needs credentials CI does not have:
   real Google domain-wide delegation (`GROUP_SYNC_GOOGLE_KEY_FILE`,
-  `GOOGLE_IMPERSONATION_EMAIL`) and AWS credentials that can assume
-  `identity-group-sync-grant` in the management account. It also takes
-  `GROUP_SYNC_SCRATCH_SOURCE_GROUP`, `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID`, the
-  optional `GROUP_SYNC_SCRATCH_ALLOWLIST` and
-  `GROUP_SYNC_SCRATCH_EXPECTED_MEMBER` so an empty scratch group is not
-  silently green. The exact invocation is in the test file's header. It could
-  not be run in the container that wrote it: there is no Google key there and
-  its AWS session cannot assume the management-account grant.
+  `GOOGLE_IMPERSONATION_EMAIL`) and Identity Store credentials in the
+  management account (the ambient chain, or
+  `GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN`). It deliberately does **not**
+  assume `identity-group-sync-grant`: that role trusts only the
+  `identity-group-sync` Lambda role, so a test runner cannot assume it, and the
+  test reads the scratch group with the operator's own permissions instead.
+  That also means the scratch group's ARN does not have to be added to the
+  production grant. It also takes `GROUP_SYNC_SCRATCH_SOURCE_GROUP`,
+  `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID`, the optional
+  `GROUP_SYNC_SCRATCH_ALLOWLIST` and `GROUP_SYNC_SCRATCH_EXPECTED_MEMBER` so an
+  empty scratch group is not silently green. The exact invocation is in the
+  test file's header. It could not be run in the container that wrote it: there
+  is no Google key there and its AWS session has no reach into the management
+  account's identity store.
 - **Test-only IAM.** The assumed role's policy is asserted by a test that pins
   the exact action list and asserts the absence of `DeleteUser`,
   `CreateGroup`, `DeleteGroup` and every `sso:*` action, the way
@@ -940,10 +947,10 @@ above.
    comes from the test's own `SyncPair` id and its scratch target, which the
    integration test asserts cannot collide with a configured pair, so the real
    `engineering@goodparty.org` → `Engineers` pair is never in reach. The
-   scratch group's ARN still has to be in the grant's membership statements
-   ("Adding a pair" is two changes); it is supplied to the test as
-   `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID` rather than added to the production
-   pair list.
+   scratch target is supplied as `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID` rather
+   than added to the production pair list, and the test reads it with the
+   operator's own Identity Store credentials, so the scratch group's ARN does
+   not need to be in the grant either. No IAM change is required to run it.
 5. **The poll interval and the cap defaults.** The plan uses an interval
    expressed in the config and cap defaults of `maxCount: 5` and
    `maxFraction: 0.1`, with `removalAlertThreshold: 0`. The interval and the

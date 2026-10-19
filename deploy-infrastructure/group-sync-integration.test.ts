@@ -24,12 +24,18 @@
  *   `GOOGLE_IMPERSONATION_EMAIL` (default
  *   `svc-identity-group-sync@goodparty.org`, the address the infrastructure
  *   stack now configures). CI has neither.
- * - **Real AWS credentials that can assume `identity-group-sync-grant` in the
- *   management account (333022194791).** The container's own session
- *   (`WorkbenchAccess` in 024901689212) cannot, which is why this test does not
- *   run there either. Nothing here reads a secret or writes to the identity
- *   store; the grant is used for `GetUserId`, `ListGroupMemberships` and the
- *   `groups.get`/`members.list` reads only.
+ * - **Real AWS credentials for the Identity Store in the management account.**
+ *   The operator's ambient chain is used, or a role named by
+ *   `GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN` is assumed first. It is
+ *   deliberately **not** the Lambda's `identity-group-sync-grant`: that role's
+ *   trust admits only the `identity-group-sync` Lambda role in the
+ *   infrastructure account, so no test runner can assume it, and the test
+ *   would fail with AccessDenied however the scratch group is configured. The
+ *   credentials only need `identitystore:GetUserId` and
+ *   `identitystore:ListGroupMemberships` on the scratch group. The container's
+ *   own session (`WorkbenchAccess` in 024901689212) cannot reach what this
+ *   needs, which is why this test does not run there either. Nothing here
+ *   reads a secret or writes to the identity store.
  *
  * ## The scratch pair
  *
@@ -41,12 +47,15 @@
  *
  * - `GROUP_SYNC_SCRATCH_SOURCE_GROUP` — the scratch Google group's address.
  * - `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID` — the scratch Identity Center group
- *   id (its ARN must already be in the grant's membership statements; adding a
- *   pair is two changes, per "Adding a pair").
+ *   id. The test reads it with the operator's own credentials, so it does not
+ *   need the scratch group's ARN added to any production grant.
  * - `GROUP_SYNC_SCRATCH_ALLOWLIST` — optional comma-separated override,
  *   default `@goodparty.org`.
  * - `GROUP_SYNC_SCRATCH_EXPECTED_MEMBER` — optional address that must appear
  *   in the source set, so an empty scratch group is not silently "green".
+ * - `GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN` — optional role to assume for
+ *   the Identity Store calls. Without it the ambient AWS credential chain is
+ *   used (`AWS_PROFILE`, SSO, instance role, ...).
  *
  * Run it with:
  *
@@ -56,6 +65,12 @@
  * GROUP_SYNC_SCRATCH_SOURCE_GROUP=group-sync-test@goodparty.org \
  * GROUP_SYNC_SCRATCH_TARGET_GROUP_ID=<scratch-group-id> \
  *   npx tsx --test deploy-infrastructure/group-sync-integration.test.ts
+ * ```
+ *
+ * To use a management-account role rather than the ambient session, add:
+ *
+ * ```sh
+ * GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN=arn:aws:iam::333022194791:role/<role>
  * ```
  *
  * ## Why it is dry-run only, and how it proves nothing was written
@@ -75,6 +90,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 
+import { IdentitystoreClient } from "@aws-sdk/client-identitystore";
+import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
+
 import {
   RESERVED_TARGET_GROUP_IDS,
   SYNC_PAIRS,
@@ -83,9 +101,10 @@ import {
 } from "./group-sync/config";
 import { createDirectoryClient } from "./group-sync/google";
 import {
-  assumeGrantRole,
   createIdentityDirectory,
-  GROUP_SYNC_GRANT_ROLE_ARN,
+  REGION as IDENTITY_STORE_REGION,
+  type IdentityDirectory,
+  type IdentityStoreClientLike,
 } from "./group-sync/identity";
 import { memoryLogger } from "./group-sync/log";
 import { memoryMetrics } from "./group-sync/metrics";
@@ -114,8 +133,9 @@ const SKIP_REASON =
   `${INTEGRATION_OPT_IN_ENV} is not 1, so the group-sync integration test did ` +
   "not run. It needs real Google domain-wide delegation " +
   "(GROUP_SYNC_GOOGLE_KEY_FILE, GOOGLE_IMPERSONATION_EMAIL) and AWS " +
-  `credentials that can assume ${GROUP_SYNC_GRANT_ROLE_ARN}. See the header ` +
-  "of deploy-infrastructure/group-sync-integration.test.ts.";
+  "credentials with Identity Store reads on the scratch group (ambient, or " +
+  "GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN). See the header of " +
+  "deploy-infrastructure/group-sync-integration.test.ts.";
 
 if (!ENABLED) {
   // Loud on purpose: a silent skip in a long `npm test` run reads as a pass.
@@ -161,13 +181,8 @@ const scratchPair = (): SyncPair => {
   };
 };
 
-/** The live Google read and the grant-scoped Identity Store adapter. */
-const liveDependencies = async (
-  pair: SyncPair,
-): Promise<{
-  directory: DirectoryClient;
-  identity: ReturnType<typeof createIdentityDirectory>;
-}> => {
+/** The live Google read. Needs only the delegated service-account key. */
+const liveGoogleDirectory = async (): Promise<DirectoryClient> => {
   const keyFile = requireEnv(
     "GROUP_SYNC_GOOGLE_KEY_FILE",
     "path to the service-account key JSON with domain-wide delegation",
@@ -176,23 +191,60 @@ const liveDependencies = async (
     process.env.GOOGLE_IMPERSONATION_EMAIL?.trim() ||
     DEFAULT_IMPERSONATION_EMAIL;
 
-  const directory = await createDirectoryClient({
+  return createDirectoryClient({
     keyJson: fs.readFileSync(keyFile, "utf8"),
     impersonationEmail,
   });
-  // The session name is the integration test's own, so CloudTrail separates
-  // these reads from the Lambda's `identity-group-sync` assumes.
-  const client = await assumeGrantRole({
-    sessionName: "identity-group-sync-integration",
-  });
-  return {
-    directory,
-    identity: createIdentityDirectory({
-      client,
-      groupId: pair.targetGroupId,
-    }),
-  };
 };
+
+/**
+ * The Identity Store client the test runs with: the role the operator named,
+ * or the ambient credential chain. Never the Lambda's grant role -- its trust
+ * admits only `identity-group-sync` in the infrastructure account, so a test
+ * runner cannot assume it.
+ */
+const liveIdentityClient = async (): Promise<IdentityStoreClientLike> => {
+  const roleArn = process.env.GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN?.trim();
+  if (!roleArn) {
+    // `AWS_PROFILE`, SSO or whatever the operator's shell already has.
+    return new IdentitystoreClient({ region: IDENTITY_STORE_REGION });
+  }
+
+  const sts = new STSClient({ region: IDENTITY_STORE_REGION });
+  const result = await sts.send(
+    new AssumeRoleCommand({
+      RoleArn: roleArn,
+      // Its own name, so CloudTrail separates these reads from the Lambda's
+      // `identity-group-sync` assumes.
+      RoleSessionName: "identity-group-sync-integration",
+    }),
+  );
+  const credentials = result.Credentials;
+  if (
+    !credentials?.AccessKeyId ||
+    !credentials.SecretAccessKey ||
+    !credentials.SessionToken
+  ) {
+    throw new Error(`AssumeRole ${roleArn} returned no usable credentials`);
+  }
+  return new IdentitystoreClient({
+    region: IDENTITY_STORE_REGION,
+    credentials: {
+      accessKeyId: credentials.AccessKeyId,
+      secretAccessKey: credentials.SecretAccessKey,
+      sessionToken: credentials.SessionToken,
+    },
+  });
+};
+
+/** The scratch target's Identity Store adapter. */
+const liveIdentityDirectory = async (
+  pair: SyncPair,
+): Promise<IdentityDirectory> =>
+  createIdentityDirectory({
+    client: await liveIdentityClient(),
+    groupId: pair.targetGroupId,
+  });
 
 describe(
   "group sync integration against the scratch pair",
@@ -219,7 +271,8 @@ describe(
 
     it("reads the scratch Google group's members, page by page, through real delegation", async () => {
       const pair = scratchPair();
-      const { directory } = await liveDependencies(pair);
+      // Google only: no AWS credential is needed for this property.
+      const directory = await liveGoogleDirectory();
 
       // The raw read, independent of the adapter, so the assertion compares
       // the adapter against Google rather than against itself.
@@ -263,7 +316,8 @@ describe(
 
     it("diffs against the real scratch target, and a dry run writes nothing", async () => {
       const pair = scratchPair();
-      const { directory, identity } = await liveDependencies(pair);
+      const directory = await liveGoogleDirectory();
+      const identity = await liveIdentityDirectory(pair);
 
       const source = await fetchSourceMembers({
         client: directory,
