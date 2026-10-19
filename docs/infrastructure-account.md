@@ -134,7 +134,9 @@ starting the work, not after. Make `who` name the *session*, not the model.
       `AdministratorAccess` in the new account: done (2026-10-07,
       pi-infra-step8). The `accounts` map gains an `infrastructure` entry,
       `namePrefix: "infrastructure-"`, `adopted: false`, `Admins:
-      ["administrator"]` and no `Engineers` entry. This is the human admin
+      ["administrator"]`. `Engineers` hold `EngineerAccess` and
+      `ReadOnlyAccess` here too, the same Identity Center sign-in they have
+      in the main account. `AdministratorAccess` is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in
       — and, now that step 7's cutover made the deploy stack self-referential,
       the break-glass route that does not depend on CI. No grant PR in front of
@@ -192,8 +194,8 @@ starting the work, not after. Make `who` name the *session*, not the model.
       gets a profile for it: done (2026-10-08, pi-infra-step12). The human
       path is Identity Center: a member of `Admins` signs in and picks
       `AdministratorAccess` for `394495727159`, the assignment step 8 created.
-      That is the whole of it, because the only human need today is
-      break-glass and Identity Center already covers it. `gp-pi` gets no AWS
+      Engineers sign in the same way, with `EngineerAccess` or
+      `ReadOnlyAccess`. `gp-pi` gets no AWS
       profile for this account, unlike workbench step 14, where `etc/aws-config`
       in the container ships a `WorkbenchAccess` profile. The reason is the
       boundary this document keeps drawing: this account holds privileged

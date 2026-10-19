@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { withAdminReserved } from "./components/identity-center";
 import { engineerAccess } from "./components/identity-center/policies";
 
@@ -77,5 +79,19 @@ describe("EngineerAccess", () => {
         );
       }
     }
+  });
+
+  // `accounts` is private to the component, so this reads the source, the
+  // same way identity-center-administrator.test.ts does.
+  it("is assigned to Engineers in the infrastructure account, with ReadOnlyAccess", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "components/identity-center.ts"),
+      "utf8"
+    );
+    const infrastructure = source.match(
+      /infrastructure: \{\s*id: INFRASTRUCTURE_ACCOUNT_ID,[\s\S]*?assignments: \{([\s\S]*?)\}/
+    );
+    assert.ok(infrastructure, "no infrastructure account entry");
+    assert.match(infrastructure[1], /Engineers: \["engineer", "readOnly"\],/);
   });
 });

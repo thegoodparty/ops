@@ -243,14 +243,14 @@ const accounts = {
   // there, the apply running as the `pulumi-deploy` role the apply manages, so
   // this assignment is what recovers the account if a bad edit locks CI out.
   //
-  // No Engineers entry yet. The account holds privileged automation, not an
-  // inner loop, and adding a set before there is a job for it gives away the
-  // boundary the account exists for.
+  // Engineers get the same Identity Center sign-in here that they have in the
+  // main account.
   infrastructure: {
     id: INFRASTRUCTURE_ACCOUNT_ID,
     namePrefix: "infrastructure-",
     adopted: false,
     assignments: {
+      Engineers: ["engineer", "readOnly"],
       Admins: ["administrator"],
     },
   },
