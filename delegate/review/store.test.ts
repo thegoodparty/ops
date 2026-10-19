@@ -138,6 +138,30 @@ describe("acquireLock", () => {
 });
 
 describe("releaseLock and lockAcquiredAt", () => {
+  it("releaseLock and lockAcquiredAt address a named lock", async () => {
+    const keys: unknown[] = [];
+    const store = createStore({
+      send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        keys.push(cmd.input.Key);
+        if (cmd.constructor.name === "GetObjectCommand") {
+          return {
+            Body: (async function* () {
+              yield Buffer.from(JSON.stringify({ acquiredAt: "2024-01-01T00:00:00.000Z" }));
+            })(),
+          };
+        }
+        return {};
+      },
+    } as unknown as S3Client);
+    await store.releaseLock("thegoodparty/ops", 42, "bbbbbb", "lock-after-77");
+    const at = await store.lockAcquiredAt("thegoodparty/ops", 42, "bbbbbb", "lock-after-77");
+    assert.deepEqual(keys, [
+      "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77",
+      "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77",
+    ]);
+    assert.equal(at?.toISOString(), "2024-01-01T00:00:00.000Z");
+  });
+
   it("releaseLock deletes the lock key", async () => {
     const calls: Array<{ name: string; input: Record<string, unknown> }> = [];
     const store = createStore({

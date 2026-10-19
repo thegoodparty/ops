@@ -347,6 +347,9 @@ export const runReview = async (args: {
   // so a second one cannot contradict it, and nothing short of a push would
   // otherwise ever clear the gate. Each dismissed review buys exactly one
   // more run, through its own lock, so concurrent asks still get one run.
+  // That lock goes stale the same way the main one does. A rerun that
+  // writes a record moves latestForSha past the dismissed approval, so a
+  // stale named lock here can only mean its task died before writing.
   let locked = await store.acquireLock(repo, prNumber, headSha);
   if (!locked) {
     const latestForSha = (await store.listRecords(repo, prNumber))
@@ -359,6 +362,15 @@ export const runReview = async (args: {
       if (state === "DISMISSED") {
         const name = `lock-after-${latestForSha.reviewId}`;
         locked = await store.acquireLock(repo, prNumber, headSha, name);
+        if (!locked) {
+          const acquiredAt = await store
+            .lockAcquiredAt(repo, prNumber, headSha, name)
+            .catch(() => undefined);
+          if (acquiredAt && Date.now() - acquiredAt.getTime() > STALE_LOCK_MS) {
+            await store.releaseLock(repo, prNumber, headSha, name).catch(() => undefined);
+            locked = await store.acquireLock(repo, prNumber, headSha, name);
+          }
+        }
         if (locked) {
           lockName = name;
           emit("review_lock_reclaimed", {

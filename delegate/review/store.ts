@@ -57,11 +57,12 @@ export const createStore = (client: S3Client = new S3Client({})) => {
   const lockAcquiredAt = async (
     repo: string,
     prNumber: number,
-    headSha: string
+    headSha: string,
+    name?: string
   ): Promise<Date | undefined> => {
     try {
       const res = await client.send(
-        new GetObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+        new GetObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha, name) })
       );
       const parsed = JSON.parse(await readBody(res.Body)) as { acquiredAt?: string };
       return parsed.acquiredAt ? new Date(parsed.acquiredAt) : undefined;
