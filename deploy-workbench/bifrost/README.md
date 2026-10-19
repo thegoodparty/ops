@@ -17,7 +17,7 @@ holds the two sidecar-specific files that belong in review:
 The ECS task definition, the sidecar container and the ALB routing rules are
 the other half of phase 1 item 9 and land in a later PR. The three
 `OAUTH2_PROXY_*` secrets are written to Secrets Manager out of band (phase 2
-item 11), never committed.
+item 11) with `fill-secrets.sh`, never committed; see "Secrets" below.
 
 ## The image
 
@@ -65,3 +65,76 @@ http://127.0.0.1:8080`, the cookie settings, the whitelist domain and the
 redirect URL — follows `agent-swarm/host/docker-compose.yml` and is recorded in
 "Protecting the admin surface" in the plan. The OSS admin username/password
 stays as the second layer inside oauth2-proxy.
+
+## Secrets (phase 2 item 11)
+
+Two Secrets Manager containers in the workbench account. Pulumi creates them
+empty (item 11) and the read grants; `fill-secrets.sh` in this directory writes
+the values out of band, the same way `agent-swarm/fill-secrets.sh` fills
+`DELEGATE_SWARM`. Nothing secret is committed.
+
+| Container | Key | Filled by |
+| --- | --- | --- |
+| `bifrost/gateway` | `BIFROST_ENCRYPTION_KEY` | generated, 32 bytes base64url |
+| | `BIFROST_ADMIN_USERNAME` | generated (`bifrost-admin`), safe to print |
+| | `BIFROST_ADMIN_PASSWORD` | generated, never printed |
+| | `FIREWORKS_API_KEY` | a human |
+| `bifrost/oauth2-proxy` | `OAUTH2_PROXY_COOKIE_SECRET` | generated, 32 bytes base64url |
+| | `OAUTH2_PROXY_CLIENT_ID` | a human, from the Google client above |
+| | `OAUTH2_PROXY_CLIENT_SECRET` | a human, from the Google client above |
+
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are also accepted, from the prompts or
+the env file, but never required: they exist only for the direct providers
+"Provider configuration" in the plan allows to be added later. `VK_*` virtual
+keys are deliberately absent here — they belong to the `engineering` team in
+phase 2 item 14, and their names follow the keys `config.json` declares. The RDS
+master credentials are managed by RDS in its own secret (phase 1 item 7).
+
+Item 8 wires `bifrost/gateway` into the task definition's `secrets` list and
+item 9 wires the three `OAUTH2_PROXY_*` keys. Those names are the seam between
+this script and the task definition, so renaming a container or a key is a
+change to both.
+
+The session has to be able to write Secrets Manager in `024901689212`. The
+account's `WorkbenchAccess` set deliberately has no Secrets Manager write (its
+only secret read is `gp-pi/brave-search`), so use an admin session in that
+account, e.g. a profile for `AdministratorAccess`:
+
+```sh
+# 1. the keys no human has to provide
+AWS_PROFILE=<admin profile> deploy-workbench/bifrost/fill-secrets.sh --generated-only
+
+# 2. the Google pair and the provider key(s), prompted without echo
+AWS_PROFILE=<admin profile> deploy-workbench/bifrost/fill-secrets.sh
+
+# ...or from a mode-600 env file. Values are never taken from argv, which is
+# visible in `ps` and in shell history.
+chmod 600 ~/.bifrost-secrets.env
+$EDITOR ~/.bifrost-secrets.env   # OAUTH2_PROXY_CLIENT_ID=..., FIREWORKS_API_KEY=..., ...
+AWS_PROFILE=<admin profile> deploy-workbench/bifrost/fill-secrets.sh \
+  --env-file ~/.bifrost-secrets.env
+
+# verify: key names only, never values
+AWS_PROFILE=<admin profile> deploy-workbench/bifrost/fill-secrets.sh --check
+```
+
+`--generated-only` leaves the human-supplied keys absent on purpose, exits 0 and
+prints which keys are still unset, so the generated pass can run before the
+Google client exists. `--check` prints the key names present in each container
+and exits 2 if a container is missing. `--force` overwrites the values a run
+supplies: it regenerates the admin password and the cookie secret (which signs
+the admin UI out once), and it does **not** rotate `BIFROST_ENCRYPTION_KEY`
+unless `--rotate-encryption-key` is passed too, because rotating that key
+invalidates every provider key already stored in the config store.
+
+Read the admin username back without exposing anything else:
+
+```sh
+AWS_PROFILE=<admin profile> aws secretsmanager get-secret-value \
+  --secret-id bifrost/gateway --region us-west-2 \
+  --query SecretString --output text | jq -r .BIFROST_ADMIN_USERNAME
+```
+
+Until both Google values are present, `bifrost/oauth2-proxy` holds one of three
+credentials. The task definition must carry all three or none (item 9), so the
+admin surface stays disabled rather than partially configured.
