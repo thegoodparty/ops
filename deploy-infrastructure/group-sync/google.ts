@@ -67,12 +67,17 @@ export type FetchLike = (
   text(): Promise<string>;
 }>;
 
-const base64url = (value: string): string =>
-  Buffer.from(value)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+/**
+ * Unpadded, URL-safe base64 (RFC 7515 `base64url`).
+ *
+ * Takes the bytes themselves, so a caller cannot hand it an already-encoded
+ * string by mistake: `Buffer.from(string)` encodes UTF-8, which re-encodes
+ * base64 text instead of decoding it. The RSA signature is raw binary and goes
+ * through here as a `Buffer`; Node's own `base64url` encoding does the work, so
+ * there is one encoding step and no hand-rolled alphabet.
+ */
+const base64url = (value: Buffer | string): string =>
+  Buffer.from(value).toString("base64url");
 
 /**
  * Parses the secret's JSON into the two fields used, failing loudly on
@@ -132,7 +137,9 @@ export const buildAssertion = (options: {
   const signature = createSign("RSA-SHA256")
     .update(signingInput)
     .sign(options.key.private_key);
-  return `${signingInput}.${base64url(signature.toString("base64"))}`;
+  // The signature is raw bytes: encode it once. Passing its base64 text through
+  // `base64url` would encode it twice and Google would reject every assertion.
+  return `${signingInput}.${base64url(signature)}`;
 };
 
 type MemberPage = {

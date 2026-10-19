@@ -95,6 +95,16 @@ export const parseOverride = (event: unknown): Override | undefined => {
     typeof payload.pairId === "string" && payload.pairId
       ? payload.pairId
       : undefined;
+  // The override is applied per pair (`runSync` matches `pairId`), so one
+  // without a `pairId` cannot mean anything. Refusing it is the difference
+  // between an operator whose run changed nothing and an operator who is told
+  // why: silently ignoring it would look like the cap had been let through.
+  if (payload.overrideRemovalCap === true && !pairId) {
+    throw new SyncAbortError(
+      "invalid-config",
+      "overrideRemovalCap requires a pairId",
+    );
+  }
   return {
     ...(pairId ? { pairId } : {}),
     // Only a `true` is an override. A string "true" or 1 is a mistake, and

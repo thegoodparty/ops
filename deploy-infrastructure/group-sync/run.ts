@@ -517,6 +517,22 @@ export const runSync = async (options: {
   const outcomes: PairOutcome[] = [];
   const seen = new Set<string>();
 
+  // A manual override that names a pair which is not configured would run
+  // nothing and report no outcome, which reads exactly like an override that
+  // was applied. Refuse it instead, so a typo in `pairId` cannot masquerade as
+  // a deliberate large removal.
+  if (
+    options.override?.pairId &&
+    !config.pairs.some((entry) => entry?.id === options.override?.pairId)
+  ) {
+    log("sync.aborted", {
+      pairId: options.override.pairId,
+      reason: "invalid-config",
+      detail: `override names pair ${options.override.pairId}, which is not configured`,
+    });
+    return [];
+  }
+
   /**
    * Records a pair that never ran: its own `Aborted` metric, one audit line,
    * and an outcome the caller can assert on. Shared by the reserved-target and

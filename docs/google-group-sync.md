@@ -469,7 +469,10 @@ total and pure: same inputs, same diff, no clock, no I/O.
     accident; it requires `lambda:InvokeFunction` on the function and is
     recorded in the audit log with the operator's identity from CloudTrail.
     The cap still trips and still alarms; the override only lets that run
-    through.
+    through. It is per pair, so `pairId` is required with it and must name a
+    configured pair: an override that matches nothing is refused with
+    `invalid-config` rather than silently ignored, because an operator who
+    asked for one thing and got nothing must not read that as success.
 - **Reserved target.** Already checked at step 1; re-asserted here so the
   guard is adjacent to the writes it protects.
 

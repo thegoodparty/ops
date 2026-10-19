@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, verify, type KeyObject } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -899,6 +899,53 @@ describe("the invocation", () => {
     assert.equal(parseOverride({ version: "0", source: "aws.events" }), undefined);
   });
 
+  it("refuses an override that names no pair, rather than ignoring it", async () => {
+    // The override is applied per pair, so one without a `pairId` cannot mean
+    // anything. Accepting it and doing nothing would look to the operator like
+    // the cap had been let through.
+    assert.throws(
+      () => parseOverride({ action: "sync", overrideRemovalCap: true }),
+      (err: unknown) =>
+        err instanceof SyncAbortError &&
+        err.reason === "invalid-config" &&
+        /pairId/.test(err.message),
+    );
+
+    const calls: string[] = [];
+    const { deps, log } = handlerDeps({ calls });
+    const outcomes = await handle(
+      { action: "sync", overrideRemovalCap: true },
+      deps,
+    );
+    assert.deepEqual(outcomes, []);
+    assert.deepEqual(calls, []);
+    const aborted = log.events.find((entry) => entry.event === "sync.aborted");
+    assert.equal(aborted?.fields.reason, "invalid-config");
+    assert.match(String(aborted?.fields.detail), /pairId/);
+  });
+
+  it("refuses an override that names a pair which is not configured", async () => {
+    const calls: string[] = [];
+    const metrics = memoryMetrics();
+    const log = memoryLogger();
+    const outcomes = await runSync({
+      config: { pollIntervalSeconds: 900, pairs: [pair({ mode: "dry-run" })] },
+      directory: fakeDirectory({ pages: [{ members: [] }], calls }),
+      identityFor: () => fakeIdentity({ users: {}, memberships: [], calls }),
+      metrics: metrics.metrics,
+      log: log.log,
+      now: () => 0,
+      override: { pairId: "not-a-pair", overrideRemovalCap: true },
+    });
+    // No pair ran, and the run says why instead of reporting success by
+    // omission.
+    assert.deepEqual(outcomes, []);
+    assert.deepEqual(calls, []);
+    const aborted = log.events.find((entry) => entry.event === "sync.aborted");
+    assert.equal(aborted?.fields.reason, "invalid-config");
+    assert.match(String(aborted?.fields.detail), /not-a-pair/);
+  });
+
   it("runs the configured pair from the SSM value, dry-run, with no writes", async () => {
     const calls: string[] = [];
     const metrics = memoryMetrics();
@@ -1104,17 +1151,40 @@ describe("identity adapter", () => {
 // JWT, the token exchange, the pagination and the abort on a non-2xx are real.
 // ---------------------------------------------------------------------------
 
-const serviceAccountKey = (): { json: string; privateKeyPem: string } => {
-  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const serviceAccountKey = (): {
+  json: string;
+  privateKeyPem: string;
+  publicKey: KeyObject;
+} => {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
   const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }) as string;
   return {
     privateKeyPem,
+    publicKey,
     json: JSON.stringify({
       type: "service_account",
       client_email: "identity-group-sync@example.iam.gserviceaccount.com",
       private_key: privateKeyPem,
     }),
   };
+};
+
+/**
+ * Verifies an assertion the way Google does: RS256 over the signing input, with
+ * the public key. A double-encoded signature fails this even though it is a
+ * well-formed JWT, which is why the test is a verification and not a shape
+ * check.
+ */
+const assertionIsSigned = (assertion: string, publicKey: KeyObject): boolean => {
+  const [header, claims, signature] = assertion.split(".");
+  return verify(
+    "RSA-SHA256",
+    Buffer.from(`${header}.${claims}`),
+    publicKey,
+    Buffer.from(signature, "base64url"),
+  );
 };
 
 const response = (status: number, body: unknown) => ({
@@ -1130,15 +1200,21 @@ const response = (status: number, body: unknown) => ({
 
 describe("google adapter", () => {
   it("signs a delegated assertion for exactly the two read scopes", () => {
-    const { json } = serviceAccountKey();
+    const { json, publicKey } = serviceAccountKey();
     const key = parseServiceAccountKey(json);
-    const [header, claims, signature] = buildAssertion({
+    const assertion = buildAssertion({
       key,
       impersonationEmail: "group-sync-admin@goodparty.org",
       nowSeconds: 1_700_000_000,
-    }).split(".");
+    });
+    const [header, claims, signature] = assertion.split(".");
 
-    assert.equal(signature.length > 0, true);
+    // The signature is the raw RSA output, base64url-encoded exactly once:
+    // 256 bytes for a 2048-bit key. The double-encoded regression produced a
+    // ~344-character signature that decodes to base64 text, and Google
+    // rejected every assertion.
+    assert.equal(Buffer.from(signature, "base64url").length, 256);
+    assert.equal(assertionIsSigned(assertion, publicKey), true);
     assert.deepEqual(JSON.parse(Buffer.from(header, "base64url").toString()), {
       alg: "RS256",
       typ: "JWT",
@@ -1167,13 +1243,20 @@ describe("google adapter", () => {
   });
 
   it("reads the group and every member page through the real client", async () => {
-    const { json } = serviceAccountKey();
+    const { json, publicKey } = serviceAccountKey();
     const urls: string[] = [];
     const fetchImpl: FetchLike = async (url, init) => {
       urls.push(url);
       if (url === "https://oauth2.googleapis.com/token") {
         assert.equal(init?.method, "POST");
         assert.match(String(init?.body), /grant_type=/);
+        // The assertion the client actually sends is one Google would accept:
+        // a signature over the header and claims, verifiable with the key.
+        const assertion = new URLSearchParams(String(init?.body)).get(
+          "assertion",
+        );
+        assert.ok(assertion);
+        assert.equal(assertionIsSigned(assertion, publicKey), true);
         return response(200, { access_token: "token-1" });
       }
       assert.equal(init?.headers?.authorization, "Bearer token-1");
