@@ -1,4 +1,4 @@
-# agent-swarm 1.171.0 on delegate-swarm.infra.goodparty.org
+# agent-swarm 2.4.1 on delegate-swarm.infra.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
 # render-env.sh from Secrets Manager:DELEGATE_SWARM; never edit .env by hand.
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
@@ -61,7 +61,7 @@ x-worker-env: &worker-env
   AWS_SDK_LOAD_CONFIG: "1"
 
 x-worker-base: &worker-base
-  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}"
+  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-2.4.1}"
   entrypoint: *agent-entrypoint
   platform: linux/amd64
   stop_grace_period: 60s
@@ -89,7 +89,7 @@ services:
     logging: *logging
 
   api:
-    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.171.0}"
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-2.4.1}"
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024

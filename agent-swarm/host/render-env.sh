@@ -92,7 +92,7 @@ fi
   echo
   echo "# --- static ---"
   cat <<'EOF'
-AGENT_SWARM_VERSION=1.171.0
+AGENT_SWARM_VERSION=2.4.1
 NODE_ENV=production
 HARNESS_PROVIDER=pi
 LEAD_MODEL_OVERRIDE=anthropic/claude-opus-5-5
