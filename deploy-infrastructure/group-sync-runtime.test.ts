@@ -247,6 +247,30 @@ describe("the Lambda's execution role", () => {
     const archive = buildGroupSyncCode();
     assert.deepEqual(Object.keys(await archive.assets), ["handler.js"]);
   });
+
+  it("takes the impersonation admin from the stack config deploy.sh sets", () => {
+    // `googleImpersonationEmail` is deployment state (manual Google setup step
+    // 4 in docs/google-group-sync.md), and unset means every pair aborts with
+    // `source-read-failed`. Pulumi.*.yaml is gitignored, so the value is
+    // declared in deploy.sh the way `providerRoleName` is, and read here into
+    // the environment the handler keys on. Pin both ends so a drift is a
+    // failing test rather than a red heartbeat after a deploy.
+    const lambda = fs.readFileSync(
+      path.resolve(__dirname, "group-sync-lambda.ts"),
+      "utf8",
+    );
+    assert.match(lambda, /get\("googleImpersonationEmail"\)/);
+    assert.match(lambda, /GOOGLE_IMPERSONATION_EMAIL:/);
+
+    const deploy = fs.readFileSync(
+      path.resolve(__dirname, "deploy.sh"),
+      "utf8",
+    );
+    assert.match(
+      deploy,
+      /pulumi config set googleImpersonationEmail svc-identity-group-sync@goodparty\.org/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

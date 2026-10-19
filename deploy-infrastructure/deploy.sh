@@ -72,6 +72,21 @@ export PULUMI_CONFIG_PASSPHRASE
   else
     pulumi config set providerRoleName pulumi-deploy
   fi
+
+  # The dedicated impersonation admin the Google group read delegates to
+  # (manual Google setup step 4 in docs/google-group-sync.md). Deployment
+  # state, not policy: `group-sync-lambda.ts` reads it as
+  # `googleImpersonationEmail` and sets `GOOGLE_IMPERSONATION_EMAIL` on the
+  # function. Until it is set the handler aborts every pair with
+  # `source-read-failed` and writes nothing, so this line is what makes a
+  # first successful run possible.
+  #
+  # Set here rather than in a checked-in `Pulumi.*.yaml`, for the same reason
+  # `providerRoleName` is: that file is local and gitignored (docs/pr-previews.md),
+  # so a value that has to survive into the apply is declared in this script.
+  # The address is engineer-confirmed; if the mailbox differs, this is the one
+  # line to change.
+  pulumi config set googleImpersonationEmail svc-identity-group-sync@goodparty.org
 } 1>&2
 
 if [ "$PREVIEW" = "true" ]; then

@@ -296,10 +296,10 @@ export const createGroupSync = (args: { provider: aws.Provider }) => {
           // rather than duplicated in the handler so the bundle has no `deploy/`
           // dependency.
           GRANT_SESSION_NAME,
-          // The dedicated impersonation admin. `pulumi config set
-          // googleImpersonationEmail <address>` in the infrastructure stack;
-          // until it is set the handler aborts every pair with
-          // `source-read-failed` and writes nothing.
+          // The dedicated impersonation admin. `deploy.sh` sets the
+          // `googleImpersonationEmail` config key for this stack; a value left
+          // empty (a local run that skipped deploy.sh) makes the handler abort
+          // every pair with `source-read-failed` and write nothing.
           GOOGLE_IMPERSONATION_EMAIL:
             new pulumi.Config().get("googleImpersonationEmail") ?? "",
         },
