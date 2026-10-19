@@ -297,10 +297,16 @@ describe(
         allowlist: pair.allowlist,
       });
 
-      const expected = [...new Set(rawEmails)].filter((email) =>
-        isAllowlisted(email, pair.allowlist),
-      );
-      assert.deepEqual(source.emails, expected);
+      // Compare as sets. These are two independent `members.list` calls and
+      // Google documents no ordering guarantee across them, so comparing in
+      // first-seen order would be flaky even when both reads are correct.
+      // Sorting both sides keeps the assertion about membership, not order;
+      // the lengths still catch a duplicate that one side deduped and the
+      // other did not.
+      const expected = [...new Set(rawEmails)]
+        .filter((email) => isAllowlisted(email, pair.allowlist))
+        .sort();
+      assert.deepEqual([...source.emails].sort(), expected);
 
       // Node cannot know the scratch group's intended membership, so it is
       // supplied. Without it, an empty scratch group would make every other
