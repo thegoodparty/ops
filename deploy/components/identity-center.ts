@@ -243,16 +243,14 @@ const accounts = {
   // there, the apply running as the `pulumi-deploy` role the apply manages, so
   // this assignment is what recovers the account if a bad edit locks CI out.
   //
-  // Engineers get EngineerAccess so an on-call engineer can recover the
-  // Delegate swarm host (agent-swarm/README.md) without an admin: a shell
-  // over Session Manager, and reboot, start and stop. Those grants are the
-  // infrastructure-scoped statements at the end of `engineerAccess`.
+  // Engineers get the same Identity Center sign-in here that they have in the
+  // main account.
   infrastructure: {
     id: INFRASTRUCTURE_ACCOUNT_ID,
     namePrefix: "infrastructure-",
     adopted: false,
     assignments: {
-      Engineers: ["engineer"],
+      Engineers: ["engineer", "readOnly"],
       Admins: ["administrator"],
     },
   },

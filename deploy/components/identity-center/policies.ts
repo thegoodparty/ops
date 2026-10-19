@@ -3,10 +3,7 @@
 // parses this field as JSON, so how it serialises does not have to match how
 // AWS stores it.
 
-import {
-  INFRASTRUCTURE_ACCOUNT_ID,
-  WORKBENCH_ACCOUNT_ID,
-} from "../../../utils/accounts";
+import { WORKBENCH_ACCOUNT_ID } from "../../../utils/accounts";
 import { bedrockInvokeResources } from "../../../utils/bedrock-models";
 
 type PolicyValue = string | string[];
@@ -161,49 +158,6 @@ export const engineerAccess: PolicyDocument = {
       Effect: "Allow",
       Action: ["transcribe:*"],
       Resource: "*",
-    },
-    // The three statements below are for recovering the Delegate swarm host
-    // (agent-swarm/README.md) without an admin. Every resource names the
-    // infrastructure account, so they grant nothing in the main account, where
-    // this set is also assigned.
-    {
-      Sid: "RecoverInfrastructureInstances",
-      Effect: "Allow",
-      Action: [
-        "ec2:RebootInstances",
-        "ec2:StartInstances",
-        "ec2:StopInstances",
-      ],
-      Resource: `arn:aws:ec2:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:instance/*`,
-    },
-    {
-      // `aws ssm start-session --target <id>` with no `--document-name`, which
-      // is how the README opens a shell, is authorized against both the
-      // instance and the default shell document. No other session document is
-      // granted, so port forwarding and one-off commands stay with admins.
-      Sid: "StartInfrastructureShellSessions",
-      Effect: "Allow",
-      Action: ["ssm:StartSession"],
-      Resource: [
-        `arn:aws:ec2:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:instance/*`,
-        `arn:aws:ssm:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:document/SSM-SessionManagerRunShell`,
-      ],
-    },
-    {
-      // Only sessions the caller started. A `session/${aws:username}-*`
-      // resource does not work here: `aws:username` is absent for an Identity
-      // Center role session, so the statement would match nothing. AWS's
-      // documented method for federated callers is the session-id tag Session
-      // Manager stamps on every session, which starts with `aws:userid`.
-      Sid: "ManageOwnInfrastructureSessions",
-      Effect: "Allow",
-      Action: ["ssm:ResumeSession", "ssm:TerminateSession"],
-      Resource: `arn:aws:ssm:us-west-2:${INFRASTRUCTURE_ACCOUNT_ID}:session/*`,
-      Condition: {
-        StringLike: {
-          "ssm:resourceTag/aws:ssmmessages:session-id": "${aws:userid}*",
-        },
-      },
     },
   ],
 };

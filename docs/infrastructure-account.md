@@ -134,7 +134,9 @@ starting the work, not after. Make `who` name the *session*, not the model.
       `AdministratorAccess` in the new account: done (2026-10-07,
       pi-infra-step8). The `accounts` map gains an `infrastructure` entry,
       `namePrefix: "infrastructure-"`, `adopted: false`, `Admins:
-      ["administrator"]` and no `Engineers` entry. This is the human admin
+      ["administrator"]`. `Engineers` hold `EngineerAccess` and
+      `ReadOnlyAccess` here too, the same Identity Center sign-in they have
+      in the main account. `AdministratorAccess` is the human admin
       path — the "admin role" a member of the admin group picks at SSO sign-in
       — and, now that step 7's cutover made the deploy stack self-referential,
       the break-glass route that does not depend on CI. No grant PR in front of
@@ -192,13 +194,14 @@ starting the work, not after. Make `who` name the *session*, not the model.
       gets a profile for it: done (2026-10-08, pi-infra-step12). The human
       path is Identity Center: a member of `Admins` signs in and picks
       `AdministratorAccess` for `394495727159`, the assignment step 8 created.
-      That is the whole of it, because the only human need today is
-      break-glass and Identity Center already covers it. `gp-pi` gets no AWS
+      Engineers sign in the same way, with `EngineerAccess` or
+      `ReadOnlyAccess`. `gp-pi` gets no AWS
       profile for this account, unlike workbench step 14, where `etc/aws-config`
       in the container ships a `WorkbenchAccess` profile. The reason is the
       boundary this document keeps drawing: this account holds privileged
-      automation rather than an inner loop. Engineers hold `EngineerAccess`
-      here only to recover the swarm host; see "Human access".
+      automation rather than an inner loop, so an interactive session against
+      it is not something anyone needs yet. If that changes, it is a new
+      profile and a new permission set, and it belongs in a PR of its own.
 
 All twelve steps are done as of 2026-10-08. The open questions below stay
 open as recorded follow-ups rather than phase-one blockers.
@@ -366,49 +369,6 @@ Two things are worth recording about the role, the first because of the SCP:
 The same `pulumiBackendStatements("infrastructure")` helper the other projects
 use, scoped to the `infrastructure` state prefixes only. Do not widen it to the
 bucket.
-
-## Human access
-
-Two Identity Center assignments, both in `deploy/components/identity-center.ts`:
-
-- `Admins` get `AdministratorAccess`. This is the admin path and the
-  break-glass route if a bad deploy role locks CI out (step 8).
-- `Engineers` get `EngineerAccess`, so an on-call engineer can recover the
-  Delegate swarm host (`agent-swarm/README.md`) without an admin. The set is
-  the same one engineers hold in the main account. Its
-  infrastructure-scoped statements, the last three in `engineerAccess`, add
-  `ec2:RebootInstances`, `ec2:StartInstances` and `ec2:StopInstances` on this
-  account's instances, `ssm:StartSession` with the default shell document
-  only, and resume or end of the caller's own sessions. Every resource in
-  those statements names this account, so they grant nothing in the main
-  account. The rest of the set comes along too: `ReadOnlyAccess`, S3 full
-  access, and the `dev`-tag-conditioned grants, which match nothing here
-  because the provider tags everything `Environment: infrastructure`.
-
-A shell on the swarm host is root on it, so it reaches everything the host's
-instance role does, including the `DELEGATE_SWARM` secret and the
-`delegate-swarm-prod-read` role in the main account. That is part of what the
-Engineers assignment hands out.
-
-An engineer opens a session from a laptop with this in `~/.aws/config`:
-
-```ini
-[profile gp-infrastructure-engineer]
-sso_session = gp-infrastructure-engineer
-sso_account_id = 394495727159
-sso_role_name = EngineerAccess
-region = us-west-2
-
-[sso-session gp-infrastructure-engineer]
-sso_start_url = https://goodparty.awsapps.com/start
-sso_region = us-west-2
-sso_registration_scopes = sso:account:access
-```
-
-Then `aws sso login --profile gp-infrastructure-engineer`. The session
-commands are in `agent-swarm/README.md` under "Connect".
-
-`gp-pi` still gets no profile for this account (step 12).
 
 ## The infrastructure SCP
 
