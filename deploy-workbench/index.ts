@@ -489,13 +489,15 @@ export const bifrostDatabaseEndpoint = database.endpoint;
 // the Bedrock model list in `utils/bedrock-models.ts` rather than the
 // delegate's five broad read policies.
 //
-// It consumes item 5's private subnets and task security group, item 6's
-// Bifrost target group and item 7's database secret rather than declaring any
-// of them again. The oauth2-proxy sidecar and the ALB's path rules are item 9;
+// It consumes item 5's private subnets and task security group and item 7's
+// database secret rather than declaring any of them again. The service's
+// load-balancer attachment is item 9's with the routing, because ECS refuses to
+// create a service against a target group that no listener or listener rule
+// references and item 6 attached neither group to a rule; see the note in
+// `ecs.ts`. The oauth2-proxy sidecar and the ALB's path rules are item 9;
 // `BIFROST_CONFIG` and the rest of the runtime configuration are item 10, so
-// the container cannot answer `/health` honestly until then and the target
-// will report unhealthy in the meantime. That is the plan's staging, not a
-// defect in this item.
+// the container cannot answer `/health` honestly until then. That is the plan's
+// staging, not a defect in this item.
 //
 // The two secret containers (`bifrost/gateway`, `bifrost/oauth2-proxy`) are
 // **not** Pulumi resources. They were created out of band by
@@ -507,7 +509,6 @@ export const bifrostDatabaseEndpoint = database.endpoint;
 const ecs = createBifrostEcs({
   provider,
   network,
-  ingress,
   database,
   repositoryUrl: bifrostRepository.repositoryUrl,
 });

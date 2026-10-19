@@ -3,7 +3,6 @@ import * as aws from "@pulumi/aws";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
-import { createBifrostIngress } from "./ingress";
 import { BIFROST_PORT, createWorkbenchNetwork, REGION } from "./network";
 import { BifrostDatabase } from "./rds";
 
@@ -26,6 +25,18 @@ import { BifrostDatabase } from "./rds";
  *   groups or the database. Those are items 5, 6 and 7, and this file consumes
  *   their exports rather than declaring a second copy of any of them. In
  *   particular there is no target group, listener or security group here.
+ * - Does not own: the service's load-balancer attachment, which is why the
+ *   service below has no `loadBalancers` block. ECS refuses to create a
+ *   service against a target group that no listener or listener rule points
+ *   at — `InvalidParameterException: The target group with targetGroupArn ...
+ *   does not have an associated load balancer` — and item 6's HTTPS listener
+ *   deliberately has no rule pointing at the Bifrost group (its default action
+ *   is oauth2-proxy, fail-closed). So the association and the attachment
+ *   arrive together in item 9, with the rules. Registering the service first
+ *   and associating the group later cannot be done: the create fails, it does
+ *   not stage. `ingress.ts`'s note that item 8 registers a target into that
+ *   group predates this constraint; nothing about the task's exposure changes,
+ *   because a group with no rule receives no traffic either way.
  * - Does not own: the `oauth2-proxy` sidecar, the three `OAUTH2_PROXY_*` secret
  *   references, or the listener rules that split inference from the admin
  *   surface. Those are item 9. The execution role's read grant on
@@ -61,18 +72,17 @@ import { BifrostDatabase } from "./rds";
  */
 
 /**
- * The network phase 1 item 5 created, the ingress item 6 created and the
- * database item 7 created. Their modules' return types are the shapes this
- * file consumes, so the three cannot drift from what is passed in.
+ * The network phase 1 item 5 created and the database item 7 created. Their
+ * modules' return types are the shapes this file consumes, so the two cannot
+ * drift from what is passed in.
  */
 type WorkbenchNetwork = ReturnType<typeof createWorkbenchNetwork>;
-type BifrostIngress = ReturnType<typeof createBifrostIngress>;
 
 /**
  * Names. Cluster and service names are account-unique within the region, the
  * task family is what the plan's upgrade procedure increments, and the
- * container name is what the service's `loadBalancers` entry has to agree
- * with — so it is a constant rather than a string in two places.
+ * container name is what the service's future `loadBalancers` entry has to
+ * agree with — so it is a constant rather than a string in two places.
  */
 export const BIFROST_CLUSTER_NAME = "bifrost";
 export const BIFROST_SERVICE_NAME = "bifrost";
@@ -312,7 +322,6 @@ export const taskRolePolicyDocument = (
 export const createBifrostEcs = (args: {
   provider: aws.Provider;
   network: WorkbenchNetwork;
-  ingress: BifrostIngress;
   database: BifrostDatabase;
   /**
    * The mirrored repository's URL, from `bifrost-image.ts`. The tag is
@@ -325,7 +334,7 @@ export const createBifrostEcs = (args: {
    */
   repositoryUrl: pulumi.Input<string>;
 }) => {
-  const { provider, network, ingress, database, repositoryUrl } = args;
+  const { provider, network, database, repositoryUrl } = args;
 
   const imageUri = pulumi.interpolate`${repositoryUrl}:${BIFROST_UPSTREAM_TAG}`;
 
@@ -465,10 +474,20 @@ export const createBifrostEcs = (args: {
    *   the module header for why nothing here reads Secrets Manager.
    * - `AWS_REGION` is set because the Bedrock provider needs a region; the
    *   delegate sets `AWS_DEFAULT_REGION` for the same reason.
+   *
+   * Every value that comes from another resource is put through one `pulumi.all`
+   * *before* the object is built, including `logGroup.name`. An `Output`
+   * interpolated inside an `apply` callback is not resolved for you: the
+   * callback's return value is taken as-is, and `JSON.stringify` on it throws
+   * `Calling [toJSON] on an [Output<T>] is not supported`
+   * (`@pulumi/pulumi/output.js`), which would fail the apply at the task
+   * definition with a message that says nothing about the log group. Listing it
+   * as an input is also what makes the dependency edge real, rather than a
+   * reference the serializer never sees.
    */
   const containerDefinitions = pulumi
-    .all([imageUri, database.secretArn])
-    .apply(([resolvedImage, databaseSecretArn]) => [
+    .all([imageUri, database.secretArn, logGroup.name])
+    .apply(([resolvedImage, databaseSecretArn, resolvedLogGroupName]) => [
       {
         name: BIFROST_CONTAINER_NAME,
         image: resolvedImage,
@@ -496,7 +515,7 @@ export const createBifrostEcs = (args: {
         logConfiguration: {
           logDriver: "awslogs",
           options: {
-            "awslogs-group": logGroup.name,
+            "awslogs-group": resolvedLogGroupName,
             "awslogs-region": REGION,
             "awslogs-stream-prefix": BIFROST_LOG_STREAM_PREFIX,
           },
@@ -539,14 +558,17 @@ export const createBifrostEcs = (args: {
    * 8080 and 4180 from the ALB group only and lets everything out through the
    * NAT; all three are item 5's, and none is re-declared here.
    *
-   * One target group is registered: Bifrost on 8080. The oauth2-proxy group
-   * exists (item 6) but nothing in the task listens on 4180 until item 9 adds
-   * the sidecar, so registering it now would be a permanently unhealthy
-   * target. Note that the ALB's HTTPS default action points at oauth2-proxy
-   * (item 6, deliberately fail-closed), so until item 9 adds the inference
-   * rule this service receives no traffic even though its target is
-   * registered — and that target will report unhealthy until item 10 gives
-   * the container a configuration real enough to answer `/health`.
+   * No `loadBalancers` block, and that is item 6's constraint rather than an
+   * omission. ECS's `CreateService` rejects a target group that no listener or
+   * listener rule references (`InvalidParameterException: The target group with
+   * targetGroupArn ... does not have an associated load balancer`), and item 6
+   * attaches neither group to a routing rule: the HTTPS listener's default
+   * action points at oauth2-proxy, fail-closed, and the inference rule is item
+   * 9. Item 9 adds the rules that associate both groups and, in the same
+   * change, the service's two `loadBalancers` entries. Until then the task runs
+   * with no target registered, which is the safe direction: the ALB's default
+   * action still answers 503, and the container cannot fail a health check it
+   * is not being asked.
    */
   const service = new aws.ecs.Service(
     "bifrostService",
@@ -563,13 +585,6 @@ export const createBifrostEcs = (args: {
         // public IP would be unusable as well as unwanted.
         assignPublicIp: false,
       },
-      loadBalancers: [
-        {
-          targetGroupArn: ingress.bifrostTargetGroup.arn,
-          containerName: BIFROST_CONTAINER_NAME,
-          containerPort: BIFROST_PORT,
-        },
-      ],
       tags: { Name: BIFROST_SERVICE_NAME },
     },
     { provider },

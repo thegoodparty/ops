@@ -378,7 +378,10 @@ describe("bifrost ecs", () => {
       "the container must set initProcessEnabled",
     );
     assert.ok(block.includes('logDriver: "awslogs"'), block);
-    assert.ok(block.includes('"awslogs-group": logGroup.name'), block);
+    // The name is resolved through the surrounding `pulumi.all` rather than
+    // read as an Output inside the `apply` callback; see the dedicated test
+    // below for why that distinction is load-bearing.
+    assert.ok(block.includes('"awslogs-group": resolvedLogGroupName'), block);
     assert.ok(block.includes('"awslogs-region": REGION'), block);
     assert.ok(
       block.includes('"awslogs-stream-prefix": BIFROST_LOG_STREAM_PREFIX'),
@@ -417,18 +420,8 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("registers against item 6's target group rather than a new one", () => {
-    const service = resourceBlock("bifrostService");
-    assert.ok(
-      service.includes("targetGroupArn: ingress.bifrostTargetGroup.arn"),
-      service,
-    );
-    assert.ok(service.includes("containerName: BIFROST_CONTAINER_NAME"));
-    assert.ok(service.includes("containerPort: BIFROST_PORT"));
-    assert.equal(BIFROST_SERVICE_NAME, "bifrost");
-
-    // Nothing in this module creates a target group, a listener, an ALB or a
-    // security group: they already exist, and a second copy would be a target
+  it("declares no target group, listener or security group of its own", () => {
+    // All of them exist in items 5 and 6. A second copy would be a target
     // nothing routes to and a group nothing references.
     for (const forbidden of [
       "new aws.lb.TargetGroup(",
@@ -442,6 +435,58 @@ describe("bifrost ecs", () => {
         `ecs.ts must not declare ${forbidden}`,
       );
     }
+    assert.equal(BIFROST_SERVICE_NAME, "bifrost");
+  });
+
+  it("leaves the load-balancer attachment to item 9, with the reason", () => {
+    // ECS's CreateService rejects a target group that no listener or listener
+    // rule references:
+    //   InvalidParameterException: The target group with targetGroupArn ...
+    //   does not have an associated load balancer.
+    // Item 6 points its only action at oauth2-proxy (fail-closed), so the
+    // Bifrost group is unassociated until item 9 adds the rules. A service
+    // that names it now would fail the apply rather than stage an idle target.
+    const service = resourceBlock("bifrostService");
+    assert.ok(
+      !service.includes("loadBalancers"),
+      "the service must not name a target group no listener references yet",
+    );
+    assert.ok(
+      !ECS_SOURCE.includes("ingress.bifrostTargetGroup"),
+      "ecs.ts must not reference a target group before item 9 associates one",
+    );
+    assert.ok(
+      !ECS_SOURCE.includes('from "./ingress"'),
+      "ecs.ts must not depend on the ingress until item 9 attaches the service",
+    );
+    // And the module must say why, so the next reader does not "fix" it by
+    // adding the block back.
+    assert.ok(ECS_SOURCE.includes("does not have an associated load balancer"));
+    assert.ok(ECS_SOURCE.includes("item 9"));
+
+    // The pieces item 9 will need are already in place: the container name and
+    // port the loadBalancers entry has to agree with.
+    assert.equal(BIFROST_CONTAINER_NAME, "bifrost");
+    assert.equal(BIFROST_PORT, 8080);
+  });
+
+  it("resolves the log group name before building the container", () => {
+    // An Output read inside an `apply` callback is not resolved for you: the
+    // callback's return value is taken as-is and `JSON.stringify` throws
+    // "Calling [toJSON] on an [Output<T>] is not supported", so the apply would
+    // fail at the task definition. The fix is to list it as an input of the
+    // surrounding `pulumi.all`, and this pins that it is not read again
+    // inside the builder.
+    const builder = containerBlock();
+    assert.ok(
+      builder.includes("pulumi\n    .all([imageUri, database.secretArn, logGroup.name])"),
+      builder,
+    );
+    assert.ok(
+      !builder.includes('"awslogs-group": logGroup.name'),
+      "the log group name must be resolved through pulumi.all, not read in apply",
+    );
+    assert.ok(builder.includes("resolvedLogGroupName"));
   });
 
   it("is one task, in a cluster with container insights", () => {
@@ -486,12 +531,12 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("is wired into index.ts with the network, the ingress and the database", () => {
+  it("is wired into index.ts with the network and the database", () => {
     assert.ok(
       INDEX_SOURCE.includes("createBifrostEcs"),
       "index.ts does not create the ECS resources",
     );
-    for (const arg of ["network,", "ingress,", "database,"]) {
+    for (const arg of ["network,", "database,"]) {
       assert.ok(
         INDEX_SOURCE.includes(`  ${arg}`),
         `index.ts does not pass ${arg} to createBifrostEcs`,
@@ -500,6 +545,12 @@ describe("bifrost ecs", () => {
     assert.ok(
       INDEX_SOURCE.includes("repositoryUrl: bifrostRepository.repositoryUrl"),
       "index.ts does not pass the mirrored repository to the task definition",
+    );
+    // The ingress is not threaded in until item 9, when the service gets a
+    // target group a listener actually references.
+    assert.ok(
+      !INDEX_SOURCE.includes("createBifrostEcs({\n  provider,\n  network,\n  ingress,"),
+      "index.ts must not pass the ingress to item 8's compute",
     );
     assert.ok(
       INDEX_SOURCE.includes("export const bifrostLogGroupName"),

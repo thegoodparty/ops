@@ -758,9 +758,9 @@ network or a permission can land before the item that creates it.
    `deploy-workbench/ecs.ts`. One cluster with container insights; one Fargate
    task definition at 0.5 vCPU / 1 GB, `awsvpc`, x86_64 because the mirror pulls
    `linux/amd64`; one task, `desiredCount: 1`; the `/aws/ecs/bifrost` log group
-   at 30 days. It consumes item 5's private subnets and task security group,
-   item 6's Bifrost target group and item 7's database secret, and declares
-   none of them again.
+   at 30 days. It consumes item 5's private subnets and task security group and
+   item 7's database secret, and declares neither again. It does **not** yet
+   name a target group; see the load-balancer note below.
 
    The task definition is `deploy/components/worker.ts`'s idiom, with two
    deliberate differences. The task role is a separate identity holding only
@@ -782,10 +782,24 @@ network or a permission can land before the item that creates it.
    `secretsmanager:GetSecretValue`. The three `OAUTH2_PROXY_*` keys are named in
    the module and read-granted but not injected: the sidecar that consumes them
    is item 9. `BIFROST_CONFIG` and the rest of the runtime configuration are
-   item 10, so **the container cannot answer `/health` until then** and the
-   target group will report unhealthy in the meantime; the plan's staging, not
-   a defect. Nor does the service receive traffic yet: item 6's HTTPS default
-   action still points at oauth2-proxy, which has no targets until item 9.
+   item 10, so **the container cannot answer `/health` until then**; the plan's
+   staging, not a defect.
+
+   The one place this item could not be implemented as written is the
+   service's load-balancer registration, and it is a defect in the sequencing
+   rather than in either item. ECS's `CreateService` rejects a target group
+   that no listener or listener rule references — `InvalidParameterException:
+   The target group with targetGroupArn ... does not have an associated load
+   balancer` — and item 6 attaches neither group to a routing rule: the HTTPS
+   listener's default action points at oauth2-proxy, deliberately fail-closed.
+   So item 8 cannot register against either group, and the plan's "registered
+   against both ALB target groups" cannot hold until the rules exist. The
+   association and the attachment therefore arrive together in item 9, with
+   the rules; meanwhile the task runs with no target registered, which is the
+   safe direction — the ALB's default action answers 503, and a container
+   cannot fail a health check nobody is asking for. `ingress.ts`'s note that
+   item 8 registers a target into the Bifrost group predates this constraint;
+   it is item 9's to correct.
 9. Add the oauth2-proxy sidecar to the task definition and the admin/inference
    ALB routing: the `/oauth2/*` and admin-path rules to the oauth2-proxy
    target group on 4180, the inference-prefix rule to the Bifrost target group
