@@ -5,7 +5,7 @@ import {
   DeleteObjectCommand,
   ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
-import { ReviewRecordSchema, recordKey, lockKey } from "./schema";
+import { ReviewRecordSchema, recordKey, lockKey, isLockKey } from "./schema";
 import type { ReviewRecord } from "./schema";
 
 const BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
@@ -22,13 +22,14 @@ export const createStore = (client: S3Client = new S3Client({})) => {
   const acquireLock = async (
     repo: string,
     prNumber: number,
-    headSha: string
+    headSha: string,
+    name?: string
   ): Promise<boolean> => {
     try {
       await client.send(
         new PutObjectCommand({
           Bucket: BUCKET,
-          Key: lockKey(repo, prNumber, headSha),
+          Key: lockKey(repo, prNumber, headSha, name),
           Body: JSON.stringify({ acquiredAt: new Date().toISOString() }),
           IfNoneMatch: "*",
         })
@@ -42,20 +43,26 @@ export const createStore = (client: S3Client = new S3Client({})) => {
     }
   };
 
-  const releaseLock = async (repo: string, prNumber: number, headSha: string): Promise<void> => {
+  const releaseLock = async (
+    repo: string,
+    prNumber: number,
+    headSha: string,
+    name?: string
+  ): Promise<void> => {
     await client.send(
-      new DeleteObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+      new DeleteObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha, name) })
     );
   };
 
   const lockAcquiredAt = async (
     repo: string,
     prNumber: number,
-    headSha: string
+    headSha: string,
+    name?: string
   ): Promise<Date | undefined> => {
     try {
       const res = await client.send(
-        new GetObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha) })
+        new GetObjectCommand({ Bucket: BUCKET, Key: lockKey(repo, prNumber, headSha, name) })
       );
       const parsed = JSON.parse(await readBody(res.Body)) as { acquiredAt?: string };
       return parsed.acquiredAt ? new Date(parsed.acquiredAt) : undefined;
@@ -97,7 +104,7 @@ export const createStore = (client: S3Client = new S3Client({})) => {
       );
 
       for (const obj of res.Contents ?? []) {
-        if (obj.Key && !obj.Key.endsWith("/lock")) {
+        if (obj.Key && !isLockKey(obj.Key)) {
           keys.push(obj.Key);
         }
       }

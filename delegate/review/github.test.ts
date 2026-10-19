@@ -232,6 +232,16 @@ describe("createGitHub", () => {
     assert.deepEqual(calls[0].body, { message: "Superseded by re-review" });
   });
 
+  it("getReviewState reads one review's state", async () => {
+    const { mockFetch, calls } = createMockFetch([{ status: 200, body: { id: 77, state: "DISMISSED" } }]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    const state = await gh.getReviewState(REPO, PR, 77);
+
+    assert.equal(state, "DISMISSED");
+    assert.equal(calls[0].method, "GET");
+    assert.equal(calls[0].url, `https://api.github.com/repos/${REPO}/pulls/${PR}/reviews/77`);
+  });
+
   it("listReviewThreads sends GraphQL with owner/name split and returns threads", async () => {
     const { mockFetch, calls } = createMockFetch([
       {
