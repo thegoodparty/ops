@@ -358,10 +358,23 @@ export const runReview = async (args: {
     if (latestForSha?.action === "approved" && latestForSha.reviewId && trigger === "re-review") {
       const state = await github
         .getReviewState(repo, prNumber, latestForSha.reviewId)
-        .catch(() => undefined);
+        .catch((err: unknown) => {
+          console.error("getReviewState failed:", err);
+          emit("review_state_unreadable", {
+            repo,
+            pr_number: prNumber,
+            head_sha: headSha,
+            run_id: runId,
+            review_id: latestForSha.reviewId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return undefined;
+        });
       if (state === "DISMISSED") {
         const name = `lock-after-${latestForSha.reviewId}`;
         locked = await store.acquireLock(repo, prNumber, headSha, name);
+        // Stale-lock reclaim for the named lock; the !latestForSha branch
+        // below only ever covers the main lock.
         if (!locked) {
           const acquiredAt = await store
             .lockAcquiredAt(repo, prNumber, headSha, name)
@@ -373,12 +386,12 @@ export const runReview = async (args: {
         }
         if (locked) {
           lockName = name;
-          emit("review_lock_reclaimed", {
+          emit("review_rerun_after_dismissal", {
             repo,
             pr_number: prNumber,
             head_sha: headSha,
             run_id: runId,
-            reason: "approval_dismissed",
+            review_id: latestForSha.reviewId,
           });
         }
       }
