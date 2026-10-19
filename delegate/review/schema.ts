@@ -104,5 +104,7 @@ export type ReviewRecord = z.infer<typeof ReviewRecordSchema>;
 export const recordKey = (repo: string, prNumber: number, headSha: string, runId: string) =>
   `reviews/${repo}/${prNumber}/${headSha}/${runId}.json`;
 
-export const lockKey = (repo: string, prNumber: number, headSha: string) =>
-  `reviews/${repo}/${prNumber}/${headSha}/lock`;
+export const lockKey = (repo: string, prNumber: number, headSha: string, name = "lock") =>
+  `reviews/${repo}/${prNumber}/${headSha}/${name}`;
+
+export const isLockKey = (key: string) => /\/lock(-after-\d+)?$/.test(key);

@@ -120,6 +120,21 @@ describe("acquireLock", () => {
     assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/lock");
     assert.equal(captured["IfNoneMatch"], "*");
   });
+
+  it("uses a named lock key when given one", async () => {
+    let captured: Record<string, unknown> = {};
+    const fake = {
+      send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
+        captured = cmd.input;
+        return {};
+      },
+    } as unknown as S3Client;
+
+    const store = createStore(fake);
+    await store.acquireLock("thegoodparty/ops", 42, "bbbbbb", "lock-after-77");
+    assert.equal(captured["Key"], "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77");
+    assert.equal(captured["IfNoneMatch"], "*");
+  });
 });
 
 describe("releaseLock and lockAcquiredAt", () => {
@@ -244,13 +259,14 @@ describe("listRecords", () => {
     assert.equal(records[1].finishedAt, "2024-01-02T00:01:00.000Z");
   });
 
-  it("skips keys ending in /lock", async () => {
+  it("skips lock keys", async () => {
     const fake = {
       send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
         if (cmd.constructor.name === "ListObjectsV2Command") {
           return {
             Contents: [
               { Key: "reviews/thegoodparty/ops/42/bbbbbb/lock" },
+              { Key: "reviews/thegoodparty/ops/42/bbbbbb/lock-after-77" },
             ],
             NextContinuationToken: undefined,
           };

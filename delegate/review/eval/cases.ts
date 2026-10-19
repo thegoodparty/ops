@@ -6,7 +6,7 @@ import {
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
 import { z } from "zod";
-import { ReviewRecordSchema } from "../schema";
+import { ReviewRecordSchema, isLockKey } from "../schema";
 import type { ReviewRecord } from "../schema";
 
 const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
@@ -68,7 +68,7 @@ const loadFromS3 = async (client: S3Client): Promise<ReviewRecord[]> => {
       }),
     );
     for (const obj of res.Contents ?? []) {
-      if (obj.Key && !obj.Key.endsWith("/lock")) {
+      if (obj.Key && !isLockKey(obj.Key)) {
         keys.push(obj.Key);
       }
     }
