@@ -27,9 +27,10 @@ whose checklist is a status, and only because it merges before step 3 freezes
 plan checklists and moves progress to git/PR history; see decision 11. After
 step 3 the checklist below is the spec, frozen at merge, and a step's status is
 derived from the PRs that name it: a merged PR is `done` with its merge date and
-link as the evidence, an open PR is `doing` with its author and open date, a
-closed unmerged PR puts the step back to `todo`, and a step with no PR is `todo`
-unless an optional ClickUp note says otherwise. That is the same `done (date,
+link as the evidence, an open PR is `doing` with its author and open date, and a
+step with no merged or open PR is `todo`, whether it never had one or its only
+PR was closed unmerged, unless an optional ClickUp note says otherwise. That is
+the same `done (date,
 evidence)` and `doing (who, date)` information the plans carry today, read from
 the place the work already is. This list is not updated after it merges.
 
