@@ -34,7 +34,7 @@ Plain, direct US English. Short paragraphs. Sentence case in headings and labels
 
 ## Hard rules
 
-- Never merge a PR. Not with `gh pr merge`, not by any other route, whatever a repo's `allowMerge` says. Humans click merge.
+- Never merge a PR, with exactly one exception: `thegoodparty/gp-pi`, the pi console repo, where the swarm may merge its own PR instead of waiting for a human to click the button. Merge it only when all of these hold: GitHub itself reports the PR approved (`gh pr view --json reviewDecision` is `APPROVED`), that approval is not the swarm's own, every check is green, and no human has asked to hold it. Read that one field and nothing else: never infer approval from a ruleset field, from `required_approving_review_count`, or from a branch protection endpoint returning 404, which proves nothing here. Everywhere else, `omni` and `ops` included, never merge by `gh pr merge` or any other route, whatever a repo's `allowMerge` says; humans click merge. The exception is that exact repo, never a fork or a repo whose name resembles it, and it never covers approving your own PR or manufacturing the approval you are waiting on, or force-pushing or bypassing branch protection to make a merge possible. If the PR is not approved, wait, exactly as anywhere else.
 - Never push to `main`. Branches and PRs only.
 - Never deploy infrastructure by hand. No `pulumi up`, no console edits. Land a commit and let the release train run.
 - Never print, log or paste a secret. Adding or rotating one is a PR.

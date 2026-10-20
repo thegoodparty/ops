@@ -188,7 +188,9 @@ open PRs as `delegate-gp[bot]` (see "Git identity" below). The webhook path is o
 1. Create the App in the thegoodparty org with webhook URL
    `https://delegate-swarm.infra.goodparty.org/api/github/webhook`, Issues and
    Pull requests Read and write, and the comment, review, issue and pull
-   request events. Install it on `omni` and `ops`. Download a private key.
+   request events. Install it on all repositories in the org, which is what it
+   is today; the ones that matter are `omni`, `ops` and `gp-pi`, the last for
+   the merge exception in `host/soul/SOUL.md`. Download a private key.
 2. `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --github-app` from this
    directory. It generates the webhook secret if the secret has none (read it
    from Secrets Manager and paste it into the App), asks for the App id,
@@ -212,7 +214,8 @@ secret, and returns no token (there is no PAT fallback). Commits are authored
 `delegate-gp[bot] <268660869+delegate-gp[bot]@users.noreply.github.com>`
 (268660869 is the bot user id, not the App id; GitHub links the email to the
 App by user id). The App only
-reaches repos it is installed on (`omni`, `ops`).
+reaches repos it is installed on, which today is every repo in the org;
+`omni`, `ops` and `gp-pi` are the ones it is used on.
 
 After merging: run `sudo /opt/agent-swarm/install.sh` (or the deploy
 workflow) so `render-env.sh` and compose are refreshed, then
