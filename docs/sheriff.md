@@ -27,17 +27,38 @@ and that decision is recorded.
 
 ## Progress
 
-One step at a time, one pull request per step. Statuses are `todo`,
-`doing (who, date)`, and `done (date, evidence)`. Steps 2 through 5 are done;
-step 1 remains `todo`. Make `who` name the session, not the model.
+One step at a time, one pull request per step. This document is a spec, frozen
+when it merged, and a step's status is derived from the pull requests that name
+it rather than written here; the convention is spelled out under "Progress"
+in [`workbench-account.md`](./workbench-account.md) and decided in decision 11
+of [`plan-gated-merges.md`](./plan-gated-merges.md). A merged PR naming the step
+is `done`, with its merge date and a link to that PR as the evidence. Failing
+that, an open PR naming it is `doing`, with its author and open date. A step
+with neither is `todo`, whether it never had a PR or its only one was closed
+unmerged.
 
-Bookkeeping rides in the implementation PR. The convention in
-[`workbench-account.md`](./workbench-account.md) is to push a `doing` status
-change before starting, but this repo requires human review for most changes,
-so a separate bookkeeping PR is a second review for no information. Update the
-status in the same PR as the work it describes and say so in the PR body. A
-step whose work leaves no PR (a console action, a support case) is the
-exception and still gets a small PR of its own.
+A pull request says which plan it implements, and which numbered step it
+closes, in its body, each on its own line:
+
+```
+Plan: docs/sheriff.md
+Step: 3
+```
+
+The `Step:` line is deliberately not part of the merge gate: a missing,
+malformed or duplicated one never flags a PR, it only leaves that step's status
+where it was. The checklists below keep the statuses and evidence they were
+written with, and are not updated. They are the record of how each step was
+tracked up to the merge, which for a console action or a support case is the
+only record there is.
+
+"Bookkeeping rides in the implementation PR" is replaced by that, not extended
+by it. It existed only because the claim convention in `workbench-account.md`
+asked for a `doing` status push before work started, and this repo's review
+requirements turned that into a second review for no information. With status
+derived from the PRs that name a step there is no separate bookkeeping to ride
+along: the implementation PR is the status. The rule that `who` name the
+session rather than the model goes with it, because `who` is now the PR author.
 
 Ordering matters and is called out per step. The same rule the other plans use
 applies here: a step that grants a permission must merge **and finish applying**
