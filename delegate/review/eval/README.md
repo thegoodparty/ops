@@ -102,7 +102,7 @@ cat report.md
 
 Seven cases with a known right answer, listed in `expected/manifest.json`. Each is scored on the outcome alone, with no judge: a block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. Every case runs several times, and a case passes only when every run does.
 
-Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time.
+Every `delegate eval` comment also runs this suite as a parallel matrix leg of the `eval-suites` job (`eval suites (expected)`) and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time.
 
 ```sh
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--out ./eval-expected] [--work-dir /tmp/review-expect]
@@ -127,11 +127,12 @@ or a comment. Findings are ignored, so a case measures the consistency
 judgement alone, and the manifest's `expect` is `{ "consistency": "..." }`
 rather than `approve`/`block`. Everything else is the runner above.
 
-Every `delegate eval` comment runs this corpus as its own `gating` job and posts
-a separate comment. Like the expected-result job it replays main's corpus and
-scores from main, so a PR cannot change the cases it is graded on. Because an
-`issue_comment` workflow is read from the default branch, the job first runs
-once it is on main; until then the corpus can be replayed locally with
+Every `delegate eval` comment runs this corpus as the `gating` leg of the same
+`eval-suites` job (`eval suites (gating)`) and posts a separate comment. Like
+the expected-result leg it replays main's corpus and scores from main, so a PR
+cannot change the cases it is graded on. Because an `issue_comment` workflow is
+read from the default branch, the leg first runs once it is on main; until then
+the corpus can be replayed locally with
 `npm run review:expect -- --manifest delegate/review/eval/gating/manifest.json`.
 Two cases at three runs cost a few dollars and add no wall time.
 
