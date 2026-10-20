@@ -23,9 +23,12 @@ files that belong in review:
   bakes the allowlist in.
 
 The ECS task definition, the sidecar container and the ALB routing rules are
-the other half of phase 1 item 9 and land in a later PR. The three
-`OAUTH2_PROXY_*` secrets are written to Secrets Manager out of band (phase 2
-item 11) with `fill-secrets.sh`, never committed; see "Secrets" below.
+the other half of phase 1 item 9 and live in `deploy-workbench/ecs.ts` and
+`deploy-workbench/ingress.ts`: the task runs this image on 4180 with the three
+`OAUTH2_PROXY_*` secrets and the settings from the plan's "Protecting the admin
+surface", and the HTTPS listener sends `/oauth2/*` and the admin paths to it.
+Those secrets are written to Secrets Manager out of band (phase 2 item 11) with
+`fill-secrets.sh`, never committed; see "Secrets" below.
 
 ## `config.json` (phase 2 item 10)
 
@@ -198,5 +201,7 @@ AWS_PROFILE=<admin profile> aws secretsmanager get-secret-value \
 ```
 
 Until both Google values are present, `bifrost/oauth2-proxy` holds one of three
-credentials. The task definition must carry all three or none (item 9), so the
-admin surface stays disabled rather than partially configured.
+credentials. The task definition carries all three, so the ECS agent will not
+start the task until they are written (phase 2 item 11); the admin surface
+stays disabled rather than partially configured, and nothing serves traffic
+before item 10 and item 12 either way.

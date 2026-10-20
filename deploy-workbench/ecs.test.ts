@@ -5,6 +5,8 @@ import * as path from "node:path";
 import {
   AWS_REGION_ENV_NAME,
   BIFROST_CLUSTER_NAME,
+  BIFROST_CONTAINER_CPU,
+  BIFROST_CONTAINER_MEMORY,
   BIFROST_CONTAINER_NAME,
   BIFROST_LOG_GROUP_NAME,
   BIFROST_LOG_RETENTION_DAYS,
@@ -18,6 +20,10 @@ import {
   EXECUTION_SECRET_ACTIONS,
   GATEWAY_SECRET_KEYS,
   GATEWAY_SECRET_NAME,
+  OAUTH2_PROXY_CONTAINER_CPU,
+  OAUTH2_PROXY_CONTAINER_MEMORY,
+  OAUTH2_PROXY_CONTAINER_NAME,
+  OAUTH2_PROXY_ENVIRONMENT,
   OAUTH2_PROXY_SECRET_KEYS,
   OAUTH2_PROXY_SECRET_NAME,
   PG_PASSWORD_ENV_NAME,
@@ -31,10 +37,15 @@ import {
   secretReference,
   taskRolePolicyDocument,
 } from "./ecs";
-import { BIFROST_PORT, REGION } from "./network";
+import { BIFROST_PORT, OAUTH2_PROXY_PORT, REGION } from "./network";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
+import { BIFROST_HOSTNAME } from "./ingress";
+import {
+  OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
+  OAUTH2_PROXY_TAG,
+} from "./oauth2-proxy-image";
 
 /**
  * The ECS module's constants, its two policy documents, and the wiring of the
@@ -93,6 +104,26 @@ const containerBlock = (): string => {
     "the container definitions must precede the task definition",
   );
   return ECS_SOURCE.slice(start, end);
+};
+
+/**
+ * One container's definition, from its `name:` line to the start of the next
+ * container object (or the end of the builder for the last one). The builder
+ * holds an array of containers, so a whole-block `includes` cannot tell the
+ * sidecar's secrets from Bifrost's; this can. The end marker names the container
+ * constants rather than any `name:` line, because the secrets and environment
+ * entries inside a container also use that key.
+ */
+const containerDefinitionBlock = (nameConstant: string): string => {
+  const block = containerBlock();
+  const marker = new RegExp(`\\n\\s*name: ${nameConstant},`);
+  const start = block.search(marker);
+  assert.ok(start >= 0, `ecs.ts has no container named ${nameConstant}`);
+  const rest = block.slice(start + 1);
+  const next = rest.search(
+    /\n\s*name: (?:BIFROST_CONTAINER_NAME|OAUTH2_PROXY_CONTAINER_NAME),/,
+  );
+  return next >= 0 ? rest.slice(0, next) : rest;
 };
 
 describe("bifrost ecs", () => {
@@ -330,16 +361,27 @@ describe("bifrost ecs", () => {
     }
 
     // The gateway container gets exactly its own four, by name, from its own
-    // container; the oauth2-proxy three are item 9's to inject.
-    const block = containerBlock();
-    assert.ok(block.includes("GATEWAY_SECRET_KEYS.map"), block);
+    // container; the sidecar gets its own three, from its own container. Each
+    // container's secrets name its own secret container and never the other's.
+    const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(gateway.includes("GATEWAY_SECRET_KEYS.map"), gateway);
     assert.ok(
-      block.includes("secretReference(GATEWAY_SECRET_NAME, key)"),
-      block,
+      gateway.includes("secretReference(GATEWAY_SECRET_NAME, key)"),
+      gateway,
     );
     assert.ok(
-      !ECS_SOURCE.includes("OAUTH2_PROXY_SECRET_KEYS.map"),
-      "the oauth2-proxy sidecar is item 9; nothing here may inject its keys",
+      !gateway.includes("OAUTH2_PROXY_SECRET_NAME"),
+      "the Bifrost container must not receive the OAuth proxy's credentials",
+    );
+    const sidecar = containerDefinitionBlock("OAUTH2_PROXY_CONTAINER_NAME");
+    assert.ok(sidecar.includes("OAUTH2_PROXY_SECRET_KEYS.map"), sidecar);
+    assert.ok(
+      sidecar.includes("secretReference(OAUTH2_PROXY_SECRET_NAME, key)"),
+      sidecar,
+    );
+    assert.ok(
+      !sidecar.includes("GATEWAY_SECRET_NAME"),
+      "the sidecar must not receive the gateway's provider or admin secrets",
     );
   });
 
@@ -400,23 +442,30 @@ describe("bifrost ecs", () => {
   });
 
   it("runs Bifrost under an init process with awslogs", () => {
-    const block = containerBlock();
-    // Both are the delegate's idiom, copied deliberately: PID 1 reaps and
-    // forwards signals, and the container's stdout is the log group.
-    assert.ok(
-      block.includes("linuxParameters: { initProcessEnabled: true }"),
-      "the container must set initProcessEnabled",
-    );
-    assert.ok(block.includes('logDriver: "awslogs"'), block);
-    // The name is resolved through the surrounding `pulumi.all` rather than
-    // read as an Output inside the `apply` callback; see the dedicated test
-    // below for why that distinction is load-bearing.
-    assert.ok(block.includes('"awslogs-group": resolvedLogGroupName'), block);
-    assert.ok(block.includes('"awslogs-region": REGION'), block);
-    assert.ok(
-      block.includes('"awslogs-stream-prefix": BIFROST_LOG_STREAM_PREFIX'),
-      block,
-    );
+    for (const name of [
+      "BIFROST_CONTAINER_NAME",
+      "OAUTH2_PROXY_CONTAINER_NAME",
+    ]) {
+      const block = containerDefinitionBlock(name);
+      // Both are the delegate's idiom, copied deliberately: PID 1 reaps and
+      // forwards signals, and the container's stdout is the log group. Item 9
+      // gives the sidecar the same treatment: it is the container that holds
+      // the task's public admin door, so it must shut down on a signal.
+      assert.ok(
+        block.includes("linuxParameters: { initProcessEnabled: true }"),
+        `${name} must set initProcessEnabled`,
+      );
+      assert.ok(block.includes('logDriver: "awslogs"'), block);
+      // The name is resolved through the surrounding `pulumi.all` rather than
+      // read as an Output inside the `apply` callback; see the dedicated test
+      // below for why that distinction is load-bearing.
+      assert.ok(block.includes('"awslogs-group": resolvedLogGroupName'), block);
+      assert.ok(block.includes('"awslogs-region": REGION'), block);
+      assert.ok(
+        block.includes('"awslogs-stream-prefix": BIFROST_LOG_STREAM_PREFIX'),
+        block,
+      );
+    }
     assert.equal(BIFROST_LOG_STREAM_PREFIX, "bifrost");
   });
 
@@ -430,7 +479,7 @@ describe("bifrost ecs", () => {
       "the log group must set a retention; CloudWatch never expires by default",
     );
 
-    const block = containerBlock();
+    const block = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     assert.ok(block.includes("containerPort: BIFROST_PORT"), block);
     assert.equal(BIFROST_PORT, 8080);
     assert.equal(BIFROST_CONTAINER_NAME, "bifrost");
@@ -468,39 +517,150 @@ describe("bifrost ecs", () => {
     assert.equal(BIFROST_SERVICE_NAME, "bifrost");
   });
 
-  it("leaves the load-balancer attachment to item 9, with the reason", () => {
-    // ECS's CreateService rejects a target group that no listener or listener
-    // rule references:
+  it("registers the task as a target in both listener-referenced groups", () => {
+    // Item 8 could not register at all: ECS's CreateService rejects a target
+    // group that no listener or listener rule references
     //   InvalidParameterException: The target group with targetGroupArn ...
     //   does not have an associated load balancer.
-    // Item 6 points its only action at oauth2-proxy (fail-closed), so the
-    // Bifrost group is unassociated until item 9 adds the rules. A service
-    // that names it now would fail the apply rather than stage an idle target.
+    // Item 9 adds the rules (ingress.ts) and the registration together.
     const service = resourceBlock("bifrostService");
+    assert.ok(service.includes("loadBalancers: ["), service);
     assert.ok(
-      !service.includes("loadBalancers"),
-      "the service must not name a target group no listener references yet",
+      service.includes("targetGroupArn: ingress.bifrostTargetGroup.arn"),
+      service,
     );
     assert.ok(
-      !ECS_SOURCE.includes("ingress.bifrostTargetGroup"),
-      "ecs.ts must not reference a target group before item 9 associates one",
+      service.includes("targetGroupArn: ingress.oauth2ProxyTargetGroup.arn"),
+      service,
+    );
+    // Each group receives the container that publishes its port, which is what
+    // the target groups' health checks (Bifrost /health, proxy /ping) assume.
+    const bifrostEntry = service.indexOf(
+      "targetGroupArn: ingress.bifrostTargetGroup.arn",
+    );
+    const proxyEntry = service.indexOf(
+      "targetGroupArn: ingress.oauth2ProxyTargetGroup.arn",
+    );
+    assert.ok(bifrostEntry >= 0 && proxyEntry > bifrostEntry, service);
+    const bifrostLoadBalancer = service.slice(bifrostEntry, proxyEntry);
+    const proxyLoadBalancer = service.slice(proxyEntry, service.indexOf("],\n", proxyEntry));
+    assert.ok(
+      bifrostLoadBalancer.includes("containerName: BIFROST_CONTAINER_NAME") &&
+        bifrostLoadBalancer.includes("containerPort: BIFROST_PORT"),
+      "the Bifrost target group must receive the Bifrost container on 8080",
     );
     assert.ok(
-      !ECS_SOURCE.includes('from "./ingress"'),
-      "ecs.ts must not depend on the ingress until item 9 attaches the service",
+      proxyLoadBalancer.includes("containerName: OAUTH2_PROXY_CONTAINER_NAME") &&
+        proxyLoadBalancer.includes("containerPort: OAUTH2_PROXY_PORT"),
+      "the oauth2-proxy target group must receive the sidecar on 4180",
     );
-    // And the module must say why, so the next reader does not "fix" it by
-    // adding the block back.
+    // The listener rules are an explicit dependency, so the groups are
+    // associated before ECS registers the task rather than by luck of
+    // Pulumi's ordering.
+    assert.ok(service.includes("dependsOn: ingress.listenerRules"), service);
+    // And the module now depends on the ingress on purpose, with the reason
+    // still recorded so nobody deletes the dependency.
+    assert.ok(ECS_SOURCE.includes('from "./ingress"'));
     assert.ok(ECS_SOURCE.includes("does not have an associated load balancer"));
-    assert.ok(ECS_SOURCE.includes("item 9"));
-
-    // The pieces item 9 will need are already in place: the container name and
-    // port the loadBalancers entry has to agree with.
-    assert.equal(BIFROST_CONTAINER_NAME, "bifrost");
-    assert.equal(BIFROST_PORT, 8080);
   });
 
-  it("resolves the log group name before building the container", () => {
+  it("runs the oauth2-proxy sidecar beside Bifrost, on its own port and secrets", () => {
+    // Item 9: the admin surface's only door. Same task and network namespace,
+    // so it proxies to 127.0.0.1:8080 without a hop back through the ALB.
+    assert.equal(OAUTH2_PROXY_CONTAINER_NAME, "oauth2-proxy");
+    assert.equal(OAUTH2_PROXY_CONTAINER_CPU, 64);
+    assert.equal(OAUTH2_PROXY_CONTAINER_MEMORY, 128);
+
+    const sidecar = containerDefinitionBlock("OAUTH2_PROXY_CONTAINER_NAME");
+    assert.ok(sidecar.includes("image: resolvedOauth2ProxyImage"), sidecar);
+    assert.ok(sidecar.includes("containerPort: OAUTH2_PROXY_PORT"), sidecar);
+    assert.equal(OAUTH2_PROXY_PORT, 4180);
+    assert.ok(sidecar.includes("OAUTH2_PROXY_SECRET_KEYS.map"), sidecar);
+    assert.ok(
+      sidecar.includes("secretReference(OAUTH2_PROXY_SECRET_NAME, key)"),
+      sidecar,
+    );
+    // The admin surface gets its three credentials and nothing else: no
+    // database password, no provider key, no AWS configuration.
+    assert.ok(!sidecar.includes("PG_PASSWORD_ENV_NAME"), sidecar);
+    assert.ok(!sidecar.includes("GATEWAY_SECRET_NAME"), sidecar);
+    assert.ok(!sidecar.includes("AWS_REGION_ENV_NAME"), sidecar);
+    // Essential, so a proxy that cannot start takes the task with it instead
+    // of leaving a gateway with an admin surface that has no door.
+    assert.ok(sidecar.includes("essential: true"), sidecar);
+  });
+
+  it("gives the sidecar the plan's Google settings, derived not copied", () => {
+    assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_PROVIDER, "google");
+    assert.equal(
+      OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE,
+      OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
+    );
+    assert.equal(
+      OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_UPSTREAMS,
+      `http://127.0.0.1:${BIFROST_PORT}`,
+    );
+    assert.equal(
+      OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_HTTP_ADDRESS,
+      `0.0.0.0:${OAUTH2_PROXY_PORT}`,
+    );
+    // The callback and the cookie domain follow the ingress hostname, so a
+    // hostname change cannot leave the Google client pointing at the old one.
+    assert.equal(
+      OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_REDIRECT_URL,
+      `https://${BIFROST_HOSTNAME}/oauth2/callback`,
+    );
+    assert.equal(
+      OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_WHITELIST_DOMAINS,
+      BIFROST_HOSTNAME,
+    );
+    assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_REVERSE_PROXY, "true");
+    assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_COOKIE_SECURE, "true");
+    assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_COOKIE_SAMESITE, "lax");
+    assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_COOKIE_EXPIRE, "168h");
+    assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_COOKIE_REFRESH, "1h");
+    assert.equal(
+      OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_SKIP_PROVIDER_BUTTON,
+      "true",
+    );
+    // ECS environment values are strings, so every one of these is too.
+    for (const value of Object.values(OAUTH2_PROXY_ENVIRONMENT)) {
+      assert.equal(typeof value, "string");
+    }
+    // The allowlist is a file, never an inline value: the stock image has no
+    // inline flag, which is the reason the derived image exists at all.
+    assert.ok(
+      !("OAUTH2_PROXY_AUTHENTICATED_EMAILS" in OAUTH2_PROXY_ENVIRONMENT),
+    );
+    const sidecar = containerDefinitionBlock("OAUTH2_PROXY_CONTAINER_NAME");
+    assert.ok(
+      sidecar.includes("Object.entries(OAUTH2_PROXY_ENVIRONMENT)"),
+      sidecar,
+    );
+  });
+
+  it("fits both containers' reservations inside the task, with no growth", () => {
+    // Fargate refuses a task whose container reservations exceed the task's
+    // cpu/memory. The sidecar's share comes out of the single container's
+    // former whole-task reservation rather than raising the task size, which
+    // is item 8's and stays at 0.5 vCPU / 1 GB.
+    assert.equal(
+      BIFROST_CONTAINER_CPU + OAUTH2_PROXY_CONTAINER_CPU,
+      Number(TASK_CPU),
+    );
+    assert.equal(
+      BIFROST_CONTAINER_MEMORY + OAUTH2_PROXY_CONTAINER_MEMORY,
+      Number(TASK_MEMORY),
+    );
+    assert.ok(BIFROST_CONTAINER_CPU > OAUTH2_PROXY_CONTAINER_CPU);
+    assert.ok(BIFROST_CONTAINER_MEMORY > OAUTH2_PROXY_CONTAINER_MEMORY);
+
+    const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(gateway.includes("cpu: BIFROST_CONTAINER_CPU"), gateway);
+    assert.ok(gateway.includes("memory: BIFROST_CONTAINER_MEMORY"), gateway);
+  });
+
+  it("resolves the log group name before building the containers", () => {
     // An Output read inside an `apply` callback is not resolved for you: the
     // callback's return value is taken as-is and `JSON.stringify` throws
     // "Calling [toJSON] on an [Output<T>] is not supported", so the apply would
@@ -508,9 +668,12 @@ describe("bifrost ecs", () => {
     // surrounding `pulumi.all`, and this pins that it is not read again
     // inside the builder.
     const builder = containerBlock();
+    assert.ok(builder.includes("pulumi"), builder);
+    assert.ok(builder.includes("logGroup.name"), builder);
+    assert.ok(builder.includes("imageUri"), builder);
     assert.ok(
-      builder.includes("pulumi\n    .all([imageUri, database.secretArn, logGroup.name])"),
-      builder,
+      builder.includes("resolvedOauth2ProxyImage"),
+      "the sidecar image must be resolved through pulumi.all too",
     );
     assert.ok(
       !builder.includes('"awslogs-group": logGroup.name'),
@@ -569,11 +732,18 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("names the pinned image from the mirror, not a floating tag", () => {
+  it("names the pinned images from the mirror stores, not floating tags", () => {
     assert.ok(ECS_SOURCE.includes("${repositoryUrl}:${BIFROST_UPSTREAM_TAG}"));
-    // The pin itself lives in bifrost-image.ts and is asserted there.
+    // The Bifrost pin itself lives in bifrost-image.ts and is asserted there.
     assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.0");
-    assert.ok(ECS_SOURCE.includes("cpuArchitecture: \"X86_64\""));
+    assert.ok(ECS_SOURCE.includes('cpuArchitecture: "X86_64"'));
+    // The sidecar's tag is content-addressed on the allowlist, so it comes
+    // from oauth2-proxy-image.ts rather than a literal in the task definition.
+    assert.ok(
+      ECS_SOURCE.includes("${oauth2ProxyRepositoryUrl}:${OAUTH2_PROXY_TAG}"),
+    );
+    assert.ok(OAUTH2_PROXY_TAG.startsWith("v7.15.5-"));
+    assert.match(OAUTH2_PROXY_TAG, /^v7\.15\.5-[0-9a-f]{12}$/);
   });
 
   it("takes its one plain environment variable from the network module", () => {
@@ -596,7 +766,7 @@ describe("bifrost ecs", () => {
       INDEX_SOURCE.includes("createBifrostEcs"),
       "index.ts does not create the ECS resources",
     );
-    for (const arg of ["network,", "database,"]) {
+    for (const arg of ["network,", "database,", "ingress,"]) {
       assert.ok(
         INDEX_SOURCE.includes(`  ${arg}`),
         `index.ts does not pass ${arg} to createBifrostEcs`,
@@ -606,11 +776,11 @@ describe("bifrost ecs", () => {
       INDEX_SOURCE.includes("repositoryUrl: bifrostRepository.repositoryUrl"),
       "index.ts does not pass the mirrored repository to the task definition",
     );
-    // The ingress is not threaded in until item 9, when the service gets a
-    // target group a listener actually references.
     assert.ok(
-      !INDEX_SOURCE.includes("createBifrostEcs({\n  provider,\n  network,\n  ingress,"),
-      "index.ts must not pass the ingress to item 8's compute",
+      INDEX_SOURCE.includes(
+        "oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl",
+      ),
+      "index.ts does not pass the derived oauth2-proxy repository to the task definition",
     );
     assert.ok(
       INDEX_SOURCE.includes("export const bifrostLogGroupName"),

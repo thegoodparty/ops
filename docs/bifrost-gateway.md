@@ -764,8 +764,9 @@ network or a permission can land before the item that creates it.
    one database is the multi-node configuration upstream does not support; the
    `/aws/ecs/bifrost` log group at 30 days. It consumes item 5's private subnets
    and task security group and item 7's database secret, and declares neither
-   again. It does **not** yet name a target group; see the load-balancer note
-   below.
+   again. It deliberately did **not** name a target group; item 9 adds the
+   rules and the registration together, and its entry below supersedes this
+   sentence.
 
    The task definition is `deploy/components/worker.ts`'s idiom, with two
    deliberate differences. The task role is a separate identity holding only
@@ -784,11 +785,11 @@ network or a permission can land before the item that creates it.
    them by the names and JSON keys that script writes —
    `bifrost/gateway`'s four into the Bifrost container — and `preview` reads
    nothing from Secrets Manager at all, which is what keeps it working without
-   `secretsmanager:GetSecretValue`. The three `OAUTH2_PROXY_*` keys are named in
-   the module and read-granted but not injected: the sidecar that consumes them
-   is item 9. `BIFROST_CONFIG` and the rest of the runtime configuration are
-   item 10, so **the container cannot answer `/health` until then**; the plan's
-   staging, not a defect.
+   `secretsmanager:GetSecretValue`. At item 8 the three `OAUTH2_PROXY_*` keys
+   were named in the module and read-granted but not injected; item 9 injects
+   them into the sidecar. `BIFROST_CONFIG` and the rest of the runtime
+   configuration are item 10, so **the container cannot answer `/health` until
+   then**; the plan's staging, not a defect.
 
    The one place this item could not be implemented as written is the
    service's load-balancer registration, and it is a defect in the sequencing
@@ -803,13 +804,49 @@ network or a permission can land before the item that creates it.
    the rules; meanwhile the task runs with no target registered, which is the
    safe direction — the ALB's default action answers 503, and a container
    cannot fail a health check nobody is asking for. `ingress.ts`'s note that
-   item 8 registers a target into the Bifrost group predates this constraint;
-   it is item 9's to correct.
-9. Add the oauth2-proxy sidecar to the task definition and the admin/inference
-   ALB routing: the `/oauth2/*` and admin-path rules to the oauth2-proxy
-   target group on 4180, the inference-prefix rule to the Bifrost target group
-   on 8080, the derived oauth2-proxy image with the allowlist baked in, and
-   the three `OAUTH2_PROXY_*` secret containers.
+   item 8 registers a target into the Bifrost group predated this constraint;
+   item 9 corrected it along with the registration.
+9. ~~Add the oauth2-proxy sidecar to the task definition and the
+   admin/inference ALB routing: the `/oauth2/*` and admin-path rules to the
+   oauth2-proxy target group on 4180, the inference-prefix rule to the Bifrost
+   target group on 8080, the derived oauth2-proxy image with the allowlist
+   baked in, and the three `OAUTH2_PROXY_*` secret containers.~~ **Done** in
+   `deploy-workbench/ecs.ts` and `deploy-workbench/ingress.ts`.
+
+   The task definition now runs two containers: Bifrost on 8080 unchanged, and
+   the derived oauth2-proxy image (`oauth2-proxy-image.ts`) on 4180 with the
+   three `OAUTH2_PROXY_*` keys from `bifrost/oauth2-proxy`, the
+   Google/cookie/upstream settings from "Protecting the admin surface"
+   (`OAUTH2_PROXY_UPSTREAMS: http://127.0.0.1:8080`, the allowlist at
+   `/etc/oauth2-proxy/allowed-emails.txt`, the redirect URL and whitelist
+   domain derived from the ingress hostname), `awslogs` into the same log group
+   and `initProcessEnabled`. Both containers are essential, and their cpu/memory
+   reservations split the task's unchanged 0.5 vCPU / 1 GB rather than raising
+   it, because Fargate rejects reservations that exceed the task.
+
+   The HTTPS listener gains four rules, none of which re-points the default
+   action: `/oauth2/*` to oauth2-proxy (priority 10), `/` and `/api/*` to
+   oauth2-proxy (20), the four inference prefixes to Bifrost (30), and
+   `/health` and `/metrics` to Bifrost (40). An unmatched path still falls to
+   the oauth2-proxy default, so nothing reaches the gateway without the proxy
+   deciding first. `/health` is on Bifrost because item 12 proves it through
+   the ALB, and `/metrics` stays on Bifrost's own basic auth; they are a
+   separate rule because an ALB `path-pattern` condition accepts at most five
+   values.
+
+   The service now registers the task as a target in both groups, with the
+   listener rules as an explicit `dependsOn` so the groups are associated
+   before `CreateService` runs. That is the registration item 8 could not make,
+   and the reason moves with it; `ingress.ts` no longer claims item 8 registers
+   a target.
+
+   One consequence to know before item 12: the sidecar names all three
+   `OAUTH2_PROXY_*` keys, so the ECS agent will not start the task until item 11
+   has written them to `bifrost/oauth2-proxy`. That is the plan's sequence —
+   nothing can serve traffic before item 10 supplies `BIFROST_CONFIG` anyway —
+   and it fails closed rather than starting a proxy without its credentials.
+   This item changes no secret value, no `config.json` and no image pin, and
+   nothing was deployed.
 
 **Phase 2 — the gateway itself**
 

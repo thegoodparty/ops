@@ -431,14 +431,12 @@ const network = createWorkbenchNetwork({ provider });
 // network from item 5 and the zone from phase 0 item 2 rather than creating
 // either again.
 //
-// The listener rules that split inference from the admin surface belong to
-// item 9, not this item. The HTTPS listener has a default action because a
-// listener must have one, and it points at oauth2-proxy, the plan's catch-all:
-// until item 9 adds the inference-prefix rule, that target group has no
-// registered targets, so requests are a 503 rather than reaching Bifrost. The
-// interim state fails closed, and item 8 registering the ECS task cannot expose
-// the Bifrost admin surface ahead of oauth2-proxy. See the design record in
-// `ingress.ts`.
+// The path rules that split inference from the admin surface are item 9's and
+// live in `ingress.ts`: `/oauth2/*` and the admin paths to oauth2-proxy, the
+// inference prefixes and health/metrics to Bifrost. The HTTPS listener's
+// default action still points at oauth2-proxy, the plan's catch-all, and the
+// rules do not re-point it: an unmatched path is authenticated by the proxy,
+// never sent straight to Bifrost. See the design record in `ingress.ts`.
 const ingress = createBifrostIngress({
   provider,
   zone: workbenchZone,
@@ -461,12 +459,13 @@ export const bifrostAlbDnsName = ingress.loadBalancer.dnsName;
 // creating either again; those live in `network.ts`, which this item does not
 // touch.
 //
-// Nothing consumes it yet. The ECS task definition's `secrets` injection and
-// its read grant on `bifrostDatabaseSecretArn` are item 8's, and the oauth2
-// admin surface is item 9's, so this item's apply creates an instance and
-// leaves it idle. That is deliberate: the store is the plan's one expensive
-// irreversible resource, and creating it before the task that uses it means a
-// failed first boot is a task problem rather than a database one.
+// Nothing consumes it yet beyond the injected password. The ECS task
+// definition's `secrets` injection and its read grant on
+// `bifrostDatabaseSecretArn` are item 8's; `config.json`'s store settings are
+// item 10, so this item's apply creates an instance and leaves it otherwise
+// idle. That is deliberate: the store is the plan's one expensive irreversible
+// resource, and creating it before the task that uses it means a failed first
+// boot is a task problem rather than a database one.
 const database = createBifrostDatabase({ provider, network });
 
 /**
@@ -481,23 +480,22 @@ export const bifrostDatabaseEndpoint = database.endpoint;
 // ---------------------------------------------------------------------------
 // The gateway's compute.
 //
-// Phase 1 item 8 of docs/bifrost-gateway.md: one ECS cluster with container
-// insights, one Fargate task definition and one service, the `/aws/ecs/bifrost`
-// log group, and the two IAM roles. The task definition copies the idiom in
-// `deploy/components/worker.ts` — `secrets` from Secrets Manager, `awslogs`,
-// `linuxParameters.initProcessEnabled` — with a separate task role scoped to
-// the Bedrock model list in `utils/bedrock-models.ts` rather than the
-// delegate's five broad read policies.
+// Phase 1 items 8 and 9 of docs/bifrost-gateway.md: one ECS cluster with
+// container insights, one Fargate task definition with two containers and one
+// service, the `/aws/ecs/bifrost` log group, and the two IAM roles. The task
+// definition copies the idiom in `deploy/components/worker.ts` — `secrets` from
+// Secrets Manager, `awslogs`, `linuxParameters.initProcessEnabled` — with a
+// separate task role scoped to the Bedrock model list in
+// `utils/bedrock-models.ts` rather than the delegate's five broad read policies.
 //
-// It consumes item 5's private subnets and task security group and item 7's
-// database secret rather than declaring any of them again. The service's
-// load-balancer attachment is item 9's with the routing, because ECS refuses to
-// create a service against a target group that no listener or listener rule
-// references and item 6 attached neither group to a rule; see the note in
-// `ecs.ts`. The oauth2-proxy sidecar and the ALB's path rules are item 9;
-// `BIFROST_CONFIG` and the rest of the runtime configuration are item 10, so
-// the container cannot answer `/health` honestly until then. That is the plan's
-// staging, not a defect in this item.
+// It consumes item 5's private subnets and task security group, item 7's
+// database secret and item 6's ingress rather than declaring any of them again.
+// The sidecar (oauth2-proxy on 4180) and the service's registration in both
+// target groups are item 9's, with the listener rules that make the groups
+// attachable; the ingress object is passed in below for exactly that reason.
+// `BIFROST_CONFIG` and the rest of the runtime configuration are item 10, so the
+// container cannot answer `/health` honestly until then. That is the plan's
+// staging, not a defect here.
 //
 // The two secret containers (`bifrost/gateway`, `bifrost/oauth2-proxy`) are
 // **not** Pulumi resources. They were created out of band by
@@ -510,7 +508,9 @@ const ecs = createBifrostEcs({
   provider,
   network,
   database,
+  ingress,
   repositoryUrl: bifrostRepository.repositoryUrl,
+  oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl,
 });
 
 /** The service's task family, for a human reading `pulumi stack output`. */

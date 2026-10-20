@@ -61,6 +61,16 @@ export const OAUTH2_PROXY_ALLOWLIST_PATH = path.join(
 );
 
 /**
+ * The path the Dockerfile bakes the allowlist to, and the one the sidecar's
+ * `OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE` names. The task definition and the
+ * Dockerfile have to agree on it or the proxy starts with a missing file and
+ * exits; `oauth2-proxy-image.test.ts` pins the Dockerfile side and
+ * `ecs.test.ts` pins the environment, both against this constant.
+ */
+export const OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH =
+  "/etc/oauth2-proxy/allowed-emails.txt";
+
+/**
  * The first 12 hex characters of the allowlist's sha256.
  *
  * The tag is content-addressed rather than fixed at the upstream tag so that

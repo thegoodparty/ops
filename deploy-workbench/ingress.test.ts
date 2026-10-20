@@ -4,14 +4,23 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_ZONE_NAME } from "./dns";
 import {
+  ADMIN_PATH_PATTERNS,
+  ADMIN_RULE_PRIORITY,
   ALB_IDLE_TIMEOUT_SECONDS,
   BIFROST_ALB_NAME,
   BIFROST_HEALTH_CHECK_PATH,
   BIFROST_HOSTNAME,
   BIFROST_TARGET_GROUP_NAME,
+  HTTPS_LISTENER_RULES,
+  INFERENCE_PATH_PATTERNS,
+  INFERENCE_RULE_PRIORITY,
+  OAUTH2_CALLBACK_PATH_PATTERNS,
+  OAUTH2_CALLBACK_RULE_PRIORITY,
   OAUTH2_PROXY_HEALTH_CHECK_PATH,
   OAUTH2_PROXY_TARGET_GROUP_NAME,
   TARGET_GROUPS,
+  TELEMETRY_PATH_PATTERNS,
+  TELEMETRY_RULE_PRIORITY,
   TLS_POLICY,
 } from "./ingress";
 import {
@@ -149,18 +158,157 @@ describe("bifrost ingress", () => {
   });
 
   it("fails closed: the HTTPS default action points at oauth2-proxy, not Bifrost", () => {
-    // Until item 9 adds the inference-prefix rule, the default reaches a
-    // target group with no registered targets (503) instead of exposing
-    // Bifrost's admin surface as soon as item 8 registers the ECS task.
+    // Item 9 adds the path rules below, and none of them re-points the default.
+    // An unmatched path still goes through the authenticating proxy, so there
+    // is no path on this listener that reaches Bifrost without oauth2-proxy
+    // deciding first.
     const httpsBlock = resourceBlock("bifrostHttpsListener");
+    const defaultActions = httpsBlock.match(
+      /defaultActions:\s*\[([\s\S]*?)\n\s*\],/,
+    );
+    assert.ok(defaultActions, "the HTTPS listener must declare defaultActions");
     assert.ok(
-      httpsBlock.includes("targetGroupArn: oauth2ProxyTargetGroup.arn"),
+      defaultActions[1].includes("targetGroupArn: oauth2ProxyTargetGroup.arn"),
       "the HTTPS listener default action must forward to oauth2-proxy",
     );
     assert.ok(
-      !httpsBlock.includes("targetGroupArn: bifrostTargetGroup.arn"),
-      "the HTTPS listener default action must not forward to Bifrost before item 9 adds the inference rule",
+      !defaultActions[1].includes("bifrostTargetGroup"),
+      "the HTTPS listener default action must never forward to Bifrost",
     );
+  });
+
+  it("splits the admin surface from inference by path, as the plan specifies", () => {
+    // The routing table in "Protecting the admin surface": `/oauth2/*` and the
+    // admin paths to the proxy on 4180, the inference prefixes to Bifrost on
+    // 8080, and `/health` and `/metrics` to Bifrost so a harness never meets a
+    // browser redirect and the scraper never needs a Google session.
+    assert.deepEqual(
+      HTTPS_LISTENER_RULES.map((rule) => ({
+        key: rule.key,
+        priority: rule.priority,
+        paths: [...rule.pathPatterns],
+        target: rule.target,
+      })),
+      [
+        {
+          key: "oauth2Callback",
+          priority: OAUTH2_CALLBACK_RULE_PRIORITY,
+          paths: ["/oauth2/*"],
+          target: "oauth2Proxy",
+        },
+        {
+          key: "admin",
+          priority: ADMIN_RULE_PRIORITY,
+          paths: ["/", "/api/*"],
+          target: "oauth2Proxy",
+        },
+        {
+          key: "inference",
+          priority: INFERENCE_RULE_PRIORITY,
+          paths: ["/v1/*", "/anthropic/*", "/openai/*", "/genai/*"],
+          target: "bifrost",
+        },
+        {
+          key: "telemetry",
+          priority: TELEMETRY_RULE_PRIORITY,
+          paths: ["/health", "/metrics"],
+          target: "bifrost",
+        },
+      ],
+    );
+    // Priorities are unique, which ALB requires on a listener, and ascending in
+    // the order above.
+    const priorities = HTTPS_LISTENER_RULES.map((rule) => rule.priority);
+    assert.equal(new Set(priorities).size, priorities.length);
+    assert.deepEqual(priorities, [...priorities].sort((a, b) => a - b));
+  });
+
+  it("leaves no public path that reaches Bifrost without oauth2-proxy", () => {
+    // The property the fail-closed default buys: the only paths that bypass the
+    // proxy are the ones enumerated here, and none of them is the admin surface
+    // or a login endpoint.
+    const bifrostPaths = HTTPS_LISTENER_RULES.filter(
+      (rule) => rule.target === "bifrost",
+    ).flatMap((rule) => [...rule.pathPatterns]);
+    assert.deepEqual(
+      [...bifrostPaths].sort(),
+      [
+        "/genai/*",
+        "/health",
+        "/metrics",
+        "/openai/*",
+        "/v1/*",
+        "/anthropic/*",
+      ].sort(),
+    );
+    for (const forbidden of ["/", "/api/*", "/oauth2/*"]) {
+      assert.ok(
+        !bifrostPaths.includes(forbidden),
+        `${forbidden} must go through oauth2-proxy, not straight to Bifrost`,
+      );
+    }
+
+    // And the proxy rules cover the admin surface and the login endpoints.
+    const proxyPaths = HTTPS_LISTENER_RULES.filter(
+      (rule) => rule.target === "oauth2Proxy",
+    ).flatMap((rule) => [...rule.pathPatterns]);
+    assert.deepEqual(
+      [...proxyPaths].sort(),
+      ["/", "/api/*", "/oauth2/*"].sort(),
+    );
+    assert.deepEqual(
+      [...ADMIN_PATH_PATTERNS],
+      ["/", "/api/*"],
+    );
+    assert.deepEqual([...OAUTH2_CALLBACK_PATH_PATTERNS], ["/oauth2/*"]);
+    assert.deepEqual([...INFERENCE_PATH_PATTERNS], [
+      "/v1/*",
+      "/anthropic/*",
+      "/openai/*",
+      "/genai/*",
+    ]);
+    assert.deepEqual([...TELEMETRY_PATH_PATTERNS], ["/health", "/metrics"]);
+
+    // An ALB path-pattern condition accepts at most five values; more is an
+    // apply-time error rather than a routing surprise.
+    for (const rule of HTTPS_LISTENER_RULES) {
+      assert.ok(
+        rule.pathPatterns.length <= 5,
+        `${rule.key} has ${rule.pathPatterns.length} path values; ALB allows at most 5`,
+      );
+    }
+  });
+
+  it("creates the rules against the listener and both target groups", () => {
+    // The rules are what make the two target groups attachable: ECS refuses to
+    // register a target into a group no listener or rule references, which is
+    // why item 8 could not register at all.
+    assert.ok(
+      INGRESS_SOURCE.includes("new aws.lb.ListenerRule("),
+      "ingress.ts does not create the listener rules",
+    );
+    assert.ok(
+      INGRESS_SOURCE.includes("listenerArn: httpsListener.arn"),
+      "the rules must attach to the HTTPS listener",
+    );
+    assert.ok(
+      INGRESS_SOURCE.includes("priority: spec.priority"),
+      "the rules must use the priorities in HTTPS_LISTENER_RULES",
+    );
+    assert.ok(
+      INGRESS_SOURCE.includes("targetGroupArn: ruleTargetGroupArns[spec.target]"),
+      "each rule must forward to the target group its spec names",
+    );
+    // Both groups are named by the mapping, so no rule can accidentally point
+    // at a third target or at a string literal.
+    assert.ok(
+      INGRESS_SOURCE.includes("bifrost: bifrostTargetGroup.arn") &&
+        INGRESS_SOURCE.includes("oauth2Proxy: oauth2ProxyTargetGroup.arn"),
+      "the rule target mapping must name both target groups",
+    );
+    // The rules are returned, because the ECS service takes them as an explicit
+    // dependency before it registers the task.
+    assert.ok(INGRESS_SOURCE.includes("listenerRules,"));
   });
 
   it("pins both Route 53 records to the workbench zone", () => {
