@@ -32,6 +32,20 @@ whole suite with `npm test`.
 **Commit with `--no-verify`.** Explain *why* in PR bodies, not what. No
 "test plan" section, no Co-Authored-By.
 
+**Plans and step status.** A `docs/` file with a numbered implementation plan
+is a spec, frozen when it merged: do not edit its checklist to record progress.
+Status is derived from the PRs that name the step, so an implementation PR
+carries, each on its own line in the body:
+
+```
+Plan: docs/<plan>.md
+Step: 3
+```
+
+`Plan:` is what the gate reads. `Step:` only advances a step's status, and
+omitting it fails silently. ClickUp carries only what git cannot express. See
+decision 11 of `docs/plan-gated-merges.md`.
+
 ## Review and approval
 
 Who has to approve a PR here no longer depends on which paths it touches:
