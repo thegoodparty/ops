@@ -152,6 +152,37 @@ const requireEnv = (name: string, why: string): string => {
   return value.trim();
 };
 
+/**
+ * Refuses a scratch configuration that overlaps a production pair in any of
+ * the three fields that could reach one, plus the reserved target. Called from
+ * `scratchPair()` rather than from a single test: a failed `it` does not stop
+ * the later ones, so the guard has to run before every use, not once in
+ * parallel with the reads it protects.
+ */
+const assertScratchOnly = (pair: SyncPair): void => {
+  const sameEmail = (a: string, b: string): boolean =>
+    a.trim().toLowerCase() === b.trim().toLowerCase();
+  assert.ok(
+    SYNC_PAIRS.every((configured) => configured.id !== pair.id),
+    `pair id ${pair.id} is also configured in SYNC_PAIRS`,
+  );
+  assert.ok(
+    SYNC_PAIRS.every(
+      (configured) => configured.targetGroupId !== pair.targetGroupId,
+    ),
+    `target ${pair.targetGroupId} is also a configured pair's target`,
+  );
+  assert.ok(
+    SYNC_PAIRS.every(
+      (configured) =>
+        !sameEmail(configured.sourceGroupEmail, pair.sourceGroupEmail),
+    ),
+    `source ${pair.sourceGroupEmail} is also a configured pair's source`,
+  );
+  assert.ok(!RESERVED_TARGET_GROUP_IDS.includes(pair.targetGroupId));
+  assert.notEqual(pair.targetGroupId, ADMINS_GROUP_ID);
+};
+
 /** The scratch pair. Every run of the suite builds it fresh from the env. */
 const scratchPair = (): SyncPair => {
   const sourceGroupEmail = requireEnv(
@@ -167,7 +198,7 @@ const scratchPair = (): SyncPair => {
     .map((entry) => entry.trim())
     .filter(Boolean);
 
-  return {
+  const pair: SyncPair = {
     id: INTEGRATION_PAIR_ID,
     sourceGroupEmail,
     targetGroupId,
@@ -179,6 +210,10 @@ const scratchPair = (): SyncPair => {
     allowlist: allowlist.length > 0 ? allowlist : ["@goodparty.org"],
     removalAlertThreshold: 0,
   };
+  // Every test builds its pair here, so this runs before every live read and
+  // a collision cannot be skipped by another test's failure.
+  assertScratchOnly(pair);
+  return pair;
 };
 
 /** The live Google read. Needs only the delegated service-account key. */
@@ -251,22 +286,10 @@ describe(
   { skip: ENABLED ? false : SKIP_REASON },
   () => {
     it("cannot collide with a configured pair or with Admins", () => {
+      // `scratchPair()` enforces the safety property before returning, so this
+      // test documents it and the assertion runs before every live read.
       const pair = scratchPair();
-      // The safety property of the whole file: this test's writes (if any were
-      // ever added) and its reads stay on the scratch group.
       assert.equal(pair.mode, "dry-run");
-      assert.ok(
-        SYNC_PAIRS.every((configured) => configured.id !== pair.id),
-        `pair id ${pair.id} is also configured in SYNC_PAIRS`,
-      );
-      assert.ok(
-        SYNC_PAIRS.every(
-          (configured) => configured.targetGroupId !== pair.targetGroupId,
-        ),
-        `target ${pair.targetGroupId} is also a configured pair's target`,
-      );
-      assert.ok(!RESERVED_TARGET_GROUP_IDS.includes(pair.targetGroupId));
-      assert.notEqual(pair.targetGroupId, ADMINS_GROUP_ID);
     });
 
     it("reads the scratch Google group's members, page by page, through real delegation", async () => {
