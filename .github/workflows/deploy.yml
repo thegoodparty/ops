@@ -42,10 +42,12 @@ jobs:
       # (`deploy/components/ci-roles.ts`). Run them after the credentials step
       # and any test file in the repo is an admin-credentialled shell.
       #
-      # `.github/CODEOWNERS` lets its opted-out paths merge on a bot approval,
-      # so this ordering is what keeps a bot-approved merge from reaching the
-      # deploy role. Nothing below needs AWS except the docker build's ECR
-      # Public login, the ECR push and the deploy itself.
+      # `.github/CODEOWNERS` can let a path it leaves unowned merge on a bot
+      # approval, so this ordering is what keeps such a merge from reaching the
+      # deploy role. No path is in that state today -- the opt-out list is
+      # empty and `*` owns everything -- but the ordering has to hold for any
+      # path that is ever de-owned. Nothing below needs AWS except the docker
+      # build's ECR Public login, the ECR push and the deploy itself.
       - run: npm ci
       - run: npm test
       - run: npm run build
