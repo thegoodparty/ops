@@ -34,25 +34,22 @@ whole suite with `npm test`.
 
 ## Review and approval
 
-Who has to approve a PR here depends on which paths it touches. The default
-branch requires one approving review plus code-owner review.
-`.github/CODEOWNERS` **owns every path by default** and names a short opt-out
-list, so a human on `@thegoodparty/gp-contrib` must approve anything not
-explicitly opted out. A path with no owner satisfies the code-owner half
-vacuously, so on an opted-out path a `delegate-reviewer[bot]` approval is
-enough to merge, with no human behind it.
+Who has to approve a PR here no longer depends on which paths it touches:
+every path needs a human. The default branch requires one approving review
+plus code-owner review. `.github/CODEOWNERS` **owns every path by default**:
+`*` is its only rule, so a human on `@thegoodparty/gp-contrib` must approve
+every PR. A path with no owner would satisfy the code-owner half vacuously, but
+the opt-out list that could leave a path unowned is deliberately empty, so
+nothing merges on a `delegate-reviewer[bot]` approval — not documentation, not
+root files, not anything else.
 
-**Everything merges on a bot approval except** the paths `.github/CODEOWNERS`
-opts out:
+The opt-out list in `.github/CODEOWNERS` is also the only mechanism that grants
+the bot authority to approve, and adding an entry to it is a security change
+that needs a human. There are no entries today.
 
-- `docs/`, `README.md` — documentation.
-- `.gitignore` — inert.
-- `CLAUDE.md`, at the root and in any directory — removed from the review list
-  by #173, and preserved as an opt-out here.
-
-**A human on `@thegoodparty/gp-contrib` must approve** everything else. The
-owned entries worth naming, because the file being edited does not obviously
-reach a credential:
+**A human on `@thegoodparty/gp-contrib` must approve** every path, `docs/`
+included. The owned entries worth naming, because the file being edited does
+not obviously reach a credential:
 
 - `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/`,
   `deploy-infrastructure/` — the trees that define IAM, CI and the reviewer
@@ -79,8 +76,8 @@ role carries `AdministratorAccess` and `npm test` executes repository
 code. Do not move a step that runs
 repository code below that credentials step.
 
-Both halves are explained at length in `.github/CODEOWNERS`. Read it before
-adding a path to either side; scope by directory, not by file.
+All of this is explained at length in `.github/CODEOWNERS`. Read it before
+adding a path to the opt-out list; scope by directory, not by file.
 
 ## Scripts
 
