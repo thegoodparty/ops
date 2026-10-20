@@ -930,6 +930,12 @@ describe("bifrost ecs", () => {
       "index.ts does not pass the derived oauth2-proxy repository to the task definition",
     );
     assert.ok(
+      INDEX_SOURCE.includes(
+        "bootstrapRepositoryUrl: bifrostBootstrapRepository.repositoryUrl",
+      ),
+      "index.ts does not pass the derived bootstrap repository; the claim container's image URI would be built from an undefined repository",
+    );
+    assert.ok(
       INDEX_SOURCE.includes("export const bifrostLogGroupName"),
       "index.ts must export the log group name for item 12",
     );
